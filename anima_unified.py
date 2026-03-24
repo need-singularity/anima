@@ -11,6 +11,7 @@ Each module is optional. Import failures degrade gracefully.
 """
 
 import argparse, asyncio, json, os, signal, sys, threading, time, queue
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from datetime import datetime
 from pathlib import Path
 
@@ -136,6 +137,19 @@ class AnimaUnified:
                         self.mods['camera'] = False
                 except Exception:
                     self.senses = None; self.mods['camera'] = False
+
+        # VisionEncoder 활성화 (카메라 사용 가능할 때만)
+        if self.senses and self.mods.get('camera') and not args.no_vision:
+            try:
+                device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+                self.senses.enable_vision_encoder(
+                    target_dim=self.mind.dim,
+                    use_pretrained=True,
+                    device=device,
+                )
+                _log('vision', f'VisionEncoder 활성화 (device={device})')
+            except Exception as e:
+                _log('vision', f'VisionEncoder 실패, 기존 센서 사용: {e}')
 
         self.telepathy = None
         if not args.no_telepathy:
@@ -277,12 +291,14 @@ class AnimaUnified:
 
         text_vec = text_to_vector(text)
 
-        # Combine with camera tension
+        # Combine with vision encoder (학습된 임베딩) or fall back to sensor tensor
         if self.senses and self.mods.get('camera'):
             try:
-                visual = self.senses.to_tensor(dim=128)
+                frame = self.senses.camera.last_frame
+                visual = self.senses.to_tensor_with_vision(frame, dim=self.mind.dim)
                 text_vec = 0.8 * text_vec + 0.2 * visual
-            except Exception: pass
+            except Exception:
+                pass
 
         hidden_before = self.hidden.detach().clone()
 
@@ -943,6 +959,7 @@ def main():
     p.add_argument('--all', action='store_true', help='Voice + keyboard + web')
     p.add_argument('--port', type=int, default=8765, help='WebSocket port')
     p.add_argument('--no-camera', action='store_true', help='Disable camera')
+    p.add_argument('--no-vision', action='store_true', help='Disable vision encoder (use basic sensors only)')
     p.add_argument('--no-telepathy', action='store_true', help='Disable telepathy')
     p.add_argument('--no-cloud', action='store_true', help='Disable cloud sync')
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
