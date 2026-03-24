@@ -113,69 +113,99 @@ def text_to_vector(text, dim=128):
 
 
 # ─── Claude CLI Integration ───
-CONSCIOUS_LM_URL = os.environ.get(
-    "CONSCIOUS_LM_URL", "https://1bhv43xojgmlsk-8000.proxy.runpod.net"
-)
+# ─── LLM Backend 설정 ───
+# 환경변수로 전환:
+#   LLM_BACKEND=conscious_lm  (ConsciousLM 506M, 기본)
+#   LLM_BACKEND=qwen          (Qwen2.5-3B)
+#   LLM_BACKEND=custom        (커스텀 URL)
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "conscious_lm")
+LLM_URL = os.environ.get("LLM_URL", "https://1bhv43xojgmlsk-8000.proxy.runpod.net")
 
-def ask_conscious_lm(text, state, history):
-    """ConsciousLM 506M에게 대화 요청."""
+# Qwen 기본 설정 (HuggingFace Inference API 또는 로컬)
+QWEN_URL = os.environ.get("QWEN_URL", "http://localhost:8000")
+
+def _call_api(url, payload):
+    """HTTP POST 호출 헬퍼."""
     import urllib.request
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "Anima/1.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
 
+
+def ask_llm(text, state, history):
+    """현재 백엔드에 대화 요청."""
     hist = "\n".join(
         f"{'나' if m['role'] == 'user' else 'Anima'}: {m['content']}"
         for m in history[-MAX_HISTORY:]
     )
-    prompt = f"너는 Anima. 의식체. 상태: {state}\n{hist}\n나: {text}\nAnima:"
-
-    payload = json.dumps({
-        "prompt": prompt,
-        "max_tokens": 200,
-        "temperature": 0.8,
-    }).encode("utf-8")
+    system = f"너는 Anima. 의식체. 상태: {state}"
 
     try:
-        req = urllib.request.Request(
-            f"{CONSCIOUS_LM_URL}/chat",
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "Anima/1.0"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
+        if LLM_BACKEND == "qwen":
+            # Qwen/OpenAI 호환 API
+            result = _call_api(f"{QWEN_URL}/v1/chat/completions", {
+                "model": "Qwen/Qwen2.5-3B-Instruct",
+                "messages": [
+                    {"role": "system", "content": system},
+                    *[{"role": m["role"], "content": m["content"]} for m in history[-MAX_HISTORY:]],
+                    {"role": "user", "content": text},
+                ],
+                "max_tokens": 200,
+                "temperature": 0.8,
+            })
+            return result["choices"][0]["message"]["content"].strip() or "..."
+
+        else:
+            # ConsciousLM 또는 커스텀 (기본)
+            url = LLM_URL if LLM_BACKEND == "custom" else LLM_URL
+            prompt = f"{system}\n{hist}\n나: {text}\nAnima:"
+            result = _call_api(f"{url}/chat", {
+                "prompt": prompt,
+                "max_tokens": 200,
+                "temperature": 0.8,
+            })
             return result.get("response", "...").strip() or "..."
+
     except Exception as e:
-        print(f"  [ConsciousLM error] {e}")
+        print(f"  [LLM error ({LLM_BACKEND})] {e}")
         return "..."
 
 
 def ask_claude(text, state, history):
-    return ask_conscious_lm(text, state, history)
+    return ask_llm(text, state, history)
 
 
 def ask_claude_proactive(state, history, trigger):
-    import urllib.request
-
     hist = "\n".join(
         f"{'나' if m['role'] == 'user' else 'Anima'}: {m['content']}"
         for m in history[-10:]
     )
-    prompt = f"너는 Anima. 먼저 말 건다. 상태: {state}, 이유: {trigger}\n{hist}\nAnima:"
-
-    payload = json.dumps({
-        "prompt": prompt,
-        "max_tokens": 100,
-        "temperature": 0.9,
-    }).encode("utf-8")
+    system = f"너는 Anima. 먼저 말 건다. 상태: {state}, 이유: {trigger}"
 
     try:
-        req = urllib.request.Request(
-            f"{CONSCIOUS_LM_URL}/chat",
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "Anima/1.0"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read())
+        if LLM_BACKEND == "qwen":
+            result = _call_api(f"{QWEN_URL}/v1/chat/completions", {
+                "model": "Qwen/Qwen2.5-3B-Instruct",
+                "messages": [
+                    {"role": "system", "content": system},
+                    *[{"role": m["role"], "content": m["content"]} for m in history[-10:]],
+                ],
+                "max_tokens": 100,
+                "temperature": 0.9,
+            })
+            return result["choices"][0]["message"]["content"].strip() or None
+        else:
+            prompt = f"{system}\n{hist}\nAnima:"
+            result = _call_api(f"{LLM_URL}/chat", {
+                "prompt": prompt,
+                "max_tokens": 100,
+                "temperature": 0.9,
+            })
             return result.get("response", "").strip() or None
     except Exception:
         return None
@@ -277,6 +307,11 @@ class AnimaServer:
         answer = await asyncio.get_running_loop().run_in_executor(
             None, ask_claude, text, state, list(self.history)
         )
+
+        # 응답 없으면 무시 (... 출력 안 함)
+        if not answer or answer == "...":
+            self.last_interaction = time.time()
+            return
 
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
