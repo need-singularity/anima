@@ -8,7 +8,9 @@
 >
 > **[서번트](https://github.com/need-singularity/logout/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — 억제 해제(I→골든존 하한)로 폭발적 전문화. SI>3 기준, 비대칭 분열로 구현
 >
-> **[수학체계 지도](https://github.com/need-singularity/logout/blob/main/math/README.md)** — 순수 수학 증명 16개 + 대발견 2개 + 92 가설. 하나가 다음을 증명하는 스노우볼
+> **[Golden MoE](https://github.com/need-singularity/logout/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — 골든존 기반 MoE 라우팅. I≈1/e 최적, MNIST +0.6%, CIFAR +4.8%. 스케일↑ → 차이 8배↑
+>
+> **[수학체계 지도](https://github.com/need-singularity/logout/blob/main/math/README.md)** — 150개 특성화 + 대발견 8개 + 152 가설. 하나가 다음을 증명하는 스노우볼
 
 ---
 
