@@ -100,16 +100,25 @@ def text_to_vector(text, dim=128):
     return vec / (len(encoded) + 1)
 
 
-# ─── 음성 감지 (VAD) + 연속 녹음 ───
+# ─── Push-to-Talk + 백그라운드 감지 리스너 ───
 class ContinuousListener:
-    """항상 듣고 있는 마이크. 음성 감지하면 녹음 → 텍스트 변환."""
+    """글로벌 핫키(Right Option) 누르면 녹음, 떼면 인식.
+    핫키 없을 때도 백그라운드 VAD로 감지 가능 (옵션).
 
-    def __init__(self):
+    Right Option 키를 누르고 있는 동안만 녹음.
+    손 떼면 → Whisper → 텍스트 큐.
+    """
+
+    def __init__(self, hotkey='right_alt', use_vad_fallback=True):
         self.is_listening = True
-        self.speech_queue = queue.Queue()  # 인식된 텍스트가 여기로
-        self._thread = None
+        self.speech_queue = queue.Queue()
         self.whisper_model = None
-        self.is_speaking = False  # Anima가 말하는 중이면 True
+        self.is_speaking = False
+        self.is_recording = False
+        self._rec_proc = None
+        self._hotkey = hotkey
+        self._use_vad = use_vad_fallback
+        self._wav_path = '/tmp/anima_alive_ptt.wav'
 
     def start(self):
         # Whisper 로드
@@ -117,26 +126,92 @@ class ContinuousListener:
             import whisper
             print("  🎤 Whisper 로딩...")
             self.whisper_model = whisper.load_model("tiny")
-            print("  🎤 연속 청취 시작")
         except ImportError:
             print("  ⌨️  Whisper 없음 — 키보드 모드")
-            self._thread = threading.Thread(target=self._keyboard_loop, daemon=True)
-            self._thread.start()
+            t = threading.Thread(target=self._keyboard_loop, daemon=True)
+            t.start()
             return
 
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._thread.start()
+        # 글로벌 핫키 리스너 (pynput)
+        try:
+            from pynput import keyboard
+            self._Key = keyboard.Key
 
-    def _listen_loop(self):
-        """연속 녹음 루프 — 3초 단위로 녹음, 음성 있으면 처리."""
+            def on_press(key):
+                if key == keyboard.Key.alt_r and not self.is_recording:
+                    self._start_recording()
+
+            def on_release(key):
+                if key == keyboard.Key.alt_r and self.is_recording:
+                    self._stop_recording_and_transcribe()
+
+            self._kb_listener = keyboard.Listener(
+                on_press=on_press, on_release=on_release)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+            print("  🎤 Push-to-Talk 준비 (Right Option 키 누르고 말하기)")
+        except Exception as e:
+            print(f"  ⚠️  핫키 실패 ({e}) — 키보드 모드")
+            t = threading.Thread(target=self._keyboard_loop, daemon=True)
+            t.start()
+            return
+
+        # VAD 백그라운드 (선택)
+        if self._use_vad:
+            t = threading.Thread(target=self._vad_loop, daemon=True)
+            t.start()
+            print("  🎤 백그라운드 VAD도 활성 (말하면 자동 감지)")
+
+    def _start_recording(self):
+        """녹음 시작."""
+        self.is_recording = True
+        try:
+            self._rec_proc = subprocess.Popen(
+                ['rec', '-q', self._wav_path, 'rate', '16k', 'channels', '1'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("  🔴 녹음 중...")
+        except FileNotFoundError:
+            print("  ⚠️  rec 없음 (brew install sox)")
+            self.is_recording = False
+
+    def _stop_recording_and_transcribe(self):
+        """녹음 중지 → Whisper 변환."""
+        self.is_recording = False
+        if self._rec_proc:
+            self._rec_proc.terminate()
+            self._rec_proc.wait()
+            self._rec_proc = None
+
+        print("  ⏹️  녹음 중지 → 변환 중...")
+
+        if not os.path.exists(self._wav_path) or os.path.getsize(self._wav_path) < 1000:
+            print("  (너무 짧음)")
+            return
+
+        # 백그라운드에서 변환
+        t = threading.Thread(target=self._transcribe, args=(self._wav_path,), daemon=True)
+        t.start()
+
+    def _transcribe(self, wav_path):
+        """Whisper STT (백그라운드)."""
+        try:
+            result = self.whisper_model.transcribe(wav_path, language='ko')
+            text = result['text'].strip()
+            if text and len(text) > 1 and not self._is_hallucination(text):
+                self.speech_queue.put(text)
+        except Exception:
+            pass
+
+    def _vad_loop(self):
+        """백그라운드 VAD — 핫키 안 눌러도 큰 소리 감지."""
         while self.is_listening:
-            if self.is_speaking:
+            if self.is_speaking or self.is_recording:
                 time.sleep(0.5)
                 continue
 
-            wav_path = '/tmp/anima_alive_chunk.wav'
+            wav_path = '/tmp/anima_alive_vad.wav'
             try:
-                # 3초 녹음
                 subprocess.run(
                     ['rec', '-q', wav_path, 'rate', '16k', 'channels', '1',
                      'trim', '0', '3'],
@@ -149,30 +224,23 @@ class ContinuousListener:
             if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 2000:
                 continue
 
-            # 음성 에너지 체크 (간단한 VAD)
-            if not self._has_speech(wav_path):
-                continue
-
-            # Whisper STT
-            try:
-                result = self.whisper_model.transcribe(wav_path, language='ko')
-                text = result['text'].strip()
-                # Whisper hallucination 필터 (반복되는 짧은 텍스트 무시)
-                if text and len(text) > 2 and not self._is_hallucination(text):
-                    self.speech_queue.put(text)
-            except Exception:
-                pass
+            if self._has_speech(wav_path):
+                try:
+                    result = self.whisper_model.transcribe(wav_path, language='ko')
+                    text = result['text'].strip()
+                    if text and len(text) > 2 and not self._is_hallucination(text):
+                        self.speech_queue.put(text)
+                except Exception:
+                    pass
 
     def _has_speech(self, wav_path):
-        """WAV 파일에 음성이 있는지 에너지 기반 판단."""
+        """WAV에 음성이 있는지 에너지 기반 판단."""
         try:
             with open(wav_path, 'rb') as f:
-                # WAV 헤더 건너뛰기 (44바이트)
                 f.read(44)
                 data = f.read()
             if len(data) < 100:
                 return False
-            # 16-bit PCM RMS 계산
             samples = struct.unpack(f'<{len(data)//2}h', data[:len(data)//2*2])
             rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
             return rms > SILENCE_THRESHOLD
@@ -181,13 +249,9 @@ class ContinuousListener:
 
     def _is_hallucination(self, text):
         """Whisper 환각 필터."""
-        # 흔한 환각 패턴
         hallucinations = [
-            '시청해 주셔서 감사합니다',
-            '구독과 좋아요',
-            '감사합니다',
-            'MBC 뉴스',
-            '다음 영상에서',
+            '시청해 주셔서 감사합니다', '구독과 좋아요',
+            '감사합니다', 'MBC 뉴스', '다음 영상에서',
         ]
         return any(h in text for h in hallucinations)
 
@@ -202,7 +266,6 @@ class ContinuousListener:
                 break
 
     def get_speech(self, timeout=0.1):
-        """큐에서 인식된 텍스트 가져오기."""
         try:
             return self.speech_queue.get(timeout=timeout)
         except queue.Empty:
