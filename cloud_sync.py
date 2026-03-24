@@ -88,6 +88,7 @@ class CloudSync:
         self._memory_key = "memory/memory.json"
         self._state_key = "state/state.pt"
         self._meta_key = "meta/sync_manifest.json"
+        self._web_memories_key = "memory/web_memories.json"
 
     # ─── S3 Client ─────────────────────────────────────────────
 
@@ -178,8 +179,8 @@ class CloudSync:
 
     # ─── Push ──────────────────────────────────────────────────
 
-    async def push(self, memory_path: str, state_path: str):
-        """Upload memory.json and state.pt to R2.
+    async def push(self, memory_path: str, state_path: str, web_memories_path: str = None):
+        """Upload memory.json, state.pt, and web_memories.json to R2.
 
         Adds device_id and timestamp metadata to each object.
         Skips gracefully if offline or credentials missing.
@@ -231,6 +232,15 @@ class CloudSync:
                 )
             else:
                 logger.warning(f"State file not found: {state_path}")
+
+            # Upload web_memories.json
+            wm_path = web_memories_path or str(
+                Path(memory_path).parent / "web_memories.json"
+            )
+            if Path(wm_path).exists():
+                await loop.run_in_executor(
+                    None, self._upload_file, wm_path, self._web_memories_key, metadata
+                )
 
             # Update manifest
             await self._push_manifest(now)
@@ -290,15 +300,14 @@ class CloudSync:
     # ─── Pull ──────────────────────────────────────────────────
 
     async def pull(self) -> dict:
-        """Download latest memory and state from R2.
+        """Download latest memory, state, and web_memories from R2.
 
         Returns:
-            {'memory': dict, 'state_path': str} where state_path is a
-            temp file path to the downloaded .pt file.
-            Returns {'memory': None, 'state_path': None} if nothing found
-            or if offline.
+            {'memory': dict, 'state_path': str, 'web_memories': dict}
+            where state_path is a temp file path to the downloaded .pt file.
+            Returns None values if nothing found or if offline.
         """
-        result = {"memory": None, "state_path": None}
+        result = {"memory": None, "state_path": None, "web_memories": None}
 
         if not self._is_available():
             logger.warning("R2 not configured, skipping pull")
@@ -334,6 +343,21 @@ class CloudSync:
             else:
                 if os.path.exists(tmp_state):
                     os.unlink(tmp_state)
+
+            # Pull web_memories.json
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", delete=False
+            ) as f:
+                tmp_web = f.name
+
+            found = await loop.run_in_executor(
+                None, self._download_file, self._web_memories_key, tmp_web
+            )
+            if found:
+                result["web_memories"] = json.loads(
+                    Path(tmp_web).read_text(encoding="utf-8")
+                )
+            os.unlink(tmp_web)
 
             logger.info(
                 f"Pull complete: memory={'yes' if result['memory'] else 'no'}, "
@@ -495,6 +519,48 @@ class CloudSync:
             # Clean up temp state file
             if remote["state_path"] and os.path.exists(remote["state_path"]):
                 os.unlink(remote["state_path"])
+
+            # Step 3b: Merge web_memories
+            wm_path = str(Path(memory_path).parent / "web_memories.json")
+            if remote.get("web_memories") is not None:
+                local_wm = None
+                if Path(wm_path).exists():
+                    try:
+                        local_wm = json.loads(
+                            Path(wm_path).read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        pass
+
+                if local_wm is not None:
+                    # 병합: timestamp 기준 중복 제거
+                    local_mems = {m.get('timestamp', ''): m
+                                  for m in local_wm.get('memories', [])}
+                    for m in remote["web_memories"].get('memories', []):
+                        ts = m.get('timestamp', '')
+                        if ts not in local_mems:
+                            local_mems[ts] = m
+                    merged_wm = {
+                        'version': 1,
+                        'total_searches': max(
+                            local_wm.get('total_searches', 0),
+                            remote["web_memories"].get('total_searches', 0),
+                        ),
+                        'memories': sorted(
+                            local_mems.values(),
+                            key=lambda x: x.get('timestamp', ''),
+                        )[-100:],
+                    }
+                    Path(wm_path).write_text(
+                        json.dumps(merged_wm, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    logger.info(f"Merged web memories: {len(merged_wm['memories'])} entries")
+                else:
+                    Path(wm_path).write_text(
+                        json.dumps(remote["web_memories"], ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
 
             # Step 4: Push merged state back
             await self.push(memory_path, state_path)

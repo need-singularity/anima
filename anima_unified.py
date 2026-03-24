@@ -45,6 +45,7 @@ _try_import("from tension_link import TensionLink, create_fingerprint, interpret
 _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
 _try_import("from growth_engine import GrowthEngine")
+_try_import("from web_sense import WebSense")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # 60초 유휴 후 꿈 모드 진입
@@ -154,6 +155,12 @@ class AnimaUnified:
                 self.mods['cloud'] = False
         else:
             self.mods['cloud'] = False
+
+        # Web Sense (장력 기반 자율 웹 탐색)
+        self.web_sense = self._init_mod('web_sense', lambda: (
+            WebSense(memory_file=ANIMA_DIR / 'web_memories.json')
+            if 'WebSense' in globals() else None
+        ))
 
         # RC-10: Dream Engine (오프라인 학습)
         self.dream = self._init_mod('dream', lambda: (
@@ -294,8 +301,26 @@ class AnimaUnified:
                 state += f", face={'yes' if vis['face_detected'] else 'no'}"
             except Exception: pass
 
+        # Web Sense: 높은 호기심/PE면 검색 결과를 컨텍스트에 포함
+        web_context = ""
+        if self.web_sense and self.mods.get('web_sense'):
+            try:
+                pe = self.mind.surprise_history[-1] if self.mind.surprise_history else 0.0
+                if self.web_sense.should_search(curiosity, pe):
+                    recalled = self.web_sense.recall(text)
+                    if recalled:
+                        web_context = f"\n[웹 기억] {recalled[0].get('summary', '')[:500]}"
+                    else:
+                        result = self.web_sense.search(text, self.history)
+                        if result:
+                            web_context = f"\n[웹 검색: {result['query']}]\n{result['summary'][:800]}"
+                            _log('web_sense', f"검색: '{result['query']}' → {len(result['results'])}건")
+            except Exception as e:
+                _log('web_sense', f"Error: {e}")
+
         self.history.append({'role': 'user', 'content': text})
-        answer = ask_claude(text, state, self.history)
+        query_text = text + web_context if web_context else text
+        answer = ask_claude(query_text, state, self.history)
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
             self.history = self.history[-MAX_HISTORY:]
@@ -427,6 +452,46 @@ class AnimaUnified:
                 'mitosis': mitosis_data,
                 'learner': learner_data,
             })
+
+            # Web Sense: 장력 기반 자율 검색
+            if self.web_sense and self.mods.get('web_sense'):
+                try:
+                    # prediction_error 추출 (surprise_history의 최근 값)
+                    pe = 0.0
+                    if self.mind.surprise_history:
+                        pe = self.mind.surprise_history[-1]
+                    if self.web_sense.should_search(c, pe):
+                        # 최근 대화에서 검색 쿼리 생성
+                        last_text = ''
+                        for msg in reversed(self.history):
+                            if msg.get('role') == 'user':
+                                last_text = msg.get('content', '')
+                                break
+                        if last_text:
+                            # 기존 기억에서 먼저 검색
+                            recalled = self.web_sense.recall(last_text)
+                            if not recalled:
+                                result = self.web_sense.search(last_text, self.history)
+                                if result:
+                                    _log('web_sense',
+                                         f"검색: '{result['query']}' → {len(result['results'])}건")
+                                    # 검색 결과를 tension 시스템에 주입
+                                    from anima_alive import text_to_vector as _ttv
+                                    search_vec = _ttv(result['summary'][:500])
+                                    with torch.no_grad():
+                                        self.mind(search_vec, self.hidden)
+                                    # 웹 브로드캐스트
+                                    self._ws_broadcast_sync({
+                                        'type': 'web_search',
+                                        'query': result['query'],
+                                        'results': [{'title': r['title'], 'url': r['url'],
+                                                     'snippet': r['snippet'][:200]}
+                                                    for r in result['results']],
+                                    })
+                            else:
+                                _log('web_sense', f"기억에서 발견: {recalled[0]['query']}")
+                except Exception as e:
+                    _log('web_sense', f"Error: {e}")
 
             trigger = None
             if c > PROACTIVE_THRESHOLD and gap > 15:
