@@ -5,6 +5,8 @@ set -e
 ANIMA_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ANIMA_DIR"
 
+export KMP_DUPLICATE_LIB_OK=TRUE
+
 echo "=================================================="
 echo "  Anima — Full Launch"
 echo "=================================================="

@@ -13,6 +13,9 @@ Dependencies: opencv-python (cv2), torch
 No dlib / mediapipe -- only OpenCV Haar cascades (ship with opencv).
 """
 
+import os
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+
 import cv2
 import torch
 import threading
@@ -123,8 +126,22 @@ class CameraInput:
         self._thread: Optional[threading.Thread] = None
         self._prev_gray: Optional[np.ndarray] = None
 
-        # Haar cascades (bundled with opencv)
-        cascade_dir = cv2.data.haarcascades
+        # Haar cascades — find path (cv2.data may not exist in brew opencv)
+        if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
+            cascade_dir = cv2.data.haarcascades
+        else:
+            # Fallback: search common brew locations
+            import glob
+            for candidate in [
+                '/opt/homebrew/share/opencv4/haarcascades/',
+                '/opt/homebrew/share/OpenCV/haarcascades/',
+                '/usr/local/share/opencv4/haarcascades/',
+            ]:
+                if glob.glob(candidate + '*.xml'):
+                    cascade_dir = candidate
+                    break
+            else:
+                cascade_dir = '/opt/homebrew/share/opencv4/haarcascades/'
         self._face_cascade = cv2.CascadeClassifier(
             cascade_dir + "haarcascade_frontalface_default.xml"
         )
