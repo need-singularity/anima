@@ -191,10 +191,12 @@ class ConsciousMind(nn.Module):
             loss.backward()
             self._predictor_optim.step()
 
-        # Blend: 70% prediction error + 30% raw delta (smooth via EMA)
+        # Blend: 70% prediction error + 30% raw delta (smooth via EMA + decay)
         blended = 0.7 * prediction_error + 0.3 * raw_curiosity
         self._curiosity_ema = 0.3 * blended + 0.7 * self._curiosity_ema
-        curiosity = self._curiosity_ema
+        # Natural decay: curiosity fades if nothing new (prevents saturation)
+        self._curiosity_ema *= 0.98
+        curiosity = min(self._curiosity_ema, 2.0)  # cap at 2.0
 
         # Track surprise for self-awareness
         self.surprise_history.append(prediction_error)
