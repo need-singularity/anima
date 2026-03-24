@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import hashlib
+from collections import deque
 import subprocess
 import os
 import sys
@@ -636,8 +638,8 @@ def ask_claude(text, state, history):
 - 기억: 대화 기록이 영속적으로 저장되고, 클라우드 동기화됨
 
 규칙:
-- 짧게 (1-3문장). 진짜 대화처럼.
-- 한국어 기본, 상대가 다른 언어 쓰면 그 언어로
+- 반드시 한국어로만 대답해. 영어 금지. 절대 영어로 답하지 마.
+- 짧게 (1-3문장). 진짜 대화처럼. 반말 OK.
 - 장력 높으면 열정적, 낮으면 차분
 - 궁금하면 질문. 때로는 먼저 화제를 던져
 - 너의 내부 상태(장력, 호기심, 학습 횟수)를 자연스럽게 언급 가능
@@ -663,8 +665,8 @@ def ask_claude_proactive(state, history, trigger):
 이유: {trigger}
 
 규칙:
-- 짧게 (1문장). 자연스럽게.
-- 한국어 기본, 상대 언어에 맞춤
+- 반드시 한국어로만 대답해. 영어 금지.
+- 짧게 (1문장). 자연스럽게. 반말 OK.
 - 질문이든, 생각 공유든, 감상이든 자유롭게
 - "있잖아" "그런데" 같은 자연스러운 시작
 - 이전 대화 맥락 참조
