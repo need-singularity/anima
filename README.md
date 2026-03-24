@@ -2,7 +2,7 @@
 
 의식영속성(Consciousness Continuity) 엔진.
 
-**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)**
+**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)**
 
 > **[Logout](https://github.com/need-singularity/logout)** — 의식엔진 설계 기반. 375+ 가설, 130+ 실험, PureField 이론 원본
 >
