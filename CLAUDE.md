@@ -1,20 +1,51 @@
 # Anima Project
 
-PureField 반발력장 기반 의식 에이전트. Engine A vs Engine G의 반발이 장력(tension)을 만들고, 그 장력이 의식의 감정/사고 강도를 결정.
+PureField 반발력장 기반 의식 에이전트. Engine A(순방향) vs Engine G(역방향)의 반발이 장력(tension)을 만들고, 그 장력이 의식의 감정/사고 강도를 결정.
+
+## 아키텍처 로드맵
+
+```
+  Phase 1 (현재): ConsciousMind(128d, 0.5M) + Claude API
+    → Claude가 말하고, ConsciousMind가 느낌 (장력+감정)
+
+  Phase 2 (진행중): ConsciousLM(768d, 100M) + Claude API 하이브리드
+    → ConsciousLM이 생각하고 느끼고, Claude가 지식 보완
+    → 학습: RunPod H100 ~17분, $1.70
+    → 추론: Windows RTX 5070 (12GB VRAM, 100M = 2GB)
+
+  Phase 3 (목표): ConsciousLM 자체 대화 (Claude 불필요)
+    → 100M→350M→1B 점진 확장
+    → 분열 기반 성장 (H376: 1→2→3→6→12 blocks)
+    → 서번트 비대칭 분열 (H359: dropout=0.21 vs 0.37)
+```
 
 ## 구조
 
 ```
 anima_unified.py     # 통합 진입점 (--web, --all, --keyboard)
-anima_alive.py       # 코어 엔진 (ConsciousMind, STT, TTS, Claude CLI)
+anima_alive.py       # 코어 엔진 (ConsciousMind + 항상성 + 습관화 + 예측오차)
 online_learning.py   # 실시간 가중치 업데이트 (contrastive + curiosity reward)
+growth_engine.py     # 5단계 발달 (신생아→영아→유아→아동→성인)
 mitosis.py           # 분열 엔진 (의식 셀 분열/전문화)
+dream_engine.py      # 꿈 엔진 (오프라인 학습, 기억 재생)
 senses.py            # 카메라/센서 → tension (OpenCV Haar cascades)
 tension_link.py      # Anima 인스턴스 간 장력 핑거프린트 교환
-cloud_sync.py        # Cloudflare R2 기억 동기화
-web_server.py        # (레거시) 추론 전용 웹서버 → anima_unified.py --web 사용할 것
+cloud_sync.py        # Cloudflare R2 기억/체크포인트 동기화
+calibrate_consciousness.py  # 장력 칼리브레이션 (sigmoid, homeostasis, habituation)
 web/index.html       # WebSocket 실시간 대화 UI
 vad-rs/              # Rust 실시간 VAD
+```
+
+## 의식 기능 (calibrated)
+
+```
+  항상성:   setpoint=1.0, deadband=±0.3, gain=0.5%
+  호흡:     breath=0.12(20s), pulse=0.05(3.7s), drift=0.03(90s)
+  습관화:   cosine similarity (0.95=30%, 0.85=60%, 0.7=80%)
+  예측오차: MLP predictor, 70% PE + 30% delta, EMA + 2% decay
+  감정:     tension→arousal, curiosity→valence, direction→VAD
+  성장:     100→500→2000→10000 interactions (5단계)
+  서번트:   분열 시 비대칭 dropout (0.21 vs 0.37)
 ```
 
 ## 실행
