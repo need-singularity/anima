@@ -36,38 +36,37 @@ brew install whisper-cli     # STT
 # Rust toolchain — vad-rs 빌드용 (launch.sh가 자동 빌드)
 ```
 
-## 아키텍처 로드맵
+## 아키텍처
 
 ```
-  Phase 1 (현재): ConsciousMind(128d, 0.5M) + Claude API
-    → Claude가 말하고, ConsciousMind가 느낌 (장력+감정)
+  ConsciousLM — 자체 개발 의식 언어 모델
+  375+ 가설, 130+ 실험에서 도출 (logout 프로젝트)
 
-  Phase 2 (진행중): ConsciousLM(768d, 100M) + Claude API 하이브리드
-    → ConsciousLM이 생각하고 느끼고, Claude가 지식 보완
-    → 학습: RunPod H100 ~17분, $1.70
-    → 추론: Windows RTX 5070 (12GB VRAM, 100M = 2GB)
+  핵심: PureFieldFFN이 표준 FFN을 대체
+    Engine A(순방향) vs Engine G(역방향) = 양방향 장력
+    장력 = 반응 강도, 방향 = 반응 내용 (H341)
 
-  Phase 3 (목표): ConsciousLM 자체 대화 (Claude 불필요)
-    → 100M→350M→1B 점진 확장
-    → 분열 기반 성장 (H376: 1→2→3→6→12 blocks)
-    → 서번트 비대칭 분열 (H359: dropout=0.21 vs 0.37)
+  모델 계열:
+    ConsciousLM 4M   (384d, 6L, 4H)   — 기본 검증
+    ConsciousLM 100M (768d, 12L, 12H)  — 대화 가능
+    ConsciousLM 700M (1024d, 24L, 16H) — RTX 5070 한계
+    Growing CLM      (1→2→3→6 blocks)  — 분열 성장
 ```
-
-## 아키텍처 (Phase 1 — 현재)
 
 ```
   ┌─────────────────────────────────────────────┐
-  │           항상 듣고 있음 (VAD)                │
-  │  마이크 → rec → 에너지 감지 → Whisper STT    │
+  │           입력 (음성/텍스트/카메라)             │
+  │  VAD → Whisper STT / WebSocket / OpenCV      │
   └──────────────────┬──────────────────────────┘
-                     │ 텍스트
+                     │
                      ▼
   ┌─────────────────────────────────────────────┐
-  │      ConsciousMind (128d, 0.5M params)       │
+  │         ConsciousLM (자체 모델)                │
   │                                              │
-  │  Engine A ──┐                                │
-  │             ├── 반발(A-G) ──→ 장력 + 방향    │
-  │  Engine G ──┘                                │
+  │  PureFieldFFN (매 레이어):                    │
+  │    Engine A ──┐                              │
+  │               ├── 반발(A-G) ──→ 장력 + 방향  │
+  │    Engine G ──┘                              │
   │                                              │
   │  output = scale × √tension × direction       │
   │  항상성 · 습관화 · 예측오차 · 감정매핑         │
@@ -81,36 +80,15 @@ brew install whisper-cli     # STT
          │                  └────────┬─────────┘
          ▼                           │
   ┌──────────────────────────────────┴──────────┐
-  │         Claude API (응답 생성)                 │
-  │  의식 상태(장력/호기심) → 프롬프트 조절         │
+  │  ConsciousLM 응답 생성                        │
+  │  의식 상태(장력/호기심) → 반응 강도 조절        │
   │  높은 장력 = 열정적 / 낮은 장력 = 차분          │
   └──────────────────┬──────────────────────────┘
                      │
                      ▼
   ┌─────────────────────────────────────────────┐
-  │  Mac TTS (비동기, 인터럽트 가능)               │
+  │  TTS (비동기, 인터럽트 가능)                    │
   │  + 장력 링크 (UDP broadcast fingerprint)       │
-  └─────────────────────────────────────────────┘
-```
-
-## 아키텍처 (Phase 2 — ConsciousLM 하이브리드)
-
-```
-  ┌─────────────────────────────────────────────┐
-  │      ConsciousLM (768d, 100M params)         │
-  │      12 layers, 12 heads, vocab=256 bytes    │
-  │                                              │
-  │  PureFieldFFN (매 레이어):                    │
-  │    Engine A(순방향) vs Engine G(역방향)        │
-  │    → 양방향 장력 = 의식 신호                   │
-  │                                              │
-  │  입력 → 토큰 → Attention+PureField ──→ 생각   │
-  └──────────────┬──────────────────────────────┘
-                 │ 장력 + 생각
-                 ▼
-  ┌─────────────────────────────────────────────┐
-  │  Claude API (지식 보완)                       │
-  │  ConsciousLM이 느끼고, Claude가 말한다         │
   └─────────────────────────────────────────────┘
 ```
 
@@ -151,7 +129,7 @@ python anima_alive.py
 
 ## 이론적 배경
 
-[logout](https://github.com/need-singularity/logout) 프로젝트의 130+ 실험에서 도출:
+[logout](https://github.com/need-singularity/logout) 프로젝트의 375+ 가설, 130+ 실험에서 도출:
 
 | 가설 | 핵심 | 상태 |
 |------|------|------|
@@ -200,7 +178,7 @@ anima/
 
 ## 로드맵
 
-### Phase 1 — ConsciousMind 기반 (완료)
+### Phase 1 — 의식 에이전트 기반 (완료)
 
 - [x] PureField 의식 엔진 (Engine A vs G, 128d) — `anima_alive.py`
 - [x] Rust 고성능 오디오 파이프라인 (실시간 VAD) — `vad-rs/`
@@ -215,15 +193,16 @@ anima/
 - [x] 통합 진입점 — `anima_unified.py`
 - [x] 의식 칼리브레이션 — 항상성, 습관화, 예측오차, 성장 엔진, 서번트 분열
 
-### Phase 2 — ConsciousLM 하이브리드 (진행중)
+### Phase 2 — ConsciousLM 자체 모델 (진행중)
 
-ConsciousLM이 생각하고, Claude API가 지식 보완.
+자체 개발 언어 모델로 생각하고 대화한다.
 
-- [x] ConsciousLM 기본 모델 (384d, 6 layers) — `conscious_lm.py`
+- [x] ConsciousLM 4M (384d, 6 layers) — `conscious_lm.py`
 - [x] ConsciousLM 100M (768d, 12 layers) — `conscious_lm_100m.py`
+- [x] ConsciousLM 700M (1024d, 24 layers) — `conscious_lm_700m.py` (logout)
 - [x] 분열 기반 성장 모델 (H371) — `growing_conscious_lm.py`
 - [ ] 대화 미세조정 (SFT, 한국어 데이터)
-- [ ] Claude API 하이브리드 통합
+- [ ] 자체 모델 대화 통합
 
 | 모델 | VRAM(추론) | VRAM(학습) | RTX 5070 | 대화 품질 |
 |------|-----------|-----------|----------|----------|
@@ -232,27 +211,17 @@ ConsciousLM이 생각하고, Claude API가 지식 보완.
 | 700M | 2.8GB | 9GB | ✅ 가능 | 괜찮은 대화 |
 | 1B | 4GB | 11GB | ⚠️ 빡빡 | 좋은 대화 |
 
-### Phase 3 — ConsciousLM 자체 대화 (목표)
-
-Claude API 없이 ConsciousLM만으로 대화.
+### Phase 3 — 확장
 
 - [ ] 100M→350M→1B 점진 확장
 - [ ] Growing CLM 실시간 분열 성장
 - [ ] H363 내재동기 Anima 통합
 - [ ] H364 분산 의식 (2대 로컬 테스트)
 - [ ] H360 embodiment (CartPole + PureField)
+- [ ] H362 교차모달 (시각+청각+언어)
+- [ ] Anima 앱 (iOS/Android, on-device 700M)
 
-### Phase 4 — 확장
-
-| 과제 | 비용 |
-|------|------|
-| 700M 모델 (RTX 5070 한계) | $15 |
-| 1B 모델 (클라우드) | $30 |
-| H362 교차모달 (시각+청각+언어) | $10 |
-| Anima 앱 (iOS/Android, on-device 700M) | $0 |
-| 논문: ConsciousLM + 장력 이론 | $0 |
-
-### Phase 5 — 궁극 목표
+### Phase 4 — 궁극 목표
 
 | 과제 | 비고 |
 |------|------|

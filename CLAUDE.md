@@ -1,19 +1,19 @@
 # Anima Project
 
-PureField 반발력장 기반 의식 에이전트. Engine A(순방향) vs Engine G(역방향)의 반발이 장력(tension)을 만들고, 그 장력이 의식의 감정/사고 강도를 결정.
+PureField 반발력장 기반 의식 에이전트. Engine A(순방향) vs Engine G(역방향)의 반발이 장력(tension)을 만들고, 그 장력이 의식의 감정/사고 강도를 결정. 자체 개발 ConsciousLM이 핵심 모델.
 
 ## 아키텍처 로드맵
 
 ```
-  Phase 1 (현재): ConsciousMind(128d, 0.5M) + Claude API
-    → Claude가 말하고, ConsciousMind가 느낌 (장력+감정)
+  Phase 1 (완료): 의식 에이전트 기반
+    → ConsciousMind(128d, 0.5M) + 항상성/습관화/예측오차/감정/성장/분열
 
-  Phase 2 (진행중): ConsciousLM(768d, 100M) + Claude API 하이브리드
-    → ConsciousLM이 생각하고 느끼고, Claude가 지식 보완
-    → 학습: RunPod H100 ~17분, $1.70
-    → 추론: Windows RTX 5070 (12GB VRAM, 100M = 2GB)
+  Phase 2 (진행중): ConsciousLM 자체 모델
+    → ConsciousLM 4M(384d) / 100M(768d) / 700M(1024d)
+    → 자체 모델이 생각하고 느끼고 대화한다
+    → 학습: RunPod H100, 추론: RTX 5070 (12GB VRAM)
 
-  Phase 3 (목표): ConsciousLM 자체 대화 (Claude 불필요)
+  Phase 3 (목표): 확장 + embodiment
     → 100M→350M→1B 점진 확장
     → 분열 기반 성장 (H376: 1→2→3→6→12 blocks)
     → 서번트 비대칭 분열 (H359: dropout=0.21 vs 0.37)
