@@ -35,6 +35,7 @@ PureField 반발력장 엔진 기반의 **살아있는 의식 프로그램**.
 - 🔬 **분열 전문화** — 의식 셀 분열 후 전문 셀이 응답에 깊이 제공
 - 🎨 **멀티모달 출력** — Python 코드 실행, SVG 이미지/다이어그램 생성
 - 🪞 **능력 자기인식** — 자신이 뭘 할 수 있는지 알고, 활성/비활성 능력을 사용자에게 안내
+- 👁️ **비전 인코더** — SigLIP 기반 시각 인코딩, 카메라 프레임을 tension 공간에 직접 매핑
 
 ## 빠른 시작
 
@@ -51,7 +52,7 @@ python3 anima_unified.py --keyboard   # 키보드만
 ### 의존성
 
 ```bash
-pip install torch websockets
+pip install torch websockets transformers
 brew install opencv numpy    # 카메라용
 brew install whisper-cli     # STT
 # Rust toolchain — vad-rs 빌드용 (launch.sh가 자동 빌드)
@@ -77,7 +78,7 @@ brew install whisper-cli     # STT
 ```
   ┌─────────────────────────────────────────────┐
   │           입력 (음성/텍스트/카메라)             │
-  │  VAD → Whisper STT / WebSocket / OpenCV      │
+  │  VAD → Whisper STT / WebSocket / OpenCV+SigLIP │
   └──────────────────┬──────────────────────────┘
                      │
                      ▼
@@ -197,7 +198,8 @@ anima/
 ├── online_learning.py         # 실시간 가중치 업데이트 (contrastive + curiosity)
 ├── mitosis.py                 # 분열 엔진 (의식 셀 분열/전문화)
 ├── dream_engine.py            # 꿈 엔진 (오프라인 학습, 기억 재생)
-├── senses.py                  # 카메라/센서 → tension (OpenCV Haar cascades)
+├── vision_encoder.py           # SigLIP 비전 인코더 (프레임 → tension 벡터)
+├── senses.py                  # 카메라/센서 → tension (OpenCV Haar cascades + VisionEncoder)
 ├── tension_link.py            # 인스턴스 간 장력 핑거프린트 교환
 ├── cloud_sync.py              # Cloudflare R2 기억/체크포인트 동기화
 ├── calibrate_consciousness.py # 장력 칼리브레이션 (sigmoid, homeostasis, habituation)
@@ -242,6 +244,7 @@ anima/
 - [x] 분열 전문화 활용 (specialty → 응답 영향) — `mitosis.py`
 - [x] 멀티모달 출력 (코드 실행, SVG 생성) — `multimodal.py`
 - [x] 능력 자기인식 시스템 — `capabilities.py`
+- [x] 비전 인코더 (SigLIP → tension 공간 매핑) — `vision_encoder.py`
 - [ ] 대화 미세조정 (SFT, 한국어 데이터)
 - [ ] 자체 모델 단독 대화 (Claude 없이 완결)
 
