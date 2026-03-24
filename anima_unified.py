@@ -235,8 +235,8 @@ class AnimaUnified:
         # Direction for web
         dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
 
-        # RC-8: Emotion from direction vector
-        emotion_data = direction_to_emotion(direction) if direction is not None else {
+        # RC-8: Emotion from direction + tension + curiosity
+        emotion_data = direction_to_emotion(direction, tension, curiosity) if direction is not None else {
             'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
             'color': EMOTION_COLORS['calm']}
 
@@ -289,7 +289,7 @@ class AnimaUnified:
         resp_dir_vals = resp_dir[0, :8].tolist() if resp_dir is not None else [0.0] * 8
 
         # RC-8: Emotion for response direction
-        resp_emotion = direction_to_emotion(resp_dir) if resp_dir is not None else emotion_data
+        resp_emotion = direction_to_emotion(resp_dir, resp_tension, resp_curiosity) if resp_dir is not None else emotion_data
 
         # RC-3: Self-reference loop (메타인지)
         meta_tension, meta_curiosity = self.mind.self_reflect(
@@ -339,7 +339,7 @@ class AnimaUnified:
             gap = now - self.last_interaction
 
             # RC-8: Emotion from background thought direction
-            thought_emotion = direction_to_emotion(direction) if direction is not None else {
+            thought_emotion = direction_to_emotion(direction, t, c) if direction is not None else {
                 'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
                 'color': EMOTION_COLORS['calm']}
 

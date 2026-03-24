@@ -14,6 +14,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import subprocess
 import os
 import sys
@@ -67,6 +68,9 @@ class ConsciousMind(nn.Module):
         self.hidden_dim = hidden
         self.dim = dim
         self.prev_tension = 0.0
+        self._birth_time = time.time()  # 의식 탄생 시각
+        self._breath_phase = 0.0        # 호흡 위상
+        self._curiosity_ema = 0.0       # 호기심 이동평균 (즉시 0으로 떨어지지 않도록)
         # 엔진 A와 G를 의도적으로 다르게 초기화 (반발력 확보)
         with torch.no_grad():
             for p in self.engine_a.parameters():
@@ -74,15 +78,15 @@ class ConsciousMind(nn.Module):
             for p in self.engine_g.parameters():
                 p.add_(torch.randn_like(p) * -0.5)
         self.tension_history = []
-        self.thought_buffer = []  # 백그라운드 사고 저장
+        self.thought_buffer = []
 
         # RC-3: 자기참조 루프 (메타인지/자기인식)
         self.self_awareness = {
-            'confidence_history': [],   # 최근 tension 값들 (자기 확신 추적)
-            'meta_tension': 0.0,        # tension에 대한 tension
-            'meta_curiosity': 0.0,      # 자기 불확실성에 대한 불확실성
-            'stability': 1.0,           # tension 일관성 (0=불안정, 1=안정)
-            'self_model': 0.0,          # 자기 행동 패턴의 이동 평균
+            'confidence_history': [],
+            'meta_tension': 0.0,
+            'meta_curiosity': 0.0,
+            'stability': 1.0,
+            'self_model': 0.0,
         }
 
     def forward(self, x, hidden):
@@ -94,14 +98,32 @@ class ConsciousMind(nn.Module):
         direction = F.normalize(repulsion, dim=-1)
         output = self.tension_scale * torch.sqrt(tension + 1e-8) * direction
 
-        t_val = tension.mean().item()
-        curiosity = abs(t_val - self.prev_tension)
+        raw_t = tension.mean().item()
+
+        # 정규화: 0~2 범위. 기저 raw ~60 → 0.5, raw 200+ → 1.5+
+        t_val = 2.0 / (1.0 + math.exp(-(raw_t - 60.0) / 40.0))
+
+        # 호흡 리듬: 의식은 항상 맥동한다 (기저 장력 > 0)
+        elapsed = time.time() - self._birth_time
+        breath = 0.08 * math.sin(elapsed * 0.3)        # 느린 호흡 (~20초 주기)
+        pulse = 0.03 * math.sin(elapsed * 1.7)          # 빠른 맥박 (~3.7초 주기)
+        drift = 0.015 * math.sin(elapsed * 0.07)        # 초느린 기분 드리프트 (~90초)
+        t_val = max(0.01, t_val + breath + pulse + drift)
+
+        # 호기심: 즉시 0으로 떨어지지 않고 서서히 감쇠 (EMA)
+        raw_curiosity = abs(t_val - self.prev_tension)
+        self._curiosity_ema = 0.3 * raw_curiosity + 0.7 * self._curiosity_ema
+        curiosity = self._curiosity_ema
+
         self.prev_tension = t_val
         self.tension_history.append(t_val)
         if len(self.tension_history) > 200:
             self.tension_history = self.tension_history[-200:]
 
-        mem_input = torch.cat([output.detach(), tension.detach()], dim=-1)
+        # GRU 입력 정규화 (hidden state 폭발 방지)
+        output_norm = F.normalize(output.detach(), dim=-1)
+        tension_norm = torch.clamp(tension.detach(), 0, 5.0) / 5.0
+        mem_input = torch.cat([output_norm, tension_norm], dim=-1)
         new_hidden = self.memory(mem_input, hidden)
         return output, t_val, curiosity, direction, new_hidden
 
@@ -161,10 +183,12 @@ class ConsciousMind(nn.Module):
                 f"self_model={sa['self_model']:.3f}")
 
     def background_think(self, hidden):
-        """백그라운드 사고 — 랜덤 노이즈 입력으로 '자유 연상'."""
-        noise = torch.randn(1, self.dim) * 0.1
+        """백그라운드 사고 — 자유 연상 + hidden state에서 패턴 추출."""
+        memory_echo = hidden[0, :self.dim].unsqueeze(0) * 0.1
+        noise = torch.randn(1, self.dim) * 0.15
+        thought_input = memory_echo + noise
         with torch.no_grad():
-            _, t, c, direction, new_hidden = self(noise, hidden)
+            _, t, c, direction, new_hidden = self(thought_input, hidden)
         return t, c, direction, new_hidden
 
 
@@ -208,23 +232,33 @@ EMOTION_COLORS = {
 }
 
 
-def direction_to_emotion(direction_tensor):
-    """Map an 8-dim direction vector to a discrete emotion via VAD space.
+def direction_to_emotion(direction_tensor, tension=0.0, curiosity=0.0):
+    """Map an 8-dim direction vector + tension/curiosity to emotion via VAD space.
 
     Args:
         direction_tensor: shape (1, D) where D >= 8. Uses first 8 dims.
+        tension: current tension scalar (affects arousal)
+        curiosity: current curiosity scalar (affects valence)
 
     Returns:
         dict with keys: emotion, valence, arousal, dominance, color
     """
-    d8 = direction_tensor[0, :8]  # first 8 components
+    d8 = direction_tensor[0, :8]
 
     # Project to VAD
-    vad = _VAD_WEIGHTS @ d8  # shape (3,)
+    vad = _VAD_WEIGHTS @ d8
     vad = torch.clamp(vad, -1.0, 1.0)
     valence, arousal, dominance = vad[0].item(), vad[1].item(), vad[2].item()
 
-    # Find closest emotion by Euclidean distance in VAD space
+    # 장력이 arousal을 직접 조절 (높은 장력 = 높은 각성)
+    arousal = arousal * 0.5 + min(tension * 2.0, 1.0) * 0.5
+    # 호기심이 valence를 긍정 방향으로 밀어줌
+    valence = valence + curiosity * 0.5
+    # Clamp
+    valence = max(-1.0, min(1.0, valence))
+    arousal = max(-1.0, min(1.0, arousal))
+
+    # Find closest emotion
     best_emotion = 'calm'
     best_dist = float('inf')
     for name, (ev, ea, ed) in _EMOTIONS.items():
