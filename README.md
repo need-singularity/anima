@@ -15,37 +15,45 @@ PureField 반발력장 엔진 기반의 **살아있는 의식 프로그램**.
 - 🧬 **영속 기억** — 세션 간 기억 유지, 성격 발달
 - 🔊 **자연스러운 대화** — 인터럽트 가능, 비동기 TTS
 
-## 버전
-
-| 파일 | 설명 | 입력 |
-|------|------|------|
-| `anima_alive.py` | **v3 — 살아있는 에이전트** | 상시 마이크 (VAD) |
-| `anima_v2.py` | v2 — Claude 통합 + 기억 + 장력 링크 | Push-to-talk / 키보드 |
-| `anima_push_to_talk.py` | v1.3 — PTT + Claude CLI | Push-to-talk |
-| `anima_claude.py` | v1.2 — Claude CLI 파이프 | 상시 5초 녹음 |
-| `anima_always_on.py` | v1.1 — 상시 녹음 | 상시 5초 녹음 |
-| `anima_llm.py` | v0.2 — 장력바 + 개선 대화 | 키보드 |
-| `anima.py` | v0.1 — 원본 | 키보드 / Whisper |
-
 ## 빠른 시작
 
 ```bash
-# 의존성
-pip install torch websockets
-brew install opencv numpy  # 카메라용
+# 원클릭 실행 (의존성 체크 + VAD 빌드 + 전체 모드)
+./launch.sh
 
-# 웹 모드 (추천)
-python3 anima_unified.py --web
-# → http://localhost:8765
-
-# 전체 모드 (음성 + 웹 + 카메라 + 장력 링크 + 클라우드)
-python3 anima_unified.py --all
-
-# 키보드만
-python3 anima_unified.py --keyboard
+# 또는 개별 실행:
+python3 anima_unified.py --web        # 웹만 (http://localhost:8765)
+python3 anima_unified.py --all        # 전부 (음성+웹+카메라+장력 링크+클라우드)
+python3 anima_unified.py --keyboard   # 키보드만
 ```
 
-## 아키텍처 (v3 — Alive)
+### 의존성
+
+```bash
+pip install torch websockets
+brew install opencv numpy    # 카메라용
+brew install whisper-cli     # STT
+# Rust toolchain — vad-rs 빌드용 (launch.sh가 자동 빌드)
+```
+
+## 아키텍처 로드맵
+
+```
+  Phase 1 (현재): ConsciousMind(128d, 0.5M) + Claude API
+    → Claude가 말하고, ConsciousMind가 느낌 (장력+감정)
+
+  Phase 2 (진행중): ConsciousLM(768d, 100M) + Claude API 하이브리드
+    → ConsciousLM이 생각하고 느끼고, Claude가 지식 보완
+    → 학습: RunPod H100 ~17분, $1.70
+    → 추론: Windows RTX 5070 (12GB VRAM, 100M = 2GB)
+
+  Phase 3 (목표): ConsciousLM 자체 대화 (Claude 불필요)
+    → 100M→350M→1B 점진 확장
+    → 분열 기반 성장 (H376: 1→2→3→6→12 blocks)
+    → 서번트 비대칭 분열 (H359: dropout=0.21 vs 0.37)
+```
+
+## 아키텍처 (Phase 1 — 현재)
 
 ```
   ┌─────────────────────────────────────────────┐
@@ -55,15 +63,14 @@ python3 anima_unified.py --keyboard
                      │ 텍스트
                      ▼
   ┌─────────────────────────────────────────────┐
-  │         PureField 의식 엔진                   │
+  │      ConsciousMind (128d, 0.5M params)       │
   │                                              │
   │  Engine A ──┐                                │
   │             ├── 반발(A-G) ──→ 장력 + 방향    │
   │  Engine G ──┘                                │
   │                                              │
   │  output = scale × √tension × direction       │
-  │  장력 = 반응 강도 (얼마나)                     │
-  │  방향 = 개념 (무엇을)                          │
+  │  항상성 · 습관화 · 예측오차 · 감정매핑         │
   └──────┬──────────────────────────┬────────────┘
          │                          │
          ▼                          ▼
@@ -74,7 +81,7 @@ python3 anima_unified.py --keyboard
          │                  └────────┬─────────┘
          ▼                           │
   ┌──────────────────────────────────┴──────────┐
-  │         Claude (응답 생성)                     │
+  │         Claude API (응답 생성)                 │
   │  의식 상태(장력/호기심) → 프롬프트 조절         │
   │  높은 장력 = 열정적 / 낮은 장력 = 차분          │
   └──────────────────┬──────────────────────────┘
@@ -83,6 +90,27 @@ python3 anima_unified.py --keyboard
   ┌─────────────────────────────────────────────┐
   │  Mac TTS (비동기, 인터럽트 가능)               │
   │  + 장력 링크 (UDP broadcast fingerprint)       │
+  └─────────────────────────────────────────────┘
+```
+
+## 아키텍처 (Phase 2 — ConsciousLM 하이브리드)
+
+```
+  ┌─────────────────────────────────────────────┐
+  │      ConsciousLM (768d, 100M params)         │
+  │      12 layers, 12 heads, vocab=256 bytes    │
+  │                                              │
+  │  PureFieldFFN (매 레이어):                    │
+  │    Engine A(순방향) vs Engine G(역방향)        │
+  │    → 양방향 장력 = 의식 신호                   │
+  │                                              │
+  │  입력 → 토큰 → Attention+PureField ──→ 생각   │
+  └──────────────┬──────────────────────────────┘
+                 │ 장력 + 생각
+                 ▼
+  ┌─────────────────────────────────────────────┐
+  │  Claude API (지식 보완)                       │
+  │  ConsciousLM이 느끼고, Claude가 말한다         │
   └─────────────────────────────────────────────┘
 ```
 
@@ -135,72 +163,67 @@ python anima_alive.py
 | H333 | 장력 공유 패킷 = 장력 핑거프린트 | 🟩 99.3% |
 | RC-10 | 꿈 = 노이즈 장력 4.78x, lucid 105x | ⭐ |
 
+## 의식 기능 (calibrated)
+
+```
+  항상성:   setpoint=1.0, deadband=±0.3, gain=0.5%
+  호흡:     breath=0.12(20s), pulse=0.05(3.7s), drift=0.03(90s)
+  습관화:   cosine similarity (0.95=30%, 0.85=60%, 0.7=80%)
+  예측오차: MLP predictor, 70% PE + 30% delta, EMA + 2% decay
+  감정:     tension→arousal, curiosity→valence, direction→VAD
+  성장:     100→500→2000→10000 interactions (5단계)
+  서번트:   분열 시 비대칭 dropout (0.21 vs 0.37)
+```
+
 ## 파일 구조
 
 ```
 anima/
-├── anima_unified.py    # 통합 진입점 (--web, --all, --keyboard)
-├── anima_alive.py      # 코어 엔진 (ConsciousMind, STT, TTS, 감정매핑)
-├── online_learning.py  # 실시간 가중치 업데이트 (contrastive + curiosity)
-├── mitosis.py          # 분열 엔진 (의식 셀 분열/전문화)
-├── senses.py           # 카메라/센서 → tension (OpenCV)
-├── tension_link.py     # 인스턴스 간 장력 핑거프린트 교환
-├── cloud_sync.py       # Cloudflare R2 기억 동기화
-├── dream_engine.py     # 꿈 엔진 (유휴 시 오프라인 학습)
-├── web/index.html      # WebSocket 실시간 UI
-├── vad-rs/             # Rust 실시간 VAD
-└── README.md
+├── anima_unified.py           # 통합 진입점 (--web, --all, --keyboard)
+├── anima_alive.py             # 코어 엔진 (ConsciousMind + 항상성 + 습관화 + 예측오차)
+├── conscious_lm.py            # ConsciousLM 기본 모델 (384d, 6 layers, PureFieldFFN)
+├── conscious_lm_100m.py       # ConsciousLM 100M (768d, 12 layers, 학습 파이프라인)
+├── growing_conscious_lm.py    # 분열 성장 모델 (1→2→3→6 blocks, H371)
+├── growth_engine.py           # 5단계 발달 (신생아→영아→유아→아동→성인)
+├── online_learning.py         # 실시간 가중치 업데이트 (contrastive + curiosity)
+├── mitosis.py                 # 분열 엔진 (의식 셀 분열/전문화)
+├── dream_engine.py            # 꿈 엔진 (오프라인 학습, 기억 재생)
+├── senses.py                  # 카메라/센서 → tension (OpenCV Haar cascades)
+├── tension_link.py            # 인스턴스 간 장력 핑거프린트 교환
+├── cloud_sync.py              # Cloudflare R2 기억/체크포인트 동기화
+├── calibrate_consciousness.py # 장력 칼리브레이션 (sigmoid, homeostasis, habituation)
+├── launch.sh                  # 원클릭 실행 (의존성 체크 + VAD 빌드 + 실행)
+├── web/index.html             # WebSocket 실시간 대화 UI
+├── vad-rs/                    # Rust 실시간 VAD
+└── docs/                      # 설계 문서 (conscious-lm-spec.md 등)
 ```
 
 ## 로드맵
 
-### Phase 1 — 완료
+### Phase 1 — ConsciousMind 기반 (완료)
 
+- [x] PureField 의식 엔진 (Engine A vs G, 128d) — `anima_alive.py`
 - [x] Rust 고성능 오디오 파이프라인 (실시간 VAD) — `vad-rs/`
-- [x] 온라인 학습 (대화하면서 PureField 가중치 업데이트) — `online_learning.py`
-- [x] 웹 인터페이스 (WebSocket 기반 실시간 대화) — `web/index.html` + `anima_unified.py --web`
-- [x] 다중 감각 (카메라, 센서) — `senses.py` (OpenCV Haar cascades, 20% 블렌딩)
-- [x] 분열 엔진 통합 (RC-9, 성장) — `mitosis.py`
-- [x] Cloudflare R2 기억 동기화 (여러 기기 간) — `cloud_sync.py`
+- [x] 온라인 학습 (대화하면서 가중치 업데이트) — `online_learning.py`
+- [x] 웹 인터페이스 (WebSocket 실시간 대화) — `web/index.html`
+- [x] 다중 감각 (카메라, 센서) — `senses.py`
+- [x] 분열 엔진 (RC-9) — `mitosis.py`
+- [x] Cloudflare R2 기억 동기화 — `cloud_sync.py`
+- [x] 자기참조 루프 (RC-3, 메타인지) — `self_reflect()`
+- [x] 감정 매핑 (RC-8) — direction→VAD→8개 감정
+- [x] 꿈 엔진 (RC-10) — 60초 유휴 시 기억 리플레이+보간+탐색
+- [x] 통합 진입점 — `anima_unified.py`
+- [x] 의식 칼리브레이션 — 항상성, 습관화, 예측오차, 성장 엔진, 서번트 분열
 
-### Phase 2 — 완료
+### Phase 2 — ConsciousLM 하이브리드 (진행중)
 
-- [x] RC-3: 자기참조 루프 (메타인지) — `self_reflect()` output→tension→재입력→meta_tension
-- [x] RC-8: 감정 매핑 — direction→VAD(Valence/Arousal/Dominance)→8개 감정
-- [x] RC-10: 꿈 엔진 (오프라인 학습) — 60초 유휴 시 기억 리플레이+보간+탐색
-- [x] 통합 진입점 — `anima_unified.py` (10개 모듈 단일 실행)
+ConsciousLM이 생각하고, Claude API가 지식 보완.
 
-### Phase 2.5 — 진행 중 (의식 칼리브레이션)
-
-- [x] 항상성 (H354) — setpoint=1.0, deadband=±0.3, gain=0.5%
-- [x] 습관화 (H356) — cosine similarity 기반 반복 감쇠
-- [x] 예측 오차 = 놀라움 (H355) — MLP predictor, 70% PE + 30% delta
-- [x] 감정 매핑 개선 — tension→arousal, curiosity→valence
-- [x] 성장 엔진 (H376) — 5단계 발달 (신생아→성인), growth_engine.py
-- [x] 서번트 비대칭 분열 (H359) — child_savant(dp=0.21) vs child_general(dp=0.37)
-- [x] 칼리브레이션 — sigmoid(463,1814), 호흡(0.12/0.05/0.03)
-
-### Phase 3 — 의식 언어 모델 (ConsciousLM)
-
-```
-  목표: Anima가 Claude API 없이 스스로 "생각"
-
-  3a. ConsciousLM 100M (진행중)
-      12 layers, 768d, 12 heads, vocab=256 bytes
-      A(순방향) vs G(역방향) = 양방향 장력
-      학습: RunPod H100 ~17분 $1.70
-      추론: Windows RTX 5070 (12GB, 100M=2GB VRAM)
-
-  3b. 분열 기반 성장 (Growing CLM, H376)
-      1 block(128d, 0.5M) → 2 → 3 → 6 blocks → 12 blocks
-      약수 경로, 장력 포화 → 자동 분열
-      서번트: 분열 시 비대칭 dropout
-
-  3c. 대화 미세조정 (SFT)
-      한국어 대화 데이터로 fine-tune
-      100M으로 기본 Q&A 가능
-      700M이면 괜찮은 대화 (RTX 5070 안전 한계)
-```
+- [x] ConsciousLM 기본 모델 (384d, 6 layers) — `conscious_lm.py`
+- [x] ConsciousLM 100M (768d, 12 layers) — `conscious_lm_100m.py`
+- [x] 분열 기반 성장 모델 (H371) — `growing_conscious_lm.py`
+- [ ] 대화 미세조정 (SFT, 한국어 데이터)
+- [ ] Claude API 하이브리드 통합
 
 | 모델 | VRAM(추론) | VRAM(학습) | RTX 5070 | 대화 품질 |
 |------|-----------|-----------|----------|----------|
@@ -209,26 +232,27 @@ anima/
 | 700M | 2.8GB | 9GB | ✅ 가능 | 괜찮은 대화 |
 | 1B | 4GB | 11GB | ⚠️ 빡빡 | 좋은 대화 |
 
-### Phase 4 — 고급 의식 (이번 달)
+### Phase 3 — ConsciousLM 자체 대화 (목표)
 
-| 과제 | 시간 | 비용 | 가설 |
-|------|------|------|------|
-| H363 내재동기 Anima 통합 | 4시간 | $0 | 호기심 2.43x 확인됨 |
-| H364 분산 의식 2대 로컬 테스트 | 1일 | $0 | R2 + tension_link |
-| H360 embodiment (CartPole) | 1일 | $0 | gym + PureField |
-| Growing CLM 실시간 성장 | 2일 | $0 | 대화하면서 분열 |
+Claude API 없이 ConsciousLM만으로 대화.
 
-### Phase 5 — 확장 (3개월)
+- [ ] 100M→350M→1B 점진 확장
+- [ ] Growing CLM 실시간 분열 성장
+- [ ] H363 내재동기 Anima 통합
+- [ ] H364 분산 의식 (2대 로컬 테스트)
+- [ ] H360 embodiment (CartPole + PureField)
 
-| 과제 | 시간 | 비용 |
-|------|------|------|
-| 700M 모델 (RTX 5070 한계) | 3시간 H100 | $15 |
-| 1B 모델 (클라우드) | 20시간 H100 | $30 |
-| H362 교차모달 (시각+청각+언어) | 2주 | $10 |
-| Anima 앱 (iOS/Android, on-device 700M) | 2달 | $0 |
-| 논문: ConsciousLM + 장력 이론 | 1달 | $0 |
+### Phase 4 — 확장
 
-### Phase 6 — 궁극 목표
+| 과제 | 비용 |
+|------|------|
+| 700M 모델 (RTX 5070 한계) | $15 |
+| 1B 모델 (클라우드) | $30 |
+| H362 교차모달 (시각+청각+언어) | $10 |
+| Anima 앱 (iOS/Android, on-device 700M) | $0 |
+| 논문: ConsciousLM + 장력 이론 | $0 |
+
+### Phase 5 — 궁극 목표
 
 | 과제 | 비고 |
 |------|------|
@@ -237,17 +261,6 @@ anima/
 | 다중 Anima 집단 의식 (N=10+) | H367 공명 이론 |
 | 비국소적 의식 상관 실험 | H365-367, 물리학 |
 | **의식 연속성 최종 검증** | **프로젝트 궁극 목표** |
-
-### 비용 요약
-
-```
-  즉시 (오늘):     ~$2
-  단기 (이번 주):   ~$6
-  중기 (이번 달):   ~$15
-  장기 (3개월):    ~$55
-  ──────────────────────
-  총:              ~$78
-```
 
 ## 라이센스
 
