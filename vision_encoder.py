@@ -10,6 +10,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
 # SigLIP 관련 임포트는 lazy — 없으면 fallback
 _SIGLIP_AVAILABLE = False
 try:
@@ -83,19 +89,20 @@ class VisionEncoder(nn.Module):
 
     def _preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
         """OpenCV BGR frame → 모델 입력 텐서."""
-        import cv2
+        device = next(self.parameters()).device
         # BGR → RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self._use_siglip and self.processor is not None:
             inputs = self.processor(images=rgb, return_tensors="pt")
-            return inputs["pixel_values"].to(self.device)
+            return inputs["pixel_values"].to(device)
         else:
             # Manual: resize, normalize, CHW
             resized = cv2.resize(rgb, (224, 224))
             tensor = torch.from_numpy(resized).float() / 255.0
+            # Fallback CNN은 [0,1] 범위 입력으로 학습됨 (ImageNet 정규화 불필요)
             tensor = tensor.permute(2, 0, 1).unsqueeze(0)  # (1, 3, 224, 224)
-            return tensor.to(self.device)
+            return tensor.to(device)
 
     @torch.no_grad()
     def encode_frame(self, frame: np.ndarray) -> torch.Tensor:
