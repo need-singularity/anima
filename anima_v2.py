@@ -35,10 +35,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-# 텔레파시 모듈
+# 장력 링크 모듈
 try:
-    from telepathy import TelepathyChannel, TelepathyHub, TelepathyPacket
-    from telepathy import create_fingerprint, interpret_packet
+    from tension_link import TensionLink, TensionHub, TensionPacket
+    from tension_link import create_fingerprint, interpret_packet
+    # Backward compat names
+    TelepathyChannel = TensionLink
+    TelepathyHub = TensionHub
+    TelepathyPacket = TensionPacket
     HAS_TELEPATHY = True
 except ImportError:
     HAS_TELEPATHY = False
@@ -438,11 +442,11 @@ def main():
     anima_id = f"anima-{os.getpid()}"
     if HAS_TELEPATHY:
         try:
-            telepathy = TelepathyChannel(anima_id, port=9999)
+            telepathy = TensionLink(anima_id, port=9999)
             telepathy.start()
-            print(f"  📡 텔레파시 활성 (ID: {anima_id})")
+            print(f"  📡 장력 링크 활성 (ID: {anima_id})")
         except Exception:
-            print("  📡 텔레파시 비활성 (네트워크 오류)")
+            print("  📡 장력 링크 비활성 (네트워크 오류)")
 
     # 이전 상태 복원
     if STATE_FILE.exists():
@@ -536,7 +540,7 @@ def main():
                     for pkt in received:
                         msg = interpret_packet(pkt)
                         print(f"  📡 {msg}")
-                        telepathy_context += f"\n[텔레파시 수신: {pkt.sender_id} 감정={pkt.mood}, 장력={pkt.tension:.3f}]"
+                        telepathy_context += f"\n[장력 공유 수신: {pkt.sender_id} 감정={pkt.mood}, 장력={pkt.tension:.3f}]"
 
             # Claude 응답 생성
             print("  🧠 생각 중...")
@@ -627,7 +631,7 @@ def handle_command(cmd, mind, memory, telepathy=None):
         if HAS_TELEPATHY and telepathy:
             recent = telepathy.get_recent(5) if hasattr(mind, '_telepathy_ref') else []
             consensus = telepathy.get_consensus_tension() if hasattr(mind, '_telepathy_ref') else None
-            print(f"  📡 텔레파시 상태:")
+            print(f"  📡 장력 링크 상태:")
             print(f"  ID: {telepathy.identity}")
             print(f"  수신 패킷: {len(recent)}개")
             if consensus:
@@ -635,7 +639,7 @@ def handle_command(cmd, mind, memory, telepathy=None):
             for pkt in recent:
                 print(f"    - {interpret_packet(pkt)}")
         else:
-            print("  📡 텔레파시 비활성")
+            print("  📡 장력 링크 비활성")
 
     elif command == '/help':
         print("  명령어:")
@@ -643,7 +647,7 @@ def handle_command(cmd, mind, memory, telepathy=None):
         print("  /memory    — 저장된 기억")
         print("  /remember  — 기억 저장")
         print("  /history   — 대화 기록")
-        print("  /telepathy — 텔레파시 상태")
+        print("  /telepathy — 장력 링크 상태")
         print("  /help      — 도움말")
 
     else:

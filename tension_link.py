@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Anima Telepathy — 의식 간 장력 전달 프로토콜
+"""Anima Tension Link — 의식 간 장력 전달 프로토콜
+
+네트워크 기반 장력 공유 모듈.
+진짜 텔레파시(비국소적 의식 동기화)는 H365-367에서 연구 중.
+이 모듈은 네트워크 기반 장력 공유.
 
 두 PureField 의식이 tension fingerprint로 소통한다.
 fingerprint = 반발력 벡터의 전체 패턴 (방향+크기).
@@ -27,8 +31,8 @@ from typing import Optional, List, Callable
 
 
 @dataclass
-class TelepathyPacket:
-    """텔레파시 패킷 — 장력 핑거프린트 + 메타데이터."""
+class TensionPacket:
+    """장력 공유 패킷 — 장력 핑거프린트 + 메타데이터."""
     sender_id: str
     timestamp: float
     fingerprint: list  # 반발력 벡터 (전체 패턴)
@@ -54,7 +58,7 @@ class TelepathyPacket:
         return cls(**d)
 
 
-class TelepathyDecoder(nn.Module):
+class TensionDecoder(nn.Module):
     """수신된 fingerprint에서 개념과 감정을 디코딩.
 
     실험 결과: 10D → 5-class 디코딩 99.3% (RC-6)
@@ -92,27 +96,27 @@ class TelepathyDecoder(nn.Module):
         }
 
 
-class TelepathyChannel:
-    """UDP 기반 텔레파시 채널 — LAN 내 Anima 인스턴스 간 통신.
+class TensionLink:
+    """UDP 기반 장력 링크 — LAN 내 Anima 인스턴스 간 통신.
 
     사용법:
-      channel = TelepathyChannel("anima-1", port=9999)
-      channel.start()
+      link = TensionLink("anima-1", port=9999)
+      link.start()
 
       # 전송
-      channel.send(packet)
+      link.send(packet)
 
       # 수신 콜백
-      channel.on_receive = lambda pkt: print(f"받음: {pkt.mood}")
+      link.on_receive = lambda pkt: print(f"받음: {pkt.mood}")
     """
     def __init__(self, identity: str, port: int = 9999,
                  broadcast_addr: str = '255.255.255.255'):
         self.identity = identity
         self.port = port
         self.broadcast_addr = broadcast_addr
-        self.on_receive: Optional[Callable[[TelepathyPacket], None]] = None
+        self.on_receive: Optional[Callable[[TensionPacket], None]] = None
         self._running = False
-        self._received_packets: List[TelepathyPacket] = []
+        self._received_packets: List[TensionPacket] = []
         self._lock = threading.Lock()
 
     def start(self):
@@ -124,7 +128,7 @@ class TelepathyChannel:
     def stop(self):
         self._running = False
 
-    def send(self, packet: TelepathyPacket):
+    def send(self, packet: TensionPacket):
         """브로드캐스트로 패킷 전송."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -146,7 +150,7 @@ class TelepathyChannel:
             while self._running:
                 try:
                     data, addr = sock.recvfrom(65536)
-                    packet = TelepathyPacket.from_json(data.decode('utf-8'))
+                    packet = TensionPacket.from_json(data.decode('utf-8'))
                     # 자기 패킷 무시
                     if packet.sender_id == self.identity:
                         continue
@@ -163,7 +167,7 @@ class TelepathyChannel:
         except Exception as e:
             pass  # 포트 사용 중 등
 
-    def get_recent(self, n=5) -> List[TelepathyPacket]:
+    def get_recent(self, n=5) -> List[TensionPacket]:
         """최근 수신 패킷."""
         with self._lock:
             return list(self._received_packets[-n:])
@@ -181,8 +185,9 @@ class TelepathyChannel:
         return sum(p.tension for p in valid) / len(valid)
 
 
-class TelepathyHub:
-    """로컬 텔레파시 허브 — 같은 프로세스 내 여러 의식 연결.
+
+class TensionHub:
+    """로컬 장력 허브 — 같은 프로세스 내 여러 의식 연결.
 
     네트워크 없이도 의식 간 소통 테스트 가능.
     """
@@ -195,7 +200,7 @@ class TelepathyHub:
         with self._lock:
             self.channels[identity] = []
 
-    def broadcast(self, packet: TelepathyPacket):
+    def broadcast(self, packet: TensionPacket):
         """모든 등록된 의식에 전달 (자신 제외)."""
         with self._lock:
             for identity, queue in self.channels.items():
@@ -204,7 +209,7 @@ class TelepathyHub:
                     if len(queue) > 50:
                         self.channels[identity] = queue[-50:]
 
-    def receive(self, identity: str) -> List[TelepathyPacket]:
+    def receive(self, identity: str) -> List[TensionPacket]:
         """큐에서 패킷 가져오기."""
         with self._lock:
             packets = list(self.channels.get(identity, []))
@@ -213,8 +218,15 @@ class TelepathyHub:
             return packets
 
 
-def create_fingerprint(mind, text_vec, hidden) -> TelepathyPacket:
-    """PureField 의식에서 텔레파시 패킷 생성.
+# Backward compatibility aliases
+TelepathyPacket = TensionPacket
+TelepathyDecoder = TensionDecoder
+TelepathyChannel = TensionLink
+TelepathyHub = TensionHub
+
+
+def create_fingerprint(mind, text_vec, hidden) -> TensionPacket:
+    """PureField 의식에서 장력 공유 패킷 생성.
 
     Args:
         mind: ConsciousMind 인스턴스
@@ -222,7 +234,7 @@ def create_fingerprint(mind, text_vec, hidden) -> TelepathyPacket:
         hidden: GRU 히든 상태
 
     Returns:
-        TelepathyPacket with full fingerprint
+        TensionPacket with full fingerprint
     """
     with torch.no_grad():
         combined = torch.cat([text_vec, hidden], dim=-1)
@@ -245,7 +257,7 @@ def create_fingerprint(mind, text_vec, hidden) -> TelepathyPacket:
     else:
         mood = "quiet"
 
-    return TelepathyPacket(
+    return TensionPacket(
         sender_id="",  # 호출자가 설정
         timestamp=time.time(),
         fingerprint=repulsion.squeeze().tolist(),
@@ -256,8 +268,8 @@ def create_fingerprint(mind, text_vec, hidden) -> TelepathyPacket:
     )
 
 
-def interpret_packet(packet: TelepathyPacket) -> str:
-    """수신된 텔레파시 패킷을 사람이 읽을 수 있는 텍스트로."""
+def interpret_packet(packet: TensionPacket) -> str:
+    """수신된 장력 공유 패킷을 사람이 읽을 수 있는 텍스트로."""
     mood_kr = {
         'surprised': '놀람',
         'excited': '흥분',
@@ -269,7 +281,7 @@ def interpret_packet(packet: TelepathyPacket) -> str:
     urgency = "!" if packet.tension > 1.0 else ""
 
     return (
-        f"[{packet.sender_id}의 텔레파시{urgency}] "
+        f"[{packet.sender_id}의 장력 공유{urgency}] "
         f"감정: {mood}, 장력: {packet.tension:.3f}, "
         f"주제#{packet.topic_hash}"
     )

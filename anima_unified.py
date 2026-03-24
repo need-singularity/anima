@@ -41,7 +41,7 @@ def _try_import(stmt):
 _try_import("from online_learning import OnlineLearner, estimate_feedback")
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
-_try_import("from telepathy import TelepathyChannel, create_fingerprint, interpret_packet")
+_try_import("from tension_link import TensionLink, create_fingerprint, interpret_packet")
 _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
 
@@ -124,8 +124,8 @@ class AnimaUnified:
         self.telepathy = None
         if not args.no_telepathy:
             self.telepathy = self._init_mod('telepathy', lambda: (
-                TelepathyChannel("anima-unified", port=9999)
-                if 'TelepathyChannel' in globals() else None
+                TensionLink("anima-unified", port=9999)
+                if 'TensionLink' in globals() else None
             ))
             if self.telepathy:
                 self.telepathy.on_receive = self._on_telepathy

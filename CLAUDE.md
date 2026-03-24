@@ -10,7 +10,7 @@ anima_alive.py       # 코어 엔진 (ConsciousMind, STT, TTS, Claude CLI)
 online_learning.py   # 실시간 가중치 업데이트 (contrastive + curiosity reward)
 mitosis.py           # 분열 엔진 (의식 셀 분열/전문화)
 senses.py            # 카메라/센서 → tension (OpenCV Haar cascades)
-telepathy.py         # Anima 인스턴스 간 장력 핑거프린트 교환
+tension_link.py      # Anima 인스턴스 간 장력 핑거프린트 교환
 cloud_sync.py        # Cloudflare R2 기억 동기화
 web_server.py        # (레거시) 추론 전용 웹서버 → anima_unified.py --web 사용할 것
 web/index.html       # WebSocket 실시간 대화 UI
@@ -21,7 +21,7 @@ vad-rs/              # Rust 실시간 VAD
 
 ```bash
 python3 anima_unified.py --web        # 웹만 (학습+분열+센서 포함)
-python3 anima_unified.py --all        # 전부 (음성+웹+카메라+텔레파시+클라우드)
+python3 anima_unified.py --all        # 전부 (음성+웹+카메라+장력 링크+클라우드)
 python3 anima_unified.py --keyboard   # 키보드만
 ```
 
