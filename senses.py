@@ -130,6 +130,7 @@ class CameraInput:
         self._permission_denied = False
         self._thread: Optional[threading.Thread] = None
         self._prev_gray: Optional[np.ndarray] = None
+        self._last_frame: Optional[np.ndarray] = None
 
         # Haar cascades — find path (cv2.data may not exist in brew opencv)
         if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
@@ -163,6 +164,11 @@ class CameraInput:
     def state(self) -> VisualState:
         with self._lock:
             return self._state
+
+    @property
+    def last_frame(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._last_frame
 
     @property
     def running(self) -> bool:
@@ -223,6 +229,8 @@ class CameraInput:
             cap.release()
 
     def _process_frame(self, frame: np.ndarray):
+        with self._lock:
+            self._last_frame = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray_small = cv2.resize(gray, (160, 120))
 

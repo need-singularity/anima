@@ -41,3 +41,10 @@ def test_sensehub_encode_vision_none_without_encoder():
     frame = np.random.randint(0, 255, (240, 320, 3), dtype=np.uint8)
     result = hub.encode_vision(frame)
     assert result is None
+
+
+def test_camera_last_frame_initially_none():
+    """CameraInput 초기화 시 last_frame은 None."""
+    from senses import CameraInput
+    cam = CameraInput(camera_index=0, fps=1)
+    assert cam.last_frame is None
