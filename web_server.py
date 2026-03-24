@@ -137,7 +137,7 @@ def ask_conscious_lm(text, state, history):
         req = urllib.request.Request(
             f"{CONSCIOUS_LM_URL}/chat",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "Anima/1.0"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -171,7 +171,7 @@ def ask_claude_proactive(state, history, trigger):
         req = urllib.request.Request(
             f"{CONSCIOUS_LM_URL}/chat",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "Anima/1.0"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
