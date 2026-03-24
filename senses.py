@@ -397,6 +397,7 @@ class SenseHub:
         self.screen: Optional[ScreenCapture] = None
         if enable_screen:
             self.screen = ScreenCapture(interval=screen_interval)
+        self.vision_encoder = None
 
     def start(self):
         """Start all sensors. Camera failure does not prevent other sensors."""
@@ -500,6 +501,35 @@ class SenseHub:
                 out[idx + 1] = torch.cos(freq * ch * 3.14159)
 
         return out.unsqueeze(0)  # (1, dim) to match ConsciousMind input
+
+    def enable_vision_encoder(self, target_dim: int = 128, use_pretrained: bool = True, device: str = 'cpu'):
+        """VisionEncoder를 활성화."""
+        from vision_encoder import VisionEncoder
+        self.vision_encoder = VisionEncoder(
+            target_dim=target_dim,
+            use_pretrained=use_pretrained,
+            device=device,
+        )
+
+    def encode_vision(self, frame: np.ndarray) -> 'torch.Tensor | None':
+        """프레임을 비전 인코더로 인코딩. 인코더 없으면 None."""
+        if self.vision_encoder is None:
+            return None
+        return self.vision_encoder.encode_frame(frame)
+
+    def to_tensor_with_vision(self, frame: np.ndarray = None, dim: int = 128) -> torch.Tensor:
+        """비전 임베딩 + 센서 데이터 결합.
+
+        비전 인코더 있고 frame 있으면: 0.7*vision + 0.3*sensor
+        아니면: 기존 to_tensor() 반환
+        """
+        sensor_tensor = self.to_tensor(dim=dim)
+
+        if frame is not None and self.vision_encoder is not None:
+            vision_tensor = self.vision_encoder.encode_frame(frame)
+            return 0.7 * vision_tensor + 0.3 * sensor_tensor
+
+        return sensor_tensor
 
 
 # ─── Convenience: quick test ────────────────────────────────────
