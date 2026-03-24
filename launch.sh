@@ -7,6 +7,10 @@ cd "$ANIMA_DIR"
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
+# Load environment variables
+[ -f "$ANIMA_DIR/.local/.env" ] && set -a && source "$ANIMA_DIR/.local/.env" && set +a
+[ -f "$ANIMA_DIR/.env" ] && set -a && source "$ANIMA_DIR/.env" && set +a
+
 echo "=================================================="
 echo "  Anima — Full Launch"
 echo "=================================================="
@@ -47,6 +51,13 @@ cap = cv2.VideoCapture(0)
 print('ok' if cap.isOpened() else 'denied')
 cap.release()
 " 2>/dev/null || echo "fail")
+
+# R2 Cloud
+if [ -n "$ANIMA_R2_ENDPOINT" ]; then
+    echo "  [OK] R2 cloud ($ANIMA_R2_BUCKET)"
+else
+    echo "  [--] R2 cloud (ANIMA_R2_* 환경변수 없음)"
+fi
 
 if [ "$CAM" = "ok" ]; then
     echo "  [OK] camera"
