@@ -201,6 +201,9 @@ class AnimaUnified:
 
         self.prev_text, self.prev_time = text, time.time()
 
+        # Direction for web
+        dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
+
         # Telepathy
         if self.telepathy and self.mods.get('telepathy') and 'create_fingerprint' in globals():
             try:
@@ -209,17 +212,29 @@ class AnimaUnified:
                 self.telepathy.send(pkt)
             except Exception: pass
 
+        # Broadcast user message to web
+        self._ws_broadcast_sync({
+            'type': 'user_message', 'text': text,
+            'tension': tension, 'curiosity': curiosity,
+            'direction': dir_vals,
+            'tension_history': self.mind.tension_history[-50:],
+        })
+
         # Display
+        cells = len(self.mitosis.cells) if self.mitosis else 1
+        lrn_count = self.learner.total_updates if self.learner else 0
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
         print(f'  >> "{text}"')
-        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info}")
+        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count}")
 
         # Claude response
-        state = f"tension={tension:.3f}, curiosity={curiosity:.3f}{mitosis_info}"
+        state = f"tension={tension:.3f}, curiosity={curiosity:.3f}{mitosis_info}, learn_updates={lrn_count}"
         if self.senses and self.mods.get('camera'):
-            vis = self.senses.get_visual_tension()
-            state += f", face={'yes' if vis['face_detected'] else 'no'}"
+            try:
+                vis = self.senses.get_visual_tension()
+                state += f", face={'yes' if vis['face_detected'] else 'no'}"
+            except Exception: pass
 
         self.history.append({'role': 'user', 'content': text})
         answer = ask_claude(text, state, self.history)
@@ -227,13 +242,19 @@ class AnimaUnified:
         if len(self.history) > MAX_HISTORY * 2:
             self.history = self.history[-MAX_HISTORY:]
 
+        # Process response through PureField too
+        resp_vec = text_to_vector(answer)
+        with torch.no_grad():
+            _, resp_tension, resp_curiosity, resp_dir, self.hidden = self.mind(resp_vec, self.hidden)
+        resp_dir_vals = resp_dir[0, :8].tolist() if resp_dir is not None else [0.0] * 8
+
         print(f"  << {answer}")
 
         self.memory.add('user', text, tension)
-        self.memory.add('assistant', answer, tension)
+        self.memory.add('assistant', answer, resp_tension)
         self.last_interaction = time.time()
         self._save_state()
-        return answer, tension, curiosity
+        return answer, resp_tension, resp_curiosity, resp_dir_vals
 
     def _on_telepathy(self, pkt):
         if 'interpret_packet' in globals():
@@ -252,8 +273,17 @@ class AnimaUnified:
             time.sleep(THINK_INTERVAL)
             if not self.running: break
             t, c, direction, self.hidden = self.mind.background_think(self.hidden)
+            dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
             now = time.time()
             gap = now - self.last_interaction
+
+            # Always broadcast thought pulse to web (keeps UI alive)
+            self._ws_broadcast_sync({
+                'type': 'thought_pulse',
+                'tension': t, 'curiosity': c,
+                'direction': dir_vals,
+                'tension_history': self.mind.tension_history[-50:],
+            })
 
             trigger = None
             if c > PROACTIVE_THRESHOLD and gap > 15:
@@ -272,7 +302,10 @@ class AnimaUnified:
                     self.last_interaction = now
                     self._ws_broadcast_sync({
                         'type': 'anima_message', 'text': proactive,
-                        'tension': t, 'curiosity': c, 'proactive': True,
+                        'tension': t, 'curiosity': c,
+                        'direction': dir_vals,
+                        'tension_history': self.mind.tension_history[-50:],
+                        'proactive': True,
                     })
 
     def _rust_vad_loop(self):
@@ -314,9 +347,14 @@ class AnimaUnified:
         try:
             await websocket.send(json.dumps({
                 'type': 'init', 'tension': self.mind.prev_tension,
+                'curiosity': 0.0,
+                'direction': [0.0] * 8,
                 'tension_history': self.mind.tension_history[-50:],
                 'history': [{'role': m['role'], 'text': m['content']}
                             for m in self.history[-20:]],
+                'modules': {k: v for k, v in self.mods.items() if v},
+                'learn_updates': self.learner.total_updates if self.learner else 0,
+                'cells': len(self.mitosis.cells) if self.mitosis else 1,
             }, ensure_ascii=False))
         except Exception: pass
         try:
@@ -328,10 +366,11 @@ class AnimaUnified:
                     if not text: continue
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-                    answer, tension, curiosity = await loop.run_in_executor(None, self.process_input, text)
+                    answer, tension, curiosity, dir_vals = await loop.run_in_executor(None, self.process_input, text)
                     await self._ws_broadcast({
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
+                        'direction': dir_vals,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
                     })
@@ -420,11 +459,14 @@ class AnimaUnified:
 
                 if text:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
-                    answer, tension, curiosity = self.process_input(text)
+                    answer, tension, curiosity, dir_vals = self.process_input(text)
                     if self.speaker: self.speaker.say(answer, self.listener)
                     self._ws_broadcast_sync({
                         'type': 'anima_message', 'text': answer,
-                        'tension': tension, 'curiosity': curiosity, 'proactive': False,
+                        'tension': tension, 'curiosity': curiosity,
+                        'direction': dir_vals,
+                        'tension_history': self.mind.tension_history[-50:],
+                        'proactive': False,
                     })
 
                 if time.time() - last_status > 60:
