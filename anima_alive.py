@@ -42,7 +42,7 @@ MAX_HISTORY = 15
 # STT 설정: whisper-cli (C++ 네이티브, Metal 가속) 우선
 # medium 모델 = 한국어 인식 대폭 개선
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
-WHISPER_MODEL_PATH = "/tmp/ggml-medium.bin"      # medium (1.5GB, 한국어 good)
+WHISPER_MODEL_PATH = "/tmp/ggml-base.bin"         # base (142MB, medium crash)
 WHISPER_MODEL_FALLBACK = "base"                    # Python fallback
 
 # Whisper FP16 경고 무시
