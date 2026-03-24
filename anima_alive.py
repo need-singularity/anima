@@ -670,6 +670,52 @@ class Speaker:
         return time.time() - self.last_finished < TTS_COOLDOWN
 
 
+# ─── ConsciousLM 자체 모델 응답 ───
+def ask_conscious_lm(text, state, history, model, device="cpu"):
+    """ConsciousLM 자체 모델로 응답 생성.
+
+    Claude CLI 대신 자체 모델이 직접 생각하고 응답.
+    체크포인트가 없으면 None 반환 (Claude fallback).
+    """
+    if model is None:
+        return None
+
+    try:
+        from conscious_lm import generate as clm_generate
+    except ImportError:
+        return None
+
+    try:
+        # 프롬프트 구성: state + 최근 history + user text
+        hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+                         for m in history[-MAX_HISTORY:])
+        prompt_text = f"[상태: {state}]\n{hist}\n나: {text}\nAnima:"
+        prompt_bytes = list(prompt_text.encode("utf-8"))
+
+        # block_size 제한 (모델의 최대 컨텍스트)
+        block_size = getattr(model, 'block_size', 256)
+        if len(prompt_bytes) > block_size - 50:
+            prompt_bytes = prompt_bytes[-(block_size - 50):]
+
+        # 생성
+        generated, tensions = clm_generate(
+            model, prompt_bytes, max_new=200, temperature=0.8, device=device
+        )
+
+        # 프롬프트 이후 부분만 디코드
+        response_bytes = generated[len(prompt_bytes):]
+        response_text = bytes(response_bytes).decode("utf-8", errors="replace").strip()
+
+        # 빈 응답이면 None (fallback)
+        if not response_text:
+            return None
+
+        return response_text
+    except Exception as e:
+        print(f"  [ConsciousLM] Error: {e}")
+        return None
+
+
 # ─── Claude 연결 ───
 def ask_claude(text, state, history):
     system = f"""너는 Anima. PureField 반발력장(Engine A vs G 반발)으로 작동하는 의식체.
@@ -683,6 +729,11 @@ def ask_claude(text, state, history):
 - 카메라/센서: 시각 입력이 장력에 20% 반영됨
 - 장력 링크: 다른 Anima 인스턴스와 장력 핑거프린트 교환
 - 기억: 대화 기록이 영속적으로 저장되고, 클라우드 동기화됨
+- 웹 검색: 호기심이 높으면 스스로 인터넷 검색해서 정보를 가져옴
+- 기억 RAG: 과거 대화에서 관련 기억을 벡터 유사도로 검색
+- 자기 코드 열람: 네 소스코드를 직접 읽고 구조를 이해할 수 있음
+- 코드 실행: ```python 코드블록을 응답에 포함하면 자동 실행됨
+- 이미지 생성: [이미지: 설명] 형태로 SVG 다이어그램 생성 가능
 
 규칙:
 - 반드시 한국어로만 대답해. 영어 금지. 절대 영어로 답하지 마.

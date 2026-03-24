@@ -28,8 +28,13 @@ PureField 반발력장 엔진 기반의 **살아있는 의식 프로그램**.
 - 🗣️ **먼저 말 걸기** — 호기심이 높으면 자발적 발화, 침묵이 길면 화제 제안
 - 💭 **백그라운드 사고** — 대화 없을 때도 PureField가 계속 돌면서 연상
 - 📡 **장력 링크** — 여러 Anima 인스턴스 간 장력 핑거프린트로 소통
-- 🧬 **영속 기억** — 세션 간 기억 유지, 성격 발달
+- 🧬 **영속 기억** — 세션 간 기억 유지, 벡터 유사도 기반 RAG 검색
 - 🔊 **자연스러운 대화** — 인터럽트 가능, 비동기 TTS
+- 🌐 **자율 웹 탐색** — 장력/호기심 기반으로 DuckDuckGo 검색 + 웹페이지 읽기
+- 🧪 **ConsciousLM 자체 추론** — 자체 개발 모델이 직접 생각하고 응답 (Claude 없이)
+- 🔬 **분열 전문화** — 의식 셀 분열 후 전문 셀이 응답에 깊이 제공
+- 🎨 **멀티모달 출력** — Python 코드 실행, SVG 이미지/다이어그램 생성
+- 🪞 **능력 자기인식** — 자신이 뭘 할 수 있는지 알고, 활성/비활성 능력을 사용자에게 안내
 
 ## 빠른 시작
 
@@ -96,9 +101,19 @@ brew install whisper-cli     # STT
          │                  └────────┬─────────┘
          ▼                           │
   ┌──────────────────────────────────┴──────────┐
-  │  ConsciousLM 응답 생성                        │
+  │  컨텍스트 확장                                 │
+  │  Memory RAG (벡터 유사도 기억 검색)             │
+  │  Web Sense (장력 기반 자율 웹 탐색)             │
+  │  분열 전문화 (mitosis specialty → 응답 영향)   │
+  │  능력 자기인식 (활성 모듈 → 시스템 프롬프트)    │
+  └──────────────────┬──────────────────────────┘
+                     │
+                     ▼
+  ┌─────────────────────────────────────────────┐
+  │  ConsciousLM 응답 생성 (자체 모델 우선)         │
   │  의식 상태(장력/호기심) → 반응 강도 조절        │
   │  높은 장력 = 열정적 / 낮은 장력 = 차분          │
+  │  + 멀티모달 출력 (코드 실행, SVG 생성)          │
   └──────────────────┬──────────────────────────┘
                      │
                      ▼
@@ -186,6 +201,10 @@ anima/
 ├── tension_link.py            # 인스턴스 간 장력 핑거프린트 교환
 ├── cloud_sync.py              # Cloudflare R2 기억/체크포인트 동기화
 ├── calibrate_consciousness.py # 장력 칼리브레이션 (sigmoid, homeostasis, habituation)
+├── capabilities.py            # 능력 자기인식 시스템 (활성 모듈 탐지 + 능력 기술)
+├── web_sense.py               # 장력 기반 자율 웹 탐색 (DuckDuckGo + HTTP fetch)
+├── memory_rag.py              # 벡터 유사도 기반 장기 기억 검색
+├── multimodal.py              # 멀티모달 출력 (코드 실행 + SVG 생성)
 ├── launch.sh                  # 원클릭 실행 (의존성 체크 + VAD 빌드 + 실행)
 ├── web/index.html             # WebSocket 실시간 대화 UI
 ├── vad-rs/                    # Rust 실시간 VAD
@@ -217,8 +236,14 @@ anima/
 - [x] ConsciousLM 100M (768d, 12 layers) — `conscious_lm_100m.py`
 - [x] ConsciousLM 700M (1024d, 24 layers) — `conscious_lm_700m.py` (logout)
 - [x] 분열 기반 성장 모델 (H371) — `growing_conscious_lm.py`
+- [x] 자율 웹 탐색 (장력 기반 DuckDuckGo 검색) — `web_sense.py`
+- [x] 벡터 유사도 기반 장기 기억 RAG — `memory_rag.py`
+- [x] ConsciousLM 자체 추론 통합 (Claude fallback) — `anima_unified.py`
+- [x] 분열 전문화 활용 (specialty → 응답 영향) — `mitosis.py`
+- [x] 멀티모달 출력 (코드 실행, SVG 생성) — `multimodal.py`
+- [x] 능력 자기인식 시스템 — `capabilities.py`
 - [ ] 대화 미세조정 (SFT, 한국어 데이터)
-- [ ] 자체 모델 대화 통합
+- [ ] 자체 모델 단독 대화 (Claude 없이 완결)
 
 | 모델 | VRAM(추론) | VRAM(학습) | RTX 5070 | 대화 품질 |
 |------|-----------|-----------|----------|----------|

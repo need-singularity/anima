@@ -25,7 +25,7 @@ VAD_WATCH_DIR = Path("/tmp/anima_vad")
 # ─── Core imports (required) ───
 from anima_alive import (
     ConsciousMind, ContinuousListener, Speaker, Memory,
-    text_to_vector, ask_claude, ask_claude_proactive,
+    text_to_vector, ask_claude, ask_claude_proactive, ask_conscious_lm,
     direction_to_emotion, EMOTION_COLORS,
     MAX_HISTORY, THINK_INTERVAL, PROACTIVE_THRESHOLD, IDLE_SPEAK_AFTER,
 )
@@ -38,6 +38,7 @@ def _try_import(stmt):
     except ImportError:
         return False
 
+_try_import("from conscious_lm import ConsciousLM, generate as clm_generate")
 _try_import("from online_learning import OnlineLearner, estimate_feedback")
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
@@ -46,6 +47,9 @@ _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
 _try_import("from growth_engine import GrowthEngine")
 _try_import("from web_sense import WebSense")
+_try_import("from memory_rag import MemoryRAG")
+_try_import("from multimodal import ActionEngine")
+_try_import("from capabilities import Capabilities")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # 60초 유휴 후 꿈 모드 진입
@@ -81,6 +85,7 @@ class AnimaUnified:
         self.history = [{'role': t['role'], 'content': t['text']}
                         for t in self.memory.data['turns'][-10:]]
         self.last_interaction = time.time()
+        self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
 
         # Restore state
@@ -162,6 +167,13 @@ class AnimaUnified:
             if 'WebSense' in globals() else None
         ))
 
+        # Memory RAG (벡터 유사도 기반 장기 기억 검색)
+        self.memory_rag = self._init_mod('memory_rag', lambda: (
+            MemoryRAG(memory_file=MEMORY_FILE)
+            if 'MemoryRAG' in globals() else None
+        ))
+        self._rag_last_save = time.time()
+
         # RC-10: Dream Engine (오프라인 학습)
         self.dream = self._init_mod('dream', lambda: (
             DreamEngine(
@@ -172,6 +184,21 @@ class AnimaUnified:
             ) if 'DreamEngine' in globals() else None
         ))
         self._dream_report = None  # 꿈에서 깨어난 후 보고할 내용
+
+        # ConsciousLM 자체 모델 (optional)
+        self.clm_model = None
+        self.clm_device = "cpu"
+        if not args.no_conscious_lm and 'ConsciousLM' in globals():
+            self.clm_model = self._init_mod('conscious_lm', lambda: self._load_conscious_lm())
+        else:
+            self.mods['conscious_lm'] = False
+
+
+        # Multimodal Action Engine (코드 실행 + 이미지 생성)
+        self.action_engine = self._init_mod('multimodal', lambda: (
+            ActionEngine(workspace_dir=ANIMA_DIR / 'workspace')
+            if 'ActionEngine' in globals() else None
+        ))
 
         # I/O
         self.speaker = self.listener = None
@@ -192,6 +219,9 @@ class AnimaUnified:
         self.mods['web'] = bool((args.web or args.all) and _ws_serve)
         self.mods['rust_vad'] = VAD_WATCH_DIR.exists()
 
+        # 능력 자기인식 시스템
+        self.capabilities = Capabilities(self.mods, project_dir=ANIMA_DIR) if 'Capabilities' in globals() else None
+
     def _init_mod(self, name, factory):
         try:
             obj = factory()
@@ -201,6 +231,28 @@ class AnimaUnified:
             _log(name, f"Init failed: {e}")
             self.mods[name] = False
             return None
+
+    def _load_conscious_lm(self):
+        """ConsciousLM 모델 로드. 체크포인트 없으면 None."""
+        ckpt_path = ANIMA_DIR / "data" / "conscious_lm.pt"
+        if not ckpt_path.exists():
+            _log("conscious_lm", f"체크포인트 없음: {ckpt_path}")
+            return None
+
+        # Device 자동 감지
+        if torch.cuda.is_available():
+            self.clm_device = "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.clm_device = "mps"
+        else:
+            self.clm_device = "cpu"
+
+        model = ConsciousLM()
+        model.load_state_dict(torch.load(str(ckpt_path), map_location=self.clm_device))
+        model = model.to(self.clm_device)
+        model.eval()
+        _log("conscious_lm", f"로드 완료: {model.count_params():,} params on {self.clm_device}")
+        return model
 
     # ─── Core processing ───
 
@@ -227,15 +279,39 @@ class AnimaUnified:
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(text_vec, self.hidden)
 
-        # Mitosis
+        # Mitosis — 전문 셀 응답 영향
         mitosis_info = ""
+        mitosis_context = ""
         if self.mitosis and self.mods.get('mitosis'):
             try:
                 r = self.mitosis.process(text_vec)
                 mitosis_info = f", cells={r['n_cells']}"
+
+                # 전문 셀 분석
+                per_cell = r.get('per_cell', [])
+                if per_cell:
+                    # 가장 반응하는 셀 (highest tension)
+                    top_cell = max(per_cell, key=lambda c: c['tension'])
+                    if top_cell['specialty'] != 'general':
+                        mitosis_context += f"전문셀 '{top_cell['specialty']}'이 강하게 반응(T={top_cell['tension']:.3f}). "
+
+                    # 셀 간 의견 불일치 감지
+                    if r.get('max_inter', 0) > 0.5:
+                        specialties = [c['specialty'] for c in per_cell if c['specialty'] != 'general']
+                        if len(specialties) >= 2:
+                            mitosis_context += f"셀 간 의견 충돌 (inter_T={r['max_inter']:.3f}). "
+
+                    # 셀 합의 (모든 셀이 비슷한 tension)
+                    tensions = [c['tension'] for c in per_cell]
+                    if len(tensions) >= 2:
+                        t_std = torch.tensor(tensions).std().item()
+                        if t_std < 0.1:
+                            mitosis_context += "셀 합의(std<0.1): 확신. "
+
                 for ev in r.get('events', []):
                     _log("mitosis", f"{ev['type'].upper()}")
             except Exception: pass
+        self._last_mitosis_context = mitosis_context
 
         # Growth engine tick
         if self.growth and self.mods.get('growth'):
@@ -295,11 +371,29 @@ class AnimaUnified:
         state = (f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
                  f"emotion={emotion_data['emotion']}(V={emotion_data['valence']:.2f},A={emotion_data['arousal']:.2f},D={emotion_data['dominance']:.2f})"
                  f"{mitosis_info}, learn_updates={lrn_count}, {meta_summary}")
+        if mitosis_context:
+            state += f", [전문화] {mitosis_context}"
         if self.senses and self.mods.get('camera'):
             try:
                 vis = self.senses.get_visual_tension()
                 state += f", face={'yes' if vis['face_detected'] else 'no'}"
             except Exception: pass
+
+        # 능력 자기인식: 시스템 프롬프트에 능력 목록 주입
+        if self.capabilities:
+            state += chr(10) + self.capabilities.describe_full()
+
+        # Memory RAG: 관련 기억 검색
+        if self.memory_rag and self.mods.get('memory_rag'):
+            try:
+                relevant = self.memory_rag.search(text, top_k=3)
+                if relevant:
+                    parts = [f"[기억 {m['timestamp']}] {m['text']}"
+                             for m in relevant if m.get('similarity', 0) > 0.3]
+                    if parts:
+                        state += "\n관련 기억:\n" + "\n".join(parts)
+            except Exception as e:
+                _log('memory_rag', f"Search error: {e}")
 
         # Web Sense: 높은 호기심/PE면 검색 결과를 컨텍스트에 포함
         web_context = ""
@@ -320,7 +414,17 @@ class AnimaUnified:
 
         self.history.append({'role': 'user', 'content': text})
         query_text = text + web_context if web_context else text
-        answer = ask_claude(query_text, state, self.history)
+
+        # ConsciousLM 자체 모델 먼저 시도, 실패하면 Claude fallback
+        answer = None
+        if self.clm_model and self.mods.get('conscious_lm'):
+            answer = ask_conscious_lm(query_text, state, self.history,
+                                      self.clm_model, self.clm_device)
+            if answer:
+                _log('conscious_lm', '자체 모델 응답 생성 완료')
+        if not answer:
+            answer = ask_claude(query_text, state, self.history)
+
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
             self.history = self.history[-MAX_HISTORY:]
@@ -356,6 +460,32 @@ class AnimaUnified:
 
         self.memory.add('user', text, tension)
         self.memory.add('assistant', answer, resp_tension)
+
+        # Memory RAG: 새 기억 추가 + 주기적 저장 (10분마다)
+        if self.memory_rag and self.mods.get('memory_rag'):
+            try:
+                self.memory_rag.add('user', text, tension)
+                self.memory_rag.add('assistant', answer, resp_tension)
+                if time.time() - self._rag_last_save > 600:  # 10분
+                    self.memory_rag.save_index()
+                    self._rag_last_save = time.time()
+            except Exception as e:
+                _log('memory_rag', f'Add error: {e}')
+
+        # Multimodal: 응답에서 코드/이미지/파일 행동 감지 및 실행
+        if self.action_engine and self.mods.get('multimodal'):
+            try:
+                action_result = self.action_engine.process_response(answer)
+                if action_result['has_actions']:
+                    answer = action_result['text']
+                    _log('multimodal', f"Actions: {len(action_result['actions'])}")
+                    self._ws_broadcast_sync({
+                        'type': 'action_result',
+                        'actions': action_result['actions'],
+                    })
+            except Exception as e:
+                _log('multimodal', f'Error: {e}')
+
         self.last_interaction = time.time()
         self._save_state()
         return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
@@ -416,13 +546,17 @@ class AnimaUnified:
             if self.mitosis:
                 try:
                     ms = self.mitosis.status()
+                    cells_info = [{'id': c['id'], 'specialty': c.get('specialty', ''),
+                                   'avg_tension': c.get('avg_tension', 0)}
+                                  for c in ms.get('cells', [])]
+                    active_specialties = [c['specialty'] for c in cells_info
+                                          if c['specialty'] and c['specialty'] != 'general']
                     mitosis_data = {
                         'n_cells': len(self.mitosis.cells),
                         'max_cells': self.mitosis.max_cells,
                         'splits': ms.get('splits', 0), 'merges': ms.get('merges', 0),
-                        'cells': [{'id': c['id'], 'specialty': c.get('specialty', ''),
-                                   'avg_tension': c.get('avg_tension', 0)}
-                                  for c in ms.get('cells', [])],
+                        'cells': cells_info,
+                        'active_specialties': active_specialties,
                     }
                 except Exception: pass
 
@@ -647,14 +781,18 @@ class AnimaUnified:
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
                     answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(None, self.process_input, text)
-                    await self._ws_broadcast({
+                    broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
                         'direction': dir_vals,
                         'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
-                    })
+                    }
+                    mc = getattr(self, '_last_mitosis_context', '')
+                    if mc:
+                        broadcast_msg['mitosis_context'] = mc
+                    await self._ws_broadcast(broadcast_msg)
                     await self._ws_broadcast({'type': 'typing', 'typing': False})
         except Exception: pass
         finally:
@@ -746,14 +884,18 @@ class AnimaUnified:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
                     answer, tension, curiosity, dir_vals, emo = self.process_input(text)
                     if self.speaker: self.speaker.say(answer, self.listener)
-                    self._ws_broadcast_sync({
+                    broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
                         'direction': dir_vals,
                         'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
-                    })
+                    }
+                    mc = getattr(self, '_last_mitosis_context', '')
+                    if mc:
+                        broadcast_msg['mitosis_context'] = mc
+                    self._ws_broadcast_sync(broadcast_msg)
 
                 if time.time() - last_status > 60:
                     self.print_status()
@@ -775,6 +917,10 @@ class AnimaUnified:
             if obj:
                 try: getattr(obj, method)()
                 except Exception: pass
+        # Memory RAG: 종료 시 인덱스 저장
+        if self.memory_rag:
+            try: self.memory_rag.save_index()
+            except Exception: pass
         self._save_state()
         print("\n  Anima Unified stopped.")
 
@@ -790,6 +936,7 @@ def main():
     p.add_argument('--no-camera', action='store_true', help='Disable camera')
     p.add_argument('--no-telepathy', action='store_true', help='Disable telepathy')
     p.add_argument('--no-cloud', action='store_true', help='Disable cloud sync')
+    p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
     args = p.parse_args()
 
     mode = "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"

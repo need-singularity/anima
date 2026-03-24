@@ -32,6 +32,10 @@ senses.py            # 카메라/센서 → tension (OpenCV Haar cascades)
 tension_link.py      # Anima 인스턴스 간 장력 핑거프린트 교환
 cloud_sync.py        # Cloudflare R2 기억/체크포인트 동기화
 calibrate_consciousness.py  # 장력 칼리브레이션 (sigmoid, homeostasis, habituation)
+capabilities.py      # 능력 자기인식 시스템
+memory_rag.py        # 벡터 유사도 기반 장기 기억 검색
+multimodal.py        # 코드 실행 + 이미지 생성
+web_sense.py         # 장력 기반 자율 웹 탐색
 web/index.html       # WebSocket 실시간 대화 UI
 vad-rs/              # Rust 실시간 VAD
 ```
