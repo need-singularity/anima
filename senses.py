@@ -28,6 +28,11 @@ from typing import Optional
 
 # ─── macOS Camera Permission ────────────────────────────────────
 
+# Vision encoder blend weights
+_VISION_BLEND_WEIGHT = 0.7   # 비전 인코더 기여도
+_SENSOR_BLEND_WEIGHT = 0.3   # Haar cascade / motion 센서 기여도
+
+
 CAMERA_PERMISSION_MSG = (
     "\n"
     "  ╔══════════════════════════════════════════════════════════╗\n"
@@ -511,7 +516,7 @@ class SenseHub:
             device=device,
         )
 
-    def encode_vision(self, frame: np.ndarray) -> 'torch.Tensor | None':
+    def encode_vision(self, frame: np.ndarray) -> Optional[torch.Tensor]:
         """프레임을 비전 인코더로 인코딩. 인코더 없으면 None."""
         if self.vision_encoder is None:
             return None
@@ -526,8 +531,8 @@ class SenseHub:
         sensor_tensor = self.to_tensor(dim=dim)
 
         if frame is not None and self.vision_encoder is not None:
-            vision_tensor = self.vision_encoder.encode_frame(frame)
-            return 0.7 * vision_tensor + 0.3 * sensor_tensor
+            vision_tensor = self.encode_vision(frame)
+            return _VISION_BLEND_WEIGHT * vision_tensor + _SENSOR_BLEND_WEIGHT * sensor_tensor
 
         return sensor_tensor
 
