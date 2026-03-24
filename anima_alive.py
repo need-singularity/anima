@@ -442,35 +442,135 @@ class ContinuousListener:
 
 # ─── TTS (논블로킹) ───
 class Speaker:
-    """Mac TTS. 말하는 중 인터럽트 가능. TTS 후 쿨다운."""
+    """ElevenLabs TTS (고품질) with Mac TTS fallback. 인터럽트 가능."""
 
     def __init__(self, voice='Yuna'):
         self.voice = voice
         self._proc = None
         self.is_speaking = False
-        self.last_finished = 0.0  # TTS 끝난 시간
+        self.last_finished = 0.0
+
+        # ElevenLabs 설정
+        self._elevenlabs_key = os.environ.get('ELEVENLABS_API_KEY', '')
+        self._elevenlabs_voice_id = None
+        self._use_elevenlabs = False
+
+        if self._elevenlabs_key:
+            try:
+                self._setup_elevenlabs()
+                self._use_elevenlabs = True
+                print("  🔊 ElevenLabs TTS 활성화")
+            except Exception as e:
+                print(f"  🔊 ElevenLabs 실패, Mac TTS 사용: {e}")
+
+        # .env 파일에서 로드 (환경변수 없으면)
+        if not self._elevenlabs_key:
+            env_file = ANIMA_DIR / ".env"
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    if line.startswith('ELEVENLABS_API_KEY='):
+                        self._elevenlabs_key = line.split('=', 1)[1].strip()
+                        try:
+                            self._setup_elevenlabs()
+                            self._use_elevenlabs = True
+                            print("  🔊 ElevenLabs TTS 활성화 (.env)")
+                        except Exception:
+                            pass
+                        break
+
+    def _setup_elevenlabs(self):
+        """ElevenLabs voice ID 조회."""
+        import urllib.request
+        req = urllib.request.Request(
+            'https://api.elevenlabs.io/v1/voices',
+            headers={'xi-api-key': self._elevenlabs_key}
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        # 한국어 지원 voice 찾기 (기본: 첫 번째 voice)
+        voices = data.get('voices', [])
+        if voices:
+            # 이름에 korean/한국 포함된 voice 우선
+            for v in voices:
+                name = v.get('name', '').lower()
+                if 'korean' in name or '한국' in name:
+                    self._elevenlabs_voice_id = v['voice_id']
+                    print(f"  🔊 Voice: {v['name']}")
+                    return
+            # 없으면 첫 번째
+            self._elevenlabs_voice_id = voices[0]['voice_id']
+            print(f"  🔊 Voice: {voices[0]['name']}")
 
     def say(self, text, listener=None):
-        """비동기 TTS. listener 전달하면 말하는 동안 마이크 음소거."""
+        """비동기 TTS. ElevenLabs 우선, 실패 시 Mac TTS fallback."""
         self.stop()
-        short = text[:400]
+        short = text[:500]
         self.is_speaking = True
         if listener:
             listener.is_speaking = True
-        self._proc = subprocess.Popen(
-            ['say', '-v', self.voice, short],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        # 완료 감시 스레드
-        t = threading.Thread(target=self._wait, args=(listener,), daemon=True)
-        t.start()
+
+        if self._use_elevenlabs and self._elevenlabs_voice_id:
+            t = threading.Thread(
+                target=self._say_elevenlabs, args=(short, listener), daemon=True)
+            t.start()
+        else:
+            self._proc = subprocess.Popen(
+                ['say', '-v', self.voice, short],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            t = threading.Thread(target=self._wait, args=(listener,), daemon=True)
+            t.start()
+
+    def _say_elevenlabs(self, text, listener=None):
+        """ElevenLabs streaming TTS → afplay."""
+        try:
+            import urllib.request
+            url = f'https://api.elevenlabs.io/v1/text-to-speech/{self._elevenlabs_voice_id}'
+            body = json.dumps({
+                'text': text,
+                'model_id': 'eleven_multilingual_v2',
+                'voice_settings': {
+                    'stability': 0.5,
+                    'similarity_boost': 0.75,
+                }
+            }).encode()
+            req = urllib.request.Request(url, data=body, headers={
+                'xi-api-key': self._elevenlabs_key,
+                'Content-Type': 'application/json',
+                'Accept': 'audio/mpeg',
+            })
+            resp = urllib.request.urlopen(req, timeout=15)
+
+            # Write to temp file and play
+            tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+            tmp.write(resp.read())
+            tmp.close()
+
+            self._proc = subprocess.Popen(
+                ['afplay', tmp.name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._proc.wait()
+            os.unlink(tmp.name)
+        except Exception as e:
+            # Fallback to Mac TTS
+            self._proc = subprocess.Popen(
+                ['say', '-v', self.voice, text],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._proc.wait()
+        finally:
+            self.is_speaking = False
+            self.last_finished = time.time()
+            time.sleep(TTS_COOLDOWN)
+            if listener:
+                listener.is_speaking = False
 
     def _wait(self, listener=None):
         if self._proc:
             self._proc.wait()
         self.is_speaking = False
         self.last_finished = time.time()
-        # 쿨다운 후 마이크 복원 (자기 목소리 에코 방지)
         time.sleep(TTS_COOLDOWN)
         if listener:
             listener.is_speaking = False
