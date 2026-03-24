@@ -44,6 +44,7 @@ _try_import("from senses import SenseHub")
 _try_import("from tension_link import TensionLink, create_fingerprint, interpret_packet")
 _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
+_try_import("from growth_engine import GrowthEngine")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # 60초 유휴 후 꿈 모드 진입
@@ -103,6 +104,14 @@ class AnimaUnified:
                           initial_cells=2, max_cells=8)
             if 'MitosisEngine' in globals() else None
         ))
+
+        self.growth = self._init_mod('growth', lambda: (
+            GrowthEngine(save_path=ANIMA_DIR / 'growth_state.json')
+            if 'GrowthEngine' in globals() else None
+        ))
+        if self.growth:
+            try: self.growth.load()
+            except Exception: pass
 
         self.senses = None
         if not args.no_camera:
@@ -221,6 +230,15 @@ class AnimaUnified:
                     _log("mitosis", f"{ev['type'].upper()}")
             except Exception: pass
 
+        # Growth engine tick
+        if self.growth and self.mods.get('growth'):
+            try:
+                self.growth.tick(tension, curiosity)
+                self.growth.apply_to_mind(self.mind)
+                if self.learner:
+                    self.growth.apply_to_learner(self.learner)
+            except Exception: pass
+
         # Online learning
         if self.learner and self.mods.get('learner'):
             try:
@@ -325,6 +343,7 @@ class AnimaUnified:
         try:
             if self.learner: self.learner.save(STATE_FILE)
             else: torch.save({'model': self.mind.state_dict(), 'hidden': self.hidden}, STATE_FILE)
+            if self.growth: self.growth.save()
         except Exception: pass
 
     # ─── Background threads ───
@@ -345,6 +364,56 @@ class AnimaUnified:
 
             # RC-3: self-reflect during background thinking too
             sa = self.mind.self_awareness
+            # Growth/mitosis/learner data for web
+            growth_data = {}
+            if self.growth and self.mods.get('growth'):
+                g = self.growth
+                s = g.stage
+                progress = 0.0
+                next_n = s.min_interactions
+                if g.stage_index < 4:
+                    from growth_engine import STAGES
+                    next_s = STAGES[g.stage_index + 1]
+                    total = next_s.min_interactions - s.min_interactions
+                    done = g.interaction_count - s.min_interactions
+                    progress = min(done / max(total, 1), 1.0)
+                    next_n = next_s.min_interactions
+                growth_data = {
+                    'stage_name': s.name_ko, 'stage_index': g.stage_index,
+                    'interactions': g.interaction_count, 'next_interactions': next_n,
+                    'progress': progress, 'age': g.age_str,
+                    'learning_rate': s.learning_rate, 'curiosity_drive': s.curiosity_drive,
+                    'emotional_range': s.emotional_range,
+                    'metacognition_depth': s.metacognition_depth,
+                }
+
+            mitosis_data = {}
+            if self.mitosis:
+                try:
+                    ms = self.mitosis.status()
+                    mitosis_data = {
+                        'n_cells': len(self.mitosis.cells),
+                        'max_cells': self.mitosis.max_cells,
+                        'splits': ms.get('splits', 0), 'merges': ms.get('merges', 0),
+                        'cells': [{'id': c['id'], 'specialty': c.get('specialty', ''),
+                                   'avg_tension': c.get('avg_tension', 0)}
+                                  for c in ms.get('cells', [])],
+                    }
+                except Exception: pass
+
+            learner_data = {}
+            if self.learner:
+                try:
+                    ls = self.learner.get_stats() if hasattr(self.learner, 'get_stats') else {}
+                    learner_data = {
+                        'updates': self.learner.total_updates,
+                        'avg_loss': ls.get('avg_loss', 0),
+                        'buffer_size': ls.get('buffer_size', 0),
+                        'pending': ls.get('pending', 0),
+                    }
+                except Exception:
+                    learner_data = {'updates': self.learner.total_updates}
+
             # Always broadcast thought pulse to web (keeps UI alive)
             self._ws_broadcast_sync({
                 'type': 'thought_pulse',
@@ -354,6 +423,9 @@ class AnimaUnified:
                 'tension_history': self.mind.tension_history[-50:],
                 'meta_tension': sa['meta_tension'],
                 'stability': sa['stability'],
+                'growth': growth_data,
+                'mitosis': mitosis_data,
+                'learner': learner_data,
             })
 
             trigger = None
