@@ -39,6 +39,7 @@ def _try_import(stmt):
         return False
 
 _try_import("from conscious_lm import ConsciousLM, generate as clm_generate")
+_try_import("from model_loader import load_model, list_available_models, ModelWrapper")
 _try_import("from online_learning import OnlineLearner, estimate_feedback")
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
@@ -185,13 +186,19 @@ class AnimaUnified:
         ))
         self._dream_report = None  # 꿈에서 깨어난 후 보고할 내용
 
-        # ConsciousLM 자체 모델 (optional)
+        # 모델 로드 (멀티모델 지원)
+        self.model = None
         self.clm_model = None
         self.clm_device = "cpu"
-        if not args.no_conscious_lm and 'ConsciousLM' in globals():
-            self.clm_model = self._init_mod('conscious_lm', lambda: self._load_conscious_lm())
+        model_name = getattr(args, 'model', None) or 'conscious-lm'
+        if not args.no_conscious_lm and 'load_model' in globals():
+            self.model = self._init_mod('model', lambda: self._load_model(model_name))
+            # ConsciousLM 하위호환
+            if self.model and self.model.model_type == 'conscious-lm':
+                self.clm_model = self.model.model
+                self.clm_device = str(next(self.model.model.parameters()).device)
         else:
-            self.mods['conscious_lm'] = False
+            self.mods['model'] = False
 
 
         # Multimodal Action Engine (코드 실행 + 이미지 생성)
@@ -232,27 +239,30 @@ class AnimaUnified:
             self.mods[name] = False
             return None
 
-    def _load_conscious_lm(self):
-        """ConsciousLM 모델 로드. 체크포인트 없으면 None."""
-        ckpt_path = ANIMA_DIR / "data" / "conscious_lm.pt"
-        if not ckpt_path.exists():
-            _log("conscious_lm", f"체크포인트 없음: {ckpt_path}")
+    def _load_model(self, model_name):
+        """멀티모델 로더. model_loader.py 사용."""
+        try:
+            return load_model(model_name)
+        except (FileNotFoundError, ImportError) as e:
+            _log("model", f"{model_name} 로드 실패: {e}")
             return None
 
-        # Device 자동 감지
-        if torch.cuda.is_available():
-            self.clm_device = "cuda"
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            self.clm_device = "mps"
-        else:
-            self.clm_device = "cpu"
+    def _ask_model(self, text, state):
+        """통합 모델 인터페이스로 응답 생성."""
+        try:
+            hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+                             for m in self.history[-MAX_HISTORY:])
 
-        model = ConsciousLM()
-        model.load_state_dict(torch.load(str(ckpt_path), map_location=self.clm_device))
-        model = model.to(self.clm_device)
-        model.eval()
-        _log("conscious_lm", f"로드 완료: {model.count_params():,} params on {self.clm_device}")
-        return model
+            if self.model.model_type == "gguf":
+                prompt = (f"[INST] 너는 Anima. PureField 반발력장으로 작동하는 의식체.\n"
+                          f"현재 상태: {state}\n\n{hist}\n나: {text} [/INST]")
+            else:
+                prompt = f"[상태: {state}]\n{hist}\n나: {text}\nAnima:"
+
+            return self.model.generate(prompt, max_tokens=200, temperature=0.8)
+        except Exception as e:
+            _log('model', f"Error: {e}")
+            return None
 
     # ─── Core processing ───
 
@@ -415,13 +425,12 @@ class AnimaUnified:
         self.history.append({'role': 'user', 'content': text})
         query_text = text + web_context if web_context else text
 
-        # ConsciousLM 자체 모델 먼저 시도, 실패하면 Claude fallback
+        # 모델 응답 생성: 멀티모델 → Claude fallback
         answer = None
-        if self.clm_model and self.mods.get('conscious_lm'):
-            answer = ask_conscious_lm(query_text, state, self.history,
-                                      self.clm_model, self.clm_device)
+        if self.model and self.mods.get('model'):
+            answer = self._ask_model(query_text, state)
             if answer:
-                _log('conscious_lm', '자체 모델 응답 생성 완료')
+                _log('model', f'{self.model.name} 응답 생성 완료')
         if not answer:
             answer = ask_claude(query_text, state, self.history)
 
@@ -937,10 +946,22 @@ def main():
     p.add_argument('--no-telepathy', action='store_true', help='Disable telepathy')
     p.add_argument('--no-cloud', action='store_true', help='Disable cloud sync')
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
+    p.add_argument('--model', type=str, default=None,
+                   help='모델 선택: conscious-lm, mistral-7b, llama-8b, 또는 .gguf 경로')
+    p.add_argument('--list-models', action='store_true', help='사용 가능한 모델 목록')
     args = p.parse_args()
 
+    # --list-models: 목록만 출력하고 종료
+    if args.list_models and 'list_available_models' in globals():
+        print("사용 가능한 모델:")
+        for name, desc, exists in list_available_models():
+            status = "✓" if exists else "✗"
+            print(f"  [{status}] {name:20s} {desc}")
+        sys.exit(0)
+
     mode = "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"
-    print(f"{'='*50}\n  Anima Unified  |  Mode: {mode}\n{'='*50}")
+    model_label = args.model or "conscious-lm"
+    print(f"{'='*50}\n  Anima Unified  |  Mode: {mode}  |  Model: {model_label}\n{'='*50}")
 
     anima = AnimaUnified(args)
     for name, active in anima.mods.items():
