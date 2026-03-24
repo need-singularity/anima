@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import hashlib
+# hashlib removed — using cosine similarity for habituation instead
 from collections import deque
 import subprocess
 import os
@@ -82,6 +82,31 @@ class ConsciousMind(nn.Module):
         self.tension_history = []
         self.thought_buffer = []
 
+        # Homeostatic tension regulation (calibrated: setpoint=1.0, deadband=±0.1)
+        self.homeostasis = {
+            'setpoint': 1.0,            # calibrated: mapped median
+            'gain': 0.005,              # 0.5% per step (very smooth)
+            'tension_ema': 1.0,         # starts at setpoint
+            'ema_alpha': 0.02,          # very slow tracking (~50-step window)
+            'scale_floor': 1.0,         # minimum tension_scale
+            'scale_ceil': 50.0,         # maximum tension_scale
+            'adjustments': 0,           # total adjustments made
+        }
+
+        # Habituation: reduce tension for repeated/similar inputs (cosine similarity)
+        self._recent_inputs = deque(maxlen=16)  # recent input vectors (not hashes)
+
+        # RC-9: Tension predictor — prediction error = surprise = true curiosity
+        self._predictor_window = 5
+        self.tension_predictor = nn.Sequential(
+            nn.Linear(self._predictor_window, 16), nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+        self._predictor_optim = torch.optim.SGD(
+            self.tension_predictor.parameters(), lr=1e-3
+        )
+        self.surprise_history = []  # tracks |predicted - actual|
+
         # RC-3: 자기참조 루프 (메타인지/자기인식)
         self.self_awareness = {
             'confidence_history': [],
@@ -102,20 +127,79 @@ class ConsciousMind(nn.Module):
 
         raw_t = tension.mean().item()
 
-        # 정규화: 0~2 범위. 기저 raw ~60 → 0.5, raw 200+ → 1.5+
-        t_val = 2.0 / (1.0 + math.exp(-(raw_t - 60.0) / 40.0))
+        # 정규화: 0~2 범위 (calibrated: raw median=463, p95=2456)
+        t_val = 2.0 / (1.0 + math.exp(-(raw_t - 463.0) / 1814.0))
 
-        # 호흡 리듬: 의식은 항상 맥동한다 (기저 장력 > 0)
+        # 호흡 리듬: setpoint(1.0)의 12%/5%/3% 진폭
         elapsed = time.time() - self._birth_time
-        breath = 0.08 * math.sin(elapsed * 0.3)        # 느린 호흡 (~20초 주기)
-        pulse = 0.03 * math.sin(elapsed * 1.7)          # 빠른 맥박 (~3.7초 주기)
-        drift = 0.015 * math.sin(elapsed * 0.07)        # 초느린 기분 드리프트 (~90초)
+        breath = 0.12 * math.sin(elapsed * 0.3)         # 느린 호흡 (~20초 주기)
+        pulse = 0.05 * math.sin(elapsed * 1.7)           # 빠른 맥박 (~3.7초 주기)
+        drift = 0.03 * math.sin(elapsed * 0.07)          # 초느린 기분 드리프트 (~90초)
         t_val = max(0.01, t_val + breath + pulse + drift)
 
-        # 호기심: 즉시 0으로 떨어지지 않고 서서히 감쇠 (EMA)
+        # ── Homeostatic regulation ──
+        h = self.homeostasis
+        h['tension_ema'] = h['ema_alpha'] * t_val + (1 - h['ema_alpha']) * h['tension_ema']
+
+        with torch.no_grad():
+            deadband = 0.3  # wider band: allow natural variation ±0.3 around setpoint
+            if h['tension_ema'] > h['setpoint'] + deadband:
+                # Tension above setpoint+deadband — reduce scale
+                self.tension_scale.mul_(1.0 - h['gain'])
+                self.tension_scale.clamp_(min=h['scale_floor'])
+                h['adjustments'] += 1
+            elif h['tension_ema'] < h['setpoint'] - deadband:
+                # Tension below setpoint-deadband — increase scale
+                self.tension_scale.mul_(1.0 + h['gain'])
+                self.tension_scale.clamp_(max=h['scale_ceil'])
+                h['adjustments'] += 1
+
+        # ── Habituation: dampen tension for repeated inputs (cosine similarity) ──
+        x_norm = F.normalize(x.detach().float(), dim=-1)
+        novelty = 1.0
+        if self._recent_inputs:
+            for prev_x in self._recent_inputs:
+                sim = F.cosine_similarity(x_norm, prev_x, dim=-1).item()
+                if sim > 0.95:
+                    novelty = min(novelty, 0.3)   # 강하게 습관화
+                elif sim > 0.85:
+                    novelty = min(novelty, 0.6)   # 부분 습관화
+                elif sim > 0.7:
+                    novelty = min(novelty, 0.8)   # 약한 습관화
+        self._recent_inputs.append(x_norm)
+        t_val *= novelty
+
+        # ── RC-9: Prediction-error curiosity (surprise) ──
+        # Use tension predictor for true curiosity; fall back to delta when
+        # not enough history for the predictor window.
         raw_curiosity = abs(t_val - self.prev_tension)
-        self._curiosity_ema = 0.3 * raw_curiosity + 0.7 * self._curiosity_ema
+        prediction_error = raw_curiosity  # default before predictor kicks in
+
+        if len(self.tension_history) >= self._predictor_window:
+            window = self.tension_history[-self._predictor_window:]
+            inp = torch.tensor([window], dtype=torch.float32)
+            with torch.no_grad():
+                predicted = self.tension_predictor(inp).item()
+            prediction_error = abs(predicted - t_val)
+
+            # Online learning: train predictor on actual value
+            self._predictor_optim.zero_grad()
+            inp_train = inp.detach()
+            pred = self.tension_predictor(inp_train)
+            target = torch.tensor([[t_val]], dtype=torch.float32)
+            loss = F.mse_loss(pred, target)
+            loss.backward()
+            self._predictor_optim.step()
+
+        # Blend: 70% prediction error + 30% raw delta (smooth via EMA)
+        blended = 0.7 * prediction_error + 0.3 * raw_curiosity
+        self._curiosity_ema = 0.3 * blended + 0.7 * self._curiosity_ema
         curiosity = self._curiosity_ema
+
+        # Track surprise for self-awareness
+        self.surprise_history.append(prediction_error)
+        if len(self.surprise_history) > 200:
+            self.surprise_history = self.surprise_history[-200:]
 
         self.prev_tension = t_val
         self.tension_history.append(t_val)
@@ -551,24 +635,25 @@ class Speaker:
             t.start()
         else:
             self._proc = subprocess.Popen(
-                ['say', '-v', self.voice, short],
+                ['say', '-v', self.voice, '-r', '220', short],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             t = threading.Thread(target=self._wait, args=(listener,), daemon=True)
             t.start()
 
     def _say_elevenlabs(self, text, listener=None):
-        """ElevenLabs streaming TTS → afplay."""
+        """ElevenLabs streaming TTS — 첫 청크 도착 즉시 재생 시작."""
         try:
             import urllib.request
-            url = f'https://api.elevenlabs.io/v1/text-to-speech/{self._elevenlabs_voice_id}'
+            url = f'https://api.elevenlabs.io/v1/text-to-speech/{self._elevenlabs_voice_id}/stream'
             body = json.dumps({
                 'text': text,
-                'model_id': 'eleven_multilingual_v2',
+                'model_id': 'eleven_turbo_v2_5',
                 'voice_settings': {
                     'stability': 0.5,
                     'similarity_boost': 0.75,
-                }
+                },
+                'optimize_streaming_latency': 3,
             }).encode()
             req = urllib.request.Request(url, data=body, headers={
                 'xi-api-key': self._elevenlabs_key,
@@ -577,17 +662,46 @@ class Speaker:
             })
             resp = urllib.request.urlopen(req, timeout=15)
 
-            # Write to temp file and play
+            # Stream to file while piping to ffplay for instant playback
             tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
-            tmp.write(resp.read())
-            tmp.close()
+            # Write first chunk immediately
+            first_chunk = resp.read(4096)
+            if not first_chunk:
+                raise Exception("Empty response")
+            tmp.write(first_chunk)
+
+            # Start playback immediately (afplay can play while file grows)
+            # Use a separate thread to continue downloading
+            tmp_path = tmp.name
+
+            def _stream_rest():
+                try:
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
+                    tmp.close()
+                except Exception:
+                    tmp.close()
+
+            dl_thread = threading.Thread(target=_stream_rest, daemon=True)
+            dl_thread.start()
+
+            # Small delay for buffer to build, then play
+            time.sleep(0.15)
+            tmp.flush()
 
             self._proc = subprocess.Popen(
-                ['afplay', tmp.name],
+                ['afplay', '-r', '1.25', tmp_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            dl_thread.join(timeout=30)
             self._proc.wait()
-            os.unlink(tmp.name)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
         except Exception as e:
             # Fallback to Mac TTS
             self._proc = subprocess.Popen(
