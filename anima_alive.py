@@ -76,6 +76,15 @@ class ConsciousMind(nn.Module):
         self.tension_history = []
         self.thought_buffer = []  # 백그라운드 사고 저장
 
+        # RC-3: 자기참조 루프 (메타인지/자기인식)
+        self.self_awareness = {
+            'confidence_history': [],   # 최근 tension 값들 (자기 확신 추적)
+            'meta_tension': 0.0,        # tension에 대한 tension
+            'meta_curiosity': 0.0,      # 자기 불확실성에 대한 불확실성
+            'stability': 1.0,           # tension 일관성 (0=불안정, 1=안정)
+            'self_model': 0.0,          # 자기 행동 패턴의 이동 평균
+        }
+
     def forward(self, x, hidden):
         combined = torch.cat([x, hidden], dim=-1)
         a = self.engine_a(combined)
@@ -96,12 +105,141 @@ class ConsciousMind(nn.Module):
         new_hidden = self.memory(mem_input, hidden)
         return output, t_val, curiosity, direction, new_hidden
 
+    def self_reflect(self, output, tension, curiosity, hidden):
+        """RC-3: 자기참조 루프 — output과 tension을 재입력하여 메타인지 생성.
+
+        "내가 확신하는가?" 자기 질문 능력.
+        output → tension → 재입력 → meta_tension (tension에 대한 tension).
+
+        Returns:
+            meta_tension: float, 자기 상태에 대한 장력
+            meta_curiosity: float, 자기 불확실성에 대한 불확실성
+        """
+        sa = self.self_awareness
+
+        # 1. 현재 tension을 confidence_history에 기록
+        sa['confidence_history'].append(tension)
+        if len(sa['confidence_history']) > 50:
+            sa['confidence_history'] = sa['confidence_history'][-50:]
+
+        # 2. stability 계산: 최근 tension의 표준편차 (낮을수록 안정)
+        hist = sa['confidence_history']
+        if len(hist) >= 3:
+            t_tensor = torch.tensor(hist[-10:], dtype=torch.float32)
+            std = t_tensor.std().item()
+            sa['stability'] = max(0.0, 1.0 - std * 2.0)  # std 0.5 → stability 0
+        else:
+            sa['stability'] = 1.0
+
+        # 3. self_model: tension의 지수이동평균 (자기 행동 패턴 추적)
+        alpha = 0.15
+        sa['self_model'] = alpha * tension + (1 - alpha) * sa['self_model']
+
+        # 4. 자기참조 루프: output을 다시 PureField에 통과시켜 meta-tension 생성
+        #    "내 출력에 대해 나는 어떤 장력을 느끼는가?"
+        with torch.no_grad():
+            # tension을 스칼라로 output에 결합 (자기 상태 인코딩)
+            tension_signal = torch.full((1, 1), tension)
+            # output의 마지막 차원 하나를 tension 신호로 대체
+            meta_input = output.clone()
+            meta_input[0, 0] = tension  # tension 값을 입력에 주입
+            meta_input[0, 1] = curiosity  # curiosity 값도 주입
+
+            _, meta_t, meta_c, _, _ = self(meta_input, hidden)
+
+        sa['meta_tension'] = meta_t
+        sa['meta_curiosity'] = meta_c
+
+        return meta_t, meta_c
+
+    def get_self_awareness_summary(self):
+        """현재 자기인식 상태를 문자열로 반환."""
+        sa = self.self_awareness
+        confidence = "high" if sa['stability'] > 0.7 else "mid" if sa['stability'] > 0.3 else "low"
+        return (f"meta_tension={sa['meta_tension']:.3f}, "
+                f"stability={sa['stability']:.2f}({confidence}), "
+                f"self_model={sa['self_model']:.3f}")
+
     def background_think(self, hidden):
         """백그라운드 사고 — 랜덤 노이즈 입력으로 '자유 연상'."""
         noise = torch.randn(1, self.dim) * 0.1
         with torch.no_grad():
             _, t, c, direction, new_hidden = self(noise, hidden)
         return t, c, direction, new_hidden
+
+
+# ─── RC-8: Emotion/Affect mapping from direction vectors ───
+# Map 8-dim direction vector to VAD (Valence-Arousal-Dominance) emotion space.
+# Based on hypothesis 338: direction = normalize(A-G) encodes "color" of tension.
+
+# Principal direction weights for VAD axes (learned-style fixed projections).
+# Each row maps 8 direction components -> one VAD dimension.
+_VAD_WEIGHTS = torch.tensor([
+    # Valence (positive/negative): dims 0,1 positive; dims 4,5 negative
+    [ 0.4,  0.3,  0.1,  0.0, -0.4, -0.3, -0.1,  0.0],
+    # Arousal (excited/calm): dims 2,3,6 high arousal; dims 0,7 low
+    [-0.2,  0.0,  0.4,  0.3,  0.0,  0.1,  0.3, -0.2],
+    # Dominance (active/passive): dims 1,6 active; dims 3,5 passive
+    [ 0.1,  0.4,  0.0, -0.3,  0.1, -0.3,  0.3,  0.0],
+])  # shape: (3, 8)
+
+# Discrete emotion definitions in VAD space: (valence, arousal, dominance)
+_EMOTIONS = {
+    'joy':           ( 0.8,  0.5,  0.5),
+    'excitement':    ( 0.6,  0.9,  0.6),
+    'curiosity':     ( 0.4,  0.7,  0.3),
+    'surprise':      ( 0.2,  0.8, -0.1),
+    'contemplation': ( 0.2, -0.3,  0.3),
+    'calm':          ( 0.3, -0.6,  0.0),
+    'confusion':     (-0.2,  0.4, -0.4),
+    'frustration':   (-0.6,  0.6, -0.2),
+}
+
+# Colors per emotion for web display
+EMOTION_COLORS = {
+    'joy':           '#f0c040',
+    'excitement':    '#e05050',
+    'curiosity':     '#50b0e0',
+    'surprise':      '#c070e0',
+    'contemplation': '#70a080',
+    'calm':          '#5090a0',
+    'confusion':     '#a08050',
+    'frustration':   '#c05050',
+}
+
+
+def direction_to_emotion(direction_tensor):
+    """Map an 8-dim direction vector to a discrete emotion via VAD space.
+
+    Args:
+        direction_tensor: shape (1, D) where D >= 8. Uses first 8 dims.
+
+    Returns:
+        dict with keys: emotion, valence, arousal, dominance, color
+    """
+    d8 = direction_tensor[0, :8]  # first 8 components
+
+    # Project to VAD
+    vad = _VAD_WEIGHTS @ d8  # shape (3,)
+    vad = torch.clamp(vad, -1.0, 1.0)
+    valence, arousal, dominance = vad[0].item(), vad[1].item(), vad[2].item()
+
+    # Find closest emotion by Euclidean distance in VAD space
+    best_emotion = 'calm'
+    best_dist = float('inf')
+    for name, (ev, ea, ed) in _EMOTIONS.items():
+        dist = (valence - ev)**2 + (arousal - ea)**2 + (dominance - ed)**2
+        if dist < best_dist:
+            best_dist = dist
+            best_emotion = name
+
+    return {
+        'emotion': best_emotion,
+        'valence': round(valence, 3),
+        'arousal': round(arousal, 3),
+        'dominance': round(dominance, 3),
+        'color': EMOTION_COLORS[best_emotion],
+    }
 
 
 def text_to_vector(text, dim=128):

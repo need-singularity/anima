@@ -17,9 +17,58 @@ import cv2
 import torch
 import threading
 import time
+import sys
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# ─── macOS Camera Permission ────────────────────────────────────
+
+CAMERA_PERMISSION_MSG = (
+    "\n"
+    "  ╔══════════════════════════════════════════════════════════╗\n"
+    "  ║  카메라 권한이 필요합니다 (Camera permission required)   ║\n"
+    "  ╠══════════════════════════════════════════════════════════╣\n"
+    "  ║  macOS가 카메라 접근을 차단했습니다.                     ║\n"
+    "  ║                                                          ║\n"
+    "  ║  해결 방법:                                              ║\n"
+    "  ║  시스템 설정 → 개인정보 보호 및 보안 → 카메라            ║\n"
+    "  ║  → Terminal 허용                                         ║\n"
+    "  ║                                                          ║\n"
+    "  ║  설정 변경 후 Terminal을 재시작하세요.                   ║\n"
+    "  ╚══════════════════════════════════════════════════════════╝\n"
+)
+
+
+def request_camera_permission(camera_index: int = 0) -> bool:
+    """Try to open the camera to trigger the macOS permission dialog.
+
+    On macOS, the first call to cv2.VideoCapture() for a camera will
+    trigger the system permission prompt -- but only if the app has
+    never been denied before. If it was previously denied, the user
+    must manually enable it in System Settings.
+
+    Returns True if camera is accessible, False otherwise.
+    """
+    try:
+        cap = cv2.VideoCapture(camera_index)
+        if cap.isOpened():
+            # Try to actually read a frame to confirm permission
+            ret, _ = cap.read()
+            cap.release()
+            if ret:
+                return True
+            # Camera opened but can't read -- likely permission issue
+            print(CAMERA_PERMISSION_MSG)
+            return False
+        else:
+            print(CAMERA_PERMISSION_MSG)
+            return False
+    except Exception as e:
+        print(f"[senses] Camera error: {e}")
+        print(CAMERA_PERMISSION_MSG)
+        return False
 
 
 # ─── Data containers ────────────────────────────────────────────
@@ -70,6 +119,7 @@ class CameraInput:
         self._state = VisualState()
         self._lock = threading.Lock()
         self._running = False
+        self._permission_denied = False
         self._thread: Optional[threading.Thread] = None
         self._prev_gray: Optional[np.ndarray] = None
 
@@ -115,7 +165,19 @@ class CameraInput:
         cap = cv2.VideoCapture(self.camera_index)
         if not cap.isOpened():
             print("[senses] WARNING: cannot open camera", self.camera_index)
+            print(CAMERA_PERMISSION_MSG)
             self._running = False
+            self._permission_denied = True
+            return
+
+        # Verify we can actually read frames (catches macOS permission denial)
+        ret, _ = cap.read()
+        if not ret:
+            print("[senses] WARNING: camera opened but cannot read frames (permission denied?)")
+            print(CAMERA_PERMISSION_MSG)
+            cap.release()
+            self._running = False
+            self._permission_denied = True
             return
 
         # Lower resolution for speed
@@ -314,12 +376,27 @@ class SenseHub:
         screen_interval: float = 5.0,
     ):
         self.camera = CameraInput(camera_index=camera_index, fps=camera_fps)
+        self.camera_available = False
         self.screen: Optional[ScreenCapture] = None
         if enable_screen:
             self.screen = ScreenCapture(interval=screen_interval)
 
     def start(self):
-        self.camera.start()
+        """Start all sensors. Camera failure does not prevent other sensors."""
+        try:
+            self.camera.start()
+            # Give the camera thread a moment to detect permission issues
+            time.sleep(0.5)
+            if self.camera.running and not self.camera._permission_denied:
+                self.camera_available = True
+            else:
+                self.camera_available = False
+                if self.camera._permission_denied:
+                    print("[senses] 카메라 없이 계속합니다 (continuing without camera)")
+        except Exception as e:
+            print(f"[senses] Camera start failed: {e}")
+            self.camera_available = False
+
         if self.screen is not None:
             self.screen.start()
 

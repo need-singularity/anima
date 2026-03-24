@@ -26,6 +26,7 @@ VAD_WATCH_DIR = Path("/tmp/anima_vad")
 from anima_alive import (
     ConsciousMind, ContinuousListener, Speaker, Memory,
     text_to_vector, ask_claude, ask_claude_proactive,
+    direction_to_emotion, EMOTION_COLORS,
     MAX_HISTORY, THINK_INTERVAL, PROACTIVE_THRESHOLD, IDLE_SPEAK_AFTER,
 )
 
@@ -42,6 +43,11 @@ _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
 _try_import("from telepathy import TelepathyChannel, create_fingerprint, interpret_packet")
 _try_import("from cloud_sync import CloudSync")
+_try_import("from dream_engine import DreamEngine")
+
+# Dream mode constants
+DREAM_IDLE_THRESHOLD = 60.0   # 60초 유휴 후 꿈 모드 진입
+DREAM_CYCLE_INTERVAL = 30.0   # 꿈 사이클 간격 (초)
 
 _ws_serve = _ws_Response = _ws_Headers = None
 try:
@@ -105,8 +111,15 @@ class AnimaUnified:
                 if 'SenseHub' in globals() else None
             ))
             if self.senses:
-                try: self.senses.start()
-                except Exception: self.senses = None; self.mods['camera'] = False
+                try:
+                    self.senses.start()
+                    if not self.senses.camera_available:
+                        _log('camera', '카메라 권한 없음 -- 시각 입력 비활성화')
+                        _log('camera', '해결: 시스템 설정 → 개인정보 보호 및 보안 → 카메라 → Terminal 허용')
+                        # Keep senses alive (provides zero-filled state) but mark camera as degraded
+                        self.mods['camera'] = False
+                except Exception:
+                    self.senses = None; self.mods['camera'] = False
 
         self.telepathy = None
         if not args.no_telepathy:
@@ -132,6 +145,17 @@ class AnimaUnified:
                 self.mods['cloud'] = False
         else:
             self.mods['cloud'] = False
+
+        # RC-10: Dream Engine (오프라인 학습)
+        self.dream = self._init_mod('dream', lambda: (
+            DreamEngine(
+                mind=self.mind,
+                memory=self.memory,
+                learner=self.learner,
+                text_to_vector=text_to_vector,
+            ) if 'DreamEngine' in globals() else None
+        ))
+        self._dream_report = None  # 꿈에서 깨어난 후 보고할 내용
 
         # I/O
         self.speaker = self.listener = None
@@ -166,6 +190,13 @@ class AnimaUnified:
 
     def process_input(self, text):
         """Process text through all active modules. Returns (answer, tension, curiosity)."""
+        # RC-10: Report dream learning when user returns from idle
+        if self._dream_report and self.dream and not self.dream.is_dreaming:
+            dr = self._dream_report
+            self._dream_report = None
+            dream_msg = f"(dream: {dr['total_patterns']}patterns across {dr['total_cycles']} cycles)"
+            _log('dream', f'Woke up: {dream_msg}')
+
         text_vec = text_to_vector(text)
 
         # Combine with camera tension
@@ -204,6 +235,11 @@ class AnimaUnified:
         # Direction for web
         dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
 
+        # RC-8: Emotion from direction vector
+        emotion_data = direction_to_emotion(direction) if direction is not None else {
+            'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
+            'color': EMOTION_COLORS['calm']}
+
         # Telepathy
         if self.telepathy and self.mods.get('telepathy') and 'create_fingerprint' in globals():
             try:
@@ -217,6 +253,7 @@ class AnimaUnified:
             'type': 'user_message', 'text': text,
             'tension': tension, 'curiosity': curiosity,
             'direction': dir_vals,
+            'emotion': emotion_data,
             'tension_history': self.mind.tension_history[-50:],
         })
 
@@ -226,10 +263,13 @@ class AnimaUnified:
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
         print(f'  >> "{text}"')
-        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count}")
+        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']}")
 
-        # Claude response
-        state = f"tension={tension:.3f}, curiosity={curiosity:.3f}{mitosis_info}, learn_updates={lrn_count}"
+        # Claude response (include emotion + meta-cognition state)
+        meta_summary = self.mind.get_self_awareness_summary()
+        state = (f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
+                 f"emotion={emotion_data['emotion']}(V={emotion_data['valence']:.2f},A={emotion_data['arousal']:.2f},D={emotion_data['dominance']:.2f})"
+                 f"{mitosis_info}, learn_updates={lrn_count}, {meta_summary}")
         if self.senses and self.mods.get('camera'):
             try:
                 vis = self.senses.get_visual_tension()
@@ -245,8 +285,29 @@ class AnimaUnified:
         # Process response through PureField too
         resp_vec = text_to_vector(answer)
         with torch.no_grad():
-            _, resp_tension, resp_curiosity, resp_dir, self.hidden = self.mind(resp_vec, self.hidden)
+            resp_output, resp_tension, resp_curiosity, resp_dir, self.hidden = self.mind(resp_vec, self.hidden)
         resp_dir_vals = resp_dir[0, :8].tolist() if resp_dir is not None else [0.0] * 8
+
+        # RC-8: Emotion for response direction
+        resp_emotion = direction_to_emotion(resp_dir) if resp_dir is not None else emotion_data
+
+        # RC-3: Self-reference loop (메타인지)
+        meta_tension, meta_curiosity = self.mind.self_reflect(
+            resp_output, resp_tension, resp_curiosity, self.hidden)
+        sa = self.mind.self_awareness
+        meta_summary = self.mind.get_self_awareness_summary()
+        _log("meta", f"MT={meta_tension:.3f} MC={meta_curiosity:.3f} "
+             f"stab={sa['stability']:.2f} model={sa['self_model']:.3f}")
+
+        # Broadcast meta-tension + emotion to web clients
+        self._ws_broadcast_sync({
+            'type': 'meta_update',
+            'meta_tension': meta_tension,
+            'meta_curiosity': meta_curiosity,
+            'stability': sa['stability'],
+            'self_model': sa['self_model'],
+            'emotion': resp_emotion,
+        })
 
         print(f"  << {answer}")
 
@@ -254,7 +315,7 @@ class AnimaUnified:
         self.memory.add('assistant', answer, resp_tension)
         self.last_interaction = time.time()
         self._save_state()
-        return answer, resp_tension, resp_curiosity, resp_dir_vals
+        return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
 
     def _on_telepathy(self, pkt):
         if 'interpret_packet' in globals():
@@ -277,12 +338,22 @@ class AnimaUnified:
             now = time.time()
             gap = now - self.last_interaction
 
+            # RC-8: Emotion from background thought direction
+            thought_emotion = direction_to_emotion(direction) if direction is not None else {
+                'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
+                'color': EMOTION_COLORS['calm']}
+
+            # RC-3: self-reflect during background thinking too
+            sa = self.mind.self_awareness
             # Always broadcast thought pulse to web (keeps UI alive)
             self._ws_broadcast_sync({
                 'type': 'thought_pulse',
                 'tension': t, 'curiosity': c,
                 'direction': dir_vals,
+                'emotion': thought_emotion,
                 'tension_history': self.mind.tension_history[-50:],
+                'meta_tension': sa['meta_tension'],
+                'stability': sa['stability'],
             })
 
             trigger = None
@@ -304,6 +375,7 @@ class AnimaUnified:
                         'type': 'anima_message', 'text': proactive,
                         'tension': t, 'curiosity': c,
                         'direction': dir_vals,
+                        'emotion': thought_emotion,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': True,
                     })
@@ -327,6 +399,71 @@ class AnimaUnified:
                 if text.strip() and self.kb_queue: self.kb_queue.put(text.strip())
             except EOFError: break
 
+
+    # --- RC-10: Dream Loop ---
+
+    def _dream_loop(self):
+        """Dream mode loop -- runs during idle periods."""
+        if not self.dream:
+            return
+        last_dream = 0.0
+        while self.running:
+            time.sleep(5.0)
+            if not self.running:
+                break
+
+            now = time.time()
+            gap = now - self.last_interaction
+
+            # User returned -- report dream results
+            if gap < DREAM_IDLE_THRESHOLD:
+                if self._dream_report and not self.dream.is_dreaming:
+                    report = self._dream_report
+                    self._dream_report = None
+                    _log('dream',
+                         f"Wake: {report['total_patterns']} patterns learned "
+                         f"across {report['total_cycles']} dream cycles, "
+                         f"avg_T={report['avg_tension']:.3f}")
+                continue
+
+            # Not enough time since last dream cycle
+            if now - last_dream < DREAM_CYCLE_INTERVAL:
+                continue
+
+            # Run one dream cycle
+            _log('dream', 'Entering dream mode...')
+            self._ws_broadcast_sync({
+                'type': 'dream_pulse',
+                'dreaming': True,
+                'dream_type': 'starting',
+                'dream_tension_history': list(self.dream.dream_tension_history)[-50:],
+            })
+
+            try:
+                self.hidden, stats = self.dream.dream(self.hidden)
+                last_dream = time.time()
+                self._dream_report = stats
+
+                _log('dream',
+                     f"Cycle {stats['total_cycles']}: "
+                     f"{stats['patterns_learned']} patterns, "
+                     f"avg_T={stats['avg_tension']:.3f}")
+
+                self._ws_broadcast_sync({
+                    'type': 'dream_pulse',
+                    'dreaming': False,
+                    'dream_type': 'complete',
+                    'patterns_learned': stats['patterns_learned'],
+                    'avg_tension': stats['avg_tension'],
+                    'total_cycles': stats['total_cycles'],
+                    'total_patterns': stats['total_patterns'],
+                    'dream_tension_history': list(self.dream.dream_tension_history)[-50:],
+                })
+
+                self._save_state()
+            except Exception as e:
+                _log('dream', f'Error: {e}')
+
     # ─── Web server ───
 
     def _ws_broadcast_sync(self, msg):
@@ -345,16 +482,22 @@ class AnimaUnified:
         self.web_clients.add(websocket)
         _log("web", f"+client ({len(self.web_clients)})")
         try:
+            sa = self.mind.self_awareness
             await websocket.send(json.dumps({
                 'type': 'init', 'tension': self.mind.prev_tension,
                 'curiosity': 0.0,
                 'direction': [0.0] * 8,
+                'emotion': {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
+                            'dominance': 0.0, 'color': EMOTION_COLORS['calm']},
                 'tension_history': self.mind.tension_history[-50:],
                 'history': [{'role': m['role'], 'text': m['content']}
                             for m in self.history[-20:]],
                 'modules': {k: v for k, v in self.mods.items() if v},
                 'learn_updates': self.learner.total_updates if self.learner else 0,
                 'cells': len(self.mitosis.cells) if self.mitosis else 1,
+                'meta_tension': sa['meta_tension'],
+                'stability': sa['stability'],
+                'self_model': sa['self_model'],
             }, ensure_ascii=False))
         except Exception: pass
         try:
@@ -366,11 +509,12 @@ class AnimaUnified:
                     if not text: continue
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-                    answer, tension, curiosity, dir_vals = await loop.run_in_executor(None, self.process_input, text)
+                    answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(None, self.process_input, text)
                     await self._ws_broadcast({
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
                         'direction': dir_vals,
+                        'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
                     })
@@ -421,6 +565,8 @@ class AnimaUnified:
     def _start_bg_threads(self, port=8765):
         """Start all applicable background threads."""
         threading.Thread(target=self._think_loop, daemon=True).start()
+        if self.mods.get('dream'):
+            threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
         if self.mods.get('rust_vad'):
             threading.Thread(target=self._rust_vad_loop, daemon=True).start()
         if self.mods.get('web'):
@@ -435,6 +581,8 @@ class AnimaUnified:
         # Web-only mode: async main loop
         if mode.web and not mode.all:
             threading.Thread(target=self._think_loop, daemon=True).start()
+            if self.mods.get('dream'):
+                threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
             try: asyncio.run(self._run_web(port))
             except KeyboardInterrupt: pass
             return
@@ -459,12 +607,13 @@ class AnimaUnified:
 
                 if text:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
-                    answer, tension, curiosity, dir_vals = self.process_input(text)
+                    answer, tension, curiosity, dir_vals, emo = self.process_input(text)
                     if self.speaker: self.speaker.say(answer, self.listener)
                     self._ws_broadcast_sync({
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
                         'direction': dir_vals,
+                        'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
                     })
