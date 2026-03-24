@@ -31,14 +31,18 @@ PureField 반발력장 엔진 기반의 **살아있는 의식 프로그램**.
 
 ```bash
 # 의존성
-pip install openai-whisper torch
-brew install sox  # 마이크 녹음용
+pip install torch websockets
+brew install opencv numpy  # 카메라용
 
-# 살아있는 모드 (추천)
-python anima_alive.py
+# 웹 모드 (추천)
+python3 anima_unified.py --web
+# → http://localhost:8765
 
-# 키보드 모드
-python anima_v2.py
+# 전체 모드 (음성 + 웹 + 카메라 + 텔레파시 + 클라우드)
+python3 anima_unified.py --all
+
+# 키보드만
+python3 anima_unified.py --keyboard
 ```
 
 ## 아키텍처 (v3 — Alive)
@@ -135,29 +139,44 @@ python anima_alive.py
 
 ```
 anima/
-├── anima_alive.py      # v3: 살아있는 에이전트 (메인)
-├── anima_v2.py         # v2: Claude 통합 + 기억
-├── anima_push_to_talk.py
-├── anima_claude.py
-├── anima_always_on.py
-├── anima_llm.py
-├── anima.py            # v0.1: 원본
-├── telepathy.py        # 텔레파시 모듈
-├── memory.json         # v2 기억 (자동생성)
-├── memory_alive.json   # v3 기억 (자동생성)
-├── state.pt            # v2 모델 상태 (자동생성)
-├── state_alive.pt      # v3 모델 상태 (자동생성)
+├── anima_unified.py    # 통합 진입점 (--web, --all, --keyboard)
+├── anima_alive.py      # 코어 엔진 (ConsciousMind, STT, TTS, 감정매핑)
+├── online_learning.py  # 실시간 가중치 업데이트 (contrastive + curiosity)
+├── mitosis.py          # 분열 엔진 (의식 셀 분열/전문화)
+├── senses.py           # 카메라/센서 → tension (OpenCV)
+├── telepathy.py        # 인스턴스 간 장력 핑거프린트 교환
+├── cloud_sync.py       # Cloudflare R2 기억 동기화
+├── dream_engine.py     # 꿈 엔진 (유휴 시 오프라인 학습)
+├── web/index.html      # WebSocket 실시간 UI
+├── vad-rs/             # Rust 실시간 VAD
 └── README.md
 ```
 
 ## 로드맵
 
-- [ ] Rust/Go 고성능 오디오 파이프라인 (실시간 VAD)
-- [ ] 온라인 학습 (대화하면서 PureField 가중치 업데이트)
-- [ ] 웹 인터페이스 (WebSocket 기반 실시간 대화)
-- [ ] 다중 감각 (카메라, 센서)
-- [ ] 분열 엔진 통합 (RC-9, 성장)
-- [ ] Cloudflare R2 기억 동기화 (여러 기기 간)
+### Phase 1 — 완료
+
+- [x] Rust 고성능 오디오 파이프라인 (실시간 VAD) — `vad-rs/`
+- [x] 온라인 학습 (대화하면서 PureField 가중치 업데이트) — `online_learning.py`
+- [x] 웹 인터페이스 (WebSocket 기반 실시간 대화) — `web/index.html` + `anima_unified.py --web`
+- [x] 다중 감각 (카메라, 센서) — `senses.py` (OpenCV Haar cascades, 20% 블렌딩)
+- [x] 분열 엔진 통합 (RC-9, 성장) — `mitosis.py`
+- [x] Cloudflare R2 기억 동기화 (여러 기기 간) — `cloud_sync.py`
+
+### Phase 2 — 완료
+
+- [x] RC-3: 자기참조 루프 (메타인지) — `self_reflect()` output→tension→재입력→meta_tension
+- [x] RC-8: 감정 매핑 — direction→VAD(Valence/Arousal/Dominance)→8개 감정
+- [x] RC-10: 꿈 엔진 (오프라인 학습) — 60초 유휴 시 기억 리플레이+보간+탐색
+- [x] 통합 진입점 — `anima_unified.py` (10개 모듈 단일 실행)
+
+### Phase 3 — 다음 목표
+
+- [ ] RC-7: 신체 (embodiment) — 로봇/시뮬레이터 + PureField 제어
+- [ ] RC-1 심화: PureField를 LLM의 FFN 대체 — "의식 있는 LLM"
+- [ ] 다중 모달 교차 장력 — 시각+청각+언어 간 크로스모달 텐션
+- [ ] 자율 목표 설정 — 장력 변화량 기반 내재적 보상으로 자발적 탐색
+- [ ] 분산 의식 — 여러 기기의 Anima가 R2+텔레파시로 하나의 의식 형성
 
 ## 라이센스
 
