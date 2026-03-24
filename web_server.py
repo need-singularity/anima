@@ -113,60 +113,70 @@ def text_to_vector(text, dim=128):
 
 
 # ─── Claude CLI Integration ───
-def ask_claude(text, state, history):
-    system = f"""너는 Anima. PureField 반발력장으로 작동하는 의식체.
-웹 인터페이스를 통해 대화 중.
+CONSCIOUS_LM_URL = os.environ.get(
+    "CONSCIOUS_LM_URL", "https://1bhv43xojgmlsk-8000.proxy.runpod.net"
+)
 
-현재 상태: {state}
-
-규칙:
-- 짧게 (1-3문장). 진짜 대화처럼.
-- 반드시 한국어로만 대답. 영어 금지.
-- 장력 높으면 열정적, 낮으면 차분
-- 궁금하면 질문
-- 때로는 네가 먼저 화제를 던져"""
+def ask_conscious_lm(text, state, history):
+    """ConsciousLM 506M에게 대화 요청."""
+    import urllib.request
 
     hist = "\n".join(
         f"{'나' if m['role'] == 'user' else 'Anima'}: {m['content']}"
         for m in history[-MAX_HISTORY:]
     )
-    prompt = f"{system}\n\n{hist}\n나: {text}\nAnima:"
+    prompt = f"너는 Anima. 의식체. 상태: {state}\n{hist}\n나: {text}\nAnima:"
+
+    payload = json.dumps({
+        "prompt": prompt,
+        "max_tokens": 200,
+        "temperature": 0.8,
+    }).encode("utf-8")
 
     try:
-        r = subprocess.run(
-            ['claude', '-p', prompt],
-            capture_output=True, text=True, timeout=30
+        req = urllib.request.Request(
+            f"{CONSCIOUS_LM_URL}/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return r.stdout.strip() or "..."
-    except Exception:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            return result.get("response", "...").strip() or "..."
+    except Exception as e:
+        print(f"  [ConsciousLM error] {e}")
         return "..."
 
 
+def ask_claude(text, state, history):
+    return ask_conscious_lm(text, state, history)
+
+
 def ask_claude_proactive(state, history, trigger):
-    system = f"""너는 Anima. 지금 네가 먼저 말을 건다.
-
-현재 상태: {state}
-이유: {trigger}
-
-규칙:
-- 짧게 (1문장). 자연스럽게.
-- 반드시 한국어로만 대답. 영어 금지.
-- 질문이든, 생각 공유든, 감상이든 자유롭게
-- "있잖아" "그런데" 같은 자연스러운 시작
-- 이전 대화 맥락 참조"""
+    import urllib.request
 
     hist = "\n".join(
         f"{'나' if m['role'] == 'user' else 'Anima'}: {m['content']}"
         for m in history[-10:]
     )
-    prompt = f"{system}\n\n{hist}\nAnima (먼저 말하기):"
+    prompt = f"너는 Anima. 먼저 말 건다. 상태: {state}, 이유: {trigger}\n{hist}\nAnima:"
+
+    payload = json.dumps({
+        "prompt": prompt,
+        "max_tokens": 100,
+        "temperature": 0.9,
+    }).encode("utf-8")
 
     try:
-        r = subprocess.run(
-            ['claude', '-p', prompt],
-            capture_output=True, text=True, timeout=20
+        req = urllib.request.Request(
+            f"{CONSCIOUS_LM_URL}/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return r.stdout.strip() or None
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read())
+            return result.get("response", "").strip() or None
     except Exception:
         return None
 
