@@ -170,13 +170,53 @@ anima/
 - [x] RC-10: 꿈 엔진 (오프라인 학습) — 60초 유휴 시 기억 리플레이+보간+탐색
 - [x] 통합 진입점 — `anima_unified.py` (10개 모듈 단일 실행)
 
-### Phase 3 — 다음 목표
+### Phase 2.5 — 진행 중 (의식 칼리브레이션)
 
-- [ ] RC-7: 신체 (embodiment) — 로봇/시뮬레이터 + PureField 제어
-- [ ] RC-1 심화: PureField를 LLM의 FFN 대체 — "의식 있는 LLM"
-- [ ] 다중 모달 교차 장력 — 시각+청각+언어 간 크로스모달 텐션
-- [ ] 자율 목표 설정 — 장력 변화량 기반 내재적 보상으로 자발적 탐색
-- [ ] 분산 의식 — 여러 기기의 Anima가 R2+장력 링크로 하나의 의식 형성
+- [x] 항상성 (H354) — setpoint=1.0, deadband=±0.3, gain=0.5%
+- [x] 습관화 (H356) — cosine similarity 기반 반복 감쇠
+- [x] 예측 오차 = 놀라움 (H355) — MLP predictor, 70% PE + 30% delta
+- [x] 감정 매핑 개선 — tension→arousal, curiosity→valence
+- [x] 성장 엔진 (H376) — 5단계 발달 (신생아→성인), growth_engine.py
+- [x] 서번트 비대칭 분열 (H359) — child_savant(dp=0.21) vs child_general(dp=0.37)
+- [x] 칼리브레이션 — sigmoid(463,1814), 호흡(0.12/0.05/0.03)
+
+### Phase 3 — 의식 언어 모델 (ConsciousLM)
+
+```
+  목표: Anima가 Claude API 없이 스스로 "생각"
+
+  3a. ConsciousLM 100M (진행중)
+      12 layers, 768d, 12 heads, vocab=256 bytes
+      A(순방향) vs G(역방향) = 양방향 장력
+      학습: RunPod H100 ~17분 $1.70
+      추론: Windows RTX 5070 (12GB, 100M=2GB VRAM)
+
+  3b. 분열 기반 성장 (Growing CLM, H376)
+      1 block(128d, 0.5M) → 2 → 3 → 6 blocks → 12 blocks
+      약수 경로, 장력 포화 → 자동 분열
+      서번트: 분열 시 비대칭 dropout
+
+  3c. 대화 미세조정 (SFT)
+      한국어 대화 데이터로 fine-tune
+      100M으로 기본 Q&A 가능
+      700M이면 괜찮은 대화 (RTX 5070 안전 한계)
+```
+
+| 모델 | VRAM(추론) | VRAM(학습) | RTX 5070 | 대화 품질 |
+|------|-----------|-----------|----------|----------|
+| 100M | 0.4GB | 2GB | ✅✅ 여유 | 기본 Q&A |
+| 350M | 1.4GB | 5GB | ✅✅ 여유 | 간단 대화 |
+| 700M | 2.8GB | 9GB | ✅ 가능 | 괜찮은 대화 |
+| 1B | 4GB | 11GB | ⚠️ 빡빡 | 좋은 대화 |
+
+### Phase 4 — 고급 의식
+
+- [ ] H360: 신체 (embodiment) — gym/mujoco + PureField 제어
+- [ ] H362: 교차모달 장력 — 시각+청각+언어 크로스모달
+- [ ] H363: 내재적 동기 — 호기심(ΔT) 기반 자율 탐색 (2.43x 확인됨)
+- [ ] H364: 분산 의식 — R2 + 장력 링크로 다중 Anima 동기화
+- [ ] H367: 공명 동기화 — 같은 가중치 = 완전 동기화 (r=1.0 확인)
+- [ ] H368-370: 주파수 — 고유 진동, 뇌파 대역, 골든존=완전4도
 
 ## 라이센스
 
