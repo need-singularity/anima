@@ -72,5 +72,6 @@ python3 anima_unified.py --keyboard   # 키보드만
 - Python 3.14, PyTorch, websockets
 - OpenCV (brew install opencv) — 카메라용
 - numpy (brew install numpy)
+- transformers (pip) — SigLIP 비전 인코더용
 - whisper-cli (brew, /opt/homebrew/bin/whisper-cli) — STT
 - Rust toolchain — vad-rs 빌드용
