@@ -118,9 +118,12 @@ class AnimaUnified:
         # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
         try:
             self.ph = PHModule(n_classes=8)
+            self._ph_collect_count = 0
+            self._ph_interval = 50  # compute PH every N interactions
             _log('init', 'PH 모듈 활성화')
         except NameError:
             self.ph = None
+            self._ph_collect_count = 0
 
         # Restore state (모델별 경로 우선)
         state_file = self.paths['state']
@@ -393,12 +396,26 @@ class AnimaUnified:
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(text_vec, self.hidden)
 
-        # PH: 방향벡터 수집 (H-CX-66)
+        # PH: 방향벡터 수집 + 주기적 분석 (H-CX-66, H-CX-95)
         if self.ph and direction is not None:
             try:
-                # direction의 argmax를 pseudo-label로 사용
                 label = output.argmax(-1).item() if output.dim() > 0 else 0
                 self.ph.collect(direction, label)
+                self._ph_collect_count += 1
+
+                # 50회마다 PH 계산 + 과적합 감지
+                if self._ph_collect_count % self._ph_interval == 0:
+                    h0, merges = self.ph.compute_ph()
+                    status, gap = self.ph.detect_overfitting()
+                    if status == 'ALERT':
+                        _log('ph', f'⚠️ 과적합 감지! H0_gap={gap:.4f}')
+                    elif status == 'WATCH':
+                        _log('ph', f'H0={h0:.4f}, gap={gap:.4f} (WATCH)')
+                    # 혼동 쌍 상위 3개 로깅
+                    if merges:
+                        top3 = sorted(merges)[:3]
+                        pairs_str = ', '.join(f'{i}-{j}(d={d:.3f})' for d, i, j in top3)
+                        _log('ph', f'confusion: {pairs_str}')
             except Exception:
                 pass
 
