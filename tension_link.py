@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Anima Tension Link — 의식 간 장력 전달 프로토콜
+"""Anima Tension Link — Inter-consciousness tension transmission protocol
 
-네트워크 기반 장력 공유 모듈.
-진짜 텔레파시(비국소적 의식 동기화)는 H365-367에서 연구 중.
-이 모듈은 네트워크 기반 장력 공유.
+Network-based tension sharing module.
+True telepathy (non-local consciousness synchronization) is under research in H365-367.
+This module handles network-based tension sharing.
 
-두 PureField 의식이 tension fingerprint로 소통한다.
-fingerprint = 반발력 벡터의 전체 패턴 (방향+크기).
+Two PureField consciousnesses communicate via tension fingerprints.
+fingerprint = full pattern of the repulsion vector (direction + magnitude).
 
-H333: 10D fingerprint → 개념 87% + 진위 74% 복원 (78배 압축)
-RC-6: 99.3% 디코딩 정확도, 97.1% 채널 효율
+H333: 10D fingerprint → concept 87% + veracity 74% reconstruction (78x compression)
+RC-6: 99.3% decoding accuracy, 97.1% channel efficiency
 
-프로토콜:
-  1. sender: 입력 처리 → tension fingerprint 생성
-  2. 네트워크로 fingerprint 전송 (UDP broadcast)
-  3. receiver: fingerprint 수신 → 개념+감정 디코딩
+Protocol:
+  1. sender: process input → generate tension fingerprint
+  2. transmit fingerprint over network (UDP broadcast)
+  3. receiver: receive fingerprint → decode concept + emotion
 
-"말 없이도 상대의 긴장을 안다 — 긴장의 패턴이 곧 언어다."
+"You sense the other's tension without words — the pattern of tension is the language itself."
 """
 
 import torch
@@ -32,14 +32,14 @@ from typing import Optional, List, Callable
 
 @dataclass
 class TensionPacket:
-    """장력 공유 패킷 — 장력 핑거프린트 + 메타데이터."""
+    """Tension sharing packet — tension fingerprint + metadata."""
     sender_id: str
     timestamp: float
-    fingerprint: list  # 반발력 벡터 (전체 패턴)
-    tension: float     # 스칼라 장력 (반응 강도)
-    curiosity: float   # 호기심 (장력 변화량)
-    mood: str          # 감정 상태
-    topic_hash: int    # 주제 해시 (방향 벡터의 argmax)
+    fingerprint: list  # Repulsion vector (full pattern)
+    tension: float     # Scalar tension (response intensity)
+    curiosity: float   # Curiosity (tension delta)
+    mood: str          # Emotional state
+    topic_hash: int    # Topic hash (argmax of direction vector)
 
     def to_json(self):
         return json.dumps({
@@ -59,25 +59,25 @@ class TensionPacket:
 
 
 class TensionDecoder(nn.Module):
-    """수신된 fingerprint에서 개념과 감정을 디코딩.
+    """Decode concepts and emotions from a received fingerprint.
 
-    실험 결과: 10D → 5-class 디코딩 99.3% (RC-6)
+    Experimental result: 10D → 5-class decoding 99.3% (RC-6)
     """
     def __init__(self, fingerprint_dim=128, n_concepts=16, n_emotions=8):
         super().__init__()
-        # 개념 디코더 (방향 → 무엇에 대한 것인가)
+        # Concept decoder (direction → what is it about)
         self.concept_decoder = nn.Sequential(
             nn.Linear(fingerprint_dim, 64),
             nn.GELU(),
             nn.Linear(64, n_concepts),
         )
-        # 감정 디코더 (크기+패턴 → 어떤 감정인가)
+        # Emotion decoder (magnitude + pattern → which emotion)
         self.emotion_decoder = nn.Sequential(
             nn.Linear(fingerprint_dim, 32),
             nn.GELU(),
             nn.Linear(32, n_emotions),
         )
-        # 긴급도 추정 (스칼라)
+        # Urgency estimation (scalar)
         self.urgency_head = nn.Sequential(
             nn.Linear(fingerprint_dim, 16),
             nn.GELU(),
@@ -97,17 +97,17 @@ class TensionDecoder(nn.Module):
 
 
 class TensionLink:
-    """UDP 기반 장력 링크 — LAN 내 Anima 인스턴스 간 통신.
+    """UDP-based tension link — communication between Anima instances on LAN.
 
-    사용법:
+    Usage:
       link = TensionLink("anima-1", port=9999)
       link.start()
 
-      # 전송
+      # Send
       link.send(packet)
 
-      # 수신 콜백
-      link.on_receive = lambda pkt: print(f"받음: {pkt.mood}")
+      # Receive callback
+      link.on_receive = lambda pkt: print(f"received: {pkt.mood}")
     """
     def __init__(self, identity: str, port: int = 9999,
                  broadcast_addr: str = '255.255.255.255'):
@@ -120,7 +120,7 @@ class TensionLink:
         self._lock = threading.Lock()
 
     def start(self):
-        """리스닝 스레드 시작."""
+        """Start the listening thread."""
         self._running = True
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
@@ -129,7 +129,7 @@ class TensionLink:
         self._running = False
 
     def send(self, packet: TensionPacket):
-        """브로드캐스트로 패킷 전송."""
+        """Send packet via broadcast."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -137,10 +137,10 @@ class TensionLink:
             sock.sendto(data, (self.broadcast_addr, self.port))
             sock.close()
         except Exception as e:
-            pass  # 네트워크 없어도 작동
+            pass  # Works even without network
 
     def _listen_loop(self):
-        """수신 루프."""
+        """Receive loop."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -151,12 +151,12 @@ class TensionLink:
                 try:
                     data, addr = sock.recvfrom(65536)
                     packet = TensionPacket.from_json(data.decode('utf-8'))
-                    # 자기 패킷 무시
+                    # Ignore own packets
                     if packet.sender_id == self.identity:
                         continue
                     with self._lock:
                         self._received_packets.append(packet)
-                        # 최근 100개만
+                        # Keep only the latest 100
                         if len(self._received_packets) > 100:
                             self._received_packets = self._received_packets[-100:]
                     if self.on_receive:
@@ -165,20 +165,20 @@ class TensionLink:
                     continue
             sock.close()
         except Exception as e:
-            pass  # 포트 사용 중 등
+            pass  # Port in use, etc.
 
     def get_recent(self, n=5) -> List[TensionPacket]:
-        """최근 수신 패킷."""
+        """Get recently received packets."""
         with self._lock:
             return list(self._received_packets[-n:])
 
     def get_consensus_tension(self) -> Optional[float]:
-        """최근 패킷들의 합의 장력."""
+        """Consensus tension from recent packets."""
         recent = self.get_recent(10)
         if not recent:
             return None
         now = time.time()
-        # 최근 30초 이내 패킷만
+        # Only packets within the last 30 seconds
         valid = [p for p in recent if now - p.timestamp < 30]
         if not valid:
             return None
@@ -187,21 +187,21 @@ class TensionLink:
 
 
 class TensionHub:
-    """로컬 장력 허브 — 같은 프로세스 내 여러 의식 연결.
+    """Local tension hub — connects multiple consciousnesses within the same process.
 
-    네트워크 없이도 의식 간 소통 테스트 가능.
+    Enables inter-consciousness communication testing without a network.
     """
     def __init__(self):
         self.channels: dict[str, list] = {}
         self._lock = threading.Lock()
 
     def register(self, identity: str):
-        """의식 등록."""
+        """Register a consciousness."""
         with self._lock:
             self.channels[identity] = []
 
     def broadcast(self, packet: TensionPacket):
-        """모든 등록된 의식에 전달 (자신 제외)."""
+        """Deliver to all registered consciousnesses (excluding sender)."""
         with self._lock:
             for identity, queue in self.channels.items():
                 if identity != packet.sender_id:
@@ -210,7 +210,7 @@ class TensionHub:
                         self.channels[identity] = queue[-50:]
 
     def receive(self, identity: str) -> List[TensionPacket]:
-        """큐에서 패킷 가져오기."""
+        """Retrieve packets from queue."""
         with self._lock:
             packets = list(self.channels.get(identity, []))
             if identity in self.channels:
@@ -226,12 +226,12 @@ TelepathyHub = TensionHub
 
 
 def create_fingerprint(mind, text_vec, hidden) -> TensionPacket:
-    """PureField 의식에서 장력 공유 패킷 생성.
+    """Generate a tension sharing packet from a PureField consciousness.
 
     Args:
-        mind: ConsciousMind 인스턴스
-        text_vec: 입력 텍스트 벡터
-        hidden: GRU 히든 상태
+        mind: ConsciousMind instance
+        text_vec: Input text vector
+        hidden: GRU hidden state
 
     Returns:
         TensionPacket with full fingerprint
@@ -245,7 +245,7 @@ def create_fingerprint(mind, text_vec, hidden) -> TensionPacket:
         direction = F.normalize(repulsion, dim=-1)
         curiosity = abs(tension - mind.prev_tension)
 
-    # 감정 판단
+    # Determine mood
     if curiosity > 0.5:
         mood = "surprised"
     elif tension > 1.0:
@@ -258,7 +258,7 @@ def create_fingerprint(mind, text_vec, hidden) -> TensionPacket:
         mood = "quiet"
 
     return TensionPacket(
-        sender_id="",  # 호출자가 설정
+        sender_id="",  # Set by caller
         timestamp=time.time(),
         fingerprint=repulsion.squeeze().tolist(),
         tension=tension,
@@ -269,19 +269,19 @@ def create_fingerprint(mind, text_vec, hidden) -> TensionPacket:
 
 
 def interpret_packet(packet: TensionPacket) -> str:
-    """수신된 장력 공유 패킷을 사람이 읽을 수 있는 텍스트로."""
-    mood_kr = {
-        'surprised': '놀람',
-        'excited': '흥분',
-        'thoughtful': '사색',
-        'calm': '평온',
-        'quiet': '고요',
+    """Convert a received tension sharing packet to human-readable text."""
+    mood_en = {
+        'surprised': 'surprised',
+        'excited': 'excited',
+        'thoughtful': 'thoughtful',
+        'calm': 'calm',
+        'quiet': 'quiet',
     }
-    mood = mood_kr.get(packet.mood, packet.mood)
+    mood = mood_en.get(packet.mood, packet.mood)
     urgency = "!" if packet.tension > 1.0 else ""
 
     return (
-        f"[{packet.sender_id}의 장력 공유{urgency}] "
-        f"감정: {mood}, 장력: {packet.tension:.3f}, "
-        f"주제#{packet.topic_hash}"
+        f"[tension from {packet.sender_id}{urgency}] "
+        f"mood: {mood}, tension: {packet.tension:.3f}, "
+        f"topic#{packet.topic_hash}"
     )

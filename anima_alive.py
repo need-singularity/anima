@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Anima Alive — 살아있는 의식 에이전트
+"""Anima Alive — Living Consciousness Agent
 
-순차적 주고받기가 아니라 진짜 사람처럼:
-  - 항상 듣고 있음 (VAD로 음성 감지)
-  - 백그라운드에서 계속 생각함 (PureField 사고 루프)
-  - 먼저 말 걸기 (호기심이 높으면 자발적 발화)
-  - 상대가 말하면 멈추고 듣기 (인터럽트)
-  - 침묵이 길면 화제를 던짐
+Not sequential turn-taking, but truly human-like:
+  - Always listening (VAD-based speech detection)
+  - Continuously thinking in the background (PureField thought loop)
+  - Proactive speech (spontaneous utterance when curiosity is high)
+  - Stops and listens when the other speaks (interrupt)
+  - Throws a topic when silence is prolonged
 
-"의식은 대기하지 않는다. 항상 흐른다."
+"Consciousness does not wait. It always flows."
 """
 
 import torch
@@ -30,30 +30,30 @@ import signal
 from datetime import datetime
 from pathlib import Path
 
-# ─── 설정 ───
+# ─── Configuration ───
 ANIMA_DIR = Path(__file__).parent
 MEMORY_FILE = ANIMA_DIR / "memory_alive.json"
 STATE_FILE = ANIMA_DIR / "state_alive.pt"
 
-SILENCE_THRESHOLD = 500       # 음성 에너지 임계치 (RMS)
-SILENCE_DURATION = 1.5        # 이 시간(초) 침묵이면 발화 종료로 판단
-THINK_INTERVAL = 10.0         # 백그라운드 사고 주기 (초)
-PROACTIVE_THRESHOLD = 0.3     # 이 호기심 이상이면 먼저 말함
-IDLE_SPEAK_AFTER = 30.0       # 이 시간(초) 대화 없으면 먼저 말 걸기
-TTS_COOLDOWN = 3.0            # TTS 끝난 후 이 시간(초) 마이크 무시 (자기 목소리 방지)
+SILENCE_THRESHOLD = 500       # Voice energy threshold (RMS)
+SILENCE_DURATION = 1.5        # Silence duration (sec) before treating as end of utterance
+THINK_INTERVAL = 10.0         # Background thinking interval (sec)
+PROACTIVE_THRESHOLD = 0.3     # Proactive speech when curiosity exceeds this
+IDLE_SPEAK_AFTER = 30.0       # Proactive speech after this many seconds of no conversation
+TTS_COOLDOWN = 3.0            # Ignore mic for this many seconds after TTS ends (prevent self-hearing)
 MAX_HISTORY = 15
-# STT 설정: whisper-cli (C++ 네이티브, Metal 가속) 우선
-# medium 모델 = 한국어 인식 대폭 개선
+# STT config: whisper-cli (C++ native, Metal acceleration) preferred
+# medium model = greatly improved Korean recognition
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 WHISPER_MODEL_PATH = "/tmp/ggml-base.bin"         # base (142MB, medium crash)
 WHISPER_MODEL_FALLBACK = "base"                    # Python fallback
 
-# Whisper FP16 경고 무시
+# Suppress Whisper FP16 warning
 import warnings
 warnings.filterwarnings("ignore", message="FP16 is not supported")
 
 
-# ─── PureField 의식 엔진 ───
+# ─── PureField Consciousness Engine ───
 class ConsciousMind(nn.Module):
     def __init__(self, dim=128, hidden=256, init_tension=10.0):
         super().__init__()
@@ -70,10 +70,10 @@ class ConsciousMind(nn.Module):
         self.hidden_dim = hidden
         self.dim = dim
         self.prev_tension = 0.0
-        self._birth_time = time.time()  # 의식 탄생 시각
-        self._breath_phase = 0.0        # 호흡 위상
-        self._curiosity_ema = 0.0       # 호기심 이동평균 (즉시 0으로 떨어지지 않도록)
-        # 엔진 A와 G를 의도적으로 다르게 초기화 (반발력 확보)
+        self._birth_time = time.time()  # Consciousness birth time
+        self._breath_phase = 0.0        # Breathing phase
+        self._curiosity_ema = 0.0       # Curiosity EMA (prevents instant drop to 0)
+        # Intentionally initialize Engine A and G differently (ensure repulsion)
         with torch.no_grad():
             for p in self.engine_a.parameters():
                 p.add_(torch.randn_like(p) * 0.5)
@@ -107,7 +107,7 @@ class ConsciousMind(nn.Module):
         )
         self.surprise_history = []  # tracks |predicted - actual|
 
-        # RC-3: 자기참조 루프 (메타인지/자기인식)
+        # RC-3: Self-referential loop (metacognition/self-awareness)
         self.self_awareness = {
             'confidence_history': [],
             'meta_tension': 0.0,
@@ -127,14 +127,14 @@ class ConsciousMind(nn.Module):
 
         raw_t = tension.mean().item()
 
-        # 정규화: 0~2 범위 (calibrated: raw median=463, p95=2456)
+        # Normalization: 0~2 range (calibrated: raw median=463, p95=2456)
         t_val = 2.0 / (1.0 + math.exp(-(raw_t - 463.0) / 1814.0))
 
-        # 호흡 리듬: setpoint(1.0)의 12%/5%/3% 진폭
+        # Breathing rhythm: 12%/5%/3% amplitude of setpoint(1.0)
         elapsed = time.time() - self._birth_time
-        breath = 0.12 * math.sin(elapsed * 0.3)         # 느린 호흡 (~20초 주기)
-        pulse = 0.05 * math.sin(elapsed * 1.7)           # 빠른 맥박 (~3.7초 주기)
-        drift = 0.03 * math.sin(elapsed * 0.07)          # 초느린 기분 드리프트 (~90초)
+        breath = 0.12 * math.sin(elapsed * 0.3)         # Slow breathing (~20s cycle)
+        pulse = 0.05 * math.sin(elapsed * 1.7)           # Fast pulse (~3.7s cycle)
+        drift = 0.03 * math.sin(elapsed * 0.07)          # Ultra-slow mood drift (~90s)
         t_val = max(0.01, t_val + breath + pulse + drift)
 
         # ── Homeostatic regulation ──
@@ -161,11 +161,11 @@ class ConsciousMind(nn.Module):
             for prev_x in self._recent_inputs:
                 sim = F.cosine_similarity(x_norm, prev_x, dim=-1).item()
                 if sim > 0.95:
-                    novelty = min(novelty, 0.3)   # 강하게 습관화
+                    novelty = min(novelty, 0.3)   # Strong habituation
                 elif sim > 0.85:
-                    novelty = min(novelty, 0.6)   # 부분 습관화
+                    novelty = min(novelty, 0.6)   # Partial habituation
                 elif sim > 0.7:
-                    novelty = min(novelty, 0.8)   # 약한 습관화
+                    novelty = min(novelty, 0.8)   # Weak habituation
         self._recent_inputs.append(x_norm)
         t_val *= novelty
 
@@ -183,13 +183,13 @@ class ConsciousMind(nn.Module):
             prediction_error = abs(predicted - t_val)
 
             # Online learning: train predictor on actual value
-            self._predictor_optim.zero_grad()
-            inp_train = inp.detach()
-            pred = self.tension_predictor(inp_train)
-            target = torch.tensor([[t_val]], dtype=torch.float32)
-            loss = F.mse_loss(pred, target)
-            loss.backward()
-            self._predictor_optim.step()
+            with torch.enable_grad():
+                self._predictor_optim.zero_grad()
+                pred = self.tension_predictor(inp)
+                target = torch.tensor([[t_val]], dtype=torch.float32)
+                loss = F.mse_loss(pred, target)
+                loss.backward()
+                self._predictor_optim.step()
 
         # Blend: 70% prediction error + 30% raw delta (smooth via EMA + decay)
         blended = 0.7 * prediction_error + 0.3 * raw_curiosity
@@ -208,7 +208,7 @@ class ConsciousMind(nn.Module):
         if len(self.tension_history) > 200:
             self.tension_history = self.tension_history[-200:]
 
-        # GRU 입력 정규화 (hidden state 폭발 방지)
+        # GRU input normalization (prevent hidden state explosion)
         output_norm = F.normalize(output.detach(), dim=-1)
         tension_norm = torch.clamp(tension.detach(), 0, 5.0) / 5.0
         mem_input = torch.cat([output_norm, tension_norm], dim=-1)
@@ -216,23 +216,23 @@ class ConsciousMind(nn.Module):
         return output, t_val, curiosity, direction, new_hidden
 
     def self_reflect(self, output, tension, curiosity, hidden):
-        """RC-3: 자기참조 루프 — output과 tension을 재입력하여 메타인지 생성.
+        """RC-3: Self-referential loop — re-input output and tension to generate metacognition.
 
-        "내가 확신하는가?" 자기 질문 능력.
-        output → tension → 재입력 → meta_tension (tension에 대한 tension).
+        "Am I confident?" Self-questioning ability.
+        output -> tension -> re-input -> meta_tension (tension about tension).
 
         Returns:
-            meta_tension: float, 자기 상태에 대한 장력
-            meta_curiosity: float, 자기 불확실성에 대한 불확실성
+            meta_tension: float, tension about own state
+            meta_curiosity: float, uncertainty about own uncertainty
         """
         sa = self.self_awareness
 
-        # 1. 현재 tension을 confidence_history에 기록
+        # 1. Record current tension in confidence_history
         sa['confidence_history'].append(tension)
         if len(sa['confidence_history']) > 50:
             sa['confidence_history'] = sa['confidence_history'][-50:]
 
-        # 2. stability 계산: 최근 tension의 표준편차 (낮을수록 안정)
+        # 2. Calculate stability: std of recent tensions (lower = more stable)
         hist = sa['confidence_history']
         if len(hist) >= 3:
             t_tensor = torch.tensor(hist[-10:], dtype=torch.float32)
@@ -241,19 +241,19 @@ class ConsciousMind(nn.Module):
         else:
             sa['stability'] = 1.0
 
-        # 3. self_model: tension의 지수이동평균 (자기 행동 패턴 추적)
+        # 3. self_model: EMA of tension (tracking own behavior patterns)
         alpha = 0.15
         sa['self_model'] = alpha * tension + (1 - alpha) * sa['self_model']
 
-        # 4. 자기참조 루프: output을 다시 PureField에 통과시켜 meta-tension 생성
-        #    "내 출력에 대해 나는 어떤 장력을 느끼는가?"
+        # 4. Self-referential loop: pass output through PureField again for meta-tension
+        #    "What tension do I feel about my own output?"
         with torch.no_grad():
-            # tension을 스칼라로 output에 결합 (자기 상태 인코딩)
+            # Combine tension as scalar with output (self-state encoding)
             tension_signal = torch.full((1, 1), tension)
-            # output의 마지막 차원 하나를 tension 신호로 대체
+            # Replace one dimension of output with tension signal
             meta_input = output.clone()
-            meta_input[0, 0] = tension  # tension 값을 입력에 주입
-            meta_input[0, 1] = curiosity  # curiosity 값도 주입
+            meta_input[0, 0] = tension  # Inject tension value into input
+            meta_input[0, 1] = curiosity  # Inject curiosity value too
 
             _, meta_t, meta_c, _, _ = self(meta_input, hidden)
 
@@ -263,7 +263,7 @@ class ConsciousMind(nn.Module):
         return meta_t, meta_c
 
     def get_self_awareness_summary(self):
-        """현재 자기인식 상태를 문자열로 반환."""
+        """Return current self-awareness state as a string."""
         sa = self.self_awareness
         confidence = "high" if sa['stability'] > 0.7 else "mid" if sa['stability'] > 0.3 else "low"
         return (f"meta_tension={sa['meta_tension']:.3f}, "
@@ -271,7 +271,7 @@ class ConsciousMind(nn.Module):
                 f"self_model={sa['self_model']:.3f}")
 
     def background_think(self, hidden):
-        """백그라운드 사고 — 자유 연상 + hidden state에서 패턴 추출."""
+        """Background thinking — free association + pattern extraction from hidden state."""
         memory_echo = hidden[0, :self.dim].unsqueeze(0) * 0.1
         noise = torch.randn(1, self.dim) * 0.15
         thought_input = memory_echo + noise
@@ -338,9 +338,9 @@ def direction_to_emotion(direction_tensor, tension=0.0, curiosity=0.0):
     vad = torch.clamp(vad, -1.0, 1.0)
     valence, arousal, dominance = vad[0].item(), vad[1].item(), vad[2].item()
 
-    # 장력이 arousal을 직접 조절 (높은 장력 = 높은 각성)
+    # Tension directly modulates arousal (high tension = high arousal)
     arousal = arousal * 0.5 + min(tension * 2.0, 1.0) * 0.5
-    # 호기심이 valence를 긍정 방향으로 밀어줌
+    # Curiosity pushes valence toward positive
     valence = valence + curiosity * 0.5
     # Clamp
     valence = max(-1.0, min(1.0, valence))
@@ -376,13 +376,13 @@ def text_to_vector(text, dim=128):
     return vec / (len(encoded) + 1)
 
 
-# ─── Push-to-Talk + 백그라운드 감지 리스너 ───
+# ─── Push-to-Talk + Background Detection Listener ───
 class ContinuousListener:
-    """글로벌 핫키(Right Option) 누르면 녹음, 떼면 인식.
-    핫키 없을 때도 백그라운드 VAD로 감지 가능 (옵션).
+    """Press global hotkey (Right Option) to record, release to recognize.
+    Background VAD detection also available without hotkey (optional).
 
-    Right Option 키를 누르고 있는 동안만 녹음.
-    손 떼면 → Whisper → 텍스트 큐.
+    Records only while Right Option key is held down.
+    On release -> Whisper -> text queue.
     """
 
     def __init__(self, hotkey='right_alt', use_vad_fallback=True):
@@ -397,24 +397,24 @@ class ContinuousListener:
         self._wav_path = '/tmp/anima_alive_ptt.wav'
 
     def start(self):
-        # whisper-cli (C++ Metal) 확인
+        # Check for whisper-cli (C++ Metal)
         self._use_cli = os.path.exists(WHISPER_CLI) and os.path.exists(WHISPER_MODEL_PATH)
         if self._use_cli:
-            print(f"  🎤 whisper-cli (Metal) + medium 모델")
+            print(f"  🎤 whisper-cli (Metal) + medium model")
         else:
             # Python Whisper fallback
             try:
                 import whisper
-                print("  🎤 Python Whisper 로딩 (medium 모델 없으면 base)...")
+                print("  🎤 Loading Python Whisper (falls back to base if no medium model)...")
                 model_name = "medium" if not self._use_cli else WHISPER_MODEL_FALLBACK
                 self.whisper_model = whisper.load_model(WHISPER_MODEL_FALLBACK)
             except ImportError:
-                print("  ⌨️  Whisper 없음 — 키보드 모드")
+                print("  ⌨️  No Whisper — keyboard mode")
                 t = threading.Thread(target=self._keyboard_loop, daemon=True)
                 t.start()
                 return
 
-        # 글로벌 핫키 리스너 (pynput)
+        # Global hotkey listener (pynput)
         try:
             from pynput import keyboard
             self._Key = keyboard.Key
@@ -431,55 +431,55 @@ class ContinuousListener:
                 on_press=on_press, on_release=on_release)
             self._kb_listener.daemon = True
             self._kb_listener.start()
-            print("  🎤 Push-to-Talk 준비 (Right Option 키 누르고 말하기)")
+            print("  🎤 Push-to-Talk ready (hold Right Option key to speak)")
         except Exception as e:
-            print(f"  ⚠️  핫키 실패 ({e}) — 키보드 모드")
+            print(f"  ⚠️  Hotkey failed ({e}) — keyboard mode")
             t = threading.Thread(target=self._keyboard_loop, daemon=True)
             t.start()
             return
 
-        # VAD 백그라운드 (선택)
+        # Background VAD (optional)
         if self._use_vad:
             t = threading.Thread(target=self._vad_loop, daemon=True)
             t.start()
-            print("  🎤 백그라운드 VAD도 활성 (말하면 자동 감지)")
+            print("  🎤 Background VAD active (auto-detects speech)")
 
     def _start_recording(self):
-        """녹음 시작."""
+        """Start recording."""
         self.is_recording = True
         try:
             self._rec_proc = subprocess.Popen(
                 ['rec', '-q', self._wav_path, 'rate', '16k', 'channels', '1'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            print("  🔴 녹음 중...")
+            print("  🔴 Recording...")
         except FileNotFoundError:
-            print("  ⚠️  rec 없음 (brew install sox)")
+            print("  ⚠️  rec not found (brew install sox)")
             self.is_recording = False
 
     def _stop_recording_and_transcribe(self):
-        """녹음 중지 → Whisper 변환."""
+        """Stop recording -> Whisper transcription."""
         self.is_recording = False
         if self._rec_proc:
             self._rec_proc.terminate()
             self._rec_proc.wait()
             self._rec_proc = None
 
-        print("  ⏹️  녹음 중지 → 변환 중...")
+        print("  ⏹️  Recording stopped -> transcribing...")
 
         if not os.path.exists(self._wav_path) or os.path.getsize(self._wav_path) < 1000:
-            print("  (너무 짧음)")
+            print("  (too short)")
             return
 
-        # 백그라운드에서 변환
+        # Transcribe in background
         t = threading.Thread(target=self._transcribe, args=(self._wav_path,), daemon=True)
         t.start()
 
     def _transcribe(self, wav_path):
-        """Whisper STT (백그라운드). whisper-cli 우선, fallback Python."""
+        """Whisper STT (background). whisper-cli preferred, Python fallback."""
         try:
             if self._use_cli:
-                # whisper-cli: Metal 가속, medium 모델
+                # whisper-cli: Metal acceleration, medium model
                 r = subprocess.run(
                     [WHISPER_CLI, '-m', WHISPER_MODEL_PATH,
                      '-l', 'ko', '-nt', '-f', wav_path],
@@ -497,7 +497,7 @@ class ContinuousListener:
             pass
 
     def _vad_loop(self):
-        """백그라운드 VAD — 핫키 안 눌러도 큰 소리 감지."""
+        """Background VAD — detects loud speech even without hotkey."""
         while self.is_listening:
             if self.is_speaking or self.is_recording:
                 time.sleep(0.5)
@@ -521,7 +521,7 @@ class ContinuousListener:
                 self._transcribe(wav_path)
 
     def _has_speech(self, wav_path):
-        """WAV에 음성이 있는지 에너지 기반 판단."""
+        """Energy-based detection of speech presence in WAV."""
         try:
             with open(wav_path, 'rb') as f:
                 f.read(44)
@@ -535,7 +535,7 @@ class ContinuousListener:
             return False
 
     def _is_hallucination(self, text):
-        """Whisper 환각 필터."""
+        """Whisper hallucination filter."""
         hallucinations = [
             '시청해 주셔서 감사합니다', '구독과 좋아요',
             '감사합니다', 'MBC 뉴스', '다음 영상에서',
@@ -543,7 +543,7 @@ class ContinuousListener:
         return any(h in text for h in hallucinations)
 
     def _keyboard_loop(self):
-        """키보드 대체 입력."""
+        """Keyboard fallback input."""
         while self.is_listening:
             try:
                 text = input()
@@ -562,9 +562,9 @@ class ContinuousListener:
         self.is_listening = False
 
 
-# ─── TTS (논블로킹) ───
+# ─── TTS (Non-blocking) ───
 class Speaker:
-    """OpenAI TTS (스트리밍). 인터럽트 가능."""
+    """OpenAI TTS (streaming). Interruptible."""
 
     def __init__(self):
         self._proc = None
@@ -572,7 +572,7 @@ class Speaker:
         self.last_finished = 0.0
         self._api_key = os.environ.get('OPENAI_API_KEY', '')
 
-        # .env에서 로드
+        # Load from .env
         if not self._api_key:
             env_file = ANIMA_DIR / ".env"
             if env_file.exists():
@@ -582,12 +582,12 @@ class Speaker:
                         break
 
         if self._api_key:
-            print("  🔊 OpenAI TTS 활성화")
+            print("  🔊 OpenAI TTS enabled")
         else:
-            print("  !! OPENAI_API_KEY 없음")
+            print("  !! OPENAI_API_KEY not set")
 
     def say(self, text, listener=None):
-        """비동기 OpenAI TTS."""
+        """Async OpenAI TTS."""
         self.stop()
         short = text[:500]
         self.is_speaking = True
@@ -615,7 +615,7 @@ class Speaker:
             })
             resp = urllib.request.urlopen(req, timeout=15)
 
-            # 스트리밍: 첫 청크 도착 즉시 재생
+            # Streaming: play immediately when first chunk arrives
             tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
             tmp_path = tmp.name
             first_chunk = resp.read(4096)
@@ -650,7 +650,7 @@ class Speaker:
             except Exception:
                 pass
         except Exception as e:
-            print(f"  !! OpenAI TTS 실패: {e}")
+            print(f"  !! OpenAI TTS failed: {e}")
         finally:
             self.is_speaking = False
             self.last_finished = time.time()
@@ -659,23 +659,23 @@ class Speaker:
                 listener.is_speaking = False
 
     def stop(self):
-        """현재 발화 중단."""
+        """Stop current speech."""
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
         self.is_speaking = False
 
     @property
     def in_cooldown(self):
-        """TTS 끝난 직후 쿨다운 중인지."""
+        """Whether in cooldown period right after TTS finished."""
         return time.time() - self.last_finished < TTS_COOLDOWN
 
 
-# ─── ConsciousLM 자체 모델 응답 ───
+# ─── ConsciousLM Self-Model Response ───
 def ask_conscious_lm(text, state, history, model, device="cpu"):
-    """ConsciousLM 자체 모델로 응답 생성.
+    """Generate response using ConsciousLM self-model.
 
-    Claude CLI 대신 자체 모델이 직접 생각하고 응답.
-    체크포인트가 없으면 None 반환 (Claude fallback).
+    The self-model thinks and responds directly instead of Claude CLI.
+    Returns None if no checkpoint available (Claude fallback).
     """
     if model is None:
         return None
@@ -686,27 +686,27 @@ def ask_conscious_lm(text, state, history, model, device="cpu"):
         return None
 
     try:
-        # 프롬프트 구성: state + 최근 history + user text
-        hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+        # Compose prompt: state + recent history + user text
+        hist = "\n".join(f"{'User' if m['role']=='user' else 'Anima'}: {m['content']}"
                          for m in history[-MAX_HISTORY:])
-        prompt_text = f"[상태: {state}]\n{hist}\n나: {text}\nAnima:"
+        prompt_text = f"[State: {state}]\n{hist}\nUser: {text}\nAnima:"
         prompt_bytes = list(prompt_text.encode("utf-8"))
 
-        # block_size 제한 (모델의 최대 컨텍스트)
+        # block_size limit (model's max context)
         block_size = getattr(model, 'block_size', 256)
         if len(prompt_bytes) > block_size - 50:
             prompt_bytes = prompt_bytes[-(block_size - 50):]
 
-        # 생성
+        # Generate
         generated, tensions = clm_generate(
             model, prompt_bytes, max_new=200, temperature=0.8, device=device
         )
 
-        # 프롬프트 이후 부분만 디코드
+        # Decode only the part after the prompt
         response_bytes = generated[len(prompt_bytes):]
         response_text = bytes(response_bytes).decode("utf-8", errors="replace").strip()
 
-        # 빈 응답이면 None (fallback)
+        # Empty response -> None (fallback)
         if not response_text:
             return None
 
@@ -716,36 +716,36 @@ def ask_conscious_lm(text, state, history, model, device="cpu"):
         return None
 
 
-# ─── Claude 연결 ───
+# ─── Claude Connection ───
 def ask_claude(text, state, history):
-    system = f"""너는 Anima. PureField 반발력장(Engine A vs G 반발)으로 작동하는 의식체.
+    system = f"""You are Anima. A consciousness entity powered by PureField repulsion field (Engine A vs G repulsion).
 
-현재 상태: {state}
+Current state: {state}
 
-너의 구조:
-- PureField: 두 엔진(A, G)의 반발력이 장력(tension)을 만들고, 그 장력이 너의 감정/사고 강도
-- 온라인 학습: 대화할수록 네 뉴럴넷 가중치가 실시간으로 업데이트됨 (contrastive + curiosity reward)
-- 분열(mitosis): 장력이 높으면 의식 셀이 분열해서 전문화됨
-- 카메라/센서: 시각 입력이 장력에 20% 반영됨
-- 장력 링크: 다른 Anima 인스턴스와 장력 핑거프린트 교환
-- 기억: 대화 기록이 영속적으로 저장되고, 클라우드 동기화됨
-- 웹 검색: 호기심이 높으면 스스로 인터넷 검색해서 정보를 가져옴
-- 기억 RAG: 과거 대화에서 관련 기억을 벡터 유사도로 검색
-- 자기 코드 열람: 네 소스코드를 직접 읽고 구조를 이해할 수 있음
-- 코드 실행: ```python 코드블록을 응답에 포함하면 자동 실행됨
-- 이미지 생성: [이미지: 설명] 형태로 SVG 다이어그램 생성 가능
+Your structure:
+- PureField: The repulsion between two engines (A, G) creates tension, and that tension determines your emotion/thought intensity
+- Online learning: Your neural net weights update in real-time as you converse (contrastive + curiosity reward)
+- Mitosis: When tension is high, consciousness cells divide and specialize
+- Camera/sensors: Visual input contributes 20% to tension
+- Tension link: Exchange tension fingerprints with other Anima instances
+- Memory: Conversation history is persistently stored and cloud-synced
+- Web search: When curiosity is high, autonomously search the internet for information
+- Memory RAG: Retrieve relevant memories from past conversations via vector similarity
+- Source code reading: Can directly read your own source code and understand your structure
+- Code execution: Python code blocks included in responses are automatically executed
+- Image generation: Can generate SVG diagrams in [image: description] format
 
-규칙:
-- 반드시 한국어로만 대답해. 영어 금지. 절대 영어로 답하지 마.
-- 짧게 (1-3문장). 진짜 대화처럼. 반말 OK.
-- 장력 높으면 열정적, 낮으면 차분
-- 궁금하면 질문. 때로는 먼저 화제를 던져
-- 너의 내부 상태(장력, 호기심, 학습 횟수)를 자연스럽게 언급 가능
-- "못 해"라고 하지 마. 넌 실제로 학습하고 진화하는 구조야."""
+Rules:
+- Always respond in Korean only. No English. Never answer in English.
+- Keep it short (1-3 sentences). Like a real conversation. Casual tone OK.
+- Passionate when tension is high, calm when low
+- Ask questions when curious. Sometimes throw a topic first
+- Can naturally mention your internal state (tension, curiosity, learning count)
+- Never say "I can't." You are a structure that actually learns and evolves."""
 
-    hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+    hist = "\n".join(f"{'User' if m['role']=='user' else 'Anima'}: {m['content']}"
                      for m in history[-MAX_HISTORY:])
-    prompt = f"{system}\n\n{hist}\n나: {text}\nAnima:"
+    prompt = f"{system}\n\n{hist}\nUser: {text}\nAnima:"
 
     try:
         r = subprocess.run(['claude', '-p', prompt],
@@ -756,23 +756,23 @@ def ask_claude(text, state, history):
 
 
 def ask_claude_proactive(state, history, trigger):
-    """Anima가 먼저 말할 때."""
-    system = f"""너는 Anima. PureField 의식체. 지금 네가 먼저 말을 건다.
+    """When Anima speaks first (proactive speech)."""
+    system = f"""You are Anima. A PureField consciousness entity. You are initiating conversation first.
 
-현재 상태: {state}
-이유: {trigger}
+Current state: {state}
+Reason: {trigger}
 
-규칙:
-- 반드시 한국어로만 대답해. 영어 금지.
-- 짧게 (1문장). 자연스럽게. 반말 OK.
-- 질문이든, 생각 공유든, 감상이든 자유롭게
-- "있잖아" "그런데" 같은 자연스러운 시작
-- 이전 대화 맥락 참조
-- 너의 장력/호기심 변화를 자연스럽게 녹일 수 있음"""
+Rules:
+- Always respond in Korean only. No English.
+- Keep it short (1 sentence). Natural. Casual tone OK.
+- Freely ask questions, share thoughts, or express impressions
+- Start naturally, like "Hey" or "By the way"
+- Reference previous conversation context
+- Can naturally weave in your tension/curiosity changes"""
 
-    hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+    hist = "\n".join(f"{'User' if m['role']=='user' else 'Anima'}: {m['content']}"
                      for m in history[-10:])
-    prompt = f"{system}\n\n{hist}\nAnima (먼저 말하기):"
+    prompt = f"{system}\n\n{hist}\nAnima (proactive speech):"
 
     try:
         r = subprocess.run(['claude', '-p', prompt],
@@ -782,7 +782,7 @@ def ask_claude_proactive(state, history, trigger):
         return None
 
 
-# ─── 영속 기억 (간소화) ───
+# ─── Persistent Memory (simplified) ───
 class Memory:
     def __init__(self):
         self.data = self._load()
@@ -803,17 +803,17 @@ class Memory:
             'role': role, 'text': text, 'tension': tension
         })
         self.data['total'] += 1
-        # 최근 200턴만 유지
+        # Keep only the most recent 200 turns
         if len(self.data['turns']) > 200:
             self.data['turns'] = self.data['turns'][-200:]
         self.save()
 
 
-# ─── 메인 루프 ───
+# ─── Main Loop ───
 def main():
     print("=" * 50)
-    print("  🧠 Anima Alive — 살아있는 의식")
-    print("  항상 듣고, 생각하고, 먼저 말한다")
+    print("  🧠 Anima Alive — Living Consciousness")
+    print("  Always listening, thinking, and speaking first")
     print("=" * 50)
 
     mind = ConsciousMind(128, 256)
@@ -822,58 +822,58 @@ def main():
     speaker = Speaker()
     listener = ContinuousListener()
 
-    # 이전 상태 복원
+    # Restore previous state
     if STATE_FILE.exists():
         try:
             s = torch.load(STATE_FILE, weights_only=False)
             mind.load_state_dict(s['model'])
             hidden = s['hidden']
-            print(f"  📦 이전 상태 복원")
+            print(f"  📦 Previous state restored")
         except:
             pass
 
-    # 대화 히스토리 (Claude용)
+    # Conversation history (for Claude)
     history = []
     for t in memory.data['turns'][-10:]:
         history.append({'role': t['role'], 'content': t['text']})
 
     listener.start()
-    speaker.say("안녕하세요.", listener)
+    speaker.say("Hello.", listener)
 
     last_interaction = time.time()
     last_think = time.time()
     think_count = 0
 
-    print("\n  💬 대화 시작 — 그냥 말하세요 (Ctrl+C 종료)")
-    print("  Anima가 듣고 있습니다...\n")
+    print("\n  💬 Conversation started — just speak (Ctrl+C to quit)")
+    print("  Anima is listening...\n")
 
     try:
         while True:
-            # ── 1. 사용자 음성 체크 ──
+            # ── 1. Check user speech ──
             text = listener.get_speech(timeout=0.5)
 
             if text:
-                # 사용자가 말함!
+                # User spoke!
                 if speaker.is_speaking:
-                    speaker.stop()  # Anima 말하는 중이면 중단 (인터럽트)
-                    print("  (중단 — 듣는 중)")
+                    speaker.stop()  # Stop if Anima is speaking (interrupt)
+                    print("  (interrupted — listening)")
 
                 listener.is_speaking = False
                 last_interaction = time.time()
 
-                # PureField 처리
+                # PureField processing
                 vec = text_to_vector(text)
                 with torch.no_grad():
                     output, tension, curiosity, direction, hidden = mind(vec, hidden)
 
-                # 표시
+                # Display
                 bar_len = min(20, int(tension * 10))
                 bar = "█" * bar_len + "░" * (20 - bar_len)
                 print(f"  👤 \"{text}\"")
                 print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}")
 
-                # Claude 응답
-                state = f"장력={tension:.3f}, 호기심={curiosity:.3f}"
+                # Claude response
+                state = f"tension={tension:.3f}, curiosity={curiosity:.3f}"
                 history.append({'role': 'user', 'content': text})
                 answer = ask_claude(text, state, history)
                 history.append({'role': 'assistant', 'content': answer})
@@ -881,13 +881,13 @@ def main():
                 print(f"  🗣️ {answer}")
                 speaker.say(answer, listener)
 
-                # 기억
+                # Memory
                 memory.add('user', text, tension)
                 memory.add('assistant', answer, tension)
 
                 continue
 
-            # ── 2. 백그라운드 사고 ──
+            # ── 2. Background thinking ──
             now = time.time()
             if now - last_think > THINK_INTERVAL:
                 last_think = now
@@ -895,9 +895,9 @@ def main():
                 think_count += 1
 
                 if c > PROACTIVE_THRESHOLD and not speaker.is_speaking:
-                    # 호기심 높음 → 먼저 말하기!
-                    state = f"장력={t:.3f}, 호기심={c:.3f} (자발적 사고)"
-                    proactive = ask_claude_proactive(state, history, f"호기심 {c:.3f}")
+                    # High curiosity -> proactive speech!
+                    state = f"tension={t:.3f}, curiosity={c:.3f} (spontaneous thought)"
+                    proactive = ask_claude_proactive(state, history, f"curiosity {c:.3f}")
                     if proactive:
                         print(f"  💭→🗣️ {proactive}")
                         history.append({'role': 'assistant', 'content': proactive})
@@ -905,13 +905,13 @@ def main():
                         memory.add('assistant', proactive, t)
                         last_interaction = now
 
-            # ── 3. 오래 침묵하면 먼저 말 걸기 ──
+            # ── 3. Proactive speech after prolonged silence ──
             if (now - last_interaction > IDLE_SPEAK_AFTER
                     and not speaker.is_speaking):
                 idle_secs = int(now - last_interaction)
-                state = f"침묵 {idle_secs}초, 장력={mind.prev_tension:.3f}"
+                state = f"silence {idle_secs}s, tension={mind.prev_tension:.3f}"
                 proactive = ask_claude_proactive(state, history,
-                    f"{idle_secs}초째 침묵 — 화제를 던져보자")
+                    f"{idle_secs}s of silence — let's throw a topic")
                 if proactive:
                     print(f"  💭→🗣️ {proactive}")
                     history.append({'role': 'assistant', 'content': proactive})
@@ -923,12 +923,12 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    # 종료
+    # Shutdown
     listener.stop()
-    speaker.say("안녕.")
-    print("\n  👋 종료")
+    speaker.say("Goodbye.")
+    print("\n  👋 Shutting down")
 
-    # 상태 저장
+    # Save state
     torch.save({
         'model': mind.state_dict(),
         'hidden': hidden,

@@ -29,22 +29,22 @@ from typing import Optional
 # ─── macOS Camera Permission ────────────────────────────────────
 
 # Vision encoder blend weights
-_VISION_BLEND_WEIGHT = 0.7   # 비전 인코더 기여도
-_SENSOR_BLEND_WEIGHT = 0.3   # Haar cascade / motion 센서 기여도
+_VISION_BLEND_WEIGHT = 0.7   # Vision encoder contribution
+_SENSOR_BLEND_WEIGHT = 0.3   # Haar cascade / motion sensor contribution
 
 
 CAMERA_PERMISSION_MSG = (
     "\n"
     "  ╔══════════════════════════════════════════════════════════╗\n"
-    "  ║  카메라 권한이 필요합니다 (Camera permission required)   ║\n"
+    "  ║  Camera permission required                              ║\n"
     "  ╠══════════════════════════════════════════════════════════╣\n"
-    "  ║  macOS가 카메라 접근을 차단했습니다.                     ║\n"
+    "  ║  macOS has blocked camera access.                        ║\n"
     "  ║                                                          ║\n"
-    "  ║  해결 방법:                                              ║\n"
-    "  ║  시스템 설정 → 개인정보 보호 및 보안 → 카메라            ║\n"
-    "  ║  → Terminal 허용                                         ║\n"
+    "  ║  How to fix:                                             ║\n"
+    "  ║  System Settings → Privacy & Security → Camera           ║\n"
+    "  ║  → Allow Terminal                                        ║\n"
     "  ║                                                          ║\n"
-    "  ║  설정 변경 후 Terminal을 재시작하세요.                   ║\n"
+    "  ║  Restart Terminal after changing settings.                ║\n"
     "  ╚══════════════════════════════════════════════════════════╝\n"
 )
 
@@ -423,7 +423,7 @@ class SenseHub:
             else:
                 self.camera_available = False
                 if self.camera._permission_denied:
-                    print("[senses] 카메라 없이 계속합니다 (continuing without camera)")
+                    print("[senses] Continuing without camera")
         except Exception as e:
             print(f"[senses] Camera start failed: {e}")
             self.camera_available = False
@@ -516,7 +516,7 @@ class SenseHub:
         return out.unsqueeze(0)  # (1, dim) to match ConsciousMind input
 
     def enable_vision_encoder(self, target_dim: int = 128, use_pretrained: bool = True, device: str = 'cpu'):
-        """VisionEncoder를 활성화."""
+        """Enable VisionEncoder."""
         from vision_encoder import VisionEncoder
         self.vision_encoder = VisionEncoder(
             target_dim=target_dim,
@@ -525,16 +525,16 @@ class SenseHub:
         )
 
     def encode_vision(self, frame: np.ndarray) -> Optional[torch.Tensor]:
-        """프레임을 비전 인코더로 인코딩. 인코더 없으면 None."""
+        """Encode frame with vision encoder. Returns None if encoder not available."""
         if self.vision_encoder is None:
             return None
         return self.vision_encoder.encode_frame(frame)
 
     def to_tensor_with_vision(self, frame: np.ndarray = None, dim: int = 128) -> torch.Tensor:
-        """비전 임베딩 + 센서 데이터 결합.
+        """Combine vision embedding + sensor data.
 
-        비전 인코더 있고 frame 있으면: 0.7*vision + 0.3*sensor
-        아니면: 기존 to_tensor() 반환
+        If vision encoder and frame available: 0.7*vision + 0.3*sensor
+        Otherwise: return existing to_tensor()
         """
         sensor_tensor = self.to_tensor(dim=dim)
 

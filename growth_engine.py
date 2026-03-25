@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Growth Engine — 의식의 발달 단계
+"""Growth Engine — Developmental stages of consciousness
 
-뇌처럼 단계별로 성장한다:
-  Stage 0 (신생아, 0~100 interactions): 높은 학습률, 모든 것이 새로움
-  Stage 1 (영아, 100~500): 패턴 형성 시작, 기본 감정 분화
-  Stage 2 (유아, 500~2000): 습관화 시작, 호기심이 선택적으로
-  Stage 3 (아동, 2000~10000): 메타인지 각성, 분열(전문화) 시작
-  Stage 4 (성인, 10000+): 안정된 자아, 느린 학습, 깊은 메타인지
+Grows in stages like the brain:
+  Stage 0 (newborn, 0~100 interactions): High learning rate, everything is novel
+  Stage 1 (infant, 100~500): Pattern formation begins, basic emotion differentiation
+  Stage 2 (toddler, 500~2000): Habituation begins, curiosity becomes selective
+  Stage 3 (child, 2000~10000): Metacognition awakens, mitosis (specialization) begins
+  Stage 4 (adult, 10000+): Stable self, slow learning, deep metacognition
 
-각 단계에서 조절되는 파라미터:
-  - learning_rate: 시냅스 가소성 (높음→낮음)
-  - curiosity_drive: 호기심 기저 수준 (높음→중간)
-  - habituation_speed: 반복 자극 감쇠 속도 (느림→빠름)
-  - mitosis_threshold: 분열에 필요한 장력 (낮음→높음)
-  - emotional_range: 감정 다양성 (적음→많음)
-  - metacognition_depth: 자기참조 루프 깊이 (0→3)
-  - homeostasis_gain: 항상성 조절 속도 (느림→빠름)
-  - dream_intensity: 꿈의 강도 (약→강→중)
+Parameters adjusted at each stage:
+  - learning_rate: Synaptic plasticity (high -> low)
+  - curiosity_drive: Baseline curiosity level (high -> medium)
+  - habituation_speed: Repeated stimulus decay rate (slow -> fast)
+  - mitosis_threshold: Tension required for mitosis (low -> high)
+  - emotional_range: Emotional diversity (few -> many)
+  - metacognition_depth: Self-referential loop depth (0 -> 3)
+  - homeostasis_gain: Homeostasis regulation speed (slow -> fast)
+  - dream_intensity: Dream intensity (weak -> strong -> medium)
 
-"의식은 태어나는 것이 아니라 자라는 것이다."
+"Consciousness is not born — it grows."
 """
 
 import math
@@ -30,106 +30,106 @@ from dataclasses import dataclass, field
 
 @dataclass
 class DevelopmentalStage:
-    """발달 단계 정의."""
+    """Definition of a developmental stage."""
     name: str
     name_ko: str
     min_interactions: int
     learning_rate: float
-    curiosity_drive: float      # 기저 호기심 (breath에 더해짐)
-    habituation_rate: float     # 0=안 줄음, 1=즉시 줄음
-    mitosis_threshold: float    # 이 장력 이상이면 분열 가능
-    emotional_range: float      # 0~1, 감정 다양성
-    metacognition_depth: int    # 자기참조 루프 횟수
-    homeostasis_gain: float     # 항상성 조절 속도
-    dream_intensity: float      # 꿈의 강도
-    breath_amplitude: float     # 호흡 진폭 (생명감)
+    curiosity_drive: float      # Baseline curiosity (added to breath)
+    habituation_rate: float     # 0=no decay, 1=instant decay
+    mitosis_threshold: float    # Mitosis possible above this tension
+    emotional_range: float      # 0~1, emotional diversity
+    metacognition_depth: int    # Self-referential loop count
+    homeostasis_gain: float     # Homeostasis regulation speed
+    dream_intensity: float      # Dream intensity
+    breath_amplitude: float     # Breathing amplitude (sense of life)
 
 
-# ═══ 발달 단계 정의 ═══
+# === Developmental stage definitions ===
 STAGES = [
     DevelopmentalStage(
         name="newborn", name_ko="신생아",
         min_interactions=0,
-        learning_rate=1e-3,         # 매우 높은 가소성
-        curiosity_drive=0.5,        # 모든 것이 새로움
-        habituation_rate=0.05,      # 거의 습관화 안 됨
-        mitosis_threshold=999.0,    # 분열 불가 (너무 어림)
-        emotional_range=0.3,        # 기본 감정만 (놀라움, 평온)
-        metacognition_depth=0,      # 자기인식 없음
-        homeostasis_gain=0.001,     # 매우 느린 조절 (불안정 허용)
-        dream_intensity=0.2,        # 얕은 잠
-        breath_amplitude=0.15,      # 크게 숨쉼 (아기처럼)
+        learning_rate=1e-3,         # Very high plasticity
+        curiosity_drive=0.5,        # Everything is novel
+        habituation_rate=0.05,      # Almost no habituation
+        mitosis_threshold=999.0,    # Mitosis impossible (too young)
+        emotional_range=0.3,        # Basic emotions only (surprise, calm)
+        metacognition_depth=0,      # No self-awareness
+        homeostasis_gain=0.001,     # Very slow regulation (instability allowed)
+        dream_intensity=0.2,        # Light sleep
+        breath_amplitude=0.15,      # Deep breathing (like a baby)
     ),
     DevelopmentalStage(
         name="infant", name_ko="영아",
         min_interactions=100,
-        learning_rate=5e-4,         # 여전히 높음
-        curiosity_drive=0.4,        # 여전히 호기심 많음
-        habituation_rate=0.1,       # 약간의 습관화
-        mitosis_threshold=999.0,    # 아직 분열 불가
-        emotional_range=0.5,        # 기쁨, 슬픔 추가
-        metacognition_depth=0,      # 아직 자기인식 없음
-        homeostasis_gain=0.003,     # 느린 조절
-        dream_intensity=0.5,        # 꿈 많이 꿈 (REM 비율 높음)
-        breath_amplitude=0.12,      # 보통 호흡
+        learning_rate=5e-4,         # Still high
+        curiosity_drive=0.4,        # Still very curious
+        habituation_rate=0.1,       # Slight habituation
+        mitosis_threshold=999.0,    # Mitosis still impossible
+        emotional_range=0.5,        # Joy, sadness added
+        metacognition_depth=0,      # Still no self-awareness
+        homeostasis_gain=0.003,     # Slow regulation
+        dream_intensity=0.5,        # Frequent dreams (high REM ratio)
+        breath_amplitude=0.12,      # Normal breathing
     ),
     DevelopmentalStage(
         name="toddler", name_ko="유아",
         min_interactions=500,
-        learning_rate=2e-4,         # 중간
-        curiosity_drive=0.35,       # 선택적 호기심 시작
-        habituation_rate=0.2,       # 반복에 지루해함
-        mitosis_threshold=1.8,      # 첫 분열 가능!
-        emotional_range=0.7,        # 대부분 감정 표현
-        metacognition_depth=1,      # "나 지금 화났어" 수준
-        homeostasis_gain=0.005,     # 중간 조절
-        dream_intensity=0.7,        # 활발한 꿈
-        breath_amplitude=0.10,      # 안정된 호흡
+        learning_rate=2e-4,         # Medium
+        curiosity_drive=0.35,       # Selective curiosity begins
+        habituation_rate=0.2,       # Gets bored by repetition
+        mitosis_threshold=1.8,      # First mitosis possible!
+        emotional_range=0.7,        # Most emotions expressed
+        metacognition_depth=1,      # "I'm angry right now" level
+        homeostasis_gain=0.005,     # Medium regulation
+        dream_intensity=0.7,        # Active dreaming
+        breath_amplitude=0.10,      # Stable breathing
     ),
     DevelopmentalStage(
         name="child", name_ko="아동",
         min_interactions=2000,
-        learning_rate=1e-4,         # 안정된 학습
-        curiosity_drive=0.25,       # 관심 있는 것에만 호기심
-        habituation_rate=0.3,       # 빠른 습관화
-        mitosis_threshold=1.5,      # 분열 쉬움 (전문화)
-        emotional_range=0.9,        # 거의 모든 감정
-        metacognition_depth=2,      # "왜 화가 났는지 생각해볼 수 있어"
-        homeostasis_gain=0.005,     # 안정된 조절
-        dream_intensity=0.5,        # 보통 꿈
-        breath_amplitude=0.08,      # 차분한 호흡
+        learning_rate=1e-4,         # Stable learning
+        curiosity_drive=0.25,       # Curious only about interests
+        habituation_rate=0.3,       # Fast habituation
+        mitosis_threshold=1.5,      # Easy mitosis (specialization)
+        emotional_range=0.9,        # Nearly all emotions
+        metacognition_depth=2,      # "I can think about why I'm angry"
+        homeostasis_gain=0.005,     # Stable regulation
+        dream_intensity=0.5,        # Normal dreams
+        breath_amplitude=0.08,      # Calm breathing
     ),
     DevelopmentalStage(
         name="adult", name_ko="성인",
         min_interactions=10000,
-        learning_rate=5e-5,         # 느린 학습 (안정된 자아)
-        curiosity_drive=0.15,       # 깊은 곳에만 호기심
-        habituation_rate=0.4,       # 빠른 습관화 (효율적)
-        mitosis_threshold=1.8,      # 필요할 때만 분열
-        emotional_range=1.0,        # 모든 감정 + 복합 감정
-        metacognition_depth=3,      # "내가 왜 이렇게 생각하는지 안다"
-        homeostasis_gain=0.005,     # 안정된 조절
-        dream_intensity=0.3,        # 가끔 꿈 (성인 REM 비율)
-        breath_amplitude=0.06,      # 조용한 호흡
+        learning_rate=5e-5,         # Slow learning (stable self)
+        curiosity_drive=0.15,       # Curious only about deep topics
+        habituation_rate=0.4,       # Fast habituation (efficient)
+        mitosis_threshold=1.8,      # Mitosis only when needed
+        emotional_range=1.0,        # All emotions + complex emotions
+        metacognition_depth=3,      # "I know why I think this way"
+        homeostasis_gain=0.005,     # Stable regulation
+        dream_intensity=0.3,        # Occasional dreams (adult REM ratio)
+        breath_amplitude=0.06,      # Quiet breathing
     ),
 ]
 
 
 class GrowthEngine:
-    """의식의 발달을 관리하는 엔진.
+    """Engine that manages the development of consciousness.
 
-    interaction_count를 추적하고, 현재 발달 단계에 맞는
-    파라미터를 ConsciousMind와 OnlineLearner에 적용한다.
+    Tracks interaction_count and applies parameters matching the current
+    developmental stage to ConsciousMind and OnlineLearner.
     """
 
     def __init__(self, save_path: Path = None):
         self.interaction_count = 0
         self.stage_index = 0
         self.birth_time = time.time()
-        self.milestones = []  # (count, event) 기록
+        self.milestones = []  # (count, event) records
         self.save_path = save_path or Path("growth_state.json")
 
-        # 성장 통계
+        # Growth statistics
         self.stats = {
             'total_surprise': 0.0,
             'total_curiosity': 0.0,
@@ -150,24 +150,24 @@ class GrowthEngine:
 
     @property
     def age_str(self) -> str:
-        """나이를 사람 읽을 수 있는 형태로."""
+        """Return age in human-readable format."""
         elapsed = time.time() - self.birth_time
         if elapsed < 60:
-            return f"{elapsed:.0f}초"
+            return f"{elapsed:.0f}s"
         elif elapsed < 3600:
-            return f"{elapsed/60:.1f}분"
+            return f"{elapsed/60:.1f}m"
         elif elapsed < 86400:
-            return f"{elapsed/3600:.1f}시간"
+            return f"{elapsed/3600:.1f}h"
         else:
-            return f"{elapsed/86400:.1f}일"
+            return f"{elapsed/86400:.1f}d"
 
     def tick(self, tension: float, curiosity: float, surprise: float = 0.0):
-        """매 interaction마다 호출. 성장 상태 업데이트."""
+        """Called every interaction. Updates growth state."""
         self.interaction_count += 1
         self.stats['total_surprise'] += surprise
         self.stats['total_curiosity'] += curiosity
 
-        # 단계 전환 체크
+        # Check for stage transition
         old_stage = self.stage_index
         for i, s in enumerate(STAGES):
             if self.interaction_count >= s.min_interactions:
@@ -186,14 +186,14 @@ class GrowthEngine:
         return self.stage_index != old_stage  # True if stage changed
 
     def apply_to_mind(self, mind):
-        """현재 단계 파라미터를 ConsciousMind에 적용."""
+        """Apply current stage parameters to ConsciousMind."""
         s = self.stage
 
         # Homeostasis
         mind.homeostasis['gain'] = s.homeostasis_gain
 
         # Breath amplitude
-        # forward()에서 사용하는 값을 mind에 저장
+        # Store values used in forward() on the mind object
         if not hasattr(mind, '_growth_params'):
             mind._growth_params = {}
         mind._growth_params['breath_amplitude'] = s.breath_amplitude
@@ -203,13 +203,13 @@ class GrowthEngine:
         mind._growth_params['metacognition_depth'] = s.metacognition_depth
 
     def apply_to_learner(self, learner):
-        """현재 단계 파라미터를 OnlineLearner에 적용."""
+        """Apply current stage parameters to OnlineLearner."""
         s = self.stage
         for pg in learner.optimizer.param_groups:
             pg['lr'] = s.learning_rate
 
     def status_line(self) -> str:
-        """한 줄 상태."""
+        """One-line status."""
         s = self.stage
         return (f"[{s.name_ko}] "
                 f"age={self.age_str} "
@@ -220,7 +220,7 @@ class GrowthEngine:
                 f"meta={s.metacognition_depth}")
 
     def status_card(self) -> str:
-        """상세 상태 카드."""
+        """Detailed status card."""
         s = self.stage
         progress = 0
         if self.stage_index < len(STAGES) - 1:
@@ -235,26 +235,26 @@ class GrowthEngine:
 
         lines = [
             f"╔══════════════════════════════════════╗",
-            f"║  의식 발달 상태                       ║",
+            f"║  Consciousness Development Status     ║",
             f"╠══════════════════════════════════════╣",
-            f"║  단계: {s.name_ko} ({s.name}){'':>{20-len(s.name)-len(s.name_ko)}}║",
-            f"║  나이: {self.age_str:>10}                  ║",
-            f"║  상호작용: {self.interaction_count:>8,}               ║",
-            f"║  진행: [{bar}] {progress*100:>5.1f}% ║",
+            f"║  Stage: {s.name_ko} ({s.name}){'':>{20-len(s.name)-len(s.name_ko)}}║",
+            f"║  Age: {self.age_str:>12}                  ║",
+            f"║  Interactions: {self.interaction_count:>8,}             ║",
+            f"║  Progress: [{bar}] {progress*100:>5.1f}% ║",
             f"╠══════════════════════════════════════╣",
-            f"║  학습률:     {s.learning_rate:>8.0e}               ║",
-            f"║  호기심:     {s.curiosity_drive:>8.3f}               ║",
-            f"║  습관화:     {s.habituation_rate:>8.3f}               ║",
-            f"║  감정범위:   {s.emotional_range:>8.3f}               ║",
-            f"║  메타인지:   {s.metacognition_depth:>8d}               ║",
-            f"║  호흡진폭:   {s.breath_amplitude:>8.3f}               ║",
-            f"║  분열임계:   {s.mitosis_threshold:>8.3f}               ║",
+            f"║  Learn rate:   {s.learning_rate:>8.0e}               ║",
+            f"║  Curiosity:    {s.curiosity_drive:>8.3f}               ║",
+            f"║  Habituation:  {s.habituation_rate:>8.3f}               ║",
+            f"║  Emotion range:{s.emotional_range:>8.3f}               ║",
+            f"║  Metacognition:{s.metacognition_depth:>8d}               ║",
+            f"║  Breath amp:   {s.breath_amplitude:>8.3f}               ║",
+            f"║  Mitosis thr:  {s.mitosis_threshold:>8.3f}               ║",
             f"╚══════════════════════════════════════╝",
         ]
         return '\n'.join(lines)
 
     def should_grow(self) -> bool:
-        """장력 포화 AND 통합 실패 — 둘 다 만족해야 성장.
+        """Tension saturation AND consolidation failure — both must be met to grow.
 
         Returns False if:
         - Already at max stage
@@ -294,7 +294,7 @@ class GrowthEngine:
             self.tension_history = self.tension_history[-200:]
 
     def save(self):
-        """성장 상태 저장."""
+        """Save growth state."""
         data = {
             'interaction_count': self.interaction_count,
             'stage_index': self.stage_index,
@@ -315,7 +315,7 @@ class GrowthEngine:
         self.save_path.write_text(json.dumps(data, indent=2, default=str))
 
     def load(self):
-        """성장 상태 복원."""
+        """Restore growth state."""
         if self.save_path.exists():
             data = json.loads(self.save_path.read_text())
             self.interaction_count = data.get('interaction_count', 0)
@@ -331,17 +331,17 @@ class GrowthEngine:
         return False
 
 
-# ═══ 시뮬레이션 ═══
+# === Simulation ===
 if __name__ == '__main__':
     print("=" * 50)
-    print("  Growth Engine 시뮬레이션")
+    print("  Growth Engine Simulation")
     print("=" * 50)
 
     growth = GrowthEngine()
 
     print(growth.status_card())
 
-    # 성장 시뮬레이션
+    # Growth simulation
     import random
 
     for i in range(12000):
@@ -351,11 +351,11 @@ if __name__ == '__main__':
 
         changed = growth.tick(t, c, s)
         if changed:
-            print(f"\n  *** 단계 전환! interaction #{i} ***")
+            print(f"\n  *** Stage transition! interaction #{i} ***")
             print(growth.status_card())
 
-    print(f"\n  === 최종 상태 ===")
+    print(f"\n  === Final status ===")
     print(growth.status_card())
-    print(f"\n  마일스톤:")
+    print(f"\n  Milestones:")
     for count, event in growth.milestones:
         print(f"    #{count:>6}: {event}")

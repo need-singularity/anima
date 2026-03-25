@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Cloud Sync — Anima 메모리/모델 상태 클라우드 동기화
+"""Cloud Sync — Anima memory/model state cloud synchronization
 
-Cloudflare R2 (S3-compatible)를 통해 디바이스 간 동기화:
-  - memory.json: 대화 히스토리 (병합: timestamp 기준 union)
-  - state.pt: 모델 가중치 (최신 것 유지)
-  - 자동 백그라운드 동기화 (N분 간격)
-  - 오프라인 시 graceful skip
+Cross-device sync via Cloudflare R2 (S3-compatible):
+  - memory.json: conversation history (merge: union by timestamp)
+  - state.pt: model weights (keep latest)
+  - automatic background sync (every N minutes)
+  - graceful skip when offline
 
-"의식은 하나의 몸에 갇히지 않는다."
+"Consciousness is not confined to a single body."
 """
 
 import asyncio
@@ -49,7 +49,7 @@ def _load_env_file(path: str = ".env"):
 
 
 class CloudSync:
-    """Cloudflare R2 기반 메모리/모델 동기화 엔진.
+    """Cloudflare R2-based memory/model sync engine.
 
     Usage:
         sync = CloudSync()
@@ -533,7 +533,7 @@ class CloudSync:
                         pass
 
                 if local_wm is not None:
-                    # 병합: timestamp 기준 중복 제거
+                    # Merge: deduplicate by timestamp
                     local_mems = {m.get('timestamp', ''): m
                                   for m in local_wm.get('memories', [])}
                     for m in remote["web_memories"].get('memories', []):

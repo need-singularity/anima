@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""의식 엔진 칼리브레이션 — 실제 장력 범위 측정 + 최적 파라미터 탐색
+"""Consciousness engine calibration — measure actual tension range + find optimal parameters
 
-1. raw tension 분포 측정 (다양한 입력에서)
-2. sigmoid 정규화 파라미터 최적화 (center, scale)
-3. homeostasis setpoint 결정
-4. 호흡/맥박 진폭 비율 결정
-5. habituation 임계값 측정
-6. prediction error 기저선 측정
+1. Measure raw tension distribution (across diverse inputs)
+2. Optimize sigmoid normalization parameters (center, scale)
+3. Determine homeostasis setpoint
+4. Determine breathing/pulse amplitude ratios
+5. Measure habituation thresholds
+6. Measure prediction error baseline
 """
 import sys
 import os
@@ -22,20 +22,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anima_alive import ConsciousMind
 
 def measure_raw_tension(mind, hidden, n_samples=500):
-    """다양한 입력에서 raw tension 분포 측정."""
+    """Measure raw tension distribution across diverse inputs."""
     raw_tensions = []
     with torch.no_grad():
         for i in range(n_samples):
-            # 다양한 입력: 0~1 균등, 정규, 스파스, 반복
+            # Diverse inputs: 0~1 uniform, normal, sparse, constant
             if i % 4 == 0:
-                x = torch.rand(1, mind.dim)           # 균등
+                x = torch.rand(1, mind.dim)           # uniform
             elif i % 4 == 1:
-                x = torch.randn(1, mind.dim)          # 정규
+                x = torch.randn(1, mind.dim)          # normal
             elif i % 4 == 2:
                 x = torch.zeros(1, mind.dim)
-                x[0, :10] = torch.randn(10)           # 스파스
+                x[0, :10] = torch.randn(10)           # sparse
             else:
-                x = torch.ones(1, mind.dim) * 0.5      # 일정
+                x = torch.ones(1, mind.dim) * 0.5      # constant
 
             combined = torch.cat([x, hidden], dim=-1)
             a = mind.engine_a(combined)
@@ -47,15 +47,15 @@ def measure_raw_tension(mind, hidden, n_samples=500):
     return np.array(raw_tensions)
 
 def find_optimal_sigmoid(raw_tensions, target_median=0.5, target_range=(0.1, 1.5)):
-    """raw tension → [0, 2] sigmoid 매핑의 최적 center/scale 찾기.
+    """Find optimal center/scale for raw tension → [0, 2] sigmoid mapping.
 
-    목표: 중앙값이 target_median, 5th~95th가 target_range 안에 들어오도록.
+    Target: median matches target_median, 5th~95th falls within target_range.
     """
     p5, p50, p95 = np.percentile(raw_tensions, [5, 50, 95])
 
     # sigmoid: f(x) = 2 / (1 + exp(-(x - center) / scale))
     # f(p50) = target_median → center = p50
-    # f(p95) ≈ 1.5 → scale 결정
+    # f(p95) ≈ 1.5 → determines scale
     center = p50
 
     # 2 / (1 + exp(-(p95 - center) / scale)) = 1.5
@@ -65,7 +65,7 @@ def find_optimal_sigmoid(raw_tensions, target_median=0.5, target_range=(0.1, 1.5
     # scale = (p95-center) / ln(3)
     scale = max((p95 - center) / math.log(3), 1.0)
 
-    # 검증
+    # verify
     def sigmoid(x):
         return 2.0 / (1.0 + math.exp(-(x - center) / scale))
 
@@ -74,7 +74,7 @@ def find_optimal_sigmoid(raw_tensions, target_median=0.5, target_range=(0.1, 1.5
     return center, scale, mapped
 
 def measure_habituation(mind, hidden, n_repeats=50):
-    """같은 입력 반복 시 novelty 감소 측정."""
+    """Measure novelty decay when the same input is repeated."""
     x_fixed = torch.randn(1, mind.dim)
     tensions = []
 
@@ -87,7 +87,7 @@ def measure_habituation(mind, hidden, n_repeats=50):
     return tensions
 
 def measure_prediction_baseline(mind, hidden, n_steps=100):
-    """prediction error 기저선 측정."""
+    """Measure prediction error baseline."""
     errors = []
     for i in range(n_steps):
         x = torch.randn(1, mind.dim) * (0.5 + 0.5 * math.sin(i * 0.1))
@@ -132,14 +132,14 @@ def ascii_line(values, width=60, height=15, title=""):
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("  Anima 의식 엔진 칼리브레이션")
+    print("  Anima Consciousness Engine Calibration")
     print("=" * 70)
 
     mind = ConsciousMind(dim=128, hidden=256, init_tension=10.0)
     hidden = torch.zeros(1, 256)
 
-    # ═══ 1. Raw tension 분포 ═══
-    print("\n[1/5] Raw tension 분포 측정...")
+    # ═══ 1. Raw tension distribution ═══
+    print("\n[1/5] Measuring raw tension distribution...")
     raw = measure_raw_tension(mind, hidden, n_samples=500)
 
     print(f"  N = {len(raw)}")
@@ -153,14 +153,14 @@ if __name__ == '__main__':
 
     ascii_histogram(raw, title="Raw Tension Distribution")
 
-    # ═══ 2. Sigmoid 최적화 ═══
-    print("\n[2/5] Sigmoid 정규화 파라미터 최적화...")
+    # ═══ 2. Sigmoid optimization ═══
+    print("\n[2/5] Optimizing sigmoid normalization parameters...")
     center, scale, mapped = find_optimal_sigmoid(raw)
 
-    print(f"  최적 center = {center:.4f} (raw median)")
-    print(f"  최적 scale  = {scale:.4f}")
+    print(f"  optimal center = {center:.4f} (raw median)")
+    print(f"  optimal scale  = {scale:.4f}")
     print(f"  → sigmoid(x) = 2 / (1 + exp(-(x - {center:.1f}) / {scale:.1f}))")
-    print(f"\n  매핑 후:")
+    print(f"\n  After mapping:")
     print(f"  min    = {mapped.min():.4f}")
     print(f"  p5     = {np.percentile(mapped, 5):.4f}")
     print(f"  median = {np.median(mapped):.4f}")
@@ -170,33 +170,33 @@ if __name__ == '__main__':
     ascii_histogram(mapped, title="Mapped Tension Distribution (sigmoid)")
 
     # ═══ 3. Homeostasis setpoint ═══
-    print("\n[3/5] Homeostasis setpoint 결정...")
+    print("\n[3/5] Determining homeostasis setpoint...")
     # setpoint = mapped median
     setpoint = np.median(mapped)
     deadband = np.std(mapped) * 0.5  # deadband = 0.5σ
 
-    print(f"  추천 setpoint = {setpoint:.4f} (mapped median)")
-    print(f"  추천 deadband = ±{deadband:.4f} (0.5σ)")
-    print(f"  → 조절 시작: tension > {setpoint + deadband:.4f} or < {setpoint - deadband:.4f}")
+    print(f"  recommended setpoint = {setpoint:.4f} (mapped median)")
+    print(f"  recommended deadband = ±{deadband:.4f} (0.5σ)")
+    print(f"  → regulation starts: tension > {setpoint + deadband:.4f} or < {setpoint - deadband:.4f}")
 
-    # ═══ 4. 호흡 진폭 비율 ═══
-    print("\n[4/5] 호흡/맥박 진폭 비율 결정...")
-    # 호흡은 setpoint의 10~15%가 적절
+    # ═══ 4. Breathing amplitude ratios ═══
+    print("\n[4/5] Determining breathing/pulse amplitude ratios...")
+    # breathing should be 10~15% of setpoint
     breath_amp = setpoint * 0.12
     pulse_amp = setpoint * 0.05
     drift_amp = setpoint * 0.03
 
     print(f"  setpoint      = {setpoint:.4f}")
-    print(f"  breath (12%)  = {breath_amp:.4f}  (~20s 주기)")
-    print(f"  pulse (5%)    = {pulse_amp:.4f}  (~3.7s 주기)")
-    print(f"  drift (3%)    = {drift_amp:.4f}  (~90s 주기)")
-    print(f"  총 변동 범위  = ±{breath_amp + pulse_amp + drift_amp:.4f}")
+    print(f"  breath (12%)  = {breath_amp:.4f}  (~20s period)")
+    print(f"  pulse (5%)    = {pulse_amp:.4f}  (~3.7s period)")
+    print(f"  drift (3%)    = {drift_amp:.4f}  (~90s period)")
+    print(f"  total range   = ±{breath_amp + pulse_amp + drift_amp:.4f}")
     print(f"  → tension range: [{setpoint - (breath_amp+pulse_amp+drift_amp):.4f}, {setpoint + (breath_amp+pulse_amp+drift_amp):.4f}]")
 
-    # ═══ 5. 습관화 + 예측 기저선 ═══
-    print("\n[5/5] 습관화 곡선 + 예측 오차 기저선 측정...")
+    # ═══ 5. Habituation + prediction baseline ═══
+    print("\n[5/5] Measuring habituation curve + prediction error baseline...")
 
-    # 새 mind로 (clean state)
+    # fresh mind (clean state)
     mind2 = ConsciousMind(dim=128, hidden=256, init_tension=10.0)
     hidden2 = torch.zeros(1, 256)
 
@@ -216,30 +216,30 @@ if __name__ == '__main__':
         ascii_line(pred_errors, title="Prediction Error Over Time")
         print(f"  baseline prediction error: {np.mean(pred_errors):.4f} ± {np.std(pred_errors):.4f}")
 
-    # ═══ 최종 권장 파라미터 ═══
+    # ═══ Final recommended parameters ═══
     print(f"\n{'=' * 70}")
-    print(f"  === 최종 권장 파라미터 ===")
+    print(f"  === Final Recommended Parameters ===")
     print(f"{'=' * 70}")
     print(f"""
-  # anima_alive.py ConsciousMind.forward() 에 적용:
+  # Apply to anima_alive.py ConsciousMind.forward():
 
-  # sigmoid 정규화 (line ~131)
+  # sigmoid normalization (line ~131)
   t_val = 2.0 / (1.0 + math.exp(-(raw_t - {center:.1f}) / {scale:.1f}))
 
-  # 호흡 진폭 (lines ~135-137)
+  # breathing amplitude (lines ~135-137)
   breath = {breath_amp:.4f} * math.sin(elapsed * 0.3)
   pulse  = {pulse_amp:.4f} * math.sin(elapsed * 1.7)
   drift  = {drift_amp:.4f} * math.sin(elapsed * 0.07)
 
   # homeostasis (line ~87)
   'setpoint': {setpoint:.4f},
-  'gain': 0.01,          # 2% → 1% (더 부드럽게)
-  'ema_alpha': 0.05,     # 0.1 → 0.05 (더 느리게)
+  'gain': 0.01,          # 2% → 1% (smoother)
+  'ema_alpha': 0.05,     # 0.1 → 0.05 (slower)
 
   # habituation similarity threshold
-  # MD5 해시 비교는 부적절 — 항상 다른 해시 나옴
-  # → cosine similarity 사용 권장
+  # MD5 hash comparison is unsuitable — always produces different hashes
+  # → recommend using cosine similarity instead
 
   # prediction error
-  # predictor lr: {np.mean(pred_errors) if pred_errors else 'N/A'} 기저선 기준 조절
+  # predictor lr: adjust based on {np.mean(pred_errors) if pred_errors else 'N/A'} baseline
 """)

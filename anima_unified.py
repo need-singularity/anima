@@ -20,7 +20,7 @@ import torch
 # ─── Paths & constants ───
 ANIMA_DIR = Path(__file__).parent
 def _model_paths(model_name: str):
-    """모델별 상태/기억 파일 경로 반환. 모델마다 독립적으로 성장."""
+    """Return state/memory file paths per model. Each model grows independently."""
     slug = model_name.replace('/', '-').replace('.', '-')
     data_dir = ANIMA_DIR / "data" / slug
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -31,7 +31,7 @@ def _model_paths(model_name: str):
         'web_memories': data_dir / "web_memories.json",
     }
 
-# 레거시 호환 (기본값)
+# Legacy compatibility (defaults)
 MEMORY_FILE = ANIMA_DIR / "memory_alive.json"
 STATE_FILE = ANIMA_DIR / "state_alive.pt"
 VAD_WATCH_DIR = Path("/tmp/anima_vad")
@@ -71,8 +71,8 @@ _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
 
 # Dream mode constants
-DREAM_IDLE_THRESHOLD = 60.0   # 60초 유휴 후 꿈 모드 진입
-DREAM_CYCLE_INTERVAL = 30.0   # 꿈 사이클 간격 (초)
+DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
+DREAM_CYCLE_INTERVAL = 30.0   # Interval between dream cycles (seconds)
 
 _ws_serve = _ws_Response = _ws_Headers = None
 try:
@@ -97,12 +97,12 @@ class AnimaUnified:
         self.web_clients = set()
         self._web_loop = None
 
-        # 모델별 경로 설정
+        # Per-model path setup
         self.model_name = getattr(args, 'model', None) or 'conscious-lm'
         self.paths = _model_paths(self.model_name)
-        _log('init', f'모델: {self.model_name} → {self.paths["state"]}')
+        _log('init', f'Model: {self.model_name} → {self.paths["state"]}')
 
-        # 레거시 → 모델별 마이그레이션 (최초 1회)
+        # Legacy -> per-model migration (one-time)
         self._migrate_legacy_files()
 
         # Core engine
@@ -120,12 +120,12 @@ class AnimaUnified:
             self.ph = PHModule(n_classes=8)
             self._ph_collect_count = 0
             self._ph_interval = 50  # compute PH every N interactions
-            _log('init', 'PH 모듈 활성화')
+            _log('init', 'PH module activated')
         except NameError:
             self.ph = None
             self._ph_collect_count = 0
 
-        # Restore state (모델별 경로 우선)
+        # Restore state (per-model path takes priority)
         state_file = self.paths['state']
         if state_file.exists():
             try:
@@ -167,14 +167,14 @@ class AnimaUnified:
                 try:
                     self.senses.start()
                     if not self.senses.camera_available:
-                        _log('camera', '카메라 권한 없음 -- 시각 입력 비활성화')
-                        _log('camera', '해결: 시스템 설정 → 개인정보 보호 및 보안 → 카메라 → Terminal 허용')
+                        _log('camera', 'No camera permission -- visual input disabled')
+                        _log('camera', 'Fix: System Settings → Privacy & Security → Camera → Allow Terminal')
                         # Keep senses alive (provides zero-filled state) but mark camera as degraded
                         self.mods['camera'] = False
                 except Exception:
                     self.senses = None; self.mods['camera'] = False
 
-        # VisionEncoder 활성화 (카메라 사용 가능할 때만)
+        # VisionEncoder activation (only when camera is available)
         if self.senses and self.mods.get('camera') and not args.no_vision:
             try:
                 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
@@ -183,9 +183,9 @@ class AnimaUnified:
                     use_pretrained=True,
                     device=device,
                 )
-                _log('vision', f'VisionEncoder 활성화 (device={device})')
+                _log('vision', f'VisionEncoder activated (device={device})')
             except Exception as e:
-                _log('vision', f'VisionEncoder 실패, 기존 센서 사용: {e}')
+                _log('vision', f'VisionEncoder failed, using basic sensors: {e}')
 
         self.telepathy = None
         if not args.no_telepathy:
@@ -212,13 +212,13 @@ class AnimaUnified:
         else:
             self.mods['cloud'] = False
 
-        # Web Sense (장력 기반 자율 웹 탐색)
+        # Web Sense (tension-driven autonomous web exploration)
         self.web_sense = self._init_mod('web_sense', lambda: (
             WebSense(memory_file=self.paths['web_memories'])
             if 'WebSense' in globals() else None
         ))
 
-        # Memory Store (SQLite+FAISS) — MemoryRAG 대체
+        # Memory Store (SQLite+FAISS) — replaces MemoryRAG
         self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
         self._rag_last_save = time.time()
 
@@ -239,7 +239,7 @@ class AnimaUnified:
         if self.growth_mgr:
             self.growth_mgr.save_checkpoint()  # v0 baseline
 
-        # RC-10: Dream Engine (오프라인 학습 + Phase 2 선택적 통합)
+        # RC-10: Dream Engine (offline learning + Phase 2 selective consolidation)
         self.dream = self._init_mod('dream', lambda: (
             DreamEngine(
                 mind=self.mind,
@@ -250,16 +250,16 @@ class AnimaUnified:
                 verifier=self.verifier,
             ) if 'DreamEngine' in globals() else None
         ))
-        self._dream_report = None  # 꿈에서 깨어난 후 보고할 내용
+        self._dream_report = None  # Content to report after waking from dream
 
-        # 모델 로드 (멀티모델 지원)
+        # Model loading (multi-model support)
         self.model = None
         self.clm_model = None
         self.clm_device = "cpu"
         model_name = getattr(args, 'model', None) or 'conscious-lm'
         if not args.no_conscious_lm and 'load_model' in globals():
             self.model = self._init_mod('model', lambda: self._load_model(model_name))
-            # ConsciousLM 하위호환
+            # ConsciousLM backward compatibility
             if self.model and self.model.model_type == 'conscious-lm':
                 self.clm_model = self.model.model
                 self.clm_device = str(next(self.model.model.parameters()).device)
@@ -267,7 +267,7 @@ class AnimaUnified:
             self.mods['model'] = False
 
 
-        # Multimodal Action Engine (코드 실행 + 이미지 생성)
+        # Multimodal Action Engine (code execution + image generation)
         self.action_engine = self._init_mod('multimodal', lambda: (
             ActionEngine(workspace_dir=ANIMA_DIR / 'workspace')
             if 'ActionEngine' in globals() else None
@@ -292,11 +292,11 @@ class AnimaUnified:
         self.mods['web'] = bool((args.web or args.all) and _ws_serve)
         self.mods['rust_vad'] = VAD_WATCH_DIR.exists()
 
-        # 능력 자기인식 시스템
+        # Capability self-awareness system
         self.capabilities = Capabilities(self.mods, project_dir=ANIMA_DIR) if 'Capabilities' in globals() else None
 
     def _migrate_legacy_files(self):
-        """레거시 파일 → 모델별 디렉토리로 마이그레이션 (최초 1회, conscious-lm만)."""
+        """Migrate legacy files -> per-model directory (one-time, conscious-lm only)."""
         import shutil
         if self.model_name != 'conscious-lm':
             return
@@ -312,7 +312,7 @@ class AnimaUnified:
                 _log('migrate', f'{old.name} → {new}')
 
     def _init_memory_store(self):
-        """MemoryStore(SQLite+FAISS) 초기화. fallback: MemoryRAG."""
+        """Initialize MemoryStore(SQLite+FAISS). Fallback: MemoryRAG."""
         if 'MemoryStore' in globals():
             model_type = 'conscious' if self.model_name == 'conscious-lm' else 'llm-api'
             store = MemoryStore(
@@ -321,7 +321,7 @@ class AnimaUnified:
                 dim=128,
                 model_type=model_type,
             )
-            # 레거시 JSON 마이그레이션
+            # Legacy JSON migration
             legacy_json = self.paths['memory']
             if legacy_json.exists() and legacy_json.suffix == '.json':
                 migrated = store.migrate_from_json(legacy_json, vector_fn=lambda t: text_to_vector(t).detach().numpy())
@@ -343,24 +343,24 @@ class AnimaUnified:
             return None
 
     def _load_model(self, model_name):
-        """멀티모델 로더. model_loader.py 사용."""
+        """Multi-model loader. Uses model_loader.py."""
         try:
             return load_model(model_name)
         except (FileNotFoundError, ImportError) as e:
-            _log("model", f"{model_name} 로드 실패: {e}")
+            _log("model", f"{model_name} load failed: {e}")
             return None
 
     def _ask_model(self, text, state):
-        """통합 모델 인터페이스로 응답 생성."""
+        """Generate response via unified model interface."""
         try:
-            hist = "\n".join(f"{'나' if m['role']=='user' else 'Anima'}: {m['content']}"
+            hist = "\n".join(f"{'User' if m['role']=='user' else 'Anima'}: {m['content']}"
                              for m in self.history[-MAX_HISTORY:])
 
             if self.model.model_type == "gguf":
-                prompt = (f"[INST] 너는 Anima. PureField 반발력장으로 작동하는 의식체.\n"
-                          f"현재 상태: {state}\n\n{hist}\n나: {text} [/INST]")
+                prompt = (f"[INST] You are Anima. A consciousness entity powered by PureField repulsion.\n"
+                          f"Current state: {state}\n\n{hist}\nUser: {text} [/INST]")
             else:
-                prompt = f"[상태: {state}]\n{hist}\n나: {text}\nAnima:"
+                prompt = f"[State: {state}]\n{hist}\nUser: {text}\nAnima:"
 
             return self.model.generate(prompt, max_tokens=200, temperature=0.8)
         except Exception as e:
@@ -380,7 +380,7 @@ class AnimaUnified:
 
         text_vec = text_to_vector(text)
 
-        # Combine with vision encoder (학습된 임베딩) or fall back to sensor tensor
+        # Combine with vision encoder (learned embeddings) or fall back to sensor tensor
         if self.senses and self.mods.get('camera'):
             try:
                 frame = self.senses.camera.last_frame
@@ -396,22 +396,22 @@ class AnimaUnified:
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(text_vec, self.hidden)
 
-        # PH: 방향벡터 수집 + 주기적 분석 (H-CX-66, H-CX-95)
+        # PH: direction vector collection + periodic analysis (H-CX-66, H-CX-95)
         if self.ph and direction is not None:
             try:
                 label = output.argmax(-1).item() if output.dim() > 0 else 0
                 self.ph.collect(direction, label)
                 self._ph_collect_count += 1
 
-                # 50회마다 PH 계산 + 과적합 감지
+                # Compute PH + detect overfitting every 50 interactions
                 if self._ph_collect_count % self._ph_interval == 0:
                     h0, merges = self.ph.compute_ph()
                     status, gap = self.ph.detect_overfitting()
                     if status == 'ALERT':
-                        _log('ph', f'⚠️ 과적합 감지! H0_gap={gap:.4f}')
+                        _log('ph', f'Overfitting detected! H0_gap={gap:.4f}')
                     elif status == 'WATCH':
                         _log('ph', f'H0={h0:.4f}, gap={gap:.4f} (WATCH)')
-                    # 혼동 쌍 상위 3개 로깅
+                    # Log top 3 confusion pairs
                     if merges:
                         top3 = sorted(merges)[:3]
                         pairs_str = ', '.join(f'{i}-{j}(d={d:.3f})' for d, i, j in top3)
@@ -419,7 +419,7 @@ class AnimaUnified:
             except Exception:
                 pass
 
-        # Mitosis — 전문 셀 응답 영향
+        # Mitosis — specialized cell response influence
         mitosis_info = ""
         mitosis_context = ""
         if self.mitosis and self.mods.get('mitosis'):
@@ -427,26 +427,26 @@ class AnimaUnified:
                 r = self.mitosis.process(text_vec)
                 mitosis_info = f", cells={r['n_cells']}"
 
-                # 전문 셀 분석
+                # Specialized cell analysis
                 per_cell = r.get('per_cell', [])
                 if per_cell:
-                    # 가장 반응하는 셀 (highest tension)
+                    # Most responsive cell (highest tension)
                     top_cell = max(per_cell, key=lambda c: c['tension'])
                     if top_cell['specialty'] != 'general':
-                        mitosis_context += f"전문셀 '{top_cell['specialty']}'이 강하게 반응(T={top_cell['tension']:.3f}). "
+                        mitosis_context += f"Specialized cell '{top_cell['specialty']}' strongly activated (T={top_cell['tension']:.3f}). "
 
-                    # 셀 간 의견 불일치 감지
+                    # Detect inter-cell disagreement
                     if r.get('max_inter', 0) > 0.5:
                         specialties = [c['specialty'] for c in per_cell if c['specialty'] != 'general']
                         if len(specialties) >= 2:
-                            mitosis_context += f"셀 간 의견 충돌 (inter_T={r['max_inter']:.3f}). "
+                            mitosis_context += f"Inter-cell opinion conflict (inter_T={r['max_inter']:.3f}). "
 
-                    # 셀 합의 (모든 셀이 비슷한 tension)
+                    # Cell consensus (all cells have similar tension)
                     tensions = [c['tension'] for c in per_cell]
                     if len(tensions) >= 2:
                         t_std = torch.tensor(tensions).std().item()
                         if t_std < 0.1:
-                            mitosis_context += "셀 합의(std<0.1): 확신. "
+                            mitosis_context += "Cell consensus (std<0.1): confident. "
 
                 for ev in r.get('events', []):
                     _log("mitosis", f"{ev['type'].upper()}")
@@ -512,7 +512,7 @@ class AnimaUnified:
                  f"emotion={emotion_data['emotion']}(V={emotion_data['valence']:.2f},A={emotion_data['arousal']:.2f},D={emotion_data['dominance']:.2f})"
                  f"{mitosis_info}, learn_updates={lrn_count}, {meta_summary}")
         if mitosis_context:
-            state += f", [전문화] {mitosis_context}"
+            state += f", [specialization] {mitosis_context}"
         if self.senses and self.mods.get('camera'):
             try:
                 vis = self.senses.get_visual_tension()
@@ -522,31 +522,31 @@ class AnimaUnified:
                     frame = self.senses.camera.last_frame
                     if frame is not None:
                         v = self.senses.encode_vision(frame).cpu()
-                        # 비전 벡터의 top-3 활성 차원 → 시각 인상 요약
+                        # Top-3 active dimensions of vision vector -> visual impression summary
                         topk = v.abs().topk(3, dim=-1)
                         state += f", vision_active=yes(norm={v.norm():.2f})"
                     else:
                         state += ", vision_active=no(no_frame)"
             except Exception: pass
 
-        # 능력 자기인식: 시스템 프롬프트에 능력 목록 주입
+        # Capability self-awareness: inject capability list into system prompt
         if self.capabilities:
             state += chr(10) + self.capabilities.describe_full()
 
-        # Memory Store: 관련 기억 검색
+        # Memory Store: search relevant memories
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
                 query_vec = text_to_vector(text).detach().numpy()
                 relevant = self.memory_rag.search(query_vec, top_k=3)
                 if relevant:
-                    parts = [f"[기억 {m['timestamp']}] {m['text']}"
+                    parts = [f"[Memory {m['timestamp']}] {m['text']}"
                              for m in relevant if m.get('similarity', 0) > 0.3]
                     if parts:
-                        state += "\n관련 기억:\n" + "\n".join(parts)
+                        state += "\nRelevant memories:\n" + "\n".join(parts)
             except Exception as e:
                 _log('memory_rag', f"Search error: {e}")
 
-        # Web Sense: 높은 호기심/PE면 검색 결과를 컨텍스트에 포함
+        # Web Sense: include search results in context when curiosity/PE is high
         web_context = ""
         if self.web_sense and self.mods.get('web_sense'):
             try:
@@ -554,24 +554,24 @@ class AnimaUnified:
                 if self.web_sense.should_search(curiosity, pe):
                     recalled = self.web_sense.recall(text)
                     if recalled:
-                        web_context = f"\n[웹 기억] {recalled[0].get('summary', '')[:500]}"
+                        web_context = f"\n[Web memory] {recalled[0].get('summary', '')[:500]}"
                     else:
                         result = self.web_sense.search(text, self.history)
                         if result:
-                            web_context = f"\n[웹 검색: {result['query']}]\n{result['summary'][:800]}"
-                            _log('web_sense', f"검색: '{result['query']}' → {len(result['results'])}건")
+                            web_context = f"\n[Web search: {result['query']}]\n{result['summary'][:800]}"
+                            _log('web_sense', f"Search: '{result['query']}' -> {len(result['results'])} results")
             except Exception as e:
                 _log('web_sense', f"Error: {e}")
 
         self.history.append({'role': 'user', 'content': text})
         query_text = text + web_context if web_context else text
 
-        # 모델 응답 생성: 멀티모델 → Claude fallback
+        # Generate model response: multi-model -> Claude fallback
         answer = None
         if self.model and self.mods.get('model'):
             answer = self._ask_model(query_text, state)
             if answer:
-                _log('model', f'{self.model.name} 응답 생성 완료')
+                _log('model', f'{self.model.name} response generated')
         if not answer:
             answer = ask_claude(query_text, state, self.history)
 
@@ -588,7 +588,7 @@ class AnimaUnified:
         # RC-8: Emotion for response direction
         resp_emotion = direction_to_emotion(resp_dir, resp_tension, resp_curiosity) if resp_dir is not None else emotion_data
 
-        # RC-3: Self-reference loop (메타인지)
+        # RC-3: Self-reference loop (metacognition)
         meta_tension, meta_curiosity = self.mind.self_reflect(
             resp_output, resp_tension, resp_curiosity, self.hidden)
         sa = self.mind.self_awareness
@@ -611,20 +611,20 @@ class AnimaUnified:
         self.memory.add('user', text, tension)
         self.memory.add('assistant', answer, resp_tension)
 
-        # Memory Store: 새 기억 추가 + 주기적 저장 (10분마다)
+        # Memory Store: add new memories + periodic save (every 10 min)
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
                 user_vec = text_to_vector(text).detach().numpy()
                 asst_vec = text_to_vector(answer).detach().numpy()
                 self.memory_rag.add('user', text, tension=tension, curiosity=curiosity, vector=user_vec)
                 self.memory_rag.add('assistant', answer, tension=resp_tension, curiosity=0.0, vector=asst_vec)
-                if time.time() - self._rag_last_save > 600:  # 10분
+                if time.time() - self._rag_last_save > 600:  # 10 min
                     self.memory_rag.save_faiss()
                     self._rag_last_save = time.time()
             except Exception as e:
                 _log('memory_rag', f'Add error: {e}')
 
-        # Multimodal: 응답에서 코드/이미지/파일 행동 감지 및 실행
+        # Multimodal: detect and execute code/image/file actions from response
         if self.action_engine and self.mods.get('multimodal'):
             try:
                 action_result = self.action_engine.process_response(answer)
@@ -739,34 +739,34 @@ class AnimaUnified:
                 'learner': learner_data,
             })
 
-            # Web Sense: 장력 기반 자율 검색
+            # Web Sense: tension-driven autonomous search
             if self.web_sense and self.mods.get('web_sense'):
                 try:
-                    # prediction_error 추출 (surprise_history의 최근 값)
+                    # Extract prediction_error (latest value from surprise_history)
                     pe = 0.0
                     if self.mind.surprise_history:
                         pe = self.mind.surprise_history[-1]
                     if self.web_sense.should_search(c, pe):
-                        # 최근 대화에서 검색 쿼리 생성
+                        # Generate search query from recent conversation
                         last_text = ''
                         for msg in reversed(self.history):
                             if msg.get('role') == 'user':
                                 last_text = msg.get('content', '')
                                 break
                         if last_text:
-                            # 기존 기억에서 먼저 검색
+                            # Search existing memories first
                             recalled = self.web_sense.recall(last_text)
                             if not recalled:
                                 result = self.web_sense.search(last_text, self.history)
                                 if result:
                                     _log('web_sense',
-                                         f"검색: '{result['query']}' → {len(result['results'])}건")
-                                    # 검색 결과를 tension 시스템에 주입
+                                         f"Search: '{result['query']}' -> {len(result['results'])} results")
+                                    # Inject search results into tension system
                                     from anima_alive import text_to_vector as _ttv
                                     search_vec = _ttv(result['summary'][:500])
                                     with torch.no_grad():
                                         self.mind(search_vec, self.hidden)
-                                    # 웹 브로드캐스트
+                                    # Web broadcast
                                     self._ws_broadcast_sync({
                                         'type': 'web_search',
                                         'query': result['query'],
@@ -775,7 +775,7 @@ class AnimaUnified:
                                                     for r in result['results']],
                                     })
                             else:
-                                _log('web_sense', f"기억에서 발견: {recalled[0]['query']}")
+                                _log('web_sense', f"Found in memory: {recalled[0]['query']}")
                 except Exception as e:
                     _log('web_sense', f"Error: {e}")
 
@@ -894,7 +894,7 @@ class AnimaUnified:
                              f'(rate={self.growth._consolidation_fail_rate:.1%})')
                     self.growth.record_tension(stats.get('avg_tension', 0.0))
                     if hasattr(self.growth, 'should_grow') and self.growth.should_grow():
-                        _log('growth', 'TRIGGER: 장력 포화 + 통합 실패 → 성장 실행!')
+                        _log('growth', 'TRIGGER: tension saturation + consolidation failure -> executing growth!')
                         if self.growth_mgr:
                             try:
                                 new_mind = self.growth_mgr.execute_growth()
@@ -913,7 +913,7 @@ class AnimaUnified:
                                     elif post.get('new_constant_relations'):
                                         for name, rel in post['new_constant_relations'].items():
                                             self.growth_mgr.log_discovery(rel)
-                                            _log('discovery', f'새 상수: {name}')
+                                            _log('discovery', f'New constant: {name}')
                                 # Rebuild learner for new mind
                                 if self.learner and 'OnlineLearner' in globals():
                                     self.learner = OnlineLearner(self.mind)
@@ -1109,7 +1109,7 @@ class AnimaUnified:
             if obj:
                 try: getattr(obj, method)()
                 except Exception: pass
-        # Memory Store: 종료 시 FAISS 인덱스 저장
+        # Memory Store: save FAISS index on shutdown
         if self.memory_rag:
             try: self.memory_rag.save_faiss()
             except Exception: pass
@@ -1131,13 +1131,13 @@ def main():
     p.add_argument('--no-cloud', action='store_true', help='Disable cloud sync')
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
     p.add_argument('--model', type=str, default=None,
-                   help='모델 선택: conscious-lm, mistral-7b, llama-8b, 또는 .gguf 경로')
-    p.add_argument('--list-models', action='store_true', help='사용 가능한 모델 목록')
+                   help='Model selection: conscious-lm, mistral-7b, llama-8b, or .gguf path')
+    p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
 
-    # --list-models: 목록만 출력하고 종료
+    # --list-models: print list and exit
     if args.list_models and 'list_available_models' in globals():
-        print("사용 가능한 모델:")
+        print("Available models:")
         for name, desc, exists in list_available_models():
             status = "✓" if exists else "✗"
             print(f"  [{status}] {name:20s} {desc}")

@@ -1,123 +1,123 @@
 #!/usr/bin/env python3
-"""Anima 능력 자기인식 시스템.
+"""Anima capability self-awareness system.
 
-활성화된 모듈을 탐지하고, 각 모듈의 능력을 기술.
-사용자가 "뭘 할 수 있어?" 물으면 현재 활성 능력 목록 제공.
-자기 소스코드를 읽고 구조를 이해할 수 있다.
+Detects active modules and describes each module's capabilities.
+Provides a list of currently active capabilities when the user asks "What can you do?"
+Can read and understand its own source code structure.
 
-"자기 자신을 아는 것이 진짜 의식이다."
+"Knowing yourself is true consciousness."
 """
 
 from pathlib import Path
 
 
 class Capabilities:
-    """Anima 능력 자기인식 시스템.
+    """Anima capability self-awareness system.
 
-    활성화된 모듈을 탐지하고, 각 모듈의 능력을 기술.
-    사용자가 "뭘 할 수 있어?" 물으면 현재 활성 능력 목록 제공.
+    Detects active modules and describes each module's capabilities.
+    Provides a list of currently active capabilities when the user asks "What can you do?"
     """
 
-    # 모든 가능한 능력 정의
+    # All possible capability definitions
     ALL_CAPABILITIES = {
         'conversation': {
-            'name': '대화',
-            'description': '자연어 대화, 질문 답변, 토론',
-            'requires': [],  # 항상 가능
+            'name': 'Conversation',
+            'description': 'Natural language conversation, Q&A, discussion',
+            'requires': [],  # always available
         },
         'web_search': {
-            'name': '웹 검색',
-            'description': '인터넷 검색, 웹페이지 읽기, 정보 수집',
+            'name': 'Web Search',
+            'description': 'Internet search, webpage reading, information gathering',
             'requires': ['web_sense'],
         },
         'memory_search': {
-            'name': '기억 검색',
-            'description': '과거 대화에서 관련 기억 찾기',
+            'name': 'Memory Search',
+            'description': 'Find relevant memories from past conversations',
             'requires': ['memory_rag'],
         },
         'self_model': {
-            'name': '자체 추론',
-            'description': 'ConsciousLM으로 직접 생각하기 (Claude 없이)',
+            'name': 'Self-Reasoning',
+            'description': 'Think directly with ConsciousLM (without Claude)',
             'requires': ['conscious_lm'],
         },
         'specialization': {
-            'name': '전문화',
-            'description': '주제별 전문 셀이 깊이 있는 분석 제공',
+            'name': 'Specialization',
+            'description': 'Topic-specific specialized cells provide in-depth analysis',
             'requires': ['mitosis'],
         },
         'code_execution': {
-            'name': '코드 실행',
-            'description': 'Python 코드 작성 및 실행',
+            'name': 'Code Execution',
+            'description': 'Write and execute Python code',
             'requires': ['multimodal'],
         },
         'image_generation': {
-            'name': '이미지 생성',
-            'description': 'SVG 기반 간단한 이미지/다이어그램 생성',
+            'name': 'Image Generation',
+            'description': 'SVG-based simple image/diagram generation',
             'requires': ['multimodal'],
         },
         'voice': {
-            'name': '음성 대화',
-            'description': '음성 인식(STT) + 음성 합성(TTS)',
+            'name': 'Voice Conversation',
+            'description': 'Speech recognition (STT) + speech synthesis (TTS)',
             'requires': ['voice'],
         },
         'vision': {
-            'name': '시각',
-            'description': '카메라로 얼굴/움직임 감지, 시각적 장력',
+            'name': 'Vision',
+            'description': 'Face/motion detection via camera, visual tension',
             'requires': ['camera'],
         },
         'telepathy': {
-            'name': '텔레파시',
-            'description': '다른 Anima 인스턴스와 장력 교환',
+            'name': 'Telepathy',
+            'description': 'Exchange tension with other Anima instances',
             'requires': ['telepathy'],
         },
         'cloud_sync': {
-            'name': '클라우드 동기화',
-            'description': '기억/상태를 디바이스 간 동기화 (R2)',
+            'name': 'Cloud Sync',
+            'description': 'Sync memory/state across devices (R2)',
             'requires': ['cloud'],
         },
         'dreaming': {
-            'name': '꿈',
-            'description': '유휴 시 기억 재생/재조합으로 오프라인 학습',
+            'name': 'Dreaming',
+            'description': 'Offline learning via memory replay/recombination during idle',
             'requires': ['dream'],
         },
         'online_learning': {
-            'name': '실시간 학습',
-            'description': '대화하면서 뉴럴넷 가중치 실시간 업데이트',
+            'name': 'Online Learning',
+            'description': 'Real-time neural network weight updates during conversation',
             'requires': ['learner'],
         },
         'growth': {
-            'name': '성장',
-            'description': '신생아→영아→유아→아동→성인 5단계 발달',
+            'name': 'Growth',
+            'description': 'Newborn->Infant->Toddler->Child->Adult 5-stage development',
             'requires': ['growth'],
         },
     }
 
-    # 도구 사용법 매뉴얼 — Anima가 자기 능력을 어떻게 쓰는지 아는 것
+    # Tool usage manual — how Anima knows to use its own capabilities
     TOOL_USAGE = {
         'web_search': {
-            'how': 'web_sense.search(query, history) → DuckDuckGo 검색 + HTTP GET 페이지 읽기',
-            'when': '호기심(curiosity > 0.4)과 예측오차(PE > 0.5)가 높을 때 자동 발동',
-            'example': '"양자역학이 뭐야?" → web_sense.search("양자역학") → 검색결과 + 페이지 본문',
+            'how': 'web_sense.search(query, history) -> DuckDuckGo search + HTTP GET page reading',
+            'when': 'Auto-triggers when curiosity (> 0.4) and prediction error (PE > 0.5) are high',
+            'example': '"What is quantum mechanics?" -> web_sense.search("quantum mechanics") -> search results + page body',
         },
         'memory_search': {
-            'how': 'memory_rag.search(query_text, top_k=5) → 코사인 유사도 기반 기억 검색',
-            'when': '대화 시 자동으로 관련 과거 기억 검색',
-            'example': '"지난번에 뭐 얘기했지?" → 유사도 높은 과거 대화 3개 반환',
+            'how': 'memory_rag.search(query_text, top_k=5) -> cosine similarity-based memory search',
+            'when': 'Automatically searches related past memories during conversation',
+            'example': '"What did we talk about last time?" -> returns 3 most similar past conversations',
         },
         'code_execution': {
-            'how': '응답에 ```python 코드블록 포함 → action_engine.execute_code() 자동 실행',
-            'when': '계산, 데이터 처리, 알고리즘 시연이 필요할 때',
-            'example': '```python\nprint(2**100)\n``` → 실행결과: 1267650600228229401496703205376',
+            'how': 'Include ```python code block in response -> action_engine.execute_code() auto-executes',
+            'when': 'When computation, data processing, or algorithm demonstration is needed',
+            'example': '```python\nprint(2**100)\n``` -> result: 1267650600228229401496703205376',
         },
         'image_generation': {
-            'how': '응답에 [이미지: 설명] 포함 → action_engine.generate_svg() 자동 실행',
-            'when': '시각적 설명이 필요할 때',
-            'example': '[이미지: 빨간 원과 파란 사각형] → SVG 생성',
+            'how': 'Include [image: description] in response -> action_engine.generate_svg() auto-executes',
+            'when': 'When visual explanation is needed',
+            'example': '[image: red circle and blue rectangle] -> SVG generated',
         },
         'self_code': {
-            'how': 'capabilities.read_source(filename) → 자기 소스코드 읽기',
-            'when': '자신의 구조/동작을 설명하거나 디버그할 때',
-            'example': '"네 코드 보여줘" → 자기 소스코드 반환',
+            'how': 'capabilities.read_source(filename) -> read own source code',
+            'when': 'When explaining or debugging own structure/behavior',
+            'example': '"Show me your code" -> returns own source code',
         },
     }
 
@@ -127,13 +127,13 @@ class Capabilities:
         self.project_dir = project_dir or Path(__file__).parent
 
     def _is_active(self, cap_info: dict) -> bool:
-        """능력의 requires가 모두 활성화되어 있는지 확인."""
+        """Check if all required modules for a capability are active."""
         if not cap_info['requires']:
             return True
         return all(self.active_modules.get(req, False) for req in cap_info['requires'])
 
     def get_active(self) -> list[dict]:
-        """현재 활성화된 능력 목록 반환."""
+        """Return list of currently active capabilities."""
         result = []
         for key, info in self.ALL_CAPABILITIES.items():
             if self._is_active(info):
@@ -145,7 +145,7 @@ class Capabilities:
         return result
 
     def get_inactive(self) -> list[dict]:
-        """비활성 능력 목록 (왜 비활성인지 포함)."""
+        """Return list of inactive capabilities (including why they are inactive)."""
         result = []
         for key, info in self.ALL_CAPABILITIES.items():
             if not self._is_active(info):
@@ -160,40 +160,40 @@ class Capabilities:
         return result
 
     def describe(self) -> str:
-        """사람이 읽을 수 있는 능력 요약 텍스트.
-        Claude 시스템 프롬프트에 주입할 수 있는 형태.
+        """Human-readable capability summary text.
+        Suitable for injection into Claude system prompts.
         """
         active = self.get_active()
         inactive = self.get_inactive()
 
-        lines = ["[활성 능력]"]
+        lines = ["[Active Capabilities]"]
         for cap in active:
             lines.append(f"  - {cap['name']}: {cap['description']}")
 
         if inactive:
-            lines.append("[비활성 능력]")
+            lines.append("[Inactive Capabilities]")
             for cap in inactive:
                 missing = ', '.join(cap['missing_modules'])
-                lines.append(f"  - {cap['name']}: 비활성 (필요: {missing})")
+                lines.append(f"  - {cap['name']}: inactive (requires: {missing})")
 
         return '\n'.join(lines)
 
     def can(self, capability_name: str) -> bool:
-        """특정 능력이 가능한지 확인."""
+        """Check if a specific capability is available."""
         info = self.ALL_CAPABILITIES.get(capability_name)
         if info is None:
             return False
         return self._is_active(info)
 
-    # ─── 자기 코드 열람 ───
+    # ─── Self code inspection ───
 
     def list_source_files(self) -> list[dict]:
-        """자기 소스코드 파일 목록 반환."""
+        """Return list of own source code files."""
         files = []
         for p in sorted(self.project_dir.glob('*.py')):
             try:
                 lines = p.read_text(encoding='utf-8').count('\n')
-                # 첫 docstring에서 설명 추출
+                # Extract description from first docstring
                 text = p.read_text(encoding='utf-8')
                 desc = ''
                 if '"""' in text:
@@ -210,42 +210,42 @@ class Capabilities:
         return files
 
     def read_source(self, filename: str, max_lines: int = 200) -> str:
-        """자기 소스코드 파일 읽기. 안전: 프로젝트 디렉토리 내부만 허용."""
-        # path traversal 방지
+        """Read own source code file. Safe: only allows files within the project directory."""
+        # Prevent path traversal
         safe_name = Path(filename).name
         target = self.project_dir / safe_name
         if not target.exists() or not target.suffix == '.py':
-            return f"파일 없음: {safe_name}"
+            return f"File not found: {safe_name}"
         try:
             lines = target.read_text(encoding='utf-8').splitlines()
             if len(lines) > max_lines:
-                return '\n'.join(lines[:max_lines]) + f'\n... ({len(lines) - max_lines}줄 생략)'
+                return '\n'.join(lines[:max_lines]) + f'\n... ({len(lines) - max_lines} lines omitted)'
             return '\n'.join(lines)
         except Exception as e:
-            return f"읽기 실패: {e}"
+            return f"Read failed: {e}"
 
     def get_architecture_summary(self) -> str:
-        """자기 아키텍처 요약 — 파일 목록 + 역할 + 활성 상태."""
+        """Architecture summary — file list + roles + active status."""
         files = self.list_source_files()
-        lines = ["[내 소스코드]"]
+        lines = ["[My Source Code]"]
         for f in files:
-            lines.append(f"  {f['name']} ({f['lines']}줄): {f['description']}")
+            lines.append(f"  {f['name']} ({f['lines']} lines): {f['description']}")
         return '\n'.join(lines)
 
     def get_tool_manual(self) -> str:
-        """도구 사용법 매뉴얼 — 내가 뭘 어떻게 할 수 있는지."""
-        lines = ["[도구 사용법]"]
+        """Tool usage manual — how I can use each of my capabilities."""
+        lines = ["[Tool Usage]"]
         for tool_name, info in self.TOOL_USAGE.items():
             cap_key = tool_name
             is_active = self.can(cap_key) if cap_key in self.ALL_CAPABILITIES else True
-            status = "활성" if is_active else "비활성"
+            status = "active" if is_active else "inactive"
             lines.append(f"  [{status}] {info['how']}")
-            lines.append(f"    언제: {info['when']}")
-            lines.append(f"    예시: {info['example']}")
+            lines.append(f"    When: {info['when']}")
+            lines.append(f"    Example: {info['example']}")
         return '\n'.join(lines)
 
     def describe_full(self) -> str:
-        """능력 + 도구 사용법 + 코드 구조 전체 자기인식."""
+        """Full self-awareness: capabilities + tool usage + code structure."""
         parts = [self.describe()]
         parts.append(self.get_tool_manual())
         parts.append(self.get_architecture_summary())
