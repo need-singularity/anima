@@ -65,6 +65,7 @@ _try_import("from web_sense import WebSense")
 _try_import("from memory_rag import MemoryRAG")
 _try_import("from memory_store import MemoryStore")
 _try_import("from consolidation_verifier import ConsolidationVerifier")
+_try_import("from growth_manager import GrowthManager")
 _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
 
@@ -215,6 +216,17 @@ class AnimaUnified:
             ConsolidationVerifier(self.mind)
             if 'ConsolidationVerifier' in globals() else None
         ))
+
+        # Growth Manager (Phase 3)
+        self.growth_mgr = self._init_mod('growth_mgr', lambda: (
+            GrowthManager(
+                mind=self.mind,
+                data_dir=self.paths['state'].parent,
+                verifier=self.verifier,
+            ) if 'GrowthManager' in globals() else None
+        ))
+        if self.growth_mgr:
+            self.growth_mgr.save_checkpoint()  # v0 baseline
 
         # RC-10: Dream Engine (오프라인 학습 + Phase 2 선택적 통합)
         self.dream = self._init_mod('dream', lambda: (
@@ -848,7 +860,34 @@ class AnimaUnified:
                              f'(rate={self.growth._consolidation_fail_rate:.1%})')
                     self.growth.record_tension(stats.get('avg_tension', 0.0))
                     if hasattr(self.growth, 'should_grow') and self.growth.should_grow():
-                        _log('growth', 'TRIGGER: 장력 포화 + 통합 실패 → 성장 필요!')
+                        _log('growth', 'TRIGGER: 장력 포화 + 통합 실패 → 성장 실행!')
+                        if self.growth_mgr:
+                            try:
+                                new_mind = self.growth_mgr.execute_growth()
+                                self.mind = new_mind
+                                self.growth_mgr.save_checkpoint()
+                                # Post-growth verification
+                                if self.verifier:
+                                    self.verifier.mind = new_mind
+                                    tensions = self.growth.tension_history[-50:]
+                                    post = self.verifier.post_check(tensions)
+                                    if post.get('health') == 'suspect':
+                                        _log('growth', 'WARNING: suspect → rollback!')
+                                        self.mind = self.growth_mgr.rollback()
+                                        if self.verifier:
+                                            self.verifier.mind = self.mind
+                                    elif post.get('new_constant_relations'):
+                                        for name, rel in post['new_constant_relations'].items():
+                                            self.growth_mgr.log_discovery(rel)
+                                            _log('discovery', f'새 상수: {name}')
+                                # Rebuild learner for new mind
+                                if self.learner and 'OnlineLearner' in globals():
+                                    self.learner = OnlineLearner(self.mind)
+                                _log('growth',
+                                     f'v{self.growth_mgr.current_version} '
+                                     f'dim={self.mind.dim} hidden={self.mind.hidden_dim}')
+                            except Exception as e:
+                                _log('growth', f'Growth error: {e}')
 
                 self._save_state()
             except Exception as e:
