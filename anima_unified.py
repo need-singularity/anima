@@ -63,6 +63,7 @@ _try_import("from dream_engine import DreamEngine")
 _try_import("from growth_engine import GrowthEngine")
 _try_import("from web_sense import WebSense")
 _try_import("from memory_rag import MemoryRAG")
+_try_import("from memory_store import MemoryStore")
 _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
 
@@ -204,11 +205,8 @@ class AnimaUnified:
             if 'WebSense' in globals() else None
         ))
 
-        # Memory RAG (벡터 유사도 기반 장기 기억 검색)
-        self.memory_rag = self._init_mod('memory_rag', lambda: (
-            MemoryRAG(memory_file=self.paths['memory'])
-            if 'MemoryRAG' in globals() else None
-        ))
+        # Memory Store (SQLite+FAISS) — MemoryRAG 대체
+        self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
         self._rag_last_save = time.time()
 
         # RC-10: Dream Engine (오프라인 학습)
@@ -280,6 +278,27 @@ class AnimaUnified:
             if old.exists() and not new.exists():
                 shutil.copy2(old, new)
                 _log('migrate', f'{old.name} → {new}')
+
+    def _init_memory_store(self):
+        """MemoryStore(SQLite+FAISS) 초기화. fallback: MemoryRAG."""
+        if 'MemoryStore' in globals():
+            model_type = 'conscious' if self.model_name == 'conscious-lm' else 'llm-api'
+            store = MemoryStore(
+                db_path=self.paths['memory'].with_suffix('.db'),
+                faiss_path=self.paths['memory'].parent / 'memory.faiss',
+                dim=128,
+                model_type=model_type,
+            )
+            # 레거시 JSON 마이그레이션
+            legacy_json = self.paths['memory']
+            if legacy_json.exists() and legacy_json.suffix == '.json':
+                migrated = store.migrate_from_json(legacy_json, vector_fn=lambda t: text_to_vector(t).detach().numpy())
+                if migrated > 0:
+                    _log('migrate', f'{migrated} memories → SQLite+FAISS')
+            return store
+        elif 'MemoryRAG' in globals():
+            return MemoryRAG(memory_file=self.paths['memory'])
+        return None
 
     def _init_mod(self, name, factory):
         try:
@@ -459,10 +478,11 @@ class AnimaUnified:
         if self.capabilities:
             state += chr(10) + self.capabilities.describe_full()
 
-        # Memory RAG: 관련 기억 검색
+        # Memory Store: 관련 기억 검색
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
-                relevant = self.memory_rag.search(text, top_k=3)
+                query_vec = text_to_vector(text).detach().numpy()
+                relevant = self.memory_rag.search(query_vec, top_k=3)
                 if relevant:
                     parts = [f"[기억 {m['timestamp']}] {m['text']}"
                              for m in relevant if m.get('similarity', 0) > 0.3]
@@ -536,13 +556,15 @@ class AnimaUnified:
         self.memory.add('user', text, tension)
         self.memory.add('assistant', answer, resp_tension)
 
-        # Memory RAG: 새 기억 추가 + 주기적 저장 (10분마다)
+        # Memory Store: 새 기억 추가 + 주기적 저장 (10분마다)
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
-                self.memory_rag.add('user', text, tension)
-                self.memory_rag.add('assistant', answer, resp_tension)
+                user_vec = text_to_vector(text).detach().numpy()
+                asst_vec = text_to_vector(answer).detach().numpy()
+                self.memory_rag.add('user', text, tension=tension, curiosity=curiosity, vector=user_vec)
+                self.memory_rag.add('assistant', answer, tension=resp_tension, curiosity=0.0, vector=asst_vec)
                 if time.time() - self._rag_last_save > 600:  # 10분
-                    self.memory_rag.save_index()
+                    self.memory_rag.save_faiss()
                     self._rag_last_save = time.time()
             except Exception as e:
                 _log('memory_rag', f'Add error: {e}')
@@ -992,9 +1014,9 @@ class AnimaUnified:
             if obj:
                 try: getattr(obj, method)()
                 except Exception: pass
-        # Memory RAG: 종료 시 인덱스 저장
+        # Memory Store: 종료 시 FAISS 인덱스 저장
         if self.memory_rag:
-            try: self.memory_rag.save_index()
+            try: self.memory_rag.save_faiss()
             except Exception: pass
         self._save_state()
         print("\n  Anima Unified stopped.")
