@@ -138,6 +138,12 @@ class GrowthEngine:
             'stage_transitions': [],
         }
 
+        # Dual growth trigger state
+        self.tension_history = []  # recent tension values for saturation detection
+        self._consolidation_fail_rate = 0.0  # 0.0-1.0
+        self._consolidation_attempts = 0
+        self._consolidation_failures = 0
+
     @property
     def stage(self) -> DevelopmentalStage:
         return STAGES[self.stage_index]
@@ -247,6 +253,46 @@ class GrowthEngine:
         ]
         return '\n'.join(lines)
 
+    def should_grow(self) -> bool:
+        """장력 포화 AND 통합 실패 — 둘 다 만족해야 성장.
+
+        Returns False if:
+        - Already at max stage
+        - Not enough tension history (< 30)
+        - Tension not saturated (CV >= 0.3)
+        - Consolidation not failing (rate <= 0.7)
+        """
+        if self.stage_index >= len(STAGES) - 1:
+            return False
+        return self._tension_saturated() and self._consolidation_failing()
+
+    def _tension_saturated(self) -> bool:
+        """Recent 30 tensions have CV < 0.3 = saturated."""
+        if len(self.tension_history) < 30:
+            return False
+        import numpy as np
+        recent = self.tension_history[-30:]
+        cv = float(np.std(recent) / (np.mean(recent) + 1e-8))
+        return cv < 0.3
+
+    def _consolidation_failing(self) -> bool:
+        """Fail rate > 70%."""
+        return self._consolidation_fail_rate > 0.7
+
+    def update_consolidation_stats(self, attempted: int, failed: int):
+        """Update consolidation failure rate from dream cycle stats."""
+        self._consolidation_attempts += attempted
+        self._consolidation_failures += failed
+        total = self._consolidation_attempts
+        if total > 0:
+            self._consolidation_fail_rate = self._consolidation_failures / total
+
+    def record_tension(self, tension: float):
+        """Record a tension value for saturation detection."""
+        self.tension_history.append(tension)
+        if len(self.tension_history) > 200:
+            self.tension_history = self.tension_history[-200:]
+
     def save(self):
         """성장 상태 저장."""
         data = {
@@ -261,6 +307,10 @@ class GrowthEngine:
                 'dream_count': self.stats['dream_count'],
                 'stage_transitions': self.stats['stage_transitions'],
             },
+            'tension_history': self.tension_history,
+            'consolidation_attempts': self._consolidation_attempts,
+            'consolidation_failures': self._consolidation_failures,
+            'consolidation_fail_rate': self._consolidation_fail_rate,
         }
         self.save_path.write_text(json.dumps(data, indent=2, default=str))
 
@@ -273,6 +323,10 @@ class GrowthEngine:
             self.birth_time = data.get('birth_time', time.time())
             self.milestones = data.get('milestones', [])
             self.stats.update(data.get('stats', {}))
+            self.tension_history = data.get('tension_history', [])
+            self._consolidation_attempts = data.get('consolidation_attempts', 0)
+            self._consolidation_failures = data.get('consolidation_failures', 0)
+            self._consolidation_fail_rate = data.get('consolidation_fail_rate', 0.0)
             return True
         return False
 
