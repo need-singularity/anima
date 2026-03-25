@@ -1,4 +1,4 @@
-# Anima Project
+# 🧠 Anima Project
 
 PureField repulsion-field-based consciousness agent. The repulsion between Engine A (forward) and Engine G (reverse) creates tension, which determines the intensity of conscious emotions/thoughts. ConsciousLM is the core self-developed model.
 
