@@ -40,6 +40,9 @@ class DreamEngine:
         text_to_vector=None,
         dream_cycle_steps=10,
         noise_scale=0.15,
+        store=None,
+        verifier=None,
+        consolidation_threshold=0.01,
     ):
         self.mind = mind
         self.memory = memory
@@ -47,6 +50,9 @@ class DreamEngine:
         self._text_to_vector = text_to_vector
         self.dream_cycle_steps = dream_cycle_steps
         self.noise_scale = noise_scale
+        self.store = store
+        self.verifier = verifier
+        self.consolidation_threshold = consolidation_threshold
 
         # Dream state
         self.is_dreaming = False
@@ -70,11 +76,67 @@ class DreamEngine:
         self.is_dreaming = True
         self._session_patterns = 0
         cycle_tensions = []
+        consolidation_attempted = 0
+        consolidation_succeeded = 0
+        consolidation_failed = 0
 
         turns = self.memory.data.get('turns', [])
 
+        # Check if store has unconsolidated memories
+        unconsolidated_available = False
+        if self.store is not None:
+            try:
+                unconsolidated_available = len(
+                    self.store.get_unconsolidated(limit=1)
+                ) > 0
+            except Exception:
+                unconsolidated_available = False
+
         for step in range(self.dream_cycle_steps):
-            # 꿈 유형을 랜덤 선택 (가중치: replay 50%, interpolate 30%, explore 20%)
+            # ── Selective consolidation flow (when store available) ──
+            if self.store is not None and unconsolidated_available:
+                roll = random.random()
+                if roll < 0.70:
+                    # 70%: failed memories first
+                    candidates = self.store.get_unconsolidated(
+                        order_by='failed_count', limit=5
+                    )
+                elif roll < 0.90:
+                    # 20%: new unconsolidated (by id)
+                    candidates = self.store.get_unconsolidated(
+                        order_by='id', limit=5
+                    )
+                else:
+                    candidates = []
+
+                if candidates:
+                    mem = random.choice(candidates)
+                    hidden = self._consolidate_memory(
+                        mem, hidden,
+                        cycle_tensions,
+                        stats={
+                            'attempted': consolidation_attempted,
+                            'succeeded': consolidation_succeeded,
+                            'failed': consolidation_failed,
+                        },
+                    )
+                    consolidation_attempted += 1
+                    # Check result from last tension pair
+                    if self._last_consolidation_success:
+                        consolidation_succeeded += 1
+                    else:
+                        consolidation_failed += 1
+                    continue
+                else:
+                    # Refresh availability check
+                    try:
+                        unconsolidated_available = len(
+                            self.store.get_unconsolidated(limit=1)
+                        ) > 0
+                    except Exception:
+                        unconsolidated_available = False
+
+            # ── Original random dream flow ──
             if len(turns) >= 2:
                 dream_type = random.choices(
                     ['replay', 'interpolate', 'explore'],
@@ -131,7 +193,74 @@ class DreamEngine:
             'tensions': cycle_tensions,
             'total_cycles': self.total_dream_cycles,
             'total_patterns': self.total_patterns_learned,
+            'consolidation_attempted': consolidation_attempted,
+            'consolidation_succeeded': consolidation_succeeded,
+            'consolidation_failed': consolidation_failed,
         }
+
+    def _consolidate_memory(self, memory, hidden, cycle_tensions, stats):
+        """Selective consolidation of a single memory from store.
+
+        Args:
+            memory: dict from store.get_unconsolidated (has 'id', 'text', etc.)
+            hidden: current GRU hidden state
+            cycle_tensions: list to append tensions to
+            stats: dict with current counters (unused, kept for future)
+
+        Returns:
+            updated hidden state
+        """
+        self._last_consolidation_success = False
+        self.current_dream_type = 'consolidate'
+
+        # 1. Convert text to vector
+        vec = self._text_to_vector(memory['text'])
+
+        # 2. Verifier pre-check
+        if self.verifier is not None:
+            check = self.verifier.pre_check(memory, hidden)
+            if not check.get('should_consolidate', True):
+                return hidden
+
+        # 3. Tension before
+        with torch.no_grad():
+            output, t_before, curiosity, direction, hidden = self.mind(vec, hidden)
+        cycle_tensions.append(t_before)
+        self.dream_tension_history.append(t_before)
+
+        # 4. Learn if learner available
+        if self.learner:
+            try:
+                self.learner.observe(vec, hidden.detach().clone(), t_before, curiosity, direction)
+                self.learner.feedback(0.0)
+                self._session_patterns += 1
+            except Exception:
+                pass
+
+        # 5. Tension after
+        with torch.no_grad():
+            output, t_after, curiosity2, direction2, hidden = self.mind(vec, hidden)
+        cycle_tensions.append(t_after)
+        self.dream_tension_history.append(t_after)
+
+        # 6. Compute delta
+        delta = abs(t_after - t_before)
+
+        # 7. Verifier drift check
+        if self.verifier is not None:
+            self.verifier.verify_drift(t_before, t_after)
+
+        # 8-9. Mark consolidated or failed
+        if delta >= self.consolidation_threshold:
+            self.store.mark_consolidated(
+                memory['id'], tension_at_consolidate=t_after
+            )
+            self._last_consolidation_success = True
+        else:
+            self.store.mark_failed(memory['id'], delta_tension=delta)
+            self._last_consolidation_success = False
+
+        return hidden
 
     def _replay(self, turns):
         """기억 재생 -- 과거 경험을 노이즈와 함께 재생."""
