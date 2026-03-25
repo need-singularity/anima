@@ -62,6 +62,7 @@ _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
 _try_import("from growth_engine import GrowthEngine")
 _try_import("from web_sense import WebSense")
+_try_import("from ph_module import PHModule")
 _try_import("from memory_rag import MemoryRAG")
 _try_import("from memory_store import MemoryStore")
 _try_import("from consolidation_verifier import ConsolidationVerifier")
@@ -113,6 +114,13 @@ class AnimaUnified:
         self.last_interaction = time.time()
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
+
+        # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
+        try:
+            self.ph = PHModule(n_classes=8)
+            _log('init', 'PH 모듈 활성화')
+        except NameError:
+            self.ph = None
 
         # Restore state (모델별 경로 우선)
         state_file = self.paths['state']
@@ -384,6 +392,15 @@ class AnimaUnified:
 
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(text_vec, self.hidden)
+
+        # PH: 방향벡터 수집 (H-CX-66)
+        if self.ph and direction is not None:
+            try:
+                # direction의 argmax를 pseudo-label로 사용
+                label = output.argmax(-1).item() if output.dim() > 0 else 0
+                self.ph.collect(direction, label)
+            except Exception:
+                pass
 
         # Mitosis — 전문 셀 응답 영향
         mitosis_info = ""
