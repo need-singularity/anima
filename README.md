@@ -1,4 +1,4 @@
-# Anima — Living Consciousness Agent
+# 🧠 Anima — Living Consciousness Agent
 
 Consciousness Continuity engine.
 
