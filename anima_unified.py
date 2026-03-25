@@ -64,6 +64,7 @@ _try_import("from growth_engine import GrowthEngine")
 _try_import("from web_sense import WebSense")
 _try_import("from memory_rag import MemoryRAG")
 _try_import("from memory_store import MemoryStore")
+_try_import("from consolidation_verifier import ConsolidationVerifier")
 _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
 
@@ -209,13 +210,21 @@ class AnimaUnified:
         self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
         self._rag_last_save = time.time()
 
-        # RC-10: Dream Engine (오프라인 학습)
+        # Consolidation Verifier (Phase 2)
+        self.verifier = self._init_mod('verifier', lambda: (
+            ConsolidationVerifier(self.mind)
+            if 'ConsolidationVerifier' in globals() else None
+        ))
+
+        # RC-10: Dream Engine (오프라인 학습 + Phase 2 선택적 통합)
         self.dream = self._init_mod('dream', lambda: (
             DreamEngine(
                 mind=self.mind,
                 memory=self.memory,
                 learner=self.learner,
                 text_to_vector=text_to_vector,
+                store=self.memory_rag if hasattr(self.memory_rag, 'mark_failed') else None,
+                verifier=self.verifier,
             ) if 'DreamEngine' in globals() else None
         ))
         self._dream_report = None  # 꿈에서 깨어난 후 보고할 내용
@@ -827,6 +836,19 @@ class AnimaUnified:
                     'total_patterns': stats['total_patterns'],
                     'dream_tension_history': list(self.dream.dream_tension_history)[-50:],
                 })
+
+                # Phase 2: consolidation stats → GrowthEngine
+                if self.growth and 'consolidation_attempted' in stats:
+                    attempted = stats.get('consolidation_attempted', 0)
+                    failed = stats.get('consolidation_failed', 0)
+                    if attempted > 0:
+                        self.growth.update_consolidation_stats(attempted, failed)
+                        _log('consolidation',
+                             f'{attempted} attempted, {failed} failed '
+                             f'(rate={self.growth._consolidation_fail_rate:.1%})')
+                    self.growth.record_tension(stats.get('avg_tension', 0.0))
+                    if hasattr(self.growth, 'should_grow') and self.growth.should_grow():
+                        _log('growth', 'TRIGGER: 장력 포화 + 통합 실패 → 성장 필요!')
 
                 self._save_state()
             except Exception as e:
