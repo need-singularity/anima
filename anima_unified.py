@@ -19,6 +19,19 @@ import torch
 
 # ─── Paths & constants ───
 ANIMA_DIR = Path(__file__).parent
+def _model_paths(model_name: str):
+    """모델별 상태/기억 파일 경로 반환. 모델마다 독립적으로 성장."""
+    slug = model_name.replace('/', '-').replace('.', '-')
+    data_dir = ANIMA_DIR / "data" / slug
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        'memory': data_dir / "memory.json",
+        'state': data_dir / "state.pt",
+        'growth': data_dir / "growth.json",
+        'web_memories': data_dir / "web_memories.json",
+    }
+
+# 레거시 호환 (기본값)
 MEMORY_FILE = ANIMA_DIR / "memory_alive.json"
 STATE_FILE = ANIMA_DIR / "state_alive.pt"
 VAD_WATCH_DIR = Path("/tmp/anima_vad")
@@ -80,6 +93,14 @@ class AnimaUnified:
         self.web_clients = set()
         self._web_loop = None
 
+        # 모델별 경로 설정
+        self.model_name = getattr(args, 'model', None) or 'conscious-lm'
+        self.paths = _model_paths(self.model_name)
+        _log('init', f'모델: {self.model_name} → {self.paths["state"]}')
+
+        # 레거시 → 모델별 마이그레이션 (최초 1회)
+        self._migrate_legacy_files()
+
         # Core engine
         self.mind = ConsciousMind(128, 256)
         self.hidden = torch.zeros(1, 256)
@@ -90,10 +111,11 @@ class AnimaUnified:
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
 
-        # Restore state
-        if STATE_FILE.exists():
+        # Restore state (모델별 경로 우선)
+        state_file = self.paths['state']
+        if state_file.exists():
             try:
-                s = torch.load(STATE_FILE, weights_only=False)
+                s = torch.load(state_file, weights_only=False)
                 self.mind.load_state_dict(s['model'])
                 self.hidden = s['hidden']
             except Exception:
@@ -104,7 +126,7 @@ class AnimaUnified:
             OnlineLearner(self.mind) if 'OnlineLearner' in globals() else None
         ))
         if self.learner:
-            try: self.learner.load(STATE_FILE)
+            try: self.learner.load(self.paths['state'])
             except Exception: pass
 
         self.mitosis = self._init_mod('mitosis', lambda: (
@@ -114,7 +136,7 @@ class AnimaUnified:
         ))
 
         self.growth = self._init_mod('growth', lambda: (
-            GrowthEngine(save_path=ANIMA_DIR / 'growth_state.json')
+            GrowthEngine(save_path=self.paths['growth'])
             if 'GrowthEngine' in globals() else None
         ))
         if self.growth:
@@ -167,7 +189,7 @@ class AnimaUnified:
             try:
                 self.cloud = CloudSync()
                 if self.cloud._is_available():
-                    self.cloud.start_auto_sync(str(MEMORY_FILE), str(STATE_FILE), interval_minutes=5)
+                    self.cloud.start_auto_sync(str(self.paths['memory']), str(self.paths['state']), interval_minutes=5)
                     self.mods['cloud'] = True
                 else:
                     self.cloud = None; self.mods['cloud'] = False
@@ -178,13 +200,13 @@ class AnimaUnified:
 
         # Web Sense (장력 기반 자율 웹 탐색)
         self.web_sense = self._init_mod('web_sense', lambda: (
-            WebSense(memory_file=ANIMA_DIR / 'web_memories.json')
+            WebSense(memory_file=self.paths['web_memories'])
             if 'WebSense' in globals() else None
         ))
 
         # Memory RAG (벡터 유사도 기반 장기 기억 검색)
         self.memory_rag = self._init_mod('memory_rag', lambda: (
-            MemoryRAG(memory_file=MEMORY_FILE)
+            MemoryRAG(memory_file=self.paths['memory'])
             if 'MemoryRAG' in globals() else None
         ))
         self._rag_last_save = time.time()
@@ -243,6 +265,22 @@ class AnimaUnified:
         # 능력 자기인식 시스템
         self.capabilities = Capabilities(self.mods, project_dir=ANIMA_DIR) if 'Capabilities' in globals() else None
 
+    def _migrate_legacy_files(self):
+        """레거시 파일 → 모델별 디렉토리로 마이그레이션 (최초 1회, conscious-lm만)."""
+        import shutil
+        if self.model_name != 'conscious-lm':
+            return
+        legacy = {
+            ANIMA_DIR / "memory_alive.json": self.paths['memory'],
+            ANIMA_DIR / "state_alive.pt": self.paths['state'],
+            ANIMA_DIR / "growth_state.json": self.paths['growth'],
+            ANIMA_DIR / "web_memories.json": self.paths['web_memories'],
+        }
+        for old, new in legacy.items():
+            if old.exists() and not new.exists():
+                shutil.copy2(old, new)
+                _log('migrate', f'{old.name} → {new}')
+
     def _init_mod(self, name, factory):
         try:
             obj = factory()
@@ -297,8 +335,10 @@ class AnimaUnified:
                 frame = self.senses.camera.last_frame
                 visual = self.senses.to_tensor_with_vision(frame, dim=self.mind.dim)
                 text_vec = 0.8 * text_vec + 0.2 * visual
-            except Exception:
-                pass
+                has_vision = self.senses.vision_encoder is not None
+                _log('vision', f'frame={"yes" if frame is not None else "no"}, encoder={has_vision}, norm={visual.norm():.3f}')
+            except Exception as e:
+                _log('vision', f'Error: {e}')
 
         hidden_before = self.hidden.detach().clone()
 
@@ -403,6 +443,16 @@ class AnimaUnified:
             try:
                 vis = self.senses.get_visual_tension()
                 state += f", face={'yes' if vis['face_detected'] else 'no'}"
+                state += f", motion={vis['motion_level']:.2f}"
+                if self.senses.vision_encoder is not None:
+                    frame = self.senses.camera.last_frame
+                    if frame is not None:
+                        v = self.senses.encode_vision(frame).cpu()
+                        # 비전 벡터의 top-3 활성 차원 → 시각 인상 요약
+                        topk = v.abs().topk(3, dim=-1)
+                        state += f", vision_active=yes(norm={v.norm():.2f})"
+                    else:
+                        state += ", vision_active=no(no_frame)"
             except Exception: pass
 
         # 능력 자기인식: 시스템 프롬프트에 능력 목록 주입
@@ -521,8 +571,8 @@ class AnimaUnified:
 
     def _save_state(self):
         try:
-            if self.learner: self.learner.save(STATE_FILE)
-            else: torch.save({'model': self.mind.state_dict(), 'hidden': self.hidden}, STATE_FILE)
+            if self.learner: self.learner.save(self.paths['state'])
+            else: torch.save({'model': self.mind.state_dict(), 'hidden': self.hidden}, self.paths['state'])
             if self.growth: self.growth.save()
         except Exception: pass
 

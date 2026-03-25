@@ -539,7 +539,7 @@ class SenseHub:
         sensor_tensor = self.to_tensor(dim=dim)
 
         if frame is not None and self.vision_encoder is not None:
-            vision_tensor = self.encode_vision(frame)
+            vision_tensor = self.encode_vision(frame).cpu()
             return _VISION_BLEND_WEIGHT * vision_tensor + _SENSOR_BLEND_WEIGHT * sensor_tensor
 
         return sensor_tensor
