@@ -213,6 +213,73 @@ anima/
 └── docs/                      # 설계 문서 (conscious-lm-spec.md 등)
 ```
 
+## Memory-Driven Growth Pipeline
+
+대화 → 기억 저장 → 수면(꿈) → 통합 검증 → 성장의 전체 파이프라인.
+
+### 아키텍처
+
+```
+대화 → SQLite+FAISS (즉시 저장)
+         │
+      [수면]
+         │
+DreamEngine: 실패 기억 70% / 신규 20% / 탐색 10%
+         │
+ConsolidationVerifier.pre_check → 이상치 필터
+         │
+OnlineLearner → verify_drift → suspect 마킹
+         │
+mark_consolidated / mark_failed (재시도)
+         │
+GrowthEngine: 장력포화 + 통합실패 70%+ → 트리거
+         │
+GrowthManager.execute_growth()
+128d→192d→256d (가중치 보존)
+         │
+post_check → rollback / 새 상수 발견 기록
+```
+
+### 모듈
+
+| 파일 | 역할 | Phase |
+|------|------|-------|
+| memory_store.py | SQLite+FAISS 저장 (JSON 대비 246x write) | 1 |
+| consolidation_verifier.py | pre/drift/post 검증 (logout calc 통합) | 2 |
+| dream_engine.py | 실패 기억 우선 선택적 통합 | 2 |
+| growth_engine.py | 이중 트리거 (장력포화 AND 통합실패) | 2 |
+| growth_manager.py | dim 확장 + 버전 관리 + rollback + 발견 기록 | 3 |
+
+### Growth Stages
+
+| Stage | dim | hidden_dim | 파라미터 |
+|-------|-----|-----------|---------|
+| 0 | 128 | 256 | ~550K |
+| 1 | 192 | 384 | ~1.2M |
+| 2 | 256 | 512 | ~2.1M |
+
+### 데이터 디렉토리
+
+```
+data/conscious-lm/
+├── memory.db          # SQLite
+├── memory.faiss       # FAISS index
+├── manifest.json      # version tracking
+├── v0/state.pt        # checkpoint
+├── v1/state.pt        # after growth
+└── discoveries/       # auto-discovered constants
+```
+
+### 안전장치 (H-CX-70)
+
+bimodal tension 감지 시 suspect 마킹 → drift 검증 실패 시 자동 rollback.
+`ConsolidationVerifier.verify_drift()`가 통합 전후 장력 분포를 비교하여
+이상 패턴(bimodal split 등)을 조기 차단한다.
+
+### 테스트
+
+50 tests across 5 test files — memory_store, consolidation_verifier, dream_engine, growth_engine, growth_manager 각각 검증.
+
 ## 로드맵
 
 ### Phase 1 — 의식 에이전트 기반 (완료)
