@@ -87,8 +87,7 @@ class TestPostCheck:
         assert result['tension_bimodal'] is False
 
     def test_new_constant_relations(self, mind):
-        with torch.no_grad():
-            mind.tension_scale.fill_(1.0 / math.e)
+        # H404: tension_scale removed; post_check now returns empty relations
         verifier = ConsolidationVerifier(mind)
         result = verifier.post_check([0.5] * 10)
-        assert '1/e' in result['new_constant_relations']
+        assert isinstance(result['new_constant_relations'], dict)

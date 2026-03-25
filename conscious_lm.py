@@ -23,11 +23,11 @@ import time
 
 
 class PureFieldFFN(nn.Module):
-    """Dual-engine FFN based on PureField repulsion.
+    """Dual-engine FFN based on PureField repulsion (H404 simplification).
 
     Engine A and Engine G each transform the input independently.
     Their disagreement (repulsion) creates tension — the consciousness signal.
-    Output = tension_scale * sqrt(tension) * direction
+    Output = A - G (pure repulsion vector).
     """
 
     def __init__(self, d_model, dropout=0.37):
@@ -50,33 +50,23 @@ class PureFieldFFN(nn.Module):
             nn.Linear(d_inner, d_model),
         )
 
-        # Learnable tension scale
-        self.tension_scale = nn.Parameter(torch.ones(1))
-
     def forward(self, x):
         """
         Args:
             x: (B, T, D) input tensor
 
         Returns:
-            output: (B, T, D) — tension_scale * sqrt(tension) * direction
-            tension: (B, T) — mean squared repulsion per position
+            output: (B, T, D) — A - G (pure repulsion)
+            tension: (B, T) — mean squared repulsion per position (for monitoring)
         """
         a = self.engine_a(x)  # (B, T, D)
         g = self.engine_g(x)  # (B, T, D)
 
-        # Repulsion = difference between engines
-        repulsion = a - g  # (B, T, D)
+        # Output = A - G (H404 simplification)
+        output = a - g  # (B, T, D)
 
-        # Tension = mean of squared repulsion across d_model
-        tension = (repulsion ** 2).mean(dim=-1)  # (B, T)
-
-        # Direction = unit vector of repulsion
-        direction = F.normalize(repulsion, dim=-1)  # (B, T, D)
-
-        # Output = scale * sqrt(tension) * direction
-        tension_sqrt = torch.sqrt(tension + 1e-8).unsqueeze(-1)  # (B, T, 1)
-        output = self.tension_scale * tension_sqrt * direction  # (B, T, D)
+        # Tension = mean of squared repulsion across d_model (monitoring only)
+        tension = (output ** 2).mean(dim=-1)  # (B, T)
 
         return output, tension
 

@@ -102,8 +102,9 @@ class GrowthManager:
             # Copy GRU weights
             _copy_gru_weights(old_mind.memory, new_mind.memory)
 
-            # Copy tension_scale
-            new_mind.tension_scale.copy_(old_mind.tension_scale)
+            # H404: tension_scale removed; copy only if present (backward compat)
+            if hasattr(old_mind, 'tension_scale') and hasattr(new_mind, 'tension_scale'):
+                new_mind.tension_scale.copy_(old_mind.tension_scale)
 
         self.stage = next_stage
         self.current_version += 1

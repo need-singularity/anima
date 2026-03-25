@@ -59,11 +59,10 @@ class OnlineLearner:
         self.feedback_weight = feedback_weight
         self.divergence_weight = divergence_weight
 
-        # Only train Engine A, G, tension_scale (memory GRU is frozen)
+        # Only train Engine A, G (memory GRU is frozen; H404: tension_scale removed)
         self.params = (
             list(mind.engine_a.parameters())
             + list(mind.engine_g.parameters())
-            + [mind.tension_scale]
         )
         self.optimizer = torch.optim.Adam(self.params, lr=lr)
 

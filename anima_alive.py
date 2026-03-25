@@ -66,7 +66,6 @@ class ConsciousMind(nn.Module):
             nn.Linear(256, dim)
         )
         self.memory = nn.GRUCell(dim + 1, hidden)
-        self.tension_scale = nn.Parameter(torch.tensor(init_tension))
         self.hidden_dim = hidden
         self.dim = dim
         self.prev_tension = 0.0
@@ -88,8 +87,8 @@ class ConsciousMind(nn.Module):
             'gain': 0.005,              # 0.5% per step (very smooth)
             'tension_ema': 1.0,         # starts at setpoint
             'ema_alpha': 0.02,          # very slow tracking (~50-step window)
-            'scale_floor': 1.0,         # minimum tension_scale
-            'scale_ceil': 50.0,         # maximum tension_scale
+            'scale_floor': 1.0,         # (unused after H404)
+            'scale_ceil': 50.0,         # (unused after H404)
             'adjustments': 0,           # total adjustments made
         }
 
@@ -120,10 +119,10 @@ class ConsciousMind(nn.Module):
         combined = torch.cat([x, hidden], dim=-1)
         a = self.engine_a(combined)
         g = self.engine_g(combined)
-        repulsion = a - g
-        tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
-        direction = F.normalize(repulsion, dim=-1)
-        output = self.tension_scale * torch.sqrt(tension + 1e-8) * direction
+        # Output = A - G (H404 simplification)
+        output = a - g
+        tension = (output ** 2).mean(dim=-1, keepdim=True)
+        direction = F.normalize(output, dim=-1)
 
         raw_t = tension.mean().item()
 
@@ -141,18 +140,9 @@ class ConsciousMind(nn.Module):
         h = self.homeostasis
         h['tension_ema'] = h['ema_alpha'] * t_val + (1 - h['ema_alpha']) * h['tension_ema']
 
-        with torch.no_grad():
-            deadband = 0.3  # wider band: allow natural variation ±0.3 around setpoint
-            if h['tension_ema'] > h['setpoint'] + deadband:
-                # Tension above setpoint+deadband — reduce scale
-                self.tension_scale.mul_(1.0 - h['gain'])
-                self.tension_scale.clamp_(min=h['scale_floor'])
-                h['adjustments'] += 1
-            elif h['tension_ema'] < h['setpoint'] - deadband:
-                # Tension below setpoint-deadband — increase scale
-                self.tension_scale.mul_(1.0 + h['gain'])
-                self.tension_scale.clamp_(max=h['scale_ceil'])
-                h['adjustments'] += 1
+        # Homeostatic regulation: track EMA only (H404: no tension_scale adjustment)
+        if h['tension_ema'] > h['setpoint'] + 0.3 or h['tension_ema'] < h['setpoint'] - 0.3:
+            h['adjustments'] += 1
 
         # ── Habituation: dampen tension for repeated inputs (cosine similarity) ──
         x_norm = F.normalize(x.detach().float(), dim=-1)

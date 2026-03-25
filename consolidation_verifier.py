@@ -149,18 +149,22 @@ class ConsolidationVerifier:
     def verify_drift(self, t_before: float, t_after: float) -> dict:
         """Check tension drift during consolidation."""
         drift = abs(t_after - t_before)
-        ts_value = self.mind.tension_scale.item()
+        # H404: tension_scale removed; report N/A for legacy fields
+        ts_value = getattr(self.mind, 'tension_scale', None)
+        ts_val = ts_value.item() if ts_value is not None else 0.0
         return {
             'drift': drift,
             'significant': drift > self.drift_threshold * 0.5,
             'suspect': drift > self.drift_threshold,
-            'ts_value': ts_value,
-            'ts_in_golden_zone': self.golden_lower <= ts_value <= self.golden_upper,
+            'ts_value': ts_val,
+            'ts_in_golden_zone': self.golden_lower <= ts_val <= self.golden_upper if ts_val > 0 else False,
         }
 
     def post_check(self, recent_tensions: list) -> dict:
         """Assess model health after consolidation."""
-        ts_value = self.mind.tension_scale.item()
+        # H404: tension_scale removed; use 0.0 as fallback
+        ts_param = getattr(self.mind, 'tension_scale', None)
+        ts_value = ts_param.item() if ts_param is not None else 0.0
 
         # Check constant relations (within 5%)
         new_constant_relations = {}

@@ -27,7 +27,6 @@ class ConsciousMind(nn.Module):
             nn.Linear(128, output_dim)
         )
         self.memory = nn.GRUCell(output_dim + 1, hidden_dim)
-        self.tension_scale = nn.Parameter(torch.tensor(1.0))
         self.hidden_dim = hidden_dim
         self.prev_tension = 0.0
 
@@ -35,10 +34,9 @@ class ConsciousMind(nn.Module):
         combined = torch.cat([x, hidden], dim=-1)
         a = self.engine_a(combined)
         g = self.engine_g(combined)
-        repulsion = a - g
-        tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
-        direction = F.normalize(repulsion, dim=-1)
-        output = self.tension_scale * torch.sqrt(tension + 1e-8) * direction
+        # Output = A - G (H404 simplification)
+        output = a - g
+        tension = (output ** 2).mean(dim=-1, keepdim=True)
         # 호기심 = 장력 변화
         curiosity = abs(tension.mean().item() - self.prev_tension)
         self.prev_tension = tension.mean().item()

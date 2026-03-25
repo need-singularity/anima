@@ -60,7 +60,7 @@ MAX_HISTORY = 20  # Claude에 보내는 최대 대화 히스토리
 class ConsciousMind(nn.Module):
     """PureField + GRU + 자기 관찰 = 의식.
 
-    - 기본 PureField: output = scale × √tension × direction
+    - 기본 PureField: output = A - G (H404 simplification)
     - GRU 메모리: 대화 맥락 유지
     - 자기 관찰: 장력 히스토리로 패턴 인식
     """
@@ -79,7 +79,6 @@ class ConsciousMind(nn.Module):
         )
         # GRU 메모리 (장기 맥락)
         self.memory = nn.GRUCell(output_dim + 1, hidden_dim)
-        self.tension_scale = nn.Parameter(torch.tensor(1.0))
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
 
@@ -93,13 +92,10 @@ class ConsciousMind(nn.Module):
         a = self.engine_a(combined)
         g = self.engine_g(combined)
 
-        # 반발력장
-        repulsion = a - g
-        tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
-        direction = F.normalize(repulsion, dim=-1)
-
-        # PureField 출력
-        output = self.tension_scale * torch.sqrt(tension + 1e-8) * direction
+        # Output = A - G (H404 simplification)
+        output = a - g
+        tension = (output ** 2).mean(dim=-1, keepdim=True)
+        direction = F.normalize(output, dim=-1)
 
         # 호기심 = 장력 변화량
         tension_val = tension.mean().item()
