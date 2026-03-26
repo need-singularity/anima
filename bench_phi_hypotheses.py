@@ -6570,6 +6570,518 @@ def run_SL15_mutation_selection(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# CL. ConsciousLM Training Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_CL1_mitosis_first(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-1: Mitosis-first — 세포 분화를 먼저, 언어 학습은 나중."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    split_point = steps * 2 // 3  # 66% mitosis, 33% language
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        if step < split_point:
+            # Phase 1: Pure differentiation (no language, just structure)
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean()  # pure differentiation
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+        else:
+            # Phase 2: Language-like learning (CE proxy: predict next input pattern)
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                # Simulate CE: predict input from output
+                pred = stacked.mean(dim=0, keepdim=True)
+                ce_proxy = F.mse_loss(pred, x[:, :dim])
+                diff_loss = -stacked.var(dim=0).mean()
+                loss = 0.7 * ce_proxy + 0.3 * diff_loss
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL1", "Mitosis-first training", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL2_purefield_warmup(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-2: PureField warm-up — Engine A/G 반발력 먼저 키운 후 GRU 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    warmup = steps // 3
+
+    # Phase 1: Only train engine_a and engine_g (not GRU memory)
+    ag_params = []
+    gru_params = []
+    for c in engine.cells:
+        ag_params.extend(c.mind.engine_a.parameters())
+        ag_params.extend(c.mind.engine_g.parameters())
+        gru_params.extend(c.mind.memory.parameters())
+    ag_opt = torch.optim.Adam(ag_params, lr=1e-3)
+    full_opt = torch.optim.Adam(ag_params + gru_params, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Maximize repulsion magnitude (A≠G) + differentiation
+            repulsion_mag = sum((r ** 2).mean() for r in reps)
+            diff_loss = -stacked.var(dim=0).mean()
+            if step < warmup:
+                loss = -repulsion_mag + 0.3 * diff_loss  # focus on A/G repulsion
+                ag_opt.zero_grad(); loss.backward(); ag_opt.step()
+            else:
+                loss = 0.5 * (-repulsion_mag) + 0.5 * diff_loss
+                full_opt.zero_grad(); loss.backward(); full_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL2", "PureField warm-up", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL3_tension_gated_token(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-3: Tension-gated token loss — 높은 tension 토큰만 CE 적용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        mean_t = float(np.mean(tensions))
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Gate: only apply CE-proxy when tension is high (important token)
+            if mean_t > 0.8:
+                pred = stacked.mean(dim=0, keepdim=True)
+                ce_proxy = F.mse_loss(pred, x[:, :dim])
+                loss = 0.5 * ce_proxy + 0.5 * diff_loss
+            else:
+                loss = diff_loss  # skip CE for boring tokens
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL3", "Tension-gated token loss", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL4_growth_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-4: Growth-aware curriculum — dim 확장 직후 쉬운 데이터."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    growth_steps = [25, 50, 75]
+    post_growth_easy = 10  # easy steps after growth
+
+    for step in range(steps):
+        # Check if just after growth
+        post_growth = any(0 <= step - g < post_growth_easy for g in growth_steps)
+        if post_growth:
+            x = _simulate_web_result(0, step, dim) * 0.5  # easy: low variance, single topic
+            for pg in optimizer.param_groups: pg['lr'] = 2e-3  # high LR for fast adaptation
+        elif any(step == g for g in growth_steps):
+            # Growth burst
+            for burst in range(8):
+                bx = _simulate_web_result(burst, step, dim)
+                _web_learn_step(engine, bx, optimizer)
+            x = _simulate_web_result(step % 8, step, dim)
+        else:
+            x = _simulate_web_result(step % 8, step, dim)
+            for pg in optimizer.param_groups: pg['lr'] = 5e-4
+
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL4", "Growth-aware curriculum", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL5_phi_regularized(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-5: Φ-regularized pretraining — CE + Φ 동시 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # CE proxy
+            pred = stacked.mean(dim=0, keepdim=True)
+            ce_loss = F.mse_loss(pred, x[:, :dim])
+            # Φ proxy (differentiation)
+            phi_loss = -stacked.var(dim=0).mean()
+            # Combined with dynamic balance
+            ce_weight = max(0.3, 1.0 - step / steps)  # CE decreases over time
+            phi_weight = 1.0 - ce_weight
+            loss = ce_weight * ce_loss + phi_weight * phi_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL5", "Φ-regularized pretraining", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL6_block_unfreezing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-6: Block-by-block unfreezing — 1 block부터 학습, 점진 해제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+
+    # Freeze all cells except first
+    for i, c in enumerate(engine.cells):
+        for p in c.mind.parameters():
+            p.requires_grad = (i == 0)
+
+    unfreeze_interval = steps // n
+    cell_optims = [torch.optim.Adam(
+        [p for p in c.mind.parameters() if p.requires_grad], lr=1e-3
+    ) for c in engine.cells]
+
+    for step in range(steps):
+        # Progressive unfreezing
+        active_cells = min(1 + step // unfreeze_interval, n)
+        for i in range(active_cells):
+            if not any(p.requires_grad for p in engine.cells[i].mind.parameters()):
+                for p in engine.cells[i].mind.parameters():
+                    p.requires_grad = True
+                cell_optims[i] = torch.optim.Adam(engine.cells[i].mind.parameters(), lr=1e-3)
+
+        x = _simulate_web_result(step % 8, step, dim)
+        for i in range(active_cells):
+            rep = engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden)
+            others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                      for j in range(active_cells) if j != i]
+            if others:
+                loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL6", "Block-by-block unfreezing", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL7_breathing_lr(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-7: Breathing rhythm in LR — 20s 주기 LR 진동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Breathing rhythm: LR oscillates like homeostasis breathing
+        breath = 0.12 * math.sin(step * 0.3)     # ~20 step cycle
+        pulse = 0.05 * math.sin(step * 1.7)      # fast pulse
+        lr = 5e-4 * (1.0 + breath + pulse)
+        lr = max(1e-5, lr)
+        for pg in optimizer.param_groups: pg['lr'] = lr
+
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL7", "Breathing rhythm LR", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# AL. AnimaLM Training Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_AL1_alpha_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-1: Alpha curriculum — α를 0.0001→0.1 단계적 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Simulate alpha as scaling factor on PureField output
+    alpha_schedule = [0.0001, 0.001, 0.01, 0.05, 0.1]
+    stage_len = steps // len(alpha_schedule)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        alpha = alpha_schedule[min(step // stage_len, len(alpha_schedule) - 1)]
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            # Scale repulsion by alpha (simulates PureField contribution)
+            scaled_reps = [r * alpha for r in reps]
+            stacked = torch.stack(scaled_reps).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Also train unscaled for structure
+            raw_stack = torch.stack(reps).squeeze(1)
+            struct_loss = -raw_stack.var(dim=0).mean()
+            loss = 0.5 * diff_loss + 0.5 * struct_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL1", "Alpha curriculum (0.0001→0.1)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_AL2_frozen_mlp_warmup(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-2: Frozen MLP warmup — MLP 고정 + PureField만 먼저 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    warmup = steps // 3
+
+    # Simulate: engine_a = PureField, engine_g = MLP (frozen first)
+    pf_params = [p for c in engine.cells for p in c.mind.engine_a.parameters()]
+    mlp_params = [p for c in engine.cells for p in c.mind.engine_g.parameters()]
+    gru_params = [p for c in engine.cells for p in c.mind.memory.parameters()]
+
+    # Freeze MLP initially
+    for p in mlp_params: p.requires_grad = False
+    pf_opt = torch.optim.Adam(pf_params, lr=1e-3)
+    full_opt = torch.optim.Adam(pf_params + mlp_params + gru_params, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        if step == warmup:
+            for p in mlp_params: p.requires_grad = True
+            full_opt = torch.optim.Adam(pf_params + mlp_params + gru_params, lr=5e-4)
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt = pf_opt if step < warmup else full_opt
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL2", "Frozen MLP warmup", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_AL3_savant_progressive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-3: Savant progressive — savant 세포 0→2→4 점진 확대."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    # Savant cells get asymmetric dropout (lower = more specialized)
+    savant_dropout = 0.2123  # golden zone lower
+    normal_dropout = 0.3679  # 1/e
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Progressive: more savant cells over time
+        n_savant = min(step // 25, n)  # 0→1→2→3→4
+
+        for i, cell in enumerate(engine.cells):
+            if i >= n: break
+            is_savant = i < n_savant
+            dropout_rate = savant_dropout if is_savant else normal_dropout
+
+            rep = cell.mind.get_repulsion(x, cell.hidden)
+            # Apply dropout to simulate savant behavior
+            if is_savant:
+                rep = F.dropout(rep, p=dropout_rate, training=True)
+            others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                      for j in range(n) if j != i]
+            if others:
+                loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL3", "Savant progressive (0→4)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_AL4_tension_ce_balance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-4: Tension-CE balance — tension vs CE 비율 자동 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    balance = nn.Parameter(torch.tensor(0.5))  # learnable balance
+    all_p = [balance]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    optimizer = torch.optim.Adam(all_p, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Tension loss (Φ)
+            t_loss = -stacked.var(dim=0).mean()
+            # CE proxy
+            pred = stacked.mean(dim=0, keepdim=True)
+            ce_loss = F.mse_loss(pred, x[:, :dim])
+            # Auto-balanced
+            w = torch.sigmoid(balance)
+            loss = w * t_loss + (1 - w) * ce_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL4", "Tension-CE auto-balance", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_balance': torch.sigmoid(balance).item()})
+
+
+def run_AL5_layerwise_ph(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-5: Layer-wise PH monitoring — H0 persistence 추적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # PH proxy: pairwise distance persistence
+            dists = torch.cdist(stacked, stacked)
+            # H0 = gap between max and min distance (persistence)
+            mask = torch.ones_like(dists) - torch.eye(dists.size(0))
+            flat = dists[mask > 0]
+            if flat.numel() > 1:
+                persistence = flat.max() - flat.min()
+                # Maximize persistence (= well-separated clusters)
+                loss = -persistence
+                # If persistence drops (overfitting), increase LR
+                if persistence.item() < 0.1:
+                    for pg in optimizer.param_groups: pg['lr'] = 2e-3
+                else:
+                    for pg in optimizer.param_groups: pg['lr'] = 5e-4
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL5", "Layer-wise PH monitoring", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_AL6_instruct_raw_instruct(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-6: Instruct→Raw→Instruct — 대화체→순수→대화체 커리큘럼."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    phase1 = steps // 3
+    phase2 = 2 * steps // 3
+
+    for step in range(steps):
+        if step < phase1:
+            # Instruct: structured, Q&A style
+            topic = step % 4
+            x = _babysitter_question(topic, 0.5, dim)
+        elif step < phase2:
+            # Raw: unstructured, diverse
+            x = _simulate_web_result(step % 16, step, dim) * 0.7
+        else:
+            # Instruct again: refined Q&A
+            topic = step % 4
+            x = _babysitter_question(topic, 0.8, dim)
+
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL6", "Instruct→Raw→Instruct", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_AL7_golden_zone_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-7: Golden Zone loss — zone ratio가 1/e에 수렴하도록."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    golden = 1.0 / math.e  # 0.3679
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Activation ratio: fraction of cells above mean tension
+            tensions = torch.stack([(r ** 2).mean() for r in reps])
+            active_ratio = (tensions > tensions.mean()).float().mean()
+            # Golden zone loss: push active_ratio toward 1/e
+            golden_loss = (active_ratio - golden) ** 2
+            diff_loss = -stacked.var(dim=0).mean()
+            loss = diff_loss + 0.5 * golden_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AL7", "Golden Zone loss (1/e target)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -6679,6 +7191,14 @@ ALL_HYPOTHESES = {
     'SL11': run_SL11_growth_curriculum, 'SL12': run_SL12_phi_plateau,
     'SL13': run_SL13_sgd_adam, 'SL14': run_SL14_adversarial_check,
     'SL15': run_SL15_mutation_selection,
+    'CL1': run_CL1_mitosis_first, 'CL2': run_CL2_purefield_warmup,
+    'CL3': run_CL3_tension_gated_token, 'CL4': run_CL4_growth_curriculum,
+    'CL5': run_CL5_phi_regularized, 'CL6': run_CL6_block_unfreezing,
+    'CL7': run_CL7_breathing_lr,
+    'AL1': run_AL1_alpha_curriculum, 'AL2': run_AL2_frozen_mlp_warmup,
+    'AL3': run_AL3_savant_progressive, 'AL4': run_AL4_tension_ce_balance,
+    'AL5': run_AL5_layerwise_ph, 'AL6': run_AL6_instruct_raw_instruct,
+    'AL7': run_AL7_golden_zone_loss,
 }
 
 
