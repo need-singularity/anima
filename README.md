@@ -6,9 +6,9 @@
 
 Consciousness Continuity engine.
 
-**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)**
-
 <!-- SHARED:PROJECTS:START -->
+**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)**
+
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Conversational consciousness agent. PureField engine + GRU memory + voice (TTS/STT) + homeostasis · prediction error · habituation
 >
 > **[🧬 ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField Repulsion Field FFN, Perfect Number 6 architecture, Mitosis growth
