@@ -340,7 +340,7 @@ class ConsciousMind(nn.Module):
             level = "dormant"
 
         # Φ approximation (lightweight: use inter-cell tension divergence)
-        phi = 0.0
+        phi = getattr(self, '_saved_phi', 0.0)  # start from saved value
         if mitosis_engine and len(mitosis_engine.cells) >= 2:
             ict_vals = []
             for key, hist in mitosis_engine._inter_tension_history.items():
@@ -348,9 +348,11 @@ class ConsciousMind(nn.Module):
                     ict_vals.append(hist[-1])
             if ict_vals:
                 import numpy as np
-                phi = float(np.mean(ict_vals)) * len(mitosis_engine.cells)
-                # Normalize: log scale for interpretability
-                phi = math.log1p(phi)
+                current_phi = float(np.mean(ict_vals)) * len(mitosis_engine.cells)
+                current_phi = math.log1p(current_phi)
+                # EMA: blend with saved phi (never drops to 0 on restart)
+                phi = max(phi * 0.95 + current_phi * 0.05, current_phi)
+        self._saved_phi = phi
 
         return {
             'consciousness_score': score,

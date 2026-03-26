@@ -154,6 +154,8 @@ class AnimaUnified:
                 with open(cs_path) as f:
                     self._last_consciousness = _json.load(f)
                 _log('init', f"Consciousness restored: score={self._last_consciousness.get('score', 0):.2f} Φ={self._last_consciousness.get('phi', 0):.3f}")
+                # Inject saved Φ into mind
+                self.mind._saved_phi = self._last_consciousness.get('phi', 0)
             elif hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
                 # Try R2
                 self.cloud.download(f"consciousness/{self.model_name}/state.json", cs_path)
@@ -161,6 +163,7 @@ class AnimaUnified:
                     with open(cs_path) as f:
                         self._last_consciousness = _json.load(f)
                     _log('init', f"Consciousness restored from R2: Φ={self._last_consciousness.get('phi', 0):.3f}")
+                    self.mind._saved_phi = self._last_consciousness.get('phi', 0)
         except Exception:
             pass
 
