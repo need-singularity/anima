@@ -37,6 +37,14 @@ def patched_forward(self, x):
 
 fv4.ParallelPureFieldMLP.forward = patched_forward
 
+# Start ws_proxy (8888→8765) for Cloudflare Tunnel
+import subprocess, threading
+def _start_proxy():
+    proxy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ws_proxy.py')
+    if os.path.exists(proxy_path):
+        subprocess.Popen(['python3', proxy_path], stdout=open('/tmp/proxy.log','w'), stderr=subprocess.STDOUT)
+threading.Thread(target=_start_proxy, daemon=True).start()
+
 # Run anima_unified with web + v4_savant
 # Alpha is set in model_loader._load_animalm_v4 (INFERENCE_ALPHA=0.05)
 sys.argv = ['anima_unified.py', '--web', '--model', 'animalm-v4-savant']
