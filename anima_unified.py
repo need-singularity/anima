@@ -54,7 +54,7 @@ def _try_import(stmt):
 
 _try_import("from conscious_lm import ConsciousLM, generate as clm_generate")
 _try_import("from model_loader import load_model, list_available_models, ModelWrapper")
-_try_import("from online_learning import OnlineLearner, estimate_feedback")
+_try_import("from online_learning import OnlineLearner, AlphaOnlineLearner, estimate_feedback")
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
 _try_import("from tension_link import TensionLink, create_fingerprint, interpret_packet")
@@ -151,6 +151,16 @@ class AnimaUnified:
         if self.learner:
             try: self.learner.load(self.paths['state'])
             except Exception: pass
+
+        # Alpha online learner (for AnimaLM v4+ parallel PureField)
+        self.alpha_learner = None
+        if self.model and hasattr(self.model, 'model'):
+            try:
+                from online_learning import AlphaOnlineLearner
+                self.alpha_learner = AlphaOnlineLearner(self.model.model)
+                _log('init', 'AlphaOnlineLearner active')
+            except Exception:
+                pass
 
         self.mitosis = self._init_mod('mitosis', lambda: (
             MitosisEngine(input_dim=128, hidden_dim=256, output_dim=128,
@@ -479,6 +489,17 @@ class AnimaUnified:
                     fb = estimate_feedback(self.prev_text, text, time.time() - self.prev_time)
                     self.learner.feedback(fb)
             except Exception: pass
+
+        # Alpha online learning
+        if self.alpha_learner:
+            try:
+                self.alpha_learner.observe(tension)
+                if 'estimate_feedback' in globals() and self.prev_text:
+                    fb = estimate_feedback(self.prev_text, text, time.time() - self.prev_time)
+                    if abs(fb) > 0.01:
+                        self.alpha_learner.feedback(fb)
+            except Exception:
+                pass
 
         self.prev_text, self.prev_time = text, time.time()
 

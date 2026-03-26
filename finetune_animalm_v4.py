@@ -75,10 +75,11 @@ class ParallelPureFieldMLP(nn.Module):
         tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
         self.last_tension = tension.detach().squeeze(-1)
 
-        # Output = original + alpha * purefield correction
-        output = original_out + self.alpha * pf_out
-
-        return output
+        # Normalize PureField output to same scale as original MLP
+        pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
+        orig_scale = original_out.norm(dim=-1, keepdim=True)
+        pf_scaled = pf_norm * orig_scale  # same magnitude as original
+        return original_out + self.alpha * pf_scaled
 
 
 def add_purefield_parallel(model, n_layers=8, n_savant=2):
