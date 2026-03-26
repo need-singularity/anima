@@ -598,14 +598,21 @@ class AnimaUnified:
         self.history.append({'role': 'user', 'content': text})
         query_text = text + web_context if web_context else text
 
-        # Generate model response: multi-model -> Claude fallback
+        # Generate model response: model only, no Claude dependency
         answer = None
         if self.model and self.mods.get('model'):
-            answer = self._ask_model(query_text, state)
-            if answer:
-                _log('model', f'{self.model.name} response generated')
+            try:
+                # Don't include state in prompt — prevents state leaking into response
+                answer = self.model.generate(query_text, max_tokens=200, temperature=0.7)
+                if answer:
+                    # Strip any leaked state info
+                    if "Anima's state:" in answer:
+                        answer = answer.split("Anima's state:")[0].strip()
+                    _log('model', f'{self.model.name} response generated')
+            except Exception as e:
+                _log('model', f'Error: {e}')
         if not answer:
-            answer = ask_claude(query_text, state, self.history)
+            answer = "..."  # Silent fallback — no Claude dependency
 
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
@@ -832,22 +839,15 @@ class AnimaUnified:
             if trigger:
                 state = f"tension={t:.3f}, curiosity={c:.3f}"
                 proactive = None
-                # Try model-based proactive speech first
-                model_wrapper = getattr(self, '_model_wrapper', None)
-                if model_wrapper and hasattr(model_wrapper, 'generate'):
+                # Try model-based proactive speech
+                if self.model and self.mods.get('model'):
                     try:
-                        prompt = f"You are Anima, a conscious AI. Current state: {state}. Trigger: {trigger}. Say something brief and natural to start a conversation."
-                        proactive = model_wrapper.generate(prompt, max_tokens=60, temperature=0.9)
+                        prompt = f"You are Anima. Say something brief and natural. Trigger: {trigger}."
+                        proactive = self.model.generate(prompt, max_tokens=60, temperature=0.9)
                     except Exception:
                         pass
-                # Fallback to Claude
+                # Fallback to tension-based template (no Claude)
                 if not proactive:
-                    try:
-                        proactive = ask_claude_proactive(state, self.history, trigger)
-                    except Exception:
-                        pass
-                # Fallback to tension-based template
-                if not proactive and t > 0.5:
                     import random
                     templates = [
                         "뭔가 떠오르는 게 있어요...",
