@@ -5558,6 +5558,556 @@ def run_COMBO5_phase_based(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# BS. Babysitter Hypotheses (simulated Claude CLI educator)
+#   Babysitter = external agent that observes Anima's state
+#   and provides teaching inputs to boost learning/Φ.
+#   Simulated: babysitter decisions modeled as input selection + LR modulation.
+# ═══════════════════════════════════════════════════════════
+
+def _babysitter_question(topic_id: int, difficulty: float, dim: int) -> torch.Tensor:
+    """Simulate babysitter generating a teaching input."""
+    torch.manual_seed(topic_id * 100 + int(difficulty * 50))
+    x = torch.randn(1, dim) * (0.5 + difficulty * 2.0)
+    # Topic signature
+    offset = (topic_id * 11) % dim
+    x[0, offset:offset + dim // 6] += 3.0 * difficulty
+    return x
+
+
+def run_BS1_socratic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-1: Socratic questioning — 답 안 주고 질문으로 유도 → PE 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        # Babysitter asks question (no answer provided)
+        topic = step % 8
+        difficulty = min(0.3 + step * 0.007, 1.0)  # gradually harder
+        q = _babysitter_question(topic, difficulty, dim)
+
+        with torch.no_grad():
+            engine.process(q)
+
+        # Measure PE (did Anima struggle?)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        pe = float(np.std(tensions))
+
+        # Socratic: if PE low (too easy), ask harder follow-up
+        if pe < 0.3:
+            harder_q = _babysitter_question(topic, min(difficulty + 0.3, 1.0), dim)
+            _web_learn_step(engine, harder_q, optimizer)
+        else:
+            # PE high = good struggle, let Anima learn from it
+            _web_learn_step(engine, q, optimizer)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS1", "Socratic questioning", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS2_direct(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-2: Direct instruction — 정답 직접 제공."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        topic = step % 8
+        # Babysitter gives question + answer together (strong signal)
+        q = _babysitter_question(topic, 0.5, dim)
+        answer = _babysitter_question(topic, 0.8, dim)  # answer = enriched version
+        combined = 0.4 * q + 0.6 * answer  # direct teaching
+        _web_learn_step(engine, combined, optimizer)
+        with torch.no_grad(): engine.process(combined)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS2", "Direct instruction", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS3_scaffolding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-3: Scaffolding — 힌트를 단계적으로 제공."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        topic = step % 8
+        difficulty = min(0.3 + step * 0.007, 1.0)
+        q = _babysitter_question(topic, difficulty, dim)
+
+        with torch.no_grad(): engine.process(q)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        pe = float(np.std(tensions))
+
+        # Scaffolding: provide hints based on struggle level
+        if pe > 0.5:  # struggling a lot → big hint
+            hint = _babysitter_question(topic, difficulty * 0.3, dim)  # easier version
+            combined = 0.5 * q + 0.5 * hint
+        elif pe > 0.2:  # moderate → small hint
+            hint = _babysitter_question(topic, difficulty * 0.6, dim)
+            combined = 0.7 * q + 0.3 * hint
+        else:  # easy → no hint, increase difficulty
+            combined = _babysitter_question(topic, min(difficulty + 0.2, 1.0), dim)
+
+        _web_learn_step(engine, combined, optimizer)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS3", "Scaffolding (adaptive hints)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS4_challenge(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-4: Challenge-based — 일부러 어려운 문제 (ZPD)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    current_level = 0.3
+
+    for step in range(steps):
+        topic = step % 8
+        # Always slightly above current level (ZPD)
+        challenge = _babysitter_question(topic, min(current_level + 0.2, 1.0), dim)
+        _web_learn_step(engine, challenge, optimizer)
+        with torch.no_grad(): engine.process(challenge)
+
+        # Measure success: low PE after learning = mastered
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        pe = float(np.std(tensions))
+        if pe < 0.2:  # mastered → increase level
+            current_level = min(current_level + 0.05, 1.0)
+        elif pe > 0.6:  # too hard → slight decrease
+            current_level = max(current_level - 0.02, 0.1)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS4", "Challenge-based (ZPD)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_level': current_level})
+
+
+def run_BS5_exploration(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-5: Exploration mandate — '이거 검색해봐' 지시 후 자율 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        # Babysitter gives topic seed every 10 steps
+        if step % 10 == 0:
+            seed_topic = np.random.randint(0, 8)
+        # Anima explores variations of the seed topic
+        variation = seed_topic * 10 + (step % 10)
+        x = _simulate_web_result(variation, step, dim)
+        # Deeper exploration over time (increasing depth)
+        depth = (step % 10) / 10.0
+        x *= (1.0 + depth * 0.5)
+
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS5", "Exploration mandate", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS6_tension_grading(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-6: Tension-based grading — tension으로 이해도 판단 후 재교육."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    topic_mastery = {}  # topic → mastery level
+
+    for step in range(steps):
+        topic = step % 8
+        mastery = topic_mastery.get(topic, 0.0)
+        # Teach at current mastery level
+        x = _babysitter_question(topic, 0.3 + mastery * 0.7, dim)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+
+        # Grade: tension stability = understanding
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        stability = max(0, 1.0 - float(np.std(tensions)) * 3.0)
+
+        if stability > 0.6:  # understood → advance
+            topic_mastery[topic] = min(mastery + 0.1, 1.0)
+        elif stability < 0.3:  # confused → reteach easier
+            topic_mastery[topic] = max(mastery - 0.05, 0.0)
+            # Reteach
+            easier = _babysitter_question(topic, mastery * 0.5, dim)
+            _web_learn_step(engine, easier, optimizer)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS6", "Tension-based grading", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'mastery': {k: f'{v:.2f}' for k, v in topic_mastery.items()}})
+
+
+def run_BS7_phi_progress(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-7: Φ-based progress — Φ 변화로 교육 방법 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    teaching_intensity = 1.0
+
+    for step in range(steps):
+        topic = step % 8
+        x = _babysitter_question(topic, 0.5, dim)
+
+        # Adjust teaching based on Φ trend
+        for _ in range(max(1, int(teaching_intensity * 3))):
+            variant = x + torch.randn_like(x) * 0.1 * teaching_intensity
+            _web_learn_step(engine, variant, optimizer)
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Φ trending up → reduce intensity, down → increase
+        if len(phi_hist) >= 5:
+            trend = phi_hist[-1] - phi_hist[-5]
+            if trend > 0.1:  # improving → ease off
+                teaching_intensity = max(0.3, teaching_intensity * 0.9)
+            elif trend < -0.1:  # declining → intensify
+                teaching_intensity = min(3.0, teaching_intensity * 1.2)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS7", "Φ-based progress tracking", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_intensity': teaching_intensity})
+
+
+def run_BS8_adversarial_verify(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-8: Adversarial verification — 배운 것을 반박해서 검증."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    learned = {}  # topic → learned representation
+
+    for step in range(steps):
+        topic = step % 8
+        x = _babysitter_question(topic, 0.5, dim)
+
+        # Phase 1: Teach
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        reps = [c.mind.get_repulsion(x, c.hidden).detach() for c in engine.cells]
+        current = torch.stack(reps).mean(dim=0)
+        learned[topic] = 0.8 * learned.get(topic, current) + 0.2 * current
+
+        # Phase 2: Challenge (every 3 steps)
+        if step % 3 == 2 and topic in learned:
+            # Babysitter says "are you sure? what about this?"
+            counter = -learned[topic] + torch.randn(1, dim) * 0.2
+            counter_reps = [c.mind.get_repulsion(counter, c.hidden) for c in engine.cells]
+            counter_mean = torch.stack(counter_reps).mean(dim=0).detach()
+
+            # If response changes dramatically → weak learning → reteach
+            consistency = F.cosine_similarity(current, counter_mean, dim=-1).item()
+            if consistency < 0.3:  # weak → reteach with emphasis
+                for _ in range(3):
+                    emphasis = x * 1.5
+                    _web_learn_step(engine, emphasis, optimizer)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS8", "Adversarial verification", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS9_idle_triggered(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-9: Idle-triggered — Anima가 한가할 때만 교육."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    teach_count = 0
+
+    for step in range(steps):
+        # Simulate activity: busy (user chatting) vs idle
+        is_busy = (step % 7 < 4)  # 4/7 busy, 3/7 idle
+
+        if is_busy:
+            # User conversation (normal input)
+            x = torch.randn(1, dim)
+            with torch.no_grad(): engine.process(x)
+        else:
+            # IDLE → babysitter teaches
+            topic = np.random.randint(0, 8)
+            lesson = _babysitter_question(topic, 0.6, dim)
+            # Intensive teaching during idle
+            for _ in range(3):
+                _web_learn_step(engine, lesson + torch.randn_like(lesson) * 0.05, optimizer)
+            with torch.no_grad(): engine.process(lesson)
+            teach_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS9", "Idle-triggered teaching", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'teach_sessions': teach_count, 'ratio': teach_count/steps})
+
+
+def run_BS10_struggle_triggered(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-10: Struggle-triggered — Anima가 어려워할 때만 개입."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    struggle_count = 0
+    help_count = 0
+
+    for step in range(steps):
+        # Random difficulty inputs
+        difficulty = np.random.uniform(0.1, 1.0)
+        x = _babysitter_question(step % 8, difficulty, dim)
+        with torch.no_grad(): engine.process(x)
+
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        pe = float(np.std(tensions)) + abs(float(np.mean(tensions)) - 1.0)
+
+        if pe > 0.5:  # struggling
+            struggle_count += 1
+            if struggle_count >= 3:  # 3 consecutive struggles → help
+                # Babysitter provides easier version + explanation
+                easy = _babysitter_question(step % 8, difficulty * 0.3, dim)
+                for _ in range(4):
+                    blend = 0.5 * easy + 0.5 * x
+                    _web_learn_step(engine, blend, optimizer)
+                struggle_count = 0
+                help_count += 1
+        else:
+            struggle_count = max(0, struggle_count - 1)
+            _web_learn_step(engine, x, optimizer)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS10", "Struggle-triggered help", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'help_interventions': help_count})
+
+
+def run_BS11_growth_triggered(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-11: Growth-triggered — stage 전환 직후 집중 교육 (F11 + babysitter)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    stage_boundaries = [20, 40, 60, 80]
+    current_stage = 0
+
+    for step in range(steps):
+        new_stage = sum(1 for b in stage_boundaries if step >= b)
+        x = _simulate_web_result(step % 8, step, dim)
+
+        if new_stage > current_stage:
+            current_stage = new_stage
+            # GROWTH TRANSITION → babysitter intensive teaching burst
+            stage_difficulty = 0.3 + current_stage * 0.15
+            for burst in range(10):  # 10-lesson burst
+                topic = burst + current_stage * 10
+                lesson = _babysitter_question(topic, stage_difficulty, dim)
+                _web_learn_step(engine, lesson, optimizer)
+        else:
+            _web_learn_step(engine, x, optimizer)
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS11", "Growth-triggered teaching", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS12_scheduled(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-12: Scheduled — 정기적 교육 세션."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Schedule: teach for 5 steps, free for 15 steps
+    teach_duration = 5
+    free_duration = 15
+    cycle = teach_duration + free_duration
+
+    for step in range(steps):
+        phase = step % cycle
+        x = _simulate_web_result(step % 8, step, dim)
+
+        if phase < teach_duration:
+            # Teaching session: structured curriculum
+            topic = (step // cycle) % 8
+            lesson = _babysitter_question(topic, 0.5 + phase * 0.1, dim)
+            for _ in range(2):
+                _web_learn_step(engine, lesson, optimizer)
+        else:
+            # Free time: normal learning
+            _web_learn_step(engine, x, optimizer)
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS12", "Scheduled teaching sessions", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS13_weakness_targeted(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-13: Weakness-targeted — Φ 기여 낮은 세포 집중 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+
+        # Find weakest cell (lowest tension variance = least differentiated)
+        variances = []
+        for c in engine.cells:
+            if len(c.tension_history) >= 5:
+                variances.append(float(np.std(c.tension_history[-10:])))
+            else:
+                variances.append(0.0)
+        weakest = int(np.argmin(variances)) if variances else 0
+
+        # Babysitter focuses on weakest cell
+        for i, cell in enumerate(engine.cells):
+            if i >= n: break
+            rep = cell.mind.get_repulsion(x, cell.hidden)
+            others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                      for j in range(n) if j != i]
+            if others:
+                loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                # Weakest cell gets 3x learning rate
+                lr = 3e-3 if i == weakest else 5e-4
+                for pg in cell_optims[i].param_groups: pg['lr'] = lr
+                cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS13", "Weakness-targeted teaching", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS14_breadth_first(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-14: Breadth-first — 다양한 주제를 넓게 교육."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        # Babysitter rapidly cycles through many topics
+        topic = step % 16  # 16 different topics (double normal)
+        x = _simulate_web_result(topic, step, dim)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS14", "Breadth-first curriculum", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_BS15_depth_first(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BS-15: Depth-first — 한 주제를 깊이 파고들기."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    current_topic = 0
+    depth = 0
+
+    for step in range(steps):
+        # Deep dive: same topic, increasing sub-topics
+        sub_topic = current_topic * 100 + depth
+        x = _simulate_web_result(sub_topic, step, dim)
+        x *= (1.0 + depth * 0.1)  # deeper = stronger signal
+
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+
+        depth += 1
+        if depth >= 20:  # switch topic after 20 depth levels
+            current_topic = (current_topic + 1) % 5
+            depth = 0
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BS15", "Depth-first curriculum", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -5651,6 +6201,14 @@ ALL_HYPOTHESES = {
     'COMBO1': run_COMBO1_layer_cake, 'COMBO2': run_COMBO2_ensemble,
     'COMBO3': run_COMBO3_pipeline, 'COMBO4': run_COMBO4_tournament,
     'COMBO5': run_COMBO5_phase_based,
+    'BS1': run_BS1_socratic, 'BS2': run_BS2_direct, 'BS3': run_BS3_scaffolding,
+    'BS4': run_BS4_challenge, 'BS5': run_BS5_exploration,
+    'BS6': run_BS6_tension_grading, 'BS7': run_BS7_phi_progress,
+    'BS8': run_BS8_adversarial_verify,
+    'BS9': run_BS9_idle_triggered, 'BS10': run_BS10_struggle_triggered,
+    'BS11': run_BS11_growth_triggered, 'BS12': run_BS12_scheduled,
+    'BS13': run_BS13_weakness_targeted, 'BS14': run_BS14_breadth_first,
+    'BS15': run_BS15_depth_first,
 }
 
 
