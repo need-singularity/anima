@@ -76,7 +76,15 @@ class ModelWrapper:
         tokenizer = getattr(self, 'tokenizer', None)
         if tokenizer is None:
             return None
-        inputs = tokenizer(prompt, return_tensors="pt")
+
+        # Use Instruct chat template if available
+        if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            formatted = f"User: {prompt}\nAssistant:"
+
+        inputs = tokenizer(formatted, return_tensors="pt")
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -87,6 +95,7 @@ class ModelWrapper:
                 temperature=temperature,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.2,
             )
         text = tokenizer.decode(out[0][len(inputs["input_ids"][0]):], skip_special_tokens=True).strip()
 
