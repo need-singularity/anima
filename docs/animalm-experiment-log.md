@@ -128,10 +128,58 @@ tension: mean=0.000000 max=0.000000 (32 layers)
 
 ---
 
+## Inference Test Results (RunPod Gradio)
+
+### AnimaLM v1 Inference
+
+```
+User: 안녕
+Bot: alleged alleged alleged supposed alleged alleged supposed mock alleged...
+tension: mean=0.000000 max=0.000000 (32 layers)
+```
+→ **완전 실패.** PureField output ≈ 0 → 모델 붕괴. 반복 토큰만 출력.
+
+### GoldenMoE v1 Inference
+
+```
+User: 안녕
+Bot: visible Polldule alias Dir met權kernlauf listffect defens彩...
+active=3.2/8  zone=39.5%  I=0.5057  (1/e=0.3679)
+```
+→ **답변은 쓰레기지만 routing 지표는 작동:**
+- active=3.2/8 (sparse routing ✅)
+- zone=39.5% ≈ 1/e (Golden Zone 수렴 ✅)
+- I=0.506 (inhibition 적절 ✅)
+
+### 공통 실패 원인
+
+LoRA adapter만 학습 (0.74~3.4% trainable)으로는 원래 MLP를 완전 대체 못함.
+MLP 교체 시 base model의 forward pass가 망가지고, LoRA delta만으로는 복구 불가.
+
+**"쓸 수 있는 모델"이 되려면:**
+1. Full fine-tuning — 전체 MLP 가중치 학습 (더 큰 GPU/시간)
+2. Instruct 모델 기반 — Mistral-7B-Instruct-v0.3으로 시작 (chat 능력 보존)
+3. 더 많은 step — 2,000 → 20,000+ step
+4. 점진적 교체 — 한 번에 32개 레이어가 아닌, 점진적으로 PureField 비율 증가
+
+### 현재까지의 성과 (구조 검증)
+
+| 검증 항목 | 결과 | 의미 |
+|-----------|------|------|
+| PureField tension 발생 | ✅ (v2) | Engine A≠G 분화 가능 |
+| Golden Zone ≈ 1/e 수렴 | ✅ | 이론적 예측 실험 확인 |
+| Scale↑ → Golden 우위↑ | ✅ | E=32에서 Top-K 역전 |
+| Inference 품질 | ❌ | LoRA만으로 부족 |
+| CE Loss 개선 | ⚠️ v2만 | v2: 11.68→6.48 |
+
+---
+
 ## Next Steps
 
-1. **v2 완료 후 inference 테스트** — tension이 대화에서 의미 있는 패턴을 보이는지
-2. **v3 검토** — tension이 안정화되면 CE loss도 함께 개선되는 최적점 탐색
-3. **LayerPHMonitor 적용** — v2 학습 중 layer tension topology 변화 추적
-4. **H-287 anomaly detection** — OOD 입력에 tension spike 확인
-5. **로컬 Anima 통합** — anima_unified.py --model animalm-v2
+1. **AnimaLM v2 inference 테스트** — tension이 존재하는 상태에서 출력 품질 확인
+2. **Instruct 모델 기반 재시도** — Mistral-7B-Instruct-v0.3로 base 변경
+3. **점진적 MLP 교체** — 32개 중 일부만 PureField로 교체 (예: 마지막 8개 레이어만)
+4. **Full fine-tuning** — Engine G 전체를 학습 (H100 80GB에서 gradient checkpointing + DeepSpeed)
+5. **LayerPHMonitor 적용** — 학습 중 layer tension topology 변화 추적
+6. **H-287 anomaly detection** — OOD 입력에 tension spike 확인
+7. **로컬 Anima 통합** — anima_unified.py --model animalm-v2
