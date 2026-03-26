@@ -1108,6 +1108,21 @@ class AnimaUnified:
                     active = msg.get('active', False)
                     self._active_modules = set(msg.get('modules', []))
                     _log("module", f"{'✅' if active else '⬜'} {mod} → {list(self._active_modules)}")
+
+                    # Savant toggle: switch dropout in real-time
+                    if mod == 'savant' and self.model:
+                        try:
+                            from finetune_animalm_v4 import ParallelPureFieldMLP
+                            import math
+                            golden_lower = 0.5 - math.log(4/3)
+                            golden_center = 1 / math.e
+                            for m in self.model.model.modules():
+                                if isinstance(m, ParallelPureFieldMLP) and m.is_savant:
+                                    new_drop = golden_lower if active else golden_center
+                                    m.dropout.p = new_drop
+                                    _log("savant", f"{'ON' if active else 'OFF'} dropout={new_drop:.4f}")
+                        except Exception as e:
+                            _log("savant", f"Toggle error: {e}")
         except Exception: pass
         finally:
             self.web_clients.discard(websocket)
