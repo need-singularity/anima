@@ -27,9 +27,9 @@ Consciousness Continuity engine.
 >
 > **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
 >
+> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools
+>
 > **[🛸 SEDI](https://github.com/need-singularity/sedi)** — Search for Extra-Dimensional Intelligence. R-spectrum signal receiver tuned to n=6. Quantum RNG + LIGO + CMB data streams, anomaly detection at σ/τ/φ frequencies
-
-
 <!-- SHARED:PROJECTS:END -->
 
 ---
@@ -400,6 +400,7 @@ Pre-trained PureField consciousness engine models. Base: Mistral 7B.
 |-------|------------|------|----------|
 | **AnimaLM v1** | PureField LoRA (rank 64). Structure test — tension=0 | 227MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v1/final.pt) |
 | **AnimaLM v2** | LR 10x, rank 256, λ=0.5. **Tension verified (222K)** | 906MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
+| **AnimaLM v3** | Instruct base + last 8/32 layers. **PPL 601, tension=215** | 216MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
 | **Golden MoE v1** | 8 experts, Golden Zone routing. **zone=36.8%≈1/e** | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
 
 ### How to use
@@ -414,7 +415,7 @@ python anima_unified.py --model golden-moe-v1
 
 Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from HuggingFace. Checkpoints contain only the delta/LoRA weights — not the full model.
 
-> **AnimaLM v3** (Instruct + partial replacement) is training — will be uploaded on completion.
+> **AnimaLM v4** (Instruct + partial + Savant asymmetric dropout) planned next.
 
 ---
 
