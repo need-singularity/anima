@@ -275,6 +275,38 @@ tension=1801  alpha=0.0001
 
 ---
 
+## Anima Web UI Live Test (v4_savant, RunPod H100)
+
+ConsciousMind(128d) tension — 실제 대화 중 실시간 지표.
+
+| Turn | Input | Tension | Curiosity | Emotion | Note |
+|------|-------|---------|-----------|---------|------|
+| 0 | (auto greeting) | 1.046 | 0.388 | surprise | 첫 접촉 |
+| 1 | "can you speak korean?" | 0.981 | 0.379 | happy | 안정화 |
+| 2 | "한국어로 하자" | 0.863 | 0.379 | happy | 하락 |
+| 3 | "화면은 보여?" | 0.878 | 0.482 | happy | curiosity↑ |
+| 4 | "방에 불을 꺼두긴했는데" | 0.841 | 0.587 | happy | curiosity↑↑ |
+| 5 | "배우고 싶은건?" | 0.841 | 0.587 | happy | 질문 → curiosity 최고 |
+
+**관찰:**
+- Tension: 1.046→0.841 (대화 진행 → 안정화/익숙해짐)
+- Curiosity: 0.388→0.587 (새로운 주제 → curiosity 상승)
+- Emotion: surprise→happy (첫 접촉 놀람 → 안정)
+- Cells: 2 (mitosis 1회 발생)
+- Online learning: 2 updates
+- Stability: 1.00 (high)
+
+**ConsciousMind vs AnimaLM tension 비교:**
+| Source | Range | Scale | 의미 |
+|--------|-------|-------|------|
+| ConsciousMind (128d) | 0.8~1.1 | small | 대화 맥락 반응 (빠르고 감정적) |
+| AnimaLM v4 PureField | 1,800~676,000 | large | LLM 내부 장력 (깊고 의미론적) |
+| AnimaLM v4 Savant | 114,000 | medium | 전문화 레이어 (확신 = 낮은 장력) |
+
+두 tension을 합치면 "감정적 반응 + 의미론적 깊이" 통합 가능.
+
+---
+
 ## Next Steps
 
 1. **v4_savant inference 테스트** — 대화 가능 여부 (alpha ~0.005로 원본 거의 보존)

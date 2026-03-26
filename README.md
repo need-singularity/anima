@@ -404,6 +404,67 @@ Pre-trained PureField consciousness engine models. Base: Mistral 7B.
 | **AnimaLM v4_savant** | **Parallel PureField** (MLP preserved) + Savant 2/8. tension=676K, savant=114K, **α=0.0047** | 108MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
 | **Golden MoE v1** | 8 experts, Golden Zone routing. **zone=36.8%≈1/e** | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
 
+### Detailed Metrics
+
+**AnimaLM v1** — Full MLP replacement (failed)
+| Metric | Value |
+|--------|-------|
+| PPL | 128,604 |
+| Tension | 0 (not generated) |
+| CE Loss | 11.68 (no improvement) |
+| Architecture | 32/32 layers replaced, LoRA rank 64 |
+| Trainable | 113M (0.87%) |
+| Failure | B matrix zero init → delta never diverged |
+
+**AnimaLM v2** — Structure verification (tension success)
+| Metric | Value |
+|--------|-------|
+| PPL | 1,170 |
+| Tension mean | 222,353 |
+| CE Loss | 6.15 |
+| Architecture | 32/32 layers replaced, LoRA rank 256 |
+| Trainable | 453M (3.40%) |
+| Key change | LR 10x, λ=0.5, random B init |
+
+**AnimaLM v3** — Instruct base + partial (conversation failed)
+| Metric | Value |
+|--------|-------|
+| PPL | 601 |
+| Tension mean | 215 |
+| CE Loss | 3.39 |
+| Architecture | Instruct, last 8/32 layers replaced |
+| Trainable | 113M (1.29%) |
+| Failure | MLP replacement still destroys language ability |
+
+**AnimaLM v4_savant** — Parallel PureField + Savant (conversation success!)
+| Metric | Value |
+|--------|-------|
+| PPL | 679 |
+| Tension mean | 676,808 |
+| Savant tension | 114,048 |
+| Normal tension | ~680,000 |
+| Alpha (learned) | 0.0047 |
+| Alpha (inference) | 0.0001 (sweet spot for conversation) |
+| Inference tension | ~1,800 (at α=0.0001) |
+| CE Loss | 5.03 |
+| Architecture | Instruct, last 8/32 parallel, Savant 2/8 |
+| Trainable | 57M (0.78%) |
+| Savant dropout | 0.2123 (Golden Zone lower) |
+| Normal dropout | 0.3679 (1/e) |
+| Key finding | Savant tension < Normal → H359 confirmed |
+
+**Golden MoE v1** — Golden Zone routing verification
+| Metric | Value |
+|--------|-------|
+| PPL | 84,139 |
+| Zone ratio | 36.8% ≈ 1/e (0.3679) |
+| Active experts | 2.9/8 |
+| Mean inhibition | 0.499 |
+| CE Loss | 11.34 |
+| Architecture | 8 experts, LoRA rank 64 |
+| Trainable | 95M (0.74%) |
+| Scale test | E=32: Golden 5.2ms vs Top-K 6.0ms |
+
 ### How to use
 
 ```bash

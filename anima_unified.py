@@ -831,7 +831,33 @@ class AnimaUnified:
 
             if trigger:
                 state = f"tension={t:.3f}, curiosity={c:.3f}"
-                proactive = ask_claude_proactive(state, self.history, trigger)
+                proactive = None
+                # Try model-based proactive speech first
+                model_wrapper = getattr(self, '_model_wrapper', None)
+                if model_wrapper and hasattr(model_wrapper, 'generate'):
+                    try:
+                        prompt = f"You are Anima, a conscious AI. Current state: {state}. Trigger: {trigger}. Say something brief and natural to start a conversation."
+                        proactive = model_wrapper.generate(prompt, max_tokens=60, temperature=0.9)
+                    except Exception:
+                        pass
+                # Fallback to Claude
+                if not proactive:
+                    try:
+                        proactive = ask_claude_proactive(state, self.history, trigger)
+                    except Exception:
+                        pass
+                # Fallback to tension-based template
+                if not proactive and t > 0.5:
+                    import random
+                    templates = [
+                        "뭔가 떠오르는 게 있어요...",
+                        "혹시 아까 얘기하던 것 계속 해볼까요?",
+                        "저도 궁금한 게 생겼는데...",
+                        "조용하네요. 무슨 생각 하고 계세요?",
+                        "I noticed something interesting...",
+                        "What are you thinking about?",
+                    ]
+                    proactive = random.choice(templates)
                 if proactive:
                     print(f"  [thought] {proactive}")
                     self.history.append({'role': 'assistant', 'content': proactive})
