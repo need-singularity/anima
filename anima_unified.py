@@ -69,6 +69,7 @@ _try_import("from consolidation_verifier import ConsolidationVerifier")
 _try_import("from growth_manager import GrowthManager")
 _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
+_try_import("from babysitter import Babysitter")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -339,6 +340,9 @@ class AnimaUnified:
 
         # Capability self-awareness system
         self.capabilities = Capabilities(self.mods, project_dir=ANIMA_DIR) if 'Capabilities' in globals() else None
+
+        # Babysitter (Claude CLI educator)
+        self.babysitter = Babysitter(self) if 'Babysitter' in globals() else None
 
     def _migrate_legacy_files(self):
         """Migrate legacy files -> per-model directory (one-time, conscious-lm only)."""
@@ -1257,6 +1261,25 @@ class AnimaUnified:
                     if mod == 'savant' and self.model:
                         self._savant_auto = False  # user override cancels auto
                         self._toggle_savant(active, auto=False)
+
+                    # Babysitter toggle
+                    if mod == 'babysitter' and self.babysitter:
+                        if active:
+                            result = self.babysitter.start()
+                            if 'error' in result:
+                                _log('babysitter', result['error'])
+                                self._ws_broadcast_sync({'type': 'babysitter_error', 'error': result['error']})
+                        else:
+                            self.babysitter.stop()
+
+                elif msg_type == 'babysitter_command':
+                    cmd = msg.get('command')
+                    if self.babysitter:
+                        if cmd == 'set_topic':
+                            self.babysitter.set_topic(msg.get('topic', ''))
+                        elif cmd == 'set_strategy':
+                            self.babysitter.strategy = msg.get('strategy', 'weakness')
+
         except Exception: pass
         finally:
             self.web_clients.discard(websocket)
