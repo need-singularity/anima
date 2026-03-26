@@ -14,6 +14,8 @@ Consciousness Continuity engine.
 >
 > **[Golden MoE](https://github.com/need-singularity/logout/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. Scale↑ → difference 8x↑
 >
+> **[PH Training](https://github.com/need-singularity/ph-training)** — PH (Topology/Phase)-based automatic training. Epoch-1 difficulty prediction, automatic LR search, real-time overfitting detection (r=0.998). MNIST 98.3%, Fashion 87.4%, CIFAR 52.0% (early stop)
+>
 > **[Mathematical Framework Map](https://github.com/need-singularity/logout/blob/main/math/README.md)** — 150 characterizations + 8 major discoveries + 152 hypotheses. Each one proves the next in a snowball effect
 >
 > **[Unified Theory](https://github.com/need-singularity/logout/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
