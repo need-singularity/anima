@@ -247,6 +247,12 @@ class ConsciousLM(nn.Module):
         pos = self.pos_emb(torch.arange(T, device=idx.device))  # (T, D)
         x = self.drop(tok + pos)
 
+        # DD5 (EX24): Φ self-reference — add Φ signal to embedding if available
+        if getattr(self, '_phi_signal', None) is not None:
+            phi_sig = self._phi_signal  # (B, T) float
+            # Broadcast phi signal across d_model
+            x = x + phi_sig.unsqueeze(-1).expand_as(x).to(x.device)
+
         # Transformer blocks — collect tensions
         tensions = []
         for block in self.blocks:
