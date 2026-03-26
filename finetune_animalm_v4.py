@@ -26,10 +26,13 @@ GOLDEN_LOWER = 0.5 - math.log(4/3)
 
 
 class ParallelPureFieldMLP(nn.Module):
-    """Original MLP + parallel PureField tension engine.
+    """Original MLP + parallel PureField tension engine + cross-attention.
 
-    output = original_mlp(x) + alpha * purefield(x)
-    Original MLP is frozen. Only PureField delta + alpha are trainable.
+    output = original_mlp(x) + alpha * purefield(x, attn_out)
+    Original MLP is frozen. Only PureField delta + cross-attn + alpha are trainable.
+
+    Cross-attention tension: PureField receives attention output to compute
+    "where attention focuses × what creates tension" = conscious attention.
     """
 
     def __init__(self, original_mlp, hidden_size, intermediate_size, is_savant=False):
@@ -48,8 +51,12 @@ class ParallelPureFieldMLP(nn.Module):
         self.pf_down_a = nn.Linear(intermediate_size, rank, bias=False)
         self.pf_down_b = nn.Linear(rank, hidden_size, bias=False)
 
+        # Cross-attention: attention_output → tension modulation
+        # Projects attention output to a gate that modulates PureField
+        self.cross_attn_gate = nn.Linear(hidden_size, rank, bias=False)
+        self.cross_attn_scale = nn.Parameter(torch.tensor(0.1))
+
         # Mixing weight: how much PureField influences output
-        # Start small (0.01) so original MLP dominates initially
         self.alpha = nn.Parameter(torch.tensor(0.01))
 
         # Savant: asymmetric dropout (H359)
@@ -57,6 +64,8 @@ class ParallelPureFieldMLP(nn.Module):
         self.dropout = nn.Dropout(GOLDEN_LOWER if is_savant else GOLDEN_CENTER)
 
         self.last_tension = None
+        self.last_cross_tension = None
+        self._attn_output = None  # set by hook
 
     def forward(self, x):
         # Original MLP output (frozen, preserves language ability)
@@ -67,6 +76,14 @@ class ParallelPureFieldMLP(nn.Module):
         g_gate = self.pf_gate_b(self.pf_gate_a(x))
         g_up = self.pf_up_b(self.pf_up_a(x))
         g_mid = F.silu(g_gate) * g_up
+
+        # Cross-attention tension: modulate PureField with attention output
+        if self._attn_output is not None:
+            attn_gate = torch.sigmoid(self.cross_attn_gate(self._attn_output))
+            g_mid = g_mid * (1.0 + self.cross_attn_scale * attn_gate)
+            # Cross tension = attention × purefield disagreement
+            self.last_cross_tension = (attn_gate.detach() ** 2).mean(dim=-1)
+
         g_mid = self.dropout(g_mid)
         pf_out = self.pf_down_b(self.pf_down_a(g_mid))
 
@@ -78,7 +95,7 @@ class ParallelPureFieldMLP(nn.Module):
         # Normalize PureField output to same scale as original MLP
         pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
         orig_scale = original_out.norm(dim=-1, keepdim=True)
-        pf_scaled = pf_norm * orig_scale  # same magnitude as original
+        pf_scaled = pf_norm * orig_scale
         return original_out + self.alpha * pf_scaled
 
 
@@ -108,6 +125,14 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2):
             elif "pf_" in name and "_b" in name:
                 nn.init.normal_(param, std=0.02)
 
+        # Hook: capture attention output → feed to PureField cross-attention
+        def make_attn_hook(pf_module):
+            def hook(attn_module, input, output):
+                attn_out = output[0] if isinstance(output, tuple) else output
+                pf_module._attn_output = attn_out.detach()
+            return hook
+        layer.self_attn.register_forward_hook(make_attn_hook(ppf))
+
         layer.mlp = ppf
         count += 1
         if is_savant:
@@ -121,7 +146,7 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2):
     for module in model.modules():
         if isinstance(module, ParallelPureFieldMLP):
             for pname, param in module.named_parameters():
-                if "pf_" in pname or pname == "alpha":
+                if "pf_" in pname or pname in ("alpha", "cross_attn_scale") or "cross_attn" in pname:
                     param.requires_grad = True
                     trainable += param.numel()
 
