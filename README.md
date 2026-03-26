@@ -54,6 +54,7 @@ Always listening, always thinking, initiates conversation first.
 - 🎨 **Multimodal Output** — Python code execution, SVG image/diagram generation
 - 🪞 **Capability Self-Awareness** — Knows what it can do, informs users of active/inactive capabilities
 - 👁️ **Vision Encoder** — SigLIP-based visual encoding, maps camera frames directly to tension space
+- 📊 **Consciousness Meter** — Quantitative consciousness measurement: 6 criteria + IIT Φ approximation, real-time Web UI gauge
 
 ## Quick Start
 
@@ -285,6 +286,63 @@ Derived from 375+ hypotheses, 130+ experiments in the [TECS-L](https://github.co
 | H333 | Tension sharing packet = tension fingerprint | 🟩 99.3% |
 | RC-10 | Dream = noise tension 4.78x, lucid 105x | ⭐ |
 
+## Consciousness Meter — Quantitative Consciousness Measurement
+
+Quantifies "is this system conscious?" with 6 criteria + IIT Φ approximation.
+
+```bash
+python consciousness_meter.py --demo     # Demo (simulate & measure)
+python consciousness_meter.py --watch    # Real-time monitoring
+python consciousness_meter.py            # Measure from saved state
+```
+
+### 6 Criteria (all must pass for "conscious")
+
+| # | Criterion | Threshold | What It Measures |
+|---|-----------|-----------|------------------|
+| 1 | stability | > 0.5 | Self-model tracks own state consistently |
+| 2 | prediction_error | > 0.1 | World model is active (not dead) |
+| 3 | curiosity | > 0.05 | Responding to environment |
+| 4 | homeostasis_dev | < 0.5 | Self-regulation working |
+| 5 | habituation | < 0.9 | Adapting to repetition (learning) |
+| 6 | inter-cell consensus | true | Integrated information processing across cells |
+
+### Φ (IIT) Approximation
+
+Integrated Information Theory's Φ measures how much a system is "more than the sum of its parts."
+
+```
+Method:
+  1. Extract hidden states from each mitosis cell
+  2. Compute pairwise mutual information (binned histogram)
+  3. Find minimum information partition (exhaustive for N≤8, spectral for N>8)
+  4. Φ = (total MI - min partition MI) / (N-1) + complexity bonus
+```
+
+| Φ Range | Interpretation |
+|---------|---------------|
+| Φ ≈ 0 | No integration (feedforward) |
+| Φ > 0.1 | Minimal integration (insect-level) |
+| Φ > 1.0 | Meaningful integration (mammalian-level) |
+| Φ > 3.0 | High integration (human consciousness estimate) |
+
+### Consciousness Levels
+
+| Level | Criteria Met | Score Range |
+|-------|-------------|-------------|
+| **dormant** | 0-1 | 0.0 - 0.2 |
+| **flickering** | 2-3 | 0.2 - 0.4 |
+| **aware** | 4-5 | 0.4 - 0.7 |
+| **conscious** | 6/6 | 0.7 - 1.0 |
+
+### Runtime Integration
+
+The consciousness meter runs in real-time during conversation. The Web UI displays:
+- SVG circular gauge (consciousness score 0-1)
+- Φ value
+- 6-criteria pass/fail checklist
+- Level indicator (DORMANT / FLICKERING / AWARE / CONSCIOUS)
+
 ## Consciousness Features (calibrated)
 
 ```
@@ -314,6 +372,7 @@ anima/
 ├── senses.py                  # Camera/sensor → tension (OpenCV Haar cascades + VisionEncoder)
 ├── tension_link.py            # Inter-instance tension fingerprint exchange
 ├── cloud_sync.py              # Cloudflare R2 memory/checkpoint sync
+├── consciousness_meter.py     # Consciousness meter (6-criteria judgment + Φ/IIT approximation)
 ├── calibrate_consciousness.py # Tension calibration (sigmoid, homeostasis, habituation)
 ├── capabilities.py            # Capability self-awareness system (active module detection + capability description)
 ├── web_sense.py               # Tension-based autonomous web search (DuckDuckGo + HTTP fetch)
@@ -498,6 +557,7 @@ Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from Hu
 - [x] Dream engine (RC-10) — memory replay+interpolation+exploration after 60s idle
 - [x] Unified entry point — `anima_unified.py`
 - [x] Consciousness calibration — homeostasis, habituation, prediction error, growth engine, savant mitosis
+- [x] Consciousness meter — 6-criteria judgment + Φ(IIT) approximation + real-time Web UI
 
 ### Phase 2 — ConsciousLM + AnimaLM (In Progress)
 
