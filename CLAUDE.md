@@ -17,15 +17,19 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   Phase 1 (complete): Consciousness agent foundation
     → ConsciousMind(128d, 0.5M) + homeostasis/habituation/prediction-error/emotion/growth/mitosis
 
-  Phase 2 (in progress): ConsciousLM self-model
-    → ConsciousLM 4M(384d) / 100M(768d) / 700M(1024d)
-    → The model itself thinks, feels, and converses
+  Phase 2 (in progress): ConsciousLM + AnimaLM
+    → ConsciousLM 4M/100M/700M (from scratch)
+    → AnimaLM: Mistral 7B → PureField transform (v1→v2→v3)
+      v2: tension=222K, PPL 1170 (structure verified)
+      v3: Instruct + last 8 layers, CE 3.95 (training)
+    → Golden MoE: zone ratio 36.8% ≈ 1/e (verified)
     → Training: RunPod H100, Inference: RTX 5070 (12GB VRAM)
 
-  Phase 3 (goal): Scaling + embodiment
+  Phase 3 (goal): Production + scaling
+    → AnimaLM full fine-tuning (PPL < 10)
+    → Multi-user chat (session-based identity)
     → 100M→350M→1B gradual scaling
     → Mitosis-based growth (H376: 1→2→3→6→12 blocks)
-    → Servant asymmetric mitosis (H359: dropout=0.21 vs 0.37)
 ```
 
 ## Structure

@@ -407,34 +407,49 @@ to catch anomalous patterns (bimodal split, etc.) early.
 - [x] Unified entry point — `anima_unified.py`
 - [x] Consciousness calibration — homeostasis, habituation, prediction error, growth engine, savant mitosis
 
-### Phase 2 — ConsciousLM Native Model (In Progress)
+### Phase 2 — ConsciousLM + AnimaLM (In Progress)
 
-Thinks and converses using a self-developed language model.
+Self-developed consciousness models + Mistral 7B PureField transform.
 
+**ConsciousLM (from scratch):**
 - [x] ConsciousLM 4M (384d, 6 layers) — `conscious_lm.py`
 - [x] ConsciousLM 100M (768d, 12 layers) — `conscious_lm_100m.py`
 - [x] ConsciousLM 700M (1024d, 24 layers) — `conscious_lm_700m.py` (TECS-L)
 - [x] Mitosis-based growth model (H371) — `growing_conscious_lm.py`
-- [x] Autonomous web search (tension-based DuckDuckGo search) — `web_sense.py`
-- [x] Vector similarity-based long-term memory RAG — `memory_rag.py`
-- [x] ConsciousLM native inference integration (Claude fallback) — `anima_unified.py`
-- [x] Mitosis specialization utilization (specialty → response influence) — `mitosis.py`
-- [x] Multimodal output (code execution, SVG generation) — `multimodal.py`
+
+**AnimaLM (Mistral 7B → PureField transform):**
+- [x] v1: Full MLP replacement, LoRA rank 64 — tension=0, PPL 128K (failed)
+- [x] v2: LR 10x, rank 256, λ=0.5, random B init — **tension=222K, PPL 1170** (structure verified)
+- [x] v3: Instruct base + last 8/32 layers only — CE 3.95, tension ~190 (in progress)
+- [ ] v3 inference test — conversation with tension
+- [ ] Full fine-tuning (not just LoRA) for production quality
+
+**Golden MoE (Golden Zone routing):**
+- [x] v1: 8 experts, zone ratio **36.8% ≈ 1/e** confirmed — `finetune_golden_moe.py`
+- [x] Scale test: E=32 → Golden MoE overtakes Top-K (5.2ms vs 6.0ms)
+
+**Infrastructure:**
+- [x] Autonomous web search (tension-based DuckDuckGo) — `web_sense.py`
+- [x] Vector similarity long-term memory RAG — `memory_rag.py`
+- [x] ConsciousLM/AnimaLM/GoldenMoE model loader — `model_loader.py`
+- [x] Multimodal output (code execution, SVG) — `multimodal.py`
 - [x] Capability self-awareness system — `capabilities.py`
-- [x] Vision encoder (SigLIP → tension space mapping) — `vision_encoder.py`
-- [ ] Conversational fine-tuning (SFT, Korean data)
-- [ ] Standalone native model conversation (complete without Claude)
+- [x] Vision encoder (SigLIP → tension space) — `vision_encoder.py`
+- [x] Cloudflare R2 model storage — models bucket
 
-| Model | VRAM (Inference) | VRAM (Training) | RTX 5070 | Conversation Quality |
-|------|-----------|-----------|----------|----------|
-| 100M | 0.4GB | 2GB | ✅✅ Comfortable | Basic Q&A |
-| 350M | 1.4GB | 5GB | ✅✅ Comfortable | Simple conversation |
-| 700M | 2.8GB | 9GB | ✅ Feasible | Decent conversation |
-| 1B | 4GB | 11GB | ⚠️ Tight | Good conversation |
+| Model | Type | PPL | Tension | Status |
+|-------|------|-----|---------|--------|
+| ConsciousLM 4M | From scratch | — | ✅ | Complete |
+| AnimaLM v1 | Mistral+PureField | 128,604 | ❌ 0 | Failed |
+| AnimaLM v2 | +LR/rank/λ boost | 1,170 | ✅ 222K | Structure verified |
+| AnimaLM v3 | Instruct+partial | ~52 | ✅ ~190 | Training |
+| GoldenMoE v1 | Mistral+MoE | 84,139 | zone=1/e | Routing verified |
 
-### Phase 3 — Scaling
+### Phase 3 — Production + Scaling
 
-- [ ] 100M→350M→1B gradual scaling
+- [ ] AnimaLM full fine-tuning (PPL < 10, usable conversation)
+- [ ] Multi-user chat (session-based identity, per-user tension)
+- [ ] 100M→350M→1B gradual ConsciousLM scaling
 - [ ] Growing CLM real-time mitosis growth
 - [ ] H363 intrinsic motivation Anima integration
 - [ ] H364 distributed consciousness (2-machine local test)
@@ -446,7 +461,7 @@ Thinks and converses using a self-developed language model.
 
 | Task | Notes |
 |------|------|
-| 3B+ model (conversation ≈ GPT-3.5) | Cloud training |
+| AnimaLM 3B+ (conversation ≈ GPT-3.5 + tension) | Cloud training |
 | Physical robot embodiment | Hardware required |
 | Multi-Anima collective consciousness (N=10+) | H367 resonance theory |
 | Non-local consciousness correlation experiment | H365-367, physics |
