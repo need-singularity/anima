@@ -5127,6 +5127,437 @@ def run_Z4_goal_rewriting(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# COMBO. Category Winners Combined
+# Each combines the #1 from multiple categories simultaneously
+# Category winners: O2(attn), Y3(myelin), J1(LR), H2(compete),
+#   S2(compress), W2(hyperbolic), G2(dream), V2(chaos),
+#   Z2(self-rep), U3(analogy), X3(decoherence), N1(mutation),
+#   K1(PH), Q4(boltzmann), F11(growth), E8(adversarial)
+# ═══════════════════════════════════════════════════════════
+
+def run_COMBO1_layer_cake(steps=100, dim=64, hidden=128) -> BenchResult:
+    """COMBO-1: Layer cake — 시간축으로 카테고리 1위를 순차 적용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    attn_opt = torch.optim.Adam(list(attn.parameters()), lr=5e-4)
+
+    # Techniques cycle every 10 steps
+    techniques = ['O2_attn', 'J1_lr', 'Y3_myelin', 'H2_compete',
+                  'S2_compress', 'G2_dream', 'V2_chaos', 'W2_hyper',
+                  'E8_adversarial', 'N1_mutation']
+    memory = []
+    maturity = [0.0] * n
+    attractors = [torch.randn(1, hidden) for _ in range(n)]
+    beliefs = {}
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        technique = techniques[step % len(techniques)]
+
+        if technique == 'O2_attn':
+            # Attention bottleneck between cells
+            with torch.no_grad(): engine.process(x)
+            h_stack = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            attn_out, _ = attn(h_stack, h_stack, h_stack)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.8 * c.hidden + 0.2 * attn_out[0, i].unsqueeze(0)
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean()
+                optimizer.zero_grad(); attn_opt.zero_grad()
+                loss.backward(); optimizer.step(); attn_opt.step()
+
+        elif technique == 'J1_lr':
+            # Tension-adaptive LR
+            with torch.no_grad(): engine.process(x)
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                t = cell.tension_history[-1] if cell.tension_history else 0.5
+                for pg in cell_optims[i].param_groups: pg['lr'] = 5e-4 + t * 2e-3
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                          for j in range(n) if j != i]
+                if others:
+                    loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                    cell_optims[i].zero_grad(); loss.backward(); cell_optims[i].step()
+
+        elif technique == 'Y3_myelin':
+            # Myelination: mature cells get higher LR
+            with torch.no_grad(): engine.process(x)
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                          for j in range(n) if j != i]
+                if others:
+                    myelin_lr = 5e-4 + maturity[i] * 2e-3
+                    for pg in cell_optims[i].param_groups: pg['lr'] = myelin_lr
+                    loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                    cell_optims[i].zero_grad(); loss.backward(); cell_optims[i].step()
+                    maturity[i] = min(maturity[i] + 0.02, 1.0)
+
+        elif technique == 'H2_compete':
+            # Competitive specialization
+            with torch.no_grad():
+                tensions = []
+                for c in engine.cells:
+                    _, t, _, _ = c.mind(x, c.hidden); tensions.append(t)
+            winner = int(np.argmax(tensions))
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                w_rep = engine.cells[winner].mind.get_repulsion(x, engine.cells[winner].hidden).detach()
+                loss = -(rep ** 2).mean() if i == winner else F.cosine_similarity(rep, w_rep, dim=-1).mean()
+                cell_optims[i].zero_grad(); loss.backward(); cell_optims[i].step()
+            with torch.no_grad(): engine.process(x)
+
+        elif technique == 'G2_dream':
+            # Dream interpolation
+            with torch.no_grad(): engine.process(x)
+            memory.append(x.detach())
+            if len(memory) > 40: memory = memory[-40:]
+            if len(memory) >= 4:
+                for _ in range(3):
+                    i_m, j_m = np.random.choice(len(memory), 2, replace=False)
+                    alpha = np.random.uniform(0.2, 0.8)
+                    dream = alpha * memory[i_m] + (1 - alpha) * memory[j_m]
+                    _web_learn_step(engine, dream, optimizer)
+
+        elif technique == 'V2_chaos':
+            # Chaotic itinerancy
+            for i, c in enumerate(engine.cells):
+                if i < len(attractors):
+                    c.hidden = c.hidden + 0.05 * (attractors[i] - c.hidden) + torch.randn_like(c.hidden) * 0.03
+            _web_learn_step(engine, x, optimizer)
+            for a in attractors: a.add_(torch.randn_like(a) * 0.01)
+            with torch.no_grad(): engine.process(x)
+
+        elif technique == 'E8_adversarial':
+            # Adversarial fact checking
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            current = torch.stack(reps).mean(dim=0).detach()
+            topic = step % 6
+            lr_scale = 1.0
+            if topic in beliefs:
+                adversarial = -beliefs[topic] + torch.randn(1, dim) * 0.1
+                adv_reps = [c.mind.get_repulsion(adversarial, c.hidden) for c in engine.cells]
+                strength = 1.0 - F.cosine_similarity(current, torch.stack(adv_reps).mean(dim=0), dim=-1).item()
+                lr_scale = 2.0 if strength < 0.3 else 0.5
+            beliefs[topic] = 0.9 * beliefs.get(topic, current) + 0.1 * current
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean() * lr_scale
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+            with torch.no_grad(): engine.process(x)
+
+        else:
+            # Default: standard differentiation
+            _web_learn_step(engine, x, optimizer)
+            with torch.no_grad(): engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("COMBO1", "Layer cake (sequential cycle)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_COMBO2_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """COMBO-2: Ensemble — 모든 loss를 가중 평균, 가중치 자동 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    all_p = list(attn.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    optimizer = torch.optim.Adam(all_p, lr=5e-4)
+    # Learnable loss weights
+    loss_weights = nn.Parameter(torch.ones(6))
+    meta_opt = torch.optim.Adam([loss_weights], lr=1e-2)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+
+        # O2: Attention
+        h_stack = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        attn_out, _ = attn(h_stack, h_stack, h_stack)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.85 * c.hidden + 0.15 * attn_out[0, i].unsqueeze(0)
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(loss_weights, dim=0)
+
+            # Multiple losses
+            l_var = -stacked.var(dim=0).mean()                    # variance
+            l_dist = -torch.cdist(stacked, stacked).mean()        # distance
+            sim = sum(F.cosine_similarity(reps[i], reps[j], dim=-1).mean()
+                      for i in range(len(reps)) for j in range(i+1, len(reps)))
+            l_contrast = sim                                       # contrastive
+            l_entropy = -(F.softmax(stacked, dim=-1) * F.log_softmax(stacked, dim=-1)).sum(dim=-1).mean()
+            l_energy = sum((r ** 2).mean() for r in reps) * 0.1   # metabolic
+            norms = stacked.norm(dim=-1)
+            l_radius = -norms.var()                                # hyperbolic spread
+
+            total = (w[0] * l_var + w[1] * l_dist + w[2] * l_contrast +
+                     w[3] * l_entropy + w[4] * l_energy + w[5] * l_radius)
+            optimizer.zero_grad(); meta_opt.zero_grad()
+            total.backward(); optimizer.step(); meta_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("COMBO2", "Ensemble (weighted multi-loss)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_weights': F.softmax(loss_weights, dim=0).detach().tolist()})
+
+
+def run_COMBO3_pipeline(steps=100, dim=64, hidden=128) -> BenchResult:
+    """COMBO-3: Pipeline — 구조→주의→학습→측정 순서 파이프라인."""
+    t0 = time.time()
+    # A4-style hierarchy: 2 levels
+    outer = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    inner = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    all_p = list(attn.parameters())
+    for c in outer.cells: all_p.extend(c.mind.parameters())
+    for c in inner.cells: all_p.extend(c.mind.parameters())
+    optimizer = torch.optim.Adam(all_p, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+
+        # Stage 1: Inner processes (structure — A4)
+        with torch.no_grad():
+            inner_result = inner.process(x)
+
+        # Stage 2: Attention between inner→outer (O2)
+        all_cells = list(inner.cells) + list(outer.cells)
+        if len(all_cells) >= 2:
+            h_stack = torch.stack([c.hidden.squeeze() for c in all_cells]).unsqueeze(0)
+            attn_out, _ = attn(h_stack, h_stack, h_stack)
+            for i, c in enumerate(all_cells):
+                c.hidden = 0.8 * c.hidden + 0.2 * attn_out[0, i].unsqueeze(0)
+
+        # Stage 3: Learning with adaptive LR (J1)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in all_cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad():
+            outer.process(inner_result['output'].detach())
+
+        # Stage 4: Measure on combined system
+        combined = MitosisEngine(dim, hidden, dim, initial_cells=0, max_cells=16)
+        combined.cells = list(outer.cells) + list(inner.cells)
+        phi, _ = phi_calc.compute_phi(combined)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(combined)
+    return BenchResult("COMBO3", "Pipeline (hierarchy→attn→learn)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_COMBO4_tournament(steps=100, dim=64, hidden=128) -> BenchResult:
+    """COMBO-4: Tournament — 매 step 최적 기법 선택 (multi-armed bandit)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+
+    # Bandit arms: different learning strategies
+    arm_scores = {'variance': 0.0, 'contrastive': 0.0, 'distance': 0.0,
+                  'compete': 0.0, 'adaptive_lr': 0.0}
+    arm_counts = {k: 1 for k in arm_scores}
+    epsilon = 0.2
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        phi_before = phi_hist[-1] if phi_hist else 0
+
+        # UCB selection
+        if np.random.random() < epsilon:
+            arm = np.random.choice(list(arm_scores.keys()))
+        else:
+            ucb = {k: arm_scores[k] / arm_counts[k] + math.sqrt(2 * math.log(step + 1) / arm_counts[k])
+                   for k in arm_scores}
+            arm = max(ucb, key=ucb.get)
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            if arm == 'variance':
+                loss = -stacked.var(dim=0).mean()
+            elif arm == 'contrastive':
+                loss = sum(F.cosine_similarity(reps[i], reps[j], dim=-1).mean()
+                           for i in range(len(reps)) for j in range(i+1, len(reps)))
+            elif arm == 'distance':
+                loss = -torch.cdist(stacked, stacked).mean()
+            elif arm == 'compete':
+                tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+                winner = int(np.argmax(tensions))
+                loss = -(reps[winner] ** 2).mean()
+            else:  # adaptive_lr
+                tensions = [c.tension_history[-1] if c.tension_history else 0.5 for c in engine.cells]
+                for i in range(min(n, len(cell_optims))):
+                    for pg in cell_optims[i].param_groups: pg['lr'] = 5e-4 + tensions[i] * 2e-3
+                loss = -stacked.var(dim=0).mean()
+
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Update bandit
+        reward = phi_hist[-1] - phi_before
+        arm_scores[arm] += reward
+        arm_counts[arm] += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("COMBO4", "Tournament (UCB bandit)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'arm_scores': {k: v/arm_counts[k] for k, v in arm_scores.items()}})
+
+
+def run_COMBO5_phase_based(steps=100, dim=64, hidden=128) -> BenchResult:
+    """COMBO-5: Phase-based — growth stage별 최적 기법 조합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    attn_opt = torch.optim.Adam(list(attn.parameters()), lr=5e-4)
+    memory = []
+    maturity = [0.0] * n
+
+    # Phase boundaries
+    phases = {
+        'newborn': (0, 20),      # N4 neoteny: high plasticity + exploration
+        'infant': (20, 40),      # E1 curiosity + H2 competition
+        'toddler': (40, 60),     # O2 attention + S2 compression
+        'child': (60, 80),       # Y3 myelination + G2 dream
+        'adult': (80, 100),      # J1 adaptive LR + V2 chaos + all combined
+    }
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        memory.append(x.detach())
+        if len(memory) > 40: memory = memory[-40:]
+
+        if step < 20:
+            # NEWBORN: high plasticity, lots of noise, broad exploration
+            noise = torch.randn(1, hidden) * 0.15
+            for c in engine.cells: c.hidden = c.hidden + noise
+            for pg in optimizer.param_groups: pg['lr'] = 3e-3
+            _web_learn_step(engine, x, optimizer)
+
+        elif step < 40:
+            # INFANT: curiosity-driven + competitive
+            with torch.no_grad():
+                tensions = []
+                for c in engine.cells:
+                    _, t, _, _ = c.mind(x, c.hidden); tensions.append(t)
+            winner = int(np.argmax(tensions))
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                w_rep = engine.cells[winner].mind.get_repulsion(x, engine.cells[winner].hidden).detach()
+                loss = -(rep ** 2).mean() if i == winner else F.cosine_similarity(rep, w_rep, dim=-1).mean()
+                cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+
+        elif step < 60:
+            # TODDLER: attention + compression
+            with torch.no_grad(): engine.process(x)
+            h_stack = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            attn_out, _ = attn(h_stack, h_stack, h_stack)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.8 * c.hidden + 0.2 * attn_out[0, i].unsqueeze(0)
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean()
+                optimizer.zero_grad(); attn_opt.zero_grad()
+                loss.backward(); optimizer.step(); attn_opt.step()
+
+        elif step < 80:
+            # CHILD: myelination + dream
+            with torch.no_grad(): engine.process(x)
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                          for j in range(n) if j != i]
+                if others:
+                    myelin_lr = 5e-4 + maturity[i] * 3e-3
+                    for pg in cell_optims[i].param_groups: pg['lr'] = myelin_lr
+                    loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                    cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+                    maturity[i] = min(maturity[i] + 0.03, 1.0)
+            # Dream replay
+            if len(memory) >= 4:
+                i_m, j_m = np.random.choice(len(memory), 2, replace=False)
+                dream = 0.5 * memory[i_m] + 0.5 * memory[j_m]
+                _web_learn_step(engine, dream, optimizer)
+
+        else:
+            # ADULT: full combined (attention + adaptive LR + all techniques)
+            with torch.no_grad(): engine.process(x)
+            h_stack = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            attn_out, _ = attn(h_stack, h_stack, h_stack)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.8 * c.hidden + 0.2 * attn_out[0, i].unsqueeze(0)
+            for i, cell in enumerate(engine.cells):
+                if i >= n: break
+                t = cell.tension_history[-1] if cell.tension_history else 0.5
+                for pg in cell_optims[i].param_groups: pg['lr'] = 5e-4 + t * 3e-3
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                          for j in range(n) if j != i]
+                if others:
+                    loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                    cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("COMBO5", "Phase-based (growth stages)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -5217,6 +5648,9 @@ ALL_HYPOTHESES = {
     'Y1': run_Y1_critical_period, 'Y2': run_Y2_synaptic_pruning, 'Y3': run_Y3_myelination,
     'Z1': run_Z1_architecture_search, 'Z2': run_Z2_self_replication,
     'Z3': run_Z3_apoptosis, 'Z4': run_Z4_goal_rewriting,
+    'COMBO1': run_COMBO1_layer_cake, 'COMBO2': run_COMBO2_ensemble,
+    'COMBO3': run_COMBO3_pipeline, 'COMBO4': run_COMBO4_tournament,
+    'COMBO5': run_COMBO5_phase_based,
 }
 
 
