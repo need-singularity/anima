@@ -1074,6 +1074,7 @@ class AnimaUnified:
                         'type': 'session_info',
                         'active_sessions': n,
                         'devices': [s['device'] for s in self._sessions.values()],
+                        'modules': list(getattr(self, '_active_modules', ['voice', 'tension', 'memory', 'tts'])),
                     })
 
                 elif msg_type == 'user_message':
@@ -1127,6 +1128,11 @@ class AnimaUnified:
                     active = msg.get('active', False)
                     self._active_modules = set(msg.get('modules', []))
                     _log("module", f"{'✅' if active else '⬜'} {mod} → {list(self._active_modules)}")
+                    # Sync to all clients
+                    await self._ws_broadcast({
+                        'type': 'module_sync',
+                        'modules': list(self._active_modules),
+                    })
 
                     # Savant toggle: switch dropout in real-time
                     if mod == 'savant' and self.model:
