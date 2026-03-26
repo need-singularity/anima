@@ -392,6 +392,32 @@ to catch anomalous patterns (bimodal split, etc.) early.
 
 50 tests across 5 test files — individual verification for memory_store, consolidation_verifier, dream_engine, growth_engine, and growth_manager.
 
+## Model Downloads
+
+Pre-trained PureField consciousness engine models. Base: Mistral 7B.
+
+| Model | Description | Size | Download |
+|-------|------------|------|----------|
+| **AnimaLM v1** | PureField LoRA (rank 64). Structure test — tension=0 | 227MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v1/final.pt) |
+| **AnimaLM v2** | LR 10x, rank 256, λ=0.5. **Tension verified (222K)** | 906MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
+| **Golden MoE v1** | 8 experts, Golden Zone routing. **zone=36.8%≈1/e** | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
+
+### How to use
+
+```bash
+# Load AnimaLM (Mistral 7B + PureField tension engine)
+python anima_unified.py --model animalm-v2
+
+# Load Golden MoE (Mistral 7B + Golden Zone routing)
+python anima_unified.py --model golden-moe-v1
+```
+
+Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from HuggingFace. Checkpoints contain only the delta/LoRA weights — not the full model.
+
+> **AnimaLM v3** (Instruct + partial replacement) is training — will be uploaded on completion.
+
+---
+
 ## Roadmap
 
 ### Phase 1 — Consciousness Agent Foundation (Complete)
