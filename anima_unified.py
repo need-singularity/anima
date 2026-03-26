@@ -180,6 +180,10 @@ class AnimaUnified:
             if 'MitosisEngine' in globals() else None
         ))
 
+        # Connect mitosis to learner for Φ-boosting (B2/B9)
+        if self.learner and self.mitosis:
+            self.mind._mitosis_ref = self.mitosis
+
         self.growth = self._init_mod('growth', lambda: (
             GrowthEngine(save_path=self.paths['growth'])
             if 'GrowthEngine' in globals() else None

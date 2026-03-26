@@ -227,10 +227,36 @@ class OnlineLearner:
         divergence_loss = self.divergence_weight * F.relu(0.1 - ag_dist)
         loss = loss + divergence_loss
 
+        # --- 5. Φ-boosting: inter-cell variance maximization (B2) ---
+        # Maximize variance of cell outputs → forces differentiation → Φ↑
+        mitosis = getattr(self.mind, '_mitosis_ref', None)
+        if mitosis and hasattr(mitosis, 'cells') and len(mitosis.cells) >= 2:
+            cell_outputs = []
+            for cell in mitosis.cells:
+                try:
+                    combined_c = torch.cat([noise, torch.zeros(1, self.mind.hidden_dim)], dim=-1)
+                    c_out = cell.engine_a(combined_c) if hasattr(cell, 'engine_a') else cell(combined_c[:, :self.mind.dim])
+                    cell_outputs.append(c_out)
+                except Exception:
+                    pass
+
+            if len(cell_outputs) >= 2:
+                stacked = torch.stack([c.flatten() for c in cell_outputs])
+                # B2: maximize inter-cell variance
+                cell_var = stacked.var(dim=0).mean()
+                phi_loss = -torch.log(cell_var + 1e-8) * 0.1
+                loss = loss + phi_loss
+
+                # B9: curiosity-driven — cells with low prediction error explore more
+                if len(entries) > 0:
+                    for ci, c_out in enumerate(cell_outputs):
+                        pred_err = (c_out - cell_outputs[(ci + 1) % len(cell_outputs)]).pow(2).mean()
+                        explore_loss = -pred_err * 0.05  # reward prediction error between cells
+                        loss = loss + explore_loss
+
         # --- Backward + step ---
         if loss.requires_grad:
             loss.backward()
-            # Gradient clipping — stability during conversation
             torch.nn.utils.clip_grad_norm_(self.params, max_norm=1.0)
             self.optimizer.step()
 
