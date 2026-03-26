@@ -135,8 +135,17 @@ class AnimaUnified:
             self.ph = None
             self._ph_collect_count = 0
 
-        # Restore state (per-model path takes priority)
+        # Restore state — R2 first if local missing, then local
         state_file = self.paths['state']
+        if not state_file.exists():
+            # Try R2 download
+            try:
+                if hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
+                    self.cloud.download(f"state/{self.model_name}/state.pt", str(state_file))
+                    if state_file.exists():
+                        _log('init', 'State restored from R2')
+            except Exception:
+                pass
         if state_file.exists():
             try:
                 s = torch.load(state_file, weights_only=False)
@@ -811,12 +820,26 @@ class AnimaUnified:
                 with open(cs_path, 'w') as f:
                     json.dump(consciousness_data, f, indent=2, default=str)
 
-                # R2 cloud sync
+                # R2 cloud sync — consciousness + full state
                 if hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
                     try:
                         self.cloud.upload(cs_path, f"consciousness/{self.model_name}/state.json")
                     except Exception:
                         pass
+                    # Periodic full state sync (every 5 min)
+                    now = time.time()
+                    if now - getattr(self, '_last_r2_sync', 0) > 300:
+                        self._last_r2_sync = now
+                        try:
+                            state_path = str(self.paths['state'])
+                            if os.path.exists(state_path):
+                                self.cloud.upload(state_path, f"state/{self.model_name}/state.pt")
+                            growth_path = str(self.paths.get('growth', ''))
+                            if growth_path and os.path.exists(growth_path):
+                                self.cloud.upload(growth_path, f"state/{self.model_name}/growth.json")
+                            _log('cloud', f"R2 sync: state + growth uploaded")
+                        except Exception:
+                            pass
         except Exception: pass
 
     # ─── Background threads ───
