@@ -127,6 +127,13 @@ class OnlineLearner:
         if len(self.buffer) < 4:
             return
 
+        # F-11: Growth transition burst — amplify all losses during burst
+        mitosis = getattr(self.mind, '_mitosis_ref', None)
+        growth = getattr(self.mind, '_growth_ref', None)
+        burst_multiplier = 1.0
+        if growth and hasattr(growth, 'in_growth_burst') and growth.in_growth_burst:
+            burst_multiplier = 3.0  # 3x learning intensity during growth transition
+
         self.mind.train()
         self.optimizer.zero_grad()
 
@@ -288,6 +295,9 @@ class OnlineLearner:
                     loss = loss + consolidation_loss
 
         # --- Backward + step ---
+        # F-11: Amplify during growth burst
+        loss = loss * burst_multiplier
+
         if loss.requires_grad:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.params, max_norm=1.0)

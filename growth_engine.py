@@ -182,8 +182,20 @@ class GrowthEngine:
                 'to': new_stage.name,
                 'time': time.time(),
             })
+            # F-11: Growth transition burst — signal intensive learning
+            self._transition_burst_remaining = 8
+
+        # F-11: Check if burst learning is active
+        self._in_growth_burst = getattr(self, '_transition_burst_remaining', 0) > 0
+        if self._in_growth_burst:
+            self._transition_burst_remaining -= 1
 
         return self.stage_index != old_stage  # True if stage changed
+
+    @property
+    def in_growth_burst(self):
+        """F-11: True during 8-step intensive learning after stage transition."""
+        return getattr(self, '_in_growth_burst', False)
 
     def apply_to_mind(self, mind):
         """Apply current stage parameters to ConsciousMind."""
