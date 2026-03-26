@@ -4364,6 +4364,769 @@ def run_S3_gossip_protocol(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# T. Reward / Motivation Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_T1_intrinsic_motivation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """T-1: Intrinsic motivation — Φ 증가 자체를 보상으로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    prev_phi = 0.0
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Reward: scale learning by Φ improvement
+            phi_reward = max(0.1, 1.0 + (prev_phi - 1.0) * 2.0)  # more Φ = more learning
+            loss = diff_loss * phi_reward
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        prev_phi = phi
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("T1", "Intrinsic motivation (Φ reward)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_T2_boredom_exploration(steps=100, dim=64, hidden=128) -> BenchResult:
+    """T-2: Boredom-driven — 낮은 novelty 누적 → 행동 변경."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    boredom = 0.0
+    current_topic = 0
+
+    for step in range(steps):
+        x = _simulate_web_result(current_topic, step, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        novelty = float(np.std(tensions))
+        boredom = 0.9 * boredom + 0.1 * (1.0 - min(novelty, 1.0))
+        # Bored → switch topic + aggressive learning
+        if boredom > 0.7:
+            current_topic = (current_topic + np.random.randint(1, 8)) % 8
+            boredom = 0.0
+            for _ in range(3):
+                new_x = _simulate_web_result(current_topic, step, dim)
+                _web_learn_step(engine, new_x, optimizer)
+        else:
+            _web_learn_step(engine, x, optimizer)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("T2", "Boredom-driven exploration", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_T3_surprise_reward(steps=100, dim=64, hidden=128) -> BenchResult:
+    """T-3: Surprise reward — PE에 비례하는 학습 보상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    prev_tensions = []
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        mean_t = float(np.mean(tensions))
+        pe = abs(mean_t - (np.mean(prev_tensions[-5:]) if prev_tensions else mean_t))
+        prev_tensions.append(mean_t)
+        # Surprise = higher PE → more learning
+        lr_scale = 1.0 + pe * 5.0
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean() * lr_scale
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("T3", "Surprise reward scaling", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_T4_social_approval(steps=100, dim=64, hidden=128) -> BenchResult:
+    """T-4: Social approval — 사용자 반응을 reward로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Simulate user approval (positive for diverse responses)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = stacked.var(dim=0).mean().item()
+            approval = 1.0 / (1.0 + math.exp(-(diversity - 0.5) * 5))  # sigmoid
+            loss = -stacked.var(dim=0).mean() * (1.0 + approval * 3.0)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("T4", "Social approval signal", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# U. Abstraction Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_U1_concept_hierarchy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """U-1: Concept hierarchy — 구체→추상 세포 계층."""
+    t0 = time.time()
+    # 2 concrete cells + 2 abstract cells
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    abstract_proj = nn.Linear(dim * 2, dim)  # concrete pair → abstract
+    all_p = list(abstract_proj.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    optimizer = torch.optim.Adam(all_p, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Concrete cells process raw input
+        c_reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2)]
+        # Abstract cells process concatenated concrete outputs
+        if len(c_reps) >= 2:
+            abstract_input = abstract_proj(torch.cat(c_reps, dim=-1))
+            a_reps = [engine.cells[i].mind.get_repulsion(abstract_input, engine.cells[i].hidden)
+                      for i in range(2, min(4, len(engine.cells)))]
+            all_reps = c_reps + a_reps
+            if len(all_reps) >= 2:
+                stacked = torch.stack(all_reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean()
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("U1", "Concept hierarchy", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_U2_chunking(steps=100, dim=64, hidden=128) -> BenchResult:
+    """U-2: Chunking — 반복 패턴을 단일 단위로 압축."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    chunk_encoder = nn.Linear(dim * 3, dim)  # 3-gram → chunk
+    c_opt = torch.optim.Adam(chunk_encoder.parameters(), lr=1e-3)
+    recent = []
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        recent.append(x.detach())
+        if len(recent) > 3: recent = recent[-3:]
+        # Form chunk from 3-gram
+        if len(recent) == 3:
+            chunk = chunk_encoder(torch.cat(recent, dim=-1))
+            combined = 0.5 * x + 0.5 * chunk
+        else:
+            combined = x
+        _web_learn_step(engine, combined, optimizer)
+        with torch.no_grad(): engine.process(combined)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("U2", "Chunking (3-gram)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_U3_analogy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """U-3: Analogy — 도메인 간 구조 유사성으로 분화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        # Two different domains, same structure
+        domain_a = _simulate_web_result(step % 4, step, dim)
+        domain_b = _simulate_web_result(step % 4 + 4, step, dim)  # different topic, same pattern
+        # Analogy: cells should find structural similarity
+        reps_a = [c.mind.get_repulsion(domain_a, c.hidden) for c in engine.cells]
+        reps_b = [c.mind.get_repulsion(domain_b, c.hidden) for c in engine.cells]
+        if len(reps_a) >= 2:
+            stack_a = torch.stack(reps_a).squeeze(1)
+            stack_b = torch.stack(reps_b).squeeze(1)
+            # Structure preservation: relative distances should be similar across domains
+            dist_a = torch.cdist(stack_a, stack_a)
+            dist_b = torch.cdist(stack_b, stack_b)
+            analogy_loss = F.mse_loss(dist_a, dist_b)
+            diff_loss = -stack_a.var(dim=0).mean() - stack_b.var(dim=0).mean()
+            loss = diff_loss + 0.3 * analogy_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(domain_a)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("U3", "Analogy engine", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# V. Chaos & Criticality
+# ═══════════════════════════════════════════════════════════
+
+def run_V1_edge_of_chaos(steps=100, dim=64, hidden=128) -> BenchResult:
+    """V-1: Edge of chaos — Lyapunov ≈ 0 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            var = stacked.var(dim=0).mean()
+            # Edge of chaos: variance should be exactly 1.0 (critical)
+            critical_loss = (var - 1.0).pow(2)
+            diff_loss = -var
+            # Balance: differentiate but stay critical
+            loss = 0.3 * diff_loss + 0.7 * critical_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("V1", "Edge of chaos (criticality)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_V2_chaotic_itinerancy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """V-2: Chaotic itinerancy — 여러 attractor 사이 유동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    attractors = [torch.randn(1, hidden) for _ in range(4)]
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Push cells toward different attractors but with instability
+        for i, c in enumerate(engine.cells):
+            attr = attractors[i % len(attractors)]
+            # Weak attraction + noise (itinerancy)
+            c.hidden = c.hidden + 0.05 * (attr - c.hidden) + torch.randn_like(c.hidden) * 0.03
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        # Slowly shift attractors (itinerancy)
+        for a in attractors:
+            a.add_(torch.randn_like(a) * 0.01)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("V2", "Chaotic itinerancy", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_V3_power_law(steps=100, dim=64, hidden=128) -> BenchResult:
+    """V-3: Power-law connectivity — 허브 세포 형성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    n = len(engine.cells)
+    # Power-law weights: cell 0 = hub (connects to all), others = periphery
+    connectivity = torch.zeros(n, n)
+    for i in range(n):
+        for j in range(n):
+            if i == j: continue
+            connectivity[i, j] = 1.0 / (abs(i - j) + 1)  # closer = stronger
+    connectivity[0, :] = 0.5  # hub cell
+    connectivity[:, 0] = 0.5
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Apply power-law mixing
+        hiddens = [c.hidden.clone() for c in engine.cells]
+        for i in range(n):
+            influence = sum(connectivity[i, j].item() * hiddens[j] for j in range(n) if j != i)
+            engine.cells[i].hidden = 0.9 * engine.cells[i].hidden + 0.1 * influence / max(n-1, 1)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("V3", "Power-law connectivity", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# W. Geometry / Manifold
+# ═══════════════════════════════════════════════════════════
+
+def run_W1_curvature(steps=100, dim=64, hidden=128) -> BenchResult:
+    """W-1: Representation curvature — hidden space 곡률 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Nearby inputs
+        x_near = x + torch.randn_like(x) * 0.1
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        reps_near = [c.mind.get_repulsion(x_near, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            stacked_near = torch.stack(reps_near).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Curvature: small input change → large representation change
+            curvature = (stacked - stacked_near).pow(2).mean() / 0.01
+            loss = diff_loss - 0.2 * curvature  # maximize curvature
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("W1", "Representation curvature", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_W2_hyperbolic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """W-2: Hyperbolic embedding — 쌍곡 공간에서 계층 형성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Hyperbolic distance: d_h = arcosh(1 + 2||u-v||²/((1-||u||²)(1-||v||²)))
+            # Proxy: push norms to <1 (Poincaré ball) then maximize hyperbolic distances
+            norms = stacked.norm(dim=-1, keepdim=True)
+            projected = stacked / (norms.clamp(min=0.1) + 1.0)  # project to ball
+            diff_loss = -projected.var(dim=0).mean()
+            # Encourage hierarchical arrangement: one cell near center, others at edges
+            radius_var = projected.norm(dim=-1).var()
+            loss = diff_loss - 0.3 * radius_var
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("W2", "Hyperbolic embedding", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_W3_geodesic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """W-3: Geodesic diversity — 내재적 거리 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            # Maximize minimum geodesic distance (spread cells apart)
+            mask = torch.ones_like(dists) - torch.eye(dists.size(0))
+            min_dist = (dists + (1 - mask) * 1e6).min()
+            mean_dist = (dists * mask).sum() / mask.sum()
+            loss = -min_dist - 0.5 * mean_dist
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("W3", "Geodesic diversity", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# X. Quantum-Inspired
+# ═══════════════════════════════════════════════════════════
+
+def run_X1_superposition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """X-1: Superposition — 세포가 여러 상태 동시 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    n_states = 3  # each cell maintains 3 superposed states
+    cell_states = [[torch.randn(1, hidden) * 0.1 for _ in range(n_states)] for _ in engine.cells]
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Each cell processes input from all superposed states
+        all_reps = []
+        for i, cell in enumerate(engine.cells):
+            # Collapse: weighted average of states based on input similarity
+            weights = [F.cosine_similarity(x[:, :hidden] if x.size(1) >= hidden else
+                       F.pad(x, (0, hidden - x.size(1))), s, dim=-1).item()
+                       for s in cell_states[i]]
+            w = F.softmax(torch.tensor(weights), dim=0)
+            collapsed = sum(w[j].item() * cell_states[i][j] for j in range(n_states))
+            cell.hidden = 0.7 * cell.hidden + 0.3 * collapsed
+            rep = cell.mind.get_repulsion(x, cell.hidden)
+            all_reps.append(rep)
+            # Update states
+            for j in range(n_states):
+                cell_states[i][j] = cell_states[i][j] + 0.1 * torch.randn_like(cell_states[i][j])
+
+        if len(all_reps) >= 2:
+            stacked = torch.stack(all_reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("X1", "Superposition cells", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_X2_entanglement(steps=100, dim=64, hidden=128) -> BenchResult:
+    """X-2: Entanglement — 세포 쌍의 비국소 상관 강제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Entanglement: paired cells should have anti-correlated responses
+            # (0,1) entangled, (2,3) entangled
+            entangle_loss = torch.tensor(0.0)
+            for i in range(0, len(reps) - 1, 2):
+                if i + 1 < len(reps):
+                    # Anti-correlation within pair
+                    corr = F.cosine_similarity(reps[i], reps[i+1], dim=-1).mean()
+                    entangle_loss = entangle_loss + corr  # push to -1
+            loss = diff_loss + 0.5 * entangle_loss
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("X2", "Entanglement loss", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_X3_decoherence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """X-3: Decoherence — 환경 상호작용이 중첩을 점진적 붕괴."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Decoherence: gradually reduce noise/superposition over time
+        coherence = max(0.1, 1.0 - step / steps)  # 1.0→0.1
+        for c in engine.cells:
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * coherence * 0.1
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("X3", "Decoherence schedule", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# Y. Developmental Constraints
+# ═══════════════════════════════════════════════════════════
+
+def run_Y1_critical_period(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Y-1: Critical period — 특정 시기에만 특정 세포 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    # Critical periods: cell i can only learn during steps [i*25, (i+1)*25]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        active_cell = min(step // 25, n - 1)
+        rep = engine.cells[active_cell].mind.get_repulsion(x, engine.cells[active_cell].hidden)
+        others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                  for j in range(n) if j != active_cell]
+        if others:
+            loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+            cell_optims[active_cell].zero_grad(); loss.backward(); cell_optims[active_cell].step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Y1", "Critical period windows", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_Y2_synaptic_pruning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Y-2: Synaptic pruning — 과잉 생성 후 약한 연결 제거."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    prune_step = steps * 2 // 3  # prune at 66%
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        # Pruning: zero out small weights
+        if step == prune_step:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        mask = p.abs() > p.abs().mean() * 0.5
+                        p.mul_(mask.float())
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Y2", "Synaptic pruning", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_Y3_myelination(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Y-3: Myelination — 성숙 세포부터 속도 향상 (higher LR)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-4) for c in engine.cells]
+    maturity = [0.0] * n  # tracks how much each cell has learned
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        for i, cell in enumerate(engine.cells):
+            if i >= n: break
+            rep = cell.mind.get_repulsion(x, cell.hidden)
+            others = [engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden).detach()
+                      for j in range(n) if j != i]
+            if others:
+                loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                # Myelination: mature cells get higher LR (faster processing)
+                myelin_lr = 5e-4 + maturity[i] * 2e-3
+                for pg in cell_optims[i].param_groups: pg['lr'] = myelin_lr
+                cell_optims[i].zero_grad(); loss.backward(); cell_optims[i].step()
+                maturity[i] = min(maturity[i] + 0.01, 1.0)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Y3", "Myelination gradient", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# Z. Self-Modification
+# ═══════════════════════════════════════════════════════════
+
+def run_Z1_architecture_search(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Z-1: Architecture search — 세포가 구조 자체를 변경."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Architecture choices: add/remove a hidden layer per cell
+    extra_layers = [nn.Linear(dim, dim) for _ in engine.cells]
+    e_opt = torch.optim.Adam([p for l in extra_layers for p in l.parameters()], lr=1e-3)
+    use_extra = [False] * len(engine.cells)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for i, cell in enumerate(engine.cells):
+            if i < len(extra_layers) and use_extra[i]:
+                modified_x = extra_layers[i](x)
+                rep = cell.mind.get_repulsion(modified_x, cell.hidden)
+            else:
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+            reps.append(rep)
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad(); e_opt.zero_grad()
+            loss.backward(); optimizer.step(); e_opt.step()
+        with torch.no_grad(): engine.process(x)
+        # Toggle architecture every 20 steps based on performance
+        if step > 0 and step % 20 == 0:
+            for i in range(min(len(engine.cells), len(use_extra))):
+                use_extra[i] = not use_extra[i]  # try different architecture
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Z1", "Architecture search", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_Z2_self_replication(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Z-2: Self-replication — 높은 Φ 기여 세포만 복제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        # Every 30 steps: replicate best cell, remove worst
+        if step > 0 and step % 30 == 0 and len(engine.cells) >= 3:
+            phi_full, _ = phi_calc.compute_phi(engine)
+            contributions = []
+            for i in range(len(engine.cells)):
+                subset = MitosisEngine(dim, hidden, dim, initial_cells=0, max_cells=8)
+                subset.cells = [c for j, c in enumerate(engine.cells) if j != i]
+                phi_without, _ = phi_calc.compute_phi(subset)
+                contributions.append(phi_full - phi_without)
+            best = int(np.argmax(contributions))
+            worst = int(np.argmin(contributions))
+            if best != worst:
+                with torch.no_grad():
+                    for pw, pb in zip(engine.cells[worst].mind.parameters(),
+                                      engine.cells[best].mind.parameters()):
+                        pw.copy_(pb + torch.randn_like(pb) * 0.05)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Z2", "Self-replication (Φ-based)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_Z3_apoptosis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Z-3: Apoptosis — 기여도 0 세포 제거 + 새 세포 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, optimizer)
+        with torch.no_grad(): engine.process(x)
+        # Apoptosis check every 25 steps
+        if step > 0 and step % 25 == 0 and len(engine.cells) >= 3:
+            # Kill cells with lowest tension variance (inactive)
+            variances = []
+            for c in engine.cells:
+                if len(c.tension_history) >= 5:
+                    variances.append(float(np.std(c.tension_history[-10:])))
+                else:
+                    variances.append(0.0)
+            min_var_idx = int(np.argmin(variances))
+            # Replace dead cell with fresh random one
+            with torch.no_grad():
+                for p in engine.cells[min_var_idx].mind.parameters():
+                    nn.init.xavier_uniform_(p) if p.dim() >= 2 else nn.init.zeros_(p)
+                engine.cells[min_var_idx].hidden = torch.randn(1, hidden) * 0.1
+                engine.cells[min_var_idx].tension_history = []
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Z3", "Apoptosis (cell death+rebirth)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_Z4_goal_rewriting(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Z-4: Goal rewriting — 세포가 자기 loss 함수를 수정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Learnable loss weights per cell
+    n = len(engine.cells)
+    loss_weights = nn.Parameter(torch.ones(n, 3))  # 3 objectives: variance, distance, coherence
+    meta_opt = torch.optim.Adam([loss_weights], lr=1e-2)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(loss_weights[:len(reps)], dim=-1)
+            # Three objectives
+            var_loss = -stacked.var(dim=0).mean()
+            dist_loss = -torch.cdist(stacked, stacked).mean()
+            coherence = F.mse_loss(stacked, stacked.mean(dim=0, keepdim=True).expand_as(stacked))
+            # Each cell weights objectives differently
+            total = (w[:, 0].mean() * var_loss + w[:, 1].mean() * dist_loss +
+                     w[:, 2].mean() * coherence)
+            optimizer.zero_grad(); meta_opt.zero_grad()
+            total.backward(); optimizer.step(); meta_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("Z4", "Goal rewriting (meta-loss)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -4445,6 +5208,15 @@ ALL_HYPOTHESES = {
     'Q1': run_Q1_free_energy, 'Q2': run_Q2_metabolic_cost, 'Q3': run_Q3_phase_transition, 'Q4': run_Q4_boltzmann_temp,
     'R1': run_R1_perturbation_resistance, 'R2': run_R2_graceful_degradation, 'R3': run_R3_forgetting_resistance,
     'S1': run_S1_emergent_language, 'S2': run_S2_compression_messaging, 'S3': run_S3_gossip_protocol,
+    'T1': run_T1_intrinsic_motivation, 'T2': run_T2_boredom_exploration,
+    'T3': run_T3_surprise_reward, 'T4': run_T4_social_approval,
+    'U1': run_U1_concept_hierarchy, 'U2': run_U2_chunking, 'U3': run_U3_analogy,
+    'V1': run_V1_edge_of_chaos, 'V2': run_V2_chaotic_itinerancy, 'V3': run_V3_power_law,
+    'W1': run_W1_curvature, 'W2': run_W2_hyperbolic, 'W3': run_W3_geodesic,
+    'X1': run_X1_superposition, 'X2': run_X2_entanglement, 'X3': run_X3_decoherence,
+    'Y1': run_Y1_critical_period, 'Y2': run_Y2_synaptic_pruning, 'Y3': run_Y3_myelination,
+    'Z1': run_Z1_architecture_search, 'Z2': run_Z2_self_replication,
+    'Z3': run_Z3_apoptosis, 'Z4': run_Z4_goal_rewriting,
 }
 
 
