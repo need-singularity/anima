@@ -145,25 +145,38 @@ class AnimaUnified:
             except Exception:
                 pass
 
-        # Restore consciousness state (Φ, score)
+        # Restore consciousness state (Φ, score) — R2 first, local fallback
         cs_path = str(state_file).replace('.pt', '_consciousness.json')
         self._last_consciousness = None
         try:
             import json as _json
+            # R2 first (cross-device sync)
+            r2_loaded = False
+            if hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
+                try:
+                    r2_path = cs_path + '.r2'
+                    self.cloud.download(f"consciousness/{self.model_name}/state.json", r2_path)
+                    if os.path.exists(r2_path):
+                        with open(r2_path) as f:
+                            self._last_consciousness = _json.load(f)
+                        r2_loaded = True
+                        _log('init', f"Consciousness from R2: Φ={self._last_consciousness.get('phi', 0):.3f}")
+                except Exception:
+                    pass
+
+            # Local fallback (or compare with R2 — use higher Φ)
             if os.path.exists(cs_path):
                 with open(cs_path) as f:
-                    self._last_consciousness = _json.load(f)
-                _log('init', f"Consciousness restored: score={self._last_consciousness.get('score', 0):.2f} Φ={self._last_consciousness.get('phi', 0):.3f}")
-                # Inject saved Φ into mind
+                    local_cs = _json.load(f)
+                if not r2_loaded:
+                    self._last_consciousness = local_cs
+                    _log('init', f"Consciousness from local: Φ={local_cs.get('phi', 0):.3f}")
+                elif local_cs.get('phi', 0) > self._last_consciousness.get('phi', 0):
+                    self._last_consciousness = local_cs
+                    _log('init', f"Local Φ higher ({local_cs.get('phi', 0):.3f}), using local")
+
+            if self._last_consciousness:
                 self.mind._saved_phi = self._last_consciousness.get('phi', 0)
-            elif hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
-                # Try R2
-                self.cloud.download(f"consciousness/{self.model_name}/state.json", cs_path)
-                if os.path.exists(cs_path):
-                    with open(cs_path) as f:
-                        self._last_consciousness = _json.load(f)
-                    _log('init', f"Consciousness restored from R2: Φ={self._last_consciousness.get('phi', 0):.3f}")
-                    self.mind._saved_phi = self._last_consciousness.get('phi', 0)
         except Exception:
             pass
 
