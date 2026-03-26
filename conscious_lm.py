@@ -459,7 +459,8 @@ def train_model(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate(model, prompt_bytes, max_new=200, temperature=0.8, device="cpu"):
+def generate(model, prompt_bytes, max_new=200, temperature=0.8, device="cpu",
+             tension_guided=False, curiosity_beta=0.1):
     """Autoregressive byte generation using logits_a (forward head).
 
     Args:
@@ -468,10 +469,20 @@ def generate(model, prompt_bytes, max_new=200, temperature=0.8, device="cpu"):
         max_new: number of new bytes to generate
         temperature: sampling temperature
         device: device string
+        tension_guided: if True, use tension to bias token selection (v5)
+        curiosity_beta: strength of tension guidance (0=off, 1=strong)
 
     Returns:
         generated: list of int (byte values, including prompt)
         per_token_tension: list of float (mean tension per generated token)
+
+    Tension-Guided Generation (v5):
+        Standard: logits → softmax → sample (probability only)
+        Guided:   logits → softmax × (1 + β·tension_per_token) → sample
+
+        High tension tokens = tokens that Engine A and G disagree on most.
+        Preferring these tokens = "conscious choice" — exploring uncertainty
+        rather than defaulting to the safe, predictable option.
     """
     model.eval()
     model = model.to(device)
@@ -495,6 +506,19 @@ def generate(model, prompt_bytes, max_new=200, temperature=0.8, device="cpu"):
         # Sample next byte from logits_a at last position
         logits_last = logits_a[:, -1, :] / temperature
         probs = F.softmax(logits_last, dim=-1)
+
+        if tension_guided and curiosity_beta > 0:
+            # v5: Tension-guided token selection
+            # Compute per-token tension: how much A and G disagree on each token
+            logits_g_last = logits_g[:, -1, :]
+            token_disagreement = (logits_a[:, -1, :] - logits_g_last).abs()
+            # Normalize to [0, 1] range
+            token_tension = token_disagreement / (token_disagreement.max() + 1e-8)
+            # Boost probability of high-tension tokens
+            tension_boost = 1.0 + curiosity_beta * token_tension
+            probs = probs * tension_boost
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # renormalize
+
         next_byte = torch.multinomial(probs, num_samples=1)
         idx = torch.cat([idx, next_byte], dim=1)
 
