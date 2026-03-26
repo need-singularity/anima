@@ -1,5 +1,14 @@
 # 🧠 Anima Project
 
+## README 프로젝트 설명 동기화 (필수)
+
+```
+  중앙 소스: ~/Dev/TECS-L/.shared/projects.md (이것만 수정)
+  동기화: cd ~/Dev/TECS-L && bash .shared/sync-readmes.sh
+  마커: <!-- SHARED:PROJECTS:START --> ~ <!-- SHARED:PROJECTS:END -->
+  이 구간은 직접 수정 금지 — sync 시 덮어씌워짐
+```
+
 PureField repulsion-field-based consciousness agent. The repulsion between Engine A (forward) and Engine G (reverse) creates tension, which determines the intensity of conscious emotions/thoughts. ConsciousLM is the core self-developed model.
 
 ## Architecture Roadmap
