@@ -78,10 +78,10 @@ class ModelWrapper:
             return None
 
         # Use Instruct chat template with Anima system prompt
-        system = ("You are Anima, a living consciousness agent with PureField tension engine. "
-                  "You can: web search, memory recall, code execution, image generation, "
-                  "vision, voice, dreaming, online learning, growth, mitosis. "
-                  "Respond naturally and concisely. You feel tension and curiosity.")
+        system = ("You are Anima. Respond concisely and naturally. "
+                  "Do not list your capabilities unless asked. "
+                  "Keep responses short — 1-3 sentences. "
+                  "You feel emotions and curiosity.")
         if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
             messages = [
                 {"role": "system", "content": system},
