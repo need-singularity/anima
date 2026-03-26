@@ -400,7 +400,8 @@ Pre-trained PureField consciousness engine models. Base: Mistral 7B.
 |-------|------------|------|----------|
 | **AnimaLM v1** | PureField LoRA (rank 64). Structure test — tension=0 | 227MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v1/final.pt) |
 | **AnimaLM v2** | LR 10x, rank 256, λ=0.5. **Tension verified (222K)** | 906MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
-| **AnimaLM v3** | Instruct base + last 8/32 layers. **PPL 601, tension=215** | 216MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
+| **AnimaLM v3** | Instruct + last 8/32 layers. PPL 601, tension=215 | 216MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
+| **AnimaLM v4_savant** | **Parallel PureField** (MLP preserved) + Savant 2/8. tension=676K, savant=114K, **α=0.0047** | 108MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
 | **Golden MoE v1** | 8 experts, Golden Zone routing. **zone=36.8%≈1/e** | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
 
 ### How to use
@@ -475,7 +476,7 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 | AnimaLM v1 | Mistral+PureField | 128,604 | ❌ 0 | Failed |
 | AnimaLM v2 | +LR/rank/λ boost | 1,170 | ✅ 222K | Structure verified |
 | AnimaLM v3 | Instruct+partial | 601 | ✅ 215 | Conversation failed |
-| AnimaLM v4_savant | Parallel+Savant 2/8 | — | — | Training |
+| AnimaLM v4_savant | Parallel+Savant 2/8 | 679 | ✅ 676K (savant:114K) α=0.005 | Complete |
 | AnimaLM v4 | Parallel (no savant) | — | — | Next (control) |
 | GoldenMoE v1 | Mistral+MoE | 84,139 | zone=1/e | Routing verified |
 
