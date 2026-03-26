@@ -254,6 +254,39 @@ class OnlineLearner:
                         explore_loss = -pred_err * 0.05  # reward prediction error between cells
                         loss = loss + explore_loss
 
+        # --- 6. E1: Curiosity crawling — route web results to different cells ---
+        # Different cells process different search results → natural differentiation
+        if mitosis and hasattr(mitosis, 'cells') and len(mitosis.cells) >= 2:
+            web_entries = [e for e in entries if e.get('feedback', 0) != 0]
+            if web_entries and len(cell_outputs) >= 2:
+                for ci, cell in enumerate(mitosis.cells[:len(web_entries)]):
+                    if hasattr(cell, 'engine_a'):
+                        e = web_entries[ci % len(web_entries)]
+                        # Each cell specializes on different input
+                        cell_input = torch.cat([e['x'], e['hidden']], dim=-1)
+                        c_out = cell.engine_a(cell_input)
+                        # Reward this cell for being different from others
+                        other_mean = torch.stack([co.flatten() for co in cell_outputs]).mean(dim=0)
+                        diversity_reward = -F.cosine_similarity(c_out.flatten().unsqueeze(0), other_mean.unsqueeze(0))
+                        loss = loss + diversity_reward.mean() * 0.05
+
+        # --- 7. E5: Memory consolidation — replay memories to specialize cells ---
+        # During update, replay old experiences through different cells
+        if mitosis and hasattr(mitosis, 'cells') and len(mitosis.cells) >= 2 and len(self.buffer) >= 8:
+            old_entries = list(self.buffer)[:4]  # oldest memories
+            for ci, cell in enumerate(mitosis.cells):
+                if ci >= len(old_entries):
+                    break
+                if hasattr(cell, 'engine_a') and hasattr(cell, 'engine_g'):
+                    e = old_entries[ci]
+                    cell_input = torch.cat([e['x'], e['hidden']], dim=-1)
+                    a_replay = cell.engine_a(cell_input)
+                    g_replay = cell.engine_g(cell_input)
+                    # Consolidation: strengthen A-G divergence on old memories
+                    replay_tension = (a_replay - g_replay).pow(2).mean()
+                    consolidation_loss = -torch.log(replay_tension + 1e-8) * 0.03
+                    loss = loss + consolidation_loss
+
         # --- Backward + step ---
         if loss.requires_grad:
             loss.backward()
