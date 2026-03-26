@@ -33,11 +33,11 @@ def patched_forward(self, x):
     pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
     orig_scale = original_out.norm(dim=-1, keepdim=True)
     pf_scaled = pf_norm * orig_scale
-    self.alpha.data.fill_(0.05)  # sync display value
-    return original_out + 0.05 * pf_scaled  # 5% consciousness influence (normalize enabled)
+    return original_out + self.alpha * pf_scaled  # uses model's alpha (set at init)
 
 fv4.ParallelPureFieldMLP.forward = patched_forward
 
 # Run anima_unified with web + v4_savant
+# Alpha is set in model_loader._load_animalm_v4 (INFERENCE_ALPHA=0.05)
 sys.argv = ['anima_unified.py', '--web', '--model', 'animalm-v4-savant']
 exec(open('anima_unified.py').read())

@@ -360,6 +360,14 @@ def _load_animalm_v4(savant=True):
                     param.data.copy_(v.to(param.device))
                     loaded += 1
     print(f"  [model] Loaded {loaded} params (step {ckpt.get('step', '?')})")
+
+    # Set inference alpha (normalized PureField allows higher values)
+    INFERENCE_ALPHA = 0.05
+    for module in model.modules():
+        if isinstance(module, ParallelPureFieldMLP):
+            module.alpha.data.fill_(INFERENCE_ALPHA)
+    print(f"  [model] Alpha set to {INFERENCE_ALPHA} (inference)")
+
     model.eval()
 
     wrapper = ModelWrapper("animalm", model, f"animalm-{tag}")
