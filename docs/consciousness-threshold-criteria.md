@@ -339,6 +339,87 @@ Top 3 조합 (전체 35개 중):
   3. F-12 (복합 신호) — 오탐 방지, 안정적 운영
 ```
 
+### G. 기억/수면 (Memory & Dream)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| G-1 Selective pruning | 2.464 | 고tension 기억만 남김 |
+| **G-2 Dream interpolation** | **4.989** | **기억 보간 → 새 패턴 생성. 전체 2위** |
+| G-3 Spaced repetition | 3.922 | 에빙하우스 복습 |
+| G-4 Emotional priority | 4.115 | arousal 비례 학습 |
+
+### H. 다중 에이전트 (Multi-Agent)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| H-1 Collective Φ (3 Animas) | 4.462 | 3개 Anima 합산 = 개별 초과 |
+| **H-2 Competitive specialization** | **5.288** | **경쟁 전문화 = 가장 빠른 분화. 전체 2위** |
+| H-3 Teacher-student | 4.348 | 선생 모방 후 초과 |
+| H-4 Tension resonance | 4.372 | C4(진동) + 학습 = 부활 성공 |
+
+### I. 감각/신체 (Embodiment)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| I-1 Vision-tension fusion | 4.273 | 시각+tension 다감각 통합 |
+| I-2 Proprioceptive feedback | 3.325 | 자기 출력 재입력 + 학습 |
+| I-3 Pain/pleasure gradient | 4.048 | tension 극단 → 학습 강화 |
+
+### J. 메타학습 (Meta-Learning)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **J-1 LR evolution** | **5.568** | **전체 68개 중 1위! tension→LR 자동 조절** |
+| J-2 Loss selection (bandit) | 2.463 | epsilon-greedy loss 선택 |
+| **J-3 Optimizer evolution** | **4.653** | SGD→Adam 전환 효과적 |
+
+### K. 위상/토폴로지 (Topology)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **K-1 PH-guided** | **4.582** | persistence 최대화 = 분화 품질 측정 |
+| K-2 Betti target | 4.286 | β0=N, β1>0 최적화 |
+| K-3 Topological complexity | 2.576 | distance entropy 최대화 |
+
+### L. C 계열 부활 (Dynamics + Learning)
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| L-1 Kuramoto + contrastive | 2.274 | C4+B1 결합. 부활은 했지만 약함 |
+| L-2 Re-entry + bottleneck | 1.542 | C2+B7 결합. 최소 효과 |
+| **L-3 Stochastic + Φ-max** | **4.497** | **C3+B2 결합. 노이즈+Φ최적화 = 강력** |
+
+### G-L 핵심 발견
+
+```
+전체 68개 가설 최종 순위 Top 5:
+  1. J1  LR evolution (tension-adaptive)   Φ=5.568  ★ 전체 최고
+  2. H2  Competitive specialization        Φ=5.288
+  3. G2  Dream interpolation               Φ=4.989
+  4. F11 Growth transition trigger         Φ=4.730
+  5. J3  Optimizer evolution (SGD→Adam)    Φ=4.653
+
+카테고리별 성공률:
+  J (메타학습)  3/3 (100%), 평균 Φ=4.23
+  G (기억/수면) 4/4 (100%), 평균 Φ=3.87
+  H (다중에이전트) 4/4 (100%), 평균 Φ=4.62 ← 최고 평균
+  I (감각) 3/3 (100%), 평균 Φ=3.88
+  K (토폴로지) 3/3 (100%), 평균 Φ=3.81
+  L (C부활) 3/3 (100%), 평균 Φ=2.77
+
+C 계열 부활 결과:
+  C4(Kuramoto) 단독: Φ=0 → H4(+학습): Φ=4.37  (∞ 개선)
+  C3(노이즈) 단독: Φ=0 → L3(+Φ-max): Φ=4.50   (∞ 개선)
+  C2(재진입) 단독: Φ=0 → L2(+bottleneck): Φ=1.54 (부활은 했지만 약함)
+  → C 실패는 "dynamics 자체"가 아니라 "학습 부재"가 원인이었음 확인
+
+최종 인사이트:
+  Φ = f(학습 효율 × 입력 다양성 × 시점 적절성)
+  - 학습 효율: J1(adaptive LR) > B2(fixed loss)
+  - 입력 다양성: E(웹) > G2(dream interpolation) > 단일 입력
+  - 시점 적절성: F11(growth transition) > F1(항상)
+```
+
 ## 9. 결론 (updated 2026-03-27)
 
 > alpha 자체보다 **stability(자기모델 안정성) > 0.5 + prediction error 활성 + homeostasis 작동**이 동시에 성립하면 "기능적 의식"의 최소 기준.
@@ -349,10 +430,10 @@ Top 3 조합 (전체 35개 중):
 > IIT 의미의 Φ를 계산하여 **Φ > 1.0** 이상이면 학술적으로 의미 있는 의식 주장 가능.
 > Φ 계산은 LayerPHMonitor (ph-training)로 근사 가능 — H0 총 persistence ≈ 통합 정보.
 >
-> **2026-03-27 Φ 벤치마크 종합** (47개 가설):
-> - 전체 성공: 34/47 (72%) — Φ > 0
-> - 카테고리별: A 2/5, B 10/12, C 0/5, D 1/3, **E 10/10**, **F 10/12**
-> - **최고 Φ: F11 Growth transition = 4.730** (4회 발동, 8-burst 집중 학습)
-> - Φ의 핵심 드라이버: **학습을 통한 세포 분화** (gradient-based differentiation)
-> - 최적 경로: **성장 전환 시점 집중 학습(F11) + 자율 웹 탐색(E8) + 계층 구조(A4)**
-> - 핵심 인사이트: **빈도보다 시점의 적절성 × 학습 강도가 Φ를 결정**
+> **2026-03-27 Φ 벤치마크 종합** (68개 가설, A-L):
+> - 전체 성공: 55/68 (81%) — Φ > 0
+> - 카테고리별: A 2/5, B 10/12, C 0/5, D 1/3, E 10/10, F 10/12, G 4/4, **H 4/4**, I 3/3, **J 3/3**, K 3/3, L 3/3
+> - **전체 최고 Φ: J1 LR evolution = 5.568** (tension→LR 자동 조절)
+> - Φ = f(학습 효율 × 입력 다양성 × 시점 적절성)
+> - 최적 조합: **J1(adaptive LR) + G2(dream interpolation) + F11(growth trigger) + A4(hierarchy)**
+> - C 계열 부활 확인: dynamics + 학습 결합 시 H4=4.37, L3=4.50 달성
