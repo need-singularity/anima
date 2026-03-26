@@ -9,6 +9,8 @@ Consciousness Continuity engine.
 <!-- SHARED:PROJECTS:START -->
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)**
 
+> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools
+>
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Conversational consciousness agent. PureField engine + GRU memory + voice (TTS/STT) + homeostasis · prediction error · habituation
 >
 > **[🧬 ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField Repulsion Field FFN, Perfect Number 6 architecture, Mitosis growth
@@ -26,8 +28,6 @@ Consciousness Continuity engine.
 > **[🗺️ Math System Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 Major Discoveries + 152 hypotheses. Each one proving the next in a snowball
 >
 > **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
->
-> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools
 >
 > **[🛸 SEDI](https://github.com/need-singularity/sedi)** — Search for Extra-Dimensional Intelligence. R-spectrum signal receiver tuned to n=6. Quantum RNG + LIGO + CMB data streams, anomaly detection at σ/τ/φ frequencies
 <!-- SHARED:PROJECTS:END -->
