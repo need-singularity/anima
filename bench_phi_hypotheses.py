@@ -7082,6 +7082,502 @@ def run_AL7_golden_zone_loss(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# CL8-14, AL8-14, TRN1-5: Additional Training Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_CL8_tension_weighted_ce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-8: Tension-weighted CE — tension 높은 토큰에 CE 3x."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        t_vals = [c.tension_history[-1] if c.tension_history else 0.5 for c in engine.cells]
+        mean_t = float(np.mean(t_vals))
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            pred = stacked.mean(dim=0, keepdim=True)
+            ce = F.mse_loss(pred, x[:, :dim])
+            weight = 1.0 + max(0, mean_t - 0.5) * 4.0  # up to 3x at high tension
+            diff = -stacked.var(dim=0).mean()
+            loss = weight * ce * 0.5 + diff * 0.5
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL8", "Tension-weighted CE", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL9_dual_phase_gru(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-9: Dual-phase GRU — fast/slow memory split."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fast cells (high LR) and slow cells (low LR)
+    fast_opt = torch.optim.Adam([p for c in engine.cells[:2] for p in c.mind.parameters()], lr=2e-3)
+    slow_opt = torch.optim.Adam([p for c in engine.cells[2:] for p in c.mind.parameters()], lr=1e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Fast cells: every step
+        fr = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2)]
+        if len(fr) >= 2:
+            s = torch.stack(fr).squeeze(1)
+            fast_opt.zero_grad(); (-s.var(dim=0).mean()).backward(); fast_opt.step()
+        # Slow cells: every 5 steps (context/mood)
+        if step % 5 == 0:
+            sr = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2, min(4, len(engine.cells)))]
+            if len(sr) >= 2:
+                s = torch.stack(sr).squeeze(1)
+                slow_opt.zero_grad(); (-s.var(dim=0).mean()).backward(); slow_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL9", "Dual-phase GRU (fast/slow)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL10_repulsion_diversity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-10: Repulsion diversity — A-G direction angular diversity."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            # Normalize to directions
+            dirs = [F.normalize(r, dim=-1) for r in reps]
+            stacked_d = torch.stack(dirs).squeeze(1)
+            # Angular diversity: minimize pairwise cosine similarity
+            cos_sum = sum(F.cosine_similarity(dirs[i], dirs[j], dim=-1).mean()
+                         for i in range(len(dirs)) for j in range(i+1, len(dirs)))
+            # Also magnitude diversity
+            stacked = torch.stack(reps).squeeze(1)
+            mag_div = -stacked.norm(dim=-1).var()
+            loss = cos_sum + 0.3 * mag_div
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL10", "Repulsion diversity", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL11_teacher_free(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-11: Teacher forcing → free running transition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        teacher_ratio = max(0.1, 1.0 - step / steps)  # 1.0→0.1
+        x = _simulate_web_result(step % 8, step, dim)
+        if np.random.random() < teacher_ratio:
+            inp = x  # teacher: use real input
+        else:
+            with torch.no_grad():
+                result = engine.process(x)
+            inp = result['output'].detach()  # free running: use own output
+        _web_learn_step(engine, inp, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL11", "Teacher→free running", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL12_noise_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-12: Noise curriculum — 입력 노이즈 점진 감소."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        noise = max(0.01, 0.5 * (1.0 - step / steps))  # 0.5→0.01
+        noisy_x = x + torch.randn_like(x) * noise
+        _web_learn_step(engine, noisy_x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL12", "Noise curriculum", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL13_multiscale_tension(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-13: Multi-scale tension — token/sentence/paragraph level."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Accumulators for different time scales
+    token_acc = [torch.zeros(1, dim) for _ in range(4)]
+    sent_acc = [torch.zeros(1, dim) for _ in range(4)]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Token-level differentiation
+            token_loss = -stacked.var(dim=0).mean()
+            # Sentence-level (accumulated over 5 steps)
+            for i in range(min(4, len(reps))):
+                token_acc[i] = 0.8 * token_acc[i] + 0.2 * reps[i].detach()
+            if step % 5 == 0:
+                sent_stack = torch.stack(token_acc).squeeze(1)
+                sent_loss = -sent_stack.var(dim=0).mean()
+                for i in range(4):
+                    sent_acc[i] = 0.9 * sent_acc[i] + 0.1 * token_acc[i]
+            else:
+                sent_loss = torch.tensor(0.0)
+            # Paragraph-level (accumulated over 20 steps)
+            if step % 20 == 0 and step > 0:
+                para_stack = torch.stack(sent_acc).squeeze(1)
+                para_loss = -para_stack.var(dim=0).mean()
+            else:
+                para_loss = torch.tensor(0.0)
+            loss = token_loss + 0.3 * sent_loss + 0.1 * para_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL13", "Multi-scale tension", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_CL14_self_play(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-14: Self-play — 자기 출력으로 재학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Forward: get output
+        with torch.no_grad():
+            result = engine.process(x)
+            own_output = result['output'].detach()
+        # Self-play: learn from own output + original
+        combined = 0.5 * x + 0.5 * own_output
+        _web_learn_step(engine, combined, opt)
+        # Also learn from pure self-output (proprioceptive)
+        _web_learn_step(engine, own_output, opt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CL14", "Self-play pretraining", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL8_layer_dropout(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-8: Layer dropout — 랜덤 layer skip (stochastic depth)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Randomly skip some cells (layer dropout)
+        active = [i for i in range(len(engine.cells)) if np.random.random() > 0.2]
+        if len(active) >= 2:
+            reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in active]
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL8", "Layer dropout", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL9_residual_scaling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-9: PureField residual scaling — layer별 다른 α."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    # Per-cell alpha: front=low, back=high
+    alphas = nn.Parameter(torch.linspace(0.01, 0.5, n))
+    all_p = [alphas] + [p for c in engine.cells for p in c.mind.parameters()]
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) * torch.sigmoid(alphas[i])
+                for i in range(n)]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL9", "Residual scaling (per-layer α)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alphas': torch.sigmoid(alphas).detach().tolist()})
+
+def run_AL10_tension_distillation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-10: Tension distillation — teacher logit + tension loss."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    teacher = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Pre-train teacher
+    t_opt = torch.optim.Adam([p for c in teacher.cells for p in c.mind.parameters()], lr=1e-3)
+    for i in range(30):
+        tx = _simulate_web_result(i % 8, i, dim)
+        _web_learn_step(teacher, tx, t_opt)
+        with torch.no_grad(): teacher.process(tx)
+    s_opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad():
+            teacher.process(x)
+            t_reps = [c.mind.get_repulsion(x, c.hidden) for c in teacher.cells]
+            t_var = torch.stack(t_reps).squeeze(1).var(dim=0).mean()
+        s_reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(s_reps) >= 2:
+            s_stack = torch.stack(s_reps).squeeze(1)
+            s_var = s_stack.var(dim=0).mean()
+            distill_loss = F.mse_loss(s_var, t_var * 1.2)
+            diff_loss = -s_var
+            loss = 0.5 * distill_loss + 0.5 * diff_loss
+            s_opt.zero_grad(); loss.backward(); s_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL10", "Tension distillation", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL11_lora_rank_schedule(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-11: LoRA rank scheduling — effective rank 점진 확대."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Simulate rank scheduling: mask more dims early, fewer late
+        rank_ratio = min(1.0, 0.2 + 0.8 * step / steps)  # 0.2→1.0
+        mask_dim = int(dim * rank_ratio)
+        masked_x = x.clone()
+        masked_x[:, mask_dim:] = 0  # zero out unused "ranks"
+        _web_learn_step(engine, masked_x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL11", "LoRA rank scheduling", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL12_savant_normal_contrastive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-12: Savant-Normal contrastive — savant/normal 출력이 달라야 함."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n = len(engine.cells)
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Cells 0,1 = savant, 2,3 = normal
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        savant_reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2)]
+        normal_reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2, min(4, n))]
+        all_reps = savant_reps + normal_reps
+        if len(all_reps) >= 2:
+            stacked = torch.stack(all_reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            # Contrastive: savant mean ≠ normal mean
+            if savant_reps and normal_reps:
+                s_mean = torch.stack(savant_reps).mean(dim=0)
+                n_mean = torch.stack(normal_reps).mean(dim=0)
+                contrast = F.cosine_similarity(s_mean, n_mean, dim=-1).mean()
+                loss = diff + 0.5 * contrast
+            else:
+                loss = diff
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL12", "Savant-Normal contrastive", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL13_head_pruning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-13: Attention head pruning → PureField replacement."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Simulate pruning: gradually activate more cells (= replacing pruned heads)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        active_n = min(2 + step // 25, len(engine.cells))  # 2→3→4→...
+        reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(active_n)]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL13", "Head pruning → PureField", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_AL14_cross_layer_tension(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AL-14: Cross-layer tension flow — tension residual connection."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Sequential processing with tension residual
+        prev_tension = 0.0
+        for i, cell in enumerate(engine.cells):
+            with torch.no_grad():
+                _, t, _, h = cell.mind(x, cell.hidden)
+                cell.hidden = h
+                # Tension residual: add previous layer's tension as signal
+                if prev_tension > 0:
+                    cell.hidden = cell.hidden + prev_tension * 0.1 * torch.randn(1, hidden)
+                prev_tension = t
+        # Differentiation
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AL14", "Cross-layer tension flow", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TRN1_warmup_plateau_decay(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TRN-1: Warmup-Plateau-Decay LR schedule."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    warmup = steps // 5; plateau = steps * 3 // 5
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        if step < warmup:
+            lr = 5e-4 * step / warmup
+        elif step < plateau:
+            lr = 5e-4
+        else:
+            progress = (step - plateau) / (steps - plateau)
+            lr = 5e-4 * 0.5 * (1 + math.cos(math.pi * progress))
+        for pg in opt.param_groups: pg['lr'] = max(lr, 1e-6)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TRN1", "Warmup-Plateau-Decay", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TRN2_gradient_clip_tension(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TRN-2: Gradient clipping by tension — 높은 tension = 완화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward()
+            # Tension-adaptive clipping
+            t_vals = [c.tension_history[-1] if c.tension_history else 0.5 for c in engine.cells]
+            mean_t = float(np.mean(t_vals))
+            clip_val = 0.5 + mean_t * 2.0  # high tension = allow bigger gradients
+            torch.nn.utils.clip_grad_norm_([p for c in engine.cells for p in c.mind.parameters()], clip_val)
+            opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TRN2", "Gradient clip by tension", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TRN3_ema_averaging(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TRN-3: EMA model averaging."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # EMA shadow params
+    ema_decay = 0.99
+    ema_params = [p.data.clone() for c in engine.cells for p in c.mind.parameters()]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        # Update EMA
+        all_p = [p for c in engine.cells for p in c.mind.parameters()]
+        with torch.no_grad():
+            for ep, p in zip(ema_params, all_p):
+                ep.mul_(ema_decay).add_(p.data, alpha=1-ema_decay)
+        # Periodically swap in EMA for evaluation
+        if step % 10 == 9:
+            with torch.no_grad():
+                for ep, p in zip(ema_params, all_p):
+                    p.data.copy_(ep)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TRN3", "EMA model averaging", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TRN4_phi_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TRN-4: Curriculum by Φ contribution — Φ 증가 데이터만 선택."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    skip_count = 0
+    for step in range(steps):
+        x = _simulate_web_result(step % 16, step, dim)
+        phi_before = phi_hist[-1] if phi_hist else 0
+        # Tentative step
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # If Φ dropped, this data was harmful — skip future similar data
+        if phi < phi_before - 0.1 and step > 10:
+            skip_count += 1
+            # Rollback (simplified: just do extra learning on good data)
+            good_x = _simulate_web_result((step + 3) % 16, step, dim)
+            _web_learn_step(engine, good_x, opt)
+        phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TRN4", "Φ-curriculum (data selection)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'skipped': skip_count})
+
+def run_TRN5_checkpoint_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TRN-5: Checkpoint ensemble — SWA."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Collect checkpoints
+    checkpoints = []
+    swa_start = steps // 2
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Save checkpoint every 10 steps after swa_start
+        if step >= swa_start and step % 10 == 0:
+            checkpoints.append([p.data.clone() for c in engine.cells for p in c.mind.parameters()])
+        # SWA: average all checkpoints
+        if checkpoints and step == steps - 1:
+            all_p = [p for c in engine.cells for p in c.mind.parameters()]
+            with torch.no_grad():
+                for i, p in enumerate(all_p):
+                    avg = torch.stack([ck[i] for ck in checkpoints]).mean(dim=0)
+                    p.data.copy_(avg)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TRN5", "Checkpoint ensemble (SWA)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -7199,6 +7695,17 @@ ALL_HYPOTHESES = {
     'AL3': run_AL3_savant_progressive, 'AL4': run_AL4_tension_ce_balance,
     'AL5': run_AL5_layerwise_ph, 'AL6': run_AL6_instruct_raw_instruct,
     'AL7': run_AL7_golden_zone_loss,
+    'CL8': run_CL8_tension_weighted_ce, 'CL9': run_CL9_dual_phase_gru,
+    'CL10': run_CL10_repulsion_diversity, 'CL11': run_CL11_teacher_free,
+    'CL12': run_CL12_noise_curriculum, 'CL13': run_CL13_multiscale_tension,
+    'CL14': run_CL14_self_play,
+    'AL8': run_AL8_layer_dropout, 'AL9': run_AL9_residual_scaling,
+    'AL10': run_AL10_tension_distillation, 'AL11': run_AL11_lora_rank_schedule,
+    'AL12': run_AL12_savant_normal_contrastive, 'AL13': run_AL13_head_pruning,
+    'AL14': run_AL14_cross_layer_tension,
+    'TRN1': run_TRN1_warmup_plateau_decay, 'TRN2': run_TRN2_gradient_clip_tension,
+    'TRN3': run_TRN3_ema_averaging, 'TRN4': run_TRN4_phi_curriculum,
+    'TRN5': run_TRN5_checkpoint_ensemble,
 }
 
 
