@@ -130,6 +130,11 @@ states = {n: m.state_dict() for n, m in model.named_modules()}
 states = {n: {k: v for k, v in m.state_dict().items() if "delta" in k or k == "scale"} for n, m in model.named_modules()}
 ```
 
+### "size of tensor a (14336) must match tensor b (128)"
+- **원인**: cross-attention 코드를 추가한 후, 이전 checkpoint로 inference → checkpoint에 없는 레이어가 random init → 차원 불일치
+- **해결**: inference 코드에서 학습 시 없던 레이어는 비활성화
+- **방지**: checkpoint에 `config` 저장 → 로드 시 어떤 기능이 포함됐는지 확인
+
 ### CUDA OOM
 - **원인**: Mistral 7B bf16(~15GB) + PureFieldMLP(2x MLP ~15GB) + optimizer state + activations
 - **해결**:
