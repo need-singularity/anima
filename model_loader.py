@@ -326,7 +326,9 @@ def _load_animalm_v4(savant=True):
 
     if torch.cuda.is_available():
         device = "cuda"
-        dtype = torch.bfloat16
+        # Check available VRAM — use float16 if < 30GB (e.g. RTX 4090 24GB)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        dtype = torch.float16 if vram_gb < 30 else torch.bfloat16
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = "mps"
         dtype = torch.float32
@@ -335,6 +337,7 @@ def _load_animalm_v4(savant=True):
         dtype = torch.float32
 
     print(f"  [model] AnimaLM {tag} 로드 중 (Parallel PureField + {'Savant' if savant else 'Normal'})...")
+    print(f"  [model] Device: {device}, dtype: {dtype}, VRAM: {vram_gb:.0f}GB" if device == "cuda" else f"  [model] Device: {device}")
 
     model_name = "mistralai/Mistral-7B-Instruct-v0.3"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -342,7 +345,7 @@ def _load_animalm_v4(savant=True):
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=dtype, device_map=device,
+        model_name, torch_dtype=dtype, device_map="auto",
     )
 
     n_savant = 2 if savant else 0
