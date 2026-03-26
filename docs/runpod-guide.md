@@ -70,6 +70,13 @@ runpodctl pod remove POD_ID
 
 ## Troubleshooting
 
+### transformers "PyTorch >= 2.4 required"
+- **원인**: runpod-torch-v21 템플릿은 PyTorch 2.1 — transformers 최신이 2.4+ 요구
+- **해결**: 템플릿 `runpod-torch-v240` 이상 사용
+```bash
+runpodctl pod create --template-id runpod-torch-v240 --gpu-id "NVIDIA GeForce RTX 4090"
+```
+
 ### scp 실패: "close remote: Failure"
 - **원인**: /workspace가 NFS 마운트라 scp write가 실패할 수 있음
 - **해결**: `/root/`에 쓰거나, base64 파이프로 전송

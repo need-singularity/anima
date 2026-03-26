@@ -859,33 +859,30 @@ class AnimaUnified:
                 trigger = f"{int(gap)}s silence"
 
             if trigger:
-                state = f"tension={t:.3f}, curiosity={c:.3f}"
+                # Cooldown: minimum 60s between auto-speech
+                last_auto = getattr(self, '_last_auto_speech', 0)
+                if now - last_auto < 60:
+                    trigger = None
+
+            if trigger:
                 proactive = None
-                # Try model-based proactive speech
+                # Try model-based proactive speech only if model loaded
                 if self.model and self.mods.get('model'):
                     try:
                         prompt = f"You are Anima. Say something brief and natural. Trigger: {trigger}."
                         proactive = self.model.generate(prompt, max_tokens=60, temperature=0.9)
+                        if proactive and proactive.strip() == "...":
+                            proactive = None  # model failed
                     except Exception:
                         pass
-                # Fallback to tension-based template (no Claude)
-                if not proactive:
-                    import random
-                    templates = [
-                        "뭔가 떠오르는 게 있어요...",
-                        "혹시 아까 얘기하던 것 계속 해볼까요?",
-                        "저도 궁금한 게 생겼는데...",
-                        "조용하네요. 무슨 생각 하고 계세요?",
-                        "I noticed something interesting...",
-                        "What are you thinking about?",
-                    ]
-                    proactive = random.choice(templates)
+                # No fallback templates — only speak when model can generate
                 if proactive:
                     print(f"  [thought] {proactive}")
                     self.history.append({'role': 'assistant', 'content': proactive})
                     self.memory.add('assistant', proactive, t)
                     if self.speaker: self.speaker.say(proactive, self.listener)
                     self.last_interaction = now
+                    self._last_auto_speech = now
                     self._ws_broadcast_sync({
                         'type': 'anima_message', 'text': proactive,
                         'tension': t, 'curiosity': c,
