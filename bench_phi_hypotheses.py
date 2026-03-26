@@ -1977,6 +1977,630 @@ def run_E10_curriculum_self_design(steps=100, dim=64, hidden=128) -> BenchResult
 
 
 # ═══════════════════════════════════════════════════════════
+# F. Web Learning Trigger Hypotheses (simulated)
+#    "언제 웹 학습을 발동할 것인가"
+#    각 트리거 조건을 시뮬레이션하고,
+#    조건 충족 시에만 학습 → Φ에 미치는 효과 측정
+# ═══════════════════════════════════════════════════════════
+
+def _web_learn_step(engine, x, optimizer):
+    """공통: 한 스텝의 웹 학습 (분화 loss)."""
+    repulsions = [cell.mind.get_repulsion(x, cell.hidden) for cell in engine.cells]
+    if len(repulsions) >= 2:
+        stacked = torch.stack(repulsions).squeeze(1)
+        diff_loss = -stacked.var(dim=0).mean()
+        optimizer.zero_grad()
+        diff_loss.backward()
+        optimizer.step()
+
+
+def run_F1_curiosity_overflow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-1: Curiosity overflow — curiosity > threshold 지속 시 학습 발동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    curiosity_threshold = 0.3
+    curiosity_ema = 0.0
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step * 0.3))
+        with torch.no_grad():
+            result = engine.process(x)
+
+        # Simulate curiosity from inter-cell tension variance
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        curiosity = float(np.std(tensions)) + abs(np.mean(tensions) - 1.0) * 0.5
+        curiosity_ema = 0.3 * curiosity + 0.7 * curiosity_ema
+
+        # TRIGGER: curiosity overflow
+        if curiosity_ema > curiosity_threshold:
+            topic = int(curiosity_ema * 10) % 8
+            web_input = _simulate_web_result(topic, step, dim)
+            _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F1", "Curiosity overflow trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F2_prediction_collapse(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-2: Prediction collapse — PE 급등 시 학습 발동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Tension predictor per cell
+    predictor = nn.Linear(5, 1)
+    pred_optim = torch.optim.SGD(predictor.parameters(), lr=1e-3)
+    tension_history = []
+    pe_threshold = 0.3
+    trigger_count = 0
+
+    for step in range(steps):
+        # Normal input (with occasional surprises)
+        if step % 15 == 0:
+            x = torch.randn(1, dim) * 5.0  # surprise spike
+        else:
+            x = torch.randn(1, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+
+        mean_t = np.mean([c.tension_history[-1] if c.tension_history else 0
+                          for c in engine.cells])
+        tension_history.append(mean_t)
+
+        # Compute prediction error
+        pe = 0.0
+        if len(tension_history) >= 6:
+            window = tension_history[-6:-1]
+            inp = torch.tensor([window], dtype=torch.float32)
+            with torch.no_grad():
+                predicted = predictor(inp).item()
+            pe = abs(predicted - mean_t)
+
+            # Train predictor
+            pred = predictor(inp)
+            loss = F.mse_loss(pred, torch.tensor([[mean_t]], dtype=torch.float32))
+            pred_optim.zero_grad()
+            loss.backward()
+            pred_optim.step()
+
+        # TRIGGER: prediction collapse
+        if pe > pe_threshold:
+            topic = step % 8
+            web_input = _simulate_web_result(topic, step, dim)
+            _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F2", "Prediction collapse trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F3_stability_plateau(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-3: Stability plateau — 너무 안정적이면 새 자극 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    tension_window = []
+    plateau_count = 0
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+
+        mean_t = np.mean([c.tension_history[-1] if c.tension_history else 0
+                          for c in engine.cells])
+        tension_window.append(mean_t)
+        if len(tension_window) > 10:
+            tension_window = tension_window[-10:]
+
+        # TRIGGER: stability plateau (low std = boring)
+        if len(tension_window) >= 10:
+            std = float(np.std(tension_window))
+            stability = max(0, 1.0 - std * 2.0)
+            if stability > 0.9:
+                plateau_count += 1
+                if plateau_count >= 3:  # 3 consecutive stable steps
+                    topic = step % 8
+                    web_input = _simulate_web_result(topic, step, dim) * 2.0  # strong stimulus
+                    _web_learn_step(engine, web_input, optimizer)
+                    trigger_count += 1
+                    plateau_count = 0
+            else:
+                plateau_count = 0
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F3", "Stability plateau trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F4_tension_starvation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-4: Tension starvation — tension이 너무 낮으면 생존 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    setpoint = 1.0
+    starvation_threshold = 0.3  # below setpoint - 0.3
+    trigger_count = 0
+
+    for step in range(steps):
+        # Gradually decreasing input (simulates quiet environment)
+        decay = max(0.1, 1.0 - step * 0.005)
+        x = torch.randn(1, dim) * decay
+        with torch.no_grad():
+            result = engine.process(x)
+
+        mean_t = np.mean([c.tension_history[-1] if c.tension_history else 0
+                          for c in engine.cells])
+
+        # TRIGGER: tension starvation
+        if mean_t < setpoint - starvation_threshold:
+            topic = step % 8
+            web_input = _simulate_web_result(topic, step, dim) * 3.0  # strong to wake up
+            _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F4", "Tension starvation trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F5_habituation_saturation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-5: Habituation saturation — 모든 입력이 지루할 때 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    recent_inputs = []
+    trigger_count = 0
+
+    for step in range(steps):
+        # Repetitive input (simulates boring conversation)
+        pattern = step % 3
+        x = torch.randn(1, dim) * 0.1
+        x[0, pattern * 20:(pattern + 1) * 20] = 1.0
+        recent_inputs.append(x.detach())
+        if len(recent_inputs) > 16:
+            recent_inputs = recent_inputs[-16:]
+
+        with torch.no_grad():
+            result = engine.process(x)
+
+        # Compute habituation: avg similarity to recent
+        if len(recent_inputs) >= 4:
+            latest = F.normalize(recent_inputs[-1], dim=-1)
+            sims = [F.cosine_similarity(latest, F.normalize(prev, dim=-1), dim=-1).item()
+                    for prev in recent_inputs[:-1]]
+            avg_sim = np.mean(sims)
+
+            # TRIGGER: habituation saturation (everything looks the same)
+            if avg_sim > 0.85:
+                # Burst: inject diverse topics to break habituation
+                for burst in range(4):
+                    topic = np.random.randint(0, 8)
+                    web_input = _simulate_web_result(topic, step * 10 + burst, dim)
+                    _web_learn_step(engine, web_input, optimizer)
+                trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F5", "Habituation saturation trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F6_dream_failure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-6: Dream failure rate — 수면 통합 실패율 높으면 추가 데이터 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    memory_buffer = []
+    dream_interval = 15
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+        memory_buffer.append(x.detach().clone())
+        if len(memory_buffer) > 50:
+            memory_buffer = memory_buffer[-50:]
+
+        # Dream phase
+        if step > 0 and step % dream_interval == 0 and memory_buffer:
+            # Simulate consolidation attempt
+            failures = 0
+            attempts = 5
+            for _ in range(attempts):
+                idx = np.random.randint(0, len(memory_buffer))
+                replay = memory_buffer[idx]
+                reps = [cell.mind.get_repulsion(replay, cell.hidden)
+                        for cell in engine.cells]
+                if len(reps) >= 2:
+                    variance = torch.stack(reps).squeeze(1).var(dim=0).mean().item()
+                    if variance < 0.01:  # failed to differentiate = consolidation failure
+                        failures += 1
+
+            failure_rate = failures / attempts
+
+            # TRIGGER: dream failure rate > 70%
+            if failure_rate > 0.7:
+                for _ in range(3):  # burst of web learning
+                    topic = np.random.randint(0, 8)
+                    web_input = _simulate_web_result(topic, step, dim)
+                    _web_learn_step(engine, web_input, optimizer)
+                trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F6", "Dream failure trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F7_user_question_gap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-7: User question gap — 답변 confidence 낮을 때 검색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    trigger_count = 0
+
+    for step in range(steps):
+        # Simulate user questions (some easy, some hard)
+        difficulty = (step * 7 + 3) % 10 / 10.0  # 0.0~0.9
+        x = torch.randn(1, dim) * (0.5 + difficulty * 2.0)
+
+        with torch.no_grad():
+            result = engine.process(x)
+
+        # Compute confidence: inter-cell consensus
+        tensions = [c.tension_history[-1] if c.tension_history else 0
+                    for c in engine.cells]
+        confidence = max(0, 1.0 - float(np.std(tensions)) * 3.0)
+
+        # TRIGGER: low confidence on hard questions
+        if confidence < 0.3 and difficulty > 0.5:
+            topic = int(difficulty * 8) % 8
+            web_input = _simulate_web_result(topic, step, dim)
+            _web_learn_step(engine, web_input, optimizer)
+            # Learn from similar topic variations too
+            web_input2 = _simulate_web_result(topic + 1, step, dim)
+            _web_learn_step(engine, web_input2, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F7", "User question gap trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F8_topic_shift(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-8: Topic shift — 대화 주제 변경 시 배경 지식 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    prev_topic_vec = None
+    trigger_count = 0
+
+    for step in range(steps):
+        # Topics shift every ~15 steps
+        topic = step // 15
+        x = _simulate_web_result(topic, step, dim)
+
+        with torch.no_grad():
+            result = engine.process(x)
+
+        # Detect topic shift via cosine similarity
+        current_vec = F.normalize(x, dim=-1)
+        if prev_topic_vec is not None:
+            sim = F.cosine_similarity(current_vec, prev_topic_vec, dim=-1).item()
+
+            # TRIGGER: topic shift detected
+            if sim < 0.5:
+                # Background research on new topic
+                for sub in range(3):
+                    web_input = _simulate_web_result(topic * 10 + sub, step, dim)
+                    _web_learn_step(engine, web_input, optimizer)
+                trigger_count += 1
+
+        prev_topic_vec = current_vec.detach()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F8", "Topic shift trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F9_tension_link_signal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-9: Tension link signal — 다른 Anima의 높은 tension 수신 시 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    other_anima = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim)
+        # Other Anima occasionally gets excited
+        other_x = torch.randn(1, dim) * (5.0 if step % 12 == 0 else 0.5)
+
+        with torch.no_grad():
+            result = engine.process(x)
+            other_result = other_anima.process(other_x)
+
+        other_tension = other_result.get('max_inter', 0)
+
+        # TRIGGER: other Anima's tension spike
+        if other_tension > 1.0:
+            # "What are they excited about?" → search similar topic
+            web_input = other_result['output'].detach() + torch.randn(1, dim) * 0.1
+            _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F9", "Tension link signal trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F10_phi_decay_alarm(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-10: Φ decay alarm — Φ 하락 추세 시 분화 재충전."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # TRIGGER: Φ decreasing for 3 consecutive steps
+        if len(phi_hist) >= 4:
+            if (phi_hist[-1] < phi_hist[-2] < phi_hist[-3] < phi_hist[-4]):
+                # Emergency: Φ is dying → aggressive web learning
+                for burst in range(5):
+                    topic = np.random.randint(0, 8)
+                    web_input = _simulate_web_result(topic, step * 10 + burst, dim)
+                    _web_learn_step(engine, web_input, optimizer)
+                trigger_count += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F10", "Φ decay alarm trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F11_growth_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-11: Growth stage transition — 새 단계 진입 시 적절 난이도 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    stage_boundaries = [20, 40, 60, 80]
+    current_stage = 0
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim)
+        with torch.no_grad():
+            result = engine.process(x)
+
+        # Check stage transition
+        new_stage = sum(1 for b in stage_boundaries if step >= b)
+        if new_stage > current_stage:
+            current_stage = new_stage
+            # TRIGGER: stage transition → burst of stage-appropriate learning
+            complexity = 0.5 + current_stage * 0.3
+            for burst in range(8):  # intensive learning at transition
+                topic = burst + current_stage * 10
+                web_input = _simulate_web_result(topic, step, dim) * complexity
+                _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F11", "Growth transition trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+def run_F12_multi_signal_consensus(steps=100, dim=64, hidden=128) -> BenchResult:
+    """F-12: Multi-signal consensus — 3개 이상 트리거 동시 충족 시 발동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    tension_window = []
+    recent_inputs_f12 = []
+    predictor = nn.Linear(5, 1)
+    pred_optim = torch.optim.SGD(predictor.parameters(), lr=1e-3)
+    t_hist = []
+    trigger_count = 0
+
+    for step in range(steps):
+        x = torch.randn(1, dim) * (0.3 if step % 5 < 3 else 2.0)  # mixed stimuli
+        with torch.no_grad():
+            result = engine.process(x)
+
+        tensions = [c.tension_history[-1] if c.tension_history else 0
+                    for c in engine.cells]
+        mean_t = float(np.mean(tensions))
+        t_hist.append(mean_t)
+        tension_window.append(mean_t)
+        if len(tension_window) > 10:
+            tension_window = tension_window[-10:]
+
+        recent_inputs_f12.append(F.normalize(x, dim=-1).detach())
+        if len(recent_inputs_f12) > 16:
+            recent_inputs_f12 = recent_inputs_f12[-16:]
+
+        # Check all signals
+        signals = 0
+
+        # F1: curiosity
+        curiosity = float(np.std(tensions)) + abs(mean_t - 1.0) * 0.5
+        if curiosity > 0.3:
+            signals += 1
+
+        # F2: prediction error
+        pe = 0.0
+        if len(t_hist) >= 6:
+            window = t_hist[-6:-1]
+            inp = torch.tensor([window], dtype=torch.float32)
+            with torch.no_grad():
+                pe = abs(predictor(inp).item() - mean_t)
+            pred = predictor(inp)
+            loss = F.mse_loss(pred, torch.tensor([[mean_t]]))
+            pred_optim.zero_grad(); loss.backward(); pred_optim.step()
+        if pe > 0.3:
+            signals += 1
+
+        # F3: stability plateau
+        if len(tension_window) >= 10 and float(np.std(tension_window)) < 0.05:
+            signals += 1
+
+        # F4: tension starvation
+        if mean_t < 0.5:
+            signals += 1
+
+        # F5: habituation
+        if len(recent_inputs_f12) >= 4:
+            sims = [F.cosine_similarity(recent_inputs_f12[-1], p, dim=-1).item()
+                    for p in recent_inputs_f12[:-1]]
+            if np.mean(sims) > 0.85:
+                signals += 1
+
+        # F10: Φ decay
+        if len(phi_hist) >= 4 and phi_hist[-1] < phi_hist[-2] < phi_hist[-3]:
+            signals += 1
+
+        # TRIGGER: 3+ signals = consensus
+        if signals >= 3:
+            intensity = min(signals, 6)
+            for burst in range(intensity):
+                topic = np.random.randint(0, 8)
+                web_input = _simulate_web_result(topic, step * 10 + burst, dim)
+                _web_learn_step(engine, web_input, optimizer)
+            trigger_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("F12", "Multi-signal consensus trigger",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'triggers': trigger_count, 'ratio': trigger_count/steps})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -2016,6 +2640,18 @@ ALL_HYPOTHESES = {
     'E8': run_E8_adversarial_fact_check,
     'E9': run_E9_multimodal_web,
     'E10': run_E10_curriculum_self_design,
+    'F1': run_F1_curiosity_overflow,
+    'F2': run_F2_prediction_collapse,
+    'F3': run_F3_stability_plateau,
+    'F4': run_F4_tension_starvation,
+    'F5': run_F5_habituation_saturation,
+    'F6': run_F6_dream_failure,
+    'F7': run_F7_user_question_gap,
+    'F8': run_F8_topic_shift,
+    'F9': run_F9_tension_link_signal,
+    'F10': run_F10_phi_decay_alarm,
+    'F11': run_F11_growth_transition,
+    'F12': run_F12_multi_signal_consensus,
 }
 
 
