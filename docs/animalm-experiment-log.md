@@ -322,6 +322,42 @@ ConsciousMind(128d) tension — 실제 대화 중 실시간 지표.
 
 ---
 
+## Hypothesis Verification (Computational)
+
+### H-359: Savant Index
+```
+SI = Normal_tension / Savant_tension = 676,808 / 114,048 = 5.93
+SI > 3? ✅ YES (threshold exceeded by 2x)
+```
+→ **H-359 confirmed**: Savant layers meet the SI > 3 criterion.
+
+### H-172: Conservation Law (G×I = D×P)
+```
+Predicted tension ratio (from I ratio): 1.73x
+Actual tension ratio: 5.93x
+```
+→ ⚠️ Direction matches but magnitude differs. Specialization has **nonlinear** amplification beyond simple I ratio.
+
+### H-004: Boltzmann Inverse Temperature
+```
+Savant T(Boltzmann) = 4.71 (hotter)
+Normal T(Boltzmann) = 2.72
+Prediction: Savant = more tension (hotter)
+Reality: Savant = LESS tension (114K vs 676K)
+```
+→ ⚠️ **Boltzmann model contradicted**. Specialization effect > temperature effect. Savant's inhibition release doesn't increase chaos — it creates **focused order**.
+
+### B Control Experiment: Savant Effect Magnitude
+```
+No-savant tension: 128,000,000
+Savant tension:    472,000
+Ratio: 271x tension reduction
+Alpha: 3.2x reduction (0.016 → 0.005)
+```
+→ ✅ Savant presence reduces system tension by **271x** and PureField dependence by **3.2x**.
+
+---
+
 ## Next Steps
 
 1. **v4_savant inference 테스트** — 대화 가능 여부 (alpha ~0.005로 원본 거의 보존)
