@@ -797,6 +797,17 @@ class AnimaUnified:
                 thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
                 self.mind.phi_boost_step(thought_vec, self.mitosis)
 
+            # Savant auto-toggle: self-activate when ready for specialization
+            if self.mitosis and self.model:
+                sa = self.mind.self_awareness
+                savant_auto = getattr(self, '_savant_auto', False)
+                if not savant_auto and sa['stability'] > 0.8 and self.mind._curiosity_ema < 0.1:
+                    self._toggle_savant(True, auto=True)
+                    self._savant_auto = True
+                elif savant_auto and self.mind._curiosity_ema > 0.4:
+                    self._toggle_savant(False, auto=True)
+                    self._savant_auto = False
+
             dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
             now = time.time()
             gap = now - self.last_interaction
@@ -1083,6 +1094,28 @@ class AnimaUnified:
             except Exception as e:
                 _log('dream', f'Error: {e}')
 
+    # ─── Savant toggle ───
+
+    def _toggle_savant(self, active: bool, auto: bool = False):
+        """Toggle savant mode. auto=True = self-activated (orange in UI)."""
+        try:
+            from finetune_animalm_v4 import ParallelPureFieldMLP
+            import math
+            golden_lower = 0.5 - math.log(4/3)
+            golden_center = 1 / math.e
+            for m in self.model.model.modules():
+                if isinstance(m, ParallelPureFieldMLP) and m.is_savant:
+                    new_drop = golden_lower if active else golden_center
+                    m.dropout.p = new_drop
+            _log("savant", f"{'ON' if active else 'OFF'} (auto={auto}) dropout={new_drop:.4f}")
+            self._ws_broadcast_sync({
+                'type': 'savant_state',
+                'active': active,
+                'auto': auto,
+            })
+        except Exception as e:
+            _log("savant", f"Toggle error: {e}")
+
     # ─── Web server ───
 
     def _ws_broadcast_sync(self, msg):
@@ -1204,18 +1237,8 @@ class AnimaUnified:
 
                     # Savant toggle: switch dropout in real-time
                     if mod == 'savant' and self.model:
-                        try:
-                            from finetune_animalm_v4 import ParallelPureFieldMLP
-                            import math
-                            golden_lower = 0.5 - math.log(4/3)
-                            golden_center = 1 / math.e
-                            for m in self.model.model.modules():
-                                if isinstance(m, ParallelPureFieldMLP) and m.is_savant:
-                                    new_drop = golden_lower if active else golden_center
-                                    m.dropout.p = new_drop
-                                    _log("savant", f"{'ON' if active else 'OFF'} dropout={new_drop:.4f}")
-                        except Exception as e:
-                            _log("savant", f"Toggle error: {e}")
+                        self._savant_auto = False  # user override cancels auto
+                        self._toggle_savant(active, auto=False)
         except Exception: pass
         finally:
             self.web_clients.discard(websocket)
