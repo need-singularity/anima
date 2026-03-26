@@ -997,6 +997,185 @@ function getModuleStates() {
     );
 }
 
+// ─── LiDAR (WebXR Depth API) ───
+let xrSession = null;
+let xrRefSpace = null;
+let lidarActive = false;
+let lidarFrameCount = 0;
+
+async function startLiDAR() {
+    if (!navigator.xr) {
+        showNotification('WebXR not supported on this device');
+        return false;
+    }
+    const supported = await navigator.xr.isSessionSupported('immersive-ar');
+    if (!supported) {
+        showNotification('AR not supported — need iPhone with LiDAR (Pro/Pro Max)');
+        return false;
+    }
+
+    try {
+        xrSession = await navigator.xr.requestSession('immersive-ar', {
+            requiredFeatures: ['depth-sensing', 'local-floor'],
+            depthSensing: {
+                usagePreference: ['cpu-optimized'],
+                dataFormatPreference: ['luminance-alpha', 'float32']
+            }
+        });
+
+        xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+        xrSession.requestAnimationFrame(onLiDARFrame);
+        lidarActive = true;
+        lidarFrameCount = 0;
+        showNotification('LiDAR active — depth sensing started');
+        return true;
+    } catch (e) {
+        showNotification('LiDAR failed: ' + e.message);
+        return false;
+    }
+}
+
+function onLiDARFrame(time, frame) {
+    if (!lidarActive || !xrSession) return;
+
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (!pose) {
+        xrSession.requestAnimationFrame(onLiDARFrame);
+        return;
+    }
+
+    for (const view of pose.views) {
+        const depthInfo = frame.getDepthInformation(view);
+        if (!depthInfo) continue;
+
+        lidarFrameCount++;
+
+        // Sample depth at key points (don't send full frame every time)
+        if (lidarFrameCount % 10 === 0) { // Every 10th frame (~3Hz)
+            const w = depthInfo.width;
+            const h = depthInfo.height;
+            const samples = [];
+
+            // Sample 8x8 grid = 64 depth points
+            for (let y = 0; y < 8; y++) {
+                for (let x = 0; x < 8; x++) {
+                    const nx = (x + 0.5) / 8; // normalized 0-1
+                    const ny = (y + 0.5) / 8;
+                    const depth = depthInfo.getDepthInMeters(nx, ny);
+                    samples.push(Math.round(depth * 1000) / 1000); // mm precision
+                }
+            }
+
+            // Compute depth stats
+            const validSamples = samples.filter(d => d > 0 && d < 10);
+            const depthMean = validSamples.reduce((a, b) => a + b, 0) / (validSamples.length || 1);
+            const depthMin = Math.min(...validSamples);
+            const depthMax = Math.max(...validSamples);
+            const depthStd = Math.sqrt(validSamples.reduce((s, d) => s + (d - depthMean) ** 2, 0) / (validSamples.length || 1));
+
+            // Send to server
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'lidar_depth',
+                    frame: lidarFrameCount,
+                    grid: samples,          // 8x8 = 64 depth values
+                    stats: {
+                        mean: Math.round(depthMean * 1000) / 1000,
+                        min: Math.round(depthMin * 1000) / 1000,
+                        max: Math.round(depthMax * 1000) / 1000,
+                        std: Math.round(depthStd * 1000) / 1000,
+                    },
+                    width: w,
+                    height: h,
+                    timestamp: time,
+                }));
+            }
+
+            // Update UI badge
+            const lidarToggle = document.querySelector('[data-module="lidar"]');
+            if (lidarToggle) {
+                let badge = lidarToggle.querySelector('.lidar-depth');
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'badge lidar-depth';
+                    lidarToggle.appendChild(badge);
+                }
+                badge.textContent = depthMean.toFixed(1) + 'm';
+            }
+        }
+    }
+
+    xrSession.requestAnimationFrame(onLiDARFrame);
+}
+
+function stopLiDAR() {
+    lidarActive = false;
+    if (xrSession) {
+        xrSession.end().catch(() => {});
+        xrSession = null;
+    }
+    showNotification('LiDAR stopped');
+}
+
+function showNotification(msg) {
+    // Simple notification toast
+    const toast = document.createElement('div');
+    toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:var(--surface2);color:var(--text);padding:8px 16px;border-radius:8px;font-size:12px;z-index:999;border:1px solid var(--border);opacity:0;transition:opacity 0.3s;';
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => toast.style.opacity = '1');
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3000);
+}
+
+// Override toggleModule for LiDAR special handling
+const _originalToggleModule = toggleModule;
+function toggleModule(el) {
+    const mod = el.dataset.module;
+
+    // LiDAR: start/stop WebXR session
+    if (mod === 'lidar') {
+        if (!el.classList.contains('active')) {
+            startLiDAR().then(ok => {
+                if (!ok) return;
+                el.classList.add('active');
+                activeModules.add('lidar');
+            });
+            return;
+        } else {
+            stopLiDAR();
+        }
+    }
+
+    // Vision: request camera permission
+    if (mod === 'vision' && !el.classList.contains('active')) {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+            .then(stream => {
+                window._visionStream = stream;
+                showNotification('Camera active — Vision encoder ready');
+            })
+            .catch(() => showNotification('Camera permission denied'));
+    }
+    if (mod === 'vision' && el.classList.contains('active') && window._visionStream) {
+        window._visionStream.getTracks().forEach(t => t.stop());
+        window._visionStream = null;
+    }
+
+    el.classList.toggle('active');
+    if (activeModules.has(mod)) {
+        activeModules.delete(mod);
+    } else {
+        activeModules.add(mod);
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'module_toggle',
+            module: mod,
+            active: activeModules.has(mod),
+            modules: Array.from(activeModules)
+        }));
+    }
+}
+
 // ─── WebSocket ───
 function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';

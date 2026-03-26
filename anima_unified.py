@@ -967,9 +967,13 @@ class AnimaUnified:
             async for raw in websocket:
                 try: msg = json.loads(raw)
                 except json.JSONDecodeError: continue
-                if msg.get('type') == 'user_message':
+                msg_type = msg.get('type')
+
+                if msg_type == 'user_message':
                     text = msg.get('text', '').strip()
                     if not text: continue
+                    # Store active modules from client
+                    self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
                     answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(None, self.process_input, text)
@@ -980,12 +984,40 @@ class AnimaUnified:
                         'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
+                        'modules': list(getattr(self, '_active_modules', [])),
                     }
                     mc = getattr(self, '_last_mitosis_context', '')
                     if mc:
                         broadcast_msg['mitosis_context'] = mc
+                    # Add LLM tension/alpha if available
+                    model_wrapper = getattr(self, '_model_wrapper', None)
+                    if model_wrapper and hasattr(model_wrapper, '_last_stats'):
+                        broadcast_msg['llm_stats'] = model_wrapper._last_stats
                     await self._ws_broadcast(broadcast_msg)
                     await self._ws_broadcast({'type': 'typing', 'typing': False})
+
+                elif msg_type == 'lidar_depth':
+                    # LiDAR depth data from iPhone Safari WebXR
+                    depth_grid = msg.get('grid', [])
+                    depth_stats = msg.get('stats', {})
+                    if depth_grid and hasattr(self, 'mind'):
+                        # Map depth variance to tension boost
+                        depth_std = depth_stats.get('std', 0)
+                        depth_mean = depth_stats.get('mean', 1)
+                        # High depth variance = complex scene = boost tension
+                        self._lidar_tension_boost = min(depth_std / max(depth_mean, 0.1), 1.0)
+                        _log("lidar", f"depth={depth_mean:.2f}m std={depth_std:.3f} boost={self._lidar_tension_boost:.3f}")
+                    await self._ws_broadcast({
+                        'type': 'lidar_status',
+                        'frame': msg.get('frame', 0),
+                        'stats': depth_stats,
+                    })
+
+                elif msg_type == 'module_toggle':
+                    mod = msg.get('module', '')
+                    active = msg.get('active', False)
+                    self._active_modules = set(msg.get('modules', []))
+                    _log("module", f"{'✅' if active else '⬜'} {mod} → {list(self._active_modules)}")
         except Exception: pass
         finally:
             self.web_clients.discard(websocket)
