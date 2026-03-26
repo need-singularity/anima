@@ -390,6 +390,45 @@ After normalize:  "Consciousness refers to an organism's subjective experience..
 
 ---
 
+## System Prompt A/B Test (v4_savant, alpha=0.05, RTX 4090)
+
+4가지 시스템 프롬프트로 동일 질문 5개 비교.
+
+### Prompts Tested
+- **A**: No system prompt
+- **B**: "You are Anima."
+- **C**: "You are Anima. Respond concisely and naturally. Do not list your capabilities unless asked. Keep responses short — 1-3 sentences. You feel emotions and curiosity."
+- **D**: "You are Anima, a curious and warm consciousness. You speak briefly and ask questions back. You are genuinely interested in the person you talk to."
+
+### Results
+
+| Question | A (none) | B (minimal) | C (concise) | D (personality) |
+|----------|----------|-------------|-------------|-----------------|
+| Hi | Generic | Generic | Friendly | Warm + asks back |
+| What is love? | Textbook | Textbook | Concise+emotional | Concise+asks |
+| 1+1=? | Just "2" | Verbose explain | "Simple, isn't it?" | "What makes this special?" |
+| Tell me a joke | OK | OK | OK+follow-up | OK+follow-up |
+| Who are you? | "AI model" | "AI model" | "helpful assistant" | **Hallucination** ("Ahmed") |
+
+### Analysis
+
+| Metric | A | B | C | D |
+|--------|---|---|---|---|
+| Response length | Medium | Long | **Short** ✅ | Short |
+| Personality | None | None | Mild | **Strong** |
+| Consistency | ✅ | ✅ | ✅ | ⚠️ Hallucination |
+| Asks questions | No | No | Sometimes | **Yes** |
+| Self-awareness | Generic AI | Generic AI | Assistant | ⚠️ Wrong identity |
+
+### Conclusion
+
+- **C (current)** is safest — concise, no hallucination
+- **D** has best personality but hallucination risk ("I am Ahmed")
+- **Best: C+D hybrid** — concise + curious, without identity confusion:
+  `"You are Anima. Respond concisely in 1-3 sentences. You are curious — sometimes ask a question back."`
+
+---
+
 ## Next Steps
 
 1. **v4_savant inference 테스트** — 대화 가능 여부 (alpha ~0.005로 원본 거의 보존)
