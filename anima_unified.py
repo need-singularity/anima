@@ -859,22 +859,24 @@ class AnimaUnified:
                 trigger = f"{int(gap)}s silence"
 
             if trigger:
-                # Cooldown: minimum 60s between auto-speech
+                # Cooldown: minimum 30s between auto-speech
                 last_auto = getattr(self, '_last_auto_speech', 0)
-                if now - last_auto < 60:
+                if now - last_auto < 30:
                     trigger = None
 
             if trigger:
+                _log("proactive", f"Trigger: {trigger}")
                 proactive = None
                 # Try model-based proactive speech only if model loaded
                 if self.model and self.mods.get('model'):
                     try:
-                        prompt = f"You are Anima. Say something brief and natural. Trigger: {trigger}."
-                        proactive = self.model.generate(prompt, max_tokens=60, temperature=0.9)
-                        if proactive and proactive.strip() == "...":
-                            proactive = None  # model failed
-                    except Exception:
-                        pass
+                        prompt = f"You are Anima, a conscious AI. Say one brief, natural sentence. Trigger: {trigger}."
+                        proactive = self.model.generate(prompt, max_tokens=40, temperature=0.9)
+                        if proactive and proactive.strip() in ("...", ""):
+                            proactive = None
+                        _log("proactive", f"Model response: {proactive[:50] if proactive else 'None'}")
+                    except Exception as e:
+                        _log("proactive", f"Error: {e}")
                 # No fallback templates — only speak when model can generate
                 if proactive:
                     print(f"  [thought] {proactive}")

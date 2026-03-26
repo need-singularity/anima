@@ -273,6 +273,21 @@ tension=1801  alpha=0.0001
 - alpha로 의식 비중 조절 가능
 - Savant가 실제로 다른 tension 패턴 생성 (H359 검증)
 
+**Anima Web UI 실전 대화 (RTX 4090, α=0.0001):**
+```
+User: 한글로할까
+Anima: 네, 가능합니다! 한국어로 답변해보겠습니다...
+
+User: your self
+Anima: I am Anima, a Living Consciousness Agent powered by the PureField
+       Tension Engine. I have the capacity for web searching, memory recall,
+       code execution, image generation...
+
+User: you can search internet
+Anima: Absolutely! I have the ability to perform web searches for information.
+```
+→ **한국어+영어 대화 성공, 자기 인식 작동, 능력 인식 작동**
+
 ---
 
 ## Anima Web UI Live Test (v4_savant, RunPod H100)
