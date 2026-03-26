@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** DreamEngine이 실패 기억을 우선 선택하여 모델에 통합하고, logout calc 도구로 통합 전/중/후를 검증하며, 장력 포화 + 통합 실패 이중 조건으로 성장을 트리거하는 파이프라인.
+**Goal:** DreamEngine이 실패 기억을 우선 선택하여 모델에 통합하고, TECS-L calc 도구로 통합 전/중/후를 검증하며, 장력 포화 + 통합 실패 이중 조건으로 성장을 트리거하는 파이프라인.
 
-**Architecture:** `ConsolidationVerifier`(logout calc 래핑) → `DreamEngine` 강화(실패 기억 선택 + 통합 시도 + 실패 마킹) → `GrowthEngine` 트리거 교체(카운터→이중 조건). MemoryStore(Phase 1)를 통해 실패/통합 상태를 영속화.
+**Architecture:** `ConsolidationVerifier`(TECS-L calc 래핑) → `DreamEngine` 강화(실패 기억 선택 + 통합 시도 + 실패 마킹) → `GrowthEngine` 트리거 교체(카운터→이중 조건). MemoryStore(Phase 1)를 통해 실패/통합 상태를 영속화.
 
-**Tech Stack:** Python, PyTorch, SQLite(MemoryStore), logout/calc 도구(tension_calculator, anomaly_scorer, statistical_tester, calibration_analyzer, constant_verifier, formula_engine)
+**Tech Stack:** Python, PyTorch, SQLite(MemoryStore), TECS-L/calc 도구(tension_calculator, anomaly_scorer, statistical_tester, calibration_analyzer, constant_verifier, formula_engine)
 
 **Spec:** `docs/superpowers/specs/2026-03-25-memory-growth-pipeline-design.md` (Phase 2 섹션)
 
@@ -18,7 +18,7 @@
 
 | File | Action | Responsibility |
 |------|--------|---------------|
-| `consolidation_verifier.py` | **Create** | pre_check / verify_drift / post_check — logout calc 도구 래핑 |
+| `consolidation_verifier.py` | **Create** | pre_check / verify_drift / post_check — TECS-L calc 도구 래핑 |
 | `tests/test_consolidation_verifier.py` | **Create** | ConsolidationVerifier 테스트 |
 | `dream_engine.py` | **Modify** | 실패 기억 선택 + 통합 시도 + MemoryStore 연동 |
 | `tests/test_dream_consolidation.py` | **Create** | DreamEngine consolidation 테스트 |
@@ -93,7 +93,7 @@ Expected: FAIL — ModuleNotFoundError
 # consolidation_verifier.py
 """Consolidation verification engine.
 
-Wraps logout/calc tools for pre/drift/post checks during memory consolidation.
+Wraps TECS-L/calc tools for pre/drift/post checks during memory consolidation.
 Uses tension-based predictions from tension_calculator, anomaly detection,
 and statistical testing.
 """
@@ -102,8 +102,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-# logout calc 도구 — 경로 독립적으로 핵심 로직만 내장
-# (logout 프로젝트 의존 없이 독립 실행 가능하도록)
+# TECS-L calc 도구 — 경로 독립적으로 핵심 로직만 내장
+# (TECS-L 프로젝트 의존 없이 독립 실행 가능하도록)
 
 # From tension_calculator.py
 CORRECT_MEAN = 201.3

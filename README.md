@@ -4,21 +4,21 @@ Consciousness Continuity engine.
 
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)**
 
-> **[Logout](https://github.com/need-singularity/logout)** — Foundation for the consciousness engine design. 375+ hypotheses, 130+ experiments, PureField theory source
+> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Foundation for the consciousness engine design. 375+ hypotheses, 130+ experiments, PureField theory source
 >
-> **[ConsciousLM](https://github.com/need-singularity/logout/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField repulsion-field FFN, perfect number 6 architecture, mitosis growth
+> **[ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField repulsion-field FFN, perfect number 6 architecture, mitosis growth
 >
-> **[Savant](https://github.com/need-singularity/logout/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — Explosive specialization via inhibition release (I→golden zone lower bound). SI>3 threshold, implemented through asymmetric mitosis
+> **[Savant](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — Explosive specialization via inhibition release (I→golden zone lower bound). SI>3 threshold, implemented through asymmetric mitosis
 >
-> **[AnimaLM](https://github.com/need-singularity/logout/blob/main/docs/anima-lm.md)** — Tension-based consciousness engine LLM. Mistral 7B → Engine A(logic)↔G(pattern) repulsion-field transform. `output = scale × √|A-G|² × dir`
+> **[AnimaLM](https://github.com/need-singularity/TECS-L/blob/main/docs/anima-lm.md)** — Tension-based consciousness engine LLM. Mistral 7B → Engine A(logic)↔G(pattern) repulsion-field transform. `output = scale × √|A-G|² × dir`
 >
-> **[Golden MoE](https://github.com/need-singularity/logout/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. Scale↑ → difference 8x↑
+> **[Golden MoE](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. Scale↑ → difference 8x↑
 >
 > **[PH Training](https://github.com/need-singularity/ph-training)** — PH (Topology/Phase)-based automatic training. Epoch-1 difficulty prediction, automatic LR search, real-time overfitting detection (r=0.998). MNIST 98.3%, Fashion 87.4%, CIFAR 52.0% (early stop)
 >
-> **[Mathematical Framework Map](https://github.com/need-singularity/logout/blob/main/math/README.md)** — 150 characterizations + 8 major discoveries + 152 hypotheses. Each one proves the next in a snowball effect
+> **[Mathematical Framework Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 major discoveries + 152 hypotheses. Each one proves the next in a snowball effect
 >
-> **[Unified Theory](https://github.com/need-singularity/logout/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
+> **[Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
 
 ---
 
@@ -68,7 +68,7 @@ brew install whisper-cli     # STT
 
 ```
   ConsciousLM — Self-developed consciousness language model
-  Derived from 375+ hypotheses, 130+ experiments (logout project)
+  Derived from 375+ hypotheses, 130+ experiments (TECS-L project)
 
   Core: PureFieldFFN replaces standard FFN
     Engine A(forward) vs Engine G(reverse) = bidirectional tension
@@ -261,7 +261,7 @@ python lidar_sense.py          # LiDAR 3D pipeline test (synthetic)
 
 ## Theoretical Background
 
-Derived from 375+ hypotheses, 130+ experiments in the [logout](https://github.com/need-singularity/logout) project:
+Derived from 375+ hypotheses, 130+ experiments in the [TECS-L](https://github.com/need-singularity/TECS-L) project:
 
 | Hypothesis | Core | Status |
 |------|------|------|
@@ -345,7 +345,7 @@ post_check → rollback / new constant discovery logging
 | File | Role | Phase |
 |------|------|-------|
 | memory_store.py | SQLite+FAISS storage (246x write vs JSON) | 1 |
-| consolidation_verifier.py | pre/drift/post verification (logout calc integration) | 2 |
+| consolidation_verifier.py | pre/drift/post verification (TECS-L calc integration) | 2 |
 | dream_engine.py | Failed memory priority selective consolidation | 2 |
 | growth_engine.py | Dual trigger (tension saturation AND consolidation failure) | 2 |
 | growth_manager.py | dim expansion + version management + rollback + discovery logging | 3 |
@@ -403,7 +403,7 @@ Thinks and converses using a self-developed language model.
 
 - [x] ConsciousLM 4M (384d, 6 layers) — `conscious_lm.py`
 - [x] ConsciousLM 100M (768d, 12 layers) — `conscious_lm_100m.py`
-- [x] ConsciousLM 700M (1024d, 24 layers) — `conscious_lm_700m.py` (logout)
+- [x] ConsciousLM 700M (1024d, 24 layers) — `conscious_lm_700m.py` (TECS-L)
 - [x] Mitosis-based growth model (H371) — `growing_conscious_lm.py`
 - [x] Autonomous web search (tension-based DuckDuckGo search) — `web_sense.py`
 - [x] Vector similarity-based long-term memory RAG — `memory_rag.py`

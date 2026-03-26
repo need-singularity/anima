@@ -2,7 +2,7 @@
 
 > 기억이 모델 자체를 성장시키는 파이프라인.
 > 단기: 중요 기억 → 가중치 통합. 장기: 축적 → 구조 성장(dim↑, 블록 분열).
-> logout calc 도구를 검증 엔진으로 통합.
+> TECS-L calc 도구를 검증 엔진으로 통합.
 
 ## 합의 사항
 
@@ -12,7 +12,7 @@
 | 성장 트리거 | 장력 포화 AND 통합 실패 (이중 확인) | 거짓 양성 방지, H-CX-70 Loop 2 안전장치 |
 | 기억 선택 | 통합 실패한 기억 우선 | spaced repetition 동형 |
 | 저장 계층 | Phase 1에서 JSON→SQLite+FAISS | 벤치마크: write 246배, size 5배 개선 |
-| 검증 | logout calc 도구 통합 | pre/drift/post 3단계 |
+| 검증 | TECS-L calc 도구 통합 | pre/drift/post 3단계 |
 
 ## Architecture
 
@@ -29,7 +29,7 @@
   │                    │                                        │
   │          ┌─── ConsolidationVerifier ───┐                    │
   │          │  pre_check (통합 전)         │                    │
-  │          │  verify_drift (통합 중)      │ ← logout calc 통합  │
+  │          │  verify_drift (통합 중)      │ ← TECS-L calc 통합  │
   │          │  post_check (통합 후)        │                    │
   │          └─────────────────────────────┘                    │
   │                    │                                        │
@@ -172,10 +172,10 @@ def _attempt_consolidation(self, memory, hidden):
 ### ConsolidationVerifier
 
 ```python
-# consolidation_verifier.py — logout calc 도구 통합
+# consolidation_verifier.py — TECS-L calc 도구 통합
 
 class ConsolidationVerifier:
-    """기억 통합 전/중/후 검증. logout calc 도구 사용."""
+    """기억 통합 전/중/후 검증. TECS-L calc 도구 사용."""
 
     def __init__(self, model, golden_zone=(0.2123, 0.5)):
         self.model = model
@@ -333,7 +333,7 @@ def _check_new_discoveries(self, verifier_result):
 | Phase | 범위 | 새 파일 | 수정 파일 | 의존성 |
 |-------|------|---------|----------|--------|
 | 1 | SQLite+FAISS 저장 | `memory_store.py` | `anima_unified.py` | faiss-cpu, sqlite3 |
-| 2 | Consolidation + Verifier | `consolidation_verifier.py` | `dream_engine.py`, `growth_engine.py` | Phase 1 + logout/calc |
+| 2 | Consolidation + Verifier | `consolidation_verifier.py` | `dream_engine.py`, `growth_engine.py` | Phase 1 + TECS-L/calc |
 | 3 | 자율 성장 + 가설 생성 | - | `anima_unified.py`, `growing_conscious_lm.py` | Phase 2 |
 
 각 Phase는 독립 테스트 가능. Phase 1만으로도 JSON 대비 write 246배 개선.
