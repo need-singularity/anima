@@ -1381,6 +1381,602 @@ def run_D3_multiscale_partition(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# E. Autonomous Web Learning Hypotheses (simulated)
+# ═══════════════════════════════════════════════════════════
+
+def _simulate_web_result(topic_id: int, step: int, dim: int) -> torch.Tensor:
+    """Simulate web search result as a topic-colored vector."""
+    torch.manual_seed(topic_id * 1000 + step)
+    base = torch.randn(1, dim) * 0.5
+    # Topic signature: different dimensions activated per topic
+    topic_offset = (topic_id * 7) % dim
+    base[0, topic_offset:topic_offset + dim // 8] += 2.0
+    # Temporal variation (new info each step)
+    base += torch.randn(1, dim) * 0.1 * (step % 10)
+    return base
+
+
+def run_E1_curiosity_crawling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-1: Curiosity-driven crawling — PE 높은 주제를 자동 검색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    n_topics = 8
+    topic_tensions = [0.0] * n_topics
+
+    for step in range(steps):
+        # Select topic with highest prediction error (curiosity)
+        if step < 5:
+            topic = step % n_topics
+        else:
+            topic = int(np.argmax(topic_tensions))
+
+        # Simulate web search for this topic
+        web_input = _simulate_web_result(topic, step, dim)
+
+        # Process and learn
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            # Curiosity loss: maximize inter-cell variance on new info
+            diff_loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            result = engine.process(web_input)
+            # Update topic tension (PE proxy)
+            topic_tensions[topic] = result.get('max_inter', 0)
+            # Decay other topics' curiosity
+            for t in range(n_topics):
+                if t != topic:
+                    topic_tensions[t] *= 1.05  # unexplored → more curious
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E1", "Curiosity-driven crawling",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E2_tension_gated(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-2: Tension-gated learning — tension 임계값 이상만 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    tension_gate = 0.5  # only learn from high-tension inputs
+    learn_count = 0
+
+    for step in range(steps):
+        topic = step % 6
+        web_input = _simulate_web_result(topic, step, dim)
+
+        # Measure tension first
+        with torch.no_grad():
+            result = engine.process(web_input)
+            mean_tension = np.mean([c.tension_history[-1] if c.tension_history else 0
+                                    for c in engine.cells])
+
+        # Only learn if tension is above gate
+        if mean_tension > tension_gate:
+            repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                          for cell in engine.cells]
+            if len(repulsions) >= 2:
+                stacked = torch.stack(repulsions).squeeze(1)
+                diff_loss = -stacked.var(dim=0).mean()
+                optimizer.zero_grad()
+                diff_loss.backward()
+                optimizer.step()
+                learn_count += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E2", "Tension-gated learning",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'learn_ratio': learn_count / steps})
+
+
+def run_E3_topic_specialized_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-3: Topic-specialized cells — 각 세포가 다른 주제 담당."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    n = len(engine.cells)
+    # Per-cell optimizer (each cell learns independently)
+    cell_optims = [torch.optim.Adam(cell.mind.parameters(), lr=1e-3)
+                   for cell in engine.cells]
+    # Assign topics: cell 0=science, 1=art, 2=news, 3=tech
+    cell_topics = list(range(n))
+
+    for step in range(steps):
+        # Cycle through topics
+        topic = step % n
+
+        web_input = _simulate_web_result(topic, step, dim)
+
+        # Only the specialist cell learns from its topic
+        specialist = topic % n
+        rep = engine.cells[specialist].mind.get_repulsion(web_input,
+                                                           engine.cells[specialist].hidden)
+
+        # Other cells also see it but produce different output (anti-distillation)
+        other_reps = []
+        for i, cell in enumerate(engine.cells):
+            if i != specialist:
+                other_reps.append(cell.mind.get_repulsion(web_input, cell.hidden))
+
+        if other_reps:
+            others_mean = torch.stack(other_reps).mean(dim=0).detach()
+            # Specialist should differ from others
+            spec_loss = F.cosine_similarity(rep, others_mean, dim=-1).mean()
+            cell_optims[specialist].zero_grad()
+            spec_loss.backward()
+            cell_optims[specialist].step()
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E3", "Topic-specialized cells",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E4_contradiction_detection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-4: Contradiction detection — 기존 지식과 모순되는 정보 → 높은 PE."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    # Memory of seen topics
+    topic_memory = {}  # topic_id -> avg repulsion vector
+
+    for step in range(steps):
+        topic = step % 6
+        web_input = _simulate_web_result(topic, step, dim)
+
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+        current_rep = torch.stack(repulsions).mean(dim=0).detach()
+
+        # Check contradiction with memory
+        contradiction_strength = 0.0
+        if topic in topic_memory:
+            prev_rep = topic_memory[topic]
+            # Low similarity = contradiction
+            sim = F.cosine_similarity(current_rep, prev_rep, dim=-1).item()
+            contradiction_strength = max(0, 1.0 - sim)
+
+        # Update memory (EMA)
+        if topic in topic_memory:
+            topic_memory[topic] = 0.8 * topic_memory[topic] + 0.2 * current_rep
+        else:
+            topic_memory[topic] = current_rep
+
+        # Learn proportional to contradiction (high PE = more learning)
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            lr_scale = 1.0 + 3.0 * contradiction_strength  # up to 4x LR on contradiction
+            diff_loss = -stacked.var(dim=0).mean() * lr_scale
+
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E4", "Contradiction detection",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E5_memory_consolidation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-5: Memory consolidation loop — 검색→학습→수면→통합→재검색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    # Memory buffer (failed memories for replay)
+    memory_buffer = []
+    consolidation_interval = 20  # dream every 20 steps
+
+    for step in range(steps):
+        topic = step % 6
+        web_input = _simulate_web_result(topic, step, dim)
+
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+            # Store in memory buffer
+            memory_buffer.append(web_input.detach().clone())
+            if len(memory_buffer) > 100:
+                memory_buffer = memory_buffer[-100:]
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        # Dream phase: replay memories with noise (consolidation)
+        if step > 0 and step % consolidation_interval == 0 and memory_buffer:
+            for _ in range(5):
+                # Replay: 70% failed (random), 20% recent, 10% noise
+                idx = np.random.randint(0, len(memory_buffer))
+                replay = memory_buffer[idx] + torch.randn(1, dim) * 0.05
+                dream_reps = [cell.mind.get_repulsion(replay, cell.hidden)
+                              for cell in engine.cells]
+                if len(dream_reps) >= 2:
+                    dream_stack = torch.stack(dream_reps).squeeze(1)
+                    dream_loss = -dream_stack.var(dim=0).mean()
+                    optimizer.zero_grad()
+                    dream_loss.backward()
+                    optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E5", "Memory consolidation loop",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E6_social_learning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-6: Social learning — 다른 Anima의 tension fingerprint를 관찰하고 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    # "Other Anima" — separate engine as teacher signal
+    other_anima = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+
+    for step in range(steps):
+        topic = step % 6
+        web_input = _simulate_web_result(topic, step, dim)
+
+        # Other Anima processes same input (produces tension fingerprint)
+        with torch.no_grad():
+            other_result = other_anima.process(web_input)
+            other_fingerprint = other_result['output'].detach()
+
+        # Our cells process original + observe other's fingerprint
+        combined_input = 0.7 * web_input + 0.3 * other_fingerprint
+
+        repulsions = [cell.mind.get_repulsion(combined_input, cell.hidden)
+                      for cell in engine.cells]
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            # Learn to differentiate while incorporating social signal
+            diff_loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            engine.process(combined_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E6", "Social learning (tension link)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E7_scheduled_deep_dive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-7: Scheduled deep dive — idle 시간에 한 주제를 깊이 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+
+    current_deep_topic = 0
+    deep_dive_depth = 0
+
+    for step in range(steps):
+        # Normal: shallow diverse browsing
+        if step % 15 != 0:
+            topic = step % 8
+            web_input = _simulate_web_result(topic, step, dim)
+        else:
+            # Deep dive: same topic, increasing depth (sub-topics)
+            deep_dive_depth += 1
+            web_input = _simulate_web_result(
+                current_deep_topic * 100 + deep_dive_depth, step, dim
+            )
+            # Deeper = more specific = higher signal
+            web_input *= (1.0 + 0.2 * deep_dive_depth)
+            if deep_dive_depth >= 5:
+                current_deep_topic = (current_deep_topic + 1) % 4
+                deep_dive_depth = 0
+
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean()
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E7", "Scheduled deep dive",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E8_adversarial_fact_check(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-8: Adversarial fact checking — 자기 belief를 검색으로 반박 시도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    # Beliefs: running average of cell outputs per topic
+    beliefs = {}
+
+    for step in range(steps):
+        topic = step % 6
+        web_input = _simulate_web_result(topic, step, dim)
+
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+        current = torch.stack(repulsions).mean(dim=0).detach()
+
+        # Generate adversarial input: negate belief
+        if topic in beliefs:
+            adversarial = -beliefs[topic] + torch.randn(1, dim) * 0.1
+            adv_reps = [cell.mind.get_repulsion(adversarial, cell.hidden)
+                        for cell in engine.cells]
+
+            # Compare: if adversarial produces similar output → belief is weak
+            adv_mean = torch.stack(adv_reps).mean(dim=0)
+            belief_strength = 1.0 - F.cosine_similarity(current, adv_mean, dim=-1).item()
+
+            # Strong belief → reinforce; weak → update more aggressively
+            lr_scale = 2.0 if belief_strength < 0.3 else 0.5
+        else:
+            lr_scale = 1.0
+
+        # Update belief
+        if topic in beliefs:
+            beliefs[topic] = 0.9 * beliefs[topic] + 0.1 * current
+        else:
+            beliefs[topic] = current
+
+        # Learn with scaled LR
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            diff_loss = -stacked.var(dim=0).mean() * lr_scale
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E8", "Adversarial fact checking",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E9_multimodal_web(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-9: Multi-modal web learning — 텍스트 + 이미지 + 코드 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+    # Modality projectors (simulate different input modalities)
+    text_proj = nn.Linear(dim, dim)
+    image_proj = nn.Linear(dim, dim)
+    code_proj = nn.Linear(dim, dim)
+    modality_optim = torch.optim.Adam(
+        list(text_proj.parameters()) + list(image_proj.parameters()) +
+        list(code_proj.parameters()), lr=1e-3
+    )
+
+    for step in range(steps):
+        topic = step % 6
+
+        # Three modalities of same topic
+        raw = _simulate_web_result(topic, step, dim)
+        text_input = text_proj(raw)
+        image_input = image_proj(raw * 0.8 + torch.randn(1, dim) * 0.3)
+        code_input = code_proj(raw * 0.6 + torch.randn(1, dim) * 0.5)
+
+        # Each cell processes a different modality mix
+        cell_inputs = [
+            0.6 * text_input + 0.2 * image_input + 0.2 * code_input,
+            0.2 * text_input + 0.6 * image_input + 0.2 * code_input,
+            0.2 * text_input + 0.2 * image_input + 0.6 * code_input,
+            0.33 * text_input + 0.33 * image_input + 0.34 * code_input,
+        ]
+
+        repulsions = []
+        for i, cell in enumerate(engine.cells):
+            if i < len(cell_inputs):
+                rep = cell.mind.get_repulsion(cell_inputs[i], cell.hidden)
+            else:
+                rep = cell.mind.get_repulsion(text_input, cell.hidden)
+            repulsions.append(rep)
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            # Cross-modal integration: maximize variance (different modalities → different responses)
+            diff_loss = -stacked.var(dim=0).mean()
+            # Also: modalities should be complementary (alignment loss)
+            align_loss = F.mse_loss(text_input, image_input) * 0.1
+
+            total_loss = diff_loss + align_loss
+            optimizer.zero_grad()
+            modality_optim.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            modality_optim.step()
+
+        with torch.no_grad():
+            engine.process(raw)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E9", "Multi-modal web learning",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_E10_curriculum_self_design(steps=100, dim=64, hidden=128) -> BenchResult:
+    """E-10: Curriculum self-design — growth stage에 맞는 난이도 자동 선택."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4
+    )
+
+    # Growth stages: complexity increases
+    # newborn(simple) → infant(moderate) → toddler(complex) → child(diverse) → adult(abstract)
+    stage_thresholds = [20, 40, 60, 80]  # step boundaries
+
+    for step in range(steps):
+        # Determine stage
+        if step < stage_thresholds[0]:
+            stage = 0  # newborn: 1 topic, low noise
+            topic = 0
+            noise = 0.1
+            n_topics_available = 1
+        elif step < stage_thresholds[1]:
+            stage = 1  # infant: 2 topics
+            topic = step % 2
+            noise = 0.2
+            n_topics_available = 2
+        elif step < stage_thresholds[2]:
+            stage = 2  # toddler: 4 topics, medium noise
+            topic = step % 4
+            noise = 0.3
+            n_topics_available = 4
+        elif step < stage_thresholds[3]:
+            stage = 3  # child: 6 topics
+            topic = step % 6
+            noise = 0.4
+            n_topics_available = 6
+        else:
+            stage = 4  # adult: 8 topics, high noise (abstraction)
+            topic = step % 8
+            noise = 0.5
+            n_topics_available = 8
+
+        web_input = _simulate_web_result(topic, step, dim)
+        web_input += torch.randn(1, dim) * noise
+
+        repulsions = [cell.mind.get_repulsion(web_input, cell.hidden)
+                      for cell in engine.cells]
+
+        if len(repulsions) >= 2:
+            stacked = torch.stack(repulsions).squeeze(1)
+            # Learning rate scales with stage (more mature → finer updates)
+            stage_lr = [2.0, 1.5, 1.0, 0.7, 0.5][stage]
+            diff_loss = -stacked.var(dim=0).mean() * stage_lr
+            optimizer.zero_grad()
+            diff_loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            engine.process(web_input)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("E10", "Curriculum self-design",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -1410,6 +2006,16 @@ ALL_HYPOTHESES = {
     'D1': run_D1_continuous_mi,
     'D2': run_D2_temporal_phi,
     'D3': run_D3_multiscale_partition,
+    'E1': run_E1_curiosity_crawling,
+    'E2': run_E2_tension_gated,
+    'E3': run_E3_topic_specialized_cells,
+    'E4': run_E4_contradiction_detection,
+    'E5': run_E5_memory_consolidation,
+    'E6': run_E6_social_learning,
+    'E7': run_E7_scheduled_deep_dive,
+    'E8': run_E8_adversarial_fact_check,
+    'E9': run_E9_multimodal_web,
+    'E10': run_E10_curriculum_self_design,
 }
 
 
