@@ -223,7 +223,7 @@ def main():
     print(f"{'Step':>6} | {'Loss':>8} | {'CE':>8} | {'Bal':>8} | {'Active':>6} | {'Zone%':>6} | {'I':>6} | {'Time':>6}")
     print("-" * 78)
 
-    os.makedirs("/tmp/checkpoints/golden_moe", exist_ok=True)
+    os.makedirs("/tmp/checkpoints/golden-moe-v1", exist_ok=True)
     model.train()
     global_step = 0
     running_loss = running_ce = running_bal = 0
@@ -271,7 +271,7 @@ def main():
                 running_loss = running_ce = running_bal = 0
 
             if global_step % 500 == 0:
-                ckpt = f"/tmp/checkpoints/golden_moe/step_{global_step}.pt"
+                ckpt = f"/tmp/checkpoints/golden-moe-v1/step_{global_step}.pt"
                 states = {}
                 for name, module in model.named_modules():
                     if isinstance(module, GoldenMoELayer):
@@ -287,7 +287,7 @@ def main():
                 break
 
     # Final save
-    final = "/tmp/checkpoints/golden_moe/final.pt"
+    final = "/tmp/checkpoints/golden-moe-v1/final.pt"
     states = {}
     for name, module in model.named_modules():
         if isinstance(module, GoldenMoELayer):
@@ -319,7 +319,7 @@ def main():
                "avg_active": round(np.mean([s["active"] for s in stats]), 1) if stats else 0,
                "avg_zone_ratio": round(np.mean([s["zone_ratio"] for s in stats]), 3) if stats else 0,
                "time_min": round((time.time()-t_start)/60, 1)}
-    with open("/tmp/checkpoints/golden_moe/summary.json", "w") as f:
+    with open("/tmp/checkpoints/golden-moe-v1/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  Final PPL: {ppl:.2f}")
     print(json.dumps(summary, indent=2))

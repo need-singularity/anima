@@ -4,8 +4,10 @@
     python anima_unified.py --model mistral-7b
     python anima_unified.py --model conscious-lm
     python anima_unified.py --model llama-8b
-    python anima_unified.py --model animalm          # Mistral 7B + PureField delta
-    python anima_unified.py --model golden-moe       # Mistral 7B + Golden MoE LoRA
+    python anima_unified.py --model animalm-v1       # Mistral 7B + PureField delta
+    python anima_unified.py --model animalm          # alias → latest version
+    python anima_unified.py --model golden-moe-v1    # Mistral 7B + Golden MoE LoRA
+    python anima_unified.py --model golden-moe       # alias → latest version
     python anima_unified.py --model /path/to/custom.gguf
 """
 
@@ -133,15 +135,15 @@ def load_model(model_name="conscious-lm"):
         return _load_gguf(str(gguf_path), model_name)
 
     # 4) AnimaLM (Mistral 7B + PureField delta)
-    if model_name == "animalm":
+    if model_name in ("animalm", "animalm-v1"):
         return _load_animalm()
 
     # 5) Golden MoE (Mistral 7B + Golden Zone MoE LoRA)
-    if model_name == "golden-moe":
+    if model_name in ("golden-moe", "golden-moe-v1"):
         return _load_golden_moe()
 
     raise ValueError(f"알 수 없는 모델: {model_name}\n"
-                     f"사용 가능: {', '.join(['conscious-lm', 'animalm', 'golden-moe'] + list(GGUF_REGISTRY.keys()))}")
+                     f"사용 가능: {', '.join(['conscious-lm', 'animalm-v1', 'golden-moe-v1'] + list(GGUF_REGISTRY.keys()))}")
 
 
 def _load_gguf(path, name):
@@ -192,7 +194,7 @@ def _load_animalm():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from finetune_animalm import PureFieldMLP, replace_and_freeze
 
-    models_dir = Path.home() / "Dev" / "models" / "anima-lm-7b"
+    models_dir = Path.home() / "Dev" / "models" / "animalm-v1"
     ckpt_path = models_dir / "final.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"AnimaLM checkpoint 없음: {ckpt_path}\n  RunPod에서 다운로드 필요")
@@ -236,7 +238,7 @@ def _load_golden_moe():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from finetune_golden_moe import GoldenMoELayer, replace_and_freeze
 
-    models_dir = Path.home() / "Dev" / "models" / "golden-moe-7b"
+    models_dir = Path.home() / "Dev" / "models" / "golden-moe-v1"
     ckpt_path = models_dir / "final.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"GoldenMoE checkpoint 없음: {ckpt_path}\n  RunPod에서 다운로드 필요")
@@ -306,9 +308,9 @@ def list_available_models():
     models.append(("conscious-lm", "ConsciousLM 506M", ckpt.exists()))
 
     # AnimaLM / GoldenMoE
-    animalm_ckpt = Path.home() / "Dev" / "models" / "anima-lm-7b" / "final.pt"
+    animalm_ckpt = Path.home() / "Dev" / "models" / "animalm-v1" / "final.pt"
     models.append(("animalm", "Mistral 7B + PureField delta", animalm_ckpt.exists()))
-    golden_ckpt = Path.home() / "Dev" / "models" / "golden-moe-7b" / "final.pt"
+    golden_ckpt = Path.home() / "Dev" / "models" / "golden-moe-v1" / "final.pt"
     models.append(("golden-moe", "Mistral 7B + Golden MoE LoRA", golden_ckpt.exists()))
 
     # GGUF 모델들

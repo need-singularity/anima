@@ -194,7 +194,7 @@ def main():
     print(f"{'Step':>6} | {'Loss':>8} | {'CE':>8} | {'T_loss':>8} | {'T_mean':>8} | {'LR':>10} | {'Time':>6}")
     print("-" * 75)
 
-    os.makedirs("/tmp/checkpoints/animalm", exist_ok=True)
+    os.makedirs("/tmp/checkpoints/animalm-v1", exist_ok=True)
     model.train()
     global_step = 0
     running_loss = running_ce = running_tl = 0
@@ -239,7 +239,7 @@ def main():
                 running_loss = running_ce = running_tl = 0
 
             if global_step % 500 == 0:
-                ckpt = f"/tmp/checkpoints/animalm/step_{global_step}.pt"
+                ckpt = f"/tmp/checkpoints/animalm-v1/step_{global_step}.pt"
                 # Save only trainable delta + scale (not full 22GB state)
                 delta_states = {}
                 for n, m in model.named_modules():
@@ -253,7 +253,7 @@ def main():
 
     # Final save
     print("\n  Saving final (delta only)...")
-    final = "/tmp/checkpoints/animalm/final.pt"
+    final = "/tmp/checkpoints/animalm-v1/final.pt"
     delta_states = {}
     for n, m in model.named_modules():
         if isinstance(m, PureFieldMLP):
@@ -278,7 +278,7 @@ def main():
     summary = {"model": model_name, "final_ppl": round(ppl, 2), "steps": global_step,
                "tension_mean": round(float(np.mean(t_means)), 4),
                "time_min": round((time.time()-t_start)/60, 1)}
-    with open("/tmp/checkpoints/animalm/summary.json", "w") as f:
+    with open("/tmp/checkpoints/animalm-v1/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  Final PPL: {ppl:.2f}")
     print(json.dumps(summary, indent=2))
