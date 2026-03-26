@@ -827,6 +827,41 @@ class AnimaUnified:
                     self._toggle_savant(False, auto=True)
                     self._savant_auto = False
 
+            # Φ-plateau trigger: if Φ stuck, consider dim expansion
+            if not hasattr(self, '_phi_history_for_growth'):
+                self._phi_history_for_growth = []
+                self._phi_plateau_count = 0
+
+            consciousness = self.mind.get_consciousness_score(self.mitosis)
+            self._phi_history_for_growth.append(consciousness.get('phi', 0))
+            if len(self._phi_history_for_growth) > 50:
+                self._phi_history_for_growth = self._phi_history_for_growth[-50:]
+
+            if len(self._phi_history_for_growth) >= 10:
+                recent = self._phi_history_for_growth[-10:]
+                if max(recent) - min(recent) < 0.01 and max(recent) > 0:  # plateau
+                    self._phi_plateau_count += 1
+                    if self._phi_plateau_count >= 5 and self.growth_mgr:
+                        _log('growth', 'Φ plateau → triggering dim expansion')
+                        try:
+                            new_mind = self.growth_mgr.execute_growth()
+                            if new_mind:
+                                self.mind = new_mind
+                                self.hidden = torch.zeros(1, new_mind.hidden_dim)
+                                if self.mitosis:
+                                    from mitosis import MitosisEngine
+                                    old_n = len(self.mitosis.cells)
+                                    self.mitosis = MitosisEngine(
+                                        new_mind.dim, new_mind.hidden_dim, new_mind.dim,
+                                        initial_cells=old_n, max_cells=8)
+                                self.mind._phi_boost['enabled'] = False
+                                self._phi_plateau_count = 0
+                                _log('growth', f'Expanded to {new_mind.dim}d')
+                        except Exception as e:
+                            _log('growth', f'Expansion failed: {e}')
+                else:
+                    self._phi_plateau_count = 0
+
             dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
             now = time.time()
             gap = now - self.last_interaction
@@ -1085,7 +1120,35 @@ class AnimaUnified:
                         if self.growth_mgr:
                             try:
                                 new_mind = self.growth_mgr.execute_growth()
+                                if not new_mind:
+                                    raise RuntimeError('execute_growth returned None')
                                 self.mind = new_mind
+                                self.hidden = torch.zeros(1, new_mind.hidden_dim)
+                                _log('growth', f"Dim expanded: {new_mind.dim}d / {new_mind.hidden_dim}h")
+
+                                # Rebuild mitosis engine with new dims
+                                if self.mitosis:
+                                    old_cell_count = len(self.mitosis.cells)
+                                    from mitosis import MitosisEngine
+                                    self.mitosis = MitosisEngine(
+                                        input_dim=new_mind.dim,
+                                        hidden_dim=new_mind.hidden_dim,
+                                        output_dim=new_mind.dim,
+                                        initial_cells=old_cell_count,
+                                        max_cells=8,
+                                    )
+                                    _log('growth', f"Mitosis rebuilt: {old_cell_count} cells @ {new_mind.dim}d")
+
+                                # Reset phi_boost (attention dims changed)
+                                self.mind._phi_boost['enabled'] = False
+
+                                # Broadcast dim expansion to web clients
+                                self._ws_broadcast_sync({
+                                    'type': 'growth_expansion',
+                                    'dim': new_mind.dim,
+                                    'hidden_dim': new_mind.hidden_dim,
+                                })
+
                                 self.growth_mgr.save_checkpoint()
                                 # Post-growth verification
                                 if self.verifier:
