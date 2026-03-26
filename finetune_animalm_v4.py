@@ -78,11 +78,15 @@ class ParallelPureFieldMLP(nn.Module):
         g_mid = F.silu(g_gate) * g_up
 
         # Cross-attention tension: modulate PureField with attention output
+        # Only active if attn hook is set AND cross_attn weights match dimensions
         if self._attn_output is not None:
-            attn_gate = torch.sigmoid(self.cross_attn_gate(self._attn_output))
-            g_mid = g_mid * (1.0 + self.cross_attn_scale * attn_gate)
-            # Cross tension = attention × purefield disagreement
-            self.last_cross_tension = (attn_gate.detach() ** 2).mean(dim=-1)
+            try:
+                attn_gate = torch.sigmoid(self.cross_attn_gate(self._attn_output))
+                if attn_gate.shape[-1] == g_mid.shape[-1]:
+                    g_mid = g_mid * (1.0 + self.cross_attn_scale * attn_gate)
+                    self.last_cross_tension = (attn_gate.detach() ** 2).mean(dim=-1)
+            except Exception:
+                pass  # skip if dimensions don't match (pre-cross-attn checkpoint)
 
         g_mid = self.dropout(g_mid)
         pf_out = self.pf_down_b(self.pf_down_a(g_mid))
