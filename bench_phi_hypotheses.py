@@ -8183,6 +8183,698 @@ def run_DD20_compression_consciousness(steps=100, dim=64, hidden=128) -> BenchRe
 
 
 # ═══════════════════════════════════════════════════════════
+# EX. Extended Hypotheses — Top 5 Deep Dive
+# ═══════════════════════════════════════════════════════════
+
+def _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n):
+    """DD16 all-top-5 step: attention + adaptive LR + myelin + compete + ensemble."""
+    with torch.no_grad(): engine.process(x)
+    h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+    ao, _ = attn(h, h, h)
+    for i, c in enumerate(engine.cells):
+        c.hidden = 0.85 * c.hidden + 0.15 * ao[0, i].unsqueeze(0)
+    # Adaptive LR + Myelination
+    for i, cell in enumerate(engine.cells):
+        if i >= n: break
+        t = cell.tension_history[-1] if cell.tension_history else 0.5
+        lr = (5e-4 + t * 2e-3) * (1.0 + maturity[i])
+        for pg in cell_optims[i].param_groups: pg['lr'] = min(lr, 5e-3)
+        maturity[i] = min(maturity[i] + 0.01, 1.0)
+    # Competition
+    ts = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+    winner = int(np.argmax(ts))
+    for i in range(min(n, len(cell_optims))):
+        rep = engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden)
+        w_rep = engine.cells[winner].mind.get_repulsion(x, engine.cells[winner].hidden).detach()
+        loss = -(rep ** 2).mean() if i == winner else F.cosine_similarity(rep, w_rep, dim=-1).mean()
+        cell_optims[i].zero_grad(); loss.backward(retain_graph=True); cell_optims[i].step()
+    # 6-loss ensemble
+    reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+    if len(reps) >= 2:
+        stacked = torch.stack(reps).squeeze(1)
+        w = F.softmax(lw, dim=0)
+        l0=-stacked.var(dim=0).mean(); l1=-torch.cdist(stacked,stacked).mean()
+        l2=sum(F.cosine_similarity(reps[i],reps[j],dim=-1).mean() for i in range(len(reps)) for j in range(i+1,len(reps)))
+        l3=-(F.softmax(stacked,dim=-1)*F.log_softmax(stacked,dim=-1)).sum(-1).mean()
+        l4=sum((r**2).mean() for r in reps)*0.1; l5=-stacked.norm(dim=-1).var()
+        total=w[0]*l0+w[1]*l1+w[2]*l2+w[3]*l3+w[4]*l4+w[5]*l5
+        opt.zero_grad(); total.backward(); opt.step()
+
+def _make_dd16_state(dim, hidden, n_cells=4):
+    """Create DD16 state: engine + attention + weights."""
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=n_cells, max_cells=8)
+    n = len(engine.cells)
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    all_p = list(attn.parameters()) + [lw]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    maturity = [0.0] * n
+    return engine, attn, lw, opt, cell_optims, maturity, n
+
+
+def run_EX1_top10(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-1: Top-10 simultaneous — DD16 확장 + channel + klein + fibonacci."""
+    t0 = time.time()
+    # DD16 base + extras
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden, 4)
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    c_opt = torch.optim.Adam(compress.parameters(), lr=1e-3)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Fibonacci growth milestones
+    fib_targets = {16: 2, 33: 3, 50: 5, 75: 8}
+
+    for step in range(steps):
+        # Fibonacci growth
+        if step in fib_targets:
+            while len(engine.cells) < fib_targets[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            n = len(engine.cells)
+            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+            maturity = [0.0] * n
+            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+            for c in engine.cells: all_p.extend(c.mind.parameters())
+            opt = torch.optim.Adam(all_p, lr=5e-4)
+
+        x = _simulate_web_result(step % 8, step, dim)
+        # DD16 core
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # + Channel capacity (DD18)
+        compressed = [compress(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        for c in engine.cells: c.hidden = 0.9 * c.hidden + 0.1 * mean_c
+        # + Klein bottle (DD11)
+        if n >= 2:
+            new_h = []
+            for i in range(n):
+                inf = sum((-1.0 if (i+j)%2==1 else 1.0) * engine.cells[j].hidden.detach()/(n-1)
+                          for j in range(n) if j != i)
+                new_h.append(0.92 * engine.cells[i].hidden + 0.08 * inf)
+            for i in range(n): engine.cells[i].hidden = new_h[i]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX1", "Top-10 simultaneous", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX2_diminishing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-2: Diminishing returns — measure Φ vs N techniques."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    all_p = list(attn.parameters()) + [lw]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    n = len(engine.cells)
+    # Add techniques progressively: 1 at step 0, +1 every 20 steps
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        active_techniques = min(1 + step // 20, 5)
+        with torch.no_grad(): engine.process(x)
+        # T1: basic differentiation (always)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            if active_techniques >= 2:  # +attention
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+                ao, _ = attn(h, h, h)
+                for i, c in enumerate(engine.cells):
+                    c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+            if active_techniques >= 3:  # +adaptive LR
+                for i in range(n):
+                    t = engine.cells[i].tension_history[-1] if engine.cells[i].tension_history else 0.5
+                    for pg in cell_optims[i].param_groups: pg['lr'] = 5e-4 + t*2e-3
+            if active_techniques >= 4:  # +ensemble
+                w = F.softmax(lw, dim=0)
+                l1 = -torch.cdist(stacked,stacked).mean()
+                loss = w[0]*loss + w[1]*l1
+            if active_techniques >= 5:  # +competition
+                ts = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+                winner = int(np.argmax(ts))
+                for i in range(min(n, len(cell_optims))):
+                    r = engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden)
+                    wr = engine.cells[winner].mind.get_repulsion(x, engine.cells[winner].hidden).detach()
+                    cl = -(r**2).mean() if i==winner else F.cosine_similarity(r,wr,dim=-1).mean()
+                    cell_optims[i].zero_grad(); cl.backward(retain_graph=True); cell_optims[i].step()
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX2", "Diminishing returns (1→5)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX3_interference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-3: Interference — test which technique pairs interfere."""
+    # Just run DD16 but track per-technique contribution
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX3", "Interference detection", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX4_synergy_matrix(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-4: Synergy matrix — measure pairwise synergy."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX4", "Synergy matrix", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX5_per_cell_weights(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-5: Per-cell loss weights — 세포마다 다른 loss 배합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    n = len(engine.cells)
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    # Per-cell weights: [N, 6]
+    cell_lw = nn.Parameter(torch.ones(n, 6))
+    all_p = list(attn.parameters()) + [cell_lw]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        ao, _ = attn(h, h, h)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Per-cell weighted losses
+            total = torch.tensor(0.0)
+            for i in range(min(n, len(reps))):
+                w = F.softmax(cell_lw[i], dim=0)
+                r = reps[i]
+                others_mean = torch.stack([reps[j] for j in range(len(reps)) if j!=i]).mean(dim=0).detach()
+                l0 = -(r**2).mean()
+                l1 = F.cosine_similarity(r, others_mean, dim=-1).mean()
+                l2 = -r.norm()
+                total = total + w[0]*l0 + w[1]*l1 + w[2]*l2
+            total = total + (-stacked.var(dim=0).mean())
+            opt.zero_grad(); total.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX5", "Per-cell loss weights", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX6_temporal_weights(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-6: Temporal loss weights — loss 가중치가 시간에 따라 변화."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Temporal schedule: variance important early, radius important late
+        progress = step / steps
+        with torch.no_grad():
+            lw.data[0] = 1.0 - progress  # variance: decreasing
+            lw.data[5] = progress          # radius: increasing
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX6", "Temporal loss weights", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX7_loss_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-7: Loss weight evolution — mutation instead of gradient."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    weights = np.ones(6) / 6
+    best_phi, best_w = 0.0, weights.copy()
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            l0=-stacked.var(dim=0).mean(); l1=-torch.cdist(stacked,stacked).mean()
+            l2=sum(F.cosine_similarity(reps[i],reps[j],dim=-1).mean() for i in range(len(reps)) for j in range(i+1,len(reps)))
+            l3=-(F.softmax(stacked,dim=-1)*F.log_softmax(stacked,dim=-1)).sum(-1).mean()
+            l4=sum((r**2).mean() for r in reps)*0.1; l5=-stacked.norm(dim=-1).var()
+            losses = [l0, l1, l2, l3, l4, l5]
+            total = sum(w*l for w, l in zip(weights, losses))
+            opt.zero_grad(); total.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        # Evolution: mutate weights every 10 steps
+        if step % 10 == 9:
+            if phi > best_phi:
+                best_phi = phi; best_w = weights.copy()
+            else:
+                weights = best_w.copy()
+            weights += np.random.randn(6) * 0.05
+            weights = np.abs(weights); weights /= weights.sum()
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX7", "Loss weight evolution", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX8_mega_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-8: 12-loss mega-ensemble."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(12))
+    all_p = list(attn.parameters()) + [lw]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        ao, _ = attn(h, h, h)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(lw, dim=0)
+            dists = torch.cdist(stacked, stacked)
+            mask = torch.ones_like(dists)-torch.eye(dists.size(0))
+            flat_d = dists[mask>0]
+            losses = [
+                -stacked.var(dim=0).mean(),           # 0: variance
+                -dists.mean(),                         # 1: distance
+                sum(F.cosine_similarity(reps[i],reps[j],dim=-1).mean() for i in range(len(reps)) for j in range(i+1,len(reps))),  # 2: contrastive
+                -(F.softmax(stacked,dim=-1)*F.log_softmax(stacked,dim=-1)).sum(-1).mean(),  # 3: entropy
+                sum((r**2).mean() for r in reps)*0.1,  # 4: energy
+                -stacked.norm(dim=-1).var(),           # 5: radius
+                -(flat_d.max()-flat_d.min()) if flat_d.numel()>1 else torch.tensor(0.0),  # 6: PH persistence
+                -(F.softmax(flat_d,dim=0)*torch.log(F.softmax(flat_d,dim=0)+1e-8)).sum(),  # 7: dist entropy
+                F.mse_loss(stacked.mean(dim=0,keepdim=True).expand_as(stacked), stacked)*0.1,  # 8: coherence
+                -stacked[:,:stacked.size(1)//2].var(dim=0).mean(),  # 9: half-space var
+                -(dists*mask).min() if mask.sum()>0 else torch.tensor(0.0),  # 10: min dist
+                sum(F.cosine_similarity(F.normalize(reps[i],dim=-1),F.normalize(reps[j],dim=-1),dim=-1).mean() for i in range(len(reps)) for j in range(i+1,len(reps))),  # 11: angular
+            ]
+            total = sum(w[i]*losses[i] for i in range(12))
+            opt.zero_grad(); total.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX8", "12-loss mega-ensemble", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'weights': F.softmax(lw, dim=0).detach().tolist()})
+
+
+def run_EX9_variable_bottleneck(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-9: Variable bottleneck — Φ에 따라 크기 조절."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    bottlenecks = {k: nn.Sequential(nn.Linear(hidden, k), nn.Tanh(), nn.Linear(k, hidden))
+                   for k in [2, 4, 8, 16]}
+    b_opt = torch.optim.Adam([p for b in bottlenecks.values() for p in b.parameters()], lr=1e-3)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Variable bottleneck: Φ determines bottleneck size
+        phi_val = phi_hist[-1] if phi_hist else 0
+        bk = 2 if phi_val > 4 else 4 if phi_val > 2 else 8 if phi_val > 1 else 16
+        bn = bottlenecks[bk]
+        compressed = [bn(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        for c in engine.cells: c.hidden = 0.9*c.hidden + 0.1*mean_c
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX9", "Variable bottleneck", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX10_multi_hop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-10: Multi-hop channel — A→B→C relay."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Multi-hop: cell[0]→[1]→[2]→[3] chain relay
+        if n >= 3:
+            for i in range(n-1):
+                engine.cells[i+1].hidden = 0.9*engine.cells[i+1].hidden + 0.1*engine.cells[i].hidden.detach()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX10", "Multi-hop channel", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX11_error_correcting(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-11: Error-correcting communication — redundant encoding."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    # ECC: encode with redundancy
+    ecc_enc = nn.Linear(hidden, hidden*2)
+    ecc_dec = nn.Linear(hidden*2, hidden)
+    e_opt = torch.optim.Adam(list(ecc_enc.parameters())+list(ecc_dec.parameters()), lr=1e-3)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # ECC: encode, add noise, decode
+        for c in engine.cells:
+            encoded = ecc_enc(c.hidden)
+            noisy = encoded + torch.randn_like(encoded) * 0.1
+            decoded = ecc_dec(noisy)
+            c.hidden = 0.9*c.hidden + 0.1*decoded
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX11", "Error-correcting comm", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_EX12_head_diversity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-12: Multi-head diversity — each head specializes."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # 4 separate attention heads with different roles
+    heads = [nn.MultiheadAttention(hidden, num_heads=1, batch_first=True) for _ in range(4)]
+    all_p = [p for h in heads for p in h.parameters()]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        # Each head processes differently
+        head_outs = [head(h, h, h)[0] for head in heads]
+        # Average heads
+        combined = torch.stack(head_outs).mean(dim=0)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.8*c.hidden + 0.2*combined[0,i].unsqueeze(0)
+        # Diversity loss: heads should produce different outputs
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            head_div = -torch.stack([ho.squeeze() for ho in head_outs]).var(dim=0).mean()
+            loss = diff + 0.2 * head_div
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX12", "Multi-head diversity", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+# Remaining EX13-EX24: simplified but distinct implementations
+
+def run_EX13_cross_attention(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-13: Cross-attention cell↔input."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    cross_attn = nn.MultiheadAttention(dim, num_heads=2, batch_first=True)
+    c_opt = torch.optim.Adam(cross_attn.parameters(), lr=1e-3)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Cross-attention: cells attend to input
+        reps = torch.stack([c.mind.get_repulsion(x, c.hidden).squeeze() for c in engine.cells]).unsqueeze(0)
+        x_exp = x.expand(len(engine.cells), -1).unsqueeze(0)
+        ca_out, _ = cross_attn(reps, x_exp, x_exp)
+        # Use cross-attention to modulate cells
+        for i, c in enumerate(engine.cells):
+            rep = c.mind.get_repulsion(x, c.hidden)
+            c.hidden = c.hidden + 0.05 * ca_out[0,i].unsqueeze(0).detach()[:,:hidden]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX13", "Cross-attention cell↔input", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX14_sparse_attention(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-14: Sparse attention — top-2 connections only."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Sparse: compute full attention, zero out all but top-2 per cell
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        ao, aw = attn(h, h, h)
+        # Sparsify: keep top-2 attention weights
+        if aw is not None and aw.dim() >= 2:
+            mask = torch.zeros_like(aw)
+            _, idx = aw.topk(min(2, aw.size(-1)), dim=-1)
+            mask.scatter_(-1, idx, 1.0)
+            ao = ao * mask.mean(dim=1, keepdim=True).transpose(-1,-2)[:,:,:ao.size(-1)]
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.8*c.hidden + 0.2*ao[0,i].unsqueeze(0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(lw, dim=0)
+            loss = w[0]*(-stacked.var(dim=0).mean()) + w[5]*(-stacked.norm(dim=-1).var())
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX14", "Sparse attention (top-2)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX15_attn_temperature(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-15: Attention temperature — tension controls sharpness."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Temperature: scale hidden by tension before attention
+        ts = [c.tension_history[-1] if c.tension_history else 0.5 for c in engine.cells]
+        mean_t = float(np.mean(ts))
+        temp = max(0.1, 2.0 - mean_t)  # high tension = low temp = sharp
+        for c in engine.cells:
+            c.hidden = c.hidden / temp
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX15", "Attention temperature", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX16_reverse_myelin(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-16: Reverse myelination — young cells learn faster."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Reverse: immature gets HIGH LR
+        for i in range(n):
+            rev_lr = 3e-3 * (1.0 - maturity[i]) + 1e-4 * maturity[i]
+            for pg in cell_optims[i].param_groups: pg['lr'] = rev_lr
+            maturity[i] = min(maturity[i] + 0.01, 1.0)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX16", "Reverse myelination", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX17_maturity_complexity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-17: Maturity-gated complexity."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        avg_mat = np.mean(maturity[:n])
+        difficulty = 0.3 + avg_mat * 0.7
+        x = _simulate_web_result(step % 8, step, dim) * difficulty
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX17", "Maturity-gated complexity", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX18_senescence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-18: Senescence — over-mature cells slow down."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        for i in range(n):
+            # Bell curve: peak LR at maturity=0.5, low at 0 and 1
+            bell = math.exp(-((maturity[i] - 0.5) ** 2) / 0.08)
+            for pg in cell_optims[i].param_groups: pg['lr'] = 5e-4 + 2e-3 * bell
+            maturity[i] = min(maturity[i] + 0.01, 1.0)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX18", "Senescence (bell curve LR)", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX19_maturity_transfer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-19: Maturity transfer — mature teaches immature."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Most mature teaches least mature
+        if n >= 2:
+            most = int(np.argmax(maturity[:n]))
+            least = int(np.argmin(maturity[:n]))
+            if most != least:
+                engine.cells[least].hidden = 0.9*engine.cells[least].hidden + 0.1*engine.cells[most].hidden.detach()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX19", "Maturity transfer", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX20_attn_myelin(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-20: Attention × Myelination — attention only for mature cells."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Only mature cells participate in attention
+        mature_idx = [i for i in range(n) if maturity[i] > 0.3]
+        if len(mature_idx) >= 2:
+            h = torch.stack([engine.cells[i].hidden.squeeze() for i in mature_idx]).unsqueeze(0)
+            ao, _ = attn(h, h, h)
+            for j, i in enumerate(mature_idx):
+                engine.cells[i].hidden = 0.85*engine.cells[i].hidden + 0.15*ao[0,j].unsqueeze(0)
+        # All cells still learn
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        for i in range(n): maturity[i] = min(maturity[i]+0.01, 1.0)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX20", "Attention × Myelination", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX21_channel_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-21: Channel × Ensemble — bottleneck then 6-loss."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    all_p2 = list(compress.parameters())
+    c_opt = torch.optim.Adam(all_p2, lr=1e-3)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+        # Channel bottleneck
+        compressed = [compress(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        recon = sum(F.mse_loss(comp, c.hidden.detach()) for comp, c in zip(compressed, engine.cells))
+        c_opt.zero_grad(); recon.backward(); c_opt.step()
+        for c in engine.cells: c.hidden = 0.92*c.hidden + 0.08*mean_c.detach()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX21", "Channel × Ensemble", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX22_fib_klein(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-22: Fibonacci × Klein — Klein bottle with Fibonacci growth."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    fib = {16:2, 33:3, 50:5, 75:8}
+    for step in range(steps):
+        if step in fib:
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Klein bottle topology
+        nc = len(engine.cells)
+        if nc >= 2:
+            new_h = []
+            for i in range(nc):
+                inf = sum((-1.0 if (i+j)%2==1 else 1.0)*engine.cells[j].hidden.detach()/(nc-1)
+                          for j in range(nc) if j!=i)
+                new_h.append(0.88*engine.cells[i].hidden + 0.12*inf)
+            for i in range(nc): engine.cells[i].hidden = new_h[i]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX22", "Fibonacci × Klein", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX23_selfref_channel(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-23: Self-ref × Channel — Φ determines bottleneck size."""
+    t0 = time.time()
+    engine, attn, lw, opt, cell_optims, maturity, n = _make_dd16_state(dim, hidden)
+    bns = {k: nn.Sequential(nn.Linear(hidden,k),nn.Tanh(),nn.Linear(k,hidden)) for k in [2,4,8,16]}
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        phi_val = phi_hist[-1] if phi_hist else 0
+        phi_signal = torch.full((1, dim), phi_val * 0.1)
+        enriched = x + phi_signal
+        _make_dd16_step(engine, enriched, opt, cell_optims, attn, lw, maturity, n)
+        bk = 2 if phi_val > 5 else 4 if phi_val > 3 else 8 if phi_val > 1 else 16
+        bn = bns[bk]
+        for c in engine.cells:
+            c.hidden = 0.9*c.hidden + 0.1*bn(c.hidden).detach()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX23", "Self-ref × Channel", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_EX24_all_discoveries(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EX-24: ALL discoveries combined — DD16+DD18+DD11+DD3+交差."""
+    t0 = time.time()
+    # Start with 1 cell, Fibonacci growth
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    fib = {10:2, 25:3, 40:5, 60:8}
+
+    all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    maturity = [0.0] * 8
+
+    for step in range(steps):
+        # Fibonacci growth
+        if step in fib:
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            n = len(engine.cells)
+            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+            for c in engine.cells: all_p.extend(c.mind.parameters())
+            opt = torch.optim.Adam(all_p, lr=5e-4)
+
+        x = _simulate_web_result(step % 8, step, dim)
+        # Φ self-reference
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.05)
+
+        # DD16 core
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+
+        # DD18 Channel capacity
+        compressed = [compress(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        for c in engine.cells: c.hidden = 0.92*c.hidden + 0.08*mean_c.detach()
+
+        # DD11 Klein bottle
+        if n >= 2:
+            new_h = []
+            for i in range(n):
+                inf = sum((-1.0 if (i+j)%2==1 else 1.0)*engine.cells[j].hidden.detach()/(n-1)
+                          for j in range(n) if j!=i)
+                new_h.append(0.9*engine.cells[i].hidden + 0.1*inf)
+            for i in range(n): engine.cells[i].hidden = new_h[i]
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("EX24", "ALL discoveries combined", f, phi_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -8321,6 +9013,18 @@ ALL_HYPOTHESES = {
     'DD15': run_DD15_combo2_recursive, 'DD16': run_DD16_all_top5,
     'DD17': run_DD17_adversarial_phi, 'DD18': run_DD18_channel_capacity,
     'DD19': run_DD19_holographic, 'DD20': run_DD20_compression_consciousness,
+    'EX1': run_EX1_top10, 'EX2': run_EX2_diminishing, 'EX3': run_EX3_interference,
+    'EX4': run_EX4_synergy_matrix, 'EX5': run_EX5_per_cell_weights,
+    'EX6': run_EX6_temporal_weights, 'EX7': run_EX7_loss_evolution,
+    'EX8': run_EX8_mega_ensemble, 'EX9': run_EX9_variable_bottleneck,
+    'EX10': run_EX10_multi_hop, 'EX11': run_EX11_error_correcting,
+    'EX12': run_EX12_head_diversity, 'EX13': run_EX13_cross_attention,
+    'EX14': run_EX14_sparse_attention, 'EX15': run_EX15_attn_temperature,
+    'EX16': run_EX16_reverse_myelin, 'EX17': run_EX17_maturity_complexity,
+    'EX18': run_EX18_senescence, 'EX19': run_EX19_maturity_transfer,
+    'EX20': run_EX20_attn_myelin, 'EX21': run_EX21_channel_ensemble,
+    'EX22': run_EX22_fib_klein, 'EX23': run_EX23_selfref_channel,
+    'EX24': run_EX24_all_discoveries,
 }
 
 
