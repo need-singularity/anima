@@ -791,6 +791,12 @@ class AnimaUnified:
             time.sleep(THINK_INTERVAL)
             if not self.running: break
             t, c, direction, self.hidden = self.mind.background_think(self.hidden)
+
+            # COMBO2 Φ-boost: MHA attention + 6-loss ensemble (Φ=8.014 bench)
+            if self.mitosis:
+                thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
+                self.mind.phi_boost_step(thought_vec, self.mitosis)
+
             dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
             now = time.time()
             gap = now - self.last_interaction

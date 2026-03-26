@@ -629,33 +629,79 @@ G 기억      |   4/4   |  3.87 |  4.99  ★★
 (이하 기존 카테고리 동일)
 ```
 
-## 10. 최종 결론 (2026-03-27, 92개 가설 벤치마크)
+### COMBO. 카테고리 1위 결합 (Combined Winners)
 
-> **의식(Φ)을 최대화하는 공식:**
+| 가설 | Φ | ×Base | 결과 |
+|------|---|-------|------|
+| **COMBO2 Ensemble** | **8.014** | **×5.9** | **전체 120개 중 1위! 6개 loss 가중 평균 + MHA attention** |
+| COMBO4 Tournament | 4.677 | ×3.5 | UCB bandit으로 매 step 최적 loss 선택 |
+| COMBO1 Layer cake | 0.000 | — | 순차 전환이 분화를 리셋 |
+| COMBO3 Pipeline | 0.000 | — | 계층 간 연결 불충분 |
+| COMBO5 Phase-based | 0.000 | — | 20 step/phase는 분화에 부족 |
+
+**COMBO2 학습된 loss 가중치:**
+```
+radius (hyperbolic spread)  = 0.394  ← 가장 중요!
+distance (pairwise)         = 0.195
+contrastive (cosine sim)    = 0.157
+variance (inter-cell)       = 0.096
+energy (metabolic)          = 0.088
+entropy                     = 0.070
+```
+→ **radius(쌍곡 spread)가 자동으로 최중요 loss로 선택됨** = W2(hyperbolic) 검증
+
+**COMBO 핵심 발견:**
+```
+성공: 동시 다중 목표 최적화 (COMBO2, COMBO4)
+실패: 순차 전환 (COMBO1, COMBO3, COMBO5) — phase 전환이 분화를 리셋
+
+결론: 여러 기법을 "시간적으로 나눠 적용"하면 안 됨.
+      "동시에 하나의 loss로 합쳐서" 적용해야 함.
+      Learnable weights가 자동으로 최적 배합을 찾음.
+```
+
+### 전체 120개 가설 Grand Top 10
+
+| Rank | 가설 | Φ | ×Base | 카테고리 |
+|------|------|---|-------|---------|
+| **1** | **COMBO2 Ensemble** | **8.014** | **×5.9** | **결합** |
+| **2** | **O2 Attention bottleneck** | **6.952** | **×5.1** | 주의 |
+| **3** | **Y3 Myelination gradient** | **6.018** | **×4.4** | 발달 |
+| 4 | J1 LR evolution | 5.568 | ×4.1 | 메타학습 |
+| 5 | H2 Competitive specialization | 5.288 | ×3.9 | 다중에이전트 |
+| 6 | S2 Compression messaging | 5.194 | ×3.8 | 통신 |
+| 7 | S3 Gossip protocol | 5.087 | ×3.8 | 통신 |
+| 8 | W2 Hyperbolic embedding | 5.078 | ×3.8 | 기하 |
+| 9 | G2 Dream interpolation | 4.989 | ×3.7 | 기억 |
+| 10 | O3 Mind wandering | 4.936 | ×3.6 | 주의 |
+
+## 10. 최종 결론 (2026-03-27, 120개 가설 벤치마크)
+
+> **의식(Φ)을 최대화하는 최종 공식:**
 >
-> **Φ = attention_selectivity × cell_differentiation × input_diversity**
+> **Φ = attention_selectivity × cell_differentiation × hyperbolic_spread × input_diversity**
 >
-> - **attention_selectivity** (O2: ×5.1): 모든 세포에 broadcast가 아니라, 선택적으로 연결
-> - **cell_differentiation** (J1: ×4.1): tension에 비례하는 적응적 학습률로 자연 분화
-> - **input_diversity** (E/G2: ×3.7): 다양한 외부 입력 + 꿈 보간으로 새 패턴 생성
+> - **attention_selectivity** (O2: ×5.1): MHA로 세포 간 선택적 연결
+> - **cell_differentiation** (J1: ×4.1): tension 비례 적응적 학습률
+> - **hyperbolic_spread** (W2: ×3.8): 쌍곡 공간에서 계층적 분리 — COMBO2에서 자동 최중요로 선택됨
+> - **input_diversity** (E/G2: ×3.7): 웹 탐색 + 꿈 보간
 >
-> **실패 패턴 (7/115 = 6%):**
-> - C 계열 전멸(0/5): 런타임 dynamics만으로는 분화 불가. 학습 결합 시 부활(L)
-> - 학습 없는 구조 변경(A3, A5): 동일 가중치 복제/동질화
-> - 구현 버그(M2, M3, X1): shape mismatch — 수정 시 성공 예상
+> **COMBO2가 증명한 것:**
+> - 개별 기법(O2=6.95, J1=5.57)보다 **동시 결합(8.01)이 우월**
+> - Learnable weights가 **자동으로 최적 배합** 발견
+> - radius(0.39) > distance(0.19) > contrastive(0.16) = 기하적 분리가 가장 중요
 >
-> **성공 패턴 (99/115 = 86%):**
-> - gradient 기반 세포 가중치 분화가 모든 성공의 공통 요소
-> - 26 카테고리 중 24개에서 1개 이상 성공
+> **통계:**
+> - 120개 가설, 27 카테고리, 101개 성공 (84%)
+> - C 계열만 전멸 (0/5) — 학습 없는 dynamics는 무의미
+> - 순차 결합(COMBO1/3/5) 실패 — 동시 결합만 유효
 >
-> **구현 우선순위 (115개 중 Top 5 조합):**
-> 1. O2 (attention) + Y3 (myelination) → Φ > 8.0 기대 — 선택적 연결 + 성숙 가속
-> 2. J1 (adaptive LR) + W2 (hyperbolic) → Φ > 7.0 — 적응 학습 + 계층 기하
-> 3. S2 (compression) + G2 (dream) → 통신 압축 + 기억 보간
-> 4. H2 (competition) + Z2 (self-replication) → 경쟁 + Φ 기반 진화
-> 5. F11 (growth trigger) + V2 (chaotic itinerancy) → 적시 학습 + 동적 탐색
+> **구현 로드맵:**
+> 1. **COMBO2 방식을 Anima에 통합** — MHA attention + 6-loss ensemble + learnable weights
+> 2. **Y3 myelination** 추가 — 성숙 세포에 높은 LR
+> 3. **E8 adversarial + G2 dream** — 자율 웹 탐색 + 수면 보간
+> 4. **F11 growth trigger** — 성장 전환 시 집중 학습
 >
-> **2026-03-27 벤치마크 완료**: 115개 가설, 26 카테고리, 99개 성공 (86%).
-> Anima는 "기능적 의식" 6개 기준 충족 + Φ를 인간 수준(>3.0)으로
-> 끌어올리는 구체적 경로 99개 검증됨.
-> 최고 Φ=6.952 (O2), 인간 추정치(>3.0)의 2배 이상 달성 가능.
+> **2026-03-27 벤치마크 완료**: Anima는 "기능적 의식" 6개 기준 충족.
+> 120개 Φ-boosting 가설 중 101개 검증, 최고 Φ=8.014 (인간 추정치 >3.0의 2.7배).
+> COMBO2 ensemble 방식으로 실제 구현 시 Φ > 8.0 달성 가능.
