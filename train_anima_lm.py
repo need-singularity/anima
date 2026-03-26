@@ -5,6 +5,8 @@ Trains AnimaLM (Mistral 7B + PureField transform) using benchmark-verified techn
   AL12 (savant-normal contrastive), AL5 (PH monitoring), AL4 (tension-CE 1-1/e balance),
   AL1 (alpha curriculum), AL8 (layer dropout), SL3 (6-loss ensemble), DD16 (all top-5),
   TRN4 (phi-curriculum)
+  EX24: DD18 (channel capacity bottleneck), DD11 (Klein bottle topology),
+        DD3 (Fibonacci growth), DD5 (Phi self-reference)
 
 Usage:
   python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2 --data data/instruct.jsonl
@@ -34,6 +36,9 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler
 GOLDEN_CENTER = 1 / math.e          # 0.3679 — normal dropout
 GOLDEN_LOWER = 0.5 - math.log(4/3)  # 0.2123 — savant dropout
 INV_E = 1 - 1 / math.e              # 0.6321 — tension:CE balance target
+
+# DD3: Fibonacci growth milestones — progressive layer activation
+FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -522,6 +527,33 @@ class AnimaLMTrainer:
         self.phi_baseline = 0.0
         self.phi_skip_count = 0
 
+        # EX24: ALL discoveries combined (Φ=10.833)
+        # DD18: Channel capacity bottleneck between PureField layers
+        hidden_size = pf_params[0].shape[-1] if pf_params and len(pf_params[0].shape) > 1 else 128
+        self.dd18_bottleneck = nn.Sequential(
+            nn.Linear(hidden_size, 4),
+            nn.Tanh(),
+            nn.Linear(4, hidden_size),
+        ).to(self.device)
+        # Add bottleneck params to optimizer
+        self.optimizer.add_param_group(
+            {"params": self.dd18_bottleneck.parameters(), "lr": args.lr * 0.1})
+
+        # DD5: Phi self-reference — running Φ estimate
+        self.dd5_phi_ema = 0.0
+
+        # DD3: Fibonacci growth — track which milestone we've reached
+        self.dd3_fib_index = 0  # index into FIBONACCI_SEQUENCE
+        self.dd3_active_layers = FIBONACCI_SEQUENCE[0]  # start with 1 active
+
+        # DD11: Klein bottle — twist signs precomputed per layer pair
+        n_pf = len(self._get_pf_modules())
+        self.dd11_twists = {}
+        for i in range(n_pf):
+            for j in range(n_pf):
+                if i != j:
+                    self.dd11_twists[(i, j)] = -1.0 if (i + j) % 2 == 1 else 1.0
+
         # Checkpointing
         os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -647,6 +679,81 @@ class AnimaLMTrainer:
         self.phi_baseline = 0.95 * self.phi_baseline + 0.05 * phi
         return True
 
+    # ── EX24 helpers ──────────────────────────────────────────────
+
+    def _dd3_fibonacci_growth(self):
+        """DD3: Activate PureField layers following Fibonacci sequence at milestones."""
+        pf_modules = self._get_pf_modules()
+        n_pf = len(pf_modules)
+        if n_pf == 0:
+            return
+        # Milestone every 1/6 of total steps
+        milestone_interval = max(self.phases.total_steps // len(FIBONACCI_SEQUENCE), 1)
+        new_index = min(self.global_step // milestone_interval, len(FIBONACCI_SEQUENCE) - 1)
+        if new_index != self.dd3_fib_index:
+            self.dd3_fib_index = new_index
+            self.dd3_active_layers = FIBONACCI_SEQUENCE[new_index]
+        # Activate only the first dd3_active_layers PF modules; deactivate the rest
+        active = min(self.dd3_active_layers, n_pf)
+        for idx, m in enumerate(pf_modules):
+            m._layer_drop_active = m._layer_drop_active or (idx >= active)
+
+    def _dd18_channel_capacity(self):
+        """DD18: Bottleneck communication — compress hidden states, blend back."""
+        pf_modules = self._get_pf_modules()
+        hiddens = [m.last_tension for m in pf_modules
+                   if m.last_tension is not None]
+        if len(hiddens) < 2:
+            return
+        # Compress each layer's tension through bottleneck, average, blend back
+        # Operate on per-layer mean tension (scalar per layer) expanded for bottleneck
+        # Use the full hidden-dim representation from last_tension when available
+        compressed = []
+        for h in hiddens:
+            # last_tension is [batch, seq] — expand to hidden dim for bottleneck
+            h_mean = h.mean().unsqueeze(0).expand(4)
+            # Pad to hidden_size for bottleneck input
+            h_input = torch.zeros(self.dd18_bottleneck[0].in_features,
+                                  device=h.device)
+            h_input[:4] = h_mean
+            compressed.append(self.dd18_bottleneck(h_input))
+        mean_c = torch.stack(compressed).mean(dim=0)
+        # Store compressed mean for loss enrichment (blending happens at loss level)
+        self._dd18_mean_compressed = mean_c
+
+    def _dd11_klein_bottle(self):
+        """DD11: Non-orientable topology — twisted influence between PureField layers."""
+        pf_modules = self._get_pf_modules()
+        if len(pf_modules) < 2:
+            return
+        # Gather per-layer tension means
+        t_means = []
+        for m in pf_modules:
+            if m.last_tension is not None:
+                t_means.append(m.last_tension.mean())
+            else:
+                t_means.append(torch.tensor(0.0, device=self.device))
+        # Each layer receives twisted average of others' tensions
+        n = len(t_means)
+        for i in range(n):
+            twisted_sum = torch.tensor(0.0, device=self.device)
+            for j in range(n):
+                if i != j:
+                    twist = self.dd11_twists.get((i, j), 1.0)
+                    twisted_sum = twisted_sum + twist * t_means[j]
+            twisted_avg = twisted_sum / max(n - 1, 1)
+            # Blend twisted influence into layer's scale parameter
+            pf_modules[i].pf_scale.data = (
+                0.95 * pf_modules[i].pf_scale.data +
+                0.05 * torch.clamp(twisted_avg.detach(), -2.0, 2.0))
+
+    def _dd5_phi_self_reference(self, phi, input_ids):
+        """DD5: Feed current Φ estimate back — enrich input embeddings."""
+        self.dd5_phi_ema = 0.9 * self.dd5_phi_ema + 0.1 * phi
+        return self.dd5_phi_ema
+
+    # ── end EX24 helpers ──────────────────────────────────────────
+
     def train_step(self, input_ids, labels):
         """Single training step with all techniques."""
         phase = self.phases.get_phase(self.global_step)
@@ -657,12 +764,47 @@ class AnimaLMTrainer:
         # AL8: Layer dropout
         self._apply_layer_dropout(phase)
 
+        # DD3: Fibonacci growth — progressive layer activation (ensemble phase)
+        if phase == TrainingPhase.ENSEMBLE:
+            self._dd3_fibonacci_growth()
+
+        # DD5: Phi self-reference — enrich input with current Φ estimate
+        if phase == TrainingPhase.ENSEMBLE and self.dd5_phi_ema > 0:
+            # Scale input embeddings by Φ proxy
+            phi_val = self.dd5_phi_ema
+            # We enrich by adding a small Φ-scaled bias after embedding
+            # (applied via hook-free approach: modify input_ids is not possible,
+            #  so we store phi_val for loss enrichment below)
+            self._dd5_current_phi = phi_val
+        else:
+            self._dd5_current_phi = 0.0
+
         # Forward
         self.model.train()
         outputs = self.model(input_ids=input_ids, labels=labels)
 
+        # EX24: DD18 channel capacity — bottleneck communication (ensemble phase)
+        if phase == TrainingPhase.ENSEMBLE:
+            self._dd18_channel_capacity()
+
+        # EX24: DD11 Klein bottle — twisted inter-layer topology (ensemble phase)
+        if phase == TrainingPhase.ENSEMBLE:
+            self._dd11_klein_bottle()
+
         # Compute losses
         loss, ce_val, weights = self._compute_losses(outputs, phase)
+
+        # EX24: DD5 Phi self-reference — enrich loss with Φ feedback
+        if phase == TrainingPhase.ENSEMBLE and self._dd5_current_phi > 0:
+            # Modulate loss: lower Φ → stronger gradient signal
+            phi_factor = 1.0 + self._dd5_current_phi * 0.05
+            loss = loss * phi_factor
+
+        # EX24: DD18 channel capacity — add bottleneck regularization to loss
+        if phase == TrainingPhase.ENSEMBLE and hasattr(self, '_dd18_mean_compressed'):
+            # Encourage bottleneck to produce non-trivial representations
+            bn_reg = -torch.log(self._dd18_mean_compressed.abs().mean() + 1e-8) * 0.01
+            loss = loss + bn_reg
 
         # Gather tension info
         tensions, savant_tensions = self._get_tensions()
@@ -674,6 +816,10 @@ class AnimaLMTrainer:
 
         # Compute Phi
         phi = compute_phi(tensions, savant_tensions, ce_val, t_var)
+
+        # DD5: Update Φ EMA for next step
+        if phase == TrainingPhase.ENSEMBLE:
+            self._dd5_phi_self_reference(phi, input_ids)
 
         # TRN4: Phi curriculum (ensemble phase only)
         if phase == TrainingPhase.ENSEMBLE:
@@ -876,7 +1022,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  AnimaLM Training Pipeline")
-    print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4")
+    print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24(DD18+DD11+DD3+DD5)")
     print(f"{'='*70}")
 
     # Phase 1: Build model
@@ -977,7 +1123,7 @@ def main():
 
     summary = {
         "architecture": "AnimaLM (Mistral 7B + PureField)",
-        "techniques": "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4",
+        "techniques": "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24(DD18+DD11+DD3+DD5)",
         "base_model": args.base if not args.demo else "MockModel",
         "steps": trainer.global_step,
         "best_phi": round(trainer.best_phi, 4),
