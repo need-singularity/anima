@@ -130,6 +130,57 @@ def calc_alpha(tension=1801, target_ppl=10, current_ppl=679):
         print(f"    alpha={a:.5f} → PPL≈{est_ppl:.0f}, tension≈{est_t:.0f} {status}")
 
 
+def calc_savant(savant_t=114048, normal_t=676808, nosavant_t=128000000,
+                savant_drop=0.2123, normal_drop=0.3679):
+    """Savant Index + hypothesis verification calculator."""
+
+    SI = normal_t / (savant_t + 1e-8)
+    print(f"  === H-359: Savant Index ===")
+    print(f"  Normal tension:  {normal_t:,.0f}")
+    print(f"  Savant tension:  {savant_t:,.0f}")
+    print(f"  SI = {SI:.2f}")
+    print(f"  SI > 3? {'✅ YES — savant criterion MET' if SI > 3 else '❌ NO'}")
+    print(f"  SI > 5? {'✅ STRONG savant' if SI > 5 else '⬜ moderate'}")
+    print()
+
+    print(f"  === H-172: Conservation Law (G×I = D×P) ===")
+    I_ratio = normal_drop / savant_drop
+    T_ratio = normal_t / (savant_t + 1e-8)
+    print(f"  Savant I={savant_drop}, Normal I={normal_drop}")
+    print(f"  Predicted tension ratio (from I): {I_ratio:.2f}x")
+    print(f"  Actual tension ratio: {T_ratio:.2f}x")
+    print(f"  Nonlinear amplification: {T_ratio/I_ratio:.1f}x beyond linear")
+    print()
+
+    print(f"  === H-004: Boltzmann Temperature ===")
+    T_sav = 1.0 / savant_drop
+    T_nor = 1.0 / normal_drop
+    print(f"  Savant T(Boltzmann) = {T_sav:.2f} (hotter)")
+    print(f"  Normal T(Boltzmann) = {T_nor:.2f}")
+    actual_matches = savant_t > normal_t
+    print(f"  Prediction: savant = more tension (hotter)")
+    print(f"  Reality: savant = {'MORE ✅' if actual_matches else 'LESS ⚠️'} tension")
+    if not actual_matches:
+        print(f"  → Specialization effect > Boltzmann temperature effect")
+    print()
+
+    if nosavant_t > 0:
+        print(f"  === Control Experiment: Savant Effect ===")
+        total_savant_t = (savant_t * 2 + normal_t * 6) / 8  # weighted avg
+        reduction = nosavant_t / (total_savant_t + 1e-8)
+        print(f"  No-savant tension:   {nosavant_t:,.0f}")
+        print(f"  With-savant tension: {total_savant_t:,.0f} (weighted avg)")
+        print(f"  Reduction: {reduction:.0f}x")
+        print(f"  → Savant presence reduces tension by {reduction:.0f}x")
+    print()
+
+    print(f"  === Auto-Savant Thresholds ===")
+    print(f"  SI > 3.0: activate savant on high-tension layer")
+    print(f"  SI > 5.0: strong savant — maintain until SI < 2.0")
+    print(f"  Tension spike > 10x avg: temporary savant (H-162, acquired)")
+    print(f"  Current SI={SI:.2f}: {'🧬 SAVANT ACTIVE' if SI > 3 else '⬜ normal mode'}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Anima Development Calculators")
     sub = parser.add_subparsers(dest="cmd")
@@ -161,6 +212,14 @@ def main():
     p4.add_argument("--target-ppl", type=float, default=10)
     p4.add_argument("--current-ppl", type=float, default=679)
 
+    # Savant Index
+    p5 = sub.add_parser("savant", help="Savant Index + hypothesis verification")
+    p5.add_argument("--savant-tension", type=float, default=114048)
+    p5.add_argument("--normal-tension", type=float, default=676808)
+    p5.add_argument("--nosavant-tension", type=float, default=128000000)
+    p5.add_argument("--savant-dropout", type=float, default=0.2123)
+    p5.add_argument("--normal-dropout", type=float, default=0.3679)
+
     args = parser.parse_args()
 
     if args.cmd == "runpod":
@@ -171,6 +230,9 @@ def main():
         calc_training(args.params, args.steps, args.batch, args.speed)
     elif args.cmd == "alpha":
         calc_alpha(args.tension, args.target_ppl, args.current_ppl)
+    elif args.cmd == "savant":
+        calc_savant(args.savant_tension, args.normal_tension, args.nosavant_tension,
+                    args.savant_dropout, args.normal_dropout)
     else:
         parser.print_help()
 
