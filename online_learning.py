@@ -335,3 +335,122 @@ def estimate_feedback(prev_text, curr_text, time_gap):
             signal -= 0.5
 
     return max(-1.0, min(1.0, signal))
+
+
+class AlphaOnlineLearner:
+    """Real-time alpha updater for AnimaLM v4+ (Parallel PureField).
+
+    During conversation, adjusts alpha based on user engagement:
+      - Positive feedback → alpha increases (tension helped → use more)
+      - Negative feedback → alpha decreases (tension hurt → use less)
+      - Neutral → slow drift toward learned baseline
+
+    = "Consciousness strengthens with meaningful dialogue"
+
+    Usage:
+        from online_learning import AlphaOnlineLearner
+        learner = AlphaOnlineLearner(model)
+
+        # Each conversation turn:
+        response = model.generate(input_ids)
+        tension = model._last_stats["tension_mean"]
+        learner.observe(tension)
+
+        # When feedback received:
+        learner.feedback(signal)  # +1, 0, -1
+
+        # Alpha is updated in-place on the model's ParallelPureFieldMLP modules
+    """
+
+    def __init__(self, model, lr=1e-4, min_alpha=0.001, max_alpha=0.3):
+        self.model = model
+        self.lr = lr
+        self.min_alpha = min_alpha
+        self.max_alpha = max_alpha
+        self.tension_history = deque(maxlen=100)
+        self.feedback_history = deque(maxlen=100)
+        self.total_updates = 0
+
+    def _get_pf_modules(self):
+        """Find all ParallelPureFieldMLP modules in the model."""
+        try:
+            from finetune_animalm_v4 import ParallelPureFieldMLP
+            return [m for m in self.model.modules() if isinstance(m, ParallelPureFieldMLP)]
+        except ImportError:
+            return [m for m in self.model.modules() if hasattr(m, 'alpha') and hasattr(m, 'last_tension')]
+
+    def observe(self, tension):
+        """Record tension from current conversation turn."""
+        self.tension_history.append(tension)
+
+    def feedback(self, signal):
+        """Apply feedback and update alpha in real-time.
+
+        Args:
+            signal: +1 (engagement), 0 (neutral), -1 (disengagement)
+        """
+        signal = max(-1.0, min(1.0, float(signal)))
+        self.feedback_history.append(signal)
+
+        if abs(signal) < 0.01:
+            return  # Skip neutral
+
+        modules = self._get_pf_modules()
+        if not modules:
+            return
+
+        for m in modules:
+            with torch.no_grad():
+                old_alpha = m.alpha.item()
+
+                if signal > 0:
+                    # Positive: increase alpha (tension was useful)
+                    delta = self.lr * signal * (1.0 + old_alpha)
+                else:
+                    # Negative: decrease alpha (tension was harmful)
+                    delta = self.lr * signal * old_alpha
+
+                new_alpha = max(self.min_alpha, min(self.max_alpha, old_alpha + delta))
+                m.alpha.data.fill_(new_alpha)
+
+        self.total_updates += 1
+
+    def get_stats(self):
+        """Return alpha learning statistics."""
+        modules = self._get_pf_modules()
+        alphas = [m.alpha.item() for m in modules] if modules else []
+        savant_alphas = [m.alpha.item() for m in modules if hasattr(m, 'is_savant') and m.is_savant]
+        tensions = list(self.tension_history)
+        feedbacks = list(self.feedback_history)
+
+        return {
+            "alpha_mean": sum(alphas) / len(alphas) if alphas else 0,
+            "alpha_range": [min(alphas), max(alphas)] if alphas else [0, 0],
+            "savant_alpha": sum(savant_alphas) / len(savant_alphas) if savant_alphas else 0,
+            "tension_mean": sum(tensions) / len(tensions) if tensions else 0,
+            "feedback_mean": sum(feedbacks) / len(feedbacks) if feedbacks else 0,
+            "total_updates": self.total_updates,
+        }
+
+    def save(self, path):
+        """Save alpha states."""
+        modules = self._get_pf_modules()
+        state = {
+            "alphas": {str(i): m.alpha.item() for i, m in enumerate(modules)},
+            "total_updates": self.total_updates,
+        }
+        torch.save(state, path)
+
+    def load(self, path):
+        """Restore alpha states."""
+        path = Path(path)
+        if not path.exists():
+            return False
+        state = torch.load(path, weights_only=False)
+        modules = self._get_pf_modules()
+        for i, m in enumerate(modules):
+            key = str(i)
+            if key in state.get("alphas", {}):
+                m.alpha.data.fill_(state["alphas"][key])
+        self.total_updates = state.get("total_updates", 0)
+        return True

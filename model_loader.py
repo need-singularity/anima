@@ -93,10 +93,21 @@ class ModelWrapper:
         # Collect tension/routing stats if available
         self._last_stats = {}
         if self.model_type == "animalm":
-            from finetune_animalm import PureFieldMLP
-            tensions = [m.last_tension.mean().item() for m in self.model.modules()
-                       if isinstance(m, PureFieldMLP) and m.last_tension is not None]
+            # Support both v1~v3 (PureFieldMLP) and v4 (ParallelPureFieldMLP)
+            tensions = []
+            alphas = []
+            for m in self.model.modules():
+                if hasattr(m, 'last_tension') and m.last_tension is not None:
+                    tensions.append(m.last_tension.mean().item())
+                if hasattr(m, 'alpha'):
+                    alphas.append(m.alpha.item())
             self._last_stats["tension_mean"] = sum(tensions) / len(tensions) if tensions else 0
+            if alphas:
+                self._last_stats["alpha"] = sum(alphas) / len(alphas)
+                self._last_stats["savant_tensions"] = [
+                    m.last_tension.mean().item() for m in self.model.modules()
+                    if hasattr(m, 'is_savant') and m.is_savant and hasattr(m, 'last_tension') and m.last_tension is not None
+                ]
         elif self.model_type == "golden-moe":
             from finetune_golden_moe import GoldenMoELayer
             stats = [m.last_stats for m in self.model.modules()
@@ -142,8 +153,13 @@ def load_model(model_name="conscious-lm"):
     if model_name in ("golden-moe", "golden-moe-v1"):
         return _load_golden_moe()
 
+    # 6) AnimaLM v4_savant / v4 (Parallel PureField)
+    if model_name in ("animalm-v4-savant", "animalm-v4", "animalm-v4s"):
+        savant = "savant" in model_name or model_name == "animalm-v4s"
+        return _load_animalm_v4(savant=savant)
+
     raise ValueError(f"알 수 없는 모델: {model_name}\n"
-                     f"사용 가능: {', '.join(['conscious-lm', 'animalm-v1', 'golden-moe-v1'] + list(GGUF_REGISTRY.keys()))}")
+                     f"사용 가능: {', '.join(['conscious-lm', 'animalm-v1', 'animalm-v4-savant', 'golden-moe-v1'] + list(GGUF_REGISTRY.keys()))}")
 
 
 def _load_gguf(path, name):
@@ -276,6 +292,60 @@ def _load_golden_moe():
     return wrapper
 
 
+def _load_animalm_v4(savant=True):
+    """Load Mistral 7B Instruct with Parallel PureField (original MLP preserved)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from finetune_animalm_v4 import ParallelPureFieldMLP, add_purefield_parallel
+
+    tag = "v4_savant" if savant else "v4"
+    models_dir = Path.home() / "Dev" / "models" / f"animalm-{tag}"
+    ckpt_path = models_dir / "final.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"AnimaLM {tag} checkpoint 없음: {ckpt_path}")
+
+    if torch.cuda.is_available():
+        device = "cuda"
+        dtype = torch.bfloat16
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+        dtype = torch.float32
+    else:
+        device = "cpu"
+        dtype = torch.float32
+
+    print(f"  [model] AnimaLM {tag} 로드 중 (Parallel PureField + {'Savant' if savant else 'Normal'})...")
+
+    model_name = "mistralai/Mistral-7B-Instruct-v0.3"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, device_map=device,
+    )
+
+    n_savant = 2 if savant else 0
+    model = add_purefield_parallel(model, n_layers=8, n_savant=n_savant)
+
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+    pf_states = ckpt.get("pf_states", {})
+    loaded = 0
+    for name, module in model.named_modules():
+        if isinstance(module, ParallelPureFieldMLP) and name in pf_states:
+            for k, v in pf_states[name].items():
+                param = dict(module.named_parameters()).get(k)
+                if param is not None:
+                    param.data.copy_(v.to(param.device))
+                    loaded += 1
+    print(f"  [model] Loaded {loaded} params (step {ckpt.get('step', '?')})")
+    model.eval()
+
+    wrapper = ModelWrapper("animalm", model, f"animalm-{tag}")
+    wrapper.tokenizer = tokenizer
+    return wrapper
+
+
 def _detect_gpu_layers():
     """맥 Metal이면 전체 오프로드, 아니면 CPU."""
     try:
@@ -312,6 +382,10 @@ def list_available_models():
     models.append(("animalm", "Mistral 7B + PureField delta", animalm_ckpt.exists()))
     golden_ckpt = Path.home() / "Dev" / "models" / "golden-moe-v1" / "final.pt"
     models.append(("golden-moe", "Mistral 7B + Golden MoE LoRA", golden_ckpt.exists()))
+    v4s_ckpt = Path.home() / "Dev" / "models" / "animalm-v4_savant" / "final.pt"
+    models.append(("animalm-v4-savant", "Mistral 7B Instruct + Parallel PureField + Savant", v4s_ckpt.exists()))
+    v4_ckpt = Path.home() / "Dev" / "models" / "animalm-v4" / "final.pt"
+    models.append(("animalm-v4", "Mistral 7B Instruct + Parallel PureField", v4_ckpt.exists()))
 
     # GGUF 모델들
     for name, filename in GGUF_REGISTRY.items():
