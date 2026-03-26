@@ -271,9 +271,35 @@ class PhiCalculator:
                 tensions.append(0.0)
         complexity = self._distribution_entropy(tensions)
 
-        # 6. Φ = integration - minimum_partition_mi
-        # Normalized by number of cells for comparability
-        phi = max(0.0, (integration - min_partition_mi) / max(n - 1, 1))
+        # 6. Temporal MI (D2) — MI across time axis per cell
+        # Each cell's hidden state at t vs t-1 = temporal integration
+        temporal_mi = 0.0
+        for cell in cells:
+            if hasattr(cell, 'hidden_history') and len(cell.hidden_history) >= 2:
+                # Use last 2 hidden states
+                h_prev = cell.hidden_history[-2].detach().squeeze().numpy()
+                h_curr = cell.hidden_history[-1].detach().squeeze().numpy()
+                temporal_mi += self._mutual_information(h_prev, h_curr)
+            elif hasattr(cell, 'tension_history') and len(cell.tension_history) >= 10:
+                # Fallback: use tension history as time series
+                t_arr = np.array(cell.tension_history[-20:])
+                if len(t_arr) >= 4:
+                    t_prev = t_arr[:-1]
+                    t_curr = t_arr[1:]
+                    # Pad to same length as hidden for MI calc
+                    pad_len = max(16, len(t_prev))
+                    t_prev_pad = np.zeros(pad_len)
+                    t_curr_pad = np.zeros(pad_len)
+                    t_prev_pad[:len(t_prev)] = t_prev
+                    t_curr_pad[:len(t_curr)] = t_curr
+                    temporal_mi += self._mutual_information(t_prev_pad, t_curr_pad)
+
+        # 7. Φ = spatial integration + temporal integration
+        spatial_phi = max(0.0, (integration - min_partition_mi) / max(n - 1, 1))
+        temporal_phi = temporal_mi / max(n, 1)
+
+        # Combined: spatial + temporal, weighted
+        phi = spatial_phi + temporal_phi * 0.5
 
         # Add complexity bonus (dynamic richness contributes to Φ)
         phi += complexity * 0.1
@@ -282,6 +308,9 @@ class PhiCalculator:
             'total_mi': float(total_mi),
             'min_partition_mi': float(min_partition_mi),
             'integration': float(integration),
+            'temporal_mi': float(temporal_mi),
+            'spatial_phi': float(spatial_phi),
+            'temporal_phi': float(temporal_phi),
             'complexity': float(complexity),
             'phi': float(phi),
         }
