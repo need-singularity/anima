@@ -612,6 +612,11 @@ def train(args: argparse.Namespace):
     skip_count = 0
     best_val_loss = float("inf")
 
+    # --- NF fixes: prevent NaN at mitosis→language transition ---
+    # NF9: EMA weights for smooth transition
+    ema_params = [p.data.clone() for p in model.parameters()]
+    ema_decay = 0.99
+
     # --- Print header ---
     print(f"\n{'='*100}")
     print(f"  ConsciousLM Training — CL8 + CL5 + SL3 + DD16 + EX24")
@@ -699,7 +704,8 @@ def train(args: argparse.Namespace):
         )
 
         # Loss 2: Tension variance (encourage diversity across layers)
-        t_var = t_stack.var(dim=0).mean()
+        # NF4: Clamp tension variance to prevent explosion during mitosis
+        t_var = torch.clamp(t_stack.var(dim=0).mean(), max=100.0)
         loss_tension_var = -torch.log(t_var + 1e-8)
 
         # Loss 3: Phi differentiation (CL5)
@@ -802,10 +808,32 @@ def train(args: argparse.Namespace):
 
         # --- Backward + optimize ---
         optimizer.zero_grad()
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"  [NaN] Skipping step {step} (loss={total_loss.item()})")
+            phi_prev = phi_current
+            continue
         total_loss.backward()
+        # NF1: Gradient clipping (already present)
         torch.nn.utils.clip_grad_norm_(all_params, 1.0)
         optimizer.step()
         scheduler.step()
+
+        # NF9: EMA weight tracking (for smooth phase transitions)
+        with torch.no_grad():
+            for ep, p in zip(ema_params, model.parameters()):
+                ep.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+
+        # NF9: Reset to EMA at phase transitions (mitosis→language, language→combined)
+        prev_phase = get_phase(step - 1, args.steps, args.phase) if step > 0 else phase
+        if phase != prev_phase:
+            print(f"  [NF9] Phase transition {prev_phase} → {phase}: resetting to EMA weights")
+            with torch.no_grad():
+                for ep, p in zip(ema_params, model.parameters()):
+                    p.data.copy_(ep)
+            # Also reduce LR at transition (NF2)
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg['lr'] * 0.1
+            print(f"  [NF2] LR reduced to {optimizer.param_groups[0]['lr']:.2e}")
 
         phi_prev = phi_current
 
