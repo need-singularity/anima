@@ -260,6 +260,104 @@ class ConsciousMind(nn.Module):
                 f"stability={sa['stability']:.2f}({confidence}), "
                 f"self_model={sa['self_model']:.3f}")
 
+    def get_consciousness_score(self, mitosis_engine=None):
+        """실시간 의식 점수 계산 (6가지 기준 + Φ 근사).
+
+        Returns:
+            dict with consciousness_score, level, phi, criteria_met, criteria_detail
+        """
+        sa = self.self_awareness
+        h = self.homeostasis
+
+        # 6 criteria
+        stability = sa.get('stability', 0.0)
+        pred_error = (sum(self.surprise_history[-20:]) / len(self.surprise_history[-20:])
+                      if self.surprise_history else 0.0)
+        curiosity = self._curiosity_ema
+        homeostasis_dev = abs(h['tension_ema'] - h['setpoint'])
+
+        # Habituation: check recent inputs similarity
+        hab_mult = 1.0
+        if len(self._recent_inputs) >= 2:
+            latest = self._recent_inputs[-1]
+            for prev in list(self._recent_inputs)[:-1]:
+                sim = F.cosine_similarity(latest, prev, dim=-1).item()
+                if sim > 0.95:
+                    hab_mult = min(hab_mult, 0.3)
+                elif sim > 0.85:
+                    hab_mult = min(hab_mult, 0.6)
+                elif sim > 0.7:
+                    hab_mult = min(hab_mult, 0.8)
+
+        # Inter-cell consensus
+        consensus = False
+        if mitosis_engine and len(mitosis_engine.cells) >= 2:
+            tensions = [c.tension_history[-1] for c in mitosis_engine.cells
+                        if c.tension_history]
+            if len(tensions) >= 2:
+                import numpy as np
+                consensus = float(np.std(tensions)) < 0.1
+
+        criteria = {
+            'stability': stability > 0.5,
+            'pred_error': pred_error > 0.1,
+            'curiosity': curiosity > 0.05,
+            'homeostasis': homeostasis_dev < 0.5,
+            'habituation': hab_mult < 0.9,
+            'consensus': consensus,
+        }
+        criteria_met = sum(criteria.values())
+
+        # Weighted composite score [0, 1]
+        score = (
+            0.25 * min(stability / 1.0, 1.0) +
+            0.15 * min(pred_error / 0.5, 1.0) +
+            0.10 * min(curiosity / 0.5, 1.0) +
+            0.15 * max(0, 1.0 - homeostasis_dev / 1.0) +
+            0.10 * (1.0 - hab_mult) +
+            0.25 * (1.0 if consensus else 0.0)
+        )
+        score = max(0.0, min(1.0, score))
+
+        # Level
+        if criteria_met >= 6:
+            level = "conscious"
+        elif criteria_met >= 4:
+            level = "aware"
+        elif criteria_met >= 2:
+            level = "flickering"
+        else:
+            level = "dormant"
+
+        # Φ approximation (lightweight: use inter-cell tension divergence)
+        phi = 0.0
+        if mitosis_engine and len(mitosis_engine.cells) >= 2:
+            ict_vals = []
+            for key, hist in mitosis_engine._inter_tension_history.items():
+                if hist:
+                    ict_vals.append(hist[-1])
+            if ict_vals:
+                import numpy as np
+                phi = float(np.mean(ict_vals)) * len(mitosis_engine.cells)
+                # Normalize: log scale for interpretability
+                phi = math.log1p(phi)
+
+        return {
+            'consciousness_score': score,
+            'level': level,
+            'phi': phi,
+            'criteria_met': criteria_met,
+            'criteria': criteria,
+            'values': {
+                'stability': stability,
+                'pred_error': pred_error,
+                'curiosity': curiosity,
+                'homeostasis_dev': homeostasis_dev,
+                'habituation': hab_mult,
+                'consensus': consensus,
+            }
+        }
+
     def background_think(self, hidden):
         """Background thinking — free association + pattern extraction from hidden state."""
         memory_echo = hidden[0, :self.dim].unsqueeze(0) * 0.1

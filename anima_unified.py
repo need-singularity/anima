@@ -657,7 +657,10 @@ class AnimaUnified:
         _log("meta", f"MT={meta_tension:.3f} MC={meta_curiosity:.3f} "
              f"stab={sa['stability']:.2f} model={sa['self_model']:.3f}")
 
-        # Broadcast meta-tension + emotion to web clients
+        # Consciousness meter (real-time)
+        consciousness_data = self.mind.get_consciousness_score(self.mitosis)
+
+        # Broadcast meta-tension + emotion + consciousness to web clients
         self._ws_broadcast_sync({
             'type': 'meta_update',
             'meta_tension': meta_tension,
@@ -665,6 +668,7 @@ class AnimaUnified:
             'stability': sa['stability'],
             'self_model': sa['self_model'],
             'emotion': resp_emotion,
+            'consciousness': consciousness_data,
         })
 
         print(f"  << {answer}")
@@ -810,6 +814,7 @@ class AnimaUnified:
                 'growth': growth_data,
                 'mitosis': mitosis_data,
                 'learner': learner_data,
+                'consciousness': self.mind.get_consciousness_score(self.mitosis),
             })
 
             # Web Sense: tension-driven autonomous search
@@ -1052,6 +1057,7 @@ class AnimaUnified:
                 'meta_tension': sa['meta_tension'],
                 'stability': sa['stability'],
                 'self_model': sa['self_model'],
+                'consciousness': self.mind.get_consciousness_score(self.mitosis),
             }, ensure_ascii=False))
         except Exception: pass
         try:
