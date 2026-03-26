@@ -968,8 +968,26 @@ class AnimaUnified:
                 try: msg = json.loads(raw)
                 except json.JSONDecodeError: continue
                 msg_type = msg.get('type')
+                sid = msg.get('session_id', 'unknown')
 
-                if msg_type == 'user_message':
+                if msg_type == 'session_register':
+                    device = msg.get('device', 'unknown')
+                    if not hasattr(self, '_sessions'):
+                        self._sessions = {}
+                    self._sessions[sid] = {
+                        'device': device,
+                        'modules': msg.get('modules', []),
+                        'ws': websocket,
+                    }
+                    n = len(self._sessions)
+                    _log("session", f"+{sid[:6]} ({device}) — {n} active")
+                    await self._ws_broadcast({
+                        'type': 'session_info',
+                        'active_sessions': n,
+                        'devices': [s['device'] for s in self._sessions.values()],
+                    })
+
+                elif msg_type == 'user_message':
                     text = msg.get('text', '').strip()
                     if not text: continue
                     # Store active modules from client
@@ -985,6 +1003,8 @@ class AnimaUnified:
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
                         'modules': list(getattr(self, '_active_modules', [])),
+                        'from_session': sid,
+                        'from_device': msg.get('device', 'unknown'),
                     }
                     mc = getattr(self, '_last_mitosis_context', '')
                     if mc:
@@ -1021,6 +1041,12 @@ class AnimaUnified:
         except Exception: pass
         finally:
             self.web_clients.discard(websocket)
+            # Clean up session
+            if hasattr(self, '_sessions'):
+                to_remove = [s for s, info in self._sessions.items() if info.get('ws') == websocket]
+                for s in to_remove:
+                    del self._sessions[s]
+                    _log("session", f"-{s[:6]} — {len(self._sessions)} active")
             _log("web", f"-client ({len(self.web_clients)})")
 
     def _http_handler(self, connection, request):
