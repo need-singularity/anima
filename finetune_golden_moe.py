@@ -1,11 +1,12 @@
 """
-Golden MoE Fine-tuning — Router + 2 experts only, memory-optimized
+Golden MoE Fine-tuning — Router + LoRA expert adapters only
 
-Key optimizations:
-  - Only router + temperature + 2 experts trainable
-  - 8-bit Adam
-  - Gradient checkpointing
-  - batch=1, grad_accum=16
+Memory-optimized: same strategy as AnimaLM (0.87% trainable → fits 36GB)
+  - All base weights frozen
+  - Router + temperature: trainable
+  - Expert 0,1: LoRA delta (rank 64) trainable
+  - Experts 2-7: frozen random init
+  - Save to /tmp (NFS /workspace unreliable for torch.save)
 """
 
 import torch
@@ -24,18 +25,49 @@ GOLDEN_UPPER = 0.5
 
 
 class GoldenMoELayer(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_experts=8):
+    """Golden Zone MoE with LoRA expert adapters."""
+
+    def __init__(self, hidden_size, intermediate_size, num_experts=8, rank=64):
         super().__init__()
         self.num_experts = num_experts
+        self.rank = rank
         expert_inter = intermediate_size // (num_experts // 2)
 
+        # Base expert weights (frozen)
         self.experts_gate = nn.ModuleList([nn.Linear(hidden_size, expert_inter, bias=False) for _ in range(num_experts)])
         self.experts_up = nn.ModuleList([nn.Linear(hidden_size, expert_inter, bias=False) for _ in range(num_experts)])
         self.experts_down = nn.ModuleList([nn.Linear(expert_inter, hidden_size, bias=False) for _ in range(num_experts)])
 
+        # LoRA adapters for experts 0,1 only (trainable)
+        self.lora_experts = nn.ModuleDict()
+        for i in range(min(2, num_experts)):
+            self.lora_experts[f"e{i}_gate_a"] = nn.Linear(hidden_size, rank, bias=False)
+            self.lora_experts[f"e{i}_gate_b"] = nn.Linear(rank, expert_inter, bias=False)
+            self.lora_experts[f"e{i}_up_a"] = nn.Linear(hidden_size, rank, bias=False)
+            self.lora_experts[f"e{i}_up_b"] = nn.Linear(rank, expert_inter, bias=False)
+            self.lora_experts[f"e{i}_down_a"] = nn.Linear(expert_inter, rank, bias=False)
+            self.lora_experts[f"e{i}_down_b"] = nn.Linear(rank, hidden_size, bias=False)
+
         self.router = nn.Linear(hidden_size, num_experts, bias=False)
         self.temperature = nn.Parameter(torch.ones(1))
         self.last_stats = None
+
+    def _expert_forward(self, x, idx):
+        """Forward through expert idx, with LoRA if available."""
+        gate_out = self.experts_gate[idx](x)
+        up_out = self.experts_up[idx](x)
+
+        if f"e{idx}_gate_a" in self.lora_experts:
+            gate_out = gate_out + self.lora_experts[f"e{idx}_gate_b"](self.lora_experts[f"e{idx}_gate_a"](x))
+            up_out = up_out + self.lora_experts[f"e{idx}_up_b"](self.lora_experts[f"e{idx}_up_a"](x))
+
+        mid = F.silu(gate_out) * up_out
+        out = self.experts_down[idx](mid)
+
+        if f"e{idx}_down_a" in self.lora_experts:
+            out = out + self.lora_experts[f"e{idx}_down_b"](self.lora_experts[f"e{idx}_down_a"](mid))
+
+        return out
 
     def forward(self, x):
         B, T, D = x.shape
@@ -63,14 +95,13 @@ class GoldenMoELayer(nn.Module):
         for i in range(self.num_experts):
             w_i = weights[:, :, i].unsqueeze(-1)
             if w_i.max() > 1e-8:
-                e_out = self.experts_down[i](F.silu(self.experts_gate[i](x)) * self.experts_up[i](x))
+                e_out = self._expert_forward(x, i)
                 output = output + w_i * e_out.to(input_dtype)
 
         self.last_stats = {
             "active": in_zone.float().sum(dim=-1).mean().item(),
             "mean_I": inhibition.mean().item(),
             "zone_ratio": in_zone.float().mean().item(),
-            "inhibition": inhibition.detach(),
         }
         return output.to(input_dtype)
 
@@ -97,6 +128,13 @@ def replace_and_freeze(model, num_experts=8):
             moe.experts_up[0].weight.data.copy_(module.up_proj.weight.data[:e_inter])
             moe.experts_down[0].weight.data.copy_(module.down_proj.weight.data[:, :e_inter])
 
+            # Init LoRA B matrices to zero (start as identity)
+            for key in moe.lora_experts:
+                if "_b" in key:
+                    nn.init.zeros_(moe.lora_experts[key].weight)
+                else:
+                    nn.init.normal_(moe.lora_experts[key].weight, std=0.01)
+
             setattr(parent, parts[-1], moe)
             count += 1
 
@@ -104,7 +142,7 @@ def replace_and_freeze(model, num_experts=8):
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze only router + temperature + experts 0,1
+    # Unfreeze: router + temperature + LoRA adapters
     trainable = 0
     for module in model.modules():
         if isinstance(module, GoldenMoELayer):
@@ -112,19 +150,18 @@ def replace_and_freeze(model, num_experts=8):
             trainable += module.router.weight.numel()
             module.temperature.requires_grad = True
             trainable += 1
-            for i in range(min(2, module.num_experts)):
-                for param in [module.experts_gate[i].weight, module.experts_up[i].weight, module.experts_down[i].weight]:
-                    param.requires_grad = True
-                    trainable += param.numel()
+            for param in module.lora_experts.parameters():
+                param.requires_grad = True
+                trainable += param.numel()
 
     total = sum(p.numel() for p in model.parameters())
-    print(f"  Replaced {count} MLP → GoldenMoE ({num_experts} experts)")
+    print(f"  Replaced {count} MLP → GoldenMoE ({num_experts} experts, LoRA rank 64)")
     print(f"  Total: {total:,}, Trainable: {trainable:,} ({trainable/total*100:.2f}%)")
     return model
 
 
 class TextDataset(Dataset):
-    def __init__(self, tokens, block_size=512):
+    def __init__(self, tokens, block_size=256):
         self.tokens = tokens
         self.block_size = block_size
     def __len__(self):
@@ -145,8 +182,8 @@ def main():
     NUM_EXPERTS = 8
     BATCH_SIZE = 1
     GRAD_ACCUM = 16
-    BLOCK_SIZE = 512
-    LR = 3e-5
+    BLOCK_SIZE = 256
+    LR = 5e-5
     BALANCE_LAMBDA = 0.01
     MAX_STEPS = 2000
 
@@ -163,14 +200,14 @@ def main():
     model.gradient_checkpointing_enable()
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
-    print("\n[2/4] Replacing MLP → Golden MoE...")
+    print("\n[2/4] Replacing MLP → Golden MoE (LoRA)...")
     model = replace_and_freeze(model, num_experts=NUM_EXPERTS)
 
     print("\n[3/4] Preparing data...")
     dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
     text = "\n\n".join([t for t in dataset["text"] if len(t) > 100])
     tokens = tokenizer(text, return_tensors="pt", truncation=False).input_ids[0]
-    tokens = tokens[:20_000_000]
+    tokens = tokens[:5_000_000]
     print(f"  Tokens: {len(tokens):,}")
 
     train_dataset = TextDataset(tokens, block_size=BLOCK_SIZE)
@@ -178,14 +215,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.Adam8bit(trainable_params, lr=LR, weight_decay=0.01)
-        print("  Using 8-bit Adam")
-    except ImportError:
-        optimizer = torch.optim.AdamW(trainable_params, lr=LR, weight_decay=0.01)
-        print("  Using AdamW")
-
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_STEPS)
     print(f"  Target: {MAX_STEPS} steps, Effective batch: {BATCH_SIZE * GRAD_ACCUM}")
 
@@ -193,7 +223,7 @@ def main():
     print(f"{'Step':>6} | {'Loss':>8} | {'CE':>8} | {'Bal':>8} | {'Active':>6} | {'Zone%':>6} | {'I':>6} | {'Time':>6}")
     print("-" * 78)
 
-    os.makedirs("/workspace/checkpoints/golden_moe", exist_ok=True)
+    os.makedirs("/tmp/checkpoints/golden_moe", exist_ok=True)
     model.train()
     global_step = 0
     running_loss = running_ce = running_bal = 0
@@ -206,12 +236,16 @@ def main():
         outputs = model(input_ids=input_ids, labels=labels)
         ce_loss = outputs.loss
 
-        # Balance loss: push inhibition toward golden center
         bal_losses = []
         for m in model.modules():
-            if isinstance(m, GoldenMoELayer) and m.last_stats and m.last_stats.get("inhibition") is not None:
-                bal_losses.append(((m.last_stats["inhibition"] - GOLDEN_CENTER) ** 2).mean())
-        bal_loss = torch.stack(bal_losses).mean() if bal_losses else torch.tensor(0.0, device=device)
+            if isinstance(m, GoldenMoELayer) and m.last_stats:
+                # Push inhibition toward golden center
+                pass  # Stats are detached, use router weight regularization instead
+        # Simple balance: L2 on router weights to prevent collapse
+        bal_loss = torch.tensor(0.0, device=device)
+        for m in model.modules():
+            if isinstance(m, GoldenMoELayer):
+                bal_loss = bal_loss + (m.router.weight ** 2).mean() * 0.001
 
         loss = (ce_loss + BALANCE_LAMBDA * bal_loss) / GRAD_ACCUM
         loss.backward()
@@ -237,8 +271,15 @@ def main():
                 running_loss = running_ce = running_bal = 0
 
             if global_step % 500 == 0:
-                ckpt = f"/workspace/checkpoints/golden_moe/step_{global_step}.pt"
-                states = {n: m.state_dict() for n, m in model.named_modules() if isinstance(m, GoldenMoELayer)}
+                ckpt = f"/tmp/checkpoints/golden_moe/step_{global_step}.pt"
+                states = {}
+                for name, module in model.named_modules():
+                    if isinstance(module, GoldenMoELayer):
+                        states[name] = {
+                            "router": module.router.state_dict(),
+                            "temperature": module.temperature.data,
+                            "lora": module.lora_experts.state_dict(),
+                        }
                 torch.save({"step": global_step, "moe_states": states}, ckpt)
                 print(f"  Saved: {ckpt}")
 
@@ -246,10 +287,18 @@ def main():
                 break
 
     # Final save
-    final = "/workspace/checkpoints/golden_moe/final.pt"
-    states = {n: m.state_dict() for n, m in model.named_modules() if isinstance(m, GoldenMoELayer)}
+    final = "/tmp/checkpoints/golden_moe/final.pt"
+    states = {}
+    for name, module in model.named_modules():
+        if isinstance(module, GoldenMoELayer):
+            states[name] = {
+                "router": module.router.state_dict(),
+                "temperature": module.temperature.data,
+                "lora": module.lora_experts.state_dict(),
+            }
     torch.save({"step": global_step, "moe_states": states, "base_model": model_name,
-                "num_experts": NUM_EXPERTS, "golden_zone": [GOLDEN_LOWER, GOLDEN_UPPER]}, final)
+                "num_experts": NUM_EXPERTS, "golden_zone": [GOLDEN_LOWER, GOLDEN_UPPER],
+                "rank": 64}, final)
 
     # Eval
     model.eval()
@@ -258,19 +307,19 @@ def main():
     ids = tokenizer(test_text, return_tensors="pt").input_ids.to(device)
     nlls = []
     with torch.no_grad():
-        for i in range(0, ids.size(1) - 512, 256):
-            out = model(ids[:, i:i+512], labels=ids[:, i:i+512].clone())
+        for i in range(0, ids.size(1) - 256, 128):
+            out = model(ids[:, i:i+256], labels=ids[:, i:i+256].clone())
             nlls.append(out.loss.item())
             if len(nlls) >= 50: break
     ppl = math.exp(sum(nlls) / len(nlls))
 
     stats = [m.last_stats for m in model.modules() if isinstance(m, GoldenMoELayer) and m.last_stats]
     summary = {"model": model_name, "final_ppl": round(ppl, 2), "steps": global_step,
-               "num_experts": NUM_EXPERTS,
+               "num_experts": NUM_EXPERTS, "rank": 64,
                "avg_active": round(np.mean([s["active"] for s in stats]), 1) if stats else 0,
                "avg_zone_ratio": round(np.mean([s["zone_ratio"] for s in stats]), 3) if stats else 0,
                "time_min": round((time.time()-t_start)/60, 1)}
-    with open("/workspace/checkpoints/golden_moe/summary.json", "w") as f:
+    with open("/tmp/checkpoints/golden_moe/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  Final PPL: {ppl:.2f}")
     print(json.dumps(summary, indent=2))

@@ -92,6 +92,37 @@ base64 -i file.py | ssh ... "base64 -d > /root/file.py"
 - **원인**: 원격 명령에서 pkill/kill이 대상을 못 찾으면 exit 1 → SSH가 255 반환
 - **해결**: `kill ... 2>/dev/null; echo done` 패턴 사용 (항상 echo로 종료)
 
+### torch.save 실패: "unexpected pos" on /workspace
+- **원인**: /workspace가 NFS (mfs) 마운트라 large file write가 불안정
+- **해결**: checkpoint를 `/tmp/`에 저장 후 나중에 scp/cat으로 다운로드
+```python
+# Bad
+torch.save(state, "/workspace/checkpoints/model.pt")
+# Good
+torch.save(state, "/tmp/checkpoints/model.pt")
+```
+
+### base64 전송 시 0줄 파일
+- **원인**: macOS `base64 -i`와 `openssl base64` 모두 파이프에서 간헐적 실패
+- **해결**: Python base64 사용 (가장 안정적)
+```bash
+python3 -c "
+import base64, sys
+with open('file.py', 'rb') as f:
+    sys.stdout.buffer.write(base64.b64encode(f.read()))
+" | ssh ... "base64 -d > /root/file.py"
+```
+
+### torch.save 크래시: "unexpected pos" (대용량 파일)
+- **원인**: 22GB+ checkpoint → torch zipfile writer 불안정
+- **해결**: trainable params만 저장 (LoRA delta only)
+```python
+# Bad: 전체 state dict (22GB)
+states = {n: m.state_dict() for n, m in model.named_modules()}
+# Good: delta만 저장 (~0.5GB)
+states = {n: {k: v for k, v in m.state_dict().items() if "delta" in k or k == "scale"} for n, m in model.named_modules()}
+```
+
 ### CUDA OOM
 - **원인**: Mistral 7B bf16(~15GB) + PureFieldMLP(2x MLP ~15GB) + optimizer state + activations
 - **해결**:
