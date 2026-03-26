@@ -23,10 +23,7 @@ def patched_forward(self, x):
     g_gate = self.pf_gate_b(self.pf_gate_a(x))
     g_up = self.pf_up_b(self.pf_up_a(x))
     g_mid = torch.nn.functional.silu(g_gate) * g_up
-    if self._attn_output is not None:
-        attn_gate = torch.sigmoid(self.cross_attn_gate(self._attn_output))
-        g_mid = g_mid * (1.0 + self.cross_attn_scale * attn_gate)
-        self.last_cross_tension = (attn_gate.detach() ** 2).mean(dim=-1)
+    # Cross-attention disabled for v4_savant (trained without it)
     g_mid = self.dropout(g_mid)
     pf_out = self.pf_down_b(self.pf_down_a(g_mid))
     repulsion = original_out.detach() - pf_out
