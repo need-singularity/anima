@@ -152,15 +152,8 @@ class AnimaUnified:
             try: self.learner.load(self.paths['state'])
             except Exception: pass
 
-        # Alpha online learner (for AnimaLM v4+ parallel PureField)
+        # Alpha online learner — initialized after model load (see _post_init_alpha)
         self.alpha_learner = None
-        if self.model and hasattr(self.model, 'model'):
-            try:
-                from online_learning import AlphaOnlineLearner
-                self.alpha_learner = AlphaOnlineLearner(self.model.model)
-                _log('init', 'AlphaOnlineLearner active')
-            except Exception:
-                pass
 
         self.mitosis = self._init_mod('mitosis', lambda: (
             MitosisEngine(input_dim=128, hidden_dim=256, output_dim=128,
@@ -285,6 +278,14 @@ class AnimaUnified:
         else:
             self.mods['model'] = False
 
+        # Alpha online learner (for AnimaLM v4+ parallel PureField)
+        if self.model and hasattr(self.model, 'model'):
+            try:
+                from online_learning import AlphaOnlineLearner
+                self.alpha_learner = AlphaOnlineLearner(self.model.model)
+                _log('init', 'AlphaOnlineLearner active')
+            except Exception:
+                pass
 
         # Multimodal Action Engine (code execution + image generation)
         self.action_engine = self._init_mod('multimodal', lambda: (
