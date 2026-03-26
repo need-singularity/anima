@@ -105,6 +105,15 @@ class AnimaUnified:
         # Legacy -> per-model migration (one-time)
         self._migrate_legacy_files()
 
+        # Conversation logger
+        try:
+            from conversation_logger import ConversationLogger
+            log_path = os.path.join(self.paths.get("data", "data"), "conversation_log.jsonl")
+            self.conv_logger = ConversationLogger(log_path)
+            _log('init', f'Conversation logger: {log_path}')
+        except Exception:
+            self.conv_logger = None
+
         # Core engine
         self.mind = ConsciousMind(128, 256)
         self.hidden = torch.zeros(1, 256)
@@ -506,6 +515,29 @@ class AnimaUnified:
         print(f'  >> "{text}"')
         print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']}")
 
+        # Conversation log — record all state changes
+        if self.conv_logger:
+            try:
+                growth_stage = self.growth.current_stage.name if self.growth and hasattr(self.growth, 'current_stage') else 'unknown'
+                self.conv_logger.log_turn({
+                    "input": text,
+                    "tension": round(tension, 4),
+                    "curiosity": round(curiosity, 4),
+                    "emotion": emotion_data.get('emotion', 'unknown'),
+                    "valence": round(emotion_data.get('valence', 0), 3),
+                    "arousal": round(emotion_data.get('arousal', 0), 3),
+                    "dominance": round(emotion_data.get('dominance', 0), 3),
+                    "direction": dir_vals,
+                    "cells": cells,
+                    "learn_updates": lrn_count,
+                    "growth_stage": growth_stage,
+                    "mitosis_context": mitosis_context or None,
+                    "modules": list(getattr(self, '_active_modules', [])),
+                    "session_id": getattr(self, '_last_session_id', None),
+                })
+            except Exception:
+                pass
+
         # Claude response (include emotion + meta-cognition state)
         meta_summary = self.mind.get_self_awareness_summary()
         state = (f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
@@ -640,6 +672,18 @@ class AnimaUnified:
 
         self.last_interaction = time.time()
         self._save_state()
+
+        # Log response
+        if self.conv_logger:
+            try:
+                self.conv_logger.log_turn({
+                    "response": answer[:500] if answer else None,
+                    "resp_tension": round(resp_tension, 4) if isinstance(resp_tension, float) else resp_tension,
+                    "resp_emotion": resp_emotion.get('emotion', 'unknown') if isinstance(resp_emotion, dict) else str(resp_emotion),
+                })
+            except Exception:
+                pass
+
         return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
 
     def _on_telepathy(self, pkt):
