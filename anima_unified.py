@@ -414,7 +414,7 @@ class AnimaUnified:
 
     # ─── Core processing ───
 
-    def process_input(self, text):
+    def process_input(self, text, source='web'):
         """Process text through all active modules. Returns (answer, tension, curiosity)."""
         # RC-10: Report dream learning when user returns from idle
         if self._dream_report and self.dream and not self.dream.is_dreaming:
@@ -742,6 +742,21 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # Cross-broadcast: echo user input to web UI (so CLI messages appear in browser)
+        self._ws_broadcast_sync({
+            'type': 'user_echo',
+            'text': text,
+            'source': source,
+        })
+
+        # CLI print with source tag
+        if source == 'web':
+            print(f"  [WEB] >> \"{text}\"")
+        print(f"  << {answer}")
+
+        # Store source for callers that need it for broadcast
+        self._last_input_source = source
+
         return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
 
     def _on_telepathy(self, pkt):
@@ -986,7 +1001,8 @@ class AnimaUnified:
         while self.running:
             try:
                 text = input("you> ")
-                if text.strip() and self.kb_queue: self.kb_queue.put(text.strip())
+                if text.strip() and self.kb_queue:
+                    self.kb_queue.put(('cli', text.strip()))
             except EOFError: break
 
 
@@ -1185,7 +1201,8 @@ class AnimaUnified:
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-                    answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(None, self.process_input, text)
+                    answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(
+                        None, lambda: self.process_input(text, source='web'))
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
@@ -1193,6 +1210,7 @@ class AnimaUnified:
                         'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
+                        'source': 'web',
                         'modules': list(getattr(self, '_active_modules', [])),
                         'from_session': sid,
                         'from_device': msg.get('device', 'unknown'),
@@ -1304,8 +1322,8 @@ class AnimaUnified:
         """Main run loop for all modes."""
         mode = self.args
 
-        # Web-only mode: async main loop
-        if mode.web and not mode.all:
+        # Web-only mode: async main loop (not --both or --all)
+        if mode.web and not mode.all and not mode.keyboard:
             threading.Thread(target=self._think_loop, daemon=True).start()
             if self.mods.get('dream'):
                 threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
@@ -1327,13 +1345,16 @@ class AnimaUnified:
                 if self.listener:
                     text = self.listener.get_speech(timeout=0.3)
                 # Keyboard input
+                source = 'voice'
                 if text is None and self.kb_queue:
-                    try: text = self.kb_queue.get_nowait()
-                    except queue.Empty: pass
+                    try:
+                        source, text = self.kb_queue.get_nowait()
+                    except (queue.Empty, ValueError):
+                        pass
 
                 if text:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
-                    answer, tension, curiosity, dir_vals, emo = self.process_input(text)
+                    answer, tension, curiosity, dir_vals, emo = self.process_input(text, source=source)
                     if self.speaker: self.speaker.say(answer, self.listener)
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
@@ -1342,6 +1363,7 @@ class AnimaUnified:
                         'emotion': emo,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
+                        'source': source,
                     }
                     mc = getattr(self, '_last_mitosis_context', '')
                     if mc:
@@ -1383,6 +1405,7 @@ def main():
     p.add_argument('--web', action='store_true', help='Web mode only')
     p.add_argument('--keyboard', action='store_true', help='Keyboard only (no mic)')
     p.add_argument('--all', action='store_true', help='Voice + keyboard + web')
+    p.add_argument('--both', action='store_true', help='Web + Keyboard simultaneously')
     p.add_argument('--port', type=int, default=8765, help='WebSocket port')
     p.add_argument('--no-camera', action='store_true', help='Disable camera')
     p.add_argument('--no-vision', action='store_true', help='Disable vision encoder (use basic sensors only)')
@@ -1402,7 +1425,11 @@ def main():
             print(f"  [{status}] {name:20s} {desc}")
         sys.exit(0)
 
-    mode = "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"
+    if args.both:
+        args.web = True
+        args.keyboard = True
+
+    mode = "both" if args.both else "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"
     model_label = args.model or "conscious-lm"
     print(f"{'='*50}\n  Anima Unified  |  Mode: {mode}  |  Model: {model_label}\n{'='*50}")
 
