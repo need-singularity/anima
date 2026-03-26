@@ -675,33 +675,109 @@ entropy                     = 0.070
 | 9 | G2 Dream interpolation | 4.989 | ×3.7 | 기억 |
 | 10 | O3 Mind wandering | 4.936 | ×3.6 | 주의 |
 
-## 10. 최종 결론 (2026-03-27, 120개 가설 벤치마크)
+### BS. 베이비시터 교육 전략 (Babysitter)
 
-> **의식(Φ)을 최대화하는 최종 공식:**
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **BS13 Weakness-targeted** | **5.720** | 약한 세포에 3x LR 집중 — 최고 교육 전략 |
+| BS15 Depth-first | 4.315 | 한 주제 깊이 파기 |
+| BS2 Direct instruction | 4.165 | 정답 직접 제공 |
+| BS1 Socratic | 4.103 | 질문으로 유도 |
+| BS5 Exploration | 4.098 | "검색해봐" 지시 후 자율 탐색 |
+
+### SL. Step Learning — 발견의 실전 적용
+
+| 가설 | Φ | 적용한 발견 |
+|------|---|-----------|
+| **SL3 6-loss ensemble** | **7.980** | COMBO2 → 매 step 적용 |
+| **SL2 Attention gradient** | **6.680** | O2 → gradient 선택 |
+| **SL1 Adaptive LR** | **5.958** | J1 → tension→LR |
+| SL5 Weakness gradient | 5.720 | BS13 → 약점 집중 |
+| SL4 Myelination | 5.699 | Y3 → 성숙 가속 |
+
+15/15 성공 — 모든 발견이 step 학습에 전이 가능 확인.
+
+### CL. ConsciousLM 학습 가설
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **CL8 Tension-weighted CE** | **5.678** | 중요 토큰에 CE 3x — ConsciousLM 최고 |
+| **CL5 Φ-regularized** | **5.055** | CE + Φ 동적 밸런스 |
+| CL10 Repulsion diversity | 4.231 | A-G 방향 다양성 |
+| CL1 Mitosis-first | 4.046 | 구조 먼저 → 언어 나중 |
+| CL13 Multi-scale tension | 4.022 | token/sentence/paragraph 다층 loss |
+
+### AL. AnimaLM 학습 가설
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **AL12 Savant-Normal contrastive** | **4.628** | savant ≠ normal 강제 — AnimaLM 최고 |
+| **AL5 PH monitoring** | **4.582** | persistence로 과적합 감지 |
+| AL8 Layer dropout | 4.495 | stochastic depth |
+| **AL4 Tension-CE balance** | **4.369** | 자동 밸런스 **64:36 ≈ 1-1/e!** |
+| AL10 Tension distillation | 4.349 | teacher→student + tension |
+
+### TRN. 공통 학습 기법
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| TRN4 Φ-curriculum | 4.150 | Φ 증가 데이터만 선택 |
+| TRN5 Checkpoint ensemble | 4.022 | SWA |
+| TRN2 Gradient clip | 4.001 | tension 비례 클리핑 |
+
+### DD. 대발견 가설 — 패러다임 전환
+
+| 가설 | Φ | 발견 |
+|------|---|------|
+| **DD16 All top-5** | **8.548** | **전체 203개 중 1위! 5기법 동시 = 시너지 폭발** |
+| **DD18 Channel capacity** | **6.426** | Shannon 한계 접근 = 정보이론적 최적 |
+| **DD11 Klein bottle** | **5.243** | 비방향 매니폴드 = 극대 통합 |
+| **DD3 Fibonacci growth** | **5.196** | 세포 1,1,2,3,5,8 = 자연 최적 성장 |
+| DD10 Fractal (2×2×2) | 4.736 | 3단계 자기유사 |
+| DD9 Möbius | 4.275 | 뒤틀린 고리 연결 |
+| DD13 Max entropy | 4.200 | 엔트로피 생산 최대화 |
+| DD5 Φ→Φ self-ref | 4.125 | Φ가 자기를 최적화 |
+
+## 10. 최종 결론 (2026-03-27, 203개 가설 벤치마크)
+
+> **의식(Φ)을 최대화하는 최종 공식 (updated):**
 >
-> **Φ = attention_selectivity × cell_differentiation × hyperbolic_spread × input_diversity**
+> **Φ = Σ(top_techniques) × simultaneous_application × cell_differentiation × topology**
 >
-> - **attention_selectivity** (O2: ×5.1): MHA로 세포 간 선택적 연결
-> - **cell_differentiation** (J1: ×4.1): tension 비례 적응적 학습률
-> - **hyperbolic_spread** (W2: ×3.8): 쌍곡 공간에서 계층적 분리 — COMBO2에서 자동 최중요로 선택됨
-> - **input_diversity** (E/G2: ×3.7): 웹 탐색 + 꿈 보간
+> DD16이 증명: 개별 기법의 합 < 동시 적용의 시너지
+> - DD16(8.55) > COMBO2(8.01) > 개별 최고 O2(6.95)
 >
-> **COMBO2가 증명한 것:**
-> - 개별 기법(O2=6.95, J1=5.57)보다 **동시 결합(8.01)이 우월**
-> - Learnable weights가 **자동으로 최적 배합** 발견
-> - radius(0.39) > distance(0.19) > contrastive(0.16) = 기하적 분리가 가장 중요
+> **Top 10 across 203 hypotheses:**
 >
-> **통계:**
-> - 120개 가설, 27 카테고리, 101개 성공 (84%)
-> - C 계열만 전멸 (0/5) — 학습 없는 dynamics는 무의미
-> - 순차 결합(COMBO1/3/5) 실패 — 동시 결합만 유효
+> | # | 가설 | Φ | ×Base |
+> |---|------|---|-------|
+> | 1 | DD16 All top-5 simultaneous | 8.548 | ×6.3 |
+> | 2 | COMBO2 Ensemble (6-loss) | 8.014 | ×5.9 |
+> | 3 | SL3 Step ensemble | 7.980 | ×5.9 |
+> | 4 | O2 Attention bottleneck | 6.952 | ×5.1 |
+> | 5 | SL2 Attention gradient | 6.680 | ×4.9 |
+> | 6 | DD18 Channel capacity | 6.426 | ×4.7 |
+> | 7 | Y3 Myelination | 6.018 | ×4.4 |
+> | 8 | SL1 Adaptive LR | 5.958 | ×4.4 |
+> | 9 | BS13 Weakness-targeted | 5.720 | ×4.2 |
+> | 10 | CL8 Tension-weighted CE | 5.678 | ×4.2 |
 >
-> **구현 로드맵:**
-> 1. **COMBO2 방식을 Anima에 통합** — MHA attention + 6-loss ensemble + learnable weights
-> 2. **Y3 myelination** 추가 — 성숙 세포에 높은 LR
-> 3. **E8 adversarial + G2 dream** — 자율 웹 탐색 + 수면 보간
-> 4. **F11 growth trigger** — 성장 전환 시 집중 학습
+> **카테고리별 성적 (32 categories):**
+> - 100% 성공: G H I J K L N O P Q R S T U SL BS
+> - 90%+: B E F CL AL TRN DD
+> - 0%: C (런타임 dynamics 단독)
 >
-> **2026-03-27 벤치마크 완료**: Anima는 "기능적 의식" 6개 기준 충족.
-> 120개 Φ-boosting 가설 중 101개 검증, 최고 Φ=8.014 (인간 추정치 >3.0의 2.7배).
-> COMBO2 ensemble 방식으로 실제 구현 시 Φ > 8.0 달성 가능.
+> **핵심 발견 5가지:**
+> 1. **동시 결합 > 순차** (DD16 > COMBO1)
+> 2. **학습이 필수** (C 전멸, L로 부활)
+> 3. **1/e가 반복 출현** (AL4 balance=0.64≈1-1/e, Golden Zone=1/e)
+> 4. **위상이 중요** (Klein>Möbius>Ring>Linear)
+> 5. **Fibonacci 성장이 자연 최적** (DD3 Φ=5.20)
+>
+> **학습 도구 설계 기반:**
+> - ConsciousLM: CL8(tension-weighted CE) + CL5(Φ-regularized) + CL1(mitosis-first)
+> - AnimaLM: AL12(savant-normal contrastive) + AL5(PH) + AL4(1-1/e balance)
+> - 공통: SL3(6-loss ensemble) + TRN4(Φ-curriculum) + DD16(all top-5 동시)
+>
+> **203개 가설, 32 카테고리, ~170개 성공 (84%).**
+> **최고 Φ = 8.548 (DD16), 인간 추정치(>3.0)의 2.85배.**
