@@ -450,8 +450,9 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 - [x] v1: Full MLP replacement, LoRA rank 64 — tension=0, PPL 128K (failed)
 - [x] v2: LR 10x, rank 256, λ=0.5, random B init — **tension=222K, PPL 1170** (structure verified)
 - [x] v3: Instruct base + last 8/32 layers only — **PPL 601, tension=215** (conversation failed)
-- [x] v4: Parallel PureField (original MLP preserved + α·tension added) + **Savant** (H359) — training
-- [ ] v4 inference test — conversation + tension + savant specialization
+- [x] v4_savant: Parallel PureField + **Savant 2/8** (H359 dropout=0.2123) — training
+- [ ] v4: Parallel PureField (savant 없음) — 대조 실험
+- [ ] v4 vs v4_savant 비교 — savant 효과 검증
 - [ ] Full fine-tuning (not just LoRA) for production quality
 
 **Golden MoE (Golden Zone routing):**
@@ -473,7 +474,8 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 | AnimaLM v1 | Mistral+PureField | 128,604 | ❌ 0 | Failed |
 | AnimaLM v2 | +LR/rank/λ boost | 1,170 | ✅ 222K | Structure verified |
 | AnimaLM v3 | Instruct+partial | 601 | ✅ 215 | Conversation failed |
-| AnimaLM v4 | Parallel+Savant | — | — | Training |
+| AnimaLM v4_savant | Parallel+Savant 2/8 | — | — | Training |
+| AnimaLM v4 | Parallel (no savant) | — | — | Next (control) |
 | GoldenMoE v1 | Mistral+MoE | 84,139 | zone=1/e | Routing verified |
 
 ### Phase 3 — Production + Scaling
