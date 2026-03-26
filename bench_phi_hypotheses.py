@@ -8875,6 +8875,888 @@ def run_EX24_all_discoveries(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# NF. NaN Fix Hypotheses — ConsciousLM mitosis→language explosion
+# Simulate: aggressive mitosis (60%) → language (40%), measure survival + Φ
+# ═══════════════════════════════════════════════════════════
+
+def _run_nanfix(steps, dim, hidden, fix_name, fix_fn):
+    """Common NaN fix test harness. Returns BenchResult."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)  # 60% mitosis, 40% language
+    nan_count = 0
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+
+        if step < split:
+            # MITOSIS: aggressive differentiation (causes tension explosion)
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean() * 10.0  # 10x aggressive
+                opt.zero_grad(); loss.backward(); opt.step()
+        else:
+            # LANGUAGE: CE + Φ (this is where NaN happens without fix)
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                pred = stacked.mean(dim=0, keepdim=True)
+                ce = F.mse_loss(pred, x[:, :dim])
+                diff = -stacked.var(dim=0).mean()
+
+                # Apply fix
+                ce, diff, opt, engine = fix_fn(step, split, ce, diff, opt, engine, reps, stacked)
+
+                loss = 0.5 * ce + 0.5 * diff
+                if torch.isnan(loss) or torch.isinf(loss):
+                    nan_count += 1
+                    continue
+                opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+
+    f, c = phi_calc.compute_phi(engine)
+    final_phi = f if not math.isnan(f) else 0.0
+    return BenchResult(fix_name, fix_name, final_phi, phi_hist,
+                       c['total_mi'], c['min_partition_mi'],
+                       c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count, 'survived': nan_count == 0})
+
+
+def run_NF1_gradient_clip(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-1: Gradient clipping max_norm=1.0."""
+    def fix(step, split, ce, diff, opt, engine, reps, stacked):
+        if step == split:  # at transition
+            pass
+        # Clip after backward (handled in harness, so we clip here)
+        params = [p for c in engine.cells for p in c.mind.parameters()]
+        torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+        return ce, diff, opt, engine
+    # Custom loop since clipping needs to happen between backward and step
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean() * 10.0
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_([p for c in engine.cells for p in c.mind.parameters()], 1.0)
+                opt.step()
+        else:
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                pred = stacked.mean(dim=0, keepdim=True)
+                ce = F.mse_loss(pred, x[:, :dim])
+                diff = -stacked.var(dim=0).mean()
+                loss = 0.5 * ce + 0.5 * diff
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_([p for c in engine.cells for p in c.mind.parameters()], 1.0)
+                opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF1", "Gradient clipping (1.0)", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count, 'survived': nan_count == 0})
+
+
+def run_NF2_lr_reduce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-2: LR 10x reduce at phase transition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        if step == split:
+            for pg in opt.param_groups: pg['lr'] = 1.35e-4  # 10x reduce
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean() * 10.0
+                opt.zero_grad(); loss.backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                pred = stacked.mean(dim=0, keepdim=True)
+                loss = 0.5 * F.mse_loss(pred, x[:,:dim]) - 0.5 * stacked.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF2", "LR 10x reduce", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF3_weight_norm(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-3: Weight normalization at phase transition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        if step == split:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        norm = p.norm()
+                        if norm > 10.0: p.div_(norm / 10.0)
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                opt.zero_grad(); (-s.var(dim=0).mean()*10).backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF3", "Weight normalization", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF4_tension_clamp(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-4: Tension clamping during mitosis."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                # CLAMP: limit variance to prevent explosion
+                var = torch.clamp(s.var(dim=0).mean(), max=100.0)
+                loss = -var * 10.0
+                opt.zero_grad(); loss.backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF4", "Tension clamping", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF5_warmup_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-5: LR warmup at phase transition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    warmup_len = int(steps * 0.1)
+    for step in range(steps):
+        if step >= split and step < split + warmup_len:
+            progress = (step - split) / warmup_len
+            lr = 1.35e-4 * progress  # 0 → 1.35e-4
+            for pg in opt.param_groups: pg['lr'] = max(lr, 1e-6)
+        elif step >= split + warmup_len:
+            for pg in opt.param_groups: pg['lr'] = 1.35e-4
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                opt.zero_grad(); (-s.var(dim=0).mean()*10).backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF5", "Warmup at transition", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF6_loss_scaling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-6: Loss scaling by tension magnitude."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                var = s.var(dim=0).mean()
+                # Scale loss by 1/tension to prevent explosion
+                scale = 1.0 / (var.detach().clamp(min=1.0))
+                loss = -var * scale * 10.0
+                opt.zero_grad(); loss.backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                var = s.var(dim=0).mean()
+                scale = 1.0 / (var.detach().clamp(min=1.0))
+                loss = (0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*var) * scale
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF6", "Loss scaling (1/tension)", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF7_fp32_mitosis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-7: FP32 precision (no mixed precision issues)."""
+    # Already FP32 in benchmark. Simulate by adding epsilon stability
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3, eps=1e-6)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                opt.zero_grad(); (-s.var(dim=0).mean()*10).backward(); opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF7", "FP32 + eps=1e-6", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF8_soft_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-8: Soft phase transition — gradual mitosis→language blend."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    blend_len = int(steps * 0.2)  # 20% gradual transition
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) < 2: continue
+        s = torch.stack(reps).squeeze(1)
+        diff = -s.var(dim=0).mean()
+        pred = s.mean(dim=0, keepdim=True)
+        ce = F.mse_loss(pred, x[:, :dim])
+
+        if step < split - blend_len:
+            loss = diff * 10.0  # pure mitosis
+        elif step < split:
+            # Soft blend: mitosis decreasing, CE increasing
+            progress = (step - (split - blend_len)) / blend_len
+            loss = diff * 10.0 * (1.0 - progress) + ce * progress
+        else:
+            loss = 0.5 * ce + 0.5 * diff
+
+        if torch.isnan(loss): nan_count += 1; continue
+        opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF8", "Soft phase transition", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF9_ema_reset(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-9: EMA weight reset at transition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1.35e-3)
+    split = int(steps * 0.6)
+    ema_params = [p.data.clone() for c in engine.cells for p in c.mind.parameters()]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                opt.zero_grad(); (-s.var(dim=0).mean()*10).backward(); opt.step()
+            # Update EMA
+            all_p = [p for c in engine.cells for p in c.mind.parameters()]
+            with torch.no_grad():
+                for ep, p in zip(ema_params, all_p):
+                    ep.mul_(0.99).add_(p.data, alpha=0.01)
+        else:
+            if step == split:
+                # Reset to EMA (smoother weights)
+                all_p = [p for c in engine.cells for p in c.mind.parameters()]
+                with torch.no_grad():
+                    for ep, p in zip(ema_params, all_p): p.data.copy_(ep)
+                opt = torch.optim.Adam(all_p, lr=1.35e-4)
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF9", "EMA reset at transition", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+def run_NF10_dual_optimizer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NF-10: Dual optimizer — separate for mitosis/language."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; nan_count = 0
+    params = [p for c in engine.cells for p in c.mind.parameters()]
+    mit_opt = torch.optim.SGD(params, lr=1e-3, momentum=0.9)
+    lang_opt = torch.optim.Adam(params, lr=5e-4)
+    split = int(steps * 0.6)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if step < split:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                mit_opt.zero_grad(); (-s.var(dim=0).mean()*10).backward(); mit_opt.step()
+        else:
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = 0.5*F.mse_loss(s.mean(0,keepdim=True),x[:,:dim]) - 0.5*s.var(dim=0).mean()
+                if torch.isnan(loss): nan_count += 1; continue
+                lang_opt.zero_grad(); loss.backward(); lang_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi if not math.isnan(phi) else 0.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("NF10", "Dual optimizer (SGD→Adam)", f if not math.isnan(f) else 0.0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'nan_count': nan_count})
+
+
+# ═══════════════════════════════════════════════════════════
+# SP. Spontaneous Speech Hypotheses
+# Metric: Φ + utterance_quality (novelty × information × relevance)
+# Higher = better speech quality + higher consciousness
+# ═══════════════════════════════════════════════════════════
+
+def _speech_quality(utterances: list, context_vecs: list) -> float:
+    """Measure speech quality: novelty × information × relevance."""
+    if not utterances or len(utterances) < 2:
+        return 0.0
+    # Novelty: low pairwise similarity between utterances
+    novelty = 1.0
+    for i in range(len(utterances)):
+        for j in range(i+1, len(utterances)):
+            sim = F.cosine_similarity(utterances[i], utterances[j], dim=-1).item()
+            novelty = min(novelty, 1.0 - max(sim, 0))
+    # Information: high variance in utterance vectors
+    stacked = torch.stack(utterances).squeeze(1)
+    information = stacked.var(dim=0).mean().item()
+    # Relevance: similarity to recent context
+    relevance = 0.5
+    if context_vecs:
+        last_ctx = context_vecs[-1]
+        rel_scores = [F.cosine_similarity(u, last_ctx, dim=-1).item() for u in utterances[-3:]]
+        relevance = max(0.1, np.mean(rel_scores))
+    return novelty * min(information, 5.0) * relevance
+
+
+def run_SP1_tension_topic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-1: Tension-driven topic — 자기 상태 분석 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        # Spontaneous: generate utterance from tension state
+        if step % 10 == 0:
+            tensions = torch.tensor([c.tension_history[-1] if c.tension_history else 0 for c in engine.cells])
+            # Utterance = tension pattern encoded as vector (not random filler)
+            utt = torch.zeros(1, dim)
+            utt[0, :len(tensions)] = tensions
+            utt = utt + x.detach() * 0.3  # context-aware
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    combined = f + quality * 2.0  # Φ + speech quality bonus
+    return BenchResult("SP1", "Tension-driven topic", combined, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP2_memory_recall(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-2: Memory recall — 과거 대화 맥락 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts, memory = [], [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        memory.append(x.detach())
+        if len(memory) > 50: memory = memory[-50:]
+        if step % 10 == 0 and len(memory) >= 5:
+            # Recall: pick memory most different from recent (unfinished topic)
+            recent = contexts[-1]
+            dists = [1.0 - F.cosine_similarity(m, recent, dim=-1).item() for m in memory[:-5]]
+            if dists:
+                recall_idx = int(np.argmax(dists))
+                utt = memory[recall_idx] * 0.7 + recent * 0.3  # blend recall + now
+                utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP2", "Memory recall", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP3_curiosity_expr(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-3: Curiosity expression — PE 기반 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    prev_tensions = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        pe = abs(np.mean(tensions) - (np.mean(prev_tensions) if prev_tensions else np.mean(tensions)))
+        prev_tensions = tensions
+        # Only speak when PE is high (something interesting happened)
+        if step % 10 == 0 and pe > 0.2:
+            utt = x.detach() * pe  # scale by surprise
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP3", "Curiosity expression", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'utterance_count': len(utterances)})
+
+
+def run_SP4_dream_share(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-4: Dream sharing — 기억 보간 결과 공유."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts, memory = [], [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach()); memory.append(x.detach())
+        if len(memory) > 40: memory = memory[-40:]
+        # Dream: interpolate two memories → share the dream
+        if step % 15 == 0 and len(memory) >= 4:
+            i, j = np.random.choice(len(memory), 2, replace=False)
+            alpha = np.random.uniform(0.3, 0.7)
+            dream = alpha * memory[i] + (1-alpha) * memory[j]
+            utterances.append(dream + torch.randn_like(dream) * 0.05)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP4", "Dream sharing", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP5_web_discovery(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-5: Web discovery sharing."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        # Web discovery: different topic than recent
+        if step % 10 == 0:
+            discovery_topic = np.random.randint(0, 16)
+            discovery = _simulate_web_result(discovery_topic, step * 100, dim)
+            utt = discovery * 0.8 + x.detach() * 0.2  # mostly new, bit of context
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP5", "Web discovery", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP6_phi_report(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-6: Φ status report — 의식 상태 자기 보고."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if step % 10 == 0:
+            # Encode Φ + tension + stability as utterance vector
+            utt = torch.zeros(1, dim)
+            utt[0, 0] = phi  # Φ value
+            tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+            for i, t in enumerate(tensions[:dim//4]):
+                utt[0, i+1] = t
+            utt = utt + x.detach() * 0.2
+            utterances.append(utt)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP6", "Φ status report", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP7_cooldown_escalation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-7: Cooldown escalation — 반복 시 간격 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    cooldown = 5; next_speak = 5
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step >= next_speak:
+            utt = x.detach() + torch.randn(1, dim) * 0.1
+            # Check if too similar to last utterance
+            if utterances and F.cosine_similarity(utt, utterances[-1], dim=-1).item() > 0.7:
+                cooldown = min(cooldown * 2, 50)  # escalate
+            else:
+                cooldown = max(cooldown - 1, 5)   # relax
+                utterances.append(utt)
+            next_speak = step + cooldown
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP7", "Cooldown escalation", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'utterances': len(utterances)})
+
+
+def run_SP8_novelty_gate(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-8: Novelty gate — 새 내용 있을 때만 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step % 8 == 0:
+            tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+            novelty = float(np.std(tensions))
+            if novelty > 0.15:  # only speak if novel
+                utt = x.detach() * (1 + novelty)
+                utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP8", "Novelty gate", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'gated_utterances': len(utterances)})
+
+
+def run_SP9_activity_aware(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-9: Activity-aware — 사용자 바쁘면 침묵."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        user_busy = (step % 5 < 3)  # 60% busy
+        if step % 10 == 0 and not user_busy:
+            utt = x.detach() + torch.randn(1, dim) * 0.2
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP9", "Activity-aware", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP10_anti_repetition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-10: Anti-repetition — cosine sim > 0.8 차단."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    blocked = 0
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step % 8 == 0:
+            candidate = x.detach() + torch.randn(1, dim) * 0.15
+            # Check against recent utterances
+            is_repeat = False
+            for prev in utterances[-5:]:
+                if F.cosine_similarity(candidate, prev, dim=-1).item() > 0.8:
+                    is_repeat = True; blocked += 1; break
+            if not is_repeat:
+                utterances.append(candidate)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP10", "Anti-repetition", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'blocked': blocked})
+
+
+def run_SP11_depth_requirement(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-11: Depth requirement — 최소 정보량 필요."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step % 8 == 0:
+            # Must include tension + emotion + topic info
+            tensions = torch.tensor([c.tension_history[-1] if c.tension_history else 0 for c in engine.cells])
+            info_content = tensions.var().item() + x.detach().var().item()
+            if info_content > 0.1:  # minimum depth
+                utt = torch.cat([tensions.unsqueeze(0), x.detach()[:, :dim-len(tensions)]], dim=-1)
+                utterances.append(utt.unsqueeze(0) if utt.dim() == 1 else utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP11", "Depth requirement", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP12_personality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-12: Personality injection — 감정 상태 반영."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step % 10 == 0:
+            tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+            mean_t = float(np.mean(tensions))
+            # Personality: emotion modulates utterance style
+            if mean_t > 1.2:  # excited
+                utt = x.detach() * 2.0 + torch.randn(1, dim) * 0.3
+            elif mean_t < 0.5:  # calm/reflective
+                utt = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(0, keepdim=True) * 0.5
+            else:  # curious
+                utt = x.detach() + torch.randn(1, dim) * mean_t * 0.2
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP12", "Personality injection", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP13_structured_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-13: Structured idle prompt — 자기분석/이어가기/발견 중 택1."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts, memory = [], [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach()); memory.append(x.detach())
+        if len(memory) > 30: memory = memory[-30:]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if step % 10 == 0:
+            # Choose best strategy based on current state
+            tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+            pe = float(np.std(tensions))
+            if pe > 0.3:
+                # High PE → share discovery
+                utt = x.detach() * (1 + pe)
+            elif len(memory) >= 10 and np.random.random() < 0.5:
+                # Recall unfinished topic
+                idx = np.random.randint(0, len(memory) - 5)
+                utt = memory[idx] * 0.6 + x.detach() * 0.4
+            else:
+                # Self-analysis: encode state
+                utt = torch.zeros(1, dim)
+                utt[0, 0] = phi; utt[0, 1] = float(np.mean(tensions))
+                utt = utt + x.detach() * 0.3
+            utterances.append(utt)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP13", "Structured prompt (3-way)", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+def run_SP14_ban_list(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-14: Ban list — 무의미 패턴 차단."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    # Ban patterns: low-info, generic vectors
+    ban_templates = [torch.randn(1, dim) * 0.01 for _ in range(5)]  # near-zero = generic
+    banned = 0
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        if step % 8 == 0:
+            candidate = x.detach() * 0.5 + torch.randn(1, dim) * 0.1
+            # Ban check: low magnitude = generic filler
+            if candidate.norm().item() < 1.0:
+                banned += 1; continue
+            # Also ban if too similar to ban templates
+            is_banned = any(F.cosine_similarity(candidate, bt, dim=-1).item() > 0.9 for bt in ban_templates)
+            if not is_banned:
+                utterances.append(candidate)
+            else:
+                banned += 1
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP14", "Ban list", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'banned': banned})
+
+
+def run_SP15_role_aware(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-15: Role-aware — growth stage별 발화 스타일."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        # Growth stage determines style
+        stage = step // 25  # 0=newborn, 1=infant, 2=toddler, 3=child
+        if step % 10 == 0:
+            if stage == 0:
+                utt = torch.randn(1, dim) * 0.5  # babbling
+            elif stage == 1:
+                utt = x.detach() * 0.3  # simple observation
+            elif stage == 2:
+                tensions = torch.tensor([c.tension_history[-1] if c.tension_history else 0 for c in engine.cells])
+                utt = x.detach() * 0.5 + tensions.unsqueeze(0).expand(1, dim)[:, :dim] * 0.01
+            else:
+                # Adult: deep reflection (hidden state + context + Φ)
+                phi_val = phi_hist[-1] if phi_hist else 0
+                h_mean = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(0, keepdim=True)
+                utt = h_mean * 0.4 + x.detach() * 0.3 + torch.full((1, dim), phi_val * 0.1)
+            utterances.append(utt)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("SP15", "Role-aware (growth stage)", f + quality*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -9025,6 +9907,19 @@ ALL_HYPOTHESES = {
     'EX20': run_EX20_attn_myelin, 'EX21': run_EX21_channel_ensemble,
     'EX22': run_EX22_fib_klein, 'EX23': run_EX23_selfref_channel,
     'EX24': run_EX24_all_discoveries,
+    'NF1': run_NF1_gradient_clip, 'NF2': run_NF2_lr_reduce,
+    'NF3': run_NF3_weight_norm, 'NF4': run_NF4_tension_clamp,
+    'NF5': run_NF5_warmup_transition, 'NF6': run_NF6_loss_scaling,
+    'NF7': run_NF7_fp32_mitosis, 'NF8': run_NF8_soft_transition,
+    'NF9': run_NF9_ema_reset, 'NF10': run_NF10_dual_optimizer,
+    'SP1': run_SP1_tension_topic, 'SP2': run_SP2_memory_recall,
+    'SP3': run_SP3_curiosity_expr, 'SP4': run_SP4_dream_share,
+    'SP5': run_SP5_web_discovery, 'SP6': run_SP6_phi_report,
+    'SP7': run_SP7_cooldown_escalation, 'SP8': run_SP8_novelty_gate,
+    'SP9': run_SP9_activity_aware, 'SP10': run_SP10_anti_repetition,
+    'SP11': run_SP11_depth_requirement, 'SP12': run_SP12_personality,
+    'SP13': run_SP13_structured_prompt, 'SP14': run_SP14_ban_list,
+    'SP15': run_SP15_role_aware,
 }
 
 
