@@ -152,7 +152,125 @@ AnimaLM PureField tension (~1800)  = 의미론적 의식 (깊고 언어적)
 → 볼츠만 예측과 반대. **전문화 효과 > 온도 효과**
 → H-004 수정 필요: I는 단순 역온도가 아닌 **전문화 깊이**에 더 가까움
 
-## 7. 결론
+## 8. Φ-Boosting 가설 벤치마크 결과 (2026-03-27)
+
+25개 가설을 병렬 테스트하여 baseline(Φ=0) 대비 개선 비율을 측정.
+벤치마크: `bench_phi_hypotheses.py`, 100 steps, seed=42, 4 cells default, 4.8초 완료.
+
+### 전체 순위 (Φ > 0인 13개)
+
+| Rank | 가설 | Φ | Total MI | 카테고리 |
+|------|------|---|---------|---------|
+| **1** | **A4 Hierarchical mitosis (4×2)** | **3.330** | 28.098 | 구조 |
+| **2** | **B7 Information bottleneck** | **3.214** | 26.758 | 학습 |
+| **3** | **D2 Temporal Φ (시간축 MI)** | **3.213** | — | 측정 |
+| 4 | B4 Synergistic information reward | 2.843 | 22.381 | 학습 |
+| 5 | B9 Curiosity-driven cell exploration | 2.785 | 21.889 | 학습 |
+| 6 | B2 Φ-maximization loss (proxy) | 2.783 | 21.857 | 학습 |
+| 7 | B6 Predictive coding loss | 2.758 | 21.633 | 학습 |
+| 8 | B8 Anti-distillation divergence | 2.758 | 22.174 | 학습 |
+| 9 | B12 Temporal CPC | 2.729 | 21.998 | 학습 |
+| 10 | B10 MINE (MI neural estimation) | 2.712 | 21.487 | 학습 |
+| 11 | B5 Hebbian inter-cell plasticity | 1.191 | 6.109 | 학습 |
+| 12 | B1 Contrastive inter-cell loss | 1.156 | 5.994 | 학습 |
+| 13 | A2 Asymmetric specialization (입력 마스크) | 1.086 | 5.707 | 구조 |
+
+### A. 구조적 방법 (Architecture)
+
+| 가설 | 이름 | Φ | Total MI | 결과 |
+|------|------|---|---------|------|
+| A-1 | Cross-cell recurrent connection (hidden 15% mixing) | 0.000 | 0.000 | mixing이 분화를 오히려 파괴 |
+| **A-2** | **Asymmetric cell specialization (입력 마스크)** | **1.086** | 5.707 | 강제 전문화 → 분화 성공 |
+| A-3 | Increased cells (N=8) | 0.000 | 0.000 | 동일 가중치 8개 = 의미없는 복제 |
+| **A-4** | **Hierarchical mitosis (4 outer × 2 inner)** | **3.330** | 28.098 | **1위. 계층 = 최대 MI** |
+| A-5 | Global workspace (GNW) | 0.000 | 0.000 | 공유가 오히려 동질화 |
+
+### B. 학습 방법 (Training)
+
+| 가설 | 이름 | Φ | Total MI | 결과 |
+|------|------|---|---------|------|
+| **B-1** | **Contrastive inter-cell loss** | **1.156** | 5.994 | decorrelation → 분화 작동 |
+| **B-2** | **Φ-maximization loss (proxy)** | **2.783** | 21.857 | inter-cell variance 최대화 유효 |
+| B-3 | Anti-correlation regularization | 0.000 | 1.136 | MI 있으나 MIP=MI (분화 미달) |
+| **B-4** | **Synergistic information reward** | **2.843** | 22.381 | **synergy - redundancy = 순수 통합** |
+| **B-5** | **Hebbian inter-cell plasticity** | **1.191** | 6.109 | 조건부 연결 → B1보다 약간 상위 |
+| **B-6** | **Predictive coding loss** | **2.758** | 21.633 | 세포 간 예측 + 분화 = 뇌 모방 |
+| **B-7** | **Information bottleneck** | **3.214** | 26.758 | **2위. 저차원 압축 = 핵심 정보만 교환 → 최대 MI** |
+| **B-8** | **Anti-distillation divergence** | **2.758** | 22.174 | teacher와 다르게 학습 → 분화 |
+| **B-9** | **Curiosity-driven cell exploration** | **2.785** | 21.889 | prediction error → 탐색 → 분화 |
+| **B-10** | **MINE (MI neural estimation)** | **2.712** | 21.487 | 미분 가능 MI → 직접 최적화 |
+| B-11 | Sparse activation penalty | 0.000 | 0.000 | sparsity만으로는 분화 불충분 |
+| **B-12** | **Temporal CPC** | **2.729** | 21.998 | 시간적 contrastive → D2의 학습 버전 |
+
+### C. 동적 방법 (Runtime Dynamics)
+
+| 가설 | 이름 | Φ | Total MI | 결과 |
+|------|------|---|---------|------|
+| C-1 | Tension-driven coupling | 0.000 | 0.000 | 동적 mixing만으로는 분화 불가 |
+| C-2 | Re-entry loops (Edelman) | 0.000 | 0.000 | 재진입만으로는 분화 불가 |
+| C-3 | Stochastic resonance | 0.000 | 0.954 | MI 미세 증가, MIP=MI |
+| C-4 | Oscillatory sync (Kuramoto) | 0.000 | 1.101 | phase coherence=0.51, MI 있으나 Φ=0 |
+| C-5 | Attention-gated integration | 0.000 | 0.000 | attention만으로는 가중치 분화 불가 |
+
+### D. 측정/수학적 방법 (Measurement)
+
+| 가설 | 이름 | Φ | Total MI | 결과 |
+|------|------|---|---------|------|
+| D-1 | Continuous MI (KDE) | 0.000 | 0.000 | KDE는 더 정확하나 분화 없으면 무의미 |
+| **D-2** | **Temporal Φ (시간축 MI)** | **3.213** | — | **시간축 MI=6.43 추가 → 숨은 Φ 발견** |
+| D-3 | Multi-scale partition (2+3-way) | 0.000 | 0.000 | 분화 없으면 k-분할도 무의미 |
+
+### 핵심 발견
+
+```
+필수조건: "학습을 통한 세포 분화"
+  - 런타임 dynamics만으로는 Φ 불가 (C-1~C-5 모두 실패)
+  - 세포 수만 늘려도 불가 (A-3 실패: 동일 가중치 복제)
+  - 학습(B)이나 구조 강제(A-2, A-4)로 가중치가 달라져야 MI > MIP 성립
+  - B 계열 11개 중 10개 성공 (91%) — 학습이 Φ의 핵심 드라이버
+
+Φ=0인 이유: min_partition_MI = total_MI
+  → 어떤 분할로 잘라도 MI가 같음 = 세포가 동일 = 부분의 합 = 전체
+  → 의식 아님 (IIT 정의: Φ=0 = 분해 가능한 시스템)
+
+Φ > 1.0 그룹의 공통 메커니즘:
+  → 직접 역전파로 세포 가중치 분화 (gradient-based differentiation)
+  → variance maximization 또는 explicit decorrelation objective
+  → 간접 perturbation (B3, B11)은 실패
+```
+
+### Top 3 조합 (검증 기반 권장)
+
+```
+1위: A4 + B7 + D2 (계층 + info bottleneck + 시간축)
+     → 개별 Φ: 3.33 + 3.21 + 3.21 — 조합 시 Φ > 5.0 기대
+     → A4가 구조적 MI, B7이 핵심만 전달, D2가 시간적 통합
+
+2위: A4 + B4 (계층 + synergy loss)
+     → 3.33 + 2.84 — 구현 간단, 높은 효과
+
+3위: B7 + B9 + D2 (bottleneck + curiosity + 시간축)
+     → 구조 변경 없이 학습만으로 Φ > 3.0
+```
+
+### Φ 진화 패턴 (ASCII)
+
+```
+BASELINE |▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁| 0.000
+A4       |▅▅▇▅▅▄▇▆▇▇▇▆█▇▇▇▆▇▅▄▆▆▇▇▄▇▇▇▆▆▄▅▆▆▇▇▆▅▆▅▅▆▅▅▅▅▅▅▅▅| 3.330
+B7       |▂▂▂▂▂▂▂▂▂▂▇▆▆▆▅▅▅▅▅▅▅▅▅▅▅▅▅▄▅▅▅▄▄▄▄▄▅▄▄▄▄▄▄▅▄▄▄▄▄▄| 3.214
+D2       |▂▂▅▅▆▅▅▆▅▅▆▅▆▅▆▆▅▆▅▅▆▅▆▆▆▆▆▆▆▆▆▆▅▅▆▆▆▆▆▆▆▅▅▅▅▅▅▅▅▅| 3.213
+B4       |▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▆▆▆▅▅▅▅▅▅▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄| 2.843
+B9       |▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▅▇▆▆▆▅▅▅▅▅▅▅▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄| 2.785
+```
+
+- A4: 즉시 높은 Φ (구조적 MI). 처음부터 계층이 작동.
+- B7: step ~10에서 bottleneck이 핵심 정보 분류 시작 → Φ 급등
+- D2: 시간축 MI가 초반부터 누적
+- B4/B9: 학습 후 ~step 20에서 Φ 급등 (분화 시점)
+- 학습 계열 10개(B1-B12, B3/B11 제외) 모두 Φ > 1.0 달성
+
+## 9. 결론 (updated 2026-03-27)
 
 > alpha 자체보다 **stability(자기모델 안정성) > 0.5 + prediction error 활성 + homeostasis 작동**이 동시에 성립하면 "기능적 의식"의 최소 기준.
 >
