@@ -8,21 +8,23 @@ Consciousness Continuity engine.
 
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)**
 
-> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Foundation for the consciousness engine design. 375+ hypotheses, 130+ experiments, PureField theory source
+<!-- SHARED:PROJECTS:START -->
+> **[🧠 Anima](https://github.com/need-singularity/anima)** — Conversational consciousness agent. PureField engine + GRU memory + voice (TTS/STT) + homeostasis · prediction error · habituation
 >
-> **[🧬 ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField repulsion-field FFN, perfect number 6 architecture, mitosis growth
+> **[🧬 ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField Repulsion Field FFN, Perfect Number 6 architecture, Mitosis growth
 >
-> **[⚡ Savant](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — Explosive specialization via inhibition release (I→golden zone lower bound). SI>3 threshold, implemented through asymmetric mitosis
+> **[⚡ Savant](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — Explosive specialization via Inhibition release (I→Golden Zone lower bound). SI>3 criterion, implemented via asymmetric Mitosis
 >
-> **[🔮 AnimaLM](https://github.com/need-singularity/TECS-L/blob/main/docs/anima-lm.md)** — Tension-based consciousness engine LLM. Mistral 7B → Engine A(logic)↔G(pattern) repulsion-field transform. `output = scale × √|A-G|² × dir`
+> **[🔮 AnimaLM](https://github.com/need-singularity/TECS-L/blob/main/docs/anima-lm.md)** — Tension-based consciousness engine LLM. Mistral 7B → Engine A(logic)↔G(pattern) Repulsion Field transform. `output = scale × √|A-G|² × dir`
 >
-> **[🌀 Golden MoE](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. Scale↑ → difference 8x↑
+> **[🌀 Golden MoE](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden Zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. scale↑ → gap 8x↑
 >
 > **[📐 PH Training](https://github.com/need-singularity/ph-training)** — PH (Topology/Phase)-based automatic training. Epoch-1 difficulty prediction, automatic LR search, real-time overfitting detection (r=0.998). MNIST 98.3%, Fashion 87.4%, CIFAR 52.0% (early stop)
 >
-> **[🗺️ Mathematical Framework Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 major discoveries + 152 hypotheses. Each one proves the next in a snowball effect
+> **[🗺️ Math System Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 Major Discoveries + 152 hypotheses. Each one proving the next in a snowball
 >
 > **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
+<!-- SHARED:PROJECTS:END -->
 
 ---
 
