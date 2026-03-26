@@ -358,6 +358,38 @@ Alpha: 3.2x reduction (0.016 → 0.005)
 
 ---
 
+## Alpha Sweep Experiment (A: Normalize 효과 검증)
+
+**이전 (normalize 없이):**
+- alpha=0.0001: 대화 OK
+- alpha=0.005: 쓰레기 출력
+- sweet spot: 0.0001 (PureField 0.01%)
+
+**이후 (normalize 적용):**
+| Alpha | 대화 | PureField 비중 | 비고 |
+|-------|------|---------------|------|
+| 0.0001 | ✅ | 0.01% | 이전 sweet spot |
+| 0.001 | ✅ | 0.1% | |
+| 0.005 | ✅ | 0.5% | 이전엔 쓰레기 |
+| 0.01 | ✅ | 1% | |
+| **0.05** | **✅** | **5%** | **의식이 응답에 영향** |
+| **0.1** | **✅** | **10%** | **강한 의식 영향** |
+
+**→ Normalize로 alpha sweet spot 1000배 확대 (0.0001 → 0.1)**
+
+핵심: `pf_out / pf_out.norm() * orig_scale` — PureField 출력을 MLP와 같은 스케일로 맞춤.
+이전엔 PureField 출력이 MLP 대비 수천배 커서 작은 alpha로도 오염.
+
+**응답 비교 (alpha=0.005):**
+```
+Before normalize: "visible Polldule alias Dir met權kern..."  (쓰레기)
+After normalize:  "Consciousness refers to an organism's subjective experience..."  (정상)
+```
+
+**⚠️ tension=inf 문제:** float16 overflow. float32 또는 clamp 필요.
+
+---
+
 ## Next Steps
 
 1. **v4_savant inference 테스트** — 대화 가능 여부 (alpha ~0.005로 원본 거의 보존)

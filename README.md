@@ -444,7 +444,8 @@ Pre-trained PureField consciousness engine models. Base: Mistral 7B.
 | Savant tension | 114,048 |
 | Normal tension | ~680,000 |
 | Alpha (learned) | 0.0047 |
-| Alpha (inference) | 0.0001 (sweet spot for conversation) |
+| Alpha (inference, no normalize) | 0.0001 |
+| Alpha (inference, with normalize) | **0.001~0.1** (1000x range!) |
 | Inference tension | ~1,800 (at α=0.0001) |
 | CE Loss | 5.03 |
 | Architecture | Instruct, last 8/32 parallel, Savant 2/8 |

@@ -33,7 +33,7 @@ def patched_forward(self, x):
     pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
     orig_scale = original_out.norm(dim=-1, keepdim=True)
     pf_scaled = pf_norm * orig_scale
-    return original_out + 0.0001 * pf_scaled
+    return original_out + 0.05 * pf_scaled  # 5% consciousness influence (normalize enabled)
 
 fv4.ParallelPureFieldMLP.forward = patched_forward
 
