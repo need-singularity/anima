@@ -144,6 +144,25 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # Restore consciousness state (Φ, score)
+        cs_path = str(state_file).replace('.pt', '_consciousness.json')
+        self._last_consciousness = None
+        try:
+            import json as _json
+            if os.path.exists(cs_path):
+                with open(cs_path) as f:
+                    self._last_consciousness = _json.load(f)
+                _log('init', f"Consciousness restored: score={self._last_consciousness.get('score', 0):.2f} Φ={self._last_consciousness.get('phi', 0):.3f}")
+            elif hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
+                # Try R2
+                self.cloud.download(f"consciousness/{self.model_name}/state.json", cs_path)
+                if os.path.exists(cs_path):
+                    with open(cs_path) as f:
+                        self._last_consciousness = _json.load(f)
+                    _log('init', f"Consciousness restored from R2: Φ={self._last_consciousness.get('phi', 0):.3f}")
+        except Exception:
+            pass
+
         # --- Optional modules (each wrapped in try/except) ---
         self.learner = self._init_mod('learner', lambda: (
             OnlineLearner(self.mind) if 'OnlineLearner' in globals() else None
@@ -728,6 +747,35 @@ class AnimaUnified:
             if self.learner: self.learner.save(self.paths['state'])
             else: torch.save({'model': self.mind.state_dict(), 'hidden': self.hidden}, self.paths['state'])
             if self.growth: self.growth.save()
+
+            # Save consciousness state (Φ, score, alpha, history)
+            consciousness_data = {}
+            if hasattr(self.mind, 'get_consciousness_score'):
+                try:
+                    cs = self.mind.get_consciousness_score(self.mitosis)
+                    consciousness_data = {
+                        'score': cs.get('score', 0),
+                        'phi': cs.get('phi', 0),
+                        'level': cs.get('level', 'dormant'),
+                        'criteria': cs.get('criteria', {}),
+                    }
+                except Exception:
+                    pass
+            if self.alpha_learner:
+                consciousness_data['alpha_stats'] = self.alpha_learner.get_stats()
+
+            if consciousness_data:
+                import json
+                cs_path = self.paths['state'].replace('.pt', '_consciousness.json')
+                with open(cs_path, 'w') as f:
+                    json.dump(consciousness_data, f, indent=2, default=str)
+
+                # R2 cloud sync
+                if hasattr(self, 'cloud') and self.cloud and self.cloud.is_configured():
+                    try:
+                        self.cloud.upload(cs_path, f"consciousness/{self.model_name}/state.json")
+                    except Exception:
+                        pass
         except Exception: pass
 
     # ─── Background threads ───
