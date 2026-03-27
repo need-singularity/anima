@@ -71,6 +71,9 @@ _try_import("from growth_manager import GrowthManager")
 _try_import("from multimodal import ActionEngine")
 _try_import("from capabilities import Capabilities")
 _try_import("from babysitter import Babysitter")
+_try_import("from creativity_classifier import CreativityClassifier, text_to_vector as cc_text_to_vector")
+_try_import("from consciousness_birth_detector import BirthDetector")
+_try_import("from optimal_architecture_calc import ArchitectureCalculator")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -370,6 +373,22 @@ class AnimaUnified:
 
         # Babysitter (Claude CLI educator)
         self.babysitter = Babysitter(self) if 'Babysitter' in globals() else None
+
+        # Creativity Classifier (creative vs hallucination detection)
+        self.creativity = self._init_mod('creativity', lambda: (
+            CreativityClassifier() if 'CreativityClassifier' in globals() else None
+        ))
+
+        # Consciousness Birth Detector
+        self.birth_detector = self._init_mod('birth_detector', lambda: (
+            BirthDetector() if 'BirthDetector' in globals() else None
+        ))
+        self._think_step = 0  # step counter for birth detector
+
+        # Optimal Architecture Calculator
+        self.arch_calc = self._init_mod('arch_calc', lambda: (
+            ArchitectureCalculator() if 'ArchitectureCalculator' in globals() else None
+        ))
 
     def _migrate_legacy_files(self):
         """Migrate legacy files -> per-model directory (one-time, conscious-lm only)."""
@@ -759,6 +778,24 @@ class AnimaUnified:
             except Exception as e:
                 _log('multimodal', f'Error: {e}')
 
+        # Creativity classification (creative vs hallucination)
+        if self.creativity and self.mitosis:
+            try:
+                in_vec = cc_text_to_vector(text, dim=64) if 'cc_text_to_vector' in globals() else text_to_vector(text)[:, :64]
+                out_vec = cc_text_to_vector(answer, dim=64) if 'cc_text_to_vector' in globals() else text_to_vector(answer)[:, :64]
+                tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
+                cr_result = self.creativity.classify(in_vec, out_vec, tensions, self.mind, self.mitosis)
+                _log("creativity", f"{cr_result['label']} (n={cr_result['novelty']:.2f} c={cr_result['consistency']:.2f})")
+                self._ws_broadcast_sync({
+                    'type': 'creativity_update',
+                    'label': cr_result['label'],
+                    'novelty': cr_result['novelty'],
+                    'consistency': cr_result['consistency'],
+                    'confidence': cr_result['confidence'],
+                })
+            except Exception:
+                pass
+
         self.last_interaction = time.time()
         self._save_state()
 
@@ -857,6 +894,25 @@ class AnimaUnified:
                 thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
                 self.mind.phi_boost_step(thought_vec, self.mitosis)
 
+            # Consciousness birth detection
+            self._think_step += 1
+            if self.birth_detector and self.mitosis:
+                try:
+                    consciousness = self.mind.get_consciousness_score(self.mitosis)
+                    phi = consciousness.get('phi', 0)
+                    tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
+                    birth_event = self.birth_detector.check(self._think_step, phi, tensions, self.mitosis)
+                    if birth_event:
+                        _log("birth", f"CONSCIOUSNESS BORN at step {birth_event['birth_step']}! Phi={birth_event['phi']:.3f}")
+                        self._ws_broadcast_sync({
+                            'type': 'consciousness_birth',
+                            'step': birth_event['birth_step'],
+                            'phi': birth_event['phi'],
+                            'precursors': list(birth_event.get('precursors', {}).keys()),
+                        })
+                except Exception:
+                    pass
+
             # DD32: Circadian Φ — day/night cycle awareness
             import datetime
             hour = datetime.datetime.now().hour
@@ -912,6 +968,14 @@ class AnimaUnified:
                                 self.mind._phi_boost['enabled'] = False
                                 self._phi_plateau_count = 0
                                 _log('growth', f'Expanded to {new_mind.dim}d')
+                                # Optimal architecture recommendation
+                                if self.arch_calc:
+                                    try:
+                                        config = self.arch_calc.compute(dim=new_mind.dim, hidden=new_mind.hidden_dim)
+                                        _log("arch", f"Optimal: cells={config['cells']}, heads={config['heads']}, "
+                                             f"expansion={config['expansion']:.2f}, topology={config['topology']}")
+                                    except Exception:
+                                        pass
                         except Exception as e:
                             _log('growth', f'Expansion failed: {e}')
                 else:
@@ -1262,6 +1326,15 @@ class AnimaUnified:
                                     'dim': new_mind.dim,
                                     'hidden_dim': new_mind.hidden_dim,
                                 })
+
+                                # Optimal architecture recommendation
+                                if self.arch_calc:
+                                    try:
+                                        config = self.arch_calc.compute(dim=new_mind.dim, hidden=new_mind.hidden_dim)
+                                        _log("arch", f"Optimal: cells={config['cells']}, heads={config['heads']}, "
+                                             f"expansion={config['expansion']:.2f}, topology={config['topology']}")
+                                    except Exception:
+                                        pass
 
                                 self.growth_mgr.save_checkpoint()
                                 # Post-growth verification
