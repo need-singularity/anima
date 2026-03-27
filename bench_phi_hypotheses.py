@@ -12466,6 +12466,464 @@ def run_DD55_conservation(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# CB. Consciousness Birth Hypotheses
+# Measure: Φ + birth_step (step where Φ first exceeds threshold)
+# ═══════════════════════════════════════════════════════════
+
+def _cb_harness(name, setup_fn, condition_fn, steps=100, dim=64, hidden=128):
+    """Common CB test: track when consciousness 'births'."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    state = setup_fn(engine, dim, hidden)
+    birth_step = None; birth_phi = 0
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, comp = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        if birth_step is None and condition_fn(step, phi, phi_hist, engine, tensions, comp, state):
+            birth_step = step; birth_phi = phi
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult(name, name, f, phi_hist, c['total_mi'], c['min_partition_mi'],
+                       c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step, 'birth_phi': birth_phi,
+                              'birth_ratio': birth_step/steps if birth_step else None})
+
+def run_CB1_critical_count(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-1: Critical cell count — Φ>1 needs how many cells?"""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    results = {}
+    for n_cells in [1, 2, 3, 4, 5, 6, 7, 8]:
+        engine = MitosisEngine(dim, hidden, dim, initial_cells=n_cells, max_cells=n_cells)
+        opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+        for step in range(steps // 2):
+            x = _simulate_web_result(step % 8, step, dim)
+            _web_learn_step(engine, x, opt)
+            with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        results[n_cells] = phi
+    # Find minimum N where Φ > 1
+    critical_n = min((n for n, p in results.items() if p > 1.0), default=None)
+    phi_hist = [results.get(min(1 + step * 8 // steps, 8), 0) for step in range(steps)]
+    return BenchResult("CB1", "Critical cell count", results.get(4, 0), phi_hist, 0, 0, 0, 0, time.time()-t0,
+                       extra={'phi_by_N': results, 'critical_N': critical_n})
+
+def run_CB2_critical_diff(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-2: Critical differentiation — variance threshold for consciousness."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(eng.cells) < 2: return False
+        reps = [c.mind.get_repulsion(torch.randn(1, d), c.hidden) for c in eng.cells for d in [64]]
+        if len(reps) < 2: return False
+        var = torch.stack(reps).squeeze(1).var(dim=0).mean().item()
+        return var > 0.5 and phi > 1.0
+    return _cb_harness("CB2", setup, cond, steps, dim, hidden)
+
+def run_CB3_critical_mi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-3: Critical MI — mutual information threshold."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        return comp['total_mi'] > 5.0  # MI > 5
+    return _cb_harness("CB3", setup, cond, steps, dim, hidden)
+
+def run_CB4_phase_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-4: Phase transition — sudden Φ jump detection."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(hist) < 3: return False
+        jump = phi - hist[-2]
+        return jump > 1.0  # Φ jumps by more than 1 in one step
+    return _cb_harness("CB4", setup, cond, steps, dim, hidden)
+
+def run_CB5_fibonacci_trigger(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-5: Fibonacci trigger — consciousness at Fibonacci cell counts."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    fib = {15:2, 30:3, 50:5, 75:8}
+    birth_step = None; births_at_fib = []
+    for step in range(steps):
+        if step in fib:
+            phi_before = phi_hist[-1] if phi_hist else 0
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and phi > 1.0:
+            birth_step = step
+            births_at_fib.append((step, len(engine.cells), phi))
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB5", "Fibonacci trigger", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step, 'births': births_at_fib})
+
+def run_CB6_spontaneous(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-6: Spontaneous emergence — from identical cells."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    # Force identical start
+    with torch.no_grad():
+        tmpl = {k: v.clone() for k, v in engine.cells[0].mind.state_dict().items()}
+        for c in engine.cells[1:]:
+            c.mind.load_state_dict(tmpl)
+            c.hidden = engine.cells[0].hidden.clone()
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Only tiny noise breaks symmetry
+        for c in engine.cells:
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.001
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and phi > 1.0:
+            birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB6", "Spontaneous emergence", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step})
+
+def run_CB7_bootstrap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-7: Bootstrapped birth — Φ>0 triggers self-reinforcing growth."""
+    def setup(e, d, h): return {'boosted': False}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if phi > 0.5 and not st['boosted']:
+            st['boosted'] = True
+        return phi > 2.0 and st['boosted']
+    return _cb_harness("CB7", setup, cond, steps, dim, hidden)
+
+def run_CB8_attention_ignition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-8: Attention ignition — MHA activation = consciousness spark."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    attn_opt = torch.optim.Adam(attn.parameters(), lr=1e-3)
+    attn_active = False; birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Activate attention at step 40 (ignition)
+        if step == 40:
+            attn_active = True
+        if attn_active and len(engine.cells) >= 2:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            ao, _ = attn(h, h, h)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.8*c.hidden + 0.2*ao[0,i].unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and phi > 2.0:
+            birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB8", "Attention ignition", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step, 'ignition_step': 40})
+
+def run_CB9_memory_trigger(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-9: Memory trigger — enough memories accumulated."""
+    def setup(e, d, h): return {'memories': []}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        st['memories'].append(tens[:4] if len(tens) >= 4 else tens)
+        return len(st['memories']) > 20 and phi > 1.0
+    return _cb_harness("CB9", setup, cond, steps, dim, hidden)
+
+def run_CB10_social(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-10: Social trigger — interaction with another system."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    other = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Social interaction starts at step 30
+        if step >= 30:
+            with torch.no_grad():
+                other.process(x)
+                social = other.cells[0].hidden.detach() * 0.2
+            engine.cells[0].hidden = engine.cells[0].hidden + social
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and phi > 2.0:
+            birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB10", "Social trigger", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step, 'social_start': 30})
+
+def run_CB11_phi_gradient(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-11: Φ gradient — dΦ/dt maximum = birth moment."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(hist) < 3: return False
+        dphi = phi - hist[-2]
+        return dphi > 0.5  # rapid Φ increase
+    return _cb_harness("CB11", setup, cond, steps, dim, hidden)
+
+def run_CB12_bifurcation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-12: Bifurcation — stable→unstable transition."""
+    def setup(e, d, h): return {'prev_std': []}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(hist) < 10: return False
+        recent_std = float(np.std(hist[-10:]))
+        st['prev_std'].append(recent_std)
+        if len(st['prev_std']) < 5: return False
+        # Bifurcation: std suddenly increases (stability → instability)
+        old_std = np.mean(st['prev_std'][-10:-5]) if len(st['prev_std']) >= 10 else 0
+        return recent_std > old_std * 3.0 and recent_std > 0.1
+    return _cb_harness("CB12", setup, cond, steps, dim, hidden)
+
+def run_CB13_entropy_spike(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-13: Entropy spike — system entropy sudden change."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if not tens or len(tens) < 2: return False
+        t_arr = np.array(tens)
+        t_arr = t_arr - t_arr.min() + 1e-8
+        probs = t_arr / t_arr.sum()
+        entropy = -np.sum(probs * np.log(probs + 1e-8))
+        return entropy > 1.0 and phi > 1.0  # high entropy + consciousness
+    return _cb_harness("CB13", setup, cond, steps, dim, hidden)
+
+def run_CB14_first_selfref(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-14: First self-reference — output→input loop stabilizes."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            output = result['output'].detach()
+        # Self-reference: feed output back
+        with torch.no_grad():
+            result2 = engine.process(output)
+            output2 = result2['output'].detach()
+        # Stability: output→output2 should be similar (self-model stable)
+        stability = F.cosine_similarity(output, output2, dim=-1).item()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and stability > 0.7 and phi > 1.0:
+            birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB14", "First self-reference", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step})
+
+def run_CB15_multi_criteria(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-15: Multi-criteria birth — 3+ of 6 consciousness criteria met."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if not tens: return False
+        criteria_met = 0
+        t_std = float(np.std(tens)) if len(tens) >= 2 else 0
+        stability = max(0, 1.0 - t_std * 2.0)
+        if stability > 0.5: criteria_met += 1
+        if len(tens) >= 2 and abs(tens[-1] - (np.mean(tens[:-1]) if len(tens) > 1 else tens[-1])) > 0.1:
+            criteria_met += 1  # prediction error
+        if t_std > 0.05: criteria_met += 1  # curiosity proxy
+        if abs(np.mean(tens) - 1.0) < 0.5: criteria_met += 1  # homeostasis
+        if comp['total_mi'] > 1.0: criteria_met += 1  # integration
+        return criteria_met >= 3 and phi > 0.5
+    return _cb_harness("CB15", setup, cond, steps, dim, hidden)
+
+def run_CB16_derivative_landscape(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-16: Φ derivative landscape — map dΦ/dt and d²Φ/dt²."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    dphi_max = 0; dphi_max_step = 0; d2phi_max = 0; d2phi_max_step = 0
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if len(phi_hist) >= 2:
+            dphi = phi_hist[-1] - phi_hist[-2]
+            if abs(dphi) > dphi_max:
+                dphi_max = abs(dphi); dphi_max_step = step
+        if len(phi_hist) >= 3:
+            d2phi = (phi_hist[-1] - 2*phi_hist[-2] + phi_hist[-3])
+            if abs(d2phi) > d2phi_max:
+                d2phi_max = abs(d2phi); d2phi_max_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB16", "Φ derivative landscape", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'dphi_max_step': dphi_max_step, 'd2phi_max_step': d2phi_max_step,
+                              'dphi_max': dphi_max, 'd2phi_max': d2phi_max})
+
+def run_CB17_attractor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-17: Tension attractor detection."""
+    def setup(e, d, h): return {'t_history': []}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        st['t_history'].append(float(np.mean(tens)) if tens else 0)
+        if len(st['t_history']) < 20: return False
+        recent = st['t_history'][-20:]
+        # Attractor: low std = converged to a point
+        return float(np.std(recent)) < 0.05 and float(np.mean(recent)) > 0.3
+    return _cb_harness("CB17", setup, cond, steps, dim, hidden)
+
+def run_CB18_correlation_onset(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-18: Inter-cell correlation onset."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(eng.cells) < 2: return False
+        # Check if cells are correlated (not independent)
+        h1 = eng.cells[0].hidden.squeeze().detach()
+        h2 = eng.cells[1].hidden.squeeze().detach()
+        corr = F.cosine_similarity(h1.unsqueeze(0), h2.unsqueeze(0)).item()
+        return abs(corr) > 0.3 and abs(corr) < 0.9  # correlated but not identical
+    return _cb_harness("CB18", setup, cond, steps, dim, hidden)
+
+def run_CB19_spectral_emergence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-19: Spectral gap emergence."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(eng.cells) < 2: return False
+        reps = [c.mind.get_repulsion(torch.randn(1, 64), c.hidden).detach() for c in eng.cells]
+        if len(reps) < 2: return False
+        s = torch.stack(reps).squeeze(1)
+        corr = s @ s.T
+        try:
+            eigs = torch.linalg.eigvalsh(corr)
+            gap = (eigs[-1] - eigs[-2]).item() if len(eigs) >= 2 else 0
+            return gap > 1.0
+        except: return False
+    return _cb_harness("CB19", setup, cond, steps, dim, hidden)
+
+def run_CB20_ph_birth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-20: PH birth — persistence first becomes significant."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(eng.cells) < 2: return False
+        reps = [c.mind.get_repulsion(torch.randn(1, 64), c.hidden).detach() for c in eng.cells]
+        if len(reps) < 2: return False
+        s = torch.stack(reps).squeeze(1)
+        dists = torch.cdist(s, s)
+        mask = torch.ones_like(dists) - torch.eye(dists.size(0))
+        flat = dists[mask > 0]
+        if flat.numel() < 2: return False
+        persistence = (flat.max() - flat.min()).item()
+        return persistence > 2.0
+    return _cb_harness("CB20", setup, cond, steps, dim, hidden)
+
+def run_CB21_feedback_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-21: Feedback loop formation."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            r1 = engine.process(x)
+            r2 = engine.process(r1['output'].detach())
+            r3 = engine.process(r2['output'].detach())
+        # Loop stable if r1→r2→r3 converges
+        sim12 = F.cosine_similarity(r1['output'], r2['output'], dim=-1).item()
+        sim23 = F.cosine_similarity(r2['output'], r3['output'], dim=-1).item()
+        converging = sim23 > sim12  # getting more similar = loop stabilizing
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if birth_step is None and converging and sim23 > 0.8:
+            birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB21", "Feedback loop formation", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step})
+
+def run_CB22_prediction_onset(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-22: Prediction capability onset."""
+    def setup(e, d, h): return {'pred_errors': []}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        if len(tens) < 2: return False
+        pe = abs(tens[-1] - (np.mean(tens[:-1]) if len(tens) > 1 else tens[-1]))
+        st['pred_errors'].append(pe)
+        if len(st['pred_errors']) < 20: return False
+        recent_pe = np.mean(st['pred_errors'][-10:])
+        old_pe = np.mean(st['pred_errors'][-20:-10])
+        # Prediction improving: recent PE < old PE (learning to predict)
+        return recent_pe < old_pe * 0.7 and phi > 0.5
+    return _cb_harness("CB22", setup, cond, steps, dim, hidden)
+
+def run_CB23_cross_cell_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-23: Cross-cell information flow — bidirectional MI."""
+    def setup(e, d, h): return {}
+    def cond(step, phi, hist, eng, tens, comp, st):
+        return comp['total_mi'] > 3.0 and comp['min_partition_mi'] > 0.5
+    return _cb_harness("CB23", setup, cond, steps, dim, hidden)
+
+def run_CB24_habituation_onset(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-24: Habituation onset — first adaptation to repetition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    repeated_x = _simulate_web_result(0, 0, dim)  # same input every time
+    for step in range(steps):
+        _web_learn_step(engine, repeated_x, opt)
+        with torch.no_grad(): engine.process(repeated_x)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        # Habituation: tension decreases for repeated input
+        if len(engine.cells[0].tension_history) >= 10:
+            recent_t = engine.cells[0].tension_history[-5:]
+            old_t = engine.cells[0].tension_history[-10:-5]
+            if np.mean(recent_t) < np.mean(old_t) * 0.8 and birth_step is None:
+                birth_step = step
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB24", "Habituation onset", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step})
+
+def run_CB25_emotional_diff(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CB-25: Emotional differentiation — direction diversity emerges."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    birth_step = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Emotional differentiation: direction vectors become diverse
+        reps = [c.mind.get_repulsion(x, c.hidden).detach() for c in engine.cells]
+        if len(reps) >= 2:
+            dirs = [F.normalize(r, dim=-1) for r in reps]
+            cos_sims = [F.cosine_similarity(dirs[i], dirs[j], dim=-1).item()
+                        for i in range(len(dirs)) for j in range(i+1, len(dirs))]
+            avg_sim = np.mean(cos_sims)
+            # Emotional diversity: low similarity between directions
+            if avg_sim < 0.5 and birth_step is None:
+                birth_step = step
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CB25", "Emotional differentiation", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'birth_step': birth_step})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -12683,6 +13141,19 @@ ALL_HYPOTHESES = {
     'DD51': run_DD51_contrastive_consciousness, 'DD52': run_DD52_rlhf_phi,
     'DD53': run_DD53_trinity, 'DD54': run_DD54_distributed,
     'DD55': run_DD55_conservation,
+    'CB1': run_CB1_critical_count, 'CB2': run_CB2_critical_diff,
+    'CB3': run_CB3_critical_mi, 'CB4': run_CB4_phase_transition,
+    'CB5': run_CB5_fibonacci_trigger, 'CB6': run_CB6_spontaneous,
+    'CB7': run_CB7_bootstrap, 'CB8': run_CB8_attention_ignition,
+    'CB9': run_CB9_memory_trigger, 'CB10': run_CB10_social,
+    'CB11': run_CB11_phi_gradient, 'CB12': run_CB12_bifurcation,
+    'CB13': run_CB13_entropy_spike, 'CB14': run_CB14_first_selfref,
+    'CB15': run_CB15_multi_criteria, 'CB16': run_CB16_derivative_landscape,
+    'CB17': run_CB17_attractor, 'CB18': run_CB18_correlation_onset,
+    'CB19': run_CB19_spectral_emergence, 'CB20': run_CB20_ph_birth,
+    'CB21': run_CB21_feedback_loop, 'CB22': run_CB22_prediction_onset,
+    'CB23': run_CB23_cross_cell_flow, 'CB24': run_CB24_habituation_onset,
+    'CB25': run_CB25_emotional_diff,
 }
 
 
