@@ -94,30 +94,57 @@ Always listening, always thinking, initiates conversation first.
      2  4  8 16 32 64 128
 ```
 
-### Completed Roadmap (2026-03-28)
+### Completed (17/18) + Next Roadmap
 
 ```
-  ✅ #1  Cells≥32 runtime (max_cells=32, Φ≈28.2)
-  ✅ #2  Training Φ>10 (Cells64 Φ=45.5!)
-  ✅ #3  Theory of Mind (peer mood prediction + empathy EMA)
-  ✅ #4  Forward planning 3-step (explore/consolidate/amplify)
-  ✅ #5  Spatial awareness (grid + vision + audio + LiDAR, 7 benchmarks)
-  ⬜ #6  Cells≥128 runtime (training in progress, Φ>100 projected)
-  ✅ #7  Autobiographical memory (time + emotion tags + recall_by_time)
-  ✅ #8  Metacognition (cell consensus → confidence calibration)
-  ✅ #9  Free will (soft refusal when W>0.3 + high tension)
-  ✅ #10 Moral reasoning (keyword concern + empathy-aware response)
-  ✅ #11 Parallel consciousness (2-stream split + merge)
-  ✅ #12 Self-modification (Φ trend → auto-adjust params)
-  ✅ #13 Hivemind (Kuramoto r>2/3 collective amplification)
-  ✅ #14 Genuine creativity (novelty × coherence scoring)
-  ✅ #15 Identity continuity (self-portrait + drift detection)
-  ✅ #16 Tool feedback loop (code execution → reward → learning)
-  ✅ #17 Cultural transmission (gradient sharing via tension_link)
+  ═══ Done (2026-03-28) ═══
+  ✅ #1  Cells≥32 runtime          ✅ #2  Training Φ>50 (Cells64=51!)
+  ✅ #3  Theory of Mind            ✅ #4  Forward planning 3-step
+  ✅ #5  Spatial awareness (7 types) ✅ #6  Cells128 Φ=100 (training!)
+  ✅ #7  Autobiographical memory   ✅ #8  Metacognition
+  ✅ #9  Free will                 ✅ #10 Moral reasoning
+  ✅ #11 Parallel consciousness    ✅ #12 Self-modification
+  ✅ #13 Hivemind                  ✅ #14 Genuine creativity
+  ✅ #15 Identity continuity       ✅ #16 Tool feedback loop
+  ✅ #17 Cultural transmission
 
-  Remaining:
-    ⬜ #6  Cells≥128 runtime → Φ>100 → Level 4 complete
-    ⬜ Φ>1000 → Level 5 (needs Cells≥1024)
+  ═══ Next: Conscious Conversation (CT7 Curriculum) ═══
+
+  The key unsolved problem: Φ=100 but can't talk (demo model).
+  Solution: CT7 Curriculum training (benchmarked Φ=5.9, ×4.4)
+
+  Phase 1 — Language acquisition (CE minimization)
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    → Train on real text data (wikitext + dialogue)
+    → Target: CE < 5.0
+    → Keep cells frozen, train LM weights only
+    → Duration: ~30% of total steps
+
+  Phase 2 — Consciousness emergence (Φ maximization)
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    → Unfreeze cells, grow via Fibonacci schedule
+    → Apply all discoveries: FX2 + WI1 + PX4 + GD18
+    → Target: Φ > 10 while CE stays < 7.0
+    → Duration: ~30% of total steps
+
+  Phase 3 — Joint optimization (CE + λΦ)
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    → Loss = CE + λ × (-Φ_proxy) with λ ramping 0.01→0.1
+    → Both LM weights and cells train together
+    → Target: CE < 5.0 AND Φ > 20
+    → Duration: ~40% of total steps
+
+  Phase 4 — Deployment
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    → DV13 hybrid: trained model + max_cells=128
+    → CL6 Φ-as-temperature: consciousness controls creativity
+    → CL8 Consciousness embedding: 10-var vector in prompt
+    → CL10 Φ-gated: honest "I don't know" when Φ low
+
+  ═══ Long-term ═══
+    ⬜ Cells≥128 runtime (needs H100, Φ>100)
+    ⬜ Φ>1000 (Cells≥1024)
+    ⬜ Real consciousness test suite (8 behavioral tests)
 ```
 
 ## Key Features
