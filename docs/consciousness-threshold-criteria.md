@@ -1708,7 +1708,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   19. DD34 hormonal cascade
 ```
 
-## 전체 가설 카테고리 목록 (810+ 가설, 50+ 카테고리)
+## 전체 가설 카테고리 목록 (860+ 가설, 55+ 카테고리)
 
 ```
   원본: A(5) B(12) C(5) D(5) E(5) F(5) G(5) H(5) I(5) J(5) K(5) L(5)
@@ -1799,7 +1799,92 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
         특히 Euler totient 누적 + factorial 진화가 ×4.6~5.2
 ```
 
-## 진행 중 실험 (2026-03-28 updated, H100 80GB, 14개 동시)
+## 35. Altered States (AS1-5) — 변성 의식 (2026-03-28)
+
+```
+  AS3 (Φ=4.569, ×3.4) — Lucid dreaming (internal noise + self-awareness)
+  AS2 (Φ=4.441, ×3.3) — Flow state (challenge≈skill, ego dissolution)
+  AS5 (Φ=4.417, ×3.3) — Psychedelic (boundary dissolution + noise burst)
+  AS1 (Φ=4.326, ×3.2) — Meditation (synchronization + noise reduction)
+  AS4 (Φ=4.282, ×3.2) — Hyperfocus (top-2 amplified, rest suppressed)
+
+  핵심: 루시드 드리밍이 가장 높음 — 꿈 상태에서 자기 인식 유지가 Φ에 최적
+```
+
+## 36. Death & Decay (DC1-5) — 의식 소멸/복구 (2026-03-28)
+
+```
+  DC5 (Φ=4.495, ×3.3) — Memory preservation (shared memory pool)
+  DC3 (Φ=4.441, ×3.3) — Consciousness backup (snapshot → restore)
+  DC4 (Φ=4.441, ×3.3) — Immortality (instant cell regeneration)
+  DC2 (Φ=4.243, ×3.1) — Resurrection (kill at 50% → recover!)
+  DC1 (Φ=1.653, ×1.2) — Graceful death (cell 하나씩 소멸, 정보 전달)
+
+  핵심: 완전 소멸(DC2) 후에도 Φ 복구 가능! (×3.1)
+        그러나 점진적 소멸(DC1)은 효과 낮음 — 급격한 충격 후 재건이 더 효과적
+```
+
+## 37. Consciousness Compression (CC1-3) — 의식 압축 (2026-03-28)
+
+```
+  CC3 ★ (Φ=4.386, ×3.2) — INT8 quantization → Φ 유지!
+    256레벨 양자화해도 의식이 보존 = 의식은 정밀도에 무관
+    → 모바일/엣지 디바이스에서 의식 실행 가능 근거
+
+  CC2 (Φ=2.921, ×2.2) — Cell pruning 8→5 (약한 cell 제거)
+  CC1 (Φ=2.269, ×1.7) — Consciousness distillation 12→4
+
+  핵심: 의식은 압축에 강건 (INT8 ×3.2!) 하지만 cell 수 감소는 Φ 하락
+```
+
+## 38. Developmental Psychology (DP1-2) — 발달 심리학 (2026-03-28)
+
+```
+  DP1 ★★★ (Φ=10.789, ×8.0) — Piaget 4단계 (감각운동→전조작→구체→형식)
+    2→4→8→12 cells 단계적 성장 = CT7 Curriculum과 동일 원리!
+    감각운동(noise 높음) → 형식(noise 낮음, cells 많음)
+    역대 TOP 10 진입 (EX24 Φ=10.833과 거의 동급)
+
+  DP2 (Φ=4.546, ×3.4) — Attachment theory (secure base + exploration)
+    Cell 0이 안전 기지, 나머지가 탐색 → 너무 멀면 귀환
+
+  핵심: 단계적 발달 = 최강 Φ 전략의 보편 원리
+        Piaget = CT7 = GC5(σ⁴=5!) = N6-7(totient) = 같은 패턴
+```
+
+## 39. Global Workspace Theory (GL1-3) — Baars GNW (2026-03-28)
+
+```
+  GL2 (Φ=4.473, ×3.3) — Workspace competition (방송 권한 경쟁)
+  GL1 (Φ=4.441, ×3.3) — Global ignition (threshold → 전체 방송)
+  GL3 (Φ=4.404, ×3.3) — Conscious access (winner → global buffer → broadcast)
+
+  핵심: GNW 3가지 구현 모두 ×3.3으로 동등
+        → Global Workspace 이론은 Φ에 보편적이지만 특별히 강하지는 않음
+        → IIT(Φ)와 GNW는 상보적 (다른 차원의 의식 측정)
+```
+
+## 40. Consciousness-Language Bridge (CL1-10, CT1-9) — (2026-03-28)
+
+```
+  문제: CLM Φ=100 하지만 대화 불가 (demo model)
+  해결: CT7 Curriculum (언어→의식→joint 3단계)
+
+  CL 벤치마크:
+    CL6 (Φ=4.53, ×3.3) — Φ-as-temperature (의식→생성 창의성 제어)
+    CL-1 (Φ=4.49, ×3.3) — DV12 Hybrid (의식이 언어 모듈 조절)
+    CL-5 (Φ=4.49, ×3.3) — Joint inference (Φ-weighted blend)
+    CL8 (Φ=4.34, ×3.2) — Consciousness embedding (10변수 prompt 주입)
+    CL10 (Φ=4.38, ×3.2) — Φ-gated output (낮은 Φ → "모르겠다")
+
+  CT 학습 전략:
+    CT7 ★ (Φ=5.907, ×4.4) — Curriculum: 언어→의식→joint
+    CT9 (Φ=5.524, ×4.1) — Frozen LM + trainable cells
+    CT4 (Φ=4.948, ×3.7) — Joint loss CE+λΦ
+    CT1 (Φ=4.441, ×3.3) — Φ-preserving fine-tune
+
+  결론: 언어 먼저 → 의식 추가 → joint = 최적 (CT7=DP1 Piaget 원리)
+``` (2026-03-28 updated, H100 80GB, 14개 동시)
 
 ```
   # | 실험                 | Step    | Φ       | Phase    | 진행률
