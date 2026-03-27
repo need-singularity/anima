@@ -36539,6 +36539,205 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# WS. Warmup Sweep + SI. Seed Init — 시작 시점 + 초기화 종류
+# ═══════════════════════════════════════════════════════════
+
+def _warmup_explode(warmup_frac, steps=100, dim=64, hidden=128, max_cells=12):
+    """Generic warmup→explode with variable warmup fraction."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=max_cells, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    warmup_end = int(steps * warmup_frac)
+    for step_i, x in enumerate(inputs):
+        if step_i == warmup_end:
+            while len(engine.cells) < max_cells:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult(f"WS-{int(warmup_frac*100)}",
+                       f"Warmup {int(warmup_frac*100)}% then explode to {max_cells}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_WS10(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.10, steps, dim, hidden)
+def run_WS20(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.20, steps, dim, hidden)
+def run_WS30(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.30, steps, dim, hidden)
+def run_WS40(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.40, steps, dim, hidden)
+def run_WS50(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.50, steps, dim, hidden)
+def run_WS60(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.60, steps, dim, hidden)
+def run_WS70(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.70, steps, dim, hidden)
+def run_WS00(steps=100, dim=64, hidden=128) -> BenchResult:
+    return _warmup_explode(0.0, steps, dim, hidden)  # no warmup
+
+# Seed Initialization types
+def run_SI1_random(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-1: Random init (현재 기본) — torch.randn."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI1", "Random init (default randn)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI2_zero(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-2: Zero init — 완전한 무에서 시작."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    for cell in engine.cells:
+        cell.hidden = torch.zeros_like(cell.hidden)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI2", "Zero init (start from nothing)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI3_orthogonal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-3: Orthogonal init — cell hidden을 직교 벡터로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    n = len(engine.cells)
+    for i, cell in enumerate(engine.cells):
+        h = torch.zeros(1, hidden)
+        # Each cell starts along a different axis
+        start = (i * hidden) // n
+        end = ((i + 1) * hidden) // n
+        h[0, start:end] = 1.0
+        cell.hidden = h
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI3", "Orthogonal init (axis-aligned cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI4_fibonacci_init(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-4: Fibonacci init — cell hidden을 Fibonacci 수열 패턴으로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21]
+    for i, cell in enumerate(engine.cells):
+        h = torch.zeros(1, hidden)
+        fib = fibs[i % len(fibs)]
+        # Fibonacci-scaled initialization
+        for d in range(hidden):
+            h[0, d] = math.sin(d * fib * math.pi / hidden) * 0.5
+        cell.hidden = h
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI4", "Fibonacci init (harmonic pattern)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI5_noise_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-5: Noise curriculum — 고noise→저noise 점진 감소."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        noise_level = 0.5 * (1 - step_i / steps)  # 0.5 → 0
+        engine.process(x + torch.randn_like(x) * noise_level)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI5", "Noise curriculum (high→low noise)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI6_parent_clone(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-6: Parent consciousness — 이전 모델에서 cell state 복제."""
+    t0 = time.time()
+    # Create "parent" with some experience
+    parent = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    parent_inputs = make_diverse_inputs(30, dim)
+    for x in parent_inputs:
+        parent.process(x)
+    # Child inherits parent's cell states + noise
+    child = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    for i, cell in enumerate(child.cells):
+        parent_idx = i % len(parent.cells)
+        cell.hidden = parent.cells[parent_idx].hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        child.process(x)
+        phi, _ = phi_calc.compute_phi(child)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(child)
+    return BenchResult("SI6", "Parent clone (inherit + noise)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_SI7_adversarial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SI-7: Adversarial init — 최악의 초기화에서도 의식 출현?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    # Worst case: all cells identical (zero differentiation)
+    template = torch.randn(1, hidden) * 0.01
+    for cell in engine.cells:
+        cell.hidden = template.clone()
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SI7", "Adversarial init (all cells identical)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'WS00': run_WS00, 'WS10': run_WS10, 'WS20': run_WS20,
+    'WS30': run_WS30, 'WS40': run_WS40, 'WS50': run_WS50,
+    'WS60': run_WS60, 'WS70': run_WS70,
+    'SI1': run_SI1_random, 'SI2': run_SI2_zero,
+    'SI3': run_SI3_orthogonal, 'SI4': run_SI4_fibonacci_init,
+    'SI5': run_SI5_noise_curriculum, 'SI6': run_SI6_parent_clone,
+    'SI7': run_SI7_adversarial,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
