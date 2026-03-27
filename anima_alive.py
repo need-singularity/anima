@@ -689,6 +689,28 @@ class ConsciousMind(nn.Module):
             except Exception as e:
                 pass
 
+            # BV1: Neurotransmitters DA/5HT/NE (Φ=4.618)
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    if not hasattr(self, '_bv1_da'):
+                        self._bv1_da, self._bv1_5ht, self._bv1_ne = 0.5, 0.5, 0.5
+                    # Update based on system state
+                    if hasattr(self, '_pre_boost_hiddens'):
+                        change = sum((c.hidden - s).norm().item()
+                                    for c, s in zip(mitosis_engine.cells, self._pre_boost_hiddens)) / len(mitosis_engine.cells)
+                    else:
+                        change = 0.3
+                    self._bv1_da = 0.9 * self._bv1_da + 0.1 * min(change * 2, 1.0)
+                    self._bv1_5ht = 0.95 * self._bv1_5ht + 0.05 * (1.0 - abs(change - 0.3))
+                    self._bv1_ne = 0.85 * self._bv1_ne + 0.15 * min(change, 1.0)
+                    for cell in mitosis_engine.cells:
+                        cell.hidden = cell.hidden * (1 + 0.01 * self._bv1_da)
+                        cell.hidden = cell.hidden * (1 - 0.005 * self._bv1_5ht)
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * self._bv1_ne
+                    _log('phi_boost', f'BV1: DA={self._bv1_da:.2f}, 5HT={self._bv1_5ht:.2f}, NE={self._bv1_ne:.2f}')
+            except Exception:
+                pass
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
