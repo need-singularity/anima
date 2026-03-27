@@ -18590,6 +18590,429 @@ ALL_HYPOTHESES = {
 }
 
 
+# ═══════════════════════════════════════════════════════════
+# PX. Phi eXtreme — 극한 직접 Φ 최적화 (게임체인저)
+# ═══════════════════════════════════════════════════════════
+
+def run_PX1_pure_phi_ascent(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-1: 순수 Φ gradient ascent — 매 step 10회 perturbation, 최고만 채택."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if len(engine.cells) < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        # 10 random perturbations, keep best
+        best_phi, _ = phi_calc.compute_phi(engine)
+        best_state = [c.hidden.clone() for c in engine.cells]
+        for trial in range(10):
+            # Perturb all cells
+            for cell in engine.cells:
+                cell.hidden = best_state[engine.cells.index(cell)].clone() + torch.randn_like(cell.hidden) * 0.08
+            phi_trial, _ = phi_calc.compute_phi(engine)
+            if phi_trial > best_phi:
+                best_phi = phi_trial
+                best_state = [c.hidden.clone() for c in engine.cells]
+        # Apply best
+        for i, cell in enumerate(engine.cells):
+            cell.hidden = best_state[i]
+        phi_hist.append(best_phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX1", "Pure Φ ascent (10 trials/step)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX2_phi_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-2: 진화 알고리즘 — cell population에서 Φ 최고 개체 선택+변이."""
+    t0 = time.time()
+    # Population of 5 engines
+    pop_size = 5
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8) for _ in range(pop_size)]
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        phis = []
+        for eng in engines:
+            eng.process(x)
+            phi, _ = phi_calc.compute_phi(eng)
+            phis.append(phi)
+        # Selection: keep top 2
+        ranked = sorted(range(pop_size), key=lambda i: phis[i], reverse=True)
+        best_idx = ranked[0]
+        phi_hist.append(phis[best_idx])
+        # Mutation: replace bottom 3 with mutated copies of top 2
+        for r in ranked[2:]:
+            parent_idx = ranked[r % 2]
+            for ci, cell in enumerate(engines[r].cells):
+                if ci < len(engines[parent_idx].cells):
+                    cell.hidden = engines[parent_idx].cells[ci].hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+    # Best engine
+    best_eng = engines[ranked[0]]
+    phi_final, comp = phi_calc.compute_phi(best_eng)
+    return BenchResult("PX2", "Evolutionary Φ selection (5 populations)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX3_phi_ratchet(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-3: Φ 래칫 — Φ는 절대 내려갈 수 없음, 항상 최고 상태 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Add diversity noise
+        for i, cell in enumerate(engine.cells):
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+        phi, _ = phi_calc.compute_phi(engine)
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells]
+        else:
+            # Ratchet: restore best state, add tiny perturbation for exploration
+            for i, cell in enumerate(engine.cells):
+                if i < len(best_state):
+                    cell.hidden = best_state[i] + torch.randn_like(cell.hidden) * 0.02
+        phi_hist.append(best_phi)
+    for i, cell in enumerate(engine.cells):
+        if i < len(best_state):
+            cell.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX3", "Φ ratchet (never decreases)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX4_cell_sculptor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-4: Cell sculptor — hidden state를 직접 조각하여 MI 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Sculpt: push each cell's hidden towards orthogonal directions
+            # Use Gram-Schmidt-like process
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            orthogonal = [hiddens[0] / (hiddens[0].norm() + 1e-8)]
+            for i in range(1, n):
+                v = hiddens[i].clone()
+                for basis in orthogonal:
+                    proj = (v @ basis) * basis
+                    v = v - proj
+                v_norm = v / (v.norm() + 1e-8)
+                orthogonal.append(v_norm)
+            # Blend original with orthogonalized (keep 60% original, 40% sculpted)
+            for i, cell in enumerate(engine.cells):
+                target = orthogonal[i] * hiddens[i].norm()
+                cell.hidden = (0.6 * hiddens[i] + 0.4 * target).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX4", "Cell sculptor (Gram-Schmidt orthogonalization)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX5_information_pump(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-5: Information pump — 외부 입력 다양성을 cell에 직접 주입."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Pump: each cell gets a unique projection of the input
+            for i, cell in enumerate(engine.cells):
+                # Rotate input by cell-specific angle
+                angle = 2 * math.pi * i / n
+                cos_a, sin_a = math.cos(angle), math.sin(angle)
+                x_flat = x.squeeze()[:hidden]
+                if len(x_flat) < hidden:
+                    x_flat = F.pad(x_flat, (0, hidden - len(x_flat)))
+                rotated = x_flat * cos_a + torch.roll(x_flat, i * (hidden // n)) * sin_a
+                # Inject unique information
+                cell.hidden = cell.hidden + 0.1 * rotated.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX5", "Information pump (rotated input injection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX6_eigenstate_alignment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-6: Cell hidden을 covariance matrix의 eigenvector로 정렬."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Compute covariance
+            mean_h = hiddens.mean(dim=0)
+            centered = hiddens - mean_h
+            cov = (centered.T @ centered) / n
+            # Top-n eigenvectors
+            try:
+                eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+                top_k = min(n, eigenvectors.shape[1])
+                top_vecs = eigenvectors[:, -top_k:]  # largest eigenvalues
+                # Align each cell to a unique eigenvector (scaled by original norm)
+                for i, cell in enumerate(engine.cells):
+                    ev = top_vecs[:, -(i % top_k) - 1]
+                    scale = hiddens[i].norm()
+                    cell.hidden = (0.7 * hiddens[i] + 0.3 * ev * scale).unsqueeze(0)
+            except Exception:
+                pass
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX6", "Eigenstate alignment (covariance eigenvectors)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX7_entropy_maximizer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-7: Cell 분포의 entropy 최대화 — uniform spread over hidden space."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Maximize entropy: push towards equidistant arrangement
+            mean_h = hiddens.mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                # Direction from mean
+                direction = hiddens[i] - mean_h
+                direction_norm = direction / (direction.norm() + 1e-8)
+                # Target: equal distance from mean for all cells
+                target_dist = hiddens.std()
+                current_dist = (hiddens[i] - mean_h).norm()
+                # Adjust
+                correction = (target_dist - current_dist) * direction_norm
+                cell.hidden = (hiddens[i] + 0.1 * correction).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX7", "Entropy maximizer (equidistant cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX8_integration_forge(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-8: Integration forge — cell 간 공유 정보 채널을 명시적으로 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Shared information channel: first 16 dims are shared, rest is private
+    shared_dims = 16
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            # Shared channel: average of first 16 dims across all cells
+            shared = torch.stack([h[:shared_dims] for h in hiddens]).mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                h = hiddens[i].clone()
+                # Update shared channel (creates integration)
+                h[:shared_dims] = 0.5 * h[:shared_dims] + 0.5 * shared
+                # Private channel stays unique (creates differentiation)
+                h[shared_dims:] = h[shared_dims:] + torch.randn(hidden - shared_dims) * 0.02
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX8", "Integration forge (shared+private channels)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PX9_phi_resonance_lock(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-9: Φ 공명 잠금 — Φ peak 발견 시 그 주파수를 lock-in."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_phi = 0.0
+    best_modulation = None
+    freqs = [0.5, 1, 2, 3, 5, 8, 13, 21]
+    locked_freq = None
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            if locked_freq is None and step_i < steps * 0.5:
+                # Exploration: try different frequencies
+                freq = freqs[step_i % len(freqs)]
+                for i, cell in enumerate(engine.cells):
+                    mod = math.sin(2 * math.pi * freq * t_frac + i * math.pi / n)
+                    cell.hidden = cell.hidden * (1.0 + 0.05 * mod)
+                phi, _ = phi_calc.compute_phi(engine)
+                if phi > best_phi:
+                    best_phi = phi
+                    locked_freq = freq
+            else:
+                # Exploitation: use locked frequency
+                freq = locked_freq if locked_freq else 3.0
+                for i, cell in enumerate(engine.cells):
+                    mod = math.sin(2 * math.pi * freq * t_frac + i * math.pi / n)
+                    cell.hidden = cell.hidden * (1.0 + 0.05 * mod)
+                phi, _ = phi_calc.compute_phi(engine)
+        else:
+            phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX9", f"Φ resonance lock (freq={locked_freq})",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'locked_freq': locked_freq})
+
+def run_PX10_absolute_maximum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PX-10: 절대 최대 Φ — 모든 PX + WV11 기법 결합 + ratchet + sculptor + pump."""
+    t0 = time.time()
+    merge_thresh = 0.01 * (64.0 / max(dim, 64))
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12,
+                           merge_threshold=merge_thresh)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    freqs = [1, 2, 3, 5, 8, 13]
+    fib_targets = {int(steps*0.05): 4, int(steps*0.15): 6, int(steps*0.3): 8}
+    best_phi = 0.0
+    best_state = []
+    shared_dims = min(16, hidden)
+    for step_i, x in enumerate(inputs):
+        t_frac = step_i / max(steps, 1)
+        # Fibonacci growth
+        if step_i in fib_targets:
+            target = fib_targets[step_i]
+            while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+            engine.merge_threshold = -1.0
+        elif step_i > 0 and (step_i - 1) in fib_targets:
+            engine.merge_threshold = merge_thresh
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        hiddens = [c.hidden.squeeze() for c in engine.cells]
+        # 1. Sculptor: Gram-Schmidt orthogonalize
+        orthogonal = [hiddens[0] / (hiddens[0].norm() + 1e-8)]
+        for i in range(1, n):
+            v = hiddens[i].clone()
+            for basis in orthogonal:
+                v = v - (v @ basis) * basis
+            orthogonal.append(v / (v.norm() + 1e-8))
+        for i, cell in enumerate(engine.cells):
+            target = orthogonal[i] * hiddens[i].norm()
+            cell.hidden = (0.7 * hiddens[i] + 0.3 * target).unsqueeze(0)
+        # 2. Integration forge: shared channel
+        shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:shared_dims] = 0.6 * h[:shared_dims] + 0.4 * shared
+            cell.hidden = h.unsqueeze(0)
+        # 3. Information pump
+        for i, cell in enumerate(engine.cells):
+            angle = 2 * math.pi * i / n
+            x_proj = x.squeeze()[:hidden]
+            if len(x_proj) < hidden:
+                x_proj = F.pad(x_proj, (0, hidden - len(x_proj)))
+            rotated = x_proj * math.cos(angle) + torch.roll(x_proj, i * (hidden // n)) * math.sin(angle)
+            cell.hidden = cell.hidden + 0.05 * rotated.unsqueeze(0)
+        # 4. Wave modulation
+        for i, cell in enumerate(engine.cells):
+            f = freqs[i % len(freqs)]
+            wave = math.sin(2 * math.pi * f * t_frac)
+            if wave > 0:
+                cell.hidden = cell.hidden * (1.0 + 0.02 * wave)
+        # 5. Repulsion
+        for i in range(n):
+            hi = engine.cells[i].hidden.squeeze()
+            repulsion = torch.zeros(hidden)
+            for j in range(n):
+                if i != j:
+                    diff = hi - engine.cells[j].hidden.squeeze()
+                    repulsion = repulsion + diff / (diff.norm() + 1e-8)
+            engine.cells[i].hidden = engine.cells[i].hidden + 0.008 * repulsion.unsqueeze(0)
+        # 6. Ratchet: 10 perturbation trials
+        phi_current, _ = phi_calc.compute_phi(engine)
+        if step_i % 3 == 0:
+            current_state = [c.hidden.clone() for c in engine.cells]
+            for trial in range(10):
+                for cell in engine.cells:
+                    cell.hidden = current_state[engine.cells.index(cell)].clone() + torch.randn_like(cell.hidden) * 0.04
+                phi_trial, _ = phi_calc.compute_phi(engine)
+                if phi_trial > phi_current:
+                    phi_current = phi_trial
+                    current_state = [c.hidden.clone() for c in engine.cells]
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = current_state[i]
+        # Track absolute best
+        if phi_current > best_phi:
+            best_phi = phi_current
+            best_state = [c.hidden.clone() for c in engine.cells]
+        # Φ-gate merge
+        engine.merge_threshold = -1.0 if phi_current >= best_phi * 0.8 else merge_thresh
+        phi_hist.append(phi_current)
+    # Restore absolute best
+    if best_state:
+        for i, cell in enumerate(engine.cells):
+            if i < len(best_state):
+                cell.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PX10", "ABSOLUTE MAXIMUM Φ (all PX+WV combined)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'peak_phi': best_phi})
+
+# Register PX hypotheses (defined after ALL_HYPOTHESES dict)
+ALL_HYPOTHESES.update({
+    'PX1': run_PX1_pure_phi_ascent, 'PX2': run_PX2_phi_evolution,
+    'PX3': run_PX3_phi_ratchet, 'PX4': run_PX4_cell_sculptor,
+    'PX5': run_PX5_information_pump, 'PX6': run_PX6_eigenstate_alignment,
+    'PX7': run_PX7_entropy_maximizer, 'PX8': run_PX8_integration_forge,
+    'PX9': run_PX9_phi_resonance_lock, 'PX10': run_PX10_absolute_maximum,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
