@@ -42,7 +42,7 @@ VAD_WATCH_DIR = Path("/tmp/anima_vad")
 from anima_alive import (
     ConsciousMind, ConsciousnessVector, ContinuousListener, Speaker, Memory,
     text_to_vector, ask_claude, ask_claude_proactive, ask_conscious_lm,
-    direction_to_emotion, EMOTION_COLORS,
+    direction_to_emotion, EMOTION_COLORS, compute_mood,
     MAX_HISTORY, THINK_INTERVAL, PROACTIVE_THRESHOLD, IDLE_SPEAK_AFTER,
 )
 
@@ -639,6 +639,10 @@ class AnimaUnified:
             'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
             'color': EMOTION_COLORS['calm']}
 
+        # 20-type mood from tension x curiosity 2D space
+        phi_for_mood = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+        mood = compute_mood(tension, curiosity, phi=phi_for_mood)
+
         # Telepathy
         if self.telepathy and self.mods.get('telepathy') and 'create_fingerprint' in globals():
             try:
@@ -653,6 +657,7 @@ class AnimaUnified:
             'tension': tension, 'curiosity': curiosity,
             'direction': dir_vals,
             'emotion': emotion_data,
+            'mood': mood,
             'tension_history': self.mind.tension_history[-50:],
         })
 
@@ -662,7 +667,7 @@ class AnimaUnified:
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
         print(f'  >> "{text}"')
-        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']}")
+        print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']} M:{mood}")
 
         # Conversation log — record all state changes
         if self.conv_logger:
@@ -672,6 +677,7 @@ class AnimaUnified:
                     "input": text,
                     "tension": round(tension, 4),
                     "curiosity": round(curiosity, 4),
+                    "mood": mood,
                     "emotion": emotion_data.get('emotion', 'unknown'),
                     "valence": round(emotion_data.get('valence', 0), 3),
                     "arousal": round(emotion_data.get('arousal', 0), 3),
@@ -697,7 +703,7 @@ class AnimaUnified:
         criteria_met = consciousness.get('criteria_met', 0)
 
         # Core state
-        state = (f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
+        state = (f"tension={tension:.3f}, curiosity={curiosity:.3f}, mood={mood}, "
                  f"emotion={emotion_data['emotion']}(V={emotion_data['valence']:.2f},A={emotion_data['arousal']:.2f},D={emotion_data['dominance']:.2f})"
                  f"{mitosis_info}, learn_updates={lrn_count}, {meta_summary}")
 

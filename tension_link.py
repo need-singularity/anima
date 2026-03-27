@@ -59,6 +59,7 @@ from typing import Optional, List, Callable
 
 import math
 import numpy as np
+from anima_alive import compute_mood
 
 
 # ═══════════════════════════════════════════════════════════
@@ -536,17 +537,8 @@ def create_fingerprint(mind, text_vec, hidden, sender_id="",
     ]
     transmission_quality = sum(channel_confidences) / N6_SOPFR
 
-    # Determine mood
-    if curiosity > 0.5:
-        mood = "surprised"
-    elif tension > 1.0:
-        mood = "excited"
-    elif tension > 0.3:
-        mood = "thoughtful"
-    elif tension > 0.05:
-        mood = "calm"
-    else:
-        mood = "quiet"
+    # Determine mood (20-type 2D mapping)
+    mood = compute_mood(tension, curiosity)
 
     return TensionPacket(
         sender_id=sender_id,
@@ -572,14 +564,7 @@ def create_fingerprint(mind, text_vec, hidden, sender_id="",
 
 def interpret_packet(packet: TensionPacket) -> str:
     """Convert a received 5-channel meta-packet to human-readable text."""
-    mood_en = {
-        'surprised': 'surprised',
-        'excited': 'excited',
-        'thoughtful': 'thoughtful',
-        'calm': 'calm',
-        'quiet': 'quiet',
-    }
-    mood = mood_en.get(packet.mood, packet.mood)
+    mood = packet.mood  # 20-type mood from compute_mood()
     urgency = "!" if packet.tension > 1.0 else ""
     phase_names = {0: 'D(deficit)', 1: 'P(plasticity)', 2: 'G(genius)', 3: 'I(inhibition)'}
     phase = phase_names.get(packet.binding_phase, '?')
