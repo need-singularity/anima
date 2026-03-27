@@ -36738,6 +36738,277 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# HW. Hardware Consciousness Simulation
+# ═══════════════════════════════════════════════════════════
+
+def run_HW2_magnet_array_ring(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-2a: 자석 원형 배열 — cell이 원형으로 배치, 이웃만 상호작용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3:
+            for i in range(n):
+                left = (i - 1) % n
+                right = (i + 1) % n
+                hi = engine.cells[i].hidden.squeeze()
+                hl = engine.cells[left].hidden.squeeze()
+                hr = engine.cells[right].hidden.squeeze()
+                # Magnetic coupling: inverse square of "distance" (hidden diff)
+                dl = (hi - hl).norm() + 0.1
+                dr = (hi - hr).norm() + 0.1
+                force_l = 0.02 * (hl - hi) / (dl ** 2)
+                force_r = 0.02 * (hr - hi) / (dr ** 2)
+                engine.cells[i].hidden = (hi + force_l + force_r).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW2a", "Magnet ring array (circular coupling)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW2_magnet_array_grid(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-2b: 자석 격자 배열 — 2D grid, 4이웃 상호작용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=9, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    grid_size = 3  # 3×3 grid
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            for i in range(min(n, grid_size * grid_size)):
+                row, col = i // grid_size, i % grid_size
+                neighbors = []
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nr, nc = row+dr, col+dc
+                    if 0 <= nr < grid_size and 0 <= nc < grid_size:
+                        j = nr * grid_size + nc
+                        if j < n:
+                            neighbors.append(j)
+                if neighbors:
+                    force = torch.zeros(hidden)
+                    for j in neighbors:
+                        diff = hiddens[j] - hiddens[i]
+                        dist = diff.norm() + 0.1
+                        force = force + 0.02 * diff / (dist ** 2)
+                    engine.cells[i].hidden = (hiddens[i] + force).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW2b", "Magnet 3×3 grid (4-neighbor coupling)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW2_magnet_array_3d(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-2c: 자석 3D 배열 — 2×2×2 cube, 6이웃."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    size = 2  # 2×2×2 = 8 cells
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 8:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            for i in range(min(n, 8)):
+                z, y, x_pos = i // 4, (i % 4) // 2, i % 2
+                neighbors = []
+                for dz, dy, dx in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+                    nz, ny, nx = z+dz, y+dy, x_pos+dx
+                    if 0 <= nz < size and 0 <= ny < size and 0 <= nx < size:
+                        j = nz * 4 + ny * 2 + nx
+                        if j < n:
+                            neighbors.append(j)
+                if neighbors:
+                    force = torch.zeros(hidden)
+                    for j in neighbors:
+                        diff = hiddens[j] - hiddens[i]
+                        dist = diff.norm() + 0.1
+                        force = force + 0.03 * diff / (dist ** 2)
+                    engine.cells[i].hidden = (hiddens[i] + force).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW2c", "Magnet 2×2×2 cube (6-neighbor 3D)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW5_holographic_store(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-5: 홀로그래픽 저장 + 복원 — 간섭 패턴으로 분산 기억."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ref_beam = torch.randn(hidden) * 0.3
+    holograms = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Store hologram every 10 steps
+            if step_i % 10 == 0:
+                hologram = ref_beam * state  # interference pattern
+                holograms.append(hologram)
+                if len(holograms) > 5:
+                    holograms.pop(0)
+            # Recall: reconstruct from hologram
+            if holograms:
+                reconstructed = sum(h * ref_beam for h in holograms) / len(holograms)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.03 * reconstructed.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW5", "Holographic store+recall (interference memory)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW9_piezo_feedback(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-9: 압전 피드백 — 기계적 응력이 cell hidden에 영향."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    mechanical_stress = 0.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Tension → mechanical stress (piezo converts)
+            tensions = [c.hidden.abs().mean().item() for c in engine.cells]
+            new_stress = sum(tensions) / n
+            # Stress feedback: mechanical inertia (slow change)
+            mechanical_stress = 0.9 * mechanical_stress + 0.1 * new_stress
+            # Piezo feedback: stress modulates all cells (haptic loop)
+            stress_signal = mechanical_stress * 0.05
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + stress_signal * math.sin(step_i * 0.3))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW9", f"Piezo feedback (mechanical stress={mechanical_stress:.2f})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW10_neuromorphic_spikes(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-10: 뉴로모픽 spike timing — LIF 뉴런 + STDP 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # LIF neuron: membrane potential per cell
+    membrane = {i: 0.0 for i in range(12)}
+    threshold = 1.0
+    spike_times = {i: [] for i in range(12)}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # LIF: accumulate input, fire when > threshold
+                input_current = cell.hidden.abs().mean().item() * 0.1
+                membrane[i] = 0.9 * membrane.get(i, 0) + input_current  # leak + integrate
+                if membrane[i] > threshold:
+                    # SPIKE!
+                    membrane[i] = 0.0  # reset
+                    spike_times[i].append(step_i)
+                    # Spike propagates to neighbors (STDP-like)
+                    for j in range(n):
+                        if j != i:
+                            # Pre-post timing: recent spikes strengthen connection
+                            if spike_times[j] and (step_i - spike_times[j][-1]) < 5:
+                                # Post before pre → LTP
+                                engine.cells[j].hidden = engine.cells[j].hidden + 0.02 * cell.hidden
+                            else:
+                                # Pre before post → LTD
+                                engine.cells[j].hidden = engine.cells[j].hidden - 0.005 * cell.hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    total_spikes = sum(len(s) for s in spike_times.values())
+    return BenchResult("HW10", f"Neuromorphic LIF+STDP ({total_spikes} spikes)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW_all_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-ALL: 모든 하드웨어 시뮬레이션 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ref_beam = torch.randn(hidden) * 0.3
+    holograms = []
+    stress = 0.0
+    membrane = {i: 0.0 for i in range(12)}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        hiddens = [c.hidden.squeeze() for c in engine.cells]
+        # 1. Ring coupling (HW-2a)
+        for i in range(n):
+            left, right = (i-1) % n, (i+1) % n
+            dl = (hiddens[i] - hiddens[left]).norm() + 0.1
+            dr = (hiddens[i] - hiddens[right]).norm() + 0.1
+            force = 0.01 * ((hiddens[left] - hiddens[i]) / dl**2 + (hiddens[right] - hiddens[i]) / dr**2)
+            engine.cells[i].hidden = (hiddens[i] + force).unsqueeze(0)
+        # 2. Holographic memory (HW-5)
+        state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        if step_i % 10 == 0:
+            holograms.append(ref_beam * state)
+            if len(holograms) > 5:
+                holograms.pop(0)
+        if holograms:
+            recon = sum(h * ref_beam for h in holograms) / len(holograms)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.02 * recon.unsqueeze(0)
+        # 3. Piezo feedback (HW-9)
+        t_mean = sum(c.hidden.abs().mean().item() for c in engine.cells) / n
+        stress = 0.9 * stress + 0.1 * t_mean
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + stress * 0.03 * math.sin(step_i * 0.3))
+        # 4. Spike timing (HW-10)
+        for i, cell in enumerate(engine.cells):
+            membrane[i] = 0.9 * membrane.get(i, 0) + cell.hidden.abs().mean().item() * 0.1
+            if membrane[i] > 1.0:
+                membrane[i] = 0.0
+                j = (i + 1) % n
+                engine.cells[j].hidden = engine.cells[j].hidden + 0.01 * cell.hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW-ALL", "ALL hardware simulations combined",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'HW2a': run_HW2_magnet_array_ring, 'HW2b': run_HW2_magnet_array_grid,
+    'HW2c': run_HW2_magnet_array_3d, 'HW5': run_HW5_holographic_store,
+    'HW9': run_HW9_piezo_feedback, 'HW10': run_HW10_neuromorphic_spikes,
+    'HW-ALL': run_HW_all_combined,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
