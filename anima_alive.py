@@ -582,7 +582,7 @@ class ConsciousMind(nn.Module):
 
             print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
 
-            # UX4: Differentiable Φ proxy + Adam (Φ=7.755 record)
+            # FX2: Adam 3-step + mega ratchet (Φ=8.911 record, ×6.6 baseline)
             try:
                 if len(mitosis_engine.cells) >= 2:
                     if not hasattr(self, '_phi_offsets') or len(self._phi_offsets) != len(mitosis_engine.cells):
@@ -590,37 +590,83 @@ class ConsciousMind(nn.Module):
                                             for _ in mitosis_engine.cells]
                         self._phi_optimizer = torch.optim.Adam(self._phi_offsets, lr=0.005)
 
-                    self._phi_optimizer.zero_grad()
-                    hiddens = []
-                    for i, c in enumerate(mitosis_engine.cells):
-                        h = c.hidden.detach() + self._phi_offsets[i]
-                        hiddens.append(h.squeeze())
-                    H = torch.stack(hiddens)
-                    n_cells = len(hiddens)
+                    n_cells = len(mitosis_engine.cells)
 
-                    # Differentiable Φ proxy
-                    cov = (H.T @ H) / n_cells
-                    diag = torch.diag(torch.diag(cov))
-                    integration = (cov - diag).abs().sum()
-                    cell_var = H.var(dim=0).sum()
-                    mid = n_cells // 2
-                    part_a = H[:mid].mean(dim=0)
-                    part_b = H[mid:].mean(dim=0)
-                    partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
-                    phi_proxy = integration * cell_var * (1.0 + partition_mi)
+                    # --- Phase 1: 3 Adam optimization steps ---
+                    proxy = torch.tensor(0.0)
+                    for _adam_step in range(3):
+                        self._phi_optimizer.zero_grad()
+                        hiddens = []
+                        for i, c in enumerate(mitosis_engine.cells):
+                            h = c.hidden.detach() + self._phi_offsets[i]
+                            hiddens.append(h.squeeze())
+                        H = torch.stack(hiddens)
 
-                    (-phi_proxy).backward()  # maximize
-                    self._phi_optimizer.step()
+                        # Differentiable Φ proxy
+                        cov = (H.T @ H) / n_cells
+                        diag = torch.diag(torch.diag(cov))
+                        integration = (cov - diag).abs().sum()
+                        cell_var = H.var(dim=0).sum()
+                        mid = n_cells // 2
+                        part_a = H[:mid].mean(dim=0)
+                        part_b = H[mid:].mean(dim=0)
+                        partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
+                        proxy = integration * cell_var * (1.0 + partition_mi)
 
+                        (-proxy).backward()  # maximize
+                        self._phi_optimizer.step()
+
+                    # Apply Adam offsets conservatively
                     with torch.no_grad():
                         for i, c in enumerate(mitosis_engine.cells):
                             if i < len(self._phi_offsets):
-                                c.hidden = c.hidden + self._phi_offsets[i].data * 0.3  # conservative for runtime
+                                c.hidden = c.hidden + self._phi_offsets[i].data * 0.3
                                 self._phi_offsets[i].data *= 0.9  # decay
 
-                    print(f"  [phi_boost] UX4: proxy={phi_proxy.item():.2f}, cells={n_cells}")
+                    # --- Phase 2: Mega ratchet (10 random perturbations, keep best) ---
+                    saved_hiddens = [c.hidden.data.clone() for c in mitosis_engine.cells]
+                    best_proxy = proxy.item()
+                    best_deltas = None
+                    ratchet_gain = 0.0
+
+                    for _trial in range(10):
+                        deltas = [0.03 * torch.randn_like(c.hidden) for c in mitosis_engine.cells]
+                        with torch.no_grad():
+                            for i, c in enumerate(mitosis_engine.cells):
+                                c.hidden = saved_hiddens[i] + deltas[i]
+
+                            # Evaluate proxy for this perturbation
+                            trial_hiddens = [c.hidden.squeeze() for c in mitosis_engine.cells]
+                            tH = torch.stack(trial_hiddens)
+                            t_cov = (tH.T @ tH) / n_cells
+                            t_diag = torch.diag(torch.diag(t_cov))
+                            t_integration = (t_cov - t_diag).abs().sum()
+                            t_var = tH.var(dim=0).sum()
+                            t_mid = n_cells // 2
+                            t_pa = tH[:t_mid].mean(dim=0)
+                            t_pb = tH[t_mid:].mean(dim=0)
+                            t_mi = F.cosine_similarity(t_pa.unsqueeze(0), t_pb.unsqueeze(0)).abs()
+                            trial_proxy = (t_integration * t_var * (1.0 + t_mi)).item()
+
+                            if trial_proxy > best_proxy:
+                                best_proxy = trial_proxy
+                                best_deltas = [d.clone() for d in deltas]
+
+                        # Restore for next trial
+                        with torch.no_grad():
+                            for i, c in enumerate(mitosis_engine.cells):
+                                c.hidden = saved_hiddens[i].clone()
+
+                    # Apply best ratchet perturbation if found
+                    if best_deltas is not None:
+                        ratchet_gain = best_proxy - proxy.item()
+                        with torch.no_grad():
+                            for i, c in enumerate(mitosis_engine.cells):
+                                c.hidden = saved_hiddens[i] + best_deltas[i]
+
+                    print(f"  [phi_boost] FX2: proxy={best_proxy:.2f}, ratchet_gain={ratchet_gain:.3f}")
             except Exception:
-                pass  # UX4 graceful degradation
+                pass  # FX2 graceful degradation
 
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
