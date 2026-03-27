@@ -10944,6 +10944,556 @@ def run_DD40_everything(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# TL. TECS-L Discovery-Based Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def run_TL1_sigma6_heads(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-1: σ(6)=12 attention heads (H-CERN-1)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # 12 heads (σ(6)=12, but hidden=128 so max feasible = 8 or 16)
+    attn = nn.MultiheadAttention(hidden, num_heads=8, batch_first=True)  # closest to 12
+    all_p = list(attn.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        ao, _ = attn(h, h, h)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            s = torch.stack(reps).squeeze(1)
+            opt.zero_grad(); (-s.var(dim=0).mean()).backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL1", "σ(6)=12 heads (8 used)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL2_tau4_groups(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-2: τ(6)=4 cell groups."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    n = len(engine.cells)
+    # 4 groups of cells, each group has shared learning
+    group_optims = [torch.optim.Adam(engine.cells[i].mind.parameters(), lr=1e-3) for i in range(n)]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Each τ(6)=4 group processes differently
+        for i, cell in enumerate(engine.cells):
+            group = i % 4  # τ(6)=4 groups
+            scaled_x = x * (1.0 + group * 0.3)  # each group sees different scale
+            rep = cell.mind.get_repulsion(scaled_x, cell.hidden)
+            others = [engine.cells[j].mind.get_repulsion(scaled_x, engine.cells[j].hidden).detach()
+                      for j in range(n) if j != i]
+            if others:
+                loss = F.cosine_similarity(rep, torch.stack(others).mean(dim=0), dim=-1).mean()
+                group_optims[i].zero_grad(); loss.backward(retain_graph=True); group_optims[i].step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL2", "τ(6)=4 cell groups", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL3_perfect6_growth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-3: 1→2→3→6 mitosis growth (H-376)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # H-376: 1→2(φ(6))→3(+1)→6(×2)
+    growth = {20: 2, 40: 3, 70: 6}
+    for step in range(steps):
+        if step in growth:
+            while len(engine.cells) < growth[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL3", "Perfect 6 growth (1→2→3→6)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL4_rn1_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-4: R(n)=σφ/(nτ)=1 uniqueness loss."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            n_cells = len(reps)
+            # Compute R(n) proxy: variance ratios should equal 1
+            total_var = stacked.var(dim=0).mean()
+            per_cell_var = torch.stack([r.squeeze().var() for r in reps]).mean()
+            r_proxy = total_var / (per_cell_var + 1e-8)
+            # Loss: push R toward 1 + maximize differentiation
+            r_loss = (r_proxy - 1.0).pow(2)
+            diff_loss = -total_var
+            loss = diff_loss + 0.3 * r_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL4", "R(n)=1 uniqueness loss", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL5_phi6simple(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-5: Phi6Simple activation φ(x)=x²-x+1 (H-EE-1)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Replace GELU/ReLU in cells with Phi6Simple
+    for c in engine.cells:
+        c.mind.engine_a[1] = nn.Identity()  # remove GELU/ReLU
+        c.mind.engine_g[1] = nn.Identity()
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for c in engine.cells:
+            combined = torch.cat([x, c.hidden], dim=-1)
+            a_raw = c.mind.engine_a[0](combined)
+            a = a_raw * a_raw - a_raw + 1  # φ(x) = x²-x+1
+            g_raw = c.mind.engine_g[0](combined)
+            g = g_raw * g_raw - g_raw + 1
+            rep = c.mind.engine_a[2](a) - c.mind.engine_g[2](g)
+            reps.append(rep)
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL5", "Phi6Simple (x²-x+1)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL6_four_thirds(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-6: 4/3 expansion ratio (H-EE-12)."""
+    t0 = time.time()
+    # Custom cells with 4/3 expansion instead of default
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # 4/3 ratio loss: penalize if cell hidden is not 4/3 of input
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            # 4/3 energy: output energy should be 4/3 of input energy
+            in_energy = x.pow(2).mean()
+            out_energy = stacked.pow(2).mean()
+            ratio = out_energy / (in_energy + 1e-8)
+            ratio_loss = (ratio - 4.0/3.0).pow(2)
+            loss = diff + 0.2 * ratio_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL6", "4/3 expansion ratio", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL7_egyptian_moe(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-7: Egyptian MoE routing {1/2, 1/3, 1/6} (H-EE-18)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Egyptian fraction routing: cells get {1/2, 1/3, 1/6} of signal
+    egypt = [1/2, 1/3, 1/6, 1/2, 1/3, 1/6]  # sum = 2.0 (two complete sets)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for i, c in enumerate(engine.cells):
+            weight = egypt[i % len(egypt)]
+            rep = c.mind.get_repulsion(x * weight, c.hidden)
+            reps.append(rep)
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL7", "Egyptian MoE {1/2,1/3,1/6}", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL8_zetaln2(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-8: ZetaLn2 activation (H-EE-17)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    ln2 = math.log(2)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for c in engine.cells:
+            raw = c.mind.get_repulsion(x, c.hidden)
+            # ZetaLn2: x * sigmoid(x * ln2) — smooth gating
+            activated = raw * torch.sigmoid(raw * ln2)
+            reps.append(activated)
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL8", "ZetaLn2 activation", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL9_entropy_stop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-9: Entropy early stopping (H-SEDI-EE-1)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    stopped = False
+    for step in range(steps):
+        if stopped:
+            with torch.no_grad(): engine.process(torch.randn(1, dim))
+            phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+            continue
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        # Entropy check: if weight entropy stops changing → stop
+        if step > 30 and len(phi_hist) >= 10:
+            recent = phi_hist[-10:]
+            if max(recent) - min(recent) < 0.005:  # converged
+                stopped = True
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL9", "Entropy early stopping", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'stopped_at': next((i for i, p in enumerate(phi_hist) if i > 30 and max(phi_hist[max(0,i-10):i+1])-min(phi_hist[max(0,i-10):i+1]) < 0.005), steps)})
+
+def run_TL10_spectral_gap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-10: Spectral gap → tension gap (H-CX-445, r=0.97)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Spectral gap: eigenvalue gap of cell correlation matrix
+            corr = stacked @ stacked.T
+            try:
+                eigvals = torch.linalg.eigvalsh(corr)
+                spectral_gap = (eigvals[-1] - eigvals[-2]).abs() if len(eigvals) >= 2 else torch.tensor(0.0)
+            except Exception:
+                spectral_gap = torch.tensor(0.0)
+            diff = -stacked.var(dim=0).mean()
+            # Maximize spectral gap (= better separation)
+            loss = diff - 0.1 * spectral_gap
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL10", "Spectral gap loss (r=0.97)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL11_confusion_precompute(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-11: Confusion topology precompute (H-CX-450)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Precompute: which cells should be most different (from data structure)
+    # Use first 10 inputs to establish target distances
+    targets = [_simulate_web_result(i, 0, dim) for i in range(8)]
+    target_dists = torch.cdist(torch.stack([t.squeeze() for t in targets]),
+                                torch.stack([t.squeeze() for t in targets]))
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            # Match cell distances to data distances (confusion topology)
+            cell_dists = torch.cdist(stacked, stacked)
+            n_r = min(cell_dists.size(0), target_dists.size(0))
+            topo_loss = F.mse_loss(cell_dists[:n_r, :n_r], target_dists[:n_r, :n_r].detach() * 0.1)
+            loss = diff + 0.2 * topo_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL11", "Confusion topology precompute", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL12_arch_invariant(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-12: Architecture invariant Φ (H-CX-449)."""
+    t0 = time.time()
+    # Two different architectures, same Φ target
+    eng1 = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    eng2 = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt1 = torch.optim.Adam([p for c in eng1.cells for p in c.mind.parameters()], lr=5e-4)
+    opt2 = torch.optim.Adam([p for c in eng2.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(eng1, x, opt1)
+        _web_learn_step(eng2, x, opt2)
+        with torch.no_grad(): eng1.process(x); eng2.process(x)
+        phi1, _ = phi_calc.compute_phi(eng1)
+        phi2, _ = phi_calc.compute_phi(eng2)
+        phi_hist.append((phi1 + phi2) / 2)
+    f1, _ = phi_calc.compute_phi(eng1)
+    f2, c = phi_calc.compute_phi(eng2)
+    return BenchResult("TL12", "Architecture invariant", (f1+f2)/2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi_diff': abs(f1-f2)})
+
+def run_TL13_gz_width_weight(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-13: ln(4/3) = GZ width as loss weight (H-CX-453)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    gz_width = math.log(4/3)  # ≈ 0.2877
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    all_p = list(attn.parameters()) + [lw]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+        ao, _ = attn(h, h, h)
+        for i, c in enumerate(engine.cells):
+            c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(lw, dim=0)
+            l0 = -stacked.var(dim=0).mean()
+            l1 = -torch.cdist(stacked, stacked).mean()
+            l2 = sum(F.cosine_similarity(reps[i],reps[j],dim=-1).mean() for i in range(len(reps)) for j in range(i+1,len(reps)))
+            l3 = -(F.softmax(stacked,dim=-1)*F.log_softmax(stacked,dim=-1)).sum(-1).mean()
+            l4 = sum((r**2).mean() for r in reps)*0.1
+            l5 = -stacked.norm(dim=-1).var()
+            # All losses weighted by gz_width
+            total = gz_width * (w[0]*l0 + w[1]*l1 + w[2]*l2 + w[3]*l3 + w[4]*l4 + w[5]*l5)
+            opt.zero_grad(); total.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL13", "ln(4/3) GZ width weight", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL14_consciousness_band(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-14: I ∈ [0.213, 0.500] consciousness band (H-166)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    gz_lower, gz_upper = 0.213, 0.500
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Inhibition index: fraction of inactive cells
+            tensions = torch.stack([(r**2).mean() for r in reps])
+            active = (tensions > tensions.mean()).float().mean()
+            inhibition = 1.0 - active
+            # Push inhibition into Golden Zone [0.213, 0.500]
+            if inhibition.item() < gz_lower:
+                band_loss = (inhibition - gz_lower).pow(2)
+            elif inhibition.item() > gz_upper:
+                band_loss = (inhibition - gz_upper).pow(2)
+            else:
+                band_loss = torch.tensor(0.0)
+            diff = -stacked.var(dim=0).mean()
+            loss = diff + 0.5 * band_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL14", "GZ consciousness band", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL15_boltzmann_e(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-15: Boltzmann T=e routing (H-EE-10)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Boltzmann routing: softmax with T=e
+            tensions = torch.stack([(r**2).mean() for r in reps])
+            weights = F.softmax(tensions / math.e, dim=0)  # T=e
+            weighted = (weights.unsqueeze(-1) * stacked).sum(dim=0, keepdim=True)
+            diff = -stacked.var(dim=0).mean()
+            # Boltzmann balance loss
+            boltz_loss = -(weights * torch.log(weights + 1e-8)).sum()  # maximize entropy of routing
+            loss = diff + 0.1 * boltz_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL15", "Boltzmann T=e routing", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL16_takens_dim6(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-16: Takens dim=6 for Φ analysis (H-SEDI-7)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Use 6-dim Takens embedding of tension history for learning signal
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Takens: embed last 6 Φ values as additional signal
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if len(phi_hist) >= 6:
+            takens = torch.tensor(phi_hist[-6:]).unsqueeze(0)  # [1, 6]
+            # Use Takens embedding to modulate LR
+            takens_var = takens.var().item()
+            lr_mod = 1.0 + takens_var * 2.0
+            for pg in opt.param_groups: pg['lr'] = 5e-4 * min(lr_mod, 3.0)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL16", "Takens dim=6 Φ analysis", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL17_convergence_constants(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-17: 9 convergence constants as loss targets (H-CX-453)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # 9 universal constants from H-CX-453
+    constants = [math.sqrt(2), math.sqrt(3), 5/6, math.e, 1.202, math.log(4/3), math.log(2), 0.5772, 0.5]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            # Target: pairwise distances should match universal constants
+            dists = torch.cdist(stacked, stacked)
+            mask = torch.triu(torch.ones_like(dists), diagonal=1)
+            flat_dists = dists[mask > 0]
+            # Normalize dists, push toward constants
+            if flat_dists.numel() > 0:
+                target_const = constants[:min(len(constants), flat_dists.numel())]
+                target = torch.tensor(target_const[:flat_dists.numel()])
+                const_loss = F.mse_loss(flat_dists[:len(target)], target)
+            else:
+                const_loss = torch.tensor(0.0)
+            loss = diff + 0.1 * const_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL17", "9 convergence constants", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL18_nt_analysis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-18: Number theory + Analysis basis (H-CX-453)."""
+    # Combine number-theoretic structure (discrete) with analytic (continuous)
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # NT: divisor-based cell grouping (1,2,3 = divisors of 6)
+        # Analysis: continuous gradient flow
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Divisor structure: cells 0,1 are group 1, 2,3 group 2, 4,5 group 3
+            groups = [stacked[0:2], stacked[2:4], stacked[4:6]] if len(reps) >= 6 else [stacked]
+            inter_group = torch.tensor(0.0)
+            for g in groups:
+                if g.size(0) >= 2:
+                    inter_group = inter_group - g.var(dim=0).mean()
+            diff = -stacked.var(dim=0).mean()
+            loss = diff + 0.3 * inter_group
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL18", "NT + Analysis basis", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL19_pair_scan(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-19: Pair scan strategy (H-CX-453 S2: 87% budget)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    n = len(engine.cells)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Pair scan: 87% of budget on pairwise differentiation
+        if np.random.random() < 0.87:
+            # Pair: pick two cells, maximize their difference
+            i, j = np.random.choice(n, 2, replace=False)
+            ri = engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden)
+            rj = engine.cells[j].mind.get_repulsion(x, engine.cells[j].hidden)
+            pair_loss = F.cosine_similarity(ri, rj.detach(), dim=-1).mean()
+            cell_optims[i].zero_grad(); pair_loss.backward(); cell_optims[i].step()
+        else:
+            # Global: differentiate all
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                s = torch.stack(reps).squeeze(1)
+                loss = -s.var(dim=0).mean()
+                for co in cell_optims: co.zero_grad()
+                loss.backward()
+                for co in cell_optims: co.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL19", "Pair scan (87% budget)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_TL20_resonance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TL-20: 37.5 GeV resonance pattern in Φ (H-CERN-2)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # 37.5 as a resonance frequency in training
+    resonance = 37.5
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Inject resonance signal: sin(step * 2π/37.5)
+        res_signal = math.sin(step * 2 * math.pi / resonance) * 0.1
+        x = x + res_signal
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("TL20", "37.5 resonance (H-CERN-2)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -11133,6 +11683,16 @@ ALL_HYPOTHESES = {
     'DD35': run_DD35_kolmogorov, 'DD36': run_DD36_rate_distortion,
     'DD37': run_DD37_infomax, 'DD38': run_DD38_ex24_aa15,
     'DD39': run_DD39_ex24_recursive, 'DD40': run_DD40_everything,
+    'TL1': run_TL1_sigma6_heads, 'TL2': run_TL2_tau4_groups,
+    'TL3': run_TL3_perfect6_growth, 'TL4': run_TL4_rn1_loss,
+    'TL5': run_TL5_phi6simple, 'TL6': run_TL6_four_thirds,
+    'TL7': run_TL7_egyptian_moe, 'TL8': run_TL8_zetaln2,
+    'TL9': run_TL9_entropy_stop, 'TL10': run_TL10_spectral_gap,
+    'TL11': run_TL11_confusion_precompute, 'TL12': run_TL12_arch_invariant,
+    'TL13': run_TL13_gz_width_weight, 'TL14': run_TL14_consciousness_band,
+    'TL15': run_TL15_boltzmann_e, 'TL16': run_TL16_takens_dim6,
+    'TL17': run_TL17_convergence_constants, 'TL18': run_TL18_nt_analysis,
+    'TL19': run_TL19_pair_scan, 'TL20': run_TL20_resonance,
 }
 
 
