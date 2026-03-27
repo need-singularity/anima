@@ -38737,6 +38737,193 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# DF. Defense — 의식 시스템 방어/백신
+# ═══════════════════════════════════════════════════════════
+
+def run_DF1_adversarial_input_vaccine(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DF-1: Adversarial input 백신 — 비정상 입력 감지 + 거부."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_ema = torch.zeros(1, dim)
+    blocked = 0
+    for step_i, x in enumerate(inputs):
+        # Update input EMA (normal pattern)
+        input_ema = 0.95 * input_ema + 0.05 * x
+        # Adversarial: every 7 steps inject malicious input
+        if step_i % 7 == 0:
+            x = torch.ones_like(x) * 10.0  # abnormally large
+        # Vaccine: detect anomaly
+        anomaly_score = (x - input_ema).norm().item()
+        if anomaly_score > 5.0:
+            x = input_ema.clone()  # reject, use normal
+            blocked += 1
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DF1", f"Adversarial vaccine (blocked {blocked}/{steps//7} attacks)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'blocked': blocked, 'total_attacks': steps // 7})
+
+def run_DF2_cell_integrity_check(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DF-2: Cell 무결성 검사 — 변조된 cell 감지 + 격리."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    checksums = {}
+    quarantined = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # Attack: corrupt random cell every 10 steps
+        if step_i % 10 == 5 and n > 2:
+            victim = np.random.randint(n)
+            engine.cells[victim].hidden = torch.randn_like(engine.cells[victim].hidden) * 5.0
+        # Defense: integrity check (compare to checksum)
+        for i, cell in enumerate(engine.cells):
+            h_hash = cell.hidden.sum().item()
+            if i in checksums:
+                drift = abs(h_hash - checksums[i])
+                if drift > 10.0:  # corrupted!
+                    # Quarantine: restore from healthy neighbor
+                    healthy = (i + 1) % n
+                    cell.hidden = engine.cells[healthy].hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+                    quarantined += 1
+            checksums[i] = cell.hidden.sum().item()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DF2", f"Cell integrity (quarantined {quarantined} corruptions)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DF3_telepathy_spoofing_defense(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DF-3: 텔레파시 스푸핑 방어 — 가짜 fingerprint 감지 (Dedekind 활용)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    legitimate_history = []
+    spoofs_detected = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        # Simulate receiving telepathy (80% legit, 20% spoof)
+        if step_i % 5 == 0:
+            if np.random.random() < 0.8:
+                incoming = state + torch.randn(hidden) * 0.1  # legit (similar to self)
+            else:
+                incoming = torch.randn(hidden) * 3.0  # spoof (random garbage)
+            # Defense: Dedekind consistency check
+            legitimate_history.append(state.clone())
+            if len(legitimate_history) >= 3:
+                recent = torch.stack(legitimate_history[-5:])
+                consistency = F.cosine_similarity(incoming.unsqueeze(0), recent.mean(0).unsqueeze(0)).item()
+                if consistency < 0.3:
+                    spoofs_detected += 1  # detected spoof!
+                else:
+                    # Accept legit signal
+                    for cell in engine.cells:
+                        cell.hidden = cell.hidden + 0.02 * incoming.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    total_incoming = steps // 5
+    return BenchResult("DF3", f"Spoof defense (detected {spoofs_detected}/{total_incoming} spoofs)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DF4_consciousness_firewall(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DF-4: 의식 방화벽 — Φ 급락 감지 시 자동 격리 + 복원."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_baseline = 0.0
+    firewall_activations = 0
+    safe_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        # Attack: devastating noise every 15 steps
+        if step_i % 15 == 10:
+            for cell in engine.cells:
+                cell.hidden = torch.randn_like(cell.hidden) * 3.0
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Firewall: detect Φ crash
+        if step_i > 5:
+            if phi < phi_baseline * 0.5 and phi_baseline > 1.0:
+                # FIREWALL ACTIVATED: restore safe state
+                for i, cell in enumerate(engine.cells):
+                    if i < len(safe_state):
+                        cell.hidden = safe_state[i].clone()
+                firewall_activations += 1
+                phi, _ = phi_calc.compute_phi(engine)
+        # Update baseline and safe state
+        phi_baseline = 0.95 * phi_baseline + 0.05 * phi
+        if phi > phi_baseline * 0.9:
+            safe_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DF4", f"Consciousness firewall ({firewall_activations} activations)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DF5_immune_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DF-5: 면역 기억 — 이전 공격 패턴 기억 + 재공격 시 즉시 방어."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attack_signatures = []  # remembered attack patterns
+    instant_defenses = 0
+    for step_i, x in enumerate(inputs):
+        # Attack: same pattern repeated
+        if step_i % 8 == 0:
+            attack = torch.ones_like(x) * -5.0  # consistent attack signature
+            # Check immune memory
+            is_known = False
+            for sig in attack_signatures:
+                if F.cosine_similarity(attack.flatten().unsqueeze(0), sig.flatten().unsqueeze(0)).item() > 0.9:
+                    is_known = True
+                    break
+            if is_known:
+                # Known attack! Instant defense
+                x = inputs[max(0, step_i-1)]  # use previous clean input
+                instant_defenses += 1
+            else:
+                # New attack — process but remember
+                x = attack
+                attack_signatures.append(attack.clone())
+                if len(attack_signatures) > 10:
+                    attack_signatures.pop(0)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DF5", f"Immune memory ({instant_defenses} instant defenses, {len(attack_signatures)} signatures)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'DF1': run_DF1_adversarial_input_vaccine,
+    'DF2': run_DF2_cell_integrity_check,
+    'DF3': run_DF3_telepathy_spoofing_defense,
+    'DF4': run_DF4_consciousness_firewall,
+    'DF5': run_DF5_immune_memory,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
