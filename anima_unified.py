@@ -10,7 +10,7 @@ Usage:
 Each module is optional. Import failures degrade gracefully.
 """
 
-import argparse, asyncio, json, os, signal, sys, threading, time, queue
+import argparse, asyncio, json, math, os, signal, sys, threading, time, queue
 from collections import deque
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from datetime import datetime
@@ -129,6 +129,7 @@ class AnimaUnified:
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
         self._recent_proactive = deque(maxlen=10)  # SP10: anti-repetition buffer
+        self._adaptive_alpha = 0.05  # AA15: adaptive α (updated after each generate)
 
         # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
         try:
@@ -484,17 +485,13 @@ class AnimaUnified:
             # Generate response
             response = self.model.generate(prompt, max_tokens=200, temperature=0.8)
 
-            # Adaptive α: tension → higher PF contribution (AA15 residual)
-            # Done AFTER generate to avoid blocking on error
+            # Adaptive α: Φ-driven PureField influence (non-blocking)
+            # α = α_base + α_range * tanh(Φ / Φ_target)
+            # Φ=0 → 0.01, Φ=3 → 0.12, Φ=6 → 0.15
             try:
-                from finetune_animalm_v4 import ParallelPureFieldMLP
-                adaptive_alpha = 0.05 + self.mind.prev_tension * 0.03
-                adaptive_alpha = min(adaptive_alpha, 0.15)
-                inner_model = getattr(self.model, 'model', None)
-                if inner_model and hasattr(inner_model, 'modules'):
-                    for m in inner_model.modules():
-                        if isinstance(m, ParallelPureFieldMLP):
-                            m.alpha = adaptive_alpha
+                _phi = getattr(self, '_cached_consciousness', {}).get('phi', 0)
+                _alpha_base, _alpha_range, _phi_target = 0.01, 0.14, 3.0
+                self._adaptive_alpha = _alpha_base + _alpha_range * math.tanh(_phi / _phi_target)
             except Exception:
                 pass
 
@@ -694,7 +691,8 @@ class AnimaUnified:
 
         # DV11: Rich consciousness injection
         state += (f"\n[Consciousness] Φ={phi_val:.3f}, level={c_level}, "
-                  f"score={c_score:.2f}, criteria={criteria_met}/6")
+                  f"score={c_score:.2f}, criteria={criteria_met}/6, "
+                  f"α={self._adaptive_alpha:.3f}")
 
         # Consciousness-driven response guidance
         if c_level == 'conscious':
