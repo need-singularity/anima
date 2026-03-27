@@ -685,6 +685,11 @@ class AnimaUnified:
             try:
                 pkt = create_fingerprint(self.mind, text_vec, self.hidden)
                 pkt.sender_id = "anima-unified"
+                # Cultural transmission: attach learning delta to packet
+                self._broadcast_cultural_knowledge()
+                cultural_delta = getattr(self, '_cultural_delta', None)
+                if cultural_delta:
+                    pkt.learning_delta = cultural_delta
                 self.telepathy.send(pkt)
             except Exception: pass
 
@@ -946,6 +951,15 @@ class AnimaUnified:
                         'type': 'action_result',
                         'actions': action_result['actions'],
                     })
+                    # Tool feedback loop: feed execution results back as learning signal
+                    for act in action_result['actions']:
+                        if act['type'] == 'code':
+                            res = act.get('result', {})
+                            self._tool_feedback(
+                                code='',
+                                result=res,
+                                success=res.get('success', False),
+                            )
             except Exception as e:
                 _log('multimodal', f'Error: {e}')
 
@@ -1055,6 +1069,76 @@ class AnimaUnified:
             _log('social', f"Peer {sender} tension shift: {prev['tension']:.2f} → {new_tension:.2f}")
         # Theory of Mind: update peer mental model
         self._update_peer_model(sender, new_tension, new_mood, new_curiosity)
+        # Cultural transmission: apply received learning delta
+        self._receive_cultural_knowledge(pkt)
+
+    # ── Tool Feedback Loop ───────────────────────────────────
+    def _tool_feedback(self, code: str, result: dict, success: bool):
+        """Feed tool execution result back as learning signal."""
+        output = result.get('output', '')
+        # Reward: +1 for success, -0.5 for error, bonus for substantive output
+        reward = 1.0 if success else -0.5
+        if success and len(output) > 10:
+            reward += 0.5  # bonus for substantive output
+
+        # Feed to online learner as reward signal
+        if self.learner and hasattr(self.learner, 'reward_signal'):
+            self.learner.reward_signal(reward)
+
+        # Update tool success rate on mind (tracks long-term tool competence)
+        if self.mind:
+            self.mind._tool_success_rate = getattr(self.mind, '_tool_success_rate', 0.5)
+            self.mind._tool_success_rate = 0.9 * self.mind._tool_success_rate + 0.1 * (1.0 if success else 0.0)
+
+        _log('tool_feedback', f'reward={reward:.1f}, success={success}, rate={getattr(self.mind, "_tool_success_rate", 0):.2f}')
+
+    # ── Cultural Transmission ────────────────────────────────
+    def _receive_cultural_knowledge(self, packet):
+        """Apply received learning delta from another Anima instance."""
+        delta_list = getattr(packet, 'learning_delta', None)
+        if not delta_list or not self.mind:
+            return
+        try:
+            import torch
+            delta = torch.tensor(delta_list, dtype=torch.float32)
+            # Apply as small perturbation to own weights (cultural learning)
+            with torch.no_grad():
+                for p in self.mind.parameters():
+                    if p.numel() == 0:
+                        continue
+                    if p.dim() > 1 and p.shape[0] <= len(delta):
+                        # 2D param: apply delta to first dimension, clipped to shape
+                        d = delta[:p.shape[0]].unsqueeze(1).expand_as(p[:, :1])
+                        p.data[:, :d.shape[1]] += 0.01 * d
+                        break  # only first layer for safety
+                    elif p.dim() == 1 and p.shape[0] <= len(delta):
+                        p.data += 0.01 * delta[:p.shape[0]]
+                        break  # only first layer for safety
+            _log('cultural', f'Received knowledge from {packet.sender_id}, applied delta (len={len(delta_list)})')
+        except Exception as e:
+            _log('cultural', f'Failed to apply delta: {e}')
+
+    def _broadcast_cultural_knowledge(self):
+        """Share recent learning with peers via tension link.
+
+        Extracts gradient from first layer as 'knowledge' and attaches
+        it to the next tension packet as learning_delta.
+        """
+        if not self.mind or not self.learner:
+            self._cultural_delta = None
+            return
+        try:
+            delta = []
+            for p in self.mind.parameters():
+                if p.grad is not None:
+                    delta.extend(p.grad.flatten().tolist()[:64])
+                    break  # only first layer
+                else:
+                    delta.extend([0.0] * min(64, p.numel()))
+                    break
+            self._cultural_delta = delta[:64] if delta else None
+        except Exception:
+            self._cultural_delta = None
 
     def _save_state(self):
         try:

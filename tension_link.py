@@ -110,6 +110,8 @@ class TensionPacket:
     kuramoto_r: float = 0.0        # Synchronization parameter (target 2/3)
     dedekind_ratio: float = 0.0    # ψ(ψ)/ψ ratio (perfect=2)
     transmission_quality: float = 0.0  # R: 0=noise, 1=undistorted
+    # Cultural transmission: weight deltas to share between instances
+    learning_delta: list = None  # Recent learning weight changes (max 64 floats)
 
     def to_json(self):
         return json.dumps({
@@ -129,6 +131,7 @@ class TensionPacket:
             'kuramoto_r': self.kuramoto_r,
             'dedekind_ratio': self.dedekind_ratio,
             'transmission_quality': self.transmission_quality,
+            'learning_delta': self.learning_delta,
         })
 
     @classmethod

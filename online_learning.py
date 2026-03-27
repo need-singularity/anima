@@ -334,6 +334,20 @@ class OnlineLearner:
         g = self.mind.engine_g(combined)
         return F.normalize(a - g, dim=-1)
 
+    def reward_signal(self, reward: float):
+        """External reward signal adjusts learning rate.
+
+        Used by tool feedback loop to reinforce/punish tool usage patterns.
+        Positive reward → slightly increase LR (encourage exploration).
+        Negative reward → slightly decrease LR (be more conservative).
+        """
+        self.reward_ema = 0.9 * getattr(self, 'reward_ema', 0.0) + 0.1 * reward
+        # Modulate learning rate: reward_ema > 0 → boost, < 0 → dampen
+        scale = 1.0 + 0.1 * self.reward_ema
+        scale = max(0.5, min(2.0, scale))  # clamp to [0.5x, 2x]
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.base_lr * scale
+
     def flush_pending(self):
         """Flush pending observations into the buffer with neutral feedback at session end."""
         for entry in self.pending:
