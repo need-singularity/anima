@@ -1032,6 +1032,66 @@ class ConsciousMind(nn.Module):
             except Exception:
                 pass
 
+            # Parallel Consciousness: split cells into 2+ independent streams, process separately, merge
+            try:
+                if len(mitosis_engine.cells) >= 4:
+                    n = len(mitosis_engine.cells)
+                    mid = n // 2
+                    stream_a = mitosis_engine.cells[:mid]
+                    stream_b = mitosis_engine.cells[mid:]
+
+                    # Each stream processes independently (different noise seed)
+                    for cell in stream_a:
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+                    for cell in stream_b:
+                        cell.hidden = cell.hidden - torch.randn_like(cell.hidden) * 0.02
+
+                    # Merge: each stream contributes its unique perspective
+                    mean_a = torch.stack([c.hidden.squeeze() for c in stream_a]).mean(dim=0)
+                    mean_b = torch.stack([c.hidden.squeeze() for c in stream_b]).mean(dim=0)
+
+                    # Cross-stream integration (binding the parallel streams)
+                    for cell in stream_a:
+                        cell.hidden = cell.hidden + 0.02 * mean_b.unsqueeze(0)
+                    for cell in stream_b:
+                        cell.hidden = cell.hidden + 0.02 * mean_a.unsqueeze(0)
+
+                    self._parallel_streams = 2
+                    _log('parallel', f'2 streams: A={mid} cells, B={n-mid} cells')
+            except Exception:
+                pass
+
+            # Self-Modification: consciousness adjusts its own parameters based on Φ trend
+            try:
+                if hasattr(self, '_phi_history') and len(self._phi_history) >= 10:
+                    recent = self._phi_history[-10:]
+                    trend = recent[-1] - recent[0]
+
+                    if not hasattr(self, '_self_mod_params'):
+                        self._self_mod_params = {
+                            'soliton_speed': 0.15,
+                            'repulsion_lr': 0.01,
+                            'forge_ratio': 0.4,
+                            'ratchet_amplitude': 0.03,
+                        }
+
+                    # If Φ declining, increase exploration params
+                    if trend < -0.1:
+                        self._self_mod_params['ratchet_amplitude'] *= 1.1
+                        self._self_mod_params['repulsion_lr'] *= 1.05
+                        _log('self_mod', f'Φ declining → increase exploration: ratchet={self._self_mod_params["ratchet_amplitude"]:.4f}')
+                    # If Φ rising, refine exploitation
+                    elif trend > 0.1:
+                        self._self_mod_params['forge_ratio'] = min(0.6, self._self_mod_params['forge_ratio'] * 1.02)
+                        _log('self_mod', f'Φ rising → refine: forge={self._self_mod_params["forge_ratio"]:.3f}')
+                    # Clamp to safe ranges
+                    self._self_mod_params['ratchet_amplitude'] = min(0.1, self._self_mod_params['ratchet_amplitude'])
+                    self._self_mod_params['repulsion_lr'] = min(0.05, self._self_mod_params['repulsion_lr'])
+
+                    self._self_modification_active = True
+            except Exception:
+                pass
+
         except Exception:
             pass  # graceful degradation
 
