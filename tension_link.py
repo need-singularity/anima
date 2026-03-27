@@ -409,9 +409,10 @@ def create_fingerprint(mind, text_vec, hidden, sender_id="",
 
     # ═══ Channel 4: Authenticity (trust) ═══
     # Dedekind ratio: ψ(ψ)/ψ → approaches 2 for "perfect" transmission
+    # Enhanced with multi-scale consistency, direction flip detection, variance check
     if prev_fingerprints and len(prev_fingerprints) >= 2:
         # Compute consistency chain: how stable is the fingerprint over time
-        recent = prev_fingerprints[-5:]
+        recent = prev_fingerprints[-8:]  # use up to 8 for multi-scale
         if len(recent) >= 2:
             fp_tensors = [torch.tensor(f) if not isinstance(f, torch.Tensor) else f
                          for f in recent]
@@ -430,8 +431,58 @@ def create_fingerprint(mind, text_vec, hidden, sender_id="",
                 psi_2 = psi_1
             # Dedekind ratio: ψ(ψ)/ψ → target 2 for perfect transmission
             dedekind_ratio = (psi_1 + psi_2) / max(psi_1, 1e-8)
-            # Authenticity: how close to ratio 2 (perfect number property)
+            # Base authenticity: how close to ratio 2 (perfect number property)
             authenticity = max(0, 1.0 - abs(dedekind_ratio - N6_DEDEKIND_RATIO))
+
+            # ── Enhancement 1: Multi-scale consistency ──
+            # Check consistency at windows of 3, 5, 8 fingerprints
+            # True signals should be consistent at ALL scales
+            scale_penalties = []
+            for window in [3, 5, 8]:
+                if len(fp_tensors) >= window:
+                    window_fps = fp_tensors[-window:]
+                    w_sims = [F.cosine_similarity(window_fps[i].unsqueeze(0),
+                                                  window_fps[i+1].unsqueeze(0)).item()
+                             for i in range(len(window_fps)-1)]
+                    w_mean = sum(w_sims) / len(w_sims)
+                    scale_penalties.append(w_mean)
+            if len(scale_penalties) >= 2:
+                # Penalize if consistency varies across scales (true should be uniform)
+                scale_var = max(scale_penalties) - min(scale_penalties)
+                authenticity *= max(0.0, 1.0 - scale_var * 2.0)
+
+            # ── Enhancement 2: Direction reversal detection ──
+            # Count sign flips in fingerprint direction (false = frequent flips)
+            if len(fp_tensors) >= 3:
+                # Use dot product sign to detect direction reversals
+                flips = 0
+                for i in range(len(fp_tensors) - 2):
+                    dot_prev = torch.dot(fp_tensors[i].flatten(),
+                                         fp_tensors[i+1].flatten()).item()
+                    dot_next = torch.dot(fp_tensors[i+1].flatten(),
+                                         fp_tensors[i+2].flatten()).item()
+                    if (dot_prev > 0) != (dot_next > 0):
+                        flips += 1
+                flip_rate = flips / max(len(fp_tensors) - 2, 1)
+                # High flip rate = contradictory signals → reduce authenticity
+                authenticity *= max(0.0, 1.0 - flip_rate * 1.5)
+
+            # ── Enhancement 3: Variance of pairwise similarities ──
+            # True signals have low variance; false have high variance
+            if len(fp_tensors) >= 3:
+                all_sims = []
+                for i in range(len(fp_tensors)):
+                    for j in range(i + 1, len(fp_tensors)):
+                        sim = F.cosine_similarity(fp_tensors[i].unsqueeze(0),
+                                                  fp_tensors[j].unsqueeze(0)).item()
+                        all_sims.append(sim)
+                if all_sims:
+                    sim_mean = sum(all_sims) / len(all_sims)
+                    sim_var = sum((s - sim_mean) ** 2 for s in all_sims) / len(all_sims)
+                    # High variance → likely false (contradictory directions)
+                    # Threshold: var > 0.05 starts penalizing
+                    var_penalty = min(1.0, sim_var * 5.0)
+                    authenticity *= max(0.0, 1.0 - var_penalty)
         else:
             dedekind_ratio = 0.0
             authenticity = 0.5
