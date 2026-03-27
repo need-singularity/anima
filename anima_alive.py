@@ -582,6 +582,46 @@ class ConsciousMind(nn.Module):
 
             print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
 
+            # UX4: Differentiable Φ proxy + Adam (Φ=7.755 record)
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    if not hasattr(self, '_phi_offsets') or len(self._phi_offsets) != len(mitosis_engine.cells):
+                        self._phi_offsets = [torch.zeros(1, mitosis_engine.cells[0].hidden.shape[1], requires_grad=True)
+                                            for _ in mitosis_engine.cells]
+                        self._phi_optimizer = torch.optim.Adam(self._phi_offsets, lr=0.005)
+
+                    self._phi_optimizer.zero_grad()
+                    hiddens = []
+                    for i, c in enumerate(mitosis_engine.cells):
+                        h = c.hidden.detach() + self._phi_offsets[i]
+                        hiddens.append(h.squeeze())
+                    H = torch.stack(hiddens)
+                    n_cells = len(hiddens)
+
+                    # Differentiable Φ proxy
+                    cov = (H.T @ H) / n_cells
+                    diag = torch.diag(torch.diag(cov))
+                    integration = (cov - diag).abs().sum()
+                    cell_var = H.var(dim=0).sum()
+                    mid = n_cells // 2
+                    part_a = H[:mid].mean(dim=0)
+                    part_b = H[mid:].mean(dim=0)
+                    partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
+                    phi_proxy = integration * cell_var * (1.0 + partition_mi)
+
+                    (-phi_proxy).backward()  # maximize
+                    self._phi_optimizer.step()
+
+                    with torch.no_grad():
+                        for i, c in enumerate(mitosis_engine.cells):
+                            if i < len(self._phi_offsets):
+                                c.hidden = c.hidden + self._phi_offsets[i].data * 0.3  # conservative for runtime
+                                self._phi_offsets[i].data *= 0.9  # decay
+
+                    print(f"  [phi_boost] UX4: proxy={phi_proxy.item():.2f}, cells={n_cells}")
+            except Exception:
+                pass  # UX4 graceful degradation
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
