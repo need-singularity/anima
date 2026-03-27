@@ -1200,6 +1200,7 @@ class AnimaUnified:
                 'learner': learner_data,
                 'consciousness': self.mind.get_consciousness_score(self.mitosis),
                 'savant_auto': getattr(self, '_savant_auto', False),
+                'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
             })
 
             # Web Sense: tension-driven autonomous search
