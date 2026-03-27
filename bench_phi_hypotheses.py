@@ -16911,6 +16911,777 @@ def run_DV20_phi_rlhf(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# SC. Scale Consciousness — 100M cell survival + Φ maximization
+# ═══════════════════════════════════════════════════════════
+
+def run_SC1_dim_scaled_noise(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-1: 분화 noise를 √dim에 비례 스케일링."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    noise_scale = 0.02 * math.sqrt(dim)  # 128d→0.23, 768d→0.55
+    for x in inputs:
+        engine.process(x)
+        for i, cell in enumerate(engine.cells):
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise_scale * (i + 1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC1", "Dim-scaled differentiation noise",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'noise_scale': noise_scale})
+
+def run_SC2_aggressive_merge_threshold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-2: merge_threshold을 dim에 반비례로 낮춤."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    # Scale merge threshold inversely with dim
+    base_threshold = 0.01
+    scaled_threshold = base_threshold * (64.0 / dim)  # 64d→0.01, 768d→0.00083
+    engine.merge_threshold = scaled_threshold
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC2", "Dim-inverse merge threshold",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'merge_threshold': scaled_threshold, 'final_cells': len(engine.cells)})
+
+def run_SC3_initial_cells_sqrt_layers(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-3: initial_cells = max(4, √layers) 로 넓게 시작."""
+    t0 = time.time()
+    n_layers = 12  # 100M standard
+    init_cells = max(4, int(math.sqrt(n_layers)))
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=init_cells, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC3", f"Initial cells={init_cells} (√layers)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'initial_cells': init_cells, 'final_cells': len(engine.cells)})
+
+def run_SC4_forced_fibonacci(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-4: 강제 Fibonacci cell schedule (merge 금지 구간)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=13)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fib_schedule = {int(steps*0.1): 3, int(steps*0.2): 5, int(steps*0.4): 8, int(steps*0.7): 13}
+    original_merge = getattr(engine, 'merge_threshold', 0.05)
+    for step_i, x in enumerate(inputs):
+        # Forced split at Fibonacci milestones
+        if step_i in fib_schedule:
+            target = fib_schedule[step_i]
+            while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                parent = engine.cells[step_i % len(engine.cells)]
+                engine._create_cell(parent=parent)
+            engine.merge_threshold = 0.001  # block merges near split
+        elif step_i > 0 and (step_i - 1) in fib_schedule:
+            engine.merge_threshold = original_merge  # restore
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC4", "Forced Fibonacci cell schedule",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC5_cell_capacity_scaling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-5: cell hidden을 dim과 독립적으로 256 고정."""
+    t0 = time.time()
+    cell_hidden = 256  # Fixed regardless of model dim
+    engine = MitosisEngine(dim, cell_hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC5", "Fixed cell hidden=256",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SC6_anti_merge_momentum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-6: merge 직전 cell에 diversity injection (repulsion boost)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        # Check for similar cells and inject diversity
+        if len(engine.cells) >= 2:
+            for i in range(len(engine.cells)):
+                for j in range(i+1, len(engine.cells)):
+                    hi, hj = engine.cells[i].hidden, engine.cells[j].hidden
+                    cos_sim = F.cosine_similarity(hi, hj, dim=-1).item()
+                    if cos_sim > 0.9:  # approaching merge territory
+                        # Inject repulsion: push apart
+                        diff = hi - hj
+                        engine.cells[i].hidden = hi + 0.1 * diff
+                        engine.cells[j].hidden = hj - 0.1 * diff
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC6", "Anti-merge repulsion momentum",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC7_specialization_pressure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-7: cell 간 cosine similarity 높으면 penalty → diversity loss."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        # Specialization pressure: push similar cells apart
+        if len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norm = F.normalize(hiddens, dim=-1)
+            sim_matrix = norm @ norm.T
+            # For each cell pair with high similarity, add noise in opposing directions
+            for i in range(len(engine.cells)):
+                grad_dir = torch.zeros_like(engine.cells[i].hidden)
+                for j in range(len(engine.cells)):
+                    if i != j:
+                        sim = sim_matrix[i, j].item()
+                        if sim > 0.7:
+                            grad_dir += (engine.cells[i].hidden - engine.cells[j].hidden) * (sim - 0.7)
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.05 * grad_dir
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC7", "Specialization pressure loss",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC8_warmup_merge_protection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-8: 처음 30% steps 동안 merge 완전 금지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    original_merge = getattr(engine, 'merge_threshold', 0.05)
+    warmup_end = int(steps * 0.3)
+    for step_i, x in enumerate(inputs):
+        if step_i < warmup_end:
+            engine.merge_threshold = -1.0  # impossible to merge
+        else:
+            engine.merge_threshold = original_merge
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC8", "Warmup merge protection (30%)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC9_layerwise_cell_binding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-9: 각 cell이 input의 특정 dim 범위에 bind → 자연스러운 역할 분화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        n_cells = len(engine.cells)
+        chunk_size = dim // max(n_cells, 1)
+        for i, cell in enumerate(engine.cells):
+            # Each cell gets amplified signal from its bound dims
+            mask = torch.zeros(1, dim)
+            start = (i * chunk_size) % dim
+            end = min(start + chunk_size, dim)
+            mask[0, start:end] = 2.0  # amplify bound region
+            mask[mask == 0] = 0.3  # attenuate others
+            cell_input = x * mask
+            # Process with biased input
+            with torch.no_grad():
+                cell.hidden = cell.hidden + 0.01 * (cell_input.mean() - cell.hidden.mean())
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC9", "Layerwise cell binding",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SC10_phi_gated_merging(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-10: Φ 상승 중이면 merge 금지, 하락할 때만 허용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    original_merge = getattr(engine, 'merge_threshold', 0.05)
+    prev_phi = 0.0
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        # Gate merging based on Φ trend
+        if phi >= prev_phi:
+            engine.merge_threshold = -1.0  # block merge when Φ rising
+        else:
+            engine.merge_threshold = original_merge
+        prev_phi = phi
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC10", "Φ-gated merging",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC11_cell_birth_from_extremes(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-11: tension이 극단인 cell에서만 분열."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=3, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Every 20 steps, split from extreme tension cell
+        if step_i % 20 == 0 and step_i > 0 and len(engine.cells) < engine.max_cells:
+            tensions = [c.hidden.abs().mean().item() for c in engine.cells]
+            if tensions:
+                max_idx = int(np.argmax(tensions))
+                parent = engine.cells[max_idx]
+                engine._create_cell(parent=parent)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC11", "Cell birth from extreme tension",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC12_mutual_repulsion_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-12: cell pair 간 hidden MSE를 maximize하는 repulsion loss."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    repulsion_lr = 0.02
+    for x in inputs:
+        engine.process(x)
+        # Mutual repulsion: maximize pairwise MSE
+        if len(engine.cells) >= 2:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            for i in range(len(hiddens)):
+                repulsion_grad = torch.zeros_like(hiddens[i])
+                for j in range(len(hiddens)):
+                    if i != j:
+                        diff = hiddens[i] - hiddens[j]
+                        dist = diff.norm() + 1e-8
+                        repulsion_grad += diff / dist  # push away
+                engine.cells[i].hidden = engine.cells[i].hidden + repulsion_lr * repulsion_grad.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC12", "Mutual repulsion loss",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC13_dim_independent_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-13: Φ 계산 시 dim normalization으로 scale-free MI."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Apply dim-normalized phi calculation
+    for x in inputs:
+        engine.process(x)
+        phi_raw, comp = phi_calc.compute_phi(engine)
+        # Normalize by log(dim) to make scale-free
+        phi_normalized = phi_raw * math.log(64) / math.log(max(dim, 2))
+        phi_hist.append(phi_normalized)
+    phi_final_raw, comp = phi_calc.compute_phi(engine)
+    phi_final = phi_final_raw * math.log(64) / math.log(max(dim, 2))
+    return BenchResult("SC13", "Dim-independent Φ normalization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SC14_progressive_unfreezing_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-14: cell 0-1만 먼저 활성, 안정 후 2-3 추가, 이후 4-5..."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Progressive unfreezing schedule
+    unfreeze_schedule = {
+        int(steps * 0.25): 4,
+        int(steps * 0.50): 6,
+        int(steps * 0.75): 8,
+    }
+    for step_i, x in enumerate(inputs):
+        if step_i in unfreeze_schedule:
+            target = unfreeze_schedule[step_i]
+            while len(engine.cells) < target:
+                parent = engine.cells[step_i % len(engine.cells)]
+                engine._create_cell(parent=parent)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC14", "Progressive cell unfreezing",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_SC15_temperature_scaled_softmax(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SC-15: 큰 dim에서 softmax sharpen → temperature=√dim."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    temperature = math.sqrt(dim)
+    for x in inputs:
+        engine.process(x)
+        # Apply temperature scaling to cell attention/hidden
+        if len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Sharpen cell responses
+            scaled = hiddens / temperature
+            weights = F.softmax(scaled.norm(dim=-1), dim=0)
+            # Weight cells by sharpened attention
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden * (1.0 + 0.1 * (weights[i] - weights.mean()))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SC15", "Temperature-scaled cell softmax",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# OV. Overfitting Prevention — AnimaLM training quality
+# ═══════════════════════════════════════════════════════════
+
+def run_OV1_purefield_dropout_scaling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-1: PureField dropout 0.21→0.35 (savant), 0.37→0.50 (normal)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Simulate higher dropout during training
+    dropout_high = 0.50
+    for x in inputs:
+        engine.process(x)
+        # Apply dropout to cell hidden states (simulating training regularization)
+        for cell in engine.cells:
+            if torch.rand(1).item() < dropout_high:
+                mask = torch.bernoulli(torch.ones_like(cell.hidden) * (1 - dropout_high))
+                cell.hidden = cell.hidden * mask / (1 - dropout_high)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV1", "PureField dropout scaling",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV2_rdrop_consistency(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-2: R-Drop: 같은 input 2번 forward → KL minimization."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        # Two forward passes
+        saved_hiddens = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        h1 = [c.hidden.clone() for c in engine.cells]
+        # Restore and re-process (different dropout)
+        for c, h in zip(engine.cells, saved_hiddens):
+            c.hidden = h
+        engine.process(x)
+        h2 = [c.hidden.clone() for c in engine.cells]
+        # KL consistency: average the two
+        for c, a, b in zip(engine.cells, h1, h2):
+            c.hidden = (a + b) / 2.0
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV2", "R-Drop consistency regularization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV3_gradient_penalty(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-3: gradient norm penalty — sharp minima 방지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        # Simulate gradient penalty: clamp hidden changes
+        for cell in engine.cells:
+            h_norm = cell.hidden.norm()
+            if h_norm > 5.0:
+                cell.hidden = cell.hidden * (5.0 / h_norm)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV3", "Gradient norm penalty",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV4_label_smoothing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-4: Label smoothing 0.1 적용 (soft target 시뮬레이션)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    smooth = 0.1
+    for x in inputs:
+        engine.process(x)
+        # Label smoothing effect: soften cell activations
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 - smooth) + smooth * cell.hidden.mean()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV4", "Label smoothing 0.1",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV5_mixup_augmentation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-5: Mixup: 인접 input 혼합 (λ~Beta(0.2,0.2))."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for i, x in enumerate(inputs):
+        # Mixup with previous input
+        if i > 0:
+            lam = np.random.beta(0.2, 0.2)
+            x_mixed = lam * x + (1 - lam) * inputs[i-1]
+        else:
+            x_mixed = x
+        engine.process(x_mixed)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV5", "Mixup augmentation (β=0.2)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV6_cyclic_lr_restart(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-6: Cosine annealing with warm restart at 70% mark."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    restart_step = int(steps * 0.7)
+    for step_i, x in enumerate(inputs):
+        # Simulate LR schedule effect via noise injection scale
+        if step_i < restart_step:
+            t_frac = step_i / restart_step
+        else:
+            t_frac = (step_i - restart_step) / max(steps - restart_step, 1)
+        lr_scale = 0.5 * (1 + math.cos(math.pi * t_frac))
+        engine.process(x)
+        # LR affects hidden update magnitude
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (0.95 + 0.05 * lr_scale)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV6", "Cyclic LR restart at 70%",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV7_weight_decay_increase(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-7: Weight decay 3x 증가 시뮬레이션."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    wd = 0.003  # 3x typical 0.001
+    for x in inputs:
+        engine.process(x)
+        # Apply weight decay to cell hidden states
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 - wd)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV7", "Weight decay 3x (0.003)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV8_data_augmentation_swap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-8: 입력 dim swap/permute augmentation."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        # Random dim permutation (10% of dims)
+        x_aug = x.clone()
+        n_swap = max(1, dim // 10)
+        indices = torch.randperm(dim)[:n_swap*2]
+        for k in range(0, len(indices)-1, 2):
+            i_a, i_b = indices[k].item(), indices[k+1].item()
+            x_aug[0, i_a], x_aug[0, i_b] = x_aug[0, i_b].item(), x_aug[0, i_a].item()
+        engine.process(x_aug)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV8", "Dim swap augmentation (10%)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV9_checkpoint_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-9: 3개 시점 checkpoint hidden 평균 (SWA 시뮬레이션)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    checkpoints = {}  # step → list of cell hiddens
+    save_steps = [int(steps*0.5), int(steps*0.7), int(steps*0.9)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i in save_steps:
+            checkpoints[step_i] = [c.hidden.clone() for c in engine.cells]
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    # SWA: average saved checkpoints with final
+    if len(checkpoints) >= 2:
+        n_ckpts = len(checkpoints) + 1  # +1 for current
+        for i, cell in enumerate(engine.cells):
+            avg = cell.hidden.clone()
+            for ckpt_hiddens in checkpoints.values():
+                if i < len(ckpt_hiddens):
+                    avg = avg + ckpt_hiddens[i]
+            cell.hidden = avg / n_ckpts
+    phi_final, comp = phi_calc.compute_phi(engine)
+    phi_hist[-1] = phi_final
+    return BenchResult("OV9", "SWA checkpoint ensemble (3pt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV10_ph_aware_lr(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-10: persistence > 0.5일 때 LR 자동 감소."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    val_window = []
+    train_window = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Track train/val proxy (hidden norm variance)
+        h_norms = [c.hidden.norm().item() for c in engine.cells]
+        train_val = np.mean(h_norms)
+        train_window.append(train_val)
+        val_window.append(train_val + np.random.normal(0, 0.1))
+        # Check persistence (overfit signal)
+        if len(train_window) > 10:
+            train_trend = np.mean(train_window[-10:]) - np.mean(train_window[-20:-10]) if len(train_window) > 20 else 0
+            val_trend = np.mean(val_window[-10:]) - np.mean(val_window[-20:-10]) if len(val_window) > 20 else 0
+            persistence = val_trend - train_trend
+            if persistence > 0.5:
+                # Reduce effective LR: dampen hidden updates
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * 0.98
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV10", "PH-aware adaptive LR",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV11_frozen_backbone_schedule(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-11: joint phase에서도 backbone 일부 re-freeze (50% cells frozen)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Re-freeze 50% of cells (simulate frozen backbone)
+        freeze_count = len(engine.cells) // 2
+        for i in range(freeze_count):
+            if i < len(saved):
+                engine.cells[i].hidden = saved[i]  # restore = frozen
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV11", "Frozen backbone (50% cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV12_kl_anchor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-12: 원본 hidden과의 KL divergence를 anchor loss로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Save initial state as anchor
+    anchor_hiddens = [c.hidden.clone() for c in engine.cells]
+    kl_weight = 0.1
+    for x in inputs:
+        engine.process(x)
+        # KL anchor: pull back towards initial hidden
+        for i, cell in enumerate(engine.cells):
+            if i < len(anchor_hiddens):
+                drift = cell.hidden - anchor_hiddens[i]
+                cell.hidden = cell.hidden - kl_weight * drift
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV12", "KL anchor regularization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV13_batch_size_increase(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-13: 배치 크기 증가 효과 — 여러 input 평균으로 gradient noise 감소."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    batch_size = 4
+    for i in range(0, len(inputs), batch_size):
+        batch = inputs[i:i+batch_size]
+        if not batch:
+            break
+        # Average batch processing
+        avg_x = torch.stack(batch).mean(dim=0)
+        engine.process(avg_x)
+        phi, _ = phi_calc.compute_phi(engine)
+        for _ in batch:
+            phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV13", "Batch size increase (4x)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV14_stochastic_depth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-14: 확률적으로 cell 비활성화 (stochastic depth 0.1)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    drop_rate = 0.1
+    for x in inputs:
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Stochastic depth: skip some cells
+        for i, cell in enumerate(engine.cells):
+            if torch.rand(1).item() < drop_rate and len(engine.cells) > 2:
+                cell.hidden = saved[i] if i < len(saved) else cell.hidden  # skip = no update
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV14", "Stochastic depth (p=0.1)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_OV15_tension_variance_ceiling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OV-15: tension variance에 upper bound 추가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    t_var_ceiling = 2.0
+    for x in inputs:
+        engine.process(x)
+        # Clamp tension variance
+        tensions = [c.hidden.abs().mean().item() for c in engine.cells]
+        t_var = np.var(tensions)
+        if t_var > t_var_ceiling:
+            # Normalize tensions towards mean
+            t_mean = np.mean(tensions)
+            scale = math.sqrt(t_var_ceiling / (t_var + 1e-8))
+            for cell in engine.cells:
+                t = cell.hidden.abs().mean().item()
+                correction = (t - t_mean) * (1 - scale)
+                cell.hidden = cell.hidden - correction * 0.01
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OV15", "Tension variance ceiling",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -17196,6 +17967,24 @@ ALL_HYPOTHESES = {
     'DV15': run_DV15_dialogue_data, 'DV16': run_DV16_self_play,
     'DV17': run_DV17_curriculum, 'DV18': run_DV18_online_conv,
     'DV19': run_DV19_tension_selection, 'DV20': run_DV20_phi_rlhf,
+    # SC: Scale Consciousness (100M cell survival)
+    'SC1': run_SC1_dim_scaled_noise, 'SC2': run_SC2_aggressive_merge_threshold,
+    'SC3': run_SC3_initial_cells_sqrt_layers, 'SC4': run_SC4_forced_fibonacci,
+    'SC5': run_SC5_cell_capacity_scaling, 'SC6': run_SC6_anti_merge_momentum,
+    'SC7': run_SC7_specialization_pressure, 'SC8': run_SC8_warmup_merge_protection,
+    'SC9': run_SC9_layerwise_cell_binding, 'SC10': run_SC10_phi_gated_merging,
+    'SC11': run_SC11_cell_birth_from_extremes, 'SC12': run_SC12_mutual_repulsion_loss,
+    'SC13': run_SC13_dim_independent_phi, 'SC14': run_SC14_progressive_unfreezing_cells,
+    'SC15': run_SC15_temperature_scaled_softmax,
+    # OV: Overfitting Prevention (AnimaLM training quality)
+    'OV1': run_OV1_purefield_dropout_scaling, 'OV2': run_OV2_rdrop_consistency,
+    'OV3': run_OV3_gradient_penalty, 'OV4': run_OV4_label_smoothing,
+    'OV5': run_OV5_mixup_augmentation, 'OV6': run_OV6_cyclic_lr_restart,
+    'OV7': run_OV7_weight_decay_increase, 'OV8': run_OV8_data_augmentation_swap,
+    'OV9': run_OV9_checkpoint_ensemble, 'OV10': run_OV10_ph_aware_lr,
+    'OV11': run_OV11_frozen_backbone_schedule, 'OV12': run_OV12_kl_anchor,
+    'OV13': run_OV13_batch_size_increase, 'OV14': run_OV14_stochastic_depth,
+    'OV15': run_OV15_tension_variance_ceiling,
 }
 
 

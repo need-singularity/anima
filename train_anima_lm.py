@@ -924,8 +924,8 @@ def parse_args():
                    help="Training data (jsonl with instruction/response, or raw text)")
     p.add_argument("--steps", type=int, default=10000,
                    help="Total training steps")
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=4)   # OV13: 4x batch for generalization
+    p.add_argument("--grad-accum", type=int, default=4)   # OV13: effective batch unchanged (4*4=16)
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--savant-layers", type=int, default=2,

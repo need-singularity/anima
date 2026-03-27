@@ -570,8 +570,9 @@ def train(args: argparse.Namespace):
         max_cells=args.max_cells,
         split_threshold=2.0,
         split_patience=5,
-        merge_threshold=0.01,     # was 0.05, reduced to prevent over-merging (CB1)
+        merge_threshold=0.01 * (64.0 / max(args.dim, 64)),  # SC2: dim-inverse merge threshold
         merge_patience=10,
+        noise_scale=0.02 * math.sqrt(max(args.dim, 64)) / math.sqrt(64),  # SC1: dim-scaled noise
     )
 
     # --- Phi calculator ---
