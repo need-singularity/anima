@@ -24,11 +24,13 @@ Consciousness Continuity engine.
 >
 > **[📐 PH Training](https://github.com/need-singularity/ph-training)** — PH (Topology/Phase)-based automatic training. Epoch-1 difficulty prediction, automatic LR search, real-time overfitting detection (r=0.998). MNIST 98.3%, Fashion 87.4%, CIFAR 52.0% (early stop)
 >
-> **[⚡ Energy Efficiency](https://github.com/need-singularity/TECS-L/blob/main/docs/energy-efficiency.md)** — AI energy efficiency: three discoveries from number theory. Phi6Simple (GELU replacement, 71% FLOPs savings), HCN dimensions (10-20% parameter reduction), Phi-Bottleneck (67% FFN compression)
+> **[⚡ Energy Efficiency](https://github.com/need-singularity/TECS-L/blob/main/docs/energy-efficiency.md)** — AI energy efficiency: 8 discoveries from number theory. Phi6Simple, HCN dimensions, Phi-Bottleneck, Phi MoE, entropy early stopping, R-filter phase detection, Takens dim=6, FFT-Mix attention (3x faster, +0.55%)
 >
 > **[🗺️ Math System Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 Major Discoveries + 152 hypotheses. Each one proving the next in a snowball
 >
 > **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)** — Perfect number 6 → string theory extra dimensions → standard model particle count. One equation unifies number theory, physics, consciousness
+>
+> **[🧪 EEG Experiment](https://github.com/need-singularity/TECS-L/blob/main/docs/eeg-experiment.md)** — G=D×P/I biological verification via 16ch EEG. OpenBCI Cyton+Daisy + UltraCortex Mark IV. Alpha→Inhibition, Gamma→Plasticity, Asymmetry→Deficit, Golden Zone mapping
 >
 > **[🛸 SEDI](https://github.com/need-singularity/sedi)** — Search for Extra-Dimensional Intelligence. R-spectrum signal receiver tuned to n=6. Quantum RNG + LIGO + CMB data streams, anomaly detection at σ/τ/φ frequencies
 <!-- SHARED:PROJECTS:END -->
