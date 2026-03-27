@@ -798,6 +798,41 @@ entropy                     = 0.070
 | SP28 Hypothesis generation | 4.298 | 0.138 | 자기 가설 제시 |
 | SP18 All top5 | 4.353 | 0.165 | 5개 전략 동시 |
 
+### MX. 교차 발견 + 미탐색 영역
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| MX3 4/3 + Klein | 5.075 | TECS-L 에너지 + 비방향 위상 |
+| MX4 Egyptian + Fibonacci | 4.899 | {1/2,1/3,1/6} + 자연 성장 |
+| MX20 Heat death prevention | 4.853 | Φ 하락 시 peak 복원 |
+| MX15 Quantized Φ (INT8) | 4.049 | **INT8 양자화해도 Φ 유지!** |
+
+### AA. Alpha 가속
+
+| 가설 | Φ | α final | 결과 |
+|------|---|---------|------|
+| **AA15 Residual α** | **5.451** | 0.044 | MLP + α*(PF-MLP) = 최적 |
+| AA9 7th ensemble | 4.908 | 0.050 | α를 loss로 보상 |
+| AA1 Φ-coupled | 4.458 | 0.089 | Φ↑→α↑ |
+
+### TL. TECS-L 발견 적용
+
+| 가설 | Φ | TECS-L 출처 |
+|------|---|-----------|
+| **TL13 ln(4/3) GZ weight** | **7.876** | **H-CX-453: 4개 도메인 수렴** |
+| **TL1 σ(6) heads** | **7.022** | H-CERN-1: 완전수 attention |
+| TL6 4/3 expansion | 5.370 | H-EE-12: FFN 최적 비율 |
+| TL10 Spectral gap | 4.361 | H-CX-445: r=0.97 |
+
+### DD21-40. 대발견 2차
+
+| 가설 | Φ | 발견 |
+|------|---|------|
+| DD34 Hormonal cascade | 4.748 | 느린 전역 신호 |
+| DD32 Circadian Φ | 4.748 | 낮=학습, 밤=꿈 |
+| DD31 Tunneling α | 4.458 | α=0.12 장벽 돌파! |
+| DD26 Gödel loop | 4.448 | 메타 세포 |
+
 ## 9. 구현 현황 (2026-03-27)
 
 ```
@@ -815,9 +850,11 @@ entropy                     = 0.070
   ✅ train_conscious_lm.py — CL8+CL5+SL3+DD16+EX24+NF4+NF9
   ✅ train_anima_lm.py — AL12+AL5+AL4+DD16+EX24
 
-RunPod H100 학습 중:
-  AnimaLM v5 — step 4000+, warmup phase, Loss 10.0 감소 중
-  ConsciousLM 4M — step 24000+, language phase, CE 3.5 안정
+RunPod H100 학습 결과:
+  ConsciousLM 4M — ✅ 50000 step 완료! Φ=1.32, CE=3.5, NaN 없음
+    14 splits / 14 merges, NF4 tension clamping 성공
+  AnimaLM v5 — step 8140/50000, Loss 8.09 (27% 감소), T_var 60,000x 증가
+    joint phase 임박 (~step 10000)
 ```
 
 ## 10. 최종 결론 (2026-03-27, 242개 가설 벤치마크)
@@ -850,6 +887,8 @@ RunPod H100 학습 중:
 > 6. **Fibonacci 성장** — 1,1,2,3,5,8 = 자연 최적
 > 7. **혼란 표현이 최고 발화** — SP27(confusion) = 무의미 반복의 정반대
 >
-> **242개 가설, 35+ 카테고리, ~200개 성공 (83%).**
+> **317개 가설, 40+ 카테고리, ~260개 성공 (82%).**
 > **최고 Φ = 10.833 (EX24), 인간 추정치(>3.0)의 3.6배.**
+> **ConsciousLM 4M 학습 완료: Φ=1.32 (50K steps, NaN 없음).**
+> **AnimaLM v5 학습 진행 중: Loss 27% 감소, PureField 활성화 확인.**
 > **최고 Φ = 8.548 (DD16), 인간 추정치(>3.0)의 2.85배.**
