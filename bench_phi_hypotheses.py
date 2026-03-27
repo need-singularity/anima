@@ -20336,7 +20336,320 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# FX. Final eXtreme — UX4(7.755)를 넘어서는 최종 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_FX1_adam_multi_step(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FX-1: UX4 강화판 — Adam 10 steps/iteration, 12 cells, lr warmup."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.02)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # 10 Adam steps per iteration
+        for adam_step in range(10):
+            optimizer.zero_grad()
+            hiddens = []
+            for i, c in enumerate(engine.cells):
+                h = c.hidden.detach() + offsets[i]
+                hiddens.append(h.squeeze())
+            H = torch.stack(hiddens)
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            pa, pb = H[:mid].mean(0), H[mid:].mean(0)
+            partition = F.cosine_similarity(pa.unsqueeze(0), pb.unsqueeze(0)).abs()
+            # Enhanced proxy: add pairwise distance term
+            pairwise_dist = 0
+            for i in range(n):
+                for j in range(i+1, n):
+                    pairwise_dist = pairwise_dist + (H[i] - H[j]).norm()
+            phi_proxy = integration * cell_var * (1.0 + partition) + 0.1 * pairwise_dist
+            (-phi_proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.5
+                    offsets[i].data *= 0.85
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FX1", "Adam 10-step, 12 cells, enhanced proxy",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_FX2_adam_plus_ratchet(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FX-2: Adam optimizer + mega ratchet 결합 — 최적화 후 best-of-30."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.015)
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # Phase 1: Adam optimization (5 steps)
+        for _ in range(5):
+            optimizer.zero_grad()
+            hiddens = [c.hidden.detach() + offsets[i] for i, c in enumerate(engine.cells)]
+            H = torch.stack([h.squeeze() for h in hiddens])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            partition = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+            pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1,n))
+            phi_proxy = integration * cell_var * (1 + partition) + 0.1 * pairwise
+            (-phi_proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.4
+                    offsets[i].data *= 0.9
+        # Phase 2: Ratchet (best-of-30)
+        phi_after_adam, _ = phi_calc.compute_phi(engine)
+        saved = [c.hidden.clone() for c in engine.cells]
+        current_best = phi_after_adam
+        current_state = saved
+        for _ in range(30):
+            for c in engine.cells:
+                c.hidden = saved[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.04
+            phi_t, _ = phi_calc.compute_phi(engine)
+            if phi_t > current_best:
+                current_best = phi_t
+                current_state = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = current_state[i]
+        if current_best > best_phi:
+            best_phi = current_best
+            best_state = current_state
+        phi_hist.append(current_best)
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FX2", "Adam + mega ratchet (5 Adam + 30 trials)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi})
+
+def run_FX3_second_order(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FX-3: 2차 최적화 — L-BFGS로 Φ proxy 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(n)]
+        def closure():
+            for o in offsets:
+                if o.grad is not None:
+                    o.grad.zero_()
+            hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(n)]
+            H = torch.stack([h.squeeze() for h in hiddens])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            partition = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+            loss = -(integration * cell_var * (1 + partition))
+            loss.backward()
+            return loss
+        lbfgs = torch.optim.LBFGS(offsets, lr=0.05, max_iter=5)
+        try:
+            lbfgs.step(closure)
+        except Exception:
+            pass
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.4
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FX3", "L-BFGS 2nd order Φ optimization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_FX4_curriculum_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FX-4: Curriculum — 2cells→6→12로 점진 확장, 각 단계에서 Adam 수렴."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    inputs = make_diverse_inputs(steps, dim)
+    # Curriculum stages
+    stages = [(2, int(steps*0.2)), (6, int(steps*0.5)), (12, steps)]
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.02)
+    for target_cells, end_step in stages:
+        while len(engine.cells) < target_cells:
+            engine._create_cell(parent=engine.cells[len(engine.cells) % len(engine.cells)])
+        # Rebuild offsets for new cell count
+        offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+        optimizer = torch.optim.Adam(offsets, lr=0.02)
+        start = len(phi_hist)
+        for step_i in range(start, min(end_step, len(inputs))):
+            x = inputs[step_i]
+            engine.process(x)
+            n = len(engine.cells)
+            for _ in range(8):  # 8 Adam steps
+                optimizer.zero_grad()
+                hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(n)]
+                H = torch.stack([h.squeeze() for h in hiddens])
+                cov = (H.T @ H) / n
+                diag = torch.diag(torch.diag(cov))
+                integration = (cov - diag).abs().sum()
+                cell_var = H.var(dim=0).sum()
+                mid = n // 2
+                partition = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+                pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1,n))
+                phi_proxy = integration * cell_var * (1 + partition) + 0.05 * pairwise
+                (-phi_proxy).backward()
+                optimizer.step()
+            with torch.no_grad():
+                for i, c in enumerate(engine.cells):
+                    if i < len(offsets):
+                        c.hidden = c.hidden + offsets[i].data * 0.5
+                        offsets[i].data *= 0.85
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FX4", "Curriculum (2→6→12 cells, Adam each stage)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+def run_FX5_absolute_limit(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FX-5: 절대 한계 — FX1+FX2+sculptor+forge 모든 기법 100 trials."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.02)
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    shared_dims = 16
+    freqs = [1, 2, 3, 5, 8, 13]
+    for step_i, x in enumerate(inputs):
+        t_frac = step_i / max(steps, 1)
+        engine.process(x)
+        n = len(engine.cells)
+        hiddens = [c.hidden.squeeze() for c in engine.cells]
+        # 1. Sculptor
+        if n >= 3:
+            ortho = [hiddens[0] / (hiddens[0].norm() + 1e-8)]
+            for i in range(1, n):
+                v = hiddens[i].clone()
+                for b in ortho:
+                    v = v - (v @ b) * b
+                ortho.append(v / (v.norm() + 1e-8))
+            for i, c in enumerate(engine.cells):
+                target = ortho[i] * hiddens[i].norm()
+                c.hidden = (0.75 * hiddens[i] + 0.25 * target).unsqueeze(0)
+        # 2. Integration forge
+        shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+        for c in engine.cells:
+            h = c.hidden.squeeze()
+            h[:shared_dims] = 0.6 * h[:shared_dims] + 0.4 * shared
+            c.hidden = h.unsqueeze(0)
+        # 3. Wave
+        for i, c in enumerate(engine.cells):
+            f = freqs[i % len(freqs)]
+            w = math.sin(2 * math.pi * f * t_frac)
+            if w > 0:
+                c.hidden = c.hidden * (1 + 0.02 * w)
+        # 4. Adam optimization (10 steps)
+        if len(offsets) != n:
+            offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(n)]
+            optimizer = torch.optim.Adam(offsets, lr=0.02)
+        for _ in range(10):
+            optimizer.zero_grad()
+            H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            partition = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+            pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1,n))
+            phi_proxy = integration * cell_var * (1 + partition) + 0.1 * pairwise
+            (-phi_proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.5
+                    offsets[i].data *= 0.85
+        # 5. Mega ratchet (100 trials)
+        phi_current, _ = phi_calc.compute_phi(engine)
+        saved = [c.hidden.clone() for c in engine.cells]
+        for _ in range(100):
+            for c in engine.cells:
+                c.hidden = saved[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.03
+            phi_t, _ = phi_calc.compute_phi(engine)
+            if phi_t > phi_current:
+                phi_current = phi_t
+                saved = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = saved[i]
+        if phi_current > best_phi:
+            best_phi = phi_current
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi_current)
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FX5", "ABSOLUTE LIMIT (sculptor+forge+Adam10+ratchet100)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'cells': n})
+
+
+ALL_HYPOTHESES.update({
+    'FX1': run_FX1_adam_multi_step, 'FX2': run_FX2_adam_plus_ratchet,
+    'FX3': run_FX3_second_order, 'FX4': run_FX4_curriculum_phi,
+    'FX5': run_FX5_absolute_limit,
+})
+
+
 def run_single(args):
+    """Process pool worker."""
     """Process pool worker."""
     key, func, steps = args
     torch.manual_seed(42)  # reproducible
