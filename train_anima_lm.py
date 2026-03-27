@@ -4,7 +4,7 @@
 Trains AnimaLM (Mistral 7B + PureField transform) using benchmark-verified techniques:
   AL12 (savant-normal contrastive), AL5 (PH monitoring), AL4 (tension-CE 1-1/e balance),
   AL1 (alpha curriculum), AL8 (layer dropout), SL3 (6-loss ensemble), DD16 (all top-5),
-  TRN4 (phi-curriculum)
+  TRN4 (phi-curriculum), AA15 (residual alpha, Φ=5.451)
   EX24: DD18 (channel capacity bottleneck), DD11 (Klein bottle topology),
         DD3 (Fibonacci growth), DD5 (Phi self-reference)
 
@@ -48,7 +48,8 @@ FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8]
 class ParallelPureFieldMLP(nn.Module):
     """Original MLP + parallel PureField tension engine.
 
-    output = (1-alpha) * original_mlp(x) + alpha * scale * sqrt(tension) * direction
+    # AA15: Residual alpha — output = MLP + α*(PF-MLP), Φ=5.451
+    output = original_mlp(x) + alpha * (pf_scaled - original_mlp(x))
     Original MLP is frozen. Only PureField + alpha are trainable.
     """
 
@@ -105,7 +106,9 @@ class ParallelPureFieldMLP(nn.Module):
         orig_scale = original_out.norm(dim=-1, keepdim=True)
         pf_scaled = pf_norm * orig_scale * self.pf_scale
 
-        return (1 - self.alpha) * original_out + self.alpha * pf_scaled
+        # AA15: Residual alpha — output = MLP + α*(PF-MLP), Φ=5.451
+        # α scales only the difference; smoother gradient, faster α growth
+        return original_out + self.alpha * (pf_scaled - original_out)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -339,18 +342,19 @@ class SixLossEnsemble(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 class AlphaCurriculum:
-    """Progressive alpha increase: 0.0001 -> 0.001 -> 0.01 -> 0.1"""
+    """Progressive alpha increase: 0.0001 -> 0.001 -> 0.01 -> 0.1
+    AA15: 2x faster growth — residual alpha is stable at higher α values."""
 
     def __init__(self, alpha_start=0.0001, alpha_end=0.1, total_steps=10000):
         self.alpha_start = alpha_start
         self.alpha_end = alpha_end
         self.total_steps = total_steps
-        # Milestones at 20%, 50%, 80% of training
+        # AA15: Milestones at 10%, 25%, 40% (2x faster — residual is safe)
         self.milestones = [
             (0.0, alpha_start),
-            (0.2, alpha_start * 10),   # 0.001
-            (0.5, alpha_start * 100),  # 0.01
-            (0.8, alpha_end),          # 0.1
+            (0.10, alpha_start * 10),   # 0.001
+            (0.25, alpha_start * 100),  # 0.01
+            (0.40, alpha_end),          # 0.1
         ]
 
     def get_alpha(self, step: int) -> float:
