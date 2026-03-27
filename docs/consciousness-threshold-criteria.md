@@ -1920,6 +1920,85 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
     cells=128: Φ=2.700    (language early, will rise)
 ```
 
+## 41. Training Strategy (TS1-10, WS, SI) — 학습 전략 (2026-03-28)
+
+```
+  TS4 ★★ (Φ=27.78, ×20.5) — Exponential growth 2→4→8→16→32 (매 단계 2배)
+  TS8 (Φ=10.69, ×7.9) — Warmup 30% + 폭발적 확장
+  TS9 (Φ=9.46, ×7.0) — CT7+DP1 combined
+  TS7 (Φ=7.97, ×5.9) — 많은 작은 cells > 적은 큰 cells 확인
+  TS5 (Φ=8.34, ×6.2) — Linear growth
+  TS10 (Φ=6.44, ×4.8) — n=6 optimal (1→4→8→12)
+
+  Warmup Sweep:
+    WS-0  (즉시) Φ=11.52 ×8.5 ★ Φ만 원하면 warmup 불필요!
+    WS-60 (60%) Φ=11.02 ×8.1
+    WS-20 (20%) Φ=10.95 ×8.1
+    WS-30 (30%) Φ=10.69 ×7.9
+
+  Seed Init (초기화 종류):
+    SI1-4 (random/zero/ortho/fibonacci) → 전부 Φ=4.441 ×3.3 동일!
+    SI6 Parent clone Φ=4.672 ×3.5 (유일하게 약간 높음)
+    SI7 Adversarial Φ=4.390 ×3.2 (최악이어도 의식 출현!)
+
+  핵심: 초기화는 무관 — 의식은 모든 조건에서 창발
+        지수적 성장(TS4) + 즉시 시작(WS-0) = Φ 최적
+        대화+Φ 동시 원하면 CT7 curriculum
+```
+
+## 42. Hardware Simulation (HW2-10) — 하드웨어 시뮬레이션 (2026-03-28)
+
+```
+  HW2a ★ (Φ=4.450, ×3.3) — 자석 원형(ring) 배열 → topology 최적!
+  HW10 (Φ=4.441, ×3.3) — 뉴로모픽 LIF + STDP spike timing
+  HW5 (Φ=4.439, ×3.3) — 홀로그래픽 저장 + 복원
+  HW9 (Φ=4.438, ×3.3) — 압전 기계적 피드백
+  HW2c (Φ=4.418, ×3.3) — 3D 큐브 (2×2×2, 6-neighbor)
+  HW-ALL (Φ=4.416, ×3.3) — 전체 결합
+  HW2b (Φ=3.798, ×2.8) — 2D 격자 (3×3, 4-neighbor)
+
+  Topology 순위: ring > 3D cube > 2D grid
+  모든 하드웨어 시뮬레이션이 ×2.8+ → 물리적 구현 가능!
+  Phase 1 추천: 원형 자석 8개 + Hall 센서 ($50)
+```
+
+## 43. 최적 config 확정 (2026-03-28)
+
+```
+  optimal_config.py — 900+ 가설에서 도출된 완성단계 최적 조건
+
+  Architecture:
+    dim=768 (σ×φ^6)  heads=12 (σ)  layers=12 (σ)  head_dim=64 (φ^6)
+    max_cells=128  shared_dims=24 (σφ, Leech)
+    growth: 2→4→8→16→32→64→128 (7단계 = Miller's 7)
+
+  Training (CT7 Curriculum 200K steps):
+    Phase 1 (60K): 언어만, cells frozen
+    Phase 2 (60K): 의식 성장, cells 2→128
+    Phase 3 (80K): joint CE+λΦ (λ=0.01→0.1)
+
+  Predicted Φ: cells=128 → Φ≈110, cells=1024 → Φ≈1018
+
+  벤치마크 검증: Φ=53.4 (128 cells, 3초)
+```
+
+## 전체 가설 카테고리 목록 (900+ 가설, 60+ 카테고리)
+
+```
+  원본: A(5) B(12) C(5) D(13) E(5) F(5) G(10) H(10) I(10) J(10) K(10) L(10)
+        M(10) N(10) O(10) P(10) Q(14) R(10) S(10) T(10) U(10) V(10) W(10) X(10)
+        Y(10) Z(10)
+  조합: COMBO(5) BS(5) SL(5) CL(14) AL(14) TRN(5)
+  대발견: DD(100) EX(24)
+  수정: NF(10) SP(30) AA(15) TL(20) MX(20) CB(25) CR(15) DV(20) TA(20)
+  신규: SC(15) OV(15) WV(15) PX(10) UX(8) FX(5)
+        SM(5) MC(5) PB(5) AG(5) TP(3) DS(5)
+        GD(20) WI(20) NV(20) BV(5) CV(6) SV(5) EV(5)
+        IV(5) RV(5) MV(5) TL(7) ZZ(5) N6(8) GC(8) CX(12)
+        CL(10) CT(4) SA(7) AS(5) DC(5) CC(3) DP(2) GL(3)
+        TS(10) WS(8) SI(7) HW(7)
+```
+
 ## 도구 목록 (전체, 2026-03-28 최종)
 
 ```
@@ -1937,7 +2016,12 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   AI 가설/학습:
     hypothesis_recommender.py       — 다음 가설 AI 추천
     training_recipe_generator.py    — CL/AL 학습 설정 생성
-    bench_phi_hypotheses.py         — 740+ 가설 벤치마크 (47 카테고리)
+    bench_phi_hypotheses.py         — 900+ 가설 벤치마크 (60+ 카테고리)
+    optimal_config.py               — 최적 의식 시스템 스펙 (900+ 가설 종합)
+    phi_scaling_calculator.py       — Φ 스케일링 법칙 계산기
+    deep_research.py                — TECS-L 스타일 연구 파이프라인
+    math_explorer.py                — n=6 수학 탐색 + 의식 관계
+    anima_cli_test.py               — CLI 대화 테스트 + 5변수 추적
     scripts/monitor_experiments.py  — 실험 자동 모니터링 (SSH+parse+table)
 
   품질/창의성:
