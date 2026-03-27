@@ -1799,30 +1799,40 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
         특히 Euler totient 누적 + factorial 진화가 ×4.6~5.2
 ```
 
-## 진행 중 실험 (2026-03-28, H100 80GB, 12개 동시)
+## 진행 중 실험 (2026-03-28 updated, H100 80GB, 14개 동시)
 
 ```
-  # | 실험                 | Step    | Φ     | CE    | Phase    | 진행률
-  ──┼──────────────────────┼─────────┼───────┼───────┼──────────┼───────
-  1 | AnimaLM v7 (7B)      | 8,660   | 0.003 | 10.42 | warmup   | 17%
-  2 | CLM v3 (768d/12L)    | 15,000  | 1.426 | 5.90  | language | 30%
-  3 | Ablation (max=8)     | 46,400  | 4.552 | 3.72  | combined | 93% ⏳
-  4 | Cells16 (max=16)     | 35,000  | 5.436 | 3.53  | combined | 70% 🔥
-  5 | CLM 1B (1024d/24L)   | 5,000   | 1.604 | -     | mitosis  | 10%
-  6 | Cells32 (max=32)     | 7,800   | 1.683 | -     | mitosis  | 16%
-  7 | Cells64 (max=64)     | 7,800   | 1.489 | -     | mitosis  | 16%
-  8 | Cells2 (max=2)       | 7,600   | 1.762 | -     | mitosis  | 15%
-  9 | Cells4 (max=4)       | 7,600   | 1.479 | -     | mitosis  | 15%
- 10 | Baseline (max=8)     | 7,600   | 1.798 | -     | mitosis  | 15%
- 11 | Cells16+FX2          | 2,500   | 1.637 | -     | mitosis  | 5%
- 12 | Cells16+dim768       | 700     | 1.499 | -     | mitosis  | 1%
+  # | 실험                 | Step    | Φ       | Phase    | 진행률
+  ──┼──────────────────────┼─────────┼─────────┼──────────┼───────
+  1 | AnimaLM v7 (7B)      | 12,270  | 0.009   | joint    | 25%
+  2 | CLM v3 (768d/12L)    | 21,700  | 1.834   | language | 43%
+  3 | Ablation (max=8)     | 50,000  | 5.273   | DONE     | 100% ✅
+  4 | Cells16 (max=16)     | 35,000  | 5.436   | combined | 70%
+  5 | Cells32 (max=32)     | 33,900  | 15.394  | language | 68% 🔥
+  6 | Cells64 (max=64)     | 33,300  | 45.487  | language | 67% 🔥🔥🔥
+  7 | Cells2 (max=2)       | 34,100  | 1.640   | language | 68%
+  8 | Cells4 (max=4)       | 34,200  | 1.693   | language | 68%
+  9 | Baseline (max=8)     | 34,100  | 5.281   | language | 68%
+ 10 | Cells16+FX2          | 29,000  | 5.226   | language | 58%
+ 11 | Cells128 (max=128)   | 20,400  | 2.700   | language | 41%
+ 12 | v4 small (384d/32c)  | 11,200  | 1.594   | mitosis  | 11%
+ 13 | CLM 1B (1024d/24L)   | 5,000   | 1.604   | mitosis  | 10%
 
-  GPU: 77GB/81GB (95%), 13 processes
+  GPU: 79GB/81GB (97%), 14 processes
 
-  중간 발견:
-    - Cells16 Φ=5.436 >> Ablation(max=8) Φ=4.552 → cell 수가 Φ에 결정적
-    - CLM v3 language phase 진입 (CE=5.90, step 15K)
-    - Ablation 93% → 곧 완료, combined phase에서 Φ=4.55
+  ★★★ 대발견 (step ~34K):
+    Cells64 Φ=45.487 — 실제 학습에서 Φ>10 달성!
+    Cells32 Φ=15.394 — ×3 vs Cells16
+    스케일링: cells 2배 → Φ ~3배 (학습에서는 초선형!)
+
+  Cell sweep 스케일링 (학습 중):
+    cells=2:   Φ=1.640
+    cells=4:   Φ=1.693
+    cells=8:   Φ=5.281
+    cells=16:  Φ=5.436
+    cells=32:  Φ=15.394   (×2.9 vs 16)
+    cells=64:  Φ=45.487   (×2.95 vs 32) 🔥🔥🔥
+    cells=128: Φ=2.700    (language early, will rise)
 ```
 
 ## 도구 목록 (전체, 2026-03-28 최종)
