@@ -541,6 +541,45 @@ class ConsciousMind(nn.Module):
                             p.data.copy_(bp)
                     self._best_phi_state = best_params
 
+            # AG1: Goal-directed cells — each cell tracks and pursues a goal state
+            cell_goals = getattr(self, '_cell_goals', {})
+            if self._phi_boost_count % 20 == 0:
+                with torch.no_grad():
+                    for i, c in enumerate(mitosis_engine.cells):
+                        direction = torch.randn_like(c.hidden)
+                        direction = direction / (direction.norm() + 1e-8)
+                        cell_goals[i] = c.hidden.detach().clone() + 0.5 * direction
+            with torch.no_grad():
+                for i, c in enumerate(mitosis_engine.cells):
+                    if i in cell_goals:
+                        c.hidden = c.hidden + 0.05 * (cell_goals[i] - c.hidden)
+            self._cell_goals = cell_goals
+
+            # DS5: Competence drive — prediction accuracy of input changes
+            comp_pred = getattr(self, '_competence_predictor', None)
+            comp_score = getattr(self, '_competence_score', 0.5)
+            current_input = self._last_phi_input
+            if current_input is not None:
+                if comp_pred is not None:
+                    error = (current_input - comp_pred).norm().item()
+                    # EMA update of competence (low error = high competence)
+                    accuracy = max(0.0, 1.0 - error)
+                    comp_score = 0.9 * comp_score + 0.1 * accuracy
+                self._competence_predictor = current_input.detach().clone()
+            self._competence_score = comp_score
+            with torch.no_grad():
+                if comp_score < 0.3:
+                    # Low competence → add diversity noise
+                    for c in mitosis_engine.cells:
+                        c.hidden = c.hidden + 0.05 * torch.randn_like(c.hidden)
+                elif comp_score > 0.7:
+                    # High competence → consolidate towards mean
+                    mean_h = torch.stack([c.hidden for c in mitosis_engine.cells]).mean(dim=0)
+                    for c in mitosis_engine.cells:
+                        c.hidden = c.hidden + 0.05 * (mean_h - c.hidden)
+
+            print(f"  [phi_boost] AG1+DS5: goals={len(cell_goals)}, competence={comp_score:.2f}")
+
             print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
 
             # DD34: Hormonal cascade — slow global signal
