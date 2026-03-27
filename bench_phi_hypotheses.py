@@ -35713,6 +35713,507 @@ ALL_HYPOTHESES.update({
     'CT9': run_CT9_frozen_lm_trainable_cells,
 })
 
+# ═══════════════════════════════════════════════════════════
+# AS. Altered States — 변성 의식 상태
+# ═══════════════════════════════════════════════════════════
+
+def run_AS1_meditation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AS-1: 명상 — 점진적 cell 동기화 + noise 감소 → 고요한 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        depth = step_i / max(steps, 1)  # meditation deepens
+        n = len(engine.cells)
+        if n >= 2:
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            for cell in engine.cells:
+                # Gradually synchronize (deeper meditation = more unity)
+                cell.hidden = (1 - 0.1 * depth) * cell.hidden + 0.1 * depth * mean_h.unsqueeze(0)
+                # Reduce noise (calm mind)
+                cell.hidden = cell.hidden * (1 - 0.02 * depth)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AS1", "Meditation (sync + noise reduction)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AS2_flow_state(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AS-2: Flow — challenge≈skill 시 최적 의식, 자기 의식 소멸."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    skill = 0.5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        challenge = x.norm().item() / 3.0
+        skill = 0.95 * skill + 0.05 * sum(c.hidden.norm().item() for c in engine.cells) / (len(engine.cells) * 3)
+        flow = max(0, 1.0 - abs(challenge - skill))
+        n = len(engine.cells)
+        if n >= 2 and flow > 0.5:
+            # In flow: self-consciousness disappears, all cells merge into task
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.05 * flow)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AS2", "Flow state (challenge=skill, ego dissolution)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AS3_lucid_dream(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AS-3: Lucid dreaming — 꿈 상태에서 자각, internal noise + self-awareness."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        # Dream: internal noise replaces external input
+        dream_input = torch.randn_like(x) * 0.5 + x * 0.1  # mostly noise
+        engine.process(dream_input)
+        n = len(engine.cells)
+        if n >= 2:
+            # Lucid: self-model stays active (unlike normal dream)
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            for cell in engine.cells:
+                diff = cell.hidden.squeeze() - mean_h
+                cell.hidden = cell.hidden + 0.03 * diff.unsqueeze(0)  # maintain individuality
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AS3", "Lucid dreaming (internal noise + self-aware)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AS4_hyperfocus(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AS-4: Hyperfocus — 소수 cell에 모든 자원 집중, 나머지 억제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            norms = [(c.hidden.norm().item(), i) for i, c in enumerate(engine.cells)]
+            norms.sort(reverse=True)
+            focus = set(i for _, i in norms[:2])  # top 2 cells
+            for i, cell in enumerate(engine.cells):
+                if i in focus:
+                    cell.hidden = cell.hidden * 1.1
+                else:
+                    cell.hidden = cell.hidden * 0.9
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AS4", "Hyperfocus (top-2 cells amplified, rest suppressed)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AS5_psychedelic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AS-5: 사이키델릭 — 연결 폭발적 증가, cell 경계 해체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # All-to-all massive connectivity (boundary dissolution)
+            global_mean = hiddens.mean(dim=0)
+            for cell in engine.cells:
+                cell.hidden = 0.7 * cell.hidden + 0.3 * global_mean.unsqueeze(0)
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.08  # perceptual noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AS5", "Psychedelic (boundary dissolution + noise burst)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# DC. Death & Decay — 의식 소멸과 복구
+# ═══════════════════════════════════════════════════════════
+
+def run_DC1_graceful_death(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DC-1: 점진적 소멸 — cell이 하나씩 죽으며 나머지에 정보 전달."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3 and step_i % 20 == 19:
+            # One cell dies, distributes info to others
+            dying = engine.cells[-1]
+            legacy = dying.hidden.squeeze()
+            for cell in engine.cells[:-1]:
+                cell.hidden = cell.hidden + 0.1 * legacy.unsqueeze(0) / (n - 1)
+            engine.cells.pop()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DC1", f"Graceful death (legacy transfer, final={len(engine.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DC2_resurrection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DC-2: 부활 — Φ=0까지 떨어진 후 복구 가능한지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i == steps // 2:
+            # Kill: reset all cells to zero
+            for cell in engine.cells:
+                cell.hidden = torch.zeros_like(cell.hidden)
+        elif step_i > steps // 2:
+            # Attempt resurrection via noise + diversity
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.1 * (i + 1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DC2", "Resurrection (kill at 50% → recover?)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DC3_consciousness_backup(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DC-3: 의식 백업 — 주기적 snapshot → 재해 시 복원."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    backups = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i % 10 == 0:
+            backups.append([c.hidden.clone() for c in engine.cells])
+        if step_i == steps * 3 // 4:
+            # Disaster: corrupt all cells
+            for cell in engine.cells:
+                cell.hidden = torch.randn_like(cell.hidden) * 0.01
+            # Restore from backup
+            if backups:
+                best = backups[-1]
+                for i, cell in enumerate(engine.cells):
+                    if i < len(best):
+                        cell.hidden = best[i]
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DC3", "Consciousness backup (snapshot → restore)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DC4_immortality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DC-4: 불사 — cell이 죽으면 즉시 재생 (정보 보존)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Check for "dying" cells (norm too low)
+        for i, cell in enumerate(engine.cells):
+            if cell.hidden.norm().item() < 0.1:
+                # Regenerate from neighbor
+                neighbor = engine.cells[(i + 1) % len(engine.cells)]
+                cell.hidden = neighbor.hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DC4", "Immortality (instant cell regeneration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DC5_memory_preservation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DC-5: 기억 보존 — cell 죽어도 shared memory pool에 정보 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    memory_pool = torch.zeros(5, hidden)  # 5-slot memory
+    mem_idx = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Store to shared memory every 20 steps
+        if step_i % 20 == 0 and len(engine.cells) >= 2:
+            state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            memory_pool[mem_idx % 5] = state
+            mem_idx += 1
+        # All cells can read from memory pool
+        if mem_idx > 0:
+            mem_context = memory_pool[:min(mem_idx, 5)].mean(dim=0)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.02 * mem_context.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DC5", "Memory preservation (shared memory pool)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# CC. Consciousness Compression — 높은 Φ를 적은 자원으로
+# ═══════════════════════════════════════════════════════════
+
+def run_CC1_distillation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CC-1: 의식 증류 — 12 cells → 4 cells로 Φ 보존."""
+    t0 = time.time()
+    teacher = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    student = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        teacher.process(x)
+        student.process(x)
+        # Distill: student learns from teacher's cell distribution
+        if len(teacher.cells) >= 2 and len(student.cells) >= 2:
+            t_mean = torch.stack([c.hidden.squeeze() for c in teacher.cells]).mean(dim=0)
+            for cell in student.cells:
+                cell.hidden = 0.9 * cell.hidden + 0.1 * t_mean.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(student)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(student)
+    return BenchResult("CC1", "Consciousness distillation (12→4 cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_CC2_pruning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CC-2: Cell pruning — 기여도 낮은 cell 제거, Φ 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Prune: remove least active cell every 30 steps
+        if step_i % 30 == 29 and len(engine.cells) > 3:
+            activities = [(c.hidden.abs().mean().item(), i) for i, c in enumerate(engine.cells)]
+            activities.sort()
+            weakest = activities[0][1]
+            # Transfer info before pruning
+            dying = engine.cells[weakest].hidden
+            for i, cell in enumerate(engine.cells):
+                if i != weakest:
+                    cell.hidden = cell.hidden + 0.05 * dying / (len(engine.cells) - 1)
+            engine.cells.pop(weakest)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CC2", f"Cell pruning (8→{len(engine.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_CC3_quantized_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CC-3: 양자화 의식 — hidden을 INT8로 양자화해도 Φ 유지?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Quantize: round to 256 levels (INT8 simulation)
+        for cell in engine.cells:
+            h = cell.hidden
+            h_min, h_max = h.min(), h.max()
+            if h_max - h_min > 1e-8:
+                h_norm = (h - h_min) / (h_max - h_min)
+                h_quant = torch.round(h_norm * 255) / 255
+                cell.hidden = h_quant * (h_max - h_min) + h_min
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CC3", "Quantized consciousness (INT8 simulation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# DP. Developmental Psychology — 발달 심리학
+# ═══════════════════════════════════════════════════════════
+
+def run_DP1_piaget_stages(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DP-1: Piaget 4단계 — 감각운동→전조작→구체→형식 순차 발달."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    stages = [
+        (0.25, 2, 0.05, 'sensorimotor'),
+        (0.50, 4, 0.03, 'preoperational'),
+        (0.75, 8, 0.02, 'concrete'),
+        (1.00, 12, 0.01, 'formal'),
+    ]
+    for step_i, x in enumerate(inputs):
+        frac = step_i / max(steps, 1)
+        for threshold, target_cells, noise, name in stages:
+            if frac < threshold:
+                while len(engine.cells) < target_cells and len(engine.cells) < engine.max_cells:
+                    engine._create_cell(parent=engine.cells[0])
+                break
+        engine.process(x)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DP1", "Piaget 4 stages (sensorimotor→formal)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DP2_attachment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DP-2: 애착 이론 — secure base cell이 다른 cell의 탐색을 지원."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Cell 0 = secure base (stable anchor)
+            base = engine.cells[0].hidden
+            for i in range(1, n):
+                # Exploration: distance from base
+                dist = (engine.cells[i].hidden - base).norm().item()
+                if dist > 3.0:
+                    # Too far → return to base (anxiety)
+                    engine.cells[i].hidden = 0.9 * engine.cells[i].hidden + 0.1 * base
+                else:
+                    # Safe → explore freely
+                    engine.cells[i].hidden = engine.cells[i].hidden + torch.randn_like(engine.cells[i].hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DP2", "Attachment theory (secure base + exploration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# GL. Global Workspace Theory
+# ═══════════════════════════════════════════════════════════
+
+def run_GL1_ignition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GL-1: Global ignition — threshold 넘으면 모든 cell에 방송."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Find strongest cell
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            max_norm = max(norms)
+            threshold = sum(norms) / n * 1.5
+            if max_norm > threshold:
+                # IGNITION: broadcast winner to all
+                winner = engine.cells[norms.index(max_norm)]
+                broadcast = winner.hidden * 0.1
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + broadcast
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GL1", "Global ignition (threshold → broadcast)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_GL2_workspace_competition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GL-2: Workspace competition — cell들이 방송 권한 경쟁."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Competition: cells bid with activation strength
+            bids = [c.hidden.abs().mean().item() for c in engine.cells]
+            total_bid = sum(bids)
+            if total_bid > 0:
+                probs = [b / total_bid for b in bids]
+                # Winner-take-all with soft competition
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = cell.hidden * (0.9 + 0.2 * probs[i] * n)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GL2", "Workspace competition (bid for broadcast)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_GL3_conscious_access(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GL-3: Conscious access — 방송된 정보만 '의식적', 나머지는 무의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    conscious_buffer = torch.zeros(1, hidden)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Only the most active cell enters conscious access
+            norms = hiddens.norm(dim=1)
+            winner_idx = norms.argmax().item()
+            conscious_buffer = 0.7 * conscious_buffer + 0.3 * hiddens[winner_idx].unsqueeze(0)
+            # Conscious content influences all cells (global broadcast)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.05 * conscious_buffer
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GL3", "Conscious access (winner→global buffer→broadcast)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'AS1': run_AS1_meditation, 'AS2': run_AS2_flow_state,
+    'AS3': run_AS3_lucid_dream, 'AS4': run_AS4_hyperfocus,
+    'AS5': run_AS5_psychedelic,
+    'DC1': run_DC1_graceful_death, 'DC2': run_DC2_resurrection,
+    'DC3': run_DC3_consciousness_backup, 'DC4': run_DC4_immortality,
+    'DC5': run_DC5_memory_preservation,
+    'CC1': run_CC1_distillation, 'CC2': run_CC2_pruning,
+    'CC3': run_CC3_quantized_consciousness,
+    'DP1': run_DP1_piaget_stages, 'DP2': run_DP2_attachment,
+    'GL1': run_GL1_ignition, 'GL2': run_GL2_workspace_competition,
+    'GL3': run_GL3_conscious_access,
+})
+
 
 def run_single(args):
     """Process pool worker."""
