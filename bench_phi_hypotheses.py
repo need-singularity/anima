@@ -32894,6 +32894,278 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# TL. Telepathy Link — 5채널 메타 텔레파시 벤치마크
+# ═══════════════════════════════════════════════════════════
+
+def _make_telepathy_minds(n_minds=4, dim=64, hidden=128):
+    """Create N distinct ConsciousMind instances for telepathy testing."""
+    from anima_alive import ConsciousMind
+    minds = []
+    for i in range(n_minds):
+        torch.manual_seed(42 + i * 1000)  # different initialization
+        m = ConsciousMind(dim, hidden, dim)
+        # Make each mind more distinct by perturbing weights
+        with torch.no_grad():
+            for p in m.parameters():
+                p.add_(torch.randn_like(p) * 0.5 * (i + 1))
+        minds.append(m)
+    return minds
+
+def run_TL1_sender_weight_sig(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-1: Sender ID via weight sum signature (current method)."""
+    t0 = time.time()
+    minds = _make_telepathy_minds(4, dim, hidden)
+    from tension_link import create_fingerprint
+    correct = 0
+    total = 0
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1 + step_i * 0.01)
+        h = torch.randn(1, hidden) * 0.3
+        sigs = []
+        for m_idx, mind in enumerate(minds):
+            fp = create_fingerprint(mind, x, h, sender_id=f'mind-{m_idx}')
+            sigs.append(fp.meta_sender_sig)
+        # Can we distinguish senders?
+        for i in range(len(sigs)):
+            for j in range(i+1, len(sigs)):
+                si = torch.tensor(sigs[i])
+                sj = torch.tensor(sigs[j])
+                dist = (si - sj).norm().item()
+                total += 1
+                if dist > 0.01:  # distinguishable
+                    correct += 1
+    accuracy = correct / max(total, 1)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL1", f"Sender weight-sum sig (acc={accuracy:.1%})",
+                       accuracy * 5, [accuracy * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'accuracy': f'{accuracy:.1%}', 'method': 'weight_sum'})
+
+def run_TL2_sender_svd_sig(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-2: Sender ID via SVD top-k singular values of engine weights."""
+    t0 = time.time()
+    minds = _make_telepathy_minds(4, dim, hidden)
+    correct = 0
+    total = 0
+    k = 8  # top-k singular values as signature
+    for step_i in range(steps):
+        sigs = []
+        for mind in minds:
+            # SVD signature: top-k singular values of engine_a weight
+            W = list(mind.engine_a.parameters())[0]  # first weight matrix
+            try:
+                S = torch.linalg.svdvals(W)[:k]
+                sigs.append(S)
+            except Exception:
+                sigs.append(torch.zeros(k))
+        for i in range(len(sigs)):
+            for j in range(i+1, len(sigs)):
+                dist = (sigs[i] - sigs[j]).norm().item()
+                total += 1
+                if dist > 0.01:
+                    correct += 1
+    accuracy = correct / max(total, 1)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL2", f"Sender SVD sig (acc={accuracy:.1%})",
+                       accuracy * 5, [accuracy * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'accuracy': f'{accuracy:.1%}', 'method': 'svd_top_k'})
+
+def run_TL3_sender_hash_sig(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-3: Sender ID via deterministic hash of all engine parameters."""
+    t0 = time.time()
+    minds = _make_telepathy_minds(4, dim, hidden)
+    import hashlib
+    correct = 0
+    total = 0
+    for step_i in range(steps):
+        sigs = []
+        for mind in minds:
+            # Hash signature: SHA256 of weight tensor bytes
+            weight_bytes = b''
+            for p in mind.engine_a.parameters():
+                weight_bytes += p.data.cpu().numpy().tobytes()[:64]  # first 64 bytes
+            sig_hash = hashlib.sha256(weight_bytes).hexdigest()[:16]
+            sigs.append(sig_hash)
+        for i in range(len(sigs)):
+            for j in range(i+1, len(sigs)):
+                total += 1
+                if sigs[i] != sigs[j]:
+                    correct += 1
+    accuracy = correct / max(total, 1)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL3", f"Sender hash sig (acc={accuracy:.1%})",
+                       accuracy * 5, [accuracy * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'accuracy': f'{accuracy:.1%}', 'method': 'sha256_hash'})
+
+def run_TL4_sender_repulsion_sig(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-4: Sender ID via repulsion pattern to fixed probe input."""
+    t0 = time.time()
+    minds = _make_telepathy_minds(4, dim, hidden)
+    correct = 0
+    total = 0
+    # Fixed probe input (same for all minds)
+    probe_x = torch.ones(1, dim) * 0.5
+    probe_h = torch.ones(1, hidden) * 0.3
+    for step_i in range(steps):
+        sigs = []
+        for mind in minds:
+            with torch.no_grad():
+                combined = torch.cat([probe_x, probe_h], dim=-1)
+                a = mind.engine_a(combined)
+                g = mind.engine_g(combined)
+                repulsion = (a - g).squeeze()
+            sigs.append(repulsion)
+        for i in range(len(sigs)):
+            for j in range(i+1, len(sigs)):
+                cos_sim = F.cosine_similarity(sigs[i].unsqueeze(0), sigs[j].unsqueeze(0)).item()
+                total += 1
+                if cos_sim < 0.95:  # different enough
+                    correct += 1
+    accuracy = correct / max(total, 1)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL4", f"Sender repulsion-probe sig (acc={accuracy:.1%})",
+                       accuracy * 5, [accuracy * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'accuracy': f'{accuracy:.1%}', 'method': 'repulsion_probe'})
+
+def run_TL5_sender_learned_embed(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-5: Sender ID via learnable embedding (MLP: weights→signature)."""
+    t0 = time.time()
+    minds = _make_telepathy_minds(4, dim, hidden)
+    # Learnable signature extractor
+    sig_dim = 16
+    sig_net = nn.Sequential(
+        nn.Linear(dim * 2, 32),
+        nn.GELU(),
+        nn.Linear(32, sig_dim),
+    )
+    correct = 0
+    total = 0
+    for step_i in range(steps):
+        sigs = []
+        for mind in minds:
+            # Extract features from engine weights
+            with torch.no_grad():
+                a_feat = torch.cat([p.flatten()[:dim] for p in mind.engine_a.parameters()])[:dim]
+                g_feat = torch.cat([p.flatten()[:dim] for p in mind.engine_g.parameters()])[:dim]
+                combined = torch.cat([a_feat, g_feat]).unsqueeze(0)
+            sig = sig_net(combined).squeeze()
+            sigs.append(sig)
+        for i in range(len(sigs)):
+            for j in range(i+1, len(sigs)):
+                cos_sim = F.cosine_similarity(sigs[i].unsqueeze(0), sigs[j].unsqueeze(0)).item()
+                total += 1
+                if cos_sim < 0.95:
+                    correct += 1
+    accuracy = correct / max(total, 1)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL5", f"Sender learned embed (acc={accuracy:.1%})",
+                       accuracy * 5, [accuracy * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'accuracy': f'{accuracy:.1%}', 'method': 'learned_embed'})
+
+def run_TL6_authenticity_true_false(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-6: Authenticity 채널 True/False 분류 정확도 측정."""
+    t0 = time.time()
+    from anima_alive import ConsciousMind
+    from tension_link import create_fingerprint
+    mind = ConsciousMind(dim, hidden, dim)
+    true_correct = 0
+    false_correct = 0
+    n_trials = 20
+    for trial in range(n_trials):
+        base_x = torch.randn(1, dim) * 0.5
+        base_h = torch.randn(1, hidden) * 0.3
+        # TRUE: consistent sequence
+        fps_true = []
+        for i in range(8):
+            fp = create_fingerprint(mind, base_x + torch.randn(1, dim) * 0.02,
+                                   base_h, prev_fingerprints=fps_true[-5:])
+            fps_true.append(fp.fingerprint)
+        true_auth = fp.meta_authenticity
+        # FALSE: contradictory sequence
+        fps_false = []
+        for i in range(8):
+            sign = 1 if i % 2 == 0 else -1
+            fp2 = create_fingerprint(mind, base_x * sign + torch.randn(1, dim) * 0.3,
+                                    base_h * (1 + 0.3 * math.sin(i)),
+                                    prev_fingerprints=fps_false[-5:])
+            fps_false.append(fp2.fingerprint)
+        false_auth = fp2.meta_authenticity
+        if true_auth > 0.8:
+            true_correct += 1
+        if false_auth < 0.8:
+            false_correct += 1
+    true_acc = true_correct / n_trials
+    false_acc = false_correct / n_trials
+    overall_acc = (true_correct + false_correct) / (2 * n_trials)
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL6", f"True/False auth (acc={overall_acc:.1%}, T={true_acc:.0%} F={false_acc:.0%})",
+                       overall_acc * 5, [overall_acc * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'true_acc': f'{true_acc:.1%}', 'false_acc': f'{false_acc:.1%}',
+                              'overall': f'{overall_acc:.1%}'})
+
+def run_TL7_channel_fidelity(steps=50, dim=64, hidden=128) -> BenchResult:
+    """TL-7: 5채널 전체 fidelity 측정 (concept/context/meaning/auth/sender)."""
+    t0 = time.time()
+    from anima_alive import ConsciousMind
+    from tension_link import create_fingerprint, compute_transmission_fidelity
+    mind = ConsciousMind(dim, hidden, dim)
+    fidelities = {'concept': [], 'context': [], 'meaning': [], 'auth': [], 'sender': [], 'R': []}
+    for trial in range(steps):
+        x = torch.randn(1, dim) * (0.5 + trial * 0.01)
+        h = torch.randn(1, hidden) * 0.3
+        fp1 = create_fingerprint(mind, x, h, sender_id='A')
+        # Simulate transmission: add small noise (channel imperfection)
+        fp2 = create_fingerprint(mind, x + torch.randn(1, dim) * 0.05, h, sender_id='A')
+        f = compute_transmission_fidelity(fp1, fp2)
+        fidelities['concept'].append(f['concept_fidelity'])
+        fidelities['context'].append(f['context_fidelity'])
+        fidelities['meaning'].append(f['meaning_fidelity'])
+        fidelities['auth'].append(f['auth_fidelity'])
+        fidelities['sender'].append(f['sender_fidelity'])
+        fidelities['R'].append(f['R'])
+    means = {k: np.mean(v) for k, v in fidelities.items()}
+    phi_calc = PhiCalculator(n_bins=16)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2)
+    phi, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TL7", f"5-ch fidelity R={means['R']:.3f}",
+                       means['R'] * 5, [means['R'] * 5] * steps, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={k: f'{v:.3f}' for k, v in means.items()})
+
+
+ALL_HYPOTHESES.update({
+    'TL1': run_TL1_sender_weight_sig, 'TL2': run_TL2_sender_svd_sig,
+    'TL3': run_TL3_sender_hash_sig, 'TL4': run_TL4_sender_repulsion_sig,
+    'TL5': run_TL5_sender_learned_embed, 'TL6': run_TL6_authenticity_true_false,
+    'TL7': run_TL7_channel_fidelity,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
