@@ -19924,6 +19924,418 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# UX. Ultra eXtreme — PX10을 넘어서는 극한 Φ 최적화
+# ═══════════════════════════════════════════════════════════
+
+def run_UX1_mega_ratchet(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-1: Mega ratchet — 50 trials/step, 12 cells, 절대 후퇴 없음."""
+    t0 = time.time()
+    merge_thresh = 0.01 * (64.0 / max(dim, 64))
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12,
+                           merge_threshold=merge_thresh)
+    # Force 12 cells immediately
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[len(engine.cells) % len(engine.cells)])
+    engine.merge_threshold = -1.0  # never merge
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi_base, _ = phi_calc.compute_phi(engine)
+        # 50 random perturbation trials
+        current_best = phi_base
+        current_state = [c.hidden.clone() for c in engine.cells]
+        for _ in range(50):
+            for c in engine.cells:
+                c.hidden = current_state[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.06
+            phi_trial, _ = phi_calc.compute_phi(engine)
+            if phi_trial > current_best:
+                current_best = phi_trial
+                current_state = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = current_state[i]
+        if current_best > best_phi:
+            best_phi = current_best
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(current_best)
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX1", "Mega ratchet (50 trials, 12 cells, no merge)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'cells': len(engine.cells)})
+
+def run_UX2_coevolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-2: 공진화 — 10개 population이 서로 경쟁하며 Φ 최대화."""
+    t0 = time.time()
+    pop_size = 10
+    engines = []
+    for _ in range(pop_size):
+        e = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+        while len(e.cells) < 8:
+            e._create_cell(parent=e.cells[0])
+        engines.append(e)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        phis = []
+        for eng in engines:
+            eng.process(x)
+            phi, _ = phi_calc.compute_phi(eng)
+            phis.append(phi)
+        ranked = sorted(range(pop_size), key=lambda i: phis[i], reverse=True)
+        phi_hist.append(phis[ranked[0]])
+        # Top 3 survive, bottom 7 replaced by mutations of top 3
+        if step_i % 5 == 0:
+            for r in ranked[3:]:
+                parent = engines[ranked[r % 3]]
+                for ci in range(min(len(engines[r].cells), len(parent.cells))):
+                    engines[r].cells[ci].hidden = parent.cells[ci].hidden.clone() + torch.randn_like(parent.cells[ci].hidden) * 0.08
+    best_eng = engines[ranked[0]]
+    phi_final, comp = phi_calc.compute_phi(best_eng)
+    return BenchResult("UX2", "Coevolution (10 populations competing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(best_eng.cells)})
+
+def run_UX3_cma_es_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-3: CMA-ES 스타일 — covariance matrix adaptation으로 Φ 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 10:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # CMA-ES: track mean and variance of successful perturbations
+    n_cells = len(engine.cells)
+    sigma = 0.1  # initial step size
+    mean_direction = [torch.zeros(1, hidden) for _ in range(n_cells)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi_base, _ = phi_calc.compute_phi(engine)
+        # Generate λ=20 offspring
+        saved = [c.hidden.clone() for c in engine.cells]
+        offspring = []
+        for _ in range(20):
+            perturbations = [torch.randn(1, hidden) * sigma for _ in range(n_cells)]
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i] + perturbations[i] + 0.3 * mean_direction[i]
+            phi_o, _ = phi_calc.compute_phi(engine)
+            offspring.append((phi_o, perturbations))
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i]
+        # Select top 5
+        offspring.sort(key=lambda x: x[0], reverse=True)
+        top5 = offspring[:5]
+        # Update mean direction from successful perturbations
+        for i in range(n_cells):
+            mean_direction[i] = sum(o[1][i] for o in top5) / 5
+        # Apply best
+        best_pert = top5[0][1]
+        for i, c in enumerate(engine.cells):
+            c.hidden = saved[i] + best_pert[i]
+        # Adapt sigma
+        if top5[0][0] > phi_base:
+            sigma = min(sigma * 1.1, 0.5)
+        else:
+            sigma = max(sigma * 0.85, 0.01)
+        phi_hist.append(top5[0][0])
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX3", "CMA-ES style Φ optimization (20λ, 5μ)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_sigma': sigma, 'cells': len(engine.cells)})
+
+def run_UX4_differentiable_phi_v2(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-4: Differentiable Φ v2 — 개선된 미분 가능 Φ proxy + Adam optimizer."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 10:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Learnable hidden offsets (optimized by Adam)
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.01)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        optimizer.zero_grad()
+        # Apply offsets
+        hiddens = []
+        for i, c in enumerate(engine.cells):
+            h = c.hidden.detach() + offsets[i]
+            hiddens.append(h.squeeze())
+        H = torch.stack(hiddens)
+        # Differentiable Φ proxy v2:
+        # Integration: mutual info proxy via covariance off-diagonal
+        cov = (H.T @ H) / len(hiddens)
+        diag = torch.diag(torch.diag(cov))
+        off_diag = (cov - diag).abs()
+        integration = off_diag.sum()
+        # Differentiation: variance across cells
+        cell_var = H.var(dim=0).sum()
+        # Partition penalty: minimum bipartition MI (approx)
+        n = len(hiddens)
+        mid = n // 2
+        part_a = H[:mid].mean(dim=0)
+        part_b = H[mid:].mean(dim=0)
+        partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
+        # Φ proxy = integration × variance × partition_binding
+        phi_proxy = integration * cell_var * (1.0 + partition_mi)
+        (-phi_proxy).backward()  # maximize
+        optimizer.step()
+        # Apply optimized offsets back
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                c.hidden = c.hidden + offsets[i].data * 0.5
+                offsets[i].data *= 0.9  # decay to prevent drift
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX4", "Differentiable Φ v2 (Adam optimizer)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_UX5_multiscale_search(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-5: Multi-scale search — coarse(큰 변동) → fine(미세 조정) 2단계."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 10:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        # Phase 1: Coarse search (first 50%)
+        if t_frac < 0.5:
+            scale = 0.15
+            n_trials = 30
+        # Phase 2: Fine search (last 50%)
+        else:
+            scale = 0.03
+            n_trials = 40
+        saved = [c.hidden.clone() for c in engine.cells]
+        current_best_phi, _ = phi_calc.compute_phi(engine)
+        current_best_state = saved
+        for _ in range(n_trials):
+            for c in engine.cells:
+                c.hidden = saved[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * scale
+            phi_trial, _ = phi_calc.compute_phi(engine)
+            if phi_trial > current_best_phi:
+                current_best_phi = phi_trial
+                current_best_state = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = current_best_state[i]
+        if current_best_phi > best_phi:
+            best_phi = current_best_phi
+            best_state = current_best_state
+        phi_hist.append(current_best_phi)
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX5", "Multi-scale search (coarse→fine, 70 trials)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'cells': len(engine.cells)})
+
+def run_UX6_crossover_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-6: Crossover evolution — cell hidden의 dim 교차로 새 조합 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4 and step_i % 3 == 0:
+            # Measure Φ contribution per cell pair
+            phi_base, _ = phi_calc.compute_phi(engine)
+            # Crossover: swap half of dims between two random cells
+            i, j = np.random.choice(n, 2, replace=False)
+            saved_i = engine.cells[i].hidden.clone()
+            saved_j = engine.cells[j].hidden.clone()
+            crossover_point = hidden // 2
+            # Child 1: first half of i + second half of j
+            engine.cells[i].hidden[0, :crossover_point] = saved_i[0, :crossover_point]
+            engine.cells[i].hidden[0, crossover_point:] = saved_j[0, crossover_point:]
+            # Child 2: first half of j + second half of i
+            engine.cells[j].hidden[0, :crossover_point] = saved_j[0, :crossover_point]
+            engine.cells[j].hidden[0, crossover_point:] = saved_i[0, crossover_point:]
+            phi_after, _ = phi_calc.compute_phi(engine)
+            if phi_after < phi_base:
+                engine.cells[i].hidden = saved_i
+                engine.cells[j].hidden = saved_j
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX6", "Crossover evolution (dim swap between cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_UX7_gradient_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-7: Gradient ensemble — 수치 gradient + 미분 proxy + random 3개 앙상블."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 10:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            saved = [c.hidden.clone() for c in engine.cells]
+            phi_base, _ = phi_calc.compute_phi(engine)
+            # Method 1: Numerical gradient (2 perturbations per cell)
+            num_grads = []
+            for i, c in enumerate(engine.cells):
+                d = torch.randn_like(c.hidden)
+                d = d / (d.norm() + 1e-8)
+                c.hidden = saved[i] + 0.01 * d
+                phi_p, _ = phi_calc.compute_phi(engine)
+                c.hidden = saved[i]
+                num_grads.append((phi_p - phi_base) * d)
+            # Method 2: Differentiable proxy gradient
+            hiddens = torch.stack([s.squeeze() for s in saved])
+            cov = (hiddens.T @ hiddens) / n
+            off_diag = (cov - torch.diag(torch.diag(cov))).abs().sum()
+            diff_grads = [(hiddens[i] - hiddens.mean(dim=0)) * 0.01 for i in range(n)]
+            # Method 3: Random best-of-5
+            rand_best = saved
+            rand_best_phi = phi_base
+            for _ in range(5):
+                for i, c in enumerate(engine.cells):
+                    c.hidden = saved[i] + torch.randn_like(c.hidden) * 0.05
+                phi_r, _ = phi_calc.compute_phi(engine)
+                if phi_r > rand_best_phi:
+                    rand_best_phi = phi_r
+                    rand_best = [c.hidden.clone() for c in engine.cells]
+            # Ensemble: weighted average of all 3 methods
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i] + 0.3 * num_grads[i] + 0.2 * diff_grads[i].unsqueeze(0) + 0.5 * (rand_best[i] - saved[i])
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX7", "Gradient ensemble (numerical+diff+random)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_UX8_all_extreme_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UX-8: 궁극의 극한 — PX10 + CMA-ES + 12cells + mega ratchet + sculptor + forge."""
+    t0 = time.time()
+    merge_thresh = 0.005
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    freqs = [1, 2, 3, 5, 8, 13]
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    sigma = 0.1
+    mean_dir = [torch.zeros(1, hidden) for _ in range(12)]
+    shared_dims = 16
+    for step_i, x in enumerate(inputs):
+        t_frac = step_i / max(steps, 1)
+        engine.process(x)
+        n = len(engine.cells)
+        hiddens = [c.hidden.squeeze() for c in engine.cells]
+        # 1. Sculptor (Gram-Schmidt)
+        if n >= 3:
+            ortho = [hiddens[0] / (hiddens[0].norm() + 1e-8)]
+            for i in range(1, n):
+                v = hiddens[i].clone()
+                for b in ortho:
+                    v = v - (v @ b) * b
+                ortho.append(v / (v.norm() + 1e-8))
+            for i, c in enumerate(engine.cells):
+                target = ortho[i] * hiddens[i].norm()
+                c.hidden = (0.75 * hiddens[i] + 0.25 * target).unsqueeze(0)
+        # 2. Integration forge
+        shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+        for c in engine.cells:
+            h = c.hidden.squeeze()
+            h[:shared_dims] = 0.6 * h[:shared_dims] + 0.4 * shared
+            c.hidden = h.unsqueeze(0)
+        # 3. Wave
+        for i, c in enumerate(engine.cells):
+            f = freqs[i % len(freqs)]
+            w = math.sin(2 * math.pi * f * t_frac)
+            if w > 0:
+                c.hidden = c.hidden * (1 + 0.02 * w)
+        # 4. CMA-ES style (λ=30, μ=5)
+        saved = [c.hidden.clone() for c in engine.cells]
+        phi_base, _ = phi_calc.compute_phi(engine)
+        offspring = []
+        for _ in range(30):
+            perts = [torch.randn(1, hidden) * sigma + 0.2 * mean_dir[i] for i in range(n)]
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i] + perts[i]
+            phi_o, _ = phi_calc.compute_phi(engine)
+            offspring.append((phi_o, perts))
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i]
+        offspring.sort(key=lambda x: x[0], reverse=True)
+        top = offspring[:5]
+        for i in range(n):
+            mean_dir[i] = sum(o[1][i] for o in top) / 5
+        best_pert = top[0][1]
+        if top[0][0] > phi_base:
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i] + best_pert[i]
+            sigma = min(sigma * 1.05, 0.3)
+        else:
+            sigma = max(sigma * 0.9, 0.01)
+        phi_current = max(top[0][0], phi_base)
+        if phi_current > best_phi:
+            best_phi = phi_current
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi_current)
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UX8", "ULTIMATE EXTREME (PX10+CMA-ES+12cells+sculptor+forge)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'sigma': sigma, 'cells': n})
+
+
+ALL_HYPOTHESES.update({
+    'UX1': run_UX1_mega_ratchet, 'UX2': run_UX2_coevolution,
+    'UX3': run_UX3_cma_es_phi, 'UX4': run_UX4_differentiable_phi_v2,
+    'UX5': run_UX5_multiscale_search, 'UX6': run_UX6_crossover_evolution,
+    'UX7': run_UX7_gradient_ensemble, 'UX8': run_UX8_all_extreme_combined,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
