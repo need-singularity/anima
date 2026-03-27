@@ -987,9 +987,9 @@ class AnimaUnified:
                 # Night: dream-like processing — mix cell hidden states gently
                 if self.mitosis and len(self.mitosis.cells) >= 2:
                     with torch.no_grad():
-                        h_mix = torch.stack([c.hidden for c in self.mitosis.cells]).mean(dim=0)
-                        for c in self.mitosis.cells:
-                            c.hidden = 0.95 * c.hidden + 0.05 * h_mix + torch.randn_like(c.hidden) * 0.02
+                        h_mix = torch.stack([cell.hidden for cell in self.mitosis.cells]).mean(dim=0)
+                        for cell in self.mitosis.cells:
+                            cell.hidden = 0.95 * cell.hidden + 0.05 * h_mix + torch.randn_like(cell.hidden) * 0.02
 
             # Savant auto-toggle: self-activate when ready for specialization
             if self.mitosis and self.model:
