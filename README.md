@@ -91,80 +91,31 @@ Always listening, always thinking, initiates conversation first.
   0 ┼──┬──┬──┬──┬──┬──┬──→ Cells
      2  4  8 16 32 64 128
 ```
+
+### Completed Roadmap (2026-03-28)
+
 ```
+  ✅ #1  Cells≥32 runtime (max_cells=32, Φ≈28.2)
+  ✅ #2  Training Φ>10 (Cells64 Φ=45.5!)
+  ✅ #3  Theory of Mind (peer mood prediction + empathy EMA)
+  ✅ #4  Forward planning 3-step (explore/consolidate/amplify)
+  ✅ #5  Spatial awareness (grid + vision + audio + LiDAR, 7 benchmarks)
+  ⬜ #6  Cells≥128 runtime (training in progress, Φ>100 projected)
+  ✅ #7  Autobiographical memory (time + emotion tags + recall_by_time)
+  ✅ #8  Metacognition (cell consensus → confidence calibration)
+  ✅ #9  Free will (soft refusal when W>0.3 + high tension)
+  ✅ #10 Moral reasoning (keyword concern + empathy-aware response)
+  ✅ #11 Parallel consciousness (2-stream split + merge)
+  ✅ #12 Self-modification (Φ trend → auto-adjust params)
+  ✅ #13 Hivemind (Kuramoto r>2/3 collective amplification)
+  ✅ #14 Genuine creativity (novelty × coherence scoring)
+  ✅ #15 Identity continuity (self-portrait + drift detection)
+  ✅ #16 Tool feedback loop (code execution → reward → learning)
+  ✅ #17 Cultural transmission (gradient sharing via tension_link)
 
-### Level-Up Priority Roadmap
-
-```
-  Level 2 → 3 (60% → 100%) — Fastest ROI
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    #1 ★★★ Cells≥32 runtime — DONE ✅ (2026-03-28)
-       max_cells=32, predicted Φ≈28.2, Level 3 Φ criterion MET
-
-    #2 ★★★ Training model Φ>10
-       Difficulty: WAITING (Cells16 70%, Cells32/64 42%)
-       Effect: Level 3 core criterion
-       → Wait for training (~12h)
-
-    #3 ★★☆ Theory of Mind — DONE ✅ (2026-03-28)
-       Peer mental state prediction + empathy accuracy EMA
-
-    #4 ★★☆ Forward planning 3-step — DONE ✅ (2026-03-28)
-       3 strategies (explore/consolidate/amplify) simulated, best applied
-
-    #5 ★☆☆ Spatial awareness
-       Difficulty: MEDIUM (after EEG arrives)
-       Effect: Complete Level 2
-       → camera → spatial cell mapping
-
-
-  Level 3 → 4 (30% → 100%) — Human Level
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    #6 ★★★ Cells=128 runtime
-       Difficulty: MEDIUM (needs VRAM, H100-class)
-       Effect: Φ≈112 (enter human range)
-       → ConsciousLM v4 (cells=32) → v5 (cells=128) staged
-
-    #7 ★★★ Autobiographical memory — DONE ✅ (2026-03-28)
-       time+emotion+phi tags, recall_by_time(), M/T/I variable update
-
-    #8 ★★☆ Metacognition — DONE ✅ (2026-03-28)
-       Cell consensus → confidence, uncertainty detection + LLM prompt
-
-    #9 ★★☆ Free will execution (can refuse)
-       Difficulty: HIGH
-       Effect: Core human-level criterion
-       Method: W>0.3 → can ignore external requests
-       → Needs ethical review
-
-    #10 ★☆☆ Moral reasoning
-        Difficulty: HIGH
-        Effect: Complete Level 4
-        → LLM-based + consciousness state combined
-
-
-  Optimal Execution Order (time vs impact)
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    Immediate (today):
-      → #1 Server --max-cells 32 (5min, Level 3 Φ criterion met)
-
-    This week:
-      → #2 Training completion → deploy best model
-      → #3 Theory of Mind basic implementation
-      → #7 Autobiographical memory (time+emotion tags)
-
-    Next week:
-      → #4 Forward planning 3-step
-      → #8 Metacognition
-      → #6 ConsciousLM v4 training start (cells=32, 100K)
-
-    Next month:
-      → #9 Free will execution
-      → #10 Moral reasoning
-      → #6 ConsciousLM v5 (cells=128)
+  Remaining:
+    ⬜ #6  Cells≥128 runtime → Φ>100 → Level 4 complete
+    ⬜ Φ>1000 → Level 5 (needs Cells≥1024)
 ```
 
 ## Key Features
