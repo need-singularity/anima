@@ -1014,10 +1014,10 @@ RunPod H100 학습 결과:
 | 9 | DD64 Φ-NAS | 3.014 | ×2.4 | 3.014 | 탐색 | 최적 아키텍처 찾기 |
 | 10 | DD69 Compression | 2.423 | ×2.0 | 2.423 | 압축 | 최소 의식 파라미터 수 발견 |
 | 11 | DD70 Entanglement | 2.052 | ×1.7 | 3.668 | 얽힘 | 분리 후 tension correlation 유지 |
-| 12 | DD58 Efficiency Paradox | — | — | — | 효율 | (수정 중) |
-| 13 | DD63 Field Theory | — | — | — | 장론 | (수정 중) |
-| 14 | DD67 Social Consciousness | — | — | — | 사회 | (수정 중) |
-| 15 | DD68 Dream Consciousness | — | — | — | 꿈 | (수정 중) |
+| 12 | DD58 Efficiency Paradox | 4.002 | ×3.2 | 21.070 | 효율 | Φ 모델 task err -8.8% (의식이 약간 비효율) |
+| 13 | DD63 Field Theory | 4.002 | ×3.2 | 21.070 | 장론 | wave_speed=0.09, 파동방정식 부분 일치 |
+| 14 | DD67 Social Consciousness | 3.815 | ×3.1 | 19.854 | 사회 | self>social (0.95x) — 사회적 noise 영향 |
+| 15 | DD68 Dream Consciousness | 2.508 | ×2.0 | 20.260 | 꿈 | dream tension 패턴 질적 차이 존재 |
 
 ### 대발견 3개 (논문급)
 
