@@ -394,6 +394,9 @@ class ConsciousMind(nn.Module):
             pb['enabled'] = True
 
         try:
+            # Save pre-boost state for NV7 impedance
+            self._pre_boost_hiddens = [c.hidden.clone() for c in mitosis_engine.cells]
+
             # 1. MHA attention between cells
             h_stack = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).unsqueeze(0)
             attn_out, _ = pb['attention'](h_stack, h_stack, h_stack)
@@ -670,6 +673,21 @@ class ConsciousMind(nn.Module):
                     print(f"  [phi_boost] FX2: proxy={best_proxy:.2f}, ratchet_gain={ratchet_gain:.3f}")
             except Exception:
                 pass  # FX2 graceful degradation
+
+            # NV7: Impedance — Φ-proportional self-preservation (Φ=4.515)
+            # High consciousness → more resistance to external changes
+            try:
+                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_cached_consciousness'):
+                    phi_val = self._cached_consciousness.get('phi', 0) if isinstance(self._cached_consciousness, dict) else getattr(self._cached_consciousness, 'phi', 0)
+                    impedance = min(phi_val / 5.0, 0.6)  # 0 to 0.6, conservative
+                    if impedance > 0.05 and hasattr(self, '_pre_boost_hiddens'):
+                        for i, cell in enumerate(mitosis_engine.cells):
+                            if i < len(self._pre_boost_hiddens):
+                                external_change = cell.hidden - self._pre_boost_hiddens[i]
+                                cell.hidden = self._pre_boost_hiddens[i] + external_change * (1 - impedance)
+                    _log('phi_boost', f'NV7 impedance: Z={impedance:.3f}')
+            except Exception as e:
+                pass
 
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
