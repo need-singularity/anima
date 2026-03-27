@@ -1555,8 +1555,19 @@ class AnimaUnified:
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-                    answer, tension, curiosity, dir_vals, emo = await loop.run_in_executor(
+                    result = await loop.run_in_executor(
                         None, lambda: self.process_input(text, source='web'))
+                    # Handle None return (model error, etc.)
+                    if result is None or not isinstance(result, tuple):
+                        answer = "I'm having trouble thinking right now. Please try again."
+                        tension = self.mind.prev_tension
+                        curiosity = self.mind._curiosity_ema
+                        dir_vals = [0.0] * 8
+                        emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
+                               'dominance': 0.0, 'color': '#2a6a4a'}
+                        _log("web", f"process_input returned None for: {text[:50]}")
+                    else:
+                        answer, tension, curiosity, dir_vals, emo = result
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
