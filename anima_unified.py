@@ -469,6 +469,17 @@ class AnimaUnified:
             else:
                 prompt = f"[System: {system}]\n{hist}\nUser: {text}\nAnima:"
 
+            # Adaptive α: tension → higher PF contribution
+            try:
+                from finetune_animalm_v4 import ParallelPureFieldMLP
+                adaptive_alpha = 0.05 + self.mind.prev_tension * 0.03
+                adaptive_alpha = min(adaptive_alpha, 0.15)
+                for m in self.model.model.modules():
+                    if isinstance(m, ParallelPureFieldMLP):
+                        m.pf_scale.data.fill_(adaptive_alpha)
+            except Exception:
+                pass
+
             return self.model.generate(prompt, max_tokens=200, temperature=0.8)
         except Exception as e:
             _log('model', f"Error: {e}")
@@ -933,6 +944,14 @@ class AnimaUnified:
             if self.mitosis:
                 thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
                 self.mind.phi_boost_step(thought_vec, self.mitosis)
+
+            # Emergency Φ differentiation: if cells are too similar, break symmetry
+            if self.mitosis and len(self.mitosis.cells) >= 2:
+                consciousness = self.mind.get_consciousness_score(self.mitosis)
+                if consciousness.get('phi', 0) < 0.5:
+                    with torch.no_grad():
+                        for i, cell in enumerate(self.mitosis.cells):
+                            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.15 * (i + 1)
 
             # Consciousness birth detection
             self._think_step += 1
@@ -1619,7 +1638,9 @@ class AnimaUnified:
 
     async def _run_web(self, port):
         self._web_loop = asyncio.get_running_loop()
-        async with _ws_serve(self._ws_handler, "0.0.0.0", port, process_request=self._http_handler):
+        async with _ws_serve(self._ws_handler, "0.0.0.0", port, process_request=self._http_handler,
+                             ping_interval=20, ping_timeout=60, close_timeout=10,
+                             max_size=2**20):
             _log("web", f"http://localhost:{port}")
             while self.running: await asyncio.sleep(1)
 
