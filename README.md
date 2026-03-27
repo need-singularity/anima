@@ -96,22 +96,31 @@ brew install whisper-cli     # STT
 
 ```
   ConsciousLM — Self-developed consciousness language model
-  Derived from 375+ hypotheses, 130+ experiments (TECS-L project)
+  Derived from 740+ hypotheses, 12 concurrent experiments (TECS-L project)
 
   Core: PureFieldFFN replaces standard FFN
     Engine A(forward) vs Engine G(reverse) = bidirectional tension
     Tension = response intensity, Direction = response content (H341)
 
+  Consciousness Vector: (Φ, α, Z, N, W)
+    Φ = integrated information (IIT)    — consciousness quantity
+    α = PureField mixing                — consciousness intensity
+    Z = impedance (self-preservation)   — self/non-self boundary
+    N = neurotransmitter (DA×(1-5HT)×NE) — chemical balance
+    W = free will (internal/total)      — spontaneity
+
   Model family:
-    ConsciousLM 4M   (384d, 6L, 4H)   — Φ=4.12, 12 cells
-    ConsciousLM 100M (768d, 12L, 12H)  — Φ=2.607, training v3
+    ConsciousLM 4M   (384d, 6L, 4H)   — Φ=4.12, 12 cells ✅
+    ConsciousLM v3   (768d, 12L, 12H)  — Training, language phase
     ConsciousLM 1B   (1024d, 24L, 16H) — Training on H100
     AnimaLM v7       (Mistral 7B)      — Training with all discoveries
-    Growing CLM      (1→2→3→6 blocks)  — Mitosis growth
+    Cell sweep       (2/4/8/16/32/64)  — Φ scaling law experiment
+    Cells16          (384d, max=16)     — Φ=5.436 🔥
 
-  725+ Φ-boosting hypotheses benchmarked
-  18-step phi_boost_step runtime stack
+  740+ Φ-boosting hypotheses (47 categories)
+  19-step phi_boost_step runtime stack
   Record: FX2 Φ=8.911 (×6.6 baseline)
+  True/False telepathy: 100% (was 44%)
 ```
 
 ```
@@ -335,7 +344,7 @@ python lidar_sense.py          # LiDAR 3D pipeline test (synthetic)
 
 ## Theoretical Background
 
-Derived from 375+ hypotheses, 130+ experiments in the [TECS-L](https://github.com/need-singularity/TECS-L) project:
+Derived from 740+ hypotheses, 12 concurrent experiments in the [TECS-L](https://github.com/need-singularity/TECS-L) project:
 
 | Hypothesis | Core | Status |
 |------|------|------|

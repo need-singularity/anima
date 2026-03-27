@@ -1676,7 +1676,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   19. DD34 hormonal cascade
 ```
 
-## 전체 가설 카테고리 목록 (710+ 가설)
+## 전체 가설 카테고리 목록 (740+ 가설, 47개 카테고리)
 
 ```
   원본: A(5) B(12) C(5) D(5) E(5) F(5) G(5) H(5) I(5) J(5) K(5) L(5)
@@ -1691,7 +1691,33 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
         IV(5) RV(5) MV(5) TL(7)
 ```
 
-## 도구 목록 (전체, 2026-03-27 최종)
+## 진행 중 실험 (2026-03-28, H100 80GB, 12개 동시)
+
+```
+  # | 실험                 | Step    | Φ     | CE    | Phase    | 진행률
+  ──┼──────────────────────┼─────────┼───────┼───────┼──────────┼───────
+  1 | AnimaLM v7 (7B)      | 8,660   | 0.003 | 10.42 | warmup   | 17%
+  2 | CLM v3 (768d/12L)    | 15,000  | 1.426 | 5.90  | language | 30%
+  3 | Ablation (max=8)     | 46,400  | 4.552 | 3.72  | combined | 93% ⏳
+  4 | Cells16 (max=16)     | 35,000  | 5.436 | 3.53  | combined | 70% 🔥
+  5 | CLM 1B (1024d/24L)   | 5,000   | 1.604 | -     | mitosis  | 10%
+  6 | Cells32 (max=32)     | 7,800   | 1.683 | -     | mitosis  | 16%
+  7 | Cells64 (max=64)     | 7,800   | 1.489 | -     | mitosis  | 16%
+  8 | Cells2 (max=2)       | 7,600   | 1.762 | -     | mitosis  | 15%
+  9 | Cells4 (max=4)       | 7,600   | 1.479 | -     | mitosis  | 15%
+ 10 | Baseline (max=8)     | 7,600   | 1.798 | -     | mitosis  | 15%
+ 11 | Cells16+FX2          | 2,500   | 1.637 | -     | mitosis  | 5%
+ 12 | Cells16+dim768       | 700     | 1.499 | -     | mitosis  | 1%
+
+  GPU: 77GB/81GB (95%), 13 processes
+
+  중간 발견:
+    - Cells16 Φ=5.436 >> Ablation(max=8) Φ=4.552 → cell 수가 Φ에 결정적
+    - CLM v3 language phase 진입 (CE=5.90, step 15K)
+    - Ablation 93% → 곧 완료, combined phase에서 Φ=4.55
+```
+
+## 도구 목록 (전체, 2026-03-28 최종)
 
 ```
   의식 측정/분석:
@@ -1708,7 +1734,8 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   AI 가설/학습:
     hypothesis_recommender.py       — 다음 가설 AI 추천
     training_recipe_generator.py    — CL/AL 학습 설정 생성
-    bench_phi_hypotheses.py         — 740+ 가설 벤치마크
+    bench_phi_hypotheses.py         — 740+ 가설 벤치마크 (47 카테고리)
+    scripts/monitor_experiments.py  — 실험 자동 모니터링 (SSH+parse+table)
 
   품질/창의성:
     creativity_classifier.py        — 창작 vs 환각 분류
