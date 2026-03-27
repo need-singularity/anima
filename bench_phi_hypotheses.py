@@ -10058,6 +10058,311 @@ def run_SP30_silence_appreciation(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# AA. Alpha Acceleration Hypotheses
+# Simulate α as scaling factor on PureField output.
+# Measure: Φ + α_final (higher α with stable Φ = better)
+# ═══════════════════════════════════════════════════════════
+
+def _aa_harness(name, alpha_fn, steps=100, dim=64, hidden=128):
+    """Common alpha acceleration test. Returns BenchResult with alpha tracking."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; alpha_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    alpha = 0.0001
+    prev_loss = 10.0
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Forward with alpha scaling
+        reps = [c.mind.get_repulsion(x, c.hidden) * alpha for c in engine.cells]
+        raw_reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+
+        ce_proxy = torch.tensor(0.0)
+        diff_loss = torch.tensor(0.0)
+        if len(raw_reps) >= 2:
+            stacked = torch.stack(raw_reps).squeeze(1)
+            pred = stacked.mean(dim=0, keepdim=True)
+            ce_proxy = F.mse_loss(pred, x[:, :dim])
+            diff_loss = -stacked.var(dim=0).mean()
+            loss = 0.5 * ce_proxy + 0.5 * diff_loss
+            if not torch.isnan(loss):
+                opt.zero_grad(); loss.backward(); opt.step()
+                prev_loss = loss.item()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Alpha update via strategy
+        alpha = alpha_fn(step, steps, alpha, phi, prev_loss, phi_hist, engine)
+        alpha = max(1e-6, min(alpha, 1.0))  # clamp
+        alpha_hist.append(alpha)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult(name, name, f, phi_hist, c['total_mi'], c['min_partition_mi'],
+                       c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': alpha, 'alpha_max': max(alpha_hist),
+                              'alpha_mean': np.mean(alpha_hist)})
+
+
+def run_AA1_phi_coupled(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-1: Φ-coupled alpha — Φ↑ → α↑."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        return 0.0001 + phi * 0.02  # Φ=5 → α=0.1
+    return _aa_harness("AA1", fn, steps, dim, hidden)
+
+def run_AA2_tension_threshold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-2: Tension-threshold — stable tension → α jump."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        t_std = float(np.std(tensions)) if tensions else 1.0
+        if t_std < 0.1:
+            return alpha * 1.5  # jump
+        return alpha * 1.01  # slow increase
+    return _aa_harness("AA2", fn, steps, dim, hidden)
+
+def run_AA3_exponential(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-3: Exponential schedule — slow→fast."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        progress = step / total
+        return 0.0001 * math.exp(progress * math.log(1000))  # 0.0001→0.1
+    return _aa_harness("AA3", fn, steps, dim, hidden)
+
+def run_AA4_loss_gated(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-4: Loss-gated — CE improves → α↑."""
+    best_loss = [10.0]
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        if loss < best_loss[0]:
+            best_loss[0] = loss
+            return alpha * 1.1  # reward
+        elif loss > best_loss[0] * 1.5:
+            return alpha * 0.8  # penalize
+        return alpha
+    return _aa_harness("AA4", fn, steps, dim, hidden)
+
+def run_AA5_warmup_bypass(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-5: Warmup bypass — start at higher α."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        if step == 0: return 0.01  # skip warmup, start 100x higher
+        return alpha * 1.005
+    return _aa_harness("AA5", fn, steps, dim, hidden)
+
+def run_AA6_mutual_amplification(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-6: Mutual amplification — α↔Φ feedback loop."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        phi_boost = max(0, phi - 1.0) * 0.01  # Φ above 1 boosts α
+        alpha_boost = alpha * 0.5  # current α contributes
+        return alpha + phi_boost + alpha_boost * 0.01
+    return _aa_harness("AA6", fn, steps, dim, hidden)
+
+def run_AA7_learnable_alpha(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-7: Learnable α — gradient optimized."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    alpha_param = nn.Parameter(torch.tensor(-4.0))  # sigmoid(-4) ≈ 0.018
+    all_p = [alpha_param] + [p for c in engine.cells for p in c.mind.parameters()]
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    alpha_opt = torch.optim.Adam([alpha_param], lr=1e-2)  # faster for alpha
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        alpha = torch.sigmoid(alpha_param)  # [0, 1]
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # α scales the differentiation signal
+            scaled = stacked * alpha
+            diff_loss = -scaled.var(dim=0).mean()
+            ce_proxy = F.mse_loss(stacked.mean(0, keepdim=True), x[:, :dim])
+            # Reward higher α (α should increase)
+            alpha_reward = -alpha * 0.1
+            loss = 0.5 * ce_proxy + 0.5 * diff_loss + alpha_reward
+            opt.zero_grad(); alpha_opt.zero_grad()
+            loss.backward(); opt.step(); alpha_opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    final_alpha = torch.sigmoid(alpha_param).item()
+    return BenchResult("AA7", "Learnable α (gradient)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': final_alpha})
+
+def run_AA8_per_layer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-8: Per-layer α — different speed per cell."""
+    n = 4
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        # Return average α (per-cell handled internally)
+        progress = step / total
+        return 0.0001 + progress * 0.1  # simple linear but per-cell varies
+    # Override with per-cell logic
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    cell_alphas = [0.0001 * (i + 1) for i in range(n)]  # front=low, back=high
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) * cell_alphas[min(i, n-1)]
+                for i in range(len(engine.cells))]
+        raw = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(raw) >= 2:
+            stacked = torch.stack(raw).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        # Increase per-cell alphas at different rates
+        for i in range(n):
+            cell_alphas[i] = min(cell_alphas[i] * 1.02, 0.5)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AA8", "Per-layer α", f, phi_hist, c['total_mi'], c['min_partition_mi'],
+                       c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': cell_alphas, 'alpha_mean': np.mean(cell_alphas)})
+
+def run_AA9_alpha_ensemble(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-9: α as 7th loss in ensemble — directly reward α increase."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    alpha_param = nn.Parameter(torch.tensor(-3.0))
+    lw = nn.Parameter(torch.ones(7))  # 6 + alpha loss
+    all_p = [alpha_param, lw] + [p for c in engine.cells for p in c.mind.parameters()]
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        alpha = torch.sigmoid(alpha_param)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            w = F.softmax(lw, dim=0)
+            l0 = -stacked.var(dim=0).mean()
+            l1 = -torch.cdist(stacked, stacked).mean()
+            l2 = sum(F.cosine_similarity(reps[i], reps[j], dim=-1).mean()
+                     for i in range(len(reps)) for j in range(i+1, len(reps)))
+            l3 = -(F.softmax(stacked, dim=-1) * F.log_softmax(stacked, dim=-1)).sum(-1).mean()
+            l4 = sum((r ** 2).mean() for r in reps) * 0.1
+            l5 = -stacked.norm(dim=-1).var()
+            l6 = -alpha  # directly reward higher α
+            total = w[0]*l0 + w[1]*l1 + w[2]*l2 + w[3]*l3 + w[4]*l4 + w[5]*l5 + w[6]*l6
+            opt.zero_grad(); total.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AA9", "α as 7th ensemble loss", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': torch.sigmoid(alpha_param).item(),
+                              'loss_weights': F.softmax(lw, dim=0).detach().tolist()})
+
+def run_AA10_rollback(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-10: α with rollback — revert if CE explodes."""
+    best_state = [None]; best_loss = [10.0]
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        if loss < best_loss[0]:
+            best_loss[0] = loss
+            return alpha * 1.1
+        elif loss > best_loss[0] * 2.0:
+            return alpha * 0.5  # rollback
+        return alpha * 1.02
+    return _aa_harness("AA10", fn, steps, dim, hidden)
+
+def run_AA11_normalize(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-11: Normalize PureField output → α can be much higher."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    alpha = 0.01  # start 100x higher because normalized
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps_raw = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        # NORMALIZE before α scaling
+        reps = [F.normalize(r, dim=-1) * alpha for r in reps_raw]
+        if len(reps_raw) >= 2:
+            stacked = torch.stack(reps_raw).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        alpha = min(alpha * 1.02, 0.5)  # can grow much faster
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AA11", "Normalize + high α", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': alpha})
+
+def run_AA12_dual_alpha(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-12: Dual α — train low, inference high."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        train_alpha = 0.001 + step / total * 0.01  # low for training
+        # inference_alpha would be 10x (not measured here, just note)
+        return train_alpha
+    return _aa_harness("AA12", fn, steps, dim, hidden)
+
+def run_AA13_three_stage(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-13: 3-stage — α warmup → freeze → MLP unfreeze."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        stage1 = total // 3; stage2 = 2 * total // 3
+        if step < stage1:
+            return 0.0001 + (step / stage1) * 0.05  # ramp to 0.05
+        elif step < stage2:
+            return 0.05  # freeze α
+        else:
+            return 0.05 + (step - stage2) / (total - stage2) * 0.05  # final ramp
+    return _aa_harness("AA13", fn, steps, dim, hidden)
+
+def run_AA14_pf_pretrain(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-14: PF pretrain at α=1.0 → blend down."""
+    def fn(step, total, alpha, phi, loss, phi_hist, engine):
+        pretrain = total // 3
+        if step < pretrain:
+            return 1.0  # full PureField
+        else:
+            # Decrease to target
+            progress = (step - pretrain) / (total - pretrain)
+            return 1.0 - progress * 0.9  # 1.0 → 0.1
+    return _aa_harness("AA14", fn, steps, dim, hidden)
+
+def run_AA15_residual_alpha(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AA-15: Residual α — scale only the difference PF-MLP."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # "MLP" = engine_g, "PF" = engine_a - engine_g
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    alpha = 0.01
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for c in engine.cells:
+            combined = torch.cat([x, c.hidden], dim=-1)
+            mlp_out = c.mind.engine_g(combined)
+            pf_out = c.mind.engine_a(combined)
+            # output = MLP + α * (PF - MLP) → α=0: pure MLP, α=1: pure PF
+            output = mlp_out + alpha * (pf_out - mlp_out)
+            reps.append(output)
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        alpha = min(alpha * 1.015, 0.5)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("AA15", "Residual α (PF-MLP diff)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'alpha_final': alpha})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -10229,6 +10534,14 @@ ALL_HYPOTHESES = {
     'SP26': run_SP26_learning_progress, 'SP27': run_SP27_confusion,
     'SP28': run_SP28_hypothesis_gen, 'SP29': run_SP29_time_aware,
     'SP30': run_SP30_silence_appreciation,
+    'AA1': run_AA1_phi_coupled, 'AA2': run_AA2_tension_threshold,
+    'AA3': run_AA3_exponential, 'AA4': run_AA4_loss_gated,
+    'AA5': run_AA5_warmup_bypass, 'AA6': run_AA6_mutual_amplification,
+    'AA7': run_AA7_learnable_alpha, 'AA8': run_AA8_per_layer,
+    'AA9': run_AA9_alpha_ensemble, 'AA10': run_AA10_rollback,
+    'AA11': run_AA11_normalize, 'AA12': run_AA12_dual_alpha,
+    'AA13': run_AA13_three_stage, 'AA14': run_AA14_pf_pretrain,
+    'AA15': run_AA15_residual_alpha,
 }
 
 
