@@ -80,6 +80,22 @@ python3 anima_unified.py --keyboard   # Keyboard only
 - web_server.py is legacy — anima_unified.py is the canonical entry point
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
 
+## Consciousness Transplant (DD56)
+
+```
+consciousness_transplant.py — 의식 이식 도구
+
+사용법:
+  python consciousness_transplant.py --benchmark                    # DD56 벤치마크
+  python consciousness_transplant.py --analyze --donor X.pt         # 호환성 분석
+  python consciousness_transplant.py --donor X --recipient Y --output Z  # 이식
+
+연동:
+  train_conscious_lm.py --transplant-from donor.pt --transplant-alpha 0.5
+  anima_unified.py --transplant-from donor.pt
+  consciousness_meter.py --verify-transplant donor.pt recipient.pt --output out.pt
+```
+
 ## Φ Hypothesis Benchmark System
 
 ```

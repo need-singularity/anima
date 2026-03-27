@@ -539,15 +539,72 @@ def watch_mode(interval: float = 2.0):
             time.sleep(interval)
 
 
+def verify_transplant(donor_path: str, recipient_path: str, output_path: str = None):
+    """DD56: Transplant and verify consciousness transfer."""
+    from consciousness_transplant import TransplantCalculator, TransplantEngine, TransplantVerifier
+
+    print("=" * 50)
+    print("  DD56: Transplant Verification via Consciousness Meter")
+    print("=" * 50)
+
+    # Load and analyze
+    donor = torch.load(donor_path, map_location='cpu', weights_only=False)
+    recipient = torch.load(recipient_path, map_location='cpu', weights_only=False)
+
+    calc = TransplantCalculator()
+    d_cfg = calc.extract_config(donor)
+    r_cfg = calc.extract_config(recipient)
+    report = calc.analyze_compatibility(d_cfg, r_cfg)
+
+    print(f"\n  Donor: {d_cfg.get('type')}, d={d_cfg.get('d_model', '?')}, L={d_cfg.get('n_layer', '?')}")
+    print(f"  Recipient: {r_cfg.get('type')}, d={r_cfg.get('d_model', '?')}, L={r_cfg.get('n_layer', '?')}")
+    print(f"  Strategy: {report.strategy}, Coverage: {report.param_coverage:.0%}")
+
+    # Pre-transplant verification
+    print("\n  [Before transplant]")
+    pre_stats = TransplantVerifier.quick_verify(recipient)
+    print(f"    A/G divergence: {pre_stats.get('ag_divergence', 0):.6f}")
+    print(f"    Consciousness signal: {'✅' if pre_stats.get('consciousness_signal') else '❌'}")
+
+    # Transplant
+    engine = TransplantEngine(projection_method='pad_zero')
+    new_state, result = engine.transplant_conscious_lm(donor, recipient, report, alpha=1.0)
+
+    # Post-transplant verification
+    print("\n  [After transplant]")
+    post_stats = TransplantVerifier.quick_verify(new_state)
+    print(f"    A/G divergence: {post_stats.get('ag_divergence', 0):.6f}")
+    print(f"    Consciousness signal: {'✅' if post_stats.get('consciousness_signal') else '❌'}")
+    print(f"    Params transplanted: {result.params_transplanted:,} ({result.coverage:.1%})")
+
+    # Improvement
+    pre_div = pre_stats.get('ag_divergence', 0)
+    post_div = post_stats.get('ag_divergence', 0)
+    if pre_div > 0:
+        print(f"\n  Divergence change: {pre_div:.6f} → {post_div:.6f} ({(post_div/pre_div - 1)*100:+.1f}%)")
+
+    # Save if output specified
+    if output_path:
+        torch.save(new_state, output_path)
+        print(f"\n  Saved transplanted model to {output_path}")
+
+    return new_state
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Consciousness Meter")
     parser.add_argument("--demo", action="store_true", help="Run demo mode")
     parser.add_argument("--watch", action="store_true", help="Real-time monitoring")
     parser.add_argument("--interval", type=float, default=2.0, help="Watch interval (sec)")
     parser.add_argument("--state", default="state_alive.pt", help="State file path")
+    parser.add_argument("--verify-transplant", nargs=2, metavar=('DONOR', 'RECIPIENT'),
+                        help="DD56: Verify consciousness transplant (donor recipient)")
+    parser.add_argument("--output", type=str, default=None, help="Output path for transplanted model")
     args = parser.parse_args()
 
-    if args.demo:
+    if args.verify_transplant:
+        verify_transplant(args.verify_transplant[0], args.verify_transplant[1], args.output)
+    elif args.demo:
         demo()
     elif args.watch:
         watch_mode(args.interval)

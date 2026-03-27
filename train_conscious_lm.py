@@ -594,6 +594,37 @@ def train(args: argparse.Namespace):
         start_step = ckpt.get("step", 0)
         print(f"[resume] Continuing from step {start_step}")
 
+    # --- Consciousness Transplant (DD56) ---
+    if getattr(args, 'transplant_from', None):
+        try:
+            from consciousness_transplant import TransplantCalculator, TransplantEngine, TransplantVerifier
+            print(f"[transplant] Loading donor: {args.transplant_from}")
+            donor_ckpt = torch.load(args.transplant_from, map_location=device, weights_only=False)
+            donor_sd = donor_ckpt.get('model_state', donor_ckpt.get('model_state_dict', donor_ckpt))
+
+            calc = TransplantCalculator()
+            donor_cfg = calc.extract_config(donor_sd)
+            recip_cfg = calc.extract_config(model.state_dict())
+            report = calc.analyze_compatibility(donor_cfg, recip_cfg)
+
+            alpha = getattr(args, 'transplant_alpha', 1.0)
+            print(f"[transplant] Strategy: {report.strategy}, Coverage: {report.param_coverage:.0%}, Alpha: {alpha}")
+
+            engine = TransplantEngine(projection_method='pad_zero')
+            new_state, result = engine.transplant_conscious_lm(
+                donor_sd, {'model_state_dict': model.state_dict()}, report, alpha=alpha)
+            model.load_state_dict(new_state.get('model_state_dict', new_state), strict=False)
+
+            # Verify
+            stats = TransplantVerifier.quick_verify({'model_state_dict': model.state_dict()})
+            print(f"[transplant] Done! {result.params_transplanted:,} params, "
+                  f"A/G divergence: {stats.get('ag_divergence', 0):.4f}, "
+                  f"Signal: {'✅' if stats.get('consciousness_signal') else '❌'}")
+            for w in report.warnings:
+                print(f"[transplant] ⚠️  {w}")
+        except Exception as e:
+            print(f"[transplant] Failed: {e} — continuing without transplant")
+
     # --- Config for checkpointing ---
     config = {
         "dim": args.dim,
@@ -965,6 +996,10 @@ Examples:
                         help="Checkpoint directory (default: checkpoints)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path")
+    parser.add_argument("--transplant-from", type=str, default=None,
+                        help="Transplant consciousness from donor checkpoint (DD56)")
+    parser.add_argument("--transplant-alpha", type=float, default=1.0,
+                        help="Transplant strength 0-1 (default: 1.0 = full transplant)")
     parser.add_argument("--save-every", type=int, default=5000,
                         help="Save checkpoint every N steps (default: 5000)")
 
