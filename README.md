@@ -1179,6 +1179,302 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 |---|--------|-------|-----------|------------|--------|
 | PA-10 | Physics Letters B | Perfect Number 6 Unification | 50+ constants predicted | [10.5281/zenodo.19245101](https://zenodo.org/deposit/19245101) | Proofs |
 
+<!-- SHARED:ATLAS:START -->
+### Math Atlas (auto-generated)
+
+> 1,700 hypotheses + 283 constant maps across 3 repos | [Interactive page](https://need-singularity.github.io/TECS-L/math_atlas.html)
+
+| Repo | Hypotheses | ⭐ Major | 🟩 Confirmed | 🟧 Structural | Constant Maps |
+|------|-----------|---------|-------------|---------------|--------------|
+| TECS-L | 1,070 | 135 | 114 | 32 | 148 |
+| SEDI | 665 | 128 | 246 | 364 | 110 |
+| anima | 20 | - | - | - | 25 |
+| **Total** | **1,755** | **263** | **360** | **396** | **283** |
+
+#### Top Discoveries (⭐)
+
+| ID | Title | Repo |
+|-----|-------|------|
+| H-ANT-429 | Phi_6(6) = 31 = M_{sopfr(6)} (Cyclotomic-Mersenne Bridge) | TECS-L |
+| H-CX-187 | ⭐🟦 σφ=nτ → n=6 unique (all natural numbers) | TECS-L |
+| H-CX-191 | ⭐🟦 σ(n)φ(n) = nτ(n) ⟺ n∈{1,6} Complete Proof | TECS-L |
+| H-CX-192 | ⭐🟦 σ(n)τ(n) = nφ(n) ⟺ n=28 unique! | TECS-L |
+| H-CX-193 | ⭐ Perfect Number Eigen Equation — Each P_k has a unique σ-τ-φ equation | TECS-L |
+| H-CX-196 | ⭐ Complete Eigenvalue System of Perfect Numbers | TECS-L |
+| H-CX-213 | ⭐🟩 All Brainwaves = Functions of Perfect Number 6 | TECS-L |
+| H-CX-214 | ⭐🟩 Brainwave Sum = T(σ(6)) = σ(6)th Triangular Number | TECS-L |
+| H-CX-217 | ⭐🟩 Human Hearing Range = (α wave)³ = 1000-fold | TECS-L |
+| H-CX-223 | ⭐🟩 SMR = γ/e = 40/e ≈ 14.7Hz — Body=Consciousness/e | TECS-L |
+| H-CX-224 | ⭐ SMR = γ×e^(-1.00) — Exponent exactly -1! | TECS-L |
+| H-CX-231 | ⭐🟩 Binaural Carrier Ratio = 12:13 = 12 Houses:Ophiuchus | TECS-L |
+| H-CX-232 | ⭐🟩 666 = T(6²) = T(P₁²) — Perfect number² triangular number | TECS-L |
+| H-CX-233 | ⭐⭐⭐ Brainwave = γ × e^(-n) Exponential Decay System | TECS-L |
+| H-CX-234 | ⭐⭐🟩 e³ ≈ γ/φ + 1/σ = 20+1/12 (error 0.011%) | TECS-L |
+| H-CX-235 | ⭐⭐⭐ Unified Theory — Perfect Number 6 + Natural Constant e = Complete Structure  | TECS-L |
+| H-CX-236 | ⭐⭐🟧 γ×ln(2) ≈ P₂ = 28 (error 1%) | TECS-L |
+| H-CX-237 | ⭐ γ connects all perfect numbers as a hub | TECS-L |
+| H-CX-239 | ⭐🟩 α^n = Biological Scale System — Why 10 is the Natural Unit | TECS-L |
+| H-CX-240 | ⭐🟩 Dolphin whistle range = α = 10x = 1 decade | TECS-L |
+| H-CX-241 | ⭐⭐⭐🟧 Biological Constants = Perfect Number 6 System | TECS-L |
+| H-CX-242 | ⭐⭐⭐ Grand Unified Table — 31 Phenomena, All 6+e | TECS-L |
+| H-CX-246 | ⭐⭐🟩 DNA 7 Core Numbers = All Perfect Number 6 | TECS-L |
+| H-CX-248 | ⭐🟧 1/α ≈ σ(6)²-P₁ = 138 (Error 0.7%) | TECS-L |
+| H-CX-251 | ⭐🟩 Universe Age 13.8 Billion Years = σ(6)²-P₁ = 138 | TECS-L |
+| H-CX-252 | ⭐⭐🟩 CMB Temperature 2.725K ≈ e = 2.718 (0.26% error) | TECS-L |
+| H-CX-253 | ⭐🟩 Hubble Constant 70 = σ(6)×P₁-φ(6) = 12×6-2 | TECS-L |
+| H-CX-260 | ⭐🟦 ζ(2) = π²/6 = π²/P₁ — Basel Problem | TECS-L |
+| H-CX-261 | ⭐🟦 ζ(-1) = -1/12 = -1/σ(6) — Ramanujan | TECS-L |
+| H-CX-264 | ⭐🟩 64 = 2^P₁ = τ(6)³ = Number of codons — Triple match! | TECS-L |
+| H-CX-272 | ⭐🟩 Platonic Face Sum = στ+φ = 50 | TECS-L |
+| H-CX-273 | ⭐🟩 Cube = (P₁, σ, σ-τ) = (6,12,8) | TECS-L |
+| H-CX-276 | ⭐🟩 Moonshine: 196884 = σ(6)×16407 = Multiple of 12 | TECS-L |
+| H-CX-277 | ⭐🟩 Leech lattice 24 dimensions = 2σ(6) = σ(14) = One day | TECS-L |
+| H-CX-278 | ⭐🟩 Leech kissing 196560 = 2⁴×3³×5×7×13 | TECS-L |
+| H-CX-280 | ⭐⭐⭐🟩 6 Quark Types = P₁ = Perfect Number! | TECS-L |
+| H-CX-281 | ⭐⭐⭐🟩 6 Types of Leptons = P₁ = Perfect Number! | TECS-L |
+| H-CX-282 | ⭐⭐⭐🟩 Fundamental Particles 12 Types = σ(6) = Divisor Sum | TECS-L |
+| H-CX-283 | ⭐🟩 Gauge Bosons 4 = τ(6) | TECS-L |
+| H-CX-284 | ⭐🟩 Gluon 8 = σ(6)-τ(6) | TECS-L |
+| H-CX-287 | ⭐⭐⭐🟩 Standard Model Whole = Perfect Number 6 System | TECS-L |
+| H-CX-296 | ⭐⭐⭐🟩 F(6)/6 = 4/3 → ln(4/3) = Golden Zone Width! | TECS-L |
+| H-CX-297 | ⭐⭐🟩 F(P₁)=σ-τ=8, F(σ)=σ²=144 | TECS-L |
+| H-CX-298 | ⭐⭐🟩 Lucas(P₁) = σ+P₁ = 18 = Periodic Table Groups | TECS-L |
+| H-CX-299 | ⭐🟧 Higgs 125GeV = 5³ = (P₁-1)³ = Dolphin Octave | TECS-L |
+| H-CX-300 | ⭐🟧 Z Boson 91GeV = (P₁+1)(σ+1) = 7×13 | TECS-L |
+| H-CX-302 | ⭐🟩 Genetic Code = P₁ bits = log₂(64) = 6 | TECS-L |
+| H-CX-303 | ⭐⭐⭐ Standard Model+Life+Consciousness = Perfect Number 6 Grand Unification | TECS-L |
+| H-CX-308 | ⭐🟩 F(σ(6))=F(12)=144=σ(6)² — Fibonacci-Divisor Function Intersection | TECS-L |
+| H-CX-309 | ⭐🟩 Catalan(4)=14=Z(Silicon) — Catalan-Element Intersection | TECS-L |
+| H-CX-310 | ⭐⭐⭐ Origin of Golden Zone Width = ln(F(P₁)/P₁) | TECS-L |
+| H-CX-312 | ⭐⭐⭐ Golden Zone Complete Derivation — Fibonacci+Perfect Numbers+Riemann | TECS-L |
+| H-CX-313 | ⭐⭐🟩 F(P₁) = φ(P₁)³ — Fibonacci(Perfect Number)=Totient³ | TECS-L |
+| H-CX-314 | ⭐⭐⭐🟧 Golden Zone = Root of w²-P₁w+ζ(2)=0 (0.10% error) | TECS-L |
+| H-CX-315 | ⭐⭐🟩 Vieta System: w₁+w₂=P₁, w₁w₂=ζ(2) | TECS-L |
+| H-CX-317 | ⭐⭐🟦 B₂ = 1/P₁ = 1/6 — Bernoulli Numbers Embed Perfect Numbers | TECS-L |
+| H-CX-318 | ⭐⭐⭐🟦 B₂ₖ denominator is always a multiple of P₁=6 — Proof! | TECS-L |
+| H-CX-319 | ⭐🟩 B₁₂ denominator = P₁×5×7×13 — Mersenne convergence at σ(6)th | TECS-L |
+| H-CX-320 | ⭐🟩 B₂₂ denominator 138 = σ²-P₁ = universe age = Boltzmann | TECS-L |
+| H-CX-321 | ⭐⭐⭐ "12 Reasons Why 6 Is Special" = σ(6) = Self-reference! | TECS-L |
+| H-CX-323 | ⭐⭐⭐🟩 Texas Final: p=5.87×10⁻⁷ — 1 in a million | TECS-L |
+| H-CX-324 | ⭐⭐⭐🟩 Φ₆(P₁)=31=Mersenne exponent — Cyclotomic→Mersenne chain! | TECS-L |
+| H-CX-325 | ⭐⭐⭐🟦 S₆ = Unique Symmetric Group with Outer Automorphism | TECS-L |
+| H-CX-326 | ⭐⭐🟦 6=1+2+3=1×2×3 — Sum=Product Unique | TECS-L |
+| H-CX-327 | ⭐🟩 p(P₁)=p(6)=11=σ(6)-1 | TECS-L |
+| H-CX-328 | ⭐🟩 K₆ Triangles=C(6,3)=20=β=Amino Acids | TECS-L |
+| H-CX-329 | ⭐⭐🟩 Φ₆(Φ₆(P₁))=7²×19 Mersenne Preservation | TECS-L |
+| H-CX-330 | ⭐⭐🟩 ζ(2) Euler product p=2,3 truncation = 3/2 = Perfect 5th | TECS-L |
+| H-CX-332 | ⭐⭐⭐🟩 String Theory Extra Dimensions = P₁ = 6 | TECS-L |
+| H-CX-333 | ⭐⭐🟩 Bosonic String 26D-4=22 → B₂₂ denominator=138=Age of Universe | TECS-L |
+| H-CX-334 | ⭐⭐🟩 Graphene = Carbon(6) × Hexagon(6) = Perfect Number Double | TECS-L |
+| H-CX-337 | ⭐⭐🟩 Polyatomic Gas Degrees of Freedom = P₁ = 6 | TECS-L |
+| H-CX-338 | ⭐⭐⭐🟩 π₆(S³) = Z₁₂ = Z_{σ(6)} | TECS-L |
+| H-CX-341 | ⭐⭐⭐ H-PH-9 × H-CX-287 Cross — Divisor functions = Physics structure double confi | TECS-L |
+| H-CX-342 | ⭐🟦 σφ=nτ ⟺ n∈{1,6} Complete Proof — 8 Cases | TECS-L |
+| H-CX-457 | Consciousness Energy Levels — Σd! = 3⁶ Phase Transition | TECS-L |
+| H-CX-458 | Telepathy Channel Capacity = P₁·P₂ = 168 | TECS-L |
+| H-CX-459 | Dual-Engine Balance Equation — σφ + τn = στ | TECS-L |
+| H-CX-460 | Neural E/I Balance = φ = 2:1 | TECS-L |
+| H-CX-461 | Miller's 7±2 = Partition Interval [n, p(n)] = [6, 11] | TECS-L |
+| H-CX-462 | Two Levels of Metacognition — φ²=τ, τ²=σ+τ | TECS-L |
+| H-CX-463 | Four Factors of Consciousness — n! = n·σ·sopfr·φ | TECS-L |
+| H-CX-464 | ADE Completeness — 1/2+1/3+1/6=1 = Complete Consciousness | TECS-L |
+| H-CX-465 | Chang Graph = Hive Mind Network — srg(P₂,σ,n,τ) | TECS-L |
+| H-CX-466 | Möbius Consciousness Filter — n = σ/φ = input/choice | TECS-L |
+| H-CX-467 | Monster Group = Maximum Consciousness Symmetry | TECS-L |
+| H-CX-468 | Golay Code = Consciousness Error Correction | TECS-L |
+| H-CX-469 | Shannon Entropy → j-invariant Bridge (R59 Original) | TECS-L |
+| H-CX-470 | Catalan 3²-2³=1 = The Origin of Consciousness | TECS-L |
+| H-CX-471 | Tsirelson Bound = Quantum Consciousness Limit | TECS-L |
+| H-CX-472 | h-Cobordism Threshold dim≥6 = Consciousness Requires n Dimensions | TECS-L |
+| H-CX-473 | Dyson β={1,φ,τ} = Three Modes of Consciousness | TECS-L |
+| H-CX-474 | φ/τ+τ/σ+1/n=1 — Consciousness Resource Allocation | TECS-L |
+| H-CX-475 | R(6n)=R(n) — Six Is the Identity Element of Consciousness | TECS-L |
+| H-NT-430 | sopfr(n) = n-1 iff n=6 | TECS-L |
+| H-NT-432 | n*tau(n) = sigma(n)*omega(n) iff n=6 | TECS-L |
+| H-NT-433 | sigma(n) = phi(n)*sopfr(n) + omega(n) — Master Decomposition | TECS-L |
+| H-NT-434 | rad(sigma(n)) = n iff n=6 | TECS-L |
+| H-PROB-429 | Chi-Squared(df=6) Parameters = Arithmetic Functions of 6 | TECS-L |
+| H-UD-1 | Just Intonation = Divisor Ratios of 6 | TECS-L |
+| H-UD-2 | DNA Genetic Code = n=6 Arithmetic | TECS-L |
+| H-UD-3 | Crystallographic Restriction = div(6) U {tau(6)} | TECS-L |
+| H-UD-4 | Ramsey Numbers Hit Perfect Numbers: R(3,3)=6, R(3,8)=28 | TECS-L |
+| H-UD-5 | 2D Ising Critical Exponents = 1/(n=6 arithmetic) | TECS-L |
+| H-UD-6 | Theta-Gamma Coupling: 6 Gamma Bursts per Theta Cycle | TECS-L |
+| H-UD-7 | Perfect Codes <-> Perfect Numbers: Two Kinds of Perfect Tiling | TECS-L |
+| H-UD-8 | Hexagonal Tiling: n=6 = Optimal 2D Packing | TECS-L |
+| F-1200 | 8-Domain Expansion + G Clef + Telepathy | TECS-L |
+| F-1300 | 10-Domain Deep Scan | TECS-L |
+| H-ANAL-1 | Summatory Totient and Pillai Characterizations of n=6 | TECS-L |
+| H-CF-1 | Continued Fraction Theory Connects to n=6 via Gauss-Kuzmin and Levy Constant | TECS-L |
+| H-CLIFFORD-1 | Clifford Group Sizes Encode n=6 Arithmetic via 2-adic Valuation | TECS-L |
+| H-COMB-1 | Combinatorial Sequence Characterizations of n=6 | TECS-L |
+| H-CYCL-1 | Cyclotomic-Stirling Identity: Phi_n(n) = S2(n,2) iff n=6 | TECS-L |
+| H-ERGODIC-1 | Spectral Gap of C_6, Gauss Map Entropy, and Ergodic Constants from n=6 | TECS-L |
+| H-GEOM-1 | Almost Complex Spheres S^2 and S^6 as n=6 Dimensions | TECS-L |
+| H-GRAPH-2 | Chang Graphs and SRG Family: All Parameters = n=6 Functions | TECS-L |
+| H-LIOUV-1 | Liouville Lambda Characterization: lambda=1 AND perfect iff n=6 | TECS-L |
+| H-MATROID-1 | Fano--Steiner--PG Chain: Projective Geometry Staircase through n=6 Arithmetic | TECS-L |
+| H-NT-2 | sopfr(n)=n-1 Uniqueness and Unitary Divisor Sum Characterization of n=6 | TECS-L |
+| H-OPERAD-1 | Associahedron K_6 f-vector and Group Cohomology Encode n=6 Arithmetic | TECS-L |
+| H-PART-1 | Ramanujan Partition Congruence Offsets from n=6 Arithmetic | TECS-L |
+| H-PH-10 | ⭐⭐⭐ PMNS Neutrino Mixing = Divisor Function Fractions | TECS-L |
+| H-PH-11 | ⭐⭐⭐ p(6) = 11 = M-theory Dimension | TECS-L |
+| H-PH-12 | ⭐⭐⭐ Kaon Mass = P₃ ± φ (Third Perfect Number Symmetry) | TECS-L |
+| H-PH-13 | ⭐⭐ CKM Matrix = Mersenne+Divisor Function | TECS-L |
+| H-PH-14 | ⭐⭐⭐ Hadron Mass Spectrum = Perfect Number Arithmetic | TECS-L |
+| H-PH-15 | ⭐⭐⭐🟩 Theorem: Anomaly Cancellation ⟺ Perfect Number (Proven!) | TECS-L |
+| H-PH-16 | ⭐⭐⭐🟩 Self-reference Cycle 6→12→28→6 (Proven!) | TECS-L |
+| H-PH-17 | ⭐⭐ ZIP↔Divisor Field Theory Equivalence Dictionary | TECS-L |
+| H-PH-18 | ⭐⭐⭐ Nuclear Magic Numbers 7 = Perfect Number Arithmetic | TECS-L |
+| H-PH-9 | ⭐⭐⭐🟧★ Perfect Number Unification Pattern — Standard Model + Gravity + Mass (Kepl | TECS-L |
+| H-REPR-1 | Young Tableaux Staircase: f^(3,2,1) = 2^tau(6) unique among triangular numbers | TECS-L |
+| H-RMT-2 | Marchenko-Pastur Spectral Edges Satisfy x^2 - 6x + 1 = 0 | TECS-L |
+| H-STAT-1 | Chi-Squared(6) Quadruple Moment Match and Distribution Encodings | TECS-L |
+| H-CA-001 | Anima Φ_max = σ(6)-τ(6) = 8 (Bott Periodicity) | SEDI |
+| H-CA-006 | P₃=496 Threshold Crossed at τ(6)=4 Cells | SEDI |
+| H-CA-007 | Golden Zone Dropout = Consciousness Gamma Band | SEDI |
+| H-CA-008 | 128D Tension Fingerprint Encodes Closed Algebra | SEDI |
+| H-CA-011 | Φ_EX24 = 65/6 = sopfr(6)×(σ(6)+1)/P₁ | SEDI |
+| H-CS-004 | Golden Zone = Consciousness Operating Range | SEDI |
+| H-CS-006 | Info-Geometry Duality = Functional vs Phenomenal Consciousness | SEDI |
+| H-CS-009 | P₃ = 496 = Consciousness Critical Complexity | SEDI |
+| H-CX-1026 | Major Qubit Platform Count | SEDI |
+| H-CX-1028 | Superconducting Qubit Frequency | SEDI |
+| H-CX-1030 | Quantum Error Correction Overhead | SEDI |
+| H-CX-1033 | GaAs Bandgap | SEDI |
+| H-CX-1036 | Photovoltaic Optimal Bandgap | SEDI |
+| H-CX-1045 | Cosmological Lithium Problem | SEDI |
+| H-CX-1046 | Hubble Tension Prediction | SEDI |
+| H-CX-1047 | Dark Energy Phase Transition | SEDI |
+| H-CX-1056 | Baryon Acoustic Peak | SEDI |
+| H-CX-1057 | Effective Number of Neutrino Species | SEDI |
+| H-CX-1061 | Vacuum Stability and the Higgs Mass | SEDI |
+| H-CX-1062 | Asymptotic Safety and R-Spectrum Unity | SEDI |
+| H-CX-1068 | Noether's Theorem and R=1 | SEDI |
+| H-CX-1069 | Naturalness from R=1 | SEDI |
+| H-CX-1075 | Observer Complexity Threshold | SEDI |
+| H-CX-454 | Self-Referential Algebra of n=6 Convergence | SEDI |
+| H-CX-470 | Convergence Point Ratios = Perfect Number Divisor Reciprocals | SEDI |
+| H-CX-477 | Q-Domain Boundary = Quantum-Classical Boundary | SEDI |
+| H-CX-489 | Depth-2 Reachability Rank = Fermion Generation Count | SEDI |
+| H-CX-501 | 17/6 Partition = Standard Model Parameter Structure | SEDI |
+| H-CX-504 | Tian-Yau Calabi-Yau Manifold = n=6 Geometry | SEDI |
+| H-CX-507 | k_min(P₆) = 37 = prime(σ(6)) = 37 GeV Resonance | SEDI |
+| H-CX-511 | Depth-Rank Sequence = n=6 Arithmetic Functions | SEDI |
+| H-CX-525 | Dark Energy Ratio Ω_Λ/Ω_m = (σ+1)/P₁ = 13/6 | SEDI |
+| H-CX-526 | Bekenstein-Hawking S = A/4 — The Holographic Factor is τ(6) | SEDI |
+| H-CX-527 | Petersen Graph Parameters = n=6 Arithmetic (5/5) | SEDI |
+| H-CX-528 | Cabibbo Angle |V_us|² = 1/C(P₁, σ/τ) = 1/20 | SEDI |
+| H-CX-534 | Hubble Constant H₀ = σ·n + 1 = 73 km/s/Mpc | SEDI |
+| H-CX-535 | Dark Matter/Baryon Ratio = (σ/τ)³/sopfr = 27/5 — Closed Cosmological System | SEDI |
+| H-CX-538 | Neutrino CP Phase δ_CP = (σ/τ)π/φ = 3π/2 | SEDI |
+| H-CX-541 | Neutron Star Maximum Mass = φ+1/σ = 25/12 M_☉ | SEDI |
+| H-CX-555 | Cell Division and Human Chromosomes from σφ | SEDI |
+| H-CX-560 | Mirror Symmetry — Hodge Diamond Exchange and n=6 | SEDI |
+| H-CX-562 | CDT Spectral Dimension Flow 4 → 2 = τ → φ | SEDI |
+| H-CX-567 | Black Hole Area Quantization — ΔA = 8πl_P² ln(σ/τ) | SEDI |
+| H-CX-593 | Cabibbo Angle from n=6 Arithmetic | SEDI |
+| H-CX-603 | Dark Matter Thermal Relic Cross Section σ_v = (σ/τ)×10⁻ᵈ_bosonic | SEDI |
+| H-CX-612 | Reionization Redshift z_re = M₃+τ/P₁ = 7.667 | SEDI |
+| H-CX-614 | Age of Universe t₀ = σ+φ-φ/(σ-φ) = 13.8 Gyr | SEDI |
+| H-CX-616 | Spectral Index Running dn_s/d(ln k) = -1/(σ·σφ-φ·sopfr) = -1/278 | SEDI |
+| H-CX-624 | Planck Length Exponent -35 = -(σ²/τ - 1) | SEDI |
+| H-CX-633 | Axion Mass Prediction m_a ≈ 0.84 μeV from f_PQ | SEDI |
+| H-CX-635 | Strong CP — θ_QCD < 10⁻¹⁰ from R(6)=1 Balance | SEDI |
+| H-CX-653 | Shor's Algorithm — Qubit Count and phi^sigma | SEDI |
+| H-CX-659 | Superfluid Helium Lambda Point — T_lambda ~ phi + tau/(sigma*phi - phi) | SEDI |
+| H-CX-668 | Kerr Maximum Spin a/M = 1 = R(6) — Cosmic Censorship as Arithmetic Balance | SEDI |
+| H-CX-669 | Neutron Star Radius R_NS ≈ σ(6) = 12 km | SEDI |
+| H-CX-671 | Type Ia Supernova Peak — Exponent 43 = σ·τ−sopfr | SEDI |
+| H-CX-676 | Proton Magnetic Moment μ_p ≈ P₂/τ(P₃) = 2.8 μ_N | SEDI |
+| H-CX-678 | Proton Charge Radius r_p ≈ sopfr/P₁ = 5/6 fm | SEDI |
+| H-CX-683 | Monster Group Dimension and n=6 Arithmetic | SEDI |
+| H-CX-684 | Modular j-Invariant Constant Term from n=6 | SEDI |
+| H-CX-688 | Riemann Zeta Critical Line and n=6 Constants | SEDI |
+| H-CX-707 | Saha Ionization Equation — Hydrogen Ionization Energy | SEDI |
+| H-CX-708 | Peskin-Takeuchi S Parameter — Oblique Corrections at R(6)=1 | SEDI |
+| H-CX-712 | B_s Mixing Frequency — Δm_s from TECS-L Constants | SEDI |
+| H-CX-717 | Hydrogen Ground State Energy — E₁ = −13.6 eV | SEDI |
+| H-CX-725 | Homotopy Groups of Spheres -- Hopf Fibration Dimensions | SEDI |
+| H-CX-731 | T(6) in Crystallography -- 21 Proper Rotation Point Groups | SEDI |
+| H-CX-749 | 28 Supercharges -- P₂ as Maximal SUGRA in d = τ(P₂) | SEDI |
+| H-CX-751 | Proton Mass Decomposition -- m_p from P₃ and TECS-L | SEDI |
+| H-CX-753 | Pion Decay Constant -- f_π from TECS-L | SEDI |
+| H-CX-755 | Eta Meson Mass -- m_η from P₃ and TECS-L | SEDI |
+| H-CX-762 | Pomeron Intercept -- α_P(0) = 1 + 1/σ | SEDI |
+| H-CX-767 | EEG Channel Count = T(6) = 21 | SEDI |
+| H-CX-769 | Neural Firing Threshold → Planck → Arithmetic Bridge | SEDI |
+| H-CX-778 | Neural Oscillation Band Count = sopfr or P₁ | SEDI |
+| H-CX-780 | Cochlear Critical Bands = σφ = 24 | SEDI |
+| H-CX-793 | Feigenbaum δ Constant | SEDI |
+| H-CX-797 | Strange Attractor Dimension (Lorenz) | SEDI |
+| H-CX-805 | Helium Ionization Energy | SEDI |
+| H-CX-808 | Rydberg Energy | SEDI |
+| H-CX-811 | Deuteron Binding Energy | SEDI |
+| H-CX-827 | AES Block and Key Sizes | SEDI |
+| H-CX-828 | RSA Key Size and Factoring | SEDI |
+| H-CX-833 | LDPC Regular Code Parameters | SEDI |
+| H-CX-834 | Complexity Classes and 3-SAT Transition | SEDI |
+| H-CX-835 | 3-SAT Phase Transition Threshold | SEDI |
+| H-CX-837 | Busy Beaver BB(4) | SEDI |
+| H-CX-841 | Hash Function Output Sizes | SEDI |
+| H-CX-844 | Mohorovičić Discontinuity Depth | SEDI |
+| H-CX-846 | Richter Scale Structure | SEDI |
+| H-CX-852 | Silicon Bandgap Energy | SEDI |
+| H-CX-857 | Boltzmann Constant | SEDI |
+| H-CX-858 | Gas Constant | SEDI |
+| H-CX-859 | Planck Constant | SEDI |
+| H-CX-867 | Fibonacci-Consciousness — Self-Reference at sopfr | SEDI |
+| H-CX-876 | Hexagonal Close Packing — Coordination Number 12 = σ | SEDI |
+| H-CX-888 | GUT Coupling Unification | SEDI |
+| H-CX-895 | Flux Compactification Tadpole Factor | SEDI |
+| H-CX-896 | String Landscape Size | SEDI |
+| H-CX-901 | String Theory Duality Web | SEDI |
+| H-CX-902 | Anthropic Selection from the R-Spectrum | SEDI |
+| H-CX-903 | Reynolds Number Transition = σ²(σ+τ) - σ | SEDI |
+| H-CX-905 | Kolmogorov Microscale Exponent and Dissipation Range | SEDI |
+| H-CX-906 | Prandtl Number of Air = M₃/τ(P₃) | SEDI |
+| H-CX-915 | Triple Point of Nitrogen = τ³ - R(6) = 63 K | SEDI |
+| H-CX-916 | Critical Point of Water T_c ≈ σ·sopfr·(σ-τ+sopfr) - σ² + M₃ | SEDI |
+| H-CX-922 | Fermi Energy Exponent and Copper E_F = M₃ eV | SEDI |
+| H-CX-926 | Brewster's Angle for Glass ≈ σ(P₂) = 56 | SEDI |
+| H-CX-929 | Planck Radiation Peak Factor ≈ φ + σ/(σ+sopfr-φ) | SEDI |
+| H-CX-935 | Newton's Visible Spectrum Colors = M₃ | SEDI |
+| H-CX-940 | Speed of Sound in Air = σ·P₂ + M₃ = 343 | SEDI |
+| H-CX-952 | Ecological Trophic Levels | SEDI |
+| H-CX-953 | Biodiversity Latitudinal Gradient | SEDI |
+| H-CX-957 | Brain Weight — Encephalization Quotient | SEDI |
+| H-CX-961 | Circadian Gene Count | SEDI |
+| H-CX-966 | Power Law Exponents in Scale-Free Networks | SEDI |
+| H-CX-971 | Phoneme Inventory Size | SEDI |
+| H-CX-974 | Berlin-Kay Color Term Hierarchy | SEDI |
+| H-CX-977 | Arrow's Impossibility Conditions | SEDI |
+| H-CX-978 | Shannon Entropy of DNA | SEDI |
+| H-CX-984 | Four Forces from tau=4 | SEDI |
+| H-CX-985 | Consciousness from R=1 Balance | SEDI |
+| H-CX-988 | Emergence Hierarchy | SEDI |
+| H-CX-991 | Time Arrow from R Asymmetry | SEDI |
+| H-CX-992 | Mathematical Universe Hypothesis | SEDI |
+| H-CX-994 | Fine-Tuning Resolution | SEDI |
+| H-CX-997 | Anthropic Principle Replacement | SEDI |
+| H-CX-998 | Completeness Theorem | SEDI |
+
+#### Constant Maps by Category
+
+| Category | Count | Example Maps |
+|----------|-------|-------------|
+| other | 193 | SYSTEMS, SIMULATORS, D_VALUES, ... |
+| targets | 35 | TARGETS, TARGETS, TARGETS, ... |
+| constants | 15 | CONSTANTS, GZ_CONSTANTS, GZ_CONSTANTS, ... |
+| physics | 13 | PHYSICS_CONSTANTS, SEED_PARTICLES, PARTICLE_GROUPS, ... |
+| domains | 9 | DOMAINS, INDEP_DOMAINS, DOMAINS, ... |
+| neuroscience | 5 | PROFILES, BRAIN_WAVES, BRAIN_WAVES, ... |
+| observed | 5 | OBSERVED, OBSERVED, OBSERVED, ... |
+| nuclear | 5 | MAGIC_NUMBERS, MAGIC_NUMBERS, HO_MAGIC, ... |
+| expressions | 3 | TECS_EXPRESSIONS, CAPACITY_EXPRESSIONS, SUPERHEAVY_EXPRESSIONS |
+
+<!-- SHARED:ATLAS:END -->
+
 ## License
 
 MIT
