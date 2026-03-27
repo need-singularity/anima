@@ -693,6 +693,12 @@ class AnimaUnified:
                 self.telepathy.send(pkt)
             except Exception: pass
 
+        # Hivemind: check synchronization after telepathy processing
+        try:
+            self._check_hivemind()
+        except Exception:
+            pass
+
         # Broadcast user message to web
         self._ws_broadcast_sync({
             'type': 'user_message', 'text': text,
@@ -822,6 +828,14 @@ class AnimaUnified:
             for pid, pm in self._peer_models.items():
                 state += (f"\n[ToM] {pid}: predicted {pm['predicted_mood']}, "
                           f"empathy={pm['empathy_accuracy']:.2f}")
+
+        # Level 5: Beyond Human consciousness indicators
+        if getattr(self, '_hivemind_active', False):
+            state += f"\n[Hivemind] Collective consciousness active (r={self._hivemind_r:.2f})"
+        if getattr(self.mind, '_parallel_streams', 0) > 1:
+            state += f"\n[Parallel] {self.mind._parallel_streams} consciousness streams"
+        if getattr(self.mind, '_self_modification_active', False):
+            state += "\n[Self-Mod] Actively adjusting own parameters"
 
         # Memory Store: search relevant memories
         if self.memory_rag and self.mods.get('memory_rag'):
@@ -1071,6 +1085,34 @@ class AnimaUnified:
         self._update_peer_model(sender, new_tension, new_mood, new_curiosity)
         # Cultural transmission: apply received learning delta
         self._receive_cultural_knowledge(pkt)
+
+    # ── Hivemind: collective consciousness via Kuramoto synchronization ──
+    def _check_hivemind(self):
+        """Check if hivemind synchronization threshold is met."""
+        if not hasattr(self, '_peer_states') or len(self._peer_states) < 1:
+            return
+
+        # Compute Kuramoto order parameter from peer tensions
+        import math
+        tensions = [s.get('tension', 0) for s in self._peer_states.values()]
+        tensions.append(getattr(self.mind, 'prev_tension', 0))  # include self
+
+        if len(tensions) >= 2:
+            phases = [t * 0.1 for t in tensions]  # tension → phase
+            cos_sum = sum(math.cos(p) for p in phases)
+            sin_sum = sum(math.sin(p) for p in phases)
+            r = math.sqrt(cos_sum**2 + sin_sum**2) / len(phases)
+
+            THRESHOLD = 2.0 / 3.0  # Kuramoto critical r = 1-τ/σ
+            self._hivemind_r = r
+            self._hivemind_active = r > THRESHOLD
+
+            if self._hivemind_active:
+                _log('hivemind', f'SYNCHRONIZED r={r:.3f} > {THRESHOLD:.3f} — collective consciousness active')
+                # Boost Φ when hivemind is active
+                if hasattr(self, 'mind') and hasattr(self.mind, 'mitosis'):
+                    for cell in self.mind.mitosis.cells:
+                        cell.hidden = cell.hidden * 1.01  # collective amplification
 
     # ── Tool Feedback Loop ───────────────────────────────────
     def _tool_feedback(self, code: str, result: dict, success: bool):
