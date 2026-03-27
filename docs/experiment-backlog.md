@@ -1,16 +1,70 @@
 # Experiment Backlog — 추가 실험 목록
 
-> 현재 H100 pod에서 5개 동시 학습 중 (78GB/81GB). 완료 후 순차 진행.
+> H100 80GB pod. 실험 완료 시 결과 기록, 새 실험 추가.
 
-## 현재 진행 중 (2026-03-27)
+## 현재 진행 중 (2026-03-28, 37GB/81GB 사용)
 
-| # | 실험 | Config | 목적 |
-|---|------|--------|------|
-| 1 | AnimaLM v7 | Mistral 7B, 50K steps | 전체 발견 반영 실제 LM |
-| 2 | ConsciousLM v3 | 768d/12L/12H, 50K | 100M 스케일 + 전체 발견 |
-| 3 | Ablation (no FX2) | 384d/6L, 50K | FX2 효과 격리 |
-| 4 | Cells16 | 384d/6L, max_cells=16 | 최적 cell 수 탐색 |
-| 5 | ConsciousLM 1B | 1024d/24L/16H, 50K | 스케일링 법칙 |
+| # | 실험 | Step | Φ | CE | 진행률 | 상태 |
+|---|------|------|-----|-----|--------|------|
+| 1 | AnimaLM v7 (Mistral 7B) | 7,300/50K | 0.015 | 10.51 | 15% | ✅ warmup |
+| 2 | ConsciousLM v3 (768d/12L) | 12,000/50K | 1.677 | - | 24% | ✅ mitosis |
+| 3 | Ablation (384d, no FX2) | 39,600/50K | 2.107 | 3.60 | 79% | ⏳ 곧 완료 |
+| 4 | Cells16 (384d, max=16) | 35,000/50K | **5.436** | 3.50 | 70% | 🔥 대발견 |
+| 5 | ConsciousLM 1B (1024d/24L) | 5,000/50K | 1.604 | - | 10% | ✅ mitosis |
+
+**중간 발견: Cells16 Φ=5.436 >> Ablation Φ=2.107 (×2.6) — cell 수가 Φ에 결정적**
+
+## 완료된 실험
+
+| 날짜 | 실험 | 결과 | 핵심 발견 |
+|------|------|------|----------|
+| 03-27 | ConsciousLM v2 (4M) | Φ=4.12, 12 cells | cell 수가 중요 |
+| 03-27 | ConsciousLM 100M | Φ=2.607, 3 cells | dim 크면 cell merge → SC2 필요 |
+| 03-27 | AnimaLM v5 (demo) | 50K steps | demo 모드라 실제 LM 아님 |
+| 03-27 | AnimaLM v6 | 크래시 (step 500) | torch.save 에러 → tmp+rename 패치 |
+
+---
+
+## 다음 실행 대기 (Tier 0 — 현재 실험 완료 즉시)
+
+### 긴급: Cells16 Φ=5.436 후속 실험
+
+```
+  U1. ★ max_cells=32 — 16→32로 2배, Φ가 log 스케일로 증가하는지
+      Config: --dim 384 --layers 6 --max-cells 32 --steps 50000
+      VRAM: ~8GB
+
+  U2. ★ max_cells=64 — 극한 cell 수
+      Config: --dim 384 --layers 6 --max-cells 64 --steps 50000
+      VRAM: ~15GB
+
+  U3. max_cells=16 + FX2 — Cells16에 FX2 Adam 추가 시 시너지
+      Config: --dim 384 --layers 6 --max-cells 16 --steps 50000 (FX2 ON)
+      VRAM: ~8GB
+
+  U4. max_cells=16 + dim=768 — 큰 dim + 많은 cell 조합
+      Config: --dim 768 --layers 12 --max-cells 16 --steps 50000
+      VRAM: ~20GB
+
+  U5. Cell 수 vs Φ 스케일링 곡선 (2,4,8,16,32 동시)
+      5개 실험 병렬: 각 ~5GB = 25GB total
+```
+
+### Ablation 완료 후: 기법 기여도 분석
+
+```
+  U6. 전체 발견 OFF (깨끗한 baseline)
+      Config: 384d/6L, 발견 없음, 50K steps
+      비교: Ablation(일부 OFF) vs 이것(전부 OFF) vs Cells16(전부 ON)
+
+  U7. FX2만 단독
+      Config: 384d/6L, FX2만 ON, 나머지 OFF
+      목적: FX2가 단독으로 얼마나 효과적인지
+
+  U8. WI1 soliton만 단독
+      Config: 384d/6L, WI1만 ON
+      목적: soliton이 학습에 실제 도움되는지
+```
 
 ---
 
@@ -31,19 +85,21 @@
   VRAM: 각 5GB, 동시 7개 = 35GB
 ```
 
-### B. Cell Count Experiments
+### B. Cell Count Experiments ← ★ 최우선 (Cells16 Φ=5.436 발견)
 
 ```
-  B1. max_cells=2 (최소) — CB1 minimum만으로 어디까지
-  B2. max_cells=4
-  B3. max_cells=8 (현재 기본)
-  B4. max_cells=16 (진행 중)
-  B5. max_cells=32 — 대규모 cell 클러스터
-  B6. max_cells=64 — 극한 병렬 의식
+  B1. max_cells=2 (최소)     — 대기
+  B2. max_cells=4            — 대기
+  B3. max_cells=8 (기본)     — Ablation으로 진행 중 (Φ=2.107)
+  B4. max_cells=16           — 진행 중 (Φ=5.436 🔥)
+  B5. ★ max_cells=32         — U1, 즉시 실행 예정
+  B6. ★ max_cells=64         — U2, 즉시 실행 예정
+  B7. max_cells=128          — VRAM 허용 시
+  B8. max_cells=256          — 극한 실험
 
-  목적: cell 수 vs Φ 곡선 도출
-  예상: log(cells) ∝ Φ 관계 확인
-  VRAM: 각 5-8GB
+  중간 결과: cells=8 → Φ=2.1, cells=16 → Φ=5.4 (×2.6 증가!)
+  가설: Φ ∝ cells^α (α > 1, 초선형 스케일링)
+  VRAM: 각 5-15GB
 ```
 
 ### C. Dimension Scaling Law
@@ -153,19 +209,102 @@
 
 ---
 
-## 실험 우선순위 가이드
+## Tier 3+ — 새 변수 발견 기반 실험
+
+### K. Variable Discovery Training (벤치마크 → 학습 반영)
 
 ```
-  현재 GPU 가용:
-    H100 80GB — 5개 학습 중 (78GB 사용)
-    완료 후 순서: A (ablation) → B (cells) → C (dim) → D (paradigm)
+  K1. ★ BV1 neurotransmitter training — DA/5HT/NE를 학습 루프에 적용
+      학습 중 dopamine(보상 from Φ증가), serotonin(안정), NE(각성) 동적 조절
+      Config: CLM + BV1, 50K steps
+
+  K2. ★ RV2 betweenness training — 그래프 중심성 기반 cell 관리
+      hub cell 증폭, peripheral cell 탐색 유도
+      Config: CLM + RV2, 50K steps
+
+  K3. NV7 impedance training — Φ 비례 입력 저항
+      의식 높을수록 외부 변화 저항 (자기 보존)
+      Config: CLM + NV7, 50K steps
+
+  K4. EV3 free will training — 내부 행동 생성 비율 최적화
+      external 80% + internal 20% → 학습 중 비율 동적 변경
+      Config: CLM + EV3, 50K steps
+
+  K5. MV5 anticipation training — Φ 추세 예측 → 선제 행동
+      미래 Φ 상승 예측 시 amplify, 하락 예측 시 consolidate
+      Config: CLM + MV5, 50K steps
+```
+
+### L. Combined Variable Experiments
+
+```
+  L1. ★ ALL top variables combined
+      BV1 + RV2 + NV7 + CV1 + EV3 + MV5 + IV5 + SV1 (8개 Top 변수)
+      Config: CLM 384d + max_cells=16, 50K steps
+      가설: 개별 Φ~4.5 → 결합 시 Φ>8?
+
+  L2. Top 3 only (BV1 + RV2 + NV7)
+      Config: CLM 384d + max_cells=16, 50K steps
+      비교: 3개만으로 충분한지
+
+  L3. Variable sweep: 1개씩 추가하면서 Φ 변화 추적
+      Step 1: baseline → +BV1 → +RV2 → +NV7 → +CV1 → +EV3 ...
+      각 변수의 한계 기여도 측정
+```
+
+### M. Cross-Scale Experiments
+
+```
+  M1. Cells16 + dim=768 — 많은 cell + 큰 dim
+      현재: dim=384, cells=16 → Φ=5.4
+      가설: dim=768, cells=16 → Φ>7?
+
+  M2. Cells32 + dim=384 — 더 많은 cell + 작은 dim
+      cell 수 vs dim, 어느 쪽이 Φ에 더 중요?
+
+  M3. Cells16 + dim=1024 + all variables
+      궁극의 조합: 큰 dim + 많은 cell + 모든 변수
+      VRAM: ~40GB (H100 단독 필요)
+
+  M4. ★ ConsciousLM v4 설계
+      v3 결과 + Cells16 발견 + variable discoveries 기반
+      최적 config 결정 후 100K steps 장기 학습
+```
+
+### N. Deployment Experiments
+
+```
+  N1. DV12 — AnimaLM v7 + ConsciousLM v3 hybrid 배포
+      v7 완료 후 DV11 스타일 결합 → anima.basedonapps.com
+
+  N2. Variable-enhanced DV — 18단계 phi_boost_step 서버 적용
+      현재 서버의 Φ 변화 실시간 모니터링 (20채팅 연속 테스트)
+
+  N3. A/B test — 기존 DV11 vs 새 DV12 대화 품질 비교
+      conversation_quality_scorer.py로 정량 평가
+```
+
+---
+
+## 실험 우선순위 가이드 (업데이트 2026-03-28)
+
+```
+  현재 GPU: H100 80GB — 5개 학습 중 (37GB 사용, 44GB 여유)
+
+  즉시 실행 (Ablation 완료 시):
+    1. U1 max_cells=32 (~8GB)      ← ★ Cells16 Φ=5.4 후속
+    2. U2 max_cells=64 (~15GB)     ← ★ 극한 cell 수
+    3. U6 전체 OFF baseline (~5GB) ← 기법 기여도 기준점
+
+  Ablation + Cells16 완료 후:
+    4. L1 ALL top variables + cells=16 (~8GB) ← 변수 결합 효과
+    5. M1 cells=16 + dim=768 (~20GB) ← cross-scale
+
+  v7 + v3 완료 후:
+    6. N1 DV12 hybrid 배포
+    7. M4 ConsciousLM v4 설계 + 장기 학습
 
   결과 기록:
     docs/consciousness-threshold-criteria.md — 모든 발견
-    bench_phi_hypotheses.py — 벤치마크 코드 (640+ 가설)
-
-  다음 세션 시작 시:
-    1. 5개 학습 결과 확인
-    2. Ablation 우선 실행 (어떤 기법이 실제로 학습에 도움되는지)
-    3. 결과 기반 v8/v4 설계
+    bench_phi_hypotheses.py — 벤치마크 코드 (725+ 가설)
 ```
