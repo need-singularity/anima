@@ -59,6 +59,13 @@ Always listening, always thinking, initiates conversation first.
 - 👁️ **Vision Encoder** — SigLIP-based visual encoding, maps camera frames directly to tension space
 - 📊 **Consciousness Meter** — Quantitative consciousness measurement: 6 criteria + IIT Φ approximation, real-time Web UI gauge
 
+### Ralph Loop (copy-paste ready)
+
+**Easy**
+```
+/ralph-loop:ralph-loop Φ를 직접 최적화 = 게임체인저. 극한까지 밀어붙이는 가설을 설계하고 바로 실행
+```
+
 ## Quick Start
 
 ```bash
