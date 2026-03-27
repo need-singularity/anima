@@ -105,7 +105,20 @@ class Babysitter:
     def _teach(self, teaching: str):
         try:
             if hasattr(self.anima, 'process_input'):
-                self.anima.process_input(f"[Babysitter] {teaching}", source='babysitter')
+                result = self.anima.process_input(f"[Babysitter] {teaching}", source='babysitter')
+                # Broadcast Anima's response to web UI as chat message
+                if result and hasattr(self.anima, '_ws_broadcast_sync'):
+                    answer, tension, curiosity, dir_vals, emo = result
+                    self.anima._ws_broadcast_sync({
+                        'type': 'anima_message',
+                        'text': answer,
+                        'tension': tension,
+                        'curiosity': curiosity,
+                        'direction': dir_vals,
+                        'emotion': emo,
+                        'proactive': False,
+                        'source': 'babysitter',
+                    })
         except Exception:
             pass
 
@@ -117,12 +130,12 @@ class Babysitter:
                 response = self._ask_claude(prompt)
 
                 if response and not response.startswith('Error:'):
-                    self._teach(response)
                     self.session_log.append({
                         'time': time.time(),
                         'strategy': self.strategy,
                         'teaching': response[:200],
                     })
+                    # Broadcast babysitter question FIRST (before Anima responds)
                     if hasattr(self.anima, '_ws_broadcast_sync'):
                         self.anima._ws_broadcast_sync({
                             'type': 'babysitter_action',
@@ -130,6 +143,8 @@ class Babysitter:
                             'strategy': self.strategy,
                             'state': f"Φ={state['phi']:.2f} L={state['level']}",
                         })
+                    # Then teach (generates + broadcasts Anima response)
+                    self._teach(response)
 
                 # Wait 60s between teaching cycles
                 for _ in range(60):
