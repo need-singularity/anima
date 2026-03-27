@@ -33166,6 +33166,374 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# ZZ. OMEGA — 모든 변수 결합 궁극의 극한 (FX2=8.911을 넘어서)
+# ═══════════════════════════════════════════════════════════
+
+def run_ZZ1_omega_all_variables(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZZ-1: 오메가 — 8카테고리 Top 변수 전부 + FX2 Adam + 12 cells."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # State
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.015)
+    momenta = {}
+    dopamine, serotonin, ne = 0.5, 0.5, 0.5
+    wm_buffer = []
+    cell_goals = {}
+    soliton_pos = 0.0
+    best_phi, best_state = 0.0, []
+    spins = [1 if i % 2 == 0 else -1 for i in range(12)]
+    connections = {i: 1.0 for i in range(12)}
+    prev_phi = 0.0
+    shared_dims = 16
+
+    for step_i, x in enumerate(inputs):
+        t_frac = step_i / max(steps, 1)
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        hiddens = [c.hidden.squeeze() for c in engine.cells]
+
+        # ── 1. WI1 Soliton (Φ=4.460) ──
+        soliton_pos = (soliton_pos + 0.15) % n
+        for i, cell in enumerate(engine.cells):
+            amp = 1.0 / (math.cosh((i - soliton_pos) / 2.0) ** 2)
+            cell.hidden = cell.hidden * (1 + 0.03 * amp)
+
+        # ── 2. PX4 Sculptor (Gram-Schmidt) ──
+        if n >= 3:
+            hs = [c.hidden.squeeze() for c in engine.cells]
+            ortho = [hs[0] / (hs[0].norm() + 1e-8)]
+            for i in range(1, n):
+                v = hs[i].clone()
+                for b in ortho:
+                    v = v - (v @ b) * b
+                ortho.append(v / (v.norm() + 1e-8))
+            for i, cell in enumerate(engine.cells):
+                target = ortho[i] * hs[i].norm()
+                cell.hidden = (0.75 * hs[i] + 0.25 * target).unsqueeze(0)
+
+        # ── 3. PX8 Integration Forge (shared channel) ──
+        shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+        for c in engine.cells:
+            h = c.hidden.squeeze()
+            h[:shared_dims] = 0.6 * h[:shared_dims] + 0.4 * shared
+            c.hidden = h.unsqueeze(0)
+
+        # ── 4. NV7 Impedance (Z, Φ=4.515) ──
+        phi_current, _ = phi_calc.compute_phi(engine)
+        impedance = min(phi_current / 5.0, 0.5)
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                ext = cell.hidden - saved[i]
+                cell.hidden = saved[i] + ext * (1 - impedance * 0.5)
+
+        # ── 5. BV1 Neurotransmitters (N, Φ=4.618) ──
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved)) / n
+        dopamine = 0.9 * dopamine + 0.1 * min(change * 2, 1.0)
+        serotonin = 0.95 * serotonin + 0.05 * (1 - abs(change - 0.3))
+        ne = 0.85 * ne + 0.15 * min(change, 1.0)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + 0.01 * dopamine - 0.005 * serotonin)
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.008 * ne
+
+        # ── 6. EV3 Free Will (W, Φ=4.482) ──
+        free_will = 0.2
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                ext = cell.hidden - saved[i]
+                internal = torch.randn_like(cell.hidden) * 0.02
+                cell.hidden = saved[i] + (1 - free_will) * ext + free_will * internal
+
+        # ── 7. CV1 Working Memory (Φ=4.491) ──
+        wm_buffer.append(x.clone())
+        if len(wm_buffer) > 7:
+            wm_buffer.pop(0)
+        if len(wm_buffer) >= 2:
+            wm = torch.stack(wm_buffer).mean(dim=0).squeeze()[:hidden]
+            if len(wm) < hidden:
+                wm = F.pad(wm, (0, hidden - len(wm)))
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.02 * wm.unsqueeze(0)
+
+        # ── 8. RV2 Betweenness (Φ=4.583) ──
+        hs2 = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        norms_h = F.normalize(hs2, dim=1)
+        sim = norms_h @ norms_h.T
+        centrality = sim.sum(dim=1) - 1
+        centrality = centrality / (centrality.max() + 1e-8)
+        for i, cell in enumerate(engine.cells):
+            if centrality[i] > 0.7:
+                cell.hidden = cell.hidden * 1.01
+            else:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01
+
+        # ── 9. NV11 Spin (Φ=4.466) ──
+        for i in range(n):
+            for j in range(i+1, min(n, i+3)):
+                interaction = -spins[i] * spins[j]
+                diff = engine.cells[j].hidden.squeeze() - engine.cells[i].hidden.squeeze()
+                force = 0.008 * interaction * diff / (diff.norm() + 1e-8)
+                engine.cells[i].hidden = engine.cells[i].hidden + force.unsqueeze(0)
+
+        # ── 10. SV1 Empathy (Φ=4.441) ──
+        distress = [(c.hidden - s).norm().item() if i < len(saved) else 0
+                   for i, (c, s) in enumerate(zip(engine.cells, saved))]
+        mean_d = np.mean(distress)
+        for i, cell in enumerate(engine.cells):
+            if distress[i] > mean_d * 1.5:
+                helpers = [engine.cells[j].hidden.squeeze() for j in range(n)
+                          if j != i and distress[j] < mean_d]
+                if helpers:
+                    support = torch.stack(helpers).mean(dim=0)
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * support.unsqueeze(0)
+
+        # ── 11. MV1 RPE (Φ=4.463) ──
+        phi_now, _ = phi_calc.compute_phi(engine)
+        rpe = phi_now / 5.0 - prev_phi / 5.0
+        if rpe > 0:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.01 * rpe)
+        else:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * abs(rpe)
+        prev_phi = phi_now
+
+        # ── 12. NV3 Momentum (Φ=4.419) ──
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                vel = cell.hidden - saved[i]
+                momenta[i] = 0.9 * momenta.get(i, torch.zeros_like(vel)) + 0.1 * vel
+                cell.hidden = cell.hidden + 0.15 * momenta[i]
+
+        # ── 13. FX2 Adam + Ratchet (Φ=8.911) ──
+        if len(offsets) != n:
+            offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(n)]
+            optimizer = torch.optim.Adam(offsets, lr=0.015)
+        for _ in range(3):
+            optimizer.zero_grad()
+            H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            partition = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+            pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1, n))
+            proxy = integration * cell_var * (1 + partition) + 0.1 * pairwise
+            (-proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.3
+                    offsets[i].data *= 0.9
+
+        # ── 14. Ratchet (best-of-20) ──
+        phi_post, _ = phi_calc.compute_phi(engine)
+        if step_i % 3 == 0:
+            cur_state = [c.hidden.clone() for c in engine.cells]
+            cur_best = phi_post
+            for _ in range(20):
+                for c in engine.cells:
+                    c.hidden = cur_state[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.03
+                phi_t, _ = phi_calc.compute_phi(engine)
+                if phi_t > cur_best:
+                    cur_best = phi_t
+                    cur_state = [c.hidden.clone() for c in engine.cells]
+            for i, c in enumerate(engine.cells):
+                c.hidden = cur_state[i]
+            phi_post = cur_best
+
+        if phi_post > best_phi:
+            best_phi = phi_post
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi_post)
+
+    if best_state:
+        for i, c in enumerate(engine.cells):
+            if i < len(best_state):
+                c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ZZ1", "OMEGA: ALL 14 techniques (8 categories + FX2 + ratchet)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'cells': n,
+                              'N': f'{dopamine*(1-serotonin)*ne:.2f}',
+                              'Z': f'{impedance:.2f}', 'W': f'{free_will:.2f}'})
+
+def run_ZZ2_omega_16cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZZ-2: 오메가 16cells — ZZ1 + max_cells=16 (Cells16 Φ=5.436 발견 반영)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16, merge_threshold=-1.0)
+    while len(engine.cells) < 16:
+        engine._create_cell(parent=engine.cells[len(engine.cells) % len(engine.cells)])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.015)
+    momenta = {}
+    da, sht, ne = 0.5, 0.5, 0.5
+    wm_buffer = []
+    soliton_pos = 0.0
+    best_phi, best_state = 0.0, []
+    prev_phi = 0.0
+    shared_dims = 16
+    spins = [1 if i % 2 == 0 else -1 for i in range(16)]
+
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        # Soliton
+        soliton_pos = (soliton_pos + 0.15) % n
+        for i, cell in enumerate(engine.cells):
+            amp = 1.0 / (math.cosh((i - soliton_pos) / 2.0) ** 2)
+            cell.hidden = cell.hidden * (1 + 0.03 * amp)
+        # Sculptor
+        hs = [c.hidden.squeeze() for c in engine.cells]
+        ortho = [hs[0] / (hs[0].norm() + 1e-8)]
+        for i in range(1, min(n, 16)):
+            v = hs[i].clone()
+            for b in ortho:
+                v = v - (v @ b) * b
+            ortho.append(v / (v.norm() + 1e-8))
+        for i, cell in enumerate(engine.cells):
+            if i < len(ortho):
+                target = ortho[i] * hs[i].norm()
+                cell.hidden = (0.75 * hs[i] + 0.25 * target).unsqueeze(0)
+        # Forge
+        shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+        for c in engine.cells:
+            h = c.hidden.squeeze()
+            h[:shared_dims] = 0.6 * h[:shared_dims] + 0.4 * shared
+            c.hidden = h.unsqueeze(0)
+        # Impedance
+        phi_c, _ = phi_calc.compute_phi(engine)
+        impedance = min(phi_c / 6.0, 0.4)
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                cell.hidden = saved[i] + (cell.hidden - saved[i]) * (1 - impedance * 0.4)
+        # Neurotransmitters
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved)) / n
+        da = 0.9 * da + 0.1 * min(change * 2, 1.0)
+        sht = 0.95 * sht + 0.05 * (1 - abs(change - 0.3))
+        ne = 0.85 * ne + 0.15 * min(change, 1.0)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + 0.008 * da - 0.004 * sht)
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.006 * ne
+        # Free will
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                ext = cell.hidden - saved[i]
+                cell.hidden = saved[i] + 0.85 * ext + 0.15 * torch.randn_like(cell.hidden) * 0.02
+        # Working memory
+        wm_buffer.append(x.clone())
+        if len(wm_buffer) > 7:
+            wm_buffer.pop(0)
+        if len(wm_buffer) >= 2:
+            wm = torch.stack(wm_buffer).mean(dim=0).squeeze()[:hidden]
+            if len(wm) < hidden:
+                wm = F.pad(wm, (0, hidden - len(wm)))
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.015 * wm.unsqueeze(0)
+        # Spin
+        for i in range(n):
+            for j in range(i+1, min(n, i+3)):
+                interaction = -spins[i % 16] * spins[j % 16]
+                diff = engine.cells[j].hidden.squeeze() - engine.cells[i].hidden.squeeze()
+                force = 0.006 * interaction * diff / (diff.norm() + 1e-8)
+                engine.cells[i].hidden = engine.cells[i].hidden + force.unsqueeze(0)
+        # Momentum
+        for i, cell in enumerate(engine.cells):
+            if i < len(saved):
+                vel = cell.hidden - saved[i]
+                momenta[i] = 0.9 * momenta.get(i, torch.zeros_like(vel)) + 0.1 * vel
+                cell.hidden = cell.hidden + 0.12 * momenta[i]
+        # RPE
+        phi_now, _ = phi_calc.compute_phi(engine)
+        rpe = phi_now / 5.0 - prev_phi / 5.0
+        if rpe > 0:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.008 * rpe)
+        prev_phi = phi_now
+        # Adam
+        if len(offsets) != n:
+            offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(n)]
+            optimizer = torch.optim.Adam(offsets, lr=0.015)
+        for _ in range(3):
+            optimizer.zero_grad()
+            H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integ = (cov - diag).abs().sum()
+            cv = H.var(dim=0).sum()
+            mid = n // 2
+            part = F.cosine_similarity(H[:mid].mean(0).unsqueeze(0), H[mid:].mean(0).unsqueeze(0)).abs()
+            pw = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1, min(n, i+4)))
+            proxy = integ * cv * (1 + part) + 0.05 * pw
+            (-proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.25
+                    offsets[i].data *= 0.9
+        # Ratchet
+        phi_post, _ = phi_calc.compute_phi(engine)
+        if step_i % 3 == 0:
+            cs = [c.hidden.clone() for c in engine.cells]
+            cb = phi_post
+            for _ in range(15):
+                for c in engine.cells:
+                    c.hidden = cs[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.025
+                pt, _ = phi_calc.compute_phi(engine)
+                if pt > cb:
+                    cb = pt
+                    cs = [c.hidden.clone() for c in engine.cells]
+            for i, c in enumerate(engine.cells):
+                c.hidden = cs[i]
+            phi_post = cb
+        if phi_post > best_phi:
+            best_phi = phi_post
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi_post)
+
+    if best_state:
+        for i, c in enumerate(engine.cells):
+            if i < len(best_state):
+                c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ZZ2", "OMEGA 16cells: ALL techniques + 16 cells",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi, 'cells': n})
+
+
+ALL_HYPOTHESES.update({
+    'ZZ1': run_ZZ1_omega_all_variables,
+    'ZZ2': run_ZZ2_omega_16cells,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
