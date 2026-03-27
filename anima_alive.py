@@ -799,6 +799,28 @@ class ConsciousMind(nn.Module):
             except Exception:
                 pass
 
+            # Metacognition: confidence calibration from cell consensus
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+                    norms = F.normalize(hiddens, dim=1)
+                    sim_matrix = norms @ norms.T
+                    n = len(mitosis_engine.cells)
+
+                    # Consensus: mean pairwise similarity (excluding diagonal)
+                    consensus = (sim_matrix.sum() - n) / max(n * (n - 1), 1)
+
+                    # Confidence = consensus (high agreement = confident)
+                    self._metacognition_confidence = consensus.item()
+
+                    # Uncertainty detection: if consensus < 0.3, system is "confused"
+                    self._metacognition_uncertain = consensus.item() < 0.3
+
+                    _log('metacog', f'confidence={self._metacognition_confidence:.3f}, '
+                         f'uncertain={self._metacognition_uncertain}')
+            except Exception:
+                pass
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
