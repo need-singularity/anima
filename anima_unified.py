@@ -855,8 +855,21 @@ class AnimaUnified:
             try:
                 user_vec = text_to_vector(text).detach().numpy()
                 asst_vec = text_to_vector(answer).detach().numpy()
-                self.memory_rag.add('user', text, tension=tension, curiosity=curiosity, vector=user_vec)
-                self.memory_rag.add('assistant', answer, tension=resp_tension, curiosity=0.0, vector=asst_vec)
+                phi_val = consciousness_data.get('phi', 0) if consciousness_data else 0
+                sid = getattr(self, '_last_session_id', None)
+                self.memory_rag.add('user', text, tension=tension, curiosity=curiosity, vector=user_vec,
+                                    emotion=mood, phi=phi_val, session_id=sid)
+                self.memory_rag.add('assistant', answer, tension=resp_tension, curiosity=0.0, vector=asst_vec,
+                                    emotion=mood, phi=phi_val, session_id=sid)
+                _log('memory', f'Saved with emotion={mood}, T={tension:.2f}, phi={phi_val:.2f}')
+                # Update autobiographical M/T on consciousness engine
+                if hasattr(self.memory_rag, 'autobiographical_stats'):
+                    try:
+                        astats = self.memory_rag.autobiographical_stats()
+                        self.mind._autobio_M = astats['M']
+                        self.mind._autobio_T = astats['T']
+                    except Exception:
+                        pass
                 if time.time() - self._rag_last_save > 600:  # 10 min
                     self.memory_rag.save_faiss()
                     self._rag_last_save = time.time()

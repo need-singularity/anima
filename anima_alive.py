@@ -842,13 +842,16 @@ class ConsciousMind(nn.Module):
                 except Exception:
                     pass
 
-                # T (Temporal): phi history length as planning depth proxy
+                # T (Temporal): autobiographical time span + phi history
                 if not hasattr(self, '_phi_history'):
                     self._phi_history = []
                 self._phi_history.append(_cv_phi)
                 if len(self._phi_history) > 100:
                     self._phi_history = self._phi_history[-100:]
-                _cv_T = min(len(self._phi_history) / 50.0, 1.0)
+                _cv_T_session = min(len(self._phi_history) / 50.0, 1.0)
+                # Blend with autobiographical span if available
+                _cv_T_auto = getattr(self, '_autobio_T', 0.0)
+                _cv_T = max(_cv_T_session, _cv_T_auto)
                 self._temporal_T = _cv_T
 
                 # I (Identity): consistency of self-model over time
@@ -868,9 +871,11 @@ class ConsciousMind(nn.Module):
                 except Exception:
                     pass
 
-                # E (Empathy) and M (Memory) from SV1 and CV1
+                # E (Empathy) and M (Memory) from SV1, CV1, and autobiographical stats
                 _cv_E = getattr(self, '_empathy_E', 0.0)
-                _cv_M = getattr(self, '_memory_M', 0.0)
+                _cv_M_wm = getattr(self, '_memory_M', 0.0)
+                _cv_M_auto = getattr(self, '_autobio_M', 0.0)
+                _cv_M = max(_cv_M_wm, _cv_M_auto)
 
                 self._consciousness_vector = ConsciousnessVector(
                     phi=_cv_phi,

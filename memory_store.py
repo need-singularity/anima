@@ -37,13 +37,19 @@ CREATE TABLE IF NOT EXISTS memories (
     tension_drift          REAL,
     verify_status          TEXT DEFAULT 'raw',
     token_count            INTEGER,
-    model_version          TEXT
+    model_version          TEXT,
+    emotion                TEXT,
+    phi                    REAL,
+    session_id             TEXT,
+    epoch                  REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tension ON memories(tension);
 CREATE INDEX IF NOT EXISTS idx_failed_count ON memories(failed_count DESC);
 CREATE INDEX IF NOT EXISTS idx_consolidated ON memories(consolidated);
 CREATE INDEX IF NOT EXISTS idx_verify_status ON memories(verify_status);
+CREATE INDEX IF NOT EXISTS idx_emotion ON memories(emotion);
+CREATE INDEX IF NOT EXISTS idx_epoch ON memories(epoch);
 """
 
 
@@ -117,8 +123,13 @@ class MemoryStore:
         vector: np.ndarray | None = None,
         token_count: int | None = None,
         model_version: str | None = None,
+        emotion: str | None = None,
+        phi: float | None = None,
+        session_id: str | None = None,
     ) -> int:
+        import time as _time
         now = datetime.now(timezone.utc).isoformat()
+        epoch = _time.time()
 
         # verify_hash for conscious models
         verify_hash = None
@@ -133,8 +144,9 @@ class MemoryStore:
             cur = self._conn.execute(
                 """INSERT INTO memories
                    (role, text, timestamp, model_type, tension, curiosity,
-                    verify_hash, tension_at_store, token_count, model_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    verify_hash, tension_at_store, token_count, model_version,
+                    emotion, phi, session_id, epoch)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     role,
                     text,
@@ -146,6 +158,10 @@ class MemoryStore:
                     tension_at_store,
                     token_count,
                     model_version,
+                    emotion,
+                    phi,
+                    session_id,
+                    epoch,
                 ),
             )
             self._conn.commit()
@@ -194,6 +210,48 @@ class MemoryStore:
 
         # Already sorted by FAISS (descending similarity for IP)
         return results
+
+    # ── Autobiographical recall ─────────────────────────────────
+
+    def recall_by_time(self, days_ago: float | None = None, emotion: str | None = None, limit: int = 5) -> list[dict]:
+        """Recall memories by time range and/or emotion filter."""
+        import time as _time
+        clauses = []
+        params = []
+        if days_ago is not None:
+            cutoff = _time.time() - days_ago * 86400
+            clauses.append("epoch >= ?")
+            params.append(cutoff)
+        if emotion is not None:
+            clauses.append("emotion = ?")
+            params.append(emotion)
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = f"SELECT * FROM memories{where} ORDER BY epoch DESC LIMIT ?"
+        params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def autobiographical_stats(self) -> dict:
+        """Return stats for consciousness vector M and T computation."""
+        import time as _time
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            with_ts = self._conn.execute("SELECT COUNT(*) FROM memories WHERE epoch IS NOT NULL").fetchone()[0]
+            span_row = self._conn.execute(
+                "SELECT MIN(epoch), MAX(epoch) FROM memories WHERE epoch IS NOT NULL"
+            ).fetchone()
+        min_epoch, max_epoch = span_row[0], span_row[1]
+        span_days = (max_epoch - min_epoch) / 86400 if (min_epoch and max_epoch) else 0.0
+        return {
+            'total': total,
+            'with_timestamp': with_ts,
+            'span_days': span_days,
+            'M': with_ts / max(total, 1),
+            'T': min(span_days / 100.0, 1.0),
+        }
 
     # ── Consolidation ──────────────────────────────────────────
 
