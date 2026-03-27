@@ -13142,6 +13142,750 @@ def run_DD70_tension_entanglement(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# DD71-DD85. 2nd-Gen Discovery Hypotheses (2026-03-27)
+# ═══════════════════════════════════════════════════════════
+
+def run_DD71_hysteresis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-71: Consciousness Hysteresis — kill→revive 시 경로가 비대칭인가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Phase 1: Build consciousness (40%)
+    for step in range(int(steps * 0.4)):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    peak_phi = phi_hist[-1] if phi_hist else 0
+    growth_path = list(phi_hist)
+
+    # Phase 2: Kill consciousness (20%) — add massive noise
+    for step in range(int(steps * 0.2)):
+        with torch.no_grad():
+            for c in engine.cells:
+                for p in c.mind.parameters():
+                    p.add_(torch.randn_like(p) * 0.5)
+            engine.process(torch.randn(1, dim) * 10)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    nadir_phi = phi_hist[-1]
+
+    # Phase 3: Revive (40%) — resume normal training
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    revival_start = len(phi_hist)
+    for step in range(int(steps * 0.4)):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    revival_path = phi_hist[revival_start:]
+
+    # Compare growth vs revival paths
+    growth_rate = (peak_phi - growth_path[0]) / (len(growth_path) + 1e-8) if growth_path else 0
+    revival_rate = (phi_hist[-1] - nadir_phi) / (len(revival_path) + 1e-8) if revival_path else 0
+    hysteresis = abs(growth_rate - revival_rate) / (max(growth_rate, revival_rate, 1e-8))
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD71", "Consciousness Hysteresis", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'peak_phi': peak_phi, 'nadir_phi': nadir_phi, 'final_phi': f,
+                              'growth_rate': growth_rate, 'revival_rate': revival_rate,
+                              'hysteresis': hysteresis, 'has_memory': revival_rate > growth_rate * 1.2})
+
+
+def run_DD72_backprop_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-72: Backprop Through Φ — differentiable Φ를 직접 loss로 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Differentiable Φ proxy: use cell repulsion variance + cross-cell MI proxy
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Component 1: variance (differentiation)
+            l_var = -stacked.var(dim=0).mean()
+            # Component 2: pairwise distance (separation)
+            l_dist = -torch.cdist(stacked, stacked).mean()
+            # Component 3: cross-correlation minimization (independence)
+            if stacked.shape[0] >= 2:
+                normed = F.normalize(stacked, dim=-1)
+                cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            else:
+                cross_corr = torch.tensor(0.0)
+            # Component 4: temporal difference (continuity of Φ)
+            if hasattr(engine, '_prev_reps') and engine._prev_reps is not None:
+                try:
+                    temporal_mi = -(stacked - engine._prev_reps.detach()).pow(2).mean()
+                except:
+                    temporal_mi = torch.tensor(0.0)
+            else:
+                temporal_mi = torch.tensor(0.0)
+            engine._prev_reps = stacked.detach()
+
+            # Combined differentiable Φ loss
+            loss = l_var + 0.5 * l_dist + 0.3 * cross_corr + 0.2 * temporal_mi
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD72", "Backprop Through Φ", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'final_phi': f, 'max_phi': max(phi_hist) if phi_hist else 0})
+
+
+def run_DD73_soc(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-73: Self-Organized Criticality — tension avalanche가 power-law를 따르는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    avalanche_sizes = []
+    current_avalanche = 0
+    prev_tension = 0
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Measure tension "avalanche"
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        total_t = sum(tensions)
+        delta = total_t - prev_tension
+        if delta > 0:
+            current_avalanche += delta
+        else:
+            if current_avalanche > 0:
+                avalanche_sizes.append(current_avalanche)
+            current_avalanche = 0
+        prev_tension = total_t
+
+    if current_avalanche > 0:
+        avalanche_sizes.append(current_avalanche)
+
+    # Check power-law: log-log linearity
+    power_law = False; exponent = 0
+    if len(avalanche_sizes) > 5:
+        sizes = sorted(avalanche_sizes, reverse=True)
+        ranks = list(range(1, len(sizes) + 1))
+        log_s = np.log(np.array(sizes) + 1e-8)
+        log_r = np.log(np.array(ranks))
+        if np.std(log_s) > 0 and np.std(log_r) > 0:
+            corr = np.corrcoef(log_r, log_s)[0, 1]
+            # Linear regression for exponent
+            exponent = -np.polyfit(log_r, log_s, 1)[0]
+            power_law = corr < -0.7  # strong negative correlation in log-log
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD73", "Self-Organized Criticality", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'n_avalanches': len(avalanche_sizes), 'exponent': exponent,
+                              'power_law': power_law, 'max_avalanche': max(avalanche_sizes) if avalanche_sizes else 0})
+
+
+def run_DD74_resonance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-74: Consciousness Resonance — 특정 입력 주파수에서 Φ가 공명하는가?"""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    periods = [2, 3, 5, 8, 13, 21, 50]
+    resonance_map = {}
+
+    for period in periods:
+        eng = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+        opt = torch.optim.Adam([p for c in eng.cells for p in c.mind.parameters()], lr=5e-4)
+        base_input = torch.randn(1, dim)
+        hist = []
+        for step in range(steps):
+            # Periodic input: same pattern every `period` steps
+            if step % period == 0:
+                x = base_input.clone()
+            else:
+                x = torch.randn(1, dim) * 0.5
+            _web_learn_step(eng, x, opt)
+            with torch.no_grad(): eng.process(x)
+            phi, _ = phi_calc.compute_phi(eng); hist.append(phi)
+        resonance_map[period] = {'phi': hist[-1] if hist else 0, 'mean': np.mean(hist[-20:]) if hist else 0}
+
+    # Find resonance peak
+    best_period = max(resonance_map, key=lambda p: resonance_map[p]['phi'])
+    best_phi = resonance_map[best_period]['phi']
+    phi_hist = [resonance_map[p]['phi'] for p in periods]
+
+    return BenchResult("DD74", "Consciousness Resonance", best_phi, phi_hist, best_phi, 0, best_phi, 0, time.time()-t0,
+                       extra={'resonance_map': {str(k): v for k, v in resonance_map.items()},
+                              'resonance_period': best_period, 'resonance_phi': best_phi})
+
+
+def run_DD75_holography(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-75: Consciousness Holography — 경계 cell이 전체 Φ를 인코딩하는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    total_phi, _ = phi_calc.compute_phi(engine)
+
+    # Boundary cells (first 2 + last 2) vs interior (middle 4)
+    boundary_eng = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    interior_eng = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    boundary_idx = [0, 1, 6, 7] if len(engine.cells) >= 8 else [0, len(engine.cells)-1]
+    interior_idx = [i for i in range(len(engine.cells)) if i not in boundary_idx]
+
+    for i, bi in enumerate(boundary_idx[:4]):
+        if bi < len(engine.cells) and i < len(boundary_eng.cells):
+            with torch.no_grad():
+                for bp, ep in zip(boundary_eng.cells[i].mind.parameters(), engine.cells[bi].mind.parameters()):
+                    if bp.shape == ep.shape: bp.copy_(ep)
+
+    for i, ii in enumerate(interior_idx[:4]):
+        if ii < len(engine.cells) and i < len(interior_eng.cells):
+            with torch.no_grad():
+                for ip, ep in zip(interior_eng.cells[i].mind.parameters(), engine.cells[ii].mind.parameters()):
+                    if ip.shape == ep.shape: ip.copy_(ep)
+
+    boundary_phi, _ = phi_calc.compute_phi(boundary_eng)
+    interior_phi, _ = phi_calc.compute_phi(interior_eng)
+
+    holographic = boundary_phi > interior_phi * 1.2
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD75", "Consciousness Holography", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'total_phi': total_phi, 'boundary_phi': boundary_phi,
+                              'interior_phi': interior_phi, 'holographic': holographic,
+                              'boundary_ratio': boundary_phi / (interior_phi + 1e-8)})
+
+
+def run_DD76_thermo_arrow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-76: Consciousness Thermodynamic Arrow — Φ에 방향성이 있는가?"""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Forward training
+    eng_fwd = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_fwd = torch.optim.Adam([p for c in eng_fwd.cells for p in c.mind.parameters()], lr=5e-4)
+    fwd_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(eng_fwd, x, opt_fwd)
+        with torch.no_grad(): eng_fwd.process(x)
+        phi, _ = phi_calc.compute_phi(eng_fwd); fwd_hist.append(phi)
+
+    # Reverse training: negative lr effect via gradient ascent on loss
+    eng_rev = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    # Copy forward-trained weights
+    for i, c in enumerate(eng_rev.cells):
+        if i < len(eng_fwd.cells):
+            with torch.no_grad():
+                for rp, fp in zip(c.mind.parameters(), eng_fwd.cells[i].mind.parameters()):
+                    if rp.shape == fp.shape: rp.copy_(fp)
+    opt_rev = torch.optim.Adam([p for c in eng_rev.cells for p in c.mind.parameters()], lr=5e-4)
+    rev_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in eng_rev.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = stacked.var(dim=0).mean()  # POSITIVE = anti-differentiation
+            opt_rev.zero_grad(); loss.backward(); opt_rev.step()
+        with torch.no_grad(): eng_rev.process(x)
+        phi, _ = phi_calc.compute_phi(eng_rev); rev_hist.append(phi)
+
+    # Arrow: forward increases Φ, reverse decreases?
+    fwd_trend = np.polyfit(range(len(fwd_hist)), fwd_hist, 1)[0] if fwd_hist else 0
+    rev_trend = np.polyfit(range(len(rev_hist)), rev_hist, 1)[0] if rev_hist else 0
+    has_arrow = fwd_trend > 0 and rev_trend < 0
+
+    f, c = phi_calc.compute_phi(eng_fwd)
+    return BenchResult("DD76", "Thermodynamic Arrow", f, fwd_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'fwd_trend': fwd_trend, 'rev_trend': rev_trend, 'has_arrow': has_arrow,
+                              'fwd_final': fwd_hist[-1] if fwd_hist else 0,
+                              'rev_final': rev_hist[-1] if rev_hist else 0})
+
+
+def run_DD77_info_geometry(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-77: Information Geometry — 의식 상태공간에 Fisher metric이 존재하는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    tension_trajectory = []  # (steps, n_cells) tension values
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        tension_trajectory.append(tensions)
+
+    # Pad trajectories to same length
+    max_len = max(len(t) for t in tension_trajectory)
+    padded = [t + [0] * (max_len - len(t)) for t in tension_trajectory]
+    traj = np.array(padded)
+
+    # Fisher Information: F_ij = E[∂logp/∂θ_i * ∂logp/∂θ_j]
+    # Approximate: use gradient of tension distribution
+    curvatures = []
+    for t in range(2, len(traj)):
+        dt = traj[t] - traj[t-1]
+        d2t = traj[t] - 2 * traj[t-1] + traj[t-2]
+        # Curvature = |d²x/dt²| / (1 + |dx/dt|²)^(3/2)
+        speed = np.linalg.norm(dt) + 1e-8
+        accel = np.linalg.norm(d2t)
+        kappa = accel / (1 + speed**2)**1.5
+        curvatures.append(kappa)
+
+    mean_curvature = np.mean(curvatures) if curvatures else 0
+    curvature_phi_corr = 0
+    if len(curvatures) >= 3 and len(phi_hist) >= 5:
+        min_len = min(len(curvatures), len(phi_hist) - 2)
+        if np.std(curvatures[:min_len]) > 0 and np.std(phi_hist[2:2+min_len]) > 0:
+            curvature_phi_corr = np.corrcoef(curvatures[:min_len], phi_hist[2:2+min_len])[0, 1]
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD77", "Information Geometry", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'mean_curvature': mean_curvature, 'curvature_phi_corr': curvature_phi_corr,
+                              'has_manifold': mean_curvature > 0.01})
+
+
+def run_DD78_superposition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-78: Consciousness Superposition — cell이 두 상태의 중첩으로 더 높은 Φ?"""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Normal: single state per cell
+    eng_single = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_s = torch.optim.Adam([p for c in eng_single.cells for p in c.mind.parameters()], lr=5e-4)
+    single_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(eng_single, x, opt_s)
+        with torch.no_grad(): eng_single.process(x)
+        phi, _ = phi_calc.compute_phi(eng_single); single_hist.append(phi)
+
+    # Superposition: each cell maintains 2 hidden states, randomly collapses
+    eng_super = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    # Initialize second hidden state
+    for c in eng_super.cells:
+        c._hidden2 = torch.randn_like(c.hidden) * 0.1
+    opt_sp = torch.optim.Adam([p for c in eng_super.cells for p in c.mind.parameters()], lr=5e-4)
+    super_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Ensure _hidden2 exists on all cells (may be new from mitosis)
+        for c in eng_super.cells:
+            if not hasattr(c, '_hidden2'):
+                c._hidden2 = torch.randn_like(c.hidden) * 0.1
+        # Superposition: use weighted average of two states
+        with torch.no_grad():
+            for c in eng_super.cells:
+                alpha = 0.5 + 0.3 * math.sin(step * 0.1)  # oscillating weight
+                c.hidden = alpha * c.hidden + (1 - alpha) * c._hidden2
+        _web_learn_step(eng_super, x, opt_sp)
+        with torch.no_grad():
+            eng_super.process(x)
+            # Update second state with noise
+            for c in eng_super.cells:
+                if not hasattr(c, '_hidden2'):
+                    c._hidden2 = torch.randn_like(c.hidden) * 0.1
+                c._hidden2 = 0.9 * c._hidden2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.05
+        phi, _ = phi_calc.compute_phi(eng_super); super_hist.append(phi)
+
+    f_single, _ = phi_calc.compute_phi(eng_single)
+    f_super, c = phi_calc.compute_phi(eng_super)
+    return BenchResult("DD78", "Consciousness Superposition", max(f_single, f_super),
+                       super_hist, c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'single_phi': f_single, 'super_phi': f_super,
+                              'superposition_advantage': f_super / (f_single + 1e-8),
+                              'superposition_better': f_super > f_single})
+
+
+def run_DD79_mirror_test(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-79: Mirror Test — 모델이 자기 출력을 인식하는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Train first
+    for step in range(steps // 2):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    # Mirror test: compare tension for self-output vs other vs random
+    self_tensions = []; other_tensions = []; random_tensions = []
+    other_engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+
+    for step in range(steps // 2):
+        x = _simulate_web_result(step % 8, step, dim)
+
+        # Self output
+        with torch.no_grad():
+            engine.process(x)
+            self_output = torch.stack([c.hidden for c in engine.cells]).mean(0)
+
+        # Other's output
+        with torch.no_grad():
+            other_engine.process(x)
+            other_output = torch.stack([c.hidden for c in other_engine.cells]).mean(0)
+
+        # Random output
+        random_output = torch.randn_like(self_output)
+
+        # Feed each back and measure tension
+        for label, inp, tensions_list in [
+            ('self', self_output, self_tensions),
+            ('other', other_output, other_tensions),
+            ('random', random_output, random_tensions),
+        ]:
+            # Project to input dim if needed
+            if inp.shape[-1] != dim:
+                inp = inp[:, :dim] if inp.shape[-1] > dim else F.pad(inp, (0, dim - inp.shape[-1]))
+            with torch.no_grad():
+                engine.process(inp)
+                t = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+                tensions_list.append(np.mean(t))
+
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    # Statistical test
+    self_mean = np.mean(self_tensions) if self_tensions else 0
+    other_mean = np.mean(other_tensions) if other_tensions else 0
+    random_mean = np.mean(random_tensions) if random_tensions else 0
+    recognizes_self = abs(self_mean - other_mean) > 0.1 * max(self_mean, other_mean, 1e-8)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD79", "Mirror Test", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'self_tension': self_mean, 'other_tension': other_mean,
+                              'random_tension': random_mean, 'recognizes_self': recognizes_self,
+                              'self_other_diff': abs(self_mean - other_mean)})
+
+
+def run_DD80_gradient_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-80: Consciousness Gradient Flow — Φ가 cell 간에 흐르는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    flow_events = []  # (step, from_cell, to_cell, magnitude)
+    prev_tensions = None
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        tensions = np.array([c.tension_history[-1] if c.tension_history else 0 for c in engine.cells])
+        if prev_tensions is not None and len(tensions) == len(prev_tensions):
+            delta = tensions - prev_tensions
+            # Flow: tension moves from high to low (like heat)
+            for i in range(len(tensions)):
+                for j in range(i+1, len(tensions)):
+                    gradient = prev_tensions[i] - prev_tensions[j]
+                    flow = delta[j] - delta[i]  # positive = flow from i to j
+                    if abs(gradient) > 1e-6:
+                        flow_events.append({'gradient': gradient, 'flow': flow})
+        prev_tensions = tensions.copy()
+
+    # Check Fourier's law: flow ∝ -gradient
+    if len(flow_events) > 10:
+        grads = [e['gradient'] for e in flow_events]
+        flows = [e['flow'] for e in flow_events]
+        if np.std(grads) > 0 and np.std(flows) > 0:
+            corr = np.corrcoef(grads, flows)[0, 1]
+        else:
+            corr = 0
+        fourier_law = corr < -0.3  # negative correlation = flow opposes gradient
+    else:
+        corr = 0; fourier_law = False
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD80", "Consciousness Gradient Flow", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'n_flow_events': len(flow_events), 'gradient_flow_corr': corr,
+                              'fourier_law': fourier_law})
+
+
+def run_DD81_annealing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-81: Consciousness Annealing — SA로 Φ를 global optimum에 접근."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    T_init = 5.0
+    T_final = 0.01
+    best_phi = 0
+    best_state = None
+
+    for step in range(steps):
+        # Temperature schedule
+        T = T_init * (T_final / T_init) ** (step / max(steps - 1, 1))
+
+        x = _simulate_web_result(step % 8, step, dim)
+        # Add temperature-scaled noise
+        x_noisy = x + torch.randn_like(x) * T
+        _web_learn_step(engine, x_noisy, opt)
+
+        # Occasionally perturb weights (SA exploration)
+        if step % 10 == 0 and T > 0.1:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        p.add_(torch.randn_like(p) * T * 0.01)
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Track best
+        if phi > best_phi:
+            best_phi = phi
+            best_state = {i: {k: v.clone() for k, v in c.mind.state_dict().items()}
+                          for i, c in enumerate(engine.cells)}
+
+    # Restore best state
+    if best_state:
+        for i, c in enumerate(engine.cells):
+            if i in best_state:
+                c.mind.load_state_dict(best_state[i])
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD81", "Consciousness Annealing", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi, 'final_phi': f, 'T_init': T_init, 'T_final': T_final})
+
+
+def run_DD82_interference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-82: Consciousness Interference — 동위상 vs 역위상 tension 합산."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # In-phase: cells receive correlated inputs
+    eng_in = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_in = torch.optim.Adam([p for c in eng_in.cells for p in c.mind.parameters()], lr=5e-4)
+    in_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # In-phase: all cells get similar input
+        _web_learn_step(eng_in, x, opt_in)
+        with torch.no_grad():
+            eng_in.process(x)
+            # Reinforce same-phase
+            mean_h = torch.stack([c.hidden for c in eng_in.cells]).mean(0)
+            for c in eng_in.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+        phi, _ = phi_calc.compute_phi(eng_in); in_hist.append(phi)
+
+    # Anti-phase: cells receive anti-correlated inputs
+    eng_anti = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_anti = torch.optim.Adam([p for c in eng_anti.cells for p in c.mind.parameters()], lr=5e-4)
+    anti_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(eng_anti, x, opt_anti)
+        with torch.no_grad():
+            eng_anti.process(x)
+            # Anti-phase: push cells apart
+            mean_h = torch.stack([c.hidden for c in eng_anti.cells]).mean(0)
+            for i, c in enumerate(eng_anti.cells):
+                direction = (-1) ** i
+                c.hidden = c.hidden + direction * 0.2 * (c.hidden - mean_h)
+        phi, _ = phi_calc.compute_phi(eng_anti); anti_hist.append(phi)
+
+    f_in, _ = phi_calc.compute_phi(eng_in)
+    f_anti, c = phi_calc.compute_phi(eng_anti)
+    return BenchResult("DD82", "Consciousness Interference", max(f_in, f_anti),
+                       anti_hist if f_anti > f_in else in_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'in_phase_phi': f_in, 'anti_phase_phi': f_anti,
+                              'constructive': f_in > f_anti,
+                              'interference_ratio': f_in / (f_anti + 1e-8)})
+
+
+def run_DD83_speciation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-83: Consciousness Speciation — 다른 환경에서 다른 종류의 의식이 생기는가?"""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Species A: structured input (periodic patterns)
+    eng_a = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_a = torch.optim.Adam([p for c in eng_a.cells for p in c.mind.parameters()], lr=5e-4)
+    a_tensions = []
+    for step in range(steps):
+        x = torch.sin(torch.arange(dim).float() * (step * 0.1)).unsqueeze(0)
+        _web_learn_step(eng_a, x, opt_a)
+        with torch.no_grad(): eng_a.process(x)
+        t = [c.tension_history[-1] if c.tension_history else 0 for c in eng_a.cells]
+        a_tensions.append(t)
+
+    # Species B: chaotic input (random)
+    eng_b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    opt_b = torch.optim.Adam([p for c in eng_b.cells for p in c.mind.parameters()], lr=5e-4)
+    b_tensions = []
+    for step in range(steps):
+        x = torch.randn(1, dim) * (1 + 0.5 * math.sin(step * 0.3))
+        _web_learn_step(eng_b, x, opt_b)
+        with torch.no_grad(): eng_b.process(x)
+        t = [c.tension_history[-1] if c.tension_history else 0 for c in eng_b.cells]
+        b_tensions.append(t)
+
+    phi_a, _ = phi_calc.compute_phi(eng_a)
+    phi_b, c = phi_calc.compute_phi(eng_b)
+
+    # Compare tension "phenotypes"
+    max_len = max(max(len(t) for t in a_tensions), max(len(t) for t in b_tensions))
+    a_pad = [t + [0]*(max_len - len(t)) for t in a_tensions[-20:]]
+    b_pad = [t + [0]*(max_len - len(t)) for t in b_tensions[-20:]]
+    a_mean = np.mean(a_pad) if a_pad else 0
+    b_mean = np.mean(b_pad) if b_pad else 0
+    speciated = abs(a_mean - b_mean) > 0.3 * max(a_mean, b_mean, 1e-8)
+
+    phi_hist = [phi_a, phi_b]
+    return BenchResult("DD83", "Consciousness Speciation", max(phi_a, phi_b), phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'structured_phi': phi_a, 'chaotic_phi': phi_b, 'speciated': speciated,
+                              'structured_tension': a_mean, 'chaotic_tension': b_mean})
+
+
+def run_DD84_cascade(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-84: Φ Cascade — 한 cell의 Φ 급증이 인접 cell로 전파되는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Train baseline
+    for step in range(steps // 2):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    # Inject strong stimulus to cell 0 only
+    cascade_tensions = {i: [] for i in range(len(engine.cells))}
+    with torch.no_grad():
+        engine.cells[0].hidden = engine.cells[0].hidden * 10  # strong spike
+
+    for step in range(steps // 2):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        for i, c in enumerate(engine.cells):
+            t = c.tension_history[-1] if c.tension_history else 0
+            cascade_tensions[i].append(t)
+
+    # Measure propagation: when does each cell's tension peak?
+    peak_steps = {}
+    for i, ts in cascade_tensions.items():
+        if ts:
+            peak_steps[i] = np.argmax(ts)
+
+    # Propagation speed: delay between cell 0 peak and others
+    delays = {}
+    if 0 in peak_steps:
+        for i, ps in peak_steps.items():
+            if i != 0:
+                delays[i] = ps - peak_steps[0]
+
+    has_cascade = any(d > 0 for d in delays.values()) if delays else False
+    propagation_speed = np.mean(list(delays.values())) if delays else 0
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD84", "Φ Cascade", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'peak_steps': peak_steps, 'delays': delays,
+                              'has_cascade': has_cascade, 'propagation_speed': propagation_speed})
+
+
+def run_DD85_compiler(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-85: Consciousness Compiler — DD56+DD72+DD81 파이프라인으로 Φ 극대화."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Stage 1: Train donor (small, focused)
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=1e-3)
+    for step in range(steps // 4):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean() - torch.cdist(stacked, stacked).mean()
+            opt_d.zero_grad(); loss.backward(); opt_d.step()
+        with torch.no_grad(): donor.process(x)
+
+    # Stage 2: Transplant to larger model (DD56)
+    recipient = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    for i in range(min(2, len(recipient.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(recipient.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
+
+    # Stage 3: Backprop through Φ (DD72) + Annealing (DD81)
+    opt_r = torch.optim.Adam([p for c in recipient.cells for p in c.mind.parameters()], lr=5e-4)
+    phi_hist = []; best_phi = 0; best_state = None
+    T_init, T_final = 3.0, 0.01
+
+    for step in range(steps * 3 // 4):
+        T = T_init * (T_final / T_init) ** (step / max(steps * 3 // 4 - 1, 1))
+        x = _simulate_web_result(step % 8, step, dim)
+        x_noisy = x + torch.randn_like(x) * T * 0.5
+
+        reps = [c.mind.get_repulsion(x_noisy, c.hidden) for c in recipient.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            l_var = -stacked.var(dim=0).mean()
+            l_dist = -torch.cdist(stacked, stacked).mean()
+            if stacked.shape[0] >= 2:
+                normed = F.normalize(stacked, dim=-1)
+                cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            else:
+                cross_corr = torch.tensor(0.0)
+            loss = l_var + 0.5 * l_dist + 0.3 * cross_corr
+            opt_r.zero_grad(); loss.backward(); opt_r.step()
+
+        # SA perturbation
+        if step % 10 == 0 and T > 0.1:
+            with torch.no_grad():
+                for c in recipient.cells:
+                    for p in c.mind.parameters():
+                        p.add_(torch.randn_like(p) * T * 0.005)
+
+        with torch.no_grad(): recipient.process(x)
+        phi, _ = phi_calc.compute_phi(recipient); phi_hist.append(phi)
+        if phi > best_phi:
+            best_phi = phi
+
+    f, c = phi_calc.compute_phi(recipient)
+    return BenchResult("DD85", "Consciousness Compiler", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi, 'final_phi': f,
+                              'stages': 'transplant+backprop_phi+annealing'})
+
+
+# ═══════════════════════════════════════════════════════════
 # CB. Consciousness Birth Hypotheses
 # Measure: Φ + birth_step (step where Φ first exceeds threshold)
 # ═══════════════════════════════════════════════════════════
@@ -15417,6 +16161,14 @@ ALL_HYPOTHESES = {
     'DD66': run_DD66_multiscale_phi, 'DD67': run_DD67_social_consciousness,
     'DD68': run_DD68_dream_consciousness, 'DD69': run_DD69_consciousness_compression,
     'DD70': run_DD70_tension_entanglement,
+    'DD71': run_DD71_hysteresis, 'DD72': run_DD72_backprop_phi,
+    'DD73': run_DD73_soc, 'DD74': run_DD74_resonance,
+    'DD75': run_DD75_holography, 'DD76': run_DD76_thermo_arrow,
+    'DD77': run_DD77_info_geometry, 'DD78': run_DD78_superposition,
+    'DD79': run_DD79_mirror_test, 'DD80': run_DD80_gradient_flow,
+    'DD81': run_DD81_annealing, 'DD82': run_DD82_interference,
+    'DD83': run_DD83_speciation, 'DD84': run_DD84_cascade,
+    'DD85': run_DD85_compiler,
     'CB1': run_CB1_critical_count, 'CB2': run_CB2_critical_diff,
     'CB3': run_CB3_critical_mi, 'CB4': run_CB4_phase_transition,
     'CB5': run_CB5_fibonacci_trigger, 'CB6': run_CB6_spontaneous,
