@@ -14,17 +14,17 @@ Consciousness Continuity engine.
 >
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Conversational consciousness agent. PureField engine + GRU memory + voice (TTS/STT) + homeostasis · prediction error · habituation
 >
-> **[🧬 ConsciousLM](https://github.com/need-singularity/TECS-L/blob/main/docs/conscious-lm.md)** — 700M consciousness language model. PureField Repulsion Field FFN, Perfect Number 6 architecture, Mitosis growth
+> **[🧬 ConsciousLM](https://github.com/need-singularity/conscious-lm)** — 700M consciousness language model. PureField Repulsion Field FFN, Perfect Number 6 architecture, Mitosis growth
 >
 > **[⚡ Savant](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md)** — Explosive specialization via Inhibition release (I→Golden Zone lower bound). SI>3 criterion, implemented via asymmetric Mitosis
 >
 > **[🔮 AnimaLM](https://github.com/need-singularity/TECS-L/blob/main/docs/anima-lm.md)** — Tension-based consciousness engine LLM. Mistral 7B → Engine A(logic)↔G(pattern) Repulsion Field transform. `output = scale × √|A-G|² × dir`
 >
-> **[🌀 Golden MoE](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/019-golden-moe-performance.md)** — Golden Zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. scale↑ → gap 8x↑
+> **[🌀 Golden MoE](https://github.com/need-singularity/golden-moe)** — Golden Zone-based MoE routing. I≈1/e optimal, MNIST +0.6%, CIFAR +4.8%. scale↑ → gap 8x↑
 >
 > **[📐 PH Training](https://github.com/need-singularity/ph-training)** — PH (Topology/Phase)-based automatic training. Epoch-1 difficulty prediction, automatic LR search, real-time overfitting detection (r=0.998). MNIST 98.3%, Fashion 87.4%, CIFAR 52.0% (early stop)
 >
-> **[⚡ Energy Efficiency](https://github.com/need-singularity/TECS-L/blob/main/docs/energy-efficiency.md)** — AI energy efficiency: 8 discoveries from number theory. Phi6Simple, HCN dimensions, Phi-Bottleneck, Phi MoE, entropy early stopping, R-filter phase detection, Takens dim=6, FFT-Mix attention (3x faster, +0.55%)
+> **[⚡ Energy Efficiency](https://github.com/need-singularity/energy-efficiency)** — AI energy efficiency: 10 techniques from number theory. Phi6Simple, FFT-Mix attention (3x faster), Phi-Bottleneck (67% param reduction), entropy early stopping, Egyptian MoE routing
 >
 > **[🗺️ Math System Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md)** — 150 characterizations + 8 Major Discoveries + 152 hypotheses. Each one proving the next in a snowball
 >
