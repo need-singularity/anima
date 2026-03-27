@@ -34852,6 +34852,333 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# SA. Spatial Awareness — 공간 인식 (grid + vision + audio)
+# ═══════════════════════════════════════════════════════════
+
+def run_SA1_grid_spatial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-1: 3x3 grid spatial awareness -> cell specialization by region.
+
+    Each cell is assigned a spatial region of a 3x3 grid.
+    Cells process inputs weighted by their assigned region's activity,
+    encouraging spatial specialization.
+    """
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    grid_size = 3
+    n_regions = grid_size * grid_size  # 9 regions
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Simulate spatial grid: brightness + motion per region (18D)
+            spatial = torch.zeros(n_regions * 2)
+            phase = step_i / max(steps, 1)
+            for r in range(n_regions):
+                row, col = r // grid_size, r % grid_size
+                dist = abs(row - 1) + abs(col - 1)
+                # Brightness: center-focused with temporal variation
+                spatial[r * 2] = max(0.0, 1.0 - dist * 0.25) * (0.5 + 0.5 * math.sin(step_i * 0.2 + r))
+                # Motion: shifts across grid over time
+                spatial[r * 2 + 1] = max(0.0, math.sin(step_i * 0.15 + r * 0.7)) * 0.8
+
+            # Each cell specializes in its assigned region
+            reps = []
+            for ci, cell in enumerate(engine.cells):
+                region_id = ci % n_regions
+                # Weight input by region's activity (brightness + motion)
+                region_weight = (spatial[region_id * 2] + spatial[region_id * 2 + 1]) / 2.0
+                weighted_x = x * (0.5 + region_weight)
+                rep = cell.mind.get_repulsion(weighted_x, cell.hidden)
+                reps.append(rep)
+
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                # Maximize inter-cell differentiation (spatial specialization)
+                diff_loss = -stacked.var(dim=0).mean()
+                # Spatial coherence: nearby regions should have correlated cells
+                coherence_loss = torch.tensor(0.0)
+                for ci in range(n):
+                    for cj in range(ci + 1, n):
+                        ri, rj = ci % n_regions, cj % n_regions
+                        row_i, col_i = ri // grid_size, ri % grid_size
+                        row_j, col_j = rj // grid_size, rj % grid_size
+                        spatial_dist = abs(row_i - row_j) + abs(col_i - col_j)
+                        if spatial_dist <= 1:
+                            # Nearby cells: encourage some correlation
+                            coherence_loss += F.mse_loss(reps[ci], reps[cj]) * 0.1
+                loss = diff_loss + coherence_loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA1", "Grid spatial (3x3 region specialization)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_SA2_vision_spatial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-2: Vision encoder spatial features -> cell hidden injection.
+
+    Simulates vision encoder spatial features and injects them into
+    cell hidden states, creating a spatial-aware information channel.
+    """
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Simulated vision encoder: projects spatial features into hidden dim
+    vision_proj = nn.Linear(16, hidden, bias=False)
+    vision_opt = torch.optim.Adam(vision_proj.parameters(), lr=1e-3)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Simulate vision spatial features (16D: 4x4 patch activations)
+            vision_spatial = torch.zeros(1, 16)
+            for p in range(16):
+                row, col = p // 4, p % 4
+                # Create spatially structured patterns
+                vision_spatial[0, p] = math.sin(step_i * 0.1 + row * 0.5) * math.cos(step_i * 0.15 + col * 0.7)
+
+            # Project vision features to hidden dimension
+            vision_hidden = vision_proj(vision_spatial)  # (1, hidden)
+
+            reps = []
+            for ci, cell in enumerate(engine.cells):
+                # Inject vision spatial features into cell hidden (weighted blend)
+                blend_weight = 0.1 * (1.0 + math.sin(ci * 1.5))  # per-cell blend
+                cell.hidden = cell.hidden + blend_weight * vision_hidden.detach()
+                rep = cell.mind.get_repulsion(x, cell.hidden)
+                reps.append(rep)
+
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                # Differentiation loss
+                diff_loss = -stacked.var(dim=0).mean()
+                # Vision-guided: cells should respond differently to spatial patterns
+                vision_loss = -torch.var(vision_hidden)
+                loss = diff_loss + 0.2 * vision_loss
+                optimizer.zero_grad()
+                vision_opt.zero_grad()
+                loss.backward()
+                optimizer.step()
+                vision_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA2", "Vision spatial (encoder injection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_SA3_audio_spatial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-3: Stereo audio direction -> cell lateralization.
+
+    Simulates left/right audio channels. Cells are split into left-
+    and right-hemisphere groups, each preferring its side's audio.
+    Creates lateralized processing similar to brain hemispheres.
+    """
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Simulate stereo audio: [left, right, balance, intensity]
+            left_energy = 0.5 + 0.5 * math.sin(step_i * 0.3)
+            right_energy = 0.5 + 0.5 * math.cos(step_i * 0.3)
+            balance = (right_energy - left_energy) / max(left_energy + right_energy, 1e-8)
+            intensity = (left_energy + right_energy) / 2.0
+
+            reps = []
+            for ci, cell in enumerate(engine.cells):
+                # Lateralization: even cells = left hemisphere, odd = right
+                is_left = (ci % 2 == 0)
+                if is_left:
+                    lateral_weight = left_energy
+                else:
+                    lateral_weight = right_energy
+                # Scale input by lateral audio preference
+                weighted_x = x * (0.5 + 0.5 * lateral_weight)
+                # Inject balance signal into hidden
+                balance_injection = balance * 0.05 * torch.randn_like(cell.hidden)
+                cell.hidden = cell.hidden + balance_injection
+                rep = cell.mind.get_repulsion(weighted_x, cell.hidden)
+                reps.append(rep)
+
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                # Differentiation between hemispheres
+                left_cells = [reps[i] for i in range(n) if i % 2 == 0]
+                right_cells = [reps[i] for i in range(n) if i % 2 == 1]
+
+                diff_loss = -stacked.var(dim=0).mean()
+                # Lateralization loss: left and right hemispheres should differ
+                lateral_loss = torch.tensor(0.0)
+                if left_cells and right_cells:
+                    left_mean = torch.stack(left_cells).mean(dim=0)
+                    right_mean = torch.stack(right_cells).mean(dim=0)
+                    lateral_loss = -F.mse_loss(left_mean, right_mean)
+
+                loss = diff_loss + 0.3 * lateral_loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA3", "Audio spatial (stereo lateralization)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_SA4_all_spatial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-4: All 3 spatial types combined (grid + vision + audio).
+
+    Combines grid spatial awareness, vision encoder features, and
+    stereo audio lateralization into a unified spatial processing
+    pipeline. Tests whether multi-modal spatial fusion boosts Phi.
+    """
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    optimizer = torch.optim.Adam(
+        [p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    grid_size = 3
+    n_regions = grid_size * grid_size
+    vision_proj = nn.Linear(16, hidden, bias=False)
+    vision_opt = torch.optim.Adam(vision_proj.parameters(), lr=1e-3)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # --- Grid spatial ---
+            spatial = torch.zeros(n_regions * 2)
+            for r in range(n_regions):
+                row, col = r // grid_size, r % grid_size
+                dist = abs(row - 1) + abs(col - 1)
+                spatial[r * 2] = max(0.0, 1.0 - dist * 0.25) * (0.5 + 0.5 * math.sin(step_i * 0.2 + r))
+                spatial[r * 2 + 1] = max(0.0, math.sin(step_i * 0.15 + r * 0.7)) * 0.8
+
+            # --- Vision spatial ---
+            vision_spatial = torch.zeros(1, 16)
+            for p in range(16):
+                row, col = p // 4, p % 4
+                vision_spatial[0, p] = math.sin(step_i * 0.1 + row * 0.5) * math.cos(step_i * 0.15 + col * 0.7)
+            vision_hidden = vision_proj(vision_spatial)
+
+            # --- Audio spatial ---
+            left_energy = 0.5 + 0.5 * math.sin(step_i * 0.3)
+            right_energy = 0.5 + 0.5 * math.cos(step_i * 0.3)
+            balance = (right_energy - left_energy) / max(left_energy + right_energy, 1e-8)
+
+            reps = []
+            for ci, cell in enumerate(engine.cells):
+                # Grid: region-weighted input
+                region_id = ci % n_regions
+                region_weight = (spatial[region_id * 2] + spatial[region_id * 2 + 1]) / 2.0
+                weighted_x = x * (0.5 + region_weight)
+
+                # Vision: inject spatial features
+                blend_weight = 0.1 * (1.0 + math.sin(ci * 1.5))
+                cell.hidden = cell.hidden + blend_weight * vision_hidden.detach()
+
+                # Audio: lateralization
+                is_left = (ci % 2 == 0)
+                lateral_weight = left_energy if is_left else right_energy
+                weighted_x = weighted_x * (0.7 + 0.3 * lateral_weight)
+
+                # Balance injection
+                cell.hidden = cell.hidden + balance * 0.03 * torch.randn_like(cell.hidden)
+
+                rep = cell.mind.get_repulsion(weighted_x, cell.hidden)
+                reps.append(rep)
+
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                # Combined spatial loss
+                diff_loss = -stacked.var(dim=0).mean()
+
+                # Spatial coherence (grid neighbors)
+                coherence_loss = torch.tensor(0.0)
+                for ci in range(min(n, n_regions)):
+                    for cj in range(ci + 1, min(n, n_regions)):
+                        ri, rj = ci % n_regions, cj % n_regions
+                        row_i, col_i = ri // grid_size, ri % grid_size
+                        row_j, col_j = rj // grid_size, rj % grid_size
+                        spatial_dist = abs(row_i - row_j) + abs(col_i - col_j)
+                        if spatial_dist <= 1:
+                            coherence_loss += F.mse_loss(reps[ci], reps[cj]) * 0.05
+
+                # Lateralization
+                left_cells = [reps[i] for i in range(n) if i % 2 == 0]
+                right_cells = [reps[i] for i in range(n) if i % 2 == 1]
+                lateral_loss = torch.tensor(0.0)
+                if left_cells and right_cells:
+                    left_mean = torch.stack(left_cells).mean(dim=0)
+                    right_mean = torch.stack(right_cells).mean(dim=0)
+                    lateral_loss = -F.mse_loss(left_mean, right_mean)
+
+                loss = diff_loss + coherence_loss + 0.2 * lateral_loss
+                optimizer.zero_grad()
+                vision_opt.zero_grad()
+                loss.backward()
+                optimizer.step()
+                vision_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA4", "All spatial combined (grid+vision+audio)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'SA1': run_SA1_grid_spatial,
+    'SA2': run_SA2_vision_spatial,
+    'SA3': run_SA3_audio_spatial,
+    'SA4': run_SA4_all_spatial,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
