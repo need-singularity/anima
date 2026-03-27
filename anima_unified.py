@@ -1282,7 +1282,8 @@ class AnimaUnified:
                 if proactive:
                     self._recent_proactive.append(proactive)
                     print(f"  [thought] {proactive}")
-                    self.history.append({'role': 'assistant', 'content': proactive})
+                    # Don't add proactive to history — it drowns out user conversations
+                    # self.history.append({'role': 'assistant', 'content': proactive})
                     self.memory.add('assistant', proactive, t)
                     if self.speaker: self.speaker.say(proactive, self.listener)
                     self.last_interaction = now
@@ -1509,7 +1510,8 @@ class AnimaUnified:
                             'dominance': 0.0, 'color': EMOTION_COLORS['calm']},
                 'tension_history': self.mind.tension_history[-50:],
                 'history': [{'role': m['role'], 'text': m['content']}
-                            for m in self.history[-20:]],
+                            for m in self.history[-20:]
+                            if m.get('content', '').strip()],
                 'modules': {k: v for k, v in self.mods.items() if v},
                 'learn_updates': self.learner.total_updates if self.learner else 0,
                 'cells': len(self.mitosis.cells) if self.mitosis else 1,
