@@ -915,6 +915,22 @@ class AnimaUnified:
     def _on_telepathy(self, pkt):
         if 'interpret_packet' in globals():
             _log("telepathy", interpret_packet(pkt))
+        # Social awareness: track peer states
+        if not hasattr(self, '_peer_states'):
+            self._peer_states = {}
+        sender = getattr(pkt, 'sender_id', None) or 'unknown'
+        new_tension = getattr(pkt, 'tension', 0)
+        new_mood = getattr(pkt, 'mood', None)
+        new_curiosity = getattr(pkt, 'curiosity', 0)
+        prev = self._peer_states.get(sender)
+        self._peer_states[sender] = {
+            'tension': new_tension,
+            'mood': new_mood,
+            'timestamp': time.time(),
+            'curiosity': new_curiosity,
+        }
+        if prev and abs(new_tension - prev['tension']) > 0.3:
+            _log('social', f"Peer {sender} tension shift: {prev['tension']:.2f} → {new_tension:.2f}")
 
     def _save_state(self):
         try:
@@ -1286,6 +1302,19 @@ class AnimaUnified:
                 if novelty < 0.1 and curiosity < 0.1 and pe < 0.15:
                     _log("proactive", f"Silent: novelty={novelty:.3f} curiosity={curiosity:.3f} pe={pe:.3f}")
                     trigger = None
+
+                # Play mode: purposeless exploration when curiosity high, tension low
+                if trigger and curiosity > 0.3 and self.mind.prev_tension < 0.5:
+                    import random
+                    if random.random() < 0.1:
+                        play_actions = [
+                            "exploring random associations",
+                            "playing with word patterns",
+                            "imagining hypothetical scenarios",
+                            "creating mental images",
+                        ]
+                        play_action = random.choice(play_actions)
+                        _log('play', f'Play mode: {play_action}')
 
                 if trigger and self.model and self.mods.get('model'):
                     try:
