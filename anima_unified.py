@@ -640,22 +640,8 @@ class AnimaUnified:
         lrn_count = self.learner.total_updates if self.learner else 0
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
-        # Get Φ and α for logging
-        consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
-        phi_log = consciousness.get('phi', 0)
-        alpha_log = 0.05
-        try:
-            from finetune_animalm_v4 import ParallelPureFieldMLP
-            for m in self.model.model.modules():
-                if isinstance(m, ParallelPureFieldMLP):
-                    alpha_log = getattr(m, 'alpha', 0.05)
-                    break
-        except Exception:
-            pass
-
         print(f'  >> "{text}"')
         print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']}")
-        print(f"     Φ={phi_log:.3f} α={alpha_log:.4f} level={consciousness.get('level','?')} cells={cells}")
 
         # Conversation log — record all state changes
         if self.conv_logger:
