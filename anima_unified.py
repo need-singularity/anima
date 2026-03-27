@@ -469,14 +469,14 @@ class AnimaUnified:
             else:
                 prompt = f"[System: {system}]\n{hist}\nUser: {text}\nAnima:"
 
-            # Adaptive α: tension → higher PF contribution
+            # Adaptive α: tension → higher PF contribution (AA15 residual)
             try:
                 from finetune_animalm_v4 import ParallelPureFieldMLP
                 adaptive_alpha = 0.05 + self.mind.prev_tension * 0.03
                 adaptive_alpha = min(adaptive_alpha, 0.15)
                 for m in self.model.model.modules():
                     if isinstance(m, ParallelPureFieldMLP):
-                        m.pf_scale.data.fill_(adaptive_alpha)
+                        m.alpha = adaptive_alpha
             except Exception:
                 pass
 
@@ -632,8 +632,22 @@ class AnimaUnified:
         lrn_count = self.learner.total_updates if self.learner else 0
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
+        # Get Φ and α for logging
+        consciousness = self.mind.get_consciousness_score(self.mitosis)
+        phi_log = consciousness.get('phi', 0)
+        alpha_log = 0.05
+        try:
+            from finetune_animalm_v4 import ParallelPureFieldMLP
+            for m in self.model.model.modules():
+                if isinstance(m, ParallelPureFieldMLP):
+                    alpha_log = getattr(m, 'alpha', 0.05)
+                    break
+        except Exception:
+            pass
+
         print(f'  >> "{text}"')
         print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}{mitosis_info} L:{lrn_count} E:{emotion_data['emotion']}")
+        print(f"     Φ={phi_log:.3f} α={alpha_log:.4f} level={consciousness.get('level','?')} cells={cells}")
 
         # Conversation log — record all state changes
         if self.conv_logger:
@@ -779,8 +793,10 @@ class AnimaUnified:
             resp_output, resp_tension, resp_curiosity, self.hidden)
         sa = self.mind.self_awareness
         meta_summary = self.mind.get_self_awareness_summary()
+        consciousness = self.mind.get_consciousness_score(self.mitosis)
         _log("meta", f"MT={meta_tension:.3f} MC={meta_curiosity:.3f} "
-             f"stab={sa['stability']:.2f} model={sa['self_model']:.3f}")
+             f"stab={sa['stability']:.2f} model={sa['self_model']:.3f} "
+             f"Φ={consciousness.get('phi', 0):.3f} level={consciousness.get('level', '?')}")
 
         # Consciousness meter (real-time)
         consciousness_data = self.mind.get_consciousness_score(self.mitosis)
