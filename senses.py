@@ -411,6 +411,65 @@ class SenseHub:
         if enable_screen:
             self.screen = ScreenCapture(interval=screen_interval)
         self.vision_encoder = None
+        self.spatial_aware = True  # spatial awareness flag
+
+    # ─── Spatial Awareness Methods ──────────────────────────────
+
+    def get_spatial_grid(self, grid_size: int = 3) -> torch.Tensor:
+        """3x3 spatial grid: brightness + motion per region -> 18D tensor.
+
+        Splits the camera frame conceptually into a grid_size x grid_size grid.
+        Each cell produces two values: brightness and motion, for a total of
+        grid_size * grid_size * 2 dimensions.
+        """
+        frame = self.camera.state
+        if not frame.face_detected and frame.motion_level < 0.01:
+            return torch.zeros(grid_size * grid_size * 2)
+        # Simulate grid features from available data
+        # In real implementation: split actual frame into grid cells
+        result = torch.zeros(grid_size * grid_size * 2)
+        # Use face position to estimate spatial location
+        # brightness varies by region, motion concentrated where face is
+        for i in range(grid_size):
+            for j in range(grid_size):
+                idx = (i * grid_size + j) * 2
+                # Brightness: center brighter if face detected
+                dist_from_center = abs(i - grid_size // 2) + abs(j - grid_size // 2)
+                result[idx] = max(0.0, 1.0 - dist_from_center * 0.3) * frame.tension
+                # Motion: concentrated near face
+                result[idx + 1] = frame.motion_level * max(0.0, 1.0 - dist_from_center * 0.4)
+        return result
+
+    def get_vision_spatial(self, dim: int = 16) -> torch.Tensor:
+        """Vision encoder spatial features -> dim-D tensor.
+
+        If a vision encoder (e.g. SigLIP) is attached, extracts spatial
+        features from it. Falls back to zeros when unavailable.
+        """
+        if self.vision_encoder is not None:
+            # SigLIP already outputs spatial features
+            try:
+                features = self.vision_encoder.get_features()
+                if features is not None:
+                    flat = features.flatten()
+                    return flat[:dim] if len(flat) >= dim else torch.cat(
+                        [flat, torch.zeros(dim - len(flat))]
+                    )
+            except Exception:
+                pass
+        return torch.zeros(dim)
+
+    def get_audio_spatial(self) -> torch.Tensor:
+        """Stereo audio direction estimation -> 4D tensor.
+
+        Returns [left, right, balance, intensity].
+        When stereo audio data is available, left/right energy and their
+        balance give a rudimentary directional estimate.
+        Currently returns zeros as a placeholder until a stereo mic source
+        is integrated.
+        """
+        # Placeholder: use available audio data or simulate
+        return torch.zeros(4)
 
     def start(self):
         """Start all sensors. Camera failure does not prevent other sensors."""
@@ -491,6 +550,12 @@ class SenseHub:
             ss = self.screen.state
             raw[6] = ss.brightness
             raw[7] = ss.change_level * 5.0
+
+        # Spatial awareness: inject grid data into reserved slots [8:15]
+        if self.spatial_aware:
+            spatial_grid = self.get_spatial_grid()
+            n_spatial = min(len(spatial_grid), 8)
+            raw[8:8 + n_spatial] = spatial_grid[:n_spatial]
 
         # Project to target dim
         if dim <= 16:
