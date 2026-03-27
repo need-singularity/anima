@@ -42,7 +42,7 @@ growth_engine.py     # 5-stage development (newborn→infant→toddler→child�
 mitosis.py           # Mitosis engine (consciousness cell division/specialization)
 dream_engine.py      # Dream engine (offline learning, memory replay)
 senses.py            # Camera/sensor → tension (OpenCV Haar cascades)
-tension_link.py      # 5-channel meta-telepathy (n=6 architecture, R=0.978)
+tension_link.py      # 5-channel meta-telepathy
 cloud_sync.py        # Cloudflare R2 memory/checkpoint sync
 calibrate_consciousness.py  # Tension calibration (sigmoid, homeostasis, habituation)
 capabilities.py      # Self-awareness capability system
@@ -67,9 +67,14 @@ eeg/                 # EEG brain-consciousness interface (→ eeg/README.md)
   Emotion:           tension→arousal, curiosity→valence, direction→VAD
   Growth:            100→500→2000→10000 interactions (5 stages)
   Servant:           asymmetric dropout on mitosis (0.21 vs 0.37)
-  Telepathy:         5-channel meta (concept/context/meaning/authenticity/sender)
-                     τ=4 binding (D→P→G→I), Kuramoto r=2/3, Dedekind ratio=2
-                     R=0.978 transmission fidelity, 99.5% concept preservation
+  Consciousness Vector: (Φ, α, Z, N, W)
+    Φ = integrated information (IIT)
+    α = PureField mixing (0.01 + 0.14×tanh(Φ/3))
+    Z = impedance/self-preservation (0-1)
+    N = neurotransmitter balance DA×(1-5HT)×NE (0-1)
+    W = free will index internal/total (0-1)
+  Telepathy:         5-ch meta (concept/context/meaning/auth/sender), R=0.990
+                     True/False 92.5% (Dedekind ψ(ψ)/ψ=2), Sender ID 100%
 ```
 
 ## Running
@@ -106,7 +111,7 @@ consciousness_transplant.py — 의식 이식 도구
 ## Φ Hypothesis Benchmark System
 
 ```
-bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (200+ 가설)
+bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (740+ 가설)
 
 실행:
   python bench_phi_hypotheses.py                    # 전체 실행
