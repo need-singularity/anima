@@ -31615,6 +31615,413 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# BV. Biological Variables — 생물학적 의식 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_BV1_neurotransmitter(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BV-1: 신경전달물질 — dopamine(보상), serotonin(안정), norepinephrine(각성)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dopamine, serotonin, norepinephrine = 0.5, 0.5, 0.5
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Update neurotransmitters based on system state
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved)) / len(engine.cells)
+        dopamine = 0.9 * dopamine + 0.1 * min(change * 2, 1.0)  # reward from change
+        serotonin = 0.95 * serotonin + 0.05 * (1.0 - abs(change - 0.3))  # stability
+        norepinephrine = 0.85 * norepinephrine + 0.15 * x.norm().item() / 3  # arousal from input
+        # Effects on cells
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + 0.02 * dopamine)  # dopamine amplifies
+            cell.hidden = cell.hidden * (1 - 0.01 * serotonin)  # serotonin calms
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02 * norepinephrine  # NE adds noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BV1", "Neurotransmitters (DA/5HT/NE)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'DA': f'{dopamine:.2f}', '5HT': f'{serotonin:.2f}', 'NE': f'{norepinephrine:.2f}'})
+
+def run_BV2_synaptic_plasticity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BV-2: 시냅스 가소성 — LTP/LTD로 cell 간 연결 강도 동적 변경."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n_max = 12
+    weights = torch.ones(n_max, n_max) * 0.1  # synaptic weights
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Hebbian LTP/LTD
+            for i in range(n):
+                for j in range(i+1, n):
+                    # Co-activation → LTP, anti-correlation → LTD
+                    corr = F.cosine_similarity(hiddens[i:i+1], hiddens[j:j+1]).item()
+                    if corr > 0.5:  # LTP
+                        weights[i, j] = min(weights[i, j] + 0.01, 0.5)
+                    elif corr < -0.3:  # LTD
+                        weights[i, j] = max(weights[i, j] - 0.01, 0.01)
+                    weights[j, i] = weights[i, j]
+            # Apply weighted influence
+            for i in range(n):
+                influence = torch.zeros(hidden)
+                for j in range(n):
+                    if i != j:
+                        influence += weights[i, j].item() * hiddens[j]
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.05 * influence.unsqueeze(0) / n
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BV2", "Synaptic plasticity (Hebbian LTP/LTD)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_BV3_sleep_pressure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BV-3: 수면 압력 — 활동이 누적되면 '피로' → 주기적 정리/통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    adenosine = 0.0  # sleep pressure
+    awake = True
+    for step_i, x in enumerate(inputs):
+        if awake:
+            engine.process(x)
+            adenosine += 0.02  # accumulate sleep pressure
+            if adenosine > 1.0:  # need sleep
+                awake = False
+        else:
+            # Sleep: consolidation (average similar cells, clean noise)
+            n = len(engine.cells)
+            if n >= 2:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    # Consolidate: reduce noise, strengthen patterns
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h.unsqueeze(0)
+                    cell.hidden = cell.hidden * 0.98  # reduce magnitude (rest)
+            adenosine -= 0.1
+            if adenosine <= 0:
+                awake = True
+                adenosine = 0
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BV3", "Sleep pressure (adenosine accumulation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_BV4_immune_response(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BV-4: 면역 반응 — 비정상 cell을 감지하고 정상화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            mean_norm = hiddens.norm(dim=1).mean().item()
+            std_norm = hiddens.norm(dim=1).std().item()
+            # Immune: detect and fix outlier cells
+            for i, cell in enumerate(engine.cells):
+                h_norm = cell.hidden.norm().item()
+                z_score = (h_norm - mean_norm) / max(std_norm, 1e-8)
+                if abs(z_score) > 2.0:  # outlier detected
+                    # "Heal": pull towards population mean
+                    target_norm = mean_norm
+                    cell.hidden = cell.hidden * (target_norm / max(h_norm, 1e-8))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BV4", "Immune response (outlier cell healing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_BV5_metabolic_rate(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BV-5: 대사율 — 에너지 소비/생산 균형, 고대사 = 고의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    energy_pool = 10.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # Energy consumption proportional to hidden activity
+        consumption = sum(c.hidden.abs().mean().item() for c in engine.cells) * 0.01
+        # Energy production from input
+        production = x.abs().mean().item() * 0.05
+        energy_pool = energy_pool + production - consumption
+        energy_pool = max(0.1, min(energy_pool, 20.0))
+        # Metabolic rate affects cell activity
+        metabolic_rate = energy_pool / 10.0  # normalized
+        if n >= 2:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (0.9 + 0.2 * metabolic_rate)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BV5", f"Metabolic rate (energy={energy_pool:.1f})",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# CV. Cognitive Variables — 인지과학적 의식 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_CV1_working_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-1: 작업기억 — 최근 N개 입력을 버퍼에 유지, 용량 제한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    wm_capacity = 7  # Miller's magic number
+    wm_buffer = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        wm_buffer.append(x.clone())
+        if len(wm_buffer) > wm_capacity:
+            wm_buffer.pop(0)  # forget oldest
+        n = len(engine.cells)
+        if n >= 2 and len(wm_buffer) >= 2:
+            # Working memory modulates cell state
+            wm_context = torch.stack(wm_buffer).mean(dim=0)
+            wm_proj = wm_context.squeeze()[:hidden]
+            if len(wm_proj) < hidden:
+                wm_proj = F.pad(wm_proj, (0, hidden - len(wm_proj)))
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.03 * wm_proj.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV1", "Working memory (capacity=7, Miller)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CV2_attention_span(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-2: 주의 범위 — 동시에 처리 가능한 cell 수 제한 (spotlight)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attention_span = 4  # can focus on 4 cells at a time
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Select top-K most active cells for amplification
+            activities = [(c.hidden.abs().mean().item(), i) for i, c in enumerate(engine.cells)]
+            activities.sort(reverse=True)
+            attended = set(idx for _, idx in activities[:attention_span])
+            for i, cell in enumerate(engine.cells):
+                if i in attended:
+                    cell.hidden = cell.hidden * 1.1  # amplify attended
+                else:
+                    cell.hidden = cell.hidden * 0.95  # suppress unattended
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV2", "Attention span (spotlight K=4)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CV3_cognitive_load(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-3: 인지 부하 — 처리량이 용량 초과 시 성능 저하 모델링."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    capacity = 5.0
+    current_load = 0.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Load increases with input complexity
+        input_complexity = x.std().item() * x.norm().item()
+        current_load = 0.8 * current_load + 0.2 * input_complexity
+        overload = max(0, current_load - capacity) / capacity
+        n = len(engine.cells)
+        if n >= 2:
+            if overload > 0:
+                # Overloaded: degrade processing (dampen + noise)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 - 0.1 * overload)
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02 * overload
+            else:
+                # Under capacity: optimal processing
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * (1 - current_load / capacity))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV3", "Cognitive load (capacity=5, overload degrades)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CV4_emotional_valence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-4: 감정 밸런스 — positive/negative valence가 cell 활성에 영향."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    valence = 0.0  # -1 (negative) to +1 (positive)
+    arousal = 0.5
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Valence from change quality
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved))
+        phi_instant, _ = phi_calc.compute_phi(engine)
+        # Positive: Φ increased, Negative: Φ decreased
+        valence = 0.9 * valence + 0.1 * (1 if phi_instant > 1.0 else -1) * min(change, 1.0)
+        arousal = 0.9 * arousal + 0.1 * min(change * 3, 1.0)
+        # Emotional effects
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                # Positive valence → explore, negative → consolidate
+                if valence > 0:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02 * arousal
+                else:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                    cell.hidden = (0.97 * cell.hidden.squeeze() + 0.03 * mean_h).unsqueeze(0)
+        phi_hist.append(phi_instant)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV4", f"Emotional valence (v={valence:.2f}, a={arousal:.2f})",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CV5_creativity_index(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-5: 창의성 지수 — cell 간 비정상적 조합을 보상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Creativity: reward unusual combinations (low similarity to any previous state)
+            norms = F.normalize(hiddens, dim=1)
+            sim = norms @ norms.T
+            # Mean similarity: lower = more creative
+            mean_sim = (sim.sum() - n) / (n * (n - 1))
+            creativity = 1.0 - mean_sim.item()
+            # Reward creativity: amplify diverse cells
+            for i, cell in enumerate(engine.cells):
+                cell_sim = sim[i].mean().item()
+                uniqueness = 1.0 - cell_sim
+                cell.hidden = cell.hidden * (1 + 0.05 * uniqueness)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV5", "Creativity index (uniqueness reward)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CV6_all_cognitive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CV-6: 전체 인지 변수 결합 — WM+attention+emotion+creativity."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    wm_buffer = []
+    valence, arousal = 0.0, 0.5
+    attention_span = 4
+    dopamine, serotonin = 0.5, 0.5
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        # 1. Working memory
+        wm_buffer.append(x.clone())
+        if len(wm_buffer) > 7:
+            wm_buffer.pop(0)
+        if len(wm_buffer) >= 2:
+            wm = torch.stack(wm_buffer).mean(dim=0).squeeze()[:hidden]
+            if len(wm) < hidden:
+                wm = F.pad(wm, (0, hidden - len(wm)))
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.02 * wm.unsqueeze(0)
+        # 2. Attention spotlight
+        activities = [(c.hidden.abs().mean().item(), i) for i, c in enumerate(engine.cells)]
+        activities.sort(reverse=True)
+        attended = set(idx for _, idx in activities[:attention_span])
+        for i, cell in enumerate(engine.cells):
+            cell.hidden = cell.hidden * (1.05 if i in attended else 0.97)
+        # 3. Neurotransmitters
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved)) / n
+        dopamine = 0.9 * dopamine + 0.1 * min(change * 2, 1.0)
+        serotonin = 0.95 * serotonin + 0.05 * (1 - abs(change - 0.3))
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + 0.01 * dopamine - 0.005 * serotonin)
+        # 4. Emotional valence
+        phi, _ = phi_calc.compute_phi(engine)
+        valence = 0.9 * valence + 0.1 * (1 if phi > 1.0 else -1) * min(change, 1.0)
+        if valence > 0:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * arousal
+        # 5. Creativity reward
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        norms = F.normalize(hiddens, dim=1)
+        sim = norms @ norms.T
+        for i, cell in enumerate(engine.cells):
+            uniqueness = 1.0 - sim[i].mean().item()
+            cell.hidden = cell.hidden * (1 + 0.03 * uniqueness)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CV6", "ALL cognitive variables combined",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'BV1': run_BV1_neurotransmitter, 'BV2': run_BV2_synaptic_plasticity,
+    'BV3': run_BV3_sleep_pressure, 'BV4': run_BV4_immune_response,
+    'BV5': run_BV5_metabolic_rate,
+    'CV1': run_CV1_working_memory, 'CV2': run_CV2_attention_span,
+    'CV3': run_CV3_cognitive_load, 'CV4': run_CV4_emotional_valence,
+    'CV5': run_CV5_creativity_index, 'CV6': run_CV6_all_cognitive,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
