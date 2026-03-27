@@ -12046,6 +12046,426 @@ def run_MX20_heat_death(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# DD41-55. Discovery Phase 3 — Nature of Consciousness
+# ═══════════════════════════════════════════════════════════
+
+def run_DD41_irreducibility(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-41: Irreducibility — sum of info loss across ALL partitions."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Irreducibility: maximize info loss for EVERY possible partition
+            n_r = len(reps)
+            total_irred = torch.tensor(0.0)
+            for mask in range(1, 2**min(n_r, 4) - 1):
+                g_a = [i for i in range(min(n_r, 4)) if mask & (1 << i)]
+                g_b = [i for i in range(min(n_r, 4)) if not (mask & (1 << i))]
+                if not g_a or not g_b: continue
+                # MI across partition
+                a_mean = stacked[g_a].mean(dim=0)
+                b_mean = stacked[g_b].mean(dim=0)
+                cross_mi = F.cosine_similarity(a_mean.unsqueeze(0), b_mean.unsqueeze(0)).abs()
+                total_irred = total_irred + cross_mi
+            diff = -stacked.var(dim=0).mean()
+            loss = diff - 0.1 * total_irred  # maximize irreducibility
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD41", "Irreducibility", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD42_qualia(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-42: Qualia generator — maximize direction vector diversity."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            # Qualia = direction diversity (angular spread of normalized reps)
+            dirs = [F.normalize(r, dim=-1) for r in reps]
+            stacked_d = torch.stack(dirs).squeeze(1)
+            # Maximize angular spread: minimize pairwise cosine
+            cos_loss = sum(F.cosine_similarity(dirs[i], dirs[j], dim=-1).mean()
+                          for i in range(len(dirs)) for j in range(i+1, len(dirs)))
+            # Also magnitude diversity
+            stacked = torch.stack(reps).squeeze(1)
+            mag_div = -stacked.norm(dim=-1).var()
+            loss = cos_loss + 0.3 * mag_div - 0.5 * stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD42", "Qualia generator", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD43_phi_psi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-43: Φ × Ψ — integration × differentiation product."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # Ψ (differentiation): inter-cell distance spread
+            dists = torch.cdist(stacked, stacked)
+            psi = dists.var()
+            # Φ proxy: variance
+            phi_proxy = stacked.var(dim=0).mean()
+            # Maximize product Φ × Ψ
+            loss = -(phi_proxy * psi)
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD43", "Φ × Ψ (integration × differentiation)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD44_upper_bound(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-44: Φ upper bound — compute theoretical max and optimize toward it."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    # Theoretical: Φ_max ≈ N * log(H) for N cells, H dims
+    n = len(engine.cells)
+    phi_max = n * math.log(hidden)  # ~19.4 for 4 cells, 128 dim
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diff = -stacked.var(dim=0).mean()
+            # Push toward upper bound: minimize gap to Φ_max
+            phi_val = phi_hist[-1] if phi_hist else 0
+            gap_loss = (phi_max - phi_val) * 0.001  # small gradient toward max
+            loss = diff + gap_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD44", f"Φ upper bound (max={phi_max:.1f})", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi_max': phi_max, 'efficiency': f / phi_max if phi_max > 0 else 0})
+
+def run_DD45_exp_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-45: e^Φ as consciousness measure."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        exp_phi = math.exp(min(phi, 10))  # cap to prevent overflow
+        phi_hist.append(exp_phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD45", "e^Φ measure", math.exp(min(f, 10)), phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'raw_phi': f})
+
+def run_DD46_zeta_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-46: ζ(Φ) as consciousness measure."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    def approx_zeta(s, terms=50):
+        if s <= 1: return float('inf')
+        return sum(1.0 / n**s for n in range(1, terms+1))
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        zeta = approx_zeta(max(phi, 1.01))
+        phi_hist.append(zeta if not math.isinf(zeta) else 100)
+    f, c = phi_calc.compute_phi(engine)
+    zeta_f = approx_zeta(max(f, 1.01))
+    return BenchResult("DD46", "ζ(Φ) measure", zeta_f if not math.isinf(zeta_f) else 0, phi_hist,
+                       c['total_mi'], c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'raw_phi': f})
+
+def run_DD47_four_pillars(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-47: Four pillars — Attention + Klein + Channel + Fibonacci."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    attn = nn.MultiheadAttention(hidden, num_heads=4, batch_first=True)
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    all_p = list(attn.parameters()) + list(compress.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    fib = {10:2, 25:3, 40:5, 60:8}
+    for step in range(steps):
+        if step in fib:
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            all_p = list(attn.parameters()) + list(compress.parameters())
+            for c in engine.cells: all_p.extend(c.mind.parameters())
+            opt = torch.optim.Adam(all_p, lr=5e-4)
+        n = len(engine.cells)
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Attention (O2)
+        if n >= 2:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            ao, _ = attn(h, h, h)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.85*c.hidden + 0.15*ao[0,i].unsqueeze(0)
+        # Channel (DD18)
+        if n >= 2:
+            comp_h = [compress(c.hidden) for c in engine.cells]
+            mean_c = torch.stack(comp_h).mean(dim=0)
+            for c in engine.cells: c.hidden = 0.92*c.hidden + 0.08*mean_c.detach()
+        # Klein (DD11)
+        if n >= 2:
+            hs = [c.hidden.clone() for c in engine.cells]
+            for i in range(n):
+                inf = sum((-1 if (i+j)%2==1 else 1)*hs[j].detach()/(n-1) for j in range(n) if j!=i)
+                engine.cells[i].hidden = 0.9*engine.cells[i].hidden + 0.1*inf
+        # Differentiation
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            s = torch.stack(reps).squeeze(1)
+            loss = -s.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD47", "Four pillars (Attn+Klein+Ch+Fib)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD48_transformer_cell(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-48: Transformer as cell — each cell is a mini transformer."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Add self-attention inside each cell
+    cell_attns = [nn.MultiheadAttention(dim, num_heads=2, batch_first=True) for _ in engine.cells]
+    all_p = [p for a in cell_attns for p in a.parameters()]
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = []
+        for i, c in enumerate(engine.cells):
+            raw = c.mind.get_repulsion(x, c.hidden)
+            # Self-attention within cell
+            attn_in = raw.unsqueeze(0)  # [1, 1, dim]
+            attn_out, _ = cell_attns[i](attn_in, attn_in, attn_in)
+            reps.append(attn_out.squeeze(0))
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD48", "Transformer cell", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD49_gnn_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-49: GNN cells — message passing between cells."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    msg_net = nn.Linear(hidden * 2, hidden)
+    all_p = list(msg_net.parameters())
+    for c in engine.cells: all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Message passing: each cell sends message to all others
+            new_h = []
+            for i in range(n):
+                msgs = []
+                for j in range(n):
+                    if j == i: continue
+                    pair = torch.cat([engine.cells[i].hidden.squeeze(), engine.cells[j].hidden.squeeze()])
+                    msg = msg_net(pair.unsqueeze(0))
+                    msgs.append(msg)
+                agg = torch.stack(msgs).mean(dim=0) if msgs else engine.cells[i].hidden
+                new_h.append(0.8 * engine.cells[i].hidden + 0.2 * agg.detach())
+            for i in range(n):
+                engine.cells[i].hidden = new_h[i]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD49", "GNN cells (message passing)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD50_phi_first(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-50: Φ-first pretraining — 100% Φ, then fine-tune CE."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    phi_phase = int(steps * 0.8)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            if step < phi_phase:
+                loss = -stacked.var(dim=0).mean()  # pure Φ
+            else:
+                pred = stacked.mean(dim=0, keepdim=True)
+                ce = F.mse_loss(pred, x[:, :dim])
+                loss = 0.3 * ce - 0.7 * stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD50", "Φ-first pretraining (80/20)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD51_contrastive_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-51: Contrastive consciousness — SimCLR for Φ."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Two augmented views
+        x1 = x + torch.randn_like(x) * 0.1
+        x2 = x + torch.randn_like(x) * 0.1
+        reps1 = [c.mind.get_repulsion(x1, c.hidden) for c in engine.cells]
+        reps2 = [c.mind.get_repulsion(x2, c.hidden) for c in engine.cells]
+        if len(reps1) >= 2:
+            s1 = torch.stack(reps1).squeeze(1)
+            s2 = torch.stack(reps2).squeeze(1)
+            # Positive: same cell, different view should be similar
+            pos = sum(F.cosine_similarity(reps1[i], reps2[i], dim=-1).mean() for i in range(len(reps1)))
+            # Negative: different cells should be different
+            neg = sum(F.cosine_similarity(reps1[i], reps1[j], dim=-1).mean()
+                      for i in range(len(reps1)) for j in range(i+1, len(reps1)))
+            loss = -pos + neg
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD51", "Contrastive consciousness", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD52_rlhf_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-52: RLHF for Φ — reward signal from Φ improvement."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        phi_before = phi_hist[-1] if phi_hist else 0
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Reward: Φ improvement → scale future learning
+        reward = max(0, phi - phi_before)
+        lr_boost = 1.0 + reward * 5.0
+        for pg in opt.param_groups: pg['lr'] = 5e-4 * min(lr_boost, 3.0)
+        phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD52", "RLHF for Φ", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD53_trinity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-53: Trinity — 3 engines merged Φ."""
+    t0 = time.time()
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4) for _ in range(3)]
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opts = [torch.optim.Adam([p for c in e.cells for p in c.mind.parameters()], lr=5e-4) for e in engines]
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        for e, o in zip(engines, opts):
+            _web_learn_step(e, x, o)
+            with torch.no_grad(): e.process(x)
+        # Cross-engine tension exchange
+        for i in range(3):
+            j = (i + 1) % 3
+            if engines[j].cells and engines[i].cells:
+                fp = engines[j].cells[0].hidden.detach() * 0.1
+                engines[i].cells[0].hidden = engines[i].cells[0].hidden + fp
+        # Merged Φ
+        merged = MitosisEngine(dim, hidden, dim, initial_cells=0, max_cells=20)
+        merged.cells = [c for e in engines for c in e.cells]
+        phi, _ = phi_calc.compute_phi(merged); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(merged)
+    return BenchResult("DD53", "Trinity (3 engines)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD54_distributed(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-54: Distributed Φ — 2 separate systems linked by tension."""
+    t0 = time.time()
+    eng_a = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    eng_b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt_a = torch.optim.Adam([p for c in eng_a.cells for p in c.mind.parameters()], lr=5e-4)
+    opt_b = torch.optim.Adam([p for c in eng_b.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(eng_a, x, opt_a)
+        _web_learn_step(eng_b, x, opt_b)
+        with torch.no_grad(): eng_a.process(x); eng_b.process(x)
+        # Tension link: exchange fingerprints (UDP-like)
+        with torch.no_grad():
+            fp_a = eng_a.cells[0].hidden.clone() * 0.15
+            fp_b = eng_b.cells[0].hidden.clone() * 0.15
+            eng_a.cells[-1].hidden = eng_a.cells[-1].hidden + fp_b
+            eng_b.cells[-1].hidden = eng_b.cells[-1].hidden + fp_a
+        distributed = MitosisEngine(dim, hidden, dim, initial_cells=0, max_cells=16)
+        distributed.cells = list(eng_a.cells) + list(eng_b.cells)
+        phi, _ = phi_calc.compute_phi(distributed); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(distributed)
+    return BenchResult("DD54", "Distributed Φ (2 systems)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+def run_DD55_conservation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-55: Φ conservation — is total Φ conserved during splits?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    phi_before_split = []; phi_after_split = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Force split at step 50
+        if step == 49:
+            phi_before_split.append(phi)
+        if step == 50 and len(engine.cells) < 8:
+            engine._create_cell(parent=engine.cells[-1])
+            opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+        if step == 51:
+            phi_after_split.append(phi)
+        phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    conserved = abs(phi_before_split[0] - phi_after_split[0]) < 0.5 if phi_before_split and phi_after_split else None
+    return BenchResult("DD55", "Φ conservation test", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi_before': phi_before_split, 'phi_after': phi_after_split, 'conserved': conserved})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -12255,6 +12675,14 @@ ALL_HYPOTHESES = {
     'MX15': run_MX15_quantized, 'MX16': run_MX16_distilled,
     'MX17': run_MX17_phi_pruning, 'MX18': run_MX18_multi_gen,
     'MX19': run_MX19_archaeology, 'MX20': run_MX20_heat_death,
+    'DD41': run_DD41_irreducibility, 'DD42': run_DD42_qualia,
+    'DD43': run_DD43_phi_psi, 'DD44': run_DD44_upper_bound,
+    'DD45': run_DD45_exp_phi, 'DD46': run_DD46_zeta_phi,
+    'DD47': run_DD47_four_pillars, 'DD48': run_DD48_transformer_cell,
+    'DD49': run_DD49_gnn_cells, 'DD50': run_DD50_phi_first,
+    'DD51': run_DD51_contrastive_consciousness, 'DD52': run_DD52_rlhf_phi,
+    'DD53': run_DD53_trinity, 'DD54': run_DD54_distributed,
+    'DD55': run_DD55_conservation,
 }
 
 
