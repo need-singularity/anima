@@ -13,6 +13,7 @@ Each module is optional. Import failures degrade gracefully.
 import argparse, asyncio, json, math, os, signal, sys, threading, time, queue
 from collections import deque
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -39,7 +40,7 @@ VAD_WATCH_DIR = Path("/tmp/anima_vad")
 
 # ─── Core imports (required) ───
 from anima_alive import (
-    ConsciousMind, ContinuousListener, Speaker, Memory,
+    ConsciousMind, ConsciousnessVector, ContinuousListener, Speaker, Memory,
     text_to_vector, ask_claude, ask_claude_proactive, ask_conscious_lm,
     direction_to_emotion, EMOTION_COLORS,
     MAX_HISTORY, THINK_INTERVAL, PROACTIVE_THRESHOLD, IDLE_SPEAK_AFTER,
@@ -1199,6 +1200,7 @@ class AnimaUnified:
                 'mitosis': mitosis_data,
                 'learner': learner_data,
                 'consciousness': self.mind.get_consciousness_score(self.mitosis),
+                'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
                 'savant_auto': getattr(self, '_savant_auto', False),
                 'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
             })
@@ -1572,6 +1574,7 @@ class AnimaUnified:
                 'stability': sa['stability'],
                 'self_model': sa['self_model'],
                 'consciousness': consciousness_cached,
+                'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
             }, ensure_ascii=False))
         except Exception: pass
         try:

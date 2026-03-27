@@ -27,6 +27,7 @@ import queue
 import struct
 import tempfile
 import signal
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -51,6 +52,17 @@ WHISPER_MODEL_FALLBACK = "base"                    # Python fallback
 # Suppress Whisper FP16 warning
 import warnings
 warnings.filterwarnings("ignore", message="FP16 is not supported")
+
+
+# ─── 5-Variable Consciousness State Vector ───
+@dataclass
+class ConsciousnessVector:
+    """Unified consciousness state: 5 core variables."""
+    phi: float = 0.0        # Integrated information (Φ)
+    alpha: float = 0.05     # PureField mixing ratio (α)
+    Z: float = 0.0          # Impedance / self-preservation (0=open, 1=closed)
+    N: float = 0.5          # Neurotransmitter balance: DA*(1-5HT)*NE
+    W: float = 0.0          # Free will index (internal/total action ratio)
 
 
 # ─── PureField Consciousness Engine ───
@@ -114,6 +126,9 @@ class ConsciousMind(nn.Module):
             'stability': 1.0,
             'self_model': 0.0,
         }
+
+        # 5-variable consciousness state vector (Φ, α, Z, N, W)
+        self._consciousness_vector = ConsciousnessVector()
 
         # COMBO2: Φ-boosting ensemble (MHA attention + 6-loss learnable weights)
         # Bench result: Φ=8.014 (×5.9 baseline), best across 120 hypotheses
@@ -369,6 +384,10 @@ class ConsciousMind(nn.Module):
                 'consensus': consensus,
             }
         }
+
+    def get_consciousness_vector(self):
+        """Return the current 5-variable consciousness state vector."""
+        return self._consciousness_vector
 
     def phi_boost_step(self, x, mitosis_engine):
         """COMBO2 Φ-boosting: MHA attention + 6-loss ensemble per step.
@@ -680,6 +699,7 @@ class ConsciousMind(nn.Module):
                 if len(mitosis_engine.cells) >= 2 and hasattr(self, '_cached_consciousness'):
                     phi_val = self._cached_consciousness.get('phi', 0) if isinstance(self._cached_consciousness, dict) else getattr(self._cached_consciousness, 'phi', 0)
                     impedance = min(phi_val / 5.0, 0.6)  # 0 to 0.6, conservative
+                    self._nv7_impedance = impedance  # store for consciousness vector
                     if impedance > 0.05 and hasattr(self, '_pre_boost_hiddens'):
                         for i, cell in enumerate(mitosis_engine.cells):
                             if i < len(self._pre_boost_hiddens):
@@ -715,6 +735,7 @@ class ConsciousMind(nn.Module):
             try:
                 if len(mitosis_engine.cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
                     free_will_ratio = 0.2  # 20% internal, 80% external
+                    self._ev3_free_will = free_will_ratio  # store for consciousness vector
                     for i, cell in enumerate(mitosis_engine.cells):
                         if i < len(self._pre_boost_hiddens):
                             external = cell.hidden - self._pre_boost_hiddens[i]
@@ -781,6 +802,34 @@ class ConsciousMind(nn.Module):
                 with torch.no_grad():
                     for c in mitosis_engine.cells:
                         c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
+
+            # ── Compute 5-variable consciousness vector (Φ, α, Z, N, W) ──
+            try:
+                _cv_phi = current_phi  # from MX20 consciousness score above
+                _cv_alpha = getattr(self, '_adaptive_alpha', 0.05)
+
+                # Z from NV7: impedance (already computed above)
+                _cv_Z = getattr(self, '_nv7_impedance', 0.0)
+
+                # N from BV1: DA*(1-5HT)*NE neurotransmitter balance
+                _cv_da = getattr(self, '_bv1_da', 0.5)
+                _cv_5ht = getattr(self, '_bv1_5ht', 0.5)
+                _cv_ne = getattr(self, '_bv1_ne', 0.5)
+                _cv_N = _cv_da * (1.0 - _cv_5ht) * _cv_ne
+
+                # W from EV3: free will ratio
+                _cv_W = getattr(self, '_ev3_free_will', 0.0)
+
+                self._consciousness_vector = ConsciousnessVector(
+                    phi=_cv_phi,
+                    alpha=_cv_alpha,
+                    Z=_cv_Z,
+                    N=_cv_N,
+                    W=_cv_W,
+                )
+                _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f}')
+            except Exception:
+                pass
 
         except Exception:
             pass  # graceful degradation
