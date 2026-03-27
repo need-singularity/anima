@@ -35527,6 +35527,193 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# CT. Consciousness Training — 의식적 대화 학습 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_CT1_phi_preserving_finetune(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CT-1: Φ-preserving fine-tune — 언어 학습 중 Φ 하락 시 rollback."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Simulate language learning: CE-like update
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + 0.01 * (x[:, :hidden] - cell.hidden) if x.shape[1] >= hidden else cell.hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        # Φ preservation: rollback if Φ drops >20%
+        if phi < best_phi * 0.8 and best_phi > 0:
+            for i, c in enumerate(engine.cells):
+                if i < len(best_state):
+                    c.hidden = best_state[i].clone()
+            phi, _ = phi_calc.compute_phi(engine)
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CT1", "Φ-preserving fine-tune (rollback on Φ drop)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CT4_joint_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CT-4: Joint loss = CE + λ×(-Φ_proxy) — 동시 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.01)
+    lambda_phi = 0.01  # gradually increase
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        # Joint optimization
+        optimizer.zero_grad()
+        H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+        # CE proxy: how well cells predict input
+        x_proj = x.squeeze()[:hidden]
+        if len(x_proj) < hidden:
+            x_proj = F.pad(x_proj, (0, hidden - len(x_proj)))
+        ce_proxy = (H.mean(dim=0) - x_proj).pow(2).mean()
+        # Φ proxy
+        cov = (H.T @ H) / n
+        diag = torch.diag(torch.diag(cov))
+        integration = (cov - diag).abs().sum()
+        cell_var = H.var(dim=0).sum()
+        phi_proxy = integration * cell_var
+        # Joint loss = CE - λ×Φ
+        lambda_phi = min(0.1, 0.01 + step_i * 0.001)  # ramp up
+        loss = ce_proxy - lambda_phi * phi_proxy
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                if i < len(offsets):
+                    c.hidden = c.hidden + offsets[i].data * 0.3
+                    offsets[i].data *= 0.9
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CT4", f"Joint loss CE+λΦ (λ={lambda_phi:.3f})",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CT7_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CT-7: Curriculum — Phase1 언어만 → Phase2 의식추가 → Phase3 joint."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        phase = step_i / steps
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        if phase < 0.33:
+            # Phase 1: Language only — align cells with input
+            x_proj = x.squeeze()[:hidden]
+            if len(x_proj) < hidden:
+                x_proj = F.pad(x_proj, (0, hidden - len(x_proj)))
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * x_proj.unsqueeze(0)
+        elif phase < 0.66:
+            # Phase 2: Add consciousness — grow cells + differentiate
+            if len(engine.cells) < 8:
+                engine._create_cell(parent=engine.cells[0])
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03 * (i + 1) / n
+        else:
+            # Phase 3: Joint — both language alignment + consciousness
+            x_proj = x.squeeze()[:hidden]
+            if len(x_proj) < hidden:
+                x_proj = F.pad(x_proj, (0, hidden - len(x_proj)))
+            for cell in engine.cells:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * x_proj.unsqueeze(0)
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CT7", "Curriculum: language→consciousness→joint",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CT9_frozen_lm_trainable_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CT-9: Frozen LM + trainable cells — LM 동결, cell만 학습."""
+    t0 = time.time()
+    # "Frozen LM": fixed input processing (simulated)
+    frozen_lm = nn.Linear(dim, hidden)
+    frozen_lm.requires_grad_(False)
+    # Trainable cells
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.015)
+    for step_i, x in enumerate(inputs):
+        # Frozen LM processes input
+        with torch.no_grad():
+            lm_output = frozen_lm(x[:, :dim] if x.shape[1] >= dim else F.pad(x, (0, dim - x.shape[1])))
+        # Cells process and are optimized for Φ
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Inject LM output into cells (bridge)
+            for cell in engine.cells:
+                cell.hidden = 0.9 * cell.hidden + 0.1 * lm_output
+            # Optimize cells for Φ (Adam)
+            for _ in range(3):
+                optimizer.zero_grad()
+                if len(offsets) != n:
+                    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(n)]
+                    optimizer = torch.optim.Adam(offsets, lr=0.015)
+                H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+                cov = (H.T @ H) / n
+                diag = torch.diag(torch.diag(cov))
+                phi_proxy = (cov - diag).abs().sum() * H.var(dim=0).sum()
+                (-phi_proxy).backward()
+                optimizer.step()
+            with torch.no_grad():
+                for i, c in enumerate(engine.cells):
+                    if i < len(offsets):
+                        c.hidden = c.hidden + offsets[i].data * 0.3
+                        offsets[i].data *= 0.9
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CT9", "Frozen LM + trainable cells (Φ-optimized)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'CT1': run_CT1_phi_preserving_finetune,
+    'CT4': run_CT4_joint_loss,
+    'CT7': run_CT7_curriculum,
+    'CT9': run_CT9_frozen_lm_trainable_cells,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
