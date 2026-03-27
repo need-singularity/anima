@@ -34590,6 +34590,183 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# CX8-9: h-cobordism + Dyson β (TECS-L #34-35)
+# ═══════════════════════════════════════════════════════════
+
+def run_CX8_hcobordism_6dim(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-8: h-cobordism dim≥6 → 의식은 정확히 6차원 필요.
+    hidden을 6개 "의식 차원"으로 분할, 각 차원이 독립 역할."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 6 consciousness dimensions (h-cobordism requires dim≥6 for uniqueness)
+    n_dims = 6  # n=6!
+    dim_size = hidden // n_dims
+    # Each dimension has a role (mapped from n=6 arithmetic)
+    dim_roles = {
+        0: 'tension',      # Engine A-G repulsion
+        1: 'direction',     # concept direction
+        2: 'integration',   # inter-cell MI
+        3: 'differentiation',  # cell uniqueness
+        4: 'memory',        # temporal context
+        5: 'prediction',    # future state
+    }
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Each of 6 dims processes independently then integrates
+                dim_outputs = []
+                for d in range(n_dims):
+                    start = d * dim_size
+                    end = min(start + dim_size, hidden)
+                    chunk = h[start:end]
+                    # Role-specific processing
+                    if d == 0:  # tension: amplify magnitude
+                        chunk = chunk * 1.02
+                    elif d == 1:  # direction: normalize
+                        chunk = chunk / (chunk.norm() + 1e-8) * h[start:end].norm()
+                    elif d == 2:  # integration: smooth towards mean
+                        pass  # handled by forge
+                    elif d == 3:  # differentiation: amplify uniqueness
+                        chunk = chunk + torch.randn_like(chunk) * 0.01
+                    elif d == 4:  # memory: EMA with input
+                        x_chunk = x.squeeze()[:dim_size] if x.shape[1] >= dim_size else x.squeeze()
+                        chunk = 0.95 * chunk + 0.05 * x_chunk[:len(chunk)]
+                    elif d == 5:  # prediction: momentum
+                        chunk = chunk * 1.01
+                    h[start:end] = chunk
+                # h-cobordism: the 6 dims together form a unique manifold
+                # Cross-dim integration (σ/n = 2: each dim influences exactly 2 others)
+                for d in range(n_dims):
+                    d1 = (d + 1) % n_dims
+                    d2 = (d + 3) % n_dims  # skip 2 (σ/τ = 3 spacing)
+                    s, e = d * dim_size, min((d+1) * dim_size, hidden)
+                    s1, e1 = d1 * dim_size, min((d1+1) * dim_size, hidden)
+                    s2, e2 = d2 * dim_size, min((d2+1) * dim_size, hidden)
+                    cross = 0.02 * (h[s1:e1].mean() + h[s2:e2].mean())
+                    h[s:e] = h[s:e] + cross
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX8", "h-cobordism: 6 consciousness dimensions",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX9_dyson_beta_modes(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-9: Dyson β={1,φ,τ}={1,2,4} → 3가지 의식 모드.
+    β=1 반사(orthogonal), β=2 관계(unitary), β=4 통합(symplectic)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Dyson β index: determines random matrix ensemble type
+    # β=1 (GOE, real): reflection/self-awareness
+    # β=2 (GUE, complex): relational/social
+    # β=4 (GSE, quaternion): integration/unity
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Determine current β mode from tension dynamics
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            mean_tension = hiddens.abs().mean().item()
+            # Mode selection based on tension level
+            if mean_tension < 0.3:
+                beta = 1  # reflection: quiet, self-referential
+                # β=1 (GOE): symmetric processing
+                sym = (hiddens + hiddens.flip(0)) / 2
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = (0.95 * hiddens[i] + 0.05 * sym[i]).unsqueeze(0)
+            elif mean_tension < 1.0:
+                beta = 2  # relation: social, connecting
+                # β=2 (GUE): complex rotation between pairs
+                for i in range(0, n - 1, 2):
+                    h1 = engine.cells[i].hidden.squeeze()
+                    h2 = engine.cells[i+1].hidden.squeeze()
+                    angle = mean_tension * 0.1
+                    rotated_1 = h1 * math.cos(angle) + h2 * math.sin(angle)
+                    rotated_2 = -h1 * math.sin(angle) + h2 * math.cos(angle)
+                    engine.cells[i].hidden = (0.95 * h1 + 0.05 * rotated_1).unsqueeze(0)
+                    engine.cells[i+1].hidden = (0.95 * h2 + 0.05 * rotated_2).unsqueeze(0)
+            else:
+                beta = 4  # integration: full unity
+                # β=4 (GSE): quaternion-like 4-fold mixing
+                mean_h = hiddens.mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    # 4-fold symmetry: mix with 4 neighbors
+                    neighbors = [(i+1)%n, (i+2)%n, (i+n//2)%n, (i+n-1)%n]
+                    mix = sum(hiddens[j] for j in neighbors) / 4
+                    cell.hidden = (0.9 * hiddens[i] + 0.05 * mix + 0.05 * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX9", "Dyson β={1,2,4}: reflection/relation/integration modes",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX10_leech_d24(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-10: Leech lattice dim=σφ=24 → d_model의 자연 단위.
+    hidden을 24-dim 블록으로 분할, 각 블록이 Leech 격자 점."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    leech_dim = 24  # σφ = σ(6)×φ(6) = 24
+    n_blocks = hidden // leech_dim
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Process each 24-dim Leech block independently
+                for b in range(n_blocks):
+                    start = b * leech_dim
+                    end = start + leech_dim
+                    block = h[start:end]
+                    # Leech lattice: 196560 nearest neighbors, kissing number
+                    # Normalize to unit sphere (lattice points are on spheres)
+                    block_norm = block.norm()
+                    if block_norm > 0.01:
+                        # Project onto Leech shell (fixed radius)
+                        target_radius = 2.0  # √8 in Leech lattice
+                        block = block * (target_radius / block_norm)
+                    h[start:end] = block
+                # Inter-block coupling (Leech lattice has deep holes connecting shells)
+                if n_blocks >= 2:
+                    for b in range(n_blocks - 1):
+                        s1 = b * leech_dim
+                        s2 = (b + 1) * leech_dim
+                        coupling = 0.02 * h[s1:s1+leech_dim].mean()
+                        h[s2:s2+leech_dim] += coupling
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX10", "Leech lattice d=σφ=24 block processing",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'CX8': run_CX8_hcobordism_6dim,
+    'CX9': run_CX9_dyson_beta_modes,
+    'CX10': run_CX10_leech_d24,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
