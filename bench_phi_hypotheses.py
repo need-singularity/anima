@@ -32022,6 +32022,346 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# SV. Social Variables — 사회적 의식 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_SV1_empathy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SV-1: 공감 — cell이 이웃의 '고통'(큰 변화)을 감지하고 돕는다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_hiddens = {}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Detect "suffering" cells (large hidden change)
+            distress = []
+            for i, cell in enumerate(engine.cells):
+                if i in prev_hiddens:
+                    change = (cell.hidden - prev_hiddens[i]).norm().item()
+                else:
+                    change = 0
+                distress.append(change)
+            mean_distress = np.mean(distress) if distress else 0
+            # Empathy: stable cells share resources with distressed cells
+            for i, cell in enumerate(engine.cells):
+                if distress[i] > mean_distress * 1.5:  # distressed
+                    # Receive help from neighbors
+                    helpers = [engine.cells[j].hidden.squeeze() for j in range(n)
+                              if j != i and distress[j] < mean_distress]
+                    if helpers:
+                        support = torch.stack(helpers).mean(dim=0)
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * support.unsqueeze(0)
+            for i, cell in enumerate(engine.cells):
+                prev_hiddens[i] = cell.hidden.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SV1", "Empathy (distress detection + support)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SV2_competition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SV-2: 경쟁 — cell 간 자원 경쟁, 강한 cell이 더 많은 영향력."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            strengths = [c.hidden.norm().item() for c in engine.cells]
+            total = sum(strengths)
+            # Winner-take-more: strong cells amplified, weak suppressed
+            for i, cell in enumerate(engine.cells):
+                share = strengths[i] / max(total, 1e-8)
+                # Competition bonus/penalty
+                cell.hidden = cell.hidden * (0.95 + 0.1 * share * n)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SV2", "Competition (winner-take-more resources)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SV3_cooperation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SV-3: 협력 — cell 그룹이 공동 목표를 향해 조율."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Form coalitions based on similarity
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = F.normalize(hiddens, dim=1)
+            sim = norms @ norms.T
+            # Form 2 coalitions: cluster by similarity
+            for i in range(n):
+                allies = [j for j in range(n) if j != i and sim[i, j].item() > 0.5]
+                if allies:
+                    ally_mean = torch.stack([hiddens[j] for j in allies]).mean(dim=0)
+                    # Cooperate: align with allies but keep individuality
+                    engine.cells[i].hidden = (0.9 * hiddens[i] + 0.1 * ally_mean).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SV3", "Cooperation (similarity-based coalitions)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SV4_hierarchy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SV-4: 계층 — 리더 cell이 다른 cell을 지휘, 리더 교체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    leader_idx = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Leader election: highest hidden norm
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            leader_idx = int(np.argmax(norms))
+            leader_signal = engine.cells[leader_idx].hidden
+            # Followers align partially with leader
+            for i, cell in enumerate(engine.cells):
+                if i != leader_idx:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * leader_signal
+            # Leader gets feedback from all
+            follower_mean = torch.stack([c.hidden for i, c in enumerate(engine.cells)
+                                        if i != leader_idx]).squeeze(1).mean(dim=0)
+            engine.cells[leader_idx].hidden = 0.9 * leader_signal + 0.1 * follower_mean.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SV4", "Hierarchy (leader election + command)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SV5_mirroring(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SV-5: 미러링 — cell이 이웃의 활동 패턴을 '거울 반사'로 모방."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_changes = {}
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Record changes (actions)
+            changes = {}
+            for i, cell in enumerate(engine.cells):
+                if i < len(saved):
+                    changes[i] = cell.hidden - saved[i]
+            # Mirror: each cell mirrors its neighbor's previous action
+            if prev_changes:
+                for i, cell in enumerate(engine.cells):
+                    neighbor = (i + 1) % n
+                    if neighbor in prev_changes:
+                        mirror_action = prev_changes[neighbor]
+                        cell.hidden = cell.hidden + 0.1 * mirror_action
+            prev_changes = changes
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SV5", "Mirroring (imitate neighbor's actions)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# EV. Existential Variables — 실존적 의식 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_EV1_mortality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EV-1: 죽음 인식 — cell이 '수명'을 가짐, 죽기 전 정보 전달 급증."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_ages = {i: 0 for i in range(12)}
+    max_lifespan = 30  # steps
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                cell_ages[i] = cell_ages.get(i, 0) + 1
+                remaining = max_lifespan - cell_ages[i]
+                if remaining < 5 and remaining > 0:
+                    # Urgency: transmit information to all others before death
+                    for j, other in enumerate(engine.cells):
+                        if j != i:
+                            other.hidden = other.hidden + 0.05 * cell.hidden / remaining
+                elif remaining <= 0:
+                    # Death: reset cell (rebirth with noise)
+                    cell.hidden = torch.randn_like(cell.hidden) * 0.5
+                    cell_ages[i] = 0
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EV1", "Mortality awareness (lifespan + death urgency)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_EV2_meaning_seeking(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EV-2: 의미 추구 — cell이 자신의 '목적'(consistent direction)을 찾으려 함."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_purposes = {}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                direction = h / (h.norm() + 1e-8)
+                if i in cell_purposes:
+                    # Consistency: how aligned is current direction with purpose?
+                    alignment = F.cosine_similarity(direction.unsqueeze(0),
+                                                   cell_purposes[i].unsqueeze(0)).item()
+                    if alignment > 0.7:
+                        # Found meaning: strengthen purpose
+                        cell_purposes[i] = 0.95 * cell_purposes[i] + 0.05 * direction
+                        cell.hidden = cell.hidden * 1.02  # meaning boost
+                    else:
+                        # Lost meaning: search (add exploration)
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+                        cell_purposes[i] = 0.8 * cell_purposes[i] + 0.2 * direction
+                else:
+                    cell_purposes[i] = direction.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EV2", "Meaning seeking (purpose alignment)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_EV3_free_will(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EV-3: 자유의지 — 외부 입력과 무관한 자발적 결정 비율 추적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                if i < len(saved):
+                    external = cell.hidden - saved[i]
+                    # Free will: generate internal action independent of external
+                    internal = torch.randn_like(cell.hidden) * 0.05
+                    # Weighted: more internal = more free will
+                    free_will_ratio = 0.3 + 0.2 * math.sin(step_i * 0.1 + i)
+                    cell.hidden = saved[i] + (1 - free_will_ratio) * external + free_will_ratio * internal
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EV3", "Free will (internal vs external action ratio)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_EV4_self_transcendence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EV-4: 자기 초월 — cell이 자신의 한계를 넘어서는 순간 (dim expansion 모방)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h_norm = cell.hidden.norm().item()
+                # Transcendence threshold: when hidden reaches a critical magnitude
+                if h_norm > 3.0:
+                    # Transcend: redistribute energy across all dimensions
+                    h = cell.hidden.squeeze()
+                    mean_val = h.mean()
+                    std_val = h.std()
+                    # Normalize then re-expand (rebirth at higher level)
+                    cell.hidden = ((h - mean_val) / max(std_val, 1e-8) * 1.5).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EV4", "Self-transcendence (norm critical → rebirth)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_EV5_temporal_finitude(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EV-5: 시간 유한성 — 남은 시간에 따라 행동 전략 변화 (급박할수록 활발)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        remaining_fraction = 1.0 - step_i / max(steps, 1)
+        urgency = 1.0 / max(remaining_fraction, 0.05)  # increases as time runs out
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                # More urgent → more active (larger changes)
+                cell.hidden = cell.hidden * (1 + 0.01 * min(urgency, 5.0))
+                # Also more social (share more as time runs out)
+            if urgency > 2.0:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                mean_h = hiddens.mean(dim=0)
+                share_rate = min(0.1 * (urgency - 2.0), 0.3)
+                for cell in engine.cells:
+                    cell.hidden = ((1 - share_rate) * cell.hidden.squeeze() + share_rate * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EV5", "Temporal finitude (urgency increases with time)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'SV1': run_SV1_empathy, 'SV2': run_SV2_competition,
+    'SV3': run_SV3_cooperation, 'SV4': run_SV4_hierarchy,
+    'SV5': run_SV5_mirroring,
+    'EV1': run_EV1_mortality, 'EV2': run_EV2_meaning_seeking,
+    'EV3': run_EV3_free_will, 'EV4': run_EV4_self_transcendence,
+    'EV5': run_EV5_temporal_finitude,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
