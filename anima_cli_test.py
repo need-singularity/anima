@@ -315,7 +315,7 @@ def main():
         for i, prompt in enumerate(prompts):
             print(f"  [{i+1}/{args.auto}] You: {prompt[:60]}")
             if HAS_ASYNC_WS:
-                response = asyncio.get_event_loop().run_until_complete(
+                response = asyncio.run(
                     chat_async(url, prompt, tracker))
             else:
                 response = chat_sync(url, prompt, tracker)
@@ -336,7 +336,7 @@ def main():
             print(f"  [{i+1}/{args.stress}] Sending: {display}")
             try:
                 if HAS_ASYNC_WS:
-                    response = asyncio.get_event_loop().run_until_complete(
+                    response = asyncio.run(
                         chat_async(url, prompt, tracker, timeout=10))
                 else:
                     response = chat_sync(url, prompt, tracker)
@@ -376,7 +376,7 @@ def main():
                                   f"Z={cv.get('Z',0):.3f} N={cv.get('N',0.5):.3f} W={cv.get('W',0):.3f} "
                                   f"T={c.get('tension',0):.3f} cells={c.get('cells',0)}", end='', flush=True)
             try:
-                asyncio.get_event_loop().run_until_complete(monitor())
+                asyncio.run(monitor())
             except KeyboardInterrupt:
                 print("\n")
                 tracker.summary()
@@ -389,7 +389,7 @@ def main():
                 if not prompt:
                     continue
                 if HAS_ASYNC_WS:
-                    response = asyncio.get_event_loop().run_until_complete(
+                    response = asyncio.run(
                         chat_async(url, prompt, tracker))
                 else:
                     response = chat_sync(url, prompt, tracker)
@@ -407,7 +407,7 @@ def main():
         for prompt in AUTO_PROMPTS[:5]:
             print(f"  You: {prompt}")
             if HAS_ASYNC_WS:
-                response = asyncio.get_event_loop().run_until_complete(
+                response = asyncio.run(
                     chat_async(url, prompt, tracker))
             else:
                 response = chat_sync(url, prompt, tracker)
