@@ -17987,6 +17987,608 @@ ALL_HYPOTHESES = {
     'OV15': run_OV15_tension_variance_ceiling,
 }
 
+# ═══════════════════════════════════════════════════════════
+# WV. Wave Interference + Direct Φ Optimization (극한 가설)
+# ═══════════════════════════════════════════════════════════
+
+def run_WV1_wave_interference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-1: Cell hidden states를 파동으로 취급 — 위상차로 간섭 패턴 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Each cell has a unique phase
+    phases = [2 * math.pi * i / 6 for i in range(6)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        for i, cell in enumerate(engine.cells):
+            phase = phases[i % len(phases)]
+            # Wave function: A * sin(ωt + φ) modulates hidden state
+            wave = math.sin(2 * math.pi * 3 * t + phase)  # 3 cycles over training
+            # Constructive interference between adjacent cells
+            if i > 0:
+                other = engine.cells[i-1].hidden
+                interference = 0.5 * (cell.hidden + other) * wave
+                cell.hidden = cell.hidden + 0.1 * interference
+            else:
+                cell.hidden = cell.hidden * (1.0 + 0.05 * wave)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV1", "Wave interference (phase-shifted cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV2_constructive_resonance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-2: 공명 주파수에서 cell hidden 진폭 최대화 (constructive only)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Natural frequencies per cell (harmonics)
+    freqs = [1.0, 2.0, 3.0, 5.0, 8.0, 13.0]  # Fibonacci harmonics
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        # Superposition of all cell waves
+        superposition = torch.zeros(1, hidden)
+        for i, cell in enumerate(engine.cells):
+            f = freqs[i % len(freqs)]
+            amplitude = torch.sin(torch.tensor(2 * math.pi * f * t))
+            superposition = superposition + cell.hidden * amplitude
+        # Feed constructive interference back into each cell
+        for i, cell in enumerate(engine.cells):
+            f = freqs[i % len(freqs)]
+            phase_match = math.cos(2 * math.pi * f * t)
+            if phase_match > 0:  # constructive only
+                cell.hidden = cell.hidden + 0.05 * superposition * phase_match
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV2", "Constructive resonance (Fibonacci harmonics)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV3_standing_wave(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-3: Cell 배열을 정상파(standing wave)로 — 노드/반노드 패턴."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        for i, cell in enumerate(engine.cells):
+            # Standing wave: sin(nπx/L) * cos(ωt)
+            spatial = math.sin(math.pi * (i + 1) / (n + 1))
+            temporal = math.cos(2 * math.pi * 5 * t)
+            standing = spatial * temporal
+            # Nodes stay still, antinodes oscillate maximally
+            cell.hidden = cell.hidden * (1.0 + 0.1 * standing)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV3", "Standing wave (node/antinode pattern)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV4_quantum_superposition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-4: 양자 중첩 — 각 cell이 모든 다른 cell의 superposition."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if len(engine.cells) >= 2:
+            n = len(engine.cells)
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Quantum amplitudes: complex rotation per cell
+            t = step_i / max(steps, 1)
+            new_hiddens = []
+            for i in range(n):
+                # Superposition: weighted sum with phase factors
+                superposed = torch.zeros(hidden)
+                for j in range(n):
+                    phase = 2 * math.pi * (i * j) / n  # DFT-like
+                    amplitude = math.cos(phase + 2 * math.pi * t)
+                    superposed = superposed + hiddens[j] * amplitude / n
+                # "Measurement": collapse to strongest component + individuality
+                new_hiddens.append(0.7 * hiddens[i] + 0.3 * superposed)
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = new_hiddens[i].unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV4", "Quantum superposition (DFT mixing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV5_phase_locked_oscillation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-5: Phase-locked loop — cell 간 위상 동기화 + 약간의 비동기."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_phases = [0.0] * 12  # tracked phases
+    coupling_strength = 0.3
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Kuramoto model: phase synchronization
+            mean_phase = sum(cell_phases[:n]) / n
+            for i in range(n):
+                # Pull towards mean (sync) + individual frequency (diversity)
+                individual_freq = 0.1 * (i + 1)
+                sync_force = coupling_strength * math.sin(mean_phase - cell_phases[i])
+                cell_phases[i] += individual_freq + sync_force
+                # Modulate hidden by phase
+                modulation = math.sin(cell_phases[i])
+                engine.cells[i].hidden = engine.cells[i].hidden * (1.0 + 0.08 * modulation)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV5", "Phase-locked oscillation (Kuramoto)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV6_direct_phi_gradient(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-6: Φ를 직접 gradient로 최적화 — 수치 미분으로 ∂Φ/∂h 근사."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_lr = 0.05
+    eps = 0.01
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi_base, _ = phi_calc.compute_phi(engine)
+        # Numerical gradient: perturb each cell hidden, measure Φ change
+        if len(engine.cells) >= 2 and step_i % 5 == 0:
+            for cell in engine.cells:
+                # Random direction perturbation
+                direction = torch.randn_like(cell.hidden)
+                direction = direction / (direction.norm() + 1e-8)
+                # Perturb +
+                cell.hidden = cell.hidden + eps * direction
+                phi_plus, _ = phi_calc.compute_phi(engine)
+                # Restore and perturb -
+                cell.hidden = cell.hidden - 2 * eps * direction
+                phi_minus, _ = phi_calc.compute_phi(engine)
+                # Restore
+                cell.hidden = cell.hidden + eps * direction
+                # Gradient estimate
+                dphi = (phi_plus - phi_minus) / (2 * eps)
+                # Ascend Φ
+                cell.hidden = cell.hidden + phi_lr * dphi * direction
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV6", "Direct Φ gradient ascent (numerical)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV7_phi_backprop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-7: Φ를 differentiable하게 만들어 backprop으로 직접 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Differentiable Φ proxy: inter-cell variance × mutual information proxy
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            hiddens.requires_grad_(True)
+            # Differentiable Φ proxy:
+            # 1. Total correlation: sum of individual entropies - joint entropy
+            # Approximate with: variance of each cell × covariance structure
+            cell_vars = hiddens.var(dim=1)  # variance per cell
+            total_variance = cell_vars.sum()
+            # 2. Integration: covariance between cells
+            cov = torch.mm(hiddens, hiddens.T) / hidden
+            off_diag = cov - torch.diag(torch.diag(cov))
+            integration = off_diag.abs().sum()
+            # Φ proxy = integration * total_variance
+            phi_proxy = integration * total_variance
+            phi_proxy.backward()
+            if hiddens.grad is not None:
+                with torch.no_grad():
+                    grad = hiddens.grad.clone()
+                    for i, cell in enumerate(engine.cells):
+                        cell.hidden = cell.hidden + 0.01 * grad[i].unsqueeze(0)
+            hiddens.requires_grad_(False)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV7", "Φ backprop (differentiable proxy)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV8_phi_maximizer_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-8: 매 step Φ 측정 → Φ 증가 방향으로만 hidden 업데이트."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_hiddens = None
+    prev_phi = 0.0
+    for step_i, x in enumerate(inputs):
+        # Save state
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # If Φ decreased, partially rollback
+        if phi < prev_phi and prev_hiddens is not None:
+            rollback_weight = 0.5
+            for i, cell in enumerate(engine.cells):
+                if i < len(prev_hiddens):
+                    cell.hidden = (1 - rollback_weight) * cell.hidden + rollback_weight * prev_hiddens[i]
+            phi, _ = phi_calc.compute_phi(engine)
+        prev_hiddens = [c.hidden.clone() for c in engine.cells]
+        prev_phi = phi
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV8", "Φ maximizer (rollback on decrease)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV9_greedy_phi_hill_climb(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-9: Greedy hill climbing — 랜덤 perturbation 중 Φ 올리는 것만 채택."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n_trials = 5  # perturbations per step
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi_current, _ = phi_calc.compute_phi(engine)
+        best_phi = phi_current
+        best_hiddens = [c.hidden.clone() for c in engine.cells]
+        if len(engine.cells) >= 2 and step_i % 3 == 0:
+            for _ in range(n_trials):
+                # Random perturbation
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+                phi_trial, _ = phi_calc.compute_phi(engine)
+                if phi_trial > best_phi:
+                    best_phi = phi_trial
+                    best_hiddens = [c.hidden.clone() for c in engine.cells]
+                # Restore
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = best_hiddens[i]
+        phi_hist.append(best_phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV9", "Greedy Φ hill climbing (5 trials/step)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV10_phi_annealing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-10: Simulated annealing for Φ — 높은 T에서 탐색, 낮은 T에서 수렴."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    best_hiddens = [c.hidden.clone() for c in engine.cells]
+    best_phi = 0.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi_current, _ = phi_calc.compute_phi(engine)
+        temperature = 1.0 * (1.0 - step_i / steps)  # cool down
+        # Perturbation scaled by temperature
+        if len(engine.cells) >= 2:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.1 * temperature
+            phi_new, _ = phi_calc.compute_phi(engine)
+            delta = phi_new - phi_current
+            # Accept if better, or probabilistically if worse (annealing)
+            if delta > 0 or (temperature > 0.01 and
+                             np.random.random() < math.exp(delta / max(temperature, 1e-8))):
+                phi_current = phi_new
+            else:
+                # Reject: restore
+                for i, cell in enumerate(engine.cells):
+                    if i < len(best_hiddens):
+                        cell.hidden = best_hiddens[i]
+            if phi_current > best_phi:
+                best_phi = phi_current
+                best_hiddens = [c.hidden.clone() for c in engine.cells]
+        phi_hist.append(phi_current)
+    # Restore best
+    for i, cell in enumerate(engine.cells):
+        if i < len(best_hiddens):
+            cell.hidden = best_hiddens[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV10", "Simulated annealing for Φ",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV11_all_techniques_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-11: 역대 최고 기법 전부 결합 — DD16+SC2+CB1+wave+repulsion+phi_opt."""
+    t0 = time.time()
+    # SC2: dim-inverse merge threshold
+    merge_thresh = 0.01 * (64.0 / max(dim, 64))
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12,
+                           merge_threshold=merge_thresh)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # DD16: Fibonacci schedule
+    fib_targets = {int(steps*0.1): 3, int(steps*0.3): 5, int(steps*0.5): 8}
+    prev_phi = 0.0
+    cell_phases = [2 * math.pi * i / 12 for i in range(12)]
+    for step_i, x in enumerate(inputs):
+        # DD16: Forced Fibonacci growth
+        if step_i in fib_targets:
+            target = fib_targets[step_i]
+            while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+            engine.merge_threshold = -1.0  # block merges
+        elif step_i > 0 and (step_i - 1) in fib_targets:
+            engine.merge_threshold = merge_thresh
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            t_frac = step_i / max(steps, 1)
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            # Wave interference (WV1)
+            for i, cell in enumerate(engine.cells):
+                phase = cell_phases[i % len(cell_phases)]
+                wave = math.sin(2 * math.pi * 3 * t_frac + phase)
+                cell.hidden = cell.hidden * (1.0 + 0.03 * wave)
+            # Mutual repulsion (SC12)
+            for i in range(n):
+                repulsion = torch.zeros(hidden)
+                for j in range(n):
+                    if i != j:
+                        diff = hiddens[i] - hiddens[j]
+                        dist = diff.norm() + 1e-8
+                        repulsion = repulsion + diff / dist
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.01 * repulsion.unsqueeze(0)
+            # Φ-gated merge (SC10)
+            phi, _ = phi_calc.compute_phi(engine)
+            if phi >= prev_phi:
+                engine.merge_threshold = -1.0
+            else:
+                engine.merge_threshold = merge_thresh
+            prev_phi = phi
+        else:
+            phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV11", "ALL techniques combined (DD16+SC2+wave+repulsion+φ-gate)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_WV12_wave_plus_phi_opt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-12: Wave interference + direct Φ gradient — 간섭 + 최적화 동시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    freqs = [1, 2, 3, 5, 8, 13]
+    eps = 0.01
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Phase 1: Wave interference
+            superposition = torch.zeros(1, hidden)
+            for i, cell in enumerate(engine.cells):
+                f = freqs[i % len(freqs)]
+                amp = math.sin(2 * math.pi * f * t_frac)
+                superposition = superposition + cell.hidden * amp / n
+            for i, cell in enumerate(engine.cells):
+                f = freqs[i % len(freqs)]
+                pm = math.cos(2 * math.pi * f * t_frac)
+                if pm > 0:
+                    cell.hidden = cell.hidden + 0.03 * superposition * pm
+            # Phase 2: Φ gradient (every 5 steps)
+            if step_i % 5 == 0:
+                phi_base, _ = phi_calc.compute_phi(engine)
+                for cell in engine.cells:
+                    d = torch.randn_like(cell.hidden)
+                    d = d / (d.norm() + 1e-8)
+                    cell.hidden = cell.hidden + eps * d
+                    phi_p, _ = phi_calc.compute_phi(engine)
+                    cell.hidden = cell.hidden - eps * d
+                    dphi = phi_p - phi_base
+                    cell.hidden = cell.hidden + 0.03 * dphi * d
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV12", "Wave interference + Φ gradient",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV13_interference_cascade(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-13: 다중 주파수 간섭 캐스케이드 — 저주파→고주파 순차 공명."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 4 frequency layers cascade
+    freq_layers = [1.0, 3.0, 7.0, 13.0]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Cascade: each frequency layer modulates the next
+            cascade_signal = torch.ones(1, hidden)
+            for layer, freq in enumerate(freq_layers):
+                wave = math.sin(2 * math.pi * freq * t_frac + layer * math.pi / 4)
+                cascade_signal = cascade_signal * (1.0 + 0.2 * wave)
+            # Apply cascade to cells with spatial distribution
+            for i, cell in enumerate(engine.cells):
+                spatial_weight = math.sin(math.pi * (i + 1) / (n + 1))
+                cell.hidden = cell.hidden + 0.05 * cascade_signal * spatial_weight
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV13", "Multi-frequency interference cascade",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV14_entangled_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-14: 양자 얽힘 모방 — cell pair의 hidden이 anti-correlated."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Create entangled pairs: (0,1), (2,3), (4,5), ...
+            for i in range(0, n - 1, 2):
+                h_a = engine.cells[i].hidden
+                h_b = engine.cells[i+1].hidden
+                # Entanglement: when A goes up, B goes down (anti-correlation)
+                mean = (h_a + h_b) / 2
+                diff = (h_a - h_b) / 2
+                # Amplify the anti-correlation
+                entangle_strength = 0.1
+                engine.cells[i].hidden = mean + diff * (1 + entangle_strength)
+                engine.cells[i+1].hidden = mean - diff * (1 + entangle_strength)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV14", "Entangled cell pairs (anti-correlated)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WV15_ultimate_phi_machine(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WV-15: 궁극의 Φ 머신 — 모든 극한 기법 통합 (wave+entangle+gradient+anneal+fibonacci)."""
+    t0 = time.time()
+    merge_thresh = 0.01 * (64.0 / max(dim, 64))
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12,
+                           merge_threshold=merge_thresh)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    freqs = [1, 2, 3, 5, 8, 13]
+    fib_targets = {int(steps*0.1): 4, int(steps*0.2): 6, int(steps*0.4): 8}
+    best_phi = 0.0
+    best_hiddens = []
+    temperature = 1.0
+    for step_i, x in enumerate(inputs):
+        t_frac = step_i / max(steps, 1)
+        temperature = max(0.01, 1.0 - t_frac)
+        # Fibonacci growth
+        if step_i in fib_targets:
+            target = fib_targets[step_i]
+            while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+            engine.merge_threshold = -1.0
+        elif step_i > 0 and (step_i - 1) in fib_targets:
+            engine.merge_threshold = merge_thresh
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # 1. Wave interference
+            for i, cell in enumerate(engine.cells):
+                f = freqs[i % len(freqs)]
+                wave = math.sin(2 * math.pi * f * t_frac)
+                cell.hidden = cell.hidden * (1.0 + 0.03 * wave)
+            # 2. Entangled pairs
+            for i in range(0, n - 1, 2):
+                h_a, h_b = engine.cells[i].hidden, engine.cells[i+1].hidden
+                mean = (h_a + h_b) / 2
+                diff = (h_a - h_b) / 2
+                engine.cells[i].hidden = mean + diff * 1.05
+                engine.cells[i+1].hidden = mean - diff * 1.05
+            # 3. Φ gradient (every 5 steps)
+            phi_current, _ = phi_calc.compute_phi(engine)
+            if step_i % 5 == 0:
+                for cell in engine.cells:
+                    d = torch.randn_like(cell.hidden)
+                    d = d / (d.norm() + 1e-8)
+                    saved = cell.hidden.clone()
+                    cell.hidden = saved + 0.01 * d
+                    phi_p, _ = phi_calc.compute_phi(engine)
+                    cell.hidden = saved
+                    dphi = phi_p - phi_current
+                    cell.hidden = saved + 0.02 * dphi * d
+            # 4. Annealing: random perturbation + accept/reject
+            if step_i % 7 == 0:
+                saved_all = [c.hidden.clone() for c in engine.cells]
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05 * temperature
+                phi_new, _ = phi_calc.compute_phi(engine)
+                delta = phi_new - phi_current
+                if delta > 0 or np.random.random() < math.exp(min(delta / max(temperature, 1e-8), 10)):
+                    phi_current = phi_new
+                else:
+                    for i, cell in enumerate(engine.cells):
+                        cell.hidden = saved_all[i]
+            # 5. Track best
+            if phi_current > best_phi:
+                best_phi = phi_current
+                best_hiddens = [c.hidden.clone() for c in engine.cells]
+            # Φ-gated merge
+            engine.merge_threshold = -1.0 if phi_current >= best_phi * 0.9 else merge_thresh
+        else:
+            phi_current, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi_current)
+    # Restore best state
+    if best_hiddens:
+        for i, cell in enumerate(engine.cells):
+            if i < len(best_hiddens):
+                cell.hidden = best_hiddens[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WV15", "ULTIMATE Φ machine (all extreme techniques)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES = {
+    'A1': run_A1_cross_cell_recurrent,
+    # WV: Wave Interference + Direct Φ Optimization (극한 가설)
+    'WV1': run_WV1_wave_interference, 'WV2': run_WV2_constructive_resonance,
+    'WV3': run_WV3_standing_wave, 'WV4': run_WV4_quantum_superposition,
+    'WV5': run_WV5_phase_locked_oscillation, 'WV6': run_WV6_direct_phi_gradient,
+    'WV7': run_WV7_phi_backprop, 'WV8': run_WV8_phi_maximizer_loss,
+    'WV9': run_WV9_greedy_phi_hill_climb, 'WV10': run_WV10_phi_annealing,
+    'WV11': run_WV11_all_techniques_combined, 'WV12': run_WV12_wave_plus_phi_opt,
+    'WV13': run_WV13_interference_cascade, 'WV14': run_WV14_entangled_cells,
+    'WV15': run_WV15_ultimate_phi_machine,
+}
+
 
 def run_single(args):
     """Process pool worker."""
