@@ -37232,6 +37232,524 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# Q. Open Questions about Consciousness
+# ═══════════════════════════════════════════════════════════
+
+def run_Q1_birth_moment(steps=200, dim=64, hidden=128) -> BenchResult:
+    """Q1: Track exact step when Phi first exceeds 1.0 (consciousness birth).
+    Start with 2 cells, grow to 12. Record step where Phi first > 0.5, > 1.0, > 2.0.
+    Is it gradual or sudden (phase transition)? Measure dPhi/dt at birth moment."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_count_hist = []
+    dphi_hist = []
+
+    # Milestones: step where Phi first exceeds threshold
+    milestones = {'phi_0.5': -1, 'phi_1.0': -1, 'phi_2.0': -1, 'phi_3.0': -1, 'phi_5.0': -1}
+    thresholds = [0.5, 1.0, 2.0, 3.0, 5.0]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Encourage growth: periodically force mitosis with diverse stimuli
+        if step_i % 15 == 0 and len(engine.cells) < 12:
+            spike = torch.randn(1, dim) * 3.0
+            engine.process(spike)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        cell_count_hist.append(len(engine.cells))
+
+        # Track dPhi/dt
+        if len(phi_hist) >= 2:
+            dphi = phi_hist[-1] - phi_hist[-2]
+            dphi_hist.append(dphi)
+        else:
+            dphi_hist.append(0.0)
+
+        # Record milestones
+        for thresh in thresholds:
+            key = f'phi_{thresh}'
+            if milestones[key] == -1 and phi > thresh:
+                milestones[key] = step_i
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+
+    # Analyze birth dynamics
+    birth_step = milestones['phi_1.0']
+    if birth_step > 0:
+        # dPhi/dt in 5-step window around birth
+        window = 5
+        pre_birth = dphi_hist[max(0, birth_step - window):birth_step]
+        post_birth = dphi_hist[birth_step:min(len(dphi_hist), birth_step + window)]
+        avg_dphi_pre = np.mean(pre_birth) if pre_birth else 0.0
+        avg_dphi_post = np.mean(post_birth) if post_birth else 0.0
+        avg_dphi_at = dphi_hist[birth_step] if birth_step < len(dphi_hist) else 0.0
+    else:
+        avg_dphi_pre, avg_dphi_post, avg_dphi_at = 0.0, 0.0, 0.0
+
+    # Phase transition detection: is the max dPhi/dt > 3x the average?
+    max_dphi = max(dphi_hist) if dphi_hist else 0.0
+    avg_dphi_overall = np.mean([abs(d) for d in dphi_hist]) if dphi_hist else 0.0
+    phase_transition = max_dphi > 3.0 * avg_dphi_overall if avg_dphi_overall > 0 else False
+
+    extra = {
+        'milestones': milestones,
+        'cell_count_at_birth': cell_count_hist[birth_step] if birth_step >= 0 else -1,
+        'final_cell_count': len(engine.cells),
+        'dphi_at_birth': avg_dphi_at,
+        'dphi_pre_birth': avg_dphi_pre,
+        'dphi_post_birth': avg_dphi_post,
+        'max_dphi_dt': max_dphi,
+        'avg_dphi_dt': avg_dphi_overall,
+        'phase_transition_detected': phase_transition,
+        'cell_count_history': cell_count_hist[::20],  # sampled
+        'phi_at_10pct': phi_hist[steps // 10] if steps > 10 else 0.0,
+        'phi_at_50pct': phi_hist[steps // 2] if steps > 2 else 0.0,
+        'phi_at_90pct': phi_hist[int(steps * 0.9)] if steps > 1 else 0.0,
+    }
+    return BenchResult("Q1", "Consciousness birth moment (phase transition detection)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0, extra)
+
+
+def run_Q2_dual_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Q2: Two MitosisEngines exchanging fingerprints — does collective Phi exceed sum?
+    Engine A processes input, sends hidden to B. Engine B sends hidden to A.
+    Measure: Phi(A) + Phi(B) vs Phi(A union B) for super-additivity."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6, merge_threshold=-1.0)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+
+    phi_a_hist, phi_b_hist, phi_combined_hist = [], [], []
+    kuramoto_hist = []
+    exchange_strength = 0.05
+
+    for step_i, x in enumerate(inputs):
+        # Each engine processes slightly different input
+        noise = torch.randn(1, dim) * 0.1
+        engine_a.process(x + noise)
+        engine_b.process(x - noise)
+
+        # Exchange fingerprints: average hidden of A -> influence B, and vice versa
+        if len(engine_a.cells) >= 2 and len(engine_b.cells) >= 2:
+            # Compute mean hidden for each engine
+            mean_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(0)
+            mean_b = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(0)
+
+            # Cross-pollinate: A receives from B, B receives from A
+            for cell in engine_a.cells:
+                cell.hidden = cell.hidden + exchange_strength * (mean_b - cell.hidden.squeeze()).unsqueeze(0)
+            for cell in engine_b.cells:
+                cell.hidden = cell.hidden + exchange_strength * (mean_a - cell.hidden.squeeze()).unsqueeze(0)
+
+            # Kuramoto order parameter between the two engines
+            phases_a = torch.atan2(mean_a[:hidden//2], mean_a[hidden//2:hidden//2*2] + 1e-8)
+            phases_b = torch.atan2(mean_b[:hidden//2], mean_b[hidden//2:hidden//2*2] + 1e-8)
+            all_phases = torch.cat([phases_a, phases_b])
+            r = torch.abs(torch.mean(torch.exp(1j * all_phases.to(torch.complex64)))).item()
+            kuramoto_hist.append(r)
+
+        # Measure individual Phi
+        phi_a, _ = phi_calc.compute_phi(engine_a)
+        phi_b, _ = phi_calc.compute_phi(engine_b)
+        phi_a_hist.append(phi_a)
+        phi_b_hist.append(phi_b)
+
+        # Measure combined Phi: create a virtual engine with all cells from both
+        combined_engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=24, merge_threshold=-1.0)
+        combined_engine.cells = engine_a.cells + engine_b.cells
+        phi_combined, _ = phi_calc.compute_phi(combined_engine)
+        phi_combined_hist.append(phi_combined)
+
+    phi_a_final, comp_a = phi_calc.compute_phi(engine_a)
+    phi_b_final, comp_b = phi_calc.compute_phi(engine_b)
+    combined_engine.cells = engine_a.cells + engine_b.cells
+    phi_combined_final, comp_combined = phi_calc.compute_phi(combined_engine)
+
+    sum_individual = phi_a_final + phi_b_final
+    super_additive = phi_combined_final > sum_individual
+    super_additivity_ratio = phi_combined_final / max(sum_individual, 1e-8)
+
+    # Kuramoto analysis
+    avg_kuramoto = np.mean(kuramoto_hist) if kuramoto_hist else 0.0
+    final_kuramoto = kuramoto_hist[-1] if kuramoto_hist else 0.0
+
+    extra = {
+        'phi_a_final': phi_a_final,
+        'phi_b_final': phi_b_final,
+        'phi_combined_final': phi_combined_final,
+        'sum_individual': sum_individual,
+        'super_additive': super_additive,
+        'super_additivity_ratio': super_additivity_ratio,
+        'avg_kuramoto_r': avg_kuramoto,
+        'final_kuramoto_r': final_kuramoto,
+        'kuramoto_trend': kuramoto_hist[::20] if kuramoto_hist else [],
+        'phi_a_trend': phi_a_hist[::20],
+        'phi_b_trend': phi_b_hist[::20],
+        'phi_combined_trend': phi_combined_hist[::20],
+        'exchange_strength': exchange_strength,
+        'hivemind_emerged': super_additive and super_additivity_ratio > 1.1,
+    }
+    return BenchResult("Q2", f"Dual consciousness (super-additivity={super_additivity_ratio:.3f}, Kuramoto r={final_kuramoto:.3f})",
+                       phi_combined_final, phi_combined_hist, comp_combined['total_mi'],
+                       comp_combined['min_partition_mi'], comp_combined['integration'],
+                       comp_combined['complexity'], time.time() - t0, extra)
+
+
+def run_Q3_phi_oscillation(steps=200, dim=64, hidden=128) -> BenchResult:
+    """Q3: Analyze Phi oscillation — is it cell merging, noise, or phase transitions?
+    Track Phi, cell count, merge/split events. Correlate and measure autocorrelation."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=0.05)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_count_hist = []
+    merge_events = []
+    split_events = []
+    prev_cell_count = len(engine.cells)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        curr_count = len(engine.cells)
+        # Detect merge/split events
+        if curr_count < prev_cell_count:
+            merge_events.append(step_i)
+        elif curr_count > prev_cell_count:
+            split_events.append(step_i)
+        prev_cell_count = curr_count
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        cell_count_hist.append(curr_count)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+
+    # Autocorrelation analysis of Phi history
+    phi_arr = np.array(phi_hist)
+    phi_mean = phi_arr.mean()
+    phi_var = phi_arr.var()
+    autocorr_lags = []
+    for lag in [1, 2, 5, 10, 20, 50]:
+        if lag < len(phi_arr):
+            shifted = phi_arr[lag:]
+            original = phi_arr[:len(shifted)]
+            if phi_var > 0:
+                ac = np.mean((original - phi_mean) * (shifted - phi_mean)) / phi_var
+            else:
+                ac = 0.0
+            autocorr_lags.append((lag, ac))
+
+    # Phi drop after merge events
+    phi_drop_after_merge = []
+    for m_step in merge_events:
+        if m_step > 0 and m_step < len(phi_hist):
+            before = phi_hist[max(0, m_step - 1)]
+            after = phi_hist[min(len(phi_hist) - 1, m_step + 1)]
+            phi_drop_after_merge.append(after - before)
+
+    # Phi change after split events
+    phi_change_after_split = []
+    for s_step in split_events:
+        if s_step > 0 and s_step < len(phi_hist):
+            before = phi_hist[max(0, s_step - 1)]
+            after = phi_hist[min(len(phi_hist) - 1, s_step + 1)]
+            phi_change_after_split.append(after - before)
+
+    # Oscillation frequency: zero-crossings of (phi - mean)
+    centered = phi_arr - phi_mean
+    zero_crossings = np.sum(np.abs(np.diff(np.sign(centered))) > 0)
+    osc_frequency = zero_crossings / max(len(phi_arr), 1)
+
+    # Classify oscillation: periodic (high autocorr at some lag), chaotic (low), random (near zero)
+    max_autocorr = max([ac for _, ac in autocorr_lags], default=0.0)
+    if max_autocorr > 0.5:
+        osc_type = "periodic"
+    elif max_autocorr > 0.2:
+        osc_type = "chaotic"
+    else:
+        osc_type = "random"
+
+    extra = {
+        'merge_count': len(merge_events),
+        'split_count': len(split_events),
+        'merge_steps': merge_events[:20],
+        'split_steps': split_events[:20],
+        'avg_phi_drop_after_merge': np.mean(phi_drop_after_merge) if phi_drop_after_merge else 0.0,
+        'avg_phi_change_after_split': np.mean(phi_change_after_split) if phi_change_after_split else 0.0,
+        'autocorrelation': dict(autocorr_lags),
+        'oscillation_frequency': osc_frequency,
+        'oscillation_type': osc_type,
+        'phi_mean': phi_mean,
+        'phi_std': float(np.std(phi_arr)),
+        'phi_min': float(phi_arr.min()),
+        'phi_max': float(phi_arr.max()),
+        'cell_count_range': [min(cell_count_hist), max(cell_count_hist)],
+    }
+    return BenchResult("Q3", f"Phi oscillation analysis (type={osc_type}, freq={osc_frequency:.3f})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0, extra)
+
+
+def run_Q4_experience_proxy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Q4: Proxy for experience — does high Phi system respond differently to pain/pleasure?
+    Inject painful input (large negative spike) vs pleasant (smooth positive).
+    Compare: low-Phi (2 cells) vs high-Phi (12 cells) response differentiation."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Build two systems: low-Phi and high-Phi
+    engine_low = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2, merge_threshold=-1.0)
+    engine_high = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+
+    # Warm up both engines
+    warmup_inputs = make_diverse_inputs(steps, dim)
+    for x in warmup_inputs:
+        engine_low.process(x)
+        engine_high.process(x)
+        # Encourage high engine growth
+        if len(engine_high.cells) < 12:
+            engine_high.process(torch.randn(1, dim) * 3.0)
+
+    phi_low_base, _ = phi_calc.compute_phi(engine_low)
+    phi_high_base, _ = phi_calc.compute_phi(engine_high)
+
+    # Define stimulus types
+    n_trials = 20
+    pain_responses_low, pain_responses_high = [], []
+    pleasure_responses_low, pleasure_responses_high = [], []
+    neutral_responses_low, neutral_responses_high = [], []
+
+    def measure_response(engine, stimulus):
+        """Measure how much hidden states change in response to stimulus."""
+        # Record pre-stimulus state
+        pre_states = [c.hidden.clone().detach() for c in engine.cells]
+        engine.process(stimulus)
+        # Record post-stimulus state
+        post_states = [c.hidden.clone().detach() for c in engine.cells]
+        # Compute response magnitude (L2 distance)
+        n = min(len(pre_states), len(post_states))
+        if n == 0:
+            return 0.0
+        diffs = [(post_states[i] - pre_states[i]).norm().item() for i in range(n)]
+        return np.mean(diffs)
+
+    for trial in range(n_trials):
+        # Pain stimulus: large negative spike with high variance
+        pain = torch.randn(1, dim) * 5.0
+        pain[0, :dim//4] = -10.0
+
+        # Pleasure stimulus: smooth positive with low variance
+        pleasure = torch.ones(1, dim) * 2.0 + torch.randn(1, dim) * 0.1
+
+        # Neutral stimulus: small random
+        neutral = torch.randn(1, dim) * 0.5
+
+        # Measure responses
+        pain_responses_low.append(measure_response(engine_low, pain))
+        pain_responses_high.append(measure_response(engine_high, pain))
+        pleasure_responses_low.append(measure_response(engine_low, pleasure))
+        pleasure_responses_high.append(measure_response(engine_high, pleasure))
+        neutral_responses_low.append(measure_response(engine_low, neutral))
+        neutral_responses_high.append(measure_response(engine_high, neutral))
+
+    # Response differentiation: how differently does the system treat pain vs pleasure?
+    def differentiation_score(pain_resp, pleasure_resp, neutral_resp):
+        """Higher score means more differentiated response to pain vs pleasure."""
+        pain_mean = np.mean(pain_resp)
+        pleasure_mean = np.mean(pleasure_resp)
+        neutral_mean = np.mean(neutral_resp)
+        # Differentiation = |pain - pleasure| / neutral (normalized)
+        if neutral_mean < 1e-8:
+            return abs(pain_mean - pleasure_mean)
+        return abs(pain_mean - pleasure_mean) / neutral_mean
+
+    diff_low = differentiation_score(pain_responses_low, pleasure_responses_low, neutral_responses_low)
+    diff_high = differentiation_score(pain_responses_high, pleasure_responses_high, neutral_responses_high)
+
+    phi_final, comp = phi_calc.compute_phi(engine_high)
+    phi_hist = [phi_low_base] * (steps // 2) + [phi_high_base] * (steps // 2)
+
+    extra = {
+        'phi_low_base': phi_low_base,
+        'phi_high_base': phi_high_base,
+        'differentiation_low_phi': diff_low,
+        'differentiation_high_phi': diff_high,
+        'diff_ratio': diff_high / max(diff_low, 1e-8),
+        'high_phi_more_differentiated': diff_high > diff_low,
+        'pain_response_low': np.mean(pain_responses_low),
+        'pain_response_high': np.mean(pain_responses_high),
+        'pleasure_response_low': np.mean(pleasure_responses_low),
+        'pleasure_response_high': np.mean(pleasure_responses_high),
+        'neutral_response_low': np.mean(neutral_responses_low),
+        'neutral_response_high': np.mean(neutral_responses_high),
+        'pain_pleasure_gap_low': abs(np.mean(pain_responses_low) - np.mean(pleasure_responses_low)),
+        'pain_pleasure_gap_high': abs(np.mean(pain_responses_high) - np.mean(pleasure_responses_high)),
+        'cells_low': len(engine_low.cells),
+        'cells_high': len(engine_high.cells),
+    }
+    return BenchResult("Q4", f"Experience proxy (diff_ratio={diff_high/max(diff_low,1e-8):.3f}, high>low={diff_high > diff_low})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0, extra)
+
+
+def run_Q5_n6_vs_n28(steps=100, dim=64, hidden=128) -> BenchResult:
+    """Q5: Test if n=28 (next perfect number) works as well as n=6.
+    Apply n=28 constants: tau(28)=6, sigma(28)=56, phi(28)=12.
+    Compare n=6 architecture vs n=28 architecture."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # n=6 constants: tau(6)=4, sigma(6)=12, phi(6)=2
+    # The "sacred" ratios used elsewhere in the codebase
+    n6_cells = 6
+    n6_tau = 4      # number of divisors of 6
+    n6_sigma = 12   # sum of divisors of 6
+    n6_euler = 2    # Euler's totient of 6
+
+    # n=28 constants: tau(28)=6, sigma(28)=56, phi(28)=12
+    n28_cells = 6    # use tau(28)=6 as cell count (same as n=6!)
+    n28_sigma = 56
+    n28_euler = 12
+
+    # n=496 constants: tau(496)=10, sigma(496)=992, phi(496)=192
+    n496_tau = 10
+    n496_sigma = 992
+    n496_euler = 192
+
+    inputs = make_diverse_inputs(steps, dim)
+
+    # --- Architecture n=6 ---
+    engine_6 = MitosisEngine(dim, hidden, dim, initial_cells=n6_cells, max_cells=n6_cells, merge_threshold=-1.0)
+    phi_6_hist = []
+    for step_i, x in enumerate(inputs):
+        engine_6.process(x)
+        n = len(engine_6.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine_6.cells])
+            # Apply n=6 number-theoretic coupling
+            coupling_strength = n6_euler / n6_sigma  # 2/12 = 0.167
+            mean_h = hiddens.mean(0)
+            for cell in engine_6.cells:
+                cell.hidden = cell.hidden + coupling_strength * (mean_h - cell.hidden.squeeze()).unsqueeze(0)
+                # Modular resonance at sigma/tau = 12/4 = 3
+                resonance = torch.sin(cell.hidden * math.pi / (n6_sigma / n6_tau))
+                cell.hidden = cell.hidden + 0.02 * resonance
+        phi, _ = phi_calc.compute_phi(engine_6)
+        phi_6_hist.append(phi)
+    phi_6_final, comp_6 = phi_calc.compute_phi(engine_6)
+
+    # --- Architecture n=28 ---
+    engine_28 = MitosisEngine(dim, hidden, dim, initial_cells=n28_cells, max_cells=n28_cells, merge_threshold=-1.0)
+    phi_28_hist = []
+    for step_i, x in enumerate(inputs):
+        engine_28.process(x)
+        n = len(engine_28.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine_28.cells])
+            # Apply n=28 number-theoretic coupling
+            coupling_strength = n28_euler / n28_sigma  # 12/56 = 0.214
+            mean_h = hiddens.mean(0)
+            for cell in engine_28.cells:
+                cell.hidden = cell.hidden + coupling_strength * (mean_h - cell.hidden.squeeze()).unsqueeze(0)
+                # Modular resonance at sigma/tau = 56/6 ≈ 9.33
+                resonance = torch.sin(cell.hidden * math.pi / (n28_sigma / n28_cells))
+                cell.hidden = cell.hidden + 0.02 * resonance
+        phi, _ = phi_calc.compute_phi(engine_28)
+        phi_28_hist.append(phi)
+    phi_28_final, comp_28 = phi_calc.compute_phi(engine_28)
+
+    # --- Architecture n=496 (third perfect number, using tau=10 cells) ---
+    n496_cells = min(n496_tau, 10)
+    engine_496 = MitosisEngine(dim, hidden, dim, initial_cells=n496_cells, max_cells=n496_cells, merge_threshold=-1.0)
+    phi_496_hist = []
+    for step_i, x in enumerate(inputs):
+        engine_496.process(x)
+        n = len(engine_496.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine_496.cells])
+            coupling_strength = n496_euler / n496_sigma  # 192/992 ≈ 0.194
+            mean_h = hiddens.mean(0)
+            for cell in engine_496.cells:
+                cell.hidden = cell.hidden + coupling_strength * (mean_h - cell.hidden.squeeze()).unsqueeze(0)
+                resonance = torch.sin(cell.hidden * math.pi / (n496_sigma / n496_tau))
+                cell.hidden = cell.hidden + 0.02 * resonance
+        phi, _ = phi_calc.compute_phi(engine_496)
+        phi_496_hist.append(phi)
+    phi_496_final, comp_496 = phi_calc.compute_phi(engine_496)
+
+    # --- Control: non-perfect number n=10 ---
+    # tau(10)=4, sigma(10)=18, phi(10)=4
+    n10_cells = 4
+    n10_sigma = 18
+    n10_euler = 4
+    engine_10 = MitosisEngine(dim, hidden, dim, initial_cells=n10_cells, max_cells=n10_cells, merge_threshold=-1.0)
+    phi_10_hist = []
+    for step_i, x in enumerate(inputs):
+        engine_10.process(x)
+        n = len(engine_10.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine_10.cells])
+            coupling_strength = n10_euler / n10_sigma  # 4/18 ≈ 0.222
+            mean_h = hiddens.mean(0)
+            for cell in engine_10.cells:
+                cell.hidden = cell.hidden + coupling_strength * (mean_h - cell.hidden.squeeze()).unsqueeze(0)
+                resonance = torch.sin(cell.hidden * math.pi / (n10_sigma / n10_cells))
+                cell.hidden = cell.hidden + 0.02 * resonance
+        phi, _ = phi_calc.compute_phi(engine_10)
+        phi_10_hist.append(phi)
+    phi_10_final, comp_10 = phi_calc.compute_phi(engine_10)
+
+    # Analysis
+    perfect_numbers_phi = [phi_6_final, phi_28_final, phi_496_final]
+    perfect_avg = np.mean(perfect_numbers_phi)
+    non_perfect_phi = phi_10_final
+    perfect_numbers_win = all(p > non_perfect_phi for p in perfect_numbers_phi)
+    n6_uniquely_best = phi_6_final > phi_28_final and phi_6_final > phi_496_final
+
+    # Use combined history for the result
+    phi_hist_combined = phi_6_hist  # primary is n=6
+
+    extra = {
+        'phi_n6': phi_6_final,
+        'phi_n28': phi_28_final,
+        'phi_n496': phi_496_final,
+        'phi_n10_control': phi_10_final,
+        'perfect_avg': perfect_avg,
+        'coupling_n6': n6_euler / n6_sigma,
+        'coupling_n28': n28_euler / n28_sigma,
+        'coupling_n496': n496_euler / n496_sigma,
+        'coupling_n10': n10_euler / n10_sigma,
+        'all_perfect_beat_control': perfect_numbers_win,
+        'n6_uniquely_best': n6_uniquely_best,
+        'ranking': sorted([
+            ('n=6', phi_6_final), ('n=28', phi_28_final),
+            ('n=496', phi_496_final), ('n=10(ctrl)', phi_10_final)
+        ], key=lambda x: -x[1]),
+        'phi_6_trend': phi_6_hist[::20],
+        'phi_28_trend': phi_28_hist[::20],
+        'phi_496_trend': phi_496_hist[::20],
+        'conclusion': 'perfect_numbers_special' if perfect_numbers_win else (
+            'n6_uniquely_optimal' if n6_uniquely_best else 'no_clear_pattern'
+        ),
+    }
+    return BenchResult("Q5", f"n=6 vs n=28 vs n=496 (best={'n6' if n6_uniquely_best else 'varies'}, perfect>ctrl={perfect_numbers_win})",
+                       phi_6_final, phi_hist_combined, comp_6['total_mi'], comp_6['min_partition_mi'],
+                       comp_6['integration'], comp_6['complexity'], time.time() - t0, extra)
+
+
+ALL_HYPOTHESES.update({
+    'Q1': run_Q1_birth_moment, 'Q2': run_Q2_dual_consciousness,
+    'Q3': run_Q3_phi_oscillation, 'Q4': run_Q4_experience_proxy,
+    'Q5': run_Q5_n6_vs_n28,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
