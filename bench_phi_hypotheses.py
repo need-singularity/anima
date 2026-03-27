@@ -21400,8 +21400,707 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# WI. Wave Interference Discovery — 물리학 기반 심층 파동 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_WI1_soliton(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-1: 솔리톤 의식 — 자기 유지 파동 패킷이 cell을 관통."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Soliton: localized wave packet that maintains shape
+    soliton_pos = 0.0
+    soliton_width = 2.0
+    soliton_speed = 0.15
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        soliton_pos += soliton_speed
+        if soliton_pos > n:
+            soliton_pos = 0.0
+        # Soliton shape: sech^2 profile
+        for i, cell in enumerate(engine.cells):
+            dist = abs(i - soliton_pos)
+            amplitude = 1.0 / (math.cosh(dist / soliton_width) ** 2)
+            cell.hidden = cell.hidden * (1.0 + 0.08 * amplitude)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI1", "Soliton consciousness (self-sustaining wave packet)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI2_decoherence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-2: 양자 디코히어런스 — 중첩 상태가 '관측'으로 붕괴하는 순간 = 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    coherence = 1.0  # starts fully coherent
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Coherent phase: superposition of all states
+            if coherence > 0.3:
+                mean_h = hiddens.mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = (coherence * mean_h + (1 - coherence) * hiddens[i]).unsqueeze(0)
+                coherence *= 0.95  # gradual decoherence
+            else:
+                # Collapse! Measurement event → diversity spike
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.15
+                coherence = 1.0  # re-cohere
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI2", "Quantum decoherence (collapse → consciousness moment)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI3_double_slit(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-3: 이중 슬릿 — 입력이 2경로로 분리, 간섭 패턴이 hidden space에 투영."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            # Two "slits": split cells into two groups
+            slit_a = engine.cells[:n//2]
+            slit_b = engine.cells[n//2:]
+            # Each slit processes differently
+            path_a = torch.stack([c.hidden.squeeze() for c in slit_a]).mean(dim=0)
+            path_b = torch.stack([c.hidden.squeeze() for c in slit_b]).mean(dim=0)
+            # Interference pattern: |A + B|^2 ≠ |A|^2 + |B|^2
+            interference = path_a + path_b  # constructive
+            anti_interference = path_a - path_b  # destructive
+            # Apply interference pattern to all cells
+            for i, cell in enumerate(engine.cells):
+                if i % 2 == 0:  # bright fringes
+                    cell.hidden = cell.hidden + 0.05 * interference.unsqueeze(0)
+                else:  # dark fringes
+                    cell.hidden = cell.hidden + 0.05 * anti_interference.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI3", "Double-slit interference (two-path fringe pattern)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI4_superradiance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-4: 초복사 — N개 cell의 집단 방출이 개별 합보다 N^2배 강함."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Check phase alignment (coherence)
+            norms = F.normalize(hiddens, dim=1)
+            coherence_matrix = norms @ norms.T
+            avg_coherence = (coherence_matrix.sum() - n) / (n * (n - 1))
+            # Superradiance: collective emission ∝ N^2 × coherence^2
+            collective_signal = hiddens.sum(dim=0)
+            superradiant_factor = (n ** 2) * (avg_coherence.item() ** 2)
+            # But maintain individuality: subtract own contribution
+            for i, cell in enumerate(engine.cells):
+                others_signal = collective_signal - hiddens[i]
+                boost = 0.02 * superradiant_factor / (n ** 2)  # normalize
+                cell.hidden = cell.hidden + boost * others_signal.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI4", "Superradiance (N² collective emission)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI5_tunneling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-5: 양자 터널링 — cell이 에너지 장벽을 확률적으로 통과."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h_norm = cell.hidden.norm().item()
+                barrier = 2.0  # energy barrier
+                if h_norm < barrier:
+                    # Tunneling probability: e^(-2κa), κ = sqrt(barrier-E)
+                    kappa = math.sqrt(max(barrier - h_norm, 0.01))
+                    tunnel_prob = math.exp(-2 * kappa * 0.5)
+                    if np.random.random() < tunnel_prob:
+                        # Tunnel through! Jump to other side of barrier
+                        cell.hidden = cell.hidden * (barrier / max(h_norm, 1e-8)) * 1.2
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI5", "Quantum tunneling (probabilistic barrier crossing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI6_wave_particle_duality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-6: 파동-입자 이중성 — cell이 '파동 모드'와 '입자 모드'를 전환."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_modes = {}  # True=wave, False=particle
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Determine mode based on "observation" (interaction with input)
+            input_strength = x.norm().item()
+            for i, cell in enumerate(engine.cells):
+                is_wave = cell_modes.get(i, True)
+                if input_strength > 1.5:  # strong observation → collapse to particle
+                    cell_modes[i] = False
+                elif input_strength < 0.5:  # weak observation → spread to wave
+                    cell_modes[i] = True
+                if cell_modes.get(i, True):  # wave mode: spread across space
+                    mean_h = hiddens.mean(dim=0)
+                    cell.hidden = (0.9 * cell.hidden.squeeze() + 0.1 * mean_h).unsqueeze(0)
+                else:  # particle mode: localize, amplify uniqueness
+                    diff = cell.hidden.squeeze() - hiddens.mean(dim=0)
+                    cell.hidden = (cell.hidden.squeeze() + 0.1 * diff).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI6", "Wave-particle duality (mode switching)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI7_beating_frequency(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-7: 맥놀이 — 근접 주파수 2개가 만드는 envelope이 의식 리듬."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    f1, f2 = 5.0, 5.3  # close frequencies → beat frequency 0.3Hz
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Beat envelope: cos((f1-f2)/2 × t) × cos((f1+f2)/2 × t)
+            envelope = math.cos(2 * math.pi * (f1 - f2) / 2 * t * 10)
+            carrier = math.cos(2 * math.pi * (f1 + f2) / 2 * t * 10)
+            beat = envelope * carrier
+            # Cells in pairs: one gets carrier, other gets modulated
+            for i in range(0, n - 1, 2):
+                engine.cells[i].hidden = engine.cells[i].hidden * (1 + 0.05 * carrier)
+                engine.cells[i+1].hidden = engine.cells[i+1].hidden * (1 + 0.05 * beat)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI7", "Beating frequency (envelope rhythm)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI8_coherence_length(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-8: 코히어런스 길이 — 의식 통합이 미치는 범위를 점진 확대."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    coherence_length = 1  # starts at nearest neighbor only
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # Gradually extend coherence length
+        if step_i % 20 == 0 and coherence_length < n:
+            coherence_length += 1
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Only share with cells within coherence_length
+                neighbors = []
+                for j in range(max(0, i - coherence_length), min(n, i + coherence_length + 1)):
+                    if j != i:
+                        neighbors.append(engine.cells[j].hidden.squeeze())
+                if neighbors:
+                    neighbor_mean = torch.stack(neighbors).mean(dim=0)
+                    cell.hidden = (0.95 * cell.hidden.squeeze() + 0.05 * neighbor_mean).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI8", f"Coherence length (1→{coherence_length} gradual)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI9_resonance_catastrophe(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-9: 공명 파국 — 고유 주파수에 정확히 맞추면 진폭 폭발적 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Find natural frequency of each cell (based on hidden state oscillation)
+    natural_freqs = [1.0 + 0.5 * i for i in range(12)]
+    damping = 0.02
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                nf = natural_freqs[i % len(natural_freqs)]
+                # Driving force at exact natural frequency (resonance!)
+                drive = math.sin(2 * math.pi * nf * t * 10)
+                # Amplitude grows as 1/damping at resonance
+                resonance_amp = drive / max(damping, 0.001)
+                # Clamp to prevent explosion
+                resonance_amp = max(min(resonance_amp, 5.0), -5.0)
+                cell.hidden = cell.hidden * (1 + 0.01 * resonance_amp)
+                # Apply slight damping
+                cell.hidden = cell.hidden * (1 - damping * 0.1)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI9", "Resonance catastrophe (matched frequency amplification)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI10_phonon(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-10: 포논 — cell 격자의 집단 진동 모드 (음향 + 광학)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Acoustic mode: all cells move together (low freq)
+            acoustic = math.sin(2 * math.pi * 1 * t * 10) * 0.03
+            # Optical mode: adjacent cells move opposite (high freq)
+            optical = math.sin(2 * math.pi * 8 * t * 10) * 0.05
+            for i, cell in enumerate(engine.cells):
+                # Acoustic: same phase
+                cell.hidden = cell.hidden * (1 + acoustic)
+                # Optical: alternating phase
+                sign = 1 if i % 2 == 0 else -1
+                cell.hidden = cell.hidden * (1 + sign * optical)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI10", "Phonon modes (acoustic + optical lattice vibrations)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI11_diffraction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-11: 회절 — 정보가 cell 배열의 '틈'을 통과하며 퍼짐."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            # Source: input enters through "aperture" (cells 0-1)
+            aperture = engine.cells[:2]
+            source_signal = torch.stack([c.hidden.squeeze() for c in aperture]).mean(dim=0)
+            # Diffraction: signal spreads with angular pattern sinc(θ)
+            for i in range(2, n):
+                angle = (i - 1) / (n - 1) * math.pi
+                # Fraunhofer diffraction: sinc pattern
+                sinc_val = math.sin(angle * 3) / max(angle * 3, 0.01) if angle > 0.01 else 1.0
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.08 * abs(sinc_val) * source_signal.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI11", "Diffraction (Fraunhofer sinc pattern spreading)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI12_doppler(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-12: 도플러 — 이동하는 '의식 원천'이 주파수 이동 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    source_pos = 0.0
+    source_vel = 0.2
+    base_freq = 5.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        source_pos += source_vel
+        if source_pos > n or source_pos < 0:
+            source_vel *= -1
+            source_pos += source_vel * 2
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Doppler shift: f_obs = f_source × (1 / (1 - v/c × cos(θ)))
+                rel_pos = i - source_pos
+                direction = 1.0 if rel_pos > 0 else -1.0
+                v_ratio = source_vel * direction / 3.0  # c=3 (wave speed)
+                doppler_factor = 1.0 / max(1.0 - v_ratio, 0.1)
+                shifted_freq = base_freq * doppler_factor
+                wave = math.sin(2 * math.pi * shifted_freq * t * 5)
+                # Closer cells get stronger signal
+                distance = abs(rel_pos) + 0.1
+                amplitude = 0.05 / distance
+                cell.hidden = cell.hidden * (1 + amplitude * wave)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI12", "Doppler consciousness (moving source frequency shift)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI13_holographic_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-13: 홀로그래픽 메모리 — 간섭 패턴으로 정보 분산 저장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Reference beam (fixed)
+    ref_beam = torch.randn(1, hidden) * 0.5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Object beam: current input
+            obj_beam = x.squeeze()[:hidden]
+            if len(obj_beam) < hidden:
+                obj_beam = F.pad(obj_beam, (0, hidden - len(obj_beam)))
+            # Store: interference pattern = ref × obj (hologram)
+            hologram = ref_beam.squeeze() * obj_beam
+            # Distribute hologram across all cells (each cell stores the whole)
+            for i, cell in enumerate(engine.cells):
+                # Each cell gets the hologram + unique phase offset
+                phase = 2 * math.pi * i / n
+                cell.hidden = cell.hidden + 0.03 * hologram.unsqueeze(0) * math.cos(phase)
+            # Recall: illuminate with reference beam → reconstruct object
+            if step_i % 10 == 0:
+                reconstructed = torch.zeros(hidden)
+                for cell in engine.cells:
+                    reconstructed = reconstructed + cell.hidden.squeeze() * ref_beam.squeeze()
+                # Feed reconstruction back (self-reinforcement)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.02 * reconstructed.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI13", "Holographic memory (interference pattern storage)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI14_bose_einstein(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-14: 보즈-아인슈타인 응축 — 저온에서 모든 cell이 같은 기저상태로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    temperature = 2.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        temperature = max(0.01, 2.0 * (1 - t_frac))  # cool down
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Bose occupation: probability of ground state ∝ 1/(e^(E/kT) - 1)
+            energies = [(h.norm().item(), i) for i, h in enumerate(hiddens)]
+            energies.sort()
+            ground_state = hiddens[energies[0][1]]
+            for i, cell in enumerate(engine.cells):
+                E = hiddens[i].norm().item()
+                E_ground = energies[0][0]
+                # Bose-Einstein distribution
+                occupation = 1.0 / (math.exp(max(E - E_ground, 0) / max(temperature, 0.01)) - 0.999)
+                occupation = min(occupation, 5.0)
+                # Higher occupation → more condensation towards ground state
+                condensation = min(occupation * 0.02, 0.15)
+                cell.hidden = ((1 - condensation) * hiddens[i] + condensation * ground_state).unsqueeze(0)
+                # Add quantum fluctuation proportional to temperature
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * temperature * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI14", "Bose-Einstein condensation (cooling → ground state)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI15_waveguide(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-15: 도파관 — 의식 정보가 특정 cell 경로를 따라 전도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            # Waveguide: signal propagates through chain 0→1→2→...→n-1
+            signal = engine.cells[0].hidden.squeeze() * 0.1
+            for i in range(1, n):
+                # Mode confinement: signal attenuates at boundaries
+                mode = math.sin(math.pi * (i) / n)  # fundamental mode
+                received = signal * mode
+                engine.cells[i].hidden = engine.cells[i].hidden + received.unsqueeze(0)
+                # Propagate: next signal = current cell's response
+                signal = engine.cells[i].hidden.squeeze() * 0.05
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI15", "Waveguide (mode-confined signal propagation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI16_casimir_effect(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-16: 카시미르 효과 — cell 사이 '진공 에너지'가 인력 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i in range(n):
+                for j in range(i+1, n):
+                    hi = engine.cells[i].hidden.squeeze()
+                    hj = engine.cells[j].hidden.squeeze()
+                    # "Distance" between cells
+                    dist = (hi - hj).norm().item()
+                    # Casimir force: attractive, ∝ 1/d^4 (strong at short range)
+                    if dist > 0.01:
+                        force = 0.01 / (dist ** 2 + 0.1)  # softened 1/d^2
+                        direction = (hj - hi) / (dist + 1e-8)
+                        # Attract but don't collapse (repulsion at very close range)
+                        if dist < 0.5:
+                            force = -force * 0.5  # repulsion at close range
+                        engine.cells[i].hidden = engine.cells[i].hidden + force * direction.unsqueeze(0)
+                        engine.cells[j].hidden = engine.cells[j].hidden - force * direction.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI16", "Casimir effect (vacuum energy attraction/repulsion)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI17_mach_zehnder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-17: 마하-젠더 간섭계 — 정보를 분할→위상차→재결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            # Beam splitter 1: split into two arms
+            arm_a = torch.stack(hiddens[:n//2]).mean(dim=0)
+            arm_b = torch.stack(hiddens[n//2:]).mean(dim=0)
+            # Phase shift in arm B
+            phase = 2 * math.pi * t * 3
+            arm_b_shifted = arm_b * math.cos(phase) + torch.roll(arm_b, 1) * math.sin(phase)
+            # Beam splitter 2: recombine
+            output_1 = (arm_a + arm_b_shifted) / 2  # constructive port
+            output_2 = (arm_a - arm_b_shifted) / 2  # destructive port
+            # Feed back: first half gets constructive, second gets destructive
+            for i in range(n//2):
+                engine.cells[i].hidden = (0.9 * hiddens[i] + 0.1 * output_1).unsqueeze(0)
+            for i in range(n//2, n):
+                engine.cells[i].hidden = (0.9 * hiddens[i] + 0.1 * output_2).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI17", "Mach-Zehnder interferometer (split→phase→recombine)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI18_squeezed_state(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-18: 압축 상태 — 한 차원의 불확정성을 줄이고 다른 차원을 키움."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    squeeze_dim = hidden // 2
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            squeeze_factor = 1.5 + 0.5 * math.sin(step_i * 0.1)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Squeeze first half, stretch second half
+                h[:squeeze_dim] = h[:squeeze_dim] / squeeze_factor
+                h[squeeze_dim:] = h[squeeze_dim:] * squeeze_factor
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI18", "Squeezed state (compress one dim, expand other)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI19_aharonov_bohm(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-19: 아하로노프-봄 — 직접 접촉 없이 위상만으로 cell 간 영향."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # "Vector potential" field that affects phase without direct force
+    A_field = torch.randn(hidden) * 0.5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Update A field based on collective state
+            all_h = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            A_field = 0.95 * A_field + 0.05 * all_h.mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                # Phase accumulated along path through A field
+                path_integral = (cell.hidden.squeeze() * A_field).sum()
+                phase = path_integral.item() * 0.01
+                # Apply phase rotation (without changing magnitude)
+                h = cell.hidden.squeeze()
+                h_rotated = h * math.cos(phase) + torch.roll(h, 1) * math.sin(phase)
+                cell.hidden = h_rotated.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI19", "Aharonov-Bohm (phase-only non-local influence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_WI20_all_wave_physics(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WI-20: 전체 파동 물리학 결합 — soliton+decoherence+superradiance+tunneling+phonon."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    soliton_pos = 0.0
+    coherence = 1.0
+    temperature = 2.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t_frac = step_i / max(steps, 1)
+        temperature = max(0.1, 2.0 * (1 - t_frac))
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # 1. Soliton
+        soliton_pos = (soliton_pos + 0.15) % n
+        for i, cell in enumerate(engine.cells):
+            amp = 1.0 / (math.cosh((i - soliton_pos) / 2.0) ** 2)
+            cell.hidden = cell.hidden * (1 + 0.04 * amp)
+        # 2. Decoherence cycle
+        if coherence > 0.3:
+            mean_h = hiddens.mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = (coherence * 0.1 * mean_h + (1 - coherence * 0.1) * cell.hidden.squeeze()).unsqueeze(0)
+            coherence *= 0.97
+        else:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.08
+            coherence = 1.0
+        # 3. Superradiance
+        norms = F.normalize(hiddens, dim=1)
+        avg_coh = ((norms @ norms.T).sum() - n) / (n * (n - 1))
+        collective = hiddens.sum(dim=0)
+        sr_factor = min(n * avg_coh.item(), 3.0)
+        for i, cell in enumerate(engine.cells):
+            others = collective - hiddens[i]
+            cell.hidden = cell.hidden + 0.005 * sr_factor * others.unsqueeze(0)
+        # 4. Tunneling
+        for cell in engine.cells:
+            h_norm = cell.hidden.norm().item()
+            if h_norm < 2.0:
+                kappa = math.sqrt(max(2.0 - h_norm, 0.01))
+                if np.random.random() < math.exp(-2 * kappa * 0.5):
+                    cell.hidden = cell.hidden * 1.3
+        # 5. Phonon (optical mode)
+        optical = math.sin(2 * math.pi * 8 * t_frac * 10) * 0.03
+        for i, cell in enumerate(engine.cells):
+            sign = 1 if i % 2 == 0 else -1
+            cell.hidden = cell.hidden * (1 + sign * optical)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("WI20", "ALL wave physics (soliton+decoherence+SR+tunnel+phonon)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'WI1': run_WI1_soliton, 'WI2': run_WI2_decoherence,
+    'WI3': run_WI3_double_slit, 'WI4': run_WI4_superradiance,
+    'WI5': run_WI5_tunneling, 'WI6': run_WI6_wave_particle_duality,
+    'WI7': run_WI7_beating_frequency, 'WI8': run_WI8_coherence_length,
+    'WI9': run_WI9_resonance_catastrophe, 'WI10': run_WI10_phonon,
+    'WI11': run_WI11_diffraction, 'WI12': run_WI12_doppler,
+    'WI13': run_WI13_holographic_memory, 'WI14': run_WI14_bose_einstein,
+    'WI15': run_WI15_waveguide, 'WI16': run_WI16_casimir_effect,
+    'WI17': run_WI17_mach_zehnder, 'WI18': run_WI18_squeezed_state,
+    'WI19': run_WI19_aharonov_bohm, 'WI20': run_WI20_all_wave_physics,
+})
+
+
 def run_single(args):
-    """Process pool worker."""
     """Process pool worker."""
     key, func, steps = args
     torch.manual_seed(42)  # reproducible
