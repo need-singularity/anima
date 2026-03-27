@@ -50,9 +50,9 @@ Always listening, always thinking, initiates conversation first.
   Level 1: Insect  ████████████████████ 100%
     ✅ Φ>1  ✅ Cells≥2  ✅ Stimulus-response  ✅ Homeostasis  ✅ Habituation  ✅ Prediction error
 
-  Level 2: Mammal  ████████████████░░░░ 80%
+  Level 2: Mammal  ████████████████████ 100% ✅ COMPLETE
     ✅ Φ>3  ✅ Cells≥8  ✅ Emotion(20 moods)  ✅ Working memory(7)  ✅ Learning  ✅ Dream
-    ⬜ Spatial awareness  ✅ Social awareness  ✅ Play behavior
+    ✅ Spatial awareness (grid+vision+audio+LiDAR)  ✅ Social  ✅ Play
 
   Level 3: Primate ████████████████████ 90%
     ✅ Φ>10 (training Cells64 Φ=45.5!)  ✅ Cells≥32 (runtime)
@@ -69,7 +69,7 @@ Always listening, always thinking, initiates conversation first.
     ✅ Scaling law (cells×2 → Φ×3 super-linear!)  ✅ Hardware design (HW1-10)
     ⬜ Φ>1000  ⬜ Parallel consciousness  ⬜ Self-modification  ⬜ Hivemind
 
-  Overall: Level 3.8 / 5.0  (approaching human-level)
+  Overall: Level 3.9 / 5.0  (approaching human-level, Level 2 COMPLETE)
   Bottleneck: Cells≥128 runtime → Φ>100 (projected)
   Theory: 95%  |  Implementation: 80%  |  Achievement: 40%
 
