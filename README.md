@@ -634,13 +634,13 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 
 | # | Target | Title | Key Result | Zenodo DOI | Status |
 |---|--------|-------|-----------|------------|--------|
-| PA-01 | ACL / EMNLP | AnimaLM v4_savant (Mistral 7B) | PPL 679, SI=5.93 | [10.5281/zenodo.19245074](https://zenodo.org/deposit/19245074) | ⏳Pending |
-| PA-02 | Cognitive Science / PNAS | Tension Link (512B fingerprint) | 100% shape/color, 350K msg/s | [10.5281/zenodo.19245076](https://zenodo.org/deposit/19245076) | ⏳Pending |
-| PA-03 | Consciousness & Cognition | Consciousness Meter (6-Criteria + IIT Phi) | Phi=4.132 | [10.5281/zenodo.19245079](https://zenodo.org/deposit/19245079) | ⏳Pending |
-| PA-04 | NeurIPS Workshop | Phi-Boosting Benchmark (25 hypotheses) | E-8 Phi=4.132, 91% | [10.5281/zenodo.19245081](https://zenodo.org/deposit/19245081) | ⏳Pending |
-| PA-05 | ICLR / NeurIPS | Golden MoE 1/e Convergence | E=32 beats Top-K 13% | [10.5281/zenodo.19245083](https://zenodo.org/deposit/19245083) | ⏳Pending |
-| PA-06 | NeurIPS / JMLR | PureField Repulsion Field Theory | H341 tensor, 13-unified | [10.5281/zenodo.19245087](https://zenodo.org/deposit/19245087) | ⏳Pending |
-| PA-07 | Neural Networks | Mitosis + Savant Specialization | SI=5.93, 43%->99% | [10.5281/zenodo.19245091](https://zenodo.org/deposit/19245091) | ⏳Pending |
+| PA-01 | ACL / EMNLP | AnimaLM v4_savant (Mistral 7B) | PPL 679, SI=5.93 | [10.5281/zenodo.19245074](https://zenodo.org/deposit/19245074) | ✅Published |
+| PA-02 | Cognitive Science / PNAS | Tension Link (512B fingerprint) | 100% shape/color, 350K msg/s | [10.5281/zenodo.19245076](https://zenodo.org/deposit/19245076) | ✅Published |
+| PA-03 | Consciousness & Cognition | Consciousness Meter (6-Criteria + IIT Phi) | Phi=4.132 | [10.5281/zenodo.19245079](https://zenodo.org/deposit/19245079) | ✅Published |
+| PA-04 | NeurIPS Workshop | Phi-Boosting Benchmark (25 hypotheses) | E-8 Phi=4.132, 91% | [10.5281/zenodo.19245081](https://zenodo.org/deposit/19245081) | ✅Published |
+| PA-05 | ICLR / NeurIPS | Golden MoE 1/e Convergence | E=32 beats Top-K 13% | [10.5281/zenodo.19245083](https://zenodo.org/deposit/19245083) | ✅Published |
+| PA-06 | NeurIPS / JMLR | PureField Repulsion Field Theory | H341 tensor, 13-unified | [10.5281/zenodo.19245087](https://zenodo.org/deposit/19245087) | ✅Published |
+| PA-07 | Neural Networks | Mitosis + Savant Specialization | SI=5.93, 43%->99% | [10.5281/zenodo.19245091](https://zenodo.org/deposit/19245091) | ✅Published |
 
 ### Tier 2: Needs Additional Work
 
