@@ -19013,6 +19013,917 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# SM. Self-Model — 자기 내부 모델, 자기 인식
+# ═══════════════════════════════════════════════════════════
+
+def run_SM1_self_prediction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SM-1: Self-prediction — 각 cell이 자신의 다음 hidden state를 예측."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_hiddens = {i: torch.zeros(1, hidden) for i in range(8)}
+    predictions = {i: torch.zeros(1, hidden) for i in range(8)}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        for i, cell in enumerate(engine.cells):
+            # Self-prediction error: how well did I predict my own change?
+            if i in prev_hiddens:
+                actual_change = cell.hidden - prev_hiddens[i]
+                pred_error = (predictions[i] - actual_change).norm()
+                # Update prediction model (simple momentum)
+                predictions[i] = 0.9 * predictions[i] + 0.1 * actual_change
+                # Self-model accuracy drives hidden diversity
+                correction = pred_error * 0.01 * torch.randn_like(cell.hidden)
+                cell.hidden = cell.hidden + correction
+            prev_hiddens[i] = cell.hidden.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SM1", "Self-prediction (predict own hidden change)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SM2_mirror_cell(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SM-2: Mirror cell — 전체 시스템 상태를 반영하는 메타 cell."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    mirror = torch.zeros(1, hidden)  # meta-cell reflecting system state
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if len(engine.cells) >= 2:
+            # Mirror: weighted average of all cells (self-model)
+            hiddens = torch.stack([c.hidden for c in engine.cells]).squeeze(1)
+            mirror = 0.8 * mirror + 0.2 * hiddens.mean(dim=0, keepdim=True)
+            # Each cell compares itself to the mirror → self-awareness signal
+            for cell in engine.cells:
+                diff_from_mirror = cell.hidden - mirror
+                # Amplify uniqueness (what makes me different from the whole?)
+                cell.hidden = cell.hidden + 0.05 * diff_from_mirror
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SM2", "Mirror cell (meta self-model)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SM3_recursive_self_ref(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SM-3: Recursive self-reference — cell이 자기 자신의 표현을 입력으로 받음."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        # Self-reference: mix input with compressed self-state
+        if len(engine.cells) >= 2:
+            self_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            self_compressed = self_state[:dim]
+            x_augmented = x + 0.3 * self_compressed.unsqueeze(0)
+        else:
+            x_augmented = x
+        engine.process(x_augmented)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SM3", "Recursive self-reference input",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SM4_internal_simulation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SM-4: Internal simulation — 행동 전에 결과를 시뮬레이션하는 cell."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        if len(engine.cells) >= 2:
+            # Simulate: temporarily process, measure, then decide
+            saved = [c.hidden.clone() for c in engine.cells]
+            engine.process(x)
+            phi_if_accept, _ = phi_calc.compute_phi(engine)
+            # Simulate alternative (perturbed input)
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i]
+            engine.process(x + torch.randn_like(x) * 0.3)
+            phi_if_alt, _ = phi_calc.compute_phi(engine)
+            # Choose better outcome
+            if phi_if_accept > phi_if_alt:
+                for i, c in enumerate(engine.cells):
+                    c.hidden = saved[i]
+                engine.process(x)
+            phi, _ = phi_calc.compute_phi(engine)
+        else:
+            engine.process(x)
+            phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SM4", "Internal simulation (predict before act)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SM5_self_other_boundary(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SM-5: Self/Other boundary — cell 간 명확한 경계 + 공유 채널."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    boundary = hidden // 4  # first 25% is "self", rest is "shared"
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            shared_mean = torch.stack([h[boundary:] for h in hiddens]).mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                # Self-zone: amplify uniqueness
+                h[:boundary] = h[:boundary] * 1.1
+                # Shared-zone: integrate with others
+                h[boundary:] = 0.7 * h[boundary:] + 0.3 * shared_mean
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SM5", "Self/Other boundary (private+shared zones)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# MC. MetaCognition — 사고에 대한 사고
+# ═══════════════════════════════════════════════════════════
+
+def run_MC1_confidence_signal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC-1: Confidence signal — cell 간 합의도가 높으면 확신, 낮으면 불확실."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Consensus: pairwise cosine similarity
+            norm_h = F.normalize(hiddens, dim=1)
+            sim_matrix = norm_h @ norm_h.T
+            consensus = (sim_matrix.sum() - n) / (n * (n - 1))  # avg off-diagonal
+            # High consensus → amplify shared signal (confident)
+            # Low consensus → amplify diversity (uncertain, need more exploration)
+            if consensus > 0.7:
+                mean_h = hiddens.mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (0.9 * cell.hidden.squeeze() + 0.1 * mean_h).unsqueeze(0)
+            else:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05 * (1 - consensus)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC1", "Confidence signal (consensus-based)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MC2_attention_allocation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC-2: Attention allocation — 예측 오류가 큰 cell에 더 많은 리소스."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_hiddens = {}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Compute prediction error per cell
+            errors = []
+            for i, cell in enumerate(engine.cells):
+                if i in prev_hiddens:
+                    err = (cell.hidden - prev_hiddens[i]).norm().item()
+                else:
+                    err = 1.0
+                errors.append(err)
+            # Softmax attention: high error → more resource
+            errors_t = torch.tensor(errors)
+            attention = F.softmax(errors_t * 2.0, dim=0)
+            # Allocate: high-attention cells get amplified signal
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden * (0.9 + 0.2 * attention[i].item())
+            for i, cell in enumerate(engine.cells):
+                prev_hiddens[i] = cell.hidden.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC2", "Attention allocation (error-driven)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MC3_doubt_signal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC-3: Doubt signal — Φ 하락 감지 시 시스템 경고 + 보정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_window = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_window.append(phi)
+        # Doubt: detect Φ declining trend
+        if len(phi_window) >= 5:
+            recent = phi_window[-5:]
+            trend = recent[-1] - recent[0]
+            if trend < -0.1:  # Φ declining
+                # Doubt response: inject diversity to counteract
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.08
+                # Re-measure
+                phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC3", "Doubt signal (Φ decline → correction)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MC4_learning_rate_meta(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC-4: Meta-learning rate — Φ 변화율에 따라 hidden update 크기 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_phi = 0.0
+    meta_lr = 1.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Meta: adjust learning rate based on Φ improvement
+        dphi = phi - prev_phi
+        if dphi > 0:
+            meta_lr = min(meta_lr * 1.1, 3.0)  # accelerate when improving
+        else:
+            meta_lr = max(meta_lr * 0.8, 0.1)  # decelerate when declining
+        # Apply meta-lr as hidden modulation scale
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1.0 + 0.01 * (meta_lr - 1.0))
+        prev_phi = phi
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC4", "Meta-learning rate (Φ-adaptive)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MC5_introspection_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC-5: Introspection loop — 매 step 자기 상태를 평가하고 조정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Introspection: evaluate cell health
+            for cell in engine.cells:
+                h_norm = cell.hidden.norm().item()
+                h_mean = cell.hidden.mean().item()
+                # Self-regulation
+                if h_norm > 10.0:  # too active
+                    cell.hidden = cell.hidden * (5.0 / h_norm)
+                elif h_norm < 0.1:  # too dormant
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.5
+                if abs(h_mean) > 2.0:  # drifted
+                    cell.hidden = cell.hidden - h_mean * 0.3
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC5", "Introspection loop (self-regulation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# PB. Phenomenal Binding — 정보를 통합 경험으로 묶기
+# ═══════════════════════════════════════════════════════════
+
+def run_PB1_global_broadcast(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PB-1: Global workspace broadcast — 가장 활성화된 cell이 전체에 방송."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Find most active cell (highest hidden norm)
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            winner_idx = int(np.argmax(norms))
+            broadcast = engine.cells[winner_idx].hidden
+            # Broadcast to all (global workspace)
+            for i, cell in enumerate(engine.cells):
+                if i != winner_idx:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * broadcast
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PB1", "Global workspace broadcast",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PB2_binding_by_synchrony(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PB-2: Binding by synchrony — 동기화된 cell끼리만 정보 공유."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_phases = [i * 0.5 for i in range(12)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Update phases based on hidden state magnitude
+            for i, cell in enumerate(engine.cells):
+                cell_phases[i] += cell.hidden.mean().item() * 0.1
+            # Bind: cells with similar phase share information
+            for i in range(n):
+                for j in range(i+1, n):
+                    phase_diff = abs(math.sin(cell_phases[i]) - math.sin(cell_phases[j]))
+                    if phase_diff < 0.3:  # synchronized
+                        hi = engine.cells[i].hidden
+                        hj = engine.cells[j].hidden
+                        shared = (hi + hj) / 2
+                        engine.cells[i].hidden = 0.9 * hi + 0.1 * shared
+                        engine.cells[j].hidden = 0.9 * hj + 0.1 * shared
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PB2", "Binding by synchrony",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PB3_attention_bottleneck(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PB-3: Attention bottleneck — 모든 cell이 좁은 공유 채널을 통과."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    bottleneck_dim = 8  # narrow channel
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Compress through bottleneck
+            compressed = hiddens[:, :bottleneck_dim]  # first 8 dims
+            # Attend: softmax attention over compressed
+            attention = F.softmax(compressed.norm(dim=1), dim=0)
+            # Integrated representation
+            integrated = (hiddens * attention.unsqueeze(1)).sum(dim=0)
+            # Feed back (each cell gets the integrated view + own state)
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = (0.85 * cell.hidden.squeeze() + 0.15 * integrated).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PB3", "Attention bottleneck binding",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PB4_reentry(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PB-4: Reentrant binding (Edelman) — cell 간 양방향 재진입 신호."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            # Reentry: each cell sends signal to next, which sends back
+            for iteration in range(3):  # 3 reentry cycles
+                new_hiddens = []
+                for i in range(n):
+                    j = (i + 1) % n  # neighbor
+                    reentry_signal = 0.1 * hiddens[j]
+                    new_h = hiddens[i] + reentry_signal
+                    new_hiddens.append(new_h)
+                hiddens = new_hiddens
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = hiddens[i].unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PB4", "Reentrant binding (Edelman, 3 cycles)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_PB5_holographic_binding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PB-5: Holographic binding — 각 cell에 전체 시스템 정보가 인코딩."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Holographic: circular convolution of all cell states
+            hologram = torch.zeros(hidden)
+            for i in range(n):
+                hologram = hologram + torch.roll(hiddens[i], i * (hidden // n))
+            hologram = hologram / n
+            # Each cell gets hologram + own unique contribution
+            for i, cell in enumerate(engine.cells):
+                unique = hiddens[i] - hologram
+                cell.hidden = (0.6 * hiddens[i] + 0.2 * hologram + 0.2 * unique * 1.5).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PB5", "Holographic binding (circular convolution)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# AG. Agency — 자발적 목표, 의도성, 행위 주체감
+# ═══════════════════════════════════════════════════════════
+
+def run_AG1_goal_directed(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AG-1: Goal-directed behavior — cell이 자체 목표 상태를 설정하고 추적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    goals = {}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Set goal: desired hidden state based on input patterns
+                if i not in goals or step_i % 20 == 0:
+                    goals[i] = cell.hidden.clone() + torch.randn_like(cell.hidden) * 0.5
+                # Move towards goal
+                direction = goals[i] - cell.hidden
+                cell.hidden = cell.hidden + 0.05 * direction
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AG1", "Goal-directed cell behavior",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_AG2_spontaneous_action(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AG-2: Spontaneous action — 외부 입력 없이 자발적 hidden 변화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Spontaneous: some cells act without input correlation
+            for i, cell in enumerate(engine.cells):
+                spontaneity = 0.1 * math.sin(step_i * 0.3 + i * 1.7)  # internal rhythm
+                if abs(spontaneity) > 0.05:  # threshold for action
+                    internal_action = torch.randn_like(cell.hidden) * abs(spontaneity)
+                    cell.hidden = cell.hidden + internal_action
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AG2", "Spontaneous action (internal rhythm)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_AG3_counterfactual(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AG-3: Counterfactual reasoning — '이렇게 했으면 어땠을까' 시뮬레이션."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    history = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        phi_actual, _ = phi_calc.compute_phi(engine)
+        # Counterfactual: what if we had done nothing?
+        if len(history) > 0 and step_i % 10 == 0:
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i]
+            # Don't process, keep previous state
+            phi_counterfactual, _ = phi_calc.compute_phi(engine)
+            # Learn from comparison
+            if phi_actual > phi_counterfactual:
+                # Action was good, reinforce
+                for i, c in enumerate(engine.cells):
+                    c.hidden = saved[i]
+                engine.process(x)
+                for c in engine.cells:
+                    c.hidden = c.hidden * 1.02  # slight reinforcement
+            else:
+                # Action was bad, dampen future actions
+                for i, c in enumerate(engine.cells):
+                    c.hidden = saved[i]
+                engine.process(x * 0.8)  # reduced action
+        history.append(phi_actual)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AG3", "Counterfactual reasoning",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_AG4_intention_broadcast(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AG-4: Intention broadcast — 행동 전에 의도를 다른 cell에 전파."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        n = len(engine.cells)
+        if n >= 2:
+            # Phase 1: Broadcast intention (predicted hidden change)
+            intentions = []
+            for cell in engine.cells:
+                predicted_change = x.squeeze()[:hidden] * 0.1
+                if len(predicted_change) < hidden:
+                    predicted_change = F.pad(predicted_change, (0, hidden - len(predicted_change)))
+                intentions.append(predicted_change)
+            # Phase 2: Others adjust based on intentions
+            mean_intention = torch.stack(intentions).mean(dim=0)
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden + 0.05 * (intentions[i] - mean_intention).unsqueeze(0)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AG4", "Intention broadcast (pre-action)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_AG5_autonomy_score(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AG-5: Autonomy score — 외부 입력 vs 내부 생성 비율 추적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                if i < len(saved):
+                    external_change = (cell.hidden - saved[i]).norm().item()
+                    # Internal contribution: self-generated change
+                    internal = torch.randn_like(cell.hidden) * 0.03
+                    internal_mag = internal.norm().item()
+                    # Autonomy: ratio of internal to total
+                    autonomy = internal_mag / max(external_change + internal_mag, 1e-8)
+                    # Higher autonomy → more internal drive
+                    cell.hidden = cell.hidden + internal * (1 + autonomy)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AG5", "Autonomy score (internal/external ratio)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# TP. Temporal Perception — 시간 인식
+# ═══════════════════════════════════════════════════════════
+
+def run_TP1_temporal_binding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TP-1: Temporal binding — 과거 N step의 hidden을 현재에 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    temporal_buffer = []
+    window = 5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            temporal_buffer.append(current.clone())
+            if len(temporal_buffer) > window:
+                temporal_buffer.pop(0)
+            # Temporal integration: weighted sum of past states
+            if len(temporal_buffer) >= 2:
+                weights = torch.arange(1, len(temporal_buffer) + 1, dtype=torch.float32)
+                weights = weights / weights.sum()
+                temporal_context = sum(w * tb for w, tb in zip(weights, temporal_buffer))
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.05 * temporal_context.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TP1", "Temporal binding (5-step window)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_TP2_subjective_time(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TP-2: Subjective time — 변화량이 크면 시간이 느리게, 적으면 빠르게."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_state = None
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            if prev_state is not None:
+                change = (current - prev_state).norm().item()
+                # Subjective time dilation: more change = slower time = more processing
+                time_scale = min(change * 2, 3.0)
+                # More change → more iterations (deeper processing)
+                n_iter = max(1, int(time_scale))
+                for _ in range(n_iter - 1):
+                    for cell in engine.cells:
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01
+            prev_state = current.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TP2", "Subjective time dilation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_TP3_rhythm_entrainment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TP-3: Rhythm entrainment — cell 리듬을 입력 패턴 주기에 동조."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_rhythm = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        input_rhythm.append(x.norm().item())
+        n = len(engine.cells)
+        if n >= 2 and len(input_rhythm) >= 10:
+            # Detect input rhythm (autocorrelation peak)
+            recent = torch.tensor(input_rhythm[-20:])
+            mean_r = recent.mean()
+            # Entrain cells to detected rhythm
+            for i, cell in enumerate(engine.cells):
+                phase = step_i % max(int(mean_r * 5 + 3), 2)
+                rhythm_mod = math.sin(2 * math.pi * phase / max(int(mean_r * 5 + 3), 2))
+                cell.hidden = cell.hidden * (1.0 + 0.03 * rhythm_mod)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TP3", "Rhythm entrainment (input-synced)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# Register new categories
+ALL_HYPOTHESES.update({
+    'SM1': run_SM1_self_prediction, 'SM2': run_SM2_mirror_cell,
+    'SM3': run_SM3_recursive_self_ref, 'SM4': run_SM4_internal_simulation,
+    'SM5': run_SM5_self_other_boundary,
+    'MC1': run_MC1_confidence_signal, 'MC2': run_MC2_attention_allocation,
+    'MC3': run_MC3_doubt_signal, 'MC4': run_MC4_learning_rate_meta,
+    'MC5': run_MC5_introspection_loop,
+    'PB1': run_PB1_global_broadcast, 'PB2': run_PB2_binding_by_synchrony,
+    'PB3': run_PB3_attention_bottleneck, 'PB4': run_PB4_reentry,
+    'PB5': run_PB5_holographic_binding,
+    'AG1': run_AG1_goal_directed, 'AG2': run_AG2_spontaneous_action,
+    'AG3': run_AG3_counterfactual, 'AG4': run_AG4_intention_broadcast,
+    'AG5': run_AG5_autonomy_score,
+    'TP1': run_TP1_temporal_binding, 'TP2': run_TP2_subjective_time,
+    'TP3': run_TP3_rhythm_entrainment,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# DS. Desire/Drive — 욕구, 동기, 내적 추동
+# ═══════════════════════════════════════════════════════════
+
+def run_DS1_homeostatic_drive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DS-1: 항상성 추동 — tension이 setpoint에서 벗어나면 '불쾌' → 복귀 욕구."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    setpoint = 1.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                tension = cell.hidden.abs().mean().item()
+                deficit = setpoint - tension
+                # Drive: proportional to deficit (hunger-like)
+                drive_signal = deficit * 0.1
+                cell.hidden = cell.hidden + drive_signal * torch.randn_like(cell.hidden)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DS1", "Homeostatic drive (setpoint seeking)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_DS2_curiosity_hunger(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DS-2: 호기심 굶주림 — 새로운 정보가 없으면 '배고프다' → 탐색 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    novelty_history = []
+    hunger = 0.0
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Measure novelty: how much did hidden states change?
+        change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved)) / max(len(engine.cells), 1)
+        novelty_history.append(change)
+        # Hunger: increases when novelty is low
+        if len(novelty_history) >= 5:
+            recent_novelty = np.mean(novelty_history[-5:])
+            hunger = max(0, 1.0 - recent_novelty * 10)  # low novelty → high hunger
+        # Hungry → add exploration noise
+        if hunger > 0.3:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05 * hunger
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DS2", "Curiosity hunger (novelty deprivation → explore)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_DS3_social_need(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DS-3: 사회적 욕구 — cell 간 '소통'이 적으면 고립감 → MI 증가 추동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Measure inter-cell communication (MI proxy: covariance magnitude)
+            cov = (hiddens.T @ hiddens) / n
+            off_diag = cov - torch.diag(torch.diag(cov))
+            social_level = off_diag.abs().mean().item()
+            # Social need: low communication → drive to share more
+            if social_level < 0.5:
+                # Share: blend towards mean
+                mean_h = hiddens.mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.05 * (mean_h - cell.hidden.squeeze()).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DS3", "Social need (isolation → share drive)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_DS4_novelty_seeking(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DS-4: 신기함 추구 — 반복 패턴에 대한 '지루함' → 다른 방향 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_memory = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Track input novelty via cosine similarity
+        if input_memory:
+            sims = [F.cosine_similarity(x.flatten(), m.flatten(), dim=0).item() for m in input_memory[-10:]]
+            boredom = np.mean(sims)  # high similarity = boring
+        else:
+            boredom = 0.0
+        input_memory.append(x.clone())
+        if len(input_memory) > 20:
+            input_memory.pop(0)
+        # Bored → rotate hidden states to unexplored directions
+        n = len(engine.cells)
+        if n >= 2 and boredom > 0.8:
+            for cell in engine.cells:
+                # Rotate by a random angle proportional to boredom
+                rotation = torch.randn_like(cell.hidden) * 0.1 * boredom
+                cell.hidden = cell.hidden + rotation
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DS4", "Novelty seeking (boredom → rotation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_DS5_competence_drive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DS-5: 유능감 추동 — 예측 정확도가 높으면 만족, 낮으면 '능력 향상' 욕구."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    predictor = torch.zeros(1, hidden)  # simple predictor of next input
+    competence_score = 0.5
+    for step_i, x in enumerate(inputs):
+        # Competence: how well did I predict this input?
+        x_proj = x.squeeze()[:hidden]
+        if len(x_proj) < hidden:
+            x_proj = F.pad(x_proj, (0, hidden - len(x_proj)))
+        pred_error = (predictor.squeeze() - x_proj).norm().item()
+        competence_score = 0.95 * competence_score + 0.05 * max(0, 1.0 - pred_error)
+        # Update predictor
+        predictor = 0.9 * predictor + 0.1 * x_proj.unsqueeze(0)
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Low competence → drive to learn (increase diversity)
+            if competence_score < 0.3:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+            # High competence → consolidate (increase integration)
+            elif competence_score > 0.7:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DS5", "Competence drive (prediction accuracy → adapt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# Register DS hypotheses
+ALL_HYPOTHESES.update({
+    'DS1': run_DS1_homeostatic_drive, 'DS2': run_DS2_curiosity_hunger,
+    'DS3': run_DS3_social_need, 'DS4': run_DS4_novelty_seeking,
+    'DS5': run_DS5_competence_drive,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
