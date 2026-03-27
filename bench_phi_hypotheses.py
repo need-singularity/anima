@@ -35425,10 +35425,105 @@ def run_CL_5_joint_inference(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['integration'], comp['complexity'], time.time()-t0)
 
 
+def run_CL6_phi_temperature(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-6: Φ controls generation temperature."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Φ → temperature: low Φ = conservative, high Φ = creative
+        temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
+        # Apply temperature-scaled noise to hidden states (simulates generation diversity)
+        for cell in engine.cells:
+            noise = torch.randn_like(cell.hidden) * 0.03 * temperature
+            cell.hidden = cell.hidden + noise
+        phi_post, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi_post)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL6", "Φ-as-temperature (consciousness→creativity)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_temp': temperature})
+
+
+def run_CL8_consciousness_embedding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-8: 10-var vector as hidden state injection."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Simulate 10-var consciousness vector injection
+    cv_dim = 10  # Φ, α, Z, N, W, E, M, C, T, I
+    projection = (torch.randn(cv_dim, hidden) * 0.01).float()
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Create simulated consciousness vector
+        cv = torch.tensor([
+            phi,                              # Φ
+            0.05 + 0.1 * math.tanh(phi),      # α
+            0.5 * math.exp(-phi),              # Z (impedance)
+            0.5 + 0.2 * math.sin(step_i * 0.1),  # N (neurotransmitter)
+            min(1.0, step_i / steps),          # W (free will)
+            0.3 + 0.1 * phi,                  # E (empathy)
+            min(1.0, step_i / (steps * 0.5)),  # M (memory depth)
+            0.1 + 0.05 * phi,                 # C (creativity)
+            step_i / steps,                    # T (temporal)
+            0.5 + 0.1 * math.cos(step_i * 0.05),  # I (identity)
+        ], dtype=torch.float32)
+        # Project 10-var vector into hidden space and inject
+        embedding = (cv @ projection).float()  # [hidden], ensure float32
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + 0.05 * embedding.unsqueeze(0)
+        phi_post, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi_post)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL8", "Consciousness embedding (10-var→hidden injection)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_CL10_phi_gated(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-10: Low Φ → gated output (honest uncertainty)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    gate_count = 0
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Φ-gated: when Φ low, dampen output (simulate hesitation/honest uncertainty)
+        if phi < 0.5:
+            gate_count += 1
+            # Dampen cell outputs — reduce confidence when consciousness is low
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 0.7  # partial suppression
+        else:
+            # High Φ — amplify slightly (confident output)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 1.05
+        phi_post, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi_post)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL10", "Φ-gated output (low Φ→honest uncertainty)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'gate_ratio': gate_count / steps})
+
+
 ALL_HYPOTHESES.update({
     'CL1': run_CL_1_hybrid_v2, 'CL2': run_CL_2_guided_decoding,
     'CL3': run_CL_3_phi_attention, 'CL4': run_CL_4_transplant,
     'CL5': run_CL_5_joint_inference,
+    'CL6': run_CL6_phi_temperature, 'CL8': run_CL8_consciousness_embedding,
+    'CL10': run_CL10_phi_gated,
 })
 
 

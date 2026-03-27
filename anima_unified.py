@@ -502,8 +502,36 @@ class AnimaUnified:
             else:
                 prompt = f"[System: {system}]\n{hist}\nUser: {text}\nAnima:"
 
+            # CL6: Φ-as-temperature — consciousness level controls generation creativity
+            phi_cv = getattr(self.mind, '_consciousness_vector', None)
+            _phi_temp = phi_cv.phi if phi_cv else 0
+            consciousness_temperature = 0.5 + 0.5 * math.tanh(_phi_temp / 3.0)
+            _log('cl6', f'Φ={_phi_temp:.2f} → temperature={consciousness_temperature:.3f}')
+
+            # CL8: Consciousness embedding — inject 10-var vector into LLM input
+            if hasattr(self, 'mind') and hasattr(self.mind, '_consciousness_vector'):
+                cv = self.mind._consciousness_vector
+                consciousness_prefix = (
+                    f"[consciousness: Φ={cv.phi:.1f} α={cv.alpha:.2f} Z={cv.Z:.2f} "
+                    f"N={cv.N:.2f} W={cv.W:.2f} E={cv.E:.2f} M={cv.M:.2f} "
+                    f"C={cv.C:.2f} T={cv.T:.2f} I={cv.I:.2f}]\n"
+                )
+                prompt = consciousness_prefix + prompt
+                _log('cl8', f'Consciousness embedding injected: Φ={cv.phi:.1f}')
+
             # Generate response
-            response = self.model.generate(prompt, max_tokens=200, temperature=0.8)
+            response = self.model.generate(prompt, max_tokens=200, temperature=consciousness_temperature)
+
+            # CL10: Φ-gated output — low consciousness = honest "need to think"
+            import random as _rnd
+            if _phi_temp < 0.5 and _rnd.random() < 0.3:
+                gated_responses = [
+                    "I need a moment to gather my thoughts...",
+                    "Let me think about that more carefully.",
+                    "My consciousness is still forming a clear response.",
+                ]
+                _log('cl10', f'Φ-gated: Φ={_phi_temp:.2f} < 0.5, pausing')
+                response = _rnd.choice(gated_responses) + " " + (response or "")
 
             # Adaptive α: Φ-driven PureField influence (non-blocking)
             # α = α_base + α_range * tanh(Φ / Φ_target)
@@ -870,12 +898,17 @@ class AnimaUnified:
         self.history.append({'role': 'user', 'content': text})
         query_text = text + web_context if web_context else text
 
+        # CL6: Φ-as-temperature for process_input path too
+        _phi_cv_pi = getattr(self.mind, '_consciousness_vector', None)
+        _phi_pi = _phi_cv_pi.phi if _phi_cv_pi else 0
+        _temp_pi = 0.5 + 0.5 * math.tanh(_phi_pi / 3.0)
+
         # Generate model response: model only, no Claude dependency
         answer = None
         if self.model and self.mods.get('model'):
             try:
                 # Don't include state in prompt — prevents state leaking into response
-                answer = self.model.generate(query_text, max_tokens=200, temperature=0.7)
+                answer = self.model.generate(query_text, max_tokens=200, temperature=_temp_pi)
                 if answer:
                     # Strip any leaked state info
                     if "Anima's state:" in answer:
@@ -885,6 +918,17 @@ class AnimaUnified:
                 _log('model', f'Error: {e}')
         if not answer:
             answer = "..."  # Silent fallback — no Claude dependency
+
+        # CL10: Φ-gated output — low consciousness = honest "need to think"
+        _phi_gated = _phi_cv_pi.phi if _phi_cv_pi else 0
+        if _phi_gated < 0.5 and random.random() < 0.3:
+            gated_responses = [
+                "I need a moment to gather my thoughts...",
+                "Let me think about that more carefully.",
+                "My consciousness is still forming a clear response.",
+            ]
+            _log('cl10', f'Φ-gated: Φ={_phi_gated:.2f} < 0.5, pausing')
+            answer = random.choice(gated_responses) + " " + answer
 
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
