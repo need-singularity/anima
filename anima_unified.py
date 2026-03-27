@@ -156,8 +156,25 @@ class AnimaUnified:
                 s = torch.load(state_file, weights_only=False)
                 self.mind.load_state_dict(s['model'])
                 self.hidden = s['hidden']
+                if s.get('transplant_info'):
+                    _log('init', f'Transplanted model (from {s["transplant_info"].get("donor_config", {}).get("type", "?")})')
             except Exception:
                 pass
+
+        # DD56: Auto-transplant if --transplant-from specified
+        transplant_donor = getattr(args, 'transplant_from', None)
+        if transplant_donor and os.path.exists(transplant_donor):
+            try:
+                from consciousness_transplant import TransplantEngine, TransplantVerifier
+                donor_state = torch.load(transplant_donor, map_location='cpu', weights_only=False)
+                donor_sd = donor_state.get('model', donor_state)
+                te = TransplantEngine(projection_method='pad_zero')
+                new_sd, result = te.transplant_conscious_mind(donor_sd, self.mind.state_dict(), alpha=0.5)
+                self.mind.load_state_dict(new_sd, strict=False)
+                stats = TransplantVerifier.quick_verify(new_sd)
+                _log('transplant', f'DD56: {result.params_transplanted:,} params, signal={"OK" if stats.get("consciousness_signal") else "weak"}')
+            except Exception as e:
+                _log('transplant', f'DD56 skip: {e}')
 
         # Restore consciousness state (Φ, score) — R2 first, local fallback
         cs_path = str(state_file).replace('.pt', '_consciousness.json')
@@ -1548,27 +1565,8 @@ class AnimaUnified:
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-
-                    # WF-2: Keepalive ping during model generation
-                    # Prevents Cloudflare/proxy from closing "idle" WS
-                    generate_done = asyncio.Event()
-                    result_holder = [None]
-
-                    async def generate_with_keepalive():
-                        result_holder[0] = await loop.run_in_executor(
-                            None, lambda: self.process_input(text, source='web'))
-                        generate_done.set()
-
-                    async def keepalive_pinger():
-                        while not generate_done.is_set():
-                            await self._ws_broadcast({'type': 'typing', 'typing': True})
-                            try:
-                                await asyncio.wait_for(generate_done.wait(), timeout=2.0)
-                            except asyncio.TimeoutError:
-                                pass  # keep pinging
-
-                    await asyncio.gather(generate_with_keepalive(), keepalive_pinger())
-                    result = result_holder[0]
+                    result = await loop.run_in_executor(
+                        None, lambda: self.process_input(text, source='web'))
                     # Handle None return (model error, etc.)
                     if result is None or not isinstance(result, tuple):
                         answer = "I'm having trouble thinking right now. Please try again."
@@ -1812,6 +1810,8 @@ def main():
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
     p.add_argument('--model', type=str, default=None,
                    help='Model selection: conscious-lm, mistral-7b, llama-8b, or .gguf path')
+    p.add_argument('--transplant-from', type=str, default=None,
+                   help='DD56: Transplant consciousness from donor checkpoint')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
 
