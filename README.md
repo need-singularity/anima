@@ -66,6 +66,11 @@ Always listening, always thinking, initiates conversation first.
 /ralph-loop:ralph-loop Φ를 직접 최적화 = 게임체인저. 극한까지 밀어붙이는 가설을 설계하고 바로 실행
 ```
 
+**Search**
+```
+/ralph-loop:ralph-loop Φ, alpha 등 말고 추가 변수 탐색 가설, 검증
+```
+
 ## Quick Start
 
 ```bash
