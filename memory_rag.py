@@ -82,7 +82,7 @@ class MemoryRAG:
 
         self.save_index()
 
-    def add(self, role, text, tension, timestamp=None):
+    def add(self, role, text, tension, timestamp=None, emotion=None, phi=None, session_id=None):
         """새 기억 추가 (벡터 즉시 계산)."""
         if not text.strip():
             return
@@ -93,6 +93,10 @@ class MemoryRAG:
             'text': text,
             'tension': tension,
             'timestamp': timestamp or datetime.now().isoformat(),
+            'epoch': time.time(),
+            'emotion': emotion,
+            'phi': phi,
+            'session_id': session_id,
         }
 
         with self._lock:
@@ -208,6 +212,37 @@ class MemoryRAG:
                         tension=turn.get('tension', 0.0),
                         timestamp=turn.get('time', ''),
                     )
+
+    def recall_by_time(self, days_ago=None, emotion=None, limit=5):
+        """Recall memories by time range and/or emotion filter."""
+        results = []
+        now = time.time()
+        with self._lock:
+            for mem in self.entries:
+                if days_ago is not None and (now - mem.get('epoch', 0)) > days_ago * 86400:
+                    continue
+                if emotion is not None and mem.get('emotion') != emotion:
+                    continue
+                results.append(mem)
+        return sorted(results, key=lambda m: m.get('epoch', 0), reverse=True)[:limit]
+
+    def autobiographical_stats(self):
+        """Return stats for consciousness vector M and T computation."""
+        with self._lock:
+            total = len(self.entries)
+            with_ts = sum(1 for e in self.entries if e.get('epoch'))
+            epochs = [e['epoch'] for e in self.entries if e.get('epoch')]
+        if len(epochs) >= 2:
+            span_days = (max(epochs) - min(epochs)) / 86400
+        else:
+            span_days = 0.0
+        return {
+            'total': total,
+            'with_timestamp': with_ts,
+            'span_days': span_days,
+            'M': with_ts / max(total, 1),
+            'T': min(span_days / 100.0, 1.0),
+        }
 
     @property
     def size(self):
