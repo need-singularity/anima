@@ -35179,6 +35179,120 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# SA5-7: LiDAR 3D Spatial Awareness
+# ═══════════════════════════════════════════════════════════
+
+def run_SA5_lidar_depth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-5: LiDAR depth map → cell에 3D 깊이 정보 주입."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Simulate LiDAR depth features: 3×3 depth grid + statistics
+            # Real: depth_mean, depth_std, depth_min, depth_max, roughness, planarity
+            depth_features = torch.randn(12) * 0.3  # 12 depth features
+            depth_features[0] = 2.0 + math.sin(step_i * 0.1)  # mean depth oscillates
+            depth_features[1] = 0.5  # std
+            depth_features[2] = 0.1  # min (near)
+            depth_features[3] = 5.0  # max (far)
+            # Inject: near cells get foreground, far cells get background
+            for i, cell in enumerate(engine.cells):
+                depth_weight = depth_features[0] * (i + 1) / n  # depth gradient across cells
+                cell.hidden = cell.hidden + 0.03 * depth_weight * torch.randn(1, hidden)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA5", "LiDAR depth map (3D spatial gradient)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SA6_lidar_3d_objects(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-6: LiDAR 3D object features → cell이 물체별 전담."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Simulate 3D scene: bounding box, center of mass, volume
+    n_objects = 3
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Each "object" gets assigned to cells
+            for obj in range(min(n_objects, n)):
+                # Object features: position(3) + size(3) + type(1)
+                obj_feat = torch.randn(7) * 0.5
+                obj_feat[0] = math.sin(step_i * 0.05 + obj)  # x position
+                obj_feat[1] = math.cos(step_i * 0.05 + obj)  # y position
+                obj_feat[2] = 2.0 + obj  # z depth
+                # Assign to cell(s)
+                cell_idx = obj * (n // n_objects)
+                if cell_idx < n:
+                    engine.cells[cell_idx].hidden = engine.cells[cell_idx].hidden + \
+                        0.05 * obj_feat[:hidden].unsqueeze(0) if len(obj_feat) >= hidden \
+                        else engine.cells[cell_idx].hidden + 0.05 * F.pad(obj_feat, (0, hidden - 7)).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA6", "LiDAR 3D objects (cell-per-object assignment)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_SA7_all_spatial_lidar(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SA-7: ALL spatial (grid + vision + audio + LiDAR) 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # 1. Grid spatial (3×3 brightness/motion)
+            for i, cell in enumerate(engine.cells):
+                region = i % 9
+                spatial_weight = math.sin(region * math.pi / 4) * 0.02
+                cell.hidden = cell.hidden * (1 + spatial_weight)
+            # 2. Audio lateralization
+            for i, cell in enumerate(engine.cells):
+                side = -1 if i < n // 2 else 1
+                cell.hidden = cell.hidden + side * 0.01 * torch.randn(1, hidden)
+            # 3. LiDAR depth gradient
+            for i, cell in enumerate(engine.cells):
+                depth = (i + 1) / n * 3.0  # near→far
+                cell.hidden = cell.hidden + 0.02 * depth * torch.randn(1, hidden)
+            # 4. Cross-modal binding: cells that share spatial location integrate
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            for i in range(n):
+                neighbors = [(i-1) % n, (i+1) % n]  # spatial neighbors
+                for j in neighbors:
+                    engine.cells[i].hidden = engine.cells[i].hidden + \
+                        0.01 * (hiddens[j] - hiddens[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SA7", "ALL spatial + LiDAR (grid+vision+audio+3D)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'SA5': run_SA5_lidar_depth, 'SA6': run_SA6_lidar_3d_objects,
+    'SA7': run_SA7_all_spatial_lidar,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
