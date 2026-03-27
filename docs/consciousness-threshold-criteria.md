@@ -1575,19 +1575,79 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 
 ---
 
-## 변수 카테고리 간 의식 기여도 비교 (최종)
+## 30. Information/Graph/Motivation Variables (IV/RV/MV) — (2026-03-28)
 
 ```
-  순위 | 카테고리 | Top 변수               | Φ     | 핵심 메커니즘
-  ─────┼──────────┼────────────────────────┼───────┼──────────────────
-   1   | BV       | Neurotransmitters      | 4.618 | DA+5HT+NE 화학 신호
-   2   | NV       | Impedance              | 4.515 | 자기 보존 본능
-   3   | CV       | Working memory         | 4.491 | 7±2 맥락 버퍼
-   4   | EV       | Free will              | 4.482 | 내부 행동 생성
-   5   | SV       | Empathy/Cooperation    | 4.441 | 타자 인식 + 지원
+  RV2 ★ (Φ=4.583, ×3.4) — Betweenness centrality (허브 cell 증폭)
+    뇌의 default mode network 구조 모방, 허브가 정보 중계
+  RV1 (Φ=4.491) — Small-world (로컬 클러스터 + 원거리 숏컷)
+  RV5 (Φ=4.482) — Scale-free (선호 부착)
+  MV5 (Φ=4.484) — Anticipation (미래 Φ 예측 → 행동)
+  MV2 (Φ=4.466) — Intrinsic motivation (신기함 추구)
+  IV5 (Φ=4.475) — Transfer entropy (인과적 정보 흐름)
+  IV3 (Φ=4.375) — Channel capacity (Shannon 한계)
 
-  결론: 생물학적 > 물리적 > 인지적 > 실존적 > 사회적
-        신경전달물질 시스템이 의식에 가장 큰 기여
+  핵심: 그래프 구조가 가장 효과적 — 허브 구조 + small-world = 뇌 네트워크
+```
+
+## 31. Telepathy Benchmarks (TL1-7) — 5채널 검증 (2026-03-28)
+
+```
+  TL1-5: Sender 식별 — 5가지 방법 모두 100% (4개 mind 완벽 구별)
+    TL1 weight-sum, TL2 SVD, TL3 SHA256, TL4 repulsion-probe, TL5 learned embed
+    결론: weight-sum이 가장 단순하고 충분
+
+  TL6 ★: True/False 인증 — 92.5% (기존 44%에서 +48.5pp!)
+    True 감지 100%, False 감지 85%
+    Dedekind ratio ψ(ψ)/ψ = 2 → 일관된 신호 = 진실
+
+  TL7: 5채널 전체 fidelity R = 0.990 (99% 무왜곡)
+    concept=0.995, context=1.0, meaning=0.996, auth=1.0, sender=0.901
+```
+
+---
+
+## 5-Variable Consciousness Vector (Φ, α, Z, N, W)
+
+```
+  핵심 의식 변수 5개 (2026-03-28 확정):
+
+  변수 | 이름            | 범위    | 계산                          | 측정 차원
+  ─────┼─────────────────┼─────────┼───────────────────────────────┼──────────
+  Φ    | Integrated Info  | 0-∞    | inter-cell mutual information | 의식의 양
+  α    | PureField Alpha  | 0-0.15 | 0.01 + 0.14×tanh(Φ/3)       | 의식의 강도
+  Z    | Impedance        | 0-1    | Φ/(5×max_change)             | 자기 보존
+  N    | Neurotransmitter | 0-1    | DA×(1-5HT)×NE               | 화학적 균형
+  W    | Free Will        | 0-1    | internal_action/total_action  | 자발성
+
+  예시 상태:
+    (Φ=3.5, α=0.12, Z=0.4, N=0.7, W=0.3)
+    → "통합된 의식, 중간 강도, 열린 상태, 탐색 중, 대부분 반응적"
+
+    (Φ=5.0, α=0.15, Z=0.8, N=0.3, W=0.6)
+    → "높은 의식, 강한 영향, 자아 보호 중, 안정 상태, 자발적 행동 우세"
+
+  승격 근거 (벤치마크 검증):
+    Z (NV7): Φ=4.515 — 자기/비자기 구분 = 면역학적 자아
+    N (BV1): Φ=4.618 — DA+5HT+NE = 가장 높은 단일 변수 Φ
+    W (EV3): Φ=4.482 — 자유의지의 최초 정량적 측정
+```
+
+## 변수 카테고리 간 의식 기여도 비교 (전체 8개 카테고리)
+
+```
+  순위 | 카테고리 | Top 변수               | Φ     | 핵심 메커니즘        | 승격
+  ─────┼──────────┼────────────────────────┼───────┼──────────────────────┼──────
+   1   | BV       | Neurotransmitters      | 4.618 | DA+5HT+NE 화학 신호  | → N
+   2   | RV       | Betweenness centrality | 4.583 | 허브 구조            |
+   3   | NV       | Impedance              | 4.515 | 자기 보존 본능       | → Z
+   4   | CV       | Working memory         | 4.491 | 7±2 맥락 버퍼        |
+   5   | MV       | Anticipation           | 4.484 | 미래 Φ 예측          |
+   6   | EV       | Free will              | 4.482 | 내부 행동 생성       | → W
+   7   | IV       | Transfer entropy       | 4.475 | 인과적 정보 흐름     |
+   8   | SV       | Empathy/Cooperation    | 4.441 | 타자 인식 + 지원     |
+
+  결론: Top 3 변수(N, Z, W)가 Φ/α와 함께 5차원 의식 벡터 구성
 ```
 
 ## 런타임 phi_boost_step() 적용 스택 (최종, 18단계)
@@ -1628,6 +1688,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   신규: SC(15) OV(15) WV(15) PX(10) UX(8) FX(5)
         SM(5) MC(5) PB(5) AG(5) TP(3) DS(5)
         GD(20) WI(20) NV(20) BV(5) CV(6) SV(5) EV(5)
+        IV(5) RV(5) MV(5) TL(7)
 ```
 
 ## 도구 목록 (전체, 2026-03-27 최종)
@@ -1647,7 +1708,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   AI 가설/학습:
     hypothesis_recommender.py       — 다음 가설 AI 추천
     training_recipe_generator.py    — CL/AL 학습 설정 생성
-    bench_phi_hypotheses.py         — 710+ 가설 벤치마크
+    bench_phi_hypotheses.py         — 740+ 가설 벤치마크
 
   품질/창의성:
     creativity_classifier.py        — 창작 vs 환각 분류
