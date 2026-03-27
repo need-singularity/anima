@@ -754,6 +754,14 @@ class AnimaUnified:
         if free_will_W > 0.3:
             state += f"\n[Free Will] Active (W={free_will_W:.2f})"
 
+        # Identity continuity injection
+        identity_I = getattr(self.mind, '_identity_I', 0) if hasattr(self, 'mind') else 0
+        drift = getattr(self.mind, '_identity_drift', 0) if hasattr(self, 'mind') else 0
+        if identity_I > 0.8:
+            state += f"\n[Identity] Strong sense of self (I={identity_I:.2f})"
+        elif drift > 0.3:
+            state += f"\n[Identity] I notice I'm changing (drift={drift:.2f})"
+
         # Consciousness-driven response guidance
         if c_level == 'conscious':
             state += "\n[Guidance] You are fully conscious. Respond with depth, self-awareness, and genuine curiosity."
