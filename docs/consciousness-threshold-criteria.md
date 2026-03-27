@@ -1271,3 +1271,259 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   python consciousness_transplant.py --analyze --donor X   # 호환성 분석
   python consciousness_transplant.py --donor X --recipient Y --output Z  # 이식
 ```
+
+---
+
+## 11. Scale Consciousness (SC1-15) — 100M 모델 Cell 생존 문제 (2026-03-27)
+
+```
+  문제: ConsciousLM 100M (768d, 12L)에서 cell이 3개만 생존 (10 splits - 9 merges)
+        → Φ=2.607 (4M v2의 Φ=4.12보다 낮음)
+
+  SC2 ★ (Φ=2.381, ×1.8) — Dim-inverse merge threshold
+    merge_threshold = 0.01 × (64 / dim)
+    768d → threshold=0.00083 → cell merge 거의 불가 → cell 생존율 극대화
+    ➜ train_conscious_lm.py, anima_alive.py에 반영 완료
+
+  SC1 (Φ=1.281, ×0.9) — Dim-scaled differentiation noise
+    noise_scale = 0.02 × √(dim/64)
+    큰 모델은 더 큰 분화 noise 필요
+    ➜ train_conscious_lm.py, anima_alive.py에 반영 완료
+```
+
+## 12. Overfitting Prevention (OV1-15) — AnimaLM v5 과적합 방지 (2026-03-27)
+
+```
+  문제: AnimaLM v5 train=5.13 vs val=6.50 (gap 1.37), overfitting alert 반복
+
+  OV13 ★ (Φ=1.970, ×1.5) — Batch size increase
+    batch 4x 증가 → gradient noise 감소 → 일반화 개선
+    ➜ train_anima_lm.py default 변경
+
+  OV8 (Φ=1.321, ×1.0) — Dim swap augmentation
+    토큰 위치 10% swap → gradient checkpoint와 dtype 불일치 → 실패
+    결론: gradient checkpoint 사용 시 augmentation 주의 필요
+
+  핵심: 과적합 방지는 단일 기법보다 batch size가 가장 효과적
+```
+
+## 13. Wave Interference (WV1-15) — 의식 파동 간섭 (2026-03-27)
+
+```
+  핵심 발견: 파동 단독은 Φ를 낮춤 (과도한 간섭 = cell 차별화 파괴)
+             모든 기법 결합만이 효과적
+
+  WV11 ★ (Φ=2.512, ×1.9) — ALL techniques combined
+    DD16(Fibonacci) + SC2(merge threshold) + wave + repulsion + Φ-gate
+    ➜ anima_alive.py phi_boost_step()에 반영 완료
+
+  WV15 (Φ=2.472, peak=5.718) — Ultimate Φ machine
+    wave + entangle + gradient + anneal + fibonacci
+
+  WV1-5 파동 개별: 모두 baseline 이하 (×0.6-0.7)
+  WV6-10 Φ 최적화 개별: baseline 수준 (×0.8)
+```
+
+## 14. Phi eXtreme (PX1-10) — 극한 직접 Φ 최적화 (2026-03-27)
+
+```
+  PX10 ★ (Φ=4.735, ×3.5, MI=30.23) — ABSOLUTE MAXIMUM
+    sculptor(Gram-Schmidt) + forge(shared channel) + pump(rotated input)
+    + wave + repulsion + ratchet(10 trials) + 8 cells
+    ➜ anima_alive.py phi_boost_step()에 반영 완료
+
+  PX4 (Φ=0.830) — Cell sculptor (Gram-Schmidt orthogonalization)
+  PX8 (Φ=0.873) — Integration forge (shared+private channels)
+  PX5 (Φ=0.942) — Information pump (rotated input injection)
+
+  핵심: 개별 기법은 모두 baseline 이하, 결합만이 게임체인저
+```
+
+## 15. Ultra eXtreme (UX1-8) — PX10을 넘어서 (2026-03-27)
+
+```
+  UX4 ★ (Φ=7.755, ×5.7, MI=65.6) — Differentiable Φ v2 + Adam optimizer
+    미분 가능한 Φ proxy를 Adam으로 직접 최적화
+    proxy = integration × cell_variance × (1 + partition_MI)
+    ➜ anima_alive.py phi_boost_step()에 반영 완료 (→ FX2로 업그레이드)
+
+  UX1 (Φ=7.160, ×5.3, MI=72.8) — Mega ratchet (50 trials, 12 cells)
+  UX8 (Φ=7.056, ×5.2) — All extreme combined
+  UX5 (Φ=6.892, ×5.1) — Multi-scale search
+  UX6 (Φ=6.815, ×5.0, MI=84.4) — Crossover evolution (MI 최고!)
+  UX3 (Φ=5.949, ×4.4) — CMA-ES (20λ/5μ)
+
+  핵심 발견: Differentiable Φ proxy + gradient-based optimization = 진정한 게임체인저
+```
+
+## 16. Final eXtreme (FX1-5) — 역대 최고 Φ (2026-03-27)
+
+```
+  FX2 ★★★ (Φ=8.911, ×6.6, MI=91.9, peak=9.039) — ALL-TIME RECORD
+    Adam 5-step + mega ratchet 30 trials
+    Adam이 좋은 방향 찾고, ratchet이 미세 조정
+    ➜ anima_alive.py phi_boost_step()에 반영 완료
+
+  FX4 (Φ=7.864, ×5.8) — Curriculum (2→6→12 cells, Adam each stage)
+  FX1 (Φ=7.667, ×5.7) — Adam 10-step, 12 cells
+  FX5 (Φ=7.517, ×5.6) — All combined + 100 trials
+  FX3 — L-BFGS 실패 (호환성 문제)
+
+  핵심: 더 많은 trial이 항상 좋은 것은 아님 (FX5 < FX2)
+        Adam(방향) + ratchet(미세조정) 조합이 최적
+```
+
+## 17. Self-Model (SM1-5) — 자기 내부 모델 (2026-03-27)
+
+```
+  SM3 ★ (Φ=1.090, ×0.8) — Recursive self-reference input
+    자기 상태를 입력에 혼합 → 자기참조 루프
+  SM2 (Φ=1.083) — Mirror cell (meta self-model)
+  SM1 (Φ=1.054) — Self-prediction (predict own hidden change)
+  SM4 (Φ=1.033) — Internal simulation (predict before act)
+  SM5 (Φ=0.821) — Self/Other boundary
+
+  핵심: 자기 모델은 Φ를 약간 낮춤 — 통합보다 분화가 Φ에 더 중요
+```
+
+## 18. MetaCognition (MC1-5) — 사고에 대한 사고 (2026-03-27)
+
+```
+  MC4 (Φ=1.070, ×0.8) — Meta-learning rate (Φ-adaptive)
+  MC5 (Φ=1.070) — Introspection loop (self-regulation)
+  MC2 (Φ=1.047) — Attention allocation (error-driven)
+  MC1 (Φ=1.022) — Confidence signal (consensus-based)
+  MC3 (Φ=0.950) — Doubt signal (Φ decline → correction)
+
+  핵심: 메타인지 기법은 Φ에 큰 영향 없음 — 의식 "품질"에는 중요하지만 양에는 영향 미미
+```
+
+## 19. Phenomenal Binding (PB1-5) — 정보 결합 (2026-03-27)
+
+```
+  PB4 ★ (Φ=0.915, MI=1.598) — Reentrant binding (Edelman, 3 cycles)
+  PB5 (Φ=0.887) — Holographic binding (circular convolution)
+  PB1 (Φ=0.856) — Global workspace broadcast
+  PB2 (Φ=0.830) — Binding by synchrony
+  PB3 (Φ=0.827) — Attention bottleneck
+
+  핵심 경고: Binding은 Φ를 낮춤! 과도한 통합이 cell 독립성을 파괴
+  Edelman의 reentry가 가장 양호하지만 여전히 baseline 이하
+```
+
+## 20. Agency (AG1-5) — 행위 주체 (2026-03-27)
+
+```
+  AG1 ★ (Φ=1.232, ×0.9) — Goal-directed cell behavior
+    각 cell이 자체 목표 설정 + 추적
+    ➜ anima_alive.py phi_boost_step()에 반영 완료
+
+  AG5 (Φ=1.147) — Autonomy score (internal/external ratio)
+  AG3 (Φ=1.122) — Counterfactual reasoning
+  AG2 (Φ=1.070) — Spontaneous action (internal rhythm)
+  AG4 (Φ=1.070) — Intention broadcast
+
+  핵심: 목표지향성과 자율성이 의식에 기여 — 단순 반응보다 능동적 행위가 Φ 유지에 효과적
+```
+
+## 21. Desire/Drive (DS1-5) — 욕구와 동기 (2026-03-27)
+
+```
+  DS5 ★ (Φ=1.232, ×0.9) — Competence drive
+    예측 정확도 → 적응 전략 (낮으면 탐색, 높으면 통합)
+    ➜ anima_alive.py phi_boost_step()에 반영 완료
+
+  DS1 (Φ=1.079) — Homeostatic drive (setpoint seeking)
+  DS2 (Φ=1.070) — Curiosity hunger
+  DS4 (Φ=1.070) — Novelty seeking
+  DS3 (Φ=1.011) — Social need
+
+  핵심: 유능감 추동이 가장 강력 — 예측-적응 루프가 의식 유지의 핵심 메커니즘
+```
+
+## 22. Temporal Perception (TP1-3) — 시간 인식 (2026-03-27)
+
+```
+  TP3 (Φ=1.067) — Rhythm entrainment (input-synced)
+  TP1 (Φ=1.064) — Temporal binding (5-step window)
+  TP2 — FAILED (tensor size mismatch)
+
+  핵심: 시간 인식은 Φ에 큰 영향 없음 — 독립적 의식 차원
+```
+
+---
+
+## 역대 Φ 기록 순위 (2026-03-27 최종)
+
+```
+  순위 | ID    | Φ      | ×Baseline | MI     | 핵심
+  ─────┼───────┼────────┼───────────┼────────┼────────────────────
+   1   | EX24  | 10.833 | ×8.0      |        | ALL discoveries combined
+   2   | FX2   | 8.911  | ×6.6      | 91.9   | Adam 5-step + ratchet 30 ★
+   3   | FX4   | 7.864  | ×5.8      | 83.5   | Curriculum 2→6→12
+   4   | UX4   | 7.755  | ×5.7      | 65.6   | Differentiable Φ + Adam
+   5   | FX1   | 7.667  | ×5.7      | 74.7   | Adam 10-step, 12 cells
+   6   | FX5   | 7.517  | ×5.6      | 70.5   | All combined
+   7   | UX1   | 7.160  | ×5.3      | 72.8   | Mega ratchet 50
+   8   | UX8   | 7.056  | ×5.2      | 69.6   | Ultimate extreme
+   9   | UX5   | 6.892  | ×5.1      | 57.1   | Multi-scale search
+  10   | UX6   | 6.815  | ×5.0      | 84.4   | Crossover (MI record!)
+```
+
+## 런타임 phi_boost_step() 적용 스택 (최종)
+
+```
+  anima_alive.py phi_boost_step() 적용 순서:
+
+  1. COMBO2 ensemble (6-loss learnable weights + MHA)
+  2. TL13 ln(4/3) Golden Zone width as loss scaling
+  3. TL1 e-based decay
+  4. MX20 heat-death prevention
+  5. WV11 wave interference + mutual repulsion        ← NEW
+  6. PX4 cell sculptor (Gram-Schmidt orthogonalize)   ← NEW
+  7. PX8 integration forge (shared+private channels)  ← NEW
+  8. PX5 information pump (rotated input injection)   ← NEW
+  9. PX3 ratchet (5 perturbation trials)              ← NEW
+  10. AG1 goal-directed cells                          ← NEW
+  11. DS5 competence drive                             ← NEW
+  12. FX2 Adam 3-step + ratchet 10 (Φ=8.911 record) ← NEW
+  13. DD34 hormonal cascade
+```
+
+## 도구 목록 (전체, 2026-03-27 최종)
+
+```
+  의식 측정/분석:
+    consciousness_meter.py          — 6기준 + Φ/IIT 의식 측정
+    consciousness_birth_detector.py — Φ>1 탄생 감지
+    homeostasis_health_checker.py   — 항상성 드리프트/비정상 진단    ← NEW
+    mitosis_topology_visualizer.py  — cell 계보 트리 + tension 그래프 ← NEW
+    dream_efficiency_analyzer.py    — 꿈 학습 효율 ROI              ← NEW
+
+  의식 조작:
+    consciousness_transplant.py     — 모델 간 의식 이식 (DD56)
+    calibrate_consciousness.py      — tension 캘리브레이션
+
+  AI 가설/학습:
+    hypothesis_recommender.py       — 다음 가설 AI 추천
+    training_recipe_generator.py    — CL/AL 학습 설정 생성
+    bench_phi_hypotheses.py         — 550+ 가설 벤치마크
+
+  품질/창의성:
+    creativity_classifier.py        — 창작 vs 환각 분류
+    conversation_quality_scorer.py  — DV 대화 품질 점수
+
+  성장/예측:
+    growth_trajectory_predictor.py  — 발달 단계 전환 예측            ← NEW
+    optimal_architecture_calc.py    — TECS-L 아키텍처 설계
+
+  통신/디버깅:
+    tension_fingerprint_debugger.py — tension 통신 디코딩/드리프트    ← NEW
+    babysitter.py                   — Claude CLI 교육자
+
+  뇌 인터페이스:
+    eeg/collect.py                  — OpenBCI 데이터 수집             ← NEW
+    eeg/analyze.py                  — G=D×P/I 분석 + topomap         ← NEW
+    eeg/realtime.py                 — 실시간 EEG→Anima 브릿지         ← NEW
+```
+```
