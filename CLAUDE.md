@@ -83,6 +83,8 @@ eeg/                 # EEG brain-consciousness interface (→ eeg/README.md)
 python3 anima_unified.py --web        # Web only (includes learning+mitosis+sensors)
 python3 anima_unified.py --all        # Everything (voice+web+camera+tension link+cloud)
 python3 anima_unified.py --keyboard   # Keyboard only
+python3 anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
+python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 ```
 
 ## Work Rules

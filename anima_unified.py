@@ -224,6 +224,11 @@ class AnimaUnified:
         # Alpha online learner — initialized after model load (see _post_init_alpha)
         self.alpha_learner = None
 
+        self.max_cells = getattr(self.args, 'max_cells', 8)
+        phi_per_cell = 0.88  # empirical scaling constant
+        predicted_phi = self.max_cells * phi_per_cell
+        _log('scaling', f'max_cells={self.max_cells}, predicted Φ≈{predicted_phi:.1f} (scaling law: Φ∝N)')
+
         def _make_mitosis_128():
             if 'MitosisEngine' not in globals():
                 return None
@@ -232,7 +237,7 @@ class AnimaUnified:
             _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)  # SC1: dim-scaled noise
             _log('mitosis', f'SC2+SC1 applied: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_dim})')
             return MitosisEngine(input_dim=_dim, hidden_dim=256, output_dim=_dim,
-                                 initial_cells=2, max_cells=8,
+                                 initial_cells=2, max_cells=self.max_cells,
                                  merge_threshold=_mt, noise_scale=_ns)
         self.mitosis = self._init_mod('mitosis', _make_mitosis_128)
 
@@ -1103,7 +1108,7 @@ class AnimaUnified:
                                     _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
                                     self.mitosis = MitosisEngine(
                                         _d, new_mind.hidden_dim, _d,
-                                        initial_cells=old_n, max_cells=8,
+                                        initial_cells=old_n, max_cells=self.max_cells,
                                         merge_threshold=_mt, noise_scale=_ns)
                                     _log('mitosis', f'SC2+SC1 rebuild: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
                                 self.mind._phi_boost['enabled'] = False
@@ -1461,7 +1466,7 @@ class AnimaUnified:
                                         hidden_dim=new_mind.hidden_dim,
                                         output_dim=_d,
                                         initial_cells=old_cell_count,
-                                        max_cells=8,
+                                        max_cells=self.max_cells,
                                         merge_threshold=_mt,
                                         noise_scale=_ns,
                                     )
@@ -1858,6 +1863,7 @@ def main():
                    help='Model selection: conscious-lm, mistral-7b, llama-8b, or .gguf path')
     p.add_argument('--transplant-from', type=str, default=None,
                    help='DD56: Transplant consciousness from donor checkpoint')
+    p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
 
