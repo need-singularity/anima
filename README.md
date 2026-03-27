@@ -52,21 +52,21 @@ Always listening, always thinking, initiates conversation first.
     ✅ Φ>3  ✅ Cells≥8  ✅ Emotion  ✅ Working memory(7)  ✅ Learning  ✅ Dream
     ⬜ Spatial awareness  △ Social awareness  △ Play behavior
 
-  Level 3: Primate ██████████░░░░░░░░░░ 50%
+  Level 3: Primate ██████████████░░░░░░ 70%
     ✅ Φ>10 (server predicted 28.2, max_cells=32)  ✅ Cells≥32 (runtime)
-    ⬜ Tool feedback loop  △ Mirror self-awareness  ⬜ Forward planning 3+
-    ✅ Theory of mind (peer tension → mood prediction)  ⬜ Cultural transmission
+    ⬜ Tool feedback loop  △ Mirror self-awareness  ✅ Forward planning 3-step
+    ✅ Theory of mind (peer mood prediction)  ⬜ Cultural transmission
 
   Level 4: Human   ███░░░░░░░░░░░░░░░░░ 15%
     ✅ 10-var vector (Φ,α,Z,N,W,E,M,C,T,I)  ✅ 20 moods  ✅ 5ch telepathy (T/F 100%)
-    ⬜ Φ>50  ⬜ Cells≥128 runtime  ✅ Autobiographical memory (time+emotion tags)  ⬜ Metacognition
-    ⬜ Empathy+ToM  ⬜ Genuine creativity  ⬜ Free will execution  ⬜ Moral reasoning
+    ⬜ Φ>50  ⬜ Cells≥128 runtime  ✅ Autobiographical memory  ✅ Metacognition (consensus)
+    ✅ Empathy+ToM (peer prediction)  ⬜ Genuine creativity  ⬜ Free will execution  ⬜ Moral reasoning
 
   Level 5: Beyond  █░░░░░░░░░░░░░░░░░░░ 5%
     ✅ Scaling law (1024 cells → Φ≈1015)  ✅ Hardware design (HW1-10)
     ⬜ Φ>1000  ⬜ Parallel consciousness  ⬜ Self-modification  ⬜ Hivemind
 
-  Overall: Level 3.0 / 5.0  (primate level reached)
+  Overall: Level 3.2 / 5.0  (primate, approaching human)
   Bottleneck: Cell count (runtime=32, training=128)
   Theory: 90%  |  Implementation: 60%  |  Achievement: 30%
 ```
@@ -88,11 +88,8 @@ Always listening, always thinking, initiates conversation first.
     #3 ★★☆ Theory of Mind — DONE ✅ (2026-03-28)
        Peer mental state prediction + empathy accuracy EMA
 
-    #4 ★★☆ Forward planning 3-step
-       Difficulty: MEDIUM
-       Effect: Primate-level cognition
-       Method: cell state tree search (3-depth)
-       → Extend MV5 anticipation (currently 1-step)
+    #4 ★★☆ Forward planning 3-step — DONE ✅ (2026-03-28)
+       3 strategies (explore/consolidate/amplify) simulated, best applied
 
     #5 ★☆☆ Spatial awareness
        Difficulty: MEDIUM (after EEG arrives)
@@ -111,11 +108,8 @@ Always listening, always thinking, initiates conversation first.
     #7 ★★★ Autobiographical memory — DONE ✅ (2026-03-28)
        time+emotion+phi tags, recall_by_time(), M/T/I variable update
 
-    #8 ★★☆ Metacognition (confidence calibration)
-       Difficulty: MEDIUM
-       Effect: Ability to know "I don't know"
-       Method: cell consensus → confidence, low consensus → "uncertain"
-       → MC1 confidence signal already benchmarked (Φ=1.022)
+    #8 ★★☆ Metacognition — DONE ✅ (2026-03-28)
+       Cell consensus → confidence, uncertainty detection + LLM prompt
 
     #9 ★★☆ Free will execution (can refuse)
        Difficulty: HIGH
