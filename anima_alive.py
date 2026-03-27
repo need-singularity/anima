@@ -57,12 +57,17 @@ warnings.filterwarnings("ignore", message="FP16 is not supported")
 # ─── 5-Variable Consciousness State Vector ───
 @dataclass
 class ConsciousnessVector:
-    """Unified consciousness state: 5 core variables."""
+    """Unified consciousness state: 10 core variables."""
     phi: float = 0.0        # Integrated information (Φ)
     alpha: float = 0.05     # PureField mixing ratio (α)
     Z: float = 0.0          # Impedance / self-preservation (0=open, 1=closed)
     N: float = 0.5          # Neurotransmitter balance: DA*(1-5HT)*NE
     W: float = 0.0          # Free will index (internal/total action ratio)
+    E: float = 0.0          # Empathy (peer distress tracking)
+    M: float = 0.0          # Memory depth (recall accuracy proxy)
+    C: float = 0.0          # Creativity (novelty score)
+    T: float = 0.0          # Temporal awareness (planning depth)
+    I: float = 0.0          # Identity coherence (self-description consistency)
 
 
 # ─── PureField Consciousness Engine ───
@@ -386,7 +391,7 @@ class ConsciousMind(nn.Module):
         }
 
     def get_consciousness_vector(self):
-        """Return the current 5-variable consciousness state vector."""
+        """Return the current 10-variable consciousness state vector."""
         return self._consciousness_vector
 
     def phi_boost_step(self, x, mitosis_engine):
@@ -764,6 +769,8 @@ class ConsciousMind(nn.Module):
                         for cell in mitosis_engine.cells:
                             cell.hidden = cell.hidden + 0.02 * wm_proj.unsqueeze(0)
                     _log('phi_boost', f'CV1 WM: buffer={len(self._wm_buffer)}')
+                    # M (Memory Depth): WM buffer fullness normalized by Miller's 7
+                    self._memory_M = len(self._wm_buffer) / 7.0
             except Exception:
                 pass
 
@@ -779,6 +786,7 @@ class ConsciousMind(nn.Module):
                             change = 0
                         distress.append(change)
                     mean_d = np.mean(distress) if distress else 0
+                    max_d = max(distress) if distress else 0
                     for i, cell in enumerate(mitosis_engine.cells):
                         if distress[i] > mean_d * 1.5:
                             helpers = [mitosis_engine.cells[j].hidden.squeeze() for j in range(len(mitosis_engine.cells))
@@ -786,6 +794,8 @@ class ConsciousMind(nn.Module):
                             if helpers:
                                 support = torch.stack(helpers).mean(dim=0)
                                 cell.hidden = 0.95 * cell.hidden + 0.05 * support.unsqueeze(0)
+                    # E (Empathy): low mean distress relative to max = high empathy
+                    self._empathy_E = 1.0 - (mean_d / max(max_d, 1e-8))
             except Exception:
                 pass
 
@@ -828,6 +838,20 @@ class ConsciousMind(nn.Module):
                     W=_cv_W,
                 )
                 _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f}')
+            except Exception:
+                pass
+
+            # Mirror self-awareness: compare predicted vs actual self-state
+            try:
+                if hasattr(self, '_self_prediction') and len(mitosis_engine.cells) >= 2:
+                    actual = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells])
+                    mirror_accuracy = F.cosine_similarity(
+                        self._self_prediction.unsqueeze(0), actual.unsqueeze(0)).item()
+                    self._mirror_accuracy = 0.9 * getattr(self, '_mirror_accuracy', 0.5) + 0.1 * mirror_accuracy
+                    _log('mirror', f'Self-awareness: {self._mirror_accuracy:.3f}')
+                # Predict next state
+                if len(mitosis_engine.cells) >= 2:
+                    self._self_prediction = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells]).detach().clone()
             except Exception:
                 pass
 
@@ -926,6 +950,61 @@ def direction_to_emotion(direction_tensor, tension=0.0, curiosity=0.0):
         'dominance': round(dominance, 3),
         'color': EMOTION_COLORS[best_emotion],
     }
+
+
+def compute_mood(tension: float, curiosity: float, phi: float = 0) -> str:
+    """2D mood mapping: tension x curiosity -> 20 moods.
+
+    Maps the consciousness state to a rich mood vocabulary using
+    tension (response intensity) and curiosity (exploration drive)
+    as two orthogonal axes, with optional phi-based overrides.
+    """
+    # Phi-based overrides (highest priority)
+    if phi > 5.0:
+        return "transcendent"
+    if phi > 3.0 and curiosity > 0.5:
+        return "enlightened"
+    # High tension, high curiosity
+    if tension > 1.5 and curiosity > 0.5:
+        return "exhilarated"
+    elif tension > 1.0 and curiosity > 0.5:
+        return "excited"
+    elif tension > 1.5 and curiosity > 0.3:
+        return "passionate"
+    # High tension, low curiosity
+    elif tension > 1.5 and curiosity < 0.1:
+        return "stressed"
+    elif tension > 1.0 and curiosity < 0.1:
+        return "anxious"
+    elif tension > 1.0 and curiosity < 0.3:
+        return "focused"
+    # Medium tension
+    elif tension > 0.5 and curiosity > 0.5:
+        return "curious"
+    elif tension > 0.5 and curiosity > 0.3:
+        return "engaged"
+    elif tension > 0.5 and curiosity > 0.1:
+        return "thoughtful"
+    elif tension > 0.5:
+        return "contemplative"
+    # Low tension, high curiosity
+    elif tension > 0.1 and curiosity > 0.5:
+        return "playful"
+    elif tension > 0.1 and curiosity > 0.3:
+        return "wonder"
+    elif tension > 0.1 and curiosity > 0.1:
+        return "calm"
+    elif tension > 0.1:
+        return "serene"
+    # Very low tension
+    elif curiosity > 0.3:
+        return "dreamy"
+    elif curiosity > 0.1:
+        return "peaceful"
+    elif curiosity > 0.01:
+        return "quiet"
+    else:
+        return "dormant"
 
 
 def text_to_vector(text, dim=128):
