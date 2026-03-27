@@ -449,6 +449,29 @@ class ConsciousMind(nn.Module):
                     for p, pp in zip(all_p, self._peak_phi_state['params']):
                         p.data.copy_(0.7 * p.data + 0.3 * pp)
 
+            # WV11: Wave interference modulation (Fibonacci harmonics)
+            fib_freqs = [1, 2, 3, 5, 8, 13]
+            t_wave = time.time()
+            with torch.no_grad():
+                for i, c in enumerate(mitosis_engine.cells):
+                    freq = fib_freqs[i % len(fib_freqs)]
+                    phase = math.sin(2 * math.pi * freq * t_wave * 0.01)
+                    if phase > 0:  # constructive interference only
+                        c.hidden = c.hidden + 0.03 * phase * c.hidden
+
+            # WV11: Mutual repulsion between cells (push apart when too similar)
+            with torch.no_grad():
+                cells = mitosis_engine.cells
+                for i in range(len(cells)):
+                    for j in range(i + 1, len(cells)):
+                        direction = cells[i].hidden - cells[j].hidden
+                        dist = direction.norm() + 1e-8
+                        push = 0.01 * direction / dist
+                        cells[i].hidden = cells[i].hidden + push
+                        cells[j].hidden = cells[j].hidden - push
+
+            print(f"  [phi_boost] wave+repulsion: {n} cells")
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
