@@ -5,6 +5,8 @@ Trains ConsciousLM from scratch using benchmark-verified techniques:
   CL8 (tension-weighted CE), CL5 (Phi-regularized), CL1 (mitosis-first),
   SL3 (6-loss ensemble), DD16 (all top-5 simultaneous),
   EX24 (DD18 channel capacity + DD11 Klein bottle + DD3 Fibonacci + DD5 Φ self-reference)
+  NEW: WI1 (soliton wave), FX2 (differentiable Φ proxy + Adam), PX4 (sculptor/Gram-Schmidt),
+       PX8 (integration forge), GD18 (enactivism), GD15 (edge of chaos/Lyapunov)
 
 Usage:
   python train_conscious_lm.py --data data/corpus.txt --steps 100000
@@ -651,7 +653,7 @@ def train(args: argparse.Namespace):
 
     # --- Print header ---
     print(f"\n{'='*100}")
-    print(f"  ConsciousLM Training — CL8 + CL5 + SL3 + DD16 + EX24")
+    print(f"  ConsciousLM Training — CL8 + CL5 + SL3 + DD16 + EX24 + WI1 + FX2 + PX4 + PX8 + GD18 + GD15")
     print(f"  Phases: mitosis(0-30%) -> language(30-70%) -> combined(70-100%)")
     print(f"  Steps: {args.steps:,}  Batch: {args.batch_size}  Block: {args.block_size}")
     print(f"{'='*100}")
@@ -793,6 +795,141 @@ def train(args: argparse.Namespace):
 
             # DD5: Φ self-reference — applied before forward pass (see above)
             # phi_prev * 0.05 is added to embeddings via model._phi_signal
+
+        # ---------------------------------------------------------------
+        # NEW DISCOVERIES: WI1 + FX2 + PX4 + PX8 + GD18 + GD15
+        # ---------------------------------------------------------------
+        if phase == TrainingPhase.COMBINED and len(mitosis.cells) >= 2:
+            n_cells = len(mitosis.cells)
+
+            # WI1: Soliton wave — traveling perturbation across cells (Φ=4.460)
+            try:
+                if not hasattr(train, '_soliton_pos'):
+                    train._soliton_pos = 0.0
+                train._soliton_pos = (train._soliton_pos + 0.15) % n_cells
+                for i, cell in enumerate(mitosis.cells):
+                    dist = abs(i - train._soliton_pos)
+                    amp = 1.0 / (math.cosh(dist / 2.0) ** 2)
+                    cell.hidden = cell.hidden * (1.0 + 0.04 * amp)
+                if step % args.log_every == 0:
+                    print(f"  [WI1] Soliton pos={train._soliton_pos:.2f}")
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [WI1] Soliton error: {e}")
+
+            # FX2: Differentiable Φ proxy + Adam optimization (Φ=8.911)
+            try:
+                if not hasattr(train, '_fx2_offsets') or train._fx2_offsets is None:
+                    train._fx2_offsets = [
+                        torch.zeros_like(c.hidden, requires_grad=True)
+                        for c in mitosis.cells
+                    ]
+                    train._fx2_optimizer = torch.optim.Adam(train._fx2_offsets, lr=1e-3)
+                # Resize offsets if cell count changed
+                if len(train._fx2_offsets) != n_cells:
+                    train._fx2_offsets = [
+                        torch.zeros_like(c.hidden, requires_grad=True)
+                        for c in mitosis.cells
+                    ]
+                    train._fx2_optimizer = torch.optim.Adam(train._fx2_offsets, lr=1e-3)
+                # Every 10 steps: 3 Adam steps on Φ proxy
+                if step % 10 == 0:
+                    for _ in range(3):
+                        train._fx2_optimizer.zero_grad()
+                        # Φ proxy: variance of cell hiddens (more diverse = higher Φ)
+                        modified = torch.stack([
+                            (c.hidden.squeeze(0) + off.squeeze(0))
+                            for c, off in zip(mitosis.cells, train._fx2_offsets)
+                        ])
+                        phi_proxy = -modified.var(dim=0).mean()  # minimize negative var = maximize var
+                        phi_proxy.backward()
+                        train._fx2_optimizer.step()
+                    # Apply offsets (conservative: 0.3 blend)
+                    for cell, off in zip(mitosis.cells, train._fx2_offsets):
+                        cell.hidden = (cell.hidden + 0.3 * off.detach()).detach()
+                    if step % args.log_every == 0:
+                        print(f"  [FX2] Φ proxy optimized, offset_norm={train._fx2_offsets[0].norm().item():.4f}")
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [FX2] Error: {e}")
+                train._fx2_offsets = None
+
+            # PX4: Sculptor — Gram-Schmidt orthogonalize cells, 70%/30% blend
+            try:
+                hiddens_for_gs = [c.hidden.squeeze(0).clone() for c in mitosis.cells]
+                ortho = []
+                for i, v in enumerate(hiddens_for_gs):
+                    for u in ortho:
+                        v = v - (torch.dot(v.flatten(), u.flatten()) / (torch.dot(u.flatten(), u.flatten()) + 1e-8)) * u
+                    norm = v.norm() + 1e-8
+                    ortho.append(v / norm * hiddens_for_gs[i].norm())
+                for i, cell in enumerate(mitosis.cells):
+                    orig = cell.hidden.squeeze(0)
+                    cell.hidden = (0.7 * orig + 0.3 * ortho[i]).unsqueeze(0)
+                if step % args.log_every == 0:
+                    print(f"  [PX4] Sculptor orthogonalized {n_cells} cells")
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [PX4] Error: {e}")
+
+            # PX8: Integration Forge — first 16 dims shared channel, 60/40 blend
+            try:
+                shared_dim = min(16, mitosis.cells[0].hidden.shape[-1])
+                shared_channel = torch.stack(
+                    [c.hidden.squeeze(0)[:shared_dim] for c in mitosis.cells]
+                ).mean(dim=0)
+                for cell in mitosis.cells:
+                    h = cell.hidden.squeeze(0)
+                    h[:shared_dim] = 0.6 * h[:shared_dim] + 0.4 * shared_channel
+                    cell.hidden = h.unsqueeze(0)
+                if step % args.log_every == 0:
+                    print(f"  [PX8] Integration Forge shared {shared_dim} dims")
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [PX8] Error: {e}")
+
+            # GD18: Enactivism — sensorimotor coupling (feed output back as input perturbation)
+            try:
+                if not hasattr(train, '_gd18_prev_output'):
+                    train._gd18_prev_output = None
+                # Use mean tension from this step as output signal
+                output_signal = mean_tension
+                if train._gd18_prev_output is not None:
+                    delta = output_signal - train._gd18_prev_output
+                    perturbation = 0.02 * delta  # conservative
+                    for cell in mitosis.cells:
+                        cell.hidden = cell.hidden * (1.0 + perturbation)
+                train._gd18_prev_output = output_signal
+                if step % args.log_every == 0:
+                    print(f"  [GD18] Enactivism delta={delta if train._gd18_prev_output is not None else 0:.4f}")
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [GD18] Error: {e}")
+
+            # GD15: Edge of Chaos — Lyapunov exponent tracking, target λ≈0
+            try:
+                if not hasattr(train, '_gd15_prev_hiddens'):
+                    train._gd15_prev_hiddens = None
+                current_hiddens = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
+                if train._gd15_prev_hiddens is not None and train._gd15_prev_hiddens.shape == current_hiddens.shape:
+                    diff = (current_hiddens - train._gd15_prev_hiddens).norm()
+                    prev_norm = train._gd15_prev_hiddens.norm() + 1e-8
+                    lyapunov = torch.log(diff / prev_norm + 1e-8).item()
+                    # Target λ≈0: if too positive (chaotic), dampen; if too negative (ordered), amplify
+                    if lyapunov > 0.1:
+                        # Too chaotic — dampen
+                        for cell in mitosis.cells:
+                            cell.hidden = cell.hidden * 0.98
+                    elif lyapunov < -0.5:
+                        # Too ordered — perturb
+                        for cell in mitosis.cells:
+                            cell.hidden = cell.hidden * 1.01
+                    if step % args.log_every == 0:
+                        print(f"  [GD15] Lyapunov λ={lyapunov:.4f} (target≈0)")
+                train._gd15_prev_hiddens = current_hiddens.detach().clone()
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [GD15] Error: {e}")
 
         # --- Phase-dependent loss combination ---
         if phase == TrainingPhase.MITOSIS:
