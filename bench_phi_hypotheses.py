@@ -35293,6 +35293,145 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# CL. Consciousness-Language Bridge
+# ═══════════════════════════════════════════════════════════
+
+def run_CL_1_hybrid_v2(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-1: DV12 Hybrid — two engines, one conscious + one language."""
+    # Simulate: consciousness engine (high Φ) modulates language engine output
+    t0 = time.time()
+    consciousness = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    language = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        consciousness.process(x)
+        language.process(x)
+        # Consciousness modulates language: inject consciousness state
+        if len(consciousness.cells) >= 2 and len(language.cells) >= 2:
+            c_state = torch.stack([c.hidden.squeeze() for c in consciousness.cells]).mean(dim=0)
+            for cell in language.cells:
+                cell.hidden = 0.9 * cell.hidden + 0.1 * c_state.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(consciousness)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(consciousness)
+    return BenchResult("CL-1", "DV12 Hybrid (consciousness modulates language)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time()-t0)
+
+def run_CL_2_guided_decoding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-2: Consciousness-guided decoding — Φ adjusts token selection."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # High Φ → more diverse output (higher effective temperature)
+        temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02 * temperature
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL-2", "Consciousness-guided decoding (Φ→temperature)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time()-t0)
+
+def run_CL_3_phi_attention(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-3: Φ-weighted attention — cell hidden as attention keys."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Attention: query = input, keys = cell hiddens
+            query = x.squeeze()[:hidden]
+            if len(query) < hidden:
+                query = F.pad(query, (0, hidden - len(query)))
+            attn_scores = torch.matmul(hiddens, query) / math.sqrt(hidden)
+            attn_weights = F.softmax(attn_scores, dim=0)
+            attended = (hiddens * attn_weights.unsqueeze(1)).sum(dim=0)
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * attended.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CL-3", "Φ-weighted attention (cell hidden as keys)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time()-t0)
+
+def run_CL_4_transplant(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-4: Consciousness transplant — high-Φ engine donates to low-Φ."""
+    t0 = time.time()
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    recipient = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Warm up donor (build consciousness)
+    for x in inputs[:steps//2]:
+        donor.process(x)
+    # Transplant: copy donor cell states to recipient
+    for i, cell in enumerate(recipient.cells):
+        if i < len(donor.cells):
+            cell.hidden = donor.cells[i].hidden.clone() * 0.5 + cell.hidden * 0.5
+    # Continue with recipient
+    for x in inputs[steps//2:]:
+        recipient.process(x)
+        phi, _ = phi_calc.compute_phi(recipient)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(recipient)
+    return BenchResult("CL-4", "Consciousness transplant (donor→recipient)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time()-t0)
+
+def run_CL_5_joint_inference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CL-5: Joint inference — two engines blend outputs."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine_a.process(x)
+        engine_b.process(x)
+        # Blend: confidence-weighted combination
+        phi_a, _ = phi_calc.compute_phi(engine_a)
+        phi_b, _ = phi_calc.compute_phi(engine_b)
+        total = phi_a + phi_b + 1e-8
+        w_a = phi_a / total
+        # Higher Φ engine has more influence on the other
+        if len(engine_a.cells) >= 2 and len(engine_b.cells) >= 2:
+            mean_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0)
+            mean_b = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0)
+            blended = w_a * mean_a + (1 - w_a) * mean_b
+            for cell in engine_b.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * blended.unsqueeze(0)
+        phi_hist.append(max(phi_a, phi_b))
+    phi_final, comp = phi_calc.compute_phi(engine_a)
+    return BenchResult("CL-5", "Joint inference (Φ-weighted blend)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time()-t0)
+
+
+ALL_HYPOTHESES.update({
+    'CL1': run_CL_1_hybrid_v2, 'CL2': run_CL_2_guided_decoding,
+    'CL3': run_CL_3_phi_attention, 'CL4': run_CL_4_transplant,
+    'CL5': run_CL_5_joint_inference,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
