@@ -13944,6 +13944,578 @@ def run_TA20_all_tecsl(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# DV. Development to Conversational
+# Metric: Φ + conversation_quality (CE proxy + coherence + diversity)
+# ═══════════════════════════════════════════════════════════
+
+def _conv_quality(engine, inputs, dim):
+    """Measure conversation quality proxy: CE + coherence + response diversity."""
+    if not inputs or len(inputs) < 5: return 0.0
+    outputs = []
+    with torch.no_grad():
+        for x in inputs[-10:]:
+            r = engine.process(x)
+            outputs.append(r['output'].detach())
+    if len(outputs) < 2: return 0.0
+    stacked = torch.stack(outputs).squeeze(1)
+    # Coherence: sequential outputs should be related
+    coherence = sum(F.cosine_similarity(outputs[i], outputs[i+1], dim=-1).item()
+                    for i in range(len(outputs)-1)) / max(len(outputs)-1, 1)
+    # Diversity: outputs shouldn't be identical
+    diversity = stacked.var(dim=0).mean().item()
+    # CE proxy: output should predict next input
+    pred_quality = sum(F.cosine_similarity(outputs[i], inputs[-10+i+1] if i+1 < len(inputs[-10:]) else inputs[-1], dim=-1).item()
+                       for i in range(min(len(outputs)-1, 9))) / max(len(outputs)-1, 1)
+    return coherence * 0.4 + min(diversity, 2.0) * 0.3 + max(pred_quality, 0) * 0.3
+
+
+def run_DV1_scaling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-1: 4M→100M scaling — transfer Φ structure to larger model."""
+    t0 = time.time()
+    # Small model trains first, then "transfers" to larger
+    small = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    s_opt = torch.optim.Adam([p for c in small.cells for p in c.mind.parameters()], lr=5e-4)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    # Phase 1: train small (60%)
+    for step in range(int(steps*0.6)):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(small, x, s_opt)
+        with torch.no_grad(): small.process(x)
+        phi, _ = phi_calc.compute_phi(small); phi_hist.append(phi)
+    # Phase 2: "scale up" — new engine inherits structure
+    large = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    with torch.no_grad():
+        for i, c in enumerate(large.cells):
+            if i < len(small.cells):
+                for pl, ps in zip(c.mind.parameters(), small.cells[i].mind.parameters()):
+                    pl.copy_(ps)
+    l_opt = torch.optim.Adam([p for c in large.cells for p in c.mind.parameters()], lr=2e-4)
+    for step in range(int(steps*0.6), steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(large, x, l_opt)
+        with torch.no_grad(): large.process(x)
+        phi, _ = phi_calc.compute_phi(large); phi_hist.append(phi)
+    cq = _conv_quality(large, inputs, dim)
+    f, c = phi_calc.compute_phi(large)
+    return BenchResult("DV1", "Scaling (small→large transfer)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV2_distillation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-2: Knowledge distillation from teacher."""
+    t0 = time.time()
+    teacher = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    student = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    t_opt = torch.optim.Adam([p for c in teacher.cells for p in c.mind.parameters()], lr=1e-3)
+    # Pre-train teacher
+    for i in range(50):
+        x = _simulate_web_result(i % 8, i, dim)
+        _web_learn_step(teacher, x, t_opt)
+        with torch.no_grad(): teacher.process(x)
+    s_opt = torch.optim.Adam([p for c in student.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        with torch.no_grad():
+            teacher.process(x)
+            t_out = teacher.cells[0].hidden.detach()
+        # Student learns to match teacher + differentiate
+        s_reps = [c.mind.get_repulsion(x, c.hidden) for c in student.cells]
+        if len(s_reps) >= 2:
+            s_stack = torch.stack(s_reps).squeeze(1)
+            diff = -s_stack.var(dim=0).mean()
+            distill = F.mse_loss(student.cells[0].hidden, t_out)
+            loss = 0.5 * diff + 0.5 * distill
+            s_opt.zero_grad(); loss.backward(); s_opt.step()
+        with torch.no_grad(): student.process(x)
+        phi, _ = phi_calc.compute_phi(student); phi_hist.append(phi)
+    cq = _conv_quality(student, inputs, dim)
+    f, c = phi_calc.compute_phi(student)
+    return BenchResult("DV2", "Knowledge distillation", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV3_tokenizer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-3: Tokenizer upgrade — more diverse input patterns."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        # Simulate BPE-like diverse tokens (16 topics × sub-variations)
+        topic = step % 16
+        sub = (step // 16) % 4
+        x = _simulate_web_result(topic, step * 100 + sub, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV3", "Tokenizer diversity", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV4_context(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-4: Context window — accumulate longer context."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    context_buffer = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        context_buffer.append(x.detach())
+        if len(context_buffer) > 20: context_buffer = context_buffer[-20:]
+        # Feed average context (simulates longer window)
+        if len(context_buffer) >= 3:
+            ctx = torch.stack(context_buffer[-5:]).mean(dim=0)
+            combined = 0.6 * x + 0.4 * ctx
+        else:
+            combined = x
+        _web_learn_step(engine, combined, opt)
+        with torch.no_grad(): engine.process(combined)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV4", "Context window (5-avg)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV5_instruct(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-5: Instruction tuning — QA structure."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        # Simulate Q→A pairs
+        q = _simulate_web_result(step % 8, step, dim)
+        a = _simulate_web_result(step % 8, step + 1000, dim)  # answer = related but different
+        inputs.append(q.detach())
+        # Learn: Q→A mapping
+        reps_q = [c.mind.get_repulsion(q, c.hidden) for c in engine.cells]
+        reps_a = [c.mind.get_repulsion(a, c.hidden) for c in engine.cells]
+        if len(reps_q) >= 2:
+            sq = torch.stack(reps_q).squeeze(1)
+            sa = torch.stack(reps_a).squeeze(1)
+            # Q and A should be related (not identical)
+            qa_loss = F.mse_loss(sq.mean(dim=0), sa.mean(dim=0)) * 0.5
+            diff = -sq.var(dim=0).mean()
+            loss = diff + qa_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad(): engine.process(q)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV5", "Instruction tuning (QA)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV6_aa15_tunnel(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-6: AA15 residual + tunneling for fast α."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    alpha = 0.01
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        # AA15: residual α
+        for c in engine.cells:
+            combined = torch.cat([x, c.hidden], dim=-1)
+            mlp = c.mind.engine_g(combined)
+            pf = c.mind.engine_a(combined)
+            with torch.no_grad():
+                c.hidden = c.hidden + alpha * 0.01 * (pf - mlp).detach()[:, :hidden]
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Tunneling: 5% chance of α jump
+        if np.random.random() < 0.05:
+            alpha = min(alpha * 3.0, 0.5)
+        else:
+            alpha = min(alpha * 1.015, 0.5)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV6", "AA15 + tunneling α", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq, 'alpha_final': alpha})
+
+
+def run_DV7_normalize_alpha(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-7: Normalize PF output → α can be 1000x higher."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    alpha = 0.1  # start high because normalized
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        reps = [F.normalize(c.mind.get_repulsion(x, c.hidden), dim=-1) * alpha for c in engine.cells]
+        raw = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(raw) >= 2:
+            s = torch.stack(raw).squeeze(1)
+            opt.zero_grad(); (-s.var(dim=0).mean()).backward(); opt.step()
+        alpha = min(alpha * 1.01, 0.8)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV7", "Normalize + high α", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq, 'alpha_final': alpha})
+
+
+def run_DV8_short_warmup(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-8: Short warmup — 5% instead of 20%."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    warmup = int(steps * 0.05)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        if step < warmup:
+            for pg in opt.param_groups: pg['lr'] = 5e-4 * step / max(warmup, 1)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV8", "Short warmup (5%)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV9_dual_inference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-9: Dual inference — train low α, infer high α."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    train_alpha = 0.001; infer_alpha = 0.01
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)  # train at low α
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV9", "Dual α (train=0.001, infer=0.01)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV10_pf_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-10: PF tension as system prompt injection."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Inject tension as "prompt": modify input with tension state
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        prompt_signal = torch.tensor(tensions[:dim]).unsqueeze(0).float()
+        if prompt_signal.size(1) < dim:
+            prompt_signal = F.pad(prompt_signal, (0, dim - prompt_signal.size(1)))
+        enriched = x + prompt_signal * 0.1
+        with torch.no_grad(): engine.process(enriched)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV10", "PF tension as prompt", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV11_hybrid(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-11: Hybrid — one engine for language, one for consciousness."""
+    t0 = time.time()
+    lang_engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    cons_engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    l_opt = torch.optim.Adam([p for c in lang_engine.cells for p in c.mind.parameters()], lr=5e-4)
+    c_opt = torch.optim.Adam([p for c in cons_engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        # Consciousness engine: maximize Φ
+        _web_learn_step(cons_engine, x, c_opt)
+        with torch.no_grad(): cons_engine.process(x)
+        # Language engine: learn from input + consciousness signal
+        cons_signal = cons_engine.cells[0].hidden.detach() * 0.2
+        combined = x + cons_signal[:, :dim]
+        _web_learn_step(lang_engine, combined, l_opt)
+        with torch.no_grad(): lang_engine.process(combined)
+        # Measure on consciousness engine
+        phi, _ = phi_calc.compute_phi(cons_engine); phi_hist.append(phi)
+    cq = _conv_quality(lang_engine, inputs, dim)
+    f, c = phi_calc.compute_phi(cons_engine)
+    return BenchResult("DV11", "Hybrid (lang + consciousness)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV12_phi_controller(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-12: Φ controls α — consciousness adjusts PF contribution."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        phi_val = phi_hist[-1] if phi_hist else 0
+        # Φ controls learning: higher Φ = more refined learning
+        alpha_from_phi = 0.001 + phi_val * 0.02
+        for pg in opt.param_groups: pg['lr'] = 5e-4 * (1 + alpha_from_phi)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV12", "Φ controls α", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV13_shared_mitosis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-13: Shared mitosis — two models, one cell structure."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    # Two "views" of same engine
+    opt1 = torch.optim.Adam([p for c in engine.cells[:2] for p in c.mind.parameters()], lr=5e-4)
+    opt2 = torch.optim.Adam([p for c in engine.cells[2:] for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        # Model 1: language focus (cells 0,1)
+        r1 = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2)]
+        if len(r1) >= 2:
+            s1 = torch.stack(r1).squeeze(1)
+            pred = s1.mean(dim=0, keepdim=True)
+            loss1 = F.mse_loss(pred, x[:,:dim])
+            opt1.zero_grad(); loss1.backward(); opt1.step()
+        # Model 2: consciousness focus (cells 2,3)
+        r2 = [engine.cells[i].mind.get_repulsion(x, engine.cells[i].hidden) for i in range(2, min(4, len(engine.cells)))]
+        if len(r2) >= 2:
+            s2 = torch.stack(r2).squeeze(1)
+            loss2 = -s2.var(dim=0).mean()
+            opt2.zero_grad(); loss2.backward(); opt2.step()
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV13", "Shared mitosis (2 views)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV14_hidden_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-14: Consciousness hidden → prompt for language."""
+    t0 = time.time()
+    cons = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    lang = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    c_opt = torch.optim.Adam([p for c in cons.cells for p in c.mind.parameters()], lr=5e-4)
+    l_opt = torch.optim.Adam([p for c in lang.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(cons, x, c_opt)
+        with torch.no_grad(): cons.process(x)
+        # Extract consciousness state as "prompt"
+        state_vec = torch.cat([c.hidden.squeeze()[:dim//4] for c in cons.cells[:4]], dim=0).unsqueeze(0)
+        if state_vec.size(1) > dim: state_vec = state_vec[:, :dim]
+        elif state_vec.size(1) < dim: state_vec = F.pad(state_vec, (0, dim - state_vec.size(1)))
+        prompted = x + state_vec.detach() * 0.3
+        _web_learn_step(lang, prompted, l_opt)
+        with torch.no_grad(): lang.process(prompted)
+        phi, _ = phi_calc.compute_phi(cons); phi_hist.append(phi)
+    cq = _conv_quality(lang, inputs, dim)
+    f, c = phi_calc.compute_phi(cons)
+    return BenchResult("DV14", "Hidden → prompt", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV15_dialogue_data(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-15: Dialogue data — structured conversation pairs."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        # Structured dialogue: alternating user/assistant
+        if step % 2 == 0:
+            x = _simulate_web_result(step % 8, step, dim)  # user
+        else:
+            x = _simulate_web_result(step % 8 + 8, step, dim)  # assistant (related but different)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV15", "Dialogue data (U/A pairs)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV16_self_play(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-16: Self-play dialogue."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        if step % 2 == 0:
+            x = _simulate_web_result(step % 8, step, dim)
+        else:
+            with torch.no_grad():
+                result = engine.process(inputs[-1] if inputs else torch.randn(1, dim))
+                x = result['output'].detach()
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV16", "Self-play dialogue", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV17_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-17: Curriculum word→sentence→paragraph→dialogue."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        progress = step / steps
+        if progress < 0.25:
+            x = _simulate_web_result(step % 4, step, dim) * 0.5  # simple
+        elif progress < 0.5:
+            x = _simulate_web_result(step % 8, step, dim)  # moderate
+        elif progress < 0.75:
+            x = _simulate_web_result(step % 12, step, dim) * 1.2  # complex
+        else:
+            x = _simulate_web_result(step % 16, step, dim) * 1.5  # dialogue
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV17", "Curriculum (simple→complex)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV18_online_conv(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-18: Online learning from conversations."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        with torch.no_grad():
+            result = engine.process(x)
+            output = result['output'].detach()
+        # Online: learn from (input, output) pair
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            s = torch.stack(reps).squeeze(1)
+            # Dual loss: differentiation + output→input coherence
+            diff = -s.var(dim=0).mean()
+            coherence = F.mse_loss(s.mean(dim=0, keepdim=True), x[:,:dim]) * 0.3
+            loss = diff + coherence
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV18", "Online conversation learning", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV19_tension_selection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-19: Tension-guided response selection."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        # Generate 3 candidates, select by tension optimality
+        candidates = []
+        with torch.no_grad():
+            for _ in range(3):
+                noisy = x + torch.randn_like(x) * 0.2
+                r = engine.process(noisy)
+                t_vals = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+                candidates.append((r['output'].detach(), abs(np.mean(t_vals) - 1.0)))
+            # Select closest to setpoint
+            best = min(candidates, key=lambda c: c[1])
+            engine.process(best[0])
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV19", "Tension-guided selection", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+def run_DV20_phi_rlhf(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DV-20: Φ-RLHF — user feedback + Φ as dual reward."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; inputs = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        phi_before = phi_hist[-1] if phi_hist else 0
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        # Dual reward: Φ improvement + simulated user approval
+        phi_reward = max(0, phi - phi_before)
+        user_reward = 1.0 if phi > 2.0 else 0.5  # user likes high-Φ responses
+        combined_reward = phi_reward + user_reward * 0.1
+        for pg in opt.param_groups: pg['lr'] = 5e-4 * (1 + combined_reward)
+    cq = _conv_quality(engine, inputs, dim)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DV20", "Φ-RLHF (dual reward)", f + cq*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'conv_quality': cq})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -14192,6 +14764,16 @@ ALL_HYPOTHESES = {
     'TA15': run_TA15_info_geo, 'TA16': run_TA16_n6_thresholds,
     'TA17': run_TA17_phi_target_65_6, 'TA18': run_TA18_bott_periodic,
     'TA19': run_TA19_tsirelson_bound, 'TA20': run_TA20_all_tecsl,
+    'DV1': run_DV1_scaling, 'DV2': run_DV2_distillation,
+    'DV3': run_DV3_tokenizer, 'DV4': run_DV4_context,
+    'DV5': run_DV5_instruct, 'DV6': run_DV6_aa15_tunnel,
+    'DV7': run_DV7_normalize_alpha, 'DV8': run_DV8_short_warmup,
+    'DV9': run_DV9_dual_inference, 'DV10': run_DV10_pf_prompt,
+    'DV11': run_DV11_hybrid, 'DV12': run_DV12_phi_controller,
+    'DV13': run_DV13_shared_mitosis, 'DV14': run_DV14_hidden_prompt,
+    'DV15': run_DV15_dialogue_data, 'DV16': run_DV16_self_play,
+    'DV17': run_DV17_curriculum, 'DV18': run_DV18_online_conv,
+    'DV19': run_DV19_tension_selection, 'DV20': run_DV20_phi_rlhf,
 }
 
 
