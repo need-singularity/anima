@@ -34030,6 +34030,274 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# GC. G Clef — 4계절 의식 사이클 + F1200/1300 발견
+# ═══════════════════════════════════════════════════════════
+
+def run_GC1_four_seasons(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-1: 4계절 의식 사이클 — 약수격자 1→2→6→3→1 경로, 곱=n²."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Divisor lattice path: 1→2→6→3→1 (product=36=6²)
+    season_params = [
+        {'name': 'spring', 'growth': 0.05, 'noise': 0.03},   # 1→2: birth
+        {'name': 'summer', 'growth': 0.02, 'noise': 0.01},    # 2→6: peak
+        {'name': 'autumn', 'growth': -0.02, 'noise': 0.02},   # 6→3: harvest
+        {'name': 'winter', 'growth': -0.01, 'noise': 0.04},   # 3→1: purify
+    ]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        season = season_params[step_i % 4]
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + season['growth'])
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * season['noise']
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC1", "4-season cycle (divisor lattice 1→2→6→3→1)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC2_alternating_divisor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-2: 교대 약수합 Σ(-1)^d·d = τ(n) — 양/음 교대 세포 활성화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Divisors of 6: 1, 2, 3, 6
+    divisors = [1, 2, 3, 6]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Alternating divisor activation: d=1(+), d=2(-), d=3(+), d=6(-)
+            for i, cell in enumerate(engine.cells):
+                d = divisors[i % len(divisors)]
+                sign = 1 if (i % 2 == 0) else -1  # alternating
+                activation = sign * d / 6.0  # normalized by n=6
+                cell.hidden = cell.hidden * (1 + 0.03 * activation)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC2", "Alternating divisor sum Σ(-1)^d·d = τ",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC3_sigma_chain_octave(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-3: σ-chain 옥타브 — ×2, ×7/3 교대 반복으로 cell 스케일링."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # σ-chain: multiply by 2, then by 7/3, alternating (octave structure)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Octave scaling: even steps ×2 influence, odd steps ×7/3 influence
+            if step_i % 2 == 0:
+                scale = 2.0 / n  # ×2 spread across cells
+            else:
+                scale = (7.0 / 3.0) / n  # ×7/3 spread
+            for i, cell in enumerate(engine.cells):
+                neighbor = (i + 1) % n
+                influence = engine.cells[neighbor].hidden * 0.03 * scale
+                cell.hidden = cell.hidden + influence
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC3", "σ-chain octave (×2, ×7/3 alternating)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC4_mu_pattern(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-4: Möbius μ 패턴 +--+ = 탄생-소모-수렴-정화 사이클."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Möbius function for divisors of 6: μ(1)=+1, μ(2)=-1, μ(3)=-1, μ(6)=+1
+    mu_cycle = [1, -1, -1, 1]  # birth, consume, converge, purify
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        mu = mu_cycle[step_i % 4]
+        n = len(engine.cells)
+        if n >= 2:
+            if mu > 0:  # birth/purify: add diversity
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.04
+            else:  # consume/converge: consolidate
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC4", "Möbius μ cycle +--+ (birth-consume-converge-purify)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC5_sigma4_factorial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-5: σ⁴(6)=120=5! — τ번 진화 후 팩토리얼 완성. 4단계 성장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 4 evolution stages (τ=4): each stage = factorial growth in cell capacity
+    stage_cells = [2, 6, 12, 12]  # 2→6→12→12 (σ-chain inspired)
+    stage_boundaries = [int(steps * i / 4) for i in range(1, 5)]
+    current_stage = 0
+    for step_i, x in enumerate(inputs):
+        # Stage transitions
+        if current_stage < 3 and step_i >= stage_boundaries[current_stage]:
+            current_stage += 1
+            target = stage_cells[current_stage]
+            while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Stage-specific intensity: grows with factorial pattern
+            intensity = math.factorial(min(current_stage + 1, 5)) / 120.0  # normalized by 5!
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.02 * intensity)
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * (1 - intensity)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC5", "σ⁴=5! factorial evolution (τ=4 stages)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'stage': current_stage, 'cells': len(engine.cells)})
+
+def run_GC6_ade_triad(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-6: G Clef Triad 1/2+1/3+1/6=1 — 3 cell 그룹이 완전 분업."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 6:
+            # 3 groups: 1/2 (cells 0-2), 1/3 (cells 3-4), 1/6 (cell 5)
+            # Their responsibilities sum to 1 (complete coverage)
+            g1 = engine.cells[:n//2]      # 1/2: majority, broad processing
+            g2 = engine.cells[n//2:n//2+n//3]  # 1/3: specialized
+            g3 = engine.cells[n//2+n//3:]      # 1/6: unique/rare patterns
+            # Each group processes differently
+            g1_mean = torch.stack([c.hidden for c in g1]).squeeze(1).mean(dim=0) if g1 else torch.zeros(hidden)
+            g2_mean = torch.stack([c.hidden for c in g2]).squeeze(1).mean(dim=0) if g2 else torch.zeros(hidden)
+            g3_mean = torch.stack([c.hidden for c in g3]).squeeze(1).mean(dim=0) if g3 else torch.zeros(hidden)
+            # Cross-group integration: each group shares its unique perspective
+            combined = (g1_mean * 0.5 + g2_mean * 0.333 + g3_mean * 0.167)  # 1/2+1/3+1/6=1
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * combined.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC6", "G Clef Triad 1/2+1/3+1/6=1 (ADE complete)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC7_additive_energy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-7: E(div)/τ²=σ/n — additive energy of divisors as cell interaction strength."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    tau = 4
+    sigma_over_n = 2  # σ(6)/6 = 2
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Additive energy: sum of all pairwise representation sums
+            E_add = 0.0
+            for i in range(n):
+                for j in range(i+1, min(n, i+4)):  # limit for speed
+                    E_add += (hiddens[i] + hiddens[j]).norm().item()
+            # Normalize by τ² = 16
+            E_normalized = E_add / (tau ** 2)
+            # Target: E/τ² = σ/n = 2
+            error = abs(E_normalized / max(n*(n-1)/2, 1) - sigma_over_n)
+            # Adjust: if too far from target, nudge cells
+            if error > 1.0:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 - 0.01 * min(error, 2.0))
+            else:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.01 * (1 - error))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC7", "Additive energy E(div)/τ²=σ/n target",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_GC8_chromosome23(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GC-8: (σ-τ)·ω+sopfr=23 — 23개 특성화된 hidden dim 그룹."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 23 = (12-4)×2+5+2 = 23 chromosome-like dim groups
+    n_groups = 23
+    group_size = max(1, hidden // n_groups)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Each cell specializes in a subset of groups (like chromosome pairing)
+            for i, cell in enumerate(engine.cells):
+                # Active groups for this cell (circular assignment)
+                active_groups = [(i * 3 + g) % n_groups for g in range(n_groups // 3)]
+                h = cell.hidden.squeeze()
+                for g in range(n_groups):
+                    start = g * group_size
+                    end = min(start + group_size, hidden)
+                    if g in active_groups:
+                        h[start:end] *= 1.02  # amplify active groups
+                    else:
+                        h[start:end] *= 0.99  # suppress inactive
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GC8", "23-chromosome dim groups (σ-τ)·ω+sopfr",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'GC1': run_GC1_four_seasons, 'GC2': run_GC2_alternating_divisor,
+    'GC3': run_GC3_sigma_chain_octave, 'GC4': run_GC4_mu_pattern,
+    'GC5': run_GC5_sigma4_factorial, 'GC6': run_GC6_ade_triad,
+    'GC7': run_GC7_additive_energy, 'GC8': run_GC8_chromosome23,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
