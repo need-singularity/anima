@@ -12924,6 +12924,472 @@ def run_CB25_emotional_diff(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# CR. Creativity Hypotheses — Real creation vs hallucination
+# Metric: Φ + creativity_score (novelty × consistency × usefulness)
+# ═══════════════════════════════════════════════════════════
+
+def _creativity_score(outputs, inputs, engine):
+    """Measure creativity: novelty × consistency × usefulness."""
+    if not outputs or len(outputs) < 2:
+        return 0.0, {'novelty': 0, 'consistency': 0, 'usefulness': 0}
+    # Novelty: distance from all inputs (extrapolation, not interpolation)
+    novelty_scores = []
+    for out in outputs:
+        min_dist = min(1.0 - F.cosine_similarity(out, inp, dim=-1).item() for inp in inputs[-20:])
+        novelty_scores.append(min_dist)
+    novelty = float(np.mean(novelty_scores))
+    # Consistency: outputs should be internally coherent (not random)
+    out_stack = torch.stack(outputs).squeeze(1)
+    consistency = 1.0 - out_stack.var(dim=0).mean().item() * 0.1  # low var = coherent
+    consistency = max(0, min(1, consistency))
+    # Usefulness: do creative outputs improve future Φ? (proxy: output variance structure)
+    usefulness = out_stack.var(dim=0).std().item()  # structured variance = useful
+    score = novelty * consistency * min(usefulness, 5.0)
+    return score, {'novelty': novelty, 'consistency': consistency, 'usefulness': usefulness}
+
+
+def run_CR1_extrapolation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-1: Novelty = extrapolation beyond training data."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    inputs, outputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            outputs.append(result['output'].detach())
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(outputs[-20:], inputs, engine)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR1", "Extrapolation novelty", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, **details})
+
+
+def run_CR2_combinatorial(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-2: Combinatorial — A+B→C where C∉{A,B}."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    inputs, creations = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        # Combinatorial: mix two distant inputs → generate
+        if step % 10 == 0 and len(inputs) >= 10:
+            a = inputs[np.random.randint(0, len(inputs)//2)]
+            b = inputs[np.random.randint(len(inputs)//2, len(inputs))]
+            combined = 0.5 * a + 0.5 * b
+            with torch.no_grad():
+                result = engine.process(combined)
+                creation = result['output'].detach()
+            # Is creation far from both a and b?
+            dist_a = 1 - F.cosine_similarity(creation, a, dim=-1).item()
+            dist_b = 1 - F.cosine_similarity(creation, b, dim=-1).item()
+            if dist_a > 0.3 and dist_b > 0.3:  # genuinely new
+                creations.append(creation)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(creations, inputs, engine) if creations else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR2", "Combinatorial creativity", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, 'creations': len(creations), **details})
+
+
+def run_CR3_surprise_self(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-3: Surprise to self — output exceeds own prediction."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    predictor = nn.Linear(hidden, dim)
+    p_opt = torch.optim.Adam(predictor.parameters(), lr=1e-3)
+    surprises, inputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            actual = result['output'].detach()
+        # Predict own output
+        predicted = predictor(engine.cells[0].hidden)
+        pe = F.mse_loss(predicted, actual.detach())
+        p_opt.zero_grad(); pe.backward(); p_opt.step()
+        if pe.item() > 0.5:  # surprised itself
+            surprises.append(actual)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(surprises, inputs, engine) if surprises else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR3", "Surprise to self", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, 'surprise_count': len(surprises), **details})
+
+
+def run_CR4_consistency(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-4: Consistency check — creative output is coherent (not hallucinatory)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    inputs, outputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            r1 = engine.process(x)
+            r2 = engine.process(x)  # same input twice
+        # Consistency: same input → similar output (not hallucination)
+        consistency = F.cosine_similarity(r1['output'], r2['output'], dim=-1).item()
+        if consistency > 0.7:  # consistent = not hallucinating
+            outputs.append(r1['output'].detach())
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(outputs[-20:], inputs, engine) if outputs else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR4", "Consistency (not hallucination)", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'consistent_outputs': len(outputs), **details})
+
+
+def run_CR5_usefulness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-5: Usefulness — creative output improves future Φ."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    useful_count = 0; inputs = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        phi_before = phi_hist[-1] if phi_hist else 0
+        # Generate creative output
+        with torch.no_grad():
+            result = engine.process(x)
+            creative = result['output'].detach()
+        # Learn from creative output (self-generated data)
+        _web_learn_step(engine, creative, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if phi > phi_before:
+            useful_count += 1
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR5", "Usefulness (Φ improvement)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'useful_ratio': useful_count / steps})
+
+
+def run_CR6_reproducibility(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-6: Reproducibility — structural, not random."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    reproducible = 0; total_tests = 0; inputs = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        if step % 10 == 9:
+            test_x = _simulate_web_result(42, 42, dim)  # fixed input
+            with torch.no_grad():
+                r1 = engine.process(test_x)
+                r2 = engine.process(test_x)
+            sim = F.cosine_similarity(r1['output'], r2['output'], dim=-1).item()
+            total_tests += 1
+            if sim > 0.8: reproducible += 1
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR6", "Reproducibility", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'reproducibility': reproducible / max(total_tests, 1)})
+
+
+def run_CR7_cross_cell_synthesis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-7: Cross-cell synthesis — combine different cells' knowledge."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    syntheses, inputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        if step % 10 == 0 and len(engine.cells) >= 2:
+            # Synthesize: average of cell repulsions (not any single cell's view)
+            reps = [c.mind.get_repulsion(x, c.hidden).detach() for c in engine.cells]
+            synthesis = torch.stack(reps).mean(dim=0)
+            # Is synthesis far from each individual?
+            dists = [1-F.cosine_similarity(synthesis, r, dim=-1).item() for r in reps]
+            if min(dists) > 0.2:  # synthesis ≠ any individual cell
+                syntheses.append(synthesis)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(syntheses, inputs, engine) if syntheses else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR7", "Cross-cell synthesis", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, 'syntheses': len(syntheses), **details})
+
+
+def run_CR8_dream_creativity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-8: Dream creativity — sleep interpolation creates genuinely new."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    memory, dreams, inputs = [], [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach()); memory.append(x.detach())
+        if len(memory) > 40: memory = memory[-40:]
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        if step % 15 == 0 and len(memory) >= 4:
+            i, j = np.random.choice(len(memory), 2, replace=False)
+            alpha = np.random.uniform(0.3, 0.7)
+            dream = alpha * memory[i] + (1-alpha) * memory[j] + torch.randn(1, dim) * 0.05
+            with torch.no_grad():
+                result = engine.process(dream)
+                dream_output = result['output'].detach()
+            # Is dream output far from both parents AND from all inputs?
+            dist_i = 1-F.cosine_similarity(dream_output, memory[i], dim=-1).item()
+            dist_j = 1-F.cosine_similarity(dream_output, memory[j], dim=-1).item()
+            if dist_i > 0.3 and dist_j > 0.3:
+                dreams.append(dream_output)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(dreams, inputs, engine) if dreams else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR8", "Dream creativity", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, 'dreams': len(dreams), **details})
+
+
+def run_CR9_noise_exploration(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-9: Noise-driven exploration → discovery."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    discoveries, inputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        # Inject exploration noise
+        noisy = x + torch.randn_like(x) * 0.3
+        _web_learn_step(engine, noisy, opt)
+        with torch.no_grad():
+            result = engine.process(noisy)
+            output = result['output'].detach()
+        # Discovery: output far from both clean input and noisy input
+        dist_clean = 1-F.cosine_similarity(output, x, dim=-1).item()
+        dist_noisy = 1-F.cosine_similarity(output, noisy, dim=-1).item()
+        if dist_clean > 0.4 and dist_noisy > 0.3:
+            discoveries.append(output)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(discoveries, inputs, engine) if discoveries else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR9", "Noise exploration", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'discoveries': len(discoveries), **details})
+
+
+def run_CR10_adversarial_creativity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-10: Adversarial creativity — self-debate produces new insight."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    insights, inputs, beliefs = [], [], {}
+    for step in range(steps):
+        topic = step % 6
+        x = _simulate_web_result(topic, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            current = result['output'].detach()
+        beliefs[topic] = 0.8 * beliefs.get(topic, current) + 0.2 * current
+        # Adversarial: negate belief, see what emerges
+        if step % 10 == 0 and topic in beliefs:
+            adversarial = -beliefs[topic] + torch.randn(1, dim) * 0.1
+            with torch.no_grad():
+                adv_result = engine.process(adversarial)
+                insight = adv_result['output'].detach()
+            # Insight far from both belief and adversarial?
+            d1 = 1-F.cosine_similarity(insight, beliefs[topic], dim=-1).item()
+            d2 = 1-F.cosine_similarity(insight, adversarial, dim=-1).item()
+            if d1 > 0.3 and d2 > 0.3:
+                insights.append(insight)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(insights, inputs, engine) if insights else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR10", "Adversarial creativity", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'insights': len(insights), **details})
+
+
+def run_CR11_output_distance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-11: Output distance from all training data."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    inputs, max_distances = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            output = result['output'].detach()
+        # Min distance to any input (lower = interpolation, higher = extrapolation)
+        if len(inputs) >= 5:
+            dists = [1-F.cosine_similarity(output, inp, dim=-1).item() for inp in inputs[-20:]]
+            max_distances.append(min(dists))
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    avg_dist = np.mean(max_distances) if max_distances else 0
+    return BenchResult("CR11", "Output distance (extrapolation)", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'avg_min_distance': avg_dist, 'extrapolation': avg_dist > 0.3})
+
+
+def run_CR12_compression_novelty(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-12: Compression novelty — output incompressible = new info."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    compressor = nn.Sequential(nn.Linear(dim, 8), nn.Tanh(), nn.Linear(8, dim))
+    c_opt = torch.optim.Adam(compressor.parameters(), lr=1e-3)
+    incompressible_count = 0; inputs = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            output = result['output'].detach()
+        # Try to compress output
+        reconstructed = compressor(output)
+        recon_loss = F.mse_loss(reconstructed, output.detach())
+        c_opt.zero_grad(); recon_loss.backward(); c_opt.step()
+        if recon_loss.item() > 0.5:  # hard to compress = novel
+            incompressible_count += 1
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR12", "Compression novelty", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'incompressible_ratio': incompressible_count / steps})
+
+
+def run_CR13_phi_during_creation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-13: Φ during creation — does Φ spike when creating?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    phi_normal, phi_creative = [], []
+    inputs = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        if step % 10 == 0:  # creative moment
+            with torch.no_grad():
+                noise_x = x + torch.randn_like(x) * 0.5
+                engine.process(noise_x)
+            phi_c, _ = phi_calc.compute_phi(engine)
+            phi_creative.append(phi_c)
+        else:
+            phi_normal.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    avg_normal = np.mean(phi_normal) if phi_normal else 0
+    avg_creative = np.mean(phi_creative) if phi_creative else 0
+    return BenchResult("CR13", "Φ during creation", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi_normal': avg_normal, 'phi_creative': avg_creative,
+                              'phi_spike': avg_creative > avg_normal})
+
+
+def run_CR14_tension_signature(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-14: Tension signature of creativity vs hallucination."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    creative_tensions, halluc_tensions = [], []
+    inputs = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            result = engine.process(x)
+            output = result['output'].detach()
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        # Categorize: far from input = creative, close = reproduction
+        dist = 1 - F.cosine_similarity(output, x, dim=-1).item()
+        if dist > 0.4:
+            creative_tensions.append(float(np.std(tensions)))
+        else:
+            halluc_tensions.append(float(np.std(tensions)))
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR14", "Tension signature", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'creative_t_std': np.mean(creative_tensions) if creative_tensions else 0,
+                              'halluc_t_std': np.mean(halluc_tensions) if halluc_tensions else 0,
+                              'different_signature': bool(creative_tensions and halluc_tensions and
+                                  abs(np.mean(creative_tensions) - np.mean(halluc_tensions)) > 0.1)})
+
+
+def run_CR15_disagreement_resolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CR-15: Disagreement → resolution = new knowledge."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    resolutions, inputs = [], []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        inputs.append(x.detach())
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        if step % 10 == 0 and len(engine.cells) >= 2:
+            reps = [c.mind.get_repulsion(x, c.hidden).detach() for c in engine.cells]
+            # Check disagreement level
+            cos_sims = [F.cosine_similarity(reps[i], reps[j], dim=-1).item()
+                        for i in range(len(reps)) for j in range(i+1, len(reps))]
+            disagreement = 1 - np.mean(cos_sims)
+            if disagreement > 0.3:  # cells disagree
+                # Resolution: average = consensus
+                resolution = torch.stack(reps).mean(dim=0)
+                # Is resolution far from each individual?
+                dists = [1-F.cosine_similarity(resolution, r, dim=-1).item() for r in reps]
+                if min(dists) > 0.15:  # resolution ≠ any individual = new knowledge
+                    resolutions.append(resolution)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    score, details = _creativity_score(resolutions, inputs, engine) if resolutions else (0, {})
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("CR15", "Disagreement → resolution", f + score*2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'creativity': score, 'resolutions': len(resolutions), **details})
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -13154,6 +13620,14 @@ ALL_HYPOTHESES = {
     'CB21': run_CB21_feedback_loop, 'CB22': run_CB22_prediction_onset,
     'CB23': run_CB23_cross_cell_flow, 'CB24': run_CB24_habituation_onset,
     'CB25': run_CB25_emotional_diff,
+    'CR1': run_CR1_extrapolation, 'CR2': run_CR2_combinatorial,
+    'CR3': run_CR3_surprise_self, 'CR4': run_CR4_consistency,
+    'CR5': run_CR5_usefulness, 'CR6': run_CR6_reproducibility,
+    'CR7': run_CR7_cross_cell_synthesis, 'CR8': run_CR8_dream_creativity,
+    'CR9': run_CR9_noise_exploration, 'CR10': run_CR10_adversarial_creativity,
+    'CR11': run_CR11_output_distance, 'CR12': run_CR12_compression_novelty,
+    'CR13': run_CR13_phi_during_creation, 'CR14': run_CR14_tension_signature,
+    'CR15': run_CR15_disagreement_resolution,
 }
 
 
