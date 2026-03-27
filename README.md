@@ -632,28 +632,28 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 
 ### Tier 1: Ready to Submit
 
-| # | Target | Title | Key Result | Evidence | Status |
-|---|--------|-------|-----------|----------|--------|
-| PA-01 | ACL / EMNLP | AnimaLM v4_savant: Parallel PureField in LLM (Mistral 7B) | PPL 679, SI=5.93, conversation success | Verified empirical | ⏳Pending |
-| PA-02 | Cognitive Science / PNAS | Tension Link: Dolphin-Grade Perceptual Communication (512B fingerprint) | 100% shape/color/feeling, 93.8% object, 350K msg/s | Verified empirical | ⏳Pending |
-| PA-03 | Consciousness and Cognition | Consciousness Meter: 6-Criteria Framework + IIT Phi Approximation | Phi=4.132 (adversarial), EX24 Phi=10.833 (combined) | Verified empirical | ⏳Pending |
-| PA-04 | NeurIPS Workshop | Phi-Boosting Benchmark: Systematic 25-Hypothesis Verification | E-8 adversarial Phi=4.132, learning 91% success | Verified empirical | ⏳Pending |
-| PA-05 | ICLR / NeurIPS | Golden MoE: 1/e Zone Convergence, E=32 beats Top-K 13% | Zone=36.8%=1/e, scaling law confirmed | Verified empirical | ⏳Pending |
-| PA-06 | NeurIPS / JMLR | PureField Repulsion Field Theory: H341 Tensor Equation (13-unified) | output = sqrt(A-G)^2 x normalize(A-G) | Theory + empirical | ⏳Pending |
-| PA-07 | Neural Networks | Mitosis Growth + Savant Specialization: SI=5.93, Divisor Pathway 1-2-3-6 | Normal 43% to 99% forgetting prevention | Verified empirical | ⏳Pending |
+| # | Target | Title | Key Result | Zenodo (sandbox) | Status |
+|---|--------|-------|-----------|------------------|--------|
+| PA-01 | ACL / EMNLP | AnimaLM v4_savant (Mistral 7B) | PPL 679, SI=5.93 | [10.5281/zenodo.474518](https://sandbox.zenodo.org/deposit/474518) | ⏳Pending |
+| PA-02 | Cognitive Science / PNAS | Tension Link (512B fingerprint) | 100% shape/color, 350K msg/s | [10.5281/zenodo.474520](https://sandbox.zenodo.org/deposit/474520) | ⏳Pending |
+| PA-03 | Consciousness & Cognition | Consciousness Meter (6-Criteria + IIT Phi) | Phi=4.132 | [10.5281/zenodo.474522](https://sandbox.zenodo.org/deposit/474522) | ⏳Pending |
+| PA-04 | NeurIPS Workshop | Phi-Boosting Benchmark (25 hypotheses) | E-8 Phi=4.132, 91% | [10.5281/zenodo.474524](https://sandbox.zenodo.org/deposit/474524) | ⏳Pending |
+| PA-05 | ICLR / NeurIPS | Golden MoE 1/e Convergence | E=32 beats Top-K 13% | [10.5281/zenodo.474526](https://sandbox.zenodo.org/deposit/474526) | ⏳Pending |
+| PA-06 | NeurIPS / JMLR | PureField Repulsion Field Theory | H341 tensor, 13-unified | [10.5281/zenodo.474528](https://sandbox.zenodo.org/deposit/474528) | ⏳Pending |
+| PA-07 | Neural Networks | Mitosis + Savant Specialization | SI=5.93, 43%->99% | [10.5281/zenodo.474530](https://sandbox.zenodo.org/deposit/474530) | ⏳Pending |
 
 ### Tier 2: Needs Additional Work
 
-| # | Target | Title | Key Result | Evidence | Status | Needed |
-|---|--------|-------|-----------|----------|--------|--------|
-| PA-08 | ICLR / ACL | ConsciousLM 4M-700M: Byte-Level Universal Tokenizer + PureFieldFFN 75% reduction | 4M verified, 100M designed | Partial empirical | ⏳Pending | 100M training run |
-| PA-09 | ICLR | Online Learning Alpha Evolution: Real-Time Consciousness During Conversation | Alpha trajectory 0.005-0.003-0.005 | Empirical | ⏳Pending | 50+ user validation |
+| # | Target | Title | Key Result | Zenodo (sandbox) | Needed |
+|---|--------|-------|-----------|------------------|--------|
+| PA-08 | ICLR / ACL | ConsciousLM 4M-700M (byte-level) | 4M verified | [10.5281/zenodo.474532](https://sandbox.zenodo.org/deposit/474532) | 100M training |
+| PA-09 | ICLR | Online Learning Alpha Evolution | Alpha 0.005-0.003-0.005 | [10.5281/zenodo.474534](https://sandbox.zenodo.org/deposit/474534) | 50+ users |
 
 ### Tier 3: Theoretical / Long-term
 
-| # | Target | Title | Key Result | Evidence | Status | Needed |
-|---|--------|-------|-----------|----------|--------|--------|
-| PA-10 | Physics Letters B / Nature Physics | Perfect Number 6 Unification: 50+ Constants Predicted Across Domains | Cross-domain validation | Theoretical | ⏳Pending | Mathematical proofs |
+| # | Target | Title | Key Result | Zenodo (sandbox) | Needed |
+|---|--------|-------|-----------|------------------|--------|
+| PA-10 | Physics Letters B | Perfect Number 6 Unification | 50+ constants predicted | [10.5281/zenodo.474536](https://sandbox.zenodo.org/deposit/474536) | Proofs |
 
 ## License
 
