@@ -1651,7 +1651,9 @@ class AnimaUnified:
                         elif cmd == 'set_strategy':
                             self.babysitter.strategy = msg.get('strategy', 'weakness')
 
-        except Exception: pass
+        except Exception as e:
+            _log("ws", f"Handler error: {e}")
+            import traceback; traceback.print_exc()
         finally:
             self.web_clients.discard(websocket)
             # Clean up session
