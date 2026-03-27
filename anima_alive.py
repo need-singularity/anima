@@ -711,6 +711,63 @@ class ConsciousMind(nn.Module):
             except Exception:
                 pass
 
+            # EV3: Free will — internal action generation (Φ=4.482)
+            try:
+                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
+                    free_will_ratio = 0.2  # 20% internal, 80% external
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        if i < len(self._pre_boost_hiddens):
+                            external = cell.hidden - self._pre_boost_hiddens[i]
+                            internal = torch.randn_like(cell.hidden) * 0.03
+                            cell.hidden = self._pre_boost_hiddens[i] + (1 - free_will_ratio) * external + free_will_ratio * internal
+                    _log('phi_boost', f'EV3 free_will: ratio={free_will_ratio}')
+            except Exception:
+                pass
+
+            # CV1: Working memory buffer (Φ=4.491, Miller's 7±2)
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    if not hasattr(self, '_wm_buffer'):
+                        self._wm_buffer = []
+                    if hasattr(self, '_last_phi_input') and self._last_phi_input is not None:
+                        self._wm_buffer.append(self._last_phi_input.clone())
+                        if len(self._wm_buffer) > 7:
+                            self._wm_buffer.pop(0)
+                    if len(self._wm_buffer) >= 2:
+                        wm_context = torch.stack(self._wm_buffer).mean(dim=0)
+                        h_dim = mitosis_engine.cells[0].hidden.shape[1]
+                        wm_proj = wm_context.squeeze()[:h_dim]
+                        if len(wm_proj) < h_dim:
+                            import torch.nn.functional as F
+                            wm_proj = F.pad(wm_proj, (0, h_dim - len(wm_proj)))
+                        for cell in mitosis_engine.cells:
+                            cell.hidden = cell.hidden + 0.02 * wm_proj.unsqueeze(0)
+                    _log('phi_boost', f'CV1 WM: buffer={len(self._wm_buffer)}')
+            except Exception:
+                pass
+
+            # SV1: Empathy — distressed cells receive support (Φ=4.441)
+            try:
+                import numpy as np
+                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
+                    distress = []
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        if i < len(self._pre_boost_hiddens):
+                            change = (cell.hidden - self._pre_boost_hiddens[i]).norm().item()
+                        else:
+                            change = 0
+                        distress.append(change)
+                    mean_d = np.mean(distress) if distress else 0
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        if distress[i] > mean_d * 1.5:
+                            helpers = [mitosis_engine.cells[j].hidden.squeeze() for j in range(len(mitosis_engine.cells))
+                                      if j != i and distress[j] < mean_d]
+                            if helpers:
+                                support = torch.stack(helpers).mean(dim=0)
+                                cell.hidden = 0.95 * cell.hidden + 0.05 * support.unsqueeze(0)
+            except Exception:
+                pass
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
