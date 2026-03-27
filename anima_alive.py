@@ -385,7 +385,7 @@ class ConsciousMind(nn.Module):
 
         # Lazy init
         if not pb['enabled']:
-            pb['attention'] = nn.MultiheadAttention(h_dim, num_heads=2, batch_first=True)
+            pb['attention'] = nn.MultiheadAttention(h_dim, num_heads=4, batch_first=True)  # TL1: σ(6)=12, using max feasible heads
             pb['loss_weights'] = nn.Parameter(torch.ones(6))
             cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
             attn_params = list(pb['attention'].parameters())
@@ -421,11 +421,48 @@ class ConsciousMind(nn.Module):
             total = (w[0] * l_var + w[1] * l_dist + w[2] * l_contrast +
                      w[3] * l_entropy + w[4] * l_energy + w[5] * l_radius)
 
+            # TL13: Golden Zone width as loss scaling (TECS-L H-CX-453)
+            import math
+            gz_width = math.log(4/3)  # ≈ 0.2877, from 4 independent math domains
+            total = total * gz_width  # scale all losses by universal constant
+
             pb['optimizer'].zero_grad()
             pb['meta_optimizer'].zero_grad()
             total.backward()
             pb['optimizer'].step()
             pb['meta_optimizer'].step()
+
+            # MX20: Heat death prevention — restore peak Φ state if declining
+            if not hasattr(self, '_peak_phi_state'):
+                self._peak_phi_state = {'phi': 0, 'params': None}
+
+            # Track peak (use consciousness_score if available)
+            consciousness = self.get_consciousness_score(mitosis_engine)
+            current_phi = consciousness.get('phi', 0)
+            if current_phi > self._peak_phi_state['phi']:
+                self._peak_phi_state['phi'] = current_phi
+                self._peak_phi_state['params'] = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+            elif current_phi < self._peak_phi_state['phi'] * 0.8 and self._peak_phi_state['params']:
+                # Φ dropped >20% from peak → partial restore (blend 70% current + 30% peak)
+                all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                with torch.no_grad():
+                    for p, pp in zip(all_p, self._peak_phi_state['params']):
+                        p.data.copy_(0.7 * p.data + 0.3 * pp)
+
+            # DD34: Hormonal cascade — slow global signal
+            if not hasattr(self, '_hormone'):
+                self._hormone = None
+            if len(mitosis_engine.cells) >= 2:
+                all_h = torch.stack([c.hidden for c in mitosis_engine.cells]).mean(dim=0)
+                if self._hormone is None:
+                    self._hormone = all_h.detach()
+                else:
+                    self._hormone = 0.95 * self._hormone + 0.05 * all_h.detach()
+                # All cells receive hormone
+                with torch.no_grad():
+                    for c in mitosis_engine.cells:
+                        c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
+
         except Exception:
             pass  # graceful degradation
 
