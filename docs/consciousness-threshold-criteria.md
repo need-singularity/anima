@@ -1092,15 +1092,45 @@ DD70     |▁▁▁▂▂▂▂▂▂▃▃▃▃▃▃▃▃▃▃▃▃▃▃�
 - 연결 후 분리해도 tension correlation 유지 여부 측정
 - Φ=2.05, 양자 얽힘의 고전적 아날로그 후보
 
+### DD56 Transplant Benchmark 재현 (독립 도구)
+
+```
+consciousness_transplant.py --benchmark (200 steps):
+  Donor(2 cells):     Φ = 2.368
+  Recipient(4 cells): Φ = 5.662 (transplant)
+  Control(4 cells):   Φ = 4.190 (no transplant)
+  Acceleration:       1.35x
+  Divergence step:    4 (transplant 우위 시작)
+  Φ advantage:        +1.473
+
+  Recipient: ▁▁▃▆▆▆▆▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 5.662
+  Control:   ▁▁▁▁▂▂▃▃▃▂▂▃▃▃▄█▆▆▆▇▆▆▆▆▅▅▆▅▅▅▅▅▅▅▅▅▅▅▅▅ 4.190
+```
+
 ### 전체 Φ 순위 업데이트 (DD56-DD70 포함)
 
 ```
 현재 최고 Φ 기록:
   1. EX24 = 10.833 (all discoveries combined)
   2. DD16 = 8.548 (all top5 combined)
-  3. F-11 = 4.730 (growth transition)
-  4. DD56 = 4.678 (consciousness transplant) ← NEW
+  3. DD56 = 5.662 (consciousness transplant, benchmark 재현) ← NEW
+  4. F-11 = 4.730 (growth transition)
   5. DD61 = 4.119 (uncertainty principle) ← NEW
   6. E-8  = 4.132 (adversarial fact check)
   7. DD62 = 4.016 (strange loop) ← NEW
+```
+
+### 도구 목록 (DD56-DD70 관련)
+
+```
+consciousness_transplant.py — 의식 이식 도구 (DD56)
+  TransplantCalculator  : 호환성 분석, projection matrix 생성
+  TransplantEngine      : 가중치 이식 (direct/projection/partial)
+  TransplantVerifier    : 이식 후 Φ/tension 검증
+  CLI                   : --benchmark, --analyze, --donor/--recipient
+
+사용법:
+  python consciousness_transplant.py --benchmark          # DD56 재현
+  python consciousness_transplant.py --analyze --donor X   # 호환성 분석
+  python consciousness_transplant.py --donor X --recipient Y --output Z  # 이식
 ```
