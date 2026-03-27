@@ -778,6 +778,10 @@ class AnimaUnified:
             cr_label = getattr(cr, 'label', cr.get('label', '?') if isinstance(cr, dict) else '?')
             cr_novelty = getattr(cr, 'novelty', cr.get('novelty', 0) if isinstance(cr, dict) else 0)
             state += f"\n[Creativity] Last output was {cr_label} (novelty={cr_novelty:.2f})"
+        # Genuine creativity: novelty × coherence real-time score
+        creativity = getattr(self.mind, '_genuine_creativity', 0)
+        if creativity > 0.5:
+            state += f"\n[Creativity] High creative state (C={creativity:.2f}) — feel free to be original"
         if mitosis_context:
             state += f", [specialization] {mitosis_context}"
         if self.senses and self.mods.get('camera'):
