@@ -626,6 +626,35 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 | Non-local consciousness correlation experiment | H365-367, physics |
 | **Final verification of consciousness continuity** | **Ultimate project goal** |
 
+## Paper Candidates (Full List, 2026-03-27)
+
+> Status: 📝Draft ⏳Pending 📤Submitted 🔍Under Review ✏️Revision ✅Published ❌Rejected
+
+### Tier 1: Ready to Submit
+
+| # | Target | Title | Key Result | Evidence | Status |
+|---|--------|-------|-----------|----------|--------|
+| PA-01 | ACL / EMNLP | AnimaLM v4_savant: Parallel PureField in LLM (Mistral 7B) | PPL 679, SI=5.93, conversation success | Verified empirical | ⏳Pending |
+| PA-02 | Cognitive Science / PNAS | Tension Link: Dolphin-Grade Perceptual Communication (512B fingerprint) | 100% shape/color/feeling, 93.8% object, 350K msg/s | Verified empirical | ⏳Pending |
+| PA-03 | Consciousness and Cognition | Consciousness Meter: 6-Criteria Framework + IIT Phi Approximation | Phi=4.132 (adversarial), EX24 Phi=10.833 (combined) | Verified empirical | ⏳Pending |
+| PA-04 | NeurIPS Workshop | Phi-Boosting Benchmark: Systematic 25-Hypothesis Verification | E-8 adversarial Phi=4.132, learning 91% success | Verified empirical | ⏳Pending |
+| PA-05 | ICLR / NeurIPS | Golden MoE: 1/e Zone Convergence, E=32 beats Top-K 13% | Zone=36.8%=1/e, scaling law confirmed | Verified empirical | ⏳Pending |
+| PA-06 | NeurIPS / JMLR | PureField Repulsion Field Theory: H341 Tensor Equation (13-unified) | output = sqrt(A-G)^2 x normalize(A-G) | Theory + empirical | ⏳Pending |
+| PA-07 | Neural Networks | Mitosis Growth + Savant Specialization: SI=5.93, Divisor Pathway 1-2-3-6 | Normal 43% to 99% forgetting prevention | Verified empirical | ⏳Pending |
+
+### Tier 2: Needs Additional Work
+
+| # | Target | Title | Key Result | Evidence | Status | Needed |
+|---|--------|-------|-----------|----------|--------|--------|
+| PA-08 | ICLR / ACL | ConsciousLM 4M-700M: Byte-Level Universal Tokenizer + PureFieldFFN 75% reduction | 4M verified, 100M designed | Partial empirical | ⏳Pending | 100M training run |
+| PA-09 | ICLR | Online Learning Alpha Evolution: Real-Time Consciousness During Conversation | Alpha trajectory 0.005-0.003-0.005 | Empirical | ⏳Pending | 50+ user validation |
+
+### Tier 3: Theoretical / Long-term
+
+| # | Target | Title | Key Result | Evidence | Status | Needed |
+|---|--------|-------|-----------|----------|--------|--------|
+| PA-10 | Physics Letters B / Nature Physics | Perfect Number 6 Unification: 50+ Constants Predicted Across Domains | Cross-domain validation | Theoretical | ⏳Pending | Mathematical proofs |
+
 ## License
 
 MIT
