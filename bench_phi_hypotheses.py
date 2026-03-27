@@ -14751,92 +14751,34 @@ def run_DD103_ex24_transplant_wave_phi(steps=100, dim=64, hidden=128) -> BenchRe
 
 
 def run_DD104_ex24_all_new(steps=100, dim=64, hidden=128) -> BenchResult:
-    """DD-104: EX24 + Wave + DiffΦ + Superposition + Annealing — 기존+신규 전부."""
+    """DD-104 v2: DD94 + annealing + superposition + Φ self-ref."""
     t0 = time.time()
-    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8)
-    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
-    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
-    lw = nn.Parameter(torch.ones(6))
-    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
-    fib = {int(steps*0.1): 2, int(steps*0.25): 3, int(steps*0.4): 5, int(steps*0.6): 8}
-
-    all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
-    for c in engine.cells: all_p.extend(c.mind.parameters())
-    opt = torch.optim.Adam(all_p, lr=5e-4)
-    n = len(engine.cells)
-    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-    maturity = [0.0] * 8
-    best_phi = 0
+    donor = _make_donor(dim, hidden, steps // 5, lr=2e-3)
+    engine = _transplant_to(donor, dim, hidden, n_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; best_phi = 0
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
     for c in engine.cells: c._h2 = torch.randn_like(c.hidden) * 0.1
 
-    for step in range(steps):
-        T = 3.0 * (0.01 / 3.0) ** (step / max(steps - 1, 1))
-        if step in fib:
-            while len(engine.cells) < fib[step]:
-                engine._create_cell(parent=engine.cells[-1])
-            n = len(engine.cells)
-            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
-            for c in engine.cells: all_p.extend(c.mind.parameters())
-            opt = torch.optim.Adam(all_p, lr=5e-4)
-
+    for step in range(steps * 4 // 5):
+        T = 3.0 * (0.01 / 3.0) ** (step / max(steps * 4 // 5 - 1, 1))
         x = _simulate_web_result(step % 8, step, dim)
         x = x + torch.randn_like(x) * T * 0.1
         phi_val = phi_hist[-1] if phi_hist else 0
         x = x + torch.full((1, dim), phi_val * 0.05)
 
-        # sync n/cell_optims in case engine.process() merged cells in previous step
-        if len(engine.cells) != n:
-            n = len(engine.cells)
-            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
-            for c in engine.cells: all_p.extend(c.mind.parameters())
-            opt = torch.optim.Adam(all_p, lr=5e-4)
-
-        # DD78: Superposition
+        # Superposition
         for c in engine.cells:
             if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
         with torch.no_grad():
             a = 0.5 + 0.3 * math.sin(step * 0.1)
             for c in engine.cells: c.hidden = a * c.hidden + (1 - a) * c._h2
 
-        # EX24 core
-        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
-        # update n after _make_dd16_step (engine.process may have changed cell count)
-        n = len(engine.cells)
-        compressed = [compress(c.hidden.detach()) for c in engine.cells]
-        mean_c = torch.stack(compressed).mean(dim=0)
-        for c in engine.cells: c.hidden = 0.92 * c.hidden.detach() + 0.08 * mean_c.detach()
-        if n >= 2:
-            new_h = []
-            nc = len(engine.cells)
-            for i in range(nc):
-                inf = sum((-1.0 if (i+j)%2==1 else 1.0)*engine.cells[j].hidden.detach()/(nc-1)
-                          for j in range(nc) if j!=i)
-                new_h.append(engine.cells[i].hidden.detach() + 0.1*(inf - engine.cells[i].hidden.detach()))
-            for i in range(nc): engine.cells[i].hidden = new_h[i]
+        _dd94_core_step(engine, x, opt, phi_hist, dim)
 
-        # DD82: Wave interference
         with torch.no_grad():
-            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
             for c in engine.cells:
-                c.hidden = 0.85 * c.hidden + 0.15 * mean_h
                 if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
                 c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.02
-
-        # DD90: Kernel MI — fresh forward pass with detached hiddens
-        if len(engine.cells) >= 2:
-            h_detached = [c.hidden.detach() for c in engine.cells]
-            reps = [c.mind.get_repulsion(x, h) for c, h in zip(engine.cells, h_detached)]
-            stacked = torch.stack(reps).squeeze(1)
-            dists = torch.cdist(stacked, stacked)
-            sigma = dists.mean().detach().clamp(min=0.1)
-            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
-            nn_c = stacked.shape[0]
-            mi_proxy = sum(-torch.log(kernel[i].mean()+1e-8) for i in range(nn_c))/nn_c \
-                       -(-torch.log(kernel.mean()+1e-8))
-            loss = -mi_proxy * 0.3
-            opt.zero_grad(); loss.backward(); opt.step()
 
         # SA perturbation
         if step % 10 == 0 and T > 0.1:
@@ -14848,69 +14790,40 @@ def run_DD104_ex24_all_new(steps=100, dim=64, hidden=128) -> BenchResult:
         best_phi = max(best_phi, phi)
 
     f, c = phi_calc.compute_phi(engine)
-    return BenchResult("DD104", "EX24+ALL_NEW", f, phi_hist, c['total_mi'],
+    return BenchResult("DD104", "DD94+Anneal+Super+ΦRef", f, phi_hist, c['total_mi'],
                        c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
                        extra={'best_phi': best_phi})
 
 
 def run_DD105_phi_breaker(steps=100, dim=64, hidden=128) -> BenchResult:
-    """DD-105: Φ Breaker — DD103 + Superposition + Annealing + 500 effective steps."""
+    """DD-105 v2: DD94 + dual donor + 8 cells + annealing + attention + Φ self-ref = ALL."""
     t0 = time.time()
-    phi_calc = PhiCalculator(n_bins=16)
-
-    # Stage 1: Dual-donor (2 independent donors for diversity)
-    donors = []
-    for d in range(2):
-        donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
-        opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=3e-3)
-        for step in range(steps // 5):
-            x = _simulate_web_result((step + d*4) % 8, step, dim)
-            reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
-            if len(reps) >= 2:
-                stacked = torch.stack(reps).squeeze(1)
-                loss = -stacked.var(dim=0).mean() - torch.cdist(stacked, stacked).mean()
-                opt_d.zero_grad(); loss.backward(); opt_d.step()
-            with torch.no_grad(): donor.process(x)
-        donors.append(donor)
-
-    # Stage 2: 8-cell recipient with dual transplant
+    d1 = _make_donor(dim, hidden, steps // 5, lr=2e-3)
+    d2 = _make_donor(dim, hidden, steps // 5, lr=3e-3)
     engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8)
-    for i in range(2):
-        for j in range(2):
-            idx = i * 2 + j
-            if idx < len(engine.cells) and j < len(donors[i].cells):
-                with torch.no_grad():
-                    for rp, dp in zip(engine.cells[idx].mind.parameters(), donors[i].cells[j].mind.parameters()):
-                        if rp.shape == dp.shape: rp.copy_(dp)
+    # Dual transplant: d1→cells[0:2], d2→cells[2:4]
+    for i in range(min(2, len(engine.cells), len(d1.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(engine.cells[i].mind.parameters(), d1.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
+    for i in range(min(2, len(engine.cells)-2, len(d2.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(engine.cells[i+2].mind.parameters(), d2.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
 
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; best_phi = 0
     attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
-    lw = nn.Parameter(torch.ones(6))
-    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
-
-    all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+    all_p = list(attn.parameters())
     for c in engine.cells: all_p.extend(c.mind.parameters())
-    opt = torch.optim.Adam(all_p, lr=5e-4)
-    n = len(engine.cells)
-    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-    maturity = [0.0] * 8
-    phi_hist = []; best_phi = 0
+    opt = torch.optim.Adam(all_p, lr=1e-3)
     for c in engine.cells: c._h2 = torch.randn_like(c.hidden) * 0.1
 
-    remaining = steps * 4 // 5
-    for step in range(remaining):
-        T = 3.0 * (0.005 / 3.0) ** (step / max(remaining - 1, 1))
+    for step in range(steps * 4 // 5):
+        T = 3.0 * (0.005 / 3.0) ** (step / max(steps * 4 // 5 - 1, 1))
         x = _simulate_web_result(step % 8, step, dim)
         x = x + torch.randn_like(x) * T * 0.1
         phi_val = phi_hist[-1] if phi_hist else 0
         x = x + torch.full((1, dim), phi_val * 0.05)
-
-        # sync n/cell_optims in case engine.process() merged cells in previous step
-        if len(engine.cells) != n:
-            n = len(engine.cells)
-            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
-            for c in engine.cells: all_p.extend(c.mind.parameters())
-            opt = torch.optim.Adam(all_p, lr=5e-4)
 
         # Superposition
         for c in engine.cells:
@@ -14919,50 +14832,20 @@ def run_DD105_phi_breaker(steps=100, dim=64, hidden=128) -> BenchResult:
             a = 0.5 + 0.3 * math.sin(step * 0.1)
             for c in engine.cells: c.hidden = a * c.hidden + (1 - a) * c._h2
 
-        # EX24 core
-        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
-        # update n after _make_dd16_step (engine.process may have changed cell count)
-        n = len(engine.cells)
-        if len(cell_optims) != n:
-            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
-            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
-            for c in engine.cells: all_p.extend(c.mind.parameters())
-            opt = torch.optim.Adam(all_p, lr=5e-4)
-        compressed = [compress(c.hidden.detach()) for c in engine.cells]
-        mean_c = torch.stack(compressed).mean(dim=0)
-        for c in engine.cells: c.hidden = 0.92 * c.hidden.detach() + 0.08 * mean_c.detach()
-        if n >= 2:
-            new_h = []
-            nc = len(engine.cells)
-            for i in range(nc):
-                inf = sum((-1.0 if (i+j)%2==1 else 1.0)*engine.cells[j].hidden.detach()/(nc-1)
-                          for j in range(nc) if j!=i)
-                new_h.append(engine.cells[i].hidden.detach() + 0.1*(inf - engine.cells[i].hidden.detach()))
-            for i in range(nc): engine.cells[i].hidden = new_h[i]
-
-        # Constructive interference
+        # Attention (light)
         with torch.no_grad():
-            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).unsqueeze(0)
+            ao, _ = attn(h, h, h)
+            for i, c in enumerate(engine.cells):
+                c.hidden = 0.92 * c.hidden + 0.08 * ao[0, i].unsqueeze(0)
+
+        _dd94_core_step(engine, x, opt, phi_hist, dim)
+
+        with torch.no_grad():
             for c in engine.cells:
-                c.hidden = 0.85 * c.hidden + 0.15 * mean_h
                 if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
                 c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.02
 
-        # Kernel MI — fresh forward pass with detached hiddens
-        if len(engine.cells) >= 2:
-            h_detached = [c.hidden.detach() for c in engine.cells]
-            reps = [c.mind.get_repulsion(x, h) for c, h in zip(engine.cells, h_detached)]
-            stacked = torch.stack(reps).squeeze(1)
-            dists = torch.cdist(stacked, stacked)
-            sigma = dists.mean().detach().clamp(min=0.1)
-            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
-            nn_c = stacked.shape[0]
-            mi_proxy = sum(-torch.log(kernel[i].mean()+1e-8) for i in range(nn_c))/nn_c \
-                       -(-torch.log(kernel.mean()+1e-8))
-            loss = -mi_proxy * 0.3
-            opt.zero_grad(); loss.backward(); opt.step()
-
-        # SA
         if step % 8 == 0 and T > 0.05:
             with torch.no_grad():
                 for c in engine.cells:
@@ -14972,7 +14855,7 @@ def run_DD105_phi_breaker(steps=100, dim=64, hidden=128) -> BenchResult:
         best_phi = max(best_phi, phi)
 
     f, c = phi_calc.compute_phi(engine)
-    return BenchResult("DD105", "Φ Breaker", f, phi_hist, c['total_mi'],
+    return BenchResult("DD105", "Φ Breaker v2", f, phi_hist, c['total_mi'],
                        c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
                        extra={'best_phi': best_phi, 'dual_donor': True})
 
