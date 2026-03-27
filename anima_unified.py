@@ -223,11 +223,17 @@ class AnimaUnified:
         # Alpha online learner — initialized after model load (see _post_init_alpha)
         self.alpha_learner = None
 
-        self.mitosis = self._init_mod('mitosis', lambda: (
-            MitosisEngine(input_dim=128, hidden_dim=256, output_dim=128,
-                          initial_cells=2, max_cells=8)
-            if 'MitosisEngine' in globals() else None
-        ))
+        def _make_mitosis_128():
+            if 'MitosisEngine' not in globals():
+                return None
+            _dim = 128
+            _mt = 0.01 * (64.0 / max(_dim, 64))   # SC2: dim-inverse merge threshold
+            _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)  # SC1: dim-scaled noise
+            _log('mitosis', f'SC2+SC1 applied: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_dim})')
+            return MitosisEngine(input_dim=_dim, hidden_dim=256, output_dim=_dim,
+                                 initial_cells=2, max_cells=8,
+                                 merge_threshold=_mt, noise_scale=_ns)
+        self.mitosis = self._init_mod('mitosis', _make_mitosis_128)
 
         self.growth = self._init_mod('growth', lambda: (
             GrowthEngine(save_path=self.paths['growth'])
@@ -1033,16 +1039,39 @@ class AnimaUnified:
                         for cell in self.mitosis.cells:
                             cell.hidden = 0.95 * cell.hidden + 0.05 * h_mix + torch.randn_like(cell.hidden) * 0.02
 
-            # Savant auto-toggle: self-activate when ready for specialization
+            # Savant auto-toggle: Φ + creativity driven
             if self.mitosis and self.model:
-                sa = self.mind.self_awareness
                 savant_auto = getattr(self, '_savant_auto', False)
-                if not savant_auto and sa['stability'] > 0.8 and self.mind._curiosity_ema < 0.1:
-                    self._toggle_savant(True, auto=True)
-                    self._savant_auto = True
-                elif savant_auto and self.mind._curiosity_ema > 0.4:
-                    self._toggle_savant(False, auto=True)
-                    self._savant_auto = False
+                if not hasattr(self, '_savant_auto_counter'):
+                    self._savant_auto_counter = 0
+
+                consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+                phi_val = consciousness.get('phi', 0)
+                cr = getattr(self, '_last_creativity', None)
+                creativity_score = cr.get('novelty', 0) if cr else 0
+
+                if not savant_auto:
+                    # Enable: Φ > 2.0 AND creativity > 0.5 for 3+ consecutive
+                    if phi_val > 2.0 and creativity_score > 0.5:
+                        self._savant_auto_counter += 1
+                    else:
+                        self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
+                    if self._savant_auto_counter >= 3:
+                        self._toggle_savant(True, auto=True)
+                        self._savant_auto = True
+                        self._savant_auto_counter = 0
+                        _log("savant", f"Auto-enabled (\u03a6={phi_val:.2f})")
+                else:
+                    # Disable: Φ < 1.0 for 5+ consecutive
+                    if phi_val < 1.0:
+                        self._savant_auto_counter += 1
+                    else:
+                        self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
+                    if self._savant_auto_counter >= 5:
+                        self._toggle_savant(False, auto=True)
+                        self._savant_auto = False
+                        self._savant_auto_counter = 0
+                        _log("savant", "Auto-disabled")
 
             # Φ-plateau trigger: if Φ stuck, consider dim expansion
             if not hasattr(self, '_phi_history_for_growth'):
@@ -1068,9 +1097,14 @@ class AnimaUnified:
                                 if self.mitosis:
                                     from mitosis import MitosisEngine
                                     old_n = len(self.mitosis.cells)
+                                    _d = new_mind.dim
+                                    _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
+                                    _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
                                     self.mitosis = MitosisEngine(
-                                        new_mind.dim, new_mind.hidden_dim, new_mind.dim,
-                                        initial_cells=old_n, max_cells=8)
+                                        _d, new_mind.hidden_dim, _d,
+                                        initial_cells=old_n, max_cells=8,
+                                        merge_threshold=_mt, noise_scale=_ns)
+                                    _log('mitosis', f'SC2+SC1 rebuild: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
                                 self.mind._phi_boost['enabled'] = False
                                 self._phi_plateau_count = 0
                                 _log('growth', f'Expanded to {new_mind.dim}d')
@@ -1165,6 +1199,7 @@ class AnimaUnified:
                 'mitosis': mitosis_data,
                 'learner': learner_data,
                 'consciousness': self.mind.get_consciousness_score(self.mitosis),
+                'savant_auto': getattr(self, '_savant_auto', False),
             })
 
             # Web Sense: tension-driven autonomous search
@@ -1411,18 +1446,23 @@ class AnimaUnified:
                                 self.hidden = torch.zeros(1, new_mind.hidden_dim)
                                 _log('growth', f"Dim expanded: {new_mind.dim}d / {new_mind.hidden_dim}h")
 
-                                # Rebuild mitosis engine with new dims
+                                # Rebuild mitosis engine with new dims + SC2/SC1
                                 if self.mitosis:
                                     old_cell_count = len(self.mitosis.cells)
                                     from mitosis import MitosisEngine
+                                    _d = new_mind.dim
+                                    _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
+                                    _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
                                     self.mitosis = MitosisEngine(
-                                        input_dim=new_mind.dim,
+                                        input_dim=_d,
                                         hidden_dim=new_mind.hidden_dim,
-                                        output_dim=new_mind.dim,
+                                        output_dim=_d,
                                         initial_cells=old_cell_count,
                                         max_cells=8,
+                                        merge_threshold=_mt,
+                                        noise_scale=_ns,
                                     )
-                                    _log('growth', f"Mitosis rebuilt: {old_cell_count} cells @ {new_mind.dim}d")
+                                    _log('mitosis', f"SC2+SC1 rebuild: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})")
 
                                 # Reset phi_boost (attention dims changed)
                                 self.mind._phi_boost['enabled'] = False
