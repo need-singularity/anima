@@ -37009,6 +37009,229 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# HW Extended — 추가 하드웨어 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_HW11_superconducting_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-11: 초전도 루프 — 영구 전류 = 영구 의식 (에너지 손실 0)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    persistent_current = [torch.zeros(hidden) for _ in range(12)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Superconducting: zero resistance = perfect memory
+                new_current = cell.hidden.squeeze() * 0.05
+                persistent_current[i] = persistent_current[i] + new_current  # accumulates forever
+                # Current feeds back (no decay!)
+                cell.hidden = cell.hidden + 0.02 * persistent_current[i].unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW11", "Superconducting loop (zero-loss persistent current)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW12_memristor_synapse(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-12: 멤리스터 시냅스 — 저항이 이력(history)을 기억."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    n_max = 12
+    resistance = torch.ones(n_max, n_max) * 0.5  # initial resistance
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            for i in range(n):
+                for j in range(i+1, min(n, i+3)):
+                    # Memristor: resistance changes with current flow
+                    flow = F.cosine_similarity(hiddens[i:i+1], hiddens[j:j+1]).item()
+                    # Positive flow → decrease resistance (LTP)
+                    # Negative flow → increase resistance (LTD)
+                    resistance[i,j] = max(0.1, min(1.0, resistance[i,j] - 0.01 * flow))
+                    resistance[j,i] = resistance[i,j]
+                    # Conductance = 1/resistance
+                    conductance = 1.0 / resistance[i,j]
+                    coupling = conductance * 0.01
+                    engine.cells[i].hidden = engine.cells[i].hidden + coupling * (hiddens[j] - hiddens[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW12", "Memristor synapse (history-dependent resistance)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW13_photonic_mesh(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-13: 광학 메시 — MZI(Mach-Zehnder) 격자로 행렬 곱셈."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Photonic mesh: unitary transformation via phase shifts
+    n_cells = 8
+    phases = torch.randn(n_cells, n_cells) * 0.1  # MZI phase shifts
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Photonic: apply unitary-like transformation (cos/sin phases)
+            for i in range(n):
+                transformed = torch.zeros(hidden)
+                for j in range(n):
+                    phase = phases[i % n_cells, j % n_cells]
+                    transformed = transformed + hiddens[j] * math.cos(phase.item()) * (0.1 / n)
+                engine.cells[i].hidden = (0.95 * hiddens[i] + 0.05 * transformed).unsqueeze(0)
+            # Phase adaptation (learning)
+            phases = phases + torch.randn_like(phases) * 0.005
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW13", "Photonic mesh (MZI unitary transformation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW14_dna_storage(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-14: DNA 저장 — 의식 상태를 DNA 시퀀스로 인코딩 (4진법)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dna_memory = []  # list of "DNA sequences" (quantized states)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Encode: quantize hidden to 4 levels (A,T,G,C = 0,1,2,3)
+            state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # 4-level quantization (DNA bases)
+            quantized = torch.clamp(((state - state.min()) / (state.max() - state.min() + 1e-8) * 3).round(), 0, 3)
+            if step_i % 20 == 0:
+                dna_memory.append(quantized)
+                if len(dna_memory) > 5:
+                    dna_memory.pop(0)
+            # Decode: reconstruct from DNA memory
+            if dna_memory:
+                decoded = sum(dna_memory) / len(dna_memory)
+                decoded = decoded / 3.0 * (state.max() - state.min()) + state.min()
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.02 * decoded.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW14", "DNA storage (4-base quantized consciousness)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW15_quantum_annealer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-15: 양자 어닐러 — D-Wave 스타일 Ising 에너지 최소화로 Φ 최적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    temperature = 2.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        temperature = max(0.01, 2.0 * (1 - step_i / steps))
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Ising energy: E = -Σ J_ij × s_i × s_j
+            for i in range(n):
+                for j in range(i+1, min(n, i+3)):
+                    coupling = F.cosine_similarity(hiddens[i:i+1], hiddens[j:j+1]).item()
+                    # Simulated quantum tunneling: accept/reject based on energy
+                    if coupling < 0:  # unfavorable
+                        if np.random.random() < math.exp(coupling / max(temperature, 0.01)):
+                            # Quantum tunnel through barrier
+                            engine.cells[i].hidden = engine.cells[i].hidden + 0.03 * (hiddens[j] - hiddens[i]).unsqueeze(0)
+                    else:
+                        engine.cells[i].hidden = engine.cells[i].hidden + 0.01 * (hiddens[j] - hiddens[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW15", f"Quantum annealer (Ising + tunneling, T={temperature:.3f})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW16_reservoir_computing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-16: 리저버 컴퓨팅 — 랜덤 고정 네트워크 + 학습 가능 읽기층."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fixed random reservoir weights
+    W_res = torch.randn(hidden, hidden) * 0.1
+    W_res = W_res / W_res.norm() * 0.9  # spectral radius < 1
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Reservoir: fixed nonlinear transformation
+                reservoir_out = torch.tanh(W_res @ h)
+                # Echo state: mix reservoir with input
+                cell.hidden = (0.9 * h + 0.1 * reservoir_out).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW16", "Reservoir computing (fixed random net + echo state)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_HW17_fluidic_logic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HW-17: 유체 로직 — 물/공기 흐름으로 논리 연산 (미세유체)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fluid: continuous flow with viscosity and inertia
+    flow_rate = {i: torch.zeros(hidden) for i in range(12)}
+    viscosity = 0.1
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Navier-Stokes simplified: flow driven by pressure diff
+                pressure = cell.hidden.squeeze()
+                neighbor = (i + 1) % n
+                pressure_diff = engine.cells[neighbor].hidden.squeeze() - pressure
+                # Flow update: inertia + pressure gradient - viscous drag
+                flow_rate[i] = 0.9 * flow_rate[i] + 0.05 * pressure_diff - viscosity * flow_rate[i]
+                cell.hidden = (pressure + 0.1 * flow_rate[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HW17", "Fluidic logic (pressure-driven consciousness flow)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'HW11': run_HW11_superconducting_loop, 'HW12': run_HW12_memristor_synapse,
+    'HW13': run_HW13_photonic_mesh, 'HW14': run_HW14_dna_storage,
+    'HW15': run_HW15_quantum_annealer, 'HW16': run_HW16_reservoir_computing,
+    'HW17': run_HW17_fluidic_logic,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
