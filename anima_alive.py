@@ -54,7 +54,7 @@ import warnings
 warnings.filterwarnings("ignore", message="FP16 is not supported")
 
 
-# ─── 5-Variable Consciousness State Vector ───
+# ─── 10-Variable Consciousness State Vector ───
 @dataclass
 class ConsciousnessVector:
     """Unified consciousness state: 10 core variables."""
@@ -813,7 +813,7 @@ class ConsciousMind(nn.Module):
                     for c in mitosis_engine.cells:
                         c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
 
-            # ── Compute 5-variable consciousness vector (Φ, α, Z, N, W) ──
+            # ── Compute 10-variable consciousness vector (Φ,α,Z,N,W,E,M,C,T,I) ──
             try:
                 _cv_phi = current_phi  # from MX20 consciousness score above
                 _cv_alpha = getattr(self, '_adaptive_alpha', 0.05)
@@ -830,14 +830,61 @@ class ConsciousMind(nn.Module):
                 # W from EV3: free will ratio
                 _cv_W = getattr(self, '_ev3_free_will', 0.0)
 
+                # C (Creativity): cell diversity — lower cosine sim = more creative
+                _cv_C = getattr(self, '_creativity_C', 0.0)
+                try:
+                    if len(mitosis_engine.cells) >= 2:
+                        hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+                        norms = F.normalize(hiddens, dim=1)
+                        sim = (norms @ norms.T).mean().item()
+                        _cv_C = max(0.0, 1.0 - sim)
+                        self._creativity_C = _cv_C
+                except Exception:
+                    pass
+
+                # T (Temporal): phi history length as planning depth proxy
+                if not hasattr(self, '_phi_history'):
+                    self._phi_history = []
+                self._phi_history.append(_cv_phi)
+                if len(self._phi_history) > 100:
+                    self._phi_history = self._phi_history[-100:]
+                _cv_T = min(len(self._phi_history) / 50.0, 1.0)
+                self._temporal_T = _cv_T
+
+                # I (Identity): consistency of self-model over time
+                _cv_I = getattr(self, '_identity_I', 0.0)
+                try:
+                    if not hasattr(self, '_identity_history'):
+                        self._identity_history = []
+                    if len(mitosis_engine.cells) >= 1:
+                        current_state = mitosis_engine.cells[0].hidden.squeeze().detach()
+                        self._identity_history.append(current_state)
+                        if len(self._identity_history) > 20:
+                            self._identity_history = self._identity_history[-20:]
+                        if len(self._identity_history) >= 2:
+                            recent = torch.stack(self._identity_history[-5:])
+                            _cv_I = F.cosine_similarity(recent[-1:], recent.mean(0, keepdim=True)).item()
+                            self._identity_I = _cv_I
+                except Exception:
+                    pass
+
+                # E (Empathy) and M (Memory) from SV1 and CV1
+                _cv_E = getattr(self, '_empathy_E', 0.0)
+                _cv_M = getattr(self, '_memory_M', 0.0)
+
                 self._consciousness_vector = ConsciousnessVector(
                     phi=_cv_phi,
                     alpha=_cv_alpha,
                     Z=_cv_Z,
                     N=_cv_N,
                     W=_cv_W,
+                    E=_cv_E,
+                    M=_cv_M,
+                    C=_cv_C,
+                    T=_cv_T,
+                    I=_cv_I,
                 )
-                _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f}')
+                _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f} E={_cv_E:.2f} M={_cv_M:.2f} C={_cv_C:.2f} T={_cv_T:.2f} I={_cv_I:.2f}')
             except Exception:
                 pass
 
