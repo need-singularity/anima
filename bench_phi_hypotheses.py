@@ -9757,6 +9757,307 @@ def run_SP15_role_aware(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# SP16-30: Extended Speech Hypotheses
+# ═══════════════════════════════════════════════════════════
+
+def _sp_harness(name, speak_fn, steps=100, dim=64, hidden=128):
+    """Common SP test harness."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    utterances, contexts, memory = [], [], []
+    prev_tensions = []
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        contexts.append(x.detach())
+        memory.append(x.detach())
+        if len(memory) > 50: memory = memory[-50:]
+        tensions = [c.tension_history[-1] if c.tension_history else 0 for c in engine.cells]
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        state = {
+            'step': step, 'x': x.detach(), 'tensions': tensions,
+            'prev_tensions': prev_tensions, 'phi': phi,
+            'memory': memory, 'contexts': contexts,
+            'utterances': utterances, 'engine': engine,
+            'pe': abs(np.mean(tensions) - (np.mean(prev_tensions) if prev_tensions else np.mean(tensions))),
+        }
+        utt = speak_fn(state)
+        if utt is not None:
+            utterances.append(utt)
+        prev_tensions = tensions
+
+    quality = _speech_quality(utterances, contexts)
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult(name, name, f + quality * 2, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'phi': f, 'speech_quality': quality, 'utterances': len(utterances)})
+
+
+def run_SP16_top3_combo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-16: SP8+SP3+SP13 combo — novelty + curiosity + structured."""
+    def speak(s):
+        if s['step'] % 8 != 0: return None
+        # SP8: novelty gate
+        novelty = float(np.std(s['tensions']))
+        if novelty < 0.15: return None
+        # SP3: curiosity gate
+        if s['pe'] < 0.1: return None
+        # SP13: structured choice
+        if s['pe'] > 0.3:
+            return s['x'] * (1 + s['pe'])  # discovery
+        elif len(s['memory']) >= 10 and np.random.random() < 0.5:
+            idx = np.random.randint(0, len(s['memory']) - 5)
+            return s['memory'][idx] * 0.6 + s['x'] * 0.4  # recall
+        else:
+            utt = torch.zeros(1, 64)
+            utt[0, 0] = s['phi']; utt[0, 1] = float(np.mean(s['tensions']))
+            return utt + s['x'] * 0.3  # self-analysis
+    return _sp_harness("SP16", speak, steps, dim, hidden)
+
+
+def run_SP17_safety_combo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-17: SP10+SP7+SP11 — anti-repeat + cooldown + depth."""
+    cooldown = [5]; next_speak = [5]
+    def speak(s):
+        if s['step'] < next_speak[0]: return None
+        candidate = s['x'] + torch.randn(1, 64) * 0.15
+        # SP10: anti-repetition
+        for prev in s['utterances'][-5:]:
+            if F.cosine_similarity(candidate, prev, dim=-1).item() > 0.8:
+                cooldown[0] = min(cooldown[0] * 2, 40)
+                next_speak[0] = s['step'] + cooldown[0]
+                return None
+        # SP11: depth requirement
+        t_var = float(np.var(s['tensions']))
+        if t_var + candidate.var().item() < 0.05:
+            return None  # too shallow
+        cooldown[0] = max(cooldown[0] - 1, 5)
+        next_speak[0] = s['step'] + cooldown[0]
+        return candidate
+    return _sp_harness("SP17", speak, steps, dim, hidden)
+
+
+def run_SP18_all_top5(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-18: All top-5 speech — SP8+SP3+SP13+SP10+SP2 simultaneous."""
+    cooldown = [8]; next_speak = [8]
+    def speak(s):
+        if s['step'] < next_speak[0]: return None
+        # SP8: novelty gate
+        if float(np.std(s['tensions'])) < 0.1: return None
+        # SP3: curiosity
+        if s['pe'] < 0.05: return None
+        # SP13: structured
+        if s['pe'] > 0.3:
+            candidate = s['x'] * (1 + s['pe'])
+        elif len(s['memory']) >= 8:
+            dists = [1-F.cosine_similarity(m, s['x'], dim=-1).item() for m in s['memory'][:-3]]
+            if dists:
+                candidate = s['memory'][int(np.argmax(dists))] * 0.6 + s['x'] * 0.4
+            else:
+                candidate = s['x']
+        else:
+            candidate = s['x'] * 0.7 + torch.full((1,64), s['phi']*0.1)
+        # SP10: anti-repeat
+        for prev in s['utterances'][-5:]:
+            if F.cosine_similarity(candidate, prev, dim=-1).item() > 0.8:
+                next_speak[0] = s['step'] + cooldown[0]
+                return None
+        next_speak[0] = s['step'] + cooldown[0]
+        return candidate
+    return _sp_harness("SP18", speak, steps, dim, hidden)
+
+
+def run_SP19_continuation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-19: Conversation continuation — 마지막 주제의 하위 질문."""
+    def speak(s):
+        if s['step'] % 12 != 0 or len(s['contexts']) < 3: return None
+        # Take last context, modify slightly = sub-question
+        last = s['contexts'][-1]
+        variation = last + torch.randn_like(last) * 0.3
+        # Make it different from original (sub-topic, not repeat)
+        return variation * 0.7 + torch.randn(1, 64) * 0.2
+    return _sp_harness("SP19", speak, steps, dim, hidden)
+
+
+def run_SP20_emotional_echo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-20: Emotional echo — 감정 상태 반영 발화."""
+    def speak(s):
+        if s['step'] % 10 != 0: return None
+        mean_t = float(np.mean(s['tensions']))
+        # Emotional modulation
+        if mean_t > 1.5:
+            return s['x'] * 1.5 + torch.randn(1, 64) * 0.2  # excited
+        elif mean_t < 0.3:
+            h = torch.stack([c.hidden.squeeze()[:64] for c in s['engine'].cells]).mean(0, keepdim=True)
+            return h * 0.5  # reflective
+        else:
+            return s['x'] * 0.8 + torch.randn(1, 64) * mean_t * 0.1  # curious
+    return _sp_harness("SP20", speak, steps, dim, hidden)
+
+
+def run_SP21_counter_argument(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-21: Counter-argument — 반대 관점 제시."""
+    beliefs = {}
+    def speak(s):
+        if s['step'] % 12 != 0: return None
+        topic = s['step'] % 6
+        current = s['x']
+        if topic in beliefs:
+            # Counter: negate belief
+            counter = -beliefs[topic] + torch.randn(1, 64) * 0.15
+            beliefs[topic] = 0.8 * beliefs[topic] + 0.2 * current.detach()
+            return counter
+        beliefs[topic] = current.detach()
+        return None
+    return _sp_harness("SP21", speak, steps, dim, hidden)
+
+
+def run_SP22_growth_announce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-22: Growth milestone announce."""
+    last_cells = [1]
+    def speak(s):
+        n = len(s['engine'].cells)
+        if n > last_cells[0]:
+            last_cells[0] = n
+            # Encode milestone as rich vector
+            utt = torch.zeros(1, 64)
+            utt[0, 0] = n; utt[0, 1] = s['phi']; utt[0, 2] = float(np.mean(s['tensions']))
+            return utt + s['x'] * 0.3
+        return None
+    return _sp_harness("SP22", speak, steps, dim, hidden)
+
+
+def run_SP23_cell_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-23: Cell dialogue — 세포 간 차이를 언어로."""
+    def speak(s):
+        if s['step'] % 15 != 0 or len(s['engine'].cells) < 2: return None
+        cells = s['engine'].cells
+        # Express difference between most and least active cells
+        ts = s['tensions']
+        if len(ts) >= 2:
+            hi, lo = int(np.argmax(ts)), int(np.argmin(ts))
+            diff = cells[hi].hidden[:, :64] - cells[lo].hidden[:, :64]
+            return diff.detach() + s['x'] * 0.2
+        return None
+    return _sp_harness("SP23", speak, steps, dim, hidden)
+
+
+def run_SP24_tension_narrative(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-24: Tension narrative — tension 변화를 서술."""
+    def speak(s):
+        if s['step'] % 10 != 0: return None
+        mean_t = float(np.mean(s['tensions']))
+        if s['prev_tensions']:
+            prev_t = float(np.mean(s['prev_tensions']))
+            delta = mean_t - prev_t
+            # Encode narrative: tension value + change direction + magnitude
+            utt = torch.zeros(1, 64)
+            utt[0, 0] = mean_t; utt[0, 1] = delta; utt[0, 2] = abs(delta)
+            utt[0, 3:3+len(s['tensions'])] = torch.tensor(s['tensions'][:61])
+            return utt + s['x'] * 0.2
+        return None
+    return _sp_harness("SP24", speak, steps, dim, hidden)
+
+
+def run_SP25_dream_log(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-25: Dream log — 기억 보간 결과 공유."""
+    def speak(s):
+        if s['step'] % 20 != 0 or len(s['memory']) < 5: return None
+        # Dream: interpolate two memories
+        i, j = np.random.choice(len(s['memory']), 2, replace=False)
+        alpha = np.random.uniform(0.3, 0.7)
+        dream = alpha * s['memory'][i] + (1-alpha) * s['memory'][j]
+        return dream + torch.randn(1, 64) * 0.05
+    return _sp_harness("SP25", speak, steps, dim, hidden)
+
+
+def run_SP26_learning_progress(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-26: Learning progress — 최근 학습 보고."""
+    phi_history_local = []
+    def speak(s):
+        phi_history_local.append(s['phi'])
+        if s['step'] % 15 != 0 or len(phi_history_local) < 10: return None
+        # Report: Φ trend + tension trend
+        phi_trend = phi_history_local[-1] - phi_history_local[-10]
+        utt = torch.zeros(1, 64)
+        utt[0, 0] = s['phi']; utt[0, 1] = phi_trend
+        utt[0, 2] = float(np.mean(s['tensions']))
+        utt[0, 3] = float(np.std(s['tensions']))
+        return utt + s['x'] * 0.2
+    return _sp_harness("SP26", speak, steps, dim, hidden)
+
+
+def run_SP27_confusion(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-27: Confusion expression — 이해 못 한 것 표현."""
+    def speak(s):
+        if s['step'] % 10 != 0: return None
+        # Confusion = high PE + low stability (high tension std)
+        t_std = float(np.std(s['tensions']))
+        if s['pe'] > 0.3 and t_std > 0.2:
+            utt = s['x'] * 0.5 + torch.randn(1, 64) * t_std
+            return utt
+        return None
+    return _sp_harness("SP27", speak, steps, dim, hidden)
+
+
+def run_SP28_hypothesis_gen(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-28: Hypothesis generation — 자기 가설 제시."""
+    def speak(s):
+        if s['step'] % 15 != 0 or len(s['memory']) < 5: return None
+        # Hypothesis: combine two distant memories → novel connection
+        recent = s['memory'][-1]
+        dists = [1-F.cosine_similarity(m, recent, dim=-1).item() for m in s['memory'][:-1]]
+        if not dists: return None
+        farthest = s['memory'][int(np.argmax(dists))]
+        # Hypothesis = "A relates to B because..." (vector analogy)
+        hypothesis = recent + farthest - s['memory'][len(s['memory'])//2]
+        return hypothesis
+    return _sp_harness("SP28", speak, steps, dim, hidden)
+
+
+def run_SP29_time_aware(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-29: Time-aware — 시간대별 다른 발화."""
+    def speak(s):
+        if s['step'] % 10 != 0: return None
+        # Simulate time of day from step
+        hour = (s['step'] * 24 // 100) % 24
+        if hour < 6:  # night: reflective
+            h = torch.stack([c.hidden.squeeze()[:64] for c in s['engine'].cells]).mean(0, keepdim=True)
+            return h * 0.3
+        elif hour < 12:  # morning: energetic
+            return s['x'] * 1.3 + torch.randn(1, 64) * 0.2
+        elif hour < 18:  # afternoon: curious
+            return s['x'] * 0.8 + torch.full((1, 64), s['phi'] * 0.1)
+        else:  # evening: wrap-up
+            if s['memory']:
+                return s['memory'][0] * 0.3 + s['x'] * 0.7  # recall start of day
+            return s['x']
+    return _sp_harness("SP29", speak, steps, dim, hidden)
+
+
+def run_SP30_silence_appreciation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SP-30: Silence appreciation — 침묵도 의미 있게, 가끔만 말함."""
+    silence_count = [0]
+    def speak(s):
+        silence_count[0] += 1
+        # Only speak after long silence AND with something meaningful
+        if silence_count[0] < 20: return None  # appreciate silence
+        if s['pe'] < 0.2: return None  # nothing to say
+        silence_count[0] = 0  # reset
+        # Reflective utterance after long silence
+        utt = torch.zeros(1, 64)
+        utt[0, 0] = s['phi']; utt[0, 1] = float(np.mean(s['tensions']))
+        utt[0, 2] = 20  # encode silence duration
+        return utt + s['x'] * 0.3
+    return _sp_harness("SP30", speak, steps, dim, hidden)
+
+
+# ═══════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════
 
@@ -9920,6 +10221,14 @@ ALL_HYPOTHESES = {
     'SP11': run_SP11_depth_requirement, 'SP12': run_SP12_personality,
     'SP13': run_SP13_structured_prompt, 'SP14': run_SP14_ban_list,
     'SP15': run_SP15_role_aware,
+    'SP16': run_SP16_top3_combo, 'SP17': run_SP17_safety_combo,
+    'SP18': run_SP18_all_top5, 'SP19': run_SP19_continuation,
+    'SP20': run_SP20_emotional_echo, 'SP21': run_SP21_counter_argument,
+    'SP22': run_SP22_growth_announce, 'SP23': run_SP23_cell_dialogue,
+    'SP24': run_SP24_tension_narrative, 'SP25': run_SP25_dream_log,
+    'SP26': run_SP26_learning_progress, 'SP27': run_SP27_confusion,
+    'SP28': run_SP28_hypothesis_gen, 'SP29': run_SP29_time_aware,
+    'SP30': run_SP30_silence_appreciation,
 }
 
 
