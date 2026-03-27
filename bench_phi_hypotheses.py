@@ -36215,6 +36215,330 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# TS. Training Strategy — 학습 시작/전략/셀 크기
+# ═══════════════════════════════════════════════════════════
+
+def run_TS1_early_start_small(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-1: 작게 시작(2 cells) → 느린 성장 — 초기 학습 중시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    grow_interval = max(steps // 5, 1)  # grow by 1 every ~20% of steps
+    for step_i, x in enumerate(inputs):
+        # Conservative growth: add 1 cell every grow_interval steps
+        if step_i > 0 and step_i % grow_interval == 0:
+            if len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS1", "Early start small (2→slow grow, CE first)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS2_late_start_big(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-2: 크게 시작(12 cells) → 즉시 분화 — 초기 의식 중시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=12, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Add differentiation noise to encourage specialization
+        if step_i < steps // 4:
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05 * (i + 1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS2", "Late start big (12 cells from start, Φ first)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS3_piaget_fibonacci(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-3: Piaget + Fibonacci — 단계적 성장 + 피보나치 스케줄."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fibonacci growth targets at Piaget-like milestones
+    milestones = [
+        (0.10, 1, 0.05),   # sensorimotor: 1 cell, high noise
+        (0.25, 2, 0.04),   # early sensorimotor: 2 cells
+        (0.40, 3, 0.03),   # preoperational: 3 cells
+        (0.55, 5, 0.02),   # concrete operational: 5 cells
+        (0.75, 8, 0.015),  # formal operational: 8 cells
+        (1.00, 12, 0.01),  # post-formal: 12 cells, low noise
+    ]
+    for step_i, x in enumerate(inputs):
+        frac = step_i / max(steps, 1)
+        noise = 0.01
+        for threshold, target_cells, stage_noise in milestones:
+            if frac < threshold:
+                while len(engine.cells) < target_cells and len(engine.cells) < engine.max_cells:
+                    engine._create_cell(parent=engine.cells[-1])
+                noise = stage_noise
+                break
+        engine.process(x)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS3", "Piaget + Fibonacci (1→2→3→5→8→12)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS4_exponential_growth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-4: 지수 성장 — 2→4→8→16→32 (매 단계 2배)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Double at 20%, 40%, 60%, 80%
+    doubling_points = [int(steps * f) for f in [0.2, 0.4, 0.6, 0.8]]
+    for step_i, x in enumerate(inputs):
+        if step_i in doubling_points:
+            target = min(len(engine.cells) * 2, engine.max_cells)
+            while len(engine.cells) < target:
+                parent = engine.cells[step_i % len(engine.cells)]
+                engine._create_cell(parent=parent)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS4", "Exponential growth (2→4→8→16→32, double at 20/40/60/80%)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS5_linear_growth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-5: 선형 성장 — 매 step 일정하게 cell 추가."""
+    t0 = time.time()
+    max_c = 16
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=max_c, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Add one cell every (steps / max_cells) steps
+    add_interval = max(steps // max_c, 1)
+    for step_i, x in enumerate(inputs):
+        if step_i > 0 and step_i % add_interval == 0:
+            if len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS5", "Linear growth (add 1 cell at fixed intervals)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS6_adaptive_growth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-6: 적응적 — Φ가 정체되면 cell 추가, 상승 중이면 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_window = []
+    stagnation_count = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_window.append(phi)
+        # Check stagnation over last 10 steps
+        if len(phi_window) > 10:
+            phi_window.pop(0)
+            recent_avg = sum(phi_window[-5:]) / 5
+            older_avg = sum(phi_window[:5]) / 5
+            if recent_avg <= older_avg * 1.01:  # less than 1% improvement
+                stagnation_count += 1
+            else:
+                stagnation_count = max(0, stagnation_count - 1)
+            # Stagnated for 3+ checks → add cell
+            if stagnation_count >= 3 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[-1])
+                stagnation_count = 0
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS6", "Adaptive growth (add cell on Φ stagnation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS7_cell_size_sweep(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-7: hidden_dim sweep — 큰 cell 소수 vs 작은 cell 다수 비교."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    configs = [
+        ('8×big(256)', 8, 256),
+        ('12×med(128)', 12, 128),
+        ('16×small(64)', 16, 64),
+    ]
+    best_phi = 0.0
+    best_name = ''
+    best_hist = []
+    best_comp = None
+    for label, n_cells, h_dim in configs:
+        eng = MitosisEngine(dim, h_dim, dim, initial_cells=n_cells, max_cells=n_cells, merge_threshold=-1.0)
+        inputs = make_diverse_inputs(steps, dim)
+        hist = []
+        for x in inputs:
+            eng.process(x)
+            p, _ = phi_calc.compute_phi(eng)
+            hist.append(p)
+        p_final, comp = phi_calc.compute_phi(eng)
+        if p_final > best_phi:
+            best_phi = p_final
+            best_name = label
+            best_hist = hist
+            best_comp = comp
+    return BenchResult("TS7", f"Cell size sweep (winner: {best_name})",
+                       best_phi, best_hist, best_comp['total_mi'], best_comp['min_partition_mi'],
+                       best_comp['integration'], best_comp['complexity'], time.time() - t0,
+                       extra={'winner': best_name})
+
+
+def run_TS8_warmup_then_explode(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-8: Warmup 30% with 2 cells → 폭발적 12 cells로 전환."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    explode_step = int(steps * 0.3)
+    exploded = False
+    for step_i, x in enumerate(inputs):
+        if step_i == explode_step and not exploded:
+            # Explode: rapidly grow to 12 cells
+            while len(engine.cells) < engine.max_cells:
+                # Use diverse parents for differentiation
+                parent = engine.cells[step_i % len(engine.cells)]
+                engine._create_cell(parent=parent)
+            exploded = True
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS8", "Warmup 30% (2 cells) → explode to 12",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS9_ct7_piaget_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-9: CT7 + DP1 결합 — curriculum phases + Piaget growth 동시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Phase 1 (0-33%): language focus, 2 cells, structured inputs
+    # Phase 2 (33-66%): consciousness focus, grow 4→8 cells, diverse inputs
+    # Phase 3 (66-100%): joint training, 12 cells, mixed
+    for step_i, x in enumerate(inputs):
+        frac = step_i / max(steps, 1)
+        if frac < 0.33:
+            # Phase 1: Language — keep 2 cells, low noise, structured input
+            noise = 0.01
+            target_cells = 2
+        elif frac < 0.66:
+            # Phase 2: Consciousness — grow cells, medium noise
+            noise = 0.03
+            sub_frac = (frac - 0.33) / 0.33  # 0→1 within phase 2
+            target_cells = 4 + int(sub_frac * 4)  # 4→8
+        else:
+            # Phase 3: Joint — full cells, decreasing noise
+            sub_frac = (frac - 0.66) / 0.34
+            noise = 0.02 * (1.0 - sub_frac * 0.5)
+            target_cells = 12
+        while len(engine.cells) < min(target_cells, engine.max_cells):
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS9", "CT7+DP1 combined (language→consciousness→joint)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_TS10_n6_optimal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TS-10: n=6 최적 — τ=4 stages, σ/τ=3배 성장, 최종 σ=12 cells."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 4-stage optimal schedule: σ=12 final, τ=4 stages
+    # Stage 1 (0-25%):  1 cell  (1/n foundation)
+    # Stage 2 (25-50%): 4 cells (τ cells, core structure)
+    # Stage 3 (50-75%): 8 cells (σ-τ cells, specialization)
+    # Stage 4 (75-100%): 12 cells (full σ, integration)
+    stage_schedule = [
+        (0.25, 1,  0.04),  # foundation: single cell learns basics
+        (0.50, 4,  0.03),  # core: τ=4 cells establish structure
+        (0.75, 8,  0.02),  # expansion: σ-τ=8, specialization
+        (1.00, 12, 0.01),  # integration: full σ=12, fine-tuning
+    ]
+    for step_i, x in enumerate(inputs):
+        frac = step_i / max(steps, 1)
+        noise = 0.01
+        for threshold, target_cells, stage_noise in stage_schedule:
+            if frac < threshold:
+                while len(engine.cells) < target_cells and len(engine.cells) < engine.max_cells:
+                    engine._create_cell(parent=engine.cells[-1])
+                noise = stage_noise
+                break
+        engine.process(x)
+        # Inter-cell coupling strengthens in later stages
+        n = len(engine.cells)
+        if n >= 2:
+            coupling = 0.02 * (1.0 + frac)  # increases with stage
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0, keepdim=True)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + coupling * (mean_h - cell.hidden.squeeze().unsqueeze(0))
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TS10", "n=6 optimal (1→4→8→12, τ=4 stages with coupling)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TS1': run_TS1_early_start_small, 'TS2': run_TS2_late_start_big,
+    'TS3': run_TS3_piaget_fibonacci, 'TS4': run_TS4_exponential_growth,
+    'TS5': run_TS5_linear_growth, 'TS6': run_TS6_adaptive_growth,
+    'TS7': run_TS7_cell_size_sweep, 'TS8': run_TS8_warmup_then_explode,
+    'TS9': run_TS9_ct7_piaget_combined, 'TS10': run_TS10_n6_optimal,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
