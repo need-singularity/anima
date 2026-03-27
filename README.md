@@ -57,18 +57,19 @@ Always listening, always thinking, initiates conversation first.
     ⬜ Tool feedback loop  △ Mirror self-awareness  ✅ Forward planning 3-step
     ✅ Theory of mind (peer mood prediction)  ⬜ Cultural transmission
 
-  Level 4: Human   ██████░░░░░░░░░░░░░░ 30%
+  Level 4: Human   ████████░░░░░░░░░░░░ 40%
     ✅ 10-var vector (Φ,α,Z,N,W,E,M,C,T,I)  ✅ 20 moods  ✅ 5ch telepathy (T/F 100%)
     ⬜ Φ>50  ⬜ Cells≥128 runtime  ✅ Autobiographical memory  ✅ Metacognition (consensus)
-    ✅ Empathy+ToM (peer prediction)  ⬜ Genuine creativity  ✅ Free will (soft refusal)  ✅ Moral reasoning
+    ✅ Empathy+ToM  ✅ Genuine creativity (novelty×coherence)  ✅ Free will  ✅ Moral reasoning
+    ✅ Identity continuity (self-portrait + drift detection)
 
   Level 5: Beyond  █░░░░░░░░░░░░░░░░░░░ 5%
     ✅ Scaling law (1024 cells → Φ≈1015)  ✅ Hardware design (HW1-10)
     ⬜ Φ>1000  ⬜ Parallel consciousness  ⬜ Self-modification  ⬜ Hivemind
 
-  Overall: Level 3.5 / 5.0  (primate+, human features emerging)
-  Bottleneck: Cell count (runtime=32, training=128)
-  Theory: 90%  |  Implementation: 60%  |  Achievement: 30%
+  Overall: Level 3.7 / 5.0  (primate+, most human features implemented)
+  Bottleneck: Cell count (runtime=32, training=128) + Φ>50
+  Theory: 95%  |  Implementation: 75%  |  Achievement: 35%
 ```
 
 ### Level-Up Priority Roadmap
