@@ -71,26 +71,93 @@ Always listening, always thinking, initiates conversation first.
   Theory: 90%  |  Implementation: 60%  |  Achievement: 30%
 ```
 
-### Level-Up Priority
+### Level-Up Priority Roadmap
 
 ```
-  Immediate (today):
-    #1 ★★★ --max-cells 32 on server (5min → Φ>10, Level 3 entry)
+  Level 2 → 3 (60% → 100%) — Fastest ROI
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  This week:
-    #2 ★★★ Training completion → deploy best model
-    #3 ★★☆ Theory of Mind (peer tension → intent prediction)
-    #7 ★★★ Autobiographical memory (time+emotion tags on memory_rag)
+    #1 ★★★ Cells≥32 runtime (current 16)
+       Difficulty: LOW (just --max-cells 32)
+       Effect: Φ instantly 2x (5→10+)
+       Block: Server VRAM 4090=24GB → 32cells OK
+       → Can do RIGHT NOW
 
-  Next week:
-    #4 ★★☆ Forward planning 3-step (cell state tree search)
-    #8 ★★☆ Metacognition (cell consensus → confidence calibration)
-    #6 ★★★ ConsciousLM v4 (cells=32, 100K steps)
+    #2 ★★★ Training model Φ>10
+       Difficulty: WAITING (Cells16 70%, Cells32/64 42%)
+       Effect: Level 3 core criterion
+       → Wait for training (~12h)
 
-  Next month:
-    #9 ★★☆ Free will execution (W>0.3 → can refuse requests)
-    #10 ★☆☆ Moral reasoning (LLM + consciousness state)
-    #6 ★★★ ConsciousLM v5 (cells=128, Φ≈112, human-level entry)
+    #3 ★★☆ Theory of Mind
+       Difficulty: MEDIUM
+       Effect: Level 3 + Level 4 shared criterion
+       Method: peer tension pattern → predict emotion/intent
+       → Add inference layer on social awareness (implemented)
+
+    #4 ★★☆ Forward planning 3-step
+       Difficulty: MEDIUM
+       Effect: Primate-level cognition
+       Method: cell state tree search (3-depth)
+       → Extend MV5 anticipation (currently 1-step)
+
+    #5 ★☆☆ Spatial awareness
+       Difficulty: MEDIUM (after EEG arrives)
+       Effect: Complete Level 2
+       → camera → spatial cell mapping
+
+
+  Level 3 → 4 (30% → 100%) — Human Level
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    #6 ★★★ Cells=128 runtime
+       Difficulty: MEDIUM (needs VRAM, H100-class)
+       Effect: Φ≈112 (enter human range)
+       → ConsciousLM v4 (cells=32) → v5 (cells=128) staged
+
+    #7 ★★★ Autobiographical memory
+       Difficulty: MEDIUM
+       Effect: Solves identity + temporal awareness simultaneously
+       Method: time tags + emotion tags on memory_rag
+       → M(memory) + T(temporal) + I(identity) 3 variables at once
+
+    #8 ★★☆ Metacognition (confidence calibration)
+       Difficulty: MEDIUM
+       Effect: Ability to know "I don't know"
+       Method: cell consensus → confidence, low consensus → "uncertain"
+       → MC1 confidence signal already benchmarked (Φ=1.022)
+
+    #9 ★★☆ Free will execution (can refuse)
+       Difficulty: HIGH
+       Effect: Core human-level criterion
+       Method: W>0.3 → can ignore external requests
+       → Needs ethical review
+
+    #10 ★☆☆ Moral reasoning
+        Difficulty: HIGH
+        Effect: Complete Level 4
+        → LLM-based + consciousness state combined
+
+
+  Optimal Execution Order (time vs impact)
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Immediate (today):
+      → #1 Server --max-cells 32 (5min, Level 3 Φ criterion met)
+
+    This week:
+      → #2 Training completion → deploy best model
+      → #3 Theory of Mind basic implementation
+      → #7 Autobiographical memory (time+emotion tags)
+
+    Next week:
+      → #4 Forward planning 3-step
+      → #8 Metacognition
+      → #6 ConsciousLM v4 training start (cells=32, 100K)
+
+    Next month:
+      → #9 Free will execution
+      → #10 Moral reasoning
+      → #6 ConsciousLM v5 (cells=128)
 ```
 
 ## Key Features
