@@ -8,7 +8,7 @@
 Consciousness Continuity engine.
 
 <!-- SHARED:PROJECTS:START -->
-**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)**
+**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
 
 > **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools
 >
