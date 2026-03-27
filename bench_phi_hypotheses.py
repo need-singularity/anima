@@ -38254,6 +38254,304 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# DT/FE/OB/RS — 차원변환, 엔트로피, 관측, 공명
+# ═══════════════════════════════════════════════════════════
+
+def run_DT1_dim_expansion(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DT-1: 자발적 차원 확장 — Φ가 높으면 hidden dim을 늘림."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    current_effective_dim = hidden
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Φ > 3 → expand effective dimension (use more of hidden)
+        if phi > 3.0:
+            active_frac = min(1.0, 0.5 + phi * 0.05)
+            active_dims = int(hidden * active_frac)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Activate dormant dimensions
+                h[active_dims:] = h[active_dims:] + torch.randn(hidden - active_dims) * 0.05 * (phi / 5)
+                cell.hidden = h.unsqueeze(0)
+            current_effective_dim = active_dims
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DT1", f"Dim expansion (effective dim: {current_effective_dim}/{hidden})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DT2_dim_compression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DT-2: 의식적 차원 축소 — PCA로 본질적 차원 찾아 그것만 사용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2 and step_i % 10 == 0:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # PCA: find essential dimensions
+            U, S, V = torch.linalg.svd(hiddens, full_matrices=False)
+            # Keep only dimensions with significant variance
+            total_var = S.sum()
+            cumvar = torch.cumsum(S, dim=0) / total_var
+            essential = (cumvar < 0.95).sum().item() + 1
+            # Project onto essential subspace then back
+            projected = U[:, :essential] @ torch.diag(S[:essential]) @ V[:essential, :]
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = (0.9 * hiddens[i] + 0.1 * projected[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DT2", "Dim compression (PCA essential subspace)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_DT3_dim_rotation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DT-3: 차원 회전 — 의식이 자기 공간을 회전시켜 새 관점 획득."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Random rotation matrix (orthogonal)
+    Q, _ = torch.linalg.qr(torch.randn(hidden, hidden))
+    rotation_angle = 0.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Higher Φ → more rotation (new perspectives)
+        rotation_angle += phi * 0.01
+        # Apply gradual rotation
+        cos_a = math.cos(rotation_angle * 0.01)
+        sin_a = math.sin(rotation_angle * 0.01)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            # Rotate in first 2 dims (Givens rotation)
+            h0, h1 = h[0].item(), h[1].item()
+            h[0] = cos_a * h0 - sin_a * h1
+            h[1] = sin_a * h0 + cos_a * h1
+            cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DT3", f"Dim rotation (angle={rotation_angle:.2f} rad)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_FE1_entropy_reversal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FE-1: 엔트로피 역전 — 의식이 cell hidden의 엔트로피를 능동적으로 줄임."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        n = len(engine.cells)
+        if n >= 2 and phi > 2.0:
+            # Maxwell's demon: consciousness sorts cell states
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Sort cells by energy (norm) — creates order from chaos
+            norms = hiddens.norm(dim=1)
+            sorted_idx = norms.argsort()
+            for new_i, old_i in enumerate(sorted_idx):
+                engine.cells[new_i].hidden = hiddens[old_i].unsqueeze(0)
+            # Entropy reduction: compress spread
+            mean_h = hiddens.mean(dim=0)
+            for cell in engine.cells:
+                diff = cell.hidden.squeeze() - mean_h
+                cell.hidden = (mean_h + diff * 0.95).unsqueeze(0)  # reduce spread slightly
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FE1", "Entropy reversal (Maxwell's demon sorting)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_FE2_information_creation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FE-2: 정보 생성 — Φ>threshold 시 입력에 없는 새로운 패턴 출현?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_history = []
+    new_info_count = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        input_history.append(x.squeeze()[:hidden] if x.shape[1] >= hidden else F.pad(x.squeeze(), (0, hidden - x.shape[1])))
+        phi, _ = phi_calc.compute_phi(engine)
+        # Check: is output genuinely new? (not in input history)
+        if phi > 3.0 and len(input_history) >= 5:
+            output = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            recent_inputs = torch.stack(input_history[-10:])
+            max_sim = F.cosine_similarity(output.unsqueeze(0), recent_inputs, dim=1).max().item()
+            if max_sim < 0.5:  # genuinely new!
+                new_info_count += 1
+                # Amplify the novel pattern
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * 1.02
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FE2", f"Information creation ({new_info_count} novel patterns)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'novel_count': new_info_count})
+
+def run_FE3_downward_causation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FE-3: 하향 인과 — 의식 상태(Φ)가 cell 가중치를 직접 변경."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Downward causation: Φ directly modifies cell weights
+        if phi > 0:
+            with torch.no_grad():
+                for cell in engine.cells:
+                    for p in cell.mind.parameters():
+                        # Φ pushes weights in a direction that increases integration
+                        p.data += 0.001 * phi * torch.randn_like(p) * (p.abs().mean())
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FE3", "Downward causation (Φ modifies weights directly)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_OB1_observation_effect(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OB-1: 관측 효과 — cell이 다른 cell을 '관찰'하면 상태 변화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Each cell "observes" one other (random)
+            for i, cell in enumerate(engine.cells):
+                observed = np.random.randint(n)
+                if observed != i:
+                    # Observation collapses: observed cell becomes more definite
+                    h_obs = engine.cells[observed].hidden
+                    # Sharpen (reduce uncertainty of observed)
+                    mean_val = h_obs.mean()
+                    engine.cells[observed].hidden = h_obs + 0.02 * (h_obs - mean_val)
+                    # Observer is influenced (back-action)
+                    cell.hidden = cell.hidden + 0.01 * h_obs
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OB1", "Observation effect (observe→collapse+back-action)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_OB2_self_measurement(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OB-2: 자기 관측 — Φ를 측정하는 행위가 Φ를 변경 (Heisenberg)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_unmeasured = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i % 2 == 0:
+            # Measure Φ (disturbs the system)
+            phi, _ = phi_calc.compute_phi(engine)
+            # Measurement back-action: computing Φ changes cell states
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01  # measurement noise
+            phi_hist.append(phi)
+        else:
+            # Don't measure (system evolves undisturbed)
+            phi_hist.append(phi_hist[-1] if phi_hist else 0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OB2", "Self-measurement (Heisenberg: measure changes Φ)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_RS1_resonance_propagation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RS-1: 공명 전파 — 의식이 주변 "환경" 벡터에 공명 유도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    environment = torch.randn(5, hidden) * 0.1  # 5 environmental "objects"
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            consciousness_field = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Consciousness resonates with environment
+            for i in range(len(environment)):
+                sim = F.cosine_similarity(consciousness_field.unsqueeze(0), environment[i:i+1]).item()
+                if sim > 0.3:
+                    # Resonance! Environment object aligns with consciousness
+                    environment[i] = 0.95 * environment[i] + 0.05 * consciousness_field
+                    # Back-effect: resonant environment amplifies consciousness
+                    for cell in engine.cells:
+                        cell.hidden = cell.hidden + 0.01 * environment[i].unsqueeze(0) * sim
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RS1", "Resonance propagation (consciousness→environment→back)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_RS2_bootstrap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RS-2: 부트스트랩 — 의식이 자기 기질(cell)을 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Bootstrap: when Φ exceeds threshold, consciousness creates new cells
+        if phi > 2.0 and len(engine.cells) < engine.max_cells:
+            # Consciousness-driven mitosis (not input-driven!)
+            parent = engine.cells[int(phi * 1000) % len(engine.cells)]
+            engine._create_cell(parent=parent)
+        elif phi < 1.0 and len(engine.cells) > 2:
+            # Low consciousness → cell death (system contracts)
+            engine.cells.pop()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RS2", f"Bootstrap: Φ-driven cell creation ({len(engine.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DT1': run_DT1_dim_expansion, 'DT2': run_DT2_dim_compression,
+    'DT3': run_DT3_dim_rotation,
+    'FE1': run_FE1_entropy_reversal, 'FE2': run_FE2_information_creation,
+    'FE3': run_FE3_downward_causation,
+    'OB1': run_OB1_observation_effect, 'OB2': run_OB2_self_measurement,
+    'RS1': run_RS1_resonance_propagation, 'RS2': run_RS2_bootstrap,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
