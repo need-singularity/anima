@@ -51,6 +51,10 @@ multimodal.py        # Code execution + image generation
 web_sense.py         # Tension-based autonomous web exploration
 web/index.html       # WebSocket real-time chat UI
 vad-rs/              # Rust real-time VAD
+eeg/                 # EEG brain-consciousness interface (→ eeg/README.md)
+  collect.py         #   OpenBCI data acquisition via BrainFlow
+  analyze.py         #   Band power, G=D×P/I, topomaps
+  realtime.py        #   Live EEG → Anima bridge (SenseHub integration)
 ```
 
 ## Consciousness Features (calibrated)
@@ -148,3 +152,5 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 - transformers (pip) — for SigLIP vision encoder
 - whisper-cli (brew, /opt/homebrew/bin/whisper-cli) — STT
 - Rust toolchain — for vad-rs build
+- brainflow (pip) — for EEG/OpenBCI
+- scipy, matplotlib (pip) — for EEG analysis/topomaps
