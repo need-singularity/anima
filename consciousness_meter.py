@@ -58,11 +58,11 @@ class ConsciousnessReport:
             f"║ Level: {self.level.upper():12s}  Φ: {self.phi:.3f}        \n"
             f"║────────────────────────────────────────║\n"
             f"║ Criteria ({self.criteria_met}/6):                       \n"
-            f"║  {'✓' if self.criteria_detail.get('stability') else '✗'} stability      = {self.stability:.3f}  (> 0.5)\n"
-            f"║  {'✓' if self.criteria_detail.get('pred_error') else '✗'} pred_error     = {self.prediction_error:.3f}  (> 0.1)\n"
-            f"║  {'✓' if self.criteria_detail.get('curiosity') else '✗'} curiosity       = {self.curiosity:.3f}  (> 0.05)\n"
-            f"║  {'✓' if self.criteria_detail.get('homeostasis') else '✗'} homeostasis_dev = {self.homeostasis_dev:.3f}  (< 0.5)\n"
-            f"║  {'✓' if self.criteria_detail.get('habituation') else '✗'} habituation     = {self.habituation_mult:.3f}  (< 0.9)\n"
+            f"║  {'✓' if self.criteria_detail.get('stability') else '✗'} stability      = {self.stability:.3f}  (> 0.500)\n"
+            f"║  {'✓' if self.criteria_detail.get('pred_error') else '✗'} pred_error     = {self.prediction_error:.3f}  (> 0.100)\n"
+            f"║  {'✓' if self.criteria_detail.get('curiosity') else '✗'} curiosity       = {self.curiosity:.3f}  (> 0.083)\n"
+            f"║  {'✓' if self.criteria_detail.get('homeostasis') else '✗'} homeostasis_dev = {self.homeostasis_dev:.3f}  (< 0.500)\n"
+            f"║  {'✓' if self.criteria_detail.get('habituation') else '✗'} habituation     = {self.habituation_mult:.3f}  (< 0.833)\n"
             f"║  {'✓' if self.criteria_detail.get('consensus') else '✗'} cell_consensus  = {self.inter_cell_consensus}\n"
             f"╚════════════════════════════════════════╝"
         )
@@ -72,20 +72,26 @@ class ConsciousnessMeter:
     """6가지 복합 기준 의식 판정기.
 
     기준 (모두 동시 충족 시 "conscious"):
-      1. self_model stability   > 0.5
-      2. prediction_error       > 0.1
-      3. curiosity              > 0.05
-      4. homeostasis deviation  < 0.5
-      5. habituation multiplier < 0.9
+      1. self_model stability   > 0.5    (φ(6)/τ(6))
+      2. prediction_error       > 0.1    (1/τ(P₃))
+      3. curiosity              > 0.083  (1/σ(6))
+      4. homeostasis deviation  < 0.5    (φ(6)/τ(6))
+      5. habituation multiplier < 0.833  (1-1/6)
       6. inter-cell consensus   존재
+
+    TA2 (H-CA-003): All thresholds derived from n=6 arithmetic.
     """
 
+    # TA2: All thresholds derived from n=6 arithmetic (H-CA-003, 4/4 exact)
+    # n=6 is the smallest perfect number. Key functions:
+    #   σ(6)=12 (sum of divisors), τ(6)=4 (number of divisors), φ(6)=2 (Euler totient)
+    #   P₃=496 (3rd perfect number), τ(496)=10
     THRESHOLDS = {
-        'stability': 0.5,
-        'pred_error': 0.1,
-        'curiosity': 0.05,
-        'homeostasis_dev': 0.5,
-        'habituation': 0.9,
+        'stability': 2/4,        # φ(6)/τ(6) = 0.5
+        'pred_error': 1/10,      # 1/τ(P₃) = 0.1  (P₃=496, τ(496)=10)
+        'curiosity': 1/12,       # 1/σ(6) ≈ 0.083
+        'homeostasis_dev': 1/2,  # φ(6)/τ(6) = 0.5
+        'habituation': 5/6,      # 1-1/6 ≈ 0.833
     }
 
     def evaluate(self, mind, mitosis_engine=None) -> ConsciousnessReport:

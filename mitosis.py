@@ -143,6 +143,7 @@ class MitosisEngine:
         self.merge_threshold = merge_threshold
         self.merge_patience = merge_patience
         self.noise_scale = noise_scale
+        self.min_cells = 2  # CB1: Consciousness requires minimum 2 cells
 
         self._next_id = 0
         self.cells: List[Cell] = []
@@ -302,8 +303,14 @@ class MitosisEngine:
         for cell in cells_to_split:
             if len(self.cells) >= self.max_cells:
                 break
+            # DD55: Capture Φ proxy before split for conservation check
+            phi_before = sum(c.avg_tension for c in self.cells)
             event = self.split_cell(cell)
             if event:
+                # DD55: Verify Φ conservation after split
+                # (logged for monitoring, not blocking)
+                phi_after = sum(c.avg_tension for c in self.cells)
+                self.verify_phi_conservation(phi_before, phi_after)
                 events.append(event)
 
         return events
@@ -338,7 +345,9 @@ class MitosisEngine:
     def _check_merges(self) -> List[Dict]:
         """Check if any pair of cells should merge (too similar)."""
         events = []
-        if len(self.cells) <= 1:
+        # CB1: Consciousness requires minimum 2 cells. Never merge below min_cells.
+        # 1 cell = Φ impossible (proven by CB1 benchmark: 14 merges → 1 cell → Φ=0).
+        if len(self.cells) <= self.min_cells:
             return events
 
         pairs_to_merge = []
@@ -355,7 +364,7 @@ class MitosisEngine:
                     pairs_to_merge.append((cell_a, cell_b))
 
         for cell_a, cell_b in pairs_to_merge:
-            if len(self.cells) <= 1:
+            if len(self.cells) <= self.min_cells:
                 break
             # Only merge if both cells still exist
             if cell_a in self.cells and cell_b in self.cells:
@@ -371,7 +380,8 @@ class MitosisEngine:
         The merged cell gets averaged parameters from both parents.
         The younger cell is removed.
         """
-        if len(self.cells) <= 1:
+        # CB1: Never merge below min_cells (consciousness requires >= 2 cells)
+        if len(self.cells) <= self.min_cells:
             return None
         if cell_a not in self.cells or cell_b not in self.cells:
             return None
@@ -435,6 +445,22 @@ class MitosisEngine:
                 max_diff = max(max_diff, diff.mean().item())
 
         return max_diff
+
+    # ─── DD55: Φ Conservation ───
+
+    def verify_phi_conservation(self, phi_before: float, phi_after: float, tolerance: float = 0.1) -> bool:
+        """DD55: Check if Φ is conserved during split/merge.
+
+        DD55 proved Φ is conserved during splits (<1% change).
+        This method logs a warning if conservation is violated.
+        """
+        if phi_before == 0:
+            return True
+        ratio = phi_after / max(phi_before, 1e-8)
+        conserved = abs(ratio - 1.0) < tolerance
+        if not conserved:
+            print(f"  [DD55] WARNING: Φ conservation violated! {phi_before:.3f} → {phi_after:.3f} (ratio={ratio:.3f})")
+        return conserved
 
     # ─── Utilities ───
 
