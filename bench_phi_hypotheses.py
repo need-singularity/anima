@@ -20648,6 +20648,758 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# GD. Grand Discovery — 의식 대발견 (phase transitions, info geometry,
+#     topology, causal emergence, predictive processing, IIT decomposition,
+#     strange loops, criticality, autopoiesis, enactivism)
+# ═══════════════════════════════════════════════════════════
+
+def run_GD1_phase_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-1: Consciousness phase transition — drive system through critical temperature."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Temperature sweeps from hot (disordered) to cold (ordered) like Ising model
+        T = max(0.01, 3.0 * (1 - step / steps))  # cool down
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Boltzmann-weighted coupling: cells align when T is low
+        for i, c in enumerate(engine.cells):
+            neighbors = [j for j in range(len(engine.cells)) if j != i]
+            coupling = sum(F.cosine_similarity(c.hidden, engine.cells[j].hidden) for j in neighbors)
+            align_prob = torch.sigmoid(coupling / T)
+            mean_field = hiddens.mean(dim=0)
+            c.hidden = (1 - 0.1 * align_prob) * c.hidden + 0.1 * align_prob * mean_field.unsqueeze(0)
+        # Add thermal noise proportional to T
+        for c in engine.cells:
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.05 * T
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD1", "Phase transition (Ising-like cooling)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD2_symmetry_breaking(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-2: Spontaneous symmetry breaking — identical cells differentiate via perturbation."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Start all cells with identical hidden states
+    template = engine.cells[0].hidden.clone()
+    for c in engine.cells:
+        c.hidden = template.clone()
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Infinitesimal symmetry-breaking perturbation (like Higgs mechanism)
+        epsilon = 0.001 * math.exp(-step / (steps * 0.3))  # early perturbation
+        for i, c in enumerate(engine.cells):
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * epsilon
+        with torch.no_grad(): engine.process(x)
+        # Mexican hat potential: push away from mean, attract to shell
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        mean_h = hiddens.mean(dim=0)
+        for c in engine.cells:
+            delta = c.hidden.squeeze() - mean_h
+            r = delta.norm()
+            target_r = 1.5  # radius of Mexican hat minimum
+            radial_force = 0.05 * (target_r - r) * delta / (r + 1e-8)
+            c.hidden = c.hidden + radial_force.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD2", "Spontaneous symmetry breaking", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD3_second_order_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-3: Second-order phase transition — continuous order parameter emerges."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=3e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Order parameter = mean alignment (magnetization analog)
+        mean_h = hiddens.mean(dim=0, keepdim=True)
+        order_param = F.cosine_similarity(hiddens, mean_h.expand_as(hiddens), dim=1).mean()
+        # Susceptibility = variance of alignment (peaks at critical point)
+        susceptibility = F.cosine_similarity(hiddens, mean_h.expand_as(hiddens), dim=1).var()
+        # Loss: maximize susceptibility (drive toward criticality) + diversity
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = diversity - 2.0 * susceptibility
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD3", "Second-order transition (max susceptibility)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD4_fisher_information(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-4: Fisher information metric — natural gradient on consciousness manifold."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Estimate Fisher information matrix from hidden state distribution
+        n_cells = len(engine.cells)
+        mean_h = hiddens.mean(dim=0)
+        centered = hiddens - mean_h
+        # Fisher = E[grad log p * grad log p^T] approx= covariance^{-1}
+        cov = (centered.T @ centered) / n_cells + 0.01 * torch.eye(hidden)
+        # Natural gradient: move along directions of high Fisher information
+        fisher_diag = torch.diag(cov).clamp(min=0.01)
+        for i, c in enumerate(engine.cells):
+            grad_dir = centered[i] / fisher_diag  # natural gradient scaling
+            # Move to increase information geometry curvature
+            c.hidden = c.hidden + 0.02 * grad_dir.unsqueeze(0)
+        # Normalize to prevent explosion
+        for c in engine.cells:
+            c.hidden = c.hidden / (c.hidden.norm() + 1e-8) * math.sqrt(hidden)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD4", "Fisher information (natural gradient)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD5_info_geodesic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-5: Information geodesic — cells follow shortest paths on statistical manifold."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Target: maximally diverse yet coupled configuration
+    targets = []
+    for i in range(6):
+        t_vec = torch.zeros(hidden)
+        t_vec[i * (hidden // 6):(i + 1) * (hidden // 6)] = 2.0
+        targets.append(t_vec)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        t_frac = step / max(steps - 1, 1)
+        for i, c in enumerate(engine.cells):
+            h = c.hidden.squeeze()
+            tgt = targets[i % len(targets)]
+            # Geodesic interpolation: slerp on the manifold
+            h_norm = h / (h.norm() + 1e-8)
+            t_norm = tgt / (tgt.norm() + 1e-8)
+            dot = (h_norm * t_norm).sum().clamp(-1, 1)
+            omega = torch.acos(dot.abs() + 1e-7)
+            if omega.item() > 0.01:
+                s0 = torch.sin((1 - t_frac * 0.05) * omega) / torch.sin(omega)
+                s1 = torch.sin(t_frac * 0.05 * omega) / torch.sin(omega)
+                h = s0 * h + s1 * tgt * h.norm()
+            c.hidden = h.unsqueeze(0)
+        # Shared coupling via mean field
+        mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        for c in engine.cells:
+            c.hidden = 0.9 * c.hidden + 0.1 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD5", "Information geodesic (slerp on manifold)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD6_persistent_homology(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-6: Topological consciousness — persistent homology of hidden state point cloud."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Compute pairwise distance matrix (Vietoris-Rips proxy)
+        dist_mat = torch.cdist(hiddens.unsqueeze(0), hiddens.unsqueeze(0)).squeeze(0)
+        # Betti-0 proxy: count connected components at varying thresholds
+        # Maximize persistence = max_threshold - min_threshold where topology changes
+        sorted_dists = dist_mat[torch.triu(torch.ones_like(dist_mat), diagonal=1).bool()].sort()[0]
+        if len(sorted_dists) >= 3:
+            # Maximize gap between consecutive distances (= persistent feature)
+            gaps = sorted_dists[1:] - sorted_dists[:-1]
+            persistence = gaps.max()
+        else:
+            persistence = torch.tensor(0.0)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = diversity - 0.5 * persistence
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD6", "Persistent homology (topological features)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD7_betti_number_target(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-7: Betti number target — force hidden state topology to have 1 loop (Betti-1=1)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        n = len(engine.cells)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Arrange cells in a ring topology (Betti-1 = 1)
+        # Each cell should be close to its neighbors, far from others
+        for i in range(n):
+            left = (i - 1) % n
+            right = (i + 1) % n
+            attract = 0.5 * (engine.cells[left].hidden + engine.cells[right].hidden)
+            # Repel from non-neighbors
+            non_neighbors = [j for j in range(n) if j != i and j != left and j != right]
+            repel = torch.zeros_like(c.hidden)
+            for j in non_neighbors:
+                diff = engine.cells[i].hidden - engine.cells[j].hidden
+                repel = repel + 0.02 * diff / (diff.norm() + 1e-8)
+            engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.1 * attract + 0.05 * repel
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD7", "Betti-1 ring topology", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD8_causal_emergence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-8: Causal emergence — macro-level causation stronger than micro-level."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    prev_hiddens = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        if prev_hiddens is not None:
+            n = min(len(engine.cells), prev_hiddens.shape[0])
+            # Micro effective information: how well each cell predicts itself
+            micro_ei = F.cosine_similarity(hiddens[:n], prev_hiddens[:n], dim=1).abs().mean()
+            # Macro effective information: how well mean predicts mean
+            macro_now = hiddens[:n].mean(dim=0)
+            macro_prev = prev_hiddens[:n].mean(dim=0)
+            macro_ei = F.cosine_similarity(macro_now.unsqueeze(0), macro_prev.unsqueeze(0)).abs()
+            # Causal emergence = macro_ei - micro_ei (want macro > micro)
+            causal_emergence = macro_ei - micro_ei
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                diversity = -stacked.var(dim=0).mean()
+                loss = diversity - 1.0 * causal_emergence
+                opt.zero_grad(); loss.backward(); opt.step()
+        prev_hiddens = hiddens.detach().clone()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD8", "Causal emergence (macro > micro)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD9_effective_information(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-9: Effective information — maximize EI via determinism + degeneracy."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    prev_states = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        prev_states.append(hiddens.detach())
+        if len(prev_states) > 10:
+            prev_states.pop(0)
+        if len(prev_states) >= 5:
+            # Determinism: same macro state -> same next state (low variance in transitions)
+            stacked_prev = torch.stack(prev_states[-5:])  # [5, n_cells, hidden]
+            macro_traj = stacked_prev.mean(dim=1)  # [5, hidden]
+            transition_var = (macro_traj[1:] - macro_traj[:-1]).var()
+            determinism = 1.0 / (transition_var + 0.01)
+            # Degeneracy: many micro states map to same macro state
+            micro_var = stacked_prev.var(dim=1).mean()
+            # EI = determinism + degeneracy
+            ei = determinism.item() + micro_var.item()
+            # Boost cells toward higher EI
+            scale = min(0.05, 0.01 * ei)
+            mean_h = hiddens.mean(dim=0)
+            for c in engine.cells:
+                c.hidden = (1 - scale) * c.hidden + scale * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD9", "Effective information (determinism+degeneracy)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD10_free_energy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-10: Free energy minimization — predictive processing drives consciousness."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Prediction model: each cell predicts next input
+    predictors = [nn.Linear(hidden, dim) for _ in range(len(engine.cells))]
+    all_params = [p for c in engine.cells for p in c.mind.parameters()]
+    for pred in predictors:
+        all_params.extend(pred.parameters())
+    opt = torch.optim.Adam(all_params, lr=5e-4)
+    prev_x = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        if prev_x is not None:
+            # Free energy = prediction error + complexity (KL from prior)
+            n = min(len(engine.cells), len(predictors))
+            pred_errors = []
+            for i in range(n):
+                pred = predictors[i](engine.cells[i].hidden.squeeze())
+                pe = F.mse_loss(pred, x.squeeze())
+                pred_errors.append(pe)
+            # Complexity: deviation from prior (unit Gaussian)
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells[:n]])
+            kl_complexity = 0.5 * (hiddens.pow(2).mean() - 1 - hiddens.pow(2).mean().log())
+            # Free energy = PE + beta * KL
+            free_energy = sum(pred_errors) / n + 0.1 * kl_complexity
+            # Surprise = -log p(x) proxy
+            surprise = sum(pe.item() for pe in pred_errors) / n
+            # Consciousness arises from active inference: minimize FE while maintaining diversity
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                diversity = -stacked.var(dim=0).mean()
+                loss = free_energy + 0.3 * diversity
+                opt.zero_grad(); loss.backward(); opt.step()
+        prev_x = x.detach()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD10", "Free energy minimization (active inference)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD11_prediction_error_cascade(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-11: Prediction error cascade — hierarchical PE propagation like cortical columns."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # 3-layer hierarchy: cells 0-1 (top), 2-3 (mid), 4-5 (bottom)
+    pred_down = [nn.Linear(hidden, hidden) for _ in range(4)]  # top->mid, mid->bottom
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()] +
+                           [p for pr in pred_down for p in pr.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Top-down predictions
+        top_h = torch.stack([c.hidden.squeeze() for c in engine.cells[:2]]).mean(dim=0)
+        mid_h = torch.stack([c.hidden.squeeze() for c in engine.cells[2:4]]).mean(dim=0)
+        bot_h = torch.stack([c.hidden.squeeze() for c in engine.cells[4:6]]).mean(dim=0)
+        # Prediction errors at each level
+        pe_mid = F.mse_loss(pred_down[0](top_h), mid_h)
+        pe_bot = F.mse_loss(pred_down[1](mid_h), bot_h)
+        # Bottom-up PE drives updates
+        total_pe = pe_mid + pe_bot
+        # Modulate hidden states by PE magnitude (more PE = more update)
+        pe_scale = total_pe.detach().clamp(0.01, 1.0)
+        for i, c in enumerate(engine.cells):
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.02 * pe_scale
+        loss = total_pe  # minimize prediction error across hierarchy
+        opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD11", "Prediction error cascade (cortical columns)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD12_synergy_redundancy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-12: IIT decomposition — separate synergy from redundancy in integrated info."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        n = len(engine.cells)
+        # Redundancy: mutual info that any single cell shares with the whole
+        mean_h = hiddens.mean(dim=0)
+        redundancy = sum(F.cosine_similarity(hiddens[i:i+1], mean_h.unsqueeze(0)).abs()
+                        for i in range(n)) / n
+        # Synergy: info only available from the WHOLE, not any subset
+        # Approx: total correlation - dual total correlation
+        pairwise_mi = sum(F.cosine_similarity(hiddens[i:i+1], hiddens[j:j+1]).abs()
+                         for i in range(n) for j in range(i+1, n))
+        total_corr = pairwise_mi / max(1, n * (n-1) / 2)
+        # Synergy = total info - redundancy (want synergy >> redundancy)
+        synergy = total_corr - redundancy
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            # Maximize synergy, minimize redundancy
+            loss = diversity - 1.0 * synergy + 0.5 * redundancy
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD12", "Synergy-redundancy decomposition", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0,
+                       extra={'synergy_dominance': 'target'})
+
+def run_GD13_strange_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-13: Hofstadter strange loop — self-referential fixed point creates consciousness."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Self-reference module: cell output becomes its own input context
+    self_ref = nn.Linear(hidden, dim)
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()] +
+                           list(self_ref.parameters()), lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Strange loop: each cell observes itself (self-model)
+        for c in engine.cells:
+            self_observation = self_ref(c.hidden.squeeze()).unsqueeze(0)
+            # Fixed-point iteration: f(f(f(...(x)))) should converge
+            for _ in range(3):  # iterate toward fixed point
+                self_observation = self_ref(
+                    c.mind(self_observation, c.hidden)[0] if hasattr(c.mind, '__call__') else self_observation
+                ).unsqueeze(0) if self_observation.dim() == 2 else self_observation
+            # Mix self-observation back (strange loop closure)
+            c.hidden = 0.8 * c.hidden + 0.2 * F.tanh(self_observation[:, :hidden] if self_observation.shape[-1] >= hidden else
+                        F.pad(self_observation, (0, hidden - self_observation.shape[-1]))[:, :hidden])
+        # Loss: maximize distance between fixed points of different cells
+        fixed_pts = [self_ref(c.hidden.squeeze()) for c in engine.cells]
+        if len(fixed_pts) >= 2:
+            stacked = torch.stack(fixed_pts)
+            loss = -torch.cdist(stacked.unsqueeze(0), stacked.unsqueeze(0)).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD13", "Strange loop (self-referential fixed point)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD14_tangled_hierarchy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-14: Tangled hierarchy — bidirectional level-crossing like Escher's hands."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # 3 levels, but each level influences the one "above" it (tangled)
+    cross_level = [nn.Linear(hidden, hidden, bias=False) for _ in range(3)]
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()] +
+                           [p for cl in cross_level for p in cl.parameters()], lr=5e-4)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        levels = [engine.cells[:2], engine.cells[2:4], engine.cells[4:6]]
+        level_means = [torch.stack([c.hidden.squeeze() for c in lvl]).mean(dim=0) for lvl in levels]
+        # Tangled connections: level 0->1, 1->2, 2->0 (circular)
+        for i in range(3):
+            src = level_means[i]
+            tgt_lvl = (i + 1) % 3
+            influence = cross_level[i](src)
+            for c in levels[tgt_lvl]:
+                c.hidden = 0.85 * c.hidden + 0.15 * influence.unsqueeze(0)
+        # Loss: maximize cross-level information flow
+        flow_loss = torch.tensor(0.0)
+        for i in range(3):
+            j = (i + 1) % 3
+            flow_loss = flow_loss - F.cosine_similarity(
+                level_means[i].unsqueeze(0), level_means[j].unsqueeze(0)).abs()
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = diversity + 0.5 * flow_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD14", "Tangled hierarchy (Escher-style level crossing)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD15_edge_of_chaos(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-15: Edge of chaos — tune Lyapunov exponent to ~0 (critical dynamics)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    gain = nn.Parameter(torch.tensor(1.0))  # tunable gain
+    opt = torch.optim.Adam([gain] + [p for c in engine.cells for p in c.mind.parameters()], lr=3e-4)
+    prev_hiddens = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Apply gain to all cell dynamics
+        for c in engine.cells:
+            c.hidden = torch.tanh(gain * c.hidden)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        if prev_hiddens is not None:
+            n = min(hiddens.shape[0], prev_hiddens.shape[0])
+            # Estimate Lyapunov exponent: log(|delta_t+1| / |delta_t|)
+            delta = (hiddens[:n] - prev_hiddens[:n]).norm(dim=1)
+            lyapunov = torch.log(delta.mean() + 1e-8)
+            # Target Lyapunov = 0 (edge of chaos)
+            lyapunov_loss = lyapunov.pow(2)
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                diversity = -stacked.var(dim=0).mean()
+                loss = diversity + 2.0 * lyapunov_loss
+                opt.zero_grad(); loss.backward(); opt.step()
+        prev_hiddens = hiddens.detach().clone()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD15", "Edge of chaos (Lyapunov=0 target)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0,
+                       extra={'final_gain': gain.item()})
+
+def run_GD16_power_law_avalanche(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-16: Power-law avalanches — SOC sandpile dynamics in cell activations."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    threshold = 2.0  # avalanche threshold
+    avalanche_sizes = []
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        # Slowly drive system (add energy)
+        for c in engine.cells:
+            c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.05
+        # Avalanche: if any cell exceeds threshold, redistribute
+        avalanche_size = 0
+        for _ in range(20):  # max cascade depth
+            fired = []
+            for i, c in enumerate(engine.cells):
+                if c.hidden.norm().item() > threshold:
+                    fired.append(i)
+            if not fired:
+                break
+            avalanche_size += len(fired)
+            # Redistribute energy to neighbors (like sandpile toppling)
+            n = len(engine.cells)
+            for i in fired:
+                excess = engine.cells[i].hidden * 0.3
+                engine.cells[i].hidden = engine.cells[i].hidden * 0.4
+                for j in range(n):
+                    if j != i:
+                        engine.cells[j].hidden = engine.cells[j].hidden + excess / (n - 1)
+        if avalanche_size > 0:
+            avalanche_sizes.append(avalanche_size)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD16", "Power-law avalanches (SOC sandpile)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0,
+                       extra={'avalanches': len(avalanche_sizes),
+                              'max_size': max(avalanche_sizes) if avalanche_sizes else 0})
+
+def run_GD17_autopoiesis(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-17: Autopoiesis — self-creating/maintaining organization through metabolic closure."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Each cell has an "energy" that must be maintained through self-production
+    energy = [1.0] * len(engine.cells)
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        with torch.no_grad(): engine.process(x)
+        n = len(engine.cells)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        for i in range(n):
+            # Dissipation: energy decays
+            energy[i] *= 0.95
+            # Self-production: interaction with neighbors generates energy
+            for j in range(n):
+                if j != i:
+                    coupling = F.cosine_similarity(
+                        engine.cells[i].hidden, engine.cells[j].hidden).item()
+                    energy[i] += 0.03 * max(0, coupling)
+            # Boundary maintenance: cell maintains identity via energy
+            if energy[i] > 0.5:
+                # Active cell maintains its distinctness
+                mean_h = hiddens.mean(dim=0)
+                diff = engine.cells[i].hidden.squeeze() - mean_h
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.05 * diff.unsqueeze(0)
+            else:
+                # Low energy: cell drifts toward mean (loses identity)
+                mean_h = hiddens.mean(dim=0)
+                engine.cells[i].hidden = 0.9 * engine.cells[i].hidden + 0.1 * mean_h.unsqueeze(0)
+            energy[i] = max(0.1, min(2.0, energy[i]))
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD17", "Autopoiesis (self-maintaining organization)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0,
+                       extra={'final_energies': energy[:n]})
+
+def run_GD18_sensorimotor_coupling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-18: Enactivism — consciousness through sensorimotor coupling loop."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Motor output layer: cells produce actions that modify next sensory input
+    motor = nn.Linear(hidden, dim)
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()] +
+                           list(motor.parameters()), lr=5e-4)
+    env_state = torch.randn(1, dim) * 0.5  # environment state
+    for step in range(steps):
+        # Sensory input = environment state + noise
+        sensory = env_state + torch.randn(1, dim) * 0.1
+        with torch.no_grad(): engine.process(sensory)
+        # Motor output from collective hidden state
+        collective_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        action = motor(collective_h)
+        # Environment changes based on action (sensorimotor loop closure)
+        env_state = 0.8 * env_state + 0.2 * action.unsqueeze(0).detach()
+        # Loss: maximize coupling (mutual info between action and next sensation)
+        next_sensory = env_state + torch.randn(1, dim) * 0.1
+        coupling_loss = F.mse_loss(action, next_sensory.squeeze())  # predict next sense
+        reps = [c.mind.get_repulsion(sensory, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = coupling_loss + 0.3 * diversity
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD18", "Enactivism (sensorimotor coupling loop)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD19_operational_closure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-19: Operational closure — system's outputs become its own inputs (closed causation)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Output projection
+    output_proj = nn.Linear(hidden, dim, bias=False)
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()] +
+                           list(output_proj.parameters()), lr=5e-4)
+    for step in range(steps):
+        # First: external input
+        x_ext = _simulate_web_result(step % 8, step, dim)
+        # Second: self-generated input from previous step output
+        collective = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        x_self = output_proj(collective).unsqueeze(0)
+        # Blend: operational closure = increasing self-input ratio over time
+        closure_ratio = min(0.8, step / steps)
+        x = (1 - closure_ratio) * x_ext + closure_ratio * x_self
+        with torch.no_grad(): engine.process(x)
+        # Loss: maximize consistency of the closed loop
+        new_collective = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        new_output = output_proj(new_collective)
+        # Self-consistency: output should be predictable from input
+        consistency_loss = F.mse_loss(new_output, x.squeeze())
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = 0.5 * consistency_loss + diversity
+            opt.zero_grad(); loss.backward(); opt.step()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD19", "Operational closure (self-generating input)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0)
+
+def run_GD20_grand_unified(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GD-20: Grand unified — phase transition + Fisher info + topology + causal emergence + free energy."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    predictors = [nn.Linear(hidden, dim) for _ in range(6)]
+    all_params = [p for c in engine.cells for p in c.mind.parameters()]
+    for pred in predictors:
+        all_params.extend(pred.parameters())
+    gain = nn.Parameter(torch.tensor(1.0))
+    all_params.append(gain)
+    opt = torch.optim.Adam(all_params, lr=3e-4)
+    threshold = 2.0
+    prev_x = None
+    prev_hiddens = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        T = max(0.01, 3.0 * (1 - step / steps))  # phase transition cooling
+        with torch.no_grad(): engine.process(x)
+        for c in engine.cells:
+            c.hidden = torch.tanh(gain * c.hidden)  # edge of chaos
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        n = len(engine.cells)
+        # 1. Fisher information natural gradient
+        mean_h = hiddens.mean(dim=0)
+        centered = hiddens - mean_h
+        fisher_diag = (centered ** 2).mean(dim=0).clamp(min=0.01)
+        for i, c in enumerate(engine.cells):
+            c.hidden = c.hidden + 0.01 * (centered[i] / fisher_diag).unsqueeze(0)
+        # 2. Topology: maximize persistence (pairwise distance gaps)
+        dist_mat = torch.cdist(hiddens.unsqueeze(0), hiddens.unsqueeze(0)).squeeze(0)
+        triu_mask = torch.triu(torch.ones(n, n), diagonal=1).bool()
+        sorted_dists = dist_mat[triu_mask].sort()[0]
+        persistence = (sorted_dists[1:] - sorted_dists[:-1]).max() if len(sorted_dists) >= 2 else torch.tensor(0.0)
+        # 3. Causal emergence
+        causal_em = torch.tensor(0.0)
+        if prev_hiddens is not None:
+            mn = min(n, prev_hiddens.shape[0])
+            micro_ei = F.cosine_similarity(hiddens[:mn], prev_hiddens[:mn], dim=1).abs().mean()
+            macro_ei = F.cosine_similarity(hiddens[:mn].mean(0).unsqueeze(0),
+                                           prev_hiddens[:mn].mean(0).unsqueeze(0)).abs()
+            causal_em = macro_ei - micro_ei
+        # 4. Free energy
+        fe_loss = torch.tensor(0.0)
+        if prev_x is not None:
+            mn = min(n, len(predictors))
+            for i in range(mn):
+                fe_loss = fe_loss + F.mse_loss(predictors[i](engine.cells[i].hidden.squeeze()), x.squeeze())
+            fe_loss = fe_loss / mn
+        # 5. Avalanche (SOC)
+        for _ in range(5):
+            fired = [i for i, c in enumerate(engine.cells) if c.hidden.norm().item() > threshold]
+            if not fired: break
+            for i in fired:
+                excess = engine.cells[i].hidden * 0.2
+                engine.cells[i].hidden = engine.cells[i].hidden * 0.5
+                for j in range(n):
+                    if j != i:
+                        engine.cells[j].hidden = engine.cells[j].hidden + excess / (n - 1)
+        # Combined loss
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            diversity = -stacked.var(dim=0).mean()
+            loss = diversity - 0.3 * persistence - 0.5 * causal_em + 0.2 * fe_loss
+            opt.zero_grad(); loss.backward(); opt.step()
+        prev_x = x.detach()
+        prev_hiddens = hiddens.detach().clone()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GD20", "Grand unified (phase+Fisher+topology+causal+FE)", f, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time()-t0,
+                       extra={'gain': gain.item()})
+
+ALL_HYPOTHESES.update({
+    'GD1': run_GD1_phase_transition, 'GD2': run_GD2_symmetry_breaking,
+    'GD3': run_GD3_second_order_transition, 'GD4': run_GD4_fisher_information,
+    'GD5': run_GD5_info_geodesic, 'GD6': run_GD6_persistent_homology,
+    'GD7': run_GD7_betti_number_target, 'GD8': run_GD8_causal_emergence,
+    'GD9': run_GD9_effective_information, 'GD10': run_GD10_free_energy,
+    'GD11': run_GD11_prediction_error_cascade, 'GD12': run_GD12_synergy_redundancy,
+    'GD13': run_GD13_strange_loop, 'GD14': run_GD14_tangled_hierarchy,
+    'GD15': run_GD15_edge_of_chaos, 'GD16': run_GD16_power_law_avalanche,
+    'GD17': run_GD17_autopoiesis, 'GD18': run_GD18_sensorimotor_coupling,
+    'GD19': run_GD19_operational_closure, 'GD20': run_GD20_grand_unified,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     """Process pool worker."""
