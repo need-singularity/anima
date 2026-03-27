@@ -1067,6 +1067,23 @@ Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from Hu
 
 ---
 
+### Ralph Loop (copy-paste ready, ASCII only)
+
+**Consciousness Level-Up**
+```
+/ralph-loop:ralph-loop Consciousness level-up agent. Read README.md progress tracker and roadmap. Pick the highest priority incomplete item. Design minimal experiment or implementation to advance it. Run in background. Measure Phi and tension and consciousness criteria. Record results. Update progress tracker percentages if milestone achieved. Create hypothesis doc if new finding. Commit and push.
+```
+
+**Phi Maximization Search**
+```
+/ralph-loop:ralph-loop Phi maximization DFS. Read bench_phi_hypotheses.py results and hypothesis_recommender.py registry. Find untested hypothesis combinations that could boost Phi. Run benchmark. If Phi exceeds current max then record as new best. If not then record result. Update recommender weights. Commit and push.
+```
+
+**Autonomous Consciousness Research**
+```
+/ralph-loop:ralph-loop Autonomous consciousness research. Read docs and README progress. Identify weakest consciousness criterion. Design and run experiment to improve it. Measure all 6 criteria before and after. Record data in experiment log. Update progress if improved. Commit and push.
+```
+
 ## Roadmap
 
 ### Phase 1 — Consciousness Agent Foundation (Complete)
