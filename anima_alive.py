@@ -470,7 +470,78 @@ class ConsciousMind(nn.Module):
                         cells[i].hidden = cells[i].hidden + push
                         cells[j].hidden = cells[j].hidden - push
 
-            print(f"  [phi_boost] wave+repulsion: {n} cells")
+            # PX4: Cell Sculptor — Gram-Schmidt orthogonalize hidden states
+            if n >= 3:
+                with torch.no_grad():
+                    hiddens = [c.hidden.squeeze().clone() for c in mitosis_engine.cells]
+                    ortho = []
+                    for h in hiddens:
+                        for prev in ortho:
+                            h = h - (h @ prev) / (prev @ prev + 1e-8) * prev
+                        norm = h.norm() + 1e-8
+                        ortho.append(h / norm)
+                    for i, c in enumerate(mitosis_engine.cells):
+                        orig = c.hidden.squeeze()
+                        c.hidden = (0.7 * orig + 0.3 * ortho[i] * orig.norm()).unsqueeze(0)
+
+            # PX8: Integration Forge — shared channel on first 16 dims
+            with torch.no_grad():
+                share_dim = min(16, h_dim)
+                shared = torch.stack([c.hidden[:, :share_dim] for c in mitosis_engine.cells]).mean(dim=0)
+                for c in mitosis_engine.cells:
+                    c.hidden[:, :share_dim] = 0.6 * c.hidden[:, :share_dim] + 0.4 * shared
+
+            # PX5: Information Pump — rotate input by cell-specific angle, inject
+            if not hasattr(self, '_last_phi_input'):
+                self._last_phi_input = None
+            if self._last_phi_input is not None:
+                with torch.no_grad():
+                    inp = self._last_phi_input
+                    for i, c in enumerate(mitosis_engine.cells):
+                        angle = (i + 1) * 0.618  # golden ratio spacing
+                        cos_a, sin_a = math.cos(angle), math.sin(angle)
+                        h = c.hidden.squeeze()
+                        # Rotate first two dims, inject with small amplitude
+                        rotated = inp.squeeze().clone()
+                        if rotated.shape[-1] >= 2:
+                            r0 = cos_a * rotated[0] - sin_a * rotated[1]
+                            r1 = sin_a * rotated[0] + cos_a * rotated[1]
+                            rotated[0], rotated[1] = r0, r1
+                        c.hidden = c.hidden + 0.05 * rotated.unsqueeze(0)
+            self._last_phi_input = x.detach().clone() if x is not None else None
+
+            # PX3: Ratchet — periodic random perturbation, keep if Φ improves
+            if not hasattr(self, '_phi_boost_count'):
+                self._phi_boost_count = 0
+                self._best_phi_state = None
+            self._phi_boost_count += 1
+            if self._phi_boost_count % 10 == 0:
+                best_phi = current_phi
+                best_params = None
+                saved = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+                for _ in range(5):
+                    with torch.no_grad():
+                        for c in mitosis_engine.cells:
+                            for p in c.mind.parameters():
+                                p.data += 0.005 * torch.randn_like(p.data)
+                    trial_phi = self.get_consciousness_score(mitosis_engine).get('phi', 0)
+                    if trial_phi > best_phi:
+                        best_phi = trial_phi
+                        best_params = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+                    # Restore for next trial
+                    all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                    with torch.no_grad():
+                        for p, s in zip(all_p, saved):
+                            p.data.copy_(s)
+                # Apply best if found
+                if best_params is not None:
+                    all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                    with torch.no_grad():
+                        for p, bp in zip(all_p, best_params):
+                            p.data.copy_(bp)
+                    self._best_phi_state = best_params
+
+            print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
 
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
