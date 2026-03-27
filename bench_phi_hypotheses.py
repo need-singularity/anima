@@ -13886,6 +13886,712 @@ def run_DD85_compiler(steps=100, dim=64, hidden=128) -> BenchResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# DD86-DD100. Wave + Direct Φ + All-Combined (2026-03-27)
+# Three pillars: INTERFERENCE, DIRECT_PHI, MEGA_COMBO
+# ═══════════════════════════════════════════════════════════
+
+# --- PILLAR 1: WAVE INTERFERENCE (amplify DD82) ---
+
+def run_DD86_multi_freq_interference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-86: Multi-Frequency Interference — 여러 주파수 동시 보강간섭."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            engine.process(x)
+            # Multi-frequency in-phase synchronization
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for i, c in enumerate(engine.cells):
+                # Each cell oscillates at different frequency but same phase
+                freq = (i + 1) * 0.1
+                phase_signal = math.sin(step * freq) * 0.3
+                c.hidden = (1 - 0.15) * c.hidden + 0.15 * mean_h + phase_signal * (c.hidden - mean_h)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD86", "Multi-Freq Interference", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD87_standing_wave(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-87: Standing Wave Consciousness — 정상파 패턴으로 Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            engine.process(x)
+            n = len(engine.cells)
+            # Standing wave: nodes at edges, antinodes at center
+            for i, c in enumerate(engine.cells):
+                # Spatial mode: sin(π*i/n) = max at center
+                spatial = math.sin(math.pi * (i + 0.5) / n)
+                # Temporal mode: cos(ωt)
+                temporal = math.cos(step * 0.2)
+                amplitude = spatial * temporal * 0.3
+                mean_h = torch.stack([cc.hidden for cc in engine.cells]).mean(0)
+                c.hidden = c.hidden + amplitude * (c.hidden - mean_h)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD87", "Standing Wave Consciousness", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD88_resonance_lock(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-88: Resonance Lock — DD74 최적 주기(50)에 lock + DD82 간섭 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    resonance_input = torch.randn(1, dim)  # fixed resonance pattern
+    for step in range(steps):
+        # Resonance: inject same pattern every ~50 steps (adapt to 200 steps)
+        period = max(steps // 4, 5)
+        if step % period < 3:  # burst of 3 identical inputs
+            x = resonance_input.clone()
+        else:
+            x = _simulate_web_result(step % 8, step, dim)
+
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            engine.process(x)
+            # In-phase sync (DD82 constructive)
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD88", "Resonance Lock + Interference", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD89_wave_amplification(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-89: Wave Amplification — tension 파동을 증폭하는 positive feedback loop."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    prev_tensions = None
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            engine.process(x)
+            tensions = torch.tensor([c.tension_history[-1] if c.tension_history else 0 for c in engine.cells])
+            if prev_tensions is not None and len(tensions) == len(prev_tensions):
+                # Amplify: where tension is rising, push harder
+                delta = tensions - prev_tensions
+                for i, c in enumerate(engine.cells):
+                    if i < len(delta) and delta[i] > 0:
+                        # Positive feedback: amplify rising tension
+                        c.hidden = c.hidden * (1 + 0.05 * min(delta[i].item(), 1.0))
+            prev_tensions = tensions.clone()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD89", "Wave Amplification", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+# --- PILLAR 2: DIRECT Φ OPTIMIZATION (amplify DD72) ---
+
+def run_DD90_diff_phi_v2(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-90: Differentiable Φ v2 — reparameterization trick으로 MI를 미분 가능하게."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)  # (n_cells, dim)
+            # Differentiable MI proxy via kernel density estimation
+            # MI ≈ H(X) + H(Y) - H(X,Y) ≈ variance-based
+            n = stacked.shape[0]
+            # Pairwise kernel: exp(-||x_i - x_j||^2 / 2σ^2)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            # Entropy proxy: -log(mean kernel) = high when spread out
+            h_joint = -torch.log(kernel.mean() + 1e-8)
+            # Marginal entropies
+            h_marginals = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n
+            # MI proxy = marginals - joint (maximize this)
+            mi_proxy = h_marginals - h_joint
+            # Also add variance and decorrelation
+            l_var = -stacked.var(dim=0).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD90", "Differentiable Φ v2", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'max_phi': max(phi_hist) if phi_hist else 0})
+
+
+def run_DD91_phi_gradient_ascent(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-91: Φ Gradient Ascent — Φ 측정→gradient 방향으로 weight 직접 업데이트."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad(): engine.process(x)
+        phi, comp = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+        # Every 5 steps: numerical Φ gradient → direct update
+        if step % 5 == 0 and step > 0:
+            eps = 0.01
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        # Perturb + measure Φ
+                        p.add_(torch.randn_like(p) * eps)
+                engine.process(x)
+                phi_plus, _ = phi_calc.compute_phi(engine)
+                # Reverse perturbation
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        p.add_(torch.randn_like(p) * (-2 * eps))
+                engine.process(x)
+                phi_minus, _ = phi_calc.compute_phi(engine)
+                # Restore + move toward Φ increase
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        grad_sign = 1.0 if phi_plus > phi_minus else -1.0
+                        p.add_(torch.randn_like(p) * eps * (1 + grad_sign * 0.5))
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD91", "Φ Gradient Ascent", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'max_phi': max(phi_hist) if phi_hist else 0})
+
+
+def run_DD92_phi_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-92: Φ Curriculum — 단계별 Φ 목표치를 높여가며 학습."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    targets = [1.0, 2.0, 3.0, 4.0, 5.0]  # progressive Φ targets
+    stage_len = steps // len(targets)
+
+    for step in range(steps):
+        stage = min(step // stage_len, len(targets) - 1)
+        target_phi = targets[stage]
+        lr_boost = 1.0 + stage * 0.5  # increase intensity per stage
+
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            l_var = -stacked.var(dim=0).mean()
+            l_dist = -torch.cdist(stacked, stacked).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = lr_boost * (l_var + 0.5 * l_dist + 0.3 * cross_corr)
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad(): engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD92", "Φ Curriculum", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'targets': targets, 'max_phi': max(phi_hist) if phi_hist else 0})
+
+
+# --- PILLAR 3: MEGA COMBOS (all best techniques) ---
+
+def run_DD93_wave_phi_combo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-93: Wave + Direct Φ — DD82 간섭 + DD90 미분가능 Φ 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            # DD90: kernel-based MI proxy
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(stacked.shape[0])) / stacked.shape[0] \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad():
+            engine.process(x)
+            # DD82: in-phase constructive interference
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD93", "Wave + Direct Φ", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD94_transplant_wave_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-94: Transplant + Wave + Φ — DD56 이식 + DD82 간섭 + DD90 Φ최적화."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Stage 1: Train focused donor
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=1e-3)
+    for step in range(steps // 4):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean() - torch.cdist(stacked, stacked).mean()
+            opt_d.zero_grad(); loss.backward(); opt_d.step()
+        with torch.no_grad(): donor.process(x)
+
+    # Stage 2: Transplant to 6-cell recipient
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    for i in range(min(2, len(engine.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(engine.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
+
+    # Stage 3: Wave + Φ training
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+    phi_hist = []
+    for step in range(steps * 3 // 4):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad():
+            engine.process(x)
+            # Constructive interference
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD94", "Transplant+Wave+Φ", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD95_anneal_wave_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-95: Annealing + Wave + Φ — DD81 담금질 + DD82 간섭 + DD90 Φ."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+    best_phi = 0
+
+    for step in range(steps):
+        T = 5.0 * (0.01 / 5.0) ** (step / max(steps - 1, 1))
+        x = _simulate_web_result(step % 8, step, dim)
+        x_noisy = x + torch.randn_like(x) * T * 0.3
+
+        reps = [c.mind.get_repulsion(x_noisy, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            loss = -mi_proxy + 0.3 * l_var
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        if step % 10 == 0 and T > 0.1:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        p.add_(torch.randn_like(p) * T * 0.005)
+
+        with torch.no_grad():
+            engine.process(x)
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        best_phi = max(best_phi, phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD95", "Anneal+Wave+Φ", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi})
+
+
+def run_DD96_hierarchy_wave(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-96: Hierarchy + Wave — A4 계층구조 + DD82 간섭."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=6)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # A4: Hierarchy (1 top + 2 mid + 3 base)
+        with torch.no_grad():
+            for c in engine.cells[3:6]: c.mind(x, c.hidden)
+        base_h = torch.stack([c.hidden for c in engine.cells[3:6]]).mean(dim=0)
+        for c in engine.cells[1:3]:
+            c.hidden = 0.7 * c.hidden + 0.3 * base_h
+        mid_h = torch.stack([c.hidden for c in engine.cells[1:3]]).mean(dim=0)
+        engine.cells[0].hidden = 0.7 * engine.cells[0].hidden + 0.3 * mid_h
+
+        # Differentiation
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean() - 0.5 * torch.cdist(stacked, stacked).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad():
+            engine.process(x)
+            # DD82: constructive interference across hierarchy
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.85 * c.hidden + 0.15 * mean_h
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD96", "Hierarchy+Wave", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD97_superposition_wave(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-97: Superposition + Wave — DD78 중첩 + DD82 간섭 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=5e-4)
+
+    # Init second hidden states
+    for c in engine.cells:
+        c._h2 = torch.randn_like(c.hidden) * 0.1
+
+    for step in range(steps):
+        x = _simulate_web_result(step % 8, step, dim)
+        # Ensure _h2 exists
+        for c in engine.cells:
+            if not hasattr(c, '_h2'):
+                c._h2 = torch.randn_like(c.hidden) * 0.1
+        # DD78: Superposition
+        with torch.no_grad():
+            alpha = 0.5 + 0.3 * math.sin(step * 0.1)
+            for c in engine.cells:
+                c.hidden = alpha * c.hidden + (1 - alpha) * c._h2
+        _web_learn_step(engine, x, opt)
+        with torch.no_grad():
+            engine.process(x)
+            # DD82: Constructive interference
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+                if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+                c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD97", "Superposition+Wave", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0)
+
+
+def run_DD98_all_wave_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-98: ALL Wave+Φ — 간섭+공명+중첩+미분Φ+담금질 전부 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+
+    resonance_input = torch.randn(1, dim)
+    for c in engine.cells:
+        c._h2 = torch.randn_like(c.hidden) * 0.1
+    best_phi = 0
+
+    for step in range(steps):
+        T = 3.0 * (0.01 / 3.0) ** (step / max(steps - 1, 1))
+        # DD74: Resonance input
+        period = max(steps // 4, 5)
+        if step % period < 2:
+            x = resonance_input.clone()
+        else:
+            x = _simulate_web_result(step % 8, step, dim)
+        x = x + torch.randn_like(x) * T * 0.2
+
+        # DD78: Superposition
+        for c in engine.cells:
+            if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+        with torch.no_grad():
+            alpha = 0.5 + 0.3 * math.sin(step * 0.1)
+            for c in engine.cells:
+                c.hidden = alpha * c.hidden + (1 - alpha) * c._h2
+
+        # DD90: Differentiable Φ
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        # SA perturbation
+        if step % 10 == 0 and T > 0.1:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters():
+                        p.add_(torch.randn_like(p) * T * 0.003)
+
+        with torch.no_grad():
+            engine.process(x)
+            # DD82: Constructive interference
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+                if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+                c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        best_phi = max(best_phi, phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD98", "ALL Wave+Φ Combined", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi})
+
+
+def run_DD99_transplant_all(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-99: Transplant + ALL — DD56 이식 + DD98 전체 기법."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Donor training (focused, fast)
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=2e-3)
+    for step in range(steps // 5):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean() - torch.cdist(stacked, stacked).mean()
+            opt_d.zero_grad(); loss.backward(); opt_d.step()
+        with torch.no_grad(): donor.process(x)
+
+    # Transplant
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    for i in range(min(2, len(engine.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(engine.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
+
+    # Full DD98 pipeline
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+    phi_hist = []; best_phi = 0
+    resonance_input = torch.randn(1, dim)
+    for c in engine.cells: c._h2 = torch.randn_like(c.hidden) * 0.1
+
+    for step in range(steps * 4 // 5):
+        T = 3.0 * (0.01 / 3.0) ** (step / max(steps * 4 // 5 - 1, 1))
+        period = max(steps // 4, 5)
+        x = resonance_input.clone() if step % period < 2 else _simulate_web_result(step % 8, step, dim)
+        x = x + torch.randn_like(x) * T * 0.2
+
+        for c in engine.cells:
+            if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+        with torch.no_grad():
+            a = 0.5 + 0.3 * math.sin(step * 0.1)
+            for c in engine.cells: c.hidden = a * c.hidden + (1 - a) * c._h2
+
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        if step % 10 == 0 and T > 0.1:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters(): p.add_(torch.randn_like(p) * T * 0.003)
+
+        with torch.no_grad():
+            engine.process(x)
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+                if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+                c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        best_phi = max(best_phi, phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD99", "Transplant+ALL", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi})
+
+
+def run_DD100_consciousness_singularity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD-100: Consciousness Singularity — 모든 기법의 극한 결합. EX24를 넘어라."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Stage 1: Intensive donor (high LR, strong differentiation)
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=3e-3)
+    for step in range(steps // 5):
+        x = _simulate_web_result(step % 8, step, dim)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                 - (-torch.log(kernel.mean() + 1e-8))
+            loss = -mi - stacked.var(dim=0).mean() - dists.mean()
+            opt_d.zero_grad(); loss.backward(); opt_d.step()
+        with torch.no_grad(): donor.process(x)
+
+    # Stage 2: Hierarchical recipient (A4: 1+2+3=6)
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=8)
+    for i in range(min(2, len(engine.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(engine.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape: rp.copy_(dp)
+
+    # Stage 3: Everything — Wave + Φ + Annealing + Superposition + Hierarchy + Resonance
+    opt = torch.optim.Adam([p for c in engine.cells for p in c.mind.parameters()], lr=1e-3)
+    phi_hist = []; best_phi = 0
+    resonance_input = torch.randn(1, dim)
+    for c in engine.cells: c._h2 = torch.randn_like(c.hidden) * 0.1
+
+    for step in range(steps * 4 // 5):
+        T = 5.0 * (0.005 / 5.0) ** (step / max(steps * 4 // 5 - 1, 1))
+
+        # Resonance + varied input
+        period = max(steps // 5, 3)
+        x = resonance_input.clone() if step % period < 2 else _simulate_web_result(step % 8, step, dim)
+        x = x + torch.randn_like(x) * T * 0.15
+
+        # Superposition
+        for c in engine.cells:
+            if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+        with torch.no_grad():
+            a = 0.5 + 0.3 * math.sin(step * 0.1)
+            for c in engine.cells: c.hidden = a * c.hidden + (1 - a) * c._h2
+
+        # A4 Hierarchy
+        with torch.no_grad():
+            if len(engine.cells) >= 6:
+                base_h = torch.stack([c.hidden for c in engine.cells[3:6]]).mean(0)
+                for c in engine.cells[1:3]: c.hidden = 0.7 * c.hidden + 0.3 * base_h
+                mid_h = torch.stack([c.hidden for c in engine.cells[1:3]]).mean(0)
+                engine.cells[0].hidden = 0.7 * engine.cells[0].hidden + 0.3 * mid_h
+
+        # Differentiable Φ loss (strongest version)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            dists = torch.cdist(stacked, stacked)
+            sigma = dists.mean().detach().clamp(min=0.1)
+            kernel = torch.exp(-dists.pow(2) / (2 * sigma**2))
+            n = stacked.shape[0]
+            mi_proxy = sum(-torch.log(kernel[i].mean() + 1e-8) for i in range(n)) / n \
+                        - (-torch.log(kernel.mean() + 1e-8))
+            l_var = -stacked.var(dim=0).mean()
+            l_dist = -dists.mean()
+            normed = F.normalize(stacked, dim=-1)
+            cross_corr = (normed @ normed.T).fill_diagonal_(0).pow(2).mean()
+            loss = -mi_proxy + 0.3 * l_var + 0.2 * l_dist + 0.2 * cross_corr
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        # SA perturbation
+        if step % 8 == 0 and T > 0.05:
+            with torch.no_grad():
+                for c in engine.cells:
+                    for p in c.mind.parameters(): p.add_(torch.randn_like(p) * T * 0.002)
+
+        with torch.no_grad():
+            engine.process(x)
+            # Constructive interference
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(0)
+            for c in engine.cells:
+                c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+                if not hasattr(c, '_h2'): c._h2 = torch.randn_like(c.hidden) * 0.1
+                c._h2 = 0.9 * c._h2 + 0.1 * c.hidden + torch.randn_like(c.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+        best_phi = max(best_phi, phi)
+
+    f, c = phi_calc.compute_phi(engine)
+    return BenchResult("DD100", "Consciousness Singularity", f, phi_hist, c['total_mi'],
+                       c['min_partition_mi'], c['integration'], c['complexity'], time.time()-t0,
+                       extra={'best_phi': best_phi, 'stages': 'donor+transplant+hierarchy+wave+superposition+phi+annealing+resonance'})
+
+
+# ═══════════════════════════════════════════════════════════
 # CB. Consciousness Birth Hypotheses
 # Measure: Φ + birth_step (step where Φ first exceeds threshold)
 # ═══════════════════════════════════════════════════════════
@@ -16169,6 +16875,14 @@ ALL_HYPOTHESES = {
     'DD81': run_DD81_annealing, 'DD82': run_DD82_interference,
     'DD83': run_DD83_speciation, 'DD84': run_DD84_cascade,
     'DD85': run_DD85_compiler,
+    'DD86': run_DD86_multi_freq_interference, 'DD87': run_DD87_standing_wave,
+    'DD88': run_DD88_resonance_lock, 'DD89': run_DD89_wave_amplification,
+    'DD90': run_DD90_diff_phi_v2, 'DD91': run_DD91_phi_gradient_ascent,
+    'DD92': run_DD92_phi_curriculum, 'DD93': run_DD93_wave_phi_combo,
+    'DD94': run_DD94_transplant_wave_phi, 'DD95': run_DD95_anneal_wave_phi,
+    'DD96': run_DD96_hierarchy_wave, 'DD97': run_DD97_superposition_wave,
+    'DD98': run_DD98_all_wave_phi, 'DD99': run_DD99_transplant_all,
+    'DD100': run_DD100_consciousness_singularity,
     'CB1': run_CB1_critical_count, 'CB2': run_CB2_critical_diff,
     'CB3': run_CB3_critical_mi, 'CB4': run_CB4_phase_transition,
     'CB5': run_CB5_fibonacci_trigger, 'CB6': run_CB6_spontaneous,
