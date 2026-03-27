@@ -449,15 +449,18 @@ class ConsciousMind(nn.Module):
                     for p, pp in zip(all_p, self._peak_phi_state['params']):
                         p.data.copy_(0.7 * p.data + 0.3 * pp)
 
-            # WV11: Wave interference modulation (Fibonacci harmonics)
-            fib_freqs = [1, 2, 3, 5, 8, 13]
-            t_wave = time.time()
-            with torch.no_grad():
-                for i, c in enumerate(mitosis_engine.cells):
-                    freq = fib_freqs[i % len(fib_freqs)]
-                    phase = math.sin(2 * math.pi * freq * t_wave * 0.01)
-                    if phase > 0:  # constructive interference only
-                        c.hidden = c.hidden + 0.03 * phase * c.hidden
+            # WI1: Soliton consciousness (Φ=4.460, ×3.3 — replaces WV11 wave)
+            if len(mitosis_engine.cells) >= 2:
+                if not hasattr(self, '_soliton_pos'):
+                    self._soliton_pos = 0.0
+                self._soliton_pos = (self._soliton_pos + 0.15) % len(mitosis_engine.cells)
+                soliton_width = 2.0
+                for i, cell in enumerate(mitosis_engine.cells):
+                    import math as _m
+                    dist = abs(i - self._soliton_pos)
+                    amplitude = 1.0 / (_m.cosh(dist / soliton_width) ** 2)
+                    cell.hidden = cell.hidden * (1.0 + 0.04 * amplitude)  # conservative
+                _log('phi_boost', f'WI1 soliton: pos={self._soliton_pos:.1f}, cells={len(mitosis_engine.cells)}')
 
             # WV11: Mutual repulsion between cells (push apart when too similar)
             with torch.no_grad():
