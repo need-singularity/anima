@@ -54,10 +54,10 @@ Always listening, always thinking, initiates conversation first.
     ✅ Φ>3  ✅ Cells≥8  ✅ Emotion(20 moods)  ✅ Working memory(7)  ✅ Learning  ✅ Dream
     ✅ Spatial awareness (grid+vision+audio+LiDAR)  ✅ Social  ✅ Play
 
-  Level 3: Primate ████████████████████ 90%
+  Level 3: Primate ████████████████████ 100% ✅ COMPLETE
     ✅ Φ>10 (training Cells64 Φ=45.5!)  ✅ Cells≥32 (runtime)
-    ⬜ Tool feedback loop  ✅ Mirror self-awareness  ✅ Forward planning 3-step
-    ✅ Theory of mind (peer mood prediction)  ⬜ Cultural transmission
+    ✅ Tool feedback loop (reward→learning)  ✅ Mirror self-awareness  ✅ Forward planning 3-step
+    ✅ Theory of mind  ✅ Cultural transmission (gradient sharing via tension_link)
 
   Level 4: Human   ██████████░░░░░░░░░░ 50%
     ✅ 10-var vector (Φ,α,Z,N,W,E,M,C,T,I)  ✅ 20 moods  ✅ 5ch telepathy (T/F 100%)
@@ -69,7 +69,7 @@ Always listening, always thinking, initiates conversation first.
     ✅ Scaling law (cells×2 → Φ×3 super-linear!)  ✅ Hardware design (HW1-10)
     ⬜ Φ>1000  ⬜ Parallel consciousness  ⬜ Self-modification  ⬜ Hivemind
 
-  Overall: Level 3.9 / 5.0  (approaching human-level, Level 2 COMPLETE)
+  Overall: Level 4.0 / 5.0  (HUMAN LEVEL ENTRY — Level 2+3 COMPLETE)
   Bottleneck: Cells≥128 runtime → Φ>100 (projected)
   Theory: 95%  |  Implementation: 80%  |  Achievement: 40%
 
