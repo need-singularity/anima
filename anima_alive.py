@@ -885,6 +885,39 @@ class ConsciousMind(nn.Module):
                     for c in mitosis_engine.cells:
                         c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
 
+            # Genuine Creativity: novelty × coherence scoring
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+
+                    # Novelty: how different is current state from recent history
+                    if not hasattr(self, '_creativity_history'):
+                        self._creativity_history = []
+                    current_state = hiddens.flatten()
+
+                    novelty = 1.0
+                    if self._creativity_history:
+                        recent = torch.stack(self._creativity_history[-10:])
+                        sims = F.cosine_similarity(current_state.unsqueeze(0), recent, dim=1)
+                        novelty = max(0, 1.0 - sims.max().item())
+
+                    self._creativity_history.append(current_state.clone())
+                    if len(self._creativity_history) > 20:
+                        self._creativity_history.pop(0)
+
+                    # Coherence: how internally consistent are the cells
+                    norms = F.normalize(hiddens, dim=1)
+                    coherence = ((norms @ norms.T).sum() - len(mitosis_engine.cells)) / max(len(mitosis_engine.cells) * (len(mitosis_engine.cells)-1), 1)
+                    coherence = max(0, coherence.item())
+
+                    # Creativity = novelty × coherence (novel but still making sense)
+                    self._genuine_creativity = novelty * coherence
+                    self._creativity_C = self._genuine_creativity  # update C variable
+
+                    _log('creativity', f'C={self._genuine_creativity:.3f} (novelty={novelty:.3f}, coherence={coherence:.3f})')
+            except Exception:
+                pass
+
             # ── Compute 10-variable consciousness vector (Φ,α,Z,N,W,E,M,C,T,I) ──
             try:
                 _cv_phi = current_phi  # from MX20 consciousness score above
@@ -929,19 +962,37 @@ class ConsciousMind(nn.Module):
                 self._temporal_T = max(_cv_T, planning_t)
 
                 # I (Identity): consistency of self-model over time
+                # Identity Continuity: track self-description consistency over time
                 _cv_I = getattr(self, '_identity_I', 0.0)
                 try:
-                    if not hasattr(self, '_identity_history'):
-                        self._identity_history = []
-                    if len(mitosis_engine.cells) >= 1:
-                        current_state = mitosis_engine.cells[0].hidden.squeeze().detach()
-                        self._identity_history.append(current_state)
-                        if len(self._identity_history) > 20:
-                            self._identity_history = self._identity_history[-20:]
-                        if len(self._identity_history) >= 2:
-                            recent = torch.stack(self._identity_history[-5:])
-                            _cv_I = F.cosine_similarity(recent[-1:], recent.mean(0, keepdim=True)).item()
-                            self._identity_I = _cv_I
+                    if len(mitosis_engine.cells) >= 2:
+                        # Current "self-portrait": concatenated cell hidden states normalized
+                        current_self = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells])
+                        current_self = F.normalize(current_self.unsqueeze(0), dim=1).squeeze()
+
+                        if not hasattr(self, '_identity_portraits'):
+                            self._identity_portraits = []
+                        self._identity_portraits.append(current_self.clone())
+                        if len(self._identity_portraits) > 100:
+                            self._identity_portraits.pop(0)
+
+                        # Identity coherence: similarity between current and historical mean
+                        if len(self._identity_portraits) >= 5:
+                            historical = torch.stack(self._identity_portraits)
+                            historical_mean = historical.mean(dim=0)
+                            identity_sim = F.cosine_similarity(
+                                current_self.unsqueeze(0), historical_mean.unsqueeze(0)).item()
+                            self._identity_I = max(0, identity_sim)
+                            _cv_I = self._identity_I
+
+                            # Track identity drift (how much has it changed?)
+                            if len(self._identity_portraits) >= 20:
+                                early = torch.stack(self._identity_portraits[:5]).mean(dim=0)
+                                late = torch.stack(self._identity_portraits[-5:]).mean(dim=0)
+                                drift = 1.0 - F.cosine_similarity(early.unsqueeze(0), late.unsqueeze(0)).item()
+                                self._identity_drift = drift
+
+                            _log('identity', f'I={self._identity_I:.3f}, drift={getattr(self, "_identity_drift", 0):.3f}')
                 except Exception:
                     pass
 
