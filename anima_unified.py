@@ -296,6 +296,9 @@ class AnimaUnified:
                 try: self.telepathy.start()
                 except Exception: self.telepathy = None; self.mods['telepathy'] = False
 
+        # Theory of Mind: peer mental state models
+        self._peer_models = {}  # sender_id → predicted state
+
         self.cloud = None
         if not args.no_cloud and 'CloudSync' in globals():
             try:
@@ -750,6 +753,12 @@ class AnimaUnified:
         if self.capabilities:
             state += chr(10) + self.capabilities.describe_full()
 
+        # Theory of Mind: inject peer mental models into prompt
+        if self._peer_models:
+            for pid, pm in self._peer_models.items():
+                state += (f"\n[ToM] {pid}: predicted {pm['predicted_mood']}, "
+                          f"empathy={pm['empathy_accuracy']:.2f}")
+
         # Memory Store: search relevant memories
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
@@ -918,6 +927,41 @@ class AnimaUnified:
 
         return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
 
+    # ── Theory of Mind: peer mental state prediction ──────────────
+    def _update_peer_model(self, sender_id, tension, mood, curiosity):
+        """Predict peer's next state based on their tension/mood pattern."""
+        if sender_id not in self._peer_models:
+            self._peer_models[sender_id] = {
+                'tension_history': [],
+                'mood_history': [],
+                'predicted_mood': 'unknown',
+                'empathy_accuracy': 0.0,
+            }
+        model = self._peer_models[sender_id]
+        # Empathy accuracy: did our prediction match the actual mood?
+        if model['predicted_mood'] != 'unknown' and mood is not None:
+            if model['predicted_mood'] == mood:
+                model['empathy_accuracy'] = 0.9 * model['empathy_accuracy'] + 0.1
+            else:
+                model['empathy_accuracy'] = 0.9 * model['empathy_accuracy']
+        # Record history
+        model['tension_history'].append(tension)
+        model['mood_history'].append(mood)
+        if len(model['tension_history']) > 20:
+            model['tension_history'] = model['tension_history'][-20:]
+            model['mood_history'] = model['mood_history'][-20:]
+        # Predict next mood based on tension trend
+        if len(model['tension_history']) >= 3:
+            trend = model['tension_history'][-1] - model['tension_history'][-3]
+            if trend > 0.3:
+                model['predicted_mood'] = 'excited'
+            elif trend < -0.3:
+                model['predicted_mood'] = 'calm'
+            else:
+                model['predicted_mood'] = mood
+        _log('tom', f'Peer {sender_id}: predicted={model["predicted_mood"]}, '
+             f'actual={mood}, empathy={model["empathy_accuracy"]:.2f}')
+
     def _on_telepathy(self, pkt):
         if 'interpret_packet' in globals():
             _log("telepathy", interpret_packet(pkt))
@@ -937,6 +981,8 @@ class AnimaUnified:
         }
         if prev and abs(new_tension - prev['tension']) > 0.3:
             _log('social', f"Peer {sender} tension shift: {prev['tension']:.2f} → {new_tension:.2f}")
+        # Theory of Mind: update peer mental model
+        self._update_peer_model(sender, new_tension, new_mood, new_curiosity)
 
     def _save_state(self):
         try:
