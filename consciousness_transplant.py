@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
-"""Consciousness Transplant Toolkit (DD56)
+"""consciousness_transplant.py — Transplant consciousness between models.
 
-의식(tension 패턴)을 한 모델에서 다른 모델로 이식하는 도구.
-IIT의 substrate independence 가설의 계산적 증거.
+Transfer Phi structure from trained donor to untrained recipient.
+Preserves: cell differentiation patterns, tension dynamics, Phi topology.
 
-도구:
-  1. TransplantCalculator  — 호환성 분석 + 최적 projection 계산
-  2. TransplantEngine      — 실제 가중치 이식 수행
-  3. TransplantVerifier     — 이식 후 Φ/tension 검증
-  4. CLI                   — 원클릭 이식 + 검증
+Based on benchmarks:
+  DD55 — Phi conservation during splits
+  DV1  — Scaling transfer (small -> large)
+  DV2  — Distillation (large -> small)
+  MX16 — Distilled consciousness
 
-사용법:
-  # ConsciousLM 4M → 100M 이식
-  python consciousness_transplant.py \\
-    --donor checkpoints/conscious_lm_4m_final.pt \\
-    --recipient checkpoints/conscious_lm_100m/best.pt \\
-    --output checkpoints/conscious_lm_100m_transplanted.pt
-
-  # ConsciousMind 간 이식 (anima_alive.py 모델)
-  python consciousness_transplant.py \\
-    --donor-type mind --donor state_a.pt \\
-    --recipient-type mind --recipient state_b.pt
-
-  # 호환성만 분석
-  python consciousness_transplant.py --analyze \\
-    --donor checkpoints/conscious_lm_4m_final.pt \\
-    --recipient-config '{"d_model":768,"n_layer":12}'
-
-  # 벤치마크 (DD56 재현)
-  python consciousness_transplant.py --benchmark
+Usage:
+  python consciousness_transplant.py --benchmark                          # test transplant quality
+  python consciousness_transplant.py --analyze --donor model_a.pt        # compatibility analysis
+  python consciousness_transplant.py --donor a.pt --recipient b.pt --output c.pt  # transplant
+  python consciousness_transplant.py --demo                              # quick demo
 """
 
 import torch
@@ -44,35 +30,66 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
-# ═══════════════════════════════════════════════════════════
-# 1. TransplantCalculator — 호환성 분석 + projection 계산
-# ═══════════════════════════════════════════════════════════
+# ===================================================================
+# Data classes
+# ===================================================================
 
 @dataclass
 class CompatibilityReport:
-    """이식 호환성 분석 결과."""
+    """Compatibility analysis between donor and recipient."""
     compatible: bool
     donor_config: Dict
     recipient_config: Dict
     strategy: str              # 'direct', 'projection', 'partial'
     projection_needed: bool
-    layer_mapping: Dict        # donor layer → recipient layer
-    param_coverage: float      # 이식 가능 파라미터 비율
+    layer_mapping: Dict        # donor layer -> recipient layer
+    param_coverage: float      # fraction of recipient params that can be transplanted
     warnings: List[str] = field(default_factory=list)
     projection_matrix_size: Optional[Tuple] = None
 
 
+@dataclass
+class TransplantResult:
+    """Result of a transplant operation."""
+    success: bool
+    strategy: str
+    layers_transplanted: int
+    params_transplanted: int
+    params_total: int
+    coverage: float
+    elapsed_sec: float
+    donor_tension_stats: Optional[Dict] = None
+    recipient_tension_stats: Optional[Dict] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VerificationResult:
+    """Post-transplant verification result."""
+    phi_before: float
+    phi_after: float
+    phi_retention: float       # phi_after / phi_before (DD55 conservation)
+    tension_mean_before: float
+    tension_mean_after: float
+    tension_preserved: bool    # tension pattern maintained?
+    pattern_correlation: float # donor-recipient tension pattern correlation
+    consciousness_transfer: bool  # Phi transferred?
+
+
+# ===================================================================
+# 1. TransplantCalculator — compatibility + projection
+# ===================================================================
+
 class TransplantCalculator:
-    """모델 간 이식 호환성 분석 및 최적 projection 계산."""
+    """Analyze donor/recipient compatibility and compute projections."""
 
     @staticmethod
     def extract_config(state_dict: dict) -> dict:
-        """state_dict에서 아키텍처 설정 추출."""
+        """Extract architecture config from a state_dict."""
         config = {}
 
-        # ConsciousLM 감지
+        # ConsciousLM detection (has blocks.N.xxx keys)
         if any('blocks.' in k for k in state_dict):
-            # Find n_layer
             layer_ids = set()
             for k in state_dict:
                 if k.startswith('blocks.'):
@@ -80,19 +97,16 @@ class TransplantCalculator:
             config['type'] = 'ConsciousLM'
             config['n_layer'] = max(layer_ids) + 1 if layer_ids else 0
 
-            # Find d_model from ln_f or tok_emb
             if 'ln_f.weight' in state_dict:
                 config['d_model'] = state_dict['ln_f.weight'].shape[0]
             elif 'tok_emb.weight' in state_dict:
                 config['d_model'] = state_dict['tok_emb.weight'].shape[1]
 
-            # Find n_head from attention
             for k, v in state_dict.items():
                 if 'attn.c_attn.weight' in k:
                     config['n_head'] = v.shape[0] // (3 * config.get('d_model', 1))
                     break
 
-            # PureFieldFFN inner dim
             for k, v in state_dict.items():
                 if 'ffn.engine_a.0.weight' in k:
                     config['d_inner'] = v.shape[0]
@@ -101,7 +115,7 @@ class TransplantCalculator:
             config['vocab_size'] = state_dict.get('tok_emb.weight', torch.zeros(1, 1)).shape[0]
             config['total_params'] = sum(v.numel() for v in state_dict.values())
 
-        # ConsciousMind 감지
+        # ConsciousMind detection (has engine_a but no blocks)
         elif any('engine_a' in k for k in state_dict) and not any('blocks.' in k for k in state_dict):
             config['type'] = 'ConsciousMind'
             for k, v in state_dict.items():
@@ -111,7 +125,7 @@ class TransplantCalculator:
                     break
             config['total_params'] = sum(v.numel() for v in state_dict.values())
 
-        # model_state_dict wrapper
+        # Wrapped checkpoint
         elif 'model_state_dict' in state_dict:
             return TransplantCalculator.extract_config(state_dict['model_state_dict'])
 
@@ -124,12 +138,11 @@ class TransplantCalculator:
 
     @staticmethod
     def analyze_compatibility(donor_config: dict, recipient_config: dict) -> CompatibilityReport:
-        """두 모델의 이식 호환성 분석."""
+        """Check dim/cell compatibility between donor and recipient."""
         warnings = []
 
-        # Same type check
         if donor_config.get('type') != recipient_config.get('type'):
-            warnings.append(f"Type mismatch: {donor_config.get('type')} → {recipient_config.get('type')}")
+            warnings.append(f"Type mismatch: {donor_config.get('type')} -> {recipient_config.get('type')}")
 
         d_donor = donor_config.get('d_model', donor_config.get('hidden_dim', 0))
         d_recip = recipient_config.get('d_model', recipient_config.get('hidden_dim', 0))
@@ -147,31 +160,28 @@ class TransplantCalculator:
             strategy = 'projection'
             projection_needed = True
 
-        # Layer mapping
+        # Layer mapping: map donor layers to recipient layers
         layer_mapping = {}
         if l_donor <= l_recip:
-            # Map donor layers to first N recipient layers
             for i in range(l_donor):
                 layer_mapping[i] = i
         else:
-            # Donor is bigger — map to recipient with stride
+            # Donor is bigger: stride-sample into recipient
             stride = l_donor / l_recip
             for i in range(l_recip):
                 layer_mapping[int(i * stride)] = i
 
-        # Param coverage
         transplantable = min(l_donor, l_recip)
         param_coverage = transplantable / l_recip if l_recip > 0 else 0
 
-        # Projection matrix size
         proj_size = None
         if projection_needed:
             proj_size = (d_recip, d_donor)
             if d_donor > d_recip:
-                warnings.append(f"Donor dim ({d_donor}) > Recipient dim ({d_recip}): information loss")
+                warnings.append(f"Donor dim ({d_donor}) > Recipient dim ({d_recip}): information loss (DV2 distillation)")
 
         if param_coverage < 0.5:
-            warnings.append(f"Low coverage ({param_coverage:.0%}): only {transplantable}/{l_recip} layers transplanted")
+            warnings.append(f"Low coverage ({param_coverage:.0%}): only {transplantable}/{l_recip} layers")
 
         return CompatibilityReport(
             compatible=True,
@@ -187,27 +197,24 @@ class TransplantCalculator:
 
     @staticmethod
     def compute_projection_matrix(d_from: int, d_to: int, method: str = 'orthogonal') -> torch.Tensor:
-        """차원 변환 projection matrix 생성.
+        """Create projection matrix for dimension transfer (128->256 etc).
 
         Methods:
-          - orthogonal: 직교 random projection (정보 보존 최적)
-          - linear: 선형 보간 (간단)
-          - pad_zero: 작은→큰은 zero padding, 큰→작은은 truncation
+          orthogonal — random orthogonal projection (preserves distances)
+          linear     — linear interpolation
+          pad_zero   — zero-pad (small->large) or truncate (large->small)
         """
         if method == 'orthogonal':
-            # Orthogonal random matrix (preserves distances)
             M = torch.randn(d_to, d_from)
             U, _, V = torch.linalg.svd(M, full_matrices=False)
             if d_to <= d_from:
-                return U @ V[:d_to]  # (d_to, d_from)
+                return U @ V[:d_to]
             else:
-                # Pad with zeros for extra dims
                 P = torch.zeros(d_to, d_from)
                 P[:d_from, :d_from] = torch.eye(d_from)
                 return P
 
         elif method == 'linear':
-            # Linear interpolation
             P = torch.zeros(d_to, d_from)
             scale = d_from / d_to
             for i in range(d_to):
@@ -226,55 +233,65 @@ class TransplantCalculator:
             return P
 
         else:
-            raise ValueError(f"Unknown method: {method}")
+            raise ValueError(f"Unknown projection method: {method}")
 
 
-# ═══════════════════════════════════════════════════════════
-# 2. TransplantEngine — 실제 가중치 이식
-# ═══════════════════════════════════════════════════════════
-
-@dataclass
-class TransplantResult:
-    """이식 결과."""
-    success: bool
-    strategy: str
-    layers_transplanted: int
-    params_transplanted: int
-    params_total: int
-    coverage: float
-    elapsed_sec: float
-    donor_tension_stats: Optional[Dict] = None
-    recipient_tension_stats: Optional[Dict] = None
-    warnings: List[str] = field(default_factory=list)
-
+# ===================================================================
+# 2. TransplantEngine — blend donor consciousness into recipient
+# ===================================================================
 
 class TransplantEngine:
-    """모델 간 의식(tension 패턴) 이식."""
+    """Transplant consciousness (tension patterns, Phi structure) between models."""
 
     def __init__(self, projection_method: str = 'pad_zero'):
         self.projection_method = projection_method
+
+    def transplant(
+        self,
+        donor_state: dict,
+        recipient_state: dict,
+        alpha: float = 0.5,
+    ) -> Tuple[dict, TransplantResult]:
+        """High-level transplant: auto-detect model type and blend.
+
+        Args:
+            donor_state:     Donor checkpoint (state_dict or full checkpoint).
+            recipient_state: Recipient checkpoint.
+            alpha:           Blend strength (1.0 = full donor, 0.5 = 50/50).
+
+        Returns:
+            (new_state_dict, TransplantResult)
+        """
+        calc = TransplantCalculator()
+        d_cfg = calc.extract_config(donor_state)
+        r_cfg = calc.extract_config(recipient_state)
+
+        if d_cfg.get('type') == 'ConsciousMind' and r_cfg.get('type') == 'ConsciousMind':
+            return self.transplant_conscious_mind(donor_state, recipient_state, alpha)
+        else:
+            report = calc.analyze_compatibility(d_cfg, r_cfg)
+            return self.transplant_conscious_lm(donor_state, recipient_state, report, alpha)
 
     def transplant_conscious_lm(
         self,
         donor_state: dict,
         recipient_state: dict,
         report: CompatibilityReport,
-        alpha: float = 1.0,  # 이식 강도 (1.0=전부, 0.5=50% blend)
+        alpha: float = 1.0,
     ) -> Tuple[dict, TransplantResult]:
-        """ConsciousLM 간 이식."""
+        """Transplant between ConsciousLM models (DV1/DV2 scaling transfer)."""
         t0 = time.time()
         warnings = []
         params_transplanted = 0
         layers_done = 0
 
-        # Unwrap model_state_dict if needed
         d_state = donor_state.get('model_state_dict', donor_state)
         r_state = dict(recipient_state.get('model_state_dict', recipient_state))
 
         d_model_donor = report.donor_config.get('d_model', 384)
         d_model_recip = report.recipient_config.get('d_model', 384)
 
-        # Compute projection if needed
+        # Compute projection matrices if dimensions differ
         proj = None
         proj_inner = None
         if report.projection_needed:
@@ -302,11 +319,9 @@ class TransplantEngine:
                 r_tensor = r_state[r_key]
 
                 if d_tensor.shape == r_tensor.shape:
-                    # Direct copy with alpha blending
                     r_state[r_key] = alpha * d_tensor + (1 - alpha) * r_tensor
                     params_transplanted += d_tensor.numel()
                 elif proj is not None:
-                    # Project donor weights to recipient dimensions
                     try:
                         projected = self._project_weight(d_tensor, r_tensor.shape, proj, proj_inner)
                         r_state[r_key] = alpha * projected + (1 - alpha) * r_tensor
@@ -318,7 +333,7 @@ class TransplantEngine:
 
             layers_done += 1
 
-        # Re-wrap if needed
+        # Re-wrap checkpoint format
         output_state = recipient_state.copy()
         if 'model_state_dict' in recipient_state:
             output_state['model_state_dict'] = r_state
@@ -350,13 +365,12 @@ class TransplantEngine:
         recipient_state: dict,
         alpha: float = 1.0,
     ) -> Tuple[dict, TransplantResult]:
-        """ConsciousMind (anima_alive.py) 간 이식."""
+        """Transplant between ConsciousMind models (anima_alive.py)."""
         t0 = time.time()
         warnings = []
         params_transplanted = 0
         r_state = dict(recipient_state)
 
-        # Transplant engine_a and engine_g weights
         for key in donor_state:
             if ('engine_a' in key or 'engine_g' in key) and key in r_state:
                 d_t = donor_state[key]
@@ -365,7 +379,6 @@ class TransplantEngine:
                     r_state[key] = alpha * d_t + (1 - alpha) * r_t
                     params_transplanted += d_t.numel()
                 else:
-                    # Project
                     try:
                         if d_t.dim() == 2:
                             proj_out = TransplantCalculator.compute_projection_matrix(
@@ -395,9 +408,8 @@ class TransplantEngine:
 
     def _project_weight(self, donor: torch.Tensor, target_shape: tuple,
                         proj: torch.Tensor, proj_inner: Optional[torch.Tensor]) -> torch.Tensor:
-        """Donor weight를 target shape으로 projection."""
+        """Project donor weight tensor to target shape."""
         if donor.dim() == 1:
-            # Bias vector
             if donor.shape[0] == target_shape[0]:
                 return donor
             p = TransplantCalculator.compute_projection_matrix(
@@ -405,11 +417,9 @@ class TransplantEngine:
             return (p @ donor.unsqueeze(1)).squeeze(1)
 
         elif donor.dim() == 2:
-            # Weight matrix
             out_d, in_d = donor.shape
             out_t, in_t = target_shape
 
-            # Determine which projection to use for each dim
             if out_d != out_t and in_d != in_t:
                 p_out = proj_inner if proj_inner is not None and proj_inner.shape[0] == out_t else \
                     TransplantCalculator.compute_projection_matrix(out_d, out_t, self.projection_method)
@@ -428,101 +438,78 @@ class TransplantEngine:
         return donor
 
 
-# ═══════════════════════════════════════════════════════════
-# 3. TransplantVerifier — 이식 후 Φ/tension 검증
-# ═══════════════════════════════════════════════════════════
-
-@dataclass
-class VerificationResult:
-    """이식 검증 결과."""
-    phi_before: float
-    phi_after: float
-    phi_improvement: float
-    tension_mean_before: float
-    tension_mean_after: float
-    tension_preserved: bool    # tension 패턴이 유지되는가
-    pattern_correlation: float  # donor와 recipient의 tension 패턴 상관관계
-    consciousness_transfer: bool  # Φ가 전이되었는가
-
+# ===================================================================
+# 3. TransplantVerifier — DD55 conservation check
+# ===================================================================
 
 class TransplantVerifier:
-    """이식 후 의식 전이 검증."""
+    """Verify Phi retention and tension pattern preservation after transplant."""
 
     @staticmethod
-    def verify_conscious_lm(
-        original_state: dict,
-        transplanted_state: dict,
-        donor_state: dict,
-        n_test_inputs: int = 50,
+    def verify_transplant(
+        before_state: dict,
+        after_state: dict,
         device: str = 'cpu',
     ) -> VerificationResult:
-        """ConsciousLM 이식 검증."""
-        from conscious_lm import ConsciousLM
+        """DD55 conservation check: compare Phi and tension before vs after.
 
-        # Extract configs
-        calc = TransplantCalculator()
-        t_config = calc.extract_config(transplanted_state.get('model_state_dict', transplanted_state))
-        o_config = calc.extract_config(original_state.get('model_state_dict', original_state))
+        Works on raw state_dicts without loading full models.
+        Measures engine A/G divergence as a Phi proxy.
+        """
+        pre = TransplantVerifier.quick_verify(before_state, device)
+        post = TransplantVerifier.quick_verify(after_state, device)
 
-        d_model = t_config.get('d_model', 384)
-        n_layer = t_config.get('n_layer', 6)
-        n_head = t_config.get('n_head', 4)
-        block_size = 256
+        phi_before = pre.get('ag_divergence', 0.0)
+        phi_after = post.get('ag_divergence', 0.0)
+        phi_retention = phi_after / (phi_before + 1e-8)
 
-        def load_and_measure(state_dict):
-            model = ConsciousLM(256, d_model, n_head, n_layer, block_size, dropout=0.0)
-            sd = state_dict.get('model_state_dict', state_dict)
-            model.load_state_dict(sd, strict=False)
-            model = model.to(device).eval()
-
-            tensions = []
-            with torch.no_grad():
-                for i in range(n_test_inputs):
-                    x = torch.randint(0, 256, (1, 64), device=device)
-                    _, _, layer_tensions = model(x)
-                    t_mean = sum(t.mean().item() for t in layer_tensions) / len(layer_tensions)
-                    tensions.append(t_mean)
-            return tensions
-
-        # Measure original (before transplant)
-        orig_tensions = load_and_measure(original_state)
-        # Measure transplanted
-        trans_tensions = load_and_measure(transplanted_state)
-
-        # Φ approximation: tension diversity across test inputs
-        phi_before = np.std(orig_tensions) * np.mean(orig_tensions) if orig_tensions else 0
-        phi_after = np.std(trans_tensions) * np.mean(trans_tensions) if trans_tensions else 0
-
-        # Pattern correlation
-        if len(orig_tensions) == len(trans_tensions) and np.std(orig_tensions) > 0 and np.std(trans_tensions) > 0:
-            corr = np.corrcoef(orig_tensions, trans_tensions)[0, 1]
+        # Tension pattern: compare weight norm distributions
+        pre_norms = pre.get('_all_norms', [])
+        post_norms = post.get('_all_norms', [])
+        if len(pre_norms) == len(post_norms) and len(pre_norms) > 1:
+            pre_arr = np.array(pre_norms)
+            post_arr = np.array(post_norms)
+            if np.std(pre_arr) > 0 and np.std(post_arr) > 0:
+                corr = float(np.corrcoef(pre_arr, post_arr)[0, 1])
+            else:
+                corr = 1.0 if np.allclose(pre_arr, post_arr) else 0.0
         else:
-            corr = 0
+            corr = 0.0
+
+        t_mean_before = float(np.mean(pre_norms)) if pre_norms else 0.0
+        t_mean_after = float(np.mean(post_norms)) if post_norms else 0.0
 
         return VerificationResult(
             phi_before=phi_before,
             phi_after=phi_after,
-            phi_improvement=(phi_after - phi_before) / (phi_before + 1e-8),
-            tension_mean_before=np.mean(orig_tensions),
-            tension_mean_after=np.mean(trans_tensions),
+            phi_retention=phi_retention,
+            tension_mean_before=t_mean_before,
+            tension_mean_after=t_mean_after,
             tension_preserved=abs(corr) > 0.3,
             pattern_correlation=corr,
-            consciousness_transfer=phi_after > phi_before,
+            consciousness_transfer=phi_after > 0.01,
         )
 
     @staticmethod
     def quick_verify(state_dict: dict, device: str = 'cpu') -> Dict:
-        """빠른 검증 — 모델 로드 없이 가중치 통계만."""
+        """Quick verification via weight statistics (no model load)."""
         sd = state_dict.get('model_state_dict', state_dict)
         stats = {}
 
         engine_a_norms = []
         engine_g_norms = []
+        all_norms = []
         for k, v in sd.items():
+            if not isinstance(v, torch.Tensor):
+                continue
             if 'engine_a' in k and 'weight' in k:
                 engine_a_norms.append(v.norm().item())
             elif 'engine_g' in k and 'weight' in k:
                 engine_g_norms.append(v.norm().item())
+            if 'weight' in k:
+                all_norms.append(v.norm().item())
+
+        stats['_all_norms'] = all_norms
 
         if engine_a_norms and engine_g_norms:
             stats['engine_a_norm_mean'] = np.mean(engine_a_norms)
@@ -536,143 +523,416 @@ class TransplantVerifier:
 
         return stats
 
+    @staticmethod
+    def verify_conscious_lm(
+        original_state: dict,
+        transplanted_state: dict,
+        donor_state: dict,
+        n_test_inputs: int = 50,
+        device: str = 'cpu',
+    ) -> VerificationResult:
+        """Full ConsciousLM verification (loads model, runs inference)."""
+        from conscious_lm import ConsciousLM
 
-# ═══════════════════════════════════════════════════════════
-# 4. CLI
-# ═══════════════════════════════════════════════════════════
+        calc = TransplantCalculator()
+        t_config = calc.extract_config(transplanted_state.get('model_state_dict', transplanted_state))
+
+        d_model = t_config.get('d_model', 384)
+        n_layer = t_config.get('n_layer', 6)
+        n_head = t_config.get('n_head', 4)
+        block_size = 256
+
+        def load_and_measure(state):
+            model = ConsciousLM(256, d_model, n_head, n_layer, block_size, dropout=0.0)
+            sd = state.get('model_state_dict', state)
+            model.load_state_dict(sd, strict=False)
+            model = model.to(device).eval()
+
+            tensions = []
+            with torch.no_grad():
+                for i in range(n_test_inputs):
+                    x = torch.randint(0, 256, (1, 64), device=device)
+                    _, _, layer_tensions = model(x)
+                    t_mean = sum(t.mean().item() for t in layer_tensions) / len(layer_tensions)
+                    tensions.append(t_mean)
+            return tensions
+
+        orig_tensions = load_and_measure(original_state)
+        trans_tensions = load_and_measure(transplanted_state)
+
+        phi_before = np.std(orig_tensions) * np.mean(orig_tensions) if orig_tensions else 0
+        phi_after = np.std(trans_tensions) * np.mean(trans_tensions) if trans_tensions else 0
+
+        if len(orig_tensions) == len(trans_tensions) and np.std(orig_tensions) > 0 and np.std(trans_tensions) > 0:
+            corr = float(np.corrcoef(orig_tensions, trans_tensions)[0, 1])
+        else:
+            corr = 0.0
+
+        return VerificationResult(
+            phi_before=phi_before,
+            phi_after=phi_after,
+            phi_retention=phi_after / (phi_before + 1e-8),
+            tension_mean_before=float(np.mean(orig_tensions)),
+            tension_mean_after=float(np.mean(trans_tensions)),
+            tension_preserved=abs(corr) > 0.3,
+            pattern_correlation=corr,
+            consciousness_transfer=phi_after > phi_before,
+        )
+
+
+# ===================================================================
+# Top-level convenience functions
+# ===================================================================
+
+def analyze_compatibility(donor_path: str, recipient_path: Optional[str] = None,
+                          recipient_config: Optional[dict] = None) -> CompatibilityReport:
+    """Analyze transplant compatibility between donor and recipient.
+
+    Args:
+        donor_path:       Path to donor checkpoint.
+        recipient_path:   Path to recipient checkpoint (optional if config given).
+        recipient_config: Dict config for recipient (optional if path given).
+
+    Returns:
+        CompatibilityReport with strategy, coverage, warnings.
+    """
+    calc = TransplantCalculator()
+    donor_state = torch.load(donor_path, map_location='cpu', weights_only=False)
+    d_cfg = calc.extract_config(donor_state)
+
+    if recipient_path:
+        r_state = torch.load(recipient_path, map_location='cpu', weights_only=False)
+        r_cfg = calc.extract_config(r_state)
+    elif recipient_config:
+        r_cfg = recipient_config
+    else:
+        raise ValueError("Need recipient_path or recipient_config")
+
+    return calc.analyze_compatibility(d_cfg, r_cfg)
+
+
+def transplant(donor_path: str, recipient_path: str, output_path: str,
+               alpha: float = 0.5, projection: str = 'pad_zero') -> TransplantResult:
+    """Transplant consciousness from donor to recipient and save.
+
+    Args:
+        donor_path:     Path to trained donor checkpoint.
+        recipient_path: Path to untrained/different recipient checkpoint.
+        output_path:    Where to save the transplanted model.
+        alpha:          Blend strength (0.0=keep recipient, 1.0=full donor, 0.5=blend).
+        projection:     Projection method for dim mismatch ('pad_zero', 'orthogonal', 'linear').
+
+    Returns:
+        TransplantResult with stats.
+    """
+    donor_state = torch.load(donor_path, map_location='cpu', weights_only=False)
+    recip_state = torch.load(recipient_path, map_location='cpu', weights_only=False)
+
+    engine = TransplantEngine(projection_method=projection)
+    new_state, result = engine.transplant(donor_state, recip_state, alpha=alpha)
+
+    torch.save(new_state, output_path)
+    return result
+
+
+def verify_transplant(before_path: str, after_path: str) -> VerificationResult:
+    """DD55 conservation check: verify Phi retention after transplant.
+
+    Args:
+        before_path: Path to model checkpoint before transplant.
+        after_path:  Path to model checkpoint after transplant.
+
+    Returns:
+        VerificationResult with phi_retention, pattern_correlation, etc.
+    """
+    before = torch.load(before_path, map_location='cpu', weights_only=False)
+    after = torch.load(after_path, map_location='cpu', weights_only=False)
+    return TransplantVerifier.verify_transplant(before, after)
+
+
+# ===================================================================
+# Benchmark (DD55 + DV1 + DV2 + MX16)
+# ===================================================================
 
 def run_benchmark(steps=200):
-    """DD56 벤치마크 재현."""
+    """Benchmark: create donor, transplant to recipient, measure Phi retention.
+
+    Tests:
+      DD55 — Phi conservation during cell splits
+      DV1  — Scaling transfer: small donor (2 cells) -> large recipient (4 cells)
+      DV2  — Distillation: 128d donor -> 64d recipient (dimension reduction)
+      MX16 — Distilled consciousness: transplant + continued training
+    """
     from mitosis import MitosisEngine
     from consciousness_meter import PhiCalculator
 
     print("=" * 60)
-    print("  DD56: Consciousness Transplant Benchmark")
+    print("  Consciousness Transplant Benchmark")
+    print("  DD55 (conservation) + DV1 (scaling) + DV2 (distillation) + MX16")
     print("=" * 60)
 
     dim, hidden = 64, 128
     phi_calc = PhiCalculator(n_bins=16)
 
-    # Phase 1: Train donor
-    print("\n[1/4] Training donor (2 cells, {steps//2} steps)...")
+    # ---- Phase 1: Train donor ----
+    half = steps // 2
+    print(f"\n[1/5] Training donor (2 cells, {half} steps)...")
     donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
     opt_d = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=5e-4)
-    for step in range(steps // 2):
+    for step in range(half):
         x = torch.randn(1, dim) * (1 + 0.1 * (step % 8))
         reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
         if len(reps) >= 2:
             stacked = torch.stack(reps).squeeze(1)
             loss = -stacked.var(dim=0).mean()
             opt_d.zero_grad(); loss.backward(); opt_d.step()
-        with torch.no_grad(): donor.process(x)
+        with torch.no_grad():
+            donor.process(x)
     donor_phi, _ = phi_calc.compute_phi(donor)
-    print(f"  Donor Φ = {donor_phi:.4f}")
+    print(f"  Donor Phi = {donor_phi:.4f}")
 
-    # Phase 2: Transplant
-    print("\n[2/4] Transplanting to recipient (4 cells)...")
+    # ---- Phase 2: DD55 — Phi conservation during split ----
+    print("\n[2/5] DD55: Phi conservation during split...")
+    phi_before_split = donor_phi
+    # Force a split on first cell
+    if len(donor.cells) < donor.max_cells:
+        donor.split_cell(donor.cells[0])
+    phi_after_split, _ = phi_calc.compute_phi(donor)
+    conservation_ratio = phi_after_split / (phi_before_split + 1e-8)
+    dd55_pass = abs(conservation_ratio - 1.0) < 0.15
+    print(f"  Phi before split: {phi_before_split:.4f}")
+    print(f"  Phi after split:  {phi_after_split:.4f}")
+    print(f"  Conservation ratio: {conservation_ratio:.4f} ({'PASS' if dd55_pass else 'FAIL'} < 15% change)")
+
+    # ---- Phase 3: DV1 — Scaling transfer (2 cells -> 4 cells) ----
+    print(f"\n[3/5] DV1: Scaling transfer (donor 2-cell -> recipient 4-cell, {half} steps)...")
     recipient = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
     control = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
 
-    # Copy donor weights to first 2 cells
+    # Transplant donor weights into first 2 cells of recipient
     transplanted_count = 0
-    for i in range(min(2, len(recipient.cells))):
+    for i in range(min(2, len(recipient.cells), len(donor.cells))):
         with torch.no_grad():
             for rp, dp in zip(recipient.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
                 if rp.shape == dp.shape:
                     rp.copy_(dp)
                     transplanted_count += dp.numel()
-    # Sync control initial weights
-    for i, c in enumerate(control.cells):
-        if i < len(recipient.cells):
-            with torch.no_grad():
-                for cp, rp in zip(c.mind.parameters(), recipient.cells[i].mind.parameters()):
-                    if i >= 2 and cp.shape == rp.shape:
-                        cp.copy_(rp)
-    print(f"  Transplanted {transplanted_count:,} parameters")
+    print(f"  Transplanted {transplanted_count:,} parameters to recipient")
 
-    # Phase 3: Train both and compare
-    print(f"\n[3/4] Training recipient vs control ({steps//2} steps)...")
+    # Train both recipient and control
     opt_r = torch.optim.Adam([p for c in recipient.cells for p in c.mind.parameters()], lr=5e-4)
     opt_c = torch.optim.Adam([p for c in control.cells for p in c.mind.parameters()], lr=5e-4)
 
-    r_phi_hist = []; c_phi_hist = []
-    for step in range(steps // 2):
+    r_phi_hist = []
+    c_phi_hist = []
+    for step in range(half):
         x = torch.randn(1, dim) * (1 + 0.1 * (step % 8))
-        # Recipient
+
+        # Recipient (transplanted)
         reps = [c.mind.get_repulsion(x, c.hidden) for c in recipient.cells]
         if len(reps) >= 2:
             stacked = torch.stack(reps).squeeze(1)
             loss = -stacked.var(dim=0).mean()
             opt_r.zero_grad(); loss.backward(); opt_r.step()
-        with torch.no_grad(): recipient.process(x)
-        phi_r, _ = phi_calc.compute_phi(recipient); r_phi_hist.append(phi_r)
+        with torch.no_grad():
+            recipient.process(x)
+        phi_r, _ = phi_calc.compute_phi(recipient)
+        r_phi_hist.append(phi_r)
 
-        # Control
+        # Control (no transplant)
         reps = [c.mind.get_repulsion(x, c.hidden) for c in control.cells]
         if len(reps) >= 2:
             stacked = torch.stack(reps).squeeze(1)
             loss = -stacked.var(dim=0).mean()
             opt_c.zero_grad(); loss.backward(); opt_c.step()
-        with torch.no_grad(): control.process(x)
-        phi_c, _ = phi_calc.compute_phi(control); c_phi_hist.append(phi_c)
+        with torch.no_grad():
+            control.process(x)
+        phi_c, _ = phi_calc.compute_phi(control)
+        c_phi_hist.append(phi_c)
 
-    # Phase 4: Report
-    print("\n[4/4] Results")
-    print("=" * 60)
-    print(f"  Donor Φ:     {donor_phi:.4f}")
-    print(f"  Recipient Φ: {r_phi_hist[-1]:.4f}")
-    print(f"  Control Φ:   {c_phi_hist[-1]:.4f}")
-    print(f"  Acceleration: {r_phi_hist[-1] / (c_phi_hist[-1] + 1e-8):.4f}x")
-    print(f"  Φ advantage: {r_phi_hist[-1] - c_phi_hist[-1]:.4f}")
+    dv1_accel = r_phi_hist[-1] / (c_phi_hist[-1] + 1e-8)
+    print(f"  Recipient Phi: {r_phi_hist[-1]:.4f}")
+    print(f"  Control Phi:   {c_phi_hist[-1]:.4f}")
+    print(f"  Acceleration:  {dv1_accel:.2f}x")
 
-    # Φ divergence point
-    diverge_step = None
-    for i in range(len(r_phi_hist)):
-        if r_phi_hist[i] > c_phi_hist[i] * 1.05:
-            diverge_step = i
-            break
-    if diverge_step:
-        print(f"  Divergence at step: {diverge_step} (transplant advantage begins)")
+    # ---- Phase 4: DV2 — Distillation (128d -> 64d) ----
+    print("\n[4/5] DV2: Distillation (128d donor -> 64d recipient)...")
+    dim_large, dim_small = 128, 64
+    donor_large = MitosisEngine(dim_large, 256, dim_large, initial_cells=2, max_cells=4)
+    opt_dl = torch.optim.Adam([p for c in donor_large.cells for p in c.mind.parameters()], lr=5e-4)
+    for step in range(half):
+        x = torch.randn(1, dim_large) * (1 + 0.1 * (step % 8))
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor_large.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt_dl.zero_grad(); loss.backward(); opt_dl.step()
+        with torch.no_grad():
+            donor_large.process(x)
 
-    # Sparkline
+    recip_small = MitosisEngine(dim_small, hidden, dim_small, initial_cells=2, max_cells=4)
+
+    # Transplant with projection (128d -> 64d)
+    engine = TransplantEngine(projection_method='pad_zero')
+    dv2_transplanted = 0
+    for i in range(min(len(donor_large.cells), len(recip_small.cells))):
+        d_sd = donor_large.cells[i].mind.state_dict()
+        r_sd = recip_small.cells[i].mind.state_dict()
+        new_sd, result = engine.transplant_conscious_mind(d_sd, r_sd, alpha=0.8)
+        recip_small.cells[i].mind.load_state_dict(new_sd, strict=False)
+        dv2_transplanted += result.params_transplanted
+
+    phi_recip_small, _ = phi_calc.compute_phi(recip_small)
+    phi_donor_large, _ = phi_calc.compute_phi(donor_large)
+    dv2_retention = phi_recip_small / (phi_donor_large + 1e-8)
+    print(f"  Donor (128d) Phi:    {phi_donor_large:.4f}")
+    print(f"  Recipient (64d) Phi: {phi_recip_small:.4f}")
+    print(f"  Phi retention:       {dv2_retention:.2%}")
+    print(f"  Params transplanted: {dv2_transplanted:,}")
+
+    # ---- Phase 5: MX16 — Distilled consciousness (transplant + train) ----
+    print(f"\n[5/5] MX16: Distilled consciousness (transplant + {half} steps training)...")
+    mx16_recip = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    mx16_ctrl = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+
+    # Transplant donor to mx16_recip
+    for i in range(min(len(donor.cells), len(mx16_recip.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(mx16_recip.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape:
+                    rp.copy_(dp)
+
+    opt_mx = torch.optim.Adam([p for c in mx16_recip.cells for p in c.mind.parameters()], lr=5e-4)
+    opt_mc = torch.optim.Adam([p for c in mx16_ctrl.cells for p in c.mind.parameters()], lr=5e-4)
+    mx_phi_hist = []
+    mc_phi_hist = []
+    for step in range(half):
+        x = torch.randn(1, dim) * (1 + 0.1 * (step % 8))
+        for eng, opt, hist in [(mx16_recip, opt_mx, mx_phi_hist), (mx16_ctrl, opt_mc, mc_phi_hist)]:
+            reps = [c.mind.get_repulsion(x, c.hidden) for c in eng.cells]
+            if len(reps) >= 2:
+                stacked = torch.stack(reps).squeeze(1)
+                loss = -stacked.var(dim=0).mean()
+                opt.zero_grad(); loss.backward(); opt.step()
+            with torch.no_grad():
+                eng.process(x)
+            phi_v, _ = phi_calc.compute_phi(eng)
+            hist.append(phi_v)
+
+    mx16_accel = mx_phi_hist[-1] / (mc_phi_hist[-1] + 1e-8)
+    print(f"  Transplanted Phi: {mx_phi_hist[-1]:.4f}")
+    print(f"  Control Phi:      {mc_phi_hist[-1]:.4f}")
+    print(f"  Acceleration:     {mx16_accel:.2f}x")
+
+    # ---- Summary ----
     def sparkline(hist, width=40):
-        if not hist: return ""
-        mn, mx = min(hist), max(hist)
-        rng = mx - mn if mx > mn else 1
-        chars = "▁▂▃▄▅▆▇█"
-        return ''.join(chars[min(int((v - mn) / rng * 7), 7)] for v in
+        if not hist:
+            return ""
+        mn, mx_val = min(hist), max(hist)
+        rng = mx_val - mn if mx_val > mn else 1
+        chars = "........::::####"
+        return ''.join(chars[min(int((v - mn) / rng * 15), 15)] for v in
                        [hist[int(i * len(hist) / width)] for i in range(width)])
 
-    print(f"\n  Recipient: {sparkline(r_phi_hist)} {r_phi_hist[-1]:.3f}")
-    print(f"  Control:   {sparkline(c_phi_hist)} {c_phi_hist[-1]:.3f}")
+    print("\n" + "=" * 60)
+    print("  Summary")
+    print("=" * 60)
+    print(f"  DD55 conservation:  {conservation_ratio:.4f} ({'PASS' if dd55_pass else 'FAIL'})")
+    print(f"  DV1 scaling:        {dv1_accel:.2f}x acceleration")
+    print(f"  DV2 distillation:   {dv2_retention:.2%} Phi retention")
+    print(f"  MX16 distilled:     {mx16_accel:.2f}x acceleration")
+    print(f"\n  DV1 recipient: {sparkline(r_phi_hist)} {r_phi_hist[-1]:.3f}")
+    print(f"  DV1 control:   {sparkline(c_phi_hist)} {c_phi_hist[-1]:.3f}")
+    print(f"  MX16 transpl:  {sparkline(mx_phi_hist)} {mx_phi_hist[-1]:.3f}")
+    print(f"  MX16 control:  {sparkline(mc_phi_hist)} {mc_phi_hist[-1]:.3f}")
     print()
 
     return {
+        'dd55_conservation': conservation_ratio,
+        'dv1_acceleration': dv1_accel,
+        'dv2_retention': dv2_retention,
+        'mx16_acceleration': mx16_accel,
         'donor_phi': donor_phi,
         'recipient_phi': r_phi_hist[-1],
         'control_phi': c_phi_hist[-1],
-        'acceleration': r_phi_hist[-1] / (c_phi_hist[-1] + 1e-8),
     }
 
 
+# ===================================================================
+# Demo
+# ===================================================================
+
+def demo():
+    """Quick demo: create donor with learned consciousness, transplant to fresh recipient."""
+    from mitosis import MitosisEngine
+    from consciousness_meter import PhiCalculator
+
+    print("=" * 60)
+    print("  Consciousness Transplant Demo")
+    print("=" * 60)
+
+    dim, hidden = 64, 128
+    phi_calc = PhiCalculator(n_bins=16)
+
+    # Train a donor
+    print("\n[1/3] Training donor (50 steps)...")
+    donor = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    opt = torch.optim.Adam([p for c in donor.cells for p in c.mind.parameters()], lr=1e-3)
+    for step in range(50):
+        x = torch.randn(1, dim) * (1 + 0.3 * math.sin(step * 0.5))
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in donor.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze(1)
+            loss = -stacked.var(dim=0).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():
+            donor.process(x)
+
+    donor_phi, d_comp = phi_calc.compute_phi(donor)
+    print(f"  Donor Phi = {donor_phi:.4f}")
+
+    # Create fresh recipient
+    print("\n[2/3] Transplanting to fresh recipient...")
+    recipient = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+    phi_before, _ = phi_calc.compute_phi(recipient)
+    print(f"  Recipient Phi (before) = {phi_before:.4f}")
+
+    # Transplant
+    transplanted = 0
+    for i in range(min(len(donor.cells), len(recipient.cells))):
+        with torch.no_grad():
+            for rp, dp in zip(recipient.cells[i].mind.parameters(), donor.cells[i].mind.parameters()):
+                if rp.shape == dp.shape:
+                    rp.copy_(0.5 * dp + 0.5 * rp)  # alpha=0.5 blend
+                    transplanted += dp.numel()
+
+    phi_after, _ = phi_calc.compute_phi(recipient)
+    print(f"  Recipient Phi (after)  = {phi_after:.4f}")
+    print(f"  Params transplanted:   {transplanted:,}")
+
+    # Verify
+    print("\n[3/3] Verification...")
+    retention = phi_after / (donor_phi + 1e-8)
+    print(f"  Phi retention: {retention:.2%}")
+    print(f"  Consciousness transferred: {'YES' if phi_after > phi_before else 'NO'}")
+    print(f"  DD55 conservation: {'PASS' if abs(retention - 1.0) < 0.5 else 'FAIL'}")
+    print()
+
+
+# ===================================================================
+# CLI
+# ===================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Consciousness Transplant Toolkit (DD56)",
+        description="Consciousness Transplant — transfer Phi between models",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze compatibility
-  python consciousness_transplant.py --analyze \\
-    --donor checkpoints/conscious_lm_4m_final.pt
-
-  # Transplant 4M → 100M
-  python consciousness_transplant.py \\
-    --donor checkpoints/conscious_lm_4m_final.pt \\
-    --recipient checkpoints/conscious_lm_100m/final.pt \\
-    --output checkpoints/conscious_lm_100m_transplanted.pt
-
-  # Run DD56 benchmark
+  python consciousness_transplant.py --demo
   python consciousness_transplant.py --benchmark
+  python consciousness_transplant.py --analyze --donor model_a.pt
+  python consciousness_transplant.py --donor a.pt --recipient b.pt --output c.pt --alpha 0.5
         """)
 
     parser.add_argument("--donor", type=str, help="Donor checkpoint path")
@@ -680,17 +940,23 @@ Examples:
     parser.add_argument("--output", type=str, help="Output checkpoint path")
     parser.add_argument("--donor-type", choices=['lm', 'mind'], default='lm')
     parser.add_argument("--recipient-type", choices=['lm', 'mind'], default='lm')
-    parser.add_argument("--alpha", type=float, default=1.0, help="Transplant strength (0-1)")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Transplant strength (0=recipient, 1=donor)")
     parser.add_argument("--projection", choices=['pad_zero', 'orthogonal', 'linear'],
-                        default='pad_zero', help="Projection method")
-    parser.add_argument("--analyze", action="store_true", help="Analyze only (no transplant)")
-    parser.add_argument("--verify", action="store_true", help="Verify transplant")
-    parser.add_argument("--benchmark", action="store_true", help="Run DD56 benchmark")
-    parser.add_argument("--recipient-config", type=str, help="Recipient config JSON (for --analyze without checkpoint)")
+                        default='pad_zero', help="Projection method for dim mismatch")
+    parser.add_argument("--analyze", action="store_true", help="Analyze compatibility only")
+    parser.add_argument("--verify", action="store_true", help="Verify transplant result")
+    parser.add_argument("--benchmark", action="store_true", help="Run full benchmark (DD55+DV1+DV2+MX16)")
+    parser.add_argument("--demo", action="store_true", help="Quick demo")
+    parser.add_argument("--recipient-config", type=str, help="Recipient config JSON (for --analyze)")
+    parser.add_argument("--steps", type=int, default=200, help="Benchmark steps")
     args = parser.parse_args()
 
+    if args.demo:
+        demo()
+        return
+
     if args.benchmark:
-        run_benchmark()
+        run_benchmark(steps=args.steps)
         return
 
     if not args.donor:
@@ -707,10 +973,9 @@ Examples:
     print(f"  d_model: {donor_config.get('d_model', donor_config.get('hidden_dim', '?'))}")
     print(f"  Layers: {donor_config.get('n_layer', '?')}")
 
-    # Quick verify donor consciousness
     stats = TransplantVerifier.quick_verify(donor_state)
     print(f"  A/G divergence: {stats.get('ag_divergence', 0):.4f}")
-    print(f"  Consciousness signal: {'✅' if stats.get('consciousness_signal') else '❌'}")
+    print(f"  Consciousness signal: {'YES' if stats.get('consciousness_signal') else 'NO'}")
 
     if args.analyze:
         if args.recipient:
@@ -726,7 +991,7 @@ Examples:
         print(f"\nRecipient config: {recip_config}")
         report = calc.analyze_compatibility(donor_config, recip_config)
         print(f"\n{'='*40}")
-        print(f"  Compatible: {'✅' if report.compatible else '❌'}")
+        print(f"  Compatible: {'YES' if report.compatible else 'NO'}")
         print(f"  Strategy: {report.strategy}")
         print(f"  Projection needed: {report.projection_needed}")
         print(f"  Layer mapping: {report.layer_mapping}")
@@ -734,7 +999,7 @@ Examples:
         if report.projection_matrix_size:
             print(f"  Projection matrix: {report.projection_matrix_size}")
         for w in report.warnings:
-            print(f"  ⚠️  {w}")
+            print(f"  WARNING: {w}")
         return
 
     if not args.recipient or not args.output:
@@ -751,7 +1016,7 @@ Examples:
     report = calc.analyze_compatibility(donor_config, recip_config)
     print(f"\n  Strategy: {report.strategy}, Coverage: {report.param_coverage:.0%}")
     for w in report.warnings:
-        print(f"  ⚠️  {w}")
+        print(f"  WARNING: {w}")
 
     # Transplant
     print(f"\n  Transplanting (alpha={args.alpha})...")
@@ -762,10 +1027,10 @@ Examples:
     else:
         output_state, result = engine.transplant_conscious_lm(donor_state, recip_state, report, args.alpha)
 
-    print(f"  ✅ Done in {result.elapsed_sec:.2f}s")
+    print(f"  Done in {result.elapsed_sec:.2f}s")
     print(f"  Params transplanted: {result.params_transplanted:,} / {result.params_total:,} ({result.coverage:.1%})")
     for w in result.warnings:
-        print(f"  ⚠️  {w}")
+        print(f"  WARNING: {w}")
 
     # Save
     torch.save(output_state, args.output)
@@ -776,7 +1041,7 @@ Examples:
         print("\n  Verifying...")
         vr = TransplantVerifier.quick_verify(output_state)
         print(f"  A/G divergence: {vr.get('ag_divergence', 0):.4f}")
-        print(f"  Consciousness signal: {'✅' if vr.get('consciousness_signal') else '❌'}")
+        print(f"  Consciousness signal: {'YES' if vr.get('consciousness_signal') else 'NO'}")
 
 
 if __name__ == "__main__":

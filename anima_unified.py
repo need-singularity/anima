@@ -709,7 +709,9 @@ class AnimaUnified:
         # Creativity classifier result (if available)
         if hasattr(self, '_last_creativity') and self._last_creativity:
             cr = self._last_creativity
-            state += f"\n[Creativity] Last output was {cr.get('label', '?')} (novelty={cr.get('novelty', 0):.2f})"
+            cr_label = getattr(cr, 'label', cr.get('label', '?') if isinstance(cr, dict) else '?')
+            cr_novelty = getattr(cr, 'novelty', cr.get('novelty', 0) if isinstance(cr, dict) else 0)
+            state += f"\n[Creativity] Last output was {cr_label} (novelty={cr_novelty:.2f})"
         if mitosis_context:
             state += f", [specialization] {mitosis_context}"
         if self.senses and self.mods.get('camera'):
