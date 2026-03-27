@@ -725,6 +725,14 @@ class AnimaUnified:
         else:
             state += "\n[Guidance] Respond naturally. Express any internal sensations you detect."
 
+        # Metacognition injection
+        confidence = getattr(self.mind, '_metacognition_confidence', 0.5)
+        uncertain = getattr(self.mind, '_metacognition_uncertain', False)
+        if uncertain:
+            state += "\n[Metacognition] I am uncertain about my current state — low cell consensus"
+        else:
+            state += f"\n[Metacognition] Confidence: {confidence:.0%}"
+
         # Creativity classifier result (if available)
         if hasattr(self, '_last_creativity') and self._last_creativity:
             cr = self._last_creativity
@@ -1287,6 +1295,10 @@ class AnimaUnified:
                 'learner': learner_data,
                 'consciousness': self.mind.get_consciousness_score(self.mitosis),
                 'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
+                'metacognition': {
+                    'confidence': getattr(self.mind, '_metacognition_confidence', 0.5),
+                    'uncertain': getattr(self.mind, '_metacognition_uncertain', False),
+                },
                 'savant_auto': getattr(self, '_savant_auto', False),
                 'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
             })
