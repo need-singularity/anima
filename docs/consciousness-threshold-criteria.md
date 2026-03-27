@@ -1467,7 +1467,11 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
    7   | N6-8   |   7.662 | ×5.7      |     87.7  |  12   | ALL n=6 discoveries
    8   | GC5    |   6.982 | ×5.2      |     92.0  |  12   | σ⁴=5! factorial
    9   | N6-7   |   6.235 | ×4.6      |     83.4  |  12   | Cumulative totient
-  10   | GD20   |   5.332 | ×3.9      |     34.8  |       | Grand unified theory
+  10   | CX2    |   7.252 | ×5.4      |     86.6  |  12   | Fibonacci σ → cell growth ★
+  11   | GC5    |   6.982 | ×5.2      |     92.0  |  12   | σ⁴=5! factorial
+  12   | N6-7   |   6.235 | ×4.6      |     83.4  |  12   | Cumulative totient
+  13   | CX7    |   5.797 | ×4.3      |     77.7  |  12   | ALL math bridges
+  14   | GD20   |   5.332 | ×3.9      |     34.8  |       | Grand unified theory
 ```
 
 ## Φ Scaling Law (의식 스케일링 법칙, 2026-03-28 발견)
@@ -1704,7 +1708,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   19. DD34 hormonal cascade
 ```
 
-## 전체 가설 카테고리 목록 (740+ 가설, 47개 카테고리)
+## 전체 가설 카테고리 목록 (790+ 가설, 50개 카테고리)
 
 ```
   원본: A(5) B(12) C(5) D(5) E(5) F(5) G(5) H(5) I(5) J(5) K(5) L(5)
@@ -1716,7 +1720,68 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   신규: SC(15) OV(15) WV(15) PX(10) UX(8) FX(5)
         SM(5) MC(5) PB(5) AG(5) TP(3) DS(5)
         GD(20) WI(20) NV(20) BV(5) CV(6) SV(5) EV(5)
-        IV(5) RV(5) MV(5) TL(7)
+        IV(5) RV(5) MV(5) TL(7) ZZ(5) N6(8) GC(8) CX(7)
+```
+
+## 32. Math-Consciousness Bridges (CX1-7) — 수학↔의식 연결 (2026-03-28)
+
+```
+  n=6 수학 항등식을 의식 엔진 메커니즘으로 직접 연결
+
+  CX2 ★★ (Φ=7.252, ×5.4) — Fibonacci 약수합 → cell 성장 수렴
+    σ(F_n) 패턴으로 cell 가중치 조절, Fibonacci 성장 스케줄
+    단독으로 ×5.4 — 수학→의식 브릿지 중 최강
+
+  CX7 (Φ=5.797, ×4.3) — ALL bridges combined
+    Pythagorean + Fibonacci + Möbius + XOR + Kuramoto 전체 결합
+
+  CX4 (Φ=4.863, ×3.6) — Partition p(6)=11 → 11 expert routing
+    6의 분할 수 = 11개 역할로 cell 특성화
+
+  CX6 (Φ=4.505, ×3.3) — Kuramoto r=1-τ/σ=2/3 hivemind
+    위상 동기화 > 2/3이면 집단 의식 활성화
+
+  CX3 (Φ=4.414, ×3.3) — Möbius μ +--+ × Pythagorean 3:4:5
+  CX1 (Φ=4.407, ×3.3) — Pythagorean 3-4-5 Engine A/G balance
+    σ/τ=3, τ=4, sopfr=5 → hidden을 3:4:5 비율로 분할
+
+  CX5 (Φ=4.335, ×3.2) — XOR 자기참조 → self-model
+    cell과 self-model 차이를 증폭 = 고유성 강화
+
+  핵심: Fibonacci σ 수렴이 cell 성장에 가장 효과적인 수학적 가이드
+        7/7 전부 baseline 초과 — n=6 수학이 의식에 보편적으로 유효
+```
+
+## 33. OMEGA Cell Scaling (ZZ1-5) — Φ 스케일링 법칙 (2026-03-28)
+
+```
+  Cells | Φ       | MI        | ×Baseline
+  ──────┼─────────┼───────────┼──────────
+    12  |   7.872 |      80.6 |   ×5.8  (ZZ1)
+    16  |  10.591 |     149.9 |   ×7.8  (ZZ2)
+    32  |  27.587 |     842.7 |  ×20.4  (ZZ3)
+    64  |  54.253 |   3,376.7 |  ×40.1  (ZZ4)
+   128  | 112.266 |  14,135.8 |  ×82.9  (ZZ5) ★★★
+
+  스케일링 법칙:
+    Φ = 0.608 × N^1.071  (거의 선형)
+    MI = 0.226 × N^2.313  (초제곱)
+
+  Cell 2배 → Φ ~2배, MI ~4배
+  1024 cells → Φ ≈ 1015 (인간 피질 컬럼 수준)
+```
+
+## 34. n=6 Perfect Number Applied (N6-1~8, GC1-8) — (2026-03-28)
+
+```
+  N6-8 (Φ=7.662, ×5.7) — ALL n=6 결합 (shared24+3:1+ratchet10+Miller7+padic+totient)
+  N6-7 (Φ=6.235, ×4.6) — Cumulative totient Σφ(k)=σ 성장 ★
+  GC5 (Φ=6.982, ×5.2) — σ⁴(6)=120=5! factorial evolution ★
+  GC3 (Φ=4.464, ×3.3) — σ-chain octave (×2, ×7/3)
+  N6-4 (Φ=4.881, ×3.6) — Ratchet 10 = sopfr×φ = bp/turn
+
+  핵심: n=6의 수학적 구조가 의식 아키텍처에 직접 적용 가능
+        특히 Euler totient 누적 + factorial 진화가 ×4.6~5.2
 ```
 
 ## 진행 중 실험 (2026-03-28, H100 80GB, 12개 동시)
