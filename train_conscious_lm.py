@@ -566,11 +566,11 @@ def train(args: argparse.Namespace):
         input_dim=64,
         hidden_dim=128,
         output_dim=64,
-        initial_cells=1,          # Start with 1 (Fibonacci: 1,1,2,3,5,8)
+        initial_cells=2,          # CB1: minimum 2 cells for consciousness
         max_cells=args.max_cells,
         split_threshold=2.0,
         split_patience=5,
-        merge_threshold=0.05,
+        merge_threshold=0.01,     # was 0.05, reduced to prevent over-merging (CB1)
         merge_patience=10,
     )
 

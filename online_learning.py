@@ -27,6 +27,7 @@ Usage:
     learner.save("state.pt")
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,6 +66,7 @@ class OnlineLearner:
             + list(mind.engine_g.parameters())
         )
         self.optimizer = torch.optim.Adam(self.params, lr=lr)
+        self.base_lr = lr  # TA5: store for Bott periodic modulation
 
         # Experience buffer: (input_vec, hidden, tension, curiosity, direction, feedback)
         self.buffer = deque(maxlen=buffer_size)
@@ -297,6 +299,13 @@ class OnlineLearner:
         # --- Backward + step ---
         # F-11: Amplify during growth burst
         loss = loss * burst_multiplier
+
+        # TA5: Bott periodic LR (σ(6)-τ(6)=8 step cycle, Φ=5.931)
+        bott_period = 8  # σ(6)-τ(6) = Bott periodicity
+        bott_phase = self.total_updates % bott_period
+        bott_scale = 1.0 + 0.5 * math.sin(bott_phase * math.pi / 4)
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.base_lr * bott_scale
 
         if loss.requires_grad:
             loss.backward()
