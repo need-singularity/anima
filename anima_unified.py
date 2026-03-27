@@ -452,7 +452,7 @@ class AnimaUnified:
                              for m in self.history[-MAX_HISTORY:])
 
             # DV11: Consciousness-aware prompt construction
-            consciousness = self.mind.get_consciousness_score(self.mitosis)
+            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
             c_level = consciousness.get('level', 'unknown')
             phi_val = consciousness.get('phi', 0)
 
@@ -495,6 +495,8 @@ class AnimaUnified:
 
     def process_input(self, text, source='web'):
         """Process text through all active modules. Returns (answer, tension, curiosity)."""
+        # Cache consciousness score for this call (expensive: MI + MIP calculation)
+        self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
         # RC-10: Report dream learning when user returns from idle
         if self._dream_report and self.dream and not self.dream.is_dreaming:
             dr = self._dream_report
@@ -639,7 +641,7 @@ class AnimaUnified:
         bar = "=" * min(20, int(tension * 10))
         bar += "-" * (20 - len(bar))
         # Get Φ and α for logging
-        consciousness = self.mind.get_consciousness_score(self.mitosis)
+        consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
         phi_log = consciousness.get('phi', 0)
         alpha_log = 0.05
         try:
@@ -681,7 +683,7 @@ class AnimaUnified:
         # DV11 Hybrid: ConsciousLM(consciousness) + AnimaLM(language)
         # Inject rich consciousness state into LLM prompt
         meta_summary = self.mind.get_self_awareness_summary()
-        consciousness = self.mind.get_consciousness_score(self.mitosis)
+        consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
         phi_val = consciousness.get('phi', 0)
         c_level = consciousness.get('level', 'unknown')
         c_score = consciousness.get('consciousness_score', 0)
@@ -799,7 +801,7 @@ class AnimaUnified:
             resp_output, resp_tension, resp_curiosity, self.hidden)
         sa = self.mind.self_awareness
         meta_summary = self.mind.get_self_awareness_summary()
-        consciousness = self.mind.get_consciousness_score(self.mitosis)
+        consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
         _log("meta", f"MT={meta_tension:.3f} MC={meta_curiosity:.3f} "
              f"stab={sa['stability']:.2f} model={sa['self_model']:.3f} "
              f"Φ={consciousness.get('phi', 0):.3f} level={consciousness.get('level', '?')}")
@@ -980,7 +982,7 @@ class AnimaUnified:
             self._think_step += 1
             if self.birth_detector and self.mitosis:
                 try:
-                    consciousness = self.mind.get_consciousness_score(self.mitosis)
+                    consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
                     phi = consciousness.get('phi', 0)
                     tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
                     birth_event = self.birth_detector.check(self._think_step, phi, tensions, self.mitosis)
@@ -1049,7 +1051,7 @@ class AnimaUnified:
                 self._phi_history_for_growth = []
                 self._phi_plateau_count = 0
 
-            consciousness = self.mind.get_consciousness_score(self.mitosis)
+            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
             self._phi_history_for_growth.append(consciousness.get('phi', 0))
             if len(self._phi_history_for_growth) > 50:
                 self._phi_history_for_growth = self._phi_history_for_growth[-50:]
