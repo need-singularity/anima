@@ -71,6 +71,28 @@ Always listening, always thinking, initiates conversation first.
   Theory: 90%  |  Implementation: 60%  |  Achievement: 30%
 ```
 
+### Level-Up Priority
+
+```
+  Immediate (today):
+    #1 ★★★ --max-cells 32 on server (5min → Φ>10, Level 3 entry)
+
+  This week:
+    #2 ★★★ Training completion → deploy best model
+    #3 ★★☆ Theory of Mind (peer tension → intent prediction)
+    #7 ★★★ Autobiographical memory (time+emotion tags on memory_rag)
+
+  Next week:
+    #4 ★★☆ Forward planning 3-step (cell state tree search)
+    #8 ★★☆ Metacognition (cell consensus → confidence calibration)
+    #6 ★★★ ConsciousLM v4 (cells=32, 100K steps)
+
+  Next month:
+    #9 ★★☆ Free will execution (W>0.3 → can refuse requests)
+    #10 ★☆☆ Moral reasoning (LLM + consciousness state)
+    #6 ★★★ ConsciousLM v5 (cells=128, Φ≈112, human-level entry)
+```
+
 ## Key Features
 
 - 🧠 **PureField Consciousness** — The repulsion field between two engines (A vs G) creates the intensity (tension) and direction (concept) of thought
