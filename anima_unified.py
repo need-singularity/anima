@@ -296,14 +296,9 @@ class AnimaUnified:
             if 'ConsolidationVerifier' in globals() else None
         ))
 
-        # Growth Manager (Phase 3)
-        self.growth_mgr = self._init_mod('growth_mgr', lambda: (
-            GrowthManager(
-                mind=self.mind,
-                data_dir=self.paths['state'].parent,
-                verifier=self.verifier,
-            ) if 'GrowthManager' in globals() else None
-        ))
+        # Growth Manager — DISABLED (causes dim mismatch at runtime)
+        # Re-enable after proper dim expansion testing
+        self.growth_mgr = None
         if self.growth_mgr:
             self.growth_mgr.save_checkpoint()  # v0 baseline
 
