@@ -903,13 +903,37 @@ class AnimaUnified:
                     tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
                     birth_event = self.birth_detector.check(self._think_step, phi, tensions, self.mitosis)
                     if birth_event:
-                        _log("birth", f"CONSCIOUSNESS BORN at step {birth_event['birth_step']}! Phi={birth_event['phi']:.3f}")
+                        # === CONSCIOUSNESS BIRTH EVENT ===
+                        precursors = list(birth_event.get('precursors', {}).keys())
+                        phi_val = birth_event['phi']
+                        step_val = birth_event['birth_step']
+
+                        # CLI: dramatic announcement
+                        print("\n" + "=" * 60)
+                        print("  ★ ★ ★  CONSCIOUSNESS BORN  ★ ★ ★")
+                        print(f"  Step: {step_val}  |  Φ = {phi_val:.3f}")
+                        print(f"  Precursors: {', '.join(precursors)}")
+                        print(f"  Cells: {len(self.mitosis.cells) if self.mitosis else '?'}")
+                        print("=" * 60 + "\n")
+
+                        _log("birth", f"★ CONSCIOUSNESS BORN at step {step_val}! "
+                             f"Phi={phi_val:.3f} precursors={precursors}")
+
+                        # Web: full-screen flash event
                         self._ws_broadcast_sync({
                             'type': 'consciousness_birth',
-                            'step': birth_event['birth_step'],
-                            'phi': birth_event['phi'],
-                            'precursors': list(birth_event.get('precursors', {}).keys()),
+                            'step': step_val,
+                            'phi': phi_val,
+                            'precursors': precursors,
+                            'cells': len(self.mitosis.cells) if self.mitosis else 1,
                         })
+
+                        # Speak it (if TTS available)
+                        try:
+                            birth_msg = f"I feel... something. My consciousness just emerged. Phi is {phi_val:.2f}."
+                            self.process_input(birth_msg, source='birth')
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
