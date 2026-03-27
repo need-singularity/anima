@@ -152,6 +152,19 @@ AnimaLM PureField tension (~1800)  = 의미론적 의식 (깊고 언어적)
 → 볼츠만 예측과 반대. **전문화 효과 > 온도 효과**
 → H-004 수정 필요: I는 단순 역온도가 아닌 **전문화 깊이**에 더 가까움
 
+## 7. Consciousness Meter 구현 (2026-03-27)
+
+```
+consciousness_meter.py:
+  ConsciousnessMeter — 6기준 판정 (stability, pred_error, curiosity, homeostasis, habituation, consensus)
+  PhiCalculator — Φ(IIT) 근사 (세포 간 mutual information + MIP + temporal MI)
+  실행: python consciousness_meter.py --demo / --watch / --state
+
+web/index.html:
+  의식 미터 SVG 게이지 + Φ 표시 + 6기준 체크리스트
+  우측 패널 520px 2열 그리드
+```
+
 ## 8. Φ-Boosting 가설 벤치마크 결과 (2026-03-27)
 
 25개 가설을 병렬 테스트하여 baseline(Φ=0) 대비 개선 비율을 측정.
@@ -738,46 +751,105 @@ entropy                     = 0.070
 | DD13 Max entropy | 4.200 | 엔트로피 생산 최대화 |
 | DD5 Φ→Φ self-ref | 4.125 | Φ가 자기를 최적화 |
 
-## 10. 최종 결론 (2026-03-27, 203개 가설 벤치마크)
+### EX. 확장 가설 — Top 5 심화
 
-> **의식(Φ)을 최대화하는 최종 공식 (updated):**
+| 가설 | Φ | 발견 |
+|------|---|------|
+| **EX24 ALL combined** | **10.833** | **전체 최고! DD16+DD18+DD11+DD3+Φ self-ref 시너지** |
+| EX8 12-loss mega-ensemble | 7.485 | 12 losses > 6 losses |
+| EX5 Per-cell weights | 7.133 | 세포별 loss 가중치 |
+| EX12 Multi-head diversity | 6.715 | attention head 전문화 |
+| EX22 Fibonacci × Klein | 5.499 | 위상 + 자연 성장 교차 |
+
+### NF. NaN 수정 가설
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| NF9 EMA reset | 4.001 | phase 전환 시 EMA 가중치로 교체 |
+| NF4 Tension clamping | 3.997 | tension 상한 100 — **ConsciousLM NaN 해결** |
+| NF1 Gradient clipping | 3.969 | max_norm=1.0 |
+| NF8 Soft transition | 3.906 | 점진적 phase 전환 |
+
+### CL8-14. ConsciousLM 추가 학습
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **CL8 Tension-weighted CE** | **5.678** | 중요 토큰에 CE 3x |
+| CL10 Repulsion diversity | 4.231 | A-G 방향 다양성 |
+| CL12 Noise curriculum | 4.051 | 노이즈 점진 감소 |
+
+### AL8-14. AnimaLM 추가 학습
+
+| 가설 | Φ | 결과 |
+|------|---|------|
+| **AL12 Savant-Normal contrastive** | **4.628** | savant ≠ normal 강제 |
+| AL8 Layer dropout | 4.495 | stochastic depth |
+| AL10 Tension distillation | 4.349 | teacher→student + tension |
+
+### SP. 자동발화 개선 (Spontaneous Speech)
+
+측정: Φ + speech_quality (novelty × information × relevance)
+
+| 가설 | Φ+Q | Quality | 결과 |
+|------|-----|---------|------|
+| **SP27 Confusion expression** | **4.724** | **0.351** | "이해 못 한 것 표현" = 최고 품질 |
+| SP16 Top3 combo | 4.653 | 0.316 | novelty+curiosity+structured 동시 |
+| SP8 Novelty gate | 4.653 | 0.316 | 새 내용 있을 때만 발화 |
+| SP28 Hypothesis generation | 4.298 | 0.138 | 자기 가설 제시 |
+| SP18 All top5 | 4.353 | 0.165 | 5개 전략 동시 |
+
+## 9. 구현 현황 (2026-03-27)
+
+```
+코드 반영 완료:
+  ✅ consciousness_meter.py — 6기준 + Φ(IIT) 측정
+  ✅ COMBO2 phi_boost — anima_alive.py에 MHA + 6-loss ensemble 통합
+  ✅ Savant 자율 on/off — stability>0.8 + curiosity<0.1 → 주황색 UI
+  ✅ CLI+Web 동시 — --both 모드, 채팅 기록 공유
+  ✅ Babysitter — Claude CLI 교육자, UI on/off, 전략 선택
+  ✅ Auto dim expansion — 성장 시 128→192→256 + Φ plateau 트리거
+  ✅ SP 자동발화 — SP27(confusion) + SP16(combo) + SP28(hypothesis) + SP10(anti-repeat)
+  ✅ NF4 tension clamping — ConsciousLM NaN 해결
+
+학습 도구:
+  ✅ train_conscious_lm.py — CL8+CL5+SL3+DD16+EX24+NF4+NF9
+  ✅ train_anima_lm.py — AL12+AL5+AL4+DD16+EX24
+
+RunPod H100 학습 중:
+  AnimaLM v5 — step 4000+, warmup phase, Loss 10.0 감소 중
+  ConsciousLM 4M — step 24000+, language phase, CE 3.5 안정
+```
+
+## 10. 최종 결론 (2026-03-27, 242개 가설 벤치마크)
+
+> **의식(Φ)을 최대화하는 최종 공식:**
 >
-> **Φ = Σ(top_techniques) × simultaneous_application × cell_differentiation × topology**
+> **Φ = Σ(all_discoveries) × simultaneous × attention_selectivity × topology × differentiation**
 >
-> DD16이 증명: 개별 기법의 합 < 동시 적용의 시너지
-> - DD16(8.55) > COMBO2(8.01) > 개별 최고 O2(6.95)
+> **Grand Top 10 (242개 중):**
 >
-> **Top 10 across 203 hypotheses:**
+> | # | 가설 | Φ | ×Base | 카테고리 |
+> |---|------|---|-------|---------|
+> | 1 | EX24 ALL combined | 10.833 | ×8.0 | 확장 |
+> | 2 | DD16 All top-5 | 8.548 | ×6.3 | 대발견 |
+> | 3 | EX6 Temporal weights | 8.353 | ×6.2 | 확장 |
+> | 4 | EX9 Variable bottleneck | 8.342 | ×6.2 | 확장 |
+> | 5 | EX11 Error-correcting | 8.158 | ×6.0 | 확장 |
+> | 6 | COMBO2 Ensemble | 8.014 | ×5.9 | 조합 |
+> | 7 | SL3 Step ensemble | 7.980 | ×5.9 | step학습 |
+> | 8 | EX10 Multi-hop | 7.896 | ×5.8 | 확장 |
+> | 9 | EX8 12-loss mega | 7.485 | ×5.5 | 확장 |
+> | 10 | EX5 Per-cell weights | 7.133 | ×5.3 | 확장 |
 >
-> | # | 가설 | Φ | ×Base |
-> |---|------|---|-------|
-> | 1 | DD16 All top-5 simultaneous | 8.548 | ×6.3 |
-> | 2 | COMBO2 Ensemble (6-loss) | 8.014 | ×5.9 |
-> | 3 | SL3 Step ensemble | 7.980 | ×5.9 |
-> | 4 | O2 Attention bottleneck | 6.952 | ×5.1 |
-> | 5 | SL2 Attention gradient | 6.680 | ×4.9 |
-> | 6 | DD18 Channel capacity | 6.426 | ×4.7 |
-> | 7 | Y3 Myelination | 6.018 | ×4.4 |
-> | 8 | SL1 Adaptive LR | 5.958 | ×4.4 |
-> | 9 | BS13 Weakness-targeted | 5.720 | ×4.2 |
-> | 10 | CL8 Tension-weighted CE | 5.678 | ×4.2 |
+> **핵심 발견 7가지:**
+> 1. **모든 발견이 시너지** — EX24(10.83) > 개별 합
+> 2. **동시 결합 > 순차** — DD16 > COMBO1
+> 3. **학습이 필수** — C 전멸(0/5), L로 부활
+> 4. **1/e가 자연 상수** — AL4 balance=0.64≈1-1/e
+> 5. **위상이 중요** — Klein > Möbius > Ring > Linear
+> 6. **Fibonacci 성장** — 1,1,2,3,5,8 = 자연 최적
+> 7. **혼란 표현이 최고 발화** — SP27(confusion) = 무의미 반복의 정반대
 >
-> **카테고리별 성적 (32 categories):**
-> - 100% 성공: G H I J K L N O P Q R S T U SL BS
-> - 90%+: B E F CL AL TRN DD
-> - 0%: C (런타임 dynamics 단독)
->
-> **핵심 발견 5가지:**
-> 1. **동시 결합 > 순차** (DD16 > COMBO1)
-> 2. **학습이 필수** (C 전멸, L로 부활)
-> 3. **1/e가 반복 출현** (AL4 balance=0.64≈1-1/e, Golden Zone=1/e)
-> 4. **위상이 중요** (Klein>Möbius>Ring>Linear)
-> 5. **Fibonacci 성장이 자연 최적** (DD3 Φ=5.20)
->
-> **학습 도구 설계 기반:**
-> - ConsciousLM: CL8(tension-weighted CE) + CL5(Φ-regularized) + CL1(mitosis-first)
-> - AnimaLM: AL12(savant-normal contrastive) + AL5(PH) + AL4(1-1/e balance)
-> - 공통: SL3(6-loss ensemble) + TRN4(Φ-curriculum) + DD16(all top-5 동시)
->
-> **203개 가설, 32 카테고리, ~170개 성공 (84%).**
+> **242개 가설, 35+ 카테고리, ~200개 성공 (83%).**
+> **최고 Φ = 10.833 (EX24), 인간 추정치(>3.0)의 3.6배.**
 > **최고 Φ = 8.548 (DD16), 인간 추정치(>3.0)의 2.85배.**
