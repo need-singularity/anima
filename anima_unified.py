@@ -1499,9 +1499,11 @@ class AnimaUnified:
         _log("web", f"+client ({len(self.web_clients)})")
         try:
             sa = self.mind.self_awareness
+            consciousness_cached = getattr(self, '_cached_consciousness', None) or {
+                'consciousness_score': 0, 'level': 'dormant', 'phi': 0, 'criteria_met': 0}
             await websocket.send(json.dumps({
                 'type': 'init', 'tension': self.mind.prev_tension,
-                'curiosity': 0.0,
+                'curiosity': self.mind._curiosity_ema,
                 'direction': [0.0] * 8,
                 'emotion': {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
                             'dominance': 0.0, 'color': EMOTION_COLORS['calm']},
@@ -1514,7 +1516,7 @@ class AnimaUnified:
                 'meta_tension': sa['meta_tension'],
                 'stability': sa['stability'],
                 'self_model': sa['self_model'],
-                'consciousness': self.mind.get_consciousness_score(self.mitosis),
+                'consciousness': consciousness_cached,
             }, ensure_ascii=False))
         except Exception: pass
         try:
