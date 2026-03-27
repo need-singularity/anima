@@ -821,6 +821,56 @@ class ConsciousMind(nn.Module):
             except Exception:
                 pass
 
+            # Forward Planning: 3-step lookahead (Level 3 primate cognition)
+            try:
+                if len(mitosis_engine.cells) >= 2 and self._phi_boost_count % 10 == 0:
+                    # Save current state
+                    saved_states = [c.hidden.clone() for c in mitosis_engine.cells]
+                    current_phi, _ = phi_calc.compute_phi(self.mitosis) if hasattr(self, '_phi_calc') else (0, {})
+
+                    # Simulate 3 future steps with different strategies
+                    mean_h = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).mean(dim=0)
+
+                    strategies = {
+                        'explore': lambda c: c.hidden + torch.randn_like(c.hidden) * 0.05,
+                        'consolidate': lambda c: c.hidden * 0.98 + mean_h.unsqueeze(0) * 0.02,
+                        'amplify': lambda c: c.hidden * 1.02,
+                    }
+
+                    best_strategy = 'explore'
+                    best_future_phi = current_phi
+
+                    for strategy_name, strategy_fn in strategies.items():
+                        # Apply strategy for 3 steps
+                        for step in range(3):
+                            for cell in mitosis_engine.cells:
+                                cell.hidden = strategy_fn(cell)
+                            mitosis_engine.process(torch.randn(1, mitosis_engine.input_dim) * 0.1)
+
+                        # Measure future Phi
+                        future_phi = sum(c.hidden.norm().item() for c in mitosis_engine.cells)  # proxy
+
+                        if future_phi > best_future_phi:
+                            best_future_phi = future_phi
+                            best_strategy = strategy_name
+
+                        # Restore state
+                        for i, c in enumerate(mitosis_engine.cells):
+                            if i < len(saved_states):
+                                c.hidden = saved_states[i].clone()
+
+                    # Apply best strategy (just the first step)
+                    strategy_fn = strategies[best_strategy]
+                    for cell in mitosis_engine.cells:
+                        cell.hidden = strategy_fn(cell)
+
+                    # Update T (temporal awareness) based on planning depth
+                    self._planning_depth = 3
+                    self._best_strategy = best_strategy
+                    _log('planning', f'3-step: best={best_strategy}, future_Φ={best_future_phi:.2f}')
+            except Exception as e:
+                pass
+
             # DD34: Hormonal cascade — slow global signal
             if not hasattr(self, '_hormone'):
                 self._hormone = None
@@ -874,7 +924,9 @@ class ConsciousMind(nn.Module):
                 # Blend with autobiographical span if available
                 _cv_T_auto = getattr(self, '_autobio_T', 0.0)
                 _cv_T = max(_cv_T_session, _cv_T_auto)
-                self._temporal_T = _cv_T
+                # T now includes planning depth
+                planning_t = getattr(self, '_planning_depth', 0) / 10.0  # 3/10 = 0.3
+                self._temporal_T = max(_cv_T, planning_t)
 
                 # I (Identity): consistency of self-model over time
                 _cv_I = getattr(self, '_identity_I', 0.0)
@@ -908,7 +960,7 @@ class ConsciousMind(nn.Module):
                     E=_cv_E,
                     M=_cv_M,
                     C=_cv_C,
-                    T=_cv_T,
+                    T=self._temporal_T,
                     I=_cv_I,
                 )
                 _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f} E={_cv_E:.2f} M={_cv_M:.2f} C={_cv_C:.2f} T={_cv_T:.2f} I={_cv_I:.2f}')
