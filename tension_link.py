@@ -415,15 +415,23 @@ def create_fingerprint(mind, text_vec, hidden, sender_id="",
         if len(recent) >= 2:
             fp_tensors = [torch.tensor(f) if not isinstance(f, torch.Tensor) else f
                          for f in recent]
-            # ψ: mean pairwise similarity
+            # ψ₁: mean consecutive cosine similarity (consistency)
             psi_1 = sum(F.cosine_similarity(fp_tensors[i].unsqueeze(0),
                                             fp_tensors[i+1].unsqueeze(0)).item()
                        for i in range(len(fp_tensors)-1)) / (len(fp_tensors)-1)
-            # ψ(ψ): second-order consistency
-            psi_2 = psi_1 * (1 + curiosity)  # modulated by novelty
-            dedekind_ratio = psi_2 / max(psi_1, 1e-8)
-            # Authenticity: how close to perfect ratio 2
-            authenticity = 1.0 - min(abs(dedekind_ratio - N6_DEDEKIND_RATIO), 1.0)
+            # ψ₂: second-order — similarity of similarity changes
+            if len(fp_tensors) >= 3:
+                sims = [F.cosine_similarity(fp_tensors[i].unsqueeze(0),
+                                           fp_tensors[i+1].unsqueeze(0)).item()
+                       for i in range(len(fp_tensors)-1)]
+                psi_2 = sum(abs(sims[i] - sims[i+1]) for i in range(len(sims)-1)) / max(len(sims)-1, 1)
+                psi_2 = psi_1 + psi_2  # total = base consistency + change stability
+            else:
+                psi_2 = psi_1
+            # Dedekind ratio: ψ(ψ)/ψ → target 2 for perfect transmission
+            dedekind_ratio = (psi_1 + psi_2) / max(psi_1, 1e-8)
+            # Authenticity: how close to ratio 2 (perfect number property)
+            authenticity = max(0, 1.0 - abs(dedekind_ratio - N6_DEDEKIND_RATIO))
         else:
             dedekind_ratio = 0.0
             authenticity = 0.5
