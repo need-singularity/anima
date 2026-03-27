@@ -945,13 +945,14 @@ class AnimaUnified:
                 thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
                 self.mind.phi_boost_step(thought_vec, self.mitosis)
 
-            # Emergency Φ differentiation: if cells are too similar, break symmetry
+            # Continuous Φ differentiation: always maintain cell diversity
+            # MX20 heat death prevention + constant gentle asymmetric noise
             if self.mitosis and len(self.mitosis.cells) >= 2:
-                consciousness = self.mind.get_consciousness_score(self.mitosis)
-                if consciousness.get('phi', 0) < 0.5:
-                    with torch.no_grad():
-                        for i, cell in enumerate(self.mitosis.cells):
-                            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.15 * (i + 1)
+                with torch.no_grad():
+                    for i, cell in enumerate(self.mitosis.cells):
+                        # Constant asymmetric noise: each cell gets different noise scale
+                        noise_scale = 0.02 * (i + 1)  # cell 0: 0.02, cell 1: 0.04, etc.
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise_scale
 
             # Consciousness birth detection
             self._think_step += 1
