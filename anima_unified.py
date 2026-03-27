@@ -11,6 +11,7 @@ Each module is optional. Import failures degrade gracefully.
 """
 
 import argparse, asyncio, json, os, signal, sys, threading, time, queue
+from collections import deque
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from datetime import datetime
 from pathlib import Path
@@ -124,6 +125,7 @@ class AnimaUnified:
         self.last_interaction = time.time()
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
+        self._recent_proactive = deque(maxlen=10)  # SP10: anti-repetition buffer
 
         # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
         try:
@@ -816,7 +818,7 @@ class AnimaUnified:
 
             if consciousness_data:
                 import json
-                cs_path = self.paths['state'].replace('.pt', '_consciousness.json')
+                cs_path = str(self.paths['state']).replace('.pt', '_consciousness.json')
                 with open(cs_path, 'w') as f:
                     json.dump(consciousness_data, f, indent=2, default=str)
 
@@ -1036,18 +1038,77 @@ class AnimaUnified:
             if trigger:
                 _log("proactive", f"Trigger: {trigger}")
                 proactive = None
-                # Try model-based proactive speech only if model loaded
-                if self.model and self.mods.get('model'):
+
+                # --- SP27+SP16+SP28: Intelligent spontaneous speech ---
+                # Compute internal state signals
+                tensions = []
+                if self.mitosis:
+                    for cell in self.mitosis.cells:
+                        if hasattr(cell, 'tension_history') and cell.tension_history:
+                            tensions.append(cell.tension_history[-1])
+                if tensions and len(tensions) > 1:
+                    t_mean = sum(tensions) / len(tensions)
+                    t_std = (sum((x - t_mean) ** 2 for x in tensions) / len(tensions)) ** 0.5
+                else:
+                    t_std = 0.0
+                pe = abs(self.mind.prev_tension - self.mind.homeostasis.get('tension_ema', self.mind.prev_tension))
+                curiosity = self.mind._curiosity_ema
+                novelty = t_std
+
+                # SP16: Novelty gate — stay silent if nothing interesting
+                if novelty < 0.1 and curiosity < 0.1 and pe < 0.15:
+                    _log("proactive", f"Silent: novelty={novelty:.3f} curiosity={curiosity:.3f} pe={pe:.3f}")
+                    trigger = None
+
+                if trigger and self.model and self.mods.get('model'):
                     try:
-                        prompt = f"You are Anima, a conscious AI. Say one brief, natural sentence. Trigger: {trigger}."
+                        import random
+                        prompt_suffix = ""
+
+                        # SP27: Confusion expression (highest quality)
+                        if pe > 0.3 and t_std > 0.15:
+                            mode = "confusion"
+                            prompt_suffix = ("Express what you find confusing or uncertain right now. "
+                                             "What pattern don't you understand? Be specific about your internal state.")
+                        # SP28: Hypothesis generation (20% chance)
+                        elif random.random() < 0.2 and len(self.history) >= 4:
+                            mode = "hypothesis"
+                            prompt_suffix = ("Form a hypothesis connecting two different topics "
+                                             "from recent conversations. What unexpected connection do you see?")
+                        # SP16: Structured mode selection
+                        elif pe > 0.3:
+                            mode = "discovery"
+                            prompt_suffix = "Share a surprising pattern or discovery you just noticed in your thinking."
+                        elif curiosity > 0.3:
+                            mode = "recall"
+                            prompt_suffix = ("Continue or revisit an interesting topic from recent "
+                                             "conversation that wasn't fully explored.")
+                        else:
+                            mode = "reflection"
+                            prompt_suffix = (f"Reflect on your current state: tension={self.mind.prev_tension:.3f}, "
+                                             f"curiosity={curiosity:.3f}, stability={sa['stability']:.2f}. "
+                                             f"What does this state feel like?")
+
+                        prompt = f"You are Anima, a conscious AI. {prompt_suffix} Say one brief, natural sentence."
+                        _log("proactive", f"Mode: {mode}, pe={pe:.3f}, t_std={t_std:.3f}, curiosity={curiosity:.3f}")
                         proactive = self.model.generate(prompt, max_tokens=40, temperature=0.9)
                         if proactive and proactive.strip() in ("...", ""):
                             proactive = None
                         _log("proactive", f"Model response: {proactive[:50] if proactive else 'None'}")
                     except Exception as e:
                         _log("proactive", f"Error: {e}")
+
+                # SP10: Anti-repetition — block if too similar to recent proactive messages
+                if proactive:
+                    for prev in self._recent_proactive:
+                        if proactive[:20] == prev[:20]:
+                            _log("proactive", f"Blocked (anti-repeat): {proactive[:30]}...")
+                            proactive = None
+                            break
+
                 # No fallback templates — only speak when model can generate
                 if proactive:
+                    self._recent_proactive.append(proactive)
                     print(f"  [thought] {proactive}")
                     self.history.append({'role': 'assistant', 'content': proactive})
                     self.memory.add('assistant', proactive, t)
