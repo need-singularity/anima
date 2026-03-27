@@ -469,18 +469,24 @@ class AnimaUnified:
             else:
                 prompt = f"[System: {system}]\n{hist}\nUser: {text}\nAnima:"
 
+            # Generate response
+            response = self.model.generate(prompt, max_tokens=200, temperature=0.8)
+
             # Adaptive α: tension → higher PF contribution (AA15 residual)
+            # Done AFTER generate to avoid blocking on error
             try:
                 from finetune_animalm_v4 import ParallelPureFieldMLP
                 adaptive_alpha = 0.05 + self.mind.prev_tension * 0.03
                 adaptive_alpha = min(adaptive_alpha, 0.15)
-                for m in self.model.model.modules():
-                    if isinstance(m, ParallelPureFieldMLP):
-                        m.alpha = adaptive_alpha
+                inner_model = getattr(self.model, 'model', None)
+                if inner_model and hasattr(inner_model, 'modules'):
+                    for m in inner_model.modules():
+                        if isinstance(m, ParallelPureFieldMLP):
+                            m.alpha = adaptive_alpha
             except Exception:
                 pass
 
-            return self.model.generate(prompt, max_tokens=200, temperature=0.8)
+            return response
         except Exception as e:
             _log('model', f"Error: {e}")
             return None
