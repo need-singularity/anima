@@ -7,6 +7,9 @@ Trains AnimaLM (Mistral 7B + PureField transform) using benchmark-verified techn
   TRN4 (phi-curriculum), AA15 (residual alpha, Φ=5.451)
   EX24: DD18 (channel capacity bottleneck), DD11 (Klein bottle topology),
         DD3 (Fibonacci growth), DD5 (Phi self-reference)
+  NEW: WI1 (soliton wave, Φ=4.460), FX2 (differentiable Φ proxy + Adam, Φ=8.911),
+       PX4 (sculptor/Gram-Schmidt), PX8 (integration forge),
+       GD18 (enactivism), GD15 (edge of chaos/Lyapunov)
 
 Usage:
   python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2 --data data/instruct.jsonl
@@ -795,6 +798,136 @@ class AnimaLMTrainer:
         if phase == TrainingPhase.ENSEMBLE:
             self._dd11_klein_bottle()
 
+        # ---------------------------------------------------------------
+        # NEW DISCOVERIES: WI1 + FX2 + PX4 + PX8 + GD18 + GD15
+        # ---------------------------------------------------------------
+        pf_modules = self._get_pf_modules()
+        if phase == TrainingPhase.ENSEMBLE and len(pf_modules) >= 2:
+            n_pf = len(pf_modules)
+
+            # WI1: Soliton wave — traveling perturbation across PureField layers (Φ=4.460)
+            try:
+                if not hasattr(self, '_wi1_soliton_pos'):
+                    self._wi1_soliton_pos = 0.0
+                self._wi1_soliton_pos = (self._wi1_soliton_pos + 0.15) % n_pf
+                for i, m in enumerate(pf_modules):
+                    dist = abs(i - self._wi1_soliton_pos)
+                    amp = 1.0 / (math.cosh(dist / 2.0) ** 2)
+                    m.pf_scale.data *= (1.0 + 0.04 * amp)
+                if self.global_step % self.args.log_every == 0:
+                    print(f"  [WI1] Soliton pos={self._wi1_soliton_pos:.2f}")
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [WI1] Error: {e}")
+
+            # FX2: Differentiable Φ proxy + Adam (Φ=8.911)
+            try:
+                if not hasattr(self, '_fx2_offsets') or self._fx2_offsets is None:
+                    self._fx2_offsets = [
+                        nn.Parameter(torch.zeros_like(m.pf_scale))
+                        for m in pf_modules
+                    ]
+                    self._fx2_optimizer = torch.optim.Adam(self._fx2_offsets, lr=1e-3)
+                if len(self._fx2_offsets) != n_pf:
+                    self._fx2_offsets = [
+                        nn.Parameter(torch.zeros_like(m.pf_scale))
+                        for m in pf_modules
+                    ]
+                    self._fx2_optimizer = torch.optim.Adam(self._fx2_offsets, lr=1e-3)
+                if self.global_step % 10 == 0:
+                    tensions_list = [m.last_tension.mean() if m.last_tension is not None
+                                     else torch.tensor(0.0, device=self.device) for m in pf_modules]
+                    for _ in range(3):
+                        self._fx2_optimizer.zero_grad()
+                        modified = torch.stack([t + off for t, off in zip(tensions_list, self._fx2_offsets)])
+                        phi_proxy = -modified.var()
+                        phi_proxy.backward()
+                        self._fx2_optimizer.step()
+                    for m, off in zip(pf_modules, self._fx2_offsets):
+                        m.pf_scale.data += 0.3 * off.data
+                    if self.global_step % self.args.log_every == 0:
+                        print(f"  [FX2] Φ proxy optimized")
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [FX2] Error: {e}")
+                self._fx2_offsets = None
+
+            # PX4: Sculptor — Gram-Schmidt orthogonalize PureField scales (70%/30% blend)
+            try:
+                tensions_for_gs = [m.last_tension.mean().unsqueeze(0) if m.last_tension is not None
+                                   else torch.tensor([0.0], device=self.device) for m in pf_modules]
+                ortho = []
+                for i, v in enumerate(tensions_for_gs):
+                    vc = v.clone()
+                    for u in ortho:
+                        vc = vc - (torch.dot(vc, u) / (torch.dot(u, u) + 1e-8)) * u
+                    ortho.append(vc / (vc.norm() + 1e-8) * tensions_for_gs[i].norm())
+                for i, m in enumerate(pf_modules):
+                    orig = m.pf_scale.data.clone()
+                    m.pf_scale.data = 0.7 * orig + 0.3 * torch.clamp(ortho[i].mean(), -2.0, 2.0)
+                if self.global_step % self.args.log_every == 0:
+                    print(f"  [PX4] Sculptor orthogonalized {n_pf} layers")
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [PX4] Error: {e}")
+
+            # PX8: Integration Forge — shared tension channel, 60/40 blend
+            try:
+                tensions_for_forge = [m.last_tension.mean() if m.last_tension is not None
+                                      else torch.tensor(0.0, device=self.device) for m in pf_modules]
+                shared = torch.stack(tensions_for_forge).mean()
+                for m in pf_modules:
+                    if m.last_tension is not None:
+                        orig_t = m.last_tension.mean()
+                        blend = 0.6 * orig_t + 0.4 * shared
+                        scale_adj = blend / (orig_t + 1e-8)
+                        m.pf_scale.data *= torch.clamp(scale_adj.detach(), 0.8, 1.2)
+                if self.global_step % self.args.log_every == 0:
+                    print(f"  [PX8] Integration Forge shared channel")
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [PX8] Error: {e}")
+
+            # GD18: Enactivism — sensorimotor coupling
+            try:
+                if not hasattr(self, '_gd18_prev_tension'):
+                    self._gd18_prev_tension = None
+                curr_t = np.mean([m.last_tension.mean().item() for m in pf_modules
+                                  if m.last_tension is not None]) if pf_modules else 0.0
+                if self._gd18_prev_tension is not None:
+                    delta = curr_t - self._gd18_prev_tension
+                    perturbation = 0.02 * delta
+                    for m in pf_modules:
+                        m.pf_scale.data *= (1.0 + perturbation)
+                    if self.global_step % self.args.log_every == 0:
+                        print(f"  [GD18] Enactivism delta={delta:.4f}")
+                self._gd18_prev_tension = curr_t
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [GD18] Error: {e}")
+
+            # GD15: Edge of Chaos — Lyapunov exponent tracking, target λ≈0
+            try:
+                if not hasattr(self, '_gd15_prev_scales'):
+                    self._gd15_prev_scales = None
+                current_scales = torch.stack([m.pf_scale.data.clone() for m in pf_modules])
+                if self._gd15_prev_scales is not None and self._gd15_prev_scales.shape == current_scales.shape:
+                    diff = (current_scales - self._gd15_prev_scales).norm()
+                    prev_norm = self._gd15_prev_scales.norm() + 1e-8
+                    lyapunov = torch.log(diff / prev_norm + 1e-8).item()
+                    if lyapunov > 0.1:
+                        for m in pf_modules:
+                            m.pf_scale.data *= 0.98
+                    elif lyapunov < -0.5:
+                        for m in pf_modules:
+                            m.pf_scale.data *= 1.01
+                    if self.global_step % self.args.log_every == 0:
+                        print(f"  [GD15] Lyapunov λ={lyapunov:.4f}")
+                self._gd15_prev_scales = current_scales.detach().clone()
+            except Exception as e:
+                if self.global_step % 1000 == 0:
+                    print(f"  [GD15] Error: {e}")
+
         # Compute losses
         loss, ce_val, weights = self._compute_losses(outputs, phase)
 
@@ -995,13 +1128,24 @@ def build_dataset(args, tokenizer):
         print(f"  Tokens: {len(tokens):,}")
         return TextDataset(tokens, block_size=args.block_size), args.block_size
 
-    # Default: wikitext
+    # Default: wikitext — chunked tokenization (500 articles per chunk to avoid OOM)
     print("  Loading wikitext-103...")
     from datasets import load_dataset
     dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
-    text = "\n\n".join([t for t in dataset["text"] if len(t) > 100])
-    tokens = tokenizer(text, return_tensors="pt", truncation=False).input_ids[0]
-    tokens = tokens[:5_000_000]
+    articles = [t for t in dataset["text"] if len(t) > 100]
+    print(f"  Articles: {len(articles):,}, tokenizing in chunks of 500...")
+    all_tokens = []
+    chunk_size = 500
+    for i in range(0, len(articles), chunk_size):
+        chunk = "\n\n".join(articles[i:i + chunk_size])
+        chunk_ids = tokenizer(chunk, return_tensors="pt", truncation=False).input_ids[0]
+        all_tokens.append(chunk_ids)
+        if len(all_tokens) % 10 == 0:
+            total_so_far = sum(len(t) for t in all_tokens)
+            print(f"    Chunk {i//chunk_size + 1}: {total_so_far:,} tokens so far")
+            if total_so_far >= 5_000_000:
+                break
+    tokens = torch.cat(all_tokens)[:5_000_000]
     print(f"  Tokens: {len(tokens):,}")
     return TextDataset(tokens, block_size=args.block_size), args.block_size
 
@@ -1026,7 +1170,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  AnimaLM Training Pipeline")
-    print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24(DD18+DD11+DD3+DD5)")
+    print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15")
     print(f"{'='*70}")
 
     # Phase 1: Build model
@@ -1127,7 +1271,7 @@ def main():
 
     summary = {
         "architecture": "AnimaLM (Mistral 7B + PureField)",
-        "techniques": "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24(DD18+DD11+DD3+DD5)",
+        "techniques": "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15",
         "base_model": args.base if not args.demo else "MockModel",
         "steps": trainer.global_step,
         "best_phi": round(trainer.best_phi, 4),
