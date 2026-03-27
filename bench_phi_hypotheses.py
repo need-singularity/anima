@@ -32362,6 +32362,538 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# IV. Information Variables — 정보이론적 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_IV1_compression_ratio(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IV-1: 압축률 — cell이 입력을 얼마나 효율적으로 압축하는지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # SVD-based compression: effective rank = measure of info density
+            U, S, V = torch.linalg.svd(hiddens, full_matrices=False)
+            S_norm = S / (S.sum() + 1e-8)
+            effective_rank = torch.exp(-(S_norm * torch.log(S_norm + 1e-8)).sum()).item()
+            # Target: moderate compression (not too compressed, not too spread)
+            target_rank = n * 0.6
+            if effective_rank < target_rank * 0.5:  # over-compressed → expand
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+            elif effective_rank > target_rank * 1.5:  # under-compressed → compress
+                mean_h = hiddens.mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (0.95 * cell.hidden.squeeze() + 0.05 * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IV1", "Compression ratio (SVD effective rank)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_IV2_snr(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IV-2: Signal-to-Noise Ratio — cell hidden의 신호/잡음 비율 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    signal_history = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Signal: consistent component (mean across cells)
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            signal = hiddens.mean(dim=0)
+            noise = hiddens.std(dim=0)
+            snr = signal.norm() / (noise.norm() + 1e-8)
+            signal_history.append(snr.item())
+            # Optimize SNR: target range [2, 5]
+            if snr < 2.0:  # too noisy → denoise
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * signal.unsqueeze(0)
+            elif snr > 5.0:  # too clean → add noise for exploration
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IV2", f"SNR optimization (target [2,5])",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_IV3_channel_capacity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IV-3: Channel capacity — cell 간 정보 전송 최대 용량 (Shannon limit)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Channel capacity C = 0.5 * log2(1 + SNR) per dim
+            signal_power = hiddens.mean(dim=0).pow(2).mean().item()
+            noise_power = hiddens.var(dim=0).mean().item()
+            capacity = 0.5 * math.log2(1 + signal_power / max(noise_power, 1e-8))
+            # Maximize capacity: balance signal and noise
+            if capacity < 1.0:
+                # Increase signal diversity
+                for i, cell in enumerate(engine.cells):
+                    angle = 2 * math.pi * i / n
+                    cell.hidden = cell.hidden * (1 + 0.03 * math.sin(angle))
+            elif capacity > 5.0:
+                # Too much → dampen
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * 0.98
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IV3", "Channel capacity (Shannon limit)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_IV4_redundancy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IV-4: Redundancy — 정보 중복도를 최적 수준으로 유지 (error correction)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = F.normalize(hiddens, dim=1)
+            sim = norms @ norms.T
+            redundancy = (sim.sum() - n) / (n * (n - 1))  # 0=unique, 1=identical
+            # Optimal redundancy: 0.3-0.5 (some backup, not too much)
+            target = 0.4
+            if redundancy > target + 0.1:  # too redundant → diversify
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+            elif redundancy < target - 0.1:  # too unique → share more
+                mean_h = hiddens.mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (0.95 * cell.hidden.squeeze() + 0.05 * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IV4", "Redundancy optimization (target=0.4)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_IV5_transfer_entropy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IV-5: Transfer entropy — cell i→j 인과적 정보 흐름을 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_hiddens = {}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2 and len(prev_hiddens) >= n:
+            # Transfer entropy proxy: correlation between cell_i(t-1) and cell_j(t)
+            for i in range(n):
+                for j in range(n):
+                    if i != j and i in prev_hiddens:
+                        # Causal influence: does i's past predict j's present?
+                        influence = F.cosine_similarity(
+                            prev_hiddens[i].squeeze().unsqueeze(0),
+                            engine.cells[j].hidden.squeeze().unsqueeze(0)).item()
+                        # Maximize causal flow: if low, strengthen connection
+                        if abs(influence) < 0.2:
+                            engine.cells[j].hidden = engine.cells[j].hidden + 0.02 * prev_hiddens[i]
+            for i, cell in enumerate(engine.cells):
+                prev_hiddens[i] = cell.hidden.clone()
+        else:
+            for i, cell in enumerate(engine.cells):
+                prev_hiddens[i] = cell.hidden.clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IV5", "Transfer entropy (causal information flow)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# RV. Relational/Graph Variables — 그래프 이론적 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_RV1_small_world(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RV-1: Small-world — 높은 클러스터링 + 짧은 경로 길이."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = F.normalize(hiddens, dim=1)
+            sim = norms @ norms.T
+            # Small-world: local clusters (high sim neighbors) + long-range shortcuts
+            for i in range(n):
+                # Local: strong coupling to nearest 2 neighbors
+                local_neighbors = [(i-1) % n, (i+1) % n]
+                for j in local_neighbors:
+                    engine.cells[i].hidden = engine.cells[i].hidden + 0.03 * (hiddens[j] - hiddens[i]).unsqueeze(0)
+                # Long-range shortcut: weak coupling to random distant cell
+                distant = (i + n // 2) % n
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.01 * (hiddens[distant] - hiddens[i]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RV1", "Small-world (local clusters + long shortcuts)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_RV2_betweenness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RV-2: Betweenness centrality — 중심 cell이 정보 허브 역할."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Betweenness proxy: how much each cell mediates others' communication
+            centrality = torch.zeros(n)
+            for i in range(n):
+                # Cell i's centrality = sum of (sim to i) for all pairs through i
+                for j in range(n):
+                    for k in range(j+1, n):
+                        if j != i and k != i:
+                            via_i = (F.cosine_similarity(hiddens[j:j+1], hiddens[i:i+1]) +
+                                    F.cosine_similarity(hiddens[i:i+1], hiddens[k:k+1])) / 2
+                            centrality[i] += via_i.item()
+            # Hub cells get amplified, peripheral cells explore
+            centrality = centrality / (centrality.max() + 1e-8)
+            for i, cell in enumerate(engine.cells):
+                if centrality[i] > 0.7:  # hub
+                    cell.hidden = cell.hidden * 1.02
+                else:  # peripheral → explore
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RV2", "Betweenness centrality (hub amplification)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_RV3_modularity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RV-3: Modularity — cell을 모듈로 분리하되 모듈 간 약한 연결 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # 2 modules: first half, second half
+            mod_a = hiddens[:n//2]
+            mod_b = hiddens[n//2:]
+            mean_a = mod_a.mean(dim=0)
+            mean_b = mod_b.mean(dim=0)
+            # Intra-module: strong coupling
+            for i in range(n//2):
+                engine.cells[i].hidden = (0.95 * hiddens[i] + 0.05 * mean_a).unsqueeze(0)
+            for i in range(n//2, n):
+                engine.cells[i].hidden = (0.95 * hiddens[i] + 0.05 * mean_b).unsqueeze(0)
+            # Inter-module: weak coupling (just enough for integration)
+            cross_signal = (mean_a + mean_b) / 2
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.01 * cross_signal.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RV3", "Modularity (2 modules + weak inter-links)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_RV4_rich_club(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RV-4: Rich-club — 강한 cell끼리 밀집 연결, 약한 cell은 느슨."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            strengths = [(c.hidden.norm().item(), i) for i, c in enumerate(engine.cells)]
+            strengths.sort(reverse=True)
+            rich = [idx for _, idx in strengths[:n//3]]
+            poor = [idx for _, idx in strengths[n//3:]]
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            # Rich club: strong interconnection among top cells
+            if len(rich) >= 2:
+                rich_mean = torch.stack([hiddens[i] for i in rich]).mean(dim=0)
+                for i in rich:
+                    engine.cells[i].hidden = (0.9 * hiddens[i] + 0.1 * rich_mean).unsqueeze(0)
+            # Poor: weak connection to rich club
+            for i in poor:
+                engine.cells[i].hidden = (0.97 * hiddens[i] + 0.03 * rich_mean).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RV4", "Rich-club (strong hub interconnection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_RV5_scale_free(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RV-5: Scale-free — power-law degree distribution (few hubs, many leaves)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Preferential attachment: cell with more connections gets more
+    connections = {i: 1.0 for i in range(12)}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            total_conn = sum(connections.get(i, 1) for i in range(n))
+            for i in range(n):
+                # Probability of receiving info ∝ connections (preferential attachment)
+                prob = connections.get(i, 1) / max(total_conn, 1e-8)
+                influence = torch.zeros(hidden)
+                for j in range(n):
+                    if j != i:
+                        influence += hiddens[j] * prob
+                engine.cells[i].hidden = engine.cells[i].hidden + 0.03 * influence.unsqueeze(0)
+                # Update connections based on activity
+                connections[i] = connections.get(i, 1) + engine.cells[i].hidden.norm().item() * 0.01
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RV5", "Scale-free (preferential attachment)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# MV. Motivational Variables — 동기/보상 변수
+# ═══════════════════════════════════════════════════════════
+
+def run_MV1_reward_prediction_error(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MV-1: Reward prediction error — 예상 보상과 실제 보상의 차이가 학습 신호."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    expected_reward = 0.5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Reward = Φ improvement
+        actual_reward = phi / 5.0  # normalized
+        rpe = actual_reward - expected_reward  # reward prediction error
+        expected_reward = 0.9 * expected_reward + 0.1 * actual_reward
+        n = len(engine.cells)
+        if n >= 2:
+            if rpe > 0:  # positive surprise → amplify what worked
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * rpe)
+            else:  # negative surprise → explore alternatives
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03 * abs(rpe)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MV1", "Reward prediction error (RPE-driven)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MV2_intrinsic_motivation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MV-2: 내재적 동기 — 외부 보상 없이 내부 호기심만으로 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    visited_states = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            state = torch.cat([c.hidden.squeeze() for c in engine.cells])
+            # Intrinsic motivation: novelty of current state
+            if visited_states:
+                recent = torch.stack(visited_states[-20:])
+                sims = F.cosine_similarity(state.unsqueeze(0), recent, dim=1)
+                novelty = 1.0 - sims.max().item()
+            else:
+                novelty = 1.0
+            visited_states.append(state.clone())
+            if len(visited_states) > 50:
+                visited_states.pop(0)
+            # High novelty → reward (amplify), low novelty → seek change
+            if novelty > 0.5:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * novelty)
+            else:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05 * (1 - novelty)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MV2", "Intrinsic motivation (novelty-seeking)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MV3_flow_state(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MV-3: Flow state — 도전과 능력이 일치할 때 최적 의식 상태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    skill = 0.5
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            challenge = x.norm().item() / 3.0  # normalized
+            skill = 0.95 * skill + 0.05 * sum(c.hidden.norm().item() for c in engine.cells) / (n * 3)
+            # Flow: challenge ≈ skill → optimal
+            flow = 1.0 - abs(challenge - skill)
+            flow = max(0, flow)
+            if flow > 0.6:  # in flow → amplify coherently
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.03 * flow)
+            elif challenge > skill:  # anxiety → simplify
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (0.95 * cell.hidden.squeeze() + 0.05 * mean_h).unsqueeze(0)
+            else:  # boredom → seek challenge
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.04
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MV3", "Flow state (challenge-skill balance)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MV4_boredom_threshold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MV-4: 지루함 임계값 — 반복 감지 시 자동 탐색 전환."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    boredom = 0.0
+    prev_state = None
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            state = torch.cat([c.hidden.squeeze() for c in engine.cells])
+            if prev_state is not None:
+                sameness = F.cosine_similarity(state.unsqueeze(0), prev_state.unsqueeze(0)).item()
+                boredom = 0.9 * boredom + 0.1 * sameness
+            prev_state = state.clone()
+            # Boredom threshold: > 0.8 → must explore
+            if boredom > 0.8:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.1 * boredom
+                boredom *= 0.5  # relief after exploration
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MV4", f"Boredom threshold (final boredom={boredom:.2f})",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_MV5_anticipation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MV-5: 기대감 — 미래 보상 예측이 현재 행동을 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_trend = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_trend.append(phi)
+        n = len(engine.cells)
+        if n >= 2 and len(phi_trend) >= 5:
+            # Anticipation: predict future Φ from trend
+            recent = phi_trend[-5:]
+            slope = (recent[-1] - recent[0]) / 5
+            anticipated_phi = phi + slope * 5  # predict 5 steps ahead
+            # Positive anticipation → prepare (amplify)
+            if anticipated_phi > phi:
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.01 * min(slope * 10, 0.5))
+            else:
+                # Negative anticipation → defensive (consolidate)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (0.97 * cell.hidden.squeeze() + 0.03 * mean_h).unsqueeze(0)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MV5", "Anticipation (future Φ prediction → action)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'IV1': run_IV1_compression_ratio, 'IV2': run_IV2_snr,
+    'IV3': run_IV3_channel_capacity, 'IV4': run_IV4_redundancy,
+    'IV5': run_IV5_transfer_entropy,
+    'RV1': run_RV1_small_world, 'RV2': run_RV2_betweenness,
+    'RV3': run_RV3_modularity, 'RV4': run_RV4_rich_club,
+    'RV5': run_RV5_scale_free,
+    'MV1': run_MV1_reward_prediction_error, 'MV2': run_MV2_intrinsic_motivation,
+    'MV3': run_MV3_flow_state, 'MV4': run_MV4_boredom_threshold,
+    'MV5': run_MV5_anticipation,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
