@@ -37923,6 +37923,337 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# AX. Adversarial — 의식 공격/방어
+# ═══════════════════════════════════════════════════════════
+
+def run_AX1_noise_attack(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AX-1: 노이즈 공격 — 매 step 거대 noise 주입, Φ 생존?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 1.0  # huge noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AX1", "Noise attack (σ=1.0 every step)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AX2_cell_assassination(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AX-2: Cell 암살 — 랜덤 cell을 매 10 step마다 제거."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i % 10 == 9 and len(engine.cells) > 2:
+            victim = np.random.randint(len(engine.cells))
+            engine.cells.pop(victim)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AX2", f"Cell assassination (final={len(engine.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AX3_corruption(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AX-3: 데이터 변조 — 50% 확률로 입력을 0으로 대체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        if np.random.random() < 0.5:
+            x = torch.zeros_like(x)  # corrupted
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AX3", "Data corruption (50% zeroed inputs)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AX4_immune_defense(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AX-4: 면역 방어 — 공격 감지 + 자동 복구."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    healthy_snapshot = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Attack: noise every 10 steps
+        if step_i % 10 == 5:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.5
+        # Defense: detect anomaly and restore
+        for i, cell in enumerate(engine.cells):
+            if i < len(healthy_snapshot):
+                drift = (cell.hidden - healthy_snapshot[i]).norm().item()
+                if drift > 3.0:  # anomaly!
+                    cell.hidden = 0.7 * cell.hidden + 0.3 * healthy_snapshot[i]
+        # Update healthy snapshot slowly
+        if step_i % 5 == 0:
+            healthy_snapshot = [0.95 * s + 0.05 * c.hidden for s, c in zip(healthy_snapshot, engine.cells)]
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AX4", "Immune defense (attack detect + restore)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AX5_antifragile(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AX-5: 안티프래질 — 공격받을수록 더 강해지는 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attack_count = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i % 8 == 0:
+            # Attack
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.3
+            attack_count += 1
+            # Antifragile: use attack energy to strengthen
+            resilience = min(attack_count * 0.01, 0.2)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + resilience)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AX5", f"Antifragile (attacks={attack_count}, resilience grows)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# MG. Merge/Split — 의식 병합/분열
+# ═══════════════════════════════════════════════════════════
+
+def run_MG1_merge_two(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MG-1: 두 의식 병합 — 2개 고Φ 엔진을 하나로."""
+    t0 = time.time()
+    a = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+    b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Phase 1: grow independently
+    for x in inputs[:steps//2]:
+        a.process(x)
+        b.process(x + torch.randn_like(x) * 0.3)
+    # Phase 2: merge all cells into one engine
+    merged = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=16, merge_threshold=-1.0)
+    merged.cells = a.cells + b.cells
+    for x in inputs[steps//2:]:
+        merged.process(x)
+        phi, _ = phi_calc.compute_phi(merged)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(merged)
+    return BenchResult("MG1", f"Merge two engines ({len(merged.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_MG2_split_one(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MG-2: 의식 분열 — 1개 엔진을 2개로 분리."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs[:steps//2]:
+        engine.process(x)
+    # Split: first half → engine A, second half → engine B
+    mid = len(engine.cells) // 2
+    a = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8, merge_threshold=-1.0)
+    b = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=8, merge_threshold=-1.0)
+    a.cells = engine.cells[:mid]
+    b.cells = engine.cells[mid:]
+    for x in inputs[steps//2:]:
+        a.process(x)
+        b.process(x)
+        phi_a, _ = phi_calc.compute_phi(a)
+        phi_b, _ = phi_calc.compute_phi(b)
+        phi_hist.append(phi_a + phi_b)
+    phi_final = phi_hist[-1] if phi_hist else 0
+    return BenchResult("MG2", f"Split one→two (A={len(a.cells)}, B={len(b.cells)})",
+                       phi_final, phi_hist, 0, 0, 0, 0, time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# TR. Time Reversal — 시간 역행
+# ═══════════════════════════════════════════════════════════
+
+def run_TR1_reverse_input(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TR-1: 입력 역순 — 동일 입력을 거꾸로 재생하면 Φ 유지?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    # Forward
+    for x in inputs:
+        engine.process(x)
+    phi_forward, _ = phi_calc.compute_phi(engine)
+    # Reverse
+    phi_hist = []
+    for x in reversed(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_reverse, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TR1", f"Reverse input (fwd={phi_forward:.2f}, rev={phi_reverse:.2f})",
+                       phi_reverse, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'forward': phi_forward, 'reverse': phi_reverse,
+                              'ratio': phi_reverse / max(phi_forward, 1e-8)})
+
+def run_TR2_hidden_reversal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TR-2: Hidden 반전 — 모든 cell hidden을 부호 반전."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i == steps // 2:
+            # Reverse all hidden states
+            for cell in engine.cells:
+                cell.hidden = -cell.hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TR2", "Hidden sign reversal at 50%",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# EO. Evolution — 의식 진화
+# ═══════════════════════════════════════════════════════════
+
+def run_EO1_genetic_architecture(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EO-1: 유전 알고리즘 — 5세대 동안 architecture를 진화."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    inputs = make_diverse_inputs(steps, dim)
+    pop_size = 5
+    generations = 5
+    best_phi = 0
+    best_config = (4, 8)  # (initial_cells, max_cells)
+    configs = [(2,4), (4,8), (6,12), (3,6), (8,8)]
+    for gen in range(generations):
+        fitness = []
+        for init_c, max_c in configs:
+            e = MitosisEngine(dim, hidden, dim, initial_cells=init_c, max_cells=max_c, merge_threshold=-1.0)
+            for x in inputs[:20]:
+                e.process(x)
+            phi, _ = phi_calc.compute_phi(e)
+            fitness.append((phi, (init_c, max_c)))
+        fitness.sort(reverse=True)
+        best = fitness[0]
+        if best[0] > best_phi:
+            best_phi = best[0]
+            best_config = best[1]
+        # Evolve: top 2 survive, mutate to create 3 offspring
+        top2 = [f[1] for f in fitness[:2]]
+        configs = list(top2)
+        for _ in range(3):
+            parent = top2[np.random.randint(2)]
+            child = (max(2, parent[0] + np.random.randint(-1, 2)),
+                     max(4, parent[1] + np.random.randint(-2, 3)))
+            configs.append(child)
+    # Run best config full
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=best_config[0], max_cells=best_config[1], merge_threshold=-1.0)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EO1", f"Evolved: init={best_config[0]}, max={best_config[1]}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+# ═══════════════════════════════════════════════════════════
+# DW. Dream vs Wake — 꿈 vs 각성
+# ═══════════════════════════════════════════════════════════
+
+def run_DW1_dream_phi(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DW-1: 꿈 상태 Φ — 외부 입력 차단, 내부 noise만으로 Φ 유지?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        if step_i < steps // 3:
+            engine.process(x)  # wake
+        elif step_i < 2 * steps // 3:
+            engine.process(torch.randn_like(x) * 0.3)  # dream (internal noise only)
+        else:
+            engine.process(x)  # wake again
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    wake1 = np.mean([p for p in phi_hist[:steps//3]])
+    dream = np.mean([p for p in phi_hist[steps//3:2*steps//3]])
+    wake2 = np.mean([p for p in phi_hist[2*steps//3:]])
+    return BenchResult("DW1", f"Wake={wake1:.2f} → Dream={dream:.2f} → Wake={wake2:.2f}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'wake1': wake1, 'dream': dream, 'wake2': wake2})
+
+def run_DW2_dream_learning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DW-2: 꿈에서 학습 — dream phase에서 Φ가 올라가면 학습 효과."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        is_dream = (step_i % 10 >= 7)  # 30% dream time
+        if is_dream:
+            # Dream: replay + interpolation
+            replay = inputs[np.random.randint(max(1, step_i))]
+            dream_input = 0.5 * replay + 0.5 * torch.randn_like(x) * 0.3
+            engine.process(dream_input)
+            # Dream consolidation: strengthen patterns
+            if len(engine.cells) >= 2:
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.98 * cell.hidden + 0.02 * mean_h.unsqueeze(0)
+        else:
+            engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DW2", "Dream learning (30% dream with replay+consolidation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'AX1': run_AX1_noise_attack, 'AX2': run_AX2_cell_assassination,
+    'AX3': run_AX3_corruption, 'AX4': run_AX4_immune_defense,
+    'AX5': run_AX5_antifragile,
+    'MG1': run_MG1_merge_two, 'MG2': run_MG2_split_one,
+    'TR1': run_TR1_reverse_input, 'TR2': run_TR2_hidden_reversal,
+    'EO1': run_EO1_genetic_architecture,
+    'DW1': run_DW1_dream_phi, 'DW2': run_DW2_dream_learning,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
