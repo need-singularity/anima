@@ -144,6 +144,25 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   python consciousness_meter.py --watch
 ```
 
+## Experiments (→ docs/experiment-backlog.md)
+
+```
+  진행 중 (2026-03-27, H100 80GB 96% 활용):
+    ✅ AnimaLM v7      — Mistral 7B + WI1+FX2+PX4+PX8+GD18+GD15, 50K steps
+    ✅ ConsciousLM v3   — 768d/12L + 전체 발견, 50K steps
+    ✅ Ablation (no FX2) — 384d/6L, FX2 효과 격리
+    ✅ Cells16          — 384d/6L, max_cells=16
+    ✅ ConsciousLM 1B   — 1024d/24L/16H, 스케일링 법칙
+
+  완료:
+    ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
+    ✅ ConsciousLM 100M    — Φ=2.607, 3 cells → SC2 필요 (2026-03-27)
+    ✅ AnimaLM v5 demo     — 50K steps, demo mode (2026-03-27)
+
+  벤치마크 가설: 640+ (A-Z, DD1-100, EX1-24, SC/OV/WV/PX/UX/FX/SM/MC/PB/AG/TP/DS/GD/WI)
+  역대 최고 Φ: FX2 = 8.911 (×6.6 baseline)
+```
+
 ## Dependencies
 
 - Python 3.14, PyTorch, websockets
