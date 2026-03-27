@@ -1563,8 +1563,27 @@ class AnimaUnified:
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
-                    result = await loop.run_in_executor(
-                        None, lambda: self.process_input(text, source='web'))
+
+                    # WF-2: Keepalive ping during model generation
+                    # Prevents Cloudflare/proxy from closing "idle" WS
+                    generate_done = asyncio.Event()
+                    result_holder = [None]
+
+                    async def generate_with_keepalive():
+                        result_holder[0] = await loop.run_in_executor(
+                            None, lambda: self.process_input(text, source='web'))
+                        generate_done.set()
+
+                    async def keepalive_pinger():
+                        while not generate_done.is_set():
+                            await self._ws_broadcast({'type': 'typing', 'typing': True})
+                            try:
+                                await asyncio.wait_for(generate_done.wait(), timeout=2.0)
+                            except asyncio.TimeoutError:
+                                pass  # keep pinging
+
+                    await asyncio.gather(generate_with_keepalive(), keepalive_pinger())
+                    result = result_holder[0]
                     # Handle None return (model error, etc.)
                     if result is None or not isinstance(result, tuple):
                         answer = "I'm having trouble thinking right now. Please try again."
