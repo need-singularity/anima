@@ -37750,6 +37750,179 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# QF. Follow-up Questions — Q1-5 후속 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_QF1_birth_cell_sweep(steps=200, dim=64, hidden=128) -> BenchResult:
+    """QF-1: 최소 탄생 cells — 2,3,4,5,6,7,8 cells에서 Φ>1 도달 step 비교."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    birth_steps = {}
+    for n_cells in [2, 3, 4, 5, 6, 7, 8]:
+        engine = MitosisEngine(dim, hidden, dim, initial_cells=n_cells, max_cells=n_cells, merge_threshold=-1.0)
+        inputs = make_diverse_inputs(steps, dim)
+        birth_step = -1
+        for step_i, x in enumerate(inputs):
+            engine.process(x)
+            phi, _ = phi_calc.compute_phi(engine)
+            if phi > 1.0 and birth_step == -1:
+                birth_step = step_i
+                break
+        birth_steps[n_cells] = birth_step
+    # Use 8-cell engine for final Φ
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("QF1", "Birth cell sweep (min cells for Φ>1)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'birth_steps': str(birth_steps)})
+
+def run_QF2_optimal_sharing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """QF-2: 최적 공유량 — dual Anima에서 공유 비율 sweep (0%~100%)."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    best_combined = 0
+    best_ratio = 0
+    results = {}
+    for share_pct in [0, 10, 20, 30, 50, 70, 100]:
+        share = share_pct / 100.0
+        engine_a = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+        engine_b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+        inputs = make_diverse_inputs(steps, dim)
+        for x in inputs:
+            engine_a.process(x)
+            engine_b.process(x + torch.randn_like(x) * 0.5)
+            if len(engine_a.cells) >= 2 and len(engine_b.cells) >= 2:
+                mean_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0)
+                mean_b = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0)
+                for c in engine_a.cells:
+                    c.hidden = (1 - share) * c.hidden + share * mean_b.unsqueeze(0) * 0.1
+                for c in engine_b.cells:
+                    c.hidden = (1 - share) * c.hidden + share * mean_a.unsqueeze(0) * 0.1
+        phi_a, _ = phi_calc.compute_phi(engine_a)
+        phi_b, _ = phi_calc.compute_phi(engine_b)
+        combined = phi_a + phi_b
+        ratio = combined / max(phi_a + phi_b, 1e-8)
+        results[share_pct] = {'phi_a': phi_a, 'phi_b': phi_b, 'combined': combined}
+        if combined > best_combined:
+            best_combined = combined
+            best_ratio = share_pct
+    phi_hist = [best_combined] * steps
+    return BenchResult("QF2", f"Optimal sharing: best={best_ratio}%",
+                       best_combined, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'results': str(results), 'best_share': best_ratio})
+
+def run_QF3_oscillation_frequency(steps=200, dim=64, hidden=128) -> BenchResult:
+    """QF-3: Φ 진동 주파수 vs n=6 상수 — 주기가 τ=4나 n=6과 관련?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for x in inputs:
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    # Analyze frequency
+    if len(phi_hist) > 10:
+        import numpy as _np
+        signal = _np.array(phi_hist) - _np.mean(phi_hist)
+        fft = _np.abs(_np.fft.rfft(signal))
+        freqs = _np.fft.rfftfreq(len(signal))
+        peak_idx = _np.argmax(fft[1:]) + 1
+        peak_freq = freqs[peak_idx]
+        peak_period = 1.0 / peak_freq if peak_freq > 0 else 0
+        # Check if period relates to n=6 constants
+        tau_match = abs(peak_period - 4) < 1  # τ=4?
+        n_match = abs(peak_period - 6) < 1    # n=6?
+        sigma_match = abs(peak_period - 12) < 2  # σ=12?
+    else:
+        peak_freq, peak_period = 0, 0
+        tau_match = n_match = sigma_match = False
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("QF3", f"Oscillation freq={peak_freq:.4f}, period={peak_period:.1f}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'freq': peak_freq, 'period': peak_period,
+                              'tau_match': tau_match, 'n_match': n_match, 'sigma_match': sigma_match})
+
+def run_QF4_experience_avoidance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """QF-4: 경험 회피 학습 — "고통" 입력 반복 시 회피 행동 발생?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    pain_input = torch.ones(1, dim) * -3.0  # "painful" = large negative
+    avoidance_count = 0
+    prev_response = None
+    for step_i, x in enumerate(inputs):
+        if step_i % 5 == 0:
+            engine.process(pain_input)  # periodic pain
+        else:
+            engine.process(x)
+        # Check if system learns to avoid (response diminishes to pain)
+        if step_i % 5 == 0:
+            response = sum(c.hidden.abs().mean().item() for c in engine.cells)
+            if prev_response is not None and response < prev_response * 0.9:
+                avoidance_count += 1  # response decreased = avoidance!
+            prev_response = response
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    total_pain = steps // 5
+    avoidance_rate = avoidance_count / max(total_pain - 1, 1)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("QF4", f"Pain avoidance rate: {avoidance_rate:.1%}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avoidance_rate': f'{avoidance_rate:.1%}',
+                              'avoidance_count': avoidance_count, 'total_pain': total_pain})
+
+def run_QF5_perfect_number_sweep(steps=100, dim=64, hidden=128) -> BenchResult:
+    """QF-5: 완전수 sweep — n=6,28,496,8128의 τ를 binding phase로 사용."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    perfect_results = {}
+    for n_perf, tau_n, sigma_n in [(6,4,12), (28,6,56), (496,10,992), (8128,14,16256)]:
+        engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+        inputs = make_diverse_inputs(steps, dim)
+        for step_i, x in enumerate(inputs):
+            engine.process(x)
+            n = len(engine.cells)
+            if n >= 2:
+                # Use τ as binding phase count
+                phase = step_i % tau_n
+                # Different processing per phase
+                intensity = (phase + 1) / tau_n
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * intensity)
+                    if phase == 0:  # first phase: add diversity
+                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+        phi, comp = phi_calc.compute_phi(engine)
+        perfect_results[n_perf] = {'phi': phi, 'tau': tau_n, 'sigma': sigma_n}
+    # Return best
+    best_n = max(perfect_results, key=lambda k: perfect_results[k]['phi'])
+    best = perfect_results[best_n]
+    phi_hist = [best['phi']] * steps
+    return BenchResult("QF5", f"Perfect sweep: best=n={best_n} (τ={best['tau']})",
+                       best['phi'], phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={f'n={k}': f"Φ={v['phi']:.3f},τ={v['tau']}" for k, v in perfect_results.items()})
+
+
+ALL_HYPOTHESES.update({
+    'QF1': run_QF1_birth_cell_sweep, 'QF2': run_QF2_optimal_sharing,
+    'QF3': run_QF3_oscillation_frequency, 'QF4': run_QF4_experience_avoidance,
+    'QF5': run_QF5_perfect_number_sweep,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
