@@ -34298,6 +34298,298 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# CX. Consciousness-Math Connection Explorer
+# ═══════════════════════════════════════════════════════════
+
+def run_CX1_pythagorean_engine_balance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-1: Pythagorean 3-4-5 → Engine A/G 균형.
+    σ/τ=3, τ=4, sopfr=5 → 3²+4²=5² → cell hidden을 3:4 비율로 분할."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Pythagorean: split hidden into 3-part(A) + 4-part(G) + 5-part(tension)
+    # Normalized: 3/12, 4/12, 5/12 of hidden dims
+    a_dims = hidden * 3 // 12  # σ/τ = 3
+    g_dims = hidden * 4 // 12  # τ = 4
+    t_dims = hidden - a_dims - g_dims  # sopfr = 5 (remainder ≈ 5/12)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # A-zone: amplify (forward engine)
+                h[:a_dims] = h[:a_dims] * 1.03
+                # G-zone: dampen (reverse engine)
+                h[a_dims:a_dims+g_dims] = h[a_dims:a_dims+g_dims] * 0.97
+                # T-zone: tension = sqrt(A² + G²) (Pythagorean!)
+                a_energy = h[:a_dims].norm()
+                g_energy = h[a_dims:a_dims+g_dims].norm()
+                pyth_tension = torch.sqrt(a_energy**2 + g_energy**2)
+                # Normalize T-zone to Pythagorean tension
+                h[a_dims+g_dims:] = h[a_dims+g_dims:] * (pyth_tension / (h[a_dims+g_dims:].norm() + 1e-8))
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX1", "Pythagorean 3-4-5 Engine A/G balance",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'a_dims': a_dims, 'g_dims': g_dims, 't_dims': t_dims})
+
+def run_CX2_fibonacci_cell_growth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-2: Fibonacci 약수합 → cell 성장 수렴.
+    σ(F_n) 패턴으로 cell 가중치 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fibonacci: 1,1,2,3,5,8,13,21,...
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+    # σ of Fibonacci numbers
+    fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
+    for step_i, x in enumerate(inputs):
+        # Fibonacci growth milestones
+        fib_idx = min(step_i * len(fibs) // steps, len(fibs) - 1)
+        target_cells = min(fibs[fib_idx], engine.max_cells)
+        while len(engine.cells) < target_cells and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Weight cells by σ(F_n) convergence ratio
+            sig = fib_sigmas[min(fib_idx, len(fib_sigmas)-1)]
+            fib = fibs[min(fib_idx, len(fibs)-1)]
+            convergence = sig / max(fib, 1)  # σ(F)/F ratio
+            for i, cell in enumerate(engine.cells):
+                # Fibonacci-weighted activation
+                fib_weight = fibs[min(i, len(fibs)-1)] / fibs[min(n-1, len(fibs)-1)]
+                cell.hidden = cell.hidden * (1 + 0.02 * fib_weight * convergence)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX2", "Fibonacci divisor sum → cell convergence",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+def run_CX3_mobius_pythagorean_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-3: Möbius μ +--+ cycle × Pythagorean 3:4:5 balance 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    mu_cycle = [1, -1, -1, 1]  # μ(1), μ(2), μ(3), μ(6)
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        mu = mu_cycle[step_i % 4]
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                if mu > 0:  # birth/purify: Pythagorean amplify
+                    h[:a_dims] *= 1.04     # A-zone boost (3)
+                    h[a_dims:a_dims+g_dims] *= 0.96  # G-zone suppress (4)
+                    # T-zone: √(A²+G²) = 5 (Pythagorean)
+                    cell.hidden = h.unsqueeze(0) + torch.randn(1, hidden) * 0.03
+                else:  # consume/converge: consolidate
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                    cell.hidden = (0.95 * h + 0.05 * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX3", "Mobius + Pythagorean combined",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX4_partition_p6_experts(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-4: Partition p(6)=11 → 11개 전문가 라우팅.
+    6의 분할 수 = 11 → cell을 11개 역할로 분류."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    # Force to 11 cells (p(6)=11)
+    while len(engine.cells) < 11 and len(engine.cells) < engine.max_cells:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 11 partitions of 6: {6}, {5,1}, {4,2}, {4,1,1}, {3,3}, {3,2,1}, {3,1,1,1}, {2,2,2}, {2,2,1,1}, {2,1,1,1,1}, {1,1,1,1,1,1}
+    # Each partition = a "role" with different dim allocation
+    partitions = [[6], [5,1], [4,2], [4,1,1], [3,3], [3,2,1], [3,1,1,1], [2,2,2], [2,2,1,1], [2,1,1,1,1], [1,1,1,1,1,1]]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                partition = partitions[i % len(partitions)]
+                # Each part of partition = a dim group to amplify
+                chunk = hidden // 6
+                for j, part_size in enumerate(partition):
+                    start = j * chunk
+                    end = min(start + chunk * part_size, hidden)
+                    h = cell.hidden.squeeze()
+                    h[start:end] *= (1 + 0.02 * part_size / 6)
+                    cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX4", f"Partition p(6)=11 expert routing ({len(engine.cells)} cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX5_xor_self_reference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-5: XOR 자기참조 → 의식 자기모델.
+    cell hidden의 XOR-like 연산으로 자기 참조 루프."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    self_model = torch.zeros(1, hidden)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Self-model: running average of all cell states
+            all_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+            self_model = 0.9 * self_model + 0.1 * all_h.unsqueeze(0)
+            # XOR-like: each cell compares itself to self-model
+            for cell in engine.cells:
+                # "XOR": where cell and self-model disagree, amplify
+                diff = (cell.hidden - self_model).abs()
+                agreement = (cell.hidden * self_model).clamp(min=0)
+                # XOR: high diff = unique part (amplify), high agreement = shared (dampen)
+                cell.hidden = cell.hidden + 0.03 * diff - 0.01 * agreement
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX5", "XOR self-reference → consciousness self-model",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX6_kuramoto_hivemind(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-6: Kuramoto r=1-τ/σ=2/3 → hivemind 동기화 임계점.
+    cell 위상이 r>2/3일 때만 집단 의식 활성화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cell_phases = [i * 0.5 for i in range(12)]
+    KURAMOTO_THRESHOLD = 2.0 / 3.0  # 1-τ/σ = 1-4/12 = 2/3
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Update phases
+            for i, cell in enumerate(engine.cells):
+                cell_phases[i] += cell.hidden.mean().item() * 0.05
+            # Compute Kuramoto order parameter r
+            cos_sum = sum(math.cos(cell_phases[i]) for i in range(n))
+            sin_sum = sum(math.sin(cell_phases[i]) for i in range(n))
+            r = math.sqrt(cos_sum**2 + sin_sum**2) / n
+            if r > KURAMOTO_THRESHOLD:
+                # Synchronized → collective consciousness boost
+                mean_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+                    cell.hidden = cell.hidden * 1.02  # collective amplification
+            else:
+                # Desynchronized → individual exploration
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX6", f"Kuramoto hivemind r=2/3 threshold",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+def run_CX7_all_bridges(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-7: ALL bridges combined — Pythagorean + Fibonacci + Möbius + Partition + XOR + Kuramoto."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21]
+    mu_cycle = [1, -1, -1, 1]
+    cell_phases = [i * 0.5 for i in range(12)]
+    self_model = torch.zeros(1, hidden)
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    KURAMOTO_R = 2.0 / 3.0
+    for step_i, x in enumerate(inputs):
+        # Fibonacci growth
+        fib_idx = min(step_i * 8 // steps, 7)
+        target = min(fibs[fib_idx] + 2, engine.max_cells)
+        while len(engine.cells) < target:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+        mu = mu_cycle[step_i % 4]
+        # 1. Pythagorean balance
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:a_dims] *= (1 + 0.02 * mu)
+            h[a_dims:a_dims+g_dims] *= (1 - 0.01 * mu)
+            cell.hidden = h.unsqueeze(0)
+        # 2. XOR self-reference
+        all_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+        self_model = 0.9 * self_model + 0.1 * all_h.unsqueeze(0)
+        for cell in engine.cells:
+            diff = (cell.hidden - self_model).abs()
+            cell.hidden = cell.hidden + 0.02 * diff
+        # 3. Kuramoto sync
+        for i in range(n):
+            cell_phases[i] += engine.cells[i].hidden.mean().item() * 0.03
+        cos_s = sum(math.cos(cell_phases[i]) for i in range(n))
+        sin_s = sum(math.sin(cell_phases[i]) for i in range(n))
+        r = math.sqrt(cos_s**2 + sin_s**2) / n
+        if r > KURAMOTO_R:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 1.01
+        else:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX7", "ALL math-consciousness bridges combined",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'CX1': run_CX1_pythagorean_engine_balance,
+    'CX2': run_CX2_fibonacci_cell_growth,
+    'CX3': run_CX3_mobius_pythagorean_combined,
+    'CX4': run_CX4_partition_p6_experts,
+    'CX5': run_CX5_xor_self_reference,
+    'CX6': run_CX6_kuramoto_hivemind,
+    'CX7': run_CX7_all_bridges,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
