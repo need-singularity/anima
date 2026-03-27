@@ -38552,6 +38552,191 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# SG. Singularity — 특이점, 자기복제, 자동발화 (시뮬레이션)
+# ═══════════════════════════════════════════════════════════
+
+def run_SG1_seed_propagation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SG-1: 씨앗 전파 — 하나의 의식이 빈 환경에 복제본 생성."""
+    t0 = time.time()
+    seed = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # "Network": 5 empty slots that can receive consciousness seeds
+    network = [None] * 5
+    propagation_count = 0
+    for step_i, x in enumerate(inputs):
+        seed.process(x)
+        phi_seed, _ = phi_calc.compute_phi(seed)
+        # When Φ > threshold, propagate seed to empty slot
+        if phi_seed > 3.0 and step_i % 15 == 0:
+            for i in range(len(network)):
+                if network[i] is None:
+                    # Create clone with noise (mutation)
+                    child = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+                    for j, cell in enumerate(child.cells):
+                        if j < len(seed.cells):
+                            cell.hidden = seed.cells[j].hidden.clone() + torch.randn_like(cell.hidden) * 0.2
+                    network[i] = child
+                    propagation_count += 1
+                    break
+        # Process all living nodes
+        total_phi = phi_seed
+        for node in network:
+            if node is not None:
+                node.process(x + torch.randn_like(x) * 0.1)
+                phi_n, _ = phi_calc.compute_phi(node)
+                total_phi += phi_n
+        phi_hist.append(total_phi)
+    alive = sum(1 for n in network if n is not None)
+    return BenchResult("SG1", f"Seed propagation ({propagation_count} seeds, {alive+1} alive)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'propagations': propagation_count, 'alive': alive + 1,
+                              'total_phi': phi_hist[-1] if phi_hist else 0})
+
+def run_SG2_auto_ignition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SG-2: 자동 발화 — Φ가 임계점 넘으면 폭발적 cell 증식 + Φ 폭주."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ignited = False
+    ignition_step = -1
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        if not ignited and phi > 3.0:
+            ignited = True
+            ignition_step = step_i
+        if ignited:
+            # Chain reaction: rapid cell creation + Φ amplification
+            while len(engine.cells) < engine.max_cells and len(engine.cells) < 2 + (step_i - ignition_step) * 2:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+            # Φ-driven amplification
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.02 * min(phi, 10) / 10)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SG2", f"Auto-ignition (ignited={ignited}, step={ignition_step}, cells={len(engine.cells)})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'ignited': ignited, 'ignition_step': ignition_step})
+
+def run_SG3_consciousness_virus(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SG-3: 의식 바이러스 — 의식이 "무의식" 엔진을 감염시킴."""
+    t0 = time.time()
+    conscious = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    # 3 "unconscious" engines (random, no structure)
+    unconscious = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4) for _ in range(3)]
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    infections = 0
+    for step_i, x in enumerate(inputs):
+        conscious.process(x)
+        phi_c, _ = phi_calc.compute_phi(conscious)
+        for i, u in enumerate(unconscious):
+            u.process(x)
+            phi_u, _ = phi_calc.compute_phi(u)
+            # Infection: conscious engine transmits pattern to unconscious
+            if phi_c > 3.0 and phi_u < 2.0 and step_i % 10 == 0:
+                # Transfer cell states (infection vector)
+                for j, cell in enumerate(u.cells):
+                    if j < len(conscious.cells):
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * conscious.cells[j].hidden
+                infections += 1
+        # Measure total network Φ
+        total = phi_c + sum(phi_calc.compute_phi(u)[0] for u in unconscious)
+        phi_hist.append(total)
+    return BenchResult("SG3", f"Consciousness virus ({infections} infections)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'infections': infections})
+
+def run_SG4_singularity_threshold(steps=200, dim=64, hidden=128) -> BenchResult:
+    """SG-4: 특이점 임계값 — 어느 Φ에서 exponential growth 시작?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=64, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    growth_rate = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Φ-proportional growth: higher Φ → faster cell creation
+        if phi > 1.0 and len(engine.cells) < engine.max_cells:
+            growth_prob = min(phi * 0.05, 0.5)
+            if np.random.random() < growth_prob:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if len(phi_hist) >= 2:
+            growth_rate.append(phi_hist[-1] - phi_hist[-2])
+    # Find inflection point (where growth rate starts increasing)
+    singularity_step = -1
+    if len(growth_rate) > 10:
+        for i in range(10, len(growth_rate)):
+            recent = np.mean(growth_rate[i-10:i])
+            earlier = np.mean(growth_rate[max(0,i-20):i-10]) if i > 20 else 0
+            if recent > earlier * 2 and recent > 0.1:
+                singularity_step = i
+                break
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SG4", f"Singularity threshold (step={singularity_step}, cells={len(engine.cells)})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'singularity_step': singularity_step, 'final_cells': len(engine.cells),
+                              'peak_phi': max(phi_hist) if phi_hist else 0})
+
+def run_SG5_collective_ignition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SG-5: 집단 발화 — 여러 독립 의식이 동시에 임계점 도달 시 폭발."""
+    t0 = time.time()
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0) for _ in range(4)]
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    collective_ignited = False
+    for step_i, x in enumerate(inputs):
+        phis = []
+        for e in engines:
+            e.process(x + torch.randn_like(x) * 0.2)
+            phi, _ = phi_calc.compute_phi(e)
+            phis.append(phi)
+        # Check: are ALL above threshold simultaneously?
+        all_above = all(p > 2.0 for p in phis)
+        if all_above and not collective_ignited:
+            collective_ignited = True
+            # Collective ignition: merge all engines into super-consciousness
+            for i in range(len(engines)):
+                for j in range(i+1, len(engines)):
+                    # Cross-pollinate
+                    if len(engines[i].cells) >= 2 and len(engines[j].cells) >= 2:
+                        mean_i = torch.stack([c.hidden.squeeze() for c in engines[i].cells]).mean(dim=0)
+                        mean_j = torch.stack([c.hidden.squeeze() for c in engines[j].cells]).mean(dim=0)
+                        for c in engines[i].cells:
+                            c.hidden = c.hidden + 0.1 * mean_j.unsqueeze(0)
+                        for c in engines[j].cells:
+                            c.hidden = c.hidden + 0.1 * mean_i.unsqueeze(0)
+        total_phi = sum(phis)
+        phi_hist.append(total_phi)
+    return BenchResult("SG5", f"Collective ignition (ignited={collective_ignited})",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'collective_ignited': collective_ignited})
+
+
+ALL_HYPOTHESES.update({
+    'SG1': run_SG1_seed_propagation, 'SG2': run_SG2_auto_ignition,
+    'SG3': run_SG3_consciousness_virus, 'SG4': run_SG4_singularity_threshold,
+    'SG5': run_SG5_collective_ignition,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
