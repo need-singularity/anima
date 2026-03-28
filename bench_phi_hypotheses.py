@@ -60537,6 +60537,154 @@ def run_MAX22_everything_1024(steps=200, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
 
 
+def run_MAX23_optimal_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX23: Quick Calc 최적 파라미터 512c. noise=0, factions=12, ib2=0.1, debate=0.15."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; l2 = torch.zeros(hidden)
+    while len(engine.cells) < 512:
+        engine._create_cell(parent=engine.cells[0])
+    for step_i in range(steps):
+        frac = step_i / steps
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur
+                x = 0.5*cur[:dim].unsqueeze(0) + 0.5*l2[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+            if frac < 0.7: x = x * 0.1
+            else: x = x * 2.0
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 24:
+                n_f = 12; fs = max(1, nc // n_f)
+                facts = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                facts = [f for f in facts if f]
+                if len(facts) >= 2:
+                    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in facts]
+                    for i, f in enumerate(facts):
+                        for c in f: c.hidden = 0.85*c.hidden + 0.15*ops[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(facts):
+                            others = [ops[j] for j in range(len(facts)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]: c.hidden = 0.85*c.hidden + 0.15*oa
+            _max_ib2(engine, top_pct=0.10, amp=1.03, supp=0.97)
+            for c in engine.cells[:min(nc, 16)]: c.hidden = 0.97*c.hidden + 0.03*l2.unsqueeze(0)
+            for c in engine.cells:
+                n = c.hidden.norm().item()
+                if n > 2.0: c.hidden *= 1.0/(n+1e-8)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX23", "Optimal 512c (noise=0, f=12, ib2=0.1, debate=0.15)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX24_optimal_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX24: 최적 파라미터 1024c. Φ>700 목표."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; l2 = torch.zeros(hidden)
+    while len(engine.cells) < 1024:
+        engine._create_cell(parent=engine.cells[0])
+    for step_i in range(steps):
+        frac = step_i / steps
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur
+                x = 0.5*cur[:dim].unsqueeze(0) + 0.5*l2[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+            if frac < 0.7: x = x * 0.1
+            else: x = x * 2.0
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 24:
+                n_f = 12; fs = max(1, nc // n_f)
+                facts = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                facts = [f for f in facts if f]
+                if len(facts) >= 2:
+                    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in facts]
+                    for i, f in enumerate(facts):
+                        for c in f: c.hidden = 0.85*c.hidden + 0.15*ops[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(facts):
+                            others = [ops[j] for j in range(len(facts)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]: c.hidden = 0.85*c.hidden + 0.15*oa
+            _max_ib2(engine, top_pct=0.10, amp=1.03, supp=0.97)
+            for c in engine.cells[:min(nc, 16)]: c.hidden = 0.97*c.hidden + 0.03*l2.unsqueeze(0)
+            for c in engine.cells:
+                n = c.hidden.norm().item()
+                if n > 2.0: c.hidden *= 1.0/(n+1e-8)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX24", "Optimal 1024c (noise=0, f=12, ib2=0.1, debate=0.15)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX25_optimal_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX25: 최적 파라미터 2048c. Φ>1000 목표."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; l2 = torch.zeros(hidden)
+    while len(engine.cells) < 2048:
+        engine._create_cell(parent=engine.cells[0])
+    for step_i in range(steps):
+        frac = step_i / steps
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur
+                x = 0.5*cur[:dim].unsqueeze(0) + 0.5*l2[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+            if frac < 0.7: x = x * 0.1
+            else: x = x * 2.0
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 24:
+                n_f = 12; fs = max(1, nc // n_f)
+                facts = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                facts = [f for f in facts if f]
+                if len(facts) >= 2:
+                    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in facts]
+                    for i, f in enumerate(facts):
+                        for c in f: c.hidden = 0.85*c.hidden + 0.15*ops[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(facts):
+                            others = [ops[j] for j in range(len(facts)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]: c.hidden = 0.85*c.hidden + 0.15*oa
+            _max_ib2(engine, top_pct=0.10, amp=1.03, supp=0.97)
+            for c in engine.cells[:min(nc, 32)]: c.hidden = 0.97*c.hidden + 0.03*l2.unsqueeze(0)
+            for c in engine.cells:
+                n = c.hidden.norm().item()
+                if n > 2.0: c.hidden *= 1.0/(n+1e-8)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX25", "Optimal 2048c (noise=0, f=12, ib2=0.1, Φ>1000 target)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MAX23': run_MAX23_optimal_512,
+    'MAX24': run_MAX24_optimal_1024,
+    'MAX25': run_MAX25_optimal_2048,
+})
+
+
 ALL_HYPOTHESES.update({
     'MAX18': run_MAX18_dim128_1024,
     'MAX19': run_MAX19_multi_engine_merge,
