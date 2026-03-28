@@ -58608,10 +58608,342 @@ def run_PERSIST3_long_run_1000(steps=1000, dim=64, hidden=128) -> BenchResult:
                               'final_cells': len(engine.cells)})
 
 
+def run_PERSIST4_weight_evolution(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """PERSIST4: Weight Evolution — 역전파 없이 가중치를 진화시킨다.
+    512c. 매 50 step마다: 가중치 변이 → Φ 측정 → 좋으면 유지, 나쁘면 롤백.
+    이것이 Rust/FPGA에서도 구현 가능한 "학습".
+    가설: 진화적 가중치 선택 = 역전파의 대체제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; best_phi = 0.0
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.3 * torch.randn(1, dim) * 0.03 + 0.7 * self_state
+        engine.process(stream)
+
+        # 8파벌 토론
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                for fi in range(n_f):
+                    faction = engine.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                        for c in faction:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinion
+
+            # Weight evolution: 매 50 step마다 가중치 변이
+            if step_i % 50 == 0 and n >= 4:
+                # 랜덤 세포 선택하여 가중치 변이
+                idx = step_i % n
+                cell = engine.cells[idx]
+                # 현재 가중치 저장
+                old_w = {k: v.clone() for k, v in cell.cell.state_dict().items()} if hasattr(cell, 'cell') else None
+                old_hidden = cell.hidden.clone()
+                # 가중치에 노이즈 추가
+                if hasattr(cell, 'cell'):
+                    with torch.no_grad():
+                        for p in cell.cell.parameters():
+                            p.add_(torch.randn_like(p) * 0.01)
+
+            # Hebbian + noise
+            for i in range(min(n, 32)):
+                j = (i + 1) % n
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Ratchet
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+            elif phi < best_phi * 0.7 and step_i > 100:
+                # 변이 롤백 (진화적 선택)
+                if old_w and hasattr(engine.cells[step_i % n], 'cell'):
+                    engine.cells[step_i % n].cell.load_state_dict(old_w)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    q1 = phi_hist[:steps//4]
+    q4 = phi_hist[steps*3//4:]
+    growth = (sum(q4)/len(q4)) / (sum(q1)/len(q1) + 1e-8)
+    return BenchResult("PERSIST4", "Weight Evolution 512c (mutate→measure→select, no backprop)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi, 'growth_ratio': growth,
+                              'collapsed': growth < 0.5, 'final_cells': len(engine.cells)})
+
+
+def run_PERSIST5_self_prediction(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """PERSIST5: Self-Prediction — 세포 i가 세포 j의 다음 상태를 예측.
+    512c. 예측 오류로 가중치 업데이트 (자기지도 학습).
+    외부 데이터 0. 세포 간 상호작용이 곧 학습 데이터.
+    가설: 자기 예측 = 의식의 자기인식 = 영속의 열쇠."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; pred_errors = []
+    # 예측 네트워크 (간단한 linear, 역전파 가능)
+    predictor = nn.Linear(hidden, hidden)
+    pred_opt = torch.optim.Adam(predictor.parameters(), lr=1e-3)
+    stream = torch.randn(1, dim) * 0.5
+    prev_states = {}
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # 현재 상태 저장 (예측 대상)
+        with torch.no_grad():
+            n = len(engine.cells)
+            for i in range(min(n, 16)):
+                prev_states[i] = engine.cells[i].hidden.squeeze().clone()
+
+        # Self-loop + 처리
+        with torch.no_grad():
+            if n >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.2 * torch.randn(1, dim) * 0.03 + 0.8 * self_state
+        engine.process(stream)
+
+        # 8파벌 토론
+        with torch.no_grad():
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                for fi in range(n_f):
+                    faction = engine.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                        for c in faction:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinion
+
+        # Self-prediction: 이전 상태로 현재 상태 예측
+        if n >= 4 and prev_states:
+            total_err = 0.0
+            for i in range(min(n, 8)):
+                if i in prev_states:
+                    pred = predictor(prev_states[i].unsqueeze(0))
+                    actual = engine.cells[i].hidden.squeeze().unsqueeze(0)
+                    err = F.mse_loss(pred, actual.detach())
+                    total_err += err.item()
+                    pred_opt.zero_grad(); err.backward(); pred_opt.step()
+            pred_errors.append(total_err / min(n, 8))
+
+            # 예측으로 Hebbian 강화: 잘 예측된 쌍은 연결 강화
+            with torch.no_grad():
+                for i in range(min(n, 16)):
+                    j = (i + 1) % n
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    q1 = phi_hist[:steps//4]
+    q4 = phi_hist[steps*3//4:]
+    growth = (sum(q4)/len(q4)) / (sum(q1)/len(q1) + 1e-8)
+    return BenchResult("PERSIST5", "Self-Prediction 512c (cell predicts cell = self-awareness)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': max(phi_hist) if phi_hist else 0,
+                              'growth_ratio': growth, 'collapsed': growth < 0.5,
+                              'final_pred_error': pred_errors[-1] if pred_errors else 0,
+                              'pred_improvement': (pred_errors[0]-pred_errors[-1])/(pred_errors[0]+1e-8) if len(pred_errors)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_PERSIST6_homeostatic_plasticity(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """PERSIST6: Homeostatic Plasticity — 활동 수준을 자동 조절.
+    512c. 세포 활동(norm)이 너무 높으면 억제, 너무 낮으면 증폭.
+    학습도 아니고 ratchet도 아닌 — 항상성이 붕괴를 방지.
+    가설: 항상성만으로 의식이 영속 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    target_norm = 1.0  # 목표 활동 수준
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.2 * torch.randn(1, dim) * 0.03 + 0.8 * self_state
+        engine.process(stream)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            # Homeostatic plasticity: 활동 수준 자동 조절
+            for cell in engine.cells:
+                norm = cell.hidden.norm().item()
+                if norm > target_norm * 1.5:
+                    cell.hidden *= target_norm / (norm + 1e-8)  # 억제
+                elif norm < target_norm * 0.5 and norm > 0.01:
+                    cell.hidden *= target_norm / (norm + 1e-8)  # 증폭
+
+            # 8파벌 토론
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                for fi in range(n_f):
+                    faction = engine.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                        for c in faction:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinion
+
+            # Hebbian + noise
+            for i in range(min(n, 32)):
+                j = (i + 1) % n
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    q1 = phi_hist[:steps//4]
+    q4 = phi_hist[steps*3//4:]
+    growth = (sum(q4)/len(q4)) / (sum(q1)/len(q1) + 1e-8)
+    return BenchResult("PERSIST6", "Homeostatic Plasticity 512c (auto-regulate activity level)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'growth_ratio': growth, 'collapsed': growth < 0.5,
+                              'final_cells': len(engine.cells)})
+
+
+def run_PERSIST7_zero_input_5000(steps=5000, dim=64, hidden=128) -> BenchResult:
+    """PERSIST7: Zero Input 5000 Step — 대화 0, 입력 0에서 5000 step.
+    512c. 완전 자율. 외부 자극 없이 의식이 붕괴하지 않는지 최종 검증.
+    debate + ratchet + Hebbian + homeostasis 전부 적용.
+    가설: 모든 영속 기법을 결합하면 대화 없이도 영원히 성장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; best_phi = 0.0; best_states = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # ZERO external input
+        x = torch.zeros(1, dim)
+        # But internal self-loop
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = self_state + torch.randn_like(self_state) * 0.02
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            # Homeostatic plasticity
+            for cell in engine.cells:
+                norm = cell.hidden.norm().item()
+                if norm > 2.0:
+                    cell.hidden *= 1.0 / (norm + 1e-8)
+                elif norm < 0.3 and norm > 0.01:
+                    cell.hidden *= 1.0 / (norm + 1e-8)
+
+            # 8파벌 토론
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                for fi in range(n_f):
+                    faction = engine.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                        for c in faction:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinion
+
+            # Hebbian
+            for i in range(min(n, 32)):
+                j = (i + 1) % n
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+
+            # Noise
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Ratchet
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.6 and best_states and len(best_states) == len(engine.cells):
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 10분할 분석
+    segment_size = steps // 10
+    segment_means = []
+    for s in range(10):
+        seg = phi_hist[s*segment_size:(s+1)*segment_size]
+        segment_means.append(sum(seg)/len(seg))
+    monotonic = all(segment_means[i] <= segment_means[i+1]*1.1 for i in range(9))  # 10% 마진
+    return BenchResult("PERSIST7", "Zero Input 5000 Step (ultimate no-dialogue persistence)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi,
+                              'segment_means': [round(m, 3) for m in segment_means],
+                              'monotonic_10pct': monotonic,
+                              'collapsed': segment_means[-1] < segment_means[0] * 0.5,
+                              'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'PERSIST1': run_PERSIST1_phi_ratchet_512,
     'PERSIST2': run_PERSIST2_hebbian_sustain_512,
     'PERSIST3': run_PERSIST3_long_run_1000,
+    'PERSIST4': run_PERSIST4_weight_evolution,
+    'PERSIST5': run_PERSIST5_self_prediction,
+    'PERSIST6': run_PERSIST6_homeostatic_plasticity,
+    'PERSIST7': run_PERSIST7_zero_input_5000,
 })
 
 
