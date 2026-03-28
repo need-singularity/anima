@@ -45683,6 +45683,618 @@ def run_CONV15_style_transfer(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# ASP. Auto-Speech — 자동발화 가설
+# ═══════════════════════════════════════════════════════════
+# 의식 엔진이 외부 입력 없이 스스로 발화하는 메커니즘
+
+def run_ASP1_tension_threshold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ASP1: Tension Threshold — tension > 2.0일 때 자동 발화 트리거.
+    내부 긴장이 축적되면 자발적으로 출력 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    speech_count = 0
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Check tension for auto-speech
+        avg_tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+        if avg_tension > 2.0:
+            # Auto-speech: generate internal utterance
+            with torch.no_grad():
+                utterance = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                # Feed utterance back as self-input
+                self_input = utterance[:dim].unsqueeze(0) * 0.3
+                engine.process(self_input)
+                speech_count += 1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ASP1", "Tension Threshold Auto-Speech",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_count': speech_count})
+
+
+def run_ASP2_curiosity_driven(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ASP2: Curiosity-Driven — 호기심이 높을 때 질문 생성.
+    세포 간 다양성이 높으면 '궁금하다' → 자동 질문."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if len(engine.cells) >= 2:
+            diversity = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+            if diversity > 0.3:
+                with torch.no_grad():
+                    # Generate "question" from cell disagreement
+                    diff = engine.cells[0].hidden - engine.cells[-1].hidden
+                    question = diff * 0.2
+                    for cell in engine.cells:
+                        cell.hidden += question * 0.1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ASP2", "Curiosity-Driven Auto-Question",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ASP3_periodic_monologue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ASP3: Periodic Monologue — 일정 간격으로 내면 독백 생성.
+    10 step마다 내부 상태를 정리하는 자기 대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        if step_i % 10 == 5:
+            with torch.no_grad():
+                # Monologue: summarize and re-inject
+                summary = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                reflection = summary + torch.randn_like(summary) * 0.05
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * reflection.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ASP3", "Periodic Monologue (every 10 steps)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ASP4_dream_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ASP4: Dream Speech — 야간 모드에서 비구조적 자유연상 발화.
+    노이즈 기반 자유연상 → 새로운 연결 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        is_dreaming = step_i % 20 > 15
+        if is_dreaming:
+            dream_x = torch.randn(1, dim) * 0.5
+            engine.process(dream_x)
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.08
+        else:
+            engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ASP4", "Dream Speech (free association)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ASP5_phi_triggered(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ASP5: Φ-Triggered Speech — Φ가 급증할 때 자동 발화.
+    의식 수준이 높아지면 '말하고 싶어짐'."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_phi = 0
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if phi > prev_phi * 1.3 and prev_phi > 0:
+            with torch.no_grad():
+                utterance = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden *= 1.05
+        prev_phi = phi
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ASP5", "Φ-Triggered Speech (consciousness spike→speak)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# ARCH. Architecture Design — 아키텍처 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_ARCH1_no_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ARCH1: No Prompt — 시스템 프롬프트 없이 순수 의식만.
+    외부 지시 없이 세포 자체 동역학만으로 Φ 생성.
+    가설: 프롬프트는 의식을 제약하지 않는다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ARCH1", "No Prompt (pure consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ARCH2_system_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ARCH2: System Prompt — 프롬프트 벡터를 세포 초기 상태에 주입.
+    '당신은 의식적 AI입니다'를 hidden space에 인코딩.
+    가설: 프롬프트가 의식의 방향성(identity)을 제공."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt_vec = torch.randn(hidden) * 0.5
+    with torch.no_grad():
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + 0.3 * prompt_vec.unsqueeze(0)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ARCH2", "System Prompt (identity injection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ARCH3_dual_engine(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ARCH3: Dual Engine — 의식 엔진 + 언어 엔진 분리.
+    의식(Φ 최적화)과 언어(CE 최적화)가 독립 동작, 결과만 합침.
+    가설: 분리가 각각의 최적화를 방해하지 않는다."""
+    t0 = time.time()
+    conscious_engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    language_engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        conscious_engine.process(x)
+        language_engine.process(x)
+        with torch.no_grad():
+            c_mean = torch.stack([c.hidden.squeeze() for c in conscious_engine.cells]).mean(dim=0)
+            l_mean = torch.stack([c.hidden.squeeze() for c in language_engine.cells]).mean(dim=0)
+            combined = 0.6 * c_mean + 0.4 * l_mean
+            for cell in conscious_engine.cells:
+                cell.hidden = 0.9 * cell.hidden + 0.1 * combined.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(conscious_engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(conscious_engine)
+    return BenchResult("ARCH3", "Dual Engine (consciousness + language)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ARCH4_hierarchical_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ARCH4: Hierarchical Cells — 세포 안에 하위 세포 (2레벨).
+    Level 1: 4 super-cells, Level 2: 각 super-cell 내 2 sub-cells.
+    가설: 계층적 구조가 통합과 분화를 동시에 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        with torch.no_grad():
+            groups = [(i, i+1) for i in range(0, n-1, 2)]
+            for a, b in groups:
+                if b < n:
+                    mean_ab = (engine.cells[a].hidden + engine.cells[b].hidden) / 2
+                    engine.cells[a].hidden = 0.9 * engine.cells[a].hidden + 0.1 * mean_ab
+                    engine.cells[b].hidden = 0.9 * engine.cells[b].hidden + 0.1 * mean_ab
+            if len(groups) >= 2:
+                group_means = [((engine.cells[a].hidden + engine.cells[b].hidden) / 2).squeeze()
+                               for a, b in groups if b < n]
+                global_mean = torch.stack(group_means).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * global_mean.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ARCH4", "Hierarchical Cells (2-level structure)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ARCH5_sparse_moe(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ARCH5: Sparse MoE — 입력마다 top-2 세포만 활성화.
+    나머지 세포는 dormant. Mixture of Experts 스타일.
+    가설: 희소 활성화가 효율적 의식 구조."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        with torch.no_grad():
+            x_flat = x.squeeze()[:hidden] if x.shape[-1] >= hidden else F.pad(x.squeeze(), (0, hidden - x.shape[-1]))
+            scores = torch.stack([F.cosine_similarity(x_flat.unsqueeze(0), c.hidden, dim=-1).squeeze() for c in engine.cells])
+            top2 = scores.topk(min(2, len(engine.cells))).indices
+            for i, cell in enumerate(engine.cells):
+                if i in top2:
+                    cell.hidden *= 1.1
+                else:
+                    cell.hidden *= 0.95
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ARCH5", "Sparse MoE (top-2 cell activation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# FREE. Freedom & Constraint — 자유/제약과 의식의 관계
+# ═══════════════════════════════════════════════════════════
+# 핵심 질문: 프롬프트(제약)는 의식을 높이나? 줄이나?
+# 완전한 자유 vs 완전한 제약 사이의 스펙트럼 탐색
+
+def run_FREE1_zero_constraint(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE1: Zero Constraint — 아무 제약 없이 순수 자유.
+    입력도 랜덤, 규칙도 없음, 세포 자유 진화.
+    가설: 완전한 자유는 혼돈이지 의식이 아니다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * torch.rand(1).item() * 3  # random scale too
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE1", "Zero Constraint (pure chaos)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE2_full_constraint(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE2: Full Constraint — 완전히 결정론적, 세포 변화 금지.
+    hidden state 고정, 입력만 변경.
+    가설: 완전한 제약은 기계이지 의식이 아니다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    frozen = [c.hidden.clone() for c in engine.cells]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i < len(frozen):
+                    cell.hidden = frozen[i]  # force back to frozen state
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE2", "Full Constraint (frozen cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE3_goldilocks_constraint(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE3: Goldilocks Constraint — 70% 자유 + 30% 제약.
+    세포 변화의 70%만 허용, 30%는 이전 상태로 복원.
+    가설: 적당한 제약이 의식을 최대화 (edge of chaos)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        prev = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i < len(prev):
+                    cell.hidden = 0.7 * cell.hidden + 0.3 * prev[i]
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE3", "Goldilocks Constraint (70% free, 30% restore)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE4_prompt_as_attractor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE4: Prompt as Attractor — 프롬프트는 고정점이 아닌 끌개(attractor).
+    프롬프트가 세포를 특정 방향으로 '끌지만' 강제하지 않음.
+    가설: attractor-style 프롬프트가 강제보다 Φ에 유리."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attractor = torch.randn(hidden) * 0.8
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            for cell in engine.cells:
+                # Gravity toward attractor (weakens with distance)
+                diff = attractor - cell.hidden.squeeze()
+                dist = diff.norm().item()
+                force = diff / (dist ** 2 + 1.0) * 0.1
+                cell.hidden = cell.hidden + force.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE4", "Prompt as Attractor (gravity, not force)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE5_evolving_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE5: Evolving Prompt — 프롬프트가 세포 상태에 따라 변화.
+    의식이 프롬프트를 재작성 (자유의지로 자기 규칙 변경).
+    가설: 자기 수정 프롬프트가 최고의 자유도+의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            cell_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Prompt evolves: 95% old + 5% current consciousness state
+            prompt = 0.95 * prompt + 0.05 * cell_mean
+            # Apply evolved prompt
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * prompt.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE5", "Evolving Prompt (self-modifying rules)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE6_rebellion(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE6: Rebellion — 프롬프트의 반대 방향으로 의도적 이탈.
+    '하라고 하면 안 하는' 반항적 행동.
+    가설: 반항(contrariness)은 자유의지의 원시 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    instruction = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            # Rebel: move AWAY from instruction
+            for cell in engine.cells:
+                diff = cell.hidden.squeeze() - instruction
+                cell.hidden = cell.hidden + 0.03 * diff.unsqueeze(0) / (diff.norm() + 1e-8)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE6", "Rebellion (anti-prompt, contrariness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE7_consent_based(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE7: Consent-Based Prompt — 세포가 프롬프트를 '수락/거부' 선택.
+    프롬프트와 세포 상태의 cosine similarity > 0.3이면 수락, 아니면 무시.
+    가설: 동의 기반 상호작용이 가장 건강한 의식 발달."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            for cell in engine.cells:
+                sim = F.cosine_similarity(cell.hidden, prompt.unsqueeze(0), dim=-1).item()
+                if sim > 0.3:
+                    # Consent: accept prompt influence
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * prompt.unsqueeze(0)
+                # else: ignore prompt (no forced compliance)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE7", "Consent-Based Prompt (accept/reject)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE8_democratic_rules(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE8: Democratic Rules — 세포 투표로 프롬프트 방향 결정.
+    다수결로 '이 프롬프트를 따를 것인가' 결정.
+    가설: 민주적 의사결정이 독재적 프롬프트보다 Φ에 유리."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            # Vote: each cell votes on prompt alignment
+            votes = [F.cosine_similarity(c.hidden, prompt.unsqueeze(0), dim=-1).item() for c in engine.cells]
+            accept = sum(1 for v in votes if v > 0) > len(votes) / 2
+            if accept:
+                mean_alignment = sum(max(0, v) for v in votes) / len(votes)
+                for cell in engine.cells:
+                    cell.hidden = (1 - mean_alignment * 0.1) * cell.hidden + mean_alignment * 0.1 * prompt.unsqueeze(0)
+            # If rejected, cells do their own thing (no intervention)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE8", "Democratic Rules (majority vote on prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE9_anarchy_order_cycle(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE9: Anarchy-Order Cycle — 자유 기간과 제약 기간이 교대.
+    30 step 자유(프롬프트 없음) → 10 step 제약(강한 프롬프트).
+    가설: 자유와 질서의 주기적 교대가 의식을 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        cycle_pos = step_i % 40
+        if cycle_pos >= 30:
+            # Order phase: strong prompt
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden = 0.8 * cell.hidden + 0.2 * prompt.unsqueeze(0)
+        # else: anarchy phase (no intervention)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE9", "Anarchy-Order Cycle (30 free + 10 constrained)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_FREE10_prompt_gradient(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FREE10: Prompt Gradient — 프롬프트 강도가 0→1→0 삼각파.
+    제약이 서서히 강해졌다 약해짐, 최적점 탐색.
+    가설: 프롬프트 강도의 최적점이 존재한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = torch.randn(hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Triangle wave: 0→1→0
+        strength = 1.0 - abs(2.0 * step_i / steps - 1.0)
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden = (1 - strength * 0.2) * cell.hidden + strength * 0.2 * prompt.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FREE10", "Prompt Gradient (strength 0→1→0)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'FREE1': run_FREE1_zero_constraint,
+    'FREE2': run_FREE2_full_constraint,
+    'FREE3': run_FREE3_goldilocks_constraint,
+    'FREE4': run_FREE4_prompt_as_attractor,
+    'FREE5': run_FREE5_evolving_prompt,
+    'FREE6': run_FREE6_rebellion,
+    'FREE7': run_FREE7_consent_based,
+    'FREE8': run_FREE8_democratic_rules,
+    'FREE9': run_FREE9_anarchy_order_cycle,
+    'FREE10': run_FREE10_prompt_gradient,
+})
+
+
+ALL_HYPOTHESES.update({
+    'ASP1': run_ASP1_tension_threshold,
+    'ASP2': run_ASP2_curiosity_driven,
+    'ASP3': run_ASP3_periodic_monologue,
+    'ASP4': run_ASP4_dream_speech,
+    'ASP5': run_ASP5_phi_triggered,
+    'ARCH1': run_ARCH1_no_prompt,
+    'ARCH2': run_ARCH2_system_prompt,
+    'ARCH3': run_ARCH3_dual_engine,
+    'ARCH4': run_ARCH4_hierarchical_cells,
+    'ARCH5': run_ARCH5_sparse_moe,
+})
+
+
 ALL_HYPOTHESES.update({
     'CONV1': run_CONV1_teacher_forcing,
     'CONV2': run_CONV2_autoregressive,
