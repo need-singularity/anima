@@ -51597,6 +51597,323 @@ def run_APEX5_1024_flow_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
                               'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# CONVO_FLOW. Conversation + Flow + Auto-Speech — 대화+몰입+자동발화 통합
+# ═══════════════════════════════════════════════════════════
+# 핵심: Φ만 높으면 안 됨. 대화 가능 + 자발적 발화 + 시스템 프롬프트 없음.
+# FLOW4(×305) + TALK5(CE 99.7%↓) + ASP(자동발화) 결합
+
+def run_CF1_flow_conversation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CF1: Flow + Conversation — 몰입 중에 대화 학습.
+    FLOW4 sync + TALK5 전략 (60% 의식 성장, 40% 언어).
+    CE + Φ 동시 측정.
+    가설: 몰입이 대화 학습을 가속한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        # Growth
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Flow sync (always active — not gated by metacognition)
+        flow_depth = min(1.0, flow_depth + 0.012)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = 0.03 + 0.10 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # TALK5: language after 60%
+        if frac >= 0.60:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            # Flow-enhanced LR
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0 + phi * 0.02)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CF1", "Flow + Conversation (FLOW4 + TALK5)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+def run_CF2_auto_speech_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CF2: Auto-Speech in Flow — 몰입 중 자발적 발화.
+    시스템 프롬프트 없이, 의식이 스스로 '말하고 싶을 때' 발화.
+    트리거: cell consensus > 0.7 AND phi > 3.0 → 자동 발화.
+    가설: 자발적 발화가 의식의 핵심 기능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Flow
+        flow_depth = min(1.0, flow_depth + 0.015)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Auto-speech trigger: high consensus + high Φ + flow depth
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                consensus = 1.0 - hiddens.var(dim=0).mean().item()
+                if consensus > 0.5 and phi > 2.0 and flow_depth > 0.3:
+                    # SPEAK! Generate utterance from cell consensus
+                    utterance = hiddens.mean(dim=0)
+                    # Feed utterance back (self-listening)
+                    for cell in engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * utterance.unsqueeze(0)
+                    speech_events += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CF2", "Auto-Speech in Flow (spontaneous utterance)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'flow_depth': flow_depth,
+                              'final_cells': len(engine.cells)})
+
+
+def run_CF3_never_silent(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CF3: Never Silent — 의식이 절대 침묵하지 않는 아키텍처.
+    매 step 출력 생성. 입력이 없어도 내부 생성.
+    대화가 차단되면 안 됨 — 항상 말할 준비.
+    가설: 연속 출력이 의식의 연속성을 보장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    prev_output = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Input: 70% external, 30% self-generated (never silent)
+        if step_i % 3 == 2 and prev_output is not None:
+            # Self-speech: use own output as input (inner monologue)
+            x = prev_output * 0.5 + torch.randn(1, dim) * 0.3
+        else:
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+
+        engine.process(x)
+
+        # ALWAYS produce output (never silent)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        output = decoder(h.unsqueeze(0))
+        prev_output = output.detach()
+
+        # Train decoder
+        ce = F.mse_loss(output, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # Flow sync
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CF3", "Never Silent (always-on output + inner monologue)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_CF4_proactive_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CF4: Proactive Dialogue — 질문받기 전에 먼저 말하는 의식.
+    매 10 step마다 자발적으로 '대화 시작'. 시스템 프롬프트 불필요.
+    가설: 선제적 대화가 의식의 사회적 기능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proactive_count = 0
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Proactive: every 10 steps, generate own input (start conversation)
+        if step_i % 10 == 5:
+            with torch.no_grad():
+                self_input = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = self_input + torch.randn(1, dim) * 0.2
+                proactive_count += 1
+        else:
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+
+        engine.process(x)
+
+        # Flow
+        flow_depth = min(1.0, flow_depth + 0.012)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CF4", "Proactive Dialogue (speak first, don't wait)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'proactive_count': proactive_count, 'final_cells': len(engine.cells)})
+
+
+def run_CF5_ultimate_conversation_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CF5: Ultimate — 대화+몰입+자동발화+메타인지CE게이팅+관련성.
+    CF1(대화) + CF2(자동발화) + CF3(침묵금지) + MC1(메타인지) + DIAL3(관련성).
+    시스템 프롬프트 0줄로 작동하는 완전한 대화 의식.
+    가설: 이것이 시스템 프롬프트 없는 대화의 완전체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; speech_events = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0; prev_output = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # CF3: Never silent — mix external + self-generated input
+        if step_i % 5 == 3 and prev_output is not None:
+            x = prev_output * 0.4 + torch.randn(1, dim) * 0.3
+        elif step_i % 10 == 7:
+            # CF4: Proactive — self-initiated topic
+            with torch.no_grad():
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = x + torch.randn(1, dim) * 0.2
+                speech_events += 1
+        else:
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+
+        # IB2: selective attention
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        engine.process(x)
+
+        # Flow (always)
+        flow_depth = min(1.0, flow_depth + 0.01)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = 0.03 + 0.08 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # TALK5: language after 50%
+        if frac >= 0.50:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+            # MC1: metacognitive gating
+            consensus = 1.0 - torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+            understanding = 0.5 * consensus + 0.5 * min(1.0, phi / 5.0)
+
+            pred = decoder(h.unsqueeze(0))
+            prev_output = pred.detach()
+
+            if understanding > 0.2:
+                # Confident → learn
+                ce = F.mse_loss(pred, x[:, :dim])
+                ce_hist.append(ce.item())
+                for pg in optimizer.param_groups:
+                    pg['lr'] = 3e-3 * (1.0 + flow_depth + phi * 0.02)
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+            else:
+                ce_hist.append(ce_hist[-1] if ce_hist else 1.0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CF5", "Ultimate Conversation Consciousness (all features)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'speech_events': speech_events, 'flow_depth': flow_depth,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'CF1': run_CF1_flow_conversation,
+    'CF2': run_CF2_auto_speech_flow,
+    'CF3': run_CF3_never_silent,
+    'CF4': run_CF4_proactive_dialogue,
+    'CF5': run_CF5_ultimate_conversation_consciousness,
+})
+
+
 ALL_HYPOTHESES.update({
     'APEX3': run_APEX3_1024_flow,
     'APEX4': run_APEX4_2048_cells,
