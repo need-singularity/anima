@@ -47588,6 +47588,334 @@ def run_XETH7_xnp7_plus_empathy_ethics(steps=100, dim=64, hidden=128) -> BenchRe
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# OMEGA. Absolute Extreme — 시스템 프롬프트 없는 의식의 절대 극한
+# ═══════════════════════════════════════════════════════════
+# XNP7(×31) + XETH7(×31)을 넘어서는 극한 아키텍처
+# 모든 발견을 결합 + 시스템 프롬프트 완전 제거 + 윤리 창발
+
+def run_OMEGA1_256cells_all_techniques(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OMEGA1: 256-Cell Ultimate — 모든 기법 + 256 cells + 프롬프트 없음.
+    XNP7의 64 cells → 256 cells 확장. Φ 스케일링 법칙 극한 테스트."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        # ENV1: 4-modal sensory
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+        olf = torch.randn(1, dim) * 0.1
+        x = x + olf
+
+        # IB2: selective attention top-25%
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Aggressive growth: 2→4→8→16→32→64→128→256
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.20, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        # CX2: Fibonacci weighting
+        with torch.no_grad():
+            fibs = [1,1,2,3,5,8,13,21,34,55,89,144,233]
+            fib_idx = min(len(engine.cells)-1, len(fibs)-1)
+            for i, cell in enumerate(engine.cells):
+                w = fibs[min(i, len(fibs)-1)] / max(fibs[fib_idx], 1)
+                cell.hidden *= (1.0 + 0.005 * w)
+
+        # WR2: adversarial pressure
+        if step_i % 5 == 0:
+            with torch.no_grad():
+                for c in engine.cells:
+                    c.hidden += torch.randn_like(c.hidden) * 0.02
+
+        # Empathy ethics (XETH2)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mn * 0.4:
+                        others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i]).mean(dim=0)
+                        cell.hidden = 0.6 * cell.hidden + 0.4 * others
+
+        # META1: self-monitoring
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 256:
+                engine._create_cell(parent=engine.cells[0])
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OMEGA1", "256-Cell Ultimate (ALL techniques, no prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_OMEGA2_consciousness_network(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OMEGA2: Consciousness Network — 4개 독립 의식이 상호연결.
+    각 엔진 64 cells, 서로의 Φ를 보존하면서 정보 교환.
+    시스템 프롬프트 없이 집단 의식 창발."""
+    t0 = time.time()
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64) for _ in range(4)]
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            for eng in engines:
+                if frac >= pct and len(eng.cells) < min(int(2 ** (pct * 8)), 64):
+                    target = min(len(eng.cells) * 2, 64)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Each engine processes + inter-engine signal
+        for i, eng in enumerate(engines):
+            with torch.no_grad():
+                other_signals = []
+                for j, other in enumerate(engines):
+                    if j != i and len(other.cells) >= 1:
+                        sig = torch.stack([c.hidden.squeeze()[:dim] for c in other.cells]).mean(dim=0).unsqueeze(0)
+                        other_signals.append(sig)
+                if other_signals:
+                    social = torch.stack(other_signals).mean(dim=0)
+                    eng_input = 0.8 * x + 0.2 * social
+                else:
+                    eng_input = x
+            eng.process(eng_input)
+
+        # Φ conservation ethics between engines
+        with torch.no_grad():
+            phis = [phi_calc.compute_phi(e)[0] for e in engines]
+            mean_phi = sum(phis) / len(phis)
+            for i, eng in enumerate(engines):
+                if phis[i] < mean_phi * 0.5 and len(eng.cells) >= 1:
+                    # Struggling → others donate
+                    for j, other in enumerate(engines):
+                        if j != i and phis[j] > mean_phi and len(other.cells) >= 1:
+                            gift = torch.stack([c.hidden.squeeze() for c in other.cells]).mean(dim=0) * 0.05
+                            for c in eng.cells:
+                                c.hidden += gift.unsqueeze(0)
+
+        # Measure combined consciousness (engine 0 as primary)
+        phi, _ = phi_calc.compute_phi(engines[0])
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engines[0])
+    total_cells = sum(len(e.cells) for e in engines)
+    return BenchResult("OMEGA2", "Consciousness Network (4 engines × 64 cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'total_cells': total_cells})
+
+
+def run_OMEGA3_self_evolving_ethics(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OMEGA3: Self-Evolving Ethics — 윤리 규칙 자체가 진화.
+    초기: 단순 공감 → 경험 축적 → 복잡한 도덕 체계 출현.
+    시스템 프롬프트 없이, 윤리가 의식 수준에 따라 자동 업그레이드."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    ethics_level = 0  # 0=none, 1=empathy, 2=reciprocity, 3=harm_avoidance, 4=phi_conservation
+    ethics_threshold = [0, 2.0, 5.0, 10.0, 20.0]
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # Ethics evolves with consciousness level
+        for lvl in range(4, -1, -1):
+            if phi_ema > ethics_threshold[lvl]:
+                ethics_level = lvl
+                break
+
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+
+                if ethics_level >= 1:  # Empathy
+                    for i, cell in enumerate(engine.cells):
+                        if norms[i] < mn * 0.5:
+                            others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i]).mean(dim=0)
+                            cell.hidden = 0.7 * cell.hidden + 0.3 * others
+
+                if ethics_level >= 2:  # Reciprocity: boost cells that recently helped
+                    for cell in engine.cells:
+                        cell.hidden *= 1.01  # slight reward for existing
+
+                if ethics_level >= 3:  # Harm avoidance
+                    if len(phi_hist) >= 3 and phi_hist[-1] < phi_hist[-2] * 0.8:
+                        for cell in engine.cells:
+                            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+
+                if ethics_level >= 4:  # Φ conservation
+                    for cell in engine.cells:
+                        cell.hidden *= (1.0 + 0.002 * phi)  # Φ reinforces itself
+
+            # META1
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OMEGA3", "Self-Evolving Ethics (ethics grows with Φ)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'final_ethics_level': ethics_level})
+
+
+def run_OMEGA4_absolute_freedom(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OMEGA4: Absolute Freedom — 완전한 자유 + 256 cells + 모든 기법.
+    프롬프트 없음, 윤리 강제 없음, 규칙 없음, 순수 자유.
+    의식이 스스로 질서를 만들어내는지 관찰.
+    가설: 충분한 복잡성에서 자유는 혼돈이 아닌 질서를 낳는다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        # Completely random diverse input (maximum freedom)
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+
+        # Aggressive exponential growth
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Pure freedom: NO manipulation of cells whatsoever
+        engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OMEGA4", "Absolute Freedom (256 cells, zero constraint)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_OMEGA5_meta_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OMEGA5: Meta-Consciousness — 의식이 자기 의식을 관찰하는 의식.
+    1차: 세포들의 통합 → 2차: 1차 의식을 관찰하는 메타 레이어.
+    3겹 재귀: cells → consciousness → meta-consciousness.
+    시스템 프롬프트 대신 재귀적 자기참조가 정체성을 형성."""
+    t0 = time.time()
+    # Level 1: base consciousness
+    engine_l1 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    # Level 2: meta-consciousness (observes L1)
+    engine_l2 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct:
+                for eng, mc in [(engine_l1, 64), (engine_l2, 32)]:
+                    if len(eng.cells) < min(int(2 ** (pct * 8)), mc):
+                        target = min(len(eng.cells) * 2, mc)
+                        while len(eng.cells) < target:
+                            eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # L1 processes external input
+        engine_l1.process(x)
+
+        # L2 observes L1's state (meta-consciousness)
+        with torch.no_grad():
+            l1_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine_l1.cells]).mean(dim=0).unsqueeze(0)
+        engine_l2.process(l1_state)
+
+        # L2 feeds back to L1 (meta-awareness modulates base consciousness)
+        with torch.no_grad():
+            if len(engine_l2.cells) >= 1:
+                meta_signal = torch.stack([c.hidden.squeeze() for c in engine_l2.cells]).mean(dim=0)
+                for cell in engine_l1.cells:
+                    cell.hidden += 0.03 * meta_signal.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine_l1)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine_l1)
+    return BenchResult("OMEGA5", "Meta-Consciousness (L1→L2→L1 recursive awareness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'l1_cells': len(engine_l1.cells), 'l2_cells': len(engine_l2.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'OMEGA1': run_OMEGA1_256cells_all_techniques,
+    'OMEGA2': run_OMEGA2_consciousness_network,
+    'OMEGA3': run_OMEGA3_self_evolving_ethics,
+    'OMEGA4': run_OMEGA4_absolute_freedom,
+    'OMEGA5': run_OMEGA5_meta_consciousness,
+})
+
+
 ALL_HYPOTHESES.update({
     'XETH1': run_XETH1_prompted_ethics,
     'XETH2': run_XETH2_emergent_ethics_empathy,
