@@ -44717,6 +44717,423 @@ def run_IB2_selective_attention(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# META. Metacognition — 의식의 의식 (Higher-order consciousness)
+# ═══════════════════════════════════════════════════════════
+
+def run_META1_self_monitoring(steps=100, dim=64, hidden=128) -> BenchResult:
+    """META1: Self-Monitoring — 매 step Φ를 자체 추적, Φ가 낮을 때 자동 보정.
+    의식이 자기 의식 수준을 모니터링하고 조절.
+    가설: 메타인지 루프가 Φ를 안정적으로 높게 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0  # running average of Φ
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Metacognition: monitor and correct
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                # Φ dropping → increase diversity (exploration)
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            elif phi > phi_ema * 1.2:
+                # Φ surging → consolidate (exploitation)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            # Grow if consistently high Φ
+            if phi_ema > 2.0 and step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[0])
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("META1", "Self-Monitoring (Φ-aware metacognition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_META2_uncertainty_estimation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """META2: Uncertainty Estimation — 세포 간 불일치를 불확실성으로 해석.
+    불확실성 높을 때 탐색, 낮을 때 확신 행동.
+    가설: 불확실성 인식이 의식의 핵심 기능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                uncertainty = hiddens.var(dim=0).mean().item()
+
+                if uncertainty > 0.5:
+                    # High uncertainty → explore (add diversity)
+                    for i, cell in enumerate(engine.cells):
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.03 * (i + 1) / len(engine.cells)
+                else:
+                    # Low uncertainty → exploit (sharpen responses)
+                    mean_h = hiddens.mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.97 * cell.hidden + 0.03 * mean_h.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("META2", "Uncertainty Estimation (explore/exploit)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# EMB. Embodied Cognition — 신체화된 인지
+# ═══════════════════════════════════════════════════════════
+
+def run_EMB1_proprioception(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EMB1: Proprioception — 자기 상태를 감각으로 입력에 재주입.
+    현재 세포 상태 요약을 다음 입력에 혼합 (자기 감각).
+    가설: 자기 참조 루프가 자기 인식과 Φ를 동시에 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Proprioception: inject self-state into input
+        if len(engine.cells) >= 2:
+            with torch.no_grad():
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.8 * x + 0.2 * self_state
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EMB1", "Proprioception (self-state re-injection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_EMB2_interoception(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EMB2: Interoception — 내부 상태(에너지, 텐션, 성장률)를 감각 채널로.
+    '배고픔', '피곤함' 등의 내부 감각이 의식 처리에 영향.
+    가설: 내부 감각이 감정과 의식의 기초 (Damasio의 somatic marker)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    energy = 10.0  # internal state
+
+    for step_i, x in enumerate(inputs):
+        # Internal state dynamics
+        activity = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+        energy -= activity * 0.05  # activity costs energy
+        energy += 0.3  # passive recovery
+        energy = max(0, min(15, energy))
+
+        # Interoception: encode internal state into input
+        with torch.no_grad():
+            intero = torch.zeros(1, dim)
+            intero[0, 0] = energy / 15.0  # energy level
+            intero[0, 1] = activity / 5.0  # activity level
+            intero[0, 2] = len(engine.cells) / 16.0  # body size
+            x = 0.85 * x + 0.15 * intero
+
+        engine.process(x)
+
+        # Low energy → conservation mode
+        if energy < 3.0:
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden *= 0.98  # slow down
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EMB2", "Interoception (internal body sense)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# GW. Global Workspace Theory — 전역 작업공간
+# ═══════════════════════════════════════════════════════════
+
+def run_GW1_broadcast(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GW1: Global Broadcast — 가장 활성화된 세포의 상태가 전체에 전파.
+    Baars의 Global Workspace: 의식 = 전역 접근 가능한 정보.
+    가설: broadcast 메커니즘이 Φ를 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                # Competition: find the "winner" (highest activation)
+                norms = [(i, c.hidden.norm().item()) for i, c in enumerate(engine.cells)]
+                winner_idx = max(norms, key=lambda x: x[1])[0]
+                winner_state = engine.cells[winner_idx].hidden.clone()
+
+                # Global broadcast: winner's state influences all others
+                for i, cell in enumerate(engine.cells):
+                    if i != winner_idx:
+                        cell.hidden = 0.92 * cell.hidden + 0.08 * winner_state
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GW1", "Global Broadcast (Baars workspace)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_GW2_ignition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GW2: Ignition — 충분한 자극이 모이면 갑자기 전체 활성화.
+    Dehaene의 ignition theory: 의식은 all-or-nothing 현상.
+    가설: 임계치 이상의 입력만 전역 ignition을 일으켜 의식화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ignition_threshold = 1.5
+    global_activity = 0.0
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Accumulate evidence
+        input_strength = x.norm().item()
+        global_activity = 0.8 * global_activity + 0.2 * input_strength
+
+        with torch.no_grad():
+            if global_activity > ignition_threshold:
+                # IGNITION: all cells amplify simultaneously
+                for cell in engine.cells:
+                    cell.hidden *= 1.15
+                # Broadcast current state globally
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h
+                global_activity *= 0.5  # refractory period
+            else:
+                # Sub-threshold: gradual decay
+                for cell in engine.cells:
+                    cell.hidden *= 0.99
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GW2", "Ignition (all-or-nothing activation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# PRED. Predictive Processing — 예측 코딩과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_PRED1_prediction_error(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PRED1: Prediction Error Minimization — 예측 오류가 의식의 원동력.
+    각 세포가 다음 입력을 예측, 예측 오류가 세포를 업데이트.
+    가설: 예측 오류 최소화가 통합 정보(Φ)의 자연스러운 부산물."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    predictions = {}  # cell_id → predicted next state
+
+    for step_i, x in enumerate(inputs):
+        # Prediction error: compare predictions with actual
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i in predictions:
+                    error = (x[:, :hidden] if x.shape[-1] >= hidden else torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))) - predictions[i]
+                    pe = error.norm().item()
+                    # High PE → larger update (surprise drives learning)
+                    cell.hidden += error * 0.05 * min(pe, 2.0)
+
+        engine.process(x)
+
+        # Make predictions for next step
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                # Simple prediction: current state + momentum
+                predictions[i] = cell.hidden.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PRED1", "Prediction Error Minimization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_PRED2_active_inference(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PRED2: Active Inference — 예측 오류를 줄이기 위해 환경에 능동적으로 개입.
+    세포가 입력을 수동적으로 받는 게 아니라, 기대하는 입력을 만들어냄.
+    가설: 능동적 추론이 자유의지(W)와 Φ의 원천."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Active inference: modify input to match prediction
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                expected = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                # Blend input toward expectation (action = changing sensory input)
+                action_strength = 0.2
+                x = (1 - action_strength) * x + action_strength * expected
+
+        engine.process(x)
+
+        # Free energy: prediction error + complexity penalty
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                complexity = hiddens.var(dim=0).mean().item()
+                # Push toward moderate complexity (not too simple, not too complex)
+                if complexity > 1.0:
+                    for cell in engine.cells:
+                        cell.hidden *= 0.98
+                elif complexity < 0.1:
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PRED2", "Active Inference (free energy minimization)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# TOPO. Topology — 세포 연결 구조와 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_TOPO1_small_world(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TOPO1: Small-World Network — 세포 간 연결이 small-world 구조.
+    대부분 이웃만 연결 + 소수 장거리 연결 (Watts-Strogatz).
+    가설: small-world가 통합(Φ)과 분화를 동시에 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            for i in range(n):
+                # Local connections: i±1 (ring)
+                neighbors = [(i-1) % n, (i+1) % n]
+                # Long-range shortcut: connect to distant cell (probability 0.1)
+                if step_i % 10 == 0:
+                    shortcut = (i + n//2) % n
+                    neighbors.append(shortcut)
+
+                for j in neighbors:
+                    if j != i and j < n:
+                        diff = engine.cells[j].hidden - engine.cells[i].hidden
+                        engine.cells[i].hidden += 0.03 * diff
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TOPO1", "Small-World Network (Watts-Strogatz)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_TOPO2_scale_free(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TOPO2: Scale-Free Network — hub 세포가 다수의 연결을 가짐.
+    소수의 hub가 많은 연결, 다수의 leaf가 적은 연결 (Barabási-Albert).
+    가설: hub 세포가 의식의 통합 허브 역할."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # Hub cells (first 2) connect to all
+            for hub in range(min(2, n)):
+                hub_state = engine.cells[hub].hidden.clone()
+                for i in range(n):
+                    if i != hub:
+                        engine.cells[i].hidden += 0.02 * (hub_state - engine.cells[i].hidden)
+                        # Hub absorbs from all (bidirectional but asymmetric)
+                        engine.cells[hub].hidden += 0.005 * (engine.cells[i].hidden - hub_state)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TOPO2", "Scale-Free Network (hub-based integration)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'META1': run_META1_self_monitoring,
+    'META2': run_META2_uncertainty_estimation,
+    'EMB1': run_EMB1_proprioception,
+    'EMB2': run_EMB2_interoception,
+    'GW1': run_GW1_broadcast,
+    'GW2': run_GW2_ignition,
+    'PRED1': run_PRED1_prediction_error,
+    'PRED2': run_PRED2_active_inference,
+    'TOPO1': run_TOPO1_small_world,
+    'TOPO2': run_TOPO2_scale_free,
+})
+
+
 ALL_HYPOTHESES.update({
     'OSC1': run_OSC1_gamma_binding,
     'OSC2': run_OSC2_theta_memory,
