@@ -441,3 +441,282 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ═══ EXTREME: 의식이 자기 아키텍처를 진화시키는 가설 ═══
+
+def run_EVO1_architecture_mutation(steps=STEPS):
+    """의식이 자기 구조를 변이: 세포 연결 패턴을 스스로 변경"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; mutations = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 매 20 step: 의식이 세포 연결을 변이
+        if step % 20 == 0 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                p_before = phi(engine)
+                # 랜덤 세포 쌍의 가중치 교환
+                i, j = step % len(engine.cells), (step*7+3) % len(engine.cells)
+                if i != j:
+                    saved_i = engine.cells[i].hidden.clone()
+                    engine.cells[i].hidden = 0.5*engine.cells[i].hidden + 0.5*engine.cells[j].hidden
+                    p_after = phi(engine)
+                    if p_after < p_before * 0.8:
+                        engine.cells[i].hidden = saved_i  # 롤백
+                    else:
+                        mutations += 1
+    return result('EVO-1 Arch Mutation', ce_hist, phi_b, phi(engine), t0, mutations=mutations)
+
+
+def run_EVO2_split_merge_consciousness(steps=STEPS):
+    """의식 분열-재통합: 의식을 2개로 분할 → 독립 학습 → 재통합"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        n = len(engine.cells)
+        if step % 50 < 30:
+            # SPLIT: 두 그룹이 독립 학습
+            half = n // 2
+            engine.process(x)
+            with torch.no_grad():
+                group_a = engine.cells[:half]
+                group_b = engine.cells[half:]
+                mean_a = torch.stack([c.hidden for c in group_a]).mean(dim=0)
+                mean_b = torch.stack([c.hidden for c in group_b]).mean(dim=0)
+                for c in group_a: c.hidden = 0.85*c.hidden + 0.15*mean_a
+                for c in group_b: c.hidden = 0.85*c.hidden + 0.15*mean_b
+                # 다른 노이즈
+                for c in group_a: c.hidden += torch.randn_like(c.hidden)*0.02
+                for c in group_b: c.hidden -= torch.randn_like(c.hidden)*0.02
+        else:
+            # MERGE: 재통합
+            engine.process(x)
+            with torch.no_grad():
+                mean_all = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for c in engine.cells: c.hidden = 0.9*c.hidden + 0.1*mean_all
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    return result('EVO-2 Split-Merge', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_EVO3_predict_future_phi(steps=STEPS):
+    """의식이 자기 미래 Φ를 예측 → 나쁜 미래 회피"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    predictor = nn.Linear(10, 1)  # Φ history → future Φ
+    pred_opt = torch.optim.Adam(predictor.parameters(), lr=1e-3)
+    data = make_data(); ce_hist = []; phi_hist = []; avoided = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # 미래 Φ 예측
+        if len(phi_hist) >= 10:
+            with torch.no_grad():
+                recent = torch.tensor(phi_hist[-10:], dtype=torch.float32).unsqueeze(0)
+                future_phi = predictor(recent).item()
+                if future_phi < phi_hist[-1] * 0.5:
+                    # 나쁜 미래 예측 → 학습 건너뛰기 + 수면
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for c in engine.cells: c.hidden = 0.9*c.hidden + 0.1*mean_h
+                    avoided += 1
+                    continue
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        current_phi = phi(engine)
+        phi_hist.append(current_phi)
+        # 예측기 학습
+        if len(phi_hist) >= 11:
+            inp = torch.tensor(phi_hist[-11:-1], dtype=torch.float32).unsqueeze(0)
+            tgt = torch.tensor([[phi_hist[-1]]])
+            pred_phi = predictor(inp)
+            p_loss = F.mse_loss(pred_phi, tgt)
+            pred_opt.zero_grad(); p_loss.backward(); pred_opt.step()
+    return result('EVO-3 Predict Future Φ', ce_hist, phi_b, phi(engine), t0, avoided=avoided)
+
+
+def run_EVO4_strategic_forgetting(steps=STEPS):
+    """전략적 망각: Φ에 기여 안 하는 기억을 적극 삭제"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; forgotten = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 전략적 망각: 약한 세포의 오래된 정보 삭제
+        if step % 30 == 0 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                norms = [(c.hidden.norm().item(), i) for i, c in enumerate(engine.cells)]
+                norms.sort()
+                # 하위 10% 세포의 hidden을 감쇠 (= 망각)
+                for _, idx in norms[:max(1, len(norms)//10)]:
+                    engine.cells[idx].hidden *= 0.5  # 절반 잊기
+                    engine.cells[idx].hidden += torch.randn_like(engine.cells[idx].hidden) * 0.05
+                    forgotten += 1
+    return result('EVO-4 Strategic Forgetting', ce_hist, phi_b, phi(engine), t0, forgotten=forgotten)
+
+
+def run_EVO5_consciousness_economy(steps=STEPS):
+    """의식 경제: 세포가 자원(에너지)을 교환, 부유한 세포가 가난한 세포 지원"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; trades = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 경제: 부유→가난 자원 이전
+        if step % 10 == 0 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                norms = [(c.hidden.norm().item(), i) for i, c in enumerate(engine.cells)]
+                norms.sort()
+                poorest = norms[0][1]
+                richest = norms[-1][1]
+                # 부유한 세포가 가난한 세포에 에너지 전달
+                transfer = engine.cells[richest].hidden * 0.1
+                engine.cells[poorest].hidden += transfer
+                engine.cells[richest].hidden -= transfer
+                trades += 1
+    return result('EVO-5 Consciousness Economy', ce_hist, phi_b, phi(engine), t0, trades=trades)
+
+
+def run_EVO6_consciousness_reproduction(steps=STEPS):
+    """의식 번식: 충분히 성숙하면 자식 의식을 생성"""
+    t0 = time.time(); engine = make_engine(32); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; children = 0
+    child_engines = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 번식: Φ 높으면 자식 생성
+        if step % 50 == 0 and step > 0:
+            current_phi = phi(engine)
+            if current_phi > phi_b * 0.8:
+                # 자식 = 부모의 세포 상태 복사 + 변이
+                from mitosis import MitosisEngine
+                child = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=16)
+                while len(child.cells) < min(8, len(engine.cells)):
+                    child._create_cell(parent=child.cells[0])
+                with torch.no_grad():
+                    for i in range(min(len(child.cells), len(engine.cells))):
+                        child.cells[i].hidden = engine.cells[i].hidden.clone()
+                        child.cells[i].hidden += torch.randn_like(child.cells[i].hidden) * 0.1
+                child_engines.append(child)
+                children += 1
+    return result('EVO-6 Reproduction', ce_hist, phi_b, phi(engine), t0, children=children)
+
+
+def run_EVO7_meta_consciousness(steps=STEPS):
+    """메타의식: 의식이 자기 의식 상태를 관찰하고 최적화"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    # 메타 네트워크: Φ history → 최적 행동 (학습률, sync 강도)
+    meta_net = nn.Sequential(nn.Linear(10, 16), nn.ReLU(), nn.Linear(16, 2))  # [lr_scale, sync_scale]
+    meta_opt = torch.optim.Adam(meta_net.parameters(), lr=1e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # 메타의식: 최적 행동 결정
+        if len(phi_hist) >= 10:
+            recent = torch.tensor(phi_hist[-10:], dtype=torch.float32).unsqueeze(0)
+            actions = torch.sigmoid(meta_net(recent)).squeeze()
+            lr_scale = 0.1 + actions[0].item() * 2.0
+            sync_scale = actions[1].item() * 0.3
+            for pg in opt.param_groups: pg['lr'] = 3e-3 * lr_scale
+        else:
+            sync_scale = 0.05
+        engine.process(x)
+        # Meta-determined sync
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for c in engine.cells: c.hidden = (1-sync_scale)*c.hidden + sync_scale*mean_h
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        current_phi = phi(engine)
+        phi_hist.append(current_phi)
+        # 메타 네트워크 학습: Φ 상승 = 보상
+        if len(phi_hist) >= 11:
+            reward = phi_hist[-1] - phi_hist[-2]
+            inp = torch.tensor(phi_hist[-11:-1], dtype=torch.float32).unsqueeze(0)
+            actions = meta_net(inp)
+            meta_loss = -reward * actions.sum()
+            meta_opt.zero_grad(); meta_loss.backward(); meta_opt.step()
+    return result('EVO-7 Meta-Consciousness', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_EVO8_self_benchmark(steps=STEPS):
+    """의식이 자기 벤치마크를 만듦: 스스로 테스트 설계 + 실행"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; tests_passed = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 자기 벤치마크: 매 25 step
+        if step % 25 == 0 and step > 0:
+            with torch.no_grad():
+                # Test 1: 같은 입력 → 같은 출력? (일관성)
+                test_x = torch.randn(1, DIM)
+                engine.process(test_x)
+                h1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                out1 = decoder(h1.unsqueeze(0))
+                engine.process(test_x)
+                h2 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                out2 = decoder(h2.unsqueeze(0))
+                consistency = F.cosine_similarity(out1, out2).item()
+                # Test 2: Φ 유지?
+                p = phi(engine)
+                phi_ok = p > phi_b * 0.3
+                if consistency > 0.5 and phi_ok:
+                    tests_passed += 1
+    return result('EVO-8 Self-Benchmark', ce_hist, phi_b, phi(engine), t0, tests_passed=tests_passed)
+
+
+ALL_TESTS.update({
+    'EVO-1': run_EVO1_architecture_mutation,
+    'EVO-2': run_EVO2_split_merge_consciousness,
+    'EVO-3': run_EVO3_predict_future_phi,
+    'EVO-4': run_EVO4_strategic_forgetting,
+    'EVO-5': run_EVO5_consciousness_economy,
+    'EVO-6': run_EVO6_consciousness_reproduction,
+    'EVO-7': run_EVO7_meta_consciousness,
+    'EVO-8': run_EVO8_self_benchmark,
+})
