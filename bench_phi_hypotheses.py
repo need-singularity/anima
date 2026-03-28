@@ -59031,15 +59031,12 @@ def run_ULTIMATE1_all_conditions_512(steps=2000, dim=64, hidden=128) -> BenchRes
                             c.hidden += torch.randn_like(c.hidden) * 0.015 * (i + 1) / n_f
 
             # ── Hebbian LTP/LTD (PERSIST2) ──
-            for i in range(min(n, 32)):
-                j = (i + 1) % n
-                h_i = engine.cells[i].hidden.squeeze()
-                h_j = engine.cells[j].hidden.squeeze()
-                corr = (h_i * h_j).mean().item()
+            nc = len(engine.cells)
+            for i in range(min(nc, 32)):
+                j = (i + 1) % nc
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
                 if corr > 0:
                     engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
-                else:
-                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.01
 
             # ── Stochastic noise (영원한 활동 보장) ──
             for cell in engine.cells:
@@ -59149,8 +59146,9 @@ def run_ULTIMATE2_all_conditions_1024(steps=2000, dim=64, hidden=128) -> BenchRe
                         for c in f:
                             c.hidden += torch.randn_like(c.hidden) * 0.015 * (i+1) / n_f
 
-            for i in range(min(n, 64)):
-                j = (i+1) % n
+            nc2 = len(engine.cells)
+            for i in range(min(nc2, 64)):
+                j = (i+1) % nc2
                 corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
                 if corr > 0:
                     engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
