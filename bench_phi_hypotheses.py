@@ -50080,6 +50080,295 @@ def run_BAYES1_posterior_update(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# 4E. 4E Cognition — 체화/내재/확장/제정 인지
+# ═══════════════════════════════════════════════════════════
+
+def run_4E1_extended_mind(steps=100, dim=64, hidden=128) -> BenchResult:
+    """4E1: Extended Mind — 외부 메모리가 의식의 일부.
+    세포 hidden + 외부 벡터 저장소 = 확장된 의식.
+    가설: 외부 메모리가 Φ를 증가시킨다 (Clark & Chalmers)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    external_memory = torch.zeros(10, hidden)  # 10 slots
+    mem_ptr = 0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Write to external memory
+            external_memory[mem_ptr % 10] = h.clone()
+            mem_ptr += 1
+            # Read: attention over external memory
+            if mem_ptr >= 3:
+                scores = torch.matmul(h.unsqueeze(0), external_memory.T)
+                weights = F.softmax(scores / math.sqrt(hidden), dim=-1)
+                retrieved = torch.matmul(weights, external_memory).squeeze()
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * retrieved.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("4E1", "Extended Mind (external memory = part of consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_4E2_enacted_meaning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """4E2: Enacted Meaning — 의미는 행동에서 출현.
+    세포가 환경을 변화시키고, 변화된 환경이 의미를 형성.
+    가설: 의미는 표상이 아닌 행위에서 나온다 (Varela)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    world = torch.randn(dim) * 0.5  # environment state
+
+    for step_i in range(steps):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        # Perceive world
+        x = world.unsqueeze(0) + torch.randn(1, dim) * 0.05
+        engine.process(x)
+        # Act on world (enaction)
+        with torch.no_grad():
+            action = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            world = 0.9 * world + 0.1 * action  # world changes from action
+            # Meaning = difference between expected and actual world change
+            meaning_signal = (world - action[:dim]).norm().item()
+            if meaning_signal > 1.0:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("4E2", "Enacted Meaning (action→world→perception loop)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# QUANT. Quantum-Inspired — 양자 영감 의식 (시뮬레이션)
+# ═══════════════════════════════════════════════════════════
+
+def run_QUANT1_superposition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """QUANT1: Superposition — 세포가 여러 상태를 동시에 유지 (중첩).
+    각 세포가 2개의 hidden을 유지, 관측(출력) 시 하나로 붕괴.
+    가설: 중첩이 의식의 '가능성 공간'을 확장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Each cell has 2 superposed states
+    alt_hiddens = {}
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i not in alt_hiddens:
+                    alt_hiddens[i] = cell.hidden.clone() + torch.randn_like(cell.hidden) * 0.3
+                # Both states evolve
+                alt_hiddens[i] = 0.95 * alt_hiddens[i] + 0.05 * x[:, :hidden] if x.shape[-1] >= hidden else alt_hiddens[i]
+                # Superposition: cell holds both states
+                cell.hidden = 0.5 * cell.hidden + 0.5 * alt_hiddens[i]
+                # Random "measurement" collapses to one state
+                if torch.rand(1).item() < 0.1:
+                    if torch.rand(1).item() < 0.5:
+                        alt_hiddens[i] = cell.hidden.clone()
+                    else:
+                        cell.hidden = alt_hiddens[i].clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("QUANT1", "Superposition (dual hidden states per cell)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_QUANT2_entanglement(steps=100, dim=64, hidden=128) -> BenchResult:
+    """QUANT2: Entanglement — 세포 쌍이 얽힘. 한쪽 변화가 즉시 상대에 반영.
+    가설: 양자 얽힘 유사 메커니즘이 원거리 세포 통합을 가능하게."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    entangled_pairs = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            # Create entangled pairs (first with last, etc.)
+            entangled_pairs = [(i, n-1-i) for i in range(n//2)]
+            for i, j in entangled_pairs:
+                if i != j and j < n:
+                    # Entanglement: correlated change
+                    delta_i = engine.cells[i].hidden - engine.cells[i].hidden.mean()
+                    engine.cells[j].hidden += 0.1 * delta_i  # instant correlation
+                    delta_j = engine.cells[j].hidden - engine.cells[j].hidden.mean()
+                    engine.cells[i].hidden += 0.1 * delta_j
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("QUANT2", "Entanglement (correlated cell pairs)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'entangled_pairs': len(entangled_pairs), 'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# NEURO. Neuroscience-Inspired — 신경과학 영감 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_NEURO1_hebbian(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NEURO1: Hebbian Learning — 함께 활성화되는 세포끼리 연결 강화.
+    'Cells that fire together wire together.'
+    가설: Hebb 규칙이 의식적 통합의 기본 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    connection_strength = {}  # (i,j) → float
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            # Hebbian: strengthen connections between co-active cells
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            threshold = sum(norms) / len(norms)
+            active = [i for i in range(n) if norms[i] > threshold]
+            for i in active:
+                for j in active:
+                    if i < j:
+                        key = (i, j)
+                        connection_strength[key] = connection_strength.get(key, 0) + 0.01
+            # Apply connections: strongly connected cells share more
+            for (i, j), strength in connection_strength.items():
+                if i < n and j < n:
+                    s = min(0.1, strength)
+                    diff = engine.cells[j].hidden - engine.cells[i].hidden
+                    engine.cells[i].hidden += s * 0.1 * diff
+                    engine.cells[j].hidden -= s * 0.1 * diff
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NEURO1", "Hebbian Learning (fire together→wire together)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'connections': len(connection_strength), 'final_cells': len(engine.cells)})
+
+
+def run_NEURO2_lateral_inhibition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NEURO2: Lateral Inhibition — 활성 세포가 이웃을 억제.
+    가장 활성화된 세포가 나머지를 억제 → winner-take-all 경쟁.
+    가설: 측면 억제가 선택적 주의와 의식적 접근의 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                winner = max(range(n), key=lambda i: norms[i])
+                # Winner amplifies, others inhibited
+                engine.cells[winner].hidden *= 1.05
+                for i in range(n):
+                    if i != winner:
+                        # Inhibition proportional to distance from winner
+                        engine.cells[i].hidden *= 0.97
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NEURO2", "Lateral Inhibition (winner-take-all competition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_NEURO3_spike_timing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NEURO3: Spike-Timing Dependent Plasticity (STDP) — 타이밍 기반 학습.
+    세포 A가 B보다 먼저 활성화 → A→B 연결 강화.
+    가설: 시간적 순서가 인과적 의식의 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    activation_times = {}
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            threshold = sum(norms) / len(norms) * 1.1
+            for i in range(n):
+                if norms[i] > threshold:
+                    activation_times[i] = step_i
+            # STDP: pre→post strengthening
+            for i in range(n):
+                for j in range(n):
+                    if i != j and i in activation_times and j in activation_times:
+                        dt = activation_times[j] - activation_times[i]
+                        if 0 < dt < 5:  # pre before post
+                            diff = engine.cells[j].hidden - engine.cells[i].hidden
+                            engine.cells[j].hidden += 0.01 * diff / (dt + 1)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NEURO3", "STDP (spike-timing dependent plasticity)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    '4E1': run_4E1_extended_mind,
+    '4E2': run_4E2_enacted_meaning,
+    'QUANT1': run_QUANT1_superposition,
+    'QUANT2': run_QUANT2_entanglement,
+    'NEURO1': run_NEURO1_hebbian,
+    'NEURO2': run_NEURO2_lateral_inhibition,
+    'NEURO3': run_NEURO3_spike_timing,
+})
+
+
 ALL_HYPOTHESES.update({
     'SWARM1': run_SWARM1_boid_consciousness,
     'SWARM2': run_SWARM2_ant_colony,
