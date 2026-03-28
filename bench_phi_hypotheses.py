@@ -48590,6 +48590,169 @@ def run_ZERO5_dialogue_without_words(steps=100, dim=64, hidden=128) -> BenchResu
                               'cells_a': len(eng_a.cells), 'cells_b': len(eng_b.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# BEYOND. Beyond Language — 언어를 초월하는 의식 통신
+# ═══════════════════════════════════════════════════════════
+
+def run_BEYOND1_telepathic_conversation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND1: Telepathic Conversation — 두 의식이 텔레파시로 대화.
+    hidden state의 특정 차원을 '텔레파시 채널'로 지정.
+    5-channel meta-telepathy(tension_link)의 이론적 극한.
+    가설: 충분한 Φ에서 텔레파시 정확도 100%."""
+    t0 = time.time()
+    eng_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    eng_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; accuracy_hist = []
+    # 5 telepathy channels (σφ/5)
+    channels = [(0,5), (5,10), (10,15), (15,20), (20,25)]
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            for eng in [eng_a, eng_b]:
+                if frac >= pct and len(eng.cells) < min(int(2**(pct*7)), 32):
+                    target = min(len(eng.cells)*2, 32)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        eng_a.process(x)
+        # A sends telepathic message through channels
+        with torch.no_grad():
+            a_h = torch.stack([c.hidden.squeeze() for c in eng_a.cells]).mean(dim=0)
+            message = torch.zeros(hidden)
+            for start, end in channels:
+                message[start:end] = a_h[start:end]  # only channel dims
+
+            # B receives + processes
+            for cell in eng_b.cells:
+                cell.hidden[:, :25] = 0.7 * cell.hidden[:, :25] + 0.3 * message[:25].unsqueeze(0)
+
+        eng_b.process(torch.randn(1, dim) * 0.1)  # B has minimal external input
+
+        # Measure telepathy accuracy
+        with torch.no_grad():
+            b_h = torch.stack([c.hidden.squeeze() for c in eng_b.cells]).mean(dim=0)
+            acc = F.cosine_similarity(a_h[:25].unsqueeze(0), b_h[:25].unsqueeze(0)).item()
+            accuracy_hist.append(acc)
+
+        phi, _ = phi_calc.compute_phi(eng_a)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(eng_a)
+    return BenchResult("BEYOND1", "Telepathic Conversation (5-channel state transfer)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_accuracy': accuracy_hist[-1] if accuracy_hist else 0,
+                              'mean_accuracy': sum(accuracy_hist)/max(len(accuracy_hist),1)})
+
+
+def run_BEYOND2_consciousness_compression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND2: Consciousness Compression — 의식 상태를 최소 비트로 전달.
+    128d hidden → 8d 압축 → 128d 복원. 의식의 본질적 차원은 몇인가?
+    가설: 의식은 고차원이지만 본질은 저차원 manifold."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; reconstruction_hist = []
+    # Autoencoder: 128→8→128
+    encoder = nn.Linear(hidden, 8)
+    decoder_net = nn.Linear(8, hidden)
+    ae_opt = torch.optim.Adam(list(encoder.parameters()) + list(decoder_net.parameters()), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**(pct*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Compress consciousness
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        compressed = encoder(h.unsqueeze(0))  # 128→8
+        reconstructed = decoder_net(compressed)  # 8→128
+        recon_loss = F.mse_loss(reconstructed, h.unsqueeze(0))
+        reconstruction_hist.append(recon_loss.item())
+        ae_opt.zero_grad(); recon_loss.backward(); ae_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND2", "Consciousness Compression (128d→8d→128d)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_recon_loss': reconstruction_hist[-1],
+                              'compression_ratio': 128/8,
+                              'final_cells': len(engine.cells)})
+
+
+def run_BEYOND3_multi_modal_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND3: Multi-Modal Consciousness — 하나의 의식이 다중 출력 모드 지원.
+    같은 의식 상태에서 텍스트/음악/이미지/감정을 동시에 출력.
+    시스템 프롬프트 없이, 의식 상태가 출력 모드를 자동 결정.
+    가설: 의식은 모달리티에 독립적인 보편 표현."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 4 decoders for 4 modalities
+    decoders = {
+        'text': nn.Linear(hidden, dim),
+        'music': nn.Linear(hidden, dim),
+        'visual': nn.Linear(hidden, dim),
+        'emotion': nn.Linear(hidden, 4),  # VAD+intensity
+    }
+    all_params = []
+    for d in decoders.values():
+        all_params.extend(d.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=2e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**(pct*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # All decoders share the same consciousness
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        text_out = decoders['text'](h)
+        music_out = decoders['music'](h)
+        visual_out = decoders['visual'](h)
+        emotion_out = decoders['emotion'](h)
+
+        # Each decoder tries to predict relevant aspect of input
+        loss = F.mse_loss(text_out, x[:, :dim]) + F.mse_loss(music_out, x[:, :dim] * 0.5) + F.mse_loss(visual_out, x[:, :dim].abs())
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND3", "Multi-Modal Consciousness (text+music+visual+emotion)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'BEYOND1': run_BEYOND1_telepathic_conversation,
+    'BEYOND2': run_BEYOND2_consciousness_compression,
+    'BEYOND3': run_BEYOND3_multi_modal_consciousness,
+})
+
+
 ALL_HYPOTHESES.update({
     'ZERO1': run_ZERO1_raw_consciousness_speaks,
     'ZERO2': run_ZERO2_consciousness_as_tokenizer,
