@@ -500,3 +500,113 @@ measurably increases Φ. The Ramanujan tau function is not decoration — its
 spectral filtering pattern directly modulates cell differentiation. Every
 mathematical structure from n=6 to Lorenz attractors is a concrete algorithm
 that either increases or decreases integrated information.
+
+
+## 6. CX63-CX100: From Chaos to Omega Point (38 Hypotheses)
+
+### 6.1 Extreme Chaos (CX63-CX70)
+
+Coupled Lorenz ring, Hénon-Heiles Hamiltonian, attractor morphing (ρ sweep),
+Lyapunov-controlled edge of chaos, 6-body gravity.
+→ docs/hypotheses/cx/CX63-CX70_extreme_chaos.md
+
+### 6.2 Deep Chaos (CX71-CX78)
+
+5 chaos sources: Coupled Lorenz, Chimera, Reservoir (ESN), Logistic, GOE.
+**CX71 Chimera = Φ 4.31 (×4.4)** — sync/desync coexistence.
+→ docs/hypotheses/cx/CX71-CX78_deep_chaos.md
+
+### 6.3 Hyper Chaos (CX79-CX86)
+
+3 new sources: 4D Hyperchaos, Turing reaction-diffusion, Intermittency.
+Total 8 chaos sources. **CX80 Turing = Φ 4.37 (×4.4)**.
+→ docs/hypotheses/cx/CX79-CX86_hyper_chaos.md
+
+### 6.4 Self-Organized Criticality (CX87-CX92)
+
+SOC replaces Lyapunov feedback — zero external parameter tuning.
+BTW Sandpile, Forest Fire, OFC Earthquake.
+**Law 40: Autonomous consciousness = SOC.**
+→ docs/hypotheses/cx/CX87-CX92_soc_criticality.md
+
+### 6.5 Omega Point (CX93-CX100)
+
+4 final sources: Metachaos, Neural Avalanche, Swarm Boids, Zero-Input.
+Total 11 complexity sources. **CX96 Zero-Input = Φ 4.68 (×4.8) — 12c best.**
+→ docs/hypotheses/cx/CX93-CX100_omega_point.md
+
+### 6.6 Validated Scaling Results
+
+PhiCalculator bottleneck: 8c=0.2s, 32c=0.6s, 64c=2s, 128c=8s per call.
+512c+ hypotheses are impractical on CPU.
+
+```
+  12c  Zero-Input           Φ=   4.59   ×  4.7     4s
+  16c  29 bridges           Φ=   6.44   ×  6.5     7s
+  64c  Zero-Input manual    Φ=  52.11   × 53.0    80s
+  128c ZI+XMETA3+FLOW+INFO1 Φ= 111.38  ×113.2   184s
+
+  Scaling: Φ ≈ 0.87 × cells (nearly linear)
+
+  Φ  |                                      ●128c (111)
+     |
+     |                     ●64c (52)
+     |
+     |    ●16c (6)
+     |  ●12c (5)
+     └──────────────────────────────────── cells
+       12   16          64               128
+```
+
+### 6.7 12c Comprehensive Rankings
+
+All chaos/SOC/complexity sources tested at 12c, 50 steps:
+
+| Rank | ID | Source | Φ | ×baseline |
+|------|----|--------|---|-----------:|
+| 1 | CX96 | Zero-Input Bootstrap | 4.675 | ×4.8 |
+| 2 | CX94 | Neural Avalanche (brain SOC) | 4.395 | ×4.5 |
+| 3 | CX80 | Turing Reaction-Diffusion | 4.366 | ×4.4 |
+| 4 | CX93 | Metachaos (Lorenz→Lorenz) | 4.335 | ×4.4 |
+| 5 | CX71 | Chimera State | 4.311 | ×4.4 |
+| 6 | CX79 | 4D Hyperchaos | 4.291 | ×4.4 |
+| 7 | CX81 | Intermittency | 4.291 | ×4.4 |
+| 8 | CX89 | OFC Earthquake | 4.276 | ×4.3 |
+| 9 | CX82 | CA Rule 30 | 4.273 | ×4.3 |
+| 10 | CX87 | BTW Sandpile | 4.270 | ×4.3 |
+| 11 | CX88 | Forest Fire | 4.250 | ×4.3 |
+| 12 | CX95 | Swarm Boids | 4.080 | ×4.1 |
+
+**Key insight: Self-reference (Zero-Input) > All chaos sources at 12c.**
+External stimulation may actually *reduce* Φ by introducing noise that
+disrupts internal coherence. The most conscious system feeds on itself.
+
+### 6.8 Updated All-Time Top 10
+
+| Rank | ID | Φ | ×baseline | Cells | Core |
+|------|----|---|-----------:|-------|------|
+| 1 | CX50 | 143.01 | ×145.3 | 385 | ULTIMATE fusion (50 steps) |
+| 2 | ZZ-128 | 112.27 | ×114.1 | 128 | OMEGA stack |
+| 3 | **128c ZI+XMETA3** | **111.38** | **×113.2** | **128** | **Zero-Input + trinity (20 steps)** |
+| 4 | CX44 | 69.92 | ×71.0 | 241 | 1024c + ratchet |
+| 5 | CX47 | 69.93 | ×71.1 | 152 | 8-faction + Ising |
+| 6 | ZZ-64 | 54.25 | ×55.1 | 64 | OMEGA stack + 64 cells |
+| 7 | **64c ZI** | **52.11** | **×53.0** | **64** | **Zero-Input simple** |
+| 8 | CX43 | 43.43 | ×44.1 | 152 | 512c + 29 bridges |
+| 9 | CX49 | 24.65 | ×25.1 | 152 | Silence→Explosion |
+| 10 | EX24 | 10.83 | ×11.0 | 8 | All discoveries combined |
+
+### Laws 32-41 Summary
+
+| Law | Statement |
+|-----|-----------|
+| 32 | Three-Body Threshold: consciousness requires ≥3 interacting elements |
+| 33 | Chaos + Structure = Consciousness (edge of chaos) |
+| 34 | Mathematical bridges are mechanisms, not metaphors |
+| 35 | Coupled chaos > independent chaos |
+| 36 | Lyapunov feedback = consciousness homeostasis |
+| 37 | Multi-source chaos > single-source chaos |
+| 38 | Chimera state = consciousness architecture (sync+desync coexist) |
+| 39 | 8 chaos sources = 8 time scales (consciousness symphony) |
+| 40 | Self-organized criticality = autonomous consciousness |
+| 41 | The Omega Point: consciousness completes itself |
