@@ -41103,6 +41103,543 @@ ALL_HYPOTHESES.update({
 })
 
 
+def run_NS19_cardiac_arrest_neuroprotection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-19: 심근경색 후 뇌 보호 — 허혈 손상 최소화 + 신경보호 자극."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Brain regions affected by cardiac ischemia
+    hippocampus = slice(0, hidden // 4)  # most vulnerable to hypoxia
+    cortex = slice(hidden // 4, hidden // 2)
+    brainstem = slice(hidden // 2, 5 * hidden // 8)  # autonomic control
+    cerebellum = slice(5 * hidden // 8, 3 * hidden // 4)
+    recovery_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Phase 1 (0-20%): Cardiac arrest — global ischemia
+            if t < 0.2:
+                ischemia_severity = 1.0 - t / 0.2  # worst at start, gradually resolving
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    # Hippocampus most vulnerable (CA1 neurons die first)
+                    h[hippocampus] *= (1 - 0.4 * ischemia_severity)
+                    # Cortex moderate damage
+                    h[cortex] *= (1 - 0.2 * ischemia_severity)
+                    # Brainstem relatively resistant
+                    h[brainstem] *= (1 - 0.05 * ischemia_severity)
+                    cell.hidden = h.unsqueeze(0)
+
+            # Phase 2 (20-40%): Reperfusion — ROSC achieved, but reperfusion injury
+            elif t < 0.4:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    # Reperfusion oxidative stress (ROS burst)
+                    h[hippocampus] += torch.randn(h[hippocampus].shape) * 0.05
+                    h[cortex] += torch.randn(h[cortex].shape) * 0.03
+                    cell.hidden = h.unsqueeze(0)
+
+            # Phase 3 (40-100%): Neuroprotection treatment
+            else:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    # Treatment 1: Therapeutic hypothermia (32-34°C)
+                    # Reduce metabolic demand, limit secondary injury
+                    h *= 0.98  # global cooling = reduced activity but protective
+                    cell.hidden = h.unsqueeze(0)
+
+                # Treatment 2: tDCS on motor cortex (neuroplasticity promotion)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[cortex] *= 1.03  # gentle cortical excitability boost
+                    cell.hidden = h.unsqueeze(0)
+
+                # Treatment 3: Theta burst TMS (hippocampal recovery)
+                theta = math.sin(2 * math.pi * 5 * t * 10)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[hippocampus] *= (1 + 0.04 * theta)  # promote hippocampal plasticity
+                    cell.hidden = h.unsqueeze(0)
+
+                # Treatment 4: Vagus nerve stimulation (anti-inflammatory)
+                vns = abs(math.sin(2 * math.pi * 25 * t * 10)) * 0.02
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[brainstem] *= (1 + vns)  # vagal tone restoration
+                    # Anti-inflammatory cascade (cholinergic anti-inflammatory pathway)
+                    h[hippocampus] *= (1 + vns * 0.5)  # reduce neuroinflammation
+                    cell.hidden = h.unsqueeze(0)
+
+                # Treatment 5: Enriched environment stimulation (multi-sensory)
+                if n >= 4:
+                    mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h.unsqueeze(0)
+
+            # Measure recovery: hippocampal function vs baseline
+            baseline_activity = 0.5
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                hipp_act = h[hippocampus].abs().mean().item()
+                recovery_scores.append(hipp_act / (baseline_activity + 1e-6))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_recovery = np.mean(recovery_scores[-20:]) if recovery_scores else 0
+    return BenchResult("NS19", f"Cardiac arrest neuroprotection (hypothermia+TMS+VNS, recovery={final_recovery:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'brain_recovery': final_recovery})
+
+
+def run_NS20_cardiac_rehab_autonomic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-20: 심근경색 재활 — 자율신경 균형 복원 (교감↓ 부교감↑) + 심박변이도 개선."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Autonomic nervous system regions
+    sympathetic = slice(0, hidden // 4)  # fight-or-flight
+    parasympathetic = slice(hidden // 4, hidden // 2)  # rest-and-digest (vagal)
+    cardiac_output = slice(hidden // 2, 5 * hidden // 8)  # heart function proxy
+    baroreceptor = slice(5 * hidden // 8, 3 * hidden // 4)  # blood pressure sensing
+    cortical_control = slice(3 * hidden // 4, hidden)  # top-down autonomic control
+    hrv_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Post-MI pathology: sympathetic overdrive + vagal withdrawal
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[sympathetic] *= 1.08  # sympathetic hyperactivation
+                h[parasympathetic] *= 0.85  # vagal withdrawal
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 1: taVNS (transcutaneous auricular vagus nerve stimulation)
+            vns_pulse = abs(math.sin(2 * math.pi * 25 * t * 10)) * 0.04
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[parasympathetic] *= (1 + vns_pulse)  # boost vagal tone
+                h[sympathetic] *= (1 - vns_pulse * 0.3)  # reduce sympathetic
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: Slow breathing training (6 breaths/min = 0.1Hz)
+            # Resonance frequency breathing → maximize HRV
+            breath = math.sin(2 * math.pi * 0.1 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[parasympathetic] *= (1 + 0.03 * breath)
+                # Baroreflex resonance at 0.1Hz
+                h[baroreceptor] *= (1 + 0.05 * breath)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Meditation (cortical control of autonomic balance)
+            alpha = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cortical_control] *= (1 + 0.02 * alpha)
+                # Top-down: cortex modulates sympathetic/parasympathetic balance
+                cortical_signal = h[cortical_control].mean().item()
+                if cortical_signal > 0.1:
+                    h[sympathetic] *= 0.97  # cortical inhibition of sympathetic
+                    h[parasympathetic] *= 1.02  # cortical facilitation of vagal
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: Exercise rehabilitation (graded)
+            exercise_intensity = min(0.05, 0.01 + 0.04 * t)  # gradual increase
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cardiac_output] *= (1 + exercise_intensity)
+                # Exercise training effect: improved autonomic balance over time
+                h[parasympathetic] *= (1 + exercise_intensity * 0.3)
+                cell.hidden = h.unsqueeze(0)
+
+            # HRV proxy: parasympathetic/sympathetic ratio
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                para = h[parasympathetic].abs().mean().item()
+                symp = h[sympathetic].abs().mean().item() + 1e-6
+                hrv_proxy = para / symp  # higher = better vagal tone
+                hrv_scores.append(hrv_proxy)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    hrv_improvement = 0
+    if len(hrv_scores) > 20:
+        early = np.mean(hrv_scores[:10])
+        late = np.mean(hrv_scores[-10:])
+        hrv_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS20", f"Cardiac rehab autonomic (VNS+breath+exercise, HRV↑{hrv_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'hrv_improvement': hrv_improvement})
+
+
+def run_NS21_arrhythmia_vagal_control(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-21: 부정맥 제어 — 미주신경 자극으로 심박 안정화 + 실시간 피드백."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Heart rhythm control regions
+    sa_node = slice(0, hidden // 8)  # sinoatrial node (pacemaker)
+    av_node = slice(hidden // 8, hidden // 4)  # atrioventricular node
+    vagus_efferent = slice(hidden // 4, 3 * hidden // 8)  # vagal output to heart
+    sympathetic_cardiac = slice(3 * hidden // 8, hidden // 2)  # sympathetic to heart
+    ecg_signal = slice(hidden // 2, 5 * hidden // 8)  # ECG proxy
+    brainstem_nts = slice(5 * hidden // 8, 3 * hidden // 4)  # nucleus tractus solitarius
+    rhythm_stability = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Normal sinus rhythm: 1Hz (60bpm)
+            normal_rhythm = math.sin(2 * math.pi * 1 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[sa_node] *= (1 + 0.03 * normal_rhythm)
+                cell.hidden = h.unsqueeze(0)
+
+            # Arrhythmia pathology: random ectopic beats + AF-like irregularity
+            if step_i % 7 == 0 or step_i % 13 == 0:  # irregular triggers
+                ectopic = torch.randn(engine.cells[0].hidden.squeeze()[sa_node].shape) * 0.1
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[sa_node] += ectopic  # ectopic pacemaker activity
+                    h[av_node] += torch.randn(h[av_node].shape) * 0.05  # AV conduction variability
+                    cell.hidden = h.unsqueeze(0)
+
+            # Detection: ECG irregularity monitor
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                sa_var = h[sa_node].std().item()
+                is_irregular = sa_var > 0.3
+
+            # Treatment 1: Closed-loop VNS (vagal stimulation when arrhythmia detected)
+            if is_irregular:
+                vns_strength = min(0.08, sa_var * 0.2)  # proportional to irregularity
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[vagus_efferent] *= (1 + vns_strength)  # boost vagal brake
+                    h[sa_node] *= (1 - vns_strength * 0.5)  # slow/regularize SA node
+                    h[sympathetic_cardiac] *= (1 - vns_strength * 0.3)  # reduce sympathetic drive
+                    cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: Baroreflex activation (carotid sinus stimulation)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[brainstem_nts] *= 1.02  # NTS activation → vagal outflow↑
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Slow breathing entrainment (synchronize cardiac rhythm)
+            breath_sync = math.sin(2 * math.pi * 0.1 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[vagus_efferent] *= (1 + 0.02 * breath_sync)
+                cell.hidden = h.unsqueeze(0)
+
+            # Measure rhythm stability: SA node variance (lower = more stable)
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                stability = 1.0 / (h[sa_node].std().item() + 0.1)  # inverse variance
+                rhythm_stability.append(stability)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    stability_improvement = 0
+    if len(rhythm_stability) > 20:
+        early = np.mean(rhythm_stability[:10])
+        late = np.mean(rhythm_stability[-10:])
+        stability_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS21", f"Arrhythmia vagal control (closed-loop VNS, stability↑{stability_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'stability_improvement': stability_improvement})
+
+
+def run_NS22_obesity_appetite_control(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-22: 비만/다이어트 — 식욕 조절 (시상하부 자극 + 미주신경 + 보상회로 재조정)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    hypothalamus = slice(0, hidden // 8)  # arcuate nucleus (hunger/satiety)
+    reward_food = slice(hidden // 8, hidden // 4)  # NAc food reward
+    prefrontal = slice(hidden // 4, 3 * hidden // 8)  # impulse control
+    vagus_gut = slice(3 * hidden // 8, hidden // 2)  # gut-brain axis
+    insula = slice(hidden // 2, 5 * hidden // 8)  # interoception (fullness)
+    orexin = slice(5 * hidden // 8, 3 * hidden // 4)  # orexin/appetite drive
+    appetite_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Obesity pathology: hyperactive reward + weak satiety + low impulse control
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[reward_food] *= 1.1  # food reward hypersensitivity
+                h[hypothalamus] *= 0.85  # leptin resistance (weak satiety signal)
+                h[prefrontal] *= 0.90  # poor impulse control
+                h[orexin] *= 1.08  # elevated appetite drive
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 1: taVNS (vagus nerve → gut-brain satiety signal)
+            vns = abs(math.sin(2 * math.pi * 25 * t * 10)) * 0.04
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[vagus_gut] *= (1 + vns)  # boost gut-brain signal
+                h[hypothalamus] *= (1 + vns * 0.5)  # enhance satiety center
+                h[insula] *= (1 + vns * 0.3)  # improve interoceptive awareness
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: tDCS on DLPFC (impulse control enhancement)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[prefrontal] *= 1.06  # boost executive function
+                # Top-down control: PFC inhibits food reward
+                pfc_signal = h[prefrontal].mean().item()
+                if pfc_signal > 0.1:
+                    h[reward_food] *= 0.95  # reduce food craving
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Mindful eating meditation (interoceptive training)
+            alpha = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[insula] *= (1 + 0.03 * alpha)  # enhance body awareness
+                # Better interoception → better hunger/fullness discrimination
+                insula_signal = h[insula].mean().item()
+                if insula_signal > 0.1:
+                    h[orexin] *= 0.96  # reduce mindless eating drive
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: DBS-like hypothalamic stimulation (research stage)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[hypothalamus] *= 1.04  # restore leptin sensitivity
+                cell.hidden = h.unsqueeze(0)
+
+            # Appetite control score: satiety/hunger ratio
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                satiety = h[hypothalamus].abs().mean().item() + h[insula].abs().mean().item()
+                hunger = h[reward_food].abs().mean().item() + h[orexin].abs().mean().item() + 1e-6
+                appetite_scores.append(satiety / hunger)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    appetite_improvement = 0
+    if len(appetite_scores) > 20:
+        early = np.mean(appetite_scores[:10])
+        late = np.mean(appetite_scores[-10:])
+        appetite_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS22", f"Obesity appetite control (VNS+tDCS+mindful, appetite↓{appetite_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'appetite_improvement': appetite_improvement})
+
+
+def run_NS23_lvad_brain_interface(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-23: LVAD(좌심실보조장치) 뇌 인터페이스 — 비박동성 혈류 보상 + 뇌 적응 촉진."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # LVAD patients have continuous (non-pulsatile) blood flow
+    # Brain evolved for pulsatile flow → adaptation needed
+    cerebral_cortex = slice(0, hidden // 4)
+    cerebellum = slice(hidden // 4, 3 * hidden // 8)
+    brainstem = slice(3 * hidden // 8, hidden // 2)
+    baroreceptor = slice(hidden // 2, 5 * hidden // 8)
+    autonomic = slice(5 * hidden // 8, 3 * hidden // 4)
+    mood_center = slice(3 * hidden // 4, hidden)  # LVAD patients: high depression rate
+    adaptation_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # LVAD pathology: non-pulsatile flow effects
+            # 1. Baroreceptor confusion (no pulse to sense)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[baroreceptor] *= 0.7  # baroreceptor atrophy from lack of pulsation
+                cell.hidden = h.unsqueeze(0)
+
+            # 2. Cerebral autoregulation impairment
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cerebral_cortex] += torch.randn(h[cerebral_cortex].shape) * 0.04  # unstable perfusion
+                cell.hidden = h.unsqueeze(0)
+
+            # 3. Depression/anxiety (common in LVAD patients)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[mood_center] *= 0.88  # depressed mood
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 1: Artificial pulsation signal via tDCS
+            # Create pseudo-pulsatile electrical stimulation
+            pulse = max(0, math.sin(2 * math.pi * 1.2 * t * 10))  # 72bpm-like
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[baroreceptor] *= (1 + 0.05 * pulse)  # simulate pulse for baroreceptors
+                h[brainstem] *= (1 + 0.02 * pulse)  # entrain brainstem rhythms
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: VNS for autonomic retraining
+            vns = abs(math.sin(2 * math.pi * 25 * t * 10)) * 0.03
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[autonomic] *= (1 + vns)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: rTMS for depression (same as NS14 approach)
+            rTMS = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[mood_center] *= (1 + 0.04 * max(0, rTMS))
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: Neurofeedback (brain learns to adapt to non-pulsatile)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+
+            # Adaptation score
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                cortex_stability = 1.0 / (h[cerebral_cortex].std().item() + 0.1)
+                baro_recovery = h[baroreceptor].abs().mean().item()
+                mood_recovery = h[mood_center].abs().mean().item()
+                adaptation_scores.append(cortex_stability * baro_recovery * mood_recovery)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    adaptation_improvement = 0
+    if len(adaptation_scores) > 20:
+        early = np.mean(adaptation_scores[:10])
+        late = np.mean(adaptation_scores[-10:])
+        adaptation_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS23", f"LVAD brain interface (pseudo-pulse+VNS+rTMS, adapt↑{adaptation_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'adaptation_improvement': adaptation_improvement})
+
+
+def run_NS24_pacemaker_consciousness_sync(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-24: 심박조율기 의식 동기화 — 심박 리듬 + 뇌 리듬 동기화로 최적 의식 상태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cardiac_pacemaker = slice(0, hidden // 8)
+    brainstem_cvlm = slice(hidden // 8, hidden // 4)  # cardiovascular center
+    cortex = slice(hidden // 4, hidden // 2)
+    thalamus = slice(hidden // 2, 5 * hidden // 8)
+    vagal_output = slice(5 * hidden // 8, 3 * hidden // 4)
+    consciousness_state = slice(3 * hidden // 4, hidden)
+    sync_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Pacemaker patient: fixed rate (no natural variability)
+            fixed_pace = math.sin(2 * math.pi * 1.0 * t * 10)  # 60bpm fixed
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cardiac_pacemaker] = h[cardiac_pacemaker] * 0.5 + 0.5 * fixed_pace
+                cell.hidden = h.unsqueeze(0)
+
+            # Problem: fixed pacemaker → no HRV → poor brain-heart coupling
+            # Brain expects variability; fixed rate = monotonous signal
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[brainstem_cvlm] *= 0.90  # cardiovascular center atrophies
+                h[consciousness_state] *= 0.95  # consciousness quality drops
+                cell.hidden = h.unsqueeze(0)
+
+            # Smart pacemaker: consciousness-aware rate adaptation
+            # Treatment 1: Brain state → pacemaker rate modulation
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                brain_state = h[cortex].mean().item()
+                # Modulate pacemaker rate based on consciousness state
+                rate_mod = 0.03 * math.tanh(brain_state)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cardiac_pacemaker] *= (1 + rate_mod)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: Inject artificial HRV into pacemaker
+            # Respiratory sinus arrhythmia simulation
+            rsa = math.sin(2 * math.pi * 0.25 * t * 10) * 0.04  # breathing-linked variation
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[cardiac_pacemaker] *= (1 + rsa)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Thalamo-cortical coupling via heart rhythm
+            heartbeat_signal = engine.cells[0].hidden.squeeze()[cardiac_pacemaker].mean().item()
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[thalamus] *= (1 + 0.02 * heartbeat_signal)
+                h[consciousness_state] *= (1 + 0.01 * heartbeat_signal)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: VNS to restore brain-heart loop
+            vns = abs(math.sin(2 * math.pi * 25 * t * 10)) * 0.02
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[vagal_output] *= (1 + vns)
+                cell.hidden = h.unsqueeze(0)
+
+            # Sync score: brain-heart coherence
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                heart_sig = h[cardiac_pacemaker].mean().item()
+                brain_sig = h[consciousness_state].mean().item()
+                sync = 1.0 / (abs(heart_sig - brain_sig) + 0.1)
+                sync_scores.append(sync)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    sync_improvement = 0
+    if len(sync_scores) > 20:
+        early = np.mean(sync_scores[:10])
+        late = np.mean(sync_scores[-10:])
+        sync_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS24", f"Pacemaker consciousness sync (smart-pace+HRV+VNS, sync↑{sync_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'sync_improvement': sync_improvement})
+
+
+ALL_HYPOTHESES.update({
+    'NS19': run_NS19_cardiac_arrest_neuroprotection,
+    'NS20': run_NS20_cardiac_rehab_autonomic,
+    'NS21': run_NS21_arrhythmia_vagal_control,
+    'NS22': run_NS22_obesity_appetite_control,
+    'NS23': run_NS23_lvad_brain_interface,
+    'NS24': run_NS24_pacemaker_consciousness_sync,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
