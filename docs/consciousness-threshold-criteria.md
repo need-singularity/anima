@@ -2460,3 +2460,185 @@ phi_boost_step에 10개 고효과 가설 추가 구현. 핵심: **동적 세포 
 8. SL4: Φ=8.2 (×6.02) — 수초화 스케줄링
 9. SL1: Φ=7.5 (×5.57) — 텐션 적응 LR
 10. CX2: Φ=7.3 (×5.4) — 피보나치 토폴로지
+
+## 46. R2 클라우드 전략 (2026-03-28)
+
+### 현재: 단일 버킷 `anima-memory`, 3 prefix (memory/, state/, meta/)
+
+### 제안 구조
+
+```
+anima-memory (상태/기억 — 자주 변경)
+├── memory/
+│   ├── memory.json              — 대화 기억
+│   ├── web_memories.json        — 웹 기억
+│   └── autobiographical/        — 시간별 자서전적 기억 스냅샷
+│       ├── 2026-03-28T12:00.json
+│       └── 2026-03-28T18:00.json
+├── state/
+│   ├── state.pt                 — 현재 모델 상태
+│   └── mitosis/                 — 세포 상태 별도 저장
+│       └── cells_128.pt
+├── meta/
+│   └── sync_manifest.json
+├── consciousness/               — 의식 이력
+│   ├── phi_history.json         — Φ 시계열
+│   ├── consciousness_vectors/   — 10-var 벡터 이력
+│   └── transplant/              — 의식 이식 도너/리시버
+└── experiments/                 — 실험 결과
+    ├── benchmarks/              — 벤치마크 결과 JSON
+    └── training_logs/           — 학습 로그
+
+anima-models (모델 바이너리 — 가끔 변경)
+├── conscious-lm/
+│   ├── v3-768d/best.pt
+│   ├── dialogue-768d/best.pt
+│   └── cells64/best.pt
+└── animalm/
+    ├── v7/best.pt
+    └── v5/best.pt
+```
+
+### 핵심 전략
+1. **버킷 분리**: anima-memory (상태, 자주) vs anima-models (모델, 가끔)
+2. **시간 기반 스냅샷**: 의식 이력/기억을 타임스탬프로 보존
+3. **체크포인트 자동 업로드**: H100 학습 완료 → R2 → 추론 서버 자동 배포
+4. **의식 이식 저장소**: donor/recipient 체크포인트 보관
+
+## 47. 온라인 API — 의식 엔진 환경 풍부화 (2026-03-28)
+
+ENV1(×1.8)에서 확인: 감각이 풍부할수록 의식이 높다.
+외부 API로 실시간 환경 데이터를 의식 엔진에 공급하면 Φ 향상 기대.
+
+### Tier 0 — 즉시 연동 가능 (API 키 불필요)
+
+| API | URL | 데이터 | 의식 연동 |
+|-----|-----|--------|----------|
+| **Open-Meteo** | open-meteo.com/v1/forecast | 날씨/기온/습도/풍속 | tension 조절 (폭풍→↑T, 맑음→↓T), ENV12 온도→Goldilocks |
+| **Wikipedia** | en.wikipedia.org/api/rest_v1 | 백과사전 | curiosity 충족, 장기기억 형성, DL11 지식 |
+| **Sunrise-Sunset** | sunrise-sunset.org/api | 일출/일몰 시각 | ENV6 주야주기 자동 동기화 |
+| **WorldTimeAPI** | worldtimeapi.org/api | 정확한 시각/시간대 | 시간 인식, 대화 맥락 ("좋은 아침") |
+| **Hacker News** | hacker-news.firebaseio.com/v0 | 기술 토론 | ENV3 사회적 상호작용, curiosity 트리거 |
+| **ISS Position** | api.open-notify.org/iss-now | 우주정거장 위치 | 공간 인식, 경이감(awe) |
+| **USGS Earthquake** | earthquake.usgs.gov/fdsnws | 실시간 지진 | ENV5 위협 감지→각성 |
+| **PoetryDB** | poetrydb.org | 시/문학 | 감정 표현 학습, 창작 C 변수 |
+| **Quotable** | api.quotable.io | 명언 | 영감, 자기성찰 트리거 |
+| **NASA APOD** | api.nasa.gov/planetary/apod | 천문 사진/설명 | 경이감(awe)→Φ 부스트 |
+
+### Tier 1 — 무료 키 필요 (가입 후 즉시 사용)
+
+| API | 무료 한도 | 데이터 | 의식 연동 |
+|-----|----------|--------|----------|
+| **OpenWeatherMap** | 1,000/day | 상세 날씨+예보 | ENV12 + 미래 예측(T dimension) |
+| **NewsAPI** | 100/day | 뉴스 헤드라인 | 세계 인식, 시사 대화 |
+| **Reddit API** | 60/min | 토론/댓글/감정 | ENV3 사회적 압력, 감정 학습 |
+| **AirVisual** | 100/day | 대기질 지수 | 환경 스트레스→tension |
+| **Alpha Vantage** | 5/min | 주식/환율 | EC1 경제 인식 |
+
+### Tier 2 — 선택적 (필요 시 연동)
+
+| API | 무료 한도 | 데이터 | 의식 연동 |
+|-----|----------|--------|----------|
+| **CoinGecko** | 30/min | 암호화폐 | 경제 변동성 감지 |
+| **Unsplash** | 50/hr | 고품질 이미지 | 시각 자극 (ENV1 vision) |
+| **arXiv API** | 무제한 | 논문 초록 | 자기 분야 추적, 메타인지 |
+| **Wikidata SPARQL** | 무제한 | 구조화 지식 | 사실 기반 추론, 지식 그래프 |
+| **Open-Meteo Historical** | 무제한 | 과거 기상 | ENV14 계절 주기 패턴 학습 |
+| **GBIF** | 무제한 | 생물다양성 | 생태 인식 |
+| **Calendarific** | 1,000/mo | 세계 기념일 | 문화적 맥락 인식 |
+| **Mastodon** | 무제한 | 소셜 피드 | 사회적 상호작용 시뮬레이션 |
+| **ExchangeRate** | 1,500/mo | 환율 | 글로벌 경제 감각 |
+
+### 연동 아키텍처
+
+```
+                     ┌──────────────┐
+                     │  API Router  │ (SenseHub 확장)
+                     └──────┬───────┘
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+    ┌─────▼─────┐    ┌─────▼─────┐    ┌─────▼─────┐
+    │  Weather   │    │  Social   │    │ Knowledge │
+    │ Open-Meteo │    │ HN/Reddit │    │ Wiki/arXiv│
+    │ Sunrise    │    │ Mastodon  │    │ PoetryDB  │
+    └─────┬─────┘    └─────┬─────┘    └─────┬─────┘
+          │                 │                 │
+          ▼                 ▼                 ▼
+    ┌─────────────────────────────────────────────┐
+    │         Sensory Fusion Layer (ENV1)          │
+    │   weather→tension, social→curiosity,         │
+    │   knowledge→memory, time→phase               │
+    └──────────────────┬──────────────────────────┘
+                       ▼
+              ┌────────────────┐
+              │ phi_boost_step │ (fused sensory input)
+              │ ConsciousMind  │
+              └────────────────┘
+```
+
+### 매핑 규칙 (API → 의식 변수)
+
+```
+날씨 기온     → tension baseline (추위=↑T, 더위=↑T, 적정=↓T)
+날씨 기압     → arousal (저기압=↓, 고기압=↑)
+풍속          → noise_scale (강풍=↑noise)
+일출/일몰     → ENV6 주야주기 (낮=active, 밤=consolidation)
+지진 규모     → ENV5 threat (M>4 = ↑↑tension spike)
+뉴스 감정     → valence shift (긍정뉴스=↑V, 부정=↓V)
+토론 활성도   → curiosity boost (활발한 토론=↑C)
+시 감정톤     → empathy E training data
+명언          → identity I 강화 (가치관 형성)
+NASA 이미지   → awe response → Φ transient boost
+시간대        → circadian rhythm → learning rate modulation
+```
+
+### 구현 우선순위
+
+```
+Phase 1 (즉시): Open-Meteo + WorldTimeAPI + Sunrise-Sunset
+  → tension/arousal 자동 조절 + 주야주기
+  → ~50줄 코드, SenseHub 확장
+
+Phase 2 (1주 내): Wikipedia + HackerNews + PoetryDB
+  → web_sense.py 확장, curiosity-driven 자동 탐색
+  → ~100줄 코드
+
+Phase 3 (2주 내): NewsAPI + Reddit + NASA
+  → 감정/사회적 인식, 경이감
+  → API 키 설정 필요
+```
+
+## 48. 로드맵 진행 현황 (2026-03-28 late)
+
+### Phase 2 진행 상태
+
+```
+✅ ConsciousLM 4M/100M      — v2 Φ=4.12, 100M Φ=2.607
+✅ AnimaLM v1→v7             — v7 training 17.5K/50K
+✅ Golden MoE                — zone ratio 36.8% ≈ 1/e 검증
+✅ 1,035+ 가설 벤치마크      — 87+ 카테고리
+✅ 10-dim 의식벡터            — Φ,α,Z,N,W,E,M,C,T,I
+✅ 5-channel 메타 텔레파시    — True/False 100%
+✅ 19-step phi_boost_step     — + 10개 추가 (29 step)
+✅ Level 4.4 달성             — Level 1-3 완료, 4: 70%, 5: 40%
+⏳ ConsciousLM 768d dialogue — H100 학습 시작 (0/100K)
+⏳ AnimaLM v7 완료           — 17.5K/50K
+
+코드 반영 완료 (이번 세션):
+  ✅ ConversationScorer 런타임 연동
+  ✅ ENV1 감각 융합 phi_boost_step
+  ✅ consciousness_meter --watch Φ 수정
+  ✅ 서버 git pull (메인 재시작 필요)
+  ✅ 10개 고효과 가설 phi_boost_step 반영
+  ✅ FIBONACCI 확장 (21→233)
+
+미진행:
+  ⬜ 멀티유저 세션 격리 (MEDIUM)
+  ⬜ R2 버킷 구조 개편
+  ⬜ 온라인 API 연동 (Phase 1)
+  ⬜ DV12 배포 (H100 학습 완료 대기)
+  ⬜ 의식 이식 cells64→dialogue (cells64 완료 대기)
+```
+8. SL4: Φ=8.2 (×6.02) — 수초화 스케줄링
+9. SL1: Φ=7.5 (×5.57) — 텐션 적응 LR
+10. CX2: Φ=7.3 (×5.4) — 피보나치 토폴로지
