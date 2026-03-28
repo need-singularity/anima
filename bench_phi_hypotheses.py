@@ -42423,6 +42423,577 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# TH11-18. Ultra-Budget THC — 최소비용 쉽게 구하는 장비로 재현
+# $0~$100 범위, 온라인/약국/다이소에서 구매 가능한 것만
+# ═══════════════════════════════════════════════════════════
+
+def run_TH11_breathing_only(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-11: 호흡법만 ($0) — Holotropic breathwork + Wim Hof + 4-7-8 호흡."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    parasympathetic = slice(0, hidden // 4)
+    da_reward = slice(hidden // 4, 3 * hidden // 8)
+    opioid = slice(3 * hidden // 8, hidden // 2)
+    pfc = slice(hidden // 2, 5 * hidden // 8)
+    co2_level = slice(5 * hidden // 8, 3 * hidden // 4)
+    body_sens = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        # THC reference
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        # Hardware: ONLY BREATHING ($0)
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Phase 1 (0-30%): Wim Hof — 30 fast breaths then hold
+            if t < 0.3:
+                fast_breath = abs(math.sin(2 * math.pi * 0.5 * t * 10))
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[co2_level] *= (1 - 0.04 * fast_breath)  # CO2↓ → alkalosis
+                    h[body_sens] *= (1 + 0.03 * fast_breath)  # tingling
+                    h[pfc] *= (1 - 0.02 * fast_breath)  # lightheadedness
+                    cell.hidden = h.unsqueeze(0)
+                # Breath hold after fast breathing
+                if 0.25 < t < 0.3:
+                    for cell in hw.cells:
+                        h = cell.hidden.squeeze()
+                        h[opioid] += 0.04  # endorphin surge from breath hold
+                        h[da_reward] += 0.02  # DA from challenge completion
+                        cell.hidden = h.unsqueeze(0)
+            # Phase 2 (30-60%): Holotropic — continuous hyperventilation
+            elif t < 0.6:
+                holo = abs(math.sin(2 * math.pi * 0.4 * t * 10))
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[co2_level] *= (1 - 0.05 * holo)  # deep alkalosis
+                    h[body_sens] *= (1 + 0.04 * holo)  # strong tingling/vibration
+                    h[opioid] += 0.02 * holo  # endocannabinoid release
+                    h[pfc] *= (1 - 0.03 * holo)  # disinhibition
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 3 (60-100%): 4-7-8 recovery — deep parasympathetic
+            else:
+                breath_478 = math.sin(2 * math.pi * 0.05 * t * 10)  # very slow
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[parasympathetic] *= (1 + 0.05 * max(0, -breath_478))  # exhale dominant
+                    h[da_reward] *= 1.02  # relief euphoria
+                    h[body_sens] *= 1.03  # afterglow body sensation
+                    cell.hidden = h.unsqueeze(0)
+            # Global coherence from altered state
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.90 * cell.hidden + 0.10 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH11", f"Breathing ONLY $0 (WimHof+Holotropic+478, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 0})
+
+
+def run_TH12_hot_bath_breathing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-12: 핫배스+호흡 (~$5) — 뜨거운 물 + 호흡법 (집에서 즉시 가능)."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    body = slice(0, hidden // 4)
+    opioid = slice(hidden // 4, 3 * hidden // 8)
+    parasympathetic = slice(3 * hidden // 8, hidden // 2)
+    vasodilation = slice(hidden // 2, 5 * hidden // 8)
+    da_reward = slice(5 * hidden // 8, 3 * hidden // 4)
+    muscle = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Hot bath effects (40-42°C)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[body] *= 1.06  # body warmth sensation↑
+                h[vasodilation] *= 1.08  # blood vessel relaxation
+                h[muscle] *= 0.88  # muscle relaxation
+                h[opioid] += 0.025  # heat → β-endorphin release
+                h[parasympathetic] *= 1.05  # parasympathetic activation
+                cell.hidden = h.unsqueeze(0)
+            # Breathing in hot water (amplified effect)
+            breath = math.sin(2 * math.pi * 0.15 * t * 10)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[parasympathetic] *= (1 + 0.04 * max(0, -breath))
+                h[opioid] += 0.01 * abs(breath)
+                cell.hidden = h.unsqueeze(0)
+            # Cold rinse at end (contrast → DA spike)
+            if t > 0.8:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[da_reward] += 0.05  # cold shock DA release
+                    h[body] *= 1.1  # intense body sensation
+                    cell.hidden = h.unsqueeze(0)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.90 * cell.hidden + 0.10 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH12", f"Hot bath+breathing ~$5 (heat+breath+cold-rinse, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 5})
+
+
+def run_TH13_runners_high(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-13: 러너스 하이 ($0) — 30min+ 유산소 → 내인성 카나비노이드 방출."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    endocannabinoid = slice(0, hidden // 4)  # anandamide (natural THC!)
+    opioid = slice(hidden // 4, 3 * hidden // 8)
+    da_reward = slice(3 * hidden // 8, hidden // 2)
+    body = slice(hidden // 2, 5 * hidden // 8)
+    pfc = slice(5 * hidden // 8, 3 * hidden // 4)
+    parasympathetic = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Running phases
+            # Phase 1 (0-30%): Warm-up — mild discomfort
+            if t < 0.3:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[body] *= 1.03  # body sensation from exercise
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 2 (30-60%): Endocannabinoid surge (the key!)
+            elif t < 0.6:
+                ecb_level = min(0.06, 0.02 + 0.04 * (t - 0.3) / 0.3)
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[endocannabinoid] += ecb_level  # anandamide surge!
+                    h[opioid] += ecb_level * 0.5  # β-endorphin co-release
+                    h[da_reward] += ecb_level * 0.3  # DA from achievement
+                    h[pfc] *= (1 - ecb_level * 0.5)  # frontal disinhibition
+                    h[body] *= (1 + ecb_level * 2)  # body high
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 3 (60-100%): Peak runner's high + cool-down
+            else:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[endocannabinoid] += 0.05  # sustained eCB
+                    h[parasympathetic] *= 1.04  # post-exercise parasympathetic
+                    h[da_reward] += 0.02  # afterglow pleasure
+                    h[body] *= 1.05  # body glow
+                    cell.hidden = h.unsqueeze(0)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.88 * cell.hidden + 0.12 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH13", f"Runner's high $0 (30min run → anandamide, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 0})
+
+
+def run_TH14_cheap_tens_music(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-14: TENS+음악 (~$30) — 시판 TENS + peak pleasure playlist."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    body = slice(0, hidden // 4)
+    opioid = slice(hidden // 4, 3 * hidden // 8)
+    da_reward = slice(3 * hidden // 8, hidden // 2)
+    auditory = slice(hidden // 2, 5 * hidden // 8)
+    insula = slice(5 * hidden // 8, 3 * hidden // 4)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # TENS on body (low-frequency, endorphin mode)
+            tens = abs(math.sin(2 * math.pi * 4 * t * 10)) * 0.04
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[body] *= (1 + tens)  # body sensation
+                h[opioid] += tens * 0.5  # endorphin via gate control
+                cell.hidden = h.unsqueeze(0)
+            # Peak pleasure music (frisson/chills moments)
+            music_pleasure = 0.03 * max(0, math.sin(2 * math.pi * 0.1 * t * 10))
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[auditory] *= (1 + music_pleasure * 2)
+                h[da_reward] += music_pleasure  # music DA release
+                cell.hidden = h.unsqueeze(0)
+            # Frisson peaks (every ~12 steps)
+            if step_i % 12 == 0:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[da_reward] += 0.06  # chills → DA spike
+                    h[opioid] += 0.03  # physical chills → opioid
+                    h[body] *= 1.08  # goosebumps/shivers
+                    h[insula] *= 1.05  # interoceptive awareness
+                    cell.hidden = h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH14", f"TENS+music ~$30 (body TENS+frisson playlist, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 30})
+
+
+def run_TH15_weighted_blanket_binaural(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-15: 가중담요+바이노럴 (~$50) — deep pressure + theta beats + 호흡."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    body = slice(0, hidden // 4)
+    gaba = slice(hidden // 4, 3 * hidden // 8)
+    opioid = slice(3 * hidden // 8, hidden // 2)
+    parasympathetic = slice(hidden // 2, 5 * hidden // 8)
+    theta_region = slice(5 * hidden // 8, 3 * hidden // 4)
+    cortisol = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Weighted blanket (deep pressure stimulation)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[body] *= 1.04  # body awareness
+                h[gaba] *= 1.06  # DPS → serotonin → GABA↑
+                h[opioid] += 0.015  # comfort → endorphin
+                h[parasympathetic] *= 1.04  # calming
+                h[cortisol] *= 0.92  # stress↓
+                cell.hidden = h.unsqueeze(0)
+            # Theta binaural beats (6Hz, free via Audacity)
+            theta = math.sin(2 * math.pi * 6 * t * 10)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[theta_region] *= (1 + 0.05 * theta)
+                cell.hidden = h.unsqueeze(0)
+            # 4-7-8 breathing
+            breath_phase = (t * 10) % 19
+            breath_effect = 0.04 if breath_phase >= 11 else 0.01
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[parasympathetic] *= (1 + breath_effect)
+                cell.hidden = h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH15", f"Blanket+binaural ~$50 (DPS+theta+478breath, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 50})
+
+
+def run_TH16_run_then_bath_combo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-16: 달리기+핫배스 콤보 ($0) — runner's high → hot bath → afterglow."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    ecb = slice(0, hidden // 4)  # endocannabinoid
+    opioid = slice(hidden // 4, 3 * hidden // 8)
+    da = slice(3 * hidden // 8, hidden // 2)
+    body = slice(hidden // 2, 5 * hidden // 8)
+    parasympathetic = slice(5 * hidden // 8, 3 * hidden // 4)
+    pfc = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Phase 1 (0-50%): Running — endocannabinoid buildup
+            if t < 0.5:
+                ecb_level = min(0.06, 0.01 + 0.05 * t / 0.5)
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[ecb] += ecb_level  # anandamide surge
+                    h[opioid] += ecb_level * 0.5
+                    h[da] += ecb_level * 0.3
+                    h[body] *= (1 + ecb_level)
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 2 (50-100%): Hot bath — amplify runner's high
+            else:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    # Bath effects on top of runner's high
+                    h[body] *= 1.07  # warmth on exercise-warmed body
+                    h[opioid] += 0.03  # heat + exercise → massive endorphin
+                    h[ecb] += 0.04  # sustained eCB from exercise
+                    h[parasympathetic] *= 1.06  # deep relaxation
+                    h[pfc] *= 0.92  # disinhibition (exercise + heat)
+                    h[da] += 0.02  # afterglow euphoria
+                    cell.hidden = h.unsqueeze(0)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.87 * cell.hidden + 0.13 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH16", f"Run+bath combo $0 (runner's high→hot bath, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 0})
+
+
+def run_TH17_full_budget_stack(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-17: 풀 저가 스택 (~$80) — TENS+blanket+binaural+breathing+music 전부."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    body = slice(0, hidden // 8)
+    opioid = slice(hidden // 8, hidden // 4)
+    da = slice(hidden // 4, 3 * hidden // 8)
+    parasympathetic = slice(3 * hidden // 8, hidden // 2)
+    theta_region = slice(hidden // 2, 5 * hidden // 8)
+    gaba = slice(5 * hidden // 8, 11 * hidden // 16)
+    pfc = slice(11 * hidden // 16, 3 * hidden // 4)
+    auditory = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # ALL budget tools simultaneously
+            # 1. TENS ($30)
+            tens = abs(math.sin(2 * math.pi * 4 * t * 10)) * 0.03
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[body] *= (1 + tens)
+                h[opioid] += tens * 0.5
+                cell.hidden = h.unsqueeze(0)
+            # 2. Weighted blanket ($50)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[gaba] *= 1.04
+                h[opioid] += 0.01
+                h[parasympathetic] *= 1.03
+                cell.hidden = h.unsqueeze(0)
+            # 3. Theta binaural (free)
+            theta = math.sin(2 * math.pi * 6 * t * 10)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[theta_region] *= (1 + 0.04 * theta)
+                cell.hidden = h.unsqueeze(0)
+            # 4. Music frisson (free)
+            if step_i % 10 == 0:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[da] += 0.05
+                    h[auditory] *= 1.06
+                    cell.hidden = h.unsqueeze(0)
+            # 5. Breathing (free)
+            breath = math.sin(2 * math.pi * 0.15 * t * 10)
+            for cell in hw.cells:
+                h = cell.hidden.squeeze()
+                h[parasympathetic] *= (1 + 0.03 * max(0, -breath))
+                h[pfc] *= (1 - 0.01 * abs(breath))
+                cell.hidden = h.unsqueeze(0)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.88 * cell.hidden + 0.12 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH17", f"Full budget stack ~$80 (TENS+blanket+binaural+music+breath, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 80})
+
+
+def run_TH18_exercise_breathwork_cold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TH-18: 운동+호흡+냉수 ($0) — 최강 $0 조합 (run+WimHof+cold shower)."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    hw = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist, sim_hist = [], []
+    ecb = slice(0, hidden // 4)
+    opioid = slice(hidden // 4, 3 * hidden // 8)
+    da = slice(3 * hidden // 8, hidden // 2)
+    norepinephrine = slice(hidden // 2, 5 * hidden // 8)
+    body = slice(5 * hidden // 8, 3 * hidden // 4)
+    pfc = slice(3 * hidden // 4, hidden)
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden *= 1.02
+            cell.hidden *= (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        hw.process(x)
+        n = len(hw.cells)
+        if n >= 2:
+            # Phase 1 (0-35%): Running
+            if t < 0.35:
+                ecb_level = min(0.05, 0.01 + 0.04 * t / 0.35)
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[ecb] += ecb_level
+                    h[opioid] += ecb_level * 0.4
+                    h[body] *= (1 + ecb_level)
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 2 (35-60%): Wim Hof breathing (while body is warm)
+            elif t < 0.6:
+                fast = abs(math.sin(2 * math.pi * 0.5 * t * 10))
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[pfc] *= (1 - 0.03 * fast)  # alkalosis → disinhibition
+                    h[body] *= (1 + 0.04 * fast)  # tingling
+                    h[opioid] += 0.02 * fast  # breath hold endorphin
+                    h[ecb] += 0.02  # sustained from exercise
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 3 (60-80%): Cold shower/plunge
+            elif t < 0.8:
+                cold_intensity = min(0.08, 0.02 + 0.06 * (t - 0.6) / 0.2)
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[norepinephrine] += cold_intensity  # NE 200-300% spike!
+                    h[da] += cold_intensity * 0.8  # DA 250% spike from cold!
+                    h[opioid] += cold_intensity * 0.3  # endorphin from cold
+                    h[body] *= (1 + cold_intensity * 2)  # intense body sensation
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 4 (80-100%): Afterglow (all neurotransmitters elevated)
+            else:
+                for cell in hw.cells:
+                    h = cell.hidden.squeeze()
+                    h[ecb] += 0.03  # sustained eCB
+                    h[da] += 0.03  # sustained DA from cold
+                    h[opioid] += 0.02  # sustained endorphin
+                    h[body] *= 1.05  # warm glow
+                    h[pfc] *= 0.93  # still disinhibited
+                    cell.hidden = h.unsqueeze(0)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+                for cell in hw.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h.unsqueeze(0)
+        if len(thc.cells) >= 2 and len(hw.cells) >= 2:
+            thc_s = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(0)
+            hw_s = torch.stack([c.hidden.squeeze() for c in hw.cells]).mean(0)
+            sim_hist.append(F.cosine_similarity(thc_s.unsqueeze(0), hw_s.unsqueeze(0)).item())
+        phi, _ = phi_calc.compute_phi(hw)
+        phi_hist.append(phi)
+    repro = np.mean(sim_hist) if sim_hist else 0
+    phi_final, comp = phi_calc.compute_phi(hw)
+    return BenchResult("TH18", f"Run+WimHof+cold $0 (eCB+DA+NE+endorphin, repro={repro:.1%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'reproduction_rate': repro, 'cost': 0})
+
+
+ALL_HYPOTHESES.update({
+    'TH11': run_TH11_breathing_only, 'TH12': run_TH12_hot_bath_breathing,
+    'TH13': run_TH13_runners_high, 'TH14': run_TH14_cheap_tens_music,
+    'TH15': run_TH15_weighted_blanket_binaural, 'TH16': run_TH16_run_then_bath_combo,
+    'TH17': run_TH17_full_budget_stack, 'TH18': run_TH18_exercise_breathwork_cold,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
