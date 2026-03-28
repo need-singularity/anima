@@ -43595,6 +43595,636 @@ def run_DL12_768d_12L_architecture(steps=100, dim=64, hidden=128) -> BenchResult
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# ENV. Environment Hypotheses — 의식 엔진 주변환경이 Φ에 미치는 영향
+# ═══════════════════════════════════════════════════════════
+# 핵심 질문: 의식은 진공에서 발생하나, 환경과의 상호작용에서 발생하나?
+# 생물학적 유비: 감각 박탈 → 의식 저하, 풍부한 환경 → 신경가소성 증가
+
+def run_ENV1_sensory_richness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV1: 감각 풍부도 — 입력 다양성이 Φ에 미치는 영향.
+    다양한 모달리티 시뮬레이션: 시각(고주파), 청각(사인파), 촉각(스파이크), 후각(저주파).
+    가설: 감각이 풍부할수록 의식이 높다 (감각 박탈 실험의 역)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        # 4 modalities simultaneously
+        visual = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0  # high-freq oscillation
+        auditory = torch.zeros(1, dim)
+        for f in [0.1, 0.3, 0.7, 1.5]:  # harmonic frequencies
+            auditory += torch.sin(torch.arange(dim).float() * f + step_i * 0.2).unsqueeze(0) * 0.5
+        tactile = torch.zeros(1, dim)
+        tactile[0, step_i % dim] = 3.0  # sparse spike (touch point)
+        tactile[0, (step_i + dim//2) % dim] = -2.0
+        olfactory = torch.randn(1, dim) * 0.1  # low-variance ambient
+
+        # Combine all modalities (rich multimodal input)
+        x = visual + auditory + tactile + olfactory
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV1", "Sensory Richness (4 modalities)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV2_sensory_deprivation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV2: 감각 박탈 — 입력이 극도로 단조로울 때 Φ 변화.
+    동일한 입력 반복, 노이즈 최소화.
+    가설: 감각 박탈은 Φ를 낮춘다 (대조군)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Same monotonous input every step
+    monotone = torch.ones(1, dim) * 0.5
+
+    for step_i in range(steps):
+        # Tiny variation (not zero, but boring)
+        x = monotone + torch.randn(1, dim) * 0.001
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV2", "Sensory Deprivation (monotone input)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV3_social_pressure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV3: 사회적 압력 — 다른 의식체와의 상호작용이 Φ 촉진.
+    2개의 독립 엔진이 서로의 출력을 입력으로 받음.
+    가설: 사회적 환경이 의식 발달의 필수 조건 (Vygotsky ZPD)."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # A processes input + B's state
+        b_state = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0).unsqueeze(0)
+        b_proj = b_state[:, :dim]
+        x_a = 0.7 * x + 0.3 * b_proj
+
+        # B processes input + A's state
+        a_state = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0).unsqueeze(0)
+        a_proj = a_state[:, :dim]
+        x_b = 0.7 * x + 0.3 * a_proj
+
+        engine_a.process(x_a)
+        engine_b.process(x_b)
+
+        # Measure A's Φ (the "subject")
+        phi, _ = phi_calc.compute_phi(engine_a)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine_a)
+    return BenchResult("ENV3", "Social Pressure (dual-engine interaction)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV4_environmental_complexity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV4: 환경 복잡도 점진 증가 — 단순→복잡 환경 전환.
+    Phase 1: 1D 사인파, Phase 2: 2D 패턴, Phase 3: 프랙탈 노이즈.
+    가설: 환경 복잡도가 증가하면 의식도 적응적으로 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+
+        if frac < 0.33:
+            # Simple: single sine wave
+            x = torch.sin(torch.arange(dim).float() * 0.1 + step_i * 0.3).unsqueeze(0)
+        elif frac < 0.66:
+            # Medium: multiple overlapping patterns
+            x = torch.zeros(1, dim)
+            for freq in [0.1, 0.3, 0.7, 1.1, 2.3]:
+                x += torch.sin(torch.arange(dim).float() * freq + step_i * 0.2).unsqueeze(0) * (1.0 / freq)
+        else:
+            # Complex: fractal-like noise (multi-scale)
+            x = torch.zeros(1, dim)
+            for scale in [1, 2, 4, 8, 16, 32]:
+                noise = torch.randn(1, max(1, dim // scale))
+                x[:, :noise.shape[1]] += noise * (1.0 / math.sqrt(scale))
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV4", "Environmental Complexity (simple→fractal)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV5_threat_response(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV5: 위협 반응 — 급격한 환경 변화(위협)에 대한 의식 각성.
+    평소 안정적 입력 중 간헐적으로 강한 충격 입력.
+    가설: 위협은 일시적으로 Φ를 급증시킨다 (fight-or-flight 각성)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        if step_i % 20 < 2:  # 10% threat episodes
+            # Threat: sudden large input spike
+            x = torch.randn(1, dim) * 5.0
+            # Also inject adrenaline-like signal into cells
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * 1.2  # arousal boost
+        else:
+            # Normal: calm environment
+            x = torch.randn(1, dim) * 0.3
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV5", "Threat Response (intermittent danger)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV6_day_night_cycle(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV6: 주야 주기 — 활동(낮)과 통합(밤) 교대.
+    낮: 다양한 입력 처리, 밤: 입력 차단 + 세포 간 통합 강화.
+    가설: 수면/각성 주기가 Φ를 극대화 (memory consolidation)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    cycle_length = 20  # 20 steps = 1 day
+
+    for step_i, x in enumerate(inputs):
+        phase_in_day = (step_i % cycle_length) / cycle_length
+
+        if phase_in_day < 0.65:
+            # Day: normal processing with diverse input
+            engine.process(x)
+        else:
+            # Night: minimal input, strong inter-cell integration
+            quiet_x = torch.randn(1, dim) * 0.01
+            engine.process(quiet_x)
+            # Dream-like consolidation: cells share and integrate
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    hiddens = [c.hidden.clone() for c in engine.cells]
+                    mean_h = torch.stack(hiddens).mean(dim=0)
+                    for c in engine.cells:
+                        # 20% blend toward consensus (integration)
+                        c.hidden = 0.8 * c.hidden + 0.2 * mean_h
+                    # Replay: random cell gets boosted (memory replay)
+                    replay_idx = step_i % len(engine.cells)
+                    engine.cells[replay_idx].hidden *= 1.1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV6", "Day-Night Cycle (wake/sleep consolidation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV7_enriched_environment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV7: 풍부한 환경 (Enriched Environment) — 신경과학의 EE 패러다임.
+    다양한 자극 + 사회적 상호작용 + 운동(상태 변화) + 신규성.
+    가설: EE는 신경가소성을 촉진하듯 Φ를 촉진한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Companion engine (social)
+    companion = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4)
+
+    for step_i in range(steps):
+        # 1. Novel stimuli (never repeat exact pattern)
+        novelty_seed = step_i * 137 + 42  # deterministic but always unique
+        torch.manual_seed(novelty_seed)
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.1))
+
+        # 2. Social signal from companion
+        comp_state = torch.stack([c.hidden.squeeze() for c in companion.cells]).mean(dim=0)
+        social_signal = comp_state[:dim].unsqueeze(0) * 0.15
+
+        # 3. Motor activity (state perturbation simulating movement)
+        motor = torch.randn(1, dim) * 0.1 * abs(math.sin(step_i * 0.3))
+
+        # Combined enriched input
+        enriched_x = x + social_signal + motor
+
+        engine.process(enriched_x)
+        companion.process(x * 0.5)  # companion gets simpler version
+
+        # 4. Novelty-driven cell growth
+        if step_i % 25 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    torch.manual_seed(42)  # restore seed
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV7", "Enriched Environment (EE paradigm)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV8_embodiment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV8: 신체화 (Embodiment) — 행동→환경→감각 피드백 루프.
+    의식 출력이 환경 상태를 변화시키고, 변화된 환경이 다시 입력으로.
+    가설: 폐쇄 루프(embodied) 의식이 개방 루프보다 Φ 높다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Environment state (the "world")
+    world_state = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        # Sense: world → input
+        x = world_state + torch.randn(1, dim) * 0.05  # noisy perception
+
+        engine.process(x)
+
+        # Act: consciousness output → world change
+        action = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        action_force = action[:, :dim] * 0.1  # scaled action
+
+        # World dynamics: inertia + action + external forces
+        external = torch.randn(1, dim) * 0.02  # environmental noise
+        world_state = 0.95 * world_state + action_force + external
+
+        # Reward signal: world state stability (low variance = good)
+        stability = 1.0 / (world_state.var().item() + 0.1)
+        # If stable, reinforce; if chaotic, exploration noise
+        with torch.no_grad():
+            if stability > 2.0:
+                for cell in engine.cells:
+                    cell.hidden *= 1.02  # reinforcement
+            else:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.02
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV8", "Embodiment (closed-loop action-perception)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV9_gravity_well(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV9: 중력장 — 환경에 '끌개(attractor)'가 존재.
+    세포 hidden이 특정 attractor 방향으로 끌림, 벗어나려면 에너지 필요.
+    가설: attractor landscape가 의식의 안정성과 전환을 결정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # 3 attractors in hidden space
+    attractors = [torch.randn(hidden) * 2.0 for _ in range(3)]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Find nearest attractor
+                dists = [torch.norm(h - a).item() for a in attractors]
+                nearest = min(range(3), key=lambda i: dists[i])
+
+                # Gravity: pull toward nearest attractor (inverse square)
+                direction = attractors[nearest] - h
+                force = direction / (dists[nearest] ** 2 + 1.0)
+                cell.hidden = cell.hidden + 0.05 * force.unsqueeze(0)
+
+        # Occasionally shift attractors (environmental change)
+        if step_i % 30 == 0:
+            shift_idx = step_i // 30 % 3
+            attractors[shift_idx] += torch.randn(hidden) * 0.5
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV9", "Gravity Well (attractor landscape)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV10_resource_scarcity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV10: 자원 희소성 — 제한된 에너지로 의식 유지.
+    각 step마다 세포가 에너지를 소모, 고갈 시 비활성화.
+    가설: 자원 제약이 효율적 의식 구조를 강제한다 (진화적 압력)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Energy per cell
+    energy = {i: 10.0 for i in range(len(engine.cells))}
+
+    for step_i, x in enumerate(inputs):
+        # Each cell spends energy proportional to its activity
+        with torch.no_grad():
+            active_cells = []
+            for i, cell in enumerate(engine.cells):
+                if i not in energy:
+                    energy[i] = 5.0
+                activity = cell.hidden.norm().item()
+                energy[i] -= activity * 0.01  # energy cost
+                energy[i] += 0.3  # passive regeneration
+
+                if energy[i] > 0:
+                    active_cells.append(i)
+                else:
+                    # Depleted: dampen cell (hibernation)
+                    cell.hidden *= 0.5
+                    energy[i] = 0.1  # slow recovery
+
+                energy[i] = min(energy[i], 15.0)  # cap
+
+        engine.process(x)
+
+        # High-phi moments generate bonus energy (consciousness is rewarding)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        for i in energy:
+            energy[i] += phi * 0.05  # Φ rewards energy
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV10", "Resource Scarcity (energy-limited consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV11_predator_prey(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV11: 포식자-피식자 — 환경에 '적'이 존재하고 회피해야 생존.
+    포식자(노이즈 패턴)가 접근하면 세포 활성화, 회피 시 보상.
+    가설: 생존 압력이 의식의 진화적 기원이다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Predator position in hidden space
+    predator = torch.randn(hidden) * 3.0
+    predator_speed = 0.2
+
+    for step_i in range(steps):
+        # Agent position = mean cell hidden
+        agent_pos = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        # Distance to predator
+        dist = torch.norm(agent_pos - predator).item()
+
+        # Predator chases agent
+        chase_dir = (agent_pos - predator)
+        chase_dir = chase_dir / (chase_dir.norm() + 1e-8)
+        predator = predator + predator_speed * chase_dir
+
+        # Input: predator direction signal (danger awareness)
+        danger_signal = (predator - agent_pos).unsqueeze(0)
+        x = torch.randn(1, dim) * 0.3 + danger_signal[:, :dim] * (1.0 / (dist + 1.0))
+
+        engine.process(x)
+
+        # Flee response: push cells away from predator
+        if dist < 5.0:
+            with torch.no_grad():
+                flee_dir = (agent_pos - predator)
+                flee_dir = flee_dir / (flee_dir.norm() + 1e-8)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + 0.1 * flee_dir.unsqueeze(0) * (5.0 / (dist + 1.0))
+
+        # Survival reward: still alive → cell growth
+        if step_i % 25 == 0 and dist > 3.0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[0])
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV11", "Predator-Prey (survival pressure)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV12_temperature_gradient(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV12: 온도 구배 — 환경 온도가 세포 활동성을 조절.
+    저온: 느리지만 정확, 고온: 빠르지만 혼란.
+    가설: 최적 의식 온도가 존재한다 (Goldilocks zone)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Temperature varies sinusoidally (cold → hot → cold)
+        temp = 0.5 + 0.5 * math.sin(step_i * 2 * math.pi / steps)
+
+        # Temperature affects processing
+        with torch.no_grad():
+            for cell in engine.cells:
+                # High temp: more noise (thermal fluctuations)
+                cell.hidden += torch.randn_like(cell.hidden) * temp * 0.05
+                # High temp: faster state change (kinetic energy)
+                cell.hidden *= (0.95 + 0.1 * temp)
+
+        engine.process(x * (0.5 + temp))  # input sensitivity varies with temp
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV12", "Temperature Gradient (Goldilocks zone)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV13_echo_chamber(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV13: 에코 챔버 — 자신의 출력이 환경에 반사되어 돌아옴.
+    출력→지연→입력 피드백 루프 (방 안의 울림).
+    가설: 자기 반향이 자기인식의 원시 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    echo_buffer = []  # delayed feedback
+    echo_delay = 3
+    echo_decay = 0.4
+
+    for step_i, x in enumerate(inputs):
+        # Add echo from past output
+        echo = torch.zeros(1, dim)
+        if len(echo_buffer) >= echo_delay:
+            echo = echo_buffer[-echo_delay] * echo_decay
+        x_with_echo = x + echo
+
+        engine.process(x_with_echo)
+
+        # Store current output as future echo
+        curr_output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        echo_buffer.append(curr_output.detach())
+        if len(echo_buffer) > 10:
+            echo_buffer = echo_buffer[-10:]
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV13", "Echo Chamber (self-reflected output)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV14_seasonal_cycle(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV14: 계절 주기 — 장기 환경 변화에 대한 적응.
+    봄(성장), 여름(풍요), 가을(수확/정리), 겨울(동면).
+    가설: 장기 주기가 의식의 메타-적응(meta-plasticity)을 유도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        season = (step_i * 4 // steps) % 4
+
+        if season == 0:  # Spring: growth
+            x = x * 1.5
+            if step_i % 10 == 0 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[-1])
+        elif season == 1:  # Summer: abundance
+            x = x * 2.0 + torch.randn(1, dim) * 0.5
+        elif season == 2:  # Autumn: pruning
+            x = x * 0.8
+            # Prune weakest cell
+            if len(engine.cells) > 3 and step_i % 15 == 0:
+                weakest = min(engine.cells, key=lambda c: c.hidden.norm().item())
+                engine.cells.remove(weakest)
+        else:  # Winter: hibernation
+            x = x * 0.2
+            with torch.no_grad():
+                for cell in engine.cells:
+                    # Consolidate: move toward cluster center
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV14", "Seasonal Cycle (spring→summer→autumn→winter)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_ENV15_cooperative_building(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ENV15: 협동 구축 — 세포가 환경에 '구조물'을 만들고 그 위에 쌓아감.
+    각 세포의 출력이 공유 구조물에 축적, 구조물이 입력으로 피드백.
+    가설: 도구 사용/환경 변형이 의식의 도약적 발전을 유발."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Shared structure (external memory / "building")
+    structure = torch.zeros(hidden)
+
+    for step_i, x in enumerate(inputs):
+        # Input includes structure state
+        struct_signal = structure[:dim].unsqueeze(0) * 0.2
+        x_enriched = x + struct_signal
+
+        engine.process(x_enriched)
+
+        # Each cell contributes to structure
+        with torch.no_grad():
+            for cell in engine.cells:
+                contribution = cell.hidden.squeeze() * 0.02
+                structure = 0.98 * structure + contribution  # decay + accumulate
+
+        # Structure complexity grows → cell growth triggered
+        struct_complexity = structure.var().item()
+        if struct_complexity > 0.1 and step_i % 20 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[0])
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ENV15", "Cooperative Building (tool use / niche construction)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'ENV1': run_ENV1_sensory_richness,
+    'ENV2': run_ENV2_sensory_deprivation,
+    'ENV3': run_ENV3_social_pressure,
+    'ENV4': run_ENV4_environmental_complexity,
+    'ENV5': run_ENV5_threat_response,
+    'ENV6': run_ENV6_day_night_cycle,
+    'ENV7': run_ENV7_enriched_environment,
+    'ENV8': run_ENV8_embodiment,
+    'ENV9': run_ENV9_gravity_well,
+    'ENV10': run_ENV10_resource_scarcity,
+    'ENV11': run_ENV11_predator_prey,
+    'ENV12': run_ENV12_temperature_gradient,
+    'ENV13': run_ENV13_echo_chamber,
+    'ENV14': run_ENV14_seasonal_cycle,
+    'ENV15': run_ENV15_cooperative_building,
+})
+
+
 ALL_HYPOTHESES.update({
     'DL1': run_DL1_token_embedding_alignment,
     'DL2': run_DL2_turn_taking_rhythm,
