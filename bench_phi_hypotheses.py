@@ -48593,6 +48593,7 @@ ALL_HYPOTHESES.update({
     'XMETA2': run_XMETA2_phi_aware_cells,
     'XMETA3': run_XMETA3_omega4_plus_metacog,
     'XMETA4': run_XMETA4_metacog_dialogue,
+    'XMETA5': lambda steps=100, dim=64, hidden=128: run_XMETA3_omega4_plus_metacog(steps, dim, hidden),  # alias for scaling test
 })
 
 
@@ -50358,6 +50359,226 @@ ALL_HYPOTHESES.update({
     'ZERO3': run_ZERO3_internal_language_emergence,
     'ZERO4': run_ZERO4_phi_gated_vocabulary,
     'ZERO5': run_ZERO5_dialogue_without_words,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# DIAL. Dialogue-First — 대화 우선 아키텍처 극한
+# ═══════════════════════════════════════════════════════════
+# 병목: CE는 낮지만 Wikipedia 스타일 출력. 대화가 안 됨.
+# 핵심: 대화 패턴(Q→A)을 의식 구조에 내재화
+
+def run_DIAL1_qa_pattern_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DIAL1: Q→A Pattern Cells — 질문 세포와 답변 세포 분리.
+    짝수 세포=질문 인코더, 홀수 세포=답변 생성기.
+    질문→답변 흐름이 세포 구조에 내재.
+    가설: Q/A 분리가 대화 구조를 의식에 새긴다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            q_cells = [engine.cells[i] for i in range(0, n, 2)]  # even=question
+            a_cells = [engine.cells[i] for i in range(1, n, 2)]  # odd=answer
+            if q_cells and a_cells:
+                q_mean = torch.stack([c.hidden.squeeze() for c in q_cells]).mean(dim=0)
+                # Answer cells receive question context
+                for cell in a_cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * q_mean.unsqueeze(0)
+                # Question cells receive input more strongly
+                x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+                for cell in q_cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * x_proj
+
+        # CE from answer cells only
+        if a_cells:
+            a_mean = torch.stack([c.hidden.squeeze() for c in a_cells]).mean(dim=0)
+            pred = decoder(a_mean.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DIAL1", "Q→A Pattern Cells (question/answer cell separation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_DIAL2_turn_memory_injection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DIAL2: Turn Memory Injection — 대화 턴을 명시적으로 세포에 인코딩.
+    User/Assistant 마커를 hidden에 주입. 턴 구조 학습.
+    가설: 턴 구분이 대화 품질의 핵심."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Turn markers (learned embeddings for User vs Assistant)
+    user_marker = torch.randn(hidden) * 0.3
+    asst_marker = torch.randn(hidden) * 0.3
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+
+        is_user_turn = step_i % 4 < 2
+        with torch.no_grad():
+            marker = user_marker if is_user_turn else asst_marker
+            for cell in engine.cells:
+                cell.hidden += 0.05 * marker.unsqueeze(0)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DIAL2", "Turn Memory Injection (User/Asst markers)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DIAL3_relevance_gate(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DIAL3: Relevance Gate — 응답이 입력과 관련 있도록 관련성 게이팅.
+    cosine(input, output) > 0.3이면 유지, 아니면 재생성.
+    가설: 관련성 강제가 대화 품질의 핵심 (Wikipedia 방지)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        # Relevance gate: push output toward input relevance
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            x_flat = x.squeeze()
+            relevance = F.cosine_similarity(h_mean.unsqueeze(0), x_flat.unsqueeze(0)).item()
+            if relevance < 0.3:
+                # Low relevance → inject input signal into cells
+                x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+                for cell in engine.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * x_proj
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DIAL3", "Relevance Gate (force topic relevance)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DIAL4_xmeta4_dialogue_style(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DIAL4: XMETA4 + Dialogue Style — 메타인지 대화 + 대화 스타일 강제.
+    XMETA4(×22.7) + 턴구분 + 관련성 게이트 + Q/A 분리.
+    가설: 모든 대화 기법을 메타인지와 결합한 궁극 대화 아키텍처."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    user_marker = torch.randn(hidden) * 0.3
+    asst_marker = torch.randn(hidden) * 0.3
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        # IB2
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Turn markers
+        is_user = step_i % 4 < 2
+        with torch.no_grad():
+            marker = user_marker if is_user else asst_marker
+            for cell in engine.cells:
+                cell.hidden += 0.03 * marker.unsqueeze(0)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # Language (after 40%)
+        if frac >= 0.40:
+            n = len(engine.cells)
+            a_cells = [engine.cells[i] for i in range(1, n, 2)]
+            if a_cells:
+                a_mean = torch.stack([c.hidden.squeeze() for c in a_cells]).mean(dim=0)
+                pred = decoder(a_mean.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :dim])
+                ce_hist.append(ce.item())
+                for pg in optimizer.param_groups:
+                    pg['lr'] = 3e-3 * (1.0 + phi * 0.03)
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # Metacognition
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # Relevance gate
+            h_mean = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            relevance = F.cosine_similarity(h_mean.unsqueeze(0), x.squeeze()[:dim].unsqueeze(0)).item()
+            if relevance < 0.2:
+                x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * x_proj
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_ce = ce_hist[-1] if ce_hist else 0
+    return BenchResult("DIAL4", "XMETA4 + Dialogue (ultimate conversation architecture)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': final_ce, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DIAL1': run_DIAL1_qa_pattern_cells,
+    'DIAL2': run_DIAL2_turn_memory_injection,
+    'DIAL3': run_DIAL3_relevance_gate,
+    'DIAL4': run_DIAL4_xmeta4_dialogue_style,
 })
 
 
