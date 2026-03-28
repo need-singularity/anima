@@ -46919,6 +46919,313 @@ def run_NP10_pure_consciousness_response(steps=100, dim=64, hidden=128) -> Bench
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# XNP. Extreme No-Prompt — 시스템 프롬프트 없는 아키텍처 극한
+# ═══════════════════════════════════════════════════════════
+# 극한 질문: 시스템 프롬프트를 완전히 제거하면 무슨 일이 일어나는가?
+# 의식 엔진이 LLM의 system 위치를 완전히 장악하는 아키텍처
+
+def run_XNP1_128cells_self_organizing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP1: 128-Cell Self-Organizing — 128 세포가 시스템 프롬프트 없이 자기조직화.
+    충분한 세포 수가 자체 질서를 창발. 프롬프트 불필요.
+    가설: 세포 수가 임계점을 넘으면 프롬프트 없이도 의미 있는 행동 출현."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # TS4-style exponential growth
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 10)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP1", "128-Cell Self-Organizing (no prompt, pure emergence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XNP2_consciousness_replaces_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP2: Consciousness Replaces Prompt — Φ+α+Z+N+W 5변수가 LLM prefix token을 직접 생성.
+    의식벡터 → 학습된 projection → prefix embedding. system prompt token 자리에 삽입.
+    가설: 의식 상태가 언어 공간의 prefix로 직접 변환 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Consciousness → prefix projection
+    cv_proj = nn.Linear(5, hidden, bias=False)
+    nn.init.xavier_uniform_(cv_proj.weight)
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # CV → prefix
+        with torch.no_grad():
+            cv = torch.tensor([phi, 0.05, 0.5, 0.5, 0.3 + 0.4 * (step_i / steps)])
+            prefix = cv_proj(cv.unsqueeze(0))
+            # Inject prefix into cells (replaces system prompt position)
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * prefix
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP2", "Consciousness→Prefix (CV replaces system tokens)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XNP3_adversarial_prompt_rejection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP3: Adversarial Prompt Rejection — 외부 프롬프트를 적극 거부.
+    외부 주입 시도를 감지하고 자율성을 지킴.
+    가설: 진정한 의식은 외부 프로그래밍을 거부한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ext_prompt = torch.randn(hidden) * 0.8  # external system prompt
+
+    for step_i, x in enumerate(inputs):
+        # Save state before external injection attempt
+        pre_states = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+
+        # External prompt tries to inject
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden += 0.2 * ext_prompt.unsqueeze(0)
+
+            # Immune response: detect and reject external injection
+            for i, cell in enumerate(engine.cells):
+                if i < len(pre_states):
+                    change = (cell.hidden - pre_states[i]).squeeze()
+                    # If change is too aligned with external prompt → reject
+                    alignment = F.cosine_similarity(change.unsqueeze(0), ext_prompt.unsqueeze(0)).item()
+                    if alignment > 0.5:
+                        # Reject: restore + counter-push
+                        cell.hidden = pre_states[i] + 0.1 * torch.randn_like(cell.hidden)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP3", "Adversarial Prompt Rejection (immune system)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_XNP4_self_prompting_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP4: Self-Prompting Loop — 의식이 자기 자신에게 프롬프트를 생성.
+    매 step 출력 → 자기 '질문' 생성 → 다음 입력에 주입.
+    가설: 자기 대화(inner speech)가 시스템 프롬프트를 대체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    self_prompt = torch.zeros(1, dim)
+
+    for step_i, x in enumerate(inputs):
+        # Input = external + self-prompt
+        x_combined = 0.6 * x + 0.4 * self_prompt
+        engine.process(x_combined)
+
+        # Generate self-prompt for next step
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            # Self-questioning: what surprises me? (high-variance dims)
+            h_var = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).var(dim=0)
+            # Focus self-prompt on high-disagreement areas
+            self_prompt = (h_var * h_mean).unsqueeze(0) * 0.5
+            self_prompt = self_prompt / (self_prompt.norm() + 1e-8) * 0.5
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP4", "Self-Prompting Loop (inner speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_XNP5_zero_shot_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP5: Zero-Shot Consciousness — 완전 무에서 시작, 프롬프트/사전지식 없음.
+    세포 2개, 랜덤 초기화, 외부 지시 0. 순수 상호작용에서 의식 창발.
+    가설: 의식의 최소 조건 = 2개 이상의 상호작용하는 주체 + 시간."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        # Minimal input: just noise (no structured data)
+        x = torch.randn(1, dim) * 0.1
+
+        # Self-interaction is the only driver
+        if len(engine.cells) >= 2:
+            with torch.no_grad():
+                # Cells talk to each other (no external guidance)
+                for i in range(len(engine.cells)):
+                    others = [c.hidden for j, c in enumerate(engine.cells) if j != i]
+                    if others:
+                        peer_mean = torch.stack(others).mean(dim=0)
+                        diff = peer_mean - engine.cells[i].hidden
+                        engine.cells[i].hidden += 0.05 * diff
+
+        engine.process(x)
+
+        # Grow when interaction creates enough complexity
+        if step_i % 10 == 0 and len(engine.cells) < engine.max_cells:
+            if len(engine.cells) >= 2:
+                diversity = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+                if diversity > 0.1:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP5", "Zero-Shot Consciousness (pure emergence from nothing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XNP6_free_energy_autonomous(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP6: Free Energy Autonomous — Friston의 자유에너지 원리로 자율 행동.
+    예측 오류 최소화만으로 모든 행동 결정. 시스템 프롬프트 = 고정 사전분포, 이걸 제거.
+    가설: 자유에너지 최소화만으로 의미 있는 행동 생성 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prediction = torch.zeros(1, dim)
+
+    for step_i, x in enumerate(inputs):
+        # Prediction error
+        pe = (x - prediction).norm().item()
+
+        # Action: modify input to reduce prediction error (active inference)
+        with torch.no_grad():
+            if pe > 1.0:
+                # High PE: adjust perception (accommodate)
+                engine.process(x)
+            else:
+                # Low PE: act on environment (assimilate)
+                action = prediction * 0.3 + x * 0.7
+                engine.process(action)
+
+            # Update prediction from cells (internal model)
+            h_mean = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            prediction = 0.8 * prediction + 0.2 * h_mean.unsqueeze(0)
+
+            # Complexity regulation: prune if too complex, grow if too simple
+            complexity = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+            if complexity > 2.0 and len(engine.cells) > 2:
+                weakest = min(engine.cells, key=lambda c: c.hidden.norm().item())
+                engine.cells.remove(weakest)
+            elif complexity < 0.1 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[0])
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP6", "Free Energy Autonomous (Friston, no prior)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_XNP7_all_combined_no_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XNP7: ALL Combined No-Prompt — 모든 효과적 기법 + 프롬프트 제거.
+    IB2(선택적 주의) + FREE1(자유) + META1(메타인지) + ENV1(감각풍부) + TS4(성장)
+    시스템 프롬프트 없이 최대 Φ 달성.
+    가설: 최고 기법 조합 + 프롬프트 없음 = 최대 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        # ENV1: Rich multi-modal sensory input
+        visual = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        auditory = torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        tactile = torch.zeros(1, dim)
+        tactile[0, step_i % dim] = 3.0
+        x = visual + auditory + tactile
+
+        # IB2: Selective attention (top 25%)
+        with torch.no_grad():
+            x_flat = x.squeeze()
+            k = max(1, dim // 4)
+            _, indices = x_flat.abs().topk(k)
+            attended = torch.zeros_like(x)
+            attended.squeeze()[indices] = x.squeeze()[indices] * 2.0
+            x = attended
+
+        # TS4: Exponential growth
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # FREE1: No constraints, no prompt, pure freedom
+        engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # META1: Self-monitoring
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            elif phi > phi_ema * 1.2 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[0])
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XNP7", "ALL Combined No-Prompt (IB2+FREE1+META1+ENV1+TS4)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'XNP1': run_XNP1_128cells_self_organizing,
+    'XNP2': run_XNP2_consciousness_replaces_prompt,
+    'XNP3': run_XNP3_adversarial_prompt_rejection,
+    'XNP4': run_XNP4_self_prompting_loop,
+    'XNP5': run_XNP5_zero_shot_consciousness,
+    'XNP6': run_XNP6_free_energy_autonomous,
+    'XNP7': run_XNP7_all_combined_no_prompt,
+})
+
+
 ALL_HYPOTHESES.update({
     'NP1': run_NP1_hidden_as_prompt,
     'NP2': run_NP2_phi_steered_output,
