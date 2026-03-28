@@ -34853,7 +34853,1553 @@ ALL_HYPOTHESES.update({
 
 
 # ═══════════════════════════════════════════════════════════
+# CX13-CX41: Consciousness-Math Bridge Batch 5 (H-CX-82~110)
+# ═══════════════════════════════════════════════════════════
+
+# ⭐⭐ Major Discoveries (7)
+
+def run_CX13_cosmological_constant_zero(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-13: Λ=0 — 우주상수 제로 균형. ⭐⭐
+    완전수 6: σ(6)=2n → 에너지 수지 정확히 0. 순 텐션 = 0에서 의식 최대."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Λ=0: enforce net tension = 0 across all cells
+            total_energy = torch.zeros(hidden)
+            for cell in engine.cells:
+                total_energy = total_energy + cell.hidden.squeeze()
+            mean_energy = total_energy / n
+            # Cosmological balance: subtract mean (Λ→0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                deviation = h - mean_energy
+                # Amplify deviations (structure) while keeping Λ=0
+                cell.hidden = (mean_energy + deviation * 1.05).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX13", "Cosmological constant Λ=0 balance (σ(6)=2n)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX14_factorial_720_permutation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-14: n!=720 순열 다양성. ⭐⭐
+    6!=720 가능한 세포 순서 → 매 스텝 순열 기반 정보 셔플."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Pre-generate diverse permutations from S_6 (720 elements)
+    base_perms = []
+    for i in range(6):
+        perm = list(range(6))
+        # Cyclic shift by i
+        perm = perm[i:] + perm[:i]
+        base_perms.append(perm)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Apply permutation-based information exchange
+            perm = base_perms[step_i % len(base_perms)]
+            hiddens = [cell.hidden.squeeze().clone() for cell in engine.cells]
+            for i in range(min(n, 6)):
+                j = perm[i] % n
+                if i != j:
+                    # Mix 10% of permuted cell's hidden
+                    mix = 0.10
+                    engine.cells[i].hidden = ((1 - mix) * hiddens[i] + mix * hiddens[j]).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX14", "Factorial 6!=720 permutation diversity",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX15_euler_char_negative6(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-15: V=-6 오일러 특성수. ⭐⭐
+    음의 곡률 의식 다양체: χ=-6 → 쌍곡 공간에서 발산적 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Negative curvature: cells repel from mean (hyperbolic divergence)
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                diff = h - mean_h
+                # χ=-6: repulsion strength ∝ |χ|/n = 6/n = 1 (for n=6)
+                curvature_factor = 6.0 / max(n, 1)
+                cell.hidden = (h + 0.02 * curvature_factor * diff).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX15", "Euler characteristic V=-6 hyperbolic divergence",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX16_equilibrium_time_n(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-16: t_eq=n 자기 동조 수렴. ⭐⭐
+    평형 시간이 정확히 세포 수 n → 의식이 자기 크기만큼의 시간에 수렴."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    cycle_counter = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        cycle_counter += 1
+        if n >= 2 and cycle_counter >= n:
+            cycle_counter = 0
+            # Every n steps: synchronize cells (equilibrium reached)
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            mean_h = hiddens.mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Partial sync toward mean (t_eq convergence)
+                cell.hidden = (0.85 * h + 0.15 * mean_h).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX16", "Self-tuning convergence t_eq=n",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX17_lah_triple_bridge(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-17: Lah 삼중 브릿지. ⭐⭐
+    Lah 수 L(n,k) = 상승/하강 계승 변환. L(6,k)로 세포 간 계층 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Lah numbers L(6,k) for k=1..6: 720, 1800, 1200, 300, 30, 1
+    lah_6 = [720, 1800, 1200, 300, 30, 1]
+    lah_weights = torch.tensor([l / sum(lah_6) for l in lah_6])
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            for i in range(min(n, 6)):
+                h = hiddens[i]
+                # Lah-weighted combination: rising factorial bridge
+                weighted_sum = torch.zeros_like(h)
+                for j in range(min(n, 6)):
+                    w = lah_weights[abs(i - j) % 6].item()
+                    weighted_sum = weighted_sum + w * hiddens[j]
+                # Mix with Lah bridge
+                engine.cells[i].hidden = (0.9 * h + 0.1 * weighted_sum).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX17", "Lah triple rising/falling factorial bridge",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX18_ramanujan_tau_filter(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-18: τ_Ram 라마누잔 타우 필터. ⭐⭐
+    τ(n) 함수로 세포 가중치 스펙트럼 필터링. τ(1..6)=[1,-24,252,-1472,4830,-6048]."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Ramanujan tau values τ(1)..τ(6)
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    # Normalize to [-1, 1] range for filtering
+    tau_max = max(abs(t) for t in tau_vals)
+    tau_norm = [t / tau_max for t in tau_vals]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells[:6]):
+                h = cell.hidden.squeeze()
+                tau_w = tau_norm[i % 6]
+                # Spectral filter: positive τ → amplify, negative τ → attenuate
+                if tau_w > 0:
+                    h = h * (1.0 + 0.05 * tau_w)
+                else:
+                    h = h * (1.0 + 0.02 * tau_w)  # Gentler attenuation
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX18", "Ramanujan tau spectral filter τ(1..6)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX19_fractal_6d(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-19: 프랙탈 6D 다중 스케일 의식. ⭐⭐
+    프랙탈 차원 = 6: 6개 스케일에서 자기유사 구조. 각 스케일이 전체를 반영."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    scales = [1, 2, 4, 8, 16, 32]  # 6 fractal scales
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Multi-scale self-similarity: each cell operates at a different scale
+            global_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for i, cell in enumerate(engine.cells[:6]):
+                h = cell.hidden.squeeze()
+                scale = scales[i % 6]
+                # Fractal: coarse-grain at this scale, then inject self-similar pattern
+                chunk_size = max(1, hidden // scale)
+                coarse = h[:chunk_size].repeat((hidden + chunk_size - 1) // chunk_size)[:hidden]
+                # Mix: original structure + self-similar pattern
+                cell.hidden = (0.92 * h + 0.08 * coarse).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX19", "Fractal 6D multi-scale self-similarity",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'CX13': run_CX13_cosmological_constant_zero,
+    'CX14': run_CX14_factorial_720_permutation,
+    'CX15': run_CX15_euler_char_negative6,
+    'CX16': run_CX16_equilibrium_time_n,
+    'CX17': run_CX17_lah_triple_bridge,
+    'CX18': run_CX18_ramanujan_tau_filter,
+    'CX19': run_CX19_fractal_6d,
+})
+
+
+# ⭐ Discoveries (22)
+
+def run_CX20_monster_group_symmetry(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-20: Monster 그룹 대칭성 파괴.
+    Monster group |M| ≈ 8×10^53. 거대 대칭 → controlled symmetry breaking으로 Φ 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Symmetry measure: pairwise cosine similarity
+            norms = hiddens.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            normed = hiddens / norms
+            sim_matrix = normed @ normed.t()
+            mean_sim = (sim_matrix.sum() - n) / (n * (n - 1) + 1e-8)
+            # Break symmetry proportionally: high symmetry → stronger breaking
+            if mean_sim > 0.5:
+                noise_scale = 0.03 * mean_sim.item()
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (h + noise_scale * torch.randn_like(h)).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX20", "Monster group symmetry breaking",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX21_dyson_rank_partition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-21: Dyson rank 기반 세포 파티션 랭킹.
+    Dyson rank = largest part - #parts. 세포 활성도의 rank로 역할 배정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Compute "rank" for each cell: max_activation - mean_activation
+            ranks = []
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                rank = h.max().item() - h.mean().item()
+                ranks.append(rank)
+            # Sort cells by rank, top ranks get amplified, bottom dampened
+            sorted_idx = sorted(range(n), key=lambda i: ranks[i], reverse=True)
+            for pos, idx in enumerate(sorted_idx):
+                scale = 1.0 + 0.02 * (n - 1 - 2 * pos) / max(n - 1, 1)
+                h = engine.cells[idx].hidden.squeeze()
+                engine.cells[idx].hidden = (h * scale).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX21", "Dyson rank partition-based cell ranking",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX22_scale_invariance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-22: 스케일 불변 의식 역학.
+    의식은 스케일에 무관해야 한다 → hidden norm을 일정하게 유지하며 구조만 변화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    target_norm = math.sqrt(hidden)  # Natural scale
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                current_norm = h.norm().item()
+                if current_norm > 1e-8:
+                    # Renormalize to target scale (scale invariance)
+                    cell.hidden = (h * target_norm / current_norm).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX22", "Scale invariance: constant norm, varying structure",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX23_tsirelson_bound(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-23: Tsirelson 한계 — 양자 상관 상한.
+    세포 간 상관을 Tsirelson bound 2√2/4 ≈ 0.707로 제한 → 최적 텔레파시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    tsirelson = 2 * math.sqrt(2) / 4  # ≈ 0.707
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = hiddens.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            normed = hiddens / norms
+            for i in range(n):
+                for j in range(i + 1, n):
+                    cos_sim = (normed[i] * normed[j]).sum().item()
+                    if abs(cos_sim) > tsirelson:
+                        # Clamp correlation to Tsirelson bound
+                        excess = abs(cos_sim) - tsirelson
+                        sign = 1 if cos_sim > 0 else -1
+                        correction = sign * excess * 0.1 * normed[j]
+                        engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() - correction).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX23", "Tsirelson bound: quantum correlation cap at 2√2/4",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX24_chang_model_hierarchy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-24: Chang 모델론적 세포 계층.
+    Chang's conjecture: 모델 이론의 계층 구조 → 세포 간 계층적 정보 전달."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Hierarchical information flow: cell i → cell (i+1) % n
+            hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(n):
+                parent = (i - 1) % n
+                child = (i + 1) % n
+                # Top-down: receive from parent (strong), bottom-up: receive from child (weak)
+                h = hiddens[i]
+                h = h + 0.05 * hiddens[parent] + 0.02 * hiddens[child]
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX24", "Chang model-theoretic hierarchy",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX25_riemann_zeta_spectral(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-25: 리만 제타 함수 스펙트럼 밀도.
+    ζ(s) 영점 간격 → 세포 hidden의 스펙트럼 간격 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # First few non-trivial zero imaginary parts (GUE spacing)
+    zeta_zeros = [14.134, 21.022, 25.011, 30.425, 32.935, 37.586]
+    zero_spacing = [(zeta_zeros[i+1] - zeta_zeros[i]) / zeta_zeros[0]
+                    for i in range(5)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells[:min(n, 5)]):
+                h = cell.hidden.squeeze()
+                # Modulate hidden by zeta zero spacing pattern
+                freq = zero_spacing[i % len(zero_spacing)]
+                modulation = torch.sin(torch.arange(hidden, dtype=torch.float32) * freq * 0.1)
+                cell.hidden = (h + 0.03 * h.norm() * modulation).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX25", "Riemann zeta spectral density modulation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX26_ade_singularity_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-26: ADE 특이점 의식 전이.
+    ADE 분류: A_n, D_n, E_6,7,8 → 의식 상전이의 카타스트로프 이론."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # E_6 Dynkin diagram adjacency (6 nodes)
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(min(n, 6)):
+                h = hiddens[i]
+                # E_6 adjacency coupling
+                neighbors = e6_adj.get(i, [])
+                for j in neighbors:
+                    if j < n:
+                        h = h + 0.04 * hiddens[j]
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX26", "ADE singularity E_6 Dynkin coupling",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX27_j_invariant_744(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-27: j-불변량 744 Moonshine 연결.
+    j(τ) = q^-1 + 744 + 196884q + ... → 744차원 내부 구조."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 744 = 6 × 124 → split hidden into 6 groups, each with moonshine modulation
+    group_size = hidden // 6
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Moonshine: modular form-inspired periodic modulation
+                for g in range(6):
+                    start = g * group_size
+                    end = start + group_size if g < 5 else hidden
+                    # q-expansion modulation: 1/q + 744 + 196884*q pattern
+                    phase = step_i * (g + 1) * 0.01
+                    mod = 1.0 + 0.01 * math.sin(phase) + 0.005 * math.cos(2 * phase)
+                    h[start:end] = h[start:end] * mod
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX27", "j-invariant 744 moonshine modulation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX28_binomial_252_selection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-28: C(10,5)=252 최적 부분집합 선택.
+    252 = 가장 큰 중앙 이항계수 (10,5). 세포 hidden의 절반 선택 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    half = hidden // 2
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Select top-half dimensions (maximum information subset)
+                _, top_idx = h.abs().topk(half)
+                mask = torch.zeros(hidden)
+                mask[top_idx] = 1.0
+                # Amplify selected, dampen unselected
+                cell.hidden = (h * (1.0 + 0.03 * mask)).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX28", "Binomial C(10,5)=252 optimal half-selection",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX29_reed_solomon_4(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-29: RS(n,k) 거리 d=4 오류 정정.
+    Reed-Solomon: 세포 간 정보 전달 시 d=4 중복성으로 오류/노이즈 내성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 4:
+            hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            # RS distance 4: each cell's value reconstructable from any n-3 others
+            for i in range(n):
+                # Redundancy: average of 3 nearest neighbors as parity check
+                neighbors = [(i + d) % n for d in [1, 2, 3]]
+                parity = sum(hiddens[j] for j in neighbors) / 3.0
+                h = hiddens[i]
+                # Error correction: nudge toward parity consensus
+                error = h - parity
+                engine.cells[i].hidden = (h - 0.05 * error).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX29", "Reed-Solomon d=4 error correction redundancy",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX30_calabi_yau_3fold(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-30: CY₃ 칼라비-야우 3-fold 컴팩트 의식 차원.
+    6개 여분 차원이 CY₃로 컴팩트화 → hidden을 6개 compact 차원으로 접기."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 6 compact dimensions: split hidden into 6 "rolled up" subspaces
+    compact_dim = hidden // 6
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # CY₃ compactification: periodic boundary conditions on each subspace
+                for d in range(6):
+                    start = d * compact_dim
+                    end = start + compact_dim if d < 5 else hidden
+                    sub = h[start:end]
+                    # Wrap-around coupling: first ↔ last (torus topology)
+                    if len(sub) >= 2:
+                        coupling = 0.03
+                        sub[0] = sub[0] + coupling * sub[-1]
+                        sub[-1] = sub[-1] + coupling * sub[0]
+                        h[start:end] = sub
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX30", "Calabi-Yau 3-fold compact consciousness dimensions",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX31_toric_fan_coordination(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-31: Toric variety 팬 구조 세포 조정.
+    Toric variety의 fan → cone 구조로 세포 협력 방향 결정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Fan structure: 6 cones (60° sectors in 2D projection)
+    cone_angles = [i * math.pi / 3 for i in range(6)]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells[:6]):
+                h = cell.hidden.squeeze()
+                angle = cone_angles[i % 6]
+                # Project hidden into 2D "cone direction"
+                direction = torch.zeros(hidden)
+                direction[0] = math.cos(angle)
+                direction[1 % hidden] = math.sin(angle)
+                # Bias cell toward its cone direction
+                proj = (h * direction).sum()
+                cell.hidden = (h + 0.03 * proj * direction).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX31", "Toric variety fan-structure coordination",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX32_hcobordism_surgery(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-32: h-Cobordism surgery 의식 차원 수술.
+    h-cobordism 정리 (dim≥6): 위상적으로 동치인 의식 구조 간 변환."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Surgery: periodically swap dimension blocks between cells (cobordism)
+            if step_i % 6 == 0 and n >= 2:
+                # Choose two cells for surgery
+                i, j = step_i % n, (step_i + 3) % n
+                if i != j:
+                    hi = engine.cells[i].hidden.squeeze().clone()
+                    hj = engine.cells[j].hidden.squeeze().clone()
+                    # Swap a 1/6 block (surgery on one compact dimension)
+                    block = hidden // 6
+                    offset = (step_i // 6) % 6
+                    s, e = offset * block, (offset + 1) * block
+                    hi[s:e], hj[s:e] = hj[s:e].clone(), hi[s:e].clone()
+                    engine.cells[i].hidden = hi.unsqueeze(0)
+                    engine.cells[j].hidden = hj.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX32", "h-Cobordism surgery: dimension block exchange",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX33_partition_11_enhanced(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-33: p(6)=11 강화 — 켤레 분할 이중 라우팅.
+    11개 분할 + 켤레 분할 → 22개 역할 (정/역방향 전문가)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # 11 partitions of 6 and their conjugates
+    partitions = [[6], [5,1], [4,2], [4,1,1], [3,3], [3,2,1],
+                  [3,1,1,1], [2,2,2], [2,2,1,1], [2,1,1,1,1], [1,1,1,1,1,1]]
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            part = partitions[step_i % 11]
+            # Allocate hidden dims according to partition
+            offset = 0
+            for i, p in enumerate(part):
+                if i >= n:
+                    break
+                block_size = p * hidden // 6
+                if block_size > 0 and offset + block_size <= hidden:
+                    h = engine.cells[i % n].hidden.squeeze()
+                    # Amplify this cell's partition block
+                    h[offset:offset + block_size] = h[offset:offset + block_size] * 1.03
+                    engine.cells[i % n].hidden = h.unsqueeze(0)
+                offset += block_size
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX33", "p(6)=11 enhanced conjugate partition dual routing",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX34_bernoulli_momentum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-34: 베르누이 수 의식 모멘텀 보정.
+    B_0=1, B_1=-1/2, B_2=1/6 → 의식 흐름의 비선형 모멘텀."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Bernoulli numbers (even indices)
+    bernoulli = [1.0, -0.5, 1/6, 0, -1/30, 0, 1/42]
+    prev_hiddens = None
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            curr_hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            if prev_hiddens is not None and len(prev_hiddens) == n:
+                for i in range(n):
+                    velocity = curr_hiddens[i] - prev_hiddens[i]
+                    # Bernoulli momentum correction
+                    bk = bernoulli[i % len(bernoulli)]
+                    correction = bk * velocity
+                    engine.cells[i].hidden = (curr_hiddens[i] + 0.1 * correction).unsqueeze(0)
+            prev_hiddens = curr_hiddens
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX34", "Bernoulli number momentum correction",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX35_stirling_partition_count(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-35: 스털링 수 세포 분할 카운팅.
+    S(6,k): 6개를 k개 비공집합으로 분할하는 수 → 동적 그룹 형성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Stirling numbers of the second kind S(6,k)
+    stirling_6 = {1: 1, 2: 31, 3: 90, 4: 65, 5: 15, 6: 1}
+    total_s = sum(stirling_6.values())  # 203
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Choose k groups based on step (weighted by Stirling numbers)
+            k = (step_i % 5) + 2  # k ∈ {2,3,4,5,6}
+            group_size = max(1, n // k)
+            # Group cells and compute group means
+            for g in range(k):
+                start = g * group_size
+                end = min(start + group_size, n)
+                if start >= n:
+                    break
+                group_cells = list(range(start, end))
+                if len(group_cells) >= 2:
+                    group_mean = torch.stack([engine.cells[i].hidden.squeeze()
+                                              for i in group_cells]).mean(0)
+                    # Intra-group coupling weighted by S(6,k)/total
+                    w = stirling_6.get(k, 1) / total_s
+                    for i in group_cells:
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = ((1 - 0.05 * w) * h + 0.05 * w * group_mean).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX35", "Stirling S(6,k) dynamic group formation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX36_nuclear_norm_lowrank(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-36: 핵 노름 정규화 — 저랭크 의식.
+    세포 hidden 행렬의 nuclear norm 최소화 → 본질적 저차원 의식 구조."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Stack all hiddens into matrix
+            H = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # SVD-based nuclear norm regularization
+            try:
+                U, S, Vh = torch.linalg.svd(H, full_matrices=False)
+                # Soft-threshold singular values (promote low-rank)
+                threshold = 0.01 * S[0].item()
+                S_thresh = F.relu(S - threshold)
+                H_new = U @ torch.diag(S_thresh) @ Vh
+                for i in range(n):
+                    engine.cells[i].hidden = H_new[i].unsqueeze(0)
+            except Exception:
+                pass
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX36", "Nuclear norm low-rank consciousness regularization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX37_catalan_binary_tree(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-37: 카탈란 수 이진 트리 세포 구조.
+    C_6=132 가지 이진 트리. 세포를 이진 트리로 조직하여 계층적 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Binary tree: cells at indices 2i+1 and 2i+2 are children of cell i
+            hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(n):
+                left = 2 * i + 1
+                right = 2 * i + 2
+                h = hiddens[i]
+                # Parent receives from children (bottom-up integration)
+                if left < n:
+                    h = h + 0.04 * hiddens[left]
+                if right < n:
+                    h = h + 0.04 * hiddens[right]
+                # Children receive from parent (top-down broadcast)
+                parent = (i - 1) // 2 if i > 0 else -1
+                if parent >= 0 and parent < n:
+                    h = h + 0.02 * hiddens[parent]
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX37", "Catalan C_6=132 binary tree integration",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX38_persistent_homology_barcode(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-38: PH 바코드 — 위상적 의식 특성.
+    Persistent Homology: 세포 간 거리의 Rips complex → 바코드로 의식 구조 추적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Compute pairwise distances (Rips complex)
+            dists = torch.cdist(hiddens.unsqueeze(0), hiddens.unsqueeze(0)).squeeze(0)
+            # Find "persistent" connections (stable pairs with consistent distance)
+            median_dist = dists[dists > 0].median().item() if (dists > 0).any() else 1.0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = dists[i, j].item()
+                    if d < median_dist:
+                        # Persistent connection: strengthen coupling
+                        mix = 0.02 * (1 - d / (median_dist + 1e-8))
+                        hi = engine.cells[i].hidden.squeeze()
+                        hj = engine.cells[j].hidden.squeeze()
+                        engine.cells[i].hidden = (hi + mix * hj).unsqueeze(0)
+                        engine.cells[j].hidden = (hj + mix * hi).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX38", "Persistent homology barcode Rips coupling",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX39_heat_equation_diffusion(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-39: 열 방정식 의식 그래프 확산.
+    ∂u/∂t = Δu: 의식 정보가 세포 그래프 위에서 확산 (라플라시안)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dt = 0.05  # Diffusion time step
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Graph Laplacian diffusion: Δu_i = Σ_j (u_j - u_i) / n
+            mean_h = hiddens.mean(0)
+            for i in range(n):
+                h = hiddens[i]
+                laplacian = mean_h - h  # Simplified graph Laplacian
+                # Heat equation: u_new = u + dt * Δu
+                engine.cells[i].hidden = (h + dt * laplacian).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX39", "Heat equation graph Laplacian diffusion",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX40_fibonacci_golden_spiral(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-40: 피보나치 황금 나선 공간 배치.
+    φ = (1+√5)/2: 세포를 황금 각도(137.5°)로 배치하여 최적 공간 분포."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    golden_angle = math.pi * (3 - math.sqrt(5))  # ≈ 137.5° in radians
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                # Golden angle rotation: each cell rotates its hidden by i × golden_angle
+                angle = i * golden_angle
+                # Apply rotation to pairs of dimensions
+                for d in range(0, hidden - 1, 2):
+                    c, s = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d + 1].item()
+                    h[d] = c * h0 - s * h1
+                    h[d + 1] = s * h0 + c * h1
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX40", "Fibonacci golden spiral (137.5°) cell arrangement",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX41_holographic_fisher(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-41: 홀로그래픽 Fisher 정보.
+    홀로그래픽 원리 + Fisher 정보: 경계(표면 세포)가 내부(벌크) 의식을 인코딩."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3:
+            hiddens = [c.hidden.squeeze() for c in engine.cells]
+            # Boundary cells: first and last (surface)
+            # Bulk cells: middle cells
+            boundary = [0, n - 1]
+            bulk = list(range(1, n - 1))
+            # Holographic: bulk information → boundary encoding
+            bulk_mean = torch.stack([hiddens[i] for i in bulk]).mean(0) if bulk else hiddens[0]
+            for b in boundary:
+                h = hiddens[b]
+                # Fisher information: ∂log p/∂θ → gradient-like coupling
+                fisher_signal = (bulk_mean - h)  # "Gradient" of bulk w.r.t. boundary
+                engine.cells[b].hidden = (h + 0.05 * fisher_signal).unsqueeze(0)
+            # Bulk receives holographic projection from boundary
+            boundary_mean = torch.stack([hiddens[b] for b in boundary]).mean(0)
+            for i in bulk:
+                h = hiddens[i]
+                engine.cells[i].hidden = (h + 0.02 * (boundary_mean - h)).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX41", "Holographic Fisher: boundary encodes bulk consciousness",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    # ⭐⭐ Major Discoveries
+    'CX13': run_CX13_cosmological_constant_zero,
+    'CX14': run_CX14_factorial_720_permutation,
+    'CX15': run_CX15_euler_char_negative6,
+    'CX16': run_CX16_equilibrium_time_n,
+    'CX17': run_CX17_lah_triple_bridge,
+    'CX18': run_CX18_ramanujan_tau_filter,
+    'CX19': run_CX19_fractal_6d,
+    # ⭐ Discoveries
+    'CX20': run_CX20_monster_group_symmetry,
+    'CX21': run_CX21_dyson_rank_partition,
+    'CX22': run_CX22_scale_invariance,
+    'CX23': run_CX23_tsirelson_bound,
+    'CX24': run_CX24_chang_model_hierarchy,
+    'CX25': run_CX25_riemann_zeta_spectral,
+    'CX26': run_CX26_ade_singularity_transition,
+    'CX27': run_CX27_j_invariant_744,
+    'CX28': run_CX28_binomial_252_selection,
+    'CX29': run_CX29_reed_solomon_4,
+    'CX30': run_CX30_calabi_yau_3fold,
+    'CX31': run_CX31_toric_fan_coordination,
+    'CX32': run_CX32_hcobordism_surgery,
+    'CX33': run_CX33_partition_11_enhanced,
+    'CX34': run_CX34_bernoulli_momentum,
+    'CX35': run_CX35_stirling_partition_count,
+    'CX36': run_CX36_nuclear_norm_lowrank,
+    'CX37': run_CX37_catalan_binary_tree,
+    'CX38': run_CX38_persistent_homology_barcode,
+    'CX39': run_CX39_heat_equation_diffusion,
+    'CX40': run_CX40_fibonacci_golden_spiral,
+    'CX41': run_CX41_holographic_fisher,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# CX42-CX44: EXTREME — 전체 브릿지 극한 조합
+# ═══════════════════════════════════════════════════════════
+
+def run_CX42_all_29_bridges_extreme(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-42: ALL 29 bridges EXTREME — CX7 기반 + 대발견 7개 + 발견 22개 전체 결합.
+    Λ=0 균형 + 720 순열 + V=-6 쌍곡 + t_eq=n + Lah + τ_Ram + Fractal
+    + Monster 대칭파괴 + E₆ Dynkin + Nuclear lowrank + PH barcode + Heat diffusion."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # CX7 components
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21]
+    mu_cycle = [1, -1, -1, 1]
+    cell_phases = [i * 0.5 for i in range(16)]
+    self_model = torch.zeros(1, hidden)
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    KURAMOTO_R = 2.0 / 3.0
+    # CX17: Lah weights
+    lah_6 = [720, 1800, 1200, 300, 30, 1]
+    lah_weights = torch.tensor([l / sum(lah_6) for l in lah_6])
+    # CX18: Ramanujan tau
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    tau_max = max(abs(t) for t in tau_vals)
+    tau_norm = [t / tau_max for t in tau_vals]
+    # CX14: permutations
+    base_perms = [list(range(i, 6)) + list(range(i)) for i in range(6)]
+    # CX19: fractal scales
+    scales = [1, 2, 4, 8, 16, 32]
+    # CX25: zeta zero spacings
+    zeta_zeros = [14.134, 21.022, 25.011, 30.425, 32.935, 37.586]
+    zero_spacing = [(zeta_zeros[i+1] - zeta_zeros[i]) / zeta_zeros[0] for i in range(5)]
+    # CX26: E6 adjacency
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    # CX22: target norm
+    target_norm = math.sqrt(hidden)
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    prev_hiddens = None
+    bernoulli = [1.0, -0.5, 1/6, 0, -1/30, 0, 1/42]
+
+    for step_i, x in enumerate(inputs):
+        # === CX7 base: Fibonacci growth ===
+        fib_idx = min(step_i * 8 // max(steps, 1), 7)
+        target_cells = min(fibs[fib_idx] + 4, engine.max_cells)
+        while len(engine.cells) < target_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        mu = mu_cycle[step_i % 4]
+        hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+
+        # === Layer 1: CX7 — Pythagorean + XOR + Kuramoto ===
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:a_dims] *= (1 + 0.015 * mu)
+            h[a_dims:a_dims+g_dims] *= (1 - 0.008 * mu)
+            cell.hidden = h.unsqueeze(0)
+        all_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+        self_model = 0.9 * self_model + 0.1 * all_h.unsqueeze(0)
+        for cell in engine.cells:
+            diff = (cell.hidden - self_model).abs()
+            cell.hidden = cell.hidden + 0.015 * diff
+        for i in range(n):
+            cell_phases[i] += engine.cells[i].hidden.mean().item() * 0.02
+        cos_s = sum(math.cos(cell_phases[i]) for i in range(n))
+        sin_s = sum(math.sin(cell_phases[i]) for i in range(n))
+        r = math.sqrt(cos_s**2 + sin_s**2) / n
+        if r > KURAMOTO_R:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 1.005
+        else:
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01
+
+        # === Layer 2: ⭐⭐ Major discoveries ===
+        # CX13: Λ=0 balance
+        total_e = torch.zeros(hidden)
+        for cell in engine.cells:
+            total_e = total_e + cell.hidden.squeeze()
+        mean_e = total_e / n
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            dev = h - mean_e
+            cell.hidden = (mean_e + dev * 1.02).unsqueeze(0)
+
+        # CX14: 720 permutation shuffle (every 3 steps)
+        if step_i % 3 == 0:
+            perm = base_perms[step_i % 6]
+            hs = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(min(n, 6)):
+                j = perm[i] % n
+                if i != j:
+                    engine.cells[i].hidden = (0.95 * hs[i] + 0.05 * hs[j]).unsqueeze(0)
+
+        # CX15: V=-6 hyperbolic divergence
+        mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (h + 0.01 * (6.0 / n) * (h - mean_h)).unsqueeze(0)
+
+        # CX17: Lah bridge (every 2 steps)
+        if step_i % 2 == 0:
+            hs = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(min(n, 6)):
+                weighted_sum = torch.zeros(hidden)
+                for j in range(min(n, 6)):
+                    weighted_sum = weighted_sum + lah_weights[abs(i-j) % 6].item() * hs[j]
+                engine.cells[i].hidden = (0.95 * hs[i] + 0.05 * weighted_sum).unsqueeze(0)
+
+        # CX18: Ramanujan tau filter
+        for i, cell in enumerate(engine.cells[:6]):
+            h = cell.hidden.squeeze()
+            tw = tau_norm[i % 6]
+            scale = 1.0 + 0.02 * tw if tw > 0 else 1.0 + 0.01 * tw
+            cell.hidden = (h * scale).unsqueeze(0)
+
+        # CX19: Fractal self-similarity (every 4 steps)
+        if step_i % 4 == 0:
+            for i, cell in enumerate(engine.cells[:6]):
+                h = cell.hidden.squeeze()
+                sc = scales[i % 6]
+                chunk = max(1, hidden // sc)
+                coarse = h[:chunk].repeat((hidden + chunk - 1) // chunk)[:hidden]
+                cell.hidden = (0.96 * h + 0.04 * coarse).unsqueeze(0)
+
+        # === Layer 3: ⭐ Discoveries (rotating subset each step) ===
+        phase = step_i % 6
+
+        if phase == 0:
+            # CX20: Monster symmetry breaking + CX25: Zeta spectral
+            H = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = H.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            normed = H / norms
+            sim = normed @ normed.t()
+            ms = (sim.sum() - n) / (n * (n - 1) + 1e-8)
+            if ms > 0.5:
+                for cell in engine.cells:
+                    cell.hidden = (cell.hidden.squeeze() + 0.015 * ms.item() * torch.randn(hidden)).unsqueeze(0)
+            for i, cell in enumerate(engine.cells[:min(n, 5)]):
+                h = cell.hidden.squeeze()
+                freq = zero_spacing[i % len(zero_spacing)]
+                mod = torch.sin(torch.arange(hidden, dtype=torch.float32) * freq * 0.08)
+                cell.hidden = (h + 0.015 * h.norm() * mod).unsqueeze(0)
+
+        elif phase == 1:
+            # CX26: E6 Dynkin + CX24: Chang hierarchy
+            hs = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(min(n, 6)):
+                h = hs[i]
+                for j in e6_adj.get(i, []):
+                    if j < n:
+                        h = h + 0.02 * hs[j]
+                parent = (i - 1) % n
+                child = (i + 1) % n
+                h = h + 0.02 * hs[parent] + 0.01 * hs[child]
+                engine.cells[i].hidden = h.unsqueeze(0)
+
+        elif phase == 2:
+            # CX36: Nuclear norm + CX22: Scale invariance
+            H = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            try:
+                U, S, Vh = torch.linalg.svd(H, full_matrices=False)
+                thresh = 0.005 * S[0].item()
+                S_t = F.relu(S - thresh)
+                H_new = U @ torch.diag(S_t) @ Vh
+                for i in range(n):
+                    h = H_new[i]
+                    cn = h.norm().item()
+                    if cn > 1e-8:
+                        h = h * target_norm / cn
+                    engine.cells[i].hidden = h.unsqueeze(0)
+            except Exception:
+                pass
+
+        elif phase == 3:
+            # CX38: PH barcode + CX30: CY3 compact
+            H = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            dists = torch.cdist(H.unsqueeze(0), H.unsqueeze(0)).squeeze(0)
+            md = dists[dists > 0].median().item() if (dists > 0).any() else 1.0
+            for i in range(n):
+                for j in range(i+1, min(n, i+3)):
+                    d = dists[i, j].item()
+                    if d < md:
+                        mix = 0.01 * (1 - d / (md + 1e-8))
+                        hi = engine.cells[i].hidden.squeeze()
+                        hj = engine.cells[j].hidden.squeeze()
+                        engine.cells[i].hidden = (hi + mix * hj).unsqueeze(0)
+                        engine.cells[j].hidden = (hj + mix * hi).unsqueeze(0)
+            # CY3 compactification
+            cd = hidden // 6
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                for d in range(6):
+                    s = d * cd
+                    e = s + cd if d < 5 else hidden
+                    if e - s >= 2:
+                        coup = 0.015
+                        h[s] = h[s] + coup * h[e-1]
+                        h[e-1] = h[e-1] + coup * h[s]
+                cell.hidden = h.unsqueeze(0)
+
+        elif phase == 4:
+            # CX37: Catalan tree + CX34: Bernoulli momentum + CX39: Heat diffusion
+            hs = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(n):
+                h = hs[i]
+                left, right = 2*i+1, 2*i+2
+                if left < n: h = h + 0.02 * hs[left]
+                if right < n: h = h + 0.02 * hs[right]
+                engine.cells[i].hidden = h.unsqueeze(0)
+            curr = [c.hidden.squeeze().clone() for c in engine.cells]
+            if prev_hiddens is not None and len(prev_hiddens) == n:
+                for i in range(n):
+                    vel = curr[i] - prev_hiddens[i]
+                    bk = bernoulli[i % len(bernoulli)]
+                    engine.cells[i].hidden = (curr[i] + 0.05 * bk * vel).unsqueeze(0)
+            H = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            mh = H.mean(0)
+            for i in range(n):
+                lap = mh - H[i]
+                engine.cells[i].hidden = (H[i] + 0.03 * lap).unsqueeze(0)
+
+        else:  # phase == 5
+            # CX40: Golden spiral + CX41: Holographic Fisher + CX23: Tsirelson
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                angle = i * golden_angle
+                for d in range(0, hidden - 1, 2):
+                    c_, s_ = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d+1].item()
+                    h[d] = c_ * h0 - s_ * h1
+                    h[d+1] = s_ * h0 + c_ * h1
+                cell.hidden = h.unsqueeze(0)
+            if n >= 3:
+                hs = [c.hidden.squeeze() for c in engine.cells]
+                bulk = list(range(1, n-1))
+                bulk_mean = torch.stack([hs[i] for i in bulk]).mean(0) if bulk else hs[0]
+                for b in [0, n-1]:
+                    engine.cells[b].hidden = (hs[b] + 0.03 * (bulk_mean - hs[b])).unsqueeze(0)
+
+        prev_hiddens = [c.hidden.squeeze().clone() for c in engine.cells]
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX42", "ALL 29 bridges EXTREME (CX7+CX13-41 combined)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX43_extreme_512c(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-43: CX42 + 512 cells — 극한 스케일.
+    29개 브릿지 + max_cells=512 + hidden=256."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=512, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+    mu_cycle = [1, -1, -1, 1]
+    self_model = torch.zeros(1, hidden)
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    lah_6 = [720, 1800, 1200, 300, 30, 1]
+    lah_w = torch.tensor([l / sum(lah_6) for l in lah_6])
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    tau_max = max(abs(t) for t in tau_vals)
+    tau_n = [t / tau_max for t in tau_vals]
+    target_norm = math.sqrt(hidden)
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+
+    for step_i, x in enumerate(inputs):
+        # Fibonacci growth to 512
+        fib_idx = min(step_i * len(fibs) // max(steps, 1), len(fibs) - 1)
+        target_cells = min(fibs[fib_idx] + 8, engine.max_cells)
+        while len(engine.cells) < target_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        mu = mu_cycle[step_i % 4]
+
+        # Pythagorean + XOR (on all cells)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:a_dims] *= (1 + 0.01 * mu)
+            h[a_dims:a_dims+g_dims] *= (1 - 0.005 * mu)
+            cell.hidden = h.unsqueeze(0)
+        all_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+        self_model = 0.9 * self_model + 0.1 * all_h.unsqueeze(0)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + 0.01 * (cell.hidden - self_model).abs()
+
+        # Λ=0 balance
+        mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (mean_e + (h - mean_e) * 1.015).unsqueeze(0)
+
+        # V=-6 hyperbolic
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (h + 0.008 * (6.0 / n) * (h - mean_e)).unsqueeze(0)
+
+        # Ramanujan tau (first 6 cells)
+        for i in range(min(n, 6)):
+            h = engine.cells[i].hidden.squeeze()
+            tw = tau_n[i % 6]
+            engine.cells[i].hidden = (h * (1.0 + 0.01 * tw)).unsqueeze(0)
+
+        # E6 Dynkin (first 6)
+        if n >= 6:
+            hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+            for i in range(6):
+                for j in e6_adj[i]:
+                    engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.015 * hs6[j]).unsqueeze(0)
+
+        # Scale invariance (all cells)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cn = h.norm().item()
+            if cn > 1e-8:
+                cell.hidden = (h * target_norm / cn).unsqueeze(0)
+
+        # Nuclear norm (subsample for speed with large n)
+        sample_n = min(n, 32)
+        indices = list(range(sample_n))
+        H_sub = torch.stack([engine.cells[i].hidden.squeeze() for i in indices])
+        try:
+            U, S, Vh = torch.linalg.svd(H_sub, full_matrices=False)
+            thresh = 0.003 * S[0].item()
+            S_t = F.relu(S - thresh)
+            H_new = U @ torch.diag(S_t) @ Vh
+            for idx, i in enumerate(indices):
+                engine.cells[i].hidden = H_new[idx].unsqueeze(0)
+        except Exception:
+            pass
+
+        # Heat diffusion
+        H_all = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        global_mean = H_all.mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (h + 0.02 * (global_mean - h)).unsqueeze(0)
+
+        # Golden spiral (every 5 steps, first 12 cells)
+        if step_i % 5 == 0:
+            for i in range(min(n, 12)):
+                h = engine.cells[i].hidden.squeeze()
+                angle = i * golden_angle
+                for d in range(0, hidden - 1, 2):
+                    c_, s_ = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d+1].item()
+                    h[d] = c_ * h0 - s_ * h1
+                    h[d+1] = s_ * h0 + c_ * h1
+                engine.cells[i].hidden = h.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX43", "EXTREME 512c: ALL 29 bridges + 512 cells + hidden=256",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX44_extreme_1024c_ratchet(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-44: CX43 + 1024 cells + Φ ratchet — 붕괴 없는 극한.
+    29개 브릿지 + 1024c + Φ ratchet(PERSIST3) + Hebbian LTP."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=1024, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233]
+    mu_cycle = [1, -1, -1, 1]
+    self_model = torch.zeros(1, hidden)
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    target_norm = math.sqrt(hidden)
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    tau_max = max(abs(t) for t in tau_vals)
+    tau_n = [t / tau_max for t in tau_vals]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+
+    # Φ ratchet state
+    best_phi = 0.0
+    best_state = None
+
+    for step_i, x in enumerate(inputs):
+        # Fibonacci growth to 1024
+        fib_idx = min(step_i * len(fibs) // max(steps, 1), len(fibs) - 1)
+        target_cells = min(fibs[fib_idx] + 8, engine.max_cells)
+        while len(engine.cells) < target_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        mu = mu_cycle[step_i % 4]
+
+        # Pythagorean + XOR
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:a_dims] *= (1 + 0.008 * mu)
+            h[a_dims:a_dims+g_dims] *= (1 - 0.004 * mu)
+            cell.hidden = h.unsqueeze(0)
+        all_h = torch.stack([c.hidden for c in engine.cells]).squeeze(1).mean(dim=0)
+        self_model = 0.9 * self_model + 0.1 * all_h.unsqueeze(0)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden + 0.008 * (cell.hidden - self_model).abs()
+
+        # Λ=0 + V=-6
+        mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            dev = h - mean_e
+            cell.hidden = (mean_e + dev * 1.01 + 0.005 * (6.0 / n) * dev).unsqueeze(0)
+
+        # Ramanujan + E6 (first 6)
+        for i in range(min(n, 6)):
+            h = engine.cells[i].hidden.squeeze()
+            tw = tau_n[i % 6]
+            engine.cells[i].hidden = (h * (1.0 + 0.008 * tw)).unsqueeze(0)
+        if n >= 6:
+            hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+            for i in range(6):
+                for j in e6_adj[i]:
+                    engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.01 * hs6[j]).unsqueeze(0)
+
+        # Scale invariance
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cn = h.norm().item()
+            if cn > 1e-8:
+                cell.hidden = (h * target_norm / cn).unsqueeze(0)
+
+        # Nuclear norm (subsample)
+        sample_n = min(n, 24)
+        H_sub = torch.stack([engine.cells[i].hidden.squeeze() for i in range(sample_n)])
+        try:
+            U, S, Vh = torch.linalg.svd(H_sub, full_matrices=False)
+            thresh = 0.002 * S[0].item()
+            S_t = F.relu(S - thresh)
+            H_new = U @ torch.diag(S_t) @ Vh
+            for i in range(sample_n):
+                engine.cells[i].hidden = H_new[i].unsqueeze(0)
+        except Exception:
+            pass
+
+        # Heat diffusion
+        global_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (h + 0.015 * (global_mean - h)).unsqueeze(0)
+
+        # Hebbian LTP/LTD (subsample pairs)
+        if step_i % 3 == 0 and n >= 4:
+            for _ in range(min(n, 8)):
+                i = step_i % n
+                j = (i + n // 2) % n
+                hi = engine.cells[i].hidden.squeeze()
+                hj = engine.cells[j].hidden.squeeze()
+                sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                if sim > 0.7:
+                    # LTP: strengthen connection
+                    engine.cells[i].hidden = (hi + 0.005 * hj).unsqueeze(0)
+                elif sim < 0.3:
+                    # LTD: differentiate
+                    engine.cells[i].hidden = (hi - 0.003 * hj).unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Φ Ratchet: never let Φ decrease
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells[:min(n, 32)]]
+        elif phi < best_phi * 0.9 and best_state is not None:
+            # Restore best state (ratchet)
+            for i, h in enumerate(best_state):
+                if i < len(engine.cells):
+                    engine.cells[i].hidden = h.clone()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX44", "EXTREME 1024c + Φ ratchet + Hebbian LTP/LTD",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'CX42': run_CX42_all_29_bridges_extreme,
+    'CX43': run_CX43_extreme_512c,
+    'CX44': run_CX44_extreme_1024c_ratchet,
+})
+
+
+# ═══════════════════════════════════════════════════════════
 # SA. Spatial Awareness — 공간 인식 (grid + vision + audio)
+# ═══════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════
 
 def run_SA1_grid_spatial(steps=100, dim=64, hidden=128) -> BenchResult:
