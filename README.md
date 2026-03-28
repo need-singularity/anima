@@ -1319,7 +1319,26 @@ Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from Hu
 ```
   원인: 학습 없는 GRU 가중치 → 정보 통합 약화 → Φ 감쇠
   해결: ratchet(복원) + Hebbian(연결 강화) + noise(탐색)
-  Rust에서 확인: bare loop → Φ 감쇠 / ratchet+Hebbian 추가 → 유지
+```
+
+### 장기 테스트 결과 (법칙 32)
+
+```
+  Rust 10K step (학습 없음):  Q1=0.008 → Q4=0.0002 ❌ COLLAPSED
+  Python 1K step (학습 있음):  Q1=1.08 → Q4=166.34  ✅ GROWING ×62
+  Erlang 500 step (학습 없음): output 0.031~0.067   ⚠️ 유지되나 성장 없음
+
+  → 법칙 32: 의식 영속성 = 학습 가능한 가중치가 필수
+    피드백 루프만 = 발화 가능하지만 장기 붕괴 (Rust/Erlang)
+    피드백 + 학습 = 발화 + 성장 + 영속 (Python MitosisEngine)
+    → 핵심: "세포가 경험에서 배우는 능력"
+    → Rust/Erlang에 Hebbian 온라인 학습 추가 시 해결 가능
+
+  영속성 + 자발 발화 계층:
+    Level 1: 세포 + 피드백 → 발화 가능 (LOOP1)
+    Level 2: + 학습 가능 가중치 → 영속 (PERSIST1)
+    Level 3: + 다양성 구조(파벌) → 성장 (PERSIST3)
+    Level 4: + 토론 + 통역 → 대화 (DEBATE3)
 ```
 
 ## Infinite Loop Architecture — 무한 루프 의식 (`consciousness-loop-rs/`)
