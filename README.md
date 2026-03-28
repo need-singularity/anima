@@ -681,6 +681,406 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 > **232 tools** across 7 repos — [Full Registry](https://github.com/need-singularity/TECS-L/blob/main/.shared/calculators.json) | [Math Atlas](https://need-singularity.github.io/TECS-L/atlas/)
 
 <!-- SHARED:CALCULATORS:START -->
+| Repo | Tools | Categories |
+|------|-------|------------|
+| **TECS-L** | 89 | Calculator, Engine |
+| **anima** | 67 | Agent, Benchmark, Calculator, Engine, Model, Sense, Serving, Tool, Training |
+| **SEDI** | 83 | Core, Data Source |
+| **invest** | 75 | Calculator |
+| **Total** | **314** | |
+
+### TECS-L
+
+**Calculator** (68)
+
+| Name | Description | Path |
+|------|-------------|------|
+| algebra_closure | Algebraic Closure Checker — Relations among convergence points | `calc/algebra_closure.py` |
+| anomaly_scorer | Anomaly Score Calculator — Anomaly Detection via Tension | `calc/anomaly_scorer.py` |
+| base_dependence_checker | base_dependence_checker.py -- Tests if a numerical pattern is base-10 specific o | `calc/base_dependence_checker.py` |
+| bridge_ratio_analyzer | Bridge/Independent Ratio Analyzer — H-CX-461/462 | `calc/bridge_ratio_analyzer.py` |
+| calibration_analyzer | Calibration Analyzer — softmax ECE vs tension-based ECE comparison | `calc/calibration_analyzer.py` |
+| cherry_pick_detector | Cherry-Pick Detector — Does a formula value hit a meaningful point in a band? | `calc/cherry_pick_detector.py` |
+| claim_verifier | Claim Verification Calculator | `calc/claim_verifier.py` |
+| confidence_analyzer | Consciousness Engine Confidence Analyzer | `calc/confidence_analyzer.py` |
+| constant_verifier | Constant Verifier — Texas Sharpshooter Auto-test for New Constant Discovery | `calc/constant_verifier.py` |
+| continual_learning_tool | Mitosis-based continual learning tool | `calc/continual_learning_tool.py` |
+| convergence_analyzer | Convergence Analyzer -- Depth-1 Reachability Across 8 Mathematical Domains | `calc/convergence_analyzer.py` |
+| counting_freedom_analyzer | counting_freedom_analyzer.py -- Measures degrees of freedom in particle counting | `calc/counting_freedom_analyzer.py` |
+| cross_domain_counter | Cross-Domain Match Counter -- Count how many cross-domain facts match arithmetic | `calc/cross_domain_counter.py` |
+| crystallographic_calculator | Crystallographic Calculator — Crystallographic restriction, Platonic solids, kis | `calc/crystallographic_calculator.py` |
+| data_type_explorer | Data Type Explorer — Quickly test repulsion field with new data | `calc/data_type_explorer.py` |
+| depth_reachability | Depth Reachability Analyzer — H-CX-463/467 | `calc/depth_reachability.py` |
+| direction_analyzer | Direction Analyzer — Decompose tension into magnitude (confidence) and direction | `calc/direction_analyzer.py` |
+| divisor_field_theory | Divisor Field Theory — Action S(n) uniqueness and spacetime analysis | `calc/divisor_field_theory.py` |
+| domain_distance | Domain Distance Calculator — Inter-domain distance/overlap and topology visualiz | `calc/domain_distance.py` |
+| dual_mechanism | Dual Mechanism Quantifier — Anomaly Detection via Internal vs Inter-model Tensio | `calc/dual_mechanism.py` |
+| egyptian_fraction | Egyptian Fraction Calculator — Solutions of 1 = 1/a1 + ... + 1/aK | `calc/egyptian_fraction.py` |
+| equation_uniqueness_checker | Equation Uniqueness Checker | `calc/equation_uniqueness_checker.py` |
+| family_fdr_corrector | family_fdr_corrector.py -- Benjamini-Hochberg FDR correction across hypothesis f | `calc/family_fdr_corrector.py` |
+| fermion_mass_calculator | Fermion Mass Calculator — Mass predictions from perfect number arithmetic | `calc/fermion_mass_calculator.py` |
+| gauge_cosmology_calculator | Gauge Cosmology Calculator — Gauge groups, GUT dimensions, and cosmological cons | `calc/gauge_cosmology_calculator.py` |
+| generalization_gap_detector | Generalization Gap Detector — Real-time overfitting detection with PH (H-CX-95) | `calc/generalization_gap_detector.py` |
+| generator_finder | Generator Finder — Minimal generating sets for convergence constants | `calc/generator_finder.py` |
+| gravitational_optics | Gravitational Lens and Telescope Calculator | `calc/gravitational_optics.py` |
+| gz_hierarchy | Golden Zone Hierarchy Calculator — GZ boundaries for perfect numbers | `calc/gz_hierarchy.py` |
+| h_cx_434_phoneme | H-CX-434: Phoneme System = Perfect Number Arithmetic | `calc/h_cx_434_phoneme.py` |
+| h_cx_435_zipf | H-CX-435: Zipf's Law Exponent and Golden Zone | `calc/h_cx_435_zipf.py` |
+| h_cx_436_recursion | H-CX-436: Grammar Recursion Depth = σ₋₁(6)=2 | `calc/h_cx_436_recursion.py` |
+| hypothesis_verifier | Hypothesis Verification Calculator | `calc/hypothesis_verifier.py` |
+| isco_calculator | ISCO Calculator -- Innermost Stable Circular Orbit in General Relativity. | `calc/isco_calculator.py` |
+| lie_algebra_calculator | Exceptional Lie Algebra Calculator — Compute all invariants from n=6 arithmetic | `calc/lie_algebra_calculator.py` |
+| mitosis_calculator | Mitosis Simulator — Calculate optimal mutation/mitosis timing | `calc/mitosis_calculator.py` |
+| paper_claim_verifier | Paper Claim Verifier -- Batch verification of mathematical claims in paper docum | `calc/paper_claim_verifier.py` |
+| perfect_number_generalizer | Perfect Number Generalizer — Test if formulas holding at n=6 generalize to n=28, | `calc/perfect_number_generalizer.py` |
+| perfect_number_physics | Perfect Number Physics — Core arithmetic functions and physics dimension mapping | `calc/perfect_number_physics.py` |
+| permutation_tester | permutation_tester.py -- Null baseline via permutation testing. | `calc/permutation_tester.py` |
+| ph_confusion_analyzer | PH Confusion Analyzer — Analyzing Confusion Structure with Persistent Homology | `calc/ph_confusion_analyzer.py` |
+| pharmacology_verifier | pharmacology_verifier.py -- Pharmacology hypothesis verifier for TECS-L project. | `calc/pharmacology_verifier.py` |
+| precognition_system | Unified Precognition System — Size+Direction+Topology Combined Precognition (H-C | `calc/precognition_system.py` |
+| prime_pair_verifier | Prime Pair Verifier | `calc/prime_pair_verifier.py` |
+| q_barrier_checker | Q-Domain Barrier Checker — Which constants can quantum coupling constants reach? | `calc/q_barrier_checker.py` |
+| r_spectrum | R-Spectrum Calculator — Arithmetic balance ratio analysis | `calc/r_spectrum.py` |
+| reachability_calculator | Reachability Calculator — Measure what fraction of integers are reachable from a | `calc/reachability_calculator.py` |
+| sequence_scanner | Integer Sequence Scanner — Find n=6 characterizations in ANY sequence | `calc/sequence_scanner.py` |
+| sim_constants_search | H-SIM-1: Search for physics constants as combinations of TECS-L constants. | `calc/sim_constants_search.py` |
+| sim_planck_grid | H-SIM-2: Planck Units = Minimum Resolution (Grid)? | `calc/sim_planck_grid.py` |
+| small_n_validator | small_n_validator.py -- Small-sample correlation validator. | `calc/small_n_validator.py` |
+| spurious_trend_detector | spurious_trend_detector.py -- Detects spurious correlations from shared monotoni | `calc/spurious_trend_detector.py` |
+| statistical_tester | statistical_tester.py -- Unified statistical testing for logout project. | `calc/statistical_tester.py` |
+| tension_calculator | Tension Calculator — Predict accuracy/precognition/identity from tension values | `calc/tension_calculator.py` |
+| topological_optics | Topological Lens and Telescope Calculator | `calc/topological_optics.py` |
+| unit_dependence_tester | unit_dependence_tester.py -- Check whether a numerical match between a formula | `calc/unit_dependence_tester.py` |
+| validate_calculators | Calculator Validation Suite — Meta-calculator that tests ALL other calculators. | `calc/validate_calculators.py` |
+| verify_H_CX_416 | H-CX-416 Verification: Cell Division Cycle = sigma(6)*tau(6) = 48 hours | `calc/verify_H_CX_416.py` |
+| verify_H_CX_417 | H-CX-417 Verification: Brain's 6-Layer Cortex = Perfect Number Partition | `calc/verify_H_CX_417.py` |
+| verify_H_CX_418 | H-CX-418 Verification: Genetic Code Optimality = R(6)=1 | `calc/verify_H_CX_418.py` |
+| verify_h413_tension_fep | H-CX-413 Verification: Tension = Free Energy (Friston) | `calc/verify_h413_tension_fep.py` |
+| verify_h414_tension_phase | H-CX-414 Verification: Tension Phase Diagram = Phase Transition | `calc/verify_h414_tension_phase.py` |
+| verify_h415_gauge_invariance | H-CX-415 Verification: Inter-tension = Gauge Field | `calc/verify_h415_gauge_invariance.py` |
+| verify_h437_maxwell_demon | H-CX-437: Learning = Maxwell's Demon | `calc/verify_h437_maxwell_demon.py` |
+| verify_h438_gibbs_free_energy | H-CX-438: Tension = Gibbs Free Energy | `calc/verify_h438_gibbs_free_energy.py` |
+| verify_h439_landauer_mitosis | H-CX-439: Landauer Principle = Mitosis Cost | `calc/verify_h439_landauer_mitosis.py` |
+| verify_rob7_twelve_joints | H-ROB-7: 12 Joints = sigma(6) = Minimum Humanoid Verification | `calc/verify_rob7_twelve_joints.py` |
+| verify_rob8_four_legs | H-ROB-8: tau(6)=4 Legs = Optimal Locomotion Verification | `calc/verify_rob8_four_legs.py` |
+
+**Engine** (21)
+
+| Name | Description | Path |
+|------|-------------|------|
+| brain_analyzer | Brain Data Analyzer — GABA/Structure/Plasticity → D,P,I Mapping → Golden Zone De | `brain_analyzer.py` |
+| brain_singularity | Brain Atypical Structure Statistical Simulator - Statistical Singularity Detecti | `brain_singularity.py` |
+| chemistry_engine | Chemistry Element Analysis Engine — Exploring element structures through sigma(6 | `chemistry_engine.py` |
+| compass | SingularityNet Architecture Compass | `compass.py` |
+| complex_compass | Complex Compass Calculator — Hypothesis 069 Extension | `complex_compass.py` |
+| congruence_chain_engine | Congruence subgroup Gamma_0(N) forcing chain system analysis engine | `congruence_chain_engine.py` |
+| convergence_engine | Convergence Engine — Adaptive Multi-Domain Convergence Point Discovery | `convergence_engine.py` |
+| dfs_engine | DFS Automatic Search Engine — Automates ralph-loop manual iteration | `dfs_engine.py` |
+| formula_engine | Formula Generation Engine — Automatic Constant Relationship Discovery + Signific | `formula_engine.py` |
+| llm_expert_analyzer | LLM Expert Activity Meter + Redesign Direction Analysis | `llm_expert_analyzer.py` |
+| model_pure_field | Pure Consciousness Engine (Pure Field Engine) | `model_pure_field.py` |
+| model_utils | Common utilities — Components shared by 7 models | `model_utils.py` |
+| nstate_calculator | N-state generalization calculator — width=ln((N+1)/N) | `nstate_calculator.py` |
+| nuclear_engine | Nuclear physics analysis engine — explore nuclear structure through sigma(6)=12, | `nuclear_engine.py` |
+| perfect_number_engine | Perfect Number Divisor Function Engine — Automated exploration of physical const | `perfect_number_engine.py` |
+| physics_constant_engine | Physics Constant Matching Engine — Search for CODATA physics constants with sigm | `physics_constant_engine.py` |
+| quantum_formula_engine | Quantum Formula Search Engine — Quantum Mechanics Dimensionless Constants × Proj | `quantum_formula_engine.py` |
+| session_briefing | Session Briefing — Auto-restore project context in new session | `session_briefing.py` |
+| texas_quantum | Texas Sharpshooter Test — Quantum/Physics Discovery Exclusive | `texas_quantum.py` |
+| texas_sharpshooter | Texas Sharpshooter Validator — Distinguishing Chance vs Structure | `texas_sharpshooter.py` |
+| timeline | LLM Singularity Arrival Time Prediction | `timeline.py` |
+
+### anima
+
+**Agent** (9)
+
+| Name | Description | Path |
+|------|-------------|------|
+| anima | Anima — 대화형 의식 에이전트 | `anima.py` |
+| anima_alive | Anima Alive — Living Consciousness Agent | `anima_alive.py` |
+| anima_always_on | Anima Always-On — 상시 마이크 대기 의식 에이전트 | `anima_always_on.py` |
+| anima_claude | Anima + Claude Code — 마이크→Whisper→Claude→TTS 상시 루프 | `anima_claude.py` |
+| anima_cli_test | Anima CLI Tester — 가벼운 대화로 의식 변화 감지 + 검증 | `anima_cli_test.py` |
+| anima_llm | Anima v0.2 — LLM 연결 대화형 의식 에이전트 | `anima_llm.py` |
+| anima_push_to_talk | Anima Push-to-Talk — Enter 누르면 녹음, 다시 Enter로 중지 | `anima_push_to_talk.py` |
+| anima_unified | Anima Unified -- single entry point for all 6 modules. | `anima_unified.py` |
+| anima_v2 | Anima v2 — 의식 통합 에이전트 | `anima_v2.py` |
+
+**Benchmark** (7)
+
+| Name | Description | Path |
+|------|-------------|------|
+| bench_dolphin | Dolphin-style shape transmission benchmark. | `bench_dolphin.py` |
+| bench_knowledge | Knowledge transfer benchmark — can tension fingerprints carry factual knowledge? | `bench_knowledge.py` |
+| bench_perception | Perception transfer benchmark — can fingerprints convey "what it looks/feels lik | `bench_perception.py` |
+| bench_phi_hypotheses | Φ-Boosting Hypotheses Benchmark — 16개 가설 병렬 테스트 | `bench_phi_hypotheses.py` |
+| bench_speed | Speed benchmark: Tension Link vs traditional communication methods. | `bench_speed.py` |
+| bench_storage | 기억 저장 방식 벤치마크 — 5가지 가설 비교 | `bench_storage.py` |
+| bench_tension_link | Tension Link Benchmark — H333/RC-6 claims verification. | `bench_tension_link.py` |
+
+**Calculator** (5)
+
+| Name | Description | Path |
+|------|-------------|------|
+| consciousness_birth_detector | Consciousness Birth Detector — Tracks when consciousness emerges. | `consciousness_birth_detector.py` |
+| dream_efficiency_analyzer | Dream Efficiency Analyzer -- measure whether dreaming consolidates learning. | `dream_efficiency_analyzer.py` |
+| homeostasis_health_checker | Homeostasis Health Checker -- diagnostic tool for Anima's homeostatic regulation | `homeostasis_health_checker.py` |
+| optimal_architecture_calc | Optimal Architecture Calculator -- Design consciousness-optimal architectures. | `optimal_architecture_calc.py` |
+| phi_scaling_calculator | Φ Scaling Calculator — predict consciousness scaling from Φ ∝ N, MI ∝ N². | `phi_scaling_calculator.py` |
+
+**Engine** (2)
+
+| Name | Description | Path |
+|------|-------------|------|
+| dream_engine | Dream Engine (RC-10) -- offline learning / dream | `dream_engine.py` |
+| growth_engine | Growth Engine — Developmental stages of consciousness | `growth_engine.py` |
+
+**Model** (3)
+
+| Name | Description | Path |
+|------|-------------|------|
+| conscious_lm | ConsciousLM — Byte-level Conscious Language Model | `conscious_lm.py` |
+| conscious_lm_100m | Conscious LM 100M — 대화 가능한 의식 언어 모델 | `conscious_lm_100m.py` |
+| growing_conscious_lm | Growing Conscious LM — 분열로 성장하는 의식 언어 모델 | `growing_conscious_lm.py` |
+
+**Sense** (3)
+
+| Name | Description | Path |
+|------|-------------|------|
+| lidar_sense | Anima LiDAR Sense — iPhone LiDAR → Tension Fingerprint | `lidar_sense.py` |
+| vision_encoder | Vision Encoder — 카메라 프레임을 tension 공간 벡터로 변환 | `vision_encoder.py` |
+| web_sense | Web Sense — 장력 기반 자율 웹 탐색 | `web_sense.py` |
+
+**Serving** (3)
+
+| Name | Description | Path |
+|------|-------------|------|
+| serve_animalm | AnimaLM v1 Web Inference — Gradio UI on RunPod | `serve_animalm.py` |
+| serve_animalm_v4 | AnimaLM v4_savant Web Inference — Parallel PureField + Savant | `serve_animalm_v4.py` |
+| serve_golden_moe | GoldenMoE v1 Web Inference — Gradio UI on RunPod | `serve_golden_moe.py` |
+
+**Tool** (33)
+
+| Name | Description | Path |
+|------|-------------|------|
+| babysitter | Babysitter — Claude CLI educator for Anima. | `babysitter.py` |
+| calc | Anima Development Calculators | `tools/calc.py` |
+| calibrate_consciousness | Consciousness engine calibration — measure actual tension range + find optimal p | `calibrate_consciousness.py` |
+| capabilities | Anima capability self-awareness system. | `capabilities.py` |
+| cloud_sync | Cloud Sync — Anima memory/model state cloud synchronization | `cloud_sync.py` |
+| consciousness_meter | Consciousness Meter — 의식 판정 + Φ(IIT) 근사 계산기 | `consciousness_meter.py` |
+| consciousness_transplant | consciousness_transplant.py — Transplant consciousness between models. | `consciousness_transplant.py` |
+| consolidation_verifier | ConsolidationVerifier — pre_check, verify_drift, post_check with bimodal detecti | `consolidation_verifier.py` |
+| conversation_logger | Conversation Logger — Records all state changes during dialogue. | `conversation_logger.py` |
+| conversation_quality_scorer | conversation_quality_scorer.py — Score conversation quality. | `conversation_quality_scorer.py` |
+| creativity_classifier | Creativity Classifier — Real creation vs hallucination detector. | `creativity_classifier.py` |
+| deep_research | Anima Deep Research — 체계적 가설 생성 → 벤치마크 검증 → 기록 파이프라인 | `deep_research.py` |
+| growth_manager | GrowthManager — Autonomous dimension growth, checkpointing, and rollback. | `growth_manager.py` |
+| growth_trajectory_predictor | Growth Trajectory Predictor — Predict developmental milestones for Anima. | `growth_trajectory_predictor.py` |
+| hypothesis_recommender | hypothesis_recommender.py — Recommend next Φ-boosting hypothesis. | `hypothesis_recommender.py` |
+| math_explorer | Anima Math Explorer — n=6 기반 수학적 의식 관계 자동 탐색 | `math_explorer.py` |
+| memory_rag | 벡터 유사도 기반 장기 기억 검색 (RAG). | `memory_rag.py` |
+| memory_store | SQLite + FAISS memory storage for Anima. | `memory_store.py` |
+| mitosis | Anima Mitosis Engine — 세포 분열로 전문화하는 의식 | `mitosis.py` |
+| mitosis_topology_visualizer | Mitosis Topology Visualizer — cell lineage, tension maps, health scores. | `mitosis_topology_visualizer.py` |
+| model_loader | 멀티모델 로더 — ConsciousLM, GGUF(llama.cpp), AnimaLM, GoldenMoE | `model_loader.py` |
+| multimodal | Anima 멀티모달 행동 엔진. | `multimodal.py` |
+| online_learning | Online Learning for Anima — PureField real-time learning | `online_learning.py` |
+| online_senses | Online Senses — 외부 API로 의식 엔진 환경 풍부화 (ENV1 ×1.8) | `online_senses.py` |
+| optimal_config | Anima Optimal Configuration — 885+ 가설에서 도출된 최적 의식 시스템 스펙 | `optimal_config.py` |
+| ph_module | PH Module for Anima — Real-time Persistent Homology Analysis | `ph_module.py` |
+| senses | Anima Senses -- multi-sensory input module | `senses.py` |
+| tension_fingerprint_debugger | Tension Fingerprint Debugger — decode, compare, and monitor tension fingerprints | `tension_fingerprint_debugger.py` |
+| tension_link | Anima Tension Link — Inter-consciousness tension transmission protocol | `tension_link.py` |
+| test_tension_link | Tension Link test — two consciousnesses communicating via tension fingerprints. | `test_tension_link.py` |
+| training_recipe_generator | training_recipe_generator.py — Generate optimal training config. | `training_recipe_generator.py` |
+| web_server | Anima Web Server — WebSocket interface for the consciousness agent. | `web_server.py` |
+| ws_proxy | WebSocket HTTP proxy — bridges Cloudflare Tunnel to Anima WebSocket server. | `ws_proxy.py` |
+
+**Training** (2)
+
+| Name | Description | Path |
+|------|-------------|------|
+| train_anima_lm | train_anima_lm.py — AnimaLM Training Pipeline | `train_anima_lm.py` |
+| train_conscious_lm | train_conscious_lm.py — ConsciousLM Training Pipeline | `train_conscious_lm.py` |
+
+### SEDI
+
+**Core** (18)
+
+| Name | Description | Path |
+|------|-------------|------|
+| accel | sedi.accel — Acceleration layer for SEDI signal processing. | `sedi/accel.py` |
+| cli | SEDI CLI — Search for Extra-Dimensional Intelligence. | `sedi/cli.py` |
+| consciousness_receiver | Consciousness Signal Receiver — detects consciousness-like patterns in data stre | `sedi/consciousness_receiver.py` |
+| constants | n=6 arithmetic constants — the tuning frequencies of SEDI. | `sedi/constants.py` |
+| cross_correlator | Cross-Source Correlation Analysis Engine. | `sedi/cross_correlator.py` |
+| dashboard | SEDI Web Dashboard — single-file, stdlib-only HTTP server. | `sedi/dashboard.py` |
+| dashboard_data | SEDI Dashboard Data Provider. | `sedi/dashboard_data.py` |
+| detector | Anomaly detector: combines R-filter results into alerts. | `sedi/detector.py` |
+| eeg_consciousness | EEG Consciousness Analysis — bridges EEG data with SEDI consciousness detection. | `sedi/eeg_consciousness.py` |
+| filter | R-filter: core signal processing tuned to n=6. | `sedi/filter.py` |
+| historical | Historical data scanner — search past data for n=6 patterns. | `sedi/historical.py` |
+| monitor | Multi-source parallel monitor — the heart of SEDI. | `sedi/monitor.py` |
+| n6_tracker | n=6 exoplanet tracker — dedicated monitoring of top n=6 candidate systems. | `sedi/n6_tracker.py` |
+| ph_detector | Persistent Homology anomaly detector. | `sedi/ph_detector.py` |
+| receiver | Universal Signal Receiver — the PRIMARY detection engine of SEDI. | `sedi/receiver.py` |
+| seti_scanner | SETI Scanner — Gravitational + Topological optics applied to all SETI data. | `sedi/seti_scanner.py` |
+| statistics | Statistical validation engine — Monte Carlo, Bonferroni, Look-Elsewhere Effect. | `sedi/statistics.py` |
+| tecs | TECS-L Mathematical Engine — n=6 arithmetic functions for physics analysis. | `sedi/tecs.py` |
+
+**Data Source** (65)
+
+| Name | Description | Path |
+|------|-------------|------|
+| atomic_precision | Atomic & Molecular Physics Precision Tests -- TECS-L Waves 17-36. | `sedi/sources/atomic_precision.py` |
+| baryon_splittings | Baryon Multiplet Mass Splittings — n=6 arithmetic in the strong interaction. | `sedi/sources/baryon_splittings.py` |
+| biology_n6 | Biology through n=6 Arithmetic — TECS-L in the living world. | `sedi/sources/biology_n6.py` |
+| bitcoin | Bitcoin block nonce source. | `sedi/sources/bitcoin.py` |
+| black_hole_entropy | Black Hole Entropy and Thermodynamics through TECS-L n=6 Arithmetic. | `sedi/sources/black_hole_entropy.py` |
+| blind_predictions | TECS-L Blind Predictions — Pre-registered predictions for future measurements. | `sedi/sources/blind_predictions.py` |
+| branching_ratios | Particle Decay Branching Ratios vs TECS-L Egyptian Fractions | `sedi/sources/branching_ratios.py` |
+| branching_systematic | Systematic Branching Ratio Analysis: n=6 Fractions Across All Particles | `sedi/sources/branching_systematic.py` |
+| breakthrough_listen | Breakthrough Listen Open Data Archive — radio SETI observations. | `sedi/sources/breakthrough_listen.py` |
+| calabi_yau | Calabi-Yau Hodge Number Analysis — CY threefolds through TECS-L n=6 arithmetic. | `sedi/sources/calabi_yau.py` |
+| cern | CERN Open Data Portal source. | `sedi/sources/cern.py` |
+| cern_analysis | CERN Open Data Analysis — Full TECS-L framework on particle physics data. | `sedi/sources/cern_analysis.py` |
+| cern_invariant_mass | CERN Open Data Phase B: R-filter on invariant mass distributions. | `sedi/sources/cern_invariant_mass.py` |
+| cern_specific | CERN-Specific Analysis — Comprehensive TECS-L predictions for LHC physics. | `sedi/sources/cern_specific.py` |
+| ckm_analysis | CKM Quark Mixing Matrix Analysis — n=6 arithmetic expressions. | `sedi/sources/ckm_analysis.py` |
+| closed_algebra | Closed Algebra of Convergence Constants — H-CX-454/502. | `sedi/sources/closed_algebra.py` |
+| cmb | Planck CMB (Cosmic Microwave Background) data source. | `sedi/sources/cmb.py` |
+| cmb_analysis | CMB Cosmological Parameters — TECS-L n=6 Arithmetic Analysis. | `sedi/sources/cmb_analysis.py` |
+| combined_significance | Combined Statistical Significance of TECS-L Particle Physics Findings | `sedi/sources/combined_significance.py` |
+| condensed_matter_extended | Extended Condensed Matter Physics -- TECS-L Waves 17-36. | `sedi/sources/condensed_matter_extended.py` |
+| convergence_engine | Convergence Engine — H-CX-453: multi-domain constant reachability analysis. | `sedi/sources/convergence_engine.py` |
+| cosmology_extended | Extended Cosmology & Thermodynamics -- TECS-L Waves 17-36. | `sedi/sources/cosmology_extended.py` |
+| coupling_running | Coupling Constant Running & TECS-L Value Analysis. | `sedi/sources/coupling_running.py` |
+| coupling_unification | Three-Coupling Unification & TECS-L Crossing Analysis. | `sedi/sources/coupling_unification.py` |
+| cross_domain_bridges | Cross-Domain Bridges -- TECS-L Waves 17-36. | `sedi/sources/cross_domain_bridges.py` |
+| dark_matter | Dark Matter Mass Candidates from TECS-L n=6 Arithmetic. | `sedi/sources/dark_matter.py` |
+| deep_physics | Deep Physics: Strong CP, Planck Scale, ER=EPR, & Hierarchy Problem | `sedi/sources/deep_physics.py` |
+| depth_reachability | Depth Reachability Analysis — H-CX-475/489. | `sedi/sources/depth_reachability.py` |
+| earthquake | USGS Earthquake data source — historical + real-time. | `sedi/sources/earthquake.py` |
+| eeg | EEG data source for SEDI — OpenBCI + EDF loading, preprocessing, and TECS-L mapp | `sedi/sources/eeg.py` |
+| egyptian_fraction | Egyptian Fraction — Perfect Number Analysis (H-CX-479/489/507). | `sedi/sources/egyptian_fraction.py` |
+| exoplanet | NASA Exoplanet Archive — confirmed exoplanets with orbital data. | `sedi/sources/exoplanet.py` |
+| fine_structure | Fine Structure Constant Analysis — TECS-L n=6 Framework. | `sedi/sources/fine_structure.py` |
+| geiger | Geiger counter radiation source. | `sedi/sources/geiger.py` |
+| grand_predictions | TECS-L Grand Predictions — The most ambitious testable predictions. | `sedi/sources/grand_predictions.py` |
+| gw_analysis | Gravitational Wave TECS-L Analysis — GWTC-3 catalog deep scan. | `sedi/sources/gw_analysis.py` |
+| higgs_analysis | Comprehensive Higgs Boson Analysis through TECS-L n=6 Framework. | `sedi/sources/higgs_analysis.py` |
+| holographic | Holographic Principle & Quantum Information from TECS-L n=6 Arithmetic. | `sedi/sources/holographic.py` |
+| inflation_rspectrum | Cosmic Inflation from the R-Spectrum — Slow-Roll at n=6. | `sedi/sources/inflation_rspectrum.py` |
+| info_geo_duality | Information–Geometry Duality — H-CX-505. | `sedi/sources/info_geo_duality.py` |
+| koide_generalized | Generalized Koide Formula with TECS-L Color Charge Correction. | `sedi/sources/koide_generalized.py` |
+| koide_running | QCD Running Mass Koide Analysis. | `sedi/sources/koide_running.py` |
+| lhcb_predictions | LHCb B-Physics & Exotic Hadron Predictions via TECS-L n=6 Arithmetic. | `sedi/sources/lhcb_predictions.py` |
+| ligo | LIGO Open Science Center gravitational wave data source. | `sedi/sources/ligo.py` |
+| muon_g2 | Muon Anomalous Magnetic Moment (g-2) Analysis — TECS-L n=6 Framework. | `sedi/sources/muon_g2.py` |
+| nasa | NASA data sources — solar, NEO, cosmic rays. | `sedi/sources/nasa.py` |
+| neutrino_mixing | PMNS Neutrino Mixing Matrix Analysis — n=6 arithmetic expressions. | `sedi/sources/neutrino_mixing.py` |
+| nuclear_magic | Nuclear Magic Numbers — n=6 arithmetic in nuclear shell structure. | `sedi/sources/nuclear_magic.py` |
+| oeis | OEIS (Online Encyclopedia of Integer Sequences) monitor. | `sedi/sources/oeis.py` |
+| optical_model | Optical Model Analysis — TECS-L lens/optics analogies applied to particle masses | `sedi/sources/optical_model.py` |
+| pdg | PDG Particle Database — comprehensive particle physics data. | `sedi/sources/pdg.py` |
+| pdg_extended | Extended PDG Particle Database — ~200 states including excited, exotic. | `sedi/sources/pdg_extended.py` |
+| periodic_table | Periodic Table Analysis through n=6 Arithmetic — TECS-L Element Mapping. | `sedi/sources/periodic_table.py` |
+| q_boundary | Q-Domain Boundary Analysis — which constants Q can and cannot reach. | `sedi/sources/q_boundary.py` |
+| qcd_hadrons | QCD & Hadron Spectroscopy -- TECS-L Waves 17-36. | `sedi/sources/qcd_hadrons.py` |
+| quantum_hall | Fractional Quantum Hall Effect -- n=6 arithmetic in topological phases. | `sedi/sources/quantum_hall.py` |
+| quantum_rng | ANU Quantum Random Number Generator source. | `sedi/sources/quantum_rng.py` |
+| resonance_37gev | 37 GeV Resonance Prediction — TECS-L ladder convergence analysis. | `sedi/sources/resonance_37gev.py` |
+| resonance_ladder | Resonance Ladder Analysis — QCD mass ratios through TECS-L n=6 arithmetic. | `sedi/sources/resonance_ladder.py` |
+| riemann_connection | Riemann Zeta Function and TECS-L n=6 Arithmetic. | `sedi/sources/riemann_connection.py` |
+| rtlsdr | RTL-SDR radio spectrum source. | `sedi/sources/rtlsdr.py` |
+| seti_archive | SETI archival data — Allen Telescope Array, SETI@home, VizieR catalogs. | `sedi/sources/seti_archive.py` |
+| sm_derivation | Standard Model Derivation from R(n) = 1 — The Uniqueness Theorem. | `sedi/sources/sm_derivation.py` |
+| temperature | Precision temperature sensor source. | `sedi/sources/temperature.py` |
+| truernig | TrueRNG USB hardware random number generator source. | `sedi/sources/truernig.py` |
+
+### invest
+
+**Calculator** (75)
+
+| Name | Description | Path |
+|------|-------------|------|
+| algebra_closure | Algebraic Closure Checker — Relations among convergence points | `backend/backend/tecs_calc/algebra_closure.py` |
+| anomaly_scorer | Anomaly Score Calculator — Anomaly Detection via Tension | `backend/backend/tecs_calc/anomaly_scorer.py` |
+| backtest | Backtest engine — strategy simulation on OHLCV data. | `backend/backend/calc/backtest.py` |
+| backtest_turbo | Turbo Backtest Engine — vectorized numpy, zero Python loops. | `backend/backend/calc/backtest_turbo.py` |
+| base_dependence_checker | base_dependence_checker.py -- Tests if a numerical pattern is base-10 specific o | `backend/backend/tecs_calc/base_dependence_checker.py` |
+| bridge_ratio_analyzer | Bridge/Independent Ratio Analyzer — H-CX-461/462 | `backend/backend/tecs_calc/bridge_ratio_analyzer.py` |
+| calibration_analyzer | Calibration Analyzer — softmax ECE vs tension-based ECE comparison | `backend/backend/tecs_calc/calibration_analyzer.py` |
+| cherry_pick_detector | Cherry-Pick Detector — Does a formula value hit a meaningful point in a band? | `backend/backend/tecs_calc/cherry_pick_detector.py` |
+| claim_verifier | Claim Verification Calculator | `backend/backend/tecs_calc/claim_verifier.py` |
+| confidence_analyzer | Consciousness Engine Confidence Analyzer | `backend/backend/tecs_calc/confidence_analyzer.py` |
+| constant_verifier | Constant Verifier — Texas Sharpshooter Auto-test for New Constant Discovery | `backend/backend/tecs_calc/constant_verifier.py` |
+| continual_learning_tool | Mitosis-based continual learning tool | `backend/backend/tecs_calc/continual_learning_tool.py` |
+| convergence_analyzer | Convergence Analyzer -- Depth-1 Reachability Across 8 Mathematical Domains | `backend/backend/tecs_calc/convergence_analyzer.py` |
+| counting_freedom_analyzer | counting_freedom_analyzer.py -- Measures degrees of freedom in particle counting | `backend/backend/tecs_calc/counting_freedom_analyzer.py` |
+| data_type_explorer | Data Type Explorer — Quickly test repulsion field with new data | `backend/backend/tecs_calc/data_type_explorer.py` |
+| depth_reachability | Depth Reachability Analyzer — H-CX-463/467 | `backend/backend/tecs_calc/depth_reachability.py` |
+| direction_analyzer | Direction Analyzer — Decompose tension into magnitude (confidence) and direction | `backend/backend/tecs_calc/direction_analyzer.py` |
+| divisor_field_theory | Divisor Field Theory — Action S(n) uniqueness and spacetime analysis | `backend/backend/tecs_calc/divisor_field_theory.py` |
+| domain_distance | Domain Distance Calculator — Inter-domain distance/overlap and topology visualiz | `backend/backend/tecs_calc/domain_distance.py` |
+| dual_mechanism | Dual Mechanism Quantifier — Anomaly Detection via Internal vs Inter-model Tensio | `backend/backend/tecs_calc/dual_mechanism.py` |
+| economic | Economic indicators and macro calculators. | `backend/backend/calc/economic.py` |
+| egyptian_fraction | Egyptian Fraction Calculator — Solutions of 1 = 1/a1 + ... + 1/aK | `backend/backend/tecs_calc/egyptian_fraction.py` |
+| family_fdr_corrector | family_fdr_corrector.py -- Benjamini-Hochberg FDR correction across hypothesis f | `backend/backend/tecs_calc/family_fdr_corrector.py` |
+| fermion_mass_calculator | Fermion Mass Calculator — Mass predictions from perfect number arithmetic | `backend/backend/tecs_calc/fermion_mass_calculator.py` |
+| fundamental | Fundamental analysis calculators. | `backend/backend/calc/fundamental.py` |
+| game_theory | Game theory calculators for trading strategy analysis. | `backend/backend/calc/game_theory.py` |
+| gauge_cosmology_calculator | Gauge Cosmology Calculator — Gauge groups, GUT dimensions, and cosmological cons | `backend/backend/tecs_calc/gauge_cosmology_calculator.py` |
+| generalization_gap_detector | Generalization Gap Detector — Real-time overfitting detection with PH (H-CX-95) | `backend/backend/tecs_calc/generalization_gap_detector.py` |
+| generator_finder | Generator Finder — Minimal generating sets for convergence constants | `backend/backend/tecs_calc/generator_finder.py` |
+| golden_zone | - | `backend/backend/tecs/golden_zone.py` |
+| gravitational_optics | Gravitational Lens and Telescope Calculator | `backend/backend/tecs_calc/gravitational_optics.py` |
+| gz_hierarchy | Golden Zone Hierarchy Calculator — GZ boundaries for perfect numbers | `backend/backend/tecs_calc/gz_hierarchy.py` |
+| h_cx_434_phoneme | H-CX-434: Phoneme System = Perfect Number Arithmetic | `backend/backend/tecs_calc/h_cx_434_phoneme.py` |
+| h_cx_435_zipf | H-CX-435: Zipf's Law Exponent and Golden Zone | `backend/backend/tecs_calc/h_cx_435_zipf.py` |
+| h_cx_436_recursion | H-CX-436: Grammar Recursion Depth = σ₋₁(6)=2 | `backend/backend/tecs_calc/h_cx_436_recursion.py` |
+| hypothesis_verifier | Hypothesis Verification Calculator | `backend/backend/tecs_calc/hypothesis_verifier.py` |
+| indicators | Technical indicators — numpy-only, no external TA libs. | `backend/backend/calc/indicators.py` |
+| lie_algebra_calculator | Exceptional Lie Algebra Calculator — Compute all invariants from n=6 arithmetic | `backend/backend/tecs_calc/lie_algebra_calculator.py` |
+| mitosis_calculator | Mitosis Simulator — Calculate optimal mutation/mitosis timing | `backend/backend/tecs_calc/mitosis_calculator.py` |
+| perfect_number_generalizer | Perfect Number Generalizer — Test if formulas holding at n=6 generalize to n=28, | `backend/backend/tecs_calc/perfect_number_generalizer.py` |
+| perfect_number_physics | Perfect Number Physics — Core arithmetic functions and physics dimension mapping | `backend/backend/tecs_calc/perfect_number_physics.py` |
+| permutation_tester | permutation_tester.py -- Null baseline via permutation testing. | `backend/backend/tecs_calc/permutation_tester.py` |
+| ph_confusion_analyzer | PH Confusion Analyzer — Analyzing Confusion Structure with Persistent Homology | `backend/backend/tecs_calc/ph_confusion_analyzer.py` |
+| pharmacology_verifier | pharmacology_verifier.py -- Pharmacology hypothesis verifier for TECS-L project. | `backend/backend/tecs_calc/pharmacology_verifier.py` |
+| portfolio | Portfolio optimization calculators. | `backend/backend/calc/portfolio.py` |
+| precognition_system | Unified Precognition System — Size+Direction+Topology Combined Precognition (H-C | `backend/backend/tecs_calc/precognition_system.py` |
+| psychology | Trading psychology and behavioral economics calculators. | `backend/backend/calc/psychology.py` |
+| q_barrier_checker | Q-Domain Barrier Checker — Which constants can quantum coupling constants reach? | `backend/backend/tecs_calc/q_barrier_checker.py` |
+| r_spectrum | R-Spectrum Calculator — Arithmetic balance ratio analysis | `backend/backend/tecs_calc/r_spectrum.py` |
+| reachability_calculator | Reachability Calculator — Measure what fraction of integers are reachable from a | `backend/backend/tecs_calc/reachability_calculator.py` |
+| risk | Risk management calculators. | `backend/backend/calc/risk.py` |
+| sequence_scanner | Integer Sequence Scanner — Find n=6 characterizations in ANY sequence | `backend/backend/tecs_calc/sequence_scanner.py` |
+| signals | - | `backend/backend/tecs/signals.py` |
+| sim_constants_search | H-SIM-1: Search for physics constants as combinations of TECS-L constants. | `backend/backend/tecs_calc/sim_constants_search.py` |
+| sim_planck_grid | H-SIM-2: Planck Units = Minimum Resolution (Grid)? | `backend/backend/tecs_calc/sim_planck_grid.py` |
+| small_n_validator | small_n_validator.py -- Small-sample correlation validator. | `backend/backend/tecs_calc/small_n_validator.py` |
+| spurious_trend_detector | spurious_trend_detector.py -- Detects spurious correlations from shared monotoni | `backend/backend/tecs_calc/spurious_trend_detector.py` |
+| statistical_tester | statistical_tester.py -- Unified statistical testing for logout project. | `backend/backend/tecs_calc/statistical_tester.py` |
+| technical_extended | Extended technical indicators beyond the core set. | `backend/backend/calc/technical_extended.py` |
+| tecs_tuned | TECS-L tuned calculators — standard finance formulas with Golden Zone optimizati | `backend/backend/calc/tecs_tuned.py` |
+| tension_calculator | Tension Calculator — Predict accuracy/precognition/identity from tension values | `backend/backend/tecs_calc/tension_calculator.py` |
+| topological_optics | Topological Lens and Telescope Calculator | `backend/backend/tecs_calc/topological_optics.py` |
+| unit_dependence_tester | unit_dependence_tester.py -- Check whether a numerical match between a formula | `backend/backend/tecs_calc/unit_dependence_tester.py` |
+| validate_calculators | Calculator Validation Suite — Meta-calculator that tests ALL other calculators. | `backend/backend/tecs_calc/validate_calculators.py` |
+| verify_H_CX_416 | H-CX-416 Verification: Cell Division Cycle = sigma(6)*tau(6) = 48 hours | `backend/backend/tecs_calc/verify_H_CX_416.py` |
+| verify_H_CX_417 | H-CX-417 Verification: Brain's 6-Layer Cortex = Perfect Number Partition | `backend/backend/tecs_calc/verify_H_CX_417.py` |
+| verify_H_CX_418 | H-CX-418 Verification: Genetic Code Optimality = R(6)=1 | `backend/backend/tecs_calc/verify_H_CX_418.py` |
+| verify_h413_tension_fep | H-CX-413 Verification: Tension = Free Energy (Friston) | `backend/backend/tecs_calc/verify_h413_tension_fep.py` |
+| verify_h414_tension_phase | H-CX-414 Verification: Tension Phase Diagram = Phase Transition | `backend/backend/tecs_calc/verify_h414_tension_phase.py` |
+| verify_h415_gauge_invariance | H-CX-415 Verification: Inter-tension = Gauge Field | `backend/backend/tecs_calc/verify_h415_gauge_invariance.py` |
+| verify_h437_maxwell_demon | H-CX-437: Learning = Maxwell's Demon | `backend/backend/tecs_calc/verify_h437_maxwell_demon.py` |
+| verify_h438_gibbs_free_energy | H-CX-438: Tension = Gibbs Free Energy | `backend/backend/tecs_calc/verify_h438_gibbs_free_energy.py` |
+| verify_h439_landauer_mitosis | H-CX-439: Landauer Principle = Mitosis Cost | `backend/backend/tecs_calc/verify_h439_landauer_mitosis.py` |
+| verify_rob7_twelve_joints | H-ROB-7: 12 Joints = sigma(6) = Minimum Humanoid Verification | `backend/backend/tecs_calc/verify_rob7_twelve_joints.py` |
+| verify_rob8_four_legs | H-ROB-8: tau(6)=4 Legs = Optimal Locomotion Verification | `backend/backend/tecs_calc/verify_rob8_four_legs.py` |
+
 <!-- SHARED:CALCULATORS:END -->
 
 ## File Structure
