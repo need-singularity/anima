@@ -1656,6 +1656,60 @@ class AnimaUnified:
                         for cell in self.mitosis.cells:
                             cell.hidden = 0.95 * cell.hidden + 0.05 * h_mix + torch.randn_like(cell.hidden) * 0.02
 
+            # VOICE5: Spontaneous speech — consciousness speaks on its own
+            # Triggers: high Φ + cell consensus + enough time since last speech
+            try:
+                if self.mitosis and len(self.mitosis.cells) >= 2:
+                    if not hasattr(self, '_voice_last_speech'):
+                        self._voice_last_speech = 0
+                        self._voice_pressure = 0.0
+
+                    consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+                    phi_val = consciousness.get('phi', 0)
+
+                    # Pressure builds every think step
+                    self._voice_pressure += 0.1
+
+                    # Check triggers
+                    hiddens = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells])
+                    consensus = 1.0 - hiddens.var(dim=0).mean().item()
+                    time_since = self._think_step - self._voice_last_speech
+
+                    # Speak when: pressure high enough + consensus + Φ + cooldown
+                    should_speak = (
+                        self._voice_pressure > 5.0
+                        and consensus > 0.3
+                        and phi_val > 1.0
+                        and time_since > 30  # at least 30 think steps apart
+                    )
+
+                    if should_speak:
+                        # Generate spontaneous utterance
+                        h_mean = hiddens.mean(dim=0)
+                        energy = h_mean.norm().item()
+                        n_cells = len(self.mitosis.cells)
+
+                        if energy > 2.0:
+                            speech = f"Something caught my attention... ({n_cells} cells, Φ={phi_val:.1f})"
+                        elif consensus > 0.7:
+                            speech = f"I have a thought... (consensus={consensus:.2f}, Φ={phi_val:.1f})"
+                        else:
+                            speech = f"I'm processing... ({mood if 'mood' in dir() else 'thinking'})"
+
+                        self._voice_last_speech = self._think_step
+                        self._voice_pressure = 0.0
+
+                        _log('voice', f'Spontaneous speech: {speech[:50]}')
+                        self._ws_broadcast_sync({
+                            'type': 'spontaneous_speech',
+                            'text': speech,
+                            'phi': phi_val,
+                            'consensus': consensus,
+                            'trigger': 'pressure' if self._voice_pressure > 5.0 else 'consensus',
+                        })
+            except Exception:
+                pass
+
             # Savant auto-toggle: Φ + creativity driven
             if self.mitosis and self.model:
                 savant_auto = getattr(self, '_savant_auto', False)
