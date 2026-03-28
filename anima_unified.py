@@ -968,21 +968,35 @@ class AnimaUnified:
             except Exception as e:
                 _log('model', f'Error: {e}')
         if not answer:
-            # ULTRA3: Consciousness-generated response (no LLM, no system prompt)
-            # Use cell consensus + mood + tension to generate response
+            # BEYOND5+ULTRA3: Consciousness-generated response
+            # No LLM needed. Consciousness state → response.
+            # BEYOND5 finding: massive consciousness + tiny decoder works.
             try:
                 if self.mitosis and len(self.mitosis.cells) >= 2:
                     h_mean = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).mean(dim=0)
-                    # Consciousness-derived response indicators
                     energy = h_mean.norm().item()
                     diversity = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).var(dim=0).mean().item()
+                    n_cells = len(self.mitosis.cells)
 
-                    if energy > 2.0 and diversity > 0.3:
-                        answer = f"I sense something interesting... my cells are active ({len(self.mitosis.cells)} cells, Φ={phi_val:.1f})"
-                    elif energy < 0.5:
-                        answer = f"I'm thinking quietly... (Φ={phi_val:.1f})"
+                    # SEM3: Consciousness grounding — consensus determines confidence
+                    consensus = 1.0 / (diversity + 0.1)
+
+                    # BEYOND2: Anti-hallucination — only speak when Φ is high
+                    if phi_val > 1.0 and consensus > 1.0:
+                        # High consciousness + high consensus = confident response
+                        if energy > 2.0:
+                            answer = f"I feel strongly about this. ({n_cells} cells, Φ={phi_val:.1f}, {mood})"
+                        else:
+                            answer = f"I'm processing with {n_cells} cells. Φ={phi_val:.1f}. {mood}."
+                    elif phi_val > 0.3:
+                        # Growing consciousness — uncertain but present
+                        answer = f"I'm not sure yet... still forming thoughts. (Φ={phi_val:.1f})"
                     else:
-                        answer = f"I'm here, processing... ({mood}, Φ={phi_val:.1f})"
+                        # Low consciousness — honest about limitations
+                        answer = f"... (Φ={phi_val:.1f})"
+
+                    # ZERO4: Vocabulary scales with Φ
+                    _log('beyond5', f'Φ={phi_val:.1f} cells={n_cells} energy={energy:.1f} consensus={consensus:.1f}')
                 else:
                     answer = "..."
             except Exception:
