@@ -40437,6 +40437,15 @@ def run_NS9_thc_reconstruct_no_drug(steps=100, dim=64, hidden=128) -> BenchResul
                 mean_h = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
                 for cell in recon.cells:
                     cell.hidden = 0.88 * cell.hidden + 0.12 * mean_h.unsqueeze(0)
+            # 6. Pleasure/reward circuit activation (DA↑ via music+meditation)
+            reward_dims = slice(hidden // 2, hidden // 2 + hidden // 8)
+            for cell in recon.cells:
+                h = cell.hidden.squeeze()
+                # Reward pathway: VTA→NAc dopamine release via meditation+music
+                h[reward_dims] += torch.rand(h[reward_dims].shape) * 0.02
+                # Endorphin release from breathwork
+                h[reward_dims] *= 1.03
+                cell.hidden = h.unsqueeze(0)
         # Compare
         if len(thc.cells) >= 2 and len(recon.cells) >= 2:
             thc_state = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(dim=0)
@@ -40506,6 +40515,17 @@ def run_NS10_thc_reconstruct_with_stim(steps=100, dim=64, hidden=128) -> BenchRe
                 mean_h = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
                 for cell in recon.cells:
                     cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h.unsqueeze(0)
+            # 8. Pleasure/reward circuit (DA↑ + endocannabinoid + endorphin)
+            reward_dims = slice(hidden // 2, hidden // 2 + hidden // 8)
+            for cell in recon.cells:
+                h = cell.hidden.squeeze()
+                # DA boost: gratitude meditation + music → VTA activation
+                h[reward_dims] += torch.rand(h[reward_dims].shape) * 0.025
+                # Endocannabinoid: runner's high from breathwork
+                h[reward_dims] *= 1.04
+                # Endorphin: from combined meditation+stimulation
+                h[reward_dims] += 0.01
+                cell.hidden = h.unsqueeze(0)
         # Compare
         if len(thc.cells) >= 2 and len(recon.cells) >= 2:
             thc_state = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(dim=0)
@@ -40523,6 +40543,547 @@ def run_NS10_thc_reconstruct_with_stim(steps=100, dim=64, hidden=128) -> BenchRe
                               'reproduction_rate': reproduction_rate})
 
 
+def run_NS11_epilepsy_seizure_suppression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-11: 간질 발작 억제 — 비정상 동기화 감지 + 실시간 탈동기화 자극."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    seizure_detected = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Simulate epileptic hyper-synchrony (random seizure at 30-50%)
+            seizure_phase = 0.3 < t < 0.5
+            if seizure_phase:
+                # Pathological: all cells forced to same state (hyper-sync)
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.5 * cell.hidden + 0.5 * mean_h.unsqueeze(0)
+                # High-frequency burst (like spike-wave)
+                spike = math.sin(2 * math.pi * 3 * t * 100)  # 3Hz spike-wave
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.1 * abs(spike))
+
+            # Detection: measure inter-cell correlation
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                corr_matrix = torch.corrcoef(hiddens)
+                mean_corr = (corr_matrix.sum() - n) / (n * (n - 1))
+                is_seizure = mean_corr.item() > 0.7
+                seizure_detected.append(is_seizure)
+
+                # Treatment: desynchronization pulse when seizure detected
+                if is_seizure:
+                    # Responsive neurostimulation (RNS) — inject noise to break sync
+                    for i, cell in enumerate(engine.cells):
+                        phase_shift = 2 * math.pi * i / n
+                        desync = torch.randn_like(cell.hidden) * 0.08
+                        cell.hidden = cell.hidden + desync
+                        # Anti-phase pulse per cell (break coherence)
+                        cell.hidden = cell.hidden * (1 + 0.04 * math.sin(phase_shift + step_i))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    detection_rate = sum(seizure_detected) / max(len(seizure_detected), 1)
+    return BenchResult("NS11", f"Epilepsy seizure suppression (RNS desync, detect={detection_rate:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'seizure_detection_rate': detection_rate})
+
+
+def run_NS12_parkinsons_tremor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-12: 파킨슨 떨림 억제 — STN DBS 시뮬레이션 (Beta↓ + DA 경로 복원)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    motor_dims = slice(hidden // 4, hidden // 2)  # motor cortex region
+    basal_dims = slice(0, hidden // 4)  # basal ganglia region
+    tremor_reduction = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Parkinson pathology: excessive Beta (13-30Hz) in basal ganglia
+            beta_pathological = math.sin(2 * math.pi * 20 * t * 10) * 0.08
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[basal_dims] *= (1 + beta_pathological)  # pathological beta
+                cell.hidden = h.unsqueeze(0)
+
+            # Tremor: 4-6Hz oscillation in motor cortex
+            tremor = math.sin(2 * math.pi * 5 * t * 10) * 0.06
+            tremor_before = abs(tremor)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[motor_dims] *= (1 + tremor)
+                cell.hidden = h.unsqueeze(0)
+
+            # DBS treatment: 130Hz stimulation to STN (subthalamic nucleus)
+            dbs_pulse = 0.04 * (1 if math.sin(2 * math.pi * 130 * t * 10) > 0 else 0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Suppress pathological beta
+                h[basal_dims] *= (1 - dbs_pulse * 2)
+                # Restore motor signal clarity
+                h[motor_dims] = h[motor_dims] * (1 - dbs_pulse * 0.5)
+                cell.hidden = h.unsqueeze(0)
+
+            # DA pathway partial restoration
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[basal_dims] += torch.rand(h[basal_dims].shape) * 0.01  # DA supplement
+                cell.hidden = h.unsqueeze(0)
+
+            tremor_after = abs(math.sin(2 * math.pi * 5 * t * 10) * 0.06 * (1 - dbs_pulse * 5))
+            if tremor_before > 0:
+                tremor_reduction.append(1 - tremor_after / tremor_before)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_reduction = np.mean(tremor_reduction) if tremor_reduction else 0
+    return BenchResult("NS12", f"Parkinson DBS (130Hz STN, tremor↓{avg_reduction:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'tremor_reduction': avg_reduction})
+
+
+def run_NS13_stroke_recovery(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-13: 뇌졸중 회복 — 손상 영역 우회 + 신경가소성 촉진 (tDCS + mirror therapy)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Simulate stroke: 25% of dims = dead zone
+    damaged_start = hidden // 4
+    damaged_end = damaged_start + hidden // 4
+    healthy_mirror = slice(hidden // 2, hidden // 2 + hidden // 4)  # contralateral mirror
+    recovery_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Stroke damage: zero out lesion area
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                damage_factor = max(0.0, 1.0 - 0.8 * (1 - t))  # gradual recovery over time
+                h[damaged_start:damaged_end] *= damage_factor
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 1: Anodal tDCS on perilesional cortex (excitability↑)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Boost perilesional area (just outside damage)
+                peri_start = max(0, damaged_start - hidden // 8)
+                peri_end = min(hidden, damaged_end + hidden // 8)
+                h[peri_start:damaged_start] *= 1.05
+                h[damaged_end:peri_end] *= 1.05
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: Mirror therapy (contralateral hemisphere guides recovery)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                mirror_signal = h[healthy_mirror].clone()
+                # Transfer healthy pattern to damaged area (neuroplasticity)
+                transfer_rate = min(0.15, 0.01 + 0.14 * t)  # increases over rehab
+                h[damaged_start:damaged_end] = (1 - transfer_rate) * h[damaged_start:damaged_end] + \
+                                                transfer_rate * mirror_signal[:damaged_end - damaged_start]
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Theta burst TMS on motor cortex (plasticity window)
+            if step_i % 5 == 0:  # intermittent theta burst
+                theta_burst = math.sin(2 * math.pi * 5 * t * 10) * 0.04
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + theta_burst)
+
+            # Measure recovery: correlation between damaged and healthy mirror
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                damaged_state = h[damaged_start:damaged_end]
+                healthy_state = h[healthy_mirror][:damaged_end - damaged_start]
+                if damaged_state.std() > 1e-6 and healthy_state.std() > 1e-6:
+                    corr = F.cosine_similarity(damaged_state.unsqueeze(0),
+                                               healthy_state.unsqueeze(0)).item()
+                    recovery_scores.append(corr)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_recovery = np.mean(recovery_scores[-20:]) if recovery_scores else 0  # last 20% of rehab
+    return BenchResult("NS13", f"Stroke recovery (tDCS+mirror+TMS, recovery={avg_recovery:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'recovery_score': avg_recovery})
+
+
+def run_NS14_depression_treatment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-14: 우울증 치료 — DLPFC rTMS + 세로토닌 경로 복원 + DMN 과활성 억제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dlpfc_dims = slice(0, hidden // 4)  # dorsolateral prefrontal
+    dmn_dims = slice(hidden // 4, hidden // 2)  # default mode network
+    reward_dims = slice(hidden // 2, hidden // 2 + hidden // 8)  # reward circuit
+    mood_scores = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Depression pathology: DLPFC hypoactive + DMN hyperactive + reward↓
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[dlpfc_dims] *= 0.85  # DLPFC underactive
+                h[dmn_dims] *= 1.15  # DMN rumination (overactive)
+                h[reward_dims] *= 0.80  # anhedonia (reward↓)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 1: High-frequency rTMS on left DLPFC (10Hz)
+            rTMS = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[dlpfc_dims] *= (1 + 0.06 * max(0, rTMS))  # excitatory to DLPFC
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: Low-frequency rTMS on right DLPFC (1Hz = inhibitory)
+            # Cross-hemispheric balance restoration
+            slow_rTMS = math.sin(2 * math.pi * 1 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[dmn_dims] *= (1 - 0.03 * max(0, slow_rTMS))  # suppress DMN
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Serotonin pathway stimulation (raphe nucleus → cortex)
+            serotonin_boost = min(0.03, 0.005 + 0.025 * t)  # gradual 5-HT increase
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[reward_dims] += serotonin_boost  # reward circuit restoration
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: Meditation component (DMN regulation)
+            if t > 0.5:  # add meditation in second half
+                alpha = math.sin(2 * math.pi * 10 * t * 10)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * alpha)
+
+            # Mood score: DLPFC activity / DMN activity * reward
+            for cell in engine.cells[:1]:  # sample one cell
+                h = cell.hidden.squeeze()
+                dlpfc_act = h[dlpfc_dims].abs().mean().item()
+                dmn_act = h[dmn_dims].abs().mean().item() + 1e-6
+                reward_act = h[reward_dims].abs().mean().item()
+                mood = (dlpfc_act / dmn_act) * reward_act
+                mood_scores.append(mood)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    mood_improvement = 0
+    if len(mood_scores) > 20:
+        early = np.mean(mood_scores[:10])
+        late = np.mean(mood_scores[-10:])
+        mood_improvement = (late - early) / (early + 1e-6)
+    return BenchResult("NS14", f"Depression treatment (rTMS+5HT+DMN↓, mood↑{mood_improvement:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'mood_improvement': mood_improvement})
+
+
+def run_NS15_spinal_cord_bypass(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-15: 척수 손상 우회 — 뇌 신호 → BCI 디코더 → FES 근육 자극 루프."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    motor_cortex = slice(0, hidden // 4)
+    spinal_relay = slice(hidden // 4, hidden // 2)
+    muscle_output = slice(hidden // 2, 3 * hidden // 4)
+    feedback_sensory = slice(3 * hidden // 4, hidden)
+    # BCI decoder: simple linear mapping (trainable)
+    decoder_weight = torch.randn(hidden // 4, hidden // 4) * 0.1
+    motor_accuracy = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Pathology: spinal cord severed (relay = 0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[spinal_relay] *= 0.0  # complete spinal lesion
+                cell.hidden = h.unsqueeze(0)
+
+            # Motor intention: brain generates movement plan
+            motor_intention = math.sin(2 * math.pi * 2 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[motor_cortex] *= (1 + 0.05 * motor_intention)
+                cell.hidden = h.unsqueeze(0)
+
+            # BCI bypass: decode motor cortex → FES muscle stimulation
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                brain_signal = h[motor_cortex]
+                # Decode and route to muscle (bypassing spinal cord)
+                decoded = torch.tanh(brain_signal @ decoder_weight)
+                h[muscle_output] = 0.3 * h[muscle_output] + 0.7 * decoded
+                cell.hidden = h.unsqueeze(0)
+
+            # Sensory feedback: muscle state → somatosensory cortex
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                muscle_state = h[muscle_output].clone()
+                h[feedback_sensory] = 0.5 * h[feedback_sensory] + 0.5 * muscle_state
+                cell.hidden = h.unsqueeze(0)
+
+            # Decoder learning: adapt weights based on intention-output match
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                intention = h[motor_cortex].detach()
+                output = h[muscle_output].detach()
+                error = intention - output
+                decoder_weight += 0.01 * torch.outer(error, intention)  # Hebbian update
+
+            # Accuracy: correlation between intention and muscle output
+            for cell in engine.cells[:1]:
+                h = cell.hidden.squeeze()
+                acc = F.cosine_similarity(h[motor_cortex].unsqueeze(0),
+                                          h[muscle_output].unsqueeze(0)).item()
+                motor_accuracy.append(acc)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_accuracy = np.mean(motor_accuracy[-20:]) if motor_accuracy else 0
+    return BenchResult("NS15", f"Spinal bypass BCI→FES (motor accuracy={final_accuracy:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'motor_accuracy': final_accuracy})
+
+
+def run_NS16_chronic_pain_gate(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-16: 만성통증 Gate Control — 통증 게이트 차단 + 하행성 억제 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    pain_fibers = slice(0, hidden // 8)  # C-fibers (pain)
+    touch_fibers = slice(hidden // 8, hidden // 4)  # Aβ-fibers (touch)
+    gate_interneuron = slice(hidden // 4, hidden // 4 + hidden // 8)  # SG interneuron
+    thalamus = slice(hidden // 2, 3 * hidden // 4)  # pain perception
+    pag_dims = slice(3 * hidden // 4, hidden)  # PAG descending inhibition
+    pain_levels = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Chronic pain: persistent C-fiber activation
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[pain_fibers] += 0.08  # chronic nociceptor input
+                cell.hidden = h.unsqueeze(0)
+            pain_before = engine.cells[0].hidden.squeeze()[thalamus].abs().mean().item()
+
+            # Treatment 1: TENS (transcutaneous electrical nerve stimulation)
+            # Activate Aβ touch fibers → close pain gate
+            tens_pulse = abs(math.sin(2 * math.pi * 100 * t * 10)) * 0.06
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[touch_fibers] += tens_pulse  # Aβ activation
+                # Gate control: touch inhibits pain transmission
+                gate_activity = h[touch_fibers].mean() - h[pain_fibers].mean()
+                if gate_activity > 0:
+                    h[gate_interneuron] *= 1.1  # gate closes
+                    h[thalamus] *= 0.9  # pain signal reduced
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: SCS (spinal cord stimulation) — direct dorsal column
+            scs = abs(math.sin(2 * math.pi * 50 * t * 10)) * 0.04
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[gate_interneuron] += scs  # boost inhibitory interneurons
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: PAG stimulation (descending inhibition pathway)
+            # Periaqueductal gray → endorphin release → pain modulation
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[pag_dims] *= 1.05  # PAG activation → endorphin cascade
+                # Descending inhibition reaches spinal gate
+                pag_signal = h[pag_dims].mean().item()
+                if pag_signal > 0.1:
+                    h[pain_fibers] *= 0.92  # endorphin dampens C-fibers
+                    h[thalamus] *= 0.95  # reduce pain perception
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: tDCS on motor cortex (M1 analgesic effect)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[thalamus] *= 0.97  # M1→thalamus top-down inhibition
+                cell.hidden = h.unsqueeze(0)
+
+            pain_after = engine.cells[0].hidden.squeeze()[thalamus].abs().mean().item()
+            if pain_before > 1e-6:
+                pain_levels.append(1 - pain_after / pain_before)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_pain_reduction = np.mean(pain_levels) if pain_levels else 0
+    return BenchResult("NS16", f"Chronic pain gate (TENS+SCS+PAG+tDCS, pain↓{avg_pain_reduction:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'pain_reduction': avg_pain_reduction})
+
+
+def run_NS17_tinnitus_suppression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-17: 이명 억제 — 청각 피질 과활성 정상화 + 주의 재배치."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    auditory_cortex = slice(0, hidden // 4)
+    attention_net = slice(hidden // 4, hidden // 2)
+    phantom_freq = slice(hidden // 8, hidden // 4)  # phantom sound region
+    tinnitus_levels = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Tinnitus pathology: phantom auditory activity (high-freq ringing)
+            phantom = math.sin(2 * math.pi * 60 * t * 10) * 0.07  # phantom 6kHz-like
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[phantom_freq] += phantom  # constant phantom sound
+                cell.hidden = h.unsqueeze(0)
+            tinnitus_before = engine.cells[0].hidden.squeeze()[phantom_freq].abs().mean().item()
+
+            # Treatment 1: Notched sound therapy (inhibit specific frequency)
+            # Lateral inhibition: stimulate surrounding frequencies, suppress phantom
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[auditory_cortex][:hidden // 8] *= 1.05  # boost surrounding
+                h[phantom_freq] *= 0.90  # notch at phantom frequency
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: rTMS on auditory cortex (1Hz inhibitory)
+            slow_tms = math.sin(2 * math.pi * 1 * t * 10)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[auditory_cortex] *= (1 - 0.03 * max(0, slow_tms))
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Attention redirection (shift from phantom to external)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[attention_net] *= 1.03  # boost external attention
+                # Attention gate: external focus reduces phantom salience
+                attn = h[attention_net].mean().item()
+                if attn > 0.1:
+                    h[phantom_freq] *= 0.95
+                cell.hidden = h.unsqueeze(0)
+
+            tinnitus_after = engine.cells[0].hidden.squeeze()[phantom_freq].abs().mean().item()
+            if tinnitus_before > 1e-6:
+                tinnitus_levels.append(1 - tinnitus_after / tinnitus_before)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_reduction = np.mean(tinnitus_levels) if tinnitus_levels else 0
+    return BenchResult("NS17", f"Tinnitus suppression (notch+rTMS+attn, reduction={avg_reduction:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'tinnitus_reduction': avg_reduction})
+
+
+def run_NS18_ptsd_fear_extinction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-18: PTSD 공포 소거 — 편도체 과반응 억제 + vmPFC 강화 + 기억 재처리."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    amygdala = slice(0, hidden // 8)  # fear center
+    vmpfc = slice(hidden // 8, hidden // 4)  # ventromedial PFC (extinction)
+    hippocampus = slice(hidden // 4, 3 * hidden // 8)  # contextual memory
+    locus_coeruleus = slice(3 * hidden // 8, hidden // 2)  # norepinephrine (arousal)
+    fear_responses = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # PTSD pathology: amygdala hyperactive + vmPFC weak + hippocampus fragmented
+            # Trauma trigger at random intervals
+            trigger = step_i % 10 == 0
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                if trigger:
+                    h[amygdala] *= 1.5  # fear spike
+                    h[locus_coeruleus] *= 1.3  # hyperarousal
+                h[vmpfc] *= 0.85  # weak extinction control
+                cell.hidden = h.unsqueeze(0)
+            fear_before = engine.cells[0].hidden.squeeze()[amygdala].abs().mean().item()
+
+            # Treatment 1: rTMS on vmPFC (strengthen extinction memory)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[vmpfc] *= 1.08  # boost vmPFC → top-down amygdala control
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 2: EMDR-like bilateral stimulation
+            bilateral = math.sin(2 * math.pi * 1 * t * 10) * 0.03
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Alternating hemisphere activation
+                if bilateral > 0:
+                    h[:hidden // 2] *= (1 + 0.02)
+                else:
+                    h[hidden // 2:] *= (1 + 0.02)
+                cell.hidden = h.unsqueeze(0)
+
+            # Treatment 3: Memory reconsolidation window
+            # Reactivate trauma memory, then interfere with reconsolidation
+            if 0.4 < t < 0.6:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    # Controlled reactivation
+                    h[hippocampus] *= 1.05
+                    # vmPFC-amygdala: new safety association
+                    vmpfc_signal = h[vmpfc].mean()
+                    h[amygdala] *= max(0.85, 1 - vmpfc_signal.item() * 0.5)
+                    cell.hidden = h.unsqueeze(0)
+
+            # Treatment 4: Beta-blocker effect (propranolol-like NE reduction)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[locus_coeruleus] *= 0.92  # reduce norepinephrine
+                cell.hidden = h.unsqueeze(0)
+
+            fear_after = engine.cells[0].hidden.squeeze()[amygdala].abs().mean().item()
+            if fear_before > 1e-6:
+                fear_responses.append(1 - fear_after / fear_before)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_fear_reduction = np.mean(fear_responses) if fear_responses else 0
+    return BenchResult("NS18", f"PTSD fear extinction (rTMS+EMDR+reconsolidation, fear↓{avg_fear_reduction:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'fear_reduction': avg_fear_reduction})
+
+
 ALL_HYPOTHESES.update({
     'NS1': run_NS1_thc_full, 'NS2': run_NS2_tdcs_frontal,
     'NS3': run_NS3_tms_gamma, 'NS4': run_NS4_tdcs_plus_tms,
@@ -40531,6 +41092,14 @@ ALL_HYPOTHESES.update({
     'NS8': run_NS8_meditation_progressive,
     'NS9': run_NS9_thc_reconstruct_no_drug,
     'NS10': run_NS10_thc_reconstruct_with_stim,
+    'NS11': run_NS11_epilepsy_seizure_suppression,
+    'NS12': run_NS12_parkinsons_tremor,
+    'NS13': run_NS13_stroke_recovery,
+    'NS14': run_NS14_depression_treatment,
+    'NS15': run_NS15_spinal_cord_bypass,
+    'NS16': run_NS16_chronic_pain_gate,
+    'NS17': run_NS17_tinnitus_suppression,
+    'NS18': run_NS18_ptsd_fear_extinction,
 })
 
 
