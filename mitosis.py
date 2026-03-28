@@ -237,21 +237,39 @@ class MitosisEngine:
             cell_tensions.append(tension)
             cell_repulsions.append(repulsion)
 
-        # --- Compute inter-cell tensions ---
+        # --- Compute inter-cell tensions (O(N) sampled for large N) ---
         inter_tensions = {}
-        for i in range(len(self.cells)):
-            for j in range(i + 1, len(self.cells)):
-                diff = cell_repulsions[i] - cell_repulsions[j]
-                ict = (diff ** 2).mean().item()
-                key = (self.cells[i].cell_id, self.cells[j].cell_id)
-                inter_tensions[key] = ict
+        n = len(self.cells)
+        if n <= 32:
+            # Small N: full O(N²) — exact
+            pairs = [(i, j) for i in range(n) for j in range(i+1, n)]
+        else:
+            # Large N: sample ~32 neighbors per cell (O(N) total ~N×4 pairs)
+            import random
+            pairs = set()
+            for i in range(n):
+                # Always check immediate neighbors + random sample
+                for j in [(i+1) % n, (i-1) % n, (i+n//2) % n]:
+                    if i != j:
+                        pairs.add((min(i,j), max(i,j)))
+                # Random sample
+                for _ in range(min(4, n-1)):
+                    j = random.randint(0, n-1)
+                    if i != j:
+                        pairs.add((min(i,j), max(i,j)))
+            pairs = list(pairs)
 
-                if key not in self._inter_tension_history:
-                    self._inter_tension_history[key] = []
-                self._inter_tension_history[key].append(ict)
-                # Keep last 30 values
-                if len(self._inter_tension_history[key]) > 30:
-                    self._inter_tension_history[key] = self._inter_tension_history[key][-30:]
+        for i, j in pairs:
+            diff = cell_repulsions[i] - cell_repulsions[j]
+            ict = (diff ** 2).mean().item()
+            key = (self.cells[i].cell_id, self.cells[j].cell_id)
+            inter_tensions[key] = ict
+
+            if key not in self._inter_tension_history:
+                self._inter_tension_history[key] = []
+            self._inter_tension_history[key].append(ict)
+            if len(self._inter_tension_history[key]) > 30:
+                self._inter_tension_history[key] = self._inter_tension_history[key][-30:]
 
         # --- Combined output (tension-weighted average) ---
         if cell_tensions:
