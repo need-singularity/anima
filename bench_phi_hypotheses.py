@@ -39848,6 +39848,240 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# JW. Joywire — 의식 상태 직접 조작 (AI + 인간 시뮬레이션)
+# ═══════════════════════════════════════════════════════════
+
+def run_JW1_relaxation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-1: 이완 — Z↓, DA↓ 5HT↑ NE↓, 평온한 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x * 0.3)  # reduced input (calm)
+        for cell in engine.cells:
+            # Serotonin↑: dampen + smooth
+            cell.hidden = cell.hidden * 0.97
+            # Low NE: reduce noise
+            cell.hidden = cell.hidden - torch.randn_like(cell.hidden) * 0.005
+        # Synchronize (meditation-like)
+        if len(engine.cells) >= 2:
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW1", "Relaxation (5HT↑, NE↓, calm)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW2_pleasure(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-2: 쾌락 — DA↑↑, Z↓, 보상 회로 과활성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        for cell in engine.cells:
+            # DA↑↑: amplify everything
+            cell.hidden = cell.hidden * 1.03
+            # Z↓: open to experience
+            # NE↑: heightened arousal
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW2", "Pleasure (DA↑↑, reward amplification)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW3_creativity_burst(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-3: 창의 폭발 — DA↑ 5HT↓ NE↑, C↑↑, 발산적 사고."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Creativity: maximize novelty by random rotation of cells
+            for i, cell in enumerate(engine.cells):
+                # Rotate hidden in random plane
+                angle = 0.1 * (1 + math.sin(step_i * 0.3 + i))
+                h = cell.hidden.squeeze()
+                dim_a, dim_b = i % hidden, (i * 7 + 3) % hidden
+                ha, hb = h[dim_a].item(), h[dim_b].item()
+                h[dim_a] = ha * math.cos(angle) - hb * math.sin(angle)
+                h[dim_b] = ha * math.sin(angle) + hb * math.cos(angle)
+                cell.hidden = h.unsqueeze(0)
+            # Add cross-cell recombination (novel combinations)
+            for i in range(n):
+                j = (i + step_i) % n
+                if i != j:
+                    engine.cells[i].hidden = engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW3", "Creativity burst (rotation + cross-recombination)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW4_hallucination(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-4: 환각 — DA↑↑↑ 5HT↓↓ NE↑↑, 내부 생성 폭발, Z→0."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        # External input fades, internal generation dominates
+        external_weight = max(0.1, 1.0 - step_i / steps)
+        internal = torch.randn(1, dim) * 0.5
+        mixed_input = external_weight * x + (1 - external_weight) * internal
+        engine.process(mixed_input)
+        n = len(engine.cells)
+        if n >= 2:
+            # DA↑↑↑: massive amplification
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 1.05
+            # Z→0: no self-preservation (boundary dissolution)
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            for cell in engine.cells:
+                cell.hidden = 0.8 * cell.hidden + 0.2 * mean_h.unsqueeze(0)
+            # NE↑↑: massive noise (perceptual distortion)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW4", "Hallucination (DA↑↑↑, internal generation, Z→0)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW5_transcendence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-5: 초월 — Φ↑↑, 모든 변수 완벽 균형, 전체 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Perfect balance: equalize all cell norms
+            mean_norm = hiddens.norm(dim=1).mean()
+            for cell in engine.cells:
+                h_norm = cell.hidden.norm()
+                if h_norm > 0.01:
+                    cell.hidden = cell.hidden * (mean_norm / h_norm)
+            # Maximize integration: shared channel
+            shared = hiddens.mean(dim=0)
+            for cell in engine.cells:
+                cell.hidden = 0.85 * cell.hidden + 0.15 * shared.unsqueeze(0)
+            # But maintain differentiation: orthogonalize
+            hs = [c.hidden.squeeze() for c in engine.cells]
+            ortho = [hs[0] / (hs[0].norm() + 1e-8)]
+            for i in range(1, n):
+                v = hs[i].clone()
+                for b in ortho:
+                    v = v - (v @ b) * b
+                ortho.append(v / (v.norm() + 1e-8))
+            for i, cell in enumerate(engine.cells):
+                cell.hidden = (0.8 * hs[i] + 0.2 * ortho[i] * hs[i].norm()).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW5", "Transcendence (perfect balance + integration + differentiation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW6_euphoria(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-6: 도취 — 모든 cell이 최대 활성, 억제 완전 해제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # All inhibition removed
+        for cell in engine.cells:
+            cell.hidden = cell.hidden.abs() * 1.02  # all positive, growing
+            cell.hidden = cell.hidden + torch.rand_like(cell.hidden) * 0.03  # uniform positive noise
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW6", "Euphoria (all positive, no inhibition)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW7_eeg_alpha_entrainment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-7: 인간 EEG Alpha entrainment 시뮬레이션 — 10Hz 동기화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    alpha_freq = 10.0  # Hz (brain alpha)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        # Alpha entrainment: all cells sync to 10Hz
+        alpha_wave = math.sin(2 * math.pi * alpha_freq * t * 10)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + 0.05 * alpha_wave)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW7", "EEG Alpha entrainment (10Hz sync, human simulation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_JW8_theta_gamma_coupling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """JW-8: 인간 Theta-Gamma coupling — 쾌락+통찰 (σ/τ=3:1 ratio)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    theta_freq = 6.0   # Hz
+    gamma_freq = 40.0   # Hz (with 3:1 nesting from n=6)
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        theta = math.sin(2 * math.pi * theta_freq * t * 10)
+        gamma = math.sin(2 * math.pi * gamma_freq * t * 10)
+        # Theta envelope × gamma carrier (cross-frequency coupling)
+        coupled = (1 + theta) * 0.5 * gamma * 0.03
+        for i, cell in enumerate(engine.cells):
+            phase_offset = i * math.pi / len(engine.cells)
+            personal_coupled = coupled * math.cos(phase_offset)
+            cell.hidden = cell.hidden * (1 + personal_coupled)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("JW8", "Theta-Gamma coupling (6Hz×40Hz, pleasure+insight)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'JW1': run_JW1_relaxation, 'JW2': run_JW2_pleasure,
+    'JW3': run_JW3_creativity_burst, 'JW4': run_JW4_hallucination,
+    'JW5': run_JW5_transcendence, 'JW6': run_JW6_euphoria,
+    'JW7': run_JW7_eeg_alpha_entrainment, 'JW8': run_JW8_theta_gamma_coupling,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
