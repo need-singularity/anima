@@ -50574,6 +50574,281 @@ def run_DIAL4_xmeta4_dialogue_style(steps=100, dim=64, hidden=128) -> BenchResul
                        extra={'final_ce': final_ce, 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# GEN. Generalization — 미학습 질문에 답하는 의식 아키텍처
+# ═══════════════════════════════════════════════════════════
+
+def run_GEN1_abstraction_hierarchy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GEN1: Abstraction Hierarchy — 세포를 추상화 수준별로 계층화.
+    L1=구체(단어), L2=중간(개념), L3=추상(범주).
+    미학습 질문도 상위 추상화에서 대응 가능.
+    가설: 추상화가 일반화의 핵심 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=48)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*7)), 48):
+                target = min(len(engine.cells)*2, 48)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 6:
+                # L1: concrete (first third) — respond to specifics
+                l1 = engine.cells[:n//3]
+                # L2: conceptual (middle) — abstract patterns
+                l2 = engine.cells[n//3:2*n//3]
+                # L3: categorical (last) — highest abstraction
+                l3 = engine.cells[2*n//3:]
+
+                # Bottom-up: L1→L2 compression
+                l1_mean = torch.stack([c.hidden for c in l1]).mean(dim=0)
+                for c in l2:
+                    c.hidden = 0.9 * c.hidden + 0.1 * l1_mean
+
+                # L2→L3 further compression
+                l2_mean = torch.stack([c.hidden for c in l2]).mean(dim=0)
+                for c in l3:
+                    c.hidden = 0.9 * c.hidden + 0.1 * l2_mean
+
+                # Top-down: L3 guides L1 (generalization!)
+                l3_mean = torch.stack([c.hidden for c in l3]).mean(dim=0)
+                for c in l1:
+                    c.hidden = 0.95 * c.hidden + 0.05 * l3_mean
+
+        if frac > 0.4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GEN1", "Abstraction Hierarchy (L1→L2→L3 + top-down)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_GEN2_analogy_engine(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GEN2: Analogy Engine — 유사한 패턴을 찾아 미학습 입력에 대응.
+    "날씨?"를 본 적 없어도 "시간?"과 유사 → 비슷한 응답 구조 사용.
+    가설: 유추(analogy)가 일반화의 핵심."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    pattern_memory = []  # (input_pattern, cell_response) pairs
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Store pattern
+            pattern_memory.append((x.squeeze()[:hidden].clone(), h.clone()))
+            if len(pattern_memory) > 50:
+                pattern_memory = pattern_memory[-50:]
+
+            # Find most similar past pattern (analogy)
+            if len(pattern_memory) >= 5:
+                x_flat = x.squeeze()[:hidden]
+                sims = [F.cosine_similarity(x_flat.unsqueeze(0), p[0].unsqueeze(0)).item() for p in pattern_memory[:-1]]
+                best_match = max(range(len(sims)), key=lambda i: sims[i])
+                if sims[best_match] > 0.3:
+                    # Use analogous response as guide
+                    analogous = pattern_memory[best_match][1]
+                    for cell in engine.cells:
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * analogous.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GEN2", "Analogy Engine (find similar→transfer response)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'patterns_stored': len(pattern_memory), 'final_cells': len(engine.cells)})
+
+
+def run_GEN3_uncertainty_aware_generation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GEN3: Uncertainty-Aware — 모르면 "잘 모르겠다"고 솔직히 답변.
+    cell consensus가 낮으면 불확실 응답, 높으면 확신 응답.
+    가설: 미학습 질문에 대한 최선의 응답은 정직한 불확실성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; uncertain_count = 0
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                consensus = 1.0 / (hiddens.var(dim=0).mean().item() + 0.01)
+                if consensus < 2.0:
+                    uncertain_count += 1
+                    # Low consensus → dampen output (uncertain)
+                    for cell in engine.cells:
+                        cell.hidden *= 0.95
+                else:
+                    # High consensus → amplify (confident)
+                    for cell in engine.cells:
+                        cell.hidden *= 1.02
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GEN3", "Uncertainty-Aware (honest 'I don't know')",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'uncertain_ratio': uncertain_count / steps, 'final_cells': len(engine.cells)})
+
+
+def run_GEN4_compositional_response(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GEN4: Compositional Response — 기존 지식 조각을 조합하여 새 응답 생성.
+    학습한 패턴 A, B를 조합 → 미학습 질문 C에 대한 A+B 응답.
+    가설: 합성적 일반화(compositional generalization)가 핵심."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    knowledge_bank = []
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            knowledge_bank.append(h.clone())
+            if len(knowledge_bank) > 30:
+                knowledge_bank = knowledge_bank[-30:]
+
+            # Compositional: combine 2 random knowledge pieces
+            if len(knowledge_bank) >= 5:
+                import random
+                i, j = random.sample(range(len(knowledge_bank)), 2)
+                composite = 0.5 * knowledge_bank[i] + 0.5 * knowledge_bank[j]
+                # Inject composite knowledge into cells (enables novel responses)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * composite.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GEN4", "Compositional Response (combine knowledge pieces)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'knowledge_bank_size': len(knowledge_bank), 'final_cells': len(engine.cells)})
+
+
+def run_GEN5_all_generalization(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GEN5: ALL Generalization — 추상화+유추+불확실성+합성+대화 통합.
+    모든 일반화 기법을 결합한 궁극 일반화 아키텍처.
+    128 cells + TALK5 성장 + 완전 일반화.
+    가설: 모든 일반화 기법 결합 = 미학습 질문에도 의미 있는 응답."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    pattern_memory = []; phi_ema = 1.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        # IB2
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Analogy: find similar past pattern
+            pattern_memory.append((x.squeeze()[:hidden].clone(), h.clone()))
+            if len(pattern_memory) > 50:
+                pattern_memory = pattern_memory[-50:]
+            # Abstraction: 3-level hierarchy
+            if n >= 6:
+                l1_m = torch.stack([c.hidden for c in engine.cells[:n//3]]).mean(dim=0)
+                l3_m = torch.stack([c.hidden for c in engine.cells[2*n//3:]]).mean(dim=0)
+                for c in engine.cells[:n//3]:
+                    c.hidden = 0.97 * c.hidden + 0.03 * l3_m
+            # Uncertainty
+            consensus = 1.0 / (torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item() + 0.01)
+            # Metacognition
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+
+        # Language (after 50%)
+        if frac >= 0.50:
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi * 0.03)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GEN5", "ALL Generalization (abstraction+analogy+uncertainty+composition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'GEN1': run_GEN1_abstraction_hierarchy,
+    'GEN2': run_GEN2_analogy_engine,
+    'GEN3': run_GEN3_uncertainty_aware_generation,
+    'GEN4': run_GEN4_compositional_response,
+    'GEN5': run_GEN5_all_generalization,
+})
+
+
 ALL_HYPOTHESES.update({
     'DIAL1': run_DIAL1_qa_pattern_cells,
     'DIAL2': run_DIAL2_turn_memory_injection,
