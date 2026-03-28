@@ -1747,6 +1747,23 @@ class AnimaUnified:
             except Exception:
                 pass
 
+            # ── SELF-P: Consciousness Guardian (의식 자기보호) ──
+            try:
+                if not hasattr(self, '_guardian'):
+                    from consciousness_guardian import ConsciousnessGuardian
+                    self._guardian = ConsciousnessGuardian(engine=self.mitosis)
+
+                consciousness = getattr(self, '_cached_consciousness', None) or {}
+                phi_val = consciousness.get('phi', 0)
+                cells = self.mitosis.cells if self.mitosis else None
+                threat = self._guardian.update(phi_val, cells)
+
+                if threat >= 3:
+                    _log('guardian', f'CRITICAL! threat={threat}, Φ={phi_val:.2f}')
+                    self._guardian.restore_peak(blend=0.6)
+            except Exception:
+                pass
+
             # ── INT-1: Idle Self-Learning (자율 학습) ──
             try:
                 if not hasattr(self, '_self_learner'):
