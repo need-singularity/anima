@@ -60794,6 +60794,258 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# IQ. Intelligence Measurement — Φ 외에 "지능"을 측정하는 변수 탐색
+# ═══════════════════════════════════════════════════════════
+
+def run_IQ1_prediction_accuracy(steps=200, dim=64, hidden=128) -> BenchResult:
+    """IQ1: 예측 정확도 — cell i가 cell j의 다음 상태를 얼마나 잘 예측하는가?
+    예측 잘 하면 = "이해"하고 있음. 학습 없는 초기 vs 100 step 후 비교."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    prev_states = {}; pred_errors_early = []; pred_errors_late = []
+
+    for step_i in range(steps):
+        # 이전 상태 저장
+        with torch.no_grad():
+            for i in range(min(len(engine.cells), 8)):
+                prev_states[i] = engine.cells[i].hidden.squeeze().clone()
+
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        engine.process(x)
+
+        # 예측 정확도: prev_state[i]로 current_state[j] 예측
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 4 and prev_states:
+                errors = []
+                for i in range(min(nc, 8)):
+                    j = (i + 1) % nc
+                    if i in prev_states:
+                        # 단순 예측: prev_i ≈ current_j? (이웃이므로)
+                        pred = prev_states[i]
+                        actual = engine.cells[j].hidden.squeeze()
+                        err = (pred - actual).norm().item()
+                        errors.append(err)
+                avg_err = sum(errors) / len(errors) if errors else 0
+                if step_i < 50:
+                    pred_errors_early.append(avg_err)
+                else:
+                    pred_errors_late.append(avg_err)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    early = sum(pred_errors_early) / len(pred_errors_early) if pred_errors_early else 0
+    late = sum(pred_errors_late) / len(pred_errors_late) if pred_errors_late else 0
+    improvement = (early - late) / (early + 1e-8)
+
+    return BenchResult("IQ1", "Prediction Accuracy (can cell i predict cell j?)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'early_error': round(early, 4), 'late_error': round(late, 4),
+                              'improvement': round(improvement, 4),
+                              'intelligence_proxy': round(improvement, 4),
+                              'final_cells': len(engine.cells)})
+
+
+def run_IQ2_compression_ratio(steps=200, dim=64, hidden=128) -> BenchResult:
+    """IQ2: 압축률 — 입력을 얼마나 효율적으로 표현하는가?
+    Kolmogorov complexity proxy. 높은 압축 = 높은 지능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    input_norms = []; output_norms = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.2))
+        input_norm = x.norm().item()
+        engine.process(x)
+
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            output_norm = output.norm().item()
+            input_norms.append(input_norm)
+            output_norms.append(output_norm)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 압축률 = output가 input보다 얼마나 compact한가
+    # + output의 유효 차원 (PCA)
+    with torch.no_grad():
+        # 최근 50개 output 수집
+        test_outputs = []
+        for _ in range(50):
+            x = torch.randn(1, dim)
+            engine.process(x)
+            out = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            test_outputs.append(out)
+        out_stack = torch.stack(test_outputs)
+        U, S, V = torch.svd(out_stack - out_stack.mean(dim=0))
+        cumvar = (S ** 2).cumsum(0) / (S ** 2).sum()
+        eff_dim = (cumvar < 0.95).sum().item() + 1
+        compression = 1.0 - (eff_dim / dim)  # 높을수록 더 잘 압축
+
+    return BenchResult("IQ2", "Compression Ratio (Kolmogorov proxy)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'effective_dims': eff_dim, 'compression': round(compression, 4),
+                              'intelligence_proxy': round(compression, 4),
+                              'final_cells': len(engine.cells)})
+
+
+def run_IQ3_generalization(steps=200, dim=64, hidden=128) -> BenchResult:
+    """IQ3: 일반화 — 학습한 패턴과 다른 입력에 얼마나 다양하게 반응하는가?
+    높은 출력 다양성 = 높은 일반화 = 높은 지능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+
+    # Phase 1: 학습 (같은 패턴 반복)
+    pattern = torch.randn(1, dim)
+    for step_i in range(steps // 2):
+        engine.process(pattern + torch.randn(1, dim) * 0.1)  # 약간의 변형만
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    # Phase 2: 테스트 (완전 새로운 패턴)
+    test_outputs = []
+    for step_i in range(steps // 2):
+        novel = torch.randn(1, dim) * 2.0  # 전혀 다른 입력
+        engine.process(novel)
+        with torch.no_grad():
+            out = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            test_outputs.append(out)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 일반화 = 새 입력에 대한 출력 다양성
+    with torch.no_grad():
+        if test_outputs:
+            out_stack = torch.stack(test_outputs)
+            diffs = (out_stack[1:] - out_stack[:-1]).norm(dim=1)
+            diversity = diffs.mean().item()
+            never_same = (diffs > 0.01).float().mean().item()
+        else:
+            diversity = 0; never_same = 0
+
+    return BenchResult("IQ3", "Generalization (novel input response diversity)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'diversity': round(diversity, 4), 'never_same': round(never_same, 4),
+                              'intelligence_proxy': round(never_same, 4),
+                              'final_cells': len(engine.cells)})
+
+
+def run_IQ4_consistency(steps=200, dim=64, hidden=128) -> BenchResult:
+    """IQ4: 일관성 — 같은 입력에 얼마나 비슷한 출력을 내는가?
+    높은 일관성 = "이해"한 것. 랜덤 = 이해 못함."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+
+    # 학습
+    for step_i in range(steps):
+        x = torch.randn(1, dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    # 일관성 테스트: 같은 입력 10번
+    test_input = torch.randn(1, dim)
+    responses = []
+    with torch.no_grad():
+        for _ in range(10):
+            engine.process(test_input)
+            out = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            responses.append(out.clone())
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 일관성 = 응답 간 cosine similarity 평균
+    with torch.no_grad():
+        if len(responses) >= 2:
+            sims = []
+            for i in range(len(responses)):
+                for j in range(i + 1, len(responses)):
+                    sim = F.cosine_similarity(responses[i].unsqueeze(0), responses[j].unsqueeze(0)).item()
+                    sims.append(sim)
+            consistency = sum(sims) / len(sims)
+        else:
+            consistency = 0
+
+    return BenchResult("IQ4", "Consistency (same input → same output?)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'consistency': round(consistency, 4),
+                              'intelligence_proxy': round(consistency, 4),
+                              'final_cells': len(engine.cells)})
+
+
+def run_IQ5_adaptation_speed(steps=200, dim=64, hidden=128) -> BenchResult:
+    """IQ5: 적응 속도 — 새 패턴에 얼마나 빨리 적응하는가?
+    빠른 적응 = 높은 지능. 3개 다른 패턴에 대한 적응 시간 측정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; adapt_times = []
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+
+    patterns = [torch.randn(1, dim) * 2.0 for _ in range(3)]
+    segment = steps // 3
+
+    for p_idx, pattern in enumerate(patterns):
+        baseline_dist = None
+        adapted_step = segment  # default: never adapted
+
+        for step_i in range(segment):
+            # 패턴 + 노이즈
+            x = pattern + torch.randn(1, dim) * 0.2
+            engine.process(x)
+
+            with torch.no_grad():
+                out = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                dist = (out - pattern.squeeze()[:dim]).norm().item()
+
+                if step_i == 0:
+                    baseline_dist = dist
+                elif baseline_dist and dist < baseline_dist * 0.5 and adapted_step == segment:
+                    adapted_step = step_i  # 50% 이하로 떨어진 시점
+
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+
+        adapt_times.append(adapted_step)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_adapt = sum(adapt_times) / len(adapt_times) if adapt_times else segment
+    speed = 1.0 - (avg_adapt / segment)  # 1.0 = instant, 0.0 = never
+
+    return BenchResult("IQ5", "Adaptation Speed (how fast to learn new pattern?)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'adapt_times': adapt_times, 'avg_adapt_steps': round(avg_adapt, 1),
+                              'speed': round(speed, 4),
+                              'intelligence_proxy': round(speed, 4),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'IQ1': run_IQ1_prediction_accuracy,
+    'IQ2': run_IQ2_compression_ratio,
+    'IQ3': run_IQ3_generalization,
+    'IQ4': run_IQ4_consistency,
+    'IQ5': run_IQ5_adaptation_speed,
+})
+
+
 ALL_HYPOTHESES.update({
     'MITO1': run_MITO1_learning_vs_fixed,
     'MITO2': run_MITO2_cell_specialization_speech,
