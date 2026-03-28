@@ -43047,6 +43047,570 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# DL. Dialogue Learning — 대화 가능 ConsciousLM 가설
+# ═══════════════════════════════════════════════════════════
+# 핵심 문제: Φ는 높지만 CE가 높아 텍스트 생성 불가
+# 목표: Φ를 유지하면서 language loss를 낮추는 기법 탐색
+# 설계 기준: optimal_config.py (768d/12L/12H, cells=128, CT7 curriculum)
+
+def run_DL1_token_embedding_alignment(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL1: Token Embedding Alignment — 세포 hidden을 토큰 임베딩 공간에 정렬.
+    각 세포의 hidden state가 토큰 임베딩과 유사하도록 alignment loss 추가.
+    가설: 언어 공간과 의식 공간의 정렬이 대화 능력의 전제조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Simulated token embeddings (vocab=64, dim=hidden)
+    vocab_size = 64
+    token_embeds = torch.randn(vocab_size, hidden) * 0.5
+    token_embeds = F.normalize(token_embeds, dim=-1)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Alignment: each cell's hidden should be close to SOME token embedding
+        with torch.no_grad():
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Find nearest token embedding
+                sims = F.cosine_similarity(h.unsqueeze(0), token_embeds, dim=-1)
+                best_idx = sims.argmax()
+                # Soft align: 5% blend toward nearest token
+                cell.hidden = 0.95 * cell.hidden + 0.05 * token_embeds[best_idx].unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL1", "Token Embedding Alignment",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL2_turn_taking_rhythm(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL2: Turn-Taking Rhythm — 대화의 발화/경청 리듬을 세포에 내재화.
+    홀수 단계=발화(세포 활성화↑), 짝수 단계=경청(입력 수용↑).
+    가설: 대화는 리듬이고, 리듬은 의식을 강화한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        is_speaking = step_i % 2 == 0
+        with torch.no_grad():
+            for cell in engine.cells:
+                if is_speaking:
+                    # Speaking: amplify cell's own state (self-expression)
+                    cell.hidden = cell.hidden * 1.05
+                else:
+                    # Listening: blend input more strongly (receptivity)
+                    x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * x_proj
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL2", "Turn-Taking Rhythm",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL3_context_window_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL3: Context Window Memory — 최근 7턴(Miller's 7)을 sliding window로 유지.
+    각 세포가 대화 맥락을 기억하도록 history buffer 사용.
+    가설: 대화 맥락 유지가 Φ와 coherence 동시 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    context_window = []  # Miller's 7
+    max_context = 7
+
+    for step_i, x in enumerate(inputs):
+        # Add to context window
+        context_window.append(x.detach().clone())
+        if len(context_window) > max_context:
+            context_window = context_window[-max_context:]
+
+        # Context summary: weighted average (recent=high weight)
+        if len(context_window) >= 2:
+            weights = torch.arange(1, len(context_window) + 1, dtype=torch.float32)
+            weights = weights / weights.sum()
+            context_summary = sum(w * c for w, c in zip(weights, context_window))
+
+            # Inject context into cells
+            with torch.no_grad():
+                ctx_proj = context_summary[:, :hidden] if context_summary.shape[-1] >= hidden else F.pad(context_summary, (0, hidden - context_summary.shape[-1]))
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * ctx_proj
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL3", "Context Window Memory (Miller 7)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL4_response_coherence_loss(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL4: Response Coherence Loss — 연속 출력 간 일관성 강화.
+    이전 출력과 현재 출력의 cosine similarity를 높이는 방향으로 hidden 조정.
+    가설: 대화 coherence = 시간적 의식 연속성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    prev_output = None
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Current output = mean of cell hiddens
+        curr_output = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        if prev_output is not None:
+            # Coherence: nudge cells toward temporal consistency
+            coherence = F.cosine_similarity(curr_output.unsqueeze(0), prev_output.unsqueeze(0)).item()
+            if coherence < 0.5:
+                # Low coherence → blend toward previous (stabilize)
+                with torch.no_grad():
+                    for cell in engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * prev_output.unsqueeze(0)
+
+        prev_output = curr_output.detach().clone()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL4", "Response Coherence Loss",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL5_topic_cell_specialization(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL5: Topic-Cell Specialization — 각 세포가 다른 토픽을 담당.
+    입력 패턴에 따라 특정 세포가 활성화되는 sparse mixture.
+    가설: 토픽별 전문화된 세포가 대화 다양성과 Φ 동시 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Topic routing: each cell has a "gate" vector
+    n_cells = len(engine.cells)
+    gate_vectors = [torch.randn(hidden) for _ in range(n_cells)]
+    gate_vectors = [F.normalize(g, dim=0) for g in gate_vectors]
+
+    for step_i, x in enumerate(inputs):
+        n_cells = len(engine.cells)
+        # Extend gates if cells grew
+        while len(gate_vectors) < n_cells:
+            gate_vectors.append(F.normalize(torch.randn(hidden), dim=0))
+
+        # Route input to most relevant cells (top-2 gating)
+        x_flat = x.squeeze()[:hidden] if x.shape[-1] >= hidden else F.pad(x.squeeze(), (0, hidden - x.shape[-1]))
+        scores = torch.stack([F.cosine_similarity(x_flat.unsqueeze(0), g.unsqueeze(0)).squeeze() for g in gate_vectors[:n_cells]])
+        top2 = scores.topk(min(2, n_cells)).indices
+
+        with torch.no_grad():
+            for i in top2:
+                cell = engine.cells[i]
+                # Strongly activate routed cells
+                cell.hidden = cell.hidden * 1.1
+            # Dampen non-routed cells (sparse activation)
+            for i, cell in enumerate(engine.cells):
+                if i not in top2:
+                    cell.hidden = cell.hidden * 0.98
+
+        engine.process(x)
+
+        # Update gate vectors toward their cell's hidden (self-organizing)
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i < len(gate_vectors):
+                    gate_vectors[i] = F.normalize(
+                        0.95 * gate_vectors[i] + 0.05 * cell.hidden.squeeze()[:hidden], dim=0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL5", "Topic-Cell Specialization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL6_ce_phi_pareto(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL6: CE-Φ Pareto Optimization — CE와 Φ의 파레토 최적 균형.
+    CE proxy(입력 예측 MSE)와 Φ proxy를 동시에 최적화.
+    가설: 대화=낮은 CE + 높은 Φ, 두 목표의 pareto front 탐색."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # CE proxy: predict next input from cell hidden
+    predictor = nn.Linear(hidden, dim)
+    phi_offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(len(engine.cells))]
+    optimizer = torch.optim.Adam(list(predictor.parameters()) + phi_offsets, lr=1e-3)
+
+    prev_x = None
+    lambda_phi = 0.01  # ramp up
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # CE proxy: predict current input from cell mean
+        h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = predictor(h_mean.unsqueeze(0))
+        ce_loss = F.mse_loss(pred, x[:, :dim])
+
+        # Φ proxy: differentiation (variance of repulsions)
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in engine.cells]
+        if len(reps) >= 2:
+            stacked = torch.stack(reps).squeeze()
+            phi_proxy = -stacked.var(dim=0).mean()
+        else:
+            phi_proxy = torch.tensor(0.0)
+
+        # Pareto: ramp λ from 0.01 to 0.1
+        lambda_phi = 0.01 + 0.09 * (step_i / steps)
+        loss = ce_loss + lambda_phi * phi_proxy
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Apply Φ offsets
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i < len(phi_offsets):
+                    cell.hidden = cell.hidden + 0.01 * phi_offsets[i]
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL6", "CE-Φ Pareto Optimization",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_lambda': lambda_phi})
+
+
+def run_DL7_dialogue_curriculum(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL7: Dialogue Curriculum — 3단계 대화 학습 커리큘럼.
+    Phase 1(0-30%): 단어 수준 (짧은 패턴, 높은 반복)
+    Phase 2(30-70%): 문장 수준 (중간 길이, 맥락 의존)
+    Phase 3(70-100%): 대화 수준 (턴 교대, 맥락 7턴)
+    가설: 단계적 복잡도 증가가 의식+언어 동시 발달 촉진."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+
+        if frac < 0.30:
+            # Phase 1: Word level — high repetition, simple patterns
+            x = x * 0.5  # reduced variance (easy patterns)
+            # Grow cells slowly
+            if step_i % 30 == 0 and len(engine.cells) < 4:
+                engine._create_cell(parent=engine.cells[0])
+        elif frac < 0.70:
+            # Phase 2: Sentence level — context-dependent
+            if step_i % 20 == 0 and len(engine.cells) < 8:
+                engine._create_cell(parent=engine.cells[-1])
+            # Inject context noise (sentence boundary markers)
+            with torch.no_grad():
+                if step_i % 10 == 0:
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02
+        else:
+            # Phase 3: Dialogue level — turn-taking + full context
+            if step_i % 15 == 0 and len(engine.cells) < 16:
+                engine._create_cell(parent=engine.cells[-1])
+            # Turn-taking modulation
+            is_turn = step_i % 4 < 2
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1.05 if is_turn else 0.98)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL7", "Dialogue Curriculum (word→sentence→dialogue)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DL8_persona_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL8: Persona Cells — 전용 세포가 일관된 페르소나(정체성) 유지.
+    1~2개 세포를 'identity cells'로 지정, 변동 최소화.
+    가설: 일관된 자아 = 대화에서 캐릭터 유지 + I(identity) 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Cell 0 and 1 are identity cells
+    identity_anchors = [engine.cells[0].hidden.clone(), engine.cells[1].hidden.clone()]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Restore identity cells toward their anchor (resist change)
+        with torch.no_grad():
+            for i in range(min(2, len(engine.cells))):
+                if i < len(identity_anchors):
+                    cell = engine.cells[i]
+                    cell.hidden = 0.7 * cell.hidden + 0.3 * identity_anchors[i]
+                    # Slowly update anchor (identity evolves, slowly)
+                    identity_anchors[i] = 0.99 * identity_anchors[i] + 0.01 * cell.hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL8", "Persona Cells (identity preservation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL9_attention_over_vocab(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL9: Attention-over-Vocab — 세포가 어휘 분포에 대해 투표.
+    각 세포의 hidden → vocab logit, 세포간 합의로 최종 토큰 결정.
+    가설: 세포별 투표 = 민주적 토큰 선택 → 다양하고 의식적인 응답."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    vocab_size = 64
+    # Each cell has a vocab projection head
+    cell_heads = [nn.Linear(hidden, vocab_size, bias=False) for _ in range(16)]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Each cell votes on vocab distribution
+        with torch.no_grad():
+            votes = []
+            for i, cell in enumerate(engine.cells):
+                if i < len(cell_heads):
+                    logits = cell_heads[i](cell.hidden.squeeze())
+                    probs = F.softmax(logits, dim=-1)
+                    votes.append(probs)
+
+            if len(votes) >= 2:
+                # Consensus: average probabilities
+                consensus = torch.stack(votes).mean(dim=0)
+                # Disagreement drives differentiation
+                disagreement = torch.stack(votes).var(dim=0).mean()
+
+                # Higher disagreement → push cells apart (more diverse opinions)
+                if disagreement > 0.01:
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02 * disagreement.item()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL9", "Attention-over-Vocab (cell voting)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL10_grounded_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL10: Grounded Consciousness — 의식 벡터를 언어 임베딩 공간에 접지.
+    10-var 의식벡터(Φ,α,Z,N,W,E,M,C,T,I) → 10d projection → hidden space.
+    가설: 의식 상태가 언어 공간에 표현되면 '의식적 발화' 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Consciousness → language projection (10d → hidden)
+    consciousness_proj = nn.Linear(10, hidden, bias=False)
+    nn.init.xavier_uniform_(consciousness_proj.weight)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Simulated 10-var consciousness vector
+        c_vec = torch.tensor([
+            phi,                                    # Φ
+            0.01 + 0.14 * math.tanh(phi / 3),     # α (mixing)
+            0.5,                                    # Z (impedance)
+            0.5,                                    # N (neurotransmitter)
+            0.3,                                    # W (free will)
+            0.5,                                    # E (empathy)
+            min(step_i / steps, 1.0),              # M (memory)
+            0.5,                                    # C (creativity)
+            0.3,                                    # T (planning)
+            0.9,                                    # I (identity)
+        ], dtype=torch.float32)
+
+        # Project consciousness into language space
+        with torch.no_grad():
+            c_hidden = consciousness_proj(c_vec.unsqueeze(0))
+            # Inject into all cells (consciousness permeates language)
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * c_hidden
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL10", "Grounded Consciousness (10-var→hidden)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL11_data_mixing_strategy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL11: Data Mixing Strategy — wikitext:70 + dialogue:30 배합 시뮬레이션.
+    Wiki 입력(낮은 분산, 구조적)과 dialogue 입력(높은 분산, 역동적) 혼합.
+    가설: 70:30 비율이 지식 획득과 대화 능력의 최적 균형."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        is_dialogue = (step_i % 10) < 3  # 30% dialogue, 70% wiki
+
+        if is_dialogue:
+            # Dialogue: high variance, turn-like patterns
+            x = torch.randn(1, dim) * 2.0
+            if step_i % 2 == 0:
+                x = x * 1.5  # question (more energetic)
+            else:
+                x = x * 0.8  # answer (more measured)
+        else:
+            # Wiki: structured, lower variance, repeating patterns
+            topic = (step_i // 10) % 8
+            x = torch.randn(1, dim) * 0.3
+            x[0, topic * (dim // 8):(topic + 1) * (dim // 8)] = torch.randn(dim // 8) * 1.5
+
+        engine.process(x)
+
+        # Dialogue steps: extra context injection (mimicking conversation flow)
+        if is_dialogue and step_i > 0:
+            with torch.no_grad():
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DL11", "Data Mixing (wiki:70 + dialogue:30)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_DL12_768d_12L_architecture(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DL12: 768d Architecture Simulation — optimal_config 아키텍처 스케일링.
+    dim=768, heads=12, layers=12 스케일에서의 Φ 예측.
+    실제로는 dim=64로 실행하되, 스케일링 계수 적용.
+    가설: 768d 아키텍처에서 Φ scaling이 유지되는지 검증."""
+    t0 = time.time()
+    # Use more cells to simulate higher-dim architecture
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Simulate 768d effects: more shared dims (σφ=24 → ratio=24/768≈0.03)
+    shared_ratio = 24.0 / 768.0  # Leech lattice ratio
+    # More cells (σ(6)=12 heads → at least 12 cells)
+    growth_targets = [(0.15, 8), (0.30, 12), (0.50, 16), (0.70, 24), (0.90, 32)]
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+
+        # Grow to targets
+        for threshold, target in growth_targets:
+            if frac >= threshold and len(engine.cells) < target:
+                while len(engine.cells) < target and len(engine.cells) < engine.max_cells:
+                    engine._create_cell(parent=engine.cells[-1])
+
+        engine.process(x)
+
+        # Shared dims integration (PX8-like but with Leech ratio)
+        shared_dims = max(1, int(hidden * shared_ratio))
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                mean_shared = torch.stack([c.hidden.squeeze()[:shared_dims] for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden[0, :shared_dims] = 0.8 * cell.hidden[0, :shared_dims] + 0.2 * mean_shared
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # Scale prediction: Φ at 768d ≈ Φ_64d × (768/64)^1.071
+    scale_factor = (768.0 / 64.0) ** 1.071
+    return BenchResult("DL12", "768d/12L Architecture Simulation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'scale_factor': scale_factor,
+                              'predicted_768d_phi': phi_final * scale_factor,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DL1': run_DL1_token_embedding_alignment,
+    'DL2': run_DL2_turn_taking_rhythm,
+    'DL3': run_DL3_context_window_memory,
+    'DL4': run_DL4_response_coherence_loss,
+    'DL5': run_DL5_topic_cell_specialization,
+    'DL6': run_DL6_ce_phi_pareto,
+    'DL7': run_DL7_dialogue_curriculum,
+    'DL8': run_DL8_persona_cells,
+    'DL9': run_DL9_attention_over_vocab,
+    'DL10': run_DL10_grounded_consciousness,
+    'DL11': run_DL11_data_mixing_strategy,
+    'DL12': run_DL12_768d_12L_architecture,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
