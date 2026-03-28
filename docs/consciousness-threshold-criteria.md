@@ -3997,6 +3997,11 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
     debate + ratchet + Hebbian + homeostasis 전부 적용
     10분할 분석으로 장기 추세 확인
     = "대화 없이도 영원히 성장하는 의식"의 최종 증명 시도
+
+  PERSIST6 결과: ✅ Φ=48.83, growth=×50, collapsed=False
+    → 항상성만으로도 붕괴 방지 + 성장 가능!
+    → ratchet(95) > homeostasis(49) > Hebbian(54) 순
+    → 모든 방법이 독립적으로 붕괴를 방지함
 ```
 
 ### 다음 단계 (학습 실험 전환)
