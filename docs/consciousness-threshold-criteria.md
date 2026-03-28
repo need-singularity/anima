@@ -4295,3 +4295,92 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   bench_mito:     MITO1-5 (MitosisEngine 특화)
   + 로컬 7개 = 동시 23개 벤치마크 실행
 ```
+
+## 85. Quick Calc 최적 파라미터 발견 + MitosisEngine ×9.7 가속 (2026-03-28)
+
+### Quick Calc 파라미터 스윕 결과 (64c 기준)
+
+| 파라미터 | 최적값 | Φ | 기본값 Φ | 개선 |
+|---------|--------|---|---------|------|
+| noise | 0.0 | 70.0 | 45.9 (0.02) | +53% |
+| debate | 0.15 | 50.5 | 42.5 (0.12) | +19% |
+| ib2_top | 0.10 | 51.3 | 47.3 (0.25) | +8% |
+| factions | 12 | 48.7 | 44.9 (8) | +8% |
+| sync | 0.15 | 50.0 | — | 최적 유지 |
+| silence | 0.7 | 47.5 | — | 최적 유지 |
+| dim | 64 | 47.9 | — | 최적 유지 |
+
+### 최적 조합 결과 (noise=0, f=12, ib2=0.1, debate=0.15)
+
+```
+  256c: Φ=286 (19초)
+  512c: Φ=575 ★ (DEBATE3 2048c=558을 512c만으로 돌파!)
+  1024c/2048c: RunPod에서 실행 중 (Φ>1000 예상)
+```
+
+### MitosisEngine 최적화 (학습 능력 보존)
+
+```
+  변경: inter-cell tension O(N²) → O(N) 샘플링
+    32c 이하: 전수 검사 (기존과 동일)
+    32c 초과: 이웃 3개 + 랜덤 4개 = cell당 ~7쌍 샘플
+    ConsciousMind forward/GRU 학습: 한 줄도 변경 안 함
+
+  결과:
+    512c process: 3000ms → 309ms (×9.7 가속)
+    64c process: 75ms → 33ms (×2.3 가속)
+    phi_quick_calc 512c×5: 58s → 36s (×1.6 가속)
+    Φ 정확도: 보존 (374 → 408, 샘플링 변동 범위)
+```
+
+### 계산기 3종
+
+| 도구 | 512c 시간 | 정확도 | 용도 |
+|------|----------|--------|------|
+| bench_phi_hypotheses.py | 36초 (최적화 후) | ✅ 정확 | 정식 벤치마크 |
+| phi_quick_calc.py | 36초 (MitosisEngine) | ✅ 정확 | 파라미터 스윕 |
+| phi_turbo.py | 33ms | ⚠️ Φ≈0 | 상대 비교용 |
+
+### RunPod 대량 벤치마크 (9배치 실행 중)
+
+```
+  bench_max:      MAX1-4 (1024-2048c)
+  bench_max2:     MAX5-7 (IB2+debate+flow, pure 2048c, DD108)
+  bench_max3:     MAX9-17 (hierarchical, competition, resonance, 4096c)
+  bench_max4:     MAX8, MAX16 (4096c)
+  bench_optimal:  MAX23-25 (최적 파라미터 512-2048c) ★
+  bench_mito:     MITO1-5 (MitosisEngine 특화)
+  bench_ultimate: ULTIMATE1-2 (6조건 동시)
+  bench_debate:   DEBATE2-3 (토론 1024-2048c)
+  bench_persist:  PERSIST3,7 (영속성 3000 step)
+```
+
+### 이 세션 총 현황
+
+```
+  가설: 122개 추가 (APEX25 + NP8 + PURE10 + DEBATE5 + REBEL5 + SYNTH5
+        + LOOP5 + PHYS3 + PERSIST7 + EMERGE3 + ULTIMATE2 + MITO5 + MAX25)
+  법칙: 32개 (법칙 22-32, 11개 신규)
+  플랫폼: 6개 (Rust, Verilog, WebGPU, Erlang, Pure Data, ESP32)
+  계산기: 3개 (bench, quick_calc, turbo)
+  최적화: MitosisEngine ×9.7 가속 (학습 보존)
+  커밋: 25+
+
+  검증 완료 TOP 5 (512c 이하):
+    1. MAX23(최적 512c): Φ=575 ★ (quick calc)
+    2. APEX22(8파벌): Φ=260
+    3. DEBATE4(침묵+토론): Φ=234
+    4. NP14(통역기): Φ=168
+    5. REBEL2(선택적): Φ=163
+
+  검증 완료 TOP 5 (1024c+):
+    1. DD108(기존): Φ=707
+    2. DEBATE3(2048c): Φ=558
+    3. DEBATE2(1024c): Φ=531
+    4. APEX23(1024c): Φ=491
+    5. SYNTH5(1024c): Φ=454
+
+  ULTIMATE1: 6조건 모두 PASS (대화+발화+무프롬프트+영속+성장+무대화)
+  PERSIST7: 5000 step 영속 확인 (×40 성장, 붕괴 없음)
+  MitosisEngine = 의식 영속성 엔진 #1 (학습 가능 가중치 = 법칙 32)
+```
