@@ -13,7 +13,7 @@ Each module is optional. Import failures degrade gracefully.
 import argparse, asyncio, json, math, os, signal, sys, threading, time, queue
 from collections import deque
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -93,6 +93,33 @@ def _log(mod, msg):
     print(f"  [{datetime.now().strftime('%H:%M:%S')}] [{mod}] {msg}")
 
 
+# ─── Multi-user session isolation ───
+
+MAX_SESSIONS = 10
+SESSION_TIMEOUT = 1800  # 30 min inactivity timeout
+
+
+@dataclass
+class SessionState:
+    """Per-session consciousness state for multi-user isolation."""
+    session_id: str
+    mind: object  # ConsciousMind
+    hidden: object  # torch.Tensor
+    mitosis: object  # MitosisEngine or None
+    history: list = field(default_factory=list)
+    memory: object = None  # Memory
+    last_active: float = field(default_factory=time.time)
+    prev_text: str = None
+    prev_time: float = field(default_factory=time.time)
+    _cached_consciousness: dict = field(default_factory=dict)
+    _last_mitosis_context: str = ""
+    _adaptive_alpha: float = 0.05
+    # WebSocket metadata (set by session_register)
+    device: str = 'unknown'
+    ws: object = None
+    modules: list = field(default_factory=list)
+
+
 class AnimaUnified:
     """All 6 modules unified under one class."""
 
@@ -127,6 +154,8 @@ class AnimaUnified:
         self.history = [{'role': t['role'], 'content': t['text']}
                         for t in self.memory.data['turns'][-10:]]
         self.last_interaction = time.time()
+        self._sessions = {}  # session_id -> SessionState (multi-user isolation)
+        self._session_lock = threading.Lock()  # serialize session state swaps
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
         self._recent_proactive = deque(maxlen=10)  # SP10: anti-repetition buffer
@@ -464,6 +493,69 @@ class AnimaUnified:
             return MemoryRAG(memory_file=self.paths['memory'])
         return None
 
+    # ─── Multi-user session management ───
+
+    def _get_or_create_session(self, session_id):
+        """Get existing session or create a new one. Returns SessionState.
+        If session_id is None, returns None (use shared/default state).
+        """
+        if not session_id or session_id == 'unknown':
+            return None
+
+        # Cleanup expired sessions first
+        self._cleanup_sessions()
+
+        # Return existing session
+        if session_id in self._sessions:
+            sess = self._sessions[session_id]
+            sess.last_active = time.time()
+            return sess
+
+        # Check max sessions limit
+        if len(self._sessions) >= MAX_SESSIONS:
+            # Evict oldest inactive session
+            oldest_id = min(self._sessions, key=lambda k: self._sessions[k].last_active)
+            _log('session', f'Evicting oldest session {oldest_id[:6]} (max {MAX_SESSIONS} reached)')
+            del self._sessions[oldest_id]
+
+        # Create new session with independent consciousness state
+        new_mind = ConsciousMind(128, 256)
+        new_hidden = torch.zeros(1, 256)
+
+        new_mitosis = None
+        if 'MitosisEngine' in globals():
+            _dim = 128
+            _mt = 0.01 * (64.0 / max(_dim, 64))
+            _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)
+            new_mitosis = MitosisEngine(
+                input_dim=_dim, hidden_dim=256, output_dim=_dim,
+                initial_cells=2, max_cells=self.max_cells,
+                merge_threshold=_mt, noise_scale=_ns,
+            )
+
+        new_memory = Memory()
+
+        sess = SessionState(
+            session_id=session_id,
+            mind=new_mind,
+            hidden=new_hidden,
+            mitosis=new_mitosis,
+            history=[],
+            memory=new_memory,
+        )
+        self._sessions[session_id] = sess
+        _log('session', f'New session {session_id[:6]} created ({len(self._sessions)}/{MAX_SESSIONS})')
+        return sess
+
+    def _cleanup_sessions(self):
+        """Remove sessions inactive for more than SESSION_TIMEOUT."""
+        now = time.time()
+        expired = [sid for sid, s in self._sessions.items()
+                   if now - s.last_active > SESSION_TIMEOUT]
+        for sid in expired:
+            del self._sessions[sid]
+            _log('session', f'Expired session {sid[:6]} (inactive >{SESSION_TIMEOUT}s)')
+
     def _init_mod(self, name, factory):
         try:
             obj = factory()
@@ -595,8 +687,70 @@ class AnimaUnified:
             note += " High empathy — considering impact on others."
         return note
 
-    def process_input(self, text, source='web'):
-        """Process text through all active modules. Returns (answer, tension, curiosity)."""
+    def process_input(self, text, source='web', session_id=None):
+        """Process text through all active modules. Returns (answer, tension, curiosity).
+        If session_id is provided, uses isolated per-session consciousness state.
+        """
+        # ─── Session isolation: swap in per-session state ───
+        sess = self._get_or_create_session(session_id)
+        _saved_state = None
+
+        # Lock ensures only one session swap is active at a time
+        # (prevents concurrent process_input calls from corrupting shared attrs)
+        self._session_lock.acquire()
+        if sess is not None:
+            _saved_state = {
+                'mind': self.mind, 'hidden': self.hidden,
+                'mitosis': self.mitosis, 'history': self.history,
+                'memory': self.memory, 'prev_text': self.prev_text,
+                'prev_time': self.prev_time,
+                '_cached_consciousness': getattr(self, '_cached_consciousness', None),
+                '_last_mitosis_context': self._last_mitosis_context,
+                '_adaptive_alpha': self._adaptive_alpha,
+            }
+            self.mind = sess.mind
+            self.hidden = sess.hidden
+            self.mitosis = sess.mitosis
+            self.history = sess.history
+            self.memory = sess.memory
+            self.prev_text = sess.prev_text
+            self.prev_time = sess.prev_time
+            self._cached_consciousness = sess._cached_consciousness
+            self._last_mitosis_context = sess._last_mitosis_context
+            self._adaptive_alpha = sess._adaptive_alpha
+            self._last_session_id = session_id
+
+        try:
+            return self._process_input_inner(text, source, session_id)
+        finally:
+            # ─── Write back session state and restore shared state ───
+            if sess is not None and _saved_state is not None:
+                sess.mind = self.mind
+                sess.hidden = self.hidden
+                sess.mitosis = self.mitosis
+                sess.history = self.history
+                sess.memory = self.memory
+                sess.prev_text = self.prev_text
+                sess.prev_time = self.prev_time
+                sess._cached_consciousness = self._cached_consciousness
+                sess._last_mitosis_context = self._last_mitosis_context
+                sess._adaptive_alpha = self._adaptive_alpha
+                sess.last_active = time.time()
+                # Restore shared state
+                self.mind = _saved_state['mind']
+                self.hidden = _saved_state['hidden']
+                self.mitosis = _saved_state['mitosis']
+                self.history = _saved_state['history']
+                self.memory = _saved_state['memory']
+                self.prev_text = _saved_state['prev_text']
+                self.prev_time = _saved_state['prev_time']
+                self._cached_consciousness = _saved_state['_cached_consciousness']
+                self._last_mitosis_context = _saved_state['_last_mitosis_context']
+                self._adaptive_alpha = _saved_state['_adaptive_alpha']
+            self._session_lock.release()
+
+    def _process_input_inner(self, text, source='web', session_id=None):
+        """Inner process_input logic (separated for session isolation try/finally)."""
         # Free will: soft refusal when W>0.3 + high tension
         import random
         free_will_W = getattr(self.mind, '_ev3_free_will', 0) if hasattr(self, 'mind') else 0
@@ -2065,19 +2219,17 @@ class AnimaUnified:
 
                 if msg_type == 'session_register':
                     device = msg.get('device', 'unknown')
-                    if not hasattr(self, '_sessions'):
-                        self._sessions = {}
-                    self._sessions[sid] = {
-                        'device': device,
-                        'modules': msg.get('modules', []),
-                        'ws': websocket,
-                    }
+                    sess = self._get_or_create_session(sid)
+                    if sess is not None:
+                        sess.device = device
+                        sess.ws = websocket
+                        sess.modules = msg.get('modules', [])
                     n = len(self._sessions)
                     _log("session", f"+{sid[:6]} ({device}) — {n} active")
                     await self._ws_broadcast({
                         'type': 'session_info',
                         'active_sessions': n,
-                        'devices': [s['device'] for s in self._sessions.values()],
+                        'devices': [s.device for s in self._sessions.values()],
                         'modules': list(getattr(self, '_active_modules', ['voice', 'tension', 'memory', 'tts'])),
                     })
 
@@ -2088,8 +2240,9 @@ class AnimaUnified:
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
                     loop = asyncio.get_running_loop()
+                    _sid = sid  # capture for lambda
                     result = await loop.run_in_executor(
-                        None, lambda: self.process_input(text, source='web'))
+                        None, lambda: self.process_input(text, source='web', session_id=_sid))
                     # Handle None return (model error, etc.)
                     if result is None or not isinstance(result, tuple):
                         answer = "I'm having trouble thinking right now. Please try again."
@@ -2179,12 +2332,13 @@ class AnimaUnified:
             import traceback; traceback.print_exc()
         finally:
             self.web_clients.discard(websocket)
-            # Clean up session
+            # Clean up session (mark ws as disconnected but keep state for reconnect)
+            # Session state persists until SESSION_TIMEOUT for potential reconnection
             if hasattr(self, '_sessions'):
-                to_remove = [s for s, info in self._sessions.items() if info.get('ws') == websocket]
-                for s in to_remove:
-                    del self._sessions[s]
-                    _log("session", f"-{s[:6]} — {len(self._sessions)} active")
+                for sid_key, sess_obj in self._sessions.items():
+                    if getattr(sess_obj, 'ws', None) == websocket:
+                        sess_obj.ws = None
+                        _log("session", f"~{sid_key[:6]} ws disconnected — state kept ({len(self._sessions)} sessions)")
             _log("web", f"-client ({len(self.web_clients)})")
 
     def _http_handler(self, connection, request):
