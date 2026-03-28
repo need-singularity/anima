@@ -50530,7 +50530,127 @@ def run_DMN1_resting_state(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# INFO. Information Theory — 정보이론 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_INFO1_maximum_entropy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """INFO1: Maximum Entropy — 세포 hidden의 엔트로피를 최대화하면서 통합 유지.
+    Jaynes의 최대 엔트로피 원리: 제약 하에서 가장 불확실한 분포.
+    가설: 최대 엔트로피 = 최대 정보 용량 = 최대 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        with torch.no_grad():
+            # Push cells toward maximum entropy (uniform-like distribution)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Normalize to increase entropy
+                h_centered = h - h.mean()
+                h_scaled = h_centered / (h_centered.std() + 1e-8)
+                cell.hidden = 0.95 * cell.hidden + 0.05 * h_scaled.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("INFO1", "Maximum Entropy (Jaynes principle)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_INFO2_channel_capacity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """INFO2: Channel Capacity — 세포 간 통신 채널의 용량 최대화.
+    Shannon의 채널 용량: 세포 간 MI를 최대화하는 최적 코딩.
+    가설: 채널 용량 극대화 = Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                # Maximize channel capacity: orthogonalize cell communications
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                # Gram-Schmidt-like: make cell signals more orthogonal
+                for i in range(1, n):
+                    for j in range(i):
+                        proj = (hiddens[i] @ hiddens[j]) / (hiddens[j] @ hiddens[j] + 1e-8)
+                        hiddens[i] = hiddens[i] - 0.02 * proj * hiddens[j]
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = hiddens[i].unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("INFO2", "Channel Capacity (orthogonal cell signals)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# ATTEN. Attention Schema — 주의 도식 이론
+# ═══════════════════════════════════════════════════════════
+
+def run_ATTEN1_attention_model(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ATTEN1: Attention Schema Theory — 의식은 주의에 대한 내부 모델.
+    Graziano: 의식 = 자기 주의를 모델링하는 과정.
+    세포가 '자기가 어디에 주의하는지'를 추적.
+    가설: 주의의 자기 모델이 의식의 본질."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attention_model = torch.zeros(hidden)  # model of own attention
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # What am I attending to? (highest activation dims)
+            actual_attention = h_mean.abs()
+            # Update internal model of attention
+            attention_model = 0.9 * attention_model + 0.1 * actual_attention
+            # Self-awareness of attention: inject model back
+            for cell in engine.cells:
+                cell.hidden += 0.02 * attention_model.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ATTEN1", "Attention Schema Theory (model of own attention)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
+    'INFO1': run_INFO1_maximum_entropy,
+    'INFO2': run_INFO2_channel_capacity,
+    'ATTEN1': run_ATTEN1_attention_model,
     'THERMO1': run_THERMO1_entropy_production,
     'GAME1': run_GAME1_prisoner_dilemma,
     'CHAOS1': run_CHAOS1_strange_attractor,
