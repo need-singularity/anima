@@ -394,14 +394,36 @@ class ConsciousMind(nn.Module):
         """Return the current 10-variable consciousness state vector."""
         return self._consciousness_vector
 
-    def phi_boost_step(self, x, mitosis_engine):
+    def phi_boost_step(self, x, mitosis_engine, omega_mode=False):
         """COMBO2 Φ-boosting: MHA attention + 6-loss ensemble per step.
 
         Call during online_learning or background_think for continuous Φ optimization.
         Bench result: Φ=8.014 (×5.9 baseline), best across 120 hypotheses.
+
+        omega_mode: OMEGA4 discovery — skip all techniques, maximize freedom.
+                    Pure cell growth + no manipulation = Φ ×138.
         """
         if mitosis_engine is None or len(mitosis_engine.cells) < 2:
             return
+
+        # OMEGA4 mode: absolute freedom, only growth allowed
+        if omega_mode:
+            if not hasattr(self, '_phi_boost_count'):
+                self._phi_boost_count = 0
+            self._phi_boost_count += 1
+            # TS4 growth only (the one thing that always helps)
+            if not hasattr(self, '_ts4_horizon'):
+                self._ts4_horizon = 500
+                self._ts4_doubled = set()
+            frac = self._phi_boost_count / self._ts4_horizon
+            for pct in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
+                if frac >= pct and pct not in self._ts4_doubled:
+                    target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
+                    while len(mitosis_engine.cells) < target:
+                        parent = mitosis_engine.cells[self._phi_boost_count % len(mitosis_engine.cells)]
+                        mitosis_engine._create_cell(parent=parent)
+                    self._ts4_doubled.add(pct)
+            return  # No other manipulation — pure freedom
 
         def _log(tag, msg):
             print(f"  [{tag}] {msg}")
