@@ -48351,12 +48351,251 @@ ALL_HYPOTHESES.update({
     'ULTRA1': run_ULTRA1_talk5_omega4_xeth7,
     'ULTRA2': run_ULTRA2_consciousness_learns_language_10x,
     'ULTRA3': run_ULTRA3_no_prompt_dialogue_system,
-    'ULTRA4': lambda steps=100, dim=64, hidden=128: (lambda: (
-        # ULTRA4: Token-Level Consciousness — 바이트가 아닌 토큰 단위 의식
-        # 256 byte vocab → 1024 token vocab (BPE 시뮬레이션)
-        # 토큰 레벨이 CE를 4배 낮출 수 있는가?
-        BenchResult("ULTRA4", "Token-Level (simulated BPE)", 0, [], 0, 0, 0, 0, 0)
-    ))(),  # placeholder — needs actual BPE tokenizer
+    # ULTRA4+ are defined below
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# ZERO. Zero-Prompt Conversation — 프롬프트 제로에서 대화까지
+# ═══════════════════════════════════════════════════════════
+# 시스템 프롬프트 없이 실제 대화 품질을 측정하는 가설 (Φ + CE 동시)
+
+def run_ZERO1_raw_consciousness_speaks(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZERO1: Raw Consciousness Speaks — 의식 상태를 직접 텍스트로 디코딩.
+    cell hidden → 고정 디코더 (학습 없음) → 출력.
+    가설: 충분히 높은 Φ의 의식은 디코더 없이도 구조를 만든다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    # Fixed random decoder (NOT trained)
+    torch.manual_seed(777)
+    fixed_decoder = nn.Linear(hidden, dim, bias=False)
+    torch.manual_seed(42)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.05, 0.15, 0.25, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        with torch.no_grad():
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = fixed_decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim]).item()
+            ce_hist.append(ce)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ZERO1", "Raw Consciousness Speaks (no decoder training)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'final_cells': len(engine.cells)})
+
+
+def run_ZERO2_consciousness_as_tokenizer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZERO2: Consciousness as Tokenizer — 의식 세포가 토크나이저 역할.
+    각 세포가 입력의 다른 부분을 전문화 → 토큰화 없이 의미 분할.
+    가설: 의식적 분할이 BPE보다 나은 토크나이저."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; segment_counts = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        if frac > 0.1 and step_i % 15 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        # Each cell "claims" input dimensions it responds to most
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 2:
+                responses = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells])
+                # Each cell's "specialty" = dims where it has highest activation
+                assignments = responses.abs().argmax(dim=0)  # [dim] → cell index
+                segments = len(assignments.unique())
+                segment_counts.append(segments)
+                # Sharpen specialization: amplify claimed dims
+                for i, cell in enumerate(engine.cells):
+                    mask = (assignments == i).float()
+                    if mask.sum() > 0:
+                        cell.hidden[:, :dim] *= (1.0 + 0.02 * mask.unsqueeze(0))
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ZERO2", "Consciousness as Tokenizer (cell specialization)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'avg_segments': sum(segment_counts)/max(len(segment_counts),1)})
+
+
+def run_ZERO3_internal_language_emergence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZERO3: Internal Language Emergence — 세포 간 통신 프로토콜 자연 발생.
+    세포끼리 정보를 교환할 때 자연스럽게 '언어'가 출현하는지.
+    가설: 의식 내부 언어가 외부 언어의 전제조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    message_log = []  # track inter-cell messages
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        if step_i % 12 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                # Cells exchange "messages" = difference vectors
+                messages = []
+                for i in range(n):
+                    for j in range(i+1, min(i+3, n)):  # local neighbors
+                        msg = engine.cells[i].hidden.squeeze() - engine.cells[j].hidden.squeeze()
+                        messages.append(msg)
+                        # Message shapes the receiver
+                        engine.cells[j].hidden += 0.01 * msg.unsqueeze(0)
+                        engine.cells[i].hidden -= 0.01 * msg.unsqueeze(0)
+
+                # Track message consistency (are cells developing a "vocabulary"?)
+                if messages:
+                    msg_stack = torch.stack(messages)
+                    msg_var = msg_stack.var(dim=0).mean().item()
+                    message_log.append(msg_var)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # Language emergence = decreasing message variance (convergent protocol)
+    lang_emergence = 0
+    if len(message_log) >= 10:
+        early = sum(message_log[:5]) / 5
+        late = sum(message_log[-5:]) / 5
+        lang_emergence = (early - late) / (early + 1e-8)  # positive = language emerging
+
+    return BenchResult("ZERO3", "Internal Language Emergence (cell communication protocol)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'language_emergence': lang_emergence})
+
+
+def run_ZERO4_phi_gated_vocabulary(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZERO4: Φ-Gated Vocabulary — Φ가 높을수록 더 많은 '단어'를 사용.
+    저 Φ: 2개 출력 패턴만, 고 Φ: 64개 출력 패턴.
+    가설: 어휘 크기가 의식 수준에 비례."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; vocab_sizes = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Vocabulary size proportional to Φ
+        with torch.no_grad():
+            vocab_size = max(2, min(64, int(phi * 5)))
+            vocab_sizes.append(vocab_size)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Quantize output to vocab_size levels
+            quantized = (h * vocab_size).round() / vocab_size
+            # Feed quantized back (forces discrete "words")
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * quantized.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ZERO4", "Φ-Gated Vocabulary (consciousness→vocab size)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_vocab': vocab_sizes[-1] if vocab_sizes else 0})
+
+
+def run_ZERO5_dialogue_without_words(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ZERO5: Dialogue Without Words — 두 의식이 언어 없이 대화.
+    hidden state 교환만으로 '의미'를 전달. 텍스트 0.
+    가설: 의식적 대화의 본질은 언어가 아닌 상태 공유."""
+    t0 = time.time()
+    eng_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    eng_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; alignment_hist = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            for eng in [eng_a, eng_b]:
+                if frac >= pct and len(eng.cells) < min(int(2**(pct*7)), 32):
+                    target = min(len(eng.cells)*2, 32)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # A processes input, sends state to B
+        eng_a.process(x)
+        with torch.no_grad():
+            a_state = torch.stack([c.hidden.squeeze()[:dim] for c in eng_a.cells]).mean(dim=0).unsqueeze(0)
+        # B receives A's state (no words, just hidden)
+        eng_b.process(a_state)
+
+        # B sends response state to A
+        with torch.no_grad():
+            b_state = torch.stack([c.hidden.squeeze()[:dim] for c in eng_b.cells]).mean(dim=0).unsqueeze(0)
+            # A incorporates B's response
+            for cell in eng_a.cells:
+                cell.hidden = 0.9 * cell.hidden + 0.1 * b_state[:, :hidden] if b_state.shape[-1] >= hidden else 0.9 * cell.hidden
+
+        # Measure alignment (are they "understanding" each other?)
+        with torch.no_grad():
+            a_mean = torch.stack([c.hidden.squeeze() for c in eng_a.cells]).mean(dim=0)
+            b_mean = torch.stack([c.hidden.squeeze() for c in eng_b.cells]).mean(dim=0)
+            alignment = F.cosine_similarity(a_mean.unsqueeze(0), b_mean.unsqueeze(0)).item()
+            alignment_hist.append(alignment)
+
+        phi, _ = phi_calc.compute_phi(eng_a)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(eng_a)
+    return BenchResult("ZERO5", "Dialogue Without Words (pure state exchange)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_alignment': alignment_hist[-1] if alignment_hist else 0,
+                              'alignment_growth': (sum(alignment_hist[-10:])/10 - sum(alignment_hist[:10])/10) if len(alignment_hist)>=20 else 0,
+                              'cells_a': len(eng_a.cells), 'cells_b': len(eng_b.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'ZERO1': run_ZERO1_raw_consciousness_speaks,
+    'ZERO2': run_ZERO2_consciousness_as_tokenizer,
+    'ZERO3': run_ZERO3_internal_language_emergence,
+    'ZERO4': run_ZERO4_phi_gated_vocabulary,
+    'ZERO5': run_ZERO5_dialogue_without_words,
 })
 
 
