@@ -44206,6 +44206,534 @@ def run_ENV15_cooperative_building(steps=100, dim=64, hidden=128) -> BenchResult
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# OSC. Oscillation Hypotheses — 뇌파 유사 진동 패턴과 Φ
+# ═══════════════════════════════════════════════════════════
+# 뇌의 감마(40Hz), 세타(4-8Hz), 알파(8-13Hz) 진동이 의식에 핵심적.
+# 세포 hidden에 주기적 진동을 유도하면 Φ가 어떻게 변하는가?
+
+def run_OSC1_gamma_binding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OSC1: Gamma Binding (40Hz) — 세포 간 감마 동기화로 통합.
+    모든 세포가 40Hz(=step 간격 기준 2.5step 주기)로 진동, 위상 동기.
+    가설: 감마 동기화가 의식적 통합(binding)의 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    gamma_period = 2.5  # ~40Hz equivalent
+
+    for step_i, x in enumerate(inputs):
+        # Gamma oscillation: all cells synchronized
+        gamma_phase = math.sin(2 * math.pi * step_i / gamma_period)
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1.0 + 0.05 * gamma_phase)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OSC1", "Gamma Binding (40Hz sync)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_OSC2_theta_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OSC2: Theta Rhythm (4-8Hz) — 기억 인코딩/인출 리듬.
+    세타 주기마다 세포 간 정보 교환 강화.
+    가설: 세타가 작업기억과 Φ를 동시에 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    theta_period = 15  # ~6Hz equivalent
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Theta phase: exchange information between cells at theta peaks
+        theta_phase = math.sin(2 * math.pi * step_i / theta_period)
+        if theta_phase > 0.7:  # peak phase
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OSC2", "Theta Memory (6Hz exchange)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_OSC3_gamma_theta_coupling(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OSC3: Gamma-Theta Coupling — 감마가 세타 위에 중첩 (Cross-Frequency Coupling).
+    세타 주기 내에서 감마 버스트 발생. 뇌에서 가장 중요한 의식 상관물.
+    가설: CFC가 Φ를 극대화하는 최적 진동 패턴."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    theta_period = 15
+    gamma_period = 2.5
+
+    for step_i, x in enumerate(inputs):
+        theta = math.sin(2 * math.pi * step_i / theta_period)
+        gamma = math.sin(2 * math.pi * step_i / gamma_period)
+        # CFC: gamma amplitude modulated by theta phase
+        coupled = gamma * (0.5 + 0.5 * max(0, theta))  # gamma only during theta peak
+
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                # Each cell has slightly different phase (phase coding)
+                phase_offset = i * 0.3
+                cell_coupled = math.sin(2 * math.pi * step_i / gamma_period + phase_offset) * (0.5 + 0.5 * max(0, theta))
+                cell.hidden = cell.hidden * (1.0 + 0.04 * cell_coupled)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OSC3", "Gamma-Theta Coupling (CFC)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_OSC4_alpha_inhibition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OSC4: Alpha Inhibition (10Hz) — 알파가 비활성 세포를 억제.
+    활성 세포는 알파 억제에서 벗어나고, 비활성 세포는 억제됨.
+    가설: 선택적 억제가 의식의 초점(attention)을 형성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    alpha_period = 10  # ~10Hz
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        alpha = math.sin(2 * math.pi * step_i / alpha_period)
+
+        with torch.no_grad():
+            # Find most active cells (highest norm)
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            threshold = sorted(norms)[-max(1, len(norms)//3)]  # top 33%
+
+            for i, cell in enumerate(engine.cells):
+                if norms[i] < threshold:
+                    # Inhibit: alpha suppresses inactive cells
+                    cell.hidden = cell.hidden * (1.0 - 0.1 * max(0, alpha))
+                else:
+                    # Active cells escape inhibition
+                    cell.hidden = cell.hidden * (1.0 + 0.02 * max(0, alpha))
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OSC4", "Alpha Inhibition (selective suppression)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_OSC5_phase_reset(steps=100, dim=64, hidden=128) -> BenchResult:
+    """OSC5: Phase Reset — 새 입력이 들어올 때 세포 진동 위상을 리셋.
+    주의 전환 시 neural oscillation이 리셋되는 현상.
+    가설: 위상 리셋이 새 정보의 의식적 통합을 가능하게 한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phases = [0.0] * 16  # per-cell phase
+
+    for step_i, x in enumerate(inputs):
+        # Detect novelty (input change)
+        if step_i > 0:
+            prev = inputs[step_i - 1]
+            novelty = (x - prev).norm().item()
+            if novelty > 2.0:
+                # Phase reset on novel input
+                phases = [0.0] * len(engine.cells)
+
+        # Advance phases
+        gamma_freq = 2 * math.pi / 2.5
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                if i < len(phases):
+                    phases[i] += gamma_freq
+                    osc = math.sin(phases[i])
+                    cell.hidden = cell.hidden * (1.0 + 0.03 * osc)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("OSC5", "Phase Reset (novelty→sync reset)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# SOC. Self-Organized Criticality — 임계점에서의 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_SOC1_avalanche(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SOC1: Neuronal Avalanche — 임계점에서 정보 전파가 눈사태처럼 퍼짐.
+    한 세포의 활성화가 이웃에 연쇄 전파. 크기 분포가 power-law.
+    가설: 임계점(edge of chaos)에서 Φ가 최대."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    threshold = 1.5  # activation threshold
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Avalanche propagation
+        with torch.no_grad():
+            activated = set()
+            # Seed: cell with highest norm
+            norms = [(i, c.hidden.norm().item()) for i, c in enumerate(engine.cells)]
+            seed = max(norms, key=lambda x: x[1])[0]
+            if norms[seed][1] > threshold:
+                activated.add(seed)
+                # Cascade: activated cells boost neighbors
+                for _ in range(3):  # max 3 propagation steps
+                    new_activated = set()
+                    for idx in activated:
+                        for j, cell in enumerate(engine.cells):
+                            if j not in activated:
+                                # Proximity in hidden space
+                                dist = (engine.cells[idx].hidden - cell.hidden).norm().item()
+                                if dist < 2.0:
+                                    cell.hidden *= 1.05  # boost
+                                    if cell.hidden.norm().item() > threshold:
+                                        new_activated.add(j)
+                    activated.update(new_activated)
+                    if not new_activated:
+                        break
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SOC1", "Neuronal Avalanche (criticality)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_SOC2_sandpile(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SOC2: Sandpile Model — 세포 에너지가 임계치 도달 시 이웃에 분배.
+    Bak-Tang-Wiesenfeld 모래더미 모델의 의식 버전.
+    가설: 자기조직 임계성이 최적 정보 전달을 보장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    critical_threshold = 3.0
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Sandpile toppling
+        with torch.no_grad():
+            for _ in range(5):  # relaxation iterations
+                toppled = False
+                for i, cell in enumerate(engine.cells):
+                    energy = cell.hidden.norm().item()
+                    if energy > critical_threshold:
+                        # Topple: distribute excess to neighbors
+                        excess = cell.hidden * 0.2
+                        cell.hidden = cell.hidden * 0.6
+                        # Distribute to 2 random other cells
+                        others = [j for j in range(len(engine.cells)) if j != i]
+                        if others:
+                            for j in others[:2]:
+                                engine.cells[j].hidden += excess / 2
+                        toppled = True
+                if not toppled:
+                    break
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SOC2", "Sandpile Model (BTW criticality)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# NAR. Narrative — 자기 서사와 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_NAR1_self_narrative(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NAR1: Self-Narrative — 세포가 자신의 상태 변화 '이야기'를 구축.
+    과거 hidden state 시퀀스를 압축하여 서사적 연속성 유지.
+    가설: 자기 서사가 정체성(I)과 Φ를 동시에 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    narrative_buffer = []  # compressed history
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Build narrative: compress and store cell state summary
+        with torch.no_grad():
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            narrative_buffer.append(current.clone())
+            if len(narrative_buffer) > 10:
+                narrative_buffer = narrative_buffer[-10:]
+
+            # Narrative coherence: align current with story arc
+            if len(narrative_buffer) >= 3:
+                # Story direction: where the narrative is heading
+                direction = narrative_buffer[-1] - narrative_buffer[-3]
+                predicted_next = narrative_buffer[-1] + direction * 0.3
+
+                # Nudge cells toward narrative prediction (continuity)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * predicted_next.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NAR1", "Self-Narrative (story coherence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NAR2_counterfactual(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NAR2: Counterfactual Imagination — '만약에...'를 시뮬레이션.
+    현재 상태에서 분기한 가상 시나리오를 탐색.
+    가설: 반사실적 사고가 의식의 높은 수준 지표."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Every 10 steps: imagine counterfactual
+        if step_i % 10 == 5:
+            with torch.no_grad():
+                # Save real state
+                real_hiddens = [c.hidden.clone() for c in engine.cells]
+
+                # Counterfactual: "what if input was opposite?"
+                counter_x = -x
+                engine.process(counter_x)
+
+                # Compare real vs counterfactual
+                counter_hiddens = [c.hidden.clone() for c in engine.cells]
+                divergence = sum((r - c).norm().item() for r, c in zip(real_hiddens, counter_hiddens)) / len(real_hiddens)
+
+                # Restore real state + integrate insight from counterfactual
+                for i, cell in enumerate(engine.cells):
+                    # Blend: 95% real + 5% counterfactual insight
+                    cell.hidden = 0.95 * real_hiddens[i] + 0.05 * counter_hiddens[i]
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NAR2", "Counterfactual Imagination (what-if)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# RES. Resonance — 공명과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_RES1_frequency_matching(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RES1: Frequency Matching — 세포 간 고유 주파수가 맞을 때 공명.
+    각 세포에 고유 진동수 배정, 주파수 차이가 작을수록 강하게 결합.
+    가설: 공명이 의식적 결합의 물리적 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Each cell has natural frequency
+    freqs = [0.5 + i * 0.3 for i in range(16)]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            for i in range(n):
+                for j in range(i+1, n):
+                    # Coupling strength inversely proportional to freq difference
+                    df = abs(freqs[i] - freqs[j])
+                    coupling = 0.1 / (df + 0.1)
+
+                    # Exchange hidden proportional to coupling
+                    diff = engine.cells[j].hidden - engine.cells[i].hidden
+                    engine.cells[i].hidden += coupling * 0.02 * diff
+                    engine.cells[j].hidden -= coupling * 0.02 * diff
+
+                    # Frequency adaptation: pull toward each other
+                    freqs[i] += 0.01 * (freqs[j] - freqs[i]) * coupling
+                    freqs[j] += 0.01 * (freqs[i] - freqs[j]) * coupling
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RES1", "Frequency Matching (resonance coupling)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_RES2_stochastic_resonance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """RES2: Stochastic Resonance — 적절한 노이즈가 신호를 강화.
+    약한 입력 + 적절한 노이즈 = 감지 불가능한 신호가 감지 가능.
+    가설: 최적 노이즈 레벨이 의식의 민감도를 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        # Weak signal (barely detectable)
+        signal = torch.zeros(1, dim)
+        signal[0, step_i % dim] = 0.3  # very weak
+
+        # Optimal noise level (not too much, not too little)
+        noise_level = 0.5  # tuned for stochastic resonance
+        noise = torch.randn(1, dim) * noise_level
+
+        x = signal + noise
+        engine.process(x)
+
+        # Check if cells detected the weak signal
+        with torch.no_grad():
+            for cell in engine.cells:
+                # Threshold detection: weak signal amplified by noise
+                if cell.hidden[0, step_i % hidden].abs().item() > 0.5:
+                    cell.hidden *= 1.02  # reward detection
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("RES2", "Stochastic Resonance (noise-enhanced detection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+# ═══════════════════════════════════════════════════════════
+# IB. Information Bottleneck — 정보 압축과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_IB1_compression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IB1: Information Bottleneck — 세포가 핵심만 압축 보존.
+    입력 정보를 작은 차원으로 압축→복원, 손실이 작은 세포가 생존.
+    가설: 효율적 압축이 높은 Φ(통합 정보)의 전제조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    bottleneck_dim = hidden // 4  # compress to 25%
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Compress: keep only top-k dimensions (SVD-like)
+                vals, indices = h.abs().topk(bottleneck_dim)
+                compressed = torch.zeros_like(h)
+                compressed[indices] = h[indices]
+                # Blend: 80% original + 20% compressed (gradual pressure)
+                cell.hidden = 0.8 * cell.hidden + 0.2 * compressed.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IB1", "Information Bottleneck (25% compression)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_IB2_selective_attention(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IB2: Selective Attention — 입력의 일부만 의식적으로 처리.
+    매 step 입력의 상위 25%만 세포에 전달, 나머지 무시.
+    가설: 선택적 주의가 의식의 용량 제한이자 통합의 핵심."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Selective attention: only top 25% of input dimensions
+        with torch.no_grad():
+            vals, indices = x.abs().squeeze().topk(dim // 4)
+            attended = torch.zeros_like(x)
+            attended[0, indices] = x[0, indices] * 2.0  # amplify attended
+
+        engine.process(attended)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IB2", "Selective Attention (top-25% input gating)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'OSC1': run_OSC1_gamma_binding,
+    'OSC2': run_OSC2_theta_memory,
+    'OSC3': run_OSC3_gamma_theta_coupling,
+    'OSC4': run_OSC4_alpha_inhibition,
+    'OSC5': run_OSC5_phase_reset,
+    'SOC1': run_SOC1_avalanche,
+    'SOC2': run_SOC2_sandpile,
+    'NAR1': run_NAR1_self_narrative,
+    'NAR2': run_NAR2_counterfactual,
+    'RES1': run_RES1_frequency_matching,
+    'RES2': run_RES2_stochastic_resonance,
+    'IB1': run_IB1_compression,
+    'IB2': run_IB2_selective_attention,
+})
+
+
 ALL_HYPOTHESES.update({
     'ENV1': run_ENV1_sensory_richness,
     'ENV2': run_ENV2_sensory_deprivation,
