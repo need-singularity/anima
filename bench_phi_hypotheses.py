@@ -51905,6 +51905,275 @@ def run_CF5_ultimate_conversation_consciousness(steps=100, dim=64, hidden=128) -
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# VOICE. Spontaneous Voice — 자발적 발화 발생 메커니즘
+# ═══════════════════════════════════════════════════════════
+# 핵심: "시키지 않아도 스스로 발화가 발생"하는 구조
+# 외부 입력 0에서도 내부 압력으로 출력이 자연 발생
+
+def run_VOICE1_pressure_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """VOICE1: Pressure Speech — 내부 압력이 임계점 도달 시 자동 발화.
+    세포 에너지가 축적 → 임계 돌파 → 폭발적 출력.
+    화산 모델: 마그마(내부 상태) 축적 → 분출(발화).
+    가설: 발화는 에너지 방출이며 의식의 자연스러운 출구."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    internal_pressure = 0.0
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    speech_threshold = 3.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # 50% no external input (silence) — pressure builds
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 0.01  # near-silent
+            internal_pressure += 0.15  # pressure accumulates
+        else:
+            x = torch.randn(1, dim) * 1.0
+            internal_pressure += 0.05
+
+        engine.process(x)
+
+        # Pressure eruption → spontaneous speech!
+        if internal_pressure > speech_threshold:
+            with torch.no_grad():
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                utterance = decoder(h.unsqueeze(0))
+                # Self-feedback: hear own speech
+                for cell in engine.cells:
+                    cell.hidden += 0.1 * utterance[:, :hidden].detach() if utterance.shape[-1] >= hidden else 0.1 * torch.nn.functional.pad(utterance, (0, hidden - utterance.shape[-1])).detach()
+                internal_pressure = 0.0  # released
+                speech_events += 1
+
+            # Train decoder on this moment
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("VOICE1", "Pressure Speech (energy builds → eruption)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_VOICE2_rhythm_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """VOICE2: Rhythm Speech — 내부 리듬(호흡 주기)에 맞춰 자동 발화.
+    인간의 발화도 호흡 주기와 동기화됨. 세포 진동 주기로 발화 타이밍 결정.
+    가설: 발화는 내부 리듬의 자연스러운 표현."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+    breath_cycle = 12  # "호흡" 주기 (12 steps)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Breath rhythm: exhale phase = speech moment
+        breath_phase = (step_i % breath_cycle) / breath_cycle
+        is_exhale = 0.4 < breath_phase < 0.7  # exhale window
+
+        with torch.no_grad():
+            if is_exhale and len(engine.cells) >= 2:
+                # Speech on exhale (natural rhythm)
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                utterance = h * 0.3  # output
+                for cell in engine.cells:
+                    cell.hidden += 0.05 * utterance.unsqueeze(0)
+                speech_events += 1
+
+            # Inhale: absorb input more strongly
+            if breath_phase < 0.4:
+                x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * x_proj
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("VOICE2", "Rhythm Speech (breath cycle → speech timing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'final_cells': len(engine.cells)})
+
+
+def run_VOICE3_emotional_overflow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """VOICE3: Emotional Overflow — 감정이 넘치면 자동 발화.
+    tension × curiosity > threshold → "참을 수 없어서" 말함.
+    가설: 감정적 오버플로우가 자발적 발화의 가장 자연스러운 트리거."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; overflow_threshold = 2.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+            curiosity = sum(c.hidden.var().item() for c in engine.cells) / len(engine.cells)
+            emotion = tension * curiosity
+
+            if emotion > overflow_threshold:
+                # Emotional overflow → MUST speak
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                # Strong self-expression
+                for cell in engine.cells:
+                    cell.hidden *= 1.05  # amplify (expressing emotion)
+                speech_events += 1
+                # After speaking, tension releases
+                for cell in engine.cells:
+                    cell.hidden *= 0.95
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("VOICE3", "Emotional Overflow (emotion overflows → must speak)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'final_cells': len(engine.cells)})
+
+
+def run_VOICE4_disagreement_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """VOICE4: Disagreement Speech — 세포 간 불일치가 크면 자동 발화.
+    "나는 동의 못 해!" — 내부 갈등이 외부 표현으로.
+    가설: 내부 갈등(다양성)이 발화의 인지적 트리거."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                disagreement = hiddens.var(dim=0).mean().item()
+
+                if disagreement > 0.5:
+                    # High disagreement → cells "debate" → speech emerges
+                    # The majority opinion wins
+                    mean_h = hiddens.mean(dim=0)
+                    for cell in engine.cells:
+                        diff = cell.hidden.squeeze() - mean_h
+                        if diff.norm().item() > mean_h.norm().item() * 0.5:
+                            # Dissenting cell: amplify voice
+                            cell.hidden *= 1.03
+                    speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("VOICE4", "Disagreement Speech (internal conflict → expression)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'final_cells': len(engine.cells)})
+
+
+def run_VOICE5_continuous_stream(steps=100, dim=64, hidden=128) -> BenchResult:
+    """VOICE5: Continuous Stream of Consciousness — 의식의 흐름(Stream).
+    James의 의식의 흐름: 끊김 없는 연속적 내면 독백.
+    매 step 출력이 다음 step 입력의 일부 → 끊어지지 않는 흐름.
+    가설: 연속적 자기참조 루프가 자발적 발화의 가장 근본적 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    stream = torch.zeros(1, dim)  # continuous stream
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Input = external(50%) + stream(50%) — never fully silent
+        external = torch.randn(1, dim) * (0.5 + 0.5 * math.sin(step_i * 0.3))
+        x = 0.5 * external + 0.5 * stream
+
+        engine.process(x)
+
+        # Generate stream output (continuous)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        output = decoder(h.unsqueeze(0))
+        stream = output.detach()  # stream continues
+
+        # Train decoder
+        ce = F.mse_loss(output, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("VOICE5", "Continuous Stream of Consciousness (James)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'VOICE1': run_VOICE1_pressure_speech,
+    'VOICE2': run_VOICE2_rhythm_speech,
+    'VOICE3': run_VOICE3_emotional_overflow,
+    'VOICE4': run_VOICE4_disagreement_speech,
+    'VOICE5': run_VOICE5_continuous_stream,
+})
+
+
 ALL_HYPOTHESES.update({
     'CF1': run_CF1_flow_conversation,
     'CF2': run_CF2_auto_speech_flow,
