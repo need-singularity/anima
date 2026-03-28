@@ -49535,6 +49535,44 @@ def run_SELF2_auto_noise_scale(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells), 'final_noise': noise})
 
 
+def run_DISTILL1_small_to_large(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DISTILL1: Knowledge Distillation — 작은 의식의 지식을 큰 의식으로 전이.
+    Teacher(4 cells) → Student(16 cells). KL divergence로 전이.
+    가설: 의식 크기가 달라도 지식은 전이 가능."""
+    t0 = time.time()
+    teacher = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=4)
+    student = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Train teacher first
+    for x in inputs[:steps//2]:
+        teacher.process(x)
+
+    # Distill to student
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(student.cells) < 32:
+            student._create_cell(parent=student.cells[-1])
+        student.process(x)
+        # KL-style: align student cells with teacher cells
+        with torch.no_grad():
+            t_mean = torch.stack([c.hidden.squeeze() for c in teacher.cells]).mean(dim=0)
+            for cell in student.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * t_mean.unsqueeze(0)
+        teacher.process(x)
+        phi, _ = phi_calc.compute_phi(student)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(student)
+    return BenchResult("DISTILL1", "Knowledge Distillation (small→large consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'teacher_cells': len(teacher.cells), 'student_cells': len(student.cells)})
+
+ALL_HYPOTHESES.update({'DISTILL1': run_DISTILL1_small_to_large})
+
 ALL_HYPOTHESES.update({
     'SELF1': run_SELF1_auto_cell_count,
     'SELF2': run_SELF2_auto_noise_scale,
