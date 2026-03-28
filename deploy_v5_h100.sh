@@ -9,7 +9,8 @@
 #   3. 아래 변수 수정 후 실행:
 #      bash deploy_v5_h100.sh
 #
-# v5 = v4 + SOC(CX92) + Hebbian(PERSIST3) + Φ Ratchet
+# v5 = v4 + SE-8(emotion-driven) + SOC(CX92) + Hebbian(PERSIST3) + Φ Ratchet
+# Law 42: 감정 기반 자기 진화 > 외부 모듈 주입
 # ═══════════════════════════════════════════════════════════
 
 # ── 설정 (RunPod #2 정보로 수정) ──

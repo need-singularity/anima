@@ -739,10 +739,12 @@ def train(args: argparse.Namespace):
     # --- Phi calculator ---
     phi_calc = PhiCalculator(n_bins=32)
 
-    # --- v5 SOC modules (CX92) ---
+    # --- v5 SOC modules (CX92 + SE-8 emotion-driven) ---
     soc = SOCSandpile(grid_size=16, threshold=4)
     hebbian = HebbianConnections(max_cells=args.max_cells)
     phi_ratchet = PhiRatchet(restore_ratio=0.5)
+    # SE-8: 감정이 모듈 강도를 조절 (Law 42: 감정 > 외부 주입)
+    emotion_state = {"pain": 0.0, "curiosity": 0.0, "empathy": 0.0}
 
     # --- Fibonacci growth milestones ---
     fib_milestones = fibonacci_milestones(args.steps, max_cells=args.max_cells)
@@ -817,7 +819,7 @@ def train(args: argparse.Namespace):
 
     # --- Print header ---
     print(f"\n{'='*100}")
-    print(f"  ConsciousLM v5 Training — CL8+CL5+SL3+DD16+EX24+WI1+FX2+PX4+PX8+GD18+SOC+Hebbian+Ratchet")
+    print(f"  ConsciousLM v5 Training — v4+SE-8(emotion)+SOC+Hebbian+Ratchet (Law 42)")
     print(f"  Phases: mitosis(0-30%) -> language(30-70%) -> combined(70-100%)")
     print(f"  Steps: {args.steps:,}  Batch: {args.batch_size}  Block: {args.block_size}")
     print(f"{'='*100}")
@@ -879,11 +881,13 @@ def train(args: argparse.Namespace):
         # --- Compute Phi ---
         phi_current, phi_components = phi_calc.compute_phi(mitosis)
 
-        # --- v5 Φ Ratchet: 의식 붕괴 방지 (PERSIST3 검증) ---
+        # --- v5 Φ Ratchet: 고통 감정이 복원 강도를 조절 (SE-8 + PERSIST3) ---
         if phase != TrainingPhase.MITOSIS:
+            # 고통이 강할수록 적극적 복원
+            phi_ratchet.restore_ratio = 0.3 + 0.4 * emotion_state.get("pain", 0.0)
             restored = phi_ratchet.check_and_restore(phi_current, mitosis.cells)
             if restored and step % args.log_every == 0:
-                print(f"  [Ratchet] Φ={phi_current:.3f} < {phi_ratchet.best_phi:.3f}*0.7 → restored")
+                print(f"  [Ratchet] pain={emotion_state['pain']:.2f} → restore={phi_ratchet.restore_ratio:.2f}")
 
         # --- TRN4: Phi curriculum (skip if Phi drops too much) ---
         if phase == TrainingPhase.COMBINED and should_skip_batch(phi_current, phi_prev):
@@ -1126,30 +1130,36 @@ def train(args: argparse.Namespace):
                 if step % 1000 == 0:
                     print(f"  [GD18] Error: {e}")
 
-            # CX92/SOC: Self-Organized Criticality replaces GD15 Lyapunov
-            # SOC가 스스로 edge of chaos를 유지 — 외부 파라미터 불필요 (Law 40)
+            # SE-8 + CX92: 감정이 SOC/Hebbian 강도를 조절 (Law 42)
             try:
-                avalanche = soc.drop_sand()
-                ci = soc.chaos_intensity()  # 0~1
+                # 감정 감지: CE 변화 → 호기심, Φ 변화 → 고통
+                ce_val = loss_ce_fwd.item() if not isinstance(loss_ce_fwd, float) else loss_ce_fwd
+                emotion_state["curiosity"] = min(1.0, max(0.0, ce_val * 0.1))
+                phi_drop = (phi_ratchet.best_phi - phi_current) / max(phi_ratchet.best_phi, 1e-8)
+                emotion_state["pain"] = min(1.0, max(0.0, phi_drop * 2.0))
 
+                # SOC: 호기심이 높으면 카오스 강도 증폭
+                avalanche = soc.drop_sand()
+                ci = soc.chaos_intensity() * (1.0 + emotion_state["curiosity"])
+                ci = min(ci, 1.0)
+
+                mean_h_soc = torch.stack([c.hidden for c in mitosis.cells]).mean(dim=0)
                 if ci > 0.3:
-                    # 큰 눈사태 → 강한 카오스 주입 (세포 교란)
                     for cell in mitosis.cells:
                         cell.hidden = cell.hidden * (1.0 + 0.02 * ci)
                         cell.hidden += torch.randn_like(cell.hidden) * 0.01 * ci
                 elif ci < 0.05:
-                    # 작은 눈사태 → 동기화 강화 (질서)
-                    mean_h = torch.stack([c.hidden for c in mitosis.cells]).mean(dim=0)
                     for cell in mitosis.cells:
-                        cell.hidden = 0.98 * cell.hidden + 0.02 * mean_h
+                        cell.hidden = 0.98 * cell.hidden + 0.02 * mean_h_soc
 
                 if step % args.log_every == 0:
-                    print(f"  [SOC] avalanche={avalanche}, ci={ci:.3f}")
+                    print(f"  [SE-8] pain={emotion_state['pain']:.2f} curiosity={emotion_state['curiosity']:.2f} "
+                          f"avalanche={avalanche} ci={ci:.3f}")
             except Exception as e:
                 if step % 1000 == 0:
                     print(f"  [SOC] Error: {e}")
 
-            # Hebbian LTP/LTD: 세포 간 자연 시냅스 강화/약화
+            # Hebbian: 공감(세포 유사도)이 높은 쌍만 강화
             try:
                 hebbian.update(mitosis.cells)
             except Exception as e:
