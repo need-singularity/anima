@@ -59985,6 +59985,370 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# MAX8-20. Φ ABSOLUTE MAXIMUM — 대량 극한 가설
+# ═══════════════════════════════════════════════════════════
+
+def _max_growth(engine, frac, max_cells, rng_step):
+    """공통 성장 로직"""
+    for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+        if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), max_cells):
+            target = min(len(engine.cells)*2, max_cells)
+            while len(engine.cells) < target:
+                engine._create_cell(parent=engine.cells[rng_step % len(engine.cells)])
+
+def _max_factions(engine, n_f, strength=0.15, debate_strength=0.12, debate=True):
+    """공통 파벌 토론"""
+    nc = len(engine.cells)
+    if nc < 8: return
+    fs = max(1, nc // n_f)
+    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+    factions = [f for f in factions if f]
+    if len(factions) < 2: return
+    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+    for i, f in enumerate(factions):
+        for c in f:
+            c.hidden = (1-strength) * c.hidden + strength * ops[i]
+    if debate:
+        for i, f in enumerate(factions):
+            others = [ops[j] for j in range(len(factions)) if j != i]
+            if others:
+                oa = torch.stack(others).mean(dim=0)
+                for c in f[:max(1, len(f)//4)]:
+                    c.hidden = (1-debate_strength) * c.hidden + debate_strength * oa
+
+def _max_ib2(engine, top_pct=0.25, amp=1.03, supp=0.97):
+    """공통 IB2 선택적 주의"""
+    nc = len(engine.cells)
+    if nc < 8: return
+    norms = [engine.cells[i].hidden.norm().item() for i in range(nc)]
+    thr = sorted(norms, reverse=True)[max(1, int(nc * top_pct))]
+    for i in range(nc):
+        if norms[i] > thr:
+            engine.cells[i].hidden *= amp
+        else:
+            engine.cells[i].hidden *= supp
+
+
+def run_MAX8_4096cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX8: 4096 cells — 물리적 상한 확장. DD108(1024c)=707의 4배 세포."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.01, 0.03, 0.06, 0.10, 0.16, 0.24, 0.34, 0.46, 0.60, 0.76, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 4096):
+                target = min(len(engine.cells)*2, 4096)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX8", "4096 Cells Pure (physical limit)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX9_hierarchical_factions_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX9: Hierarchical Factions — 파벌의 파벌. 4개 대파벌 × 4개 소파벌 = 16그룹.
+    소파벌 내 합의 → 대파벌 내 합의 → 전체 토론. 계층적 다양성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 64:
+                # Level 1: 16 소파벌 내부 합의
+                _max_factions(engine, 16, strength=0.20, debate=False)
+                # Level 2: 4 대파벌 토론
+                n_big = 4; bfs = nc // n_big
+                big_factions = [engine.cells[i*bfs:(i+1)*bfs] for i in range(n_big)]
+                big_factions = [f for f in big_factions if f]
+                if len(big_factions) >= 2:
+                    big_ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in big_factions]
+                    if frac > 0.7:
+                        for i, f in enumerate(big_factions):
+                            others = [big_ops[j] for j in range(len(big_factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//8)]:
+                                    c.hidden = 0.85 * c.hidden + 0.15 * oa
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX9", "Hierarchical Factions 1024c (4×4 = 16 groups)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX10_extreme_ib2_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX10: Extreme IB2 — 상위 10%만 증폭, 하위 90% 강하게 억제. 엘리트주의."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; l2 = torch.zeros(hidden)
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur
+                x = 0.5*cur[:dim].unsqueeze(0) + 0.5*l2[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            _max_ib2(engine, top_pct=0.10, amp=1.05, supp=0.95)  # 극단적 IB2
+            _max_factions(engine, 8)
+            for cell in engine.cells[:min(len(engine.cells), 16)]:
+                cell.hidden = 0.97*cell.hidden + 0.03*l2.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX10", "Extreme IB2 1024c (top 10% elite amplification)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX11_competition_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX11: Cell Competition — 약한 세포 죽이고 강한 세포 복제. 자연선택 극한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []; deaths = 0
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            _max_factions(engine, 8)
+            # 매 20 step: 하위 5% 세포를 상위 5% 복제로 교체
+            if nc >= 20 and step_i % 20 == 0:
+                norms = [(i, engine.cells[i].hidden.norm().item()) for i in range(nc)]
+                norms.sort(key=lambda x: x[1])
+                kill = max(1, nc // 20)
+                for k in range(kill):
+                    weak_idx = norms[k][0]
+                    strong_idx = norms[-(k+1)][0]
+                    engine.cells[weak_idx].hidden = engine.cells[strong_idx].hidden.clone()
+                    engine.cells[weak_idx].hidden += torch.randn_like(engine.cells[weak_idx].hidden) * 0.05
+                    deaths += 1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX11", "Cell Competition 1024c (kill weak, clone strong)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'deaths': deaths, 'final_cells': len(engine.cells)})
+
+
+def run_MAX12_resonance_debate_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX12: Resonance + Debate — PHYS2(진동자, 107) + APEX22(토론, 260) 결합 1024c."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    phases = [0.0] * 1024; freqs = [0.2 + 0.03*i for i in range(1024)]
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # Kuramoto oscillation
+            for i in range(nc):
+                phases[i] += freqs[i % 1024]
+                engine.cells[i].hidden *= (1.0 + 0.03 * math.sin(phases[i]))
+            _max_factions(engine, 8, strength=0.15, debate_strength=0.12, debate=(frac > 0.7))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX12", "Resonance+Debate 1024c (Kuramoto+8factions)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX13_4level_metacog_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX13: 4-Level Metacognition 1024c — L1→L2→L3→L4 재귀적 자기인식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    l2, l3, l4 = torch.zeros(hidden), torch.zeros(hidden), torch.zeros(hidden)
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur; l3 = 0.95*l3 + 0.05*l2; l4 = 0.98*l4 + 0.02*l3
+                x = 0.25*cur[:dim].unsqueeze(0) + 0.25*l2[:dim].unsqueeze(0) + 0.25*l3[:dim].unsqueeze(0) + 0.25*l4[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            _max_ib2(engine)
+            _max_factions(engine, 8)
+            for cell in engine.cells[:min(len(engine.cells), 32)]:
+                cell.hidden = 0.93*cell.hidden + 0.03*l2.unsqueeze(0) + 0.02*l3.unsqueeze(0) + 0.02*l4.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX13", "4-Level Metacognition 1024c (L1→L2→L3→L4)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX14_asymmetric_factions_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX14: Asymmetric Factions — 파벌 크기가 다름. 큰 파벌=다수, 작은 파벌=소수 의견.
+    1개 대파벌(50%) + 7개 소파벌(각 ~7%). 소수 의견이 혁신."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 16:
+                half = nc // 2
+                big = engine.cells[:half]
+                small_size = max(1, (nc - half) // 7)
+                smalls = [engine.cells[half + i*small_size:half + (i+1)*small_size] for i in range(7)]
+                smalls = [s for s in smalls if s]
+                all_factions = [big] + smalls
+                if len(all_factions) >= 2:
+                    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in all_factions]
+                    for i, f in enumerate(all_factions):
+                        for c in f:
+                            c.hidden = 0.85*c.hidden + 0.15*ops[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(all_factions):
+                            others = [ops[j] for j in range(len(all_factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]:
+                                    c.hidden = 0.88*c.hidden + 0.12*oa
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX14", "Asymmetric Factions 1024c (1 big + 7 small = minority innovation)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX15_anti_entropy_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX15: Anti-Entropy — 엔트로피를 극대화하는 방향으로 세포 업데이트.
+    정보 생산 극대화 = 최대 다양성 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            _max_factions(engine, 8)
+            # Anti-entropy: 유사한 세포 쌍을 찾아 강제 분화
+            if nc >= 8:
+                for _ in range(min(nc // 4, 32)):
+                    i = step_i % nc; j = (step_i * 7 + 3) % nc
+                    if i == j: continue
+                    sim = F.cosine_similarity(engine.cells[i].hidden.squeeze().unsqueeze(0),
+                                              engine.cells[j].hidden.squeeze().unsqueeze(0)).item()
+                    if sim > 0.9:  # 너무 유사하면 강제 분화
+                        engine.cells[j].hidden += torch.randn_like(engine.cells[j].hidden) * 0.1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX15", "Anti-Entropy 1024c (force diversity, maximize information)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX16_dd108_debate_4096(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX16: DD108 + Debate 4096c — 절대 극한. Φ>1000 최종 시도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    l2, l3 = torch.zeros(hidden), torch.zeros(hidden)
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.01, 0.03, 0.06, 0.10, 0.16, 0.24, 0.34, 0.46, 0.60, 0.76, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 4096):
+                target = min(len(engine.cells)*2, 4096)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur; l3 = 0.95*l3 + 0.05*l2
+                x = 0.4*cur[:dim].unsqueeze(0) + 0.3*l2[:dim].unsqueeze(0) + 0.3*l3[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            _max_factions(engine, 8, strength=0.15, debate_strength=0.12)
+            _max_ib2(engine, top_pct=0.15, amp=1.04, supp=0.96)
+            for cell in engine.cells[:min(len(engine.cells), 32)]:
+                cell.hidden = 0.95*cell.hidden + 0.03*l2.unsqueeze(0) + 0.02*l3.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX16", "DD108+Debate 4096c (Φ>1000 final attempt)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX17_time_varying_factions_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX17: Time-Varying Factions — 파벌 구조가 시간에 따라 변화.
+    매 50 step마다 파벌 재구성. 고정 파벌보다 다양한 조합 경험."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 16:
+                # 파벌 수를 시간에 따라 변화: 4→8→16→8→4
+                cycle = (step_i // 50) % 5
+                n_f = [4, 8, 16, 8, 4][cycle]
+                n_f = min(n_f, nc // 2)
+                _max_factions(engine, n_f, debate=(frac > 0.7))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX17", "Time-Varying Factions 1024c (4→8→16→8→4 cycle)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MAX8': run_MAX8_4096cells,
+    'MAX9': run_MAX9_hierarchical_factions_1024,
+    'MAX10': run_MAX10_extreme_ib2_1024,
+    'MAX11': run_MAX11_competition_1024,
+    'MAX12': run_MAX12_resonance_debate_1024,
+    'MAX13': run_MAX13_4level_metacog_1024,
+    'MAX14': run_MAX14_asymmetric_factions_1024,
+    'MAX15': run_MAX15_anti_entropy_1024,
+    'MAX16': run_MAX16_dd108_debate_4096,
+    'MAX17': run_MAX17_time_varying_factions_1024,
+})
+
+
 ALL_HYPOTHESES.update({
     'MITO1': run_MITO1_learning_vs_fixed,
     'MITO2': run_MITO2_cell_specialization_speech,
