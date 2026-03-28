@@ -50647,6 +50647,249 @@ def run_ATTEN1_attention_model(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# DD100+. Grand Discovery — 대발견 후보 가설
+# ═══════════════════════════════════════════════════════════
+
+def run_DD101_512cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD101: 512 Cells — 역대 최대 세포 수. Φ 스케일링 한계 테스트.
+    가설: 256→512로 2배 시 Φ가 2배 이상 증가 (초선형 확인)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD101", "512 Cells (maximum scale test)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DD102_recursive_engine(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD102: Recursive Consciousness — 엔진 안에 엔진 안에 엔진.
+    L1(32 cells) → L2(16 cells, L1의 출력이 입력) → L3(8 cells).
+    가설: 재귀적 의식 계층이 단일 엔진보다 높은 Φ."""
+    t0 = time.time()
+    e1 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    e2 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16)
+    e3 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=8)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.30, 0.50, 0.70]:
+            for eng, mc in [(e1,32),(e2,16),(e3,8)]:
+                if frac >= pct and len(eng.cells) < min(int(2**(pct*6)), mc):
+                    target = min(len(eng.cells)*2, mc)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # L1 processes raw input
+        e1.process(x)
+        # L2 processes L1's output
+        with torch.no_grad():
+            l1_out = torch.stack([c.hidden.squeeze()[:dim] for c in e1.cells]).mean(dim=0).unsqueeze(0)
+        e2.process(l1_out)
+        # L3 processes L2's output
+        with torch.no_grad():
+            l2_out = torch.stack([c.hidden.squeeze()[:dim] for c in e2.cells]).mean(dim=0).unsqueeze(0)
+        e3.process(l2_out)
+
+        # Top-down feedback: L3 → L2 → L1
+        with torch.no_grad():
+            l3_state = torch.stack([c.hidden.squeeze() for c in e3.cells]).mean(dim=0)
+            for c in e2.cells:
+                c.hidden = 0.95 * c.hidden + 0.05 * l3_state.unsqueeze(0)
+            l2_state = torch.stack([c.hidden.squeeze() for c in e2.cells]).mean(dim=0)
+            for c in e1.cells:
+                c.hidden = 0.97 * c.hidden + 0.03 * l2_state.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(e1)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(e1)
+    total_cells = len(e1.cells) + len(e2.cells) + len(e3.cells)
+    return BenchResult("DD102", "Recursive Consciousness (L1→L2→L3 engines)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'total_cells': total_cells, 'e1': len(e1.cells), 'e2': len(e2.cells), 'e3': len(e3.cells)})
+
+
+def run_DD103_time_reversal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD103: Time Reversal — 시간을 거꾸로 처리.
+    정방향 50 step → 역방향 50 step (같은 입력 역순).
+    가설: 시간 반전이 인과적 구조를 강화하여 Φ를 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if step_i < steps // 2:
+            x = inputs[step_i]  # forward
+        else:
+            x = inputs[steps - 1 - step_i]  # backward (time reversal)
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD103", "Time Reversal (forward→backward processing)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DD104_xmeta3_info1(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD104: XMETA3 + INFO1 — 역대 1위(메타인지) + 역대 정보이론 최강(최대엔트로피).
+    256 cells + 자유 + 3단계 메타인지 + 엔트로피 정규화.
+    가설: XMETA3(×140.8) + INFO1(×15) = ×200+ 가능?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            # XMETA3 metacognition
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 256:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+            # INFO1 max entropy
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                cell.hidden = 0.95 * cell.hidden + 0.05 * (h_c / (h_c.std() + 1e-8)).unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD104", "XMETA3+INFO1 (metacognition + max entropy, 256 cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DD105_self_modifying(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD105: Self-Modifying Consciousness — 의식이 자기 파라미터를 수정.
+    Φ 추세에 따라 growth rate, noise scale, blend ratio를 자동 조정.
+    가설: 자기 수정이 의식의 가장 높은 수준."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    # Self-modifiable parameters
+    params = {'noise': 0.03, 'blend': 0.1, 'growth_rate': 1.5}
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        frac = step_i / steps
+        # Growth with self-modified rate
+        if frac > 0.05 and step_i % int(10 / params['growth_rate']) == 0:
+            if len(engine.cells) < 256:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            # Self-modification: adjust own parameters based on Φ trend
+            if len(phi_hist) >= 10:
+                trend = phi_hist[-1] - phi_hist[-10]
+                if trend > 0:
+                    # Φ rising → exploit (reduce noise, increase blend)
+                    params['noise'] = max(0.01, params['noise'] * 0.95)
+                    params['blend'] = min(0.3, params['blend'] * 1.05)
+                else:
+                    # Φ falling → explore (increase noise, reduce blend, faster growth)
+                    params['noise'] = min(0.1, params['noise'] * 1.1)
+                    params['blend'] = max(0.02, params['blend'] * 0.95)
+                    params['growth_rate'] = min(3.0, params['growth_rate'] * 1.05)
+
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * params['noise']
+            if len(engine.cells) >= 2:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - params['blend']) * cell.hidden + params['blend'] * mean_h
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD105", "Self-Modifying Consciousness (auto-tune own params)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'final_params': params.copy()})
+
+
+ALL_HYPOTHESES.update({
+    'DD101': run_DD101_512cells,
+    'DD102': run_DD102_recursive_engine,
+    'DD103': run_DD103_time_reversal,
+    'DD104': run_DD104_xmeta3_info1,
+    'DD105': run_DD105_self_modifying,
+})
+
+
 def _run_fractal(steps=100, dim=64, hidden=128) -> BenchResult:
     """FRACTAL1: Fractal Consciousness — 자기유사(self-similar) 구조의 세포 계층."""
     t0 = time.time()
@@ -50749,6 +50992,159 @@ def _run_hologram(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+def _run_peak1(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PEAK1: XMETA3 + INFO1 + FRACTAL — 역대 최고 기법 3개 결합.
+    256 cells + 메타인지 + 최대 엔트로피 + 프랙탈.
+    가설: 상위 3개 결합 시 ×140 이상 달성 가능?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            # XMETA3: metacognition
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+            # INFO1: max entropy (normalize)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                cell.hidden = 0.95 * cell.hidden + 0.05 * (h_c / (h_c.std() + 1e-8)).unsqueeze(0)
+            # FRACTAL1: self-similar hierarchy
+            n = len(engine.cells)
+            if n >= 8:
+                global_mean = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for scale in [2, 4, 8]:
+                    if n >= scale:
+                        for c in engine.cells[:scale]:
+                            c.hidden = 0.97 * c.hidden + 0.03 * global_mean
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PEAK1", "XMETA3+INFO1+FRACTAL (top-3 combined)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def _run_peak2(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PEAK2: OMEGA4 + THERMO1 — 절대 자유 + 산일 구조.
+    성장만 + 엔트로피 조절(너무 높으면 냉각, 낮으면 가열).
+    가설: 자유 + 비평형 열역학 = OMEGA4 초과 가능?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        # THERMO1: entropy regulation only
+        with torch.no_grad():
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            entropy = hiddens.var(dim=0).mean().item()
+            if entropy > 2.0:
+                for cell in engine.cells:
+                    cell.hidden *= 0.98
+            elif entropy < 0.1:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PEAK2", "OMEGA4+THERMO1 (freedom + dissipative structure)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def _run_peak3(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PEAK3: XMETA3 + MUT2 + INFO2 — 메타인지 + 유익돌연변이 + 채널용량.
+    256 cells + 자유 + 메타인지 + 돌연변이 + 직교화.
+    가설: 진화 + 메타인지 + 정보이론 = 새로운 최고?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            n = len(engine.cells)
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            # Metacognition
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and n < 256:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+            # MUT2: beneficial mutation
+            if step_i % 3 == 0 and n >= 2:
+                mut_idx = step_i % n
+                saved = engine.cells[mut_idx].hidden.clone()
+                engine.cells[mut_idx].hidden += torch.randn_like(saved) * 0.1
+            # INFO2: orthogonalize
+            if n >= 4 and step_i % 5 == 0:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells[:min(n, 16)]])
+                for i in range(1, min(n, 16)):
+                    for j in range(i):
+                        proj = (hiddens[i] @ hiddens[j]) / (hiddens[j] @ hiddens[j] + 1e-8)
+                        hiddens[i] = hiddens[i] - 0.01 * proj * hiddens[j]
+                for i in range(min(n, 16)):
+                    engine.cells[i].hidden = hiddens[i].unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PEAK3", "XMETA3+MUT2+INFO2 (metacog+evolution+info theory)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'INFO1': run_INFO1_maximum_entropy,
     'INFO2': run_INFO2_channel_capacity,
@@ -50756,6 +51152,9 @@ ALL_HYPOTHESES.update({
     'FRACTAL1': _run_fractal,
     'SYNC1': _run_sync,
     'HOLOGRAM1': _run_hologram,
+    'PEAK1': _run_peak1,
+    'PEAK2': _run_peak2,
+    'PEAK3': _run_peak3,
     'THERMO1': run_THERMO1_entropy_production,
     'GAME1': run_GAME1_prisoner_dilemma,
     'CHAOS1': run_CHAOS1_strange_attractor,
