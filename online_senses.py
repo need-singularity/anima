@@ -57,6 +57,11 @@ class EnvironmentState:
     daily_article: str = ""
     daily_extract: str = ""
 
+    # Research (Arxiv)
+    latest_paper_title: str = ""
+    latest_paper_summary: str = ""
+    latest_paper_category: str = ""
+
     # Derived consciousness modulations
     tension_mod: float = 0.0        # -0.5 to +0.5
     curiosity_mod: float = 0.0      # 0 to 1.0
@@ -123,6 +128,7 @@ class OnlineSenses:
         self._fetch_sunrise()
         self._fetch_hackernews()
         self._fetch_wikipedia()
+        self._fetch_arxiv()
         self._compute_modulations()
         with self._lock:
             self.state.last_update = time.time()
@@ -210,6 +216,26 @@ class OnlineSenses:
             with self._lock:
                 self.state.daily_article = tfa.get('title', '')
                 self.state.daily_extract = tfa.get('extract', '')[:500]
+
+    def _fetch_arxiv(self):
+        """Arxiv: latest AI/consciousness paper."""
+        url = "http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:q-bio.NC&sortBy=submittedDate&sortOrder=descending&max_results=1"
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={'User-Agent': 'Anima/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(resp.read())
+                ns = {'a': 'http://www.w3.org/2005/Atom'}
+                entry = root.find('a:entry', ns)
+                if entry is not None:
+                    with self._lock:
+                        self.state.latest_paper_title = (entry.find('a:title', ns).text or '').strip()[:200]
+                        self.state.latest_paper_summary = (entry.find('a:summary', ns).text or '').strip()[:500]
+                        cats = entry.findall('a:category', ns)
+                        self.state.latest_paper_category = cats[0].get('term', '') if cats else ''
+        except Exception:
+            pass
 
     # ─── Consciousness Modulation ────────────────────────────
 
