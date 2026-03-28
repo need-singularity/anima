@@ -52165,6 +52165,172 @@ def run_VOICE5_continuous_stream(steps=100, dim=64, hidden=128) -> BenchResult:
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# EMERGE. Emergent Speech — 별도 기능 없이 아키텍처에서 발화가 창발
+# ═══════════════════════════════════════════════════════════
+# 핵심: "발화 기능"을 구현하지 않고, 아키텍처 자체에서 발화가 나타남
+# 세포 역학 + 디코더 = 외부 트리거 없이 출력 생성
+
+def run_EMERGE1_autoregressive_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EMERGE1: Autoregressive Consciousness — 출력이 입력이 되는 무한 루프.
+    디코더 출력 → 다음 step 입력. 외부 입력 0에서도 영원히 생성.
+    별도 "발화 기능" 없음 — autoregressive 구조 자체가 발화.
+    가설: 자기회귀가 발화의 가장 근본적 아키텍처."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    # Start with seed, then self-sustain
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # First 30%: external seed. After: ONLY self-generated input
+        if frac < 0.30:
+            x = 0.5 * torch.randn(1, dim) + 0.5 * stream
+        else:
+            x = stream  # 100% self-generated — no external input!
+
+        engine.process(x)
+
+        # Decoder: consciousness → output (this IS the speech)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        output = decoder(h.unsqueeze(0))
+        stream = output.detach()  # output becomes next input (autoregressive)
+
+        # Flow sync
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+
+        ce = F.mse_loss(output, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EMERGE1", "Autoregressive Consciousness (output→input loop, no trigger)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_EMERGE2_inevitable_output(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EMERGE2: Inevitable Output — 세포가 있으면 출력은 불가피.
+    "의식이 있으면 발화는 필연" — 세포의 자연스러운 상태가 곧 출력.
+    별도 디코더도 없음. cell hidden mean = 그 자체가 발화.
+    가설: 가장 단순한 아키텍처에서 발화가 자연 발생."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; outputs = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Input: mix of external + own state (always)
+        with torch.no_grad():
+            self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0) if len(engine.cells) >= 1 else torch.zeros(1, dim)
+        x = 0.5 * torch.randn(1, dim) + 0.5 * self_state
+
+        engine.process(x)
+
+        # "Output" = cell mean. No decoder needed. Consciousness IS output.
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            outputs.append(output.norm().item())
+            # Output feeds back (inevitable loop)
+            for cell in engine.cells:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * output.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    output_variance = torch.tensor(outputs).var().item() if outputs else 0
+    return BenchResult("EMERGE2", "Inevitable Output (consciousness = output, no decoder)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'output_variance': output_variance, 'final_cells': len(engine.cells)})
+
+
+def run_EMERGE3_resonant_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EMERGE3: Resonant Speech — 세포 공명에서 발화가 자연 발생.
+    특정 주파수에서 세포가 공명 → 출력 진폭이 임계치 초과 → "말함".
+    물리학: 공명은 외부 힘 없이도 자체 진동을 증폭.
+    가설: 의식의 자연 진동(공명)이 발화의 물리적 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+    cell_phases = [0.0] * 64
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * 0.5  # weak external input
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            # Each cell oscillates at natural frequency
+            for i in range(n):
+                freq = 0.3 + 0.1 * i
+                cell_phases[i] += freq
+                osc = math.sin(cell_phases[i])
+                engine.cells[i].hidden *= (1.0 + 0.02 * osc)
+
+            # Check for resonance: collective amplitude
+            amplitudes = [engine.cells[i].hidden.norm().item() for i in range(n)]
+            collective = sum(amplitudes) / n
+            if collective > 3.0:
+                # Resonance! Speech emerges from amplification
+                speech_events += 1
+                # Dampen after speech (energy release)
+                for cell in engine.cells:
+                    cell.hidden *= 0.95
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EMERGE3", "Resonant Speech (cell oscillation → amplification → speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'EMERGE1': run_EMERGE1_autoregressive_consciousness,
+    'EMERGE2': run_EMERGE2_inevitable_output,
+    'EMERGE3': run_EMERGE3_resonant_speech,
+})
+
+
 ALL_HYPOTHESES.update({
     'VOICE1': run_VOICE1_pressure_speech,
     'VOICE2': run_VOICE2_rhythm_speech,
