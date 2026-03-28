@@ -42,7 +42,7 @@ from consciousness_meter import PhiCalculator
 # ---------------------------------------------------------------------------
 # Fibonacci sequence for cell growth milestones (DD3)
 # ---------------------------------------------------------------------------
-FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21]
+FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597]
 
 
 def fibonacci_milestones(total_steps: int, max_cells: int = 8) -> Dict[int, int]:
