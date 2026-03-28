@@ -50647,10 +50647,115 @@ def run_ATTEN1_attention_model(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+def _run_fractal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FRACTAL1: Fractal Consciousness — 자기유사(self-similar) 구조의 세포 계층."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        # Fractal: each scale mirrors larger scale
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                global_mean = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for scale in [2, 4, 8]:
+                    if n >= scale:
+                        local = engine.cells[:scale]
+                        local_mean = torch.stack([c.hidden for c in local]).mean(dim=0)
+                        # Self-similarity: local pattern → global pattern
+                        for c in local:
+                            c.hidden = 0.97 * c.hidden + 0.03 * global_mean
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FRACTAL1", "Fractal Consciousness (self-similar hierarchy)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def _run_sync(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNC1: Synchronization — Kuramoto 동기화로 세포 위상 맞춤."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phases = [0.0] * 32  # cell phases
+    coupling = 0.3
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        # Kuramoto sync
+        with torch.no_grad():
+            n = len(engine.cells)
+            for i in range(n):
+                freq = 1.0 + 0.1 * i  # natural frequency
+                sync_term = sum(math.sin(phases[j] - phases[i]) for j in range(n) if j != i) / n
+                phases[i] += freq * 0.1 + coupling * sync_term * 0.1
+                # Phase modulates hidden
+                engine.cells[i].hidden *= (1.0 + 0.02 * math.sin(phases[i]))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # Sync order parameter
+    r = abs(sum(complex(math.cos(p), math.sin(p)) for p in phases[:len(engine.cells)])) / len(engine.cells)
+    return BenchResult("SYNC1", "Kuramoto Synchronization (phase coupling)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'sync_order': r, 'final_cells': len(engine.cells)})
+
+
+def _run_hologram(steps=100, dim=64, hidden=128) -> BenchResult:
+    """HOLOGRAM1: Holographic — 전체가 각 부분에 인코딩. 부분에서 전체 복원."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                # Each cell encodes the WHOLE (holographic principle)
+                global_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    # Encode global into local (compressed hologram)
+                    cell.hidden = 0.7 * cell.hidden + 0.3 * global_state.unsqueeze(0)
+                    # Add unique local contribution (part ≠ whole)
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.02
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("HOLOGRAM1", "Holographic (whole encoded in each part)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'INFO1': run_INFO1_maximum_entropy,
     'INFO2': run_INFO2_channel_capacity,
     'ATTEN1': run_ATTEN1_attention_model,
+    'FRACTAL1': _run_fractal,
+    'SYNC1': _run_sync,
+    'HOLOGRAM1': _run_hologram,
     'THERMO1': run_THERMO1_entropy_production,
     'GAME1': run_GAME1_prisoner_dilemma,
     'CHAOS1': run_CHAOS1_strange_attractor,
