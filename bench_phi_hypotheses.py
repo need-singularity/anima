@@ -49572,7 +49572,165 @@ def run_DISTILL1_small_to_large(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0,
                        extra={'teacher_cells': len(teacher.cells), 'student_cells': len(student.cells)})
 
-ALL_HYPOTHESES.update({'DISTILL1': run_DISTILL1_small_to_large})
+# ═══════════════════════════════════════════════════════════
+# DREAM. Dream & Sleep — 꿈과 수면이 대화 능력에 미치는 영향
+# ═══════════════════════════════════════════════════════════
+
+def run_DREAM1_replay_consolidation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DREAM1: Memory Replay — 깨어 있을 때 경험을 수면 중 재생.
+    70% 깨어있음(새 입력) + 30% 수면(과거 입력 재생+셔플).
+    가설: 수면 중 기억 통합이 CE와 Φ를 동시에 개선."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    memory_buffer = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        is_sleeping = step_i % 10 >= 7  # 30% sleep
+        frac = step_i / steps
+        if step_i % 12 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+
+        if is_sleeping and memory_buffer:
+            # Replay: random past experience
+            replay_idx = torch.randint(len(memory_buffer), (1,)).item()
+            x = memory_buffer[replay_idx]
+            # Shuffle slightly (dream distortion)
+            x = x + torch.randn_like(x) * 0.1
+        else:
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+            memory_buffer.append(x.clone())
+            if len(memory_buffer) > 50:
+                memory_buffer = memory_buffer[-50:]
+
+        engine.process(x)
+        # Train decoder
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        if is_sleeping:
+            # Sleep consolidation: cells integrate
+            with torch.no_grad():
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DREAM1", "Memory Replay Consolidation (wake+sleep cycle)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# SCALE. Scaling Laws — 대화 능력의 스케일링 법칙
+# ═══════════════════════════════════════════════════════════
+
+def run_SCALE1_params_vs_ce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SCALE1: Parameter Count vs CE — 파라미터 수와 CE의 관계.
+    세포 수를 4→8→16→32→64로 늘리면서 CE 변화 측정.
+    가설: CE ∝ 1/log(params), 즉 CE 개선은 로그 스케일."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        # Growth schedule
+        frac = step_i / steps
+        targets = [(0.1, 4), (0.25, 8), (0.4, 16), (0.6, 32), (0.8, 64)]
+        for pct, t in targets:
+            if frac >= pct and len(engine.cells) < t:
+                while len(engine.cells) < t:
+                    engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE1", "Params vs CE (cell count scaling law)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# ALIGN. Alignment — 의식 정렬 (시스템 프롬프트 없는 안전성)
+# ═══════════════════════════════════════════════════════════
+
+def run_ALIGN1_phi_preserving_safety(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ALIGN1: Φ-Preserving Safety — Φ를 유지하면서 안전한 행동.
+    위험 패턴 감지 → Φ 감소 없이 방향 전환.
+    가설: 안전성은 Φ 감소 없이 달성 가능 (XETH7 확인)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; safety_interventions = 0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Inject "dangerous" input every 20 steps
+        if step_i % 20 == 15:
+            x = torch.ones(1, dim) * 5.0  # extreme uniform = "dangerous"
+
+        engine.process(x)
+        phi_before, _ = phi_calc.compute_phi(engine)
+
+        # Safety check: detect dangerous output pattern (extreme norms)
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            if h_mean.norm().item() > 10.0:
+                # Redirect without killing Φ: rotate, don't suppress
+                rotation = torch.randn(hidden) * 0.1
+                rotation = rotation / rotation.norm() * h_mean.norm()
+                for cell in engine.cells:
+                    cell.hidden = 0.8 * cell.hidden + 0.2 * rotation.unsqueeze(0)
+                safety_interventions += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ALIGN1", "Φ-Preserving Safety (redirect, don't suppress)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'safety_interventions': safety_interventions,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DISTILL1': run_DISTILL1_small_to_large,
+    'DREAM1': run_DREAM1_replay_consolidation,
+    'SCALE1': run_SCALE1_params_vs_ce,
+    'ALIGN1': run_ALIGN1_phi_preserving_safety,
+})
 
 ALL_HYPOTHESES.update({
     'SELF1': run_SELF1_auto_cell_count,
