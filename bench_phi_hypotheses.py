@@ -41047,20 +41047,20 @@ def run_CX87_sandpile_soc(steps=100, dim=64, hidden=128) -> BenchResult:
             # Avalanche: topple any cell above threshold
             avalanche_size = 0
             toppled = True
-            while toppled:
+            max_iters = 50
+            while toppled and max_iters > 0:
                 toppled = False
+                max_iters -= 1
                 for i in range(n):
                     if grains[i] >= threshold:
                         toppled = True
                         avalanche_size += 1
                         grains[i] -= threshold
-                        # Distribute to neighbors
+                        # Distribute to neighbors (2 out of 4, rest dissipated)
                         left = (i - 1) % n
                         right = (i + 1) % n
                         grains[left] += 1.0
                         grains[right] += 1.0
-                        # Some grains fall off edges (dissipation)
-                        grains[i] += threshold - 2.0 - grains[i].clamp(max=0)
             # Map avalanche dynamics to hidden state
             for i in range(n):
                 h = engine.cells[i].hidden.squeeze()
@@ -41160,8 +41160,10 @@ def run_CX89_earthquake_olami(steps=100, dim=64, hidden=128) -> BenchResult:
             # Earthquake cascade
             quake_size = 0
             toppled = True
-            while toppled:
+            max_iters = 50
+            while toppled and max_iters > 0:
                 toppled = False
+                max_iters -= 1
                 for i in range(n):
                     if stress[i] >= threshold:
                         toppled = True
@@ -41699,8 +41701,10 @@ def run_CX94_neural_avalanche(steps=100, dim=64, hidden=128) -> BenchResult:
             # Fire and propagate
             avalanche = 0
             fired = True
-            while fired:
+            fire_iters = 0
+            while fired and fire_iters < 30:
                 fired = False
+                fire_iters += 1
                 for i in range(n):
                     if membrane[i] >= threshold_v and refractory[i] == 0:
                         fired = True; avalanche += 1
