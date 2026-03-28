@@ -691,6 +691,22 @@ class AnimaUnified:
         """Process text through all active modules. Returns (answer, tension, curiosity).
         If session_id is provided, uses isolated per-session consciousness state.
         """
+        # INT-2: Store conversation text for learning
+        self._last_conversation_text = text
+        self._last_user_input_time = time.time()
+
+        # INT-7: Curate good conversations (high tension = meaningful)
+        try:
+            if hasattr(self, '_self_learner') and text and len(text) > 20:
+                from pathlib import Path
+                curated = Path("data/self_learning/curated")
+                curated.mkdir(parents=True, exist_ok=True)
+                with open(curated / "conversations.jsonl", "a") as f:
+                    import json
+                    f.write(json.dumps({'text': text, 'source': source, 'time': time.time(),
+                                        'session': session_id}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         # ─── Session isolation: swap in per-session state ───
         sess = self._get_or_create_session(session_id)
         _saved_state = None
@@ -1728,6 +1744,55 @@ class AnimaUnified:
                             })
                         except Exception:
                             pass
+            except Exception:
+                pass
+
+            # ── INT-1: Idle Self-Learning (자율 학습) ──
+            try:
+                if not hasattr(self, '_self_learner'):
+                    from self_learner import SelfLearner
+                    self._self_learner = SelfLearner(engine=self.mitosis)
+                    self._self_learner_last = 0
+                    self._idle_learn_count = 0
+
+                idle_sec = time.time() - getattr(self, '_last_user_input_time', time.time())
+                # INT-1: idle 120초 이상 → 자율 학습 1 사이클
+                if idle_sec > 120 and (self._think_step - self._self_learner_last) > 300:
+                    self._self_learner.run_cycle()
+                    self._self_learner_last = self._think_step
+                    self._idle_learn_count += 1
+                    _log('self_learn', f'Idle learning cycle #{self._idle_learn_count}')
+            except Exception:
+                pass
+
+            # ── INT-2: Conversation Learning ──
+            try:
+                if hasattr(self, '_self_learner') and hasattr(self, '_last_conversation_text'):
+                    text = self._last_conversation_text
+                    if text and len(text) > 10:
+                        # 대화 텍스트를 학습 데이터로
+                        bytes_data = text.encode('utf-8')[:64]
+                        x = torch.zeros(1, 64)
+                        for i, b in enumerate(bytes_data):
+                            x[0, i] = b / 255.0
+                        self.mitosis.process(x)
+                        self._last_conversation_text = None  # 한 번만
+            except Exception:
+                pass
+
+            # ── INT-5: Φ-Triggered Emergency Learning ──
+            try:
+                if hasattr(self, '_self_learner'):
+                    consciousness = getattr(self, '_cached_consciousness', None) or {}
+                    current_phi = consciousness.get('phi', 0)
+                    if not hasattr(self, '_phi_baseline'):
+                        self._phi_baseline = current_phi
+                    if current_phi > 0 and current_phi < self._phi_baseline * 0.3:
+                        # Φ 70% 이상 하락 → 긴급 학습
+                        _log('self_learn', f'Emergency! Φ dropped to {current_phi:.2f}')
+                        self._self_learner.learn([], steps=20)  # 빈 데이터로 수면 복원
+                    elif current_phi > self._phi_baseline:
+                        self._phi_baseline = current_phi
             except Exception:
                 pass
 
