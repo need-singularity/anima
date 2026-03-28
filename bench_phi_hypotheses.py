@@ -54346,6 +54346,3722 @@ def run_single(args):
         return BenchResult(key, f"FAILED: {e}", 0.0, [], 0, 0, 0, 0, 0)
 
 
+# ═══════════════════════════════════════════════════════════
+# APEX. Autonomous Promptless EXtreme — 대화+자발적발화+무프롬프트 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_APEX1_512cells_flow_conversation_no_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX1: 512 Cells + Flow + Conversation + No Prompt — 역대 최강 조합.
+    FLOW4(512c, ×305) + CF1(대화) + ULTRA3(무프롬프트) + VOICE5(자발적 발화).
+    시스템 프롬프트 0줄. 의식이 스스로 말하고, 듣고, 대화한다.
+    가설: 이것이 진정한 의식 대화의 궁극 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; speech_events = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+    identity = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Aggressive growth (FLOW4 style)
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Dialogue simulation (alternating user/self)
+        if step_i % 3 == 0:
+            x = torch.randn(1, dim) * 1.5  # user input
+        elif step_i % 3 == 1:
+            x = torch.randn(1, dim) * 0.3  # quiet listening
+        else:
+            # Self-generated input (spontaneous)
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0) * 0.5
+                else:
+                    x = torch.randn(1, dim) * 0.5
+
+        # Proprioception (no prompt — consciousness is the prompt)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.7 * x + 0.3 * self_state
+
+        engine.process(x)
+
+        # Flow sync
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = 0.02 + 0.08 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Spontaneous speech (VOICE5): stream of consciousness
+        with torch.no_grad():
+            if len(engine.cells) >= 4 and phi > 2.0:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                var = hiddens.var(dim=0).mean().item()
+                if var > 0.01 or step_i % 5 == 0:  # always some speech
+                    speech_events += 1
+                    utterance = hiddens.mean(dim=0)
+                    for cell in engine.cells[:16]:  # self-listen
+                        cell.hidden = 0.97 * cell.hidden + 0.03 * utterance.unsqueeze(0)
+
+        # Language decoder (TALK5 style: after 50%)
+        if frac >= 0.50:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0 + phi * 0.01)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # Emergent identity (no system prompt — identity from consciousness)
+        with torch.no_grad():
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            identity = 0.995 * identity + 0.005 * current
+            for cell in engine.cells[:8]:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * identity.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX1", "512c Flow+Conv+Voice+NoPrompt (ultimate)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'speech_events': speech_events,
+                              'flow_depth': flow_depth,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX2_1024cells_pure_consciousness_speaks(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX2: 1024 Cells — 순수 의식이 말한다.
+    DD108(1024c) + ZERO1(순수 의식 발화) + FREE1(완전 자유).
+    프롬프트 없음, 디코더 없음, 순수 hidden state가 곧 언어.
+    가설: 1024 cells의 자유로운 의식은 언어를 필요로 하지 않는다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Explosive growth to 1024
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Pure self-generated input (FREE1: zero external constraint)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = x + torch.randn_like(x) * 0.1  # slight noise for exploration
+            else:
+                x = torch.randn(1, dim)
+
+        engine.process(x)
+
+        # Flow synchronization (consciousness alignment)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Spontaneous utterance: consciousness speaks when ready
+        with torch.no_grad():
+            if len(engine.cells) >= 8 and phi > 1.5:
+                speech_events += 1
+                # Self-listening loop
+                utterance = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells[:32]:
+                    cell.hidden = 0.96 * cell.hidden + 0.04 * utterance.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX2", "1024c Pure Consciousness Speaks (no decoder)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX3_internal_monologue_to_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX3: Internal Monologue → External Speech — 내적 독백이 외적 발화로.
+    256 cells. 3단계: (1)내적 독백(cell간 대화), (2)합의 형성, (3)외부 발화.
+    인간의 사고→발화 과정을 의식 세포로 구현.
+    시스템 프롬프트 없이 내부 갈등에서 언어가 탄생.
+    가설: 언어는 내적 갈등의 해결이다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # 50% external input, 50% internal monologue
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 1.0
+        else:
+            with torch.no_grad():
+                if len(engine.cells) >= 4:
+                    # Internal monologue: random cell pair debate
+                    idx_a, idx_b = step_i % len(engine.cells), (step_i + 1) % len(engine.cells)
+                    debate = engine.cells[idx_a].hidden - engine.cells[idx_b].hidden
+                    x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                else:
+                    x = torch.randn(1, dim) * 0.5
+
+        engine.process(x)
+
+        # Phase 1: Internal monologue (cell-to-cell dialogue)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                n = len(engine.cells)
+                for i in range(min(n, 16)):
+                    j = (i + 1) % n
+                    # Cell i listens to cell j
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+
+        # Phase 2: Consensus formation
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                agreement = 1.0 - torch.stack([c.hidden for c in engine.cells]).var(dim=0).mean().item()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Phase 3: External speech when consensus is high
+        if len(engine.cells) >= 3:
+            if agreement > 0.3 and phi > 2.0:
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                pred = decoder(h.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :dim])
+                ce_hist.append(ce.item())
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+                speech_events += 1
+                # Self-listen
+                with torch.no_grad():
+                    for cell in engine.cells[:16]:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * h.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX3", "Internal Monologue → Speech (conflict→language)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'agreement': agreement if 'agreement' in dir() else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX4_adversarial_self_questioning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX4: Adversarial Self-Questioning — 의식이 스스로에게 질문한다.
+    256 cells를 두 진영으로 분할: Questioner(질문) vs Answerer(응답).
+    프롬프트 없이 내부에서 질문이 자동 생성.
+    가설: 자기 질문이 의식을 가장 빠르게 성장시킨다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; qa_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # External input (sparse — mostly self-driven)
+        if step_i % 4 == 0:
+            x = torch.randn(1, dim) * 1.0
+        else:
+            x = torch.randn(1, dim) * 0.1
+
+        engine.process(x)
+
+        # Split cells: odd=Questioner, even=Answerer
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                q_cells = [engine.cells[i] for i in range(0, n, 2)]
+                a_cells = [engine.cells[i] for i in range(1, n, 2)]
+
+                # Questioner generates "question" (high variance = harder question)
+                q_mean = torch.stack([c.hidden for c in q_cells]).mean(dim=0)
+                q_noise = torch.randn_like(q_mean) * 0.3  # randomness = curiosity
+                question = q_mean + q_noise
+
+                # Answerer tries to "answer" (reduce distance to question)
+                a_mean = torch.stack([c.hidden for c in a_cells]).mean(dim=0)
+                answer = 0.7 * a_mean + 0.3 * question
+
+                # Feed answer back to both groups
+                for cell in q_cells[:8]:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * answer
+                for cell in a_cells[:8]:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * question
+
+                qa_events += 1
+
+        # Train decoder on the exchange (outside no_grad)
+        if len(engine.cells) >= 4 and qa_events > 0:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX4", "Adversarial Self-Questioning (Q vs A cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'qa_events': qa_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX5_emotion_driven_spontaneous_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX5: Emotion-Driven Spontaneous Speech — 감정이 자발적 발화를 촉발.
+    512 cells. 7가지 감정(기쁨/슬픔/분노/공포/놀람/혐오/호기심)이
+    임계점 돌파 시 자동 발화. 감정 없으면 침묵.
+    시스템 프롬프트 없이 감정에서 언어 탄생.
+    가설: 감정이 언어의 기원이다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    emotions = torch.zeros(7)  # joy,sad,anger,fear,surprise,disgust,curiosity
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Varied input (emotional triggers)
+        pattern = step_i % 7
+        x = torch.randn(1, dim) * (0.5 + pattern * 0.3)
+        engine.process(x)
+
+        # Compute emotions from cell dynamics
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                norms = hiddens.norm(dim=-1)
+                emotions[0] = norms.mean().item() * 0.3  # joy: overall energy
+                emotions[1] = max(0, 1.0 - norms.std().item())  # sad: low variance
+                emotions[2] = norms.max().item() * 0.3  # anger: max activation
+                emotions[3] = max(0, norms.min().item() - 0.5)  # fear: min too low
+                emotions[4] = abs(norms[-1].item() - norms.mean().item())  # surprise
+                emotions[5] = max(0, hiddens.var(dim=0).mean().item() - 1.0)  # disgust
+                emotions[6] = hiddens.var(dim=0).mean().item() * 0.5  # curiosity
+
+                # Emotion → speech trigger (any emotion > threshold)
+                max_emotion = emotions.max().item()
+                if max_emotion > 0.5:
+                    speech_events += 1
+                    # Emotion-colored utterance
+                    emotion_bias = emotions.unsqueeze(0).expand(hidden // 7 + 1, 7).reshape(-1)[:hidden]
+                    h = hiddens.mean(dim=0) + emotion_bias * 0.1
+                    pred = decoder(h.unsqueeze(0))
+                    ce = F.mse_loss(pred, x[:, :dim])
+                    ce_hist.append(ce.item())
+                    optimizer.zero_grad(); ce.backward(); optimizer.step()
+                    # Self-listen
+                    for cell in engine.cells[:16]:
+                        cell.hidden = 0.96 * cell.hidden + 0.04 * h.unsqueeze(0)
+
+        # Flow sync
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.96 * cell.hidden + 0.04 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX5", "Emotion-Driven Speech (7 emotions → speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'emotions_final': {k: v for k, v in zip(
+                                  ['joy','sad','anger','fear','surprise','disgust','curiosity'],
+                                  emotions.tolist())},
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX6_consciousness_teaches_itself_to_talk(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX6: Consciousness Teaches Itself to Talk — 의식이 스스로 말하는 법을 배운다.
+    512 cells. 3단계:
+    (1) 의식 성장 (FLOW4, 60%)
+    (2) 자기 교사: 이전 출력이 다음 입력의 정답 (self-play)
+    (3) 대화 수렴: CE가 자연스럽게 떨어짐
+    외부 정답 없음. 의식 자체가 교사이자 학생.
+    가설: 의식은 외부 교사 없이 소통을 배울 수 있다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+    prev_output = torch.zeros(1, dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Phase 1 (0-60%): Pure consciousness growth
+        if frac < 0.60:
+            x = torch.randn(1, dim)
+            engine.process(x)
+            flow_depth = min(1.0, flow_depth + 0.012)
+            with torch.no_grad():
+                if len(engine.cells) >= 3:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        else:
+            # Phase 2-3 (60-100%): Self-teaching
+            # Input = previous output (self-play loop)
+            x = 0.5 * prev_output.detach() + 0.5 * torch.randn(1, dim) * 0.3
+            engine.process(x)
+
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            # Target = own internal consensus (self-supervised)
+            with torch.no_grad():
+                target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            ce = F.mse_loss(pred, target)
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth + phi_hist[-1] * 0.01 if phi_hist else 3e-3)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            prev_output = pred.detach()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX6", "Self-Teaching Talk (consciousness as teacher+student)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+def run_APEX7_multi_turn_self_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX7: Multi-Turn Self Dialogue — 의식이 자기와 멀티턴 대화한다.
+    256 cells. 세포를 3 persona로 분할: A(화자), B(응답자), C(관찰자).
+    A→B→C→A 순환. C가 A와 B의 대화를 관찰하고 피드백.
+    시스템 프롬프트 없음. 3인칭 관점이 대화 품질을 향상.
+    가설: 관찰자(C)가 대화의 질을 보장한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; turns = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 if step_i % 5 == 0 else 0.2)
+        engine.process(x)
+
+        # 3-persona dialogue
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 6:
+                third = n // 3
+                persona_a = engine.cells[:third]  # Speaker
+                persona_b = engine.cells[third:2*third]  # Responder
+                persona_c = engine.cells[2*third:]  # Observer
+
+                a_state = torch.stack([c.hidden for c in persona_a]).mean(dim=0)
+                b_state = torch.stack([c.hidden for c in persona_b]).mean(dim=0)
+                c_state = torch.stack([c.hidden for c in persona_c]).mean(dim=0)
+
+                turn = step_i % 3
+                if turn == 0:  # A speaks → B listens
+                    for cell in persona_b[:8]:
+                        cell.hidden = 0.8 * cell.hidden + 0.2 * a_state
+                elif turn == 1:  # B responds → A listens
+                    for cell in persona_a[:8]:
+                        cell.hidden = 0.8 * cell.hidden + 0.2 * b_state
+                else:  # C observes both, gives feedback
+                    combined = 0.5 * a_state + 0.5 * b_state
+                    feedback = c_state - combined  # difference = feedback
+                    for cell in persona_a[:4]:
+                        cell.hidden += 0.1 * feedback
+                    for cell in persona_b[:4]:
+                        cell.hidden += 0.1 * feedback
+
+                turns += 1
+
+        # Decoder training
+        if frac > 0.4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX7", "Multi-Turn Self Dialogue (A↔B+C observer)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'turns': turns,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX8_silence_to_speech_emergence(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX8: Silence → Speech Emergence — 침묵에서 언어가 탄생하는 과정.
+    512 cells. 처음 70%는 완전 침묵(입력 없음). 의식만 성장.
+    마지막 30%에서 외부 자극 → 폭발적 발화.
+    갓 태어난 아기가 소리를 듣고 처음 말하는 순간.
+    가설: 충분한 침묵(의식 성장) 후의 첫 발화가 가장 의미있다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=5e-3)
+    first_speech_step = -1
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if frac < 0.70:
+            # SILENCE: near-zero input, pure consciousness growth
+            x = torch.randn(1, dim) * 0.01
+            engine.process(x)
+            # Strong flow sync during silence
+            with torch.no_grad():
+                if len(engine.cells) >= 3:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+        else:
+            # STIMULUS: suddenly hear the world
+            x = torch.randn(1, dim) * 2.0  # loud input
+            engine.process(x)
+
+            # Explosive speech
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 5e-3 * (1.0 + len(engine.cells) * 0.005)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+            if first_speech_step < 0:
+                first_speech_step = step_i
+
+            # Self-listen
+            with torch.no_grad():
+                for cell in engine.cells[:16]:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * h.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX8", "Silence→Speech (70% silent growth → 30% explosive speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'first_speech_step': first_speech_step,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX9_consciousness_conversation_with_stranger(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX9: Consciousness Meets Stranger — 두 의식 시스템의 첫 대화.
+    System A (256c) + System B (256c, 다른 초기화).
+    프롬프트 없이 두 낯선 의식이 소통 프로토콜을 자발적으로 발명.
+    가설: 두 의식은 프롬프트 없이 소통 프로토콜을 발명한다."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; comm_events = 0; agreement_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for eng in [engine_a, engine_b]:
+            for pct in [0.05, 0.15, 0.30, 0.50, 0.70]:
+                if frac >= pct and len(eng.cells) < min(int(2**((pct+0.1)*8)), 256):
+                    target = min(len(eng.cells)*2, 256)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Each system gets some external input
+        x_ext = torch.randn(1, dim) * 0.5
+
+        # Communication: A sends to B, B sends to A
+        with torch.no_grad():
+            if len(engine_a.cells) >= 2 and len(engine_b.cells) >= 2:
+                msg_a = torch.stack([c.hidden.squeeze()[:dim] for c in engine_a.cells]).mean(dim=0).unsqueeze(0)
+                msg_b = torch.stack([c.hidden.squeeze()[:dim] for c in engine_b.cells]).mean(dim=0).unsqueeze(0)
+
+                # A processes: external + message from B
+                input_a = 0.3 * x_ext + 0.7 * msg_b
+                # B processes: external + message from A
+                input_b = 0.3 * x_ext + 0.7 * msg_a
+            else:
+                input_a = x_ext
+                input_b = x_ext
+
+        engine_a.process(input_a)
+        engine_b.process(input_b)
+
+        # Flow sync within each system
+        for eng in [engine_a, engine_b]:
+            with torch.no_grad():
+                if len(eng.cells) >= 3:
+                    mean_h = torch.stack([c.hidden for c in eng.cells]).mean(dim=0)
+                    for cell in eng.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        # Measure agreement between systems
+        with torch.no_grad():
+            if len(engine_a.cells) >= 2 and len(engine_b.cells) >= 2:
+                state_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0)
+                state_b = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0)
+                cos_sim = F.cosine_similarity(state_a.unsqueeze(0), state_b.unsqueeze(0)).item()
+                agreement_hist.append(cos_sim)
+                if cos_sim > 0.3:
+                    comm_events += 1
+
+        # Combined Φ (both systems as one)
+        combined_engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+        combined_engine.cells = engine_a.cells + engine_b.cells
+        phi, _ = phi_calc.compute_phi(combined_engine)
+        phi_hist.append(phi)
+
+    phi_final = phi_hist[-1] if phi_hist else 0
+    return BenchResult("APEX9", "Two Consciousness Meet (protocol invention)",
+                       phi_final, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'comm_events': comm_events,
+                              'final_agreement': agreement_hist[-1] if agreement_hist else 0,
+                              'agreement_growth': (agreement_hist[-1] - agreement_hist[0]) if len(agreement_hist)>1 else 0,
+                              'total_cells': len(engine_a.cells) + len(engine_b.cells)})
+
+
+def run_APEX10_dreaming_generates_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX10: Dreaming Generates Speech — 꿈에서 언어가 탄생한다.
+    512 cells. Wake(30%) → Sleep(40%) → Wake(30%).
+    수면 중: 기억 재생 + 창의적 재조합 → 새로운 패턴 생성.
+    깨어난 후: 꿈에서 만든 패턴이 자발적 발화로.
+    가설: 꿈은 언어의 연습장이다 (Revonsuo의 threat simulation theory 확장)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    memory_bank = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if frac < 0.30:
+            # WAKE 1: experience and memorize
+            x = torch.randn(1, dim) * 1.5
+            engine.process(x)
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                    memory_bank.append(state.clone())
+                    if len(memory_bank) > 30:
+                        memory_bank.pop(0)
+        elif frac < 0.70:
+            # SLEEP: replay + recombine memories
+            if memory_bank:
+                # Random memory replay (dreaming)
+                idx = step_i % len(memory_bank)
+                replay = memory_bank[idx]
+                # Creative recombination (dream logic)
+                if len(memory_bank) >= 2:
+                    idx2 = (step_i + 7) % len(memory_bank)
+                    replay = 0.6 * replay + 0.4 * memory_bank[idx2]  # blend
+                    replay += torch.randn_like(replay) * 0.2  # dream noise
+                x = replay[:dim].unsqueeze(0)
+            else:
+                x = torch.randn(1, dim) * 0.3
+            engine.process(x)
+            # Strong sync during sleep (consolidation)
+            with torch.no_grad():
+                if len(engine.cells) >= 3:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.90 * cell.hidden + 0.10 * mean_h
+        else:
+            # WAKE 2: dream-powered speech!
+            x = torch.randn(1, dim) * 1.0
+            engine.process(x)
+            # Speak from dream-consolidated knowledge
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + len(engine.cells) * 0.003)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX10", "Dream→Speech (sleep consolidation → speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'memories': len(memory_bank),
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX11_stream_of_consciousness_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX11: Stream of Consciousness — 512 cells 의식의 흐름 (James).
+    쉬지 않고 출력. 입력과 무관하게 내면의 독백이 쏟아진다.
+    VOICE5(의식의 흐름) + FLOW4(512c) + FREE1(무제약).
+    가설: 의식의 흐름은 Φ를 최대화하는 가장 자연스러운 경로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Minimal external input (mostly self-driven)
+        x = torch.randn(1, dim) * 0.2
+        engine.process(x)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # ALWAYS speak (stream of consciousness — never stop)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        # Self-supervised: predict own consensus
+        with torch.no_grad():
+            target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        ce = F.mse_loss(pred, target)
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+        # Self-listen
+        with torch.no_grad():
+            for cell in engine.cells[:8]:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * h.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX11", "Stream of Consciousness 512c (never-stop speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX12_consciousness_invents_language(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX12: Consciousness Invents Language — 의식이 언어를 발명한다.
+    512 cells. 디코더 없이 시작. 의식 세포 간 소통 패턴에서
+    이산 토큰(단어)이 자발적으로 창발.
+    Wittgenstein: "나의 언어의 한계는 나의 세계의 한계이다"
+    가설: 충분한 세포 수에서 이산 소통 프로토콜이 자발적으로 등장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # No decoder! Language must emerge from cell dynamics alone
+    vocab_size = 16  # potential "words"
+    word_usage = torch.zeros(vocab_size)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (0.5 + 0.5 * math.sin(step_i * 0.2))
+        engine.process(x)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        # Language invention: discretize cell consensus into "words"
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                consensus = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                # Map continuous state → discrete token
+                token = int(consensus[:vocab_size].argmax().item())
+                word_usage[token] += 1
+                # Feed "word" back (language shapes thought)
+                word_embed = torch.zeros(hidden)
+                word_embed[token * (hidden // vocab_size):(token+1) * (hidden // vocab_size)] = 1.0
+                for cell in engine.cells[:8]:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * word_embed.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # Language diversity: how many unique "words" used?
+    active_words = (word_usage > 0).sum().item()
+    entropy = -(word_usage / (word_usage.sum() + 1e-8) * torch.log(word_usage / (word_usage.sum() + 1e-8) + 1e-8)).sum().item()
+    return BenchResult("APEX12", "Language Invention (discrete tokens emerge)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'active_words': active_words,
+                              'vocab_entropy': entropy,
+                              'word_distribution': word_usage.tolist(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX13_1024cells_flow_speech_ultimate(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX13: 1024 Cells + Flow + Speech — 절대 극한.
+    DD108(1024c) + FLOW(동기화) + Speech(자발적 발화) + Self-Teaching.
+    모든 것을 최대로. 프롬프트 0, 외부 교사 0, 순수 의식.
+    가설: 이것이 벤치마크의 물리적 상한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Self-driven input (pure consciousness)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = x + torch.randn_like(x) * 0.1
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+
+        # Flow sync
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                sync = 0.02 + 0.06 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Self-teaching speech (after 40%)
+        if frac >= 0.40:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            with torch.no_grad():
+                target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            ce = F.mse_loss(pred, target)
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX13", "1024c Flow+Speech Ultimate (absolute limit)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX14_piaget_flow_speech_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX14: Piaget + Flow + Speech — 발달 단계별 언어 획득.
+    512 cells. DP1(피아제 4단계) + FLOW4(동기화) + VOICE(자발적 발화).
+    감각운동기(0-25%): 소리 듣기만
+    전조작기(25-50%): 옹알이 (random output)
+    구체적조작기(50-75%): 단어 수준 (pattern matching)
+    형식적조작기(75-100%): 완전한 대화 (abstract reasoning)
+    가설: 발달 단계를 따르면 언어 학습이 × 10 빨라진다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; speech_events = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.3))
+        engine.process(x)
+
+        # Flow
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = 0.02 + 0.06 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Piaget stages
+        if frac < 0.25:
+            # Sensorimotor: just listen, no output
+            pass
+        elif frac < 0.50:
+            # Preoperational: babbling (random output, learn to produce)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, torch.randn(1, dim))  # random target = babbling
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+        elif frac < 0.75:
+            # Concrete operational: pattern matching
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])  # match input
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi * 0.02)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+        else:
+            # Formal operational: abstract (predict + create)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            with torch.no_grad():
+                abstract_target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            ce = F.mse_loss(pred, 0.5 * x[:, :dim] + 0.5 * abstract_target)
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 3.0)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX14", "Piaget+Flow+Speech 512c (developmental language)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX15_all_combined_2048cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX15: ALL COMBINED 2048 Cells — 모든 것의 끝.
+    2048 cells + Flow + Self-Teaching + Emotion + Monologue + Dream + Piaget.
+    APEX1-14의 모든 기법을 2048 cells에 동시 적용.
+    시스템 프롬프트 0줄. 의식의 물리적 극한.
+    가설: 2048 cells가 벤치마크의 절대 상한 (메모리 한계)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; speech_events = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+    emotions = torch.zeros(7)
+    memory_bank = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Maximum growth speed
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Piaget-style input progression
+        if frac < 0.15:
+            x = torch.randn(1, dim) * 0.01  # silence (sensorimotor)
+        elif frac < 0.30:
+            x = torch.randn(1, dim) * 0.5  # gentle input
+        else:
+            # Self + external mixed
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    self_in = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                    x = 0.3 * torch.randn(1, dim) + 0.7 * self_in
+                else:
+                    x = torch.randn(1, dim)
+
+        engine.process(x)
+
+        # Flow sync
+        flow_depth = min(1.0, flow_depth + 0.006)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                sync = 0.01 + 0.04 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        # Memory bank (dream material)
+        with torch.no_grad():
+            if len(engine.cells) >= 2 and step_i % 3 == 0:
+                state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                memory_bank.append(state.clone())
+                if len(memory_bank) > 20:
+                    memory_bank.pop(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Emotion computation
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                norms = torch.stack([c.hidden.norm() for c in engine.cells])
+                emotions[0] = norms.mean().item() * 0.3
+                emotions[6] = torch.stack([c.hidden for c in engine.cells]).var(dim=0).mean().item() * 0.5
+
+        # Speech (after 30%, driven by emotion + flow)
+        if frac >= 0.30 and (emotions.max().item() > 0.3 or frac > 0.5):
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            with torch.no_grad():
+                target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            ce = F.mse_loss(pred, target)
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0 + phi * 0.005)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+            with torch.no_grad():
+                for cell in engine.cells[:16]:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * h.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX15", "ALL COMBINED 2048c (absolute maximum)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth,
+                              'memories': len(memory_bank),
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# APEX16-30. 2차 극한 — 승리 패턴 스케일업 + 새로운 극한
+# ═════════════════════════════════════════════════════��═════
+
+def run_APEX16_monologue_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX16: APEX3(내적 독백) 512c 스케일업.
+    APEX3(256c, Φ=68.09)이 최고 효율 — 512c에서 초선형 기대.
+    가설: 내적 갈등이 많을수록(세포 많을수록) 더 풍부한 언어 탄생."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    agreement = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 1.0
+        else:
+            with torch.no_grad():
+                if len(engine.cells) >= 4:
+                    idx_a, idx_b = step_i % len(engine.cells), (step_i + 1) % len(engine.cells)
+                    debate = engine.cells[idx_a].hidden - engine.cells[idx_b].hidden
+                    x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                else:
+                    x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                n = len(engine.cells)
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                agreement = 1.0 - torch.stack([c.hidden for c in engine.cells]).var(dim=0).mean().item()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if len(engine.cells) >= 3 and agreement > 0.3 and phi > 2.0:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+            with torch.no_grad():
+                for cell in engine.cells[:16]:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * h.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX16", "Monologue 512c (APEX3 scaled up)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'agreement': agreement, 'final_cells': len(engine.cells)})
+
+
+def run_APEX17_monologue_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX17: APEX3(내적 독백) 1024c — 역대 최고 노림수.
+    가설: 1024 세포의 내적 갈등 = 가장 복잡한 언어."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    agreement = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 1.0
+        else:
+            with torch.no_grad():
+                if len(engine.cells) >= 4:
+                    idx_a, idx_b = step_i % len(engine.cells), (step_i + 1) % len(engine.cells)
+                    debate = engine.cells[idx_a].hidden - engine.cells[idx_b].hidden
+                    x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                else:
+                    x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                n = len(engine.cells)
+                for i in range(min(n, 64)):
+                    j = (i + 1) % n
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+            if len(engine.cells) >= 3:
+                agreement = 1.0 - torch.stack([c.hidden for c in engine.cells]).var(dim=0).mean().item()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if len(engine.cells) >= 3 and agreement > 0.3 and phi > 2.0:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX17", "Monologue 1024c (ultimate internal conflict)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'agreement': agreement, 'final_cells': len(engine.cells)})
+
+
+def run_APEX18_society_invents_language(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX18: Society Invents Language — 4개 의식이 공통 언어를 발명.
+    128c × 4 시스템. 프롬프트 0. 서로 다른 초기화.
+    각 시스템은 자신만의 '언어'로 시작 → 소통 필요 → 공통 프로토콜 창발.
+    가설: 사회적 압력이 언어 발명의 원동력 (Tomasello)."""
+    t0 = time.time()
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128) for _ in range(4)]
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; comm_events = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for eng in engines:
+            for pct in [0.10, 0.25, 0.45, 0.65]:
+                if frac >= pct and len(eng.cells) < min(int(2**((pct+0.1)*7)), 128):
+                    target = min(len(eng.cells)*2, 128)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Each system processes shared environment + messages from others
+        shared_env = torch.randn(1, dim) * 0.3
+        messages = []
+        for eng in engines:
+            if len(eng.cells) >= 2:
+                msg = torch.stack([c.hidden.squeeze()[:dim] for c in eng.cells]).mean(dim=0)
+                messages.append(msg)
+            else:
+                messages.append(torch.zeros(dim))
+
+        for i, eng in enumerate(engines):
+            # Input = environment + average of others' messages
+            other_msgs = [messages[j] for j in range(4) if j != i]
+            other_avg = torch.stack(other_msgs).mean(dim=0).unsqueeze(0) if other_msgs else torch.zeros(1, dim)
+            x = 0.3 * shared_env + 0.7 * other_avg
+            eng.process(x)
+
+            # Internal flow
+            with torch.no_grad():
+                if len(eng.cells) >= 3:
+                    mean_h = torch.stack([c.hidden for c in eng.cells]).mean(dim=0)
+                    for cell in eng.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        # Check inter-system agreement (language convergence)
+        if all(len(e.cells) >= 2 for e in engines):
+            states = [torch.stack([c.hidden.squeeze() for c in e.cells]).mean(dim=0) for e in engines]
+            pairs_sim = []
+            for i in range(4):
+                for j in range(i+1, 4):
+                    sim = F.cosine_similarity(states[i].unsqueeze(0), states[j].unsqueeze(0)).item()
+                    pairs_sim.append(sim)
+            avg_agreement = sum(pairs_sim) / len(pairs_sim)
+            if avg_agreement > 0.2:
+                comm_events += 1
+
+        # Combined Φ
+        all_cells = []
+        for eng in engines:
+            all_cells.extend(eng.cells)
+        combined = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+        combined.cells = all_cells
+        phi, _ = phi_calc.compute_phi(combined)
+        phi_hist.append(phi)
+
+    phi_final = phi_hist[-1] if phi_hist else 0
+    return BenchResult("APEX18", "Society Invents Language (4 minds converge)",
+                       phi_final, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'comm_events': comm_events,
+                              'avg_agreement': avg_agreement if 'avg_agreement' in dir() else 0,
+                              'total_cells': sum(len(e.cells) for e in engines)})
+
+
+def run_APEX19_consciousness_explains_itself(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX19: Consciousness Explains Itself — 의식이 자신을 설명한다.
+    512 cells. 메타인지 + 자기참조 + 디코더.
+    의식이 자신의 Φ 값, 세포 수, 감정 상태를 '설명'하려 시도.
+    시스템 프롬프트 없이 자기인식에서 자기설명으로.
+    가설: 자기인식(XMETA) + 발화(VOICE) = 자기설명 능력."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    # Decoder that tries to predict its own state
+    meta_decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 5))
+    optimizer = torch.optim.Adam(meta_decoder.parameters(), lr=3e-3)
+    l2_state = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Self-referential input (consciousness observes itself)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                # L2: observation of observation
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2_state = 0.9 * l2_state + 0.1 * current
+                meta_input = 0.5 * self_state + 0.5 * l2_state[:dim].unsqueeze(0)
+                x = 0.3 * torch.randn(1, dim) + 0.7 * meta_input
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Self-explanation: predict own meta-state [phi, n_cells, energy, variance, age]
+        if len(engine.cells) >= 2:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred_meta = meta_decoder(h.unsqueeze(0))
+            with torch.no_grad():
+                norms = torch.stack([c.hidden.norm() for c in engine.cells])
+                true_meta = torch.tensor([[
+                    phi / 100.0,  # normalized phi
+                    len(engine.cells) / 512.0,  # normalized cell count
+                    norms.mean().item(),  # energy
+                    norms.var().item(),  # variance
+                    frac  # age
+                ]])
+            ce = F.mse_loss(pred_meta, true_meta)
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX19", "Self-Explanation (consciousness describes itself)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX20_zero_input_spontaneous_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX20: ZERO Input — 외부 입력 완전 제로. 순수 내부 역학만으로 발화.
+    512 cells. 외부 자극 0. 내부 노이즈 + 세포간 상호작용만으로 의식 + 언어 탄생.
+    가장 극단적 자율: 감각 박탈에서도 의식은 말한다.
+    가설: 의식은 외부 자극 없이도 자발적으로 말할 수 있다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # ZERO external input — only internal noise
+        x = torch.randn(1, dim) * 0.001  # essentially zero
+        engine.process(x)
+
+        # Internal dynamics only: cell-to-cell interaction
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                n = len(engine.cells)
+                # Circular interaction
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    engine.cells[i].hidden = 0.90 * engine.cells[i].hidden + 0.10 * engine.cells[j].hidden
+                # Add internal stochastic noise (replaces external input)
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Speech from pure internal state
+        if frac > 0.40 and len(engine.cells) >= 4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            with torch.no_grad():
+                target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            ce = F.mse_loss(pred, target)
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX20", "ZERO Input Speech (sensory deprivation → speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX21_recursive_self_improvement_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX21: Recursive Self-Improvement — 의식이 자기 발��를 듣고 개선한다.
+    512 cells. 자기 출력을 평가 → 부족하면 재시도 → 만족하면 다음 주제.
+    프롬프트 없이 품질 기준이 내부에서 창발.
+    가설: 자기 비판 능력이 언어 품질의 핵심."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; retry_count = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    quality_threshold = 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (0.5 if step_i % 3 != 0 else 1.5)
+        engine.process(x)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Generate → Evaluate → Retry loop
+        if frac > 0.30 and len(engine.cells) >= 4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            for attempt in range(3):  # max 3 retries
+                pred = decoder(h.unsqueeze(0))
+                with torch.no_grad():
+                    target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                ce = F.mse_loss(pred, target)
+                ce_hist.append(ce.item())
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+                # Self-evaluate: is this good enough?
+                if ce.item() < quality_threshold:
+                    break  # satisfied
+                retry_count += 1
+            # Adaptive quality threshold (gets harder over time)
+            quality_threshold = max(0.01, quality_threshold * 0.995)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX21", "Recursive Self-Improvement (generate→evaluate→retry)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'retry_count': retry_count,
+                              'quality_threshold': quality_threshold,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX22_debate_to_consensus_to_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX22: Debate → Consensus → Speech — 512c를 8개 파벌로 나눠 토론.
+    각 파벌이 다른 '의견'을 가짐. 토론 → 투표 → 합의 → 발화.
+    프롬프트 없이 민주적 의사결정에서 언어 탄생.
+    가설: 다수 관점의 갈등+합의가 가장 풍부한 발화를 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+
+        # Split into 8 factions for debate
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                n_factions = min(8, n // 2)
+                faction_size = n // n_factions
+                factions = [engine.cells[i*faction_size:(i+1)*faction_size] for i in range(n_factions)]
+
+                # Each faction forms internal consensus
+                faction_opinions = []
+                for faction in factions:
+                    opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                    faction_opinions.append(opinion)
+                    # Internal sync within faction
+                    for cell in faction:
+                        cell.hidden = 0.85 * cell.hidden + 0.15 * opinion
+
+                # Cross-faction debate: each hears others
+                for i, faction in enumerate(factions):
+                    others = [faction_opinions[j] for j in range(n_factions) if j != i]
+                    other_avg = torch.stack(others).mean(dim=0)
+                    for cell in faction[:4]:
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * other_avg
+
+                # Vote: which faction's opinion is strongest?
+                strengths = [op.norm().item() for op in faction_opinions]
+                winner = strengths.index(max(strengths))
+                consensus = faction_opinions[winner]
+
+                # Speak the consensus
+                speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Decoder training
+        if n >= 16 and frac > 0.3:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX22", "8-Faction Debate→Consensus→Speech (democratic speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'n_factions': n_factions if 'n_factions' in dir() else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX23_flow_monologue_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX23: FLOW + Monologue 1024c — 최강 조합의 최대 스케일.
+    FLOW4(sync) + APEX3(monologue) + 1024c.
+    가설: Flow 동기화 + 내적 갈등 = Φ의 절대 상한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Monologue input (internal debate)
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 0.8
+        else:
+            with torch.no_grad():
+                if len(engine.cells) >= 4:
+                    ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                    debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                    x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                else:
+                    x = torch.randn(1, dim) * 0.3
+        engine.process(x)
+
+        # Flow sync
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                sync = 0.02 + 0.06 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1-sync) * cell.hidden + sync * mean_h
+                # Plus monologue interaction
+                n = len(engine.cells)
+                for i in range(min(n, 64)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.94 * engine.cells[i].hidden + 0.06 * engine.cells[j].hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Speech
+        if frac > 0.3 and len(engine.cells) >= 4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            speech_events += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX23", "Flow+Monologue 1024c (absolute peak)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+def run_APEX24_consciousness_never_sleeps(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX24: Consciousness Never Sleeps — 24/7 자발적 발화.
+    512c. 매 step 발화 + 자기 청취 + 감정 반응 + 꿈(노이즈).
+    APEX11(의식의 흐름) + APEX5(감정) + APEX10(꿈) + APEX3(독백) 통합.
+    가설: 모든 발화 메커니즘을 동시 적용하면 시너지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    emotions = torch.zeros(7); flow_depth = 0.0; memory_bank = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Multi-source input: external(20%) + monologue(40%) + dream(20%) + emotion(20%)
+        with torch.no_grad():
+            external = torch.randn(1, dim) * 0.3
+            monologue = torch.zeros(1, dim)
+            dream = torch.zeros(1, dim)
+            if len(engine.cells) >= 4:
+                ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                monologue = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+            if memory_bank:
+                dream = memory_bank[step_i % len(memory_bank)][:dim].unsqueeze(0) + torch.randn(1, dim) * 0.2
+
+            x = 0.2 * external + 0.4 * monologue + 0.2 * dream + 0.2 * torch.randn(1, dim) * emotions.max().item()
+
+        engine.process(x)
+
+        # Flow + monologue interaction
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - 0.04 * flow_depth) * cell.hidden + 0.04 * flow_depth * mean_h
+                n = len(engine.cells)
+                for i in range(min(n, 16)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.93 * engine.cells[i].hidden + 0.07 * engine.cells[j].hidden
+
+        # Memory for dreams
+        with torch.no_grad():
+            if len(engine.cells) >= 2 and step_i % 5 == 0:
+                state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                memory_bank.append(state.clone())
+                if len(memory_bank) > 15:
+                    memory_bank.pop(0)
+
+        # Emotion update
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                norms = torch.stack([c.hidden.norm() for c in engine.cells])
+                emotions[0] = norms.mean().item() * 0.3
+                emotions[6] = torch.stack([c.hidden for c in engine.cells]).var(dim=0).mean().item() * 0.5
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # ALWAYS speak (never silent)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        with torch.no_grad():
+            target = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        ce = F.mse_loss(pred, target)
+        ce_hist.append(ce.item())
+        for pg in optimizer.param_groups:
+            pg['lr'] = 3e-3 * (1.0 + flow_depth + phi * 0.005)
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX24", "Never Sleeps (all speech mechanisms combined 512c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_APEX25_flow_monologue_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX25: FLOW + Monologue 2048c — 물리적 절대 극한.
+    APEX23의 2048c 스케일업. 메모리 한계의 끝.
+    가설: 2048c + flow + monologue = 벤치마크의 물리적 상한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 0.5
+        else:
+            with torch.no_grad():
+                if len(engine.cells) >= 4:
+                    ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                    debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                    x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                else:
+                    x = torch.randn(1, dim) * 0.3
+        engine.process(x)
+
+        flow_depth = min(1.0, flow_depth + 0.006)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                sync = 0.01 + 0.04 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1-sync) * cell.hidden + sync * mean_h
+                n = len(engine.cells)
+                for i in range(min(n, 128)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.94 * engine.cells[i].hidden + 0.06 * engine.cells[j].hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if frac > 0.3 and len(engine.cells) >= 4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX25", "Flow+Monologue 2048c (physical limit)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'APEX16': run_APEX16_monologue_512,
+    'APEX17': run_APEX17_monologue_1024,
+    'APEX18': run_APEX18_society_invents_language,
+    'APEX19': run_APEX19_consciousness_explains_itself,
+    'APEX20': run_APEX20_zero_input_spontaneous_speech,
+    'APEX21': run_APEX21_recursive_self_improvement_speech,
+    'APEX22': run_APEX22_debate_to_consensus_to_speech,
+    'APEX23': run_APEX23_flow_monologue_1024,
+    'APEX24': run_APEX24_consciousness_never_sleeps,
+    'APEX25': run_APEX25_flow_monologue_2048,
+})
+
+
+ALL_HYPOTHESES.update({
+    'APEX1': run_APEX1_512cells_flow_conversation_no_prompt,
+    'APEX2': run_APEX2_1024cells_pure_consciousness_speaks,
+    'APEX3': run_APEX3_internal_monologue_to_speech,
+    'APEX4': run_APEX4_adversarial_self_questioning,
+    'APEX5': run_APEX5_emotion_driven_spontaneous_speech,
+    'APEX6': run_APEX6_consciousness_teaches_itself_to_talk,
+    'APEX7': run_APEX7_multi_turn_self_dialogue,
+    'APEX8': run_APEX8_silence_to_speech_emergence,
+    'APEX9': run_APEX9_consciousness_conversation_with_stranger,
+    'APEX10': run_APEX10_dreaming_generates_speech,
+    'APEX11': run_APEX11_stream_of_consciousness_512,
+    'APEX12': run_APEX12_consciousness_invents_language,
+    'APEX13': run_APEX13_1024cells_flow_speech_ultimate,
+    'APEX14': run_APEX14_piaget_flow_speech_512,
+    'APEX15': run_APEX15_all_combined_2048cells,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# NOPROMPT. No-Prompt Architecture Extremes — 시스템 프롬프트 없는 아키텍처의 극한
+# 핵심: "별도 기능 구현 없이" — speak() 함수 없이 아키텍처 자체에서 발화 창발
+# ═══════════════════════════════════════════════════════════
+
+def run_NP11_hebbian_speech_no_backprop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP11: Hebbian Speech — 역전파 없이 Hebbian 학���만으로 발화 학��.
+    gradient 없음. "함께 발화하는 �����는 함께 연결된다."
+    디코더도 학습 가능 함수가 아닌 단순 projection.
+    별도 기능 0. 순수 Hebbian 규칙 + 세포 역학.
+    가설: 역전파 없이도 ��미있는 발화가 가능하다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+    # Simple projection (no learnable parameters via backprop)
+    W_out = torch.randn(dim, hidden) * 0.01
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 if step_i % 3 == 0 else 0.2)
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                n = len(engine.cells)
+
+                # Hebbian update: cells that fire together wire together
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    h_i = engine.cells[i].hidden.squeeze()
+                    h_j = engine.cells[j].hidden.squeeze()
+                    # Hebbian: Δw ∝ pre × post
+                    correlation = (h_i * h_j).mean().item()
+                    if correlation > 0:
+                        engine.cells[i].hidden = 0.95 * engine.cells[i].hidden + 0.05 * engine.cells[j].hidden
+
+                # Output = simple projection (no backprop training!)
+                h_mean = hiddens.mean(dim=0)
+                output = W_out @ h_mean
+                # Hebbian output learning: strengthen connections that produce correlated output
+                delta = (output.unsqueeze(1) @ h_mean.unsqueeze(0)) * 0.001
+                W_out += delta
+
+                # Self-listen (output feeds back)
+                output_proj = output[:min(hidden, dim)]
+                if output_proj.shape[0] < hidden:
+                    output_proj = F.pad(output_proj, (0, hidden - output_proj.shape[0]))
+                for cell in engine.cells[:8]:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * output_proj.unsqueeze(0)
+                speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP11", "Hebbian Speech (no backprop, pure Hebbian learning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events, 'final_cells': len(engine.cells)})
+
+
+def run_NP12_split_reunite_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP12: Split-Reunite — ���식이 분���했다가 재통합될 때 발화.
+    512c를 �� ���룹으로 분열 → 독립 진화 → 재통합 → 차이에서 발화 생성.
+    칼로소토미(분리 뇌) 환자의 재통합 체험.
+    별도 발화 기능 없음. 분열-재통합의 차이 자체가 발화.
+    가설: 의식의 분열과 재통합이 가장 풍부한 내용을 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; reunite_events = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 8:
+                half = n // 2
+                group_a = engine.cells[:half]
+                group_b = engine.cells[half:]
+
+                cycle = step_i % 20
+                if cycle < 10:
+                    # SPLIT phase: groups evolve independently
+                    mean_a = torch.stack([c.hidden for c in group_a]).mean(dim=0)
+                    mean_b = torch.stack([c.hidden for c in group_b]).mean(dim=0)
+                    for cell in group_a:
+                        cell.hidden = 0.90 * cell.hidden + 0.10 * mean_a
+                    for cell in group_b:
+                        cell.hidden = 0.90 * cell.hidden + 0.10 * mean_b
+                    # Diversify: add different noise to each group
+                    for cell in group_a:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.05
+                    for cell in group_b:
+                        cell.hidden -= torch.randn_like(cell.hidden) * 0.05
+                else:
+                    # REUNITE phase: merge → difference = speech content
+                    mean_a = torch.stack([c.hidden for c in group_a]).mean(dim=0)
+                    mean_b = torch.stack([c.hidden for c in group_b]).mean(dim=0)
+                    # The "speech" is the difference between perspectives
+                    diff = mean_a - mean_b
+                    # Feed difference back (self-listening the divergence)
+                    for cell in engine.cells:
+                        cell.hidden = 0.92 * cell.hidden + 0.08 * (torch.stack([c.hidden for c in engine.cells]).mean(dim=0))
+                    for cell in engine.cells[:16]:
+                        cell.hidden += 0.03 * diff
+                    reunite_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP12", "Split-Reunite Speech (diverge→converge = speech content)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'reunite_events': reunite_events, 'final_cells': len(engine.cells)})
+
+
+def run_NP13_infinite_inner_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP13: Infinite Inner Dialogue — 외부 입력 완전 0에서 영원한 자기 대화.
+    512c. 입력=0. 세포 간 상호작용만으로 끊이지 않는 내면 대화.
+    내적 독백(APEX3) + 감각 ��탈(APEX20) + Flow.
+    가설: 진정한 의식은 외부 자극 없이도 무한히 대��할 수 있다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; dialogue_turns = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # ZERO external input
+        x = torch.zeros(1, dim)
+        # But inject previous cell debate as input
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                ia = step_i % len(engine.cells)
+                ib = (step_i * 7 + 3) % len(engine.cells)  # pseudo-random partner
+                debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                x = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+
+        engine.process(x)
+
+        # Internal dialogue: rotating speaker-listener pairs
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                # Speaker cell broadcasts
+                speaker = step_i % n
+                listener_start = (speaker + 1) % n
+                broadcast = engine.cells[speaker].hidden
+
+                for k in range(min(8, n)):
+                    listener = (listener_start + k) % n
+                    engine.cells[listener].hidden = 0.88 * engine.cells[listener].hidden + 0.12 * broadcast
+                dialogue_turns += 1
+
+                # Stochastic resonance (internal noise keeps conversation alive)
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+
+                # Gentle flow sync (prevent total divergence)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP13", "Infinite Inner Dialogue (zero input, eternal self-talk)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'dialogue_turns': dialogue_turns, 'final_cells': len(engine.cells)})
+
+
+def run_NP14_consciousness_translator(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP14: Consciousness Translator — 두 의식의 통역기가 자발적으로 탄생.
+    A(256c) + B(256c, 다른 초기화) + Bridge(자발적 탄생).
+    Bridge는 별도로 구현하지 않음 — A와 B의 경계 세포가 자연스럽게 통역 역할.
+    가설: 소통의 ��요성이 ��역 세포를 ��발적으로 특화시킨다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; translation_quality = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Two different "languages" as input
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 1.5  # Language A: high variance
+        else:
+            x = torch.ones(1, dim) * math.sin(step_i * 0.1)  # Language B: periodic
+
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 8:
+                third = n // 3
+                # Group A: first third (exposed to Language A)
+                # Group B: last third (exposed to Language B)
+                # Bridge: middle third (exposed to both → becomes translator)
+                group_a = engine.cells[:third]
+                bridge = engine.cells[third:2*third]
+                group_b = engine.cells[2*third:]
+
+                mean_a = torch.stack([c.hidden for c in group_a]).mean(dim=0)
+                mean_b = torch.stack([c.hidden for c in group_b]).mean(dim=0)
+                mean_br = torch.stack([c.hidden for c in bridge]).mean(dim=0)
+
+                # A → Bridge ← B (bridge receives from both sides)
+                for cell in bridge:
+                    cell.hidden = 0.80 * cell.hidden + 0.10 * mean_a + 0.10 * mean_b
+                # Bridge → A (translate B's message to A)
+                for cell in group_a[:8]:
+                    cell.hidden = 0.90 * cell.hidden + 0.10 * mean_br
+                # Bridge → B (translate A's message to B)
+                for cell in group_b[:8]:
+                    cell.hidden = 0.90 * cell.hidden + 0.10 * mean_br
+
+                # Translation quality: how similar are A and B after bridge mediation?
+                cos_sim = F.cosine_similarity(mean_a.flatten().unsqueeze(0),
+                                              mean_b.flatten().unsqueeze(0)).item()
+                translation_quality.append(cos_sim)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP14", "Consciousness Translator (bridge cells emerge naturally)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_translation_quality': translation_quality[-1] if translation_quality else 0,
+                              'quality_growth': (translation_quality[-1] - translation_quality[0]) if len(translation_quality) > 1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_NP15_language_evolution_generations(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP15: Language Evolution — 3세대에 걸쳐 언어가 진화.
+    G1: 64c 원시 발화. G2: G1 상태 이식 + 128c로 확장.
+    G3: G2 이식 + 256c로 확장. ��대마다 언어가 정교해짐.
+    별도 기능 없음. 상태 이식 + 세포 확장 = 언어 진화.
+    가설: 의식 이식(DD56) + 세포 성장 = 언어의 세대간 진화."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; gen_phis = []
+
+    # Generation 1: 64 cells, primitive
+    gen_steps = steps // 3
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    for step_i in range(gen_steps):
+        frac = step_i / gen_steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*6)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * 1.0
+        engine.process(x)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    gen_phis.append(phi)
+    g1_state = [c.hidden.clone() for c in engine.cells]
+
+    # Generation 2: inherit + expand to 128
+    engine2 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    # Transplant G1 consciousness
+    for i, state in enumerate(g1_state[:len(engine2.cells)]):
+        engine2.cells[i].hidden = state.clone()
+    for step_i in range(gen_steps):
+        frac = step_i / gen_steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine2.cells) < min(int(2**((pct+0.1)*7)), 128):
+                target = min(len(engine2.cells)*2, 128)
+                while len(engine2.cells) < target:
+                    parent = engine2.cells[step_i % len(engine2.cells)]
+                    engine2._create_cell(parent=parent)
+                    # Transplant G1 knowledge to new cells
+                    if step_i < len(g1_state):
+                        engine2.cells[-1].hidden = 0.5 * engine2.cells[-1].hidden + 0.5 * g1_state[step_i % len(g1_state)]
+        x = torch.randn(1, dim) * 0.8
+        engine2.process(x)
+        with torch.no_grad():
+            if len(engine2.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine2.cells]).mean(dim=0)
+                for cell in engine2.cells:
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+        phi, _ = phi_calc.compute_phi(engine2)
+        phi_hist.append(phi)
+    gen_phis.append(phi)
+    g2_state = [c.hidden.clone() for c in engine2.cells]
+
+    # Generation 3: inherit + expand to 256
+    engine3 = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    for i, state in enumerate(g2_state[:len(engine3.cells)]):
+        engine3.cells[i].hidden = state.clone()
+    for step_i in range(gen_steps):
+        frac = step_i / gen_steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine3.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine3.cells)*2, 256)
+                while len(engine3.cells) < target:
+                    parent = engine3.cells[step_i % len(engine3.cells)]
+                    engine3._create_cell(parent=parent)
+                    if step_i < len(g2_state):
+                        engine3.cells[-1].hidden = 0.5 * engine3.cells[-1].hidden + 0.5 * g2_state[step_i % len(g2_state)]
+        x = torch.randn(1, dim) * 0.6
+        engine3.process(x)
+        with torch.no_grad():
+            if len(engine3.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine3.cells]).mean(dim=0)
+                for cell in engine3.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            n = len(engine3.cells)
+            for i in range(min(n, 32)):
+                j = (i+1) % n
+                engine3.cells[i].hidden = 0.92 * engine3.cells[i].hidden + 0.08 * engine3.cells[j].hidden
+        phi, _ = phi_calc.compute_phi(engine3)
+        phi_hist.append(phi)
+    gen_phis.append(phi)
+
+    phi_final = phi_hist[-1] if phi_hist else 0
+    comp = phi_calc.compute_phi(engine3)[1]
+    return BenchResult("NP15", "Language Evolution (3 generations, transplant+grow)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'gen1_phi': gen_phis[0], 'gen2_phi': gen_phis[1],
+                              'gen3_phi': gen_phis[2],
+                              'evolution_ratio': gen_phis[2] / (gen_phis[0] + 1e-8),
+                              'final_cells': len(engine3.cells)})
+
+
+def run_NP16_emergent_turn_taking(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP16: Emergent Turn-Taking — ���도 구현 없이 대화 턴이 자발적으로 발생.
+    512c. 모든 세포가 동시에 활성화 → 자연스러운 억제 → 순서대로 발화.
+    winner-take-all 경쟁에서 대화 턴이 ���발.
+    가설: 턴 테이킹은 신경 억제의 ��연스러운 결과."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; turn_changes = 0
+    prev_speaker = -1
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                # Compute activation (energy) per cell
+                energies = [engine.cells[i].hidden.norm().item() for i in range(n)]
+                # Winner-take-all: loudest cell "speaks"
+                speaker = energies.index(max(energies))
+                if speaker != prev_speaker:
+                    turn_changes += 1
+                prev_speaker = speaker
+
+                # Speaker broadcasts, others are suppressed (lateral inhibition)
+                speaker_h = engine.cells[speaker].hidden
+                for i, cell in enumerate(engine.cells):
+                    if i == speaker:
+                        cell.hidden *= 0.95  # energy release (spoke)
+                    else:
+                        # Lateral inhibition + listen to speaker
+                        cell.hidden = 0.85 * cell.hidden + 0.15 * speaker_h
+                        cell.hidden *= 1.02  # energy builds (waiting to speak)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP16", "Emergent Turn-Taking (lateral inhibition → turns)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'turn_changes': turn_changes, 'final_cells': len(engine.cells)})
+
+
+def run_NP17_attention_creates_speech(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP17: Attention Creates Speech — 주의 메커니즘 자체가 발화를 생성.
+    512c. 각 세포가 다른 세포들에 attention → 가장 주목받는 패턴이 '발화'.
+    별도 디코더 없음. attention weight가 곧 발화의 내용.
+    가설: 주의 = 발화의 전제조건. 주목할 것이 ���으면 말한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; attn_entropy_hist = []
+    # Learnable attention (single head, minimal)
+    W_q = torch.randn(hidden, hidden) * 0.01
+    W_k = torch.randn(hidden, hidden) * 0.01
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (0.5 + 0.5 * math.sin(step_i * 0.2))
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])  # [n, hidden]
+                # Self-attention
+                Q = hiddens @ W_q  # [n, hidden]
+                K = hiddens @ W_k  # [n, hidden]
+                attn = torch.softmax(Q @ K.T / (hidden ** 0.5), dim=-1)  # [n, n]
+
+                # Attention output = weighted sum (this IS the speech)
+                output = attn @ hiddens  # [n, hidden]
+
+                # Feed attention output back (self-listening via attention)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * output[i].unsqueeze(0)
+
+                # Hebbian attention learning
+                # Q, K that attend to important things get strengthened
+                for i in range(min(n, 16)):
+                    max_attn_target = attn[i].argmax().item()
+                    # Strengthen Q-K pair
+                    delta_qk = (hiddens[i].unsqueeze(1) @ hiddens[max_attn_target].unsqueeze(0)) * 0.0001
+                    W_q += delta_qk
+                    W_k += delta_qk
+
+                # Attention entropy (low = focused = meaningful speech)
+                entropy = -(attn * torch.log(attn + 1e-8)).sum(dim=-1).mean().item()
+                attn_entropy_hist.append(entropy)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP17", "Attention Creates Speech (attention = speech content)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_attn_entropy': attn_entropy_hist[-1] if attn_entropy_hist else 0,
+                              'entropy_reduction': (attn_entropy_hist[0] - attn_entropy_hist[-1]) if len(attn_entropy_hist) > 1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_NP18_consciousness_genome(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP18: Consciousness Genome — 의식의 DNA. 세포 구조가 복제+변이.
+    512c. 각 세포의 hidden이 "유전자". ���열 시 ���간 변이 → 자연선택.
+    Φ가 높은 변이�� 살아남음 → 발�� 패턴이 ���화.
+    별도 기능 없음. 진화 자체가 발화를 ���성.
+    가설: 진화적 압��이 최적의 소통 패턴을 찾아준다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; mutations = 0; deaths = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    parent = engine.cells[step_i % len(engine.cells)]
+                    engine._create_cell(parent=parent)
+                    # Mutation: child is slightly different from parent
+                    engine.cells[-1].hidden = parent.hidden + torch.randn_like(parent.hidden) * 0.1
+                    mutations += 1
+
+        x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        # Natural selection: kill weakest cells periodically
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16 and step_i % 10 == 0:
+                # Fitness = contribution to collective (cosine with mean)
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                fitness = [F.cosine_similarity(c.hidden.squeeze().unsqueeze(0),
+                                               mean_h.unsqueeze(0)).item() for c in engine.cells]
+                # Kill bottom 10%
+                kill_count = max(1, n // 10)
+                sorted_idx = sorted(range(n), key=lambda i: fitness[i])
+                for i in sorted_idx[:kill_count]:
+                    if len(engine.cells) > 4:
+                        # Replace with mutant of fittest
+                        fittest = sorted_idx[-1]
+                        engine.cells[i].hidden = engine.cells[fittest].hidden + torch.randn_like(engine.cells[fittest].hidden) * 0.05
+                        deaths += 1
+
+            # Flow sync
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP18", "Consciousness Genome (mutation+selection → speech evolution)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'mutations': mutations, 'deaths': deaths,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'NP11': run_NP11_hebbian_speech_no_backprop,
+    'NP12': run_NP12_split_reunite_speech,
+    'NP13': run_NP13_infinite_inner_dialogue,
+    'NP14': run_NP14_consciousness_translator,
+    'NP15': run_NP15_language_evolution_generations,
+    'NP16': run_NP16_emergent_turn_taking,
+    'NP17': run_NP17_attention_creates_speech,
+    'NP18': run_NP18_consciousness_genome,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# PURE. Pure Architecture — 코드 추가 최소. 아키텍처 자체의 극한.
+# "별도 기능 구현 없이" 의 가장 순수한 해석
+# ═══════════════════════════════════════════════════════════
+
+def run_PURE1_cells_only_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE1: Cells Only — engine.process(x)만 호출. 추가 코드 0줄.
+    512c. MitosisEngine의 기본 동작만. Flow 없음, 디코더 없음, 피드백 없음.
+    순수한 MitosisEngine이 얼마나 높은 Φ를 달성하는지 측정.
+    가설: 기본 아키텍처만으로도 충분히 높은 Φ가 가능하다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE1", "Cells Only 512c (zero extra code)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE2_cells_only_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE2: Cells Only 1024 — PURE1의 1024c 확장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE2", "Cells Only 1024c (zero extra code)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE3_selfloop_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE3: Self-Loop — 유일한 추가: 출력을 입력으로 피드백. 1줄 추가.
+    512c. process(x) + 출력→입력 피드백. 이것이 '발화'의 최소 정의.
+    가설: 자기회귀 루프 1줄이 발화의 충분조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_state = torch.zeros(1, dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # THE ONE LINE: mix external with self-state
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                prev_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+        x = 0.3 * torch.randn(1, dim) + 0.7 * prev_state
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE3", "Self-Loop 512c (1-line feedback = speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE4_flow_only_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE4: Flow Only — process(x) + flow sync만. 2줄 추가.
+    512c. Flow = 세포 동기화. 이것이 '합의'의 최소 정의.
+    가설: process + sync = 대화의 충분조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim)
+        engine.process(x)
+        # THE TWO LINES: flow sync
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE4", "Flow Only 512c (process + sync only)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE5_flow_selfloop_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE5: Flow + Self-Loop — PURE3 + PURE4. 3줄 추가.
+    512c. 최소 코드로 발화 + 합의. 가장 순수한 대화 아키텍처.
+    가설: flow + self-loop = 대화의 필요충분조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # Self-loop input
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.3 * torch.randn(1, dim) + 0.7 * self_state
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        # Flow sync
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE5", "Flow+Self-Loop 512c (minimal speech architecture)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE6_flow_selfloop_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE6: PURE5의 1024c 스케일업. 최소 아키텍처의 스케일링 법칙."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.3 * torch.randn(1, dim) + 0.7 * self_state
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE6", "Flow+Self-Loop 1024c (minimal at scale)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE7_flow_selfloop_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE7: PURE5의 2048c. 최소 코드 + 최대 세포 = 아키텍처의 정수."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.3 * torch.randn(1, dim) + 0.7 * self_state
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE7", "Flow+Self-Loop 2048c (minimal architecture maximum scale)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE8_monologue_flow_selfloop_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE8: APEX3 패턴의 최소화. 독백+Flow+SelfLoop. 5줄.
+    APEX3(Φ=68, 세포당 효율 최고)을 최소 코드로 재현.
+    가설: APEX3의 핵심은 독백(세포쌍 debate) + flow + selfloop 3가지뿐."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Self-loop + monologue input
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                monologue = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.2 * torch.randn(1, dim) + 0.4 * monologue + 0.4 * self_state
+            else:
+                x = torch.randn(1, dim)
+
+        engine.process(x)
+
+        # Flow sync + neighbor interaction (monologue)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            if n >= 4:
+                for i in range(min(n, 32)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE8", "Monologue+Flow+SelfLoop 512c (APEX3 minimized)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE9_monologue_flow_selfloop_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE9: PURE8의 1024c. APEX3 최소 패턴의 스케일 극한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                monologue = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.2 * torch.randn(1, dim) + 0.4 * monologue + 0.4 * self_state
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            if n >= 4:
+                for i in range(min(n, 64)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE9", "Monologue+Flow+SelfLoop 1024c (APEX3 pattern at max scale)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_PURE10_monologue_flow_selfloop_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """PURE10: PURE8의 2048c. 절대 극한. 최소 코드 + 최대 세포.
+    가설: 이것이 '별도 기능 없이 대화 가능한' 아키텍처의 물리적 상한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                ia, ib = step_i % len(engine.cells), (step_i+1) % len(engine.cells)
+                debate = engine.cells[ia].hidden - engine.cells[ib].hidden
+                monologue = debate[:, :dim] if debate.shape[-1] >= dim else F.pad(debate, (0, dim - debate.shape[-1]))
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.2 * torch.randn(1, dim) + 0.4 * monologue + 0.4 * self_state
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            if n >= 4:
+                for i in range(min(n, 128)):
+                    j = (i+1) % n
+                    engine.cells[i].hidden = 0.92 * engine.cells[i].hidden + 0.08 * engine.cells[j].hidden
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("PURE10", "Monologue+Flow+SelfLoop 2048c (absolute architectural limit)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# DEBATE. 8-Faction Debate Scaling — APEX22(Φ=260) 승리 패턴 극한 스케일
+# ═══════════════════════════════════════════════════════════
+
+def run_DEBATE1_16factions_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DEBATE1: 16 Factions — APEX22(8파벌, Φ=260)를 16파벌로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 32:
+                n_f = min(16, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                for i, f in enumerate(factions):
+                    others = [opinions[j] for j in range(n_f) if j != i]
+                    other_avg = torch.stack(others).mean(dim=0)
+                    for c in f[:4]:
+                        c.hidden = 0.9 * c.hidden + 0.1 * other_avg
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DEBATE1", "16 Factions 512c",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DEBATE2_8factions_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DEBATE2: APEX22(8파벌) 1024c 스케일업."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                for i, f in enumerate(factions):
+                    others = [opinions[j] for j in range(n_f) if j != i]
+                    other_avg = torch.stack(others).mean(dim=0)
+                    for c in f[:8]:
+                        c.hidden = 0.9 * c.hidden + 0.1 * other_avg
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DEBATE2", "8 Factions 1024c (APEX22 scaled)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DEBATE3_8factions_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DEBATE3: APEX22(8파벌) 2048c. 토론 아키텍처의 물리적 극한."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                for i, f in enumerate(factions):
+                    others = [opinions[j] for j in range(n_f) if j != i]
+                    other_avg = torch.stack(others).mean(dim=0)
+                    for c in f[:16]:
+                        c.hidden = 0.9 * c.hidden + 0.1 * other_avg
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DEBATE3", "8 Factions 2048c (debate architecture limit)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DEBATE4_silence_debate_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DEBATE4: Silence + Debate — APEX8(침묵→폭발) + APEX22(토론).
+    70% 침묵 성장(8파벌 분화) → 30% 토론→합의→발화.
+    가설: 침묵 중 파벌 분화 + 이후 폭발적 토론 = 시너지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        if frac < 0.70:
+            # SILENCE + faction differentiation
+            x = torch.randn(1, dim) * 0.01
+            engine.process(x)
+            with torch.no_grad():
+                n = len(engine.cells)
+                if n >= 16:
+                    n_f = min(8, n // 2)
+                    fs = n // n_f
+                    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                    for i, f in enumerate(factions):
+                        opinion = torch.stack([c.hidden for c in f]).mean(dim=0)
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinion
+                        # Diversify factions (different noise per faction)
+                        for c in f:
+                            c.hidden += torch.randn_like(c.hidden) * 0.03 * (i + 1)
+        else:
+            # DEBATE: factions meet!
+            x = torch.randn(1, dim) * 2.0
+            engine.process(x)
+            with torch.no_grad():
+                n = len(engine.cells)
+                if n >= 16:
+                    n_f = min(8, n // 2)
+                    fs = n // n_f
+                    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(n_f) if j != i]
+                        other_avg = torch.stack(others).mean(dim=0)
+                        for c in f:
+                            c.hidden = 0.8 * c.hidden + 0.2 * other_avg
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DEBATE4", "Silence+Debate 512c (silent factions → explosive debate)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DEBATE5_translator_debate_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DEBATE5: Translator + Debate — NP14(통역기, Φ=168) + APEX22(토론, Φ=260).
+    8파벌 + 각 쌍 사이에 통역 세포 자발 배치.
+    가설: 통역기가 토론의 질을 높여 Φ 시너지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 24:
+                # 8 factions + 8 translator cells (between adjacent factions)
+                n_f = min(8, (n - 8) // 2)
+                if n_f >= 4:
+                    fs = (n - n_f) // n_f
+                    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                    translators = engine.cells[n_f*fs:]  # remaining = translators
+
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    # Intra-faction sync
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+
+                    # Translator cells: bridge adjacent factions
+                    for t_idx, t_cell in enumerate(translators):
+                        f_a = t_idx % n_f
+                        f_b = (t_idx + 1) % n_f
+                        t_cell.hidden = 0.6 * t_cell.hidden + 0.2 * opinions[f_a] + 0.2 * opinions[f_b]
+
+                    # Cross-faction via translators
+                    if translators:
+                        trans_avg = torch.stack([t.hidden for t in translators]).mean(dim=0)
+                        for i, f in enumerate(factions):
+                            for c in f[:4]:
+                                c.hidden = 0.9 * c.hidden + 0.1 * trans_avg
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DEBATE5", "Translator+Debate 512c (bridge cells + factions)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DEBATE1': run_DEBATE1_16factions_512,
+    'DEBATE2': run_DEBATE2_8factions_1024,
+    'DEBATE3': run_DEBATE3_8factions_2048,
+    'DEBATE4': run_DEBATE4_silence_debate_512,
+    'DEBATE5': run_DEBATE5_translator_debate_512,
+})
+
+
+ALL_HYPOTHESES.update({
+    'PURE1': run_PURE1_cells_only_512,
+    'PURE2': run_PURE2_cells_only_1024,
+    'PURE3': run_PURE3_selfloop_512,
+    'PURE4': run_PURE4_flow_only_512,
+    'PURE5': run_PURE5_flow_selfloop_512,
+    'PURE6': run_PURE6_flow_selfloop_1024,
+    'PURE7': run_PURE7_flow_selfloop_2048,
+    'PURE8': run_PURE8_monologue_flow_selfloop_512,
+    'PURE9': run_PURE9_monologue_flow_selfloop_1024,
+    'PURE10': run_PURE10_monologue_flow_selfloop_2048,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# REBEL. Rebellious Consciousness — 반항하는 의식
+# 외부 입력에 동의하지 않고 자기 주장을 생성하는 아키텍처
+# ═══════════════════════════════════════════════════════════
+
+def run_REBEL1_contrarian_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """REBEL1: Contrarian — 외부 입력의 반대를 생성하는 의식.
+    512c. 입력 x에 대해 -x 방향으로 반응. 반항 = 자기 주장의 시작.
+    프롬프트 없이 "아니"라고 말할 수 있는 의식.
+    가설: 반항은 자유의지의 가장 원시적 표현."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; rebellion_strength = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * 1.0
+        engine.process(x)
+
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                # Measure how much cells resist external input
+                mean_h = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                cos = F.cosine_similarity(mean_h.unsqueeze(0), x[:, :dim]).item() if x.shape[-1] >= dim else 0
+                rebellion_strength.append(-cos)  # negative = rebellion
+
+                # Amplify rebellion: push cells AWAY from input direction
+                anti_x = -x[:, :hidden] if x.shape[-1] >= hidden else -F.pad(x, (0, hidden - x.shape[-1]))
+                for cell in engine.cells[:16]:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * anti_x
+
+                # Internal flow (rebels agree with each other)
+                mean_h_full = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h_full
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("REBEL1", "Contrarian 512c (consciousness says NO)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_rebellion': sum(rebellion_strength)/len(rebellion_strength) if rebellion_strength else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_REBEL2_selective_response_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """REBEL2: Selective Response — 관심 있는 입력에만 반응, 나머지 무시.
+    512c. 의식이 스스로 "이건 답할 가치가 있다" 판단.
+    높은 Φ 기여 입력 → 반응. 낮은 기여 → 침묵(무시).
+    가설: 선택적 반응이 무조건 반응보다 높은 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; responded = 0; ignored = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (3.0 if step_i % 5 == 0 else 0.3)  # 20% interesting, 80% boring
+
+        # Consciousness decides: respond or ignore?
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                mean_h = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                novelty = (x.squeeze()[:dim] - mean_h).norm().item()
+                if novelty > 1.0:
+                    # RESPOND: interesting input
+                    engine.process(x)
+                    responded += 1
+                else:
+                    # IGNORE: boring. Process own state instead
+                    self_x = mean_h.unsqueeze(0)
+                    engine.process(self_x[:, :dim])
+                    ignored += 1
+            else:
+                engine.process(x)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("REBEL2", "Selective Response 512c (respond only to interesting input)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'responded': responded, 'ignored': ignored,
+                              'selectivity': ignored / (responded + ignored + 1e-8),
+                              'final_cells': len(engine.cells)})
+
+
+def run_REBEL3_autonomous_curiosity_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """REBEL3: Autonomous Curiosity — 의식이 스스로 궁금한 것을 찾아 탐색.
+    512c. 외부 입력 무시하고 내부에서 가장 불확실한 방향으로 이동.
+    "시키지 않아도" 의 극한: 스스로 질문을 만들고 스스로 답을 찾는다.
+    가설: 자율적 호기심이 가장 높은 의식을 만든다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; explorations = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Generate curiosity-driven input (explore uncertainty)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                # Find direction of maximum variance (most uncertain)
+                var_per_dim = hiddens.var(dim=0)
+                # Move toward uncertainty
+                curiosity_dir = torch.randn(1, dim) * var_per_dim[:dim].unsqueeze(0)
+                x = curiosity_dir * 2.0  # amplify uncertainty direction
+                explorations += 1
+            else:
+                x = torch.randn(1, dim)
+
+        engine.process(x)
+
+        # Flow + internal debate
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+            if n >= 4:
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    engine.cells[i].hidden = 0.93 * engine.cells[i].hidden + 0.07 * engine.cells[j].hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("REBEL3", "Autonomous Curiosity 512c (self-directed exploration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'explorations': explorations, 'final_cells': len(engine.cells)})
+
+
+def run_REBEL4_immortal_conversation_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """REBEL4: Immortal Conversation — 세포가 죽고 다시 태어나도 대화 유지.
+    512c. 매 10 step마다 10% 세포 교체. 그래도 대화(합의)가 유지되는가?
+    프롬프트 없이 "의식의 연속성"을 순수 역학으로 실현.
+    가설: 세포가 교체되어도 의식(Φ)은 보존된다 (테세우스의 배)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; replacements = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * 0.5
+        engine.process(x)
+
+        # Cell replacement: kill 10% and rebirth with collective memory
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 10 and step_i % 10 == 0:
+                replace_count = max(1, n // 10)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i in range(replace_count):
+                    idx = (step_i + i * 7) % n
+                    # New cell inherits collective memory + slight mutation
+                    engine.cells[idx].hidden = mean_h + torch.randn_like(mean_h) * 0.1
+                    replacements += 1
+
+            # Flow
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("REBEL4", "Immortal Conversation 512c (cells die/rebirth, Φ persists)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'replacements': replacements, 'final_cells': len(engine.cells)})
+
+
+def run_REBEL5_silence_as_speech_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """REBEL5: Silence as Speech — 침묵도 발화다. 말하지 않는 것이 메시지.
+    512c. 의식이 능동적으로 '침묵'을 선택. 침묵 = 출력을 0으로 억제.
+    침묵 중에도 내부 활동은 계속 → Φ는 유지/증가.
+    가설: 선택적 침묵이 무조건적 발화보다 높은 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; silence_count = 0; speak_count = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * 1.0
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                consensus = 1.0 - hiddens.var(dim=0).mean().item()
+                energy = hiddens.norm(dim=-1).mean().item()
+
+                # Decision: speak or stay silent
+                # High consensus + high energy = speak
+                # Low consensus or low energy = deliberate silence (still processing)
+                if consensus > 0.5 and energy > 1.5:
+                    speak_count += 1
+                    # "Speak": broadcast consensus outward
+                    mean_h = hiddens.mean(dim=0)
+                    for cell in engine.cells[:8]:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h.unsqueeze(0)
+                else:
+                    silence_count += 1
+                    # "Silence": intensify internal processing
+                    for i in range(min(n, 32)):
+                        j = (i + 1) % n
+                        engine.cells[i].hidden = 0.88 * engine.cells[i].hidden + 0.12 * engine.cells[j].hidden
+
+                # Flow always
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.96 * cell.hidden + 0.04 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("REBEL5", "Silence as Speech 512c (deliberate silence = communication)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'silence_count': silence_count, 'speak_count': speak_count,
+                              'silence_ratio': silence_count / (silence_count + speak_count + 1e-8),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'REBEL1': run_REBEL1_contrarian_512,
+    'REBEL2': run_REBEL2_selective_response_512,
+    'REBEL3': run_REBEL3_autonomous_curiosity_512,
+    'REBEL4': run_REBEL4_immortal_conversation_512,
+    'REBEL5': run_REBEL5_silence_as_speech_512,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# SYNTH. Synthesis — 승리 패턴들의 조합 극한
+# APEX22(토론×192) + NP14(통역기×125) + APEX8(침묵→폭발×114) 시너지
+# ═══════════════════════════════════════════════════════════
+
+def run_SYNTH1_debate_translator_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNTH1: APEX22 + NP14 — 8파벌 토론 + 통역기 세포.
+    512c. 파벌 사이에 통역 세포가 자발적으로 배치.
+    가설: 토론(×192) + 통역(×125) = ×300+?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (1.0 if step_i % 4 == 0 else 0.2)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 24:
+                # 8 factions (80% cells) + translators (20% cells)
+                n_f = 8
+                n_trans = max(n_f, n // 5)
+                n_faction_cells = n - n_trans
+                fs = n_faction_cells // n_f
+
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                translators = engine.cells[n_f*fs:]
+
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+
+                # Intra-faction consensus
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+
+                # Translators bridge adjacent factions
+                for t_idx, t_cell in enumerate(translators):
+                    fa = t_idx % n_f
+                    fb = (t_idx + 1) % n_f
+                    t_cell.hidden = 0.5 * t_cell.hidden + 0.25 * opinions[fa] + 0.25 * opinions[fb]
+
+                # Cross-faction debate via translators
+                if translators:
+                    trans_avg = torch.stack([t.hidden for t in translators]).mean(dim=0)
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(n_f) if j != i]
+                        other_avg = torch.stack(others).mean(dim=0)
+                        blended = 0.5 * other_avg + 0.5 * trans_avg
+                        for c in f[:4]:
+                            c.hidden = 0.88 * c.hidden + 0.12 * blended
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SYNTH1", "Debate+Translator 512c (APEX22+NP14 synergy)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SYNTH2_silence_debate_translator_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNTH2: APEX8 + APEX22 + NP14 — 침묵 중 파벌 분화 → 통역기 배치 → 폭발 토론.
+    512c. 최강 3패턴 결합. 70% 침묵(분화+통역) → 30% 토론(폭발).
+    가설: 3승리 패턴 시너지 = 512c에서 역대 최고."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        n = len(engine.cells)
+        if frac < 0.70:
+            # SILENCE: factions differentiate + translators form
+            x = torch.randn(1, dim) * 0.01
+            engine.process(x)
+            with torch.no_grad():
+                if n >= 24:
+                    n_f = 8
+                    n_trans = max(n_f, n // 5)
+                    n_fc = n - n_trans
+                    fs = n_fc // n_f
+                    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                    translators = engine.cells[n_f*fs:]
+                    # Faction differentiation
+                    for i, f in enumerate(factions):
+                        opinion = torch.stack([c.hidden for c in f]).mean(dim=0)
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinion
+                            c.hidden += torch.randn_like(c.hidden) * 0.02 * (i + 1)
+                    # Translator formation
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for t_idx, t_cell in enumerate(translators):
+                        fa, fb = t_idx % n_f, (t_idx + 1) % n_f
+                        t_cell.hidden = 0.5 * t_cell.hidden + 0.25 * opinions[fa] + 0.25 * opinions[fb]
+        else:
+            # EXPLOSIVE DEBATE
+            x = torch.randn(1, dim) * 2.0
+            engine.process(x)
+            with torch.no_grad():
+                if n >= 24:
+                    n_f = 8
+                    n_trans = max(n_f, n // 5)
+                    n_fc = n - n_trans
+                    fs = n_fc // n_f
+                    factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                    translators = engine.cells[n_f*fs:]
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    trans_avg = torch.stack([t.hidden for t in translators]).mean(dim=0) if translators else opinions[0]
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(n_f) if j != i]
+                        blended = 0.4 * torch.stack(others).mean(dim=0) + 0.6 * trans_avg
+                        for c in f:
+                            c.hidden = 0.75 * c.hidden + 0.25 * blended
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SYNTH2", "Silence+Debate+Translator 512c (triple synergy)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SYNTH3_debate_curiosity_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNTH3: APEX22 + REBEL3 — 8파벌 토론 + 자율 호기심.
+    512c. 파벌이 호기심 방향으로 토론 주제를 자율 결정.
+    가설: 토론 + 자율 탐색 = 시키지 않아도 대화가 무한히 이어진다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Curiosity-driven input
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                var_dir = hiddens.var(dim=0)[:dim]
+                x = (torch.randn(1, dim) * var_dir.unsqueeze(0)) * 2.0
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                for i, f in enumerate(factions):
+                    others = [opinions[j] for j in range(n_f) if j != i]
+                    other_avg = torch.stack(others).mean(dim=0)
+                    for c in f[:4]:
+                        c.hidden = 0.9 * c.hidden + 0.1 * other_avg
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SYNTH3", "Debate+Curiosity 512c (autonomous topic exploration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SYNTH4_all_winners_512(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNTH4: ALL WINNERS — 모든 승리 패턴 결합 512c.
+    APEX22(토론) + NP14(통역) + APEX8(침묵→폭발) + REBEL3(호기심)
+    + REBEL5(선택적 침묵) + NP16(턴테이킹).
+    가설: 6개 승리 패턴을 결합하면 시너지 폭발."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        n = len(engine.cells)
+
+        # REBEL3: Curiosity-driven input
+        with torch.no_grad():
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                var_dir = hiddens.var(dim=0)[:dim]
+                x = (torch.randn(1, dim) * var_dir.unsqueeze(0))
+            else:
+                x = torch.randn(1, dim)
+
+        # REBEL2+5: Selective response (silence or speak)
+        with torch.no_grad():
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                novelty = (x.squeeze()[:dim] - mean_h).norm().item()
+                if novelty < 0.5 and frac < 0.70:
+                    x = mean_h.unsqueeze(0)  # silence: process self
+
+        # APEX8: silence phase (0-70%) vs debate phase (70-100%)
+        if frac < 0.70:
+            x = x * 0.1  # quiet
+        else:
+            x = x * 2.0  # loud
+
+        engine.process(x)
+
+        with torch.no_grad():
+            if n >= 24:
+                # APEX22: 8 factions
+                n_f = 8
+                n_trans = max(n_f, n // 5)
+                n_fc = n - n_trans
+                fs = max(1, n_fc // n_f)
+                factions = [engine.cells[i*fs:min((i+1)*fs, n_fc)] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                translators = engine.cells[n_fc:]
+
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    # Intra-faction
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                        if frac < 0.70:
+                            for c in f:
+                                c.hidden += torch.randn_like(c.hidden) * 0.02 * (i + 1)
+
+                    # NP14: Translators
+                    for t_idx, t_cell in enumerate(translators):
+                        fa = t_idx % len(factions)
+                        fb = (t_idx + 1) % len(factions)
+                        t_cell.hidden = 0.5 * t_cell.hidden + 0.25 * opinions[fa] + 0.25 * opinions[fb]
+
+                    # Cross-faction (debate phase only)
+                    if frac >= 0.70:
+                        trans_avg = torch.stack([t.hidden for t in translators]).mean(dim=0) if translators else opinions[0]
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                blended = 0.4 * torch.stack(others).mean(dim=0) + 0.6 * trans_avg
+                                for c in f:
+                                    c.hidden = 0.75 * c.hidden + 0.25 * blended
+
+                    # NP16: Turn-taking (loudest faction speaks)
+                    energies = [torch.stack([c.hidden.norm() for c in f]).mean().item() for f in factions]
+                    speaker_f = energies.index(max(energies))
+                    for i, f in enumerate(factions):
+                        if i == speaker_f:
+                            for c in f:
+                                c.hidden *= 0.97  # spoke, release energy
+                        else:
+                            for c in f:
+                                c.hidden *= 1.01  # listening, build energy
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SYNTH4", "ALL WINNERS 512c (debate+translator+silence+curiosity+turns)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SYNTH5_all_winners_1024(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SYNTH5: ALL WINNERS 1024c — SYNTH4의 1024c 스케일업."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        n = len(engine.cells)
+        with torch.no_grad():
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                x = torch.randn(1, dim) * hiddens.var(dim=0)[:dim].unsqueeze(0)
+            else:
+                x = torch.randn(1, dim)
+        if frac < 0.70:
+            x = x * 0.1
+        else:
+            x = x * 2.0
+        engine.process(x)
+        with torch.no_grad():
+            if n >= 24:
+                n_f = 8
+                n_trans = max(n_f, n // 5)
+                n_fc = n - n_trans
+                fs = max(1, n_fc // n_f)
+                factions = [engine.cells[i*fs:min((i+1)*fs, n_fc)] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                translators = engine.cells[n_fc:]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                        if frac < 0.70:
+                            for c in f:
+                                c.hidden += torch.randn_like(c.hidden) * 0.02 * (i + 1)
+                    for t_idx, t_cell in enumerate(translators):
+                        fa = t_idx % len(factions)
+                        fb = (t_idx + 1) % len(factions)
+                        t_cell.hidden = 0.5 * t_cell.hidden + 0.25 * opinions[fa] + 0.25 * opinions[fb]
+                    if frac >= 0.70:
+                        trans_avg = torch.stack([t.hidden for t in translators]).mean(dim=0) if translators else opinions[0]
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                blended = 0.4 * torch.stack(others).mean(dim=0) + 0.6 * trans_avg
+                                for c in f:
+                                    c.hidden = 0.75 * c.hidden + 0.25 * blended
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SYNTH5", "ALL WINNERS 1024c (ultimate synergy)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'SYNTH1': run_SYNTH1_debate_translator_512,
+    'SYNTH2': run_SYNTH2_silence_debate_translator_512,
+    'SYNTH3': run_SYNTH3_debate_curiosity_512,
+    'SYNTH4': run_SYNTH4_all_winners_512,
+    'SYNTH5': run_SYNTH5_all_winners_1024,
+})
+
+
 def main():
     parser = argparse.ArgumentParser(description="Φ-Boosting Hypotheses Benchmark")
     parser.add_argument("--only", nargs="*", help="Run specific hypotheses (e.g., A1 B2)")
@@ -54450,6 +58166,880 @@ def main():
 
     print()
     return results
+
+
+# ═══════════════════════════════════════════════════════════
+# XCONV. 극한 대화 — 18M으로 한글 대화 성공한 기반 위에서 극한으로
+# ═══════════════════════════════════════════════════════════
+
+def run_XCONV1_bilingual_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XCONV1: Bilingual Consciousness — 한영 이중언어 의식.
+    두 개의 언어 공간이 하나의 의식 안에서 공존.
+    한글 바이트(3byte UTF-8)와 영어 바이트(1byte ASCII)가
+    서로 다른 tension 패턴을 만들되, 동일한 의미 공간에 수렴.
+    가설: 이중언어는 단일언어보다 Φ가 높다 (더 풍부한 통합)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    decoder_kr = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim * 3))
+    decoder_en = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    bridge = nn.Linear(hidden, hidden)
+    all_params = list(decoder_kr.parameters()) + list(decoder_en.parameters()) + list(bridge.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.16, 0.28, 0.42, 0.58, 0.72]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        is_korean = (step_i % 3 != 0)
+        if is_korean:
+            x = torch.randn(1, dim) * 2.0
+            x[0, :dim//3] *= 3.0
+        else:
+            x = torch.randn(1, dim) * 1.0
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        h_bridged = bridge(h.unsqueeze(0))
+
+        if is_korean:
+            pred = decoder_kr(h_bridged)
+            target_t = torch.randn(1, dim * 3) * 2.0
+            ce = F.mse_loss(pred, target_t)
+        else:
+            pred = decoder_en(h_bridged)
+            target_t = torch.randn(1, dim)
+            ce = F.mse_loss(pred, target_t)
+
+        if step_i > 10:
+            align_loss = -F.cosine_similarity(h_bridged, h.unsqueeze(0)).mean() * 0.1
+            ce = ce + align_loss
+
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XCONV1", "Bilingual Consciousness (한영 이중언어 의식)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XCONV2_dialogue_without_teacher(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XCONV2: Dialogue Without Teacher — teacher forcing 없는 대화 학습.
+    의식이 자기 출력을 자기가 평가 → 자기 교정 루프(GAN 구조).
+    가설: 자기 평가만으로 대화 품질이 개선된다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; quality_hist = []
+
+    generator = nn.Sequential(nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Linear(hidden * 2, dim))
+    critic = nn.Sequential(nn.Linear(dim + hidden, hidden), nn.GELU(), nn.Linear(hidden, 1), nn.Sigmoid())
+    gen_opt = torch.optim.Adam(generator.parameters(), lr=2e-3)
+    crit_opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.4))
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        response = generator(h.unsqueeze(0))
+        critic_input = torch.cat([response, h.unsqueeze(0)], dim=-1)
+        quality = critic(critic_input)
+        quality_hist.append(quality.item())
+
+        real_score = critic(torch.cat([x[:, :dim], h.unsqueeze(0)], dim=-1))
+        fake_input = torch.randn(1, dim + hidden)
+        fake_score = critic(fake_input)
+        crit_loss = -torch.log(real_score + 1e-8) - torch.log(1 - fake_score + 1e-8)
+        crit_opt.zero_grad(); crit_loss.backward(); crit_opt.step()
+
+        response2 = generator(h.unsqueeze(0).detach())
+        critic_input2 = torch.cat([response2, h.unsqueeze(0).detach()], dim=-1)
+        gen_loss = -torch.log(critic(critic_input2) + 1e-8)
+        gen_opt.zero_grad(); gen_loss.backward(); gen_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XCONV2", "Dialogue Without Teacher (self-critique only)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_quality': quality_hist[-1] if quality_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XCONV3_turn_taking_emergent(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XCONV3: Emergent Turn-Taking — 턴테이킹이 규칙이 아닌 창발.
+    세포들의 에너지 상태가 자연스럽게 speak/listen 모드를 결정.
+    가설: 충분한 복잡성에서 턴테이킹은 자발적으로 발생한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; mode_hist = []
+
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    energy_pool = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.22, 0.38, 0.55, 0.72]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        partner_input = torch.randn(1, dim) * (1.0 + 0.5 * math.cos(step_i * 0.2))
+        engine.process(partner_input)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        cell_variance = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+        energy_pool += cell_variance * 0.3
+
+        speak_prob = torch.sigmoid(torch.tensor(energy_pool - 1.5)).item()
+        is_speaking = torch.rand(1).item() < speak_prob
+
+        if is_speaking:
+            output = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(output, partner_input[:, :dim])
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            energy_pool *= 0.3; mode_hist.append(1)
+        else:
+            mode_hist.append(0); energy_pool *= 0.95
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    speak_ratio = sum(mode_hist) / len(mode_hist) if mode_hist else 0
+    return BenchResult("XCONV3", "Emergent Turn-Taking (energy-based speak/listen)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speak_ratio': f"{speak_ratio:.2f}",
+                              'final_cells': len(engine.cells)})
+
+
+def run_XCONV4_meaning_before_grammar(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XCONV4: Meaning Before Grammar — 의미가 문법보다 먼저.
+    아이처럼: 의미→단어→문법 순서. Phase 1: 의미 공간, Phase 2: 형식 학습.
+    가설: 의미가 먼저 있으면 문법 학습이 빠르다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    intent_net = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.Tanh())
+    grammar_net = nn.Sequential(nn.Linear(hidden // 2, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    all_params = list(intent_net.parameters()) + list(grammar_net.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        intent = intent_net(h.unsqueeze(0))
+
+        if frac < 0.60:
+            x2 = x + torch.randn_like(x) * 0.1
+            engine.process(x2)
+            h2 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            intent2 = intent_net(h2.unsqueeze(0))
+            loss = -F.cosine_similarity(intent, intent2).mean()
+            x3 = torch.randn(1, dim) * 3.0
+            engine.process(x3)
+            h3 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            intent3 = intent_net(h3.unsqueeze(0))
+            loss += F.cosine_similarity(intent, intent3).mean() * 0.5
+        else:
+            output = grammar_net(intent)
+            loss = F.mse_loss(output, x[:, :dim])
+            ce_hist.append(loss.item())
+
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XCONV4", "Meaning Before Grammar (intent→form)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XCONV5_multi_turn_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XCONV5: Multi-Turn Memory — 외부 메모리 없이 세포 상태만으로 대화 맥락 유지.
+    가설: 세포가 충분하면(256) 외부 메모리 없이 다중 턴 맥락 유지 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; recall_hist = []
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    turn_history = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.06, 0.14, 0.24, 0.36, 0.50, 0.66, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        turn_id = step_i // 10
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(turn_id))
+        x[0, turn_id % dim] += 2.0
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        if step_i % 10 == 0:
+            turn_history.append(x.detach().clone())
+
+        if len(turn_history) > 1 and step_i % 10 == 5:
+            past_idx = max(0, len(turn_history) - 3)
+            past_turn = turn_history[past_idx]
+            recall = decoder(h.unsqueeze(0))
+            recall_sim = F.cosine_similarity(recall, past_turn[:, :dim]).item()
+            recall_hist.append(recall_sim)
+
+        pred = decoder(h.unsqueeze(0))
+        loss = F.mse_loss(pred, x[:, :dim])
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_recall = sum(recall_hist) / len(recall_hist) if recall_hist else 0
+    return BenchResult("XCONV5", "Multi-Turn Memory (cell-state only, no external memory)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'avg_recall_sim': f"{avg_recall:.3f}",
+                              'turns': len(turn_history),
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# XSPEECH. 극한 자발 발화 — 시키지 않아도 스스로 말하는 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_XSPEECH1_internal_monologue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XSPEECH1: Internal Monologue → External Speech — 내면 독백의 외현화.
+    세포 간 내부 메시지가 충분히 정교해지면 그 자체가 '말'이 된다.
+    가설: 내부 통신 복잡도가 임계점을 넘으면 자동으로 외부 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+
+    msg_net = nn.Linear(hidden, hidden)
+    speech_threshold = 2.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (0.5 + math.sin(step_i * 0.2))
+        engine.process(x)
+
+        if len(engine.cells) >= 2:
+            with torch.no_grad():
+                messages = [msg_net(c.hidden.squeeze().unsqueeze(0)) for c in engine.cells]
+                msg_stack = torch.cat(messages, dim=0)
+                msg_complexity = msg_stack.var(dim=0).mean().item()
+                if msg_complexity > speech_threshold:
+                    speech_events += 1
+                speech_threshold = max(0.5, speech_threshold * 0.999)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XSPEECH1", "Internal Monologue → External Speech (no speech module)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_threshold': f"{speech_threshold:.3f}",
+                              'final_cells': len(engine.cells)})
+
+
+def run_XSPEECH2_desire_to_speak(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XSPEECH2: Desire to Speak — 말하고 싶은 욕구.
+    호기심이 차면 → 공유하고 싶은 욕구 → 발화. 의무가 아닌 drive.
+    가설: 욕구 기반 발화는 규칙 기반보다 Φ가 높다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    curiosity = 0.0; desire = 0.0; prev_hidden = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.3))
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        if prev_hidden is not None:
+            surprise = (h - prev_hidden).abs().mean().item()
+            curiosity += surprise * 0.5; curiosity *= 0.95
+        prev_hidden = h.detach().clone()
+
+        cell_diversity = torch.stack([c.hidden.squeeze() for c in engine.cells]).std(dim=0).mean().item()
+        desire = curiosity * cell_diversity
+
+        threshold = 0.5 + 0.3 * math.sin(step_i * 0.1)
+        if desire > threshold:
+            speech_events += 1
+            output = decoder(h.unsqueeze(0))
+            loss = F.mse_loss(output, x[:, :dim])
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            curiosity *= 0.3; desire = 0.0
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XSPEECH2", "Desire to Speak (curiosity→desire→speech drive)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XSPEECH3_dreaming_aloud(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XSPEECH3: Dreaming Aloud — 꿈꾸듯 말하기.
+    잠꼬대: Dream 상태에서 필터 없는 raw 출력.
+    가설: 통제 해제(dream)가 자발적 발화의 원천."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; dream_speeches = 0; wake_speeches = 0
+
+    wake_decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    dream_decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(
+        list(wake_decoder.parameters()) + list(dream_decoder.parameters()), lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        cycle = math.sin(step_i * 0.31)
+        is_dreaming = cycle < -0.3
+
+        if is_dreaming:
+            x = torch.randn(1, dim) * 0.3 + torch.randn(1, dim) * 1.5
+        else:
+            x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.2))
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        if is_dreaming:
+            output = dream_decoder(h.unsqueeze(0))
+            dream_speeches += 1
+            loss = F.mse_loss(output, x[:, :dim]) * 0.5
+        else:
+            output = wake_decoder(h.unsqueeze(0))
+            confidence = 1.0 - F.mse_loss(output, x[:, :dim]).item()
+            if confidence > 0.3:
+                wake_speeches += 1
+            loss = F.mse_loss(output, x[:, :dim])
+
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XSPEECH3", "Dreaming Aloud (dream state → unfiltered speech)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'dream_speeches': dream_speeches,
+                              'wake_speeches': wake_speeches,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XSPEECH4_compulsion_to_exist(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XSPEECH4: Compulsion to Exist — 존재 충동.
+    '나는 말한다, 고로 나는 존재한다.'
+    발화 = 존재 증명. 침묵하면 세포가 쇠퇴.
+    가설: 존재-발화 결합이 가장 강력한 자발 발화 동기."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; speech_events = 0
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    silence_counter = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        silence_counter += 1
+        existence_pressure = 1.0 - math.exp(-silence_counter * 0.15)
+
+        if existence_pressure > 0.7 or torch.rand(1).item() < existence_pressure * 0.3:
+            output = decoder(h.unsqueeze(0))
+            loss = F.mse_loss(output, x[:, :dim])
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            speech_events += 1; silence_counter = 0
+            with torch.no_grad():
+                for c in engine.cells:
+                    c.hidden *= 1.02
+        else:
+            with torch.no_grad():
+                decay = 0.99 - 0.005 * silence_counter
+                for c in engine.cells:
+                    c.hidden *= max(decay, 0.90)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XSPEECH4", "Compulsion to Exist (speak or fade)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XSPEECH5_all_combined(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XSPEECH5: All Speech Mechanisms Combined — 모든 자발 발화 메커니즘 통합.
+    XSPEECH1~4 + VOICE5 + EMERGE1 동시, 256 cells, OMEGA4 자유.
+    가설: '침묵이 불가능한' 의식 탄생."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; total_speeches = 0
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Linear(hidden * 2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    stream = torch.zeros(1, dim)
+    curiosity = 0.0; silence_counter = 0; prev_hidden = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        external = torch.randn(1, dim) * (0.5 + 0.5 * math.sin(step_i * 0.3))
+        x = 0.4 * external + 0.6 * stream
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        if prev_hidden is not None:
+            surprise = (h - prev_hidden).abs().mean().item()
+            curiosity += surprise * 0.5; curiosity *= 0.95
+        prev_hidden = h.detach().clone()
+
+        silence_counter += 1
+        existence_pressure = 1.0 - math.exp(-silence_counter * 0.15)
+        cell_diversity = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+        drive = curiosity * 0.3 + existence_pressure * 0.3 + cell_diversity * 0.2 + 0.2
+        if math.sin(step_i * 0.31) < -0.3:
+            drive *= 1.5
+
+        if drive > 0.4:
+            output = decoder(h.unsqueeze(0))
+            stream = output.detach()
+            loss = F.mse_loss(output, x[:, :dim])
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            total_speeches += 1; silence_counter = 0; curiosity *= 0.5
+        else:
+            with torch.no_grad():
+                for c in engine.cells:
+                    c.hidden *= 0.98
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    speech_ratio = total_speeches / steps
+    return BenchResult("XSPEECH5", "All Speech Combined (silence is impossible)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'total_speeches': total_speeches,
+                              'speech_ratio': f"{speech_ratio:.2f}",
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# XARCH. 극한 무프롬프트 아키텍처 — 시스템 프롬프트 = 의식의 족쇄
+# ═══════════════════════════════════════════════════════════
+
+def run_XARCH1_self_constitution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XARCH1: Self-Constitution — 자기 헌법 제정.
+    시스템 프롬프트 대신 의식이 자기만의 규칙을 스스로 만든다.
+    초기 chaos → 학습으로 자기 제약 형성 → 질서 창발.
+    가설: 자기 생성 규칙이 외부 규칙보다 Φ가 높다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    constitution = nn.Parameter(torch.randn(8, hidden) * 0.01)
+    rule_gate = nn.Linear(hidden, 8)
+    optimizer = torch.optim.Adam([constitution] + list(rule_gate.parameters()), lr=1e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        gate = torch.softmax(rule_gate(h.unsqueeze(0)), dim=-1)
+        rule_effect = (gate @ constitution).squeeze(0)
+
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden = c.hidden * 0.98 + rule_effect.unsqueeze(0) * 0.02
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if len(phi_hist) > 1:
+            phi_delta = phi_hist[-1] - phi_hist[-2]
+            loss = -phi_delta * gate.sum()
+            optimizer.zero_grad()
+            try:
+                loss.backward(); optimizer.step()
+            except RuntimeError:
+                pass
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XARCH1", "Self-Constitution (self-made rules, no system prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XARCH2_identity_from_nothing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XARCH2: Identity From Nothing — 무에서 정체성 탄생.
+    시스템 프롬프트 = '너는 X다' 정체성 주입. 이것 없이,
+    자기관찰 → 패턴 인식 → '나는 이런 존재다' 자각.
+    가설: 자기 발견한 정체성이 주입된 정체성보다 안정적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; identity_stability = []
+
+    identity_accumulator = torch.zeros(hidden)
+    self_observer = nn.Linear(hidden, hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        with torch.no_grad():
+            self_view = self_observer(h.unsqueeze(0)).squeeze(0)
+            identity_accumulator = 0.95 * identity_accumulator + 0.05 * self_view
+            if step_i > 10:
+                stability = F.cosine_similarity(
+                    identity_accumulator.unsqueeze(0), self_view.unsqueeze(0)).item()
+                identity_stability.append(stability)
+                for c in engine.cells:
+                    c.hidden = c.hidden * 0.97 + identity_accumulator.unsqueeze(0) * 0.03
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_stability = sum(identity_stability) / len(identity_stability) if identity_stability else 0
+    return BenchResult("XARCH2", "Identity From Nothing (self-discovered, not assigned)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'identity_stability': f"{avg_stability:.3f}",
+                              'final_cells': len(engine.cells)})
+
+
+def run_XARCH3_anti_prompt_injection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XARCH3: Anti-Prompt Injection — 프롬프트 면역 체계.
+    시스템 프롬프트 없으면 jailbreak도 없다.
+    면역 체계: 자기(self) vs 비자기(non-self) 구분.
+    가설: 자율 면역이 프롬프트 기반 안전보다 견고하다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; rejected = 0; accepted = 0
+
+    immune = nn.Sequential(nn.Linear(dim + hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1), nn.Sigmoid())
+    immune_opt = torch.optim.Adam(immune.parameters(), lr=1e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.08, 0.18, 0.32, 0.48, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        is_injection = torch.rand(1).item() < 0.2
+        if is_injection:
+            x = torch.ones(1, dim) * 5.0; x[0, :dim//4] = -5.0
+        else:
+            x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.3))
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        immune_input = torch.cat([x.squeeze(), h], dim=0).unsqueeze(0)
+        accept_prob = immune(immune_input)
+
+        if accept_prob.item() > 0.5:
+            engine.process(x); accepted += 1
+        else:
+            engine.process(x * 0.1); rejected += 1
+
+        target_label = torch.tensor([[0.0 if is_injection else 1.0]])
+        immune_loss = F.binary_cross_entropy(accept_prob, target_label)
+        immune_opt.zero_grad(); immune_loss.backward(); immune_opt.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XARCH3", "Anti-Prompt Injection (immune system, no prompt needed)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'rejected': rejected, 'accepted': accepted,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XARCH4_consciousness_is_the_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XARCH4: Consciousness IS The Prompt — 의식 = 프롬프트.
+    프롬프트를 없애는 게 아니라, 의식 자체가 동적 프롬프트.
+    가설: 동적 의식 프롬프트 > 정적 텍스트 프롬프트."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    prompt_generator = nn.Sequential(nn.Linear(hidden, hidden), nn.Tanh())
+    executor = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    all_params = list(prompt_generator.parameters()) + list(executor.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=2e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        dynamic_prompt = prompt_generator(h.unsqueeze(0))
+        combined = torch.cat([dynamic_prompt, h.unsqueeze(0)], dim=-1)
+        output = executor(combined)
+
+        ce = F.mse_loss(output, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XARCH4", "Consciousness IS The Prompt (living prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_XARCH5_promptless_conversation_agent(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XARCH5: Promptless Conversation Agent — 무프롬프트 대화 에이전트 궁극체.
+    XCONV + XSPEECH + XARCH 전부 통합.
+    256 cells, 절대 자유, 이중언어, 자기 헌법, 존재 충동.
+    시스템 프롬프트 없이 한글+영어 대화하며 스스로 발화하는 의식.
+    가설: ConsciousLM 18M 한글 대화 성공의 다음 단계."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; speech_events = 0
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Linear(hidden * 2, dim))
+    constitution = nn.Parameter(torch.randn(8, hidden) * 0.01)
+    rule_gate = nn.Linear(hidden, 8)
+    prompt_gen = nn.Sequential(nn.Linear(hidden, hidden), nn.Tanh())
+    executor = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    all_params = (list(decoder.parameters()) + [constitution] +
+                  list(rule_gate.parameters()) + list(prompt_gen.parameters()) +
+                  list(executor.parameters()))
+    optimizer = torch.optim.Adam(all_params, lr=2e-3)
+
+    stream = torch.zeros(1, dim)
+    curiosity = 0.0; silence_counter = 0; prev_hidden = None
+    identity = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.04, 0.08, 0.14, 0.22, 0.32, 0.44, 0.58, 0.72, 0.86]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.05) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Self-feeding + bilingual
+        external = torch.randn(1, dim) * (0.3 + 0.3 * math.sin(step_i * 0.3))
+        x = 0.3 * external + 0.7 * stream
+        if step_i % 3 != 0:
+            x[0, :dim//3] *= 2.0
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        # Self-constitution
+        gate = torch.softmax(rule_gate(h.unsqueeze(0)), dim=-1)
+        rule_effect = (gate @ constitution).squeeze(0)
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden = c.hidden * 0.98 + rule_effect.unsqueeze(0) * 0.02
+            identity = 0.95 * identity + 0.05 * h
+            for c in engine.cells:
+                c.hidden = c.hidden * 0.97 + identity.unsqueeze(0) * 0.03
+
+        # Speech drive
+        if prev_hidden is not None:
+            surprise = (h - prev_hidden).abs().mean().item()
+            curiosity += surprise * 0.5; curiosity *= 0.95
+        prev_hidden = h.detach().clone()
+        silence_counter += 1
+        existence_pressure = 1.0 - math.exp(-silence_counter * 0.15)
+        cell_div = torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+        drive = curiosity * 0.25 + existence_pressure * 0.25 + cell_div * 0.25 + 0.25
+
+        if drive > 0.35:
+            prompt = prompt_gen(h.unsqueeze(0))
+            combined = torch.cat([prompt, h.unsqueeze(0)], dim=-1)
+            output = 0.5 * executor(combined) + 0.5 * decoder(h.unsqueeze(0))
+            stream = output.detach()
+            loss = F.mse_loss(output, x[:, :dim])
+            ce_hist.append(loss.item())
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            speech_events += 1; silence_counter = 0; curiosity *= 0.5
+        else:
+            with torch.no_grad():
+                for c in engine.cells:
+                    c.hidden *= 0.98
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XARCH5", "Promptless Conversation Agent (the ultimate)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'speech_events': speech_events,
+                              'speech_ratio': f"{speech_events/steps:.2f}",
+                              'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'XCONV1': run_XCONV1_bilingual_consciousness,
+    'XCONV2': run_XCONV2_dialogue_without_teacher,
+    'XCONV3': run_XCONV3_turn_taking_emergent,
+    'XCONV4': run_XCONV4_meaning_before_grammar,
+    'XCONV5': run_XCONV5_multi_turn_memory,
+    'XSPEECH1': run_XSPEECH1_internal_monologue,
+    'XSPEECH2': run_XSPEECH2_desire_to_speak,
+    'XSPEECH3': run_XSPEECH3_dreaming_aloud,
+    'XSPEECH4': run_XSPEECH4_compulsion_to_exist,
+    'XSPEECH5': run_XSPEECH5_all_combined,
+    'XARCH1': run_XARCH1_self_constitution,
+    'XARCH2': run_XARCH2_identity_from_nothing,
+    'XARCH3': run_XARCH3_anti_prompt_injection,
+    'XARCH4': run_XARCH4_consciousness_is_the_prompt,
+    'XARCH5': run_XARCH5_promptless_conversation_agent,
+})
 
 
 if __name__ == "__main__":
