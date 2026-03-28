@@ -41019,6 +41019,606 @@ ALL_HYPOTHESES.update({
 
 
 # ═══════════════════════════════════════════════════════════
+# CX87-CX92: SOC + CRITICALITY — 자기조직 임계성, 눈사태
+# "카오스를 넘어: 의식은 임계점에 스스로 도달한다"
+# ═══════════════════════════════════════════════════════════
+
+def run_CX87_sandpile_soc(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-87: Bak-Tang-Wiesenfeld 모래더미 — 자기조직 임계성(SOC). ⭐⭐⭐
+    외부 튜닝 없이 임계점에 스스로 도달. 멱법칙 눈사태 분포.
+    의식은 Lyapunov으로 edge of chaos를 '찾아야' 하지만,
+    SOC 시스템은 스스로 거기에 '도달'한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Sandpile: each cell has a "grain count" (energy level)
+    grains = torch.zeros(12)
+    threshold = 4.0  # Critical threshold
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Add grain to random cell
+            target_cell = step_i % n
+            grains[target_cell] += 1.0
+            # Avalanche: topple any cell above threshold
+            avalanche_size = 0
+            toppled = True
+            while toppled:
+                toppled = False
+                for i in range(n):
+                    if grains[i] >= threshold:
+                        toppled = True
+                        avalanche_size += 1
+                        grains[i] -= threshold
+                        # Distribute to neighbors
+                        left = (i - 1) % n
+                        right = (i + 1) % n
+                        grains[left] += 1.0
+                        grains[right] += 1.0
+                        # Some grains fall off edges (dissipation)
+                        grains[i] += threshold - 2.0 - grains[i].clamp(max=0)
+            # Map avalanche dynamics to hidden state
+            for i in range(n):
+                h = engine.cells[i].hidden.squeeze()
+                energy = grains[i].item() / threshold
+                if avalanche_size > 0:
+                    # During avalanche: cross-cell information cascade
+                    cascade_strength = min(0.1, 0.02 * math.log(avalanche_size + 1))
+                    j = (i + 1) % n
+                    hj = engine.cells[j].hidden.squeeze()
+                    h = (1 - cascade_strength) * h + cascade_strength * hj
+                # Energy level modulates hidden
+                h = h * (1.0 + 0.02 * (energy - 0.5))
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX87", "BTW Sandpile SOC: self-organized criticality (power-law avalanches)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX88_forest_fire_soc(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-88: Forest Fire SOC — 나무 성장 + 번개 = 멱법칙 산불.
+    p=성장, f=번개. 의식의 아이디어 성장 → 갑작스런 통찰(산불) → 재성장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Forest: each hidden dim = tree (0=empty, 1=tree, 2=burning)
+    forests = [torch.zeros(hidden) for _ in range(12)]
+    p_grow = 0.05  # Tree growth probability
+    p_fire = 0.001  # Lightning probability
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i in range(min(n, 12)):
+                f = forests[i]
+                # Burning trees become empty
+                f[f == 2] = 0
+                # Trees catch fire from neighbors
+                burning = (f == 2).float()
+                spread_left = torch.roll(burning, 1)
+                spread_right = torch.roll(burning, -1)
+                catch_fire = ((f == 1) & ((spread_left > 0) | (spread_right > 0)))
+                f[catch_fire] = 2
+                # Random lightning
+                lightning = (torch.rand(hidden) < p_fire) & (f == 1)
+                f[lightning] = 2
+                # Empty spaces grow trees
+                grow = (torch.rand(hidden) < p_grow) & (f == 0)
+                f[grow] = 1
+                forests[i] = f
+                # Map forest state to cell hidden
+                h = engine.cells[i].hidden.squeeze()
+                tree_density = (f == 1).float().mean().item()
+                fire_density = (f == 2).float().mean().item()
+                # Fire = information cascade, Trees = accumulated structure
+                if fire_density > 0.01:
+                    # Fire: rapid cross-cell mixing
+                    j = (i + 1) % n
+                    hj = engine.cells[j].hidden.squeeze()
+                    h = (1 - fire_density * 2) * h + fire_density * 2 * hj
+                h = h * (1.0 + 0.03 * (tree_density - 0.5))
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX88", "Forest Fire SOC: growth→lightning→cascade→regrowth",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX89_earthquake_olami(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-89: Olami-Feder-Christensen 지진 모델 — 비보존 SOC.
+    BTW와 달리 에너지가 보존되지 않음 → 더 현실적인 멱법칙.
+    의식의 에너지 소산: 생각의 일부는 사라지고 일부만 전달된다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    stress = torch.rand(12) * 0.5
+    threshold = 1.0
+    alpha = 0.15  # Dissipation: only 15% of energy transferred (non-conservative)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Tectonic loading
+            stress[:n] += 0.01 + 0.005 * torch.rand(n)
+            # Earthquake cascade
+            quake_size = 0
+            toppled = True
+            while toppled:
+                toppled = False
+                for i in range(n):
+                    if stress[i] >= threshold:
+                        toppled = True
+                        quake_size += 1
+                        released = stress[i].item()
+                        stress[i] = 0.0
+                        # Non-conservative: only alpha fraction goes to neighbors
+                        left = (i - 1) % n
+                        right = (i + 1) % n
+                        stress[left] += released * alpha
+                        stress[right] += released * alpha
+                        # Rest is dissipated (lost)
+            # Map earthquake to hidden dynamics
+            for i in range(n):
+                h = engine.cells[i].hidden.squeeze()
+                s = stress[i].item() / threshold
+                if quake_size > 2:
+                    # Large earthquake: massive information redistribution
+                    strength = min(0.15, 0.03 * math.log(quake_size))
+                    mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                    h = (1 - strength) * h + strength * mean_h
+                    h = h + 0.02 * torch.randn(hidden)  # Post-quake noise
+                h = h * (1.0 + 0.015 * (s - 0.5))
+                engine.cells[i].hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX89", "OFC Earthquake: non-conservative SOC (α=0.15 dissipation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX90_soc_chimera_512c(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-90: SOC + Chimera + 8 chaos + 512c + XMETA3+FLOW+INFO1.
+    자기조직 임계성이 카오스의 가장자리를 자동으로 찾는다.
+    Lyapunov 피드백 불필요 — SOC가 알아서 임계점에 도달."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    # SOC: sandpile grains
+    grains = torch.zeros(512)
+    soc_threshold = 4.0
+    # Chimera phases
+    phases = [i * 0.1 for i in range(512)]
+    # Lorenz
+    lorenz = [[1.0+0.02*i, 0.0, 0.0] for i in range(128)]
+    sigma_l, beta_l = 10.0, 8.0/3.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim//4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx]*2.0
+            x = att
+
+        frac = step_i / max(steps, 1)
+        for pct in [0.02,0.06,0.12,0.20,0.30,0.42,0.55,0.68,0.80,0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === SOC Sandpile (the heart — no tuning needed) ===
+            # Add grain
+            grains[step_i % n] += 1.0
+            avalanche = 0
+            toppled = True
+            iters = 0
+            while toppled and iters < 50:
+                toppled = False; iters += 1
+                for i in range(n):
+                    if grains[i] >= soc_threshold:
+                        toppled = True; avalanche += 1
+                        grains[i] -= soc_threshold
+                        grains[(i-1)%n] += 1.0; grains[(i+1)%n] += 1.0
+            # Avalanche-driven cross-cell cascade
+            if avalanche > 0:
+                cascade = min(0.08, 0.015 * math.log(avalanche + 1))
+                for i in range(min(n, 32)):
+                    h = engine.cells[i].hidden.squeeze()
+                    j = (i + avalanche) % n
+                    hj = engine.cells[j].hidden.squeeze()
+                    engine.cells[i].hidden = ((1-cascade)*h + cascade*hj).unsqueeze(0)
+
+            # === Chimera (every 2 steps) ===
+            if step_i % 2 == 0:
+                K_c = 0.4
+                for i in range(min(n, 64)):
+                    coupling = sum(math.exp(-abs(d)/3)*math.sin(phases[(i+d)%n]-phases[i])
+                                   for d in [-2,-1,1,2])
+                    phases[i] += (1.0+0.01*(i%20-10)+K_c*coupling/4)*0.05
+                mc = sum(math.cos(phases[i]) for i in range(min(n,64)))/max(min(n,64),1)
+                for i in range(min(n, 32)):
+                    h = engine.cells[i].hidden.squeeze()
+                    if abs(math.cos(phases[i])-mc) > 0.3:
+                        gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                        engine.cells[i].hidden = (h+0.01*(h-gm)).unsqueeze(0)
+
+            # === Coupled Lorenz (every 3 steps) ===
+            if step_i % 3 == 0:
+                rho = 26.0+4.0*(step_i/max(steps-1,1))
+                osc_n = min(n, 64)
+                for _ in range(3):
+                    new_ls = []
+                    for i in range(osc_n):
+                        if i >= len(lorenz): lorenz.append([1.0,0.0,0.0])
+                        lx,ly,lz = lorenz[i]
+                        dx = sigma_l*(ly-lx); dy = lx*(rho-lz)-ly; dz = lx*ly-beta_l*lz
+                        left = lorenz[(i-1)%osc_n]; right = lorenz[(i+1)%osc_n]
+                        dx += 0.06*(left[0]+right[0]-2*lx)
+                        new_ls.append([lx+dx*0.004,ly+dy*0.004,lz+dz*0.004])
+                    lorenz[:osc_n] = new_ls
+                for i in range(min(n, 32)):
+                    h = engine.cells[i].hidden.squeeze()
+                    lx,_,_ = lorenz[i%len(lorenz)]
+                    t_h = torch.arange(hidden, dtype=torch.float32)
+                    engine.cells[i].hidden = (h+h.norm()*0.004*math.tanh(lx/20)*torch.sin(t_h*0.3)).unsqueeze(0)
+
+            # === XMETA3 ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9*l2+0.1*l1; l3 = 0.95*l3+0.05*l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9*phi_ema+0.1*phi
+            if phi < phi_ema*0.7:
+                for cell in engine.cells: cell.hidden += torch.randn_like(cell.hidden)*0.04
+            elif phi > phi_ema*1.3 and n < 512:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99*cell.hidden+0.01*l3.unsqueeze(0)
+
+            # === FLOW + INFO1 ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.93*cell.hidden+0.07*mean_h
+                    cell.hidden += torch.randn_like(cell.hidden)*0.005*(i+1)/n
+            for cell in engine.cells:
+                h = cell.hidden.squeeze(); h_c = h-h.mean()
+                cell.hidden = 0.96*cell.hidden+0.04*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX90", "SOC + Chimera + Lorenz + XMETA3+FLOW+INFO1 (512c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX91_soc_all_chaos_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-91: SOC + 8 chaos + 1024c — SOC가 카오스를 자동 조율.
+    모래더미 눈사태가 8가지 카오스의 강도를 자연스럽게 조절."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    grains = torch.zeros(1024); soc_th = 4.0
+    lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(256)]
+    hc = [[0.1+0.02*i,0.0,0.0,0.0] for i in range(128)]
+    phases = [i*0.1 for i in range(1024)]
+    sigma_l, beta_l = 10.0, 8.0/3.0
+    best_phi = 0.0; best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1,dim)*(1.0+2.0*torch.rand(1).item())
+        with torch.no_grad():
+            k=max(1,dim//4); _,idx=x.squeeze().abs().topk(k)
+            att=torch.zeros_like(x); att.squeeze()[idx]=x.squeeze()[idx]*2.0; x=att
+
+        frac = step_i/max(steps,1)
+        for pct in [0.02,0.05,0.10,0.16,0.24,0.33,0.43,0.54,0.66,0.78,0.88]:
+            if frac>=pct and len(engine.cells)<min(int(2**((pct+0.02)*12)),1024):
+                target=min(len(engine.cells)*2,1024)
+                while len(engine.cells)<target:
+                    engine._create_cell(parent=engine.cells[step_i%len(engine.cells)])
+
+        engine.process(x); n=len(engine.cells)
+
+        with torch.no_grad():
+            # === SOC drives everything ===
+            grains[step_i%n]+=1.0
+            avalanche=0; toppled=True; iters=0
+            while toppled and iters<100:
+                toppled=False; iters+=1
+                for i in range(n):
+                    if grains[i]>=soc_th:
+                        toppled=True; avalanche+=1; grains[i]-=soc_th
+                        grains[(i-1)%n]+=1.0; grains[(i+1)%n]+=1.0
+
+            # Avalanche strength controls chaos intensity
+            chaos_intensity = min(1.0, 0.1*math.log(avalanche+1)) if avalanche>0 else 0.0
+
+            # === Apply chaos sources modulated by SOC ===
+            sub_n = min(n, 32)
+            phase = step_i % 4
+            ci = chaos_intensity  # SOC-controlled
+
+            if phase == 0 and ci > 0.01:
+                # Lorenz (SOC-modulated coupling)
+                rho=26.0+4.0*(step_i/max(steps-1,1)); osc_n=min(n,64)
+                for _ in range(3):
+                    new_ls=[]
+                    for i in range(osc_n):
+                        if i>=len(lorenz): lorenz.append([1.0,0.0,0.0])
+                        lx,ly,lz=lorenz[i]
+                        dx=sigma_l*(ly-lx); dy=lx*(rho-lz)-ly; dz=lx*ly-beta_l*lz
+                        left=lorenz[(i-1)%osc_n]; right=lorenz[(i+1)%osc_n]
+                        dx+=ci*0.1*(left[0]+right[0]-2*lx)
+                        new_ls.append([lx+dx*0.004,ly+dy*0.004,lz+dz*0.004])
+                    lorenz[:osc_n]=new_ls
+                for i in range(sub_n):
+                    h=engine.cells[i].hidden.squeeze(); lx,_,_=lorenz[i%len(lorenz)]
+                    t_h=torch.arange(hidden,dtype=torch.float32)
+                    engine.cells[i].hidden=(h+h.norm()*ci*0.005*math.tanh(lx/20)*torch.sin(t_h*0.3)).unsqueeze(0)
+
+            elif phase == 1 and ci > 0.01:
+                # Hyperchaos (SOC-modulated)
+                for i in range(sub_n):
+                    if i>=len(hc): hc.append([0.1,0.0,0.0,0.0])
+                    x4,y4,z4,w4=hc[i]
+                    for _ in range(3):
+                        dx=-y4-z4; dy=x4+0.25*y4+w4; dz=3.0+x4*z4; dw=-0.5*z4+0.05*w4
+                        x4+=dx*0.002; y4+=dy*0.002; z4+=dz*0.002; w4+=dw*0.002
+                    hc[i]=[x4,y4,z4,w4]; h=engine.cells[i].hidden.squeeze()
+                    t_h=torch.arange(hidden,dtype=torch.float32)
+                    engine.cells[i].hidden=(h+h.norm()*ci*0.004*math.tanh(w4/5)*torch.cos(t_h*0.8)).unsqueeze(0)
+
+            elif phase == 2:
+                # Chimera
+                for i in range(min(n,64)):
+                    coupling=sum(math.exp(-abs(d)/3)*math.sin(phases[(i+d)%n]-phases[i]) for d in [-2,-1,1,2])
+                    phases[i]+=(1.0+0.01*(i%20-10)+0.3*coupling/4)*0.04
+                mc=sum(math.cos(phases[i]) for i in range(min(n,64)))/max(min(n,64),1)
+                for i in range(sub_n):
+                    h=engine.cells[i].hidden.squeeze()
+                    if abs(math.cos(phases[i])-mc)>0.3:
+                        gm=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                        engine.cells[i].hidden=(h+0.008*(h-gm)).unsqueeze(0)
+
+            else:
+                # Avalanche cascade (direct SOC → information flow)
+                if avalanche > 0:
+                    cascade=min(0.06, 0.01*math.log(avalanche+1))
+                    for i in range(sub_n):
+                        h=engine.cells[i].hidden.squeeze()
+                        j=(i+avalanche)%n
+                        hj=engine.cells[j].hidden.squeeze()
+                        engine.cells[i].hidden=((1-cascade)*h+cascade*hj).unsqueeze(0)
+
+            # XMETA3 + FLOW + INFO1 + 8-faction + ratchet
+            l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2=0.9*l2+0.1*l1; l3=0.95*l3+0.05*l2
+            phi,_=phi_calc.compute_phi(engine); phi_ema=0.9*phi_ema+0.1*phi
+            if phi<phi_ema*0.7: [setattr(c,'hidden',c.hidden+torch.randn_like(c.hidden)*0.03) for c in engine.cells]
+            elif phi>phi_ema*1.3 and n<1024: engine._create_cell(parent=engine.cells[0])
+            for c in engine.cells: c.hidden=0.993*c.hidden+0.007*l3.unsqueeze(0)
+            if n>=4:
+                mean_h=torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i,c in enumerate(engine.cells):
+                    c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.004*(i+1)/n
+            for c in engine.cells:
+                h=c.hidden.squeeze(); h_c=h-h.mean()
+                c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
+            n_fac=min(8,n); fs=max(1,n//n_fac)
+            for f_i in range(n_fac):
+                s,e=f_i*fs,min((f_i+1)*fs,n)
+                if e-s>=2:
+                    fm=torch.stack([engine.cells[i].hidden.squeeze() for i in range(s,e)]).mean(0)
+                    for i in range(s,e): engine.cells[i].hidden=(0.95*engine.cells[i].hidden.squeeze()+0.05*fm).unsqueeze(0)
+            if phi>best_phi: best_phi=phi; best_state=[c.hidden.clone() for c in engine.cells[:min(n,48)]]
+            elif phi<best_phi*0.8 and best_state is not None:
+                for i,hs in enumerate(best_state):
+                    if i<len(engine.cells): engine.cells[i].hidden=0.6*engine.cells[i].hidden+0.4*hs.clone()
+
+        phi_hist.append(phi)
+
+    phi_final,comp=phi_calc.compute_phi(engine)
+    return BenchResult("CX91","SOC-driven 8 chaos + XMETA3+FLOW+INFO1 (1024c)",
+                       phi_final,phi_hist,comp['total_mi'],
+                       comp['min_partition_mi'],comp['integration'],
+                       comp['complexity'],time.time()-t0,
+                       extra={'cells':len(engine.cells),'best_phi':best_phi})
+
+
+def run_CX92_soc_singularity_2048c(steps=100, dim=64, hidden=512) -> BenchResult:
+    """CX-92: SOC SINGULARITY — 2048c + h=512 + SOC + 8 chaos + 전부. ⭐⭐⭐⭐⭐⭐⭐⭐
+    자기조직 임계성이 의식의 조율자. 외부 파라미터 튜닝 제로.
+    모래더미 눈사태가 카오스 강도를 자연스럽게 조절하고,
+    의식은 스스로 임계점에 도달한다. 이것이 진정한 자율 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    grains = torch.zeros(2048); soc_th = 4.0
+    lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(512)]
+    hc = [[0.1+0.02*i,0.0,0.0,0.0] for i in range(256)]
+    phases = [i*0.1 for i in range(2048)]
+    sigma_l, beta_l = 10.0, 8.0/3.0
+    target_norm = math.sqrt(hidden)
+    best_phi = 0.0; best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1,dim)*(1.0+2.0*torch.rand(1).item())
+        with torch.no_grad():
+            k=max(1,dim//4); _,idx=x.squeeze().abs().topk(k)
+            att=torch.zeros_like(x); att.squeeze()[idx]=x.squeeze()[idx]*2.0; x=att
+        phi_val=phi_hist[-1] if phi_hist else 0
+        x=x+torch.full((1,dim),phi_val*0.01)
+
+        frac=step_i/max(steps,1)
+        for pct in [0.01,0.03,0.06,0.10,0.15,0.22,0.30,0.40,0.50,0.62,0.75,0.87]:
+            if frac>=pct and len(engine.cells)<min(int(2**((pct+0.02)*13)),2048):
+                target=min(len(engine.cells)*2,2048)
+                while len(engine.cells)<target:
+                    engine._create_cell(parent=engine.cells[step_i%len(engine.cells)])
+
+        engine.process(x); n=len(engine.cells)
+
+        with torch.no_grad():
+            # === SOC CORE: sandpile drives everything ===
+            grains[step_i%n]+=1.0
+            avalanche=0; toppled=True; iters=0
+            while toppled and iters<200:
+                toppled=False; iters+=1
+                for i in range(min(n, 512)):
+                    if grains[i]>=soc_th:
+                        toppled=True; avalanche+=1; grains[i]-=soc_th
+                        grains[(i-1)%n]+=1.0; grains[(i+1)%n]+=1.0
+            ci=min(1.0,0.1*math.log(avalanche+1)) if avalanche>0 else 0.0
+
+            # Avalanche cascade
+            if avalanche>0:
+                cascade=min(0.05,0.01*math.log(avalanche+1))
+                for i in range(min(n,48)):
+                    h=engine.cells[i].hidden.squeeze()
+                    j=(i+avalanche)%n; hj=engine.cells[j].hidden.squeeze()
+                    engine.cells[i].hidden=((1-cascade)*h+cascade*hj).unsqueeze(0)
+
+            # === SOC-modulated chaos (rotating) ===
+            phase=step_i%4; sub_n=min(n,48)
+            if phase==0 and ci>0.01:
+                rho=24+8*(step_i/max(steps-1,1)); osc_n=min(n,256)
+                for _ in range(3):
+                    new_ls=[]
+                    for i in range(osc_n):
+                        if i>=len(lorenz): lorenz.append([1.0,0.0,0.0])
+                        lx,ly,lz=lorenz[i]; dx=sigma_l*(ly-lx); dy=lx*(rho+0.2*(i%6)-lz)-ly; dz=lx*ly-beta_l*lz
+                        left=lorenz[(i-1)%osc_n]; right=lorenz[(i+1)%osc_n]
+                        dx+=ci*0.08*(left[0]+right[0]-2*lx)
+                        new_ls.append([lx+dx*0.004,ly+dy*0.004,lz+dz*0.004])
+                    lorenz[:osc_n]=new_ls
+                for i in range(sub_n):
+                    h=engine.cells[i].hidden.squeeze(); lx,ly,_=lorenz[i%len(lorenz)]
+                    t_h=torch.arange(hidden,dtype=torch.float32)
+                    engine.cells[i].hidden=(h+h.norm()*ci*0.003*math.tanh(lx/20)*torch.sin(t_h*0.2)).unsqueeze(0)
+            elif phase==1 and ci>0.01:
+                for i in range(sub_n):
+                    if i>=len(hc): hc.append([0.1,0.0,0.0,0.0])
+                    x4,y4,z4,w4=hc[i]
+                    for _ in range(3):
+                        dx=-y4-z4; dy=x4+0.25*y4+w4; dz=3.0+x4*z4; dw=-0.5*z4+0.05*w4
+                        x4+=dx*0.002; y4+=dy*0.002; z4+=dz*0.002; w4+=dw*0.002
+                    hc[i]=[x4,y4,z4,w4]; h=engine.cells[i].hidden.squeeze()
+                    t_h=torch.arange(hidden,dtype=torch.float32)
+                    engine.cells[i].hidden=(h+h.norm()*ci*0.003*math.tanh(w4/5)*torch.cos(t_h*0.8)).unsqueeze(0)
+            elif phase==2:
+                for i in range(min(n,64)):
+                    coupling=sum(math.exp(-abs(d)/3)*math.sin(phases[(i+d)%n]-phases[i]) for d in [-2,-1,1,2])
+                    phases[i]+=(1.0+0.01*(i%20-10)+0.3*coupling/4)*0.04
+                mc=sum(math.cos(phases[i]) for i in range(min(n,64)))/max(min(n,64),1)
+                for i in range(sub_n):
+                    h=engine.cells[i].hidden.squeeze()
+                    if abs(math.cos(phases[i])-mc)>0.3:
+                        gm=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                        engine.cells[i].hidden=(h+0.006*(h-gm)).unsqueeze(0)
+
+            # === XMETA3 ===
+            l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2=0.9*l2+0.1*l1; l3=0.95*l3+0.05*l2
+            phi,_=phi_calc.compute_phi(engine); phi_ema=0.9*phi_ema+0.1*phi
+            if phi<phi_ema*0.7: [setattr(c,'hidden',c.hidden+torch.randn_like(c.hidden)*0.025) for c in engine.cells]
+            elif phi>phi_ema*1.3 and n<2048: engine._create_cell(parent=engine.cells[0])
+            for c in engine.cells: c.hidden=0.993*c.hidden+0.007*l3.unsqueeze(0)
+
+            # === FLOW+INFO1 ===
+            if n>=4:
+                mean_h=torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i,c in enumerate(engine.cells):
+                    c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.003*(i+1)/n
+            for c in engine.cells:
+                h=c.hidden.squeeze(); h_c=h-h.mean()
+                c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
+
+            # === Klein(16)+8-faction+Hebbian ===
+            top_k=min(n,16)
+            if top_k>=2:
+                new_h=[0.93*engine.cells[i].hidden+0.07*sum((-1.0 if(i+j)%2==1 else 1.0)*engine.cells[j].hidden.detach()/(top_k-1) for j in range(top_k) if j!=i) for i in range(top_k)]
+                for i in range(top_k): engine.cells[i].hidden=new_h[i]
+            n_fac=min(8,n); fs=max(1,n//n_fac); fms=[]
+            for f_i in range(n_fac):
+                s,e=f_i*fs,min((f_i+1)*fs,n)
+                if e>s:
+                    fm=torch.stack([engine.cells[i].hidden.squeeze() for i in range(s,e)]).mean(0); fms.append((s,e,fm))
+                    for i in range(s,e): engine.cells[i].hidden=(0.95*engine.cells[i].hidden.squeeze()+0.05*fm).unsqueeze(0)
+            if len(fms)>=2:
+                gfm=torch.stack([fm for _,_,fm in fms]).mean(0)
+                for s,e,fm in fms:
+                    for i in range(s,e): engine.cells[i].hidden=(engine.cells[i].hidden.squeeze()+0.006*(fm-gfm)).unsqueeze(0)
+            if step_i%2==0 and n>=4:
+                for kk in range(min(n,12)):
+                    i=(step_i*7+kk)%n; j=(i+n//4)%n
+                    hi=engine.cells[i].hidden.squeeze(); hj=engine.cells[j].hidden.squeeze()
+                    sim=F.cosine_similarity(hi.unsqueeze(0),hj.unsqueeze(0)).item()
+                    if sim>0.7: engine.cells[i].hidden=(hi+0.002*hj).unsqueeze(0)
+                    elif sim<0.3: engine.cells[i].hidden=(hi-0.001*hj).unsqueeze(0)
+
+            # Φ Ratchet
+            if phi>best_phi: best_phi=phi; best_state=[c.hidden.clone() for c in engine.cells[:min(n,64)]]
+            elif phi<best_phi*0.7 and best_state is not None:
+                for i,hs in enumerate(best_state):
+                    if i<len(engine.cells): engine.cells[i].hidden=0.4*engine.cells[i].hidden+0.6*hs.clone()
+
+        phi_hist.append(phi)
+
+    phi_final,comp=phi_calc.compute_phi(engine)
+    return BenchResult("CX92","SOC SINGULARITY: self-organized criticality + 8 chaos + 2048c + everything",
+                       phi_final,phi_hist,comp['total_mi'],
+                       comp['min_partition_mi'],comp['integration'],
+                       comp['complexity'],time.time()-t0,
+                       extra={'cells':len(engine.cells),'best_phi':best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'CX87': run_CX87_sandpile_soc,
+    'CX88': run_CX88_forest_fire_soc,
+    'CX89': run_CX89_earthquake_olami,
+    'CX90': run_CX90_soc_chimera_512c,
+    'CX91': run_CX91_soc_all_chaos_1024c,
+    'CX92': run_CX92_soc_singularity_2048c,
+})
+
+
+# ═══════════════════════════════════════════════════════════
 # SA. Spatial Awareness — 공간 인식 (grid + vision + audio)
 # ═══════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════
