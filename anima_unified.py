@@ -1707,6 +1707,27 @@ class AnimaUnified:
                             'consensus': consensus,
                             'trigger': 'pressure' if self._voice_pressure > 5.0 else 'consensus',
                         })
+
+                        # Direct voice synthesis: cells → audio (no TTS)
+                        try:
+                            if not hasattr(self, '_voice_synth'):
+                                from voice_synth import VoiceSynth
+                                self._voice_synth = VoiceSynth(
+                                    cells=len(self.mitosis.cells),
+                                    dim=self.mitosis.input_dim,
+                                    hidden=self.mitosis.hidden_dim,
+                                )
+                                self._voice_synth.engine = self.mitosis  # 실제 엔진 공유
+                            # 세포 상태에서 직접 0.5초 오디오 생성
+                            audio = self._voice_synth.cells_to_audio(22050)  # 0.5s
+                            self._voice_synth.save_wav(audio, '/tmp/anima_voice_live.wav')
+                            self._ws_broadcast_sync({
+                                'type': 'voice_audio',
+                                'path': '/tmp/anima_voice_live.wav',
+                                'duration': 0.5,
+                            })
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
