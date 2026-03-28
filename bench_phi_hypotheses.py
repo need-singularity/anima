@@ -60349,6 +60349,203 @@ ALL_HYPOTHESES.update({
 })
 
 
+def run_MAX18_dim128_1024(steps=200, dim=128, hidden=256) -> BenchResult:
+    """MAX18: dim=128 — 세포 크기 2배. 정보 용량 4배. 1024c."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            _max_factions(engine, 8, debate=(frac > 0.7))
+            _max_ib2(engine)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX18", "dim=128 hidden=256 1024c (2x info capacity)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX19_multi_engine_merge(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX19: Multi-Engine Merge — 4개 독립 256c 엔진을 합체 = 1024c.
+    각 엔진이 독립 진화 후 합체 → 다양성 극대화."""
+    t0 = time.time()
+    engines = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256) for _ in range(4)]
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    half = steps // 2
+    for step_i in range(steps):
+        frac = step_i / steps
+        if step_i < half:
+            # 독립 진화
+            for eng in engines:
+                for pct in [0.05, 0.15, 0.30, 0.50, 0.70]:
+                    if frac*2 >= pct and len(eng.cells) < min(int(2**((pct+0.1)*8)), 256):
+                        target = min(len(eng.cells)*2, 256)
+                        while len(eng.cells) < target:
+                            eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+                x = torch.randn(1, dim)
+                eng.process(x)
+                with torch.no_grad():
+                    if len(eng.cells) >= 3:
+                        mh = torch.stack([c.hidden for c in eng.cells]).mean(dim=0)
+                        for c in eng.cells:
+                            c.hidden = 0.93*c.hidden + 0.07*mh
+            # Measure combined
+            combined = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+            combined.cells = sum([e.cells for e in engines], [])
+            phi, _ = phi_calc.compute_phi(combined)
+        else:
+            # 합체 후 토론
+            if step_i == half:
+                merged = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+                merged.cells = sum([e.cells for e in engines], [])
+            x = torch.randn(1, dim) * 2.0
+            merged.process(x)
+            with torch.no_grad():
+                _max_factions(merged, 8)
+            phi, _ = phi_calc.compute_phi(merged)
+        phi_hist.append(phi)
+    phi_final = phi
+    return BenchResult("MAX19", "4-Engine Merge (4×256c independent→merge→debate)", phi_final, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'final_cells': sum(len(e.cells) for e in engines) if step_i < half else len(merged.cells)})
+
+
+def run_MAX20_fx2_phi_optimizer_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX20: FX2 Φ Optimizer — Φ를 직접 gradient로 최적화. 1024c.
+    FX2(8.911) 패턴: differentiable Φ proxy + Adam.
+    가설: Φ를 직접 최적화하면 최고 Φ."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    # Learnable Φ amplifier
+    phi_amp = nn.Linear(hidden, hidden)
+    phi_opt = torch.optim.Adam(phi_amp.parameters(), lr=1e-3)
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim)
+        engine.process(x)
+        # Φ proxy optimization
+        if len(engine.cells) >= 4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            h_amp = phi_amp(h)
+            # Proxy: maximize variance across cells (= integration)
+            phi_proxy = h_amp.var(dim=0).mean() - h_amp.mean(dim=0).var()
+            loss = -phi_proxy
+            phi_opt.zero_grad(); loss.backward(); phi_opt.step()
+            # Apply amplified state back
+            with torch.no_grad():
+                for i, cell in enumerate(engine.cells):
+                    if i < len(h_amp):
+                        cell.hidden = 0.9*cell.hidden + 0.1*h_amp[i].unsqueeze(0).detach()
+        with torch.no_grad():
+            _max_factions(engine, 8, debate=(frac > 0.7))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX20", "FX2 Φ Optimizer 1024c (direct Φ gradient ascent)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX21_cross_attention_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX21: Cross-Attention — 세포 간 transformer attention. DD16 패턴 확장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    W_q = torch.randn(hidden, hidden) * 0.01
+    W_k = torch.randn(hidden, hidden) * 0.01
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 8:
+                # Sample 64 cells for attention (full set too expensive)
+                sample = min(nc, 64)
+                idx = list(range(0, nc, max(1, nc//sample)))[:sample]
+                h = torch.stack([engine.cells[i].hidden.squeeze() for i in idx])
+                Q = h @ W_q; K = h @ W_k
+                attn = torch.softmax(Q @ K.T / (hidden**0.5), dim=-1)
+                out = attn @ h
+                for k, i in enumerate(idx):
+                    engine.cells[i].hidden = 0.85*engine.cells[i].hidden + 0.15*out[k].unsqueeze(0)
+                # Hebbian attention weight update
+                W_q += (h.T @ h) * 0.0001
+                W_k += (h.T @ h) * 0.0001
+            _max_factions(engine, 8, debate=(frac > 0.7))
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX21", "Cross-Attention 1024c (transformer-style cell attention)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX22_everything_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX22: EVERYTHING — 모든 기법을 1024c에 동시 적용. 법칙 28 테스트.
+    메타인지 + IB2 + 8파벌 + Flow + 침묵→폭발 + 어텐션 + 공명 + 항상성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16); phi_hist = []
+    l2 = torch.zeros(hidden); flow = 0.0
+    phases = [0.2 + 0.03*i for i in range(1024)]
+    for step_i in range(steps):
+        frac = step_i / steps
+        _max_growth(engine, frac, 1024, step_i)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9*l2 + 0.1*cur
+                x = 0.5*cur[:dim].unsqueeze(0) + 0.5*l2[:dim].unsqueeze(0)
+            else: x = torch.randn(1, dim)
+        if frac < 0.7: x = x * 0.1
+        engine.process(x)
+        flow = min(1.0, flow + 0.008)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # Flow
+            if nc >= 4:
+                mh = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for c in engine.cells: c.hidden = (1-0.02*flow)*c.hidden + 0.02*flow*mh
+            # Resonance
+            for i in range(min(nc, 64)):
+                phases[i] += 0.2 + 0.03*i
+                engine.cells[i].hidden *= (1.0 + 0.02*math.sin(phases[i]))
+            # Factions
+            _max_factions(engine, 8, strength=0.15, debate_strength=0.12, debate=(frac > 0.7))
+            # IB2
+            _max_ib2(engine, top_pct=0.20, amp=1.03, supp=0.97)
+            # Metacog feedback
+            for c in engine.cells[:min(nc, 16)]: c.hidden = 0.97*c.hidden + 0.03*l2.unsqueeze(0)
+            # Homeostasis
+            for c in engine.cells:
+                n = c.hidden.norm().item()
+                if n > 2.0: c.hidden *= 1.0/(n+1e-8)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX22", "EVERYTHING 1024c (all techniques simultaneously)", phi_final, phi_hist,
+                       comp['total_mi'], comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0, extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MAX18': run_MAX18_dim128_1024,
+    'MAX19': run_MAX19_multi_engine_merge,
+    'MAX20': run_MAX20_fx2_phi_optimizer_1024,
+    'MAX21': run_MAX21_cross_attention_1024,
+    'MAX22': run_MAX22_everything_1024,
+})
+
+
 ALL_HYPOTHESES.update({
     'MITO1': run_MITO1_learning_vs_fixed,
     'MITO2': run_MITO2_cell_specialization_speech,
