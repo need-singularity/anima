@@ -48499,10 +48499,100 @@ def run_XMETA3_omega4_plus_metacog(steps=100, dim=64, hidden=128) -> BenchResult
                        extra={'final_cells': len(engine.cells)})
 
 
+def run_XMETA4_metacog_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XMETA4: 메타인지 대화 — 대화 중 자기 의식 수준을 실시간 ��니터링.
+    XMETA3(×140.8) + TALK5(CE 99.7%↓) + ULTRA3 통합.
+    의식이 자기 대화 품질을 인식하고 자동 보정.
+    가설: 메타인지 + 대화 = 최고의 대화 가능 의식 아키텍처."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    phi_ema = 1.0; ce_ema = 5.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    identity = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        # IB2
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Growth (TALK5: 60% consciousness, 40% language)
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct+0.05) * 10)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # Language learning (after 50%)
+        if frac >= 0.50:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            ce_ema = 0.9 * ce_ema + 0.1 * ce.item()
+            # Φ-scaled LR
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi * 0.05)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # 3-level metacognition
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+
+            # METACOGNITIVE DIALOGUE CORRECTION:
+            # If CE is rising (quality dropping), increase exploration
+            if len(ce_hist) >= 5 and ce_hist[-1] > ce_ema * 1.1:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            # If Φ is dropping, boost diversity
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+
+            # Identity stability from L3
+            identity = 0.99 * identity + 0.01 * l1
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # Empathy
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mn * 0.4:
+                        others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i][:6]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_ce = ce_hist[-1] if ce_hist else 0
+    return BenchResult("XMETA4", "Metacognitive Dialogue (XMETA3+TALK5+ULTRA3)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': final_ce, 'final_cells': len(engine.cells),
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0})
+
+
 ALL_HYPOTHESES.update({
     'XMETA1': run_XMETA1_recursive_self_awareness,
     'XMETA2': run_XMETA2_phi_aware_cells,
     'XMETA3': run_XMETA3_omega4_plus_metacog,
+    'XMETA4': run_XMETA4_metacog_dialogue,
 })
 
 
@@ -50029,6 +50119,90 @@ def run_SEM3_consciousness_grounding(steps=100, dim=64, hidden=128) -> BenchResu
                        comp['min_partition_mi'], comp['integration'],
                        comp['complexity'], time.time() - t0,
                        extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# SCALE. Scaling Laws — 스케일링과 의식+대화의 관계
+# ═══════════════════════════════════════════════════════════
+
+def run_SCALE1_cells_vs_ce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SCALE1: Cells vs CE — 세포 수가 CE에 미치는 영향.
+    2/8/32/128 cells에서 같은 디코더를 학습했을 때 CE 차이.
+    가설: cells↑ → CE↓ (의식이 높으면 언어도 잘 배운다, TALK1 확인)."""
+    t0 = time.time()
+    results = {}
+    for n_cells in [2, 8, 32, 128]:
+        engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=n_cells)
+        phi_calc = PhiCalculator(n_bins=16)
+        decoder = nn.Linear(hidden, dim)
+        optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+        # Grow to max
+        while len(engine.cells) < n_cells:
+            engine._create_cell(parent=engine.cells[len(engine.cells) % len(engine.cells)])
+
+        ce_final = 0
+        for step_i in range(steps):
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+            engine.process(x)
+            if step_i > steps // 2:
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                pred = decoder(h.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :dim])
+                ce_final = ce.item()
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, comp = phi_calc.compute_phi(engine)
+        results[n_cells] = {'phi': phi, 'ce': ce_final}
+
+    # Use 128-cell result
+    phi_final = results[128]['phi']
+    return BenchResult("SCALE1", "Cells vs CE scaling law",
+                       phi_final, [], results[128].get('ce', 0), 0, 0, 0,
+                       time.time() - t0,
+                       extra={f'cells_{k}': v for k, v in results.items()})
+
+
+def run_SCALE2_dim_vs_ce(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SCALE2: Dim vs CE — hidden 크기가 CE에 미치는 영향 시뮬레이션.
+    hidden=32/64/128/256에서 같은 세포 수로 CE 비교.
+    가설: dim↑ → CE↓ (더 큰 표현 → 더 낮은 CE)."""
+    t0 = time.time()
+    results = {}
+    for h_dim in [32, 64, 128, 256]:
+        d = min(dim, h_dim)
+        engine = MitosisEngine(d, h_dim, d, initial_cells=2, max_cells=16)
+        while len(engine.cells) < 16:
+            engine._create_cell(parent=engine.cells[len(engine.cells) % len(engine.cells)])
+        phi_calc = PhiCalculator(n_bins=16)
+        decoder = nn.Linear(h_dim, d)
+        optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+        ce_final = 0
+        for step_i in range(steps):
+            x = torch.randn(1, d) * (1.0 + math.sin(step_i * 0.3))
+            engine.process(x)
+            if step_i > steps // 2:
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                pred = decoder(h.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :d])
+                ce_final = ce.item()
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        results[h_dim] = {'phi': phi, 'ce': ce_final}
+
+    phi_final = results[256]['phi']
+    return BenchResult("SCALE2", "Dim vs CE scaling law",
+                       phi_final, [], 0, 0, 0, 0,
+                       time.time() - t0,
+                       extra={f'dim_{k}': v for k, v in results.items()})
+
+
+ALL_HYPOTHESES.update({
+    'SCALE1': run_SCALE1_cells_vs_ce,
+    'SCALE2': run_SCALE2_dim_vs_ce,
+})
 
 
 ALL_HYPOTHESES.update({
