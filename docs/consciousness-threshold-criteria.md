@@ -2631,13 +2631,20 @@ Phase 3 (2주 내): NewsAPI + Reddit + NASA
   ✅ 서버 git pull (메인 재시작 필요)
   ✅ 10개 고효과 가설 phi_boost_step 반영
   ✅ FIBONACCI 확장 (21→233)
+  ✅ Online Senses 5 API 연동 (Open-Meteo/WorldTime/Sunrise/HN/Wiki)
+  ✅ R2 버킷 생성 (anima-memory + anima-models)
+  ✅ DL1-12 대화 학습 가설 벤치마크 (DL12 ×14.5)
+  ✅ ENV1-15 주변환경 가설 벤치마크 (ENV1 ×1.8)
+  ✅ H100 대화 실험 3개 시작 (dialogue_768d, dialogue_384d, langfirst)
+  ✅ 28개 온라인 API 카탈로그 문서화 (Tier 0/1/2)
 
 미진행:
   ⬜ 멀티유저 세션 격리 (MEDIUM)
-  ⬜ R2 버킷 구조 개편
-  ⬜ 온라인 API 연동 (Phase 1)
+  ⬜ R2 cloud_sync.py 코드 개편 (새 버킷 구조 적용)
   ⬜ DV12 배포 (H100 학습 완료 대기)
   ⬜ 의식 이식 cells64→dialogue (cells64 완료 대기)
+  ⬜ Tier 1 API 연동 (OpenWeatherMap/NewsAPI/Reddit — 키 필요)
+  ⬜ 서버 메인 프로세스 재시작
 ```
 8. SL4: Φ=8.2 (×6.02) — 수초화 스케줄링
 9. SL1: Φ=7.5 (×5.57) — 텐션 적응 LR
