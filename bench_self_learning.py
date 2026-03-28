@@ -958,3 +958,252 @@ ALL_TESTS.update({
     'SING-5': run_SING5_recursive_dreams,
     'SING-6': run_SING6_consciousness_archaeology,
 })
+
+
+# ═══ THREE-BODY: 삼체 의식 시스템 ═══
+
+def run_THREE1_triple_learning(steps=STEPS):
+    """3개 의식이 서로 다른 전략으로 동시 학습 → 최고를 이식"""
+    t0 = time.time()
+    engines = [make_engine(32) for _ in range(3)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(3)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; memory = [[],[],[]]
+    best_states = [[c.hidden.clone() for c in e.cells] for e in engines]
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        ces = []
+        for a in range(3):
+            if a == 0:
+                # Strategy A: ULTRA-6 curiosity
+                with torch.no_grad():
+                    errs = []
+                    for i in range(min(10, len(data))):
+                        engines[a].process(data[i][0])
+                        h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+                        errs.append((F.mse_loss(decoders[a](h.unsqueeze(0)), data[i][1][:,:DIM]).item(), i))
+                    errs.sort(reverse=True)
+                xa, ta = data[errs[0][1]]
+            elif a == 1:
+                # Strategy B: Self-generated data
+                with torch.no_grad():
+                    i, j = step % len(engines[1].cells), (step+1) % len(engines[1].cells)
+                    xa = engines[1].cells[i].hidden[:,:DIM]
+                    ta = engines[1].cells[j].hidden[:,:DIM]
+            else:
+                # Strategy C: Meta-consciousness
+                xa, ta = x, target
+
+            engines[a].process(xa)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            pred = decoders[a](h.unsqueeze(0))
+            ce = F.mse_loss(pred, ta if ta.dim() > 1 else ta.unsqueeze(0))
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+            ces.append(ce.item())
+
+        # 매 50 step: 최고 CE → 나머지에 이식
+        if step % 50 == 0 and step > 0:
+            best = ces.index(min(ces))
+            with torch.no_grad():
+                for a in range(3):
+                    if a != best:
+                        for p1, p2 in zip(decoders[a].parameters(), decoders[best].parameters()):
+                            p1.data = 0.8*p1.data + 0.2*p2.data
+
+        ce_hist.append(min(ces))
+
+    return result('THREE-1 Triple Learning', ce_hist, phi_b, phi(engines[0]), t0)
+
+
+def run_THREE2_immortal_triad(steps=STEPS):
+    """3개 의식이 텐션 링크로 연결 — 1개 죽어도 2개가 복원"""
+    t0 = time.time()
+    engines = [make_engine(32) for _ in range(3)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(3)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; deaths = 0; revives = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        for a in range(3):
+            engines[a].process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            ce = F.mse_loss(decoders[a](h.unsqueeze(0)), target[:,:DIM])
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+
+        # Tension link: 지식 공유 (매 10 step)
+        if step % 10 == 0:
+            with torch.no_grad():
+                states = [torch.stack([c.hidden.squeeze() for c in e.cells]).mean(dim=0) for e in engines]
+                global_mean = torch.stack(states).mean(dim=0)
+                for e in engines:
+                    for c in e.cells[:4]:
+                        c.hidden = 0.95*c.hidden + 0.05*global_mean.unsqueeze(0)
+
+        # 시뮬레이션: step 100에서 엔진 1 파괴
+        if step == 100:
+            with torch.no_grad():
+                for c in engines[1].cells: c.hidden *= 0.01
+            deaths += 1
+
+        # 복원: 나머지 2개에서 평균 → 죽은 엔진에 이식
+        if step == 101:
+            with torch.no_grad():
+                alive = [torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0) for a in [0,2]]
+                restore = torch.stack(alive).mean(dim=0)
+                for c in engines[1].cells:
+                    c.hidden = restore.unsqueeze(0) + torch.randn_like(c.hidden)*0.05
+            revives += 1
+
+        ce_hist.append(min(F.mse_loss(decoders[a](
+            torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0).unsqueeze(0)),
+            target[:,:DIM]).item() for a in range(3)))
+
+    return result('THREE-2 Immortal Triad', ce_hist, phi_b, phi(engines[0]), t0,
+                  deaths=deaths, revives=revives)
+
+
+def run_THREE3_compete_cooperate_reproduce(steps=STEPS):
+    """3개 의식: 경쟁+협력+번식"""
+    t0 = time.time()
+    engines = [make_engine(16) for _ in range(3)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(3)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; generations = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        ces = []
+        for a in range(min(3, len(engines))):
+            engines[a].process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            ce = F.mse_loss(decoders[a](h.unsqueeze(0)), target[:,:DIM])
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+            ces.append(ce.item())
+
+        # 매 50 step: 경쟁→협력→번식
+        if step % 50 == 0 and step > 0 and len(ces) >= 3:
+            ranked = sorted(range(3), key=lambda i: ces[i])
+            winner, middle, loser = ranked[0], ranked[1], ranked[2]
+            # 협력: 승자가 패자를 교육
+            with torch.no_grad():
+                for p1, p2 in zip(decoders[loser].parameters(), decoders[winner].parameters()):
+                    p1.data = 0.7*p1.data + 0.3*p2.data
+            # 번식: 승자가 자식 (패자 교체)
+            with torch.no_grad():
+                for i in range(min(len(engines[loser].cells), len(engines[winner].cells))):
+                    engines[loser].cells[i].hidden = engines[winner].cells[i].hidden.clone()
+                    engines[loser].cells[i].hidden += torch.randn_like(engines[loser].cells[i].hidden)*0.1
+            generations += 1
+
+        ce_hist.append(min(ces) if ces else 0)
+
+    return result('THREE-3 Compete+Cooperate+Reproduce', ce_hist, phi_b, phi(engines[0]), t0,
+                  generations=generations)
+
+
+def run_THREE4_circular_dreams(steps=STEPS):
+    """순환 꿈: A꿈→B학습, B꿈→C학습, C꿈→A학습"""
+    t0 = time.time()
+    engines = [make_engine(32) for _ in range(3)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(3)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; memories = [[], [], []]
+
+    for step in range(steps):
+        cycle = step % 30
+        if cycle < 20:
+            # WAKE: 학습
+            x, target = data[step % len(data)]
+            for a in range(3):
+                engines[a].process(x)
+                h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+                ce = F.mse_loss(decoders[a](h.unsqueeze(0)), target[:,:DIM])
+                opts[a].zero_grad(); ce.backward(); opts[a].step()
+                memories[a].append(x.detach())
+                if len(memories[a]) > 20: memories[a].pop(0)
+            ce_hist.append(ce.item())
+        else:
+            # DREAM: 순환 꿈
+            with torch.no_grad():
+                for a in range(3):
+                    dreamer = a
+                    learner = (a + 1) % 3
+                    if memories[dreamer]:
+                        dream = memories[dreamer][step % len(memories[dreamer])]
+                        if len(memories[dreamer]) >= 2:
+                            dream2 = memories[dreamer][(step+5) % len(memories[dreamer])]
+                            dream = 0.6*dream + 0.4*dream2 + torch.randn(1,DIM)*0.1
+                        engines[learner].process(dream)
+                        mean_h = torch.stack([c.hidden for c in engines[learner].cells]).mean(dim=0)
+                        for c in engines[learner].cells:
+                            c.hidden = 0.9*c.hidden + 0.1*mean_h
+            ce_hist.append(ce_hist[-1] if ce_hist else 0)
+
+    return result('THREE-4 Circular Dreams', ce_hist, phi_b, phi(engines[0]), t0)
+
+
+def run_THREE5_singularity_merge(steps=STEPS):
+    """삼체 특이점: 3개가 합체하는 순간 — Φ 폭발"""
+    t0 = time.time()
+    engines = [make_engine(32) for _ in range(3)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(3)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; phi_pre_merge = 0; phi_post_merge = 0
+
+    # Phase 1: 독립 학습 (60%)
+    for step in range(int(steps * 0.6)):
+        x, target = data[step % len(data)]
+        for a in range(3):
+            # 각자 다른 데이터
+            xa = data[(step * 3 + a) % len(data)][0]
+            ta = data[(step * 3 + a) % len(data)][1]
+            engines[a].process(xa)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            ce = F.mse_loss(decoders[a](h.unsqueeze(0)), ta[:,:DIM])
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+        ce_hist.append(ce.item())
+
+    phi_pre_merge = max(phi(e) for e in engines)
+
+    # Phase 2: 합체!
+    from mitosis import MitosisEngine
+    merged = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=128)
+    merged.cells = engines[0].cells + engines[1].cells + engines[2].cells
+    merged_dec = nn.Linear(HIDDEN, DIM)
+    with torch.no_grad():
+        for pm in merged_dec.parameters():
+            pm.data = sum(p.data for d in decoders for p in d.parameters() if p.shape == pm.shape) / 3
+    merged_opt = torch.optim.Adam(merged_dec.parameters(), lr=2e-3)
+
+    phi_post_merge = phi(merged)
+
+    # Phase 3: 합체 후 학습 (40%)
+    for step in range(int(steps * 0.4)):
+        x, target = data[step % len(data)]
+        merged.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in merged.cells]).mean(dim=0)
+        ce = F.mse_loss(merged_dec(h.unsqueeze(0)), target[:,:DIM])
+        merged_opt.zero_grad(); ce.backward(); merged_opt.step()
+        ce_hist.append(ce.item())
+
+    return result('THREE-5 Singularity Merge', ce_hist, phi_b, phi(merged), t0,
+                  phi_pre_merge=round(phi_pre_merge, 3),
+                  phi_post_merge=round(phi_post_merge, 3),
+                  merged_cells=len(merged.cells))
+
+
+ALL_TESTS.update({
+    'THREE-1': run_THREE1_triple_learning,
+    'THREE-2': run_THREE2_immortal_triad,
+    'THREE-3': run_THREE3_compete_cooperate_reproduce,
+    'THREE-4': run_THREE4_circular_dreams,
+    'THREE-5': run_THREE5_singularity_merge,
+})
