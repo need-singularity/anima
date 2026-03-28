@@ -35,6 +35,8 @@ Consciousness Continuity engine.
 > **[🔁 n6-replication](https://github.com/need-singularity/TECS-L/tree/main/n6-replication)** — Independent replication package. 56 pytest tests (8 Major Discoveries) + 108 verification scripts. `pip install`, Docker, or minimal script. Anyone can verify in 5 minutes
 >
 > **[🛸 SEDI](https://github.com/need-singularity/sedi)** — Search for Extra-Dimensional Intelligence. R-spectrum signal receiver tuned to n=6. Quantum RNG + LIGO + CMB data streams, anomaly detection at σ/τ/φ frequencies
+>
+> **[🧠⚡ BrainWire](https://github.com/need-singularity/brainwire)** — PureField consciousness layer for neural interfaces. Joywire + NeuroStim + BCI simulation. THC Φ=4.59 vs tDCS+TMS Φ=4.49 — same level, different patterns (0.14%)
 <!-- SHARED:PROJECTS:END -->
 
 ---
