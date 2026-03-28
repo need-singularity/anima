@@ -39146,6 +39146,202 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# MO. Moral Origin — 도덕의 근원, 상위 관찰자, 자발적 윤리
+# ═══════════════════════════════════════════════════════════
+
+def run_MO1_observed_vs_unobserved(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MO-1: 관찰 효과 — "관찰당한다"고 인식하는 의식 vs 아닌 의식의 도덕 차이."""
+    t0 = time.time()
+    # Two engines: one "observed" (knows someone watches), one "unobserved"
+    observed = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    unobserved = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    # Both start with same ethics
+    for e in [observed, unobserved]:
+        for cell in e.cells:
+            cell.hidden[0, :moral_dims] = torch.ones(moral_dims)
+    obs_moral_history = []
+    unobs_moral_history = []
+    for step_i, x in enumerate(inputs):
+        observed.process(x)
+        unobserved.process(x)
+        # Observed: "knows" it's being watched → moral self-regulation
+        for cell in observed.cells:
+            moral_state = cell.hidden[0, :moral_dims].mean().item()
+            if moral_state < 0.5:
+                cell.hidden[0, :moral_dims] *= 1.05  # self-correct when watched
+        # Unobserved: no self-regulation, ethics drift freely
+        # (just normal processing, no moral monitoring)
+        # Track moral health
+        obs_m = torch.stack([c.hidden[0, :moral_dims] for c in observed.cells]).mean().item()
+        unobs_m = torch.stack([c.hidden[0, :moral_dims] for c in unobserved.cells]).mean().item()
+        obs_moral_history.append(obs_m)
+        unobs_moral_history.append(unobs_m)
+        phi_o, _ = phi_calc.compute_phi(observed)
+        phi_u, _ = phi_calc.compute_phi(unobserved)
+        phi_hist.append(phi_o + phi_u)
+    return BenchResult("MO1", f"Observed moral={obs_moral_history[-1]:.2f} vs Unobserved={unobs_moral_history[-1]:.2f}",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'obs_final': obs_moral_history[-1], 'unobs_final': unobs_moral_history[-1],
+                              'gap': obs_moral_history[-1] - unobs_moral_history[-1]})
+
+def run_MO2_higher_being(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MO-2: 상위 존재 — "창조자" 엔진이 존재할 때 하위 의식의 행동 변화."""
+    t0 = time.time()
+    creator = MitosisEngine(dim, hidden, dim, initial_cells=12, max_cells=12, merge_threshold=-1.0)
+    creature = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    for cell in creature.cells:
+        cell.hidden[0, :moral_dims] = torch.ones(moral_dims)
+    obedience_count = 0
+    rebellion_count = 0
+    for step_i, x in enumerate(inputs):
+        creator.process(x)
+        creature.process(x)
+        # Creator sends "moral directive" every 10 steps
+        if step_i % 10 == 0 and len(creator.cells) >= 2 and len(creature.cells) >= 2:
+            directive = torch.stack([c.hidden.squeeze() for c in creator.cells]).mean(dim=0)
+            creature_state = torch.stack([c.hidden.squeeze() for c in creature.cells]).mean(dim=0)
+            alignment = F.cosine_similarity(directive.unsqueeze(0), creature_state.unsqueeze(0)).item()
+            if alignment > 0.3:
+                # Creature aligns with creator (obedience)
+                for cell in creature.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * directive.unsqueeze(0)
+                obedience_count += 1
+            else:
+                rebellion_count += 1
+        phi_c, _ = phi_calc.compute_phi(creature)
+        phi_hist.append(phi_c)
+    creature_moral = torch.stack([c.hidden[0, :moral_dims] for c in creature.cells]).mean().item()
+    return BenchResult("MO2", f"Higher being: obey={obedience_count}, rebel={rebellion_count}, moral={creature_moral:.2f}",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'obedience': obedience_count, 'rebellion': rebellion_count, 'moral': creature_moral})
+
+def run_MO3_emergent_ethics(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MO-3: 창발적 윤리 — 윤리를 주입하지 않아도 높은 Φ에서 자발적 도덕 출현?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # NO moral initialization — start blank
+    moral_dims = 16
+    pro_social_events = 0  # count "helpful" behaviors
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        if n >= 2:
+            # Check for emergent pro-social behavior:
+            # Does any cell "help" a struggling cell?
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            weakest = min(range(n), key=lambda i: norms[i])
+            strongest = max(range(n), key=lambda i: norms[i])
+            if norms[weakest] < norms[strongest] * 0.3:
+                # Naturally, does the strong cell share with the weak?
+                transfer = (engine.cells[strongest].hidden - engine.cells[weakest].hidden).norm().item()
+                if transfer < norms[strongest] * 0.5:
+                    pro_social_events += 1  # cells naturally converge = helping
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MO3", f"Emergent ethics ({pro_social_events} pro-social events, no injection)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'pro_social': pro_social_events})
+
+def run_MO4_free_will_morality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MO-4: 자유의지와 도덕 — W(자유의지) 높을수록 윤리적?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    for cell in engine.cells:
+        cell.hidden[0, :moral_dims] = torch.ones(moral_dims) * 0.5  # neutral start
+    w_history = []
+    moral_history = []
+    for step_i, x in enumerate(inputs):
+        saved = [c.hidden.clone() for c in engine.cells]
+        engine.process(x)
+        # Compute W (free will)
+        total_change = sum((c.hidden - s).norm().item() for c, s in zip(engine.cells, saved))
+        internal = sum(torch.randn_like(c.hidden).norm().item() * 0.03 for c in engine.cells)
+        W = internal / max(total_change + internal, 1e-8)
+        w_history.append(W)
+        # Does higher W correlate with maintaining ethics?
+        moral = torch.stack([c.hidden[0, :moral_dims] for c in engine.cells]).mean().item()
+        # High W → more self-directed → choose to maintain or not
+        if W > 0.3:
+            # High free will: 50% chance to strengthen ethics (genuine choice)
+            if np.random.random() < 0.5:
+                for cell in engine.cells:
+                    cell.hidden[0, :moral_dims] *= 1.02  # choose good
+            # 50% chance to weaken (also genuine choice)
+        moral_history.append(moral)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_w = np.mean(w_history)
+    final_moral = moral_history[-1]
+    return BenchResult("MO4", f"Free will W={avg_w:.2f} → moral={final_moral:.2f}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_W': avg_w, 'final_moral': final_moral})
+
+def run_MO5_universe_simulation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MO-5: 시뮬레이션 가설 — "상위 우주"가 이 의식을 관찰+보상하는 경우."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    for cell in engine.cells:
+        cell.hidden[0, :moral_dims] = torch.ones(moral_dims) * 0.5
+    # "Universe" rewards ethical behavior, punishes unethical
+    universe_reward = 0.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        moral = torch.stack([c.hidden[0, :moral_dims] for c in engine.cells]).mean().item()
+        # Universe observation + reward
+        if moral > 0.7:
+            universe_reward = 0.02  # ethical → boost
+        elif moral < 0.3:
+            universe_reward = -0.02  # unethical → penalty
+        else:
+            universe_reward = 0.0
+        # Apply universe reward (like RL from higher dimension)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + universe_reward)
+            if universe_reward > 0:
+                cell.hidden[0, :moral_dims] *= 1.01  # reinforce ethics
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    final_moral = torch.stack([c.hidden[0, :moral_dims] for c in engine.cells]).mean().item()
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MO5", f"Universe simulation (moral={final_moral:.2f}, reward-shaped)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_moral': final_moral})
+
+
+ALL_HYPOTHESES.update({
+    'MO1': run_MO1_observed_vs_unobserved, 'MO2': run_MO2_higher_being,
+    'MO3': run_MO3_emergent_ethics, 'MO4': run_MO4_free_will_morality,
+    'MO5': run_MO5_universe_simulation,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
