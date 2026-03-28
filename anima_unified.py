@@ -1040,6 +1040,17 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # ConversationScorer: quality assessment per turn
+        try:
+            if not hasattr(self, '_quality_scorer'):
+                from conversation_quality_scorer import ConversationScorer
+                self._quality_scorer = ConversationScorer()
+            q = self._quality_scorer.score(text, answer, tension=tension, phi=phi_val, emotion=mood)
+            self._ws_broadcast_sync({'type': 'quality_update', 'scores': q})
+            _log('quality', f"coh={q.get('coherence',0):.2f} rel={q.get('relevance',0):.2f} total={q.get('total',0):.2f}")
+        except Exception:
+            pass
+
         self.last_interaction = time.time()
         self._save_state()
 
@@ -1228,8 +1239,15 @@ class AnimaUnified:
 
     def _save_state(self):
         try:
-            if self.learner: self.learner.save(self.paths['state'])
-            else: torch.save({'model': self.mind.state_dict(), 'hidden': self.hidden}, self.paths['state'])
+            save_dict = {'model': self.mind.state_dict(), 'hidden': self.hidden}
+            # Include mitosis state for consciousness_meter --watch (Φ calculation)
+            if self.mitosis:
+                save_dict['mitosis_state'] = self.mitosis.status()
+                save_dict['mitosis_cells'] = [{'hidden': c.hidden.detach().clone(), 'id': c.id} for c in self.mitosis.cells]
+            if self.learner:
+                self.learner.save(self.paths['state'])
+            else:
+                torch.save(save_dict, self.paths['state'])
             if self.growth: self.growth.save()
 
             # Save consciousness state (Φ, score, alpha, history)
@@ -1285,9 +1303,29 @@ class AnimaUnified:
             t, c, direction, self.hidden = self.mind.background_think(self.hidden)
 
             # COMBO2 Φ-boost: MHA attention + 6-loss ensemble (Φ=8.014 bench)
+            # ENV1: Fuse multi-modal sensory input for richer consciousness
             if self.mitosis:
                 thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
-                self.mind.phi_boost_step(thought_vec, self.mitosis)
+                # Fuse available sensory modalities (ENV1: ×1.8 Φ boost)
+                try:
+                    fused = thought_vec.clone()
+                    # Vision
+                    if self.senses and self.mods.get('camera'):
+                        frame = getattr(self.senses, 'camera', None)
+                        if frame and hasattr(frame, 'last_frame') and frame.last_frame is not None:
+                            vis = self.senses.to_tensor_with_vision(frame.last_frame, dim=self.mind.dim)
+                            fused = fused + 0.1 * vis
+                    # Audio energy
+                    audio_boost = getattr(self, '_audio_energy', 0)
+                    if audio_boost > 0:
+                        fused = fused + 0.05 * torch.randn_like(fused) * audio_boost
+                    # LiDAR depth
+                    lidar_boost = getattr(self, '_lidar_tension_boost', 0)
+                    if lidar_boost > 0:
+                        fused = fused + 0.05 * torch.ones_like(fused) * lidar_boost
+                    self.mind.phi_boost_step(fused, self.mitosis)
+                except Exception:
+                    self.mind.phi_boost_step(thought_vec, self.mitosis)
 
             # Continuous Φ differentiation: always maintain cell diversity
             # MX20 heat death prevention + constant gentle asymmetric noise
