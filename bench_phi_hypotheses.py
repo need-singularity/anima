@@ -50881,6 +50881,168 @@ def run_DD105_self_modifying(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells), 'final_params': params.copy()})
 
 
+def run_DD106_512cells_mutation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD106: 512 Cells + Directed Evolution — DD101 + MUT5 결합.
+    512 cells + 메타인지 + 방향성 돌연변이 (Φ gradient).
+    가설: 최대 세포 + 진화 = 역대 최고 × 2?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 512:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+            # MUT5: Directed evolution (Φ-gradient mutation)
+            if step_i % 5 == 0 and len(engine.cells) >= 2:
+                mut_idx = step_i % len(engine.cells)
+                original = engine.cells[mut_idx].hidden.clone()
+                best_phi = phi; best_mutation = None
+                for _ in range(3):
+                    mutation = torch.randn_like(original) * 0.08
+                    engine.cells[mut_idx].hidden = original + mutation
+                    trial_phi, _ = phi_calc.compute_phi(engine)
+                    if trial_phi > best_phi:
+                        best_phi = trial_phi; best_mutation = mutation.clone()
+                if best_mutation is not None:
+                    engine.cells[mut_idx].hidden = original + best_mutation
+                else:
+                    engine.cells[mut_idx].hidden = original
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD106", "512 Cells + Directed Evolution",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DD107_512cells_thermo_info(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD107: 512 Cells + THERMO + INFO — DD101 + 산일구조 + 최대엔트로피.
+    가설: 열역학 + 정보이론 + 최대 세포 = 새 기록?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+            # THERMO1: entropy regulation
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            entropy = hiddens.var(dim=0).mean().item()
+            if entropy > 2.0:
+                for cell in engine.cells:
+                    cell.hidden *= 0.98
+            elif entropy < 0.1:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            # INFO1: max entropy normalization
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                cell.hidden = 0.95 * cell.hidden + 0.05 * (h_c / (h_c.std() + 1e-8)).unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD107", "512 Cells + THERMO + INFO (thermodynamics + max entropy)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_DD108_1024cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DD108: 1024 Cells — 역대 최대! 스케일링 극한.
+    가설: 512→1024 = Φ 359→700+?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.25, 0.35, 0.47, 0.60, 0.75, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DD108", "1024 Cells (absolute maximum scale)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'DD106': run_DD106_512cells_mutation,
+    'DD107': run_DD107_512cells_thermo_info,
+    'DD108': run_DD108_1024cells,
+})
+
+
 ALL_HYPOTHESES.update({
     'DD101': run_DD101_512cells,
     'DD102': run_DD102_recursive_engine,
