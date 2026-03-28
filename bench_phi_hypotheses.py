@@ -50358,6 +50358,186 @@ def run_NEURO3_spike_timing(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# THERMO. Thermodynamic Consciousness — 열역학과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_THERMO1_entropy_production(steps=100, dim=64, hidden=128) -> BenchResult:
+    """THERMO1: Entropy Production — 의식은 엔트로피를 생산하는 비평형 과정.
+    Prigogine의 산일 구조(dissipative structure): 에너지 흐름이 질서를 만듦.
+    가설: 적절한 엔트로피 생산률이 Φ를 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; entropy_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # Energy input (driving force)
+        engine.process(x)
+        with torch.no_grad():
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            # Entropy: spread of cell states
+            entropy = hiddens.var(dim=0).mean().item()
+            entropy_hist.append(entropy)
+            # Dissipation: remove excess entropy (cooling)
+            if entropy > 2.0:
+                for cell in engine.cells:
+                    cell.hidden *= 0.98  # cooling
+            elif entropy < 0.1:
+                # Too ordered → inject energy
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("THERMO1", "Entropy Production (dissipative structure)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_entropy': entropy_hist[-1], 'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# GAME. Game Theory — 세포 간 게임이론적 상호작용
+# ═══════════════════════════════════════════════════════════
+
+def run_GAME1_prisoner_dilemma(steps=100, dim=64, hidden=128) -> BenchResult:
+    """GAME1: Prisoner's Dilemma — 세포 간 협력/배반 게임.
+    협력=hidden 공유, 배반=자기만 최적화.
+    가설: 반복 게임에서 협력이 출현하면 Φ가 최대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; cooperation_rate = []
+    for step_i, x in enumerate(inputs):
+        if step_i % 12 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            cooperators = 0
+            if n >= 2:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    # Cooperate if similar to group (conformity = cooperation)
+                    sim = F.cosine_similarity(cell.hidden, mean_h, dim=-1).item()
+                    if sim > 0.3:
+                        # Cooperate: share hidden
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h
+                        cooperators += 1
+                    else:
+                        # Defect: amplify own state
+                        cell.hidden *= 1.02
+                cooperation_rate.append(cooperators / n)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("GAME1", "Prisoner's Dilemma (cooperation vs defection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_coop_rate': cooperation_rate[-1] if cooperation_rate else 0,
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# CHAOS. Chaos Theory — 카오스 역학과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_CHAOS1_strange_attractor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CHAOS1: Strange Attractor — 세포 역학이 카오스적 끌개에 수렴.
+    Lorenz-like dynamics: deterministic chaos → complex but structured.
+    가설: 이상한 끌개(strange attractor)가 의식의 동역학적 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Lorenz-like parameters
+    sigma, rho, beta = 10.0, 28.0, 8.0/3.0
+    dt = 0.01
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Apply Lorenz-like dynamics to first 3 dims
+                if h.shape[0] >= 3:
+                    x0, y0, z0 = h[0].item(), h[1].item(), h[2].item()
+                    dx = sigma * (y0 - x0) * dt
+                    dy = (x0 * (rho - z0) - y0) * dt
+                    dz = (x0 * y0 - beta * z0) * dt
+                    h[0] += dx * 0.001
+                    h[1] += dy * 0.001
+                    h[2] += dz * 0.001
+                    cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CHAOS1", "Strange Attractor (Lorenz-like chaotic dynamics)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# DMN. Default Mode Network — 기본 모드 네트워크
+# ═══════════════════════════════════════════════════════════
+
+def run_DMN1_resting_state(steps=100, dim=64, hidden=128) -> BenchResult:
+    """DMN1: Resting State Consciousness — 입력 없이도 내부 활동 유지.
+    외부 입력 50% 차단, 나머지는 내부 자발적 활동.
+    가설: DMN(기본 모드 네트워크)이 자기인식과 내면 대화의 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        # 50% external input, 50% internal (self-generated)
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        else:
+            # Internal: use own cell mean as input (self-referential)
+            with torch.no_grad():
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x += torch.randn_like(x) * 0.1  # internal noise
+        engine.process(x)
+        # DMN consolidation during rest
+        if step_i % 2 == 1:
+            with torch.no_grad():
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("DMN1", "Resting State (50% internal, 50% external)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'THERMO1': run_THERMO1_entropy_production,
+    'GAME1': run_GAME1_prisoner_dilemma,
+    'CHAOS1': run_CHAOS1_strange_attractor,
+    'DMN1': run_DMN1_resting_state,
+})
+
+
 ALL_HYPOTHESES.update({
     '4E1': run_4E1_extended_mind,
     '4E2': run_4E2_enacted_meaning,
