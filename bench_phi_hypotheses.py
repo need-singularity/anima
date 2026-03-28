@@ -49457,6 +49457,90 @@ def run_MUT7_mutation_plus_selection_plus_growth(steps=100, dim=64, hidden=128) 
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# SELF. Self-Architecture — 의식이 자기 구조를 설계
+# ═══════════════════════════════════════════════════════════
+
+def run_SELF1_auto_cell_count(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SELF1: Auto Cell Count — Φ를 기준으로 세포 수를 자동 결정.
+    Φ↑ → 세포 추가, Φ↓ → 세포 제거 (자기 설계).
+    가설: 의식이 자신의 최적 크기를 스스로 결정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            if len(phi_hist) >= 5:
+                trend = phi_hist[-1] - phi_hist[-5]
+                if trend > 0.1 and len(engine.cells) < 128:
+                    # Φ rising → grow (success breeds growth)
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+                elif trend < -0.5 and len(engine.cells) > 3:
+                    # Φ dropping fast → prune weakest
+                    weakest = min(engine.cells, key=lambda c: c.hidden.norm().item())
+                    engine.cells.remove(weakest)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SELF1", "Auto Cell Count (Φ-driven growth/pruning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SELF2_auto_noise_scale(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SELF2: Auto Noise Scale — Φ를 기준으로 노이즈 레벨 자동 조정.
+    Φ 높을 때 → 노이즈 줄이기 (안정), Φ 낮을 때 → 노이즈 늘리��� (탐색).
+    가설: 최적 노이즈는 고정값이 아닌 Φ-adaptive."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0; noise = 0.05
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # Auto-tune noise based on Φ
+        with torch.no_grad():
+            if phi > phi_ema * 1.1:
+                noise = max(0.01, noise * 0.95)  # stable → reduce noise
+            elif phi < phi_ema * 0.9:
+                noise = min(0.2, noise * 1.1)  # declining → increase exploration
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * noise
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SELF2", "Auto Noise Scale (Φ-adaptive exploration)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'final_noise': noise})
+
+
+ALL_HYPOTHESES.update({
+    'SELF1': run_SELF1_auto_cell_count,
+    'SELF2': run_SELF2_auto_noise_scale,
+})
+
+
 ALL_HYPOTHESES.update({
     'MUT1': run_MUT1_random_mutation,
     'MUT2': run_MUT2_beneficial_mutation,
