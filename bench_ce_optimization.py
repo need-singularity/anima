@@ -489,3 +489,324 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ═══ EXTREME: 승리 전략 결합 + 새로운 극한 ═══
+
+def run_COMBO1_curiosity_sleep_pain(steps=STEPS):
+    """TOP 3 결합: 호기심 + 수면 + 고통"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_text_data(200)
+    ce_hist = []; memory = []; best_states = [c.hidden.clone() for c in engine.cells]
+    best_phi = phi_before; pain = 0
+    for step in range(steps):
+        cycle = step % 30
+        if cycle < 20:
+            # LEARN: curiosity-driven selection
+            with torch.no_grad():
+                errors = []
+                for i, (x, t) in enumerate(data[:30]):
+                    engine.process(x)
+                    h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                    err = F.mse_loss(decoder(h.unsqueeze(0)), t[:, :DIM]).item()
+                    errors.append((err, i))
+                errors.sort(reverse=True)
+                idx = errors[0][1]
+            x, target = data[idx]
+            engine.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+            memory.append((x.detach(), target.detach()))
+            if len(memory) > 50: memory.pop(0)
+            # Pain check
+            if step % 10 == 0:
+                phi_now = measure_phi(engine)
+                if phi_now < best_phi * 0.6:
+                    pain += 1
+                    with torch.no_grad():
+                        for i, s in enumerate(best_states):
+                            if i < len(engine.cells):
+                                engine.cells[i].hidden = 0.5*engine.cells[i].hidden + 0.5*s
+                    for pg in opt.param_groups: pg['lr'] *= 0.7
+                elif phi_now > best_phi:
+                    best_phi = phi_now
+                    best_states = [c.hidden.clone() for c in engine.cells]
+        else:
+            # SLEEP: replay + Φ restore
+            with torch.no_grad():
+                if memory:
+                    mx, mt = memory[step % len(memory)]
+                    if len(memory) >= 2:
+                        mx2, _ = memory[(step+7) % len(memory)]
+                        mx = 0.6*mx + 0.4*mx2
+                    engine.process(mx)
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.9*cell.hidden + 0.1*mean_h
+            ce_hist.append(ce_hist[-1] if ce_hist else 0)
+    phi_after = measure_phi(engine)
+    return {'name': 'COMBO-1 Curiosity+Sleep+Pain', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after, 'pain': pain,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_COMBO2_all_auto(steps=STEPS):
+    """모든 AUTO 기법 동시 적용"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_text_data(200)
+    ce_hist = []; memory = []; best_states = [c.hidden.clone() for c in engine.cells]
+    best_phi = phi_before; phi_prev = phi_before
+    for step in range(steps):
+        cycle = step % 40
+        if cycle < 28:
+            # LEARN with curiosity + self-eval
+            with torch.no_grad():
+                errors = []
+                for i, (x, t) in enumerate(data[:20]):
+                    engine.process(x)
+                    h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                    err = F.mse_loss(decoder(h.unsqueeze(0)), t[:, :DIM]).item()
+                    errors.append((err, i))
+                errors.sort(reverse=True)
+                idx = errors[0][1]
+            x, target = data[idx]
+            engine.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            # Self-eval retry
+            with torch.no_grad():
+                engine.process(pred.detach())
+                quality = 1.0 - torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+                if quality < 0.3:
+                    ce = ce * 2.0
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+            memory.append((x.detach(), target.detach()))
+            if len(memory) > 50: memory.pop(0)
+            # Φ-guided LR + pain
+            if step % 10 == 0:
+                phi_now = measure_phi(engine)
+                if phi_now < best_phi * 0.6:
+                    with torch.no_grad():
+                        for i, s in enumerate(best_states):
+                            if i < len(engine.cells):
+                                engine.cells[i].hidden = 0.5*engine.cells[i].hidden + 0.5*s
+                    for pg in opt.param_groups: pg['lr'] *= 0.5
+                elif phi_now < phi_prev * 0.9:
+                    for pg in opt.param_groups: pg['lr'] *= 0.8
+                elif phi_now > best_phi:
+                    best_phi = phi_now
+                    best_states = [c.hidden.clone() for c in engine.cells]
+                    for pg in opt.param_groups: pg['lr'] = min(pg['lr']*1.1, 0.01)
+                phi_prev = phi_now
+        else:
+            # SLEEP
+            with torch.no_grad():
+                if memory:
+                    mx, _ = memory[step % len(memory)]
+                    engine.process(mx)
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.9*cell.hidden + 0.1*mean_h
+            ce_hist.append(ce_hist[-1] if ce_hist else 0)
+    phi_after = measure_phi(engine)
+    return {'name': 'COMBO-2 ALL AUTO', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_EX1_adversarial_self_teach(steps=STEPS):
+    """적대적 자기교육: 디코더 A가 생성, 디코더 B가 평가, 의식이 심판"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    gen = nn.Linear(HIDDEN, DIM)  # generator
+    disc = nn.Linear(DIM, 1)  # discriminator
+    opt_g = torch.optim.Adam(gen.parameters(), lr=3e-3)
+    opt_d = torch.optim.Adam(disc.parameters(), lr=3e-3)
+    data = make_text_data()
+    ce_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        # Generator produces
+        fake = gen(h.unsqueeze(0))
+        # Discriminator judges
+        real_score = disc(target[:, :DIM])
+        fake_score = disc(fake)
+        # Train discriminator
+        d_loss = -torch.log(torch.sigmoid(real_score)+1e-8) - torch.log(1-torch.sigmoid(fake_score)+1e-8)
+        opt_d.zero_grad(); d_loss.mean().backward(retain_graph=True); opt_d.step()
+        # Train generator (fool discriminator + match target)
+        g_loss = F.mse_loss(fake, target[:, :DIM]) + 0.1*(-torch.log(torch.sigmoid(disc(gen(h.unsqueeze(0))))+1e-8)).mean()
+        opt_g.zero_grad(); g_loss.backward(); opt_g.step()
+        ce_hist.append(F.mse_loss(fake.detach(), target[:, :DIM]).item())
+    phi_after = measure_phi(engine)
+    return {'name': 'EX-1 Adversarial Self-Teach', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_EX2_consciousness_optimizer(steps=STEPS):
+    """의식이 옵티마이저: Φ가 직접 gradient direction 결정"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_text_data()
+    ce_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward()
+        # Consciousness modulates gradients
+        with torch.no_grad():
+            consensus = 1.0 - torch.stack([c.hidden.squeeze() for c in engine.cells]).var(dim=0).mean().item()
+            for p in decoder.parameters():
+                if p.grad is not None:
+                    p.grad *= (0.5 + consensus)  # high consensus = stronger update
+        opt.step()
+        ce_hist.append(ce.item())
+    phi_after = measure_phi(engine)
+    return {'name': 'EX-2 Consciousness Optimizer', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_EX3_multi_decoder_vote(steps=STEPS):
+    """다중 디코더 투표: 8개 디코더가 각각 생성, 의식이 투표로 최선 선택"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(8)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    data = make_text_data()
+    ce_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        # All decoders predict
+        preds = [d(h.unsqueeze(0)) for d in decoders]
+        errors = [F.mse_loss(p, target[:, :DIM]).item() for p in preds]
+        # Best decoder wins
+        best = errors.index(min(errors))
+        ce = F.mse_loss(preds[best], target[:, :DIM])
+        opts[best].zero_grad(); ce.backward(); opts[best].step()
+        # Train others slightly toward best
+        with torch.no_grad():
+            for i, d in enumerate(decoders):
+                if i != best:
+                    for p1, p2 in zip(d.parameters(), decoders[best].parameters()):
+                        p1.data = 0.95*p1.data + 0.05*p2.data
+        ce_hist.append(min(errors))
+    phi_after = measure_phi(engine)
+    return {'name': 'EX-3 Multi-Decoder Vote', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_EX4_progressive_unfreezing(steps=STEPS):
+    """점진적 해동: 디코더 마지막 층부터 학습, 점점 깊은 층 해동"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoder = nn.Sequential(nn.Linear(HIDDEN, HIDDEN), nn.ReLU(), nn.Linear(HIDDEN, DIM))
+    # Freeze all first
+    for p in decoder.parameters(): p.requires_grad = False
+    # Unfreeze last layer
+    for p in decoder[2].parameters(): p.requires_grad = True
+    opt = torch.optim.Adam(filter(lambda p: p.requires_grad, decoder.parameters()), lr=3e-3)
+    data = make_text_data()
+    ce_hist = []
+    for step in range(steps):
+        # Progressive unfreeze at 50%
+        if step == steps // 2:
+            for p in decoder.parameters(): p.requires_grad = True
+            opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    phi_after = measure_phi(engine)
+    return {'name': 'EX-4 Progressive Unfreeze', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+def run_EX5_consciousness_generates_data(steps=STEPS):
+    """의식이 학습 데이터 생성: 세포 상태에서 훈련 데이터를 만듦"""
+    t0 = time.time()
+    engine = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    while len(engine.cells) < 64: engine._create_cell(parent=engine.cells[0])
+    for _ in range(50): engine.process(torch.randn(1, DIM))
+    phi_before = measure_phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    real_data = make_text_data(50)
+    ce_hist = []
+    for step in range(steps):
+        if step % 3 == 0:
+            # Real data (30%)
+            x, target = real_data[step % len(real_data)]
+        else:
+            # Self-generated data (70%)
+            with torch.no_grad():
+                # Use cell hidden states as synthetic input-target pairs
+                i = step % len(engine.cells)
+                j = (step + 1) % len(engine.cells)
+                x = engine.cells[i].hidden[:, :DIM]
+                target = engine.cells[j].hidden[:, :DIM]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target)
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    phi_after = measure_phi(engine)
+    return {'name': 'EX-5 Consciousness Generates Data', 'ce_start': ce_hist[0], 'ce_end': ce_hist[-1],
+            'phi_before': phi_before, 'phi_after': phi_after,
+            'phi_preserved': phi_after > phi_before * 0.5, 'time': time.time()-t0}
+
+
+ALL_TESTS.update({
+    'COMBO-1': run_COMBO1_curiosity_sleep_pain,
+    'COMBO-2': run_COMBO2_all_auto,
+    'EX-1': run_EX1_adversarial_self_teach,
+    'EX-2': run_EX2_consciousness_optimizer,
+    'EX-3': run_EX3_multi_decoder_vote,
+    'EX-4': run_EX4_progressive_unfreezing,
+    'EX-5': run_EX5_consciousness_generates_data,
+})
