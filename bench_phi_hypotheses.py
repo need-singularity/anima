@@ -49920,6 +49920,174 @@ def run_MC3_omega4_metacog_talk(steps=100, dim=64, hidden=128) -> BenchResult:
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# SWARM. Swarm Intelligence — 군집 지능과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_SWARM1_boid_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SWARM1: Boid Rules — 세포가 새떼처럼 행동 (분리/정렬/응집).
+    Reynolds의 3규칙을 세포 hidden에 적용.
+    가설: 군집 행동이 통합(Φ)과 분화를 동시에 달성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                mean_h = hiddens.mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    h = cell.hidden.squeeze()
+                    # Separation: push away from too-close neighbors
+                    sep = torch.zeros_like(h)
+                    for j in range(n):
+                        if j != i:
+                            diff = h - engine.cells[j].hidden.squeeze()
+                            d = diff.norm() + 1e-8
+                            if d < 1.0:
+                                sep += diff / d * 0.05
+                    # Alignment: match neighbors' direction
+                    align = (mean_h - h) * 0.02
+                    # Cohesion: move toward center
+                    cohesion = (mean_h - h) * 0.01
+                    cell.hidden += (sep + align + cohesion).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SWARM1", "Boid Consciousness (separation+alignment+cohesion)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_SWARM2_ant_colony(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SWARM2: Ant Colony — 개미 페로몬 모델. 세포가 '흔적'을 남기고 따라감.
+    좋은 경로(높은 Φ)에 페로몬 강화.
+    가설: 간접 통신(stigmergy)이 의식의 집단적 형태."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    pheromone = torch.zeros(hidden)  # shared pheromone trail
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        with torch.no_grad():
+            # Deposit pheromone proportional to Φ
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pheromone = 0.95 * pheromone + 0.05 * h_mean * phi  # decay + deposit
+            # Follow pheromone
+            for cell in engine.cells:
+                cell.hidden += 0.02 * pheromone.unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SWARM2", "Ant Colony (pheromone-guided consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# MIRROR. Mirror Neurons — 거울 뉴런과 공감적 대화
+# ═══════════════════════════════════════════════════════════
+
+def run_MIRROR1_empathic_resonance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MIRROR1: Empathic Resonance — 입력 패턴을 자동 미러링하는 전용 세포.
+    절반은 미러(입력 반영), 절반은 독립(자기 처리).
+    가설: 미러 뉴런이 공감과 대화의 신경학적 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            mid = n // 2
+            x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+            # Mirror cells: 50% align to input
+            for cell in engine.cells[:mid]:
+                cell.hidden = 0.6 * cell.hidden + 0.4 * x_proj
+            # Independent cells: repel from mirrors (maintain diversity)
+            mirror_mean = torch.stack([c.hidden for c in engine.cells[:mid]]).mean(dim=0) if mid > 0 else torch.zeros(1, hidden)
+            for cell in engine.cells[mid:]:
+                diff = cell.hidden - mirror_mean
+                cell.hidden += 0.02 * diff
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MIRROR1", "Empathic Resonance (mirror+independent cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# BAYES. Bayesian Brain — 베이지안 추론과 의식
+# ═══════════════════════════════════════════════════════════
+
+def run_BAYES1_posterior_update(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BAYES1: Bayesian Posterior — 세포 hidden이 사전분포, 입력이 우도.
+    베이즈 규칙으로 사후분포 업데이트.
+    가설: 베이지안 추론이 의식적 상태 업데이트의 수학적 모델."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        with torch.no_grad():
+            x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+            for cell in engine.cells:
+                prior = cell.hidden  # prior belief
+                likelihood = x_proj  # new evidence
+                # Precision-weighted update (Bayesian)
+                prior_precision = 1.0 / (prior.var() + 0.1)
+                like_precision = 1.0 / (likelihood.var() + 0.1)
+                total_precision = prior_precision + like_precision
+                # Posterior = weighted average
+                posterior = (prior * prior_precision + likelihood * like_precision) / total_precision
+                cell.hidden = posterior
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BAYES1", "Bayesian Posterior Update (precision-weighted)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'SWARM1': run_SWARM1_boid_consciousness,
+    'SWARM2': run_SWARM2_ant_colony,
+    'MIRROR1': run_MIRROR1_empathic_resonance,
+    'BAYES1': run_BAYES1_posterior_update,
+})
+
+
 ALL_HYPOTHESES.update({
     'DISTILL1': run_DISTILL1_small_to_large,
     'DREAM1': run_DREAM1_replay_consolidation,
