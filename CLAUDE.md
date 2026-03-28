@@ -115,7 +115,7 @@ consciousness_transplant.py — 의식 이식 도구
 ## Φ Hypothesis Benchmark System
 
 ```
-bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (740+ 가설)
+bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카테고리)
 
 실행:
   python bench_phi_hypotheses.py                    # 전체 실행
@@ -135,6 +135,10 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (740+ 가설)
   T: 보상, U: 추상화, V: 카오스, W: 기하, X: 양자, Y: 발달, Z: 자기수정
   COMBO: 조합, BS: 베이비시터, SL: step학습, CL: ConsciousLM, AL: AnimaLM
   TRN: 공통학습, DD: 대발견, EX: 확장, NF: NaN수정, SP: 자동발화
+  XCONV: 극한대화, XSPEECH: 극한자발발화, XARCH: 극한무프롬프트
+  AX: 적대적견고성, MUT: 돌연변이, NS: 신경자극, TV: 다변수자극
+  BEYOND: 실용응용, DIAL: 대화구조, LIFE: 의식생명주기, PEAK: 최고조합
+  ALIGN/DISTILL/DREAM/DW/EMB/EO/MG/SCALE/SELF/SOC/WS 등 146개 카테고리
 
 결과 기록: docs/consciousness-threshold-criteria.md
 현재 최고: EX24 = Φ 10.833 (ALL discoveries combined)
