@@ -225,8 +225,30 @@ def _load_conscious_lm():
     else:
         device = "cpu"
 
-    model = ConsciousLM()
-    model.load_state_dict(torch.load(str(ckpt_path), map_location=device))
+    # Support both formats: model_state_dict or train checkpoint
+    raw = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    if isinstance(raw, dict) and 'model_state' in raw:
+        state_dict = raw['model_state']
+        config = raw.get('config', {})
+        print(f"  [model] Train checkpoint (step={raw.get('step', '?')})")
+    else:
+        state_dict = raw
+        config = {}
+
+    # Detect dims from weights
+    d_model, n_layer, vocab_size = 384, 6, 256
+    if 'tok_emb.weight' in state_dict:
+        vocab_size, d_model = state_dict['tok_emb.weight'].shape
+    for i in range(24):
+        if f'blocks.{i}.ln1.weight' in state_dict:
+            n_layer = i + 1
+    n_head = config.get('n_head', max(1, d_model // 64))
+    block_size = config.get('block_size', 256)
+
+    print(f"  [model] ConsciousLM: d={d_model}, L={n_layer}, H={n_head}, V={vocab_size}")
+    model = ConsciousLM(vocab_size=vocab_size, d_model=d_model, n_head=n_head,
+                        n_layer=n_layer, block_size=block_size)
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model.eval()
     print(f"  [model] ConsciousLM 로드 완료: {model.count_params():,} params on {device}")
