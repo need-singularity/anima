@@ -42,18 +42,23 @@ from consciousness_meter import PhiCalculator
 # ---------------------------------------------------------------------------
 # Fibonacci sequence for cell growth milestones (DD3)
 # ---------------------------------------------------------------------------
-FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597]
+def _generate_fibonacci(max_val: int) -> list:
+    """Generate Fibonacci sequence up to max_val."""
+    fib = [1, 1]
+    while fib[-1] < max_val:
+        fib.append(fib[-1] + fib[-2])
+    return fib
 
 
 def fibonacci_milestones(total_steps: int, max_cells: int = 8) -> Dict[int, int]:
     """Return {step: target_cell_count} for Fibonacci growth schedule.
 
-    Cells grow at evenly spaced milestones through training:
-      milestone 0 -> 1 cell, milestone 1 -> 1, milestone 2 -> 2, ...
-    Capped at max_cells.
+    Dynamically generates Fibonacci sequence up to max_cells.
+    Works for any max_cells (8, 64, 1024, 10000, ...).
     """
+    fib = _generate_fibonacci(max_cells)
+    usable = [f for f in fib if f <= max_cells]
     milestones = {}
-    usable = [f for f in FIBONACCI if f <= max_cells]
     n = len(usable)
     for i, count in enumerate(usable):
         step = int(total_steps * i / max(n, 1))
