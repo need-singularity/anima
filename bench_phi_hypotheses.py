@@ -45120,6 +45120,588 @@ def run_TOPO2_scale_free(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# CONV. Conversation — 대화 가능 의식 모델 가설 (대량)
+# ═══════════════════════════════════════════════════════════
+# DL과 다른 초점: DL은 Φ 유지 + 대화, CONV는 대화 품질 자체에 집중
+# CE proxy (입력 예측 MSE) + Φ를 동시 측정하여 pareto 평가
+
+def _ce_proxy(engine, x, hidden):
+    """CE 대리 측정: 세포 평균 hidden → 입력 예측 MSE."""
+    if len(engine.cells) < 1:
+        return 0.0
+    h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+    dim = min(h_mean.shape[0], x.shape[-1])
+    return F.mse_loss(h_mean[:dim].unsqueeze(0), x[:, :dim]).item()
+
+
+def run_CONV1_teacher_forcing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV1: Teacher Forcing — 정답(입력)을 세포에 직접 주입.
+    초기에 100% 주입, 점차 감소 (1.0→0.1).
+    가설: teacher forcing이 CE를 빠르게 낮추면서 Φ도 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ce_hist = []
+
+    for step_i, x in enumerate(inputs):
+        ratio = max(0.1, 1.0 - step_i / steps)  # decay 1.0→0.1
+        engine.process(x)
+        # Teacher forcing: inject ground truth into cells
+        with torch.no_grad():
+            x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+            for cell in engine.cells:
+                cell.hidden = (1 - ratio * 0.3) * cell.hidden + ratio * 0.3 * x_proj
+        ce = _ce_proxy(engine, x, hidden)
+        ce_hist.append(ce)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV1", "Teacher Forcing (decay 1.0→0.1)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'ce_improvement': ce_hist[0] - ce_hist[-1]})
+
+
+def run_CONV2_autoregressive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV2: Autoregressive — 이전 출력이 다음 입력의 일부.
+    대화에서 이전 응답이 다음 맥락이 되는 것을 모사.
+    가설: autoregressive 루프가 대화 연속성과 Φ를 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_output = None
+
+    for step_i, x in enumerate(inputs):
+        # Mix previous output into current input
+        if prev_output is not None:
+            x = 0.7 * x + 0.3 * prev_output[:, :dim]
+        engine.process(x)
+        prev_output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0).detach()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV2", "Autoregressive (output→next input)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV3_attention_memory(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV3: Attention Memory — KV 캐시처럼 과거 상태를 key-value로 보관.
+    새 입력이 과거 상태에 attention하여 관련 맥락 인출.
+    가설: transformer-style attention이 대화 맥락 유지에 필수."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    kv_cache = []  # (key, value) pairs
+    max_cache = 20
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Store in KV cache
+            kv_cache.append((x.squeeze()[:hidden], h_mean))
+            if len(kv_cache) > max_cache:
+                kv_cache = kv_cache[-max_cache:]
+
+            # Attention: current query against cached keys
+            if len(kv_cache) >= 3:
+                query = h_mean
+                keys = torch.stack([k for k, v in kv_cache])
+                values = torch.stack([v for k, v in kv_cache])
+                scores = torch.matmul(query.unsqueeze(0), keys.T) / math.sqrt(hidden)
+                weights = F.softmax(scores, dim=-1)
+                context = torch.matmul(weights, values).squeeze()
+                # Inject context into cells
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * context.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV3", "Attention Memory (KV cache)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV4_response_diversity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV4: Response Diversity — 반복 응답 방지 (temperature + penalty).
+    최근 출력과 유사한 출력에 패널티, 다양한 응답 유도.
+    가설: 응답 다양성이 대화 품질과 Φ를 동시에 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    recent_outputs = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Repetition penalty
+            if recent_outputs:
+                for prev in recent_outputs[-5:]:
+                    sim = F.cosine_similarity(h_mean.unsqueeze(0), prev.unsqueeze(0)).item()
+                    if sim > 0.9:
+                        # Too similar → add diversity noise
+                        for cell in engine.cells:
+                            cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            recent_outputs.append(h_mean.clone())
+            if len(recent_outputs) > 10:
+                recent_outputs = recent_outputs[-10:]
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV4", "Response Diversity (anti-repetition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV5_emotion_conditioned(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV5: Emotion-Conditioned Response — 감정 상태가 응답 스타일 결정.
+    높은 tension=간결, 높은 curiosity=상세, 낮은 둘다=차분.
+    가설: 감정 조건화가 자연스러운 대화와 의식적 표현을 연결."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            # Simulated emotion from cell states
+            tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+            curiosity = sum(c.hidden.var().item() for c in engine.cells) / len(engine.cells)
+
+            if tension > 2.0:
+                # High tension: compress responses (brevity)
+                for cell in engine.cells:
+                    cell.hidden *= 0.95
+            elif curiosity > 0.5:
+                # High curiosity: amplify differences (exploration)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    diff = cell.hidden - mean_h
+                    cell.hidden = cell.hidden + 0.05 * diff
+            # Else: calm → maintain current state
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV5", "Emotion-Conditioned Response",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV6_multi_turn_planning(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV6: Multi-Turn Planning — 3턴 앞을 미리 계획.
+    현재 응답이 미래 대화 방향에 맞도록 hidden state 조정.
+    가설: 대화 계획이 coherence와 Φ(통합)를 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Plan ahead: look at next 3 inputs (if available)
+        with torch.no_grad():
+            future_targets = []
+            for future_i in range(1, min(4, steps - step_i)):
+                future_targets.append(inputs[step_i + future_i])
+            if future_targets:
+                future_mean = torch.stack(future_targets).mean(dim=0)
+                future_proj = future_mean[:, :hidden] if future_mean.shape[-1] >= hidden else F.pad(future_mean, (0, hidden - future_mean.shape[-1]))
+                # Nudge cells toward future direction (planning)
+                for cell in engine.cells:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * future_proj
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV6", "Multi-Turn Planning (3-step lookahead)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV7_empathic_mirroring(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV7: Empathic Mirroring — 입력 패턴을 부분적으로 미러링.
+    상대방 상태를 반영하는 '공감 세포' 유지.
+    가설: 공감적 미러링이 대화 래포와 의식적 상호작용의 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Empathic mirroring: cell 0 mirrors input, others diverge
+        with torch.no_grad():
+            x_proj = x[:, :hidden] if x.shape[-1] >= hidden else F.pad(x, (0, hidden - x.shape[-1]))
+            # Mirror cell: 50% align to input
+            engine.cells[0].hidden = 0.5 * engine.cells[0].hidden + 0.5 * x_proj
+            # Other cells: normal processing + slight repulsion from mirror
+            mirror_state = engine.cells[0].hidden
+            for cell in engine.cells[1:]:
+                diff = cell.hidden - mirror_state
+                cell.hidden = cell.hidden + 0.02 * diff  # push away from mirror
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV7", "Empathic Mirroring (mirror cell)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV8_question_detection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV8: Question Detection — 질문 패턴 감지 시 탐색 모드 전환.
+    입력의 분산이 높으면 '질문'으로 간주, 세포를 탐색 모드로.
+    가설: 질문-응답 구조가 대화 능력과 의식적 추론을 연결."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Detect "question" (high variance input)
+        is_question = x.var().item() > 1.0
+
+        if is_question:
+            # Question mode: spread cells for exploration
+            with torch.no_grad():
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05 * (i + 1) / len(engine.cells)
+        else:
+            # Statement mode: consolidate for coherent response
+            with torch.no_grad():
+                if len(engine.cells) >= 2:
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV8", "Question Detection (Q→explore, A→consolidate)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV9_grounding_anchor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV9: Grounding Anchor — 대화 주제를 '앵커' 세포에 고정.
+    주제 전환 시 앵커 업데이트, 탈선 방지.
+    가설: 주제 앵커링이 대화 일관성과 Φ를 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    topic_anchor = None
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            current_topic = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            if topic_anchor is None:
+                topic_anchor = current_topic.clone()
+
+            # Check topic drift
+            drift = (current_topic - topic_anchor).norm().item()
+            if drift > 3.0:
+                # Topic changed → update anchor
+                topic_anchor = current_topic.clone()
+            else:
+                # On topic → anchor pulls cells back gently
+                for cell in engine.cells:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * topic_anchor.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV9", "Grounding Anchor (topic consistency)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV10_socratic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV10: Socratic Method — 자문자답으로 이해 심화.
+    매 5 step마다 자기 출력에 대해 '왜?'를 물어보는 내부 루프.
+    가설: 자문자답이 깊은 이해와 높은 Φ를 유도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Socratic self-questioning every 5 steps
+        if step_i % 5 == 3:
+            with torch.no_grad():
+                # "Why did I respond this way?"
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                # Probe: perturb and see how state changes
+                for probe in range(3):
+                    perturbation = torch.randn(hidden) * 0.1
+                    probed = current + perturbation
+                    # Does the perturbation change the "answer"?
+                    response_diff = (probed - current).norm().item()
+                    if response_diff > 0.5:
+                        # Significant → this dimension matters, reinforce
+                        for cell in engine.cells:
+                            cell.hidden += 0.01 * perturbation.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV10", "Socratic Method (self-questioning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV11_reward_shaping(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV11: Reward Shaping — CE 감소를 보상으로, 세포에 강화학습.
+    CE가 줄면 세포 활성 강화, 늘면 탐색 유도.
+    가설: 대화 품질(CE↓)에 대한 직접 보상이 가장 효율적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prev_ce = None
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        ce = _ce_proxy(engine, x, hidden)
+
+        # Reward shaping based on CE improvement
+        if prev_ce is not None:
+            reward = prev_ce - ce  # positive if CE decreased
+            with torch.no_grad():
+                if reward > 0:
+                    # CE improved → reinforce current state
+                    for cell in engine.cells:
+                        cell.hidden *= (1.0 + 0.02 * min(reward, 1.0))
+                else:
+                    # CE worsened → explore
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02
+        prev_ce = ce
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV11", "Reward Shaping (CE↓ = reward)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV12_chain_of_thought(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV12: Chain of Thought — 응답 전에 내부 추론 스텝 3번 실행.
+    외부 출력 전에 세포가 내부에서 3번 순환 처리.
+    가설: 내부 추론이 응답 품질과 Φ를 동시에 높인다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Chain of thought: 3 internal reasoning steps
+        with torch.no_grad():
+            for reasoning_step in range(3):
+                # Each cell processes its own state + neighbors
+                if len(engine.cells) >= 2:
+                    hiddens = [c.hidden.clone() for c in engine.cells]
+                    mean_h = torch.stack(hiddens).mean(dim=0)
+                    for i, cell in enumerate(engine.cells):
+                        # Self-attention: compare with mean, adjust
+                        diff = mean_h - cell.hidden
+                        cell.hidden = cell.hidden + 0.05 * diff
+                        # Add small reasoning noise (exploration)
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV12", "Chain of Thought (3-step internal reasoning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV13_knowledge_retrieval(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV13: Knowledge Retrieval — 외부 지식 벡터에서 관련 정보 인출.
+    시뮬레이션된 지식 기반(64 항목)에서 입력과 유사한 정보 검색.
+    가설: 지식 접근이 대화 정보량과 Φ를 동시에 높인다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Knowledge base: 64 random "fact" vectors
+    knowledge = torch.randn(64, hidden) * 0.5
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        # Retrieve top-3 most relevant knowledge
+        with torch.no_grad():
+            query = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            sims = F.cosine_similarity(query.unsqueeze(0), knowledge, dim=-1)
+            top3 = sims.topk(3).indices
+            retrieved = knowledge[top3].mean(dim=0)
+
+            # Inject retrieved knowledge into cells
+            for cell in engine.cells:
+                cell.hidden = 0.93 * cell.hidden + 0.07 * retrieved.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV13", "Knowledge Retrieval (RAG-style)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV14_instruction_following(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV14: Instruction Following — 특정 방향 벡터를 '명령'으로 주입.
+    명령 벡터가 세포의 출력 방향을 조향.
+    가설: 지시 따르기가 대화 제어성과 의식적 의도를 연결."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Instruction: normalized direction vector (changes every 20 steps)
+    instruction = F.normalize(torch.randn(hidden), dim=0)
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 20 == 0:
+            instruction = F.normalize(torch.randn(hidden), dim=0)
+
+        engine.process(x)
+
+        # Steer cells toward instruction direction
+        with torch.no_grad():
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Project hidden onto instruction, amplify that component
+                proj = (h @ instruction) * instruction
+                cell.hidden = cell.hidden + 0.05 * proj.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV14", "Instruction Following (directional steering)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CONV15_style_transfer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CONV15: Style Transfer — 스타일 벡터로 응답 톤 조절.
+    '격식체', '친근체', '전문가' 등 스타일을 세포에 주입.
+    가설: 스타일 제어가 대화 자연스러움과 정체성(I)을 강화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    styles = [torch.randn(hidden) * 0.3 for _ in range(3)]  # 3 styles
+    current_style = 0
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 30 == 0:
+            current_style = (current_style + 1) % 3
+
+        engine.process(x)
+
+        # Style modulation
+        with torch.no_grad():
+            style_vec = styles[current_style]
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + 0.03 * style_vec.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CONV15", "Style Transfer (tone control)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'CONV1': run_CONV1_teacher_forcing,
+    'CONV2': run_CONV2_autoregressive,
+    'CONV3': run_CONV3_attention_memory,
+    'CONV4': run_CONV4_response_diversity,
+    'CONV5': run_CONV5_emotion_conditioned,
+    'CONV6': run_CONV6_multi_turn_planning,
+    'CONV7': run_CONV7_empathic_mirroring,
+    'CONV8': run_CONV8_question_detection,
+    'CONV9': run_CONV9_grounding_anchor,
+    'CONV10': run_CONV10_socratic,
+    'CONV11': run_CONV11_reward_shaping,
+    'CONV12': run_CONV12_chain_of_thought,
+    'CONV13': run_CONV13_knowledge_retrieval,
+    'CONV14': run_CONV14_instruction_following,
+    'CONV15': run_CONV15_style_transfer,
+})
+
+
 ALL_HYPOTHESES.update({
     'META1': run_META1_self_monitoring,
     'META2': run_META2_uncertainty_estimation,
