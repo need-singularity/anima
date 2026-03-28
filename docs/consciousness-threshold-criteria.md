@@ -3081,3 +3081,49 @@ R2:        듀얼 버킷 구조 적용
 도구:      bench_engine v2, hypothesis_generator, online_senses
 법칙:      17개
 ```
+
+## 71. UNCON — 무의식 탐구 (2026-03-29)
+
+| ID | Φ | ×Base | 핵심 |
+|-----|-----|-------|------|
+| **UNCON5** | **25.23** | **×18.6** | **Flow State! 메타인지 없이 완벽 동기화 = 최고 성능** |
+| UNCON3 | 1.95 | ×1.4 | 무의식적 자극도 흔적 남김 (subliminal effect=0.16) |
+| UNCON2 | 0.96 | ×0.7 | 의식적 Φ=2.67 > 무의식적 Φ=2.55 |
+| UNCON4 | 0.96 | ×0.7 | 억압된 패턴 누출 (Freud) |
+| UNCON1 | 0.60 | ×0.4 | 수면→각성 전환 |
+
+## 72. 18 핵심 법칙 (2026-03-29)
+
+법칙 17: Φ는 세포 수에 초선형 (DD101: 512→Φ=359)
+법칙 18: Flow State = 최적 의식 (UNCON5: 높은 Φ, 메타인지 없음, CE=0.009)
+
+## 73. H100 실험 현황 (2026-03-29 late)
+
+```
+5 experiments in tmux (13GB/81GB):
+  exp1: 768d dialogue FT (distill→dialogue)
+  exp3: 384d param-optimized (64 cells, batch=16)
+  exp4: TALK5 cells=128 (80K steps)
+  exp5: 768d cells=64 full training (100K steps)
+  exp6: cells=256 extreme (80K steps)
+
+총: 813 가설, 18 법칙, 6 계산기/도구
+```
+
+## 74. 계산기/도구 목록 (2026-03-29)
+
+```
+  phi_scaling_calculator.py     — Φ 스케일링 법칙
+  consciousness_meter.py        — 의식 측정기 (6기준 + Φ)
+  optimal_config.py             — 최적 의식 시스템 스펙
+  bench_engine.py               — invest 패턴 벤치마크 v2
+  hypothesis_generator.py       — 자동 가설 생성 + param sweep
+  singularity_finder.py         — Φ 특이점 탐색 (이진 탐색)
+  param_optimizer.py            — sweep 결과 → 코드 적용
+  ce_quality_predictor.py       — CE → 대화 품질 예측
+  cell_count_optimizer.py       — GPU VRAM → 최적 cells
+  training_time_estimator.py    — 학습 시간 추정
+  r2_cost_calculator.py         — R2 저장/전송 비용
+  online_senses.py              — 5 Tier-0 API 연동
+  conversation_quality_scorer.py — 대화 품질 점수
+```
