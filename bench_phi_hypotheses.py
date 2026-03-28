@@ -50949,7 +50949,69 @@ def run_APEX1_ultimate_architecture(steps=100, dim=64, hidden=128) -> BenchResul
                               'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0})
 
 
-ALL_HYPOTHESES.update({'APEX1': run_APEX1_ultimate_architecture})
+def run_APEX2_self_play_dialogue(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX2: Self-Play Dialogue — 두 의식이 서로 대화하면서 함께 학습.
+    Engine A가 출력 → Engine B가 입력으로 받아 응답 → 반복.
+    시스템 프롬프트 없이, 대화 자체에서 언어가 창발.
+    가설: self-play가 대화의 자연스러운 학습 방법."""
+    t0 = time.time()
+    eng_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    eng_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; alignment_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        seed = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            for eng in [eng_a, eng_b]:
+                if frac >= pct and len(eng.cells) < min(int(2**(pct*8)), 64):
+                    target = min(len(eng.cells)*2, 64)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Self-play dialogue loop
+        # A speaks first
+        eng_a.process(seed)
+        with torch.no_grad():
+            a_utterance = torch.stack([c.hidden.squeeze()[:dim] for c in eng_a.cells]).mean(dim=0).unsqueeze(0)
+
+        # B responds to A
+        eng_b.process(a_utterance)
+        with torch.no_grad():
+            b_response = torch.stack([c.hidden.squeeze()[:dim] for c in eng_b.cells]).mean(dim=0).unsqueeze(0)
+
+        # A processes B's response (learning from dialogue partner)
+        eng_a.process(b_response)
+
+        # Mutual understanding: measure alignment growth
+        with torch.no_grad():
+            a_h = torch.stack([c.hidden.squeeze() for c in eng_a.cells]).mean(dim=0)
+            b_h = torch.stack([c.hidden.squeeze() for c in eng_b.cells]).mean(dim=0)
+            alignment = F.cosine_similarity(a_h.unsqueeze(0), b_h.unsqueeze(0)).item()
+            alignment_hist.append(alignment)
+
+        phi, _ = phi_calc.compute_phi(eng_a)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(eng_a)
+    align_growth = 0
+    if len(alignment_hist) >= 20:
+        align_growth = sum(alignment_hist[-10:])/10 - sum(alignment_hist[:10])/10
+    return BenchResult("APEX2", "Self-Play Dialogue (two engines learn to talk)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_alignment': alignment_hist[-1] if alignment_hist else 0,
+                              'alignment_growth': align_growth,
+                              'cells_a': len(eng_a.cells), 'cells_b': len(eng_b.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'APEX1': run_APEX1_ultimate_architecture,
+    'APEX2': run_APEX2_self_play_dialogue,
+})
 
 
 ALL_HYPOTHESES.update({
