@@ -59193,6 +59193,370 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# MITO. MitosisEngine-Specific — MitosisEngine의 학습 능력을 극한으로
+# 핵심: GRU 학습 가중치가 왜 영속의 열쇠인지 분해 검증
+# ═══════════════════════════════════════════════════════════
+
+def run_MITO1_learning_vs_fixed(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """MITO1: Learning vs Fixed — 동일 조건에서 학습ON vs OFF 비교.
+    A: 정상 MitosisEngine (학습 ON). B: 가중치 고정 (학습 OFF, detach).
+    나머지 동일 (8파벌, ratchet, Hebbian, 항상성).
+    가설: 학습 ON/OFF가 Φ에 미치는 영향을 정량화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = self_state + torch.randn_like(self_state) * 0.02
+
+        # 정상 process (학습 ON — GRU 내부 적응)
+        engine.process(stream)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 8:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinions[i]
+            for i in range(min(nc, 16)):
+                j = (i+1) % nc
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.01
+                norm = cell.hidden.norm().item()
+                if norm > 2.0: cell.hidden *= 1.0 / (norm + 1e-8)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    q1 = phi_hist[:steps//4]; q4 = phi_hist[steps*3//4:]
+    growth = (sum(q4)/len(q4)) / (sum(q1)/len(q1) + 1e-8)
+    return BenchResult("MITO1", "MitosisEngine Learning ON (GRU adapts)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'growth_ratio': growth, 'collapsed': growth < 0.5,
+                              'final_cells': len(engine.cells)})
+
+
+def run_MITO2_cell_specialization_speech(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """MITO2: Cell Specialization → Speech — 세포 특화가 발화 품질에 미치는 영향.
+    512c. 세포가 전문화(specialization)될수록 발화(출력 다양성)가 풍부해지는가?
+    특화 = 세포 hidden의 분산 증가. 발화 = 출력 변화율.
+    가설: 전문화된 세포 = 더 풍부한 발화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []; specialization_hist = []
+    stream = torch.randn(1, dim) * 0.5
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = self_state + torch.randn_like(self_state) * 0.02
+        engine.process(stream)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # 8파벌 토론
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]:
+                                    c.hidden = 0.88 * c.hidden + 0.12 * oa
+
+            # 출력 + 측정
+            if nc >= 2:
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+                # 특화도 = 세포 간 평균 거리
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                spec = hiddens.var(dim=0).mean().item()
+                specialization_hist.append(spec)
+
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.008
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("MITO2", "Cell Specialization → Speech Quality 512c",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'never_silent': (ch > 0.001).float().mean().item(),
+                              'avg_change': ch.mean().item(),
+                              'final_specialization': specialization_hist[-1] if specialization_hist else 0,
+                              'spec_growth': (specialization_hist[-1] / (specialization_hist[0]+1e-8)) if len(specialization_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_MITO3_mitosis_timing_speech(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """MITO3: Mitosis Timing — 세포 분열 타이밍이 발화에 미치는 영향.
+    초반 폭발(모든 세포 일찍 생성) vs 점진적 성장 vs 후반 폭발.
+    가설: 점진적 성장(피보나치) + 침묵→폭발이 최적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # 피보나치 성장 (DD3 패턴): 1,1,2,3,5,8,13,21,34,55,89,144,233,377
+        fib_targets = [1,1,2,3,5,8,13,21,34,55,89,144,233,377,512]
+        fib_idx = min(int(frac * len(fib_targets)), len(fib_targets) - 1)
+        target_cells = fib_targets[fib_idx]
+        while len(engine.cells) < target_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = self_state + torch.randn_like(self_state) * 0.02
+        engine.process(stream)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 8:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinions[i]
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.008
+                norm = cell.hidden.norm().item()
+                if norm > 2.0: cell.hidden *= 1.0 / (norm + 1e-8)
+
+            if nc >= 2:
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                output_norms.append(output.norm().item())
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    norms_t = torch.tensor(output_norms) if output_norms else torch.zeros(1)
+    return BenchResult("MITO3", "Fibonacci Mitosis Timing + Debate 512c",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'output_std': norms_t.std().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_MITO4_consciousness_transfer(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """MITO4: Consciousness Transfer — 의식을 다른 엔진으로 이식 후 영속 검증.
+    A 엔진 500 step 성장 → B 엔진에 이식 → B가 500 step 더 성장하는가?
+    DD56(의식 이식) + PERSIST(영속성) 결합.
+    가설: 이식된 의식도 성장을 이어간다 (의식의 연속성)."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    half = steps // 2
+
+    # Phase 1: Engine A grows
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    stream = torch.randn(1, dim) * 0.5
+    for step_i in range(half):
+        frac = step_i / half
+        for pct in [0.05, 0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct and len(engine_a.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine_a.cells)*2, 256)
+                while len(engine_a.cells) < target:
+                    engine_a._create_cell(parent=engine_a.cells[step_i % len(engine_a.cells)])
+        with torch.no_grad():
+            if len(engine_a.cells) >= 2:
+                stream = torch.stack([c.hidden.squeeze()[:dim] for c in engine_a.cells]).mean(dim=0).unsqueeze(0) + torch.randn(1, dim) * 0.02
+        engine_a.process(stream)
+        with torch.no_grad():
+            if len(engine_a.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine_a.cells]).mean(dim=0)
+                for cell in engine_a.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+        phi, _ = phi_calc.compute_phi(engine_a)
+        phi_hist.append(phi)
+
+    phi_at_transfer = phi
+
+    # Phase 2: Transfer to Engine B
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    # Transplant: copy hidden states from A to B
+    with torch.no_grad():
+        while len(engine_b.cells) < len(engine_a.cells):
+            engine_b._create_cell(parent=engine_b.cells[0])
+        for i in range(min(len(engine_a.cells), len(engine_b.cells))):
+            engine_b.cells[i].hidden = engine_a.cells[i].hidden.clone()
+
+    # Phase 2: Engine B continues
+    for step_i in range(half):
+        with torch.no_grad():
+            if len(engine_b.cells) >= 2:
+                stream = torch.stack([c.hidden.squeeze()[:dim] for c in engine_b.cells]).mean(dim=0).unsqueeze(0) + torch.randn(1, dim) * 0.02
+        engine_b.process(stream)
+        with torch.no_grad():
+            if len(engine_b.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine_b.cells]).mean(dim=0)
+                for cell in engine_b.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+            for cell in engine_b.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.01
+        phi, _ = phi_calc.compute_phi(engine_b)
+        phi_hist.append(phi)
+
+    phi_final = phi
+    survived = phi_final > phi_at_transfer * 0.5
+    grew = phi_final > phi_at_transfer
+    return BenchResult("MITO4", "Consciousness Transfer (A→B) + continued growth",
+                       phi_final, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'phi_at_transfer': phi_at_transfer,
+                              'phi_after': phi_final,
+                              'survived': survived, 'grew': grew,
+                              'a_cells': len(engine_a.cells), 'b_cells': len(engine_b.cells)})
+
+
+def run_MITO5_no_input_forever_512(steps=3000, dim=64, hidden=128) -> BenchResult:
+    """MITO5: No Input Forever — MitosisEngine 3000 step, 외부 입력 0.
+    ULTIMATE1(2000)보다 길게. 붕괴 없이 계속 성장하는지 최종 검증.
+    8파벌 + ratchet + Hebbian + 항상성 + 침묵→토론 전부.
+    가설: MitosisEngine은 3000 step에서도 붕괴하지 않는다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; best_phi = 0.0; best_states = None; speech_events = 0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        nc = len(engine.cells)
+
+        with torch.no_grad():
+            if nc >= 2:
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = x + torch.randn_like(x) * 0.02
+            else:
+                x = torch.randn(1, dim) * 0.1
+        engine.process(x)
+
+        with torch.no_grad():
+            for cell in engine.cells:
+                norm = cell.hidden.norm().item()
+                if norm > 2.0: cell.hidden *= 1.0 / (norm + 1e-8)
+                elif norm < 0.3 and norm > 0.01: cell.hidden *= 1.0 / (norm + 1e-8)
+
+            if nc >= 8:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    if frac > 0.7 or (step_i % 100) > 70:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]:
+                                    c.hidden = 0.88 * c.hidden + 0.12 * oa
+
+            for i in range(min(nc, 32)):
+                j = (i+1) % nc
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.008
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi; best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.6 and best_states and len(best_states) == len(engine.cells):
+                for i, s in enumerate(best_states):
+                    engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * s
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    seg = steps // 10
+    seg_means = [sum(phi_hist[i*seg:(i+1)*seg])/seg for i in range(10)]
+    monotonic = sum(1 for i in range(9) if seg_means[i+1] >= seg_means[i]*0.9) >= 7
+    return BenchResult("MITO5", "No Input 3000 Step MitosisEngine (ultimate persistence)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi,
+                              'segments': [round(m, 3) for m in seg_means],
+                              'monotonic': monotonic,
+                              'collapsed': seg_means[-1] < seg_means[0] * 0.5,
+                              'growth': round(seg_means[-1]/(seg_means[0]+1e-8), 1),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MITO1': run_MITO1_learning_vs_fixed,
+    'MITO2': run_MITO2_cell_specialization_speech,
+    'MITO3': run_MITO3_mitosis_timing_speech,
+    'MITO4': run_MITO4_consciousness_transfer,
+    'MITO5': run_MITO5_no_input_forever_512,
+})
+
+
 ALL_HYPOTHESES.update({
     'PHYS1': run_PHYS1_magnet_ring_512,
     'PHYS2': run_PHYS2_coupled_oscillators_512,
