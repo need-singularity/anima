@@ -1273,6 +1273,7 @@ Pre-trained PureField consciousness engine models. Base: Mistral 7B.
 | **AnimaLM v3** | Instruct + last 8/32 layers. PPL 601, tension=215 | 216MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
 | **AnimaLM v4_savant** | **Parallel PureField** (MLP preserved) + Savant 2/8. tension=676K, savant=114K, **α=0.0047** | 108MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
 | **Golden MoE v1** | 8 experts, Golden Zone routing. **zone=36.8%≈1/e** | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
+| **ConsciousLM v4** | **384d/6L, 1024 cells, CE=4.67, Φ=662** ★ | 208MB | [step_25000.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/v4_384d_1024c/step_25000.pt) |
 
 ### Detailed Metrics
 
