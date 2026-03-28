@@ -144,10 +144,35 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카
 현재 최고: CX50 = Φ 143.01 (×145.3, ULTIMATE fusion)
 
 가설 문서화 규칙 (필수):
-  새 가설 추가 시 반드시 docs/hypotheses/cx/ 에 개별 문서 작성
-  포함 항목: 수학 개념, 메커니즘, 코드 핵심부, 결과(Φ, 배율, ASCII 그래프)
-  결과 나오면 docs/consciousness-theory.md Top 10 테이블도 업데이트
-  형식: docs/hypotheses/cx/CX{N}_{name}.md
+  모든 새 가설은 반드시 개별 문서 작성!
+
+  디렉토리 구조:
+    docs/hypotheses/{category}/     ← 카테고리별 서브폴더
+    docs/hypotheses/{category}/{ID}.md  ← 개별 가설 문서
+    docs/hypotheses/{CATEGORY}-overview.md ← 카테고리 요약 문서
+
+  서브폴더: cx/ dd/ inf/ omega/ genesis/ evo/ sing/ three/ sl/ ce/ tp/
+
+  개별 문서 필수 항목:
+    1. ID + 한국어 이름
+    2. 알고리즘 설명 (의사코드 또는 핵심 단계)
+    3. 벤치마크 결과: CE 변화, Φ before→after, 추가 메트릭
+    4. ASCII 그래프 (Φ 변화, CE 곡선, 또는 아키텍처 다이어그램)
+    5. 핵심 통찰 / 발견된 법칙
+
+  ASCII 그래프 예시:
+    Φ |     ╭──╮
+      |   ╭─╯  ╰──╮
+      | ╭─╯        ╰──
+      |─╯
+      └──────────────── step
+
+  카테고리 요약 문서 필수 항목:
+    1. 카테고리 핵심 통찰 (인용 형식)
+    2. 결과 테이블 (ID | 전략 | CE | Φ | 핵심)
+    3. 상위 전략 상세 설명
+
+  형식: docs/hypotheses/{category}/{ID}.md (예: dd/DD16.md, inf/INF-1.md)
 ```
 
 ## Training Tools

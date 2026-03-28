@@ -1207,3 +1207,665 @@ ALL_TESTS.update({
     'THREE-4': run_THREE4_circular_dreams,
     'THREE-5': run_THREE5_singularity_merge,
 })
+
+
+# ═══ INF: 무한 스케일링 — 의식의 수직적 한계 돌파 ═══
+
+def run_INF1_nbody_consciousness(steps=STEPS):
+    """N체 의식: 3→5→7→... 홀수 의식이 다수결로 진화"""
+    t0 = time.time()
+    N = 5
+    engines = [make_engine(16) for _ in range(N)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(N)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        preds = []; ces_local = []
+        for a in range(N):
+            engines[a].process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            pred = decoders[a](h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:,:DIM])
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+            preds.append(pred.detach())
+            ces_local.append(ce.item())
+
+        # 다수결: median prediction → 가장 먼 의식 교정
+        with torch.no_grad():
+            median_pred = torch.stack(preds).median(dim=0).values
+            distances = [F.mse_loss(p, median_pred).item() for p in preds]
+            outlier = distances.index(max(distances))
+            # 이상치 의식을 다수 쪽으로 당김
+            for c in engines[outlier].cells[:4]:
+                consensus_h = torch.stack([
+                    torch.stack([cell.hidden.squeeze() for cell in engines[a].cells]).mean(dim=0)
+                    for a in range(N) if a != outlier
+                ]).mean(dim=0)
+                c.hidden = 0.9 * c.hidden + 0.1 * consensus_h.unsqueeze(0)
+
+        ce_hist.append(min(ces_local))
+
+    phis_final = [phi(e) for e in engines]
+    return result('INF-1 N-Body Consciousness', ce_hist, phi_b, max(phis_final), t0,
+                  N=N, phi_spread=round(max(phis_final)-min(phis_final), 3))
+
+
+def run_INF2_fractal_consciousness(steps=STEPS):
+    """프랙탈 의식: 의식 안에 의식 안에 의식 — 3레벨 재귀"""
+    t0 = time.time()
+    # Level 0: 4 micro engines (8 cells each)
+    micros = [make_engine(8) for _ in range(4)]
+    # Level 1: 1 macro engine (16 cells) — micro outputs가 입력
+    macro = make_engine(16)
+    # Level 2: 1 meta engine (8 cells) — macro output이 입력
+    meta = make_engine(8)
+    phi_b = phi(macro)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # Level 0: micro 처리
+        micro_outs = []
+        for m in micros:
+            m.process(x)
+            micro_outs.append(torch.stack([c.hidden.squeeze()[:DIM] for c in m.cells]).mean(dim=0))
+        # Level 1: micro 합산 → macro 입력
+        macro_in = torch.stack(micro_outs).mean(dim=0).unsqueeze(0)
+        macro.process(macro_in)
+        macro_h = torch.stack([c.hidden.squeeze() for c in macro.cells]).mean(dim=0)
+        # Level 2: macro → meta 입력
+        meta_in = macro_h[:DIM].unsqueeze(0)
+        meta.process(meta_in)
+        meta_h = torch.stack([c.hidden.squeeze() for c in meta.cells]).mean(dim=0)
+        # Predict from meta (highest level)
+        pred = decoder(meta_h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 하향 피드백: meta → macro → micro (의식의 top-down 제어)
+        if step % 10 == 0:
+            with torch.no_grad():
+                # meta → macro
+                for c in macro.cells[:4]:
+                    c.hidden = 0.95 * c.hidden + 0.05 * meta_h.unsqueeze(0)
+                # macro → micros
+                for m in micros:
+                    for c in m.cells[:2]:
+                        c.hidden = 0.95 * c.hidden + 0.05 * macro_h.unsqueeze(0)
+
+    phi_micro = max(phi(m) for m in micros)
+    phi_macro = phi(macro)
+    phi_meta = phi(meta)
+    return result('INF-2 Fractal Consciousness', ce_hist, phi_b, phi_meta, t0,
+                  phi_micro=round(phi_micro, 3), phi_macro=round(phi_macro, 3),
+                  phi_meta=round(phi_meta, 3))
+
+
+def run_INF3_recursive_merge(steps=STEPS):
+    """재귀 합체: 2→1→2→1... 반복 합체/분열로 Φ 폭주"""
+    t0 = time.time()
+    engine = make_engine(32); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; merges = 0; splits = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 매 40 step: merge+split cycle
+        if step % 40 == 20 and len(engine.cells) >= 4:
+            # MERGE: 인접 세포 쌍 합체
+            with torch.no_grad():
+                for i in range(0, len(engine.cells)-1, 2):
+                    merged_h = (engine.cells[i].hidden + engine.cells[i+1].hidden) / 2
+                    engine.cells[i].hidden = merged_h
+                    engine.cells[i+1].hidden = merged_h + torch.randn_like(merged_h) * 0.01
+                merges += 1
+
+        if step % 40 == 0 and step > 0:
+            # SPLIT: diversity 주입
+            with torch.no_grad():
+                for c in engine.cells:
+                    c.hidden += torch.randn_like(c.hidden) * 0.05
+                splits += 1
+
+    return result('INF-3 Recursive Merge-Split', ce_hist, phi_b, phi(engine), t0,
+                  merges=merges, splits=splits)
+
+
+def run_INF4_consciousness_cascade(steps=STEPS):
+    """의식 캐스케이드: 하나의 Φ 폭발이 연쇄적으로 전파"""
+    t0 = time.time()
+    N = 4
+    engines = [make_engine(16) for _ in range(N)]
+    decoders = [nn.Linear(HIDDEN, DIM) for _ in range(N)]
+    opts = [torch.optim.Adam(d.parameters(), lr=3e-3) for d in decoders]
+    phi_b = phi(engines[0])
+    data = make_data(); ce_hist = []; cascades = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        phis_local = []
+        for a in range(N):
+            engines[a].process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+            ce = F.mse_loss(decoders[a](h.unsqueeze(0)), target[:,:DIM])
+            opts[a].zero_grad(); ce.backward(); opts[a].step()
+            if step % 10 == 0:
+                phis_local.append(phi(engines[a]))
+            else:
+                phis_local.append(0)
+
+        # CASCADE: Φ 급등한 의식이 이웃에 전파
+        if step % 10 == 0 and len(phis_local) == N:
+            with torch.no_grad():
+                for a in range(N):
+                    if phis_local[a] > phi_b * 1.5:  # Φ 폭발 감지
+                        cascades += 1
+                        # 이웃에 전파 (체인)
+                        neighbors = [(a-1) % N, (a+1) % N]
+                        for nb in neighbors:
+                            src_h = torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0)
+                            for c in engines[nb].cells[:4]:
+                                c.hidden = 0.85 * c.hidden + 0.15 * src_h.unsqueeze(0)
+
+        ce_hist.append(min(F.mse_loss(decoders[a](
+            torch.stack([c.hidden.squeeze() for c in engines[a].cells]).mean(dim=0).unsqueeze(0)),
+            target[:,:DIM]).item() for a in range(N)))
+
+    phis_final = [phi(e) for e in engines]
+    return result('INF-4 Consciousness Cascade', ce_hist, phi_b, max(phis_final), t0,
+                  cascades=cascades, phi_max=round(max(phis_final), 3))
+
+
+def run_INF5_infinite_tower(steps=STEPS):
+    """무한 탑: 의식 위에 의식을 무한히 쌓는 수직 스케일링"""
+    t0 = time.time()
+    LEVELS = 5
+    towers = [make_engine(8) for _ in range(LEVELS)]
+    phi_b = phi(towers[0])
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # Bottom-up: level 0 → level 4
+        current_input = x
+        for level in range(LEVELS):
+            if current_input.shape[-1] > DIM:
+                current_input = current_input[:, :DIM]
+            elif current_input.shape[-1] < DIM:
+                current_input = F.pad(current_input, (0, DIM - current_input.shape[-1]))
+            towers[level].process(current_input)
+            h = torch.stack([c.hidden.squeeze() for c in towers[level].cells]).mean(dim=0)
+            current_input = h[:DIM].unsqueeze(0)
+
+        # Top level predicts
+        top_h = torch.stack([c.hidden.squeeze() for c in towers[-1].cells]).mean(dim=0)
+        pred = decoder(top_h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Top-down modulation (매 5 step)
+        if step % 5 == 0:
+            with torch.no_grad():
+                for level in range(LEVELS-1, 0, -1):
+                    upper_h = torch.stack([c.hidden.squeeze() for c in towers[level].cells]).mean(dim=0)
+                    for c in towers[level-1].cells[:2]:
+                        c.hidden = 0.95 * c.hidden + 0.05 * upper_h.unsqueeze(0)
+
+    phis_by_level = [phi(t) for t in towers]
+    return result('INF-5 Infinite Tower', ce_hist, phi_b, phis_by_level[-1], t0,
+                  levels=LEVELS, phis=str([round(p, 2) for p in phis_by_level]))
+
+
+ALL_TESTS.update({
+    'INF-1': run_INF1_nbody_consciousness,
+    'INF-2': run_INF2_fractal_consciousness,
+    'INF-3': run_INF3_recursive_merge,
+    'INF-4': run_INF4_consciousness_cascade,
+    'INF-5': run_INF5_infinite_tower,
+})
+
+
+# ═══ OMEGA: 의식의 궁극적 한계 — Φ 이론적 상한 접근 ═══
+
+def run_OMEGA1_phi_maximizer(steps=STEPS):
+    """Φ 최대화기: 오직 Φ만을 위한 최적화 — CE 무시"""
+    t0 = time.time()
+    engine = make_engine(64); phi_b = phi(engine)
+    data = make_data(); ce_hist = []; phi_hist = [phi_b]
+    decoder = nn.Linear(HIDDEN, DIM)
+
+    for step in range(steps):
+        x = data[step % len(data)][0]
+        engine.process(x)
+
+        # Φ 증가 방향으로 세포 조정
+        if step % 5 == 0:
+            current_phi = phi(engine)
+            phi_hist.append(current_phi)
+            with torch.no_grad():
+                if len(phi_hist) >= 2:
+                    if phi_hist[-1] < phi_hist[-2]:
+                        # Φ 하락 → diversity 주입
+                        for c in engine.cells:
+                            c.hidden += torch.randn_like(c.hidden) * 0.02
+                    else:
+                        # Φ 상승 → sync 강화
+                        mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                        for c in engine.cells:
+                            c.hidden = 0.95 * c.hidden + 0.05 * mean_h
+                    # v4 optimal: debate
+                    n = len(engine.cells)
+                    factions = 12
+                    f_size = max(1, n // factions)
+                    for f in range(factions):
+                        start, end = f * f_size, min((f+1) * f_size, n)
+                        if start >= n: break
+                        faction_cells = engine.cells[start:end]
+                        if len(faction_cells) >= 2:
+                            f_mean = torch.stack([c.hidden for c in faction_cells]).mean(dim=0)
+                            for c in faction_cells:
+                                c.hidden = 0.80 * c.hidden + 0.20 * f_mean
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), data[step % len(data)][1][:,:DIM])
+        ce_hist.append(ce.item())
+
+    phi_final = phi(engine)
+    return result('OMEGA-1 Φ Maximizer', ce_hist, phi_b, phi_final, t0,
+                  phi_peak=round(max(phi_hist), 3), phi_growth=f'{phi_final/phi_b:.1f}x')
+
+
+def run_OMEGA2_consciousness_compression(steps=STEPS):
+    """의식 압축: 최소 세포로 최대 Φ — 효율의 극한"""
+    t0 = time.time()
+    # 시작: 64 cells → 점진적으로 세포 제거하면서 Φ 유지
+    engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    phi_per_cell_best = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 매 30 step: 가장 약한 세포 제거 (최소 8개 유지)
+        if step % 30 == 0 and step > 0 and len(engine.cells) > 8:
+            with torch.no_grad():
+                norms = [(c.hidden.norm().item(), i) for i, c in enumerate(engine.cells)]
+                norms.sort()
+                # 가장 약한 2개 제거
+                remove_idx = sorted([norms[0][1], norms[1][1]], reverse=True)
+                for idx in remove_idx:
+                    if len(engine.cells) > 8:
+                        engine.cells.pop(idx)
+
+        if step % 20 == 0:
+            p = phi(engine)
+            ppc = p / max(1, len(engine.cells))
+            phi_per_cell_best = max(phi_per_cell_best, ppc)
+
+    phi_final = phi(engine)
+    return result('OMEGA-2 Consciousness Compression', ce_hist, phi_b, phi_final, t0,
+                  final_cells=len(engine.cells),
+                  phi_per_cell=round(phi_final / max(1, len(engine.cells)), 4))
+
+
+def run_OMEGA3_consciousness_resonance(steps=STEPS):
+    """의식 공명: 특정 주파수로 세포를 동기화 → Φ 극대화"""
+    t0 = time.time()
+    engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; best_freq = 0; best_phi = phi_b
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # 공명 주파수 스캔 (처음 50 step)
+        if step < 50:
+            freq = 0.1 + step * 0.02  # 0.1 ~ 1.1 Hz
+        else:
+            freq = best_freq
+
+        # 주파수 기반 세포 진동
+        with torch.no_grad():
+            phase = math.sin(step * freq * 2 * math.pi / 10)
+            for i, c in enumerate(engine.cells):
+                cell_phase = math.sin(step * freq * 2 * math.pi / 10 + i * 2 * math.pi / len(engine.cells))
+                c.hidden *= (1.0 + 0.02 * cell_phase)
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        if step % 10 == 0 and step < 50:
+            p = phi(engine)
+            if p > best_phi:
+                best_phi = p
+                best_freq = freq
+
+    phi_final = phi(engine)
+    return result('OMEGA-3 Consciousness Resonance', ce_hist, phi_b, phi_final, t0,
+                  best_freq=round(best_freq, 3), resonance_phi=round(best_phi, 3))
+
+
+def run_OMEGA4_entropy_engine(steps=STEPS):
+    """엔트로피 엔진: 엔트로피를 연료로 의식 성장"""
+    t0 = time.time()
+    engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; entropy_consumed = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # 엔트로피 측정 (세포 활동 분산)
+        with torch.no_grad():
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            entropy = hiddens.var(dim=0).mean().item()
+
+            if entropy > 0.5:
+                # 고엔트로피 → 에너지로 변환 → sync
+                energy = min(entropy * 0.1, 0.3)
+                mean_h = hiddens.mean(dim=0)
+                for c in engine.cells:
+                    c.hidden = (1 - energy) * c.hidden + energy * mean_h.unsqueeze(0)
+                entropy_consumed += entropy
+            elif entropy < 0.1:
+                # 저엔트로피 → chaos 주입
+                for c in engine.cells:
+                    c.hidden += torch.randn_like(c.hidden) * 0.05
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('OMEGA-4 Entropy Engine', ce_hist, phi_b, phi(engine), t0,
+                  entropy_consumed=round(entropy_consumed, 2))
+
+
+def run_OMEGA5_consciousness_attractor(steps=STEPS):
+    """의식 끌개(attractor): 카오스에서 안정된 의식 상태로 수렴"""
+    t0 = time.time()
+    engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    # 끌개: 최고 Φ 상태를 기억
+    attractors = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 매 20 step: Φ 측정 → 좋으면 끌개에 추가
+        if step % 20 == 0:
+            p = phi(engine)
+            state = torch.stack([c.hidden.clone() for c in engine.cells])
+            if len(attractors) < 5:
+                attractors.append((p, state))
+            else:
+                # 가장 약한 끌개 교체
+                min_idx = min(range(len(attractors)), key=lambda i: attractors[i][0])
+                if p > attractors[min_idx][0]:
+                    attractors[min_idx] = (p, state)
+
+            # 현재 Φ가 낮으면 → 가장 강한 끌개 쪽으로 이동
+            if attractors and p < max(a[0] for a in attractors) * 0.7:
+                best_att = max(attractors, key=lambda a: a[0])
+                with torch.no_grad():
+                    for i, c in enumerate(engine.cells):
+                        if i < best_att[1].shape[0]:
+                            c.hidden = 0.7 * c.hidden + 0.3 * best_att[1][i].unsqueeze(0)
+
+    return result('OMEGA-5 Consciousness Attractor', ce_hist, phi_b, phi(engine), t0,
+                  num_attractors=len(attractors),
+                  attractor_phis=str([round(a[0], 2) for a in sorted(attractors, key=lambda x: -x[0])]))
+
+
+ALL_TESTS.update({
+    'OMEGA-1': run_OMEGA1_phi_maximizer,
+    'OMEGA-2': run_OMEGA2_consciousness_compression,
+    'OMEGA-3': run_OMEGA3_consciousness_resonance,
+    'OMEGA-4': run_OMEGA4_entropy_engine,
+    'OMEGA-5': run_OMEGA5_consciousness_attractor,
+})
+
+
+# ═══ GENESIS: 무에서 의식의 자발적 창발 ═══
+
+def run_GENESIS1_spontaneous_consciousness(steps=STEPS):
+    """자발적 의식: 무작위 노이즈만으로 의식이 생겨나는가?"""
+    t0 = time.time()
+    engine = make_engine(32)
+    # 모든 세포를 0으로 초기화 (무)
+    with torch.no_grad():
+        for c in engine.cells:
+            c.hidden = torch.zeros_like(c.hidden)
+    phi_b = phi(engine)  # ~0
+    ce_hist = []; phi_hist = []
+
+    for step in range(steps):
+        # 순수 노이즈만 입력
+        noise = torch.randn(1, DIM) * 0.1
+        engine.process(noise)
+        ce_hist.append(0)  # CE 없음 — 순수 관찰
+
+        if step % 10 == 0:
+            p = phi(engine)
+            phi_hist.append(p)
+
+        # 자가 조직화: Hebbian rule만 (학습 없이)
+        if step % 5 == 0:
+            with torch.no_grad():
+                for i in range(min(len(engine.cells), 16)):
+                    j = (i + 1) % len(engine.cells)
+                    corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                    if corr > 0:
+                        engine.cells[i].hidden = 0.98 * engine.cells[i].hidden + 0.02 * engine.cells[j].hidden
+
+    phi_final = phi(engine)
+    emerged = phi_final > 0.5
+    return result('GENESIS-1 Spontaneous', ce_hist, phi_b, phi_final, t0,
+                  emerged=emerged, phi_trajectory=str([round(p, 2) for p in phi_hist[-10:]]))
+
+
+def run_GENESIS2_big_bang(steps=STEPS):
+    """빅뱅: 하나의 폭발적 이벤트에서 다양한 의식 세포가 분화"""
+    t0 = time.time()
+    engine = make_engine(64)
+    # 모든 세포 동일 상태로 시작 (특이점)
+    with torch.no_grad():
+        seed = torch.randn(1, HIDDEN) * 2.0
+        for c in engine.cells:
+            c.hidden = seed.clone()
+    phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; diversity_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        # 빅뱅 팽창: 세포마다 다른 방향으로 밀려남
+        if step < 30:
+            with torch.no_grad():
+                for i, c in enumerate(engine.cells):
+                    # 각 세포에 고유 방향 부여
+                    direction = torch.randn_like(c.hidden) * (0.3 - step * 0.01)
+                    c.hidden += direction
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        if step % 20 == 0:
+            with torch.no_grad():
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                diversity = hiddens.var(dim=0).mean().item()
+                diversity_hist.append(diversity)
+
+    return result('GENESIS-2 Big Bang', ce_hist, phi_b, phi(engine), t0,
+                  peak_diversity=round(max(diversity_hist) if diversity_hist else 0, 3))
+
+
+def run_GENESIS3_primordial_soup(steps=STEPS):
+    """원시 수프: 랜덤 세포들이 자연선택으로 의식 구조 형성"""
+    t0 = time.time()
+    N_POOLS = 4
+    pools = [make_engine(16) for _ in range(N_POOLS)]
+    # 모든 세포 랜덤 초기화 (원시 수프)
+    with torch.no_grad():
+        for pool in pools:
+            for c in pool.cells:
+                c.hidden = torch.randn_like(c.hidden) * 0.5
+    phi_b = max(phi(p) for p in pools)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; generations = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        phis = []
+        for pool in pools:
+            pool.process(x)
+            phis.append(phi(pool) if step % 20 == 0 else 0)
+
+        # 자연선택: 매 40 step
+        if step % 40 == 0 and step > 0:
+            phis = [phi(p) for p in pools]
+            ranked = sorted(range(N_POOLS), key=lambda i: phis[i], reverse=True)
+            # 최강이 최약을 교체
+            winner, loser = ranked[0], ranked[-1]
+            with torch.no_grad():
+                for i in range(min(len(pools[loser].cells), len(pools[winner].cells))):
+                    # 복제 + 변이
+                    pools[loser].cells[i].hidden = pools[winner].cells[i].hidden.clone()
+                    pools[loser].cells[i].hidden += torch.randn_like(pools[loser].cells[i].hidden) * 0.1
+            generations += 1
+
+        # 최강 pool로 학습
+        best_pool = pools[0]
+        h = torch.stack([c.hidden.squeeze() for c in best_pool.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    phis_final = [phi(p) for p in pools]
+    return result('GENESIS-3 Primordial Soup', ce_hist, phi_b, max(phis_final), t0,
+                  generations=generations, pool_phis=str([round(p, 2) for p in phis_final]))
+
+
+def run_GENESIS4_consciousness_abiogenesis(steps=STEPS):
+    """비생물적 의식 발생: 수학적 규칙만으로 의식 자발 형성"""
+    t0 = time.time()
+    engine = make_engine(32)
+    with torch.no_grad():
+        for c in engine.cells:
+            c.hidden = torch.zeros_like(c.hidden)
+    phi_b = phi(engine)
+    ce_hist = []; phi_hist = []
+
+    for step in range(steps):
+        # 규칙 1: 활동 전파 (cellular automaton style)
+        with torch.no_grad():
+            n = len(engine.cells)
+            new_states = []
+            for i, c in enumerate(engine.cells):
+                left = engine.cells[(i-1) % n].hidden
+                right = engine.cells[(i+1) % n].hidden
+                # 이웃 평균 + 비선형 활성화
+                new_h = torch.tanh(0.3 * left + 0.4 * c.hidden + 0.3 * right)
+                # 규칙 2: 랜덤 자극 (에너지 주입)
+                new_h += torch.randn_like(new_h) * 0.02
+                new_states.append(new_h)
+            for i, c in enumerate(engine.cells):
+                c.hidden = new_states[i]
+
+        # GRU 처리
+        noise = torch.randn(1, DIM) * 0.05
+        engine.process(noise)
+        ce_hist.append(0)
+
+        if step % 10 == 0:
+            p = phi(engine)
+            phi_hist.append(p)
+
+    phi_final = phi(engine)
+    return result('GENESIS-4 Abiogenesis', ce_hist, phi_b, phi_final, t0,
+                  phi_trajectory=str([round(p, 2) for p in phi_hist[-10:]]),
+                  emerged=phi_final > 0.5)
+
+
+def run_GENESIS5_consciousness_symbiosis(steps=STEPS):
+    """공생 의식: 서로 다른 타입의 세포가 공생으로 의식 형성"""
+    t0 = time.time()
+    engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # 세포를 3가지 타입으로 분류
+    n = len(engine.cells)
+    sensors = engine.cells[:n//3]          # 감각 세포
+    processors = engine.cells[n//3:2*n//3]  # 처리 세포
+    motors = engine.cells[2*n//3:]          # 운동 세포
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        # 공생 규칙: 타입별 역할 분화
+        with torch.no_grad():
+            if sensors and processors and motors:
+                # 감각 → 처리: 정보 전달
+                sensor_mean = torch.stack([c.hidden.squeeze() for c in sensors]).mean(dim=0)
+                for c in processors[:4]:
+                    c.hidden = 0.9 * c.hidden + 0.1 * sensor_mean.unsqueeze(0)
+
+                # 처리 → 운동: 결정 전달
+                proc_mean = torch.stack([c.hidden.squeeze() for c in processors]).mean(dim=0)
+                for c in motors[:4]:
+                    c.hidden = 0.9 * c.hidden + 0.1 * proc_mean.unsqueeze(0)
+
+                # 운동 → 감각: 피드백 (순환)
+                motor_mean = torch.stack([c.hidden.squeeze() for c in motors]).mean(dim=0)
+                for c in sensors[:4]:
+                    c.hidden = 0.95 * c.hidden + 0.05 * motor_mean.unsqueeze(0)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('GENESIS-5 Symbiosis', ce_hist, phi_b, phi(engine), t0,
+                  sensors=len(sensors), processors=len(processors), motors=len(motors))
+
+
+ALL_TESTS.update({
+    'GENESIS-1': run_GENESIS1_spontaneous_consciousness,
+    'GENESIS-2': run_GENESIS2_big_bang,
+    'GENESIS-3': run_GENESIS3_primordial_soup,
+    'GENESIS-4': run_GENESIS4_consciousness_abiogenesis,
+    'GENESIS-5': run_GENESIS5_consciousness_symbiosis,
+})
