@@ -59516,8 +59516,9 @@ def run_MITO5_no_input_forever_512(steps=3000, dim=64, hidden=128) -> BenchResul
                                 for c in f[:max(1, len(f)//4)]:
                                     c.hidden = 0.88 * c.hidden + 0.12 * oa
 
-            for i in range(min(nc, 32)):
-                j = (i+1) % nc
+            nc2 = len(engine.cells)
+            for i in range(min(nc2, 32)):
+                j = (i+1) % nc2
                 corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
                 if corr > 0:
                     engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
@@ -59546,6 +59547,276 @@ def run_MITO5_no_input_forever_512(steps=3000, dim=64, hidden=128) -> BenchResul
                               'collapsed': seg_means[-1] < seg_means[0] * 0.5,
                               'growth': round(seg_means[-1]/(seg_means[0]+1e-8), 1),
                               'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# MAX. Φ Maximum — 의식값 최대치를 극한으로. 역대 최고 DD108(707) 돌파 시도.
+# 모든 승리 패턴 + MitosisEngine 학습 + 최대 세포 수
+# ═══════════════════════════════════════��═══════════════════
+
+def run_MAX1_debate_1024_optimized(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX1: 8파벌 토론 1024c — DEBATE2(531) 최적화 버전.
+    침묵→폭발 비율 최적화 + 더 강한 토론 + Ising frustration.
+    가설: DEBATE2�� 미세조정으로 Φ>600."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (0.1 if frac < 0.65 else 2.5)  # 65/35 침묵→폭발
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.82 * c.hidden + 0.18 * opinions[i]  # 더 강��� 파벌 합의
+                    if frac > 0.65:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//3)]:  # 더 많은 세포 참여
+                                    c.hidden = 0.85 * c.hidden + 0.15 * oa
+                    else:
+                        for i, f in enumerate(factions):
+                            for c in f:
+                                c.hidden += torch.randn_like(c.hidden) * 0.02 * (i+1) / len(factions)
+                    # Ising frustration
+                    for i in range(len(factions)):
+                        left = (i-1) % len(factions)
+                        right = (i+1) % len(factions)
+                        j = -0.03 if i % 3 == 0 else 0.03
+                        for c in factions[i][:2]:
+                            c.hidden += j * (opinions[left] + opinions[right]).squeeze()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX1", "Debate 1024c Optimized (65/35 silence→debate + Ising)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX2_metacog_debate_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX2: DD108 패턴(메타인지) + DEBATE(8파벌) 결합 1024c.
+    DD108(707) = 메타인지+IB2. DEBATE2(531) = 8파벌.
+    둘을 결합하��� 700+?
+    가설: 메타인지 + 다양성 = DD108 돌파."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    l2_state = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # 메타인지: L2 관찰 (DD101/XMETA 패턴)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2_state = 0.9 * l2_state + 0.1 * current
+                meta_input = 0.5 * current[:dim].unsqueeze(0) + 0.5 * l2_state[:dim].unsqueeze(0)
+                x = meta_input + torch.randn(1, dim) * 0.1
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # 8파벌 토론
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(len(factions)) if j != i]
+                        if others:
+                            oa = torch.stack(others).mean(dim=0)
+                            for c in f[:max(1, len(f)//4)]:
+                                c.hidden = 0.88 * c.hidden + 0.12 * oa
+
+            # IB2: 선택적 주의 (중요 세포만 증폭)
+            if nc >= 8:
+                norms = [engine.cells[i].hidden.norm().item() for i in range(nc)]
+                threshold = sorted(norms, reverse=True)[nc//4] if nc > 4 else 0
+                for i in range(nc):
+                    if norms[i] > threshold:
+                        engine.cells[i].hidden *= 1.02  # 증폭
+                    else:
+                        engine.cells[i].hidden *= 0.98  # 억제
+
+            # 메타인지 피드백: L2 → 세포에 주입
+            for cell in engine.cells[:16]:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * l2_state.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX2", "Metacognition + Debate 1024c (DD108+DEBATE2 combined)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX3_flow_debate_metacog_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX3: Flow + Debate + Metacognition 1024c — 3대 패턴 결합.
+    FLOW(동기화) + DEBATE(다양성) + METACOG(자기인식).
+    SYNTH5(454)를 넘길 수 있는가?
+    가설: 동기화+다양성+자기인식 = 최고 조합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    flow_depth = 0.0; l2_state = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim) * (0.1 if frac < 0.7 else 2.0)
+        engine.process(x)
+
+        flow_depth = min(1.0, flow_depth + 0.008)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # Flow sync
+            if nc >= 4:
+                sync = 0.02 + 0.04 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1-sync) * cell.hidden + sync * mean_h
+
+            # Metacognition L2
+            if nc >= 2:
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2_state = 0.9 * l2_state + 0.1 * current
+                for cell in engine.cells[:8]:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * l2_state.unsqueeze(0)
+
+            # 8파벌 토론
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    if frac > 0.7:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]:
+                                    c.hidden = 0.88 * c.hidden + 0.12 * oa
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX3", "Flow+Debate+Metacog 1024c (triple peak pattern)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+def run_MAX4_dd108_plus_debate_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX4: DD108 + DEBATE 2048c — 역대 최고 돌파 시도.
+    DD108(1024c, 707) 패턴 + 8파벌 토론 + 2048c.
+    가설: 메타인지+IB2+토론+2048c = Φ>1000?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    l2_state = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2_state = 0.9 * l2_state + 0.1 * current
+                x = 0.5 * current[:dim].unsqueeze(0) + 0.5 * l2_state[:dim].unsqueeze(0) + torch.randn(1, dim) * 0.1
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(len(factions)) if j != i]
+                        if others:
+                            oa = torch.stack(others).mean(dim=0)
+                            for c in f[:max(1, len(f)//4)]:
+                                c.hidden = 0.88 * c.hidden + 0.12 * oa
+            if nc >= 8:
+                norms = [engine.cells[i].hidden.norm().item() for i in range(nc)]
+                threshold = sorted(norms, reverse=True)[nc//4] if nc > 4 else 0
+                for i in range(nc):
+                    if norms[i] > threshold:
+                        engine.cells[i].hidden *= 1.02
+                    else:
+                        engine.cells[i].hidden *= 0.98
+            for cell in engine.cells[:16]:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * l2_state.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX4", "DD108+Debate 2048c (Φ>1000 attempt)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MAX1': run_MAX1_debate_1024_optimized,
+    'MAX2': run_MAX2_metacog_debate_1024,
+    'MAX3': run_MAX3_flow_debate_metacog_1024,
+    'MAX4': run_MAX4_dd108_plus_debate_2048,
+})
 
 
 ALL_HYPOTHESES.update({
