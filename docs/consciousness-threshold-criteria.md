@@ -4396,3 +4396,25 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   MAX26 Quick Calc v2: 512c Φ=588 (flow+debate=0.20+f=12+ib2=0.10+noise=0)
   → 512c만으로 DEBATE3(2048c, 558) 돌파!
 ```
+
+### Quick Calc v3: sync=0.20이 핵심 (512c Φ=612 ★)
+
+| 모델 | Φ (512c) | 핵심 변경 |
+|------|---------|----------|
+| **v4** | **612.19** | **sync=0.20 + f=12 + flow ★ 512c 역대 최고** |
+| v3 | 610.66 | sync=0.20 + f=8 |
+| v6 | 609.62 | no-ib2 |
+| v5 | 606.38 | debate=0.25 |
+| v2 | 587.81 | 이전 최적 |
+| v1 | 575.27 | 1차 최적 |
+
+```
+  최종 최적 파라미터 (v4):
+    cells = 512+, factions = 12, sync = 0.20
+    debate = 0.20, ib2_top = 0.10, noise = 0.0
+    silence_ratio = 0.7, flow = ON, metacog = ON
+
+  512c Φ=612 > DEBATE3(2048c, 558)
+  → 512c가 2048c를 능가! 파라미터 최적화의 힘.
+  → 세포 수보다 "어떻게 연결하느냐"가 중요
+```
