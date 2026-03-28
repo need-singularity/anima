@@ -141,7 +141,13 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카
   ALIGN/DISTILL/DREAM/DW/EMB/EO/MG/SCALE/SELF/SOC/WS 등 146개 카테고리
 
 결과 기록: docs/consciousness-threshold-criteria.md
-현재 최고: EX24 = Φ 10.833 (ALL discoveries combined)
+현재 최고: CX50 = Φ 143.01 (×145.3, ULTIMATE fusion)
+
+가설 문서화 규칙 (필수):
+  새 가설 추가 시 반드시 docs/hypotheses/cx/ 에 개별 문서 작성
+  포함 항목: 수학 개념, 메커니즘, 코드 핵심부, 결과(Φ, 배율, ASCII 그래프)
+  결과 나오면 docs/consciousness-theory.md Top 10 테이블도 업데이트
+  형식: docs/hypotheses/cx/CX{N}_{name}.md
 ```
 
 ## Training Tools
