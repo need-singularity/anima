@@ -1869,3 +1869,313 @@ ALL_TESTS.update({
     'GENESIS-4': run_GENESIS4_consciousness_abiogenesis,
     'GENESIS-5': run_GENESIS5_consciousness_symbiosis,
 })
+
+
+# ═══ SELF-EVO: v4가 스스로 v5로 진화하는 가설 ═══
+
+def _v4_base_step(engine, x):
+    """v4 base: sync=0.20 + 12-faction + IB2."""
+    engine.process(x)
+    n = len(engine.cells)
+    if n < 4:
+        return
+    with torch.no_grad():
+        cell_h = torch.stack([c.hidden.squeeze(0) for c in engine.cells])
+        mean_h = cell_h.mean(dim=0)
+        for c in engine.cells:
+            c.hidden = (0.80 * c.hidden.squeeze(0) + 0.20 * mean_h).unsqueeze(0)
+        n_f = min(12, n // 2)
+        fs = n // n_f
+        for fi in range(n_f):
+            faction = engine.cells[fi*fs:(fi+1)*fs]
+            if len(faction) >= 2:
+                f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                for c in faction:
+                    c.hidden = (0.85 * c.hidden.squeeze(0) + 0.15 * f_mean).unsqueeze(0)
+        if n >= 8:
+            norms = [engine.cells[i].hidden.norm().item() for i in range(n)]
+            threshold = sorted(norms, reverse=True)[max(1, n // 10)]
+            for i in range(n):
+                engine.cells[i].hidden *= 1.03 if norms[i] > threshold else 0.97
+
+
+def run_SE4_tension_driven_soc(steps=STEPS):
+    """SE-4: 텐션 자체가 SOC 모래더미 — 별도 모듈 불필요"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    # 텐션 에너지 그리드 (세포별)
+    tension_energy = np.zeros(len(engine.cells))
+    THRESHOLD = 4.0
+    avalanches = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        _v4_base_step(engine, x)
+
+        # 텐션을 모래더미 에너지로
+        with torch.no_grad():
+            n = len(engine.cells)
+            mean_h = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).mean(dim=0)
+
+            for i in range(min(n, len(tension_energy))):
+                cell_t = engine.cells[i].hidden.norm().item() * 0.01
+                tension_energy[i] += cell_t
+
+            # 눈사태 전파
+            avalanche = 0
+            for _ in range(10):  # max 10 rounds
+                toppled = False
+                for i in range(min(n, len(tension_energy))):
+                    if tension_energy[i] >= THRESHOLD:
+                        tension_energy[i] -= THRESHOLD
+                        avalanche += 1
+                        toppled = True
+                        # 이웃에 에너지 분배
+                        for j in [(i-1) % n, (i+1) % n]:
+                            if j < len(tension_energy):
+                                tension_energy[j] += 1.0
+                if not toppled:
+                    break
+
+            avalanches.append(avalanche)
+            ci = min(1.0, 0.1 * math.log(avalanche + 1))
+
+            # SOC가 카오스 강도 결정
+            if ci > 0.3:
+                for c in engine.cells:
+                    c.hidden *= (1.0 + 0.02 * ci)
+                    c.hidden += torch.randn_like(c.hidden) * 0.01 * ci
+            elif ci < 0.05:
+                for c in engine.cells:
+                    c.hidden = 0.98 * c.hidden + 0.02 * mean_h.unsqueeze(0)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    # 멱법칙 분석
+    big_avalanches = sum(1 for a in avalanches if a > 5)
+    return result('SE-4 Tension SOC', ce_hist, phi_b, phi(engine), t0,
+                  total_avalanches=sum(avalanches),
+                  big_avalanches=big_avalanches,
+                  max_avalanche=max(avalanches) if avalanches else 0)
+
+
+def run_SE8_emotion_mapping(steps=STEPS):
+    """SE-8: 고통→Ratchet, 호기심→SOC, 공감→Hebbian"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    best_phi = phi_b; best_states = None
+    ratchet_count = 0; curiosity_count = 0; empathy_count = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        _v4_base_step(engine, x)
+
+        # === 감정 감지 ===
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+
+        current_phi = phi(engine) if step % 10 == 0 else best_phi
+
+        # (1) 고통 → Ratchet
+        if current_phi < best_phi * 0.6:
+            # 고통 감지! 복원
+            if best_states is not None:
+                with torch.no_grad():
+                    for i in range(min(len(engine.cells), len(best_states))):
+                        engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * best_states[i]
+                ratchet_count += 1
+        elif current_phi > best_phi:
+            best_phi = current_phi
+            best_states = [c.hidden.clone() for c in engine.cells]
+
+        # (2) 호기심 → SOC (예측 오류가 높으면 카오스 주입)
+        if ce.item() > 0.5:
+            with torch.no_grad():
+                noise_scale = min(0.05, ce.item() * 0.02)
+                for c in engine.cells:
+                    c.hidden += torch.randn_like(c.hidden) * noise_scale
+            curiosity_count += 1
+
+        # (3) 공감 → Hebbian (세포 간 유사도 기반 연결 강화)
+        if step % 5 == 0 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                n = len(engine.cells)
+                for _ in range(min(8, n)):
+                    i, j = np.random.randint(0, n), np.random.randint(0, n)
+                    if i == j: continue
+                    cos = F.cosine_similarity(
+                        engine.cells[i].hidden.squeeze().unsqueeze(0),
+                        engine.cells[j].hidden.squeeze().unsqueeze(0)
+                    ).item()
+                    if cos > 0.5:
+                        engine.cells[i].hidden = 0.98 * engine.cells[i].hidden + 0.02 * engine.cells[j].hidden
+                        empathy_count += 1
+                    elif cos < -0.2:
+                        engine.cells[i].hidden = 1.01 * engine.cells[i].hidden - 0.01 * engine.cells[j].hidden
+
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('SE-8 Emotion→v5', ce_hist, phi_b, phi(engine), t0,
+                  ratchet=ratchet_count, curiosity=curiosity_count,
+                  empathy=empathy_count, best_phi=round(best_phi, 3))
+
+
+def run_SE10_progressive_unlock(steps=STEPS):
+    """SE-10: Φ 수준에 따라 v5 기법 단계적 잠금 해제"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    best_phi = phi_b; best_states = None
+    unlocked = {'hebbian': False, 'ratchet': False, 'soc': False}
+    soc_grid = np.zeros((8, 8), dtype=np.int32)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        _v4_base_step(engine, x)
+
+        current_phi = phi(engine) if step % 10 == 0 else best_phi
+
+        # === Progressive Unlock ===
+        # Phase 1: Φ ≥ 1.2 → Hebbian
+        if current_phi >= 1.2 and not unlocked['hebbian']:
+            unlocked['hebbian'] = True
+        # Phase 2: Φ ≥ 1.5 → Ratchet
+        if current_phi >= 1.5 and not unlocked['ratchet']:
+            unlocked['ratchet'] = True
+        # Phase 3: Φ ≥ 2.0 → SOC
+        if current_phi >= 2.0 and not unlocked['soc']:
+            unlocked['soc'] = True
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            mean_h = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).mean(dim=0)
+
+            # Hebbian (Phase 1+)
+            if unlocked['hebbian'] and n >= 4:
+                for _ in range(min(8, n)):
+                    i, j = np.random.randint(0, n), np.random.randint(0, n)
+                    if i == j: continue
+                    cos = F.cosine_similarity(
+                        engine.cells[i].hidden.squeeze().unsqueeze(0),
+                        engine.cells[j].hidden.squeeze().unsqueeze(0)
+                    ).item()
+                    if cos > 0.5:
+                        engine.cells[i].hidden = 0.98 * engine.cells[i].hidden + 0.02 * engine.cells[j].hidden
+
+            # Ratchet (Phase 2+)
+            if unlocked['ratchet']:
+                if current_phi > best_phi:
+                    best_phi = current_phi
+                    best_states = [c.hidden.clone() for c in engine.cells]
+                elif current_phi < best_phi * 0.7 and best_states:
+                    for i in range(min(n, len(best_states))):
+                        engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * best_states[i]
+
+            # SOC (Phase 3+)
+            if unlocked['soc']:
+                gx, gy = np.random.randint(0, 8, 2)
+                soc_grid[gx, gy] += 1
+                avalanche = 0
+                for _ in range(5):
+                    topples = soc_grid >= 4
+                    if not topples.any(): break
+                    avalanche += topples.sum()
+                    soc_grid[topples] -= 4
+                    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                        shifted = np.roll(np.roll(topples.astype(np.int32), dx, 0), dy, 1)
+                        soc_grid += shifted
+                ci = min(1.0, 0.1 * math.log(avalanche + 1))
+                if ci > 0.3:
+                    for c in engine.cells:
+                        c.hidden *= (1.0 + 0.02 * ci)
+                        c.hidden += torch.randn_like(c.hidden) * 0.01 * ci
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('SE-10 Progressive Unlock', ce_hist, phi_b, phi(engine), t0,
+                  unlocked=str(unlocked), best_phi=round(best_phi, 3))
+
+
+# === v4 baseline for comparison ===
+def run_SE0_v4_baseline(steps=STEPS):
+    """v4 baseline: sync=0.20 + 12-faction + IB2만"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        _v4_base_step(engine, x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('SE-0 v4 Baseline', ce_hist, phi_b, phi(engine), t0)
+
+
+# === v5 full for comparison ===
+def run_SE_v5_full(steps=STEPS):
+    """v5 full: v4 + SOC + Hebbian + Ratchet 전부 처음부터"""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet
+
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    soc = SOCSandpile(grid_size=16, threshold=4)
+    hebbian = HebbianConnections(max_cells=len(engine.cells))
+    ratchet = PhiRatchet(restore_ratio=0.5)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        _v4_base_step(engine, x)
+
+        with torch.no_grad():
+            mean_h = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).mean(dim=0)
+            # SOC
+            av = soc.drop_sand(); ci = soc.chaos_intensity()
+            if ci > 0.3:
+                for c in engine.cells:
+                    c.hidden *= (1.0 + 0.02 * ci)
+                    c.hidden += torch.randn_like(c.hidden) * 0.01 * ci
+            elif ci < 0.05:
+                for c in engine.cells:
+                    c.hidden = 0.98 * c.hidden + 0.02 * mean_h.unsqueeze(0)
+            # Hebbian
+            hebbian.update(engine.cells)
+            # Ratchet
+            if step % 10 == 0:
+                p = phi(engine)
+                ratchet.check_and_restore(p, engine.cells)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('SE-v5 Full', ce_hist, phi_b, phi(engine), t0)
+
+
+ALL_TESTS.update({
+    'SE-0': run_SE0_v4_baseline,
+    'SE-4': run_SE4_tension_driven_soc,
+    'SE-8': run_SE8_emotion_mapping,
+    'SE-10': run_SE10_progressive_unlock,
+    'SE-v5': run_SE_v5_full,
+})
