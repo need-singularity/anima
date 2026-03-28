@@ -403,9 +403,17 @@ class ConsciousMind(nn.Module):
         if mitosis_engine is None or len(mitosis_engine.cells) < 2:
             return
 
+        def _log(tag, msg):
+            print(f"  [{tag}] {msg}")
+
         pb = self._phi_boost
         n = len(mitosis_engine.cells)
         h_dim = mitosis_engine.hidden_dim
+
+        # Global step counter (used by TS4, DP1, EC1, CT7, TS6)
+        if not hasattr(self, '_phi_boost_count'):
+            self._phi_boost_count = 0
+        self._phi_boost_count += 1
 
         # Lazy init
         if not pb['enabled']:
@@ -421,12 +429,19 @@ class ConsciousMind(nn.Module):
             # Save pre-boost state for NV7 impedance
             self._pre_boost_hiddens = [c.hidden.clone() for c in mitosis_engine.cells]
 
-            # 1. MHA attention between cells
+            # 1. MHA attention between cells (+ SL2: attention weights for gradient gating)
             h_stack = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).unsqueeze(0)
-            attn_out, _ = pb['attention'](h_stack, h_stack, h_stack)
+            attn_out, attn_weights = pb['attention'](h_stack, h_stack, h_stack, need_weights=True)
             with torch.no_grad():
+                # SL2: attention-weighted blend (high-attention cells get stronger signal)
+                if attn_weights is not None:
+                    cell_importance = attn_weights[0].mean(dim=0)  # [n_cells] average attention received
+                    cell_importance = cell_importance / (cell_importance.max() + 1e-8)  # normalize
+                else:
+                    cell_importance = torch.ones(n)
                 for i, c in enumerate(mitosis_engine.cells):
-                    c.hidden = 0.85 * c.hidden + 0.15 * attn_out[0, i].unsqueeze(0)
+                    blend = 0.15 * cell_importance[i].item()  # SL2: attention-gated blend
+                    c.hidden = (1 - blend) * c.hidden + blend * attn_out[0, i].unsqueeze(0)
 
             # 2. Compute repulsions
             reps = [c.mind.get_repulsion(x, c.hidden) for c in mitosis_engine.cells]
@@ -541,10 +556,8 @@ class ConsciousMind(nn.Module):
             self._last_phi_input = x.detach().clone() if x is not None else None
 
             # PX3: Ratchet — periodic random perturbation, keep if Φ improves
-            if not hasattr(self, '_phi_boost_count'):
-                self._phi_boost_count = 0
+            if not hasattr(self, '_best_phi_state'):
                 self._best_phi_state = None
-            self._phi_boost_count += 1
             if self._phi_boost_count % 10 == 0:
                 best_phi = current_phi
                 best_params = None
@@ -764,8 +777,7 @@ class ConsciousMind(nn.Module):
                         h_dim = mitosis_engine.cells[0].hidden.shape[1]
                         wm_proj = wm_context.squeeze()[:h_dim]
                         if len(wm_proj) < h_dim:
-                            import torch.nn.functional as F
-                            wm_proj = F.pad(wm_proj, (0, h_dim - len(wm_proj)))
+                            wm_proj = torch.nn.functional.pad(wm_proj, (0, h_dim - len(wm_proj)))
                         for cell in mitosis_engine.cells:
                             cell.hidden = cell.hidden + 0.02 * wm_proj.unsqueeze(0)
                     _log('phi_boost', f'CV1 WM: buffer={len(self._wm_buffer)}')
@@ -1089,6 +1101,187 @@ class ConsciousMind(nn.Module):
                     self._self_mod_params['repulsion_lr'] = min(0.05, self._self_mod_params['repulsion_lr'])
 
                     self._self_modification_active = True
+            except Exception:
+                pass
+
+            # ═══ TS4: Exponential Growth Schedule (×20.5) ═══
+            # Double cells at 20/40/60/80% of developmental horizon
+            try:
+                if not hasattr(self, '_ts4_horizon'):
+                    self._ts4_horizon = 500  # steps to full growth
+                    self._ts4_doubled = set()
+                frac = self._phi_boost_count / self._ts4_horizon
+                for pct in [0.20, 0.40, 0.60, 0.80]:
+                    if frac >= pct and pct not in self._ts4_doubled:
+                        target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
+                        while len(mitosis_engine.cells) < target:
+                            parent = mitosis_engine.cells[len(mitosis_engine.cells) % len(mitosis_engine.cells)]
+                            mitosis_engine._create_cell(parent=parent)
+                        self._ts4_doubled.add(pct)
+                        # Rebuild optimizer with new cell params
+                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                        attn_params = list(pb['attention'].parameters())
+                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+                        _log('ts4', f'Exponential growth → {len(mitosis_engine.cells)} cells at {pct*100:.0f}%')
+            except Exception:
+                pass
+
+            # ═══ DP1: Piaget 4-Stage Development (×8.0) ═══
+            # Stage-based noise schedule: sensorimotor→preoperational→concrete→formal
+            try:
+                if not hasattr(self, '_dp1_horizon'):
+                    self._dp1_horizon = 1000
+                dp_frac = self._phi_boost_count / self._dp1_horizon
+                # Decreasing noise per stage (biological development)
+                stages = [(0.25, 0.04), (0.50, 0.025), (0.75, 0.015), (1.0, 0.008)]
+                for threshold, noise_scale in stages:
+                    if dp_frac < threshold:
+                        with torch.no_grad():
+                            for cell in mitosis_engine.cells:
+                                cell.hidden += torch.randn_like(cell.hidden) * noise_scale
+                        break
+            except Exception:
+                pass
+
+            # ═══ WR2: Adversarial Pressure (×11.5) ═══
+            # Shadow attacker noise → defensive cell growth when Φ drops
+            try:
+                if not hasattr(self, '_wr2_shadow_phi'):
+                    self._wr2_shadow_phi = 0.0
+                    self._wr2_attack_scale = 0.03
+                if self._phi_boost_count % 5 == 0:  # every 5 steps
+                    # Attacker: inject noise into cells, measure resilience
+                    pre_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                    with torch.no_grad():
+                        for c in mitosis_engine.cells:
+                            c.hidden += torch.randn_like(c.hidden) * self._wr2_attack_scale
+                    post_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                    # Resilience: how much did norms change?
+                    resilience = sum(abs(a - b) for a, b in zip(pre_norms, post_norms)) / len(pre_norms)
+                    # If not resilient enough (high change), grow defensive cell
+                    if resilience > 0.5 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                        parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                        mitosis_engine._create_cell(parent=parent)
+                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                        attn_params = list(pb['attention'].parameters())
+                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+                        _log('wr2', f'Adversarial pressure → {len(mitosis_engine.cells)} cells (resilience={resilience:.2f})')
+                    # Escalating difficulty
+                    self._wr2_attack_scale = min(0.1, self._wr2_attack_scale * 1.01)
+            except Exception:
+                pass
+
+            # ═══ EC1: Consciousness Economy (×4.7) ═══
+            # Φ as currency: earn, invest in new cells, pay upkeep, bankrupt idle cells
+            try:
+                if not hasattr(self, '_ec1_wealth'):
+                    self._ec1_wealth = 0.0
+                    self._ec1_cell_wealth = {}
+                current_phi = getattr(self, '_last_phi', 1.0)
+                self._ec1_wealth += current_phi * 0.1  # earn from Φ
+                self._ec1_wealth -= len(mitosis_engine.cells) * 0.05  # upkeep per cell
+
+                # Invest: spawn cell if wealthy enough
+                if self._ec1_wealth > 5.0 and self._phi_boost_count % 10 == 0:
+                    if len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                        parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                        mitosis_engine._create_cell(parent=parent)
+                        self._ec1_wealth -= 3.0
+                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                        attn_params = list(pb['attention'].parameters())
+                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+                        _log('ec1', f'Economy invest → {len(mitosis_engine.cells)} cells, wealth={self._ec1_wealth:.1f}')
+
+                # Bankrupt: remove weakest cell if in debt (keep minimum 2)
+                if self._ec1_wealth < -5.0 and len(mitosis_engine.cells) > 2:
+                    weakest = min(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                    mitosis_engine.cells.remove(weakest)
+                    self._ec1_wealth += 2.0
+                    cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                    attn_params = list(pb['attention'].parameters())
+                    pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+                    _log('ec1', f'Economy bankrupt → removed cell, now {len(mitosis_engine.cells)}')
+            except Exception:
+                pass
+
+            # ═══ CX2: Fibonacci Topology Weighting (×5.4) ═══
+            # Fibonacci divisor-sum convergence weighting on cell hidden states
+            try:
+                fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+                fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
+                fib_idx = min(len(mitosis_engine.cells) - 1, len(fibs) - 1)
+                convergence = fib_sigmas[fib_idx] / max(fibs[fib_idx], 1)
+                with torch.no_grad():
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        w_idx = min(i, len(fibs) - 1)
+                        w = fibs[w_idx] / max(fibs[fib_idx], 1)
+                        cell.hidden = cell.hidden * (1.0 + 0.01 * w * convergence)
+            except Exception:
+                pass
+
+            # ═══ TS6: Adaptive Growth — Φ Stagnation Trigger ═══
+            # Detect stagnation and spawn new cell to break plateau
+            try:
+                if not hasattr(self, '_ts6_window'):
+                    self._ts6_window = []
+                    self._ts6_stagnant = 0
+                current_phi = getattr(self, '_last_phi', 1.0)
+                self._ts6_window.append(current_phi)
+                if len(self._ts6_window) > 20:
+                    self._ts6_window = self._ts6_window[-20:]
+                if len(self._ts6_window) >= 10:
+                    recent = sum(self._ts6_window[-5:]) / 5
+                    older = sum(self._ts6_window[:5]) / 5
+                    if older > 0 and (recent - older) / older < 0.01:
+                        self._ts6_stagnant += 1
+                    else:
+                        self._ts6_stagnant = 0
+                    # 3 consecutive stagnation checks → spawn cell
+                    if self._ts6_stagnant >= 3 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                        parent = mitosis_engine.cells[0]
+                        mitosis_engine._create_cell(parent=parent)
+                        self._ts6_stagnant = 0
+                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                        attn_params = list(pb['attention'].parameters())
+                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+                        _log('ts6', f'Stagnation break → {len(mitosis_engine.cells)} cells')
+            except Exception:
+                pass
+
+            # ═══ SL1: Tension-Adaptive Learning Rate (×5.57) ═══
+            # High-tension cells learn faster
+            try:
+                if pb.get('optimizer') and hasattr(mitosis_engine.cells[0], 'tension_history'):
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        if hasattr(cell, 'tension_history') and cell.tension_history:
+                            t_val = cell.tension_history[-1] if isinstance(cell.tension_history[-1], float) else float(cell.tension_history[-1])
+                            adaptive_lr = 5e-4 + abs(t_val) * 2e-3
+                            adaptive_lr = min(adaptive_lr, 5e-3)  # clamp
+                            # Apply to param groups (all share same optimizer)
+                            for pg in pb['optimizer'].param_groups:
+                                pg['lr'] = adaptive_lr
+                            break  # one global LR from first cell's tension
+            except Exception:
+                pass
+
+            # ═══ CT7: Curriculum Language Grounding (Phase 1) ═══
+            # Early steps: align cell hiddens to input embeddings for language grounding
+            try:
+                if not hasattr(self, '_ct7_horizon'):
+                    self._ct7_horizon = 600
+                ct7_frac = self._phi_boost_count / self._ct7_horizon
+                if ct7_frac < 0.33 and x is not None:
+                    # Phase 1: Language grounding — blend input into cells
+                    x_proj = x[:, :h_dim] if x.shape[-1] >= h_dim else torch.nn.functional.pad(x, (0, h_dim - x.shape[-1]))
+                    with torch.no_grad():
+                        for cell in mitosis_engine.cells:
+                            cell.hidden = 0.95 * cell.hidden + 0.05 * x_proj[:cell.hidden.shape[0]]
+                elif ct7_frac < 0.66:
+                    # Phase 2: Consciousness growth — extra differentiation noise
+                    with torch.no_grad():
+                        for i, cell in enumerate(mitosis_engine.cells):
+                            cell.hidden += torch.randn_like(cell.hidden) * 0.02 * (i + 1) / len(mitosis_engine.cells)
+                # Phase 3: Joint — handled by existing COMBO2 + FX2 above
             except Exception:
                 pass
 
