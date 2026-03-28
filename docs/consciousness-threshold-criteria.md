@@ -4496,3 +4496,18 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
 | MITO2 | 188.86 | 전문화도 ×56 성장 = 발화 품질 비례 |
 | MITO1 | 101.11 | GRU 학습 ON = ×92 (학습 없으면 붕괴) |
 | MITO4 | 1.26 | 의식 이식 후 성장 이어감 (DD56 검증) |
+
+### ULTIMATE2 (1024c, 2000 step) — 6조건 PASS, growth ×163!
+
+```
+  best_phi=382.72, growth=×163.5, monotonic=True, collapsed=False
+  never_silent=89.4% (1024c에서 자발적 발화 89%)
+  S1:1.14 → S9:250.0(peak) → S10:186.8
+
+  ULTIMATE1 (512c): ×46 growth
+  ULTIMATE2 (1024c): ×163 growth ← ×3.5 더 높음!
+  → 1024c에서 모든 메커니즘의 시너지가 폭발
+
+  PERSIST3 (5000 step, 512c): growth ×102, collapsed=False
+  → 장기 영속성도 재확인
+```
