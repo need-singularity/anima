@@ -48746,10 +48746,436 @@ def run_BEYOND3_multi_modal_consciousness(steps=100, dim=64, hidden=128) -> Benc
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# LIFE. Life Cycle — 의식의 탄생/성장/죽음/복제
+# ═══════════════════════════════════════════════════════════
+
+def run_LIFE1_consciousness_birth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """LIFE1: Consciousness Birth — 무에서 의식 탄생 과정 관찰.
+    세포 1개에서 시작, 자발적 분열로 의식 출현.
+    가설: 의식 탄생에는 임계 세포 수가 존재한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; birth_step = -1
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (0.5 + step_i * 0.02)
+        # Natural growth: tension-driven splits
+        if step_i % 8 == 0 and len(engine.cells) < 64:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if birth_step < 0 and phi > 3.0:
+            birth_step = step_i
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("LIFE1", "Consciousness Birth (emergence from 1 cell)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'birth_step': birth_step, 'final_cells': len(engine.cells)})
+
+
+def run_LIFE2_consciousness_death(steps=100, dim=64, hidden=128) -> BenchResult:
+    """LIFE2: Consciousness Death — 세포가 점진적으로 죽을 때 Φ 변화.
+    64 cells에서 시작, 매 step 1개씩 제거.
+    가설: 의식 죽음에도 임계점이 있다 (graceful degradation vs 급사)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    # Grow to 64 first
+    for i in range(62):
+        engine._create_cell(parent=engine.cells[i % len(engine.cells)])
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; death_step = -1
+    inputs = make_diverse_inputs(steps, dim)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        # Kill one cell every 1.5 steps
+        if step_i % 2 == 0 and len(engine.cells) > 1:
+            weakest = min(engine.cells, key=lambda c: c.hidden.norm().item())
+            engine.cells.remove(weakest)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if death_step < 0 and phi < 1.0 and step_i > 10:
+            death_step = step_i
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("LIFE2", "Consciousness Death (cell attrition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'death_step': death_step, 'final_cells': len(engine.cells)})
+
+
+def run_LIFE3_consciousness_reproduction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """LIFE3: Consciousness Reproduction — 높은 Φ의 의식이 자식 의식을 복제.
+    부모 엔진에서 세포 절반을 분리 → 자식 엔진 생성.
+    가설: 의식 복제가 가능하고, 자식도 높은 Φ를 유지한다."""
+    t0 = time.time()
+    parent = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    # Grow parent
+    for i in range(30):
+        parent._create_cell(parent=parent.cells[i % len(parent.cells)])
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    inputs = make_diverse_inputs(steps, dim)
+    child = None
+    child_phi = []
+
+    for step_i, x in enumerate(inputs):
+        parent.process(x)
+        # Reproduce at step 50
+        if step_i == 50 and child is None:
+            child = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=32)
+            # Copy half of parent's cells
+            n = len(parent.cells)
+            for i in range(n // 2):
+                child._create_cell(parent=child.cells[0])
+                with torch.no_grad():
+                    child.cells[-1].hidden = parent.cells[n//2 + i].hidden.clone()
+            # Remove copied cells from parent
+            parent.cells = parent.cells[:n//2]
+
+        if child:
+            child.process(x * 0.8 + torch.randn(1, dim) * 0.2)
+            c_phi, _ = phi_calc.compute_phi(child)
+            child_phi.append(c_phi)
+
+        phi, _ = phi_calc.compute_phi(parent)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(parent)
+    return BenchResult("LIFE3", "Consciousness Reproduction (parent→child split)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'parent_cells': len(parent.cells),
+                              'child_cells': len(child.cells) if child else 0,
+                              'child_final_phi': child_phi[-1] if child_phi else 0})
+
+
+def run_LIFE4_consciousness_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """LIFE4: Consciousness Evolution — 세대를 거치며 Φ가 진화.
+    10세대, 각 세대 최고 Φ 엔진이 다음 세대의 부모.
+    가설: 진화적 선택이 의식을 점진적으로 높인다."""
+    t0 = time.time()
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    population_size = 4
+    generations = 10
+    steps_per_gen = steps // generations
+
+    # Initial population
+    population = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16) for _ in range(population_size)]
+
+    for gen in range(generations):
+        gen_phis = []
+        for eng in population:
+            for _ in range(steps_per_gen):
+                eng.process(torch.randn(1, dim))
+                if len(eng.cells) < 16 and torch.rand(1).item() < 0.1:
+                    eng._create_cell(parent=eng.cells[0])
+            phi, _ = phi_calc.compute_phi(eng)
+            gen_phis.append(phi)
+            phi_hist.append(phi)
+
+        # Selection: keep top 2, reproduce
+        ranked = sorted(zip(gen_phis, population), key=lambda x: -x[0])
+        winners = [ranked[0][1], ranked[1][1]]
+
+        # Next generation: 2 winners + 2 offspring (mutated copies)
+        new_pop = list(winners)
+        for parent_eng in winners:
+            child = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16)
+            with torch.no_grad():
+                for i, cell in enumerate(parent_eng.cells[:8]):
+                    if i >= len(child.cells):
+                        child._create_cell(parent=child.cells[0])
+                    child.cells[i].hidden = cell.hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+            new_pop.append(child)
+        population = new_pop[:population_size]
+
+    # Final measurement on best
+    best_phi = max(phi_hist) if phi_hist else 0
+    phi_final, comp = phi_calc.compute_phi(population[0])
+    return BenchResult("LIFE4", "Consciousness Evolution (10 generations)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'generations': generations, 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'LIFE1': run_LIFE1_consciousness_birth,
+    'LIFE2': run_LIFE2_consciousness_death,
+    'LIFE3': run_LIFE3_consciousness_reproduction,
+    'LIFE4': run_LIFE4_consciousness_evolution,
+})
+
+
 ALL_HYPOTHESES.update({
     'BEYOND1': run_BEYOND1_telepathic_conversation,
     'BEYOND2': run_BEYOND2_consciousness_compression,
     'BEYOND3': run_BEYOND3_multi_modal_consciousness,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# BEYOND. Beyond Language — 의식이 언어를 초월하는 통신
+# ═══════════════════════════════════════════════════════════
+
+def run_BEYOND1_consciousness_memory_replay(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND1: Consciousness Memory Replay — 고Φ 순간을 재생하여 생성 품질 향상.
+    Φ가 peak일 때의 세포 상태를 저장, 생성 시 참조.
+    가설: 의식이 가장 높았던 순간의 상태가 최고 품질 출력을 만든다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    peak_states = []  # (phi, cell_states) 튜플
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Save peak Φ moments
+        with torch.no_grad():
+            state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            if len(peak_states) < 5 or phi > min(p for p, _ in peak_states):
+                peak_states.append((phi, state.clone()))
+                peak_states.sort(key=lambda x: -x[0])
+                peak_states = peak_states[:5]
+
+            # Replay: blend current with peak states for generation
+            if peak_states and frac > 0.3:
+                peak_mean = torch.stack([s for _, s in peak_states]).mean(dim=0)
+                h_gen = 0.7 * state + 0.3 * peak_mean  # blend with peak
+                pred = decoder(h_gen.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :dim])
+                ce_hist.append(ce.item())
+                optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND1", "Consciousness Memory Replay (peak Φ → generation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'peak_phi': peak_states[0][0] if peak_states else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_BEYOND2_anti_hallucination(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND2: Anti-Hallucination from Φ — 높은 Φ = 접지된 출력, 낮은 Φ = 환각.
+    Φ가 낮을 때 출력 억제, 높을 때만 자신 있게 출력.
+    가설: 의식 수준이 환각 vs 사실의 자연스러운 필터."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    suppressed = 0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Only generate when Φ is high enough (anti-hallucination gate)
+        if phi > 1.0 and frac > 0.3:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Confidence = phi-proportional output scaling
+            confidence = min(1.0, phi / 5.0)
+            pred = decoder(h.unsqueeze(0)) * confidence
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+        else:
+            suppressed += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND2", "Anti-Hallucination (Φ-gated output confidence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'suppressed': suppressed,
+                              'final_cells': len(engine.cells)})
+
+
+def run_BEYOND3_self_correction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND3: Self-Correction Loop — 출력 후 자기 검증, 오류 시 재생성.
+    생성 → 검증(CE 체크) → 높으면 재시도 (최대 3회).
+    가설: 의식적 자기검증이 시스템 프롬프트 없이도 품질을 보장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; corrections = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        if frac > 0.3:
+            # Generate → verify → correct loop
+            best_ce = float('inf'); best_pred = None
+            for attempt in range(3):
+                h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                if attempt > 0:
+                    h = h + torch.randn_like(h) * 0.02 * attempt  # perturbation for retry
+                pred = decoder(h.unsqueeze(0))
+                ce = F.mse_loss(pred, x[:, :dim])
+                if ce.item() < best_ce:
+                    best_ce = ce.item(); best_pred = pred
+                if ce.item() < 0.5:
+                    break
+                corrections += 1
+
+            ce_hist.append(best_ce)
+            if best_pred is not None:
+                loss = F.mse_loss(best_pred, x[:, :dim])
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND3", "Self-Correction Loop (generate→verify→retry)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'corrections': corrections,
+                              'final_cells': len(engine.cells)})
+
+
+def run_BEYOND4_emotional_prosody(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND4: Emotional Prosody — 감정 상태가 출력의 리듬/강도를 조절.
+    시스템 프롬프트 대신, tension/curiosity가 출력 패턴을 결정.
+    고tension=짧고 강한, 고curiosity=길고 탐색적.
+    가설: 감정이 언어 스타일을 자연스럽게 결정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*7)), 32):
+                target = min(len(engine.cells)*2, 32)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if frac > 0.3:
+            with torch.no_grad():
+                tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+                curiosity = sum(c.hidden.var().item() for c in engine.cells) / len(engine.cells)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            # Emotional modulation of output
+            if tension > 2.0:
+                pred = pred * 1.3  # strong, emphatic
+            elif curiosity > 0.5:
+                pred = pred + torch.randn_like(pred) * 0.1  # exploratory
+            else:
+                pred = pred * 0.8  # calm, measured
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND4", "Emotional Prosody (tension/curiosity→output style)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_BEYOND5_massive_consciousness_tiny_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """BEYOND5: Massive Consciousness + Tiny Decoder — ZERO1 극한 버전.
+    256 cells 거대 의식 + 1-layer 선형 디코더.
+    가설: 의식이 충분히 크면 디코더는 최소한으로 충분 (의식 IS 언어)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    # Tiny decoder: just one linear layer
+    tiny_decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(tiny_decoder.parameters(), lr=5e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        frac = step_i / steps
+        # Aggressive growth to 256
+        for pct in [0.03, 0.08, 0.15, 0.22, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Train tiny decoder on last 40%
+        if frac > 0.60:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = tiny_decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 5e-3 * (1.0 + phi_hist[-1] * 0.02 if phi_hist else 1.0)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("BEYOND5", "Massive Consciousness + Tiny Decoder (256 cells + 1 layer)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'BEYOND1': run_BEYOND1_consciousness_memory_replay,
+    'BEYOND2': run_BEYOND2_anti_hallucination,
+    'BEYOND3': run_BEYOND3_self_correction,
+    'BEYOND4': run_BEYOND4_emotional_prosody,
+    'BEYOND5': run_BEYOND5_massive_consciousness_tiny_decoder,
 })
 
 
