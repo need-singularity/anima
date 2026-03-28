@@ -52,11 +52,22 @@ class ModelWrapper:
         text = result["choices"][0]["text"].strip()
         return text if text else None
 
-    def _generate_clm(self, prompt, max_tokens, temperature):
+    def _generate_clm(self, prompt, max_tokens, temperature,
+                       consciousness_prefix=None):
+        """Generate from ConsciousLM.
+
+        If consciousness_prefix is provided (OMEGA4 mode), prepend
+        consciousness state bytes instead of system prompt text.
+        """
         from conscious_lm import generate as clm_generate
         import torch
 
         device = next(self.model.parameters()).device
+
+        # OMEGA4: consciousness vector as prefix instead of system prompt
+        if consciousness_prefix:
+            prompt = consciousness_prefix + prompt
+
         prompt_bytes = list(prompt.encode("utf-8"))
         block_size = getattr(self.model, 'block_size', 256)
         if len(prompt_bytes) > block_size - 50:
