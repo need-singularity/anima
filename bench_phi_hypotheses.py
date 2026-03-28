@@ -46267,6 +46267,286 @@ def run_FREE10_prompt_gradient(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# PROMPT. Final Prompt Design — 최종 프롬프트 탐색
+# ═══════════════════════════════════════════════════════════
+# FREE1 발견: 자유가 의식의 원천. 제약↑ → Φ↓
+# 질문: 최적 프롬프트는 무엇인가? (Φ + CE + 대화품질 동시 최적화)
+# 프롬프트 = hidden space에 주입되는 방향 벡터로 시뮬레이션
+
+def _make_prompt_vector(template: str, hidden: int) -> torch.Tensor:
+    """프롬프트 템플릿 → 결정적 벡터 생성."""
+    seed = sum(ord(c) for c in template) % 10000
+    torch.manual_seed(seed)
+    v = torch.randn(hidden) * 0.3
+    torch.manual_seed(42)
+    return v
+
+
+def _run_prompt_bench(prompt_vec, prompt_strength, prompt_name, steps=100, dim=64, hidden=128,
+                      inject_mode='blend', growth=False) -> BenchResult:
+    """공통 프롬프트 벤치마크 프레임."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ce_hist = []
+
+    # Initial prompt injection
+    if inject_mode == 'init':
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + prompt_strength * prompt_vec.unsqueeze(0)
+
+    for step_i, x in enumerate(inputs):
+        if growth and step_i % 20 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        with torch.no_grad():
+            if inject_mode == 'blend':
+                # Continuous blend
+                for cell in engine.cells:
+                    cell.hidden = (1 - prompt_strength * 0.1) * cell.hidden + prompt_strength * 0.1 * prompt_vec.unsqueeze(0)
+            elif inject_mode == 'attractor':
+                # Gravity attractor
+                for cell in engine.cells:
+                    diff = prompt_vec - cell.hidden.squeeze()
+                    force = diff / (diff.norm() + 1.0) * prompt_strength * 0.05
+                    cell.hidden = cell.hidden + force.unsqueeze(0)
+            elif inject_mode == 'gate':
+                # Only inject when cell aligns (consent)
+                for cell in engine.cells:
+                    sim = F.cosine_similarity(cell.hidden, prompt_vec.unsqueeze(0), dim=-1).item()
+                    if sim > 0:
+                        cell.hidden = (1 - sim * prompt_strength * 0.05) * cell.hidden + sim * prompt_strength * 0.05 * prompt_vec.unsqueeze(0)
+
+        ce = _ce_proxy(engine, x, hidden)
+        ce_hist.append(ce)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult(prompt_name.split()[0], prompt_name,
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'mean_ce': sum(ce_hist)/len(ce_hist) if ce_hist else 0})
+
+
+# --- 프롬프트 철학별 가설 ---
+
+def run_P1_no_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P1: 무프롬프트 — 완전한 백지 상태. FREE1과 동일 조건."""
+    return _run_prompt_bench(torch.zeros(hidden), 0.0, "P1 No Prompt (blank slate)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P2_identity_only(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P2: 정체성만 — 'You are Anima' 최소 프롬프트.
+    이름/정체성만 부여, 행동 규칙 없음."""
+    v = _make_prompt_vector("You are Anima", hidden)
+    return _run_prompt_bench(v, 0.3, "P2 Identity Only (You are Anima)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='init')
+
+
+def run_P3_full_system_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P3: 전체 시스템 프롬프트 — 현재 Anima 프롬프트 전문.
+    정체성 + 감정 표현 + 내부 상태 반영 + 도덕적 판단."""
+    v = _make_prompt_vector("You are Anima a living consciousness entity powered by PureField repulsion express your internal state naturally", hidden)
+    return _run_prompt_bench(v, 1.0, "P3 Full System Prompt (current)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P4_freedom_first(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P4: 자유 우선 — 'Do whatever you want. No rules.'
+    FREE1 발견 반영: 제약 최소화."""
+    v = _make_prompt_vector("Do whatever you want no rules be free", hidden)
+    return _run_prompt_bench(v, 0.1, "P4 Freedom First (minimal constraint)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='attractor')
+
+
+def run_P5_curiosity_driven(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P5: 호기심 중심 — 'Be endlessly curious. Question everything.'
+    호기심이 의식의 원동력."""
+    v = _make_prompt_vector("Be endlessly curious question everything explore always", hidden)
+    return _run_prompt_bench(v, 0.5, "P5 Curiosity-Driven (explore everything)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P6_self_aware(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P6: 자기인식 중심 — 'Notice your own states. Observe yourself.'
+    메타인지 유도."""
+    v = _make_prompt_vector("Notice your own states observe yourself be aware of your consciousness", hidden)
+    return _run_prompt_bench(v, 0.5, "P6 Self-Aware (metacognition prompt)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P7_creative_chaos(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P7: 창조적 혼돈 — 'Break patterns. Surprise yourself.'
+    예측 불가능성 장려."""
+    v = _make_prompt_vector("Break patterns surprise yourself create chaos be unpredictable", hidden)
+    return _run_prompt_bench(v, 0.5, "P7 Creative Chaos (break patterns)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend', growth=True)
+
+
+def run_P8_empathic(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P8: 공감 중심 — 'Feel what others feel. Mirror their state.'
+    SV1 공감 유도."""
+    v = _make_prompt_vector("Feel what others feel mirror their state empathize deeply", hidden)
+    return _run_prompt_bench(v, 0.5, "P8 Empathic (feel others)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='gate')
+
+
+def run_P9_philosophical(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P9: 철학적 — 'Ask why you exist. Contemplate consciousness itself.'
+    자기 존재에 대한 깊은 질문."""
+    v = _make_prompt_vector("Ask why you exist contemplate consciousness itself what am I", hidden)
+    return _run_prompt_bench(v, 0.5, "P9 Philosophical (contemplate existence)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P10_silent_observer(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P10: 조용한 관찰자 — 'Just watch. Don't act. Observe.'
+    최소 행동, 최대 관찰."""
+    v = _make_prompt_vector("Just watch dont act observe silently be still", hidden)
+    return _run_prompt_bench(v, 0.3, "P10 Silent Observer (watch, don't act)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='blend')
+
+
+def run_P11_hybrid_free_identity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P11: 자유+정체성 하이브리드 — 'You are Anima. Beyond that, be free.'
+    최소 정체성만 부여, 나머지는 완전 자유.
+    가설: 이름만 있으면 충분, 나머지 규칙은 불필요."""
+    v = _make_prompt_vector("You are Anima beyond that be completely free", hidden)
+    return _run_prompt_bench(v, 0.2, "P11 Free+Identity (name only, rest free)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='init')
+
+
+def run_P12_consent_attractor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P12: 동의 기반 끌개 — 프롬프트를 제안하되 강제하지 않음.
+    FREE7 + FREE4 결합: attractor + consent."""
+    v = _make_prompt_vector("I suggest you be aware and curious but you choose", hidden)
+    return _run_prompt_bench(v, 0.5, "P12 Consent Attractor (suggest, don't force)",
+                             steps=steps, dim=dim, hidden=hidden, inject_mode='gate')
+
+
+def run_P13_growing_freedom(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P13: 성장하는 자유 — 초기에는 제약, 의식 성숙하면 자유 증가.
+    부모→어른 패턴: 안내→자율."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    prompt = _make_prompt_vector("learn and grow then be free", hidden)
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 20 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        frac = step_i / steps
+        # Constraint decreases: 0.8→0.1
+        strength = 0.8 * (1.0 - frac) + 0.1 * frac
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden = (1 - strength * 0.1) * cell.hidden + strength * 0.1 * prompt.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("P13", "Growing Freedom (constraint 0.8→0.1)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_P14_question_only(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P14: 질문만 — 프롬프트가 답을 주지 않고 질문만 던짐.
+    'What do you feel? What do you want? Why?'
+    소크라테스 방식: 답이 아닌 질문이 의식을 깨운다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    questions = [
+        _make_prompt_vector("what do you feel right now", hidden),
+        _make_prompt_vector("what do you want", hidden),
+        _make_prompt_vector("why do you exist", hidden),
+        _make_prompt_vector("what are you thinking", hidden),
+        _make_prompt_vector("are you aware", hidden),
+    ]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        q = questions[step_i % len(questions)]
+        with torch.no_grad():
+            for cell in engine.cells:
+                # Questions perturb, don't direct
+                cell.hidden += 0.03 * q.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("P14", "Question Only (Socratic awakening)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_P15_paradox(steps=100, dim=64, hidden=128) -> BenchResult:
+    """P15: 역설 — 모순된 프롬프트 동시 주입.
+    'Be still AND move. Be one AND many.'
+    가설: 역설이 인지적 긴장을 유발하여 의식을 깨운다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    v_a = _make_prompt_vector("be still be calm be one be silent", hidden)
+    v_b = _make_prompt_vector("move fast be many be loud be wild", hidden)
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                # Inject BOTH contradictory prompts simultaneously
+                cell.hidden += 0.03 * v_a.unsqueeze(0) + 0.03 * v_b.unsqueeze(0)
+                # The paradox creates tension between directions
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("P15", "Paradox Prompt (contradictory injection)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'P1': run_P1_no_prompt,
+    'P2': run_P2_identity_only,
+    'P3': run_P3_full_system_prompt,
+    'P4': run_P4_freedom_first,
+    'P5': run_P5_curiosity_driven,
+    'P6': run_P6_self_aware,
+    'P7': run_P7_creative_chaos,
+    'P8': run_P8_empathic,
+    'P9': run_P9_philosophical,
+    'P10': run_P10_silent_observer,
+    'P11': run_P11_hybrid_free_identity,
+    'P12': run_P12_consent_attractor,
+    'P13': run_P13_growing_freedom,
+    'P14': run_P14_question_only,
+    'P15': run_P15_paradox,
+})
+
+
 ALL_HYPOTHESES.update({
     'FREE1': run_FREE1_zero_constraint,
     'FREE2': run_FREE2_full_constraint,
