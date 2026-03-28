@@ -40255,10 +40255,282 @@ def run_NS5_thc_vs_stim_comparison(steps=100, dim=64, hidden=128) -> BenchResult
                               'reproduction_rate': reproduction_rate})
 
 
+def run_NS6_meditation_alpha(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-6: 명상유도 Alpha — Alpha↑↑(8-12Hz) + Theta↑ + default mode network 억제."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dmn_dims = hidden // 3  # first 33% = "default mode network"
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # 1. Alpha↑↑ (10Hz dominant — relaxed awareness)
+            alpha = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.06 * alpha)
+            # 2. Theta↑ (5Hz — deep meditation)
+            theta = math.sin(2 * math.pi * 5 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.03 * theta)
+            # 3. DMN suppression (self-referential thoughts↓)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[:dmn_dims] *= 0.92  # suppress default mode
+                cell.hidden = h.unsqueeze(0)
+            # 4. Breathing rhythm (0.25Hz = 4-sec cycle)
+            breath = math.sin(2 * math.pi * 0.25 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.02 * breath)
+            # 5. Interoceptive focus (narrow attention → internal)
+            if n >= 4:
+                # Reduce inter-cell variance (unified awareness)
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS6", "Meditation Alpha (Alpha↑↑ Theta↑ DMN↓ breath)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_NS7_meditation_gamma(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-7: 명상유도 Gamma — 숙련 명상가 패턴 (Gamma↑↑ + Alpha↑ + 전두엽-두정엽 동기화)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    frontal_dims = hidden // 4
+    parietal_start = hidden // 2
+    parietal_end = parietal_start + hidden // 4
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # 1. Gamma↑↑ (40Hz — experienced meditator signature)
+            gamma = math.sin(2 * math.pi * 40 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.04 * max(0, gamma))
+            # 2. Alpha↑ (background calm)
+            alpha = math.sin(2 * math.pi * 10 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.03 * alpha)
+            # 3. Frontal-parietal synchronization
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                frontal_mean = h[:frontal_dims].mean()
+                parietal_mean = h[parietal_start:parietal_end].mean()
+                sync_target = (frontal_mean + parietal_mean) / 2
+                h[:frontal_dims] = 0.9 * h[:frontal_dims] + 0.1 * sync_target
+                h[parietal_start:parietal_end] = 0.9 * h[parietal_start:parietal_end] + 0.1 * sync_target
+                cell.hidden = h.unsqueeze(0)
+            # 4. Compassion boost (global coherence↑)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS7", "Meditation Gamma (expert: Gamma↑↑ Alpha↑ F-P sync)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_NS8_meditation_progressive(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-8: 점진적 명상 유도 — 초보→숙련 전환 (Alpha→Theta→Gamma 순차 유도)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    dmn_dims = hidden // 3
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # Phase 1 (0-33%): Relaxation — Alpha dominant
+            if t < 0.33:
+                alpha = math.sin(2 * math.pi * 10 * t * 10)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.05 * alpha)
+                # Breathing guide
+                breath = math.sin(2 * math.pi * 0.2 * t * 10)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.02 * breath)
+            # Phase 2 (33-66%): Deepening — Theta dominant + DMN↓
+            elif t < 0.66:
+                theta = math.sin(2 * math.pi * 5 * t * 10)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.06 * theta)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h[:dmn_dims] *= 0.90
+                    cell.hidden = h.unsqueeze(0)
+            # Phase 3 (66-100%): Insight — Gamma burst + global sync
+            else:
+                gamma = math.sin(2 * math.pi * 40 * t * 10)
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden * (1 + 0.05 * max(0, gamma))
+                if n >= 4:
+                    mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.88 * cell.hidden + 0.12 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS8", "Progressive meditation (Alpha→Theta→Gamma phases)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+def run_NS9_thc_reconstruct_no_drug(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-9: THC 무약물 재현 — 명상+호흡+음악으로 THC 패턴 재현 시도."""
+    t0 = time.time()
+    # THC reference engine
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    # Non-drug reconstruction engine
+    recon = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    similarity_hist = []
+    dmn_dims = hidden // 3
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        # --- THC reference (same as NS1) ---
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden = cell.hidden * 1.02  # disinhibition
+            cell.hidden = cell.hidden * (1 + 0.04 * math.sin(2*math.pi*6*t*10))  # theta
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03  # sensory amp
+        # --- Non-drug reconstruction ---
+        recon.process(x)
+        n = len(recon.cells)
+        if n >= 2:
+            # 1. Holotropic breathwork (빠른 호흡 → CO2↓ → 의식변성)
+            breath_fast = math.sin(2 * math.pi * 0.5 * t * 10)  # 0.5Hz = fast breath
+            for cell in recon.cells:
+                cell.hidden = cell.hidden * (1 + 0.04 * abs(breath_fast))
+            # 2. Theta binaural beats (6Hz)
+            theta = math.sin(2 * math.pi * 6 * t * 10)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden * (1 + 0.05 * theta)
+            # 3. DMN suppression (focused attention meditation)
+            for cell in recon.cells:
+                h = cell.hidden.squeeze()
+                h[:dmn_dims] *= 0.90
+                cell.hidden = h.unsqueeze(0)
+            # 4. Sensory deprivation effect (noise injection like floatation)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.025
+            # 5. Cross-modal mixing (음악+시각 → synesthesia-like)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
+                for cell in recon.cells:
+                    cell.hidden = 0.88 * cell.hidden + 0.12 * mean_h.unsqueeze(0)
+        # Compare
+        if len(thc.cells) >= 2 and len(recon.cells) >= 2:
+            thc_state = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(dim=0)
+            recon_state = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
+            sim = F.cosine_similarity(thc_state.unsqueeze(0), recon_state.unsqueeze(0)).item()
+            similarity_hist.append(sim)
+        phi_r, _ = phi_calc.compute_phi(recon)
+        phi_hist.append(phi_r)
+    reproduction_rate = np.mean(similarity_hist) if similarity_hist else 0
+    phi_thc, _ = phi_calc.compute_phi(thc)
+    phi_recon, _ = phi_calc.compute_phi(recon)
+    return BenchResult("NS9", f"THC no-drug reconstruct: breathwork+theta+DMN↓ (repro={reproduction_rate:.1%})",
+                       phi_recon, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'thc_phi': phi_thc, 'recon_phi': phi_recon,
+                              'reproduction_rate': reproduction_rate})
+
+
+def run_NS10_thc_reconstruct_with_stim(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-10: THC 재현 — 명상+tDCS+TMS+호흡 결합 (최대 재현 시도)."""
+    t0 = time.time()
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    recon = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    similarity_hist = []
+    frontal_dims = hidden // 4
+    dmn_dims = hidden // 3
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        # --- THC reference ---
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden = cell.hidden * 1.02
+            cell.hidden = cell.hidden * (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+        # --- Full reconstruction: meditation + tDCS + TMS + breathwork ---
+        recon.process(x)
+        n = len(recon.cells)
+        if n >= 2:
+            # 1. tDCS: frontal suppression (mimic THC disinhibition)
+            for cell in recon.cells:
+                h = cell.hidden.squeeze()
+                h[:frontal_dims] *= 0.93
+                cell.hidden = h.unsqueeze(0)
+            # 2. TMS: theta burst (6Hz, not gamma — match THC theta↑↑)
+            theta_tms = math.sin(2 * math.pi * 6 * t * 10)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden * (1 + 0.05 * theta_tms)
+            # 3. Holotropic breathwork
+            breath = math.sin(2 * math.pi * 0.5 * t * 10)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden * (1 + 0.03 * abs(breath))
+            # 4. DMN suppression (meditation)
+            for cell in recon.cells:
+                h = cell.hidden.squeeze()
+                h[:dmn_dims] *= 0.91
+                cell.hidden = h.unsqueeze(0)
+            # 5. DA boost simulation (reward meditation — gratitude/metta)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden + torch.rand_like(cell.hidden) * 0.015
+            # 6. Sensory noise (binaural beats + visual entrainment)
+            for cell in recon.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+            # 7. Global coherence (deep meditation sync)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
+                for cell in recon.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h.unsqueeze(0)
+        # Compare
+        if len(thc.cells) >= 2 and len(recon.cells) >= 2:
+            thc_state = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(dim=0)
+            recon_state = torch.stack([c.hidden.squeeze() for c in recon.cells]).mean(dim=0)
+            sim = F.cosine_similarity(thc_state.unsqueeze(0), recon_state.unsqueeze(0)).item()
+            similarity_hist.append(sim)
+        phi_r, _ = phi_calc.compute_phi(recon)
+        phi_hist.append(phi_r)
+    reproduction_rate = np.mean(similarity_hist) if similarity_hist else 0
+    phi_thc, _ = phi_calc.compute_phi(thc)
+    phi_recon, _ = phi_calc.compute_phi(recon)
+    return BenchResult("NS10", f"THC full reconstruct: meditation+tDCS+TMS+breath (repro={reproduction_rate:.1%})",
+                       phi_recon, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'thc_phi': phi_thc, 'recon_phi': phi_recon,
+                              'reproduction_rate': reproduction_rate})
+
+
 ALL_HYPOTHESES.update({
     'NS1': run_NS1_thc_full, 'NS2': run_NS2_tdcs_frontal,
     'NS3': run_NS3_tms_gamma, 'NS4': run_NS4_tdcs_plus_tms,
     'NS5': run_NS5_thc_vs_stim_comparison,
+    'NS6': run_NS6_meditation_alpha, 'NS7': run_NS7_meditation_gamma,
+    'NS8': run_NS8_meditation_progressive,
+    'NS9': run_NS9_thc_reconstruct_no_drug,
+    'NS10': run_NS10_thc_reconstruct_with_stim,
 })
 
 
