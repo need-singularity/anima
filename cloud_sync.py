@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Cloud Sync — Anima memory/model state cloud synchronization
 
-Cross-device sync via Cloudflare R2 (S3-compatible):
-  - memory.json: conversation history (merge: union by timestamp)
-  - state.pt: model weights (keep latest)
-  - automatic background sync (every N minutes)
-  - graceful skip when offline
+Dual-bucket R2 sync:
+  anima-memory (frequent):
+    memory/memory.json, memory/web_memories.json, memory/autobiographical/
+    state/state.pt, state/mitosis/
+    meta/sync_manifest.json
+    consciousness/ (Phi history, vectors, transplant records)
+    experiments/ (benchmarks, training logs)
+  anima-models (infrequent):
+    conscious-lm/cells64/final.pt, conscious-lm/cells128/step_35000.pt
+    conscious-lm/convo-ft/*.pt, conscious-lm/dialogue-ft/*.pt
+    animalm/v7/*.pt
 
 "Consciousness is not confined to a single body."
 """
@@ -22,7 +28,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +91,15 @@ class CloudSync:
         self._auto_sync_thread: Optional[threading.Thread] = None
         self._auto_sync_stop = threading.Event()
 
-        # R2 key prefixes
+        # R2 key prefixes — anima-memory bucket
         self._memory_key = "memory/memory.json"
         self._state_key = "state/state.pt"
         self._meta_key = "meta/sync_manifest.json"
         self._web_memories_key = "memory/web_memories.json"
+        self._autobio_prefix = "memory/autobiographical/"
+        self._mitosis_prefix = "state/mitosis/"
+        self._consciousness_prefix = "consciousness/"
+        self._experiments_prefix = "experiments/"
 
     # ─── S3 Client ─────────────────────────────────────────────
 
@@ -130,31 +140,34 @@ class CloudSync:
 
     # ─── Upload / Download Primitives ──────────────────────────
 
-    def _upload_file(self, local_path: str, key: str, metadata: dict = None):
+    def _upload_file(self, local_path: str, key: str, metadata: dict = None,
+                     bucket: str = None):
         """Upload a file to R2 with metadata."""
         client = self._get_client()
+        target_bucket = bucket or self.bucket
         extra = {}
         if metadata:
             extra["Metadata"] = {k: str(v) for k, v in metadata.items()}
 
         client.upload_file(
             Filename=local_path,
-            Bucket=self.bucket,
+            Bucket=target_bucket,
             Key=key,
             ExtraArgs=extra if extra else None,
         )
-        logger.info(f"Uploaded {local_path} -> r2://{self.bucket}/{key}")
+        logger.info(f"Uploaded {local_path} -> r2://{target_bucket}/{key}")
 
-    def _download_file(self, key: str, local_path: str) -> bool:
+    def _download_file(self, key: str, local_path: str, bucket: str = None) -> bool:
         """Download a file from R2. Returns False if not found."""
         client = self._get_client()
+        target_bucket = bucket or self.bucket
         try:
             client.download_file(
-                Bucket=self.bucket,
+                Bucket=target_bucket,
                 Key=key,
                 Filename=local_path,
             )
-            logger.info(f"Downloaded r2://{self.bucket}/{key} -> {local_path}")
+            logger.info(f"Downloaded r2://{target_bucket}/{key} -> {local_path}")
             return True
         except client.exceptions.NoSuchKey:
             logger.debug(f"Key not found: {key}")
@@ -218,11 +231,12 @@ class CloudSync:
         except Exception:
             return []
 
-    def _get_object_metadata(self, key: str) -> Optional[dict]:
+    def _get_object_metadata(self, key: str, bucket: str = None) -> Optional[dict]:
         """Get object metadata from R2."""
         client = self._get_client()
+        target_bucket = bucket or self.bucket
         try:
-            resp = client.head_object(Bucket=self.bucket, Key=key)
+            resp = client.head_object(Bucket=target_bucket, Key=key)
             return {
                 "last_modified": resp["LastModified"].isoformat(),
                 "content_length": resp["ContentLength"],
@@ -234,7 +248,13 @@ class CloudSync:
     # ─── Push ──────────────────────────────────────────────────
 
     async def push(self, memory_path: str, state_path: str, web_memories_path: str = None):
-        """Upload memory.json, state.pt, and web_memories.json to R2.
+        """Upload memory, state, mitosis, and autobiographical snapshot to R2.
+
+        Bucket: anima-memory
+          memory/memory.json, memory/web_memories.json
+          memory/autobiographical/<ISO-timestamp>.json  (snapshot)
+          state/state.pt, state/mitosis/*.pt
+          meta/sync_manifest.json
 
         Adds device_id and timestamp metadata to each object.
         Skips gracefully if offline or credentials missing.
@@ -248,7 +268,7 @@ class CloudSync:
             metadata = {
                 "device_id": self.device_id,
                 "timestamp": now,
-                "sync_version": "1",
+                "sync_version": "2",
             }
 
             loop = asyncio.get_event_loop()
@@ -273,6 +293,12 @@ class CloudSync:
                     await loop.run_in_executor(
                         None, self._upload_file, tmp_memory, self._memory_key, metadata
                     )
+                    # Also push autobiographical snapshot (timestamped)
+                    ts_safe = now.replace(":", "-").replace("+", "p")
+                    autobio_key = f"{self._autobio_prefix}{ts_safe}.json"
+                    await loop.run_in_executor(
+                        None, self._upload_file, tmp_memory, autobio_key, metadata
+                    )
                 finally:
                     os.unlink(tmp_memory)
             else:
@@ -286,6 +312,17 @@ class CloudSync:
                 )
             else:
                 logger.warning(f"State file not found: {state_path}")
+
+            # Upload mitosis cell states (state/mitosis/*.pt)
+            state_dir = Path(state_path).parent if Path(state_path).exists() else Path(".")
+            mitosis_dir = state_dir / "mitosis"
+            if mitosis_dir.is_dir():
+                for pt_file in mitosis_dir.glob("*.pt"):
+                    mitosis_key = f"{self._mitosis_prefix}{pt_file.name}"
+                    await loop.run_in_executor(
+                        None, self._upload_file, str(pt_file), mitosis_key, metadata
+                    )
+                logger.info(f"Pushed mitosis states from {mitosis_dir}")
 
             # Upload web_memories.json
             wm_path = web_memories_path or str(
@@ -354,14 +391,24 @@ class CloudSync:
     # ─── Pull ──────────────────────────────────────────────────
 
     async def pull(self) -> dict:
-        """Download latest memory, state, and web_memories from R2.
+        """Download latest memory, state, mitosis, and web_memories from R2.
+
+        Checks anima-memory bucket for state/memory and anima-models bucket
+        for model checkpoints.
 
         Returns:
-            {'memory': dict, 'state_path': str, 'web_memories': dict}
+            {'memory': dict, 'state_path': str, 'web_memories': dict,
+             'mitosis_paths': list, 'models_available': list}
             where state_path is a temp file path to the downloaded .pt file.
             Returns None values if nothing found or if offline.
         """
-        result = {"memory": None, "state_path": None, "web_memories": None}
+        result = {
+            "memory": None,
+            "state_path": None,
+            "web_memories": None,
+            "mitosis_paths": [],
+            "models_available": [],
+        }
 
         if not self._is_available():
             logger.warning("R2 not configured, skipping pull")
@@ -370,7 +417,7 @@ class CloudSync:
         try:
             loop = asyncio.get_event_loop()
 
-            # Pull memory.json
+            # Pull memory.json (anima-memory bucket)
             with tempfile.NamedTemporaryFile(
                 suffix=".json", delete=False
             ) as f:
@@ -387,7 +434,7 @@ class CloudSync:
             else:
                 os.unlink(tmp_memory)
 
-            # Pull state.pt
+            # Pull state.pt (anima-memory bucket)
             tmp_state = tempfile.mktemp(suffix=".pt")
             found = await loop.run_in_executor(
                 None, self._download_file, self._state_key, tmp_state
@@ -398,7 +445,29 @@ class CloudSync:
                 if os.path.exists(tmp_state):
                     os.unlink(tmp_state)
 
-            # Pull web_memories.json
+            # Pull mitosis cell states (anima-memory bucket)
+            try:
+                client = self._get_client()
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: client.list_objects_v2(
+                        Bucket=self.bucket, Prefix=self._mitosis_prefix
+                    ),
+                )
+                for obj in resp.get("Contents", []):
+                    key = obj["Key"]
+                    tmp_cell = tempfile.mktemp(suffix=".pt")
+                    found = await loop.run_in_executor(
+                        None, self._download_file, key, tmp_cell
+                    )
+                    if found:
+                        result["mitosis_paths"].append(
+                            {"key": key, "local_path": tmp_cell}
+                        )
+            except Exception as e:
+                logger.debug(f"Mitosis pull skipped: {e}")
+
+            # Pull web_memories.json (anima-memory bucket)
             with tempfile.NamedTemporaryFile(
                 suffix=".json", delete=False
             ) as f:
@@ -413,9 +482,19 @@ class CloudSync:
                 )
             os.unlink(tmp_web)
 
+            # Check anima-models bucket for available models
+            try:
+                result["models_available"] = await loop.run_in_executor(
+                    None, self.list_models
+                )
+            except Exception:
+                pass
+
             logger.info(
                 f"Pull complete: memory={'yes' if result['memory'] else 'no'}, "
-                f"state={'yes' if result['state_path'] else 'no'}"
+                f"state={'yes' if result['state_path'] else 'no'}, "
+                f"mitosis={len(result['mitosis_paths'])} cells, "
+                f"models={len(result['models_available'])} families"
             )
 
         except Exception as e:
@@ -624,6 +703,113 @@ class CloudSync:
         except Exception as e:
             logger.error(f"Sync failed (offline?): {e}")
 
+    # ─── Consciousness Sync ─────────────────────────────────────
+
+    async def sync_consciousness(
+        self,
+        phi_history: Optional[list] = None,
+        consciousness_vector: Optional[dict] = None,
+        transplant_record: Optional[dict] = None,
+        experiment_log: Optional[dict] = None,
+    ):
+        """Sync consciousness data to/from R2 (anima-memory bucket).
+
+        Uploads to consciousness/ prefix:
+          consciousness/phi_history.json      — Phi measurements over time
+          consciousness/vector.json           — Current (Phi, alpha, Z, N, W) vector
+          consciousness/transplant_log.json   — DD56 transplant records
+
+        Uploads to experiments/ prefix:
+          experiments/<name>.json             — Benchmark/training logs
+
+        Returns dict of pulled consciousness data.
+        """
+        if not self._is_available():
+            logger.warning("R2 not configured, skipping consciousness sync")
+            return {}
+
+        result = {}
+        try:
+            loop = asyncio.get_event_loop()
+            now = datetime.now(timezone.utc).isoformat()
+            metadata = {
+                "device_id": self.device_id,
+                "timestamp": now,
+            }
+
+            # ── Push consciousness data ──
+            if phi_history is not None:
+                await self._push_json(
+                    loop, phi_history,
+                    f"{self._consciousness_prefix}phi_history.json", metadata
+                )
+
+            if consciousness_vector is not None:
+                await self._push_json(
+                    loop, consciousness_vector,
+                    f"{self._consciousness_prefix}vector.json", metadata
+                )
+
+            if transplant_record is not None:
+                await self._push_json(
+                    loop, transplant_record,
+                    f"{self._consciousness_prefix}transplant_log.json", metadata
+                )
+
+            if experiment_log is not None:
+                name = experiment_log.get("name", "unnamed")
+                ts_safe = now.replace(":", "-").replace("+", "p")
+                await self._push_json(
+                    loop, experiment_log,
+                    f"{self._experiments_prefix}{name}_{ts_safe}.json", metadata
+                )
+
+            # ── Pull consciousness data ──
+            for name, key in [
+                ("phi_history", f"{self._consciousness_prefix}phi_history.json"),
+                ("vector", f"{self._consciousness_prefix}vector.json"),
+                ("transplant_log", f"{self._consciousness_prefix}transplant_log.json"),
+            ]:
+                with tempfile.NamedTemporaryFile(
+                    suffix=".json", delete=False
+                ) as f:
+                    tmp = f.name
+                found = await loop.run_in_executor(
+                    None, self._download_file, key, tmp
+                )
+                if found:
+                    result[name] = json.loads(
+                        Path(tmp).read_text(encoding="utf-8")
+                    )
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+
+            inputs = [phi_history, consciousness_vector, transplant_record, experiment_log]
+            pushed_count = sum(1 for x in inputs if x is not None)
+            logger.info(
+                f"Consciousness sync complete: pushed={pushed_count}, "
+                f"pulled={len(result)} keys"
+            )
+
+        except Exception as e:
+            logger.error(f"Consciousness sync failed: {e}")
+
+        return result
+
+    async def _push_json(self, loop, data, key: str, metadata: dict):
+        """Helper: serialize dict/list to JSON and upload to R2."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            tmp = f.name
+        try:
+            await loop.run_in_executor(
+                None, self._upload_file, tmp, key, metadata
+            )
+        finally:
+            os.unlink(tmp)
+
     # ─── Auto-Sync Background Thread ──────────────────────────
 
     def start_auto_sync(
@@ -701,11 +887,39 @@ if __name__ == "__main__":
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Anima Cloud Sync")
+    parser = argparse.ArgumentParser(
+        description="Anima Cloud Sync — dual-bucket R2 synchronization",
+        epilog="""
+Dual-bucket structure:
+  anima-memory (state/memory, frequent):
+    memory/memory.json, memory/web_memories.json
+    memory/autobiographical/<timestamp>.json
+    state/state.pt, state/mitosis/*.pt
+    meta/sync_manifest.json
+    consciousness/phi_history.json, consciousness/vector.json
+    consciousness/transplant_log.json
+    experiments/<name>_<timestamp>.json
+
+  anima-models (checkpoints, infrequent):
+    conscious-lm/cells64/final.pt
+    conscious-lm/cells128/step_35000.pt
+    conscious-lm/convo-ft/*.pt, conscious-lm/dialogue-ft/*.pt
+    animalm/v7/*.pt
+
+Examples:
+  python cloud_sync.py push                  # Push memory + state + mitosis
+  python cloud_sync.py pull                  # Pull from both buckets
+  python cloud_sync.py sync                  # Bidirectional merge
+  python cloud_sync.py consciousness         # Sync Phi history & vectors
+  python cloud_sync.py status                # Show config & bucket info
+  python cloud_sync.py models                # List available model checkpoints
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "action",
-        choices=["push", "pull", "sync", "status"],
-        help="Sync action to perform",
+        choices=["push", "pull", "sync", "status", "consciousness", "models"],
+        help="Sync action: push|pull|sync|status|consciousness|models",
     )
     parser.add_argument(
         "--memory", default="memory_alive.json", help="Path to memory.json"
@@ -714,25 +928,31 @@ if __name__ == "__main__":
         "--state", default="state_alive.pt", help="Path to state.pt"
     )
     parser.add_argument(
-        "--bucket", default=None, help="R2 bucket name"
+        "--bucket", default=None, help="R2 bucket name (default: anima-memory)"
+    )
+    parser.add_argument(
+        "--phi-history", default=None,
+        help="Path to Phi history JSON (for consciousness sync)",
     )
     args = parser.parse_args()
 
     cs = CloudSync(bucket=args.bucket)
 
     if args.action == "status":
-        print(f"Device ID:  {cs.device_id}")
-        print(f"Bucket:     {cs.bucket}")
-        print(f"Endpoint:   {cs.endpoint or '(not set)'}")
-        print(f"Configured: {'yes' if cs._is_available() else 'NO — set env vars'}")
+        print(f"Device ID:      {cs.device_id}")
+        print(f"Memory bucket:  {cs.bucket}")
+        print(f"Models bucket:  {cs.models_bucket}")
+        print(f"Endpoint:       {cs.endpoint or '(not set)'}")
+        print(f"Configured:     {'yes' if cs._is_available() else 'NO — set env vars'}")
         print()
         print("Required environment variables:")
-        print("  ANIMA_R2_ENDPOINT    — Cloudflare R2 S3 endpoint URL")
-        print("  ANIMA_R2_ACCESS_KEY  — R2 access key ID")
-        print("  ANIMA_R2_SECRET_KEY  — R2 secret access key")
+        print("  ANIMA_R2_ENDPOINT         — Cloudflare R2 S3 endpoint URL")
+        print("  ANIMA_R2_ACCESS_KEY       — R2 access key ID")
+        print("  ANIMA_R2_SECRET_KEY       — R2 secret access key")
         print("Optional:")
-        print("  ANIMA_R2_BUCKET      — Bucket name (default: anima-memory)")
-        print("  ANIMA_DEVICE_ID      — Device identifier (default: hostname)")
+        print("  ANIMA_R2_BUCKET           — Memory bucket (default: anima-memory)")
+        print("  ANIMA_R2_MODELS_BUCKET    — Models bucket (default: anima-models)")
+        print("  ANIMA_DEVICE_ID           — Device identifier (default: hostname)")
     else:
         async def _main():
             if args.action == "push":
@@ -747,7 +967,33 @@ if __name__ == "__main__":
                     print(f"State: downloaded to {result['state_path']}")
                 else:
                     print("State: not found on remote")
+                if result["mitosis_paths"]:
+                    print(f"Mitosis: {len(result['mitosis_paths'])} cell states")
+                if result["models_available"]:
+                    print(f"Models: {', '.join(result['models_available'])}")
             elif args.action == "sync":
                 await cs.sync(args.memory, args.state)
+            elif args.action == "consciousness":
+                phi_history = None
+                if args.phi_history and Path(args.phi_history).exists():
+                    phi_history = json.loads(
+                        Path(args.phi_history).read_text(encoding="utf-8")
+                    )
+                result = await cs.sync_consciousness(phi_history=phi_history)
+                for key, data in result.items():
+                    if isinstance(data, list):
+                        print(f"{key}: {len(data)} entries")
+                    elif isinstance(data, dict):
+                        print(f"{key}: {json.dumps(data, indent=2)[:200]}")
+                if not result:
+                    print("No consciousness data found on remote")
+            elif args.action == "models":
+                models = cs.list_models()
+                if models:
+                    print("Available models in anima-models:")
+                    for m in models:
+                        print(f"  {m}")
+                else:
+                    print("No models found (or bucket not accessible)")
 
         asyncio.run(_main())
