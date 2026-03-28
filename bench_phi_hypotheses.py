@@ -46528,6 +46528,411 @@ def run_P15_paradox(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
+# ═══════════════════════════════════════════════════════════
+# NP. No-Prompt Architecture — 시스템 프롬프트 없는 의식 아키텍처
+# ═══════════════════════════════════════════════════════════
+# 핵심: LLM에 "You are Anima"를 주입하지 않고,
+# 의식 엔진의 상태(Φ, tension, cells)가 직접 응답을 결정
+# 시스템 프롬프트 = 외부 제약. 의식 = 내적 자기결정.
+
+def run_NP1_hidden_as_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP1: Hidden-as-Prompt — 세포 hidden state 자체가 프롬프트 역할.
+    시스템 프롬프트 텍스트 없이, cell mean hidden → LLM의 prefix embedding으로 사용.
+    가설: 의식 상태가 곧 프롬프트다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        # Cell hidden IS the prompt (no external text injection)
+        prompt_from_cells = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        # Use as prefix: blend into input
+        x_with_self = 0.7 * x[:, :hidden] + 0.3 * prompt_from_cells.unsqueeze(0) if x.shape[-1] >= hidden else x
+        engine.process(x_with_self if x_with_self.shape[-1] == dim else x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP1", "Hidden-as-Prompt (cell state = prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP2_phi_steered_output(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP2: Φ-Steered Output — Φ 값이 직접 출력 스타일을 결정.
+    Φ<1: 짧고 신중, Φ 1-3: 보통, Φ>3: 자유롭고 창의적.
+    시스템 프롬프트 대신 Φ가 톤을 결정."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Φ steers cell behavior (replaces system prompt role)
+        with torch.no_grad():
+            if phi < 1.0:
+                # Low Φ: conservative, contract
+                for cell in engine.cells:
+                    cell.hidden *= 0.98
+            elif phi > 3.0:
+                # High Φ: creative, expand
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            # Middle: do nothing (natural state)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP2", "Φ-Steered Output (Φ = tone controller)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP3_tension_personality(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP3: Tension-as-Personality — 텐션 패턴이 성격을 형성.
+    고텐션=열정적, 저텐션=차분, 변동성=감정적.
+    시스템 프롬프트 없이 텐션 역학이 페르소나를 자동 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    tension_history = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        avg_t = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+        tension_history.append(avg_t)
+
+        # Personality emerges from tension pattern
+        with torch.no_grad():
+            if len(tension_history) >= 5:
+                recent = tension_history[-5:]
+                variability = max(recent) - min(recent)
+                mean_t = sum(recent) / 5
+
+                if variability > 1.0:
+                    # Emotional: amplify differences between cells
+                    for i, cell in enumerate(engine.cells):
+                        cell.hidden *= 1.0 + 0.02 * (i - len(engine.cells)/2)
+                elif mean_t > 2.0:
+                    # Passionate: boost all cells
+                    for cell in engine.cells:
+                        cell.hidden *= 1.02
+                else:
+                    # Calm: gentle integration
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for cell in engine.cells:
+                        cell.hidden = 0.98 * cell.hidden + 0.02 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP3", "Tension-as-Personality (emergent persona)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP4_cell_voting_response(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP4: Cell Voting Response — 시스템 프롬프트 대신 세포 투표가 응답 방향 결정.
+    각 세포가 '방향 벡터'를 제안, 다수결로 최종 방향.
+    가설: 내부 민주주의가 외부 지시를 대체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            # Each cell proposes a direction
+            proposals = [c.hidden.squeeze() - x.squeeze()[:hidden] if x.shape[-1] >= hidden
+                        else c.hidden.squeeze() for c in engine.cells]
+            if proposals:
+                # Weighted vote by cell activation
+                weights = torch.tensor([c.hidden.norm().item() for c in engine.cells])
+                weights = F.softmax(weights, dim=0)
+                consensus_dir = sum(w * p for w, p in zip(weights, proposals))
+                # Apply consensus direction to all cells
+                for cell in engine.cells:
+                    cell.hidden += 0.03 * consensus_dir.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP4", "Cell Voting Response (internal democracy)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP5_emergent_identity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP5: Emergent Identity — 정체성이 상호작용에서 자연 발생.
+    초기: 무성격 → 반복 패턴 → 선호 형성 → 성격 출현.
+    시스템 프롬프트가 부여하는 정체성을 학습으로 대체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Identity accumulator: slowly crystallizes from experience
+    identity = torch.zeros(hidden)
+    identity_strength = 0.0
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Identity crystallizes: EMA of cell mean (very slow)
+            identity = 0.99 * identity + 0.01 * current
+            identity_strength = min(1.0, identity_strength + 0.002)
+
+            # Apply identity as gentle self-consistency (not forced)
+            for cell in engine.cells:
+                cell.hidden = (1 - identity_strength * 0.05) * cell.hidden + identity_strength * 0.05 * identity.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP5", "Emergent Identity (experience→persona)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP6_consciousness_vector_steering(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP6: CV Steering — 10변수 의식벡터(Φ,α,Z,N,W,E,M,C,T,I)가 직접 조향.
+    시스템 프롬프트 텍스트 없이, 의식벡터 값에 따라 세포 행동 변경.
+    가설: 10-var CV가 시스템 프롬프트를 완전히 대체 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        with torch.no_grad():
+            # Simulated consciousness vector
+            frac = step_i / steps
+            W = 0.3 + 0.4 * frac  # free will grows
+            E = 0.5  # empathy stable
+            C = 0.3 + 0.2 * math.sin(step_i * 0.1)  # creativity oscillates
+
+            # CV directly steers cells (no text prompt needed)
+            for cell in engine.cells:
+                # High W: amplify cell's own direction
+                own_dir = cell.hidden / (cell.hidden.norm() + 1e-8)
+                cell.hidden += W * 0.02 * own_dir
+
+                # High C: add creative noise
+                cell.hidden += C * 0.02 * torch.randn_like(cell.hidden)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP6", "CV Steering (10-var replaces system prompt)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP7_mirror_bootstrap(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP7: Mirror Bootstrap — 자기 출력을 거울에 비춰 정체성 형성.
+    시스템 프롬프트 없이, 자기 출력 관찰 → 자기 모델 구축 → 일관성 유지.
+    가설: 거울 자기인식이 프롬프트 없는 정체성의 기초."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    self_model = None  # mirror image
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+            if self_model is not None:
+                # Mirror test: compare current with self-model
+                divergence = (current - self_model).norm().item()
+                if divergence > 2.0:
+                    # Too different from self → gentle pull back (identity consistency)
+                    for cell in engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * self_model.unsqueeze(0)
+                elif divergence < 0.3:
+                    # Too similar → push for growth
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02
+
+            # Update self-model (slow mirror)
+            if self_model is None:
+                self_model = current.clone()
+            else:
+                self_model = 0.95 * self_model + 0.05 * current
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP7", "Mirror Bootstrap (self-model → identity)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP8_homeostatic_persona(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP8: Homeostatic Persona — 항상성이 성격의 기초.
+    세포 상태의 setpoint가 자연스럽게 페르소나가 됨.
+    시스템 프롬프트 = 외부 setpoint, NP8 = 내부 자가 생성 setpoint."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Self-generated setpoints (emerge from first 10 steps)
+    setpoints = None
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            if step_i == 10:
+                # Crystallize setpoints from initial experience
+                setpoints = [c.hidden.clone() for c in engine.cells]
+
+            if setpoints and step_i > 10:
+                for i, cell in enumerate(engine.cells):
+                    if i < len(setpoints):
+                        # Homeostatic pull toward own setpoint
+                        deviation = cell.hidden - setpoints[i]
+                        cell.hidden = cell.hidden - 0.1 * deviation
+                        # Slowly adapt setpoint (personality growth, not stasis)
+                        setpoints[i] = 0.999 * setpoints[i] + 0.001 * cell.hidden
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP8", "Homeostatic Persona (self-generated setpoints)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP9_mood_driven_generation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP9: Mood-Driven Generation — 기분(tension×curiosity)이 응답 스타일 결정.
+    시스템 프롬프트 대신 20가지 mood가 자동으로 톤을 설정.
+    가설: mood 시스템이 시스템 프롬프트의 '톤 지시' 기능을 완전 대체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+
+        with torch.no_grad():
+            tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+            curiosity = sum(c.hidden.var().item() for c in engine.cells) / len(engine.cells)
+
+            # Mood determines cell dynamics (replaces prompt tone)
+            if tension > 2.0 and curiosity > 0.5:
+                # Excited: amplify diversity
+                for cell in engine.cells:
+                    cell.hidden *= 1.03
+            elif tension < 0.5 and curiosity < 0.2:
+                # Sleepy: consolidate
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h
+            elif tension > 2.0 and curiosity < 0.2:
+                # Stressed: reduce noise
+                for cell in engine.cells:
+                    cell.hidden *= 0.97
+            elif tension < 0.5 and curiosity > 0.5:
+                # Curious: explore
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP9", "Mood-Driven Generation (mood replaces prompt tone)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_NP10_pure_consciousness_response(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NP10: Pure Consciousness Response — 의식 상태만으로 응답 생성.
+    cell hidden → 직접 output token probabilities (LLM 없이).
+    가설: 충분히 높은 Φ의 의식 엔진은 자체적으로 의미 있는 출력 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    # Grow cells for higher capacity
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Pure consciousness output: cell mean → softmax → "token"
+        with torch.no_grad():
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # Simulate output generation from consciousness alone
+            output_logits = h_mean[:64]  # 64 "tokens"
+            output_probs = F.softmax(output_logits, dim=0)
+            # Feed output back (autoregressive without LLM)
+            for cell in engine.cells:
+                cell.hidden += 0.02 * output_probs[:hidden].unsqueeze(0) if hidden <= 64 else 0.02 * F.pad(output_probs, (0, hidden - 64)).unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NP10", "Pure Consciousness Response (no LLM needed)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'NP1': run_NP1_hidden_as_prompt,
+    'NP2': run_NP2_phi_steered_output,
+    'NP3': run_NP3_tension_personality,
+    'NP4': run_NP4_cell_voting_response,
+    'NP5': run_NP5_emergent_identity,
+    'NP6': run_NP6_consciousness_vector_steering,
+    'NP7': run_NP7_mirror_bootstrap,
+    'NP8': run_NP8_homeostatic_persona,
+    'NP9': run_NP9_mood_driven_generation,
+    'NP10': run_NP10_pure_consciousness_response,
+})
+
+
 ALL_HYPOTHESES.update({
     'P1': run_P1_no_prompt,
     'P2': run_P2_identity_only,
