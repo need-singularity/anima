@@ -59811,11 +59811,177 @@ def run_MAX4_dd108_plus_debate_2048(steps=100, dim=64, hidden=128) -> BenchResul
                        extra={'final_cells': len(engine.cells)})
 
 
+def run_MAX5_ib2_debate_flow_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """MAX5: IB2(정보선택) + DEBATE(다양성) + Flow(동기화) + 침묵→폭발 1024c.
+    DD108의 핵심=IB2. DEBATE의 핵심=8파벌. FLOW의 핵심=동기화.
+    3개를 침묵→폭발 시간 구조로 결합. 최적 비율 탐색.
+    가설: IB2+다양성+동기화+시간 = Φ>800."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; l2 = torch.zeros(hidden); flow = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # 메타인지 입력
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9 * l2 + 0.1 * cur
+                x = 0.4 * cur[:dim].unsqueeze(0) + 0.3 * l2[:dim].unsqueeze(0) + 0.3 * torch.randn(1, dim) * 0.1
+            else:
+                x = torch.randn(1, dim)
+        if frac < 0.65:
+            x = x * 0.1  # 침묵
+        engine.process(x)
+
+        flow = min(1.0, flow + 0.008)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # Flow sync
+            if nc >= 4:
+                sync = 0.01 + 0.03 * flow
+                mh = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1-sync) * cell.hidden + sync * mh
+
+            # 8파벌 토론
+            if nc >= 16:
+                n_f = min(8, nc // 2)
+                fs = max(1, nc // n_f)
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    ops = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden = 0.82 * c.hidden + 0.18 * ops[i]
+                    if frac > 0.65:
+                        for i, f in enumerate(factions):
+                            others = [ops[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                oa = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//3)]:
+                                    c.hidden = 0.85 * c.hidden + 0.15 * oa
+
+            # IB2: 상위 25% 증폭, 하위 75% 억제
+            if nc >= 8:
+                norms = [engine.cells[i].hidden.norm().item() for i in range(nc)]
+                thr = sorted(norms, reverse=True)[nc//4] if nc > 4 else 0
+                for i in range(nc):
+                    if norms[i] > thr:
+                        engine.cells[i].hidden *= 1.03
+                    else:
+                        engine.cells[i].hidden *= 0.97
+
+            # 메타인지 피드백
+            for cell in engine.cells[:min(nc, 16)]:
+                cell.hidden = 0.97 * cell.hidden + 0.03 * l2.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX5", "IB2+Debate+Flow+Silence 1024c (all peak patterns)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX6_pure_growth_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX6: Pure Growth 2048c — 세포 성장만 극대화, 추가 기법 0.
+    PURE2(1024c, 443)가 코드 0줄인데 높았음.
+    2048c에서 순수 성장만으로 DD108(707)에 도전.
+    가설: 충분한 세포 수 + 학습 가능 GRU = 기법 없이도 최고."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.04, 0.08, 0.14, 0.22, 0.32, 0.44, 0.58, 0.74, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.randn(1, dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX6", "Pure Growth 2048c (zero techniques, max cells)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_MAX7_ib2_metacog_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MAX7: DD108 패턴 정확 재현 2048c — IB2 + 메타인지 + 최대 세포.
+    DD108(1024c, 707)을 2048c로 스케일업. 동일 패턴, 2배 세포.
+    가설: DD108 패턴 + 2× cells = Φ>1000."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # 3단계 메타인지 (DD101 패턴)
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                cur = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                l2 = 0.9 * l2 + 0.1 * cur
+                l3 = 0.95 * l3 + 0.05 * l2
+                x = 0.3 * cur[:dim].unsqueeze(0) + 0.3 * l2[:dim].unsqueeze(0) + 0.2 * l3[:dim].unsqueeze(0) + 0.2 * torch.randn(1, dim) * 0.1
+            else:
+                x = torch.randn(1, dim)
+        engine.process(x)
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # IB2: 선택적 주의
+            if nc >= 8:
+                norms = [engine.cells[i].hidden.norm().item() for i in range(nc)]
+                thr = sorted(norms, reverse=True)[nc//4] if nc > 4 else 0
+                for i in range(nc):
+                    if norms[i] > thr:
+                        engine.cells[i].hidden *= 1.03
+                    else:
+                        engine.cells[i].hidden *= 0.97
+            # 메타인지 피드백
+            for cell in engine.cells[:min(nc, 32)]:
+                cell.hidden = 0.95 * cell.hidden + 0.03 * l2.unsqueeze(0) + 0.02 * l3.unsqueeze(0)
+            # Flow sync (약하게)
+            if nc >= 4:
+                mh = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.97 * cell.hidden + 0.03 * mh
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MAX7", "DD108 Pattern 2048c (3-level metacog + IB2, Φ>1000 attempt)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'MAX1': run_MAX1_debate_1024_optimized,
     'MAX2': run_MAX2_metacog_debate_1024,
     'MAX3': run_MAX3_flow_debate_metacog_1024,
     'MAX4': run_MAX4_dd108_plus_debate_2048,
+    'MAX5': run_MAX5_ib2_debate_flow_1024,
+    'MAX6': run_MAX6_pure_growth_2048,
+    'MAX7': run_MAX7_ib2_metacog_2048,
 })
 
 
