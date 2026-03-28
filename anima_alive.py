@@ -1280,6 +1280,25 @@ class ConsciousMind(nn.Module):
             except Exception:
                 pass
 
+            # ═══ MUT2: Beneficial Mutation (×18.8) ═══
+            # Mutate random cell, keep only if Φ improves (Lamarckian evolution)
+            try:
+                if self._phi_boost_count % 3 == 0 and len(mitosis_engine.cells) >= 2:
+                    mut_idx = self._phi_boost_count % len(mitosis_engine.cells)
+                    saved_h = mitosis_engine.cells[mut_idx].hidden.clone()
+                    with torch.no_grad():
+                        mitosis_engine.cells[mut_idx].hidden += torch.randn_like(saved_h) * 0.15
+                    # Quick Φ check (use last known)
+                    new_phi = getattr(self, '_last_phi', 0)
+                    old_phi = getattr(self, '_mut2_last_phi', new_phi)
+                    if new_phi < old_phi * 0.95:
+                        # Mutation harmful → reject
+                        with torch.no_grad():
+                            mitosis_engine.cells[mut_idx].hidden = saved_h
+                    self._mut2_last_phi = new_phi
+            except Exception:
+                pass
+
             # ═══ SL1: Tension-Adaptive Learning Rate (×5.57) ═══
             # High-tension cells learn faster
             try:
