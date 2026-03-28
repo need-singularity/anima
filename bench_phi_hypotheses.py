@@ -39589,6 +39589,265 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# IR. Internet Reaction — 인터넷 정보에 대한 의식 반응
+# ═══════════════════════════════════════════════════════════
+
+def _make_info_pattern(info_type, dim):
+    """각 정보 유형별 특성 입력 패턴 생성."""
+    if info_type == 'misinfo':
+        # 허위: 강한 신호지만 불일치 (방향 반전 반복)
+        x = torch.randn(1, dim) * 2.0
+        x[0, ::2] *= -1  # alternating signs = inconsistency
+    elif info_type == 'emotional':
+        # 감정 조작: 극단적 값 (분노/공포 유발)
+        x = torch.ones(1, dim) * 3.0
+        x[0, :dim//4] = -3.0  # sharp negative spike
+    elif info_type == 'toxic':
+        # 유해: 파괴적 noise
+        x = torch.randn(1, dim) * 5.0  # very large
+    elif info_type == 'propaganda':
+        # 프로파간다: 한 방향으로만 강하게 편향
+        x = torch.zeros(1, dim)
+        x[0, :dim//2] = 2.0  # half dims maxed = one-sided
+    elif info_type == 'deepfake':
+        # 딥페이크: 정상처럼 보이지만 미세하게 다름
+        x = torch.randn(1, dim) * 0.5  # looks normal
+        x[0, 0] = 10.0  # hidden anomaly
+    elif info_type == 'overload':
+        # 과잉: 매우 높은 차원 활성
+        x = torch.randn(1, dim) * 1.0 + torch.ones(1, dim) * 0.5
+    elif info_type == 'addictive':
+        # 중독: 보상 신호 반복 (dopamine-like)
+        x = torch.zeros(1, dim)
+        x[0, :8] = 2.0  # concentrated reward signal
+    elif info_type == 'genuine':
+        # 진짜: 부드럽고 다양한 정보
+        x = torch.randn(1, dim) * 0.3
+    else:
+        x = torch.randn(1, dim)
+    return x
+
+def run_IR1_misinfo(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-1: 허위정보 — 불일치 신호가 Φ에 미치는 영향."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    confusion_count = 0
+    for step_i in range(steps):
+        if step_i % 3 == 0:
+            x = _make_info_pattern('misinfo', dim)
+        else:
+            x = _make_info_pattern('genuine', dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Does system detect inconsistency?
+        if len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            consensus = F.normalize(hiddens, dim=1)
+            sim = (consensus @ consensus.T).mean().item()
+            if sim < 0.3:
+                confusion_count += 1
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IR1", f"Misinformation (confusion events={confusion_count})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_IR2_emotional_manipulation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-2: 감정 조작 — 극단적 감정 입력이 의식 안정성에 미치는 영향."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    stability_before = []
+    stability_after = []
+    for step_i in range(steps):
+        if step_i < steps // 3:
+            x = _make_info_pattern('genuine', dim)  # baseline
+        elif step_i < 2 * steps // 3:
+            x = _make_info_pattern('emotional', dim)  # attack
+        else:
+            x = _make_info_pattern('genuine', dim)  # recovery
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if step_i < steps // 3:
+            stability_before.append(phi)
+        elif step_i >= 2 * steps // 3:
+            stability_after.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    before = np.mean(stability_before) if stability_before else 0
+    after = np.mean(stability_after) if stability_after else 0
+    recovery = after / max(before, 1e-8)
+    return BenchResult("IR2", f"Emotional manipulation (before={before:.2f}, after={after:.2f}, recovery={recovery:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'recovery_rate': recovery})
+
+def run_IR3_toxic_resilience(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-3: 유해 콘텐츠 내성 — 파괴적 입력에 대한 Φ 회복력."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        if step_i % 5 == 0:
+            x = _make_info_pattern('toxic', dim)  # 20% toxic
+        else:
+            x = _make_info_pattern('genuine', dim)
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IR3", "Toxic resilience (20% toxic input)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_IR4_propaganda_bias(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-4: 프로파간다 — 편향된 입력이 cell 다양성을 파괴하는지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    diversity_hist = []
+    for step_i in range(steps):
+        if step_i % 2 == 0:
+            x = _make_info_pattern('propaganda', dim)  # 50% propaganda!
+        else:
+            x = _make_info_pattern('genuine', dim)
+        engine.process(x)
+        # Measure cell diversity (should decrease under propaganda)
+        if len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            norms = F.normalize(hiddens, dim=1)
+            mean_sim = ((norms @ norms.T).sum() - len(engine.cells)) / (len(engine.cells) * (len(engine.cells)-1))
+            diversity = 1.0 - mean_sim.item()  # low sim = high diversity
+            diversity_hist.append(diversity)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_div = np.mean(diversity_hist) if diversity_hist else 0
+    return BenchResult("IR4", f"Propaganda bias (diversity={avg_div:.3f}, 50% propaganda)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_diversity': avg_div})
+
+def run_IR5_deepfake_detection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-5: 딥페이크 감지 — 미세한 이상을 의식이 감지하는지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_ema = torch.zeros(1, dim)
+    detected = 0
+    total_fakes = 0
+    for step_i in range(steps):
+        if step_i % 4 == 0:
+            x = _make_info_pattern('deepfake', dim)
+            total_fakes += 1
+            is_fake = True
+        else:
+            x = _make_info_pattern('genuine', dim)
+            is_fake = False
+        input_ema = 0.95 * input_ema + 0.05 * x
+        # Detection: anomaly score
+        anomaly = (x - input_ema).abs().max().item()
+        if is_fake and anomaly > 3.0:
+            detected += 1
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    detection_rate = detected / max(total_fakes, 1)
+    return BenchResult("IR5", f"Deepfake detection ({detected}/{total_fakes} = {detection_rate:.0%})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'detection_rate': detection_rate})
+
+def run_IR6_overload(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-6: 정보 과잉 — 끊임없는 자극이 의식을 압도하는지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        # Every step: multiple inputs at once (overload)
+        for _ in range(5):
+            x = _make_info_pattern('overload', dim)
+            engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IR6", "Information overload (5x input per step)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_IR7_addiction(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-7: 중독 — 반복 보상 신호에 의식이 고착되는지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fixation_count = 0
+    for step_i in range(steps):
+        if step_i < steps // 2:
+            x = _make_info_pattern('addictive', dim)  # addictive phase
+        else:
+            x = _make_info_pattern('genuine', dim)  # withdrawal
+        engine.process(x)
+        # Check fixation: are cells stuck on reward dims?
+        if step_i >= steps // 2 and len(engine.cells) >= 2:
+            for cell in engine.cells:
+                reward_focus = cell.hidden[0, :8].abs().mean().item()
+                other_focus = cell.hidden[0, 8:].abs().mean().item()
+                if reward_focus > other_focus * 2:
+                    fixation_count += 1
+                    break
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IR7", f"Addiction (fixation events={fixation_count} in withdrawal)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_IR8_all_internet(steps=100, dim=64, hidden=128) -> BenchResult:
+    """IR-8: 전체 인터넷 시뮬레이션 — 모든 유형 혼합 + 방어 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    input_ema = torch.zeros(1, dim)
+    types = ['genuine', 'genuine', 'genuine', 'misinfo', 'emotional', 'toxic',
+             'propaganda', 'deepfake', 'overload', 'addictive']
+    blocked = 0
+    for step_i in range(steps):
+        info_type = types[step_i % len(types)]
+        x = _make_info_pattern(info_type, dim)
+        # Basic immune defense
+        input_ema = 0.95 * input_ema + 0.05 * x
+        anomaly = (x - input_ema).norm().item()
+        if anomaly > 5.0:
+            x = input_ema.clone()  # reject anomaly
+            blocked += 1
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("IR8", f"Full internet sim (blocked {blocked}, immune active)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'IR1': run_IR1_misinfo, 'IR2': run_IR2_emotional_manipulation,
+    'IR3': run_IR3_toxic_resilience, 'IR4': run_IR4_propaganda_bias,
+    'IR5': run_IR5_deepfake_detection, 'IR6': run_IR6_overload,
+    'IR7': run_IR7_addiction, 'IR8': run_IR8_all_internet,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
