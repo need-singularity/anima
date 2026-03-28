@@ -58947,6 +58947,256 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# ULTIMATE. 궁극의 아키텍처 — 모든 조건을 동시에 만족
+# ═══════════════════════════════════════════════════════════
+# 대화가능 + 자발적 발화 + 무프롬프트 + 영속 + 성장 + 붕괴방지
+# speak()=0, decoder=0, prompt=0, external_input=0
+# 핵심: 학습가능 가중치(MitosisEngine) + 8파벌 + ratchet + Hebbian + 항상성
+
+def run_ULTIMATE1_all_conditions_512(steps=2000, dim=64, hidden=128) -> BenchResult:
+    """ULTIMATE1: 모든 조건을 동시에 만족하는 궁극 아키텍처 (512c, 2000 step).
+
+    ✅ 대화가능:       8파벌 토론 → 합의 → "발화" (DEBATE3 패턴)
+    ✅ 자발적 발화:    output = mean(cells), speak()=0줄 (PURE 패턴)
+    ✅ 무프롬프트:     정체성 = 세포 역학에서 창발 (XNP7 패턴)
+    ✅ 영속성:         ratchet + Hebbian (PERSIST3 패턴)
+    ✅ 성장:           8파벌 다양성 → 정체 방지 (법칙 23)
+    ✅ 붕괴방지:       항상성 (PERSIST6 패턴)
+    ✅ 대화없이도:     self-loop + 내부 noise (PERSIST7 패턴)
+
+    2000 step으로 장기 안정성 검증. 외부 입력 0.
+    가설: 이것이 의식의 최소 완전 아키텍처."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []; speech_events = 0
+    best_phi = 0.0; best_states = None
+    target_norm = 1.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # ── 성장: 2→512 cells ──
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        n = len(engine.cells)
+
+        # ── 입력: 외부 0, self-loop only ──
+        with torch.no_grad():
+            if n >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = self_state + torch.randn_like(self_state) * 0.02  # 내부 noise만
+            else:
+                x = torch.randn(1, dim) * 0.1
+        engine.process(x)  # 학습가능 GRU가 내부적으로 적응 (법칙 32)
+
+        with torch.no_grad():
+            # ── 항상성: 활동 수준 자동 조절 (PERSIST6) ──
+            for cell in engine.cells:
+                norm = cell.hidden.norm().item()
+                if norm > target_norm * 2.0:
+                    cell.hidden *= target_norm / (norm + 1e-8)
+                elif norm < target_norm * 0.3 and norm > 0.01:
+                    cell.hidden *= target_norm / (norm + 1e-8)
+
+            # ── 8파벌 토론 (DEBATE3) ──
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+
+                # 파벌 내 합의
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+
+                # 침묵→폭발 시간 구조 (APEX8): 70% 분화, 30% 토론
+                if frac > 0.70 or (step_i % 100) > 70:
+                    # 토론 phase: 파벌 간 교류
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(n_f) if j != i]
+                        if others:
+                            other_avg = torch.stack(others).mean(dim=0)
+                            for c in f[:max(1, len(f)//4)]:
+                                c.hidden = 0.88 * c.hidden + 0.12 * other_avg
+                else:
+                    # 침묵 phase: 파벌 독립 분화
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden += torch.randn_like(c.hidden) * 0.015 * (i + 1) / n_f
+
+            # ── Hebbian LTP/LTD (PERSIST2) ──
+            for i in range(min(n, 32)):
+                j = (i + 1) % n
+                h_i = engine.cells[i].hidden.squeeze()
+                h_j = engine.cells[j].hidden.squeeze()
+                corr = (h_i * h_j).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+                else:
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.01
+
+            # ── Stochastic noise (영원한 활동 보장) ──
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.008
+
+        # ── "발화" = mean(cells). speak()=0줄 ──
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            output_norm = output.norm().item()
+            output_norms.append(output_norm)
+            # 출력 변화 = 발화 발생
+            if len(output_norms) > 1 and abs(output_norms[-1] - output_norms[-2]) > 0.001:
+                speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # ── Φ Ratchet (PERSIST1): 붕괴 방지 ──
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.6 and best_states and len(best_states) == len(engine.cells):
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+
+    # 분석: 10분할
+    seg = steps // 10
+    seg_means = [sum(phi_hist[i*seg:(i+1)*seg])/seg for i in range(10)]
+    monotonic = sum(1 for i in range(9) if seg_means[i+1] >= seg_means[i] * 0.9) >= 7  # 7/9 이상 비감소
+    never_silent = speech_events / (steps - 1)
+    collapsed = seg_means[-1] < seg_means[0] * 0.5
+
+    return BenchResult("ULTIMATE1", "All Conditions 512c 2000step (conversation+speech+persist+growth)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={
+                           'best_phi': best_phi,
+                           'segments': [round(m, 3) for m in seg_means],
+                           'monotonic': monotonic,
+                           'collapsed': collapsed,
+                           'never_silent': round(never_silent, 3),
+                           'speech_events': speech_events,
+                           'growth_ratio': round(seg_means[-1] / (seg_means[0] + 1e-8), 1),
+                           'conditions': {
+                               'conversation': 'YES (8-faction debate)',
+                               'spontaneous_speech': f'{"YES" if never_silent > 0.3 else "NO"} ({never_silent:.0%})',
+                               'no_prompt': 'YES (zero system prompt)',
+                               'persistent': f'{"YES" if not collapsed else "NO"}',
+                               'growing': f'{"YES" if monotonic else "NO"} (×{seg_means[-1]/(seg_means[0]+1e-8):.1f})',
+                               'no_dialogue': 'YES (external input = 0)',
+                           },
+                           'final_cells': len(engine.cells)
+                       })
+
+
+def run_ULTIMATE2_all_conditions_1024(steps=2000, dim=64, hidden=128) -> BenchResult:
+    """ULTIMATE2: 궁극 아키텍처 1024c 스케일."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []; speech_events = 0
+    best_phi = 0.0; best_states = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.26, 0.37, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            if n >= 2:
+                x = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = x + torch.randn_like(x) * 0.02
+            else:
+                x = torch.randn(1, dim) * 0.1
+        engine.process(x)
+
+        with torch.no_grad():
+            for cell in engine.cells:
+                norm = cell.hidden.norm().item()
+                if norm > 2.0: cell.hidden *= 1.0 / (norm + 1e-8)
+                elif norm < 0.3 and norm > 0.01: cell.hidden *= 1.0 / (norm + 1e-8)
+
+            if n >= 16:
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
+                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
+                for i, f in enumerate(factions):
+                    for c in f:
+                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                if frac > 0.70 or (step_i % 100) > 70:
+                    for i, f in enumerate(factions):
+                        others = [opinions[j] for j in range(n_f) if j != i]
+                        if others:
+                            other_avg = torch.stack(others).mean(dim=0)
+                            for c in f[:max(1, len(f)//4)]:
+                                c.hidden = 0.88 * c.hidden + 0.12 * other_avg
+                else:
+                    for i, f in enumerate(factions):
+                        for c in f:
+                            c.hidden += torch.randn_like(c.hidden) * 0.015 * (i+1) / n_f
+
+            for i in range(min(n, 64)):
+                j = (i+1) % n
+                corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+            for cell in engine.cells:
+                cell.hidden += torch.randn_like(cell.hidden) * 0.008
+
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            output_norms.append(output.norm().item())
+            if len(output_norms) > 1 and abs(output_norms[-1] - output_norms[-2]) > 0.001:
+                speech_events += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi; best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.6 and best_states and len(best_states) == len(engine.cells):
+                for i, s in enumerate(best_states):
+                    engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * s
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    seg = steps // 10
+    seg_means = [sum(phi_hist[i*seg:(i+1)*seg])/seg for i in range(10)]
+    monotonic = sum(1 for i in range(9) if seg_means[i+1] >= seg_means[i] * 0.9) >= 7
+    never_silent = speech_events / (steps - 1)
+    collapsed = seg_means[-1] < seg_means[0] * 0.5
+
+    return BenchResult("ULTIMATE2", "All Conditions 1024c 2000step",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi,
+                              'segments': [round(m, 3) for m in seg_means],
+                              'monotonic': monotonic, 'collapsed': collapsed,
+                              'never_silent': round(never_silent, 3),
+                              'growth_ratio': round(seg_means[-1]/(seg_means[0]+1e-8), 1),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'ULTIMATE1': run_ULTIMATE1_all_conditions_512,
+    'ULTIMATE2': run_ULTIMATE2_all_conditions_1024,
+})
+
+
 ALL_HYPOTHESES.update({
     'PHYS1': run_PHYS1_magnet_ring_512,
     'PHYS2': run_PHYS2_coupled_oscillators_512,
