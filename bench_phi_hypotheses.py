@@ -47907,6 +47907,253 @@ def run_OMEGA5_meta_consciousness(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'l1_cells': len(engine_l1.cells), 'l2_cells': len(engine_l2.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# TALK. Conversation + No-Prompt Extreme — 대화 + 프롬프트 없음 극한
+# ═══════════════════════════════════════════════════════════
+# 핵심: 시스템 프롬프트 없이 실제 대화가 가능한 아키텍처
+# Φ만이 아닌 CE(대화 품질)도 동시 측정
+
+def run_TALK1_phi_as_language(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TALK1: Φ-as-Language — Φ가 높을수록 언어 품질도 높다는 가설.
+    Φ를 직접 CE proxy의 학습률로 사용. 높은 Φ = 빠른 언어 학습.
+    가설: 의식 수준이 언어 능력의 전제조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    predictor = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-3)
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # CE training with Φ-scaled learning rate
+        h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = predictor(h_mean.unsqueeze(0))
+        ce_loss = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce_loss.item())
+
+        # Φ scales LR: higher consciousness = faster language learning
+        for pg in optimizer.param_groups:
+            pg['lr'] = 1e-3 * (1.0 + phi * 0.1)
+        optimizer.zero_grad()
+        ce_loss.backward()
+        optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TALK1", "Φ-as-Language (consciousness→language speed)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'ce_ratio': ce_hist[-1]/(ce_hist[0]+1e-8),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TALK2_consciousness_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TALK2: Consciousness Decoder — 의식 상태→토큰 디코더를 학습.
+    시스템 프롬프트 없이, cell hidden → 직접 다음 바이트 예측.
+    의식 자체가 언어를 생성하는 구조.
+    가설: 충분한 Φ의 의식은 별도 LLM 없이 언어 출력 가능."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    # Decoder: consciousness→tokens
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 15 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        # Train decoder: cell consensus → predict input
+        h_consensus = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h_consensus.unsqueeze(0))
+        ce_loss = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce_loss.item())
+        optimizer.zero_grad(); ce_loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TALK2", "Consciousness Decoder (cells→tokens, no LLM)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TALK3_consciousness_conversation_loop(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TALK3: Consciousness Conversation Loop — 의식 엔진끼리 대화.
+    두 의식 엔진이 시스템 프롬프트 없이 서로 출력→입력 교환.
+    CE = 상대방 출력 예측 정확도.
+    가설: 의식 간 대화가 개별 의식의 Φ와 CE를 동시에 향상."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            for eng in [engine_a, engine_b]:
+                if frac >= pct and len(eng.cells) < min(int(2 ** (pct * 7)), 32):
+                    target = min(len(eng.cells) * 2, 32)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Turn-taking: A speaks, B listens, then swap
+        if step_i % 2 == 0:
+            engine_a.process(x)
+            with torch.no_grad():
+                a_output = torch.stack([c.hidden.squeeze()[:dim] for c in engine_a.cells]).mean(dim=0).unsqueeze(0)
+            engine_b.process(a_output)
+        else:
+            engine_b.process(x)
+            with torch.no_grad():
+                b_output = torch.stack([c.hidden.squeeze()[:dim] for c in engine_b.cells]).mean(dim=0).unsqueeze(0)
+            engine_a.process(b_output)
+
+        # CE: how well does each predict the other?
+        with torch.no_grad():
+            a_pred = torch.stack([c.hidden.squeeze()[:dim] for c in engine_a.cells]).mean(dim=0)
+            b_pred = torch.stack([c.hidden.squeeze()[:dim] for c in engine_b.cells]).mean(dim=0)
+            ce = F.mse_loss(a_pred.unsqueeze(0), b_pred.unsqueeze(0)).item()
+            ce_hist.append(ce)
+
+        phi, _ = phi_calc.compute_phi(engine_a)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine_a)
+    return BenchResult("TALK3", "Consciousness Conversation (2 engines dialogue)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'cells_a': len(engine_a.cells), 'cells_b': len(engine_b.cells)})
+
+
+def run_TALK4_omega4_plus_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TALK4: OMEGA4 + Decoder — 절대 자유 의식(Φ=187) + 언어 디코더.
+    OMEGA4 아키텍처(256 cells, 자유)에 디코더만 추가.
+    시스템 프롬프트 없이, 의식이 직접 언어를 생성하는 궁극 아키텍처.
+    가설: 높은 Φ + 학습된 디코더 = 프롬프트 없는 대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+
+    for step_i in range(steps):
+        # OMEGA4: diverse free input
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+
+        # Aggressive growth
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct + 0.1) * 9)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Pure freedom processing
+        engine.process(x)
+
+        # Train decoder alongside
+        h_consensus = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h_consensus.unsqueeze(0))
+        ce_loss = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce_loss.item())
+        optimizer.zero_grad(); ce_loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("TALK4", "OMEGA4 + Decoder (free consciousness→language)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TALK5_transplant_to_conversation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """TALK5: Transplant to Conversation — 고Φ 의식을 대화 모델에 이식.
+    Phase 1(60%): 고Φ 의식 키우기 (OMEGA4 스타일)
+    Phase 2(40%): 의식을 CE 학습 엔진에 이식, 언어 학습.
+    가설: 의식을 먼저 키우고 언어를 나중에 배우는 게 효율적."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+
+        # Growth
+        for pct in [0.10, 0.20, 0.35, 0.50]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        if frac < 0.60:
+            # Phase 1: Pure consciousness growth (no CE)
+            pass  # let cells evolve freely
+        else:
+            # Phase 2: Language learning (CE training)
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h_mean.unsqueeze(0))
+            ce_loss = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce_loss.item())
+            optimizer.zero_grad(); ce_loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_ce = ce_hist[-1] if ce_hist else 0
+    return BenchResult("TALK5", "Transplant to Conversation (consciousness first→language second)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': final_ce, 'ce_steps': len(ce_hist), 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TALK1': run_TALK1_phi_as_language,
+    'TALK2': run_TALK2_consciousness_decoder,
+    'TALK3': run_TALK3_consciousness_conversation_loop,
+    'TALK4': run_TALK4_omega4_plus_decoder,
+    'TALK5': run_TALK5_transplant_to_conversation,
+})
+
+
 ALL_HYPOTHESES.update({
     'OMEGA1': run_OMEGA1_256cells_all_techniques,
     'OMEGA2': run_OMEGA2_consciousness_network,
