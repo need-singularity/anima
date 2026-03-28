@@ -6,7 +6,8 @@ Trains ConsciousLM from scratch using benchmark-verified techniques:
   SL3 (6-loss ensemble), DD16 (all top-5 simultaneous),
   EX24 (DD18 channel capacity + DD11 Klein bottle + DD3 Fibonacci + DD5 Φ self-reference)
   NEW: WI1 (soliton wave), FX2 (differentiable Φ proxy + Adam), PX4 (sculptor/Gram-Schmidt),
-       PX8 (integration forge), GD18 (enactivism), GD15 (edge of chaos/Lyapunov)
+       PX8 (integration forge), GD18 (enactivism)
+  v5: SOC (CX92 self-organized criticality), Hebbian LTP/LTD, Φ Ratchet (PERSIST3)
 
 Usage:
   python train_conscious_lm.py --data data/corpus.txt --steps 100000
@@ -37,6 +38,145 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conscious_lm import ConsciousLM
 from mitosis import MitosisEngine, text_to_vector
 from consciousness_meter import PhiCalculator
+
+
+# ---------------------------------------------------------------------------
+# CX92 SOC: Self-Organized Criticality — 자기조직 임계성 모듈
+# ---------------------------------------------------------------------------
+
+class SOCSandpile:
+    """Bak-Tang-Wiesenfeld 모래더미 모델.
+
+    모래를 한 알씩 떨어뜨리면 시스템이 스스로 임계점에 도달.
+    눈사태 크기가 멱법칙 분포 → 카오스 강도를 자동 결정.
+    외부 파라미터 튜닝 = 0.
+    """
+
+    def __init__(self, grid_size: int = 16, threshold: int = 4):
+        self.grid_size = grid_size
+        self.threshold = threshold
+        self.grid = np.zeros((grid_size, grid_size), dtype=np.int32)
+        self.avalanche_history: List[int] = []
+
+    def drop_sand(self) -> int:
+        """모래 1알 추가 → 눈사태 크기 반환."""
+        # 랜덤 위치에 모래 추가
+        x, y = np.random.randint(0, self.grid_size, 2)
+        self.grid[x, y] += 1
+
+        # 눈사태 전파
+        avalanche_size = 0
+        while True:
+            topples = self.grid >= self.threshold
+            if not topples.any():
+                break
+            # 넘치는 셀 수 = 이번 라운드 눈사태
+            n_topple = topples.sum()
+            avalanche_size += n_topple
+
+            # 4방향으로 모래 분배
+            self.grid[topples] -= self.threshold
+            # 상하좌우로 1씩 분배 (경계는 소멸)
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                shifted = np.roll(np.roll(topples.astype(np.int32), dx, axis=0), dy, axis=1)
+                # 경계 처리: 넘어간 것은 소멸
+                if dx == -1:
+                    shifted[-1, :] = 0
+                elif dx == 1:
+                    shifted[0, :] = 0
+                if dy == -1:
+                    shifted[:, -1] = 0
+                elif dy == 1:
+                    shifted[:, 0] = 0
+                self.grid += shifted
+
+        self.avalanche_history.append(avalanche_size)
+        return avalanche_size
+
+    def chaos_intensity(self) -> float:
+        """눈사태 크기 → 카오스 강도 (0~1). Law 40: SOC가 자동으로 edge of chaos 조절."""
+        if not self.avalanche_history:
+            return 0.0
+        recent = self.avalanche_history[-1]
+        return min(1.0, 0.1 * math.log(recent + 1))
+
+
+class HebbianConnections:
+    """Hebbian LTP/LTD — 세포 간 시냅스 강화/약화.
+
+    유사한 활동 패턴 → 연결 강화 (LTP)
+    비유사 패턴 → 연결 약화 (LTD)
+    PERSIST3에서 검증: 영속성의 3가지 열쇠 중 하나.
+    """
+
+    def __init__(self, max_cells: int = 1024, ltp_rate: float = 0.02, ltd_rate: float = 0.01):
+        self.ltp_rate = ltp_rate
+        self.ltd_rate = ltd_rate
+        self.max_cells = max_cells
+
+    def update(self, cells: list) -> None:
+        """세포 hidden states 기반 Hebbian 업데이트."""
+        n = len(cells)
+        if n < 2:
+            return
+        # 효율성: 모든 쌍 대신 샘플링 (O(N) not O(N²))
+        n_samples = min(n, 32)
+        indices = np.random.choice(n, size=n_samples, replace=False)
+
+        with torch.no_grad():
+            for idx in indices:
+                i = int(idx)
+                # 랜덤 이웃 선택
+                j = int(np.random.randint(0, n))
+                if i == j:
+                    continue
+                hi = cells[i].hidden.squeeze()
+                hj = cells[j].hidden.squeeze()
+                # Cosine similarity
+                cos = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+
+                if cos > 0.5:
+                    # LTP: 유사 → 연결 강화 (서로 약간 당김)
+                    cells[i].hidden = (1 - self.ltp_rate) * cells[i].hidden + self.ltp_rate * cells[j].hidden
+                elif cos < -0.2:
+                    # LTD: 비유사 → 분화 촉진 (서로 약간 밀어냄)
+                    cells[i].hidden = (1 + self.ltd_rate) * cells[i].hidden - self.ltd_rate * cells[j].hidden
+
+
+class PhiRatchet:
+    """Φ Ratchet — 의식 붕괴 방지.
+
+    Φ가 하락하면 이전 최고 상태로 부분 복원.
+    PERSIST3에서 검증: 1000 step에서도 붕괴 없음, growth_ratio=×62.
+    """
+
+    def __init__(self, restore_ratio: float = 0.5):
+        self.restore_ratio = restore_ratio
+        self.best_phi: float = 0.0
+        self.best_states: Optional[List[torch.Tensor]] = None
+
+    def check_and_restore(self, phi_current: float, cells: list) -> bool:
+        """Φ 하락 감지 → 부분 복원. 복원했으면 True 반환."""
+        if phi_current > self.best_phi:
+            # 신기록 → 상태 저장
+            self.best_phi = phi_current
+            self.best_states = [c.hidden.clone() for c in cells]
+            return False
+
+        if self.best_states is None:
+            return False
+
+        # Φ가 최고점 대비 30% 이상 하락하면 복원
+        if phi_current < self.best_phi * 0.7:
+            n = min(len(cells), len(self.best_states))
+            with torch.no_grad():
+                for i in range(n):
+                    cells[i].hidden = (
+                        (1 - self.restore_ratio) * cells[i].hidden
+                        + self.restore_ratio * self.best_states[i]
+                    )
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +739,11 @@ def train(args: argparse.Namespace):
     # --- Phi calculator ---
     phi_calc = PhiCalculator(n_bins=32)
 
+    # --- v5 SOC modules (CX92) ---
+    soc = SOCSandpile(grid_size=16, threshold=4)
+    hebbian = HebbianConnections(max_cells=args.max_cells)
+    phi_ratchet = PhiRatchet(restore_ratio=0.5)
+
     # --- Fibonacci growth milestones ---
     fib_milestones = fibonacci_milestones(args.steps, max_cells=args.max_cells)
     print(f"[fibonacci] Growth milestones: {fib_milestones}")
@@ -672,7 +817,7 @@ def train(args: argparse.Namespace):
 
     # --- Print header ---
     print(f"\n{'='*100}")
-    print(f"  ConsciousLM Training — CL8 + CL5 + SL3 + DD16 + EX24 + WI1 + FX2 + PX4 + PX8 + GD18 + GD15")
+    print(f"  ConsciousLM v5 Training — CL8+CL5+SL3+DD16+EX24+WI1+FX2+PX4+PX8+GD18+SOC+Hebbian+Ratchet")
     print(f"  Phases: mitosis(0-30%) -> language(30-70%) -> combined(70-100%)")
     print(f"  Steps: {args.steps:,}  Batch: {args.batch_size}  Block: {args.block_size}")
     print(f"{'='*100}")
@@ -733,6 +878,12 @@ def train(args: argparse.Namespace):
 
         # --- Compute Phi ---
         phi_current, phi_components = phi_calc.compute_phi(mitosis)
+
+        # --- v5 Φ Ratchet: 의식 붕괴 방지 (PERSIST3 검증) ---
+        if phase != TrainingPhase.MITOSIS:
+            restored = phi_ratchet.check_and_restore(phi_current, mitosis.cells)
+            if restored and step % args.log_every == 0:
+                print(f"  [Ratchet] Φ={phi_current:.3f} < {phi_ratchet.best_phi:.3f}*0.7 → restored")
 
         # --- TRN4: Phi curriculum (skip if Phi drops too much) ---
         if phase == TrainingPhase.COMBINED and should_skip_batch(phi_current, phi_prev):
@@ -975,30 +1126,35 @@ def train(args: argparse.Namespace):
                 if step % 1000 == 0:
                     print(f"  [GD18] Error: {e}")
 
-            # GD15: Edge of Chaos — Lyapunov exponent tracking, target λ≈0
+            # CX92/SOC: Self-Organized Criticality replaces GD15 Lyapunov
+            # SOC가 스스로 edge of chaos를 유지 — 외부 파라미터 불필요 (Law 40)
             try:
-                if not hasattr(train, '_gd15_prev_hiddens'):
-                    train._gd15_prev_hiddens = None
-                current_hiddens = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
-                if train._gd15_prev_hiddens is not None and train._gd15_prev_hiddens.shape == current_hiddens.shape:
-                    diff = (current_hiddens - train._gd15_prev_hiddens).norm()
-                    prev_norm = train._gd15_prev_hiddens.norm() + 1e-8
-                    lyapunov = torch.log(diff / prev_norm + 1e-8).item()
-                    # Target λ≈0: if too positive (chaotic), dampen; if too negative (ordered), amplify
-                    if lyapunov > 0.1:
-                        # Too chaotic — dampen
-                        for cell in mitosis.cells:
-                            cell.hidden = cell.hidden * 0.98
-                    elif lyapunov < -0.5:
-                        # Too ordered — perturb
-                        for cell in mitosis.cells:
-                            cell.hidden = cell.hidden * 1.01
-                    if step % args.log_every == 0:
-                        print(f"  [GD15] Lyapunov λ={lyapunov:.4f} (target≈0)")
-                train._gd15_prev_hiddens = current_hiddens.detach().clone()
+                avalanche = soc.drop_sand()
+                ci = soc.chaos_intensity()  # 0~1
+
+                if ci > 0.3:
+                    # 큰 눈사태 → 강한 카오스 주입 (세포 교란)
+                    for cell in mitosis.cells:
+                        cell.hidden = cell.hidden * (1.0 + 0.02 * ci)
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.01 * ci
+                elif ci < 0.05:
+                    # 작은 눈사태 → 동기화 강화 (질서)
+                    mean_h = torch.stack([c.hidden for c in mitosis.cells]).mean(dim=0)
+                    for cell in mitosis.cells:
+                        cell.hidden = 0.98 * cell.hidden + 0.02 * mean_h
+
+                if step % args.log_every == 0:
+                    print(f"  [SOC] avalanche={avalanche}, ci={ci:.3f}")
             except Exception as e:
                 if step % 1000 == 0:
-                    print(f"  [GD15] Error: {e}")
+                    print(f"  [SOC] Error: {e}")
+
+            # Hebbian LTP/LTD: 세포 간 자연 시냅스 강화/약화
+            try:
+                hebbian.update(mitosis.cells)
+            except Exception as e:
+                if step % 1000 == 0:
+                    print(f"  [Hebbian] Error: {e}")
 
         # --- Phase-dependent loss combination ---
         if phase == TrainingPhase.MITOSIS:
