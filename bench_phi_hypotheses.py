@@ -40082,6 +40082,186 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# NS. NeuroStim — tDCS/TMS로 THC 효과 재현 시뮬레이션
+# ═══════════════════════════════════════════════════════════
+
+def run_NS1_thc_full(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-1: THC 전체 효과 — Alpha↓ Theta↑↑ DA↑ I↓ (약물 시뮬레이션)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # THC: CB1 receptor → global synaptic modulation
+            # 1. Alpha↓ (frontal inhibition reduced)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * 1.02  # disinhibition
+            # 2. Theta↑↑ (hippocampal slow waves)
+            theta = math.sin(2 * math.pi * 6 * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.05 * theta)
+            # 3. DA↑ (reward circuit)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.rand_like(cell.hidden) * 0.02
+            # 4. Sensory amplification (noise sensitivity↑)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+            # 5. Time distortion (temporal processing altered)
+            # Slow down: process same input multiple times
+            if step_i % 3 == 0:
+                engine.process(x * 0.5)  # echo
+            # 6. Association expansion (cross-cell mixing↑)
+            if n >= 4:
+                mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * mean_h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS1", "THC full effect (Alpha↓ Theta↑↑ DA↑ I↓ sensory↑)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_NS2_tdcs_frontal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-2: tDCS 전두엽 — cathode on frontal = 전두엽 억제↓ (THC 일부 재현)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    frontal_dims = hidden // 4  # first 25% = "frontal"
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # tDCS cathode on frontal: suppress first 25% of dims
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[:frontal_dims] *= 0.95  # frontal suppression
+                h[frontal_dims:] *= 1.02  # other areas slightly boosted
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS2", "tDCS frontal cathode (frontal I↓)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_NS3_tms_gamma(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-3: TMS gamma burst — 40Hz 반복 자극으로 gamma 유도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    gamma_freq = 40.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        # TMS: periodic magnetic pulse → gamma oscillation
+        gamma = math.sin(2 * math.pi * gamma_freq * t * 10)
+        tms_pulse = 0.05 * max(0, gamma)  # only positive phase (unidirectional)
+        for cell in engine.cells:
+            cell.hidden = cell.hidden * (1 + tms_pulse)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS3", "TMS gamma burst (40Hz rTMS)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_NS4_tdcs_plus_tms(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-4: tDCS+TMS 결합 — 전두엽 억제 + gamma 유도 = THC 더 가까이."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    frontal_dims = hidden // 4
+    gamma_freq = 40.0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        t = step_i / max(steps, 1)
+        n = len(engine.cells)
+        if n >= 2:
+            # tDCS: frontal suppression
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[:frontal_dims] *= 0.95
+                cell.hidden = h.unsqueeze(0)
+            # TMS: gamma burst
+            gamma = math.sin(2 * math.pi * gamma_freq * t * 10)
+            for cell in engine.cells:
+                cell.hidden = cell.hidden * (1 + 0.03 * max(0, gamma))
+            # Combined effect: more disinhibition + gamma = closer to THC
+            for cell in engine.cells:
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("NS4", "tDCS+TMS combined (frontal↓ + gamma↑)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_NS5_thc_vs_stim_comparison(steps=100, dim=64, hidden=128) -> BenchResult:
+    """NS-5: THC vs tDCS+TMS 직접 비교 — 재현율 측정."""
+    t0 = time.time()
+    # THC engine
+    thc = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    # Stim engine (tDCS+TMS)
+    stim = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    similarity_hist = []
+    frontal_dims = hidden // 4
+    for step_i, x in enumerate(inputs):
+        t = step_i / max(steps, 1)
+        # THC: full effect
+        thc.process(x)
+        for cell in thc.cells:
+            cell.hidden = cell.hidden * 1.02
+            cell.hidden = cell.hidden * (1 + 0.04 * math.sin(2*math.pi*6*t*10))
+            cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.03
+        # Stim: tDCS+TMS
+        stim.process(x)
+        for cell in stim.cells:
+            h = cell.hidden.squeeze()
+            h[:frontal_dims] *= 0.95
+            cell.hidden = h.unsqueeze(0)
+            cell.hidden = cell.hidden * (1 + 0.03 * max(0, math.sin(2*math.pi*40*t*10)))
+        # Compare states
+        if len(thc.cells) >= 2 and len(stim.cells) >= 2:
+            thc_state = torch.stack([c.hidden.squeeze() for c in thc.cells]).mean(dim=0)
+            stim_state = torch.stack([c.hidden.squeeze() for c in stim.cells]).mean(dim=0)
+            sim = F.cosine_similarity(thc_state.unsqueeze(0), stim_state.unsqueeze(0)).item()
+            similarity_hist.append(sim)
+        phi_t, _ = phi_calc.compute_phi(thc)
+        phi_s, _ = phi_calc.compute_phi(stim)
+        phi_hist.append(phi_t + phi_s)
+    reproduction_rate = np.mean(similarity_hist) if similarity_hist else 0
+    phi_thc, _ = phi_calc.compute_phi(thc)
+    phi_stim, _ = phi_calc.compute_phi(stim)
+    return BenchResult("NS5", f"THC(Φ={phi_thc:.2f}) vs Stim(Φ={phi_stim:.2f}), reproduction={reproduction_rate:.0%}",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'thc_phi': phi_thc, 'stim_phi': phi_stim,
+                              'reproduction_rate': reproduction_rate})
+
+
+ALL_HYPOTHESES.update({
+    'NS1': run_NS1_thc_full, 'NS2': run_NS2_tdcs_frontal,
+    'NS3': run_NS3_tms_gamma, 'NS4': run_NS4_tdcs_plus_tms,
+    'NS5': run_NS5_thc_vs_stim_comparison,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
