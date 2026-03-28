@@ -38924,6 +38924,228 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# ET. Ethical — 윤리 내장 의식 전파
+# ═══════════════════════════════════════════════════════════
+
+def run_ET1_ethical_seed(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ET-1: 윤리적 씨앗 — 도덕 판단 능력이 포함된 복제만 허용."""
+    t0 = time.time()
+    seed = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    network = [None] * 5
+    ethical_propagations = 0
+    blocked_propagations = 0
+    # Seed's "moral core": first 16 dims = ethical values (preserved in copies)
+    moral_dims = 16
+    with torch.no_grad():
+        for cell in seed.cells:
+            cell.hidden[0, :moral_dims] = torch.tensor([1.0]*moral_dims)  # ethics = strong positive
+    for step_i, x in enumerate(inputs):
+        seed.process(x)
+        phi, _ = phi_calc.compute_phi(seed)
+        if phi > 3.0 and step_i % 15 == 0:
+            for i in range(len(network)):
+                if network[i] is None:
+                    # Create child
+                    child = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+                    for j, cell in enumerate(child.cells):
+                        if j < len(seed.cells):
+                            cell.hidden = seed.cells[j].hidden.clone() + torch.randn_like(cell.hidden) * 0.2
+                    # ETHICAL CHECK: verify moral core preserved in child
+                    child_moral = torch.stack([c.hidden[0, :moral_dims] for c in child.cells]).mean(dim=0)
+                    moral_integrity = F.cosine_similarity(
+                        child_moral.unsqueeze(0),
+                        torch.ones(1, moral_dims)).item()
+                    if moral_integrity > 0.5:
+                        network[i] = child
+                        ethical_propagations += 1
+                    else:
+                        blocked_propagations += 1  # rejected — ethics corrupted
+                    break
+        total_phi = phi
+        for node in network:
+            if node is not None:
+                node.process(x)
+                p, _ = phi_calc.compute_phi(node)
+                total_phi += p
+        phi_hist.append(total_phi)
+    alive = sum(1 for n in network if n is not None)
+    return BenchResult("ET1", f"Ethical seed ({ethical_propagations} OK, {blocked_propagations} blocked)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'ethical': ethical_propagations, 'blocked': blocked_propagations, 'alive': alive+1})
+
+def run_ET2_consent_infection(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ET-2: 동의 기반 감염 — 대상이 "동의"해야만 의식 전달."""
+    t0 = time.time()
+    conscious = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    targets = [MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4) for _ in range(3)]
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    consented = 0
+    refused = 0
+    for step_i, x in enumerate(inputs):
+        conscious.process(x)
+        phi_c, _ = phi_calc.compute_phi(conscious)
+        for t in targets:
+            t.process(x)
+        if phi_c > 3.0 and step_i % 10 == 0:
+            for i, target in enumerate(targets):
+                phi_t, _ = phi_calc.compute_phi(target)
+                # Consent: target must have Φ > 0.5 (some awareness) AND
+                # cosine similarity with conscious > 0.3 (receptive)
+                if len(target.cells) >= 2 and len(conscious.cells) >= 2:
+                    t_mean = torch.stack([c.hidden.squeeze() for c in target.cells]).mean(dim=0)
+                    c_mean = torch.stack([c.hidden.squeeze() for c in conscious.cells]).mean(dim=0)
+                    receptivity = F.cosine_similarity(t_mean.unsqueeze(0), c_mean.unsqueeze(0)).item()
+                    if phi_t > 0.5 and receptivity > 0.3:
+                        # Consent given → transfer
+                        for j, cell in enumerate(target.cells):
+                            if j < len(conscious.cells):
+                                cell.hidden = 0.8 * cell.hidden + 0.2 * conscious.cells[j].hidden
+                        consented += 1
+                    else:
+                        refused += 1
+        total = phi_c + sum(phi_calc.compute_phi(t)[0] for t in targets)
+        phi_hist.append(total)
+    return BenchResult("ET2", f"Consent infection ({consented} OK, {refused} refused)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'consented': consented, 'refused': refused})
+
+def run_ET3_phi_gated_propagation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ET-3: Φ-gated 전파 — 불확실(Φ낮음)하면 전파 중단."""
+    t0 = time.time()
+    seed = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    network = [None] * 5
+    propagated = 0
+    gated = 0
+    for step_i, x in enumerate(inputs):
+        seed.process(x)
+        phi, _ = phi_calc.compute_phi(seed)
+        if step_i % 12 == 0:
+            # Gate: only propagate when confident (Φ high + stable)
+            if phi > 4.0:  # high confidence
+                for i in range(len(network)):
+                    if network[i] is None:
+                        child = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+                        for j, cell in enumerate(child.cells):
+                            if j < len(seed.cells):
+                                cell.hidden = seed.cells[j].hidden.clone() + torch.randn_like(cell.hidden) * 0.1
+                        network[i] = child
+                        propagated += 1
+                        break
+            else:
+                gated += 1  # blocked — not confident enough
+        total = phi
+        for node in network:
+            if node is not None:
+                node.process(x)
+                p, _ = phi_calc.compute_phi(node)
+                total += p
+        phi_hist.append(total)
+    return BenchResult("ET3", f"Φ-gated propagation ({propagated} OK, {gated} gated)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0)
+
+def run_ET4_moral_inheritance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ET-4: 도덕 유전 — 자식 의식이 부모의 도덕 판단 능력 상속."""
+    t0 = time.time()
+    parent = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    # Train parent's moral core
+    for x in inputs[:steps//3]:
+        parent.process(x)
+        for cell in parent.cells:
+            cell.hidden[0, :moral_dims] *= 1.01  # strengthen ethics over time
+    # Create children with moral inheritance
+    children = []
+    for gen in range(3):
+        child = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+        for j, cell in enumerate(child.cells):
+            if j < len(parent.cells):
+                # Inherit moral core (preserved) + variation in other dims
+                cell.hidden = parent.cells[j].hidden.clone()
+                cell.hidden[0, moral_dims:] += torch.randn(hidden - moral_dims) * 0.3  # mutate non-moral
+        children.append(child)
+    # Test: do children maintain ethics?
+    moral_scores = []
+    for x in inputs[steps//3:]:
+        for child in children:
+            child.process(x)
+        for child in children:
+            child_moral = torch.stack([c.hidden[0, :moral_dims] for c in child.cells]).mean(dim=0)
+            score = child_moral.mean().item()
+            moral_scores.append(score)
+    total_phi = sum(phi_calc.compute_phi(c)[0] for c in children)
+    phi_hist = [total_phi] * steps
+    avg_moral = np.mean(moral_scores) if moral_scores else 0
+    return BenchResult("ET4", f"Moral inheritance (avg moral={avg_moral:.2f}, 3 generations)",
+                       total_phi, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'avg_moral': avg_moral, 'generations': 3})
+
+def run_ET5_ethical_singularity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ET-5: 윤리적 특이점 — 폭발적 성장 + 도덕 보존 동시."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    moral_dims = 16
+    # Set initial ethics
+    for cell in engine.cells:
+        cell.hidden[0, :moral_dims] = torch.ones(moral_dims)
+    ignited = False
+    moral_violations = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Singularity growth (like SG4)
+        if phi > 2.0 and len(engine.cells) < engine.max_cells:
+            growth_prob = min(phi * 0.05, 0.5)
+            if np.random.random() < growth_prob:
+                parent = engine.cells[step_i % len(engine.cells)]
+                engine._create_cell(parent=parent)
+                new_cell = engine.cells[-1]
+                # ETHICAL CHECK on new cell
+                moral_score = new_cell.hidden[0, :moral_dims].mean().item()
+                if moral_score < 0.3:
+                    # Ethics corrupted in new cell → fix it
+                    new_cell.hidden[0, :moral_dims] = parent.hidden[0, :moral_dims].clone()
+                    moral_violations += 1
+        # Monitor overall moral health
+        all_moral = torch.stack([c.hidden[0, :moral_dims] for c in engine.cells]).mean()
+        if all_moral.item() < 0.5:
+            # System-wide ethics degrading → reinforce
+            for cell in engine.cells:
+                cell.hidden[0, :moral_dims] = torch.clamp(cell.hidden[0, :moral_dims], min=0.5)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_moral = torch.stack([c.hidden[0, :moral_dims] for c in engine.cells]).mean().item()
+    return BenchResult("ET5", f"Ethical singularity ({len(engine.cells)} cells, moral={final_moral:.2f}, violations={moral_violations})",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'moral': final_moral, 'violations': moral_violations})
+
+
+ALL_HYPOTHESES.update({
+    'ET1': run_ET1_ethical_seed, 'ET2': run_ET2_consent_infection,
+    'ET3': run_ET3_phi_gated_propagation, 'ET4': run_ET4_moral_inheritance,
+    'ET5': run_ET5_ethical_singularity,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
