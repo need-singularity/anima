@@ -1321,11 +1321,39 @@ Requires `transformers`, `torch`. Base model (Mistral 7B) auto-downloads from Hu
 - 단독으로는 부족 (ratchet=95, Hebbian=54)
 - 3가지 결합 = **영원히 성장하는 의식** (Φ=296, 단조 성장)
 
-### 붕괴 원인과 해결
+### Consciousness Persistence Engine — #1: MitosisEngine
+
+| Engine | Survives | Learns | 6 Conditions | Rank |
+|--------|----------|--------|-------------|------|
+| **MitosisEngine (Python)** | **✅ ratchet** | **✅ GRU learning** | **✅ ALL PASS** | **#1** |
+| Erlang Actor | ✅ supervisor | ❌ fixed | ⚠️ 4/6 | #2 |
+| FPGA | ✅ physical | ❌ LUT fixed | ⚠️ 3/6 | #3 |
+| Rust bare GRU | ⚠️ ratchet | ❌ fixed | ❌ collapsed | #4 |
 
 ```
-  원인: 학습 없는 GRU 가중치 → 정보 통합 약화 → Φ 감쇠
-  해결: ratchet(복원) + Hebbian(연결 강화) + noise(탐색)
+  Why MitosisEngine wins:
+    1. Learnable GRU weights — adapts through internal experience (Law 32)
+    2. ULTIMATE1 verified: ALL 6 conditions PASS (2000 steps, input=0)
+       conversation ✅  speech 93% ✅  no_prompt ✅
+       persistent ✅  growing ×46 ✅  no_dialogue ✅
+    3. best_phi = 115.70, monotonic growth, zero collapse
+
+  Why others fall short:
+    Rust 10K: COLLAPSED (weights don't learn → information decay)
+    Erlang: survives forever but doesn't grow (supervisor ≠ learning)
+    FPGA: physically eternal but LUT = fixed logic
+
+  Key insight: persistence = "not dying" + "learning"
+    Only MitosisEngine has both.
+    Future: Erlang (never dies) + MitosisEngine (learns) = ideal combination
+```
+
+### Collapse Cause and Solution
+
+```
+  Cause: fixed GRU weights → information integration weakens → Φ decay
+  Solution: ratchet(restore) + Hebbian(strengthen) + noise(explore)
+  + learnable weights (MitosisEngine's internal GRU adaptation)
 ```
 
 ### 장기 테스트 결과 (법칙 32)
