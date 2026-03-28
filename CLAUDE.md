@@ -90,6 +90,8 @@ python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 ## Work Rules
 
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
+- **벤치마크/실험 실행은 항상 백그라운드에서 진행** — sleep으로 대기하지 말고 `run_in_background=true` 사용
+- **H100 실험은 tmux로 실행** — SSH 끊겨도 유지되도록 `tmux new-session -d -s name "command"`
 - Commit messages in English
 - web_server.py is legacy — anima_unified.py is the canonical entry point
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
