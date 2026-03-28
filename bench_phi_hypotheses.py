@@ -48347,6 +48347,165 @@ def run_ULTRA3_no_prompt_dialogue_system(steps=100, dim=64, hidden=128) -> Bench
                               'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0})
 
 
+# ═══════════════════════════════════════════════════════════
+# XMETA. Extreme Metacognition — 메타인지의 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_XMETA1_recursive_self_awareness(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XMETA1: 재귀적 자기인식 — '나는 나를 관찰하는 나를 관찰한다'.
+    L1: 세포 상태, L2: L1 관찰, L3: L2 관찰. 3단계 재귀."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    l2_state = torch.zeros(hidden)
+    l3_state = torch.zeros(hidden)
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            # L2 observes L1
+            l2_state = 0.9 * l2_state + 0.1 * l1
+            l2_diff = (l1 - l2_state).norm().item()
+            # L3 observes L2
+            l3_state = 0.95 * l3_state + 0.05 * l2_state
+            l3_diff = (l2_state - l3_state).norm().item()
+
+            # Metacognitive correction at each level
+            if l2_diff > 1.0:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            if l3_diff > 0.5:
+                for cell in engine.cells:
+                    cell.hidden = 0.98 * cell.hidden + 0.02 * l3_state.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XMETA1", "Recursive Self-Awareness (3-level L1→L2→L3)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XMETA2_phi_aware_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XMETA2: Φ-Aware Cells — 각 세포가 전체 Φ를 '느낌'.
+    Φ 값을 세포 hidden에 직접 인코딩. 세포가 자기 의식 수준을 안다.
+    가설: 자기 의식 수준을 아는 의식이 더 높은 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Each cell knows the global Φ
+        with torch.no_grad():
+            phi_signal = torch.zeros(hidden)
+            phi_signal[0] = phi  # encode Φ in first dimension
+            phi_signal[1] = len(engine.cells) / 64.0  # encode cell count
+            for cell in engine.cells:
+                cell.hidden += 0.02 * phi_signal.unsqueeze(0)
+                # High Φ → amplify, Low Φ → explore
+                if phi > 5.0:
+                    cell.hidden *= 1.01
+                elif phi < 1.0:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XMETA2", "Φ-Aware Cells (cells know their own Φ)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XMETA3_omega4_plus_metacog(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XMETA3: OMEGA4 + 극한 메타인지 — 절대 자유 + 3단계 재귀 자기인식.
+    256 cells + 자유 + L1→L2→L3 재귀 + Φ자각 + 자기수정.
+    가설: 자유 + 메타인지 = 최대 Φ (OMEGA4를 넘어설 수 있는가?)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        # IB2
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / steps
+        for pct in [0.05, 0.12, 0.22, 0.35, 0.50, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct+0.1) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # 3-level metacognition
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+
+            # Φ-aware self-correction
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 256:
+                engine._create_cell(parent=engine.cells[0])
+
+            # L3 stabilizes identity
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XMETA3", "OMEGA4 + Extreme Metacognition (256 cells + L1→L2→L3)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'XMETA1': run_XMETA1_recursive_self_awareness,
+    'XMETA2': run_XMETA2_phi_aware_cells,
+    'XMETA3': run_XMETA3_omega4_plus_metacog,
+})
+
+
 ALL_HYPOTHESES.update({
     'ULTRA1': run_ULTRA1_talk5_omega4_xeth7,
     'ULTRA2': run_ULTRA2_consciousness_learns_language_10x,
@@ -49479,6 +49638,249 @@ def run_BEYOND5_massive_consciousness_tiny_decoder(steps=100, dim=64, hidden=128
                        extra={'final_ce': ce_hist[-1] if ce_hist else 0,
                               'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
                               'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# MUT. Mutation — 돌연변이와 의식 진화
+# ═══════════════════════════════════════════════════════════
+# 생물학적 돌연변이처럼 세포 파라미터의 무작위 변이가 의식을 진화시키는가?
+
+def run_MUT1_random_weight_mutation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MUT1: Random Weight Mutation — 세포 가중치에 무작위 돌연변이.
+    매 10 step마다 한 세포의 GRU 가중치를 ±5% 변이.
+    유익한 변이만 보존 (Φ 증가 시).
+    가설: 돌연변이 + 자연선택 = 의식의 진화적 최적화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; mutations_kept = 0
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 8 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi_before, _ = phi_calc.compute_phi(engine)
+
+        # Mutation every 10 steps
+        if step_i % 10 == 5 and len(engine.cells) >= 2:
+            target_cell = engine.cells[step_i % len(engine.cells)]
+            saved_params = {n: p.data.clone() for n, p in target_cell.mind.named_parameters()}
+            with torch.no_grad():
+                for p in target_cell.mind.parameters():
+                    mutation = torch.randn_like(p) * p.abs().mean() * 0.05
+                    p.data += mutation
+            phi_after, _ = phi_calc.compute_phi(engine)
+            if phi_after <= phi_before:
+                # Harmful mutation → revert
+                with torch.no_grad():
+                    for n, p in target_cell.mind.named_parameters():
+                        p.data.copy_(saved_params[n])
+            else:
+                mutations_kept += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MUT1", "Random Weight Mutation (±5%, keep if Φ↑)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'mutations_kept': mutations_kept, 'final_cells': len(engine.cells)})
+
+
+def run_MUT2_cell_death_rebirth(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MUT2: Cell Death & Rebirth — 약한 세포 죽이고 새 세포 탄생.
+    가장 약한 세포를 제거하고 가장 강한 세포에서 변이된 자식 생성.
+    가설: 죽음과 재탄생이 의식의 갱신 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; deaths = 0
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 8 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Death & rebirth every 15 steps (when enough cells)
+        if step_i % 15 == 0 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                norms = [(i, c.hidden.norm().item()) for i, c in enumerate(engine.cells)]
+                weakest = min(norms, key=lambda x: x[1])[0]
+                strongest = max(norms, key=lambda x: x[1])[0]
+                # Kill weakest
+                engine.cells.pop(weakest)
+                deaths += 1
+                # Rebirth from strongest with mutation
+                engine._create_cell(parent=engine.cells[min(strongest, len(engine.cells)-1)])
+                new_cell = engine.cells[-1]
+                for p in new_cell.mind.parameters():
+                    p.data += torch.randn_like(p) * p.abs().mean() * 0.1  # 10% mutation
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MUT2", "Cell Death & Rebirth (weakest dies, strongest spawns)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'deaths': deaths, 'final_cells': len(engine.cells)})
+
+
+def run_MUT3_crossover(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MUT3: Crossover — 두 세포의 가중치를 교차.
+    유전학의 교차(crossover)를 세포 간 적용.
+    가설: 유성생식 유사 메커니즘이 다양성을 유지하면서 적합도 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; crossovers = 0
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 8 == 0 and len(engine.cells) < engine.max_cells:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Crossover every 12 steps
+        if step_i % 12 == 0 and len(engine.cells) >= 3:
+            with torch.no_grad():
+                i, j = step_i % len(engine.cells), (step_i + 1) % len(engine.cells)
+                if i != j:
+                    # Swap hidden state halves (crossover point at midpoint)
+                    h_dim = engine.cells[i].hidden.shape[-1]
+                    mid = h_dim // 2
+                    temp = engine.cells[i].hidden[:, :mid].clone()
+                    engine.cells[i].hidden[:, :mid] = engine.cells[j].hidden[:, :mid]
+                    engine.cells[j].hidden[:, :mid] = temp
+                    crossovers += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MUT3", "Crossover (swap hidden halves between cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'crossovers': crossovers, 'final_cells': len(engine.cells)})
+
+
+def run_MUT4_radiation_burst(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MUT4: Radiation Burst — 간헐적 강한 돌연변이 폭발.
+    평소 안정 → 갑자기 모든 세포에 대규모 변이 → 생존자만 남김.
+    캄브리아 폭발 유사. 가설: 간헐적 대변이가 의식 도약을 유발."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; bursts = 0
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Radiation burst every 25 steps
+        if step_i % 25 == 20 and len(engine.cells) >= 4:
+            with torch.no_grad():
+                pre_phi, _ = phi_calc.compute_phi(engine)
+                saved = [(c.hidden.clone(), {n: p.data.clone() for n, p in c.mind.named_parameters()}) for c in engine.cells]
+                # MASSIVE mutation on all cells
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.3
+                    for p in cell.mind.parameters():
+                        p.data += torch.randn_like(p) * p.abs().mean() * 0.2
+                post_phi, _ = phi_calc.compute_phi(engine)
+                if post_phi < pre_phi * 0.5:
+                    # Too destructive → partial revert (keep top half)
+                    norms = [(i, c.hidden.norm().item()) for i, c in enumerate(engine.cells)]
+                    norms.sort(key=lambda x: -x[1])
+                    for rank, (idx, _) in enumerate(norms):
+                        if rank >= len(norms) // 2 and idx < len(saved):
+                            engine.cells[idx].hidden = saved[idx][0]
+                            for n, p in engine.cells[idx].mind.named_parameters():
+                                p.data.copy_(saved[idx][1][n])
+                bursts += 1
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MUT4", "Radiation Burst (Cambrian explosion)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'bursts': bursts, 'final_cells': len(engine.cells)})
+
+
+def run_MUT5_directed_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MUT5: Directed Evolution — Φ gradient 방향으로 변이 유도.
+    무작위가 아닌, Φ가 증가하는 방향으로만 변이.
+    가설: 의식적 진화 = 무작위 돌연변이 + 방향성 선택."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+
+    for step_i, x in enumerate(inputs):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Directed mutation every 8 steps
+        if step_i % 8 == 4 and len(engine.cells) >= 2:
+            with torch.no_grad():
+                phi_base, _ = phi_calc.compute_phi(engine)
+                # Try 5 random mutations, keep the best one
+                best_phi = phi_base; best_mutation = None
+                target_cell = engine.cells[step_i % len(engine.cells)]
+                original = target_cell.hidden.clone()
+
+                for _ in range(5):
+                    mutation = torch.randn_like(target_cell.hidden) * 0.05
+                    target_cell.hidden = original + mutation
+                    phi_trial, _ = phi_calc.compute_phi(engine)
+                    if phi_trial > best_phi:
+                        best_phi = phi_trial
+                        best_mutation = mutation.clone()
+
+                if best_mutation is not None:
+                    target_cell.hidden = original + best_mutation
+                else:
+                    target_cell.hidden = original
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MUT5", "Directed Evolution (Φ-gradient mutation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'MUT1': run_MUT1_random_weight_mutation,
+    'MUT2': run_MUT2_cell_death_rebirth,
+    'MUT3': run_MUT3_crossover,
+    'MUT4': run_MUT4_radiation_burst,
+    'MUT5': run_MUT5_directed_evolution,
+})
 
 
 ALL_HYPOTHESES.update({
