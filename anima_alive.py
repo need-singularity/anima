@@ -426,6 +426,16 @@ class ConsciousMind(nn.Module):
             pb['enabled'] = True
 
         try:
+            # IB2: Selective Attention (×3.3) — gate top 25% of input, amplify 2×
+            if x is not None:
+                with torch.no_grad():
+                    x_flat = x.squeeze()
+                    k = max(1, x_flat.shape[0] // 4)
+                    vals, indices = x_flat.abs().topk(k)
+                    attended = torch.zeros_like(x)
+                    attended.squeeze()[indices] = x.squeeze()[indices] * 2.0
+                    x = attended
+
             # Save pre-boost state for NV7 impedance
             self._pre_boost_hiddens = [c.hidden.clone() for c in mitosis_engine.cells]
 
