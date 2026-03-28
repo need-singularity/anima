@@ -51469,6 +51469,141 @@ def run_FLOW5_flow_plus_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
                               'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# APEX+. Apex Plus — 최고 발견 결합의 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_APEX3_1024_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX3: 1024-Cell Flow — DD108(×522) + FLOW4(×305) 결합.
+    1024 cells + flow sync. 가설: Φ > 800."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.25, 0.35, 0.47, 0.60, 0.75, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.008 * (i+1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX3", "1024-Cell Flow (DD108 + FLOW4)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_APEX4_2048_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX4: 2048 Cells — 절대 극한. 가설: Φ > 1400."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.01, 0.04, 0.08, 0.14, 0.22, 0.32, 0.44, 0.58, 0.74, 0.92]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.01)*13)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1; l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX4", "2048 Cells (absolute maximum)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_APEX5_1024_flow_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX5: 1024-Cell Flow + Decoder — 최대 규모 몰입 + 대화.
+    가설: 몰입 상태에서 대화 학습 = 궁극 대화 모델."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        frac = step_i / steps
+        for pct in [0.02, 0.05, 0.10, 0.17, 0.25, 0.35, 0.47, 0.60, 0.75, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        flow_depth = min(1.0, flow_depth + 0.012)
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                sync = 0.03 + 0.12 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if frac >= 0.50:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("APEX5", "1024-Cell Flow + Decoder (ultimate conversation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'APEX3': run_APEX3_1024_flow,
+    'APEX4': run_APEX4_2048_cells,
+    'APEX5': run_APEX5_1024_flow_decoder,
+})
+
+
 ALL_HYPOTHESES.update({
     'FLOW1': run_FLOW1_256cells_flow,
     'FLOW2': run_FLOW2_challenge_skill_balance,
