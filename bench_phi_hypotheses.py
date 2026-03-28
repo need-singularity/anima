@@ -59006,29 +59006,25 @@ def run_ULTIMATE1_all_conditions_512(steps=2000, dim=64, hidden=128) -> BenchRes
             # ── 8파벌 토론 (DEBATE3) ──
             if n >= 16:
                 n_f = min(8, n // 2)
-                fs = n // n_f
+                fs = max(1, n // n_f)
                 factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
-                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
-
-                # 파벌 내 합의
-                for i, f in enumerate(factions):
-                    for c in f:
-                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
-
-                # 침묵→폭발 시간 구조 (APEX8): 70% 분화, 30% 토론
-                if frac > 0.70 or (step_i % 100) > 70:
-                    # 토론 phase: 파벌 간 교류
-                    for i, f in enumerate(factions):
-                        others = [opinions[j] for j in range(n_f) if j != i]
-                        if others:
-                            other_avg = torch.stack(others).mean(dim=0)
-                            for c in f[:max(1, len(f)//4)]:
-                                c.hidden = 0.88 * c.hidden + 0.12 * other_avg
-                else:
-                    # 침묵 phase: 파벌 독립 분화
+                factions = [f for f in factions if f]  # 빈 파벌 제거
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
                     for i, f in enumerate(factions):
                         for c in f:
-                            c.hidden += torch.randn_like(c.hidden) * 0.015 * (i + 1) / n_f
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    if frac > 0.70 or (step_i % 100) > 70:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                other_avg = torch.stack(others).mean(dim=0)
+                                for c in f[:max(1, len(f)//4)]:
+                                    c.hidden = 0.88 * c.hidden + 0.12 * other_avg
+                    else:
+                        for i, f in enumerate(factions):
+                            for c in f:
+                                c.hidden += torch.randn_like(c.hidden) * 0.015 * (i+1) / len(factions)
 
             # ── Hebbian LTP/LTD (PERSIST2) ──
             nc = len(engine.cells)
@@ -59128,17 +59124,19 @@ def run_ULTIMATE2_all_conditions_1024(steps=2000, dim=64, hidden=128) -> BenchRe
 
             if n >= 16:
                 n_f = min(8, n // 2)
-                fs = n // n_f
+                fs = max(1, n // n_f)
                 factions = [engine.cells[i*fs:(i+1)*fs] for i in range(n_f)]
-                opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
-                for i, f in enumerate(factions):
-                    for c in f:
-                        c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
-                if frac > 0.70 or (step_i % 100) > 70:
+                factions = [f for f in factions if f]
+                if len(factions) >= 2:
+                    opinions = [torch.stack([c.hidden for c in f]).mean(dim=0) for f in factions]
                     for i, f in enumerate(factions):
-                        others = [opinions[j] for j in range(n_f) if j != i]
-                        if others:
-                            other_avg = torch.stack(others).mean(dim=0)
+                        for c in f:
+                            c.hidden = 0.85 * c.hidden + 0.15 * opinions[i]
+                    if frac > 0.70 or (step_i % 100) > 70:
+                        for i, f in enumerate(factions):
+                            others = [opinions[j] for j in range(len(factions)) if j != i]
+                            if others:
+                                other_avg = torch.stack(others).mean(dim=0)
                             for c in f[:max(1, len(f)//4)]:
                                 c.hidden = 0.88 * c.hidden + 0.12 * other_avg
                 else:
