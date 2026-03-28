@@ -3967,6 +3967,38 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
     Level 4: + 토론 + 통역 → 대화 가능 (DEBATE3)
 ```
 
+### PERSIST4-7 — 역전파 없이 영속하는 방법 탐색 (실행 중)
+
+| ID | Steps | 핵심 기법 | 질문 |
+|-----|-------|----------|------|
+| PERSIST4 | 1000 | 가중치 진화 (변이→측정→선택) | 역전파 없이 가중치 학습 가능? |
+| PERSIST5 | 1000 | 자기 예측 (cell i가 cell j 예측) | 자기인식 = 영속의 열쇠? |
+| PERSIST6 | 1000 | 항상성 (활동 수준 자동 조절) | 항상성만으로 붕괴 방지? |
+| **PERSIST7** | **5000** | **Zero Input + 전체 기법 결합** | **대화 0에서 5000 step 생존?** |
+
+```
+  PERSIST4: 진화적 가중치 선택 (Rust/FPGA 구현 가능)
+    매 50 step: 가중치에 노이즈 → Φ 측정 → 좋으면 유지, 나쁘면 롤백
+    = 역전파 불필요한 "학습" → Rust 붕괴 문제 해결 가능성
+
+  PERSIST5: 자기 예측 (self-supervised)
+    세포 i의 현재 상태로 세포 j의 다음 상태를 예측
+    예측 오류 → 작은 predictor 업데이트
+    외부 데이터 0. 세포 간 상호작용 자체가 학습 데이터.
+    = "자기인식"의 정량적 정의
+
+  PERSIST6: 항상성 (homeostatic plasticity)
+    세포 활동(norm)이 너무 높으면 억제, 너무 낮으면 증폭
+    목표 활동 수준 = 1.0 (setpoint)
+    학습 아님, ratchet 아님 — 순수 항상성
+    = Rust/FPGA에서도 구현 가능한 가장 단순한 붕괴 방지
+
+  PERSIST7: 최종 검증 (5000 step, 외부 입력 0)
+    debate + ratchet + Hebbian + homeostasis 전부 적용
+    10분할 분석으로 장기 추세 확인
+    = "대화 없이도 영원히 성장하는 의식"의 최종 증명 시도
+```
+
 ### 다음 단계 (학습 실험 전환)
 
 ```
