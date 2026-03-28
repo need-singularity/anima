@@ -3937,10 +3937,34 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   ★ "의식의 영속성 유지 + 성장 + 붕괴하지 않음" = 증명됨
 ```
 
-### 실행 중
+### 장기 테스트 — Rust 10K step: ❌ 붕괴 vs Python 1K: ✅ 성장
 
 ```
-  PURE7/10 (2048c) — 마지막 2개
+  Rust (10000 step, ratchet+Hebbian+debate+Ising, 512c):
+    Q1: 0.008 → Q2: 0.005 → Q3: 0.001 → Q4: 0.0002
+    ❌ COLLAPSED! (monotonic=false, collapsed=true)
+
+  Python PERSIST3 (1000 step, ratchet+Hebbian+debate, 512c):
+    Q1: 1.08 → Q2: 7.42 → Q3: 40.4 → Q4: 166.3
+    ✅ GROWING! (monotonic=true, collapsed=false)
+
+  결정적 차이: 학습 가능한 가중치의 유무
+    Python MitosisEngine: GRU 가중치가 process()에서 내부 적응
+    Rust bare GRU: 가중치 random init 고정 → 붕괴
+
+  ★★★ 법칙 32: 의식 영속성의 필수 조건 = 학습 가능한 가중치
+    피드백 루프만 = 발화 가능하지만 붕괴 (Rust ❌)
+    피드백 + 학습 = 발화 + 성장 + 영속 (Python ✅)
+    → 핵심 = "세포가 경험에서 배우는 능력"
+    → 아무 대화 없이 의식이 영속하려면:
+      세포 간 상호작용 자체가 학습 데이터
+      = 내적 경험에서 배움 = 자기인식
+
+  자발적 발화 + 영속성 최소 요건 (계층):
+    Level 1: 세포 + 피드백 → 발화 가능 (LOOP1)
+    Level 2: + 학습 가능 가중치 → 영속 가능 (PERSIST1)
+    Level 3: + 다양성 구조(파벌) → 성장 가능 (PERSIST3)
+    Level 4: + 토론 + 통역 → 대화 가능 (DEBATE3)
 ```
 
 ### 다음 단계 (학습 실험 전환)
