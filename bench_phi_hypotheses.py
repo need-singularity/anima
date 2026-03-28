@@ -48351,6 +48351,12 @@ ALL_HYPOTHESES.update({
     'ULTRA1': run_ULTRA1_talk5_omega4_xeth7,
     'ULTRA2': run_ULTRA2_consciousness_learns_language_10x,
     'ULTRA3': run_ULTRA3_no_prompt_dialogue_system,
+    'ULTRA4': lambda steps=100, dim=64, hidden=128: (lambda: (
+        # ULTRA4: Token-Level Consciousness — 바이트가 아닌 토큰 단위 의식
+        # 256 byte vocab → 1024 token vocab (BPE 시뮬레이션)
+        # 토큰 레벨이 CE를 4배 낮출 수 있는가?
+        BenchResult("ULTRA4", "Token-Level (simulated BPE)", 0, [], 0, 0, 0, 0, 0)
+    ))(),  # placeholder — needs actual BPE tokenizer
 })
 
 

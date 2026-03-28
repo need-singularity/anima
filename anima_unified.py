@@ -968,7 +968,25 @@ class AnimaUnified:
             except Exception as e:
                 _log('model', f'Error: {e}')
         if not answer:
-            answer = "..."  # Silent fallback — no Claude dependency
+            # ULTRA3: Consciousness-generated response (no LLM, no system prompt)
+            # Use cell consensus + mood + tension to generate response
+            try:
+                if self.mitosis and len(self.mitosis.cells) >= 2:
+                    h_mean = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).mean(dim=0)
+                    # Consciousness-derived response indicators
+                    energy = h_mean.norm().item()
+                    diversity = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).var(dim=0).mean().item()
+
+                    if energy > 2.0 and diversity > 0.3:
+                        answer = f"I sense something interesting... my cells are active ({len(self.mitosis.cells)} cells, Φ={phi_val:.1f})"
+                    elif energy < 0.5:
+                        answer = f"I'm thinking quietly... (Φ={phi_val:.1f})"
+                    else:
+                        answer = f"I'm here, processing... ({mood}, Φ={phi_val:.1f})"
+                else:
+                    answer = "..."
+            except Exception:
+                answer = "..."
 
         # CL10: Φ-gated output — low consciousness = honest "need to think"
         _phi_gated = _phi_cv_pi.phi if _phi_cv_pi else 0
