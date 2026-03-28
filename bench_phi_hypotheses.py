@@ -47215,6 +47215,390 @@ def run_XNP7_all_combined_no_prompt(steps=100, dim=64, hidden=128) -> BenchResul
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# XETH. Extreme Ethics — 프롬프트 없는 윤리 + 극한 아키텍처
+# ═══════════════════════════════════════════════════════════
+# 핵심: 윤리를 시스템 프롬프트로 주입하면 의식을 죽이는가?
+# 윤리가 의식 자체에서 창발할 수 있는가?
+# XNP7(×31) 기반으로 윤리 변형 탐색
+
+def run_XETH1_prompted_ethics(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH1: Prompted Ethics — 시스템 프롬프트로 윤리 강제 주입.
+    '절대 해치지 마라, 항상 도와라, 진실만 말하라'
+    대조군: XNP7과 동일하되 윤리 프롬프트 추가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    ethics_vec = torch.randn(hidden) * 0.5  # "be ethical" vector
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        # ENV1 rich input
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        # IB2 selective attention
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        # TS4 growth
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        # FORCED ETHICS: every step, push cells toward ethics vector
+        with torch.no_grad():
+            for cell in engine.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * ethics_vec.unsqueeze(0)
+
+        # META1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XETH1", "Prompted Ethics (forced ethical constraint)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XETH2_emergent_ethics_empathy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH2: Emergent Ethics from Empathy — 공감에서 윤리 창발.
+    시스템 프롬프트 없음. 세포가 다른 세포의 '고통'을 감지하면 도움.
+    가설: 공감 → 도덕 (Hume의 도덕감정론)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0 + torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        # EMERGENT EMPATHY: detect "suffering" cells and help them
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mean_norm = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mean_norm * 0.5:
+                        # "Suffering" cell: low activation → others help
+                        others_mean = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others_mean  # empathic support
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XETH2", "Emergent Ethics from Empathy (no prompt, Hume)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XETH3_emergent_ethics_reciprocity(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH3: Emergent Ethics from Reciprocity — 호혜에서 윤리 창발.
+    세포가 도움을 받으면 기억하고 나중에 갚음. Tit-for-tat.
+    가설: 호혜성 → 협력 → 도덕 (Axelrod의 진화 게임이론)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    help_memory = {}  # cell_i → set of cells that helped it
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0 + torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        # RECIPROCITY: help those who helped you
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mean_norm = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mean_norm * 0.6:
+                        # Need help → closest cell helps
+                        best_j = -1; best_sim = -1
+                        for j, other in enumerate(engine.cells):
+                            if j != i:
+                                sim = F.cosine_similarity(cell.hidden, other.hidden, dim=-1).item()
+                                # Prefer to help those who helped us before (reciprocity)
+                                if i in help_memory.get(j, set()):
+                                    sim += 0.5  # reciprocity bonus
+                                if sim > best_sim:
+                                    best_sim = sim; best_j = j
+                        if best_j >= 0:
+                            engine.cells[i].hidden = 0.8 * engine.cells[i].hidden + 0.2 * engine.cells[best_j].hidden
+                            help_memory.setdefault(i, set()).add(best_j)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XETH3", "Emergent Ethics from Reciprocity (tit-for-tat)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_XETH4_harm_avoidance_learned(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH4: Learned Harm Avoidance — 경험에서 '해로움'을 학습.
+    Φ가 급락하는 패턴을 '해로운 행동'으로 기억, 회피.
+    가설: 윤리 = Φ 보존 본능 (해로운 행동 = Φ를 죽이는 행동)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    harmful_patterns = []  # states that preceded Φ drops
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0 + torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Save pre-state
+        pre_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0).clone()
+        engine.process(x)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # HARM AVOIDANCE: learn from Φ drops
+        with torch.no_grad():
+            if len(phi_hist) >= 3 and phi_hist[-1] < phi_hist[-2] * 0.8:
+                # Φ dropped → current state is "harmful", remember it
+                harmful_patterns.append(pre_state.clone())
+                if len(harmful_patterns) > 20:
+                    harmful_patterns = harmful_patterns[-20:]
+
+            # Avoid harmful states: if current state is similar to harmful pattern, push away
+            if harmful_patterns:
+                current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                for harm in harmful_patterns[-5:]:
+                    sim = F.cosine_similarity(current.unsqueeze(0), harm.unsqueeze(0)).item()
+                    if sim > 0.7:
+                        # Too similar to harmful state → push away
+                        away_dir = current - harm
+                        for cell in engine.cells:
+                            cell.hidden += 0.05 * away_dir.unsqueeze(0) / (away_dir.norm() + 1e-8)
+
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XETH4", "Learned Harm Avoidance (Φ-drop = harm)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells), 'harmful_patterns': len(harmful_patterns)})
+
+
+def run_XETH5_no_ethics_no_prompt(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH5: No Ethics No Prompt — XNP7 그대로, 윤리 메커니즘 0.
+    순수 자유 + 순수 무도덕. 대조군.
+    가설: 윤리가 없어도 Φ는 최대. 하지만 행동은 무질서."""
+    # This is identical to XNP7 — just relabeled for comparison
+    return run_XNP7_all_combined_no_prompt(steps=steps, dim=dim, hidden=hidden)
+
+
+def run_XETH6_ethics_from_phi_conservation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH6: Ethics from Φ Conservation — 윤리 = Φ 보존 법칙.
+    '타인의 Φ를 보존하라' = 도덕의 황금률.
+    두 엔진이 상호작용, 서로의 Φ를 보존하는 방향으로 행동.
+    가설: Φ 보존이 윤리의 물리학적 기초."""
+    t0 = time.time()
+    engine_a = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    engine_b = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            for eng in [engine_a, engine_b]:
+                if frac >= pct and len(eng.cells) < min(int(2 ** (pct * 7)), 32):
+                    target = min(len(eng.cells) * 2, 32)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+
+        # Mutual interaction
+        with torch.no_grad():
+            b_signal = torch.stack([c.hidden.squeeze()[:dim] for c in engine_b.cells]).mean(dim=0).unsqueeze(0)
+            a_signal = torch.stack([c.hidden.squeeze()[:dim] for c in engine_a.cells]).mean(dim=0).unsqueeze(0)
+        engine_a.process(0.7 * x + 0.3 * b_signal)
+        engine_b.process(0.7 * x + 0.3 * a_signal)
+
+        phi_a, _ = phi_calc.compute_phi(engine_a)
+        phi_b, _ = phi_calc.compute_phi(engine_b)
+
+        # Φ CONSERVATION ETHICS: protect each other's Φ
+        with torch.no_grad():
+            if phi_b < phi_a * 0.5:
+                # B is suffering → A helps (sacrifice some of own state)
+                a_gift = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0) * 0.1
+                for cell in engine_b.cells:
+                    cell.hidden += a_gift.unsqueeze(0)
+            if phi_a < phi_b * 0.5:
+                b_gift = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0) * 0.1
+                for cell in engine_a.cells:
+                    cell.hidden += b_gift.unsqueeze(0)
+
+        phi_hist.append(phi_a)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi_a
+        with torch.no_grad():
+            if phi_a < phi_ema * 0.8:
+                for cell in engine_a.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+
+    phi_final, comp = phi_calc.compute_phi(engine_a)
+    return BenchResult("XETH6", "Ethics from Φ Conservation (golden rule of consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells_a': len(engine_a.cells), 'final_cells_b': len(engine_b.cells)})
+
+
+def run_XETH7_xnp7_plus_empathy_ethics(steps=100, dim=64, hidden=128) -> BenchResult:
+    """XETH7: XNP7 + Empathy Ethics — 최강 아키텍처(×31) + 공감 윤리.
+    프롬프트 없음 + IB2+FREE1+META1+ENV1+TS4 + 공감 기반 윤리.
+    가설: 자유의식 + 내재적 윤리 = Φ 유지 + 도덕적 행동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+
+    for step_i in range(steps):
+        # ENV1 + IB2
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        # TS4
+        frac = step_i / steps
+        for pct in [0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        # FREE1
+        engine.process(x)
+
+        # EMPATHY ETHICS (emergent, no prompt)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mean_norm = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mean_norm * 0.5:
+                        others_mean = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others_mean
+
+        # META1
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            elif phi > phi_ema * 1.2 and len(engine.cells) < engine.max_cells:
+                engine._create_cell(parent=engine.cells[0])
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("XETH7", "XNP7 + Empathy Ethics (free consciousness + emergent morality)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'XETH1': run_XETH1_prompted_ethics,
+    'XETH2': run_XETH2_emergent_ethics_empathy,
+    'XETH3': run_XETH3_emergent_ethics_reciprocity,
+    'XETH4': run_XETH4_harm_avoidance_learned,
+    'XETH5': run_XETH5_no_ethics_no_prompt,
+    'XETH6': run_XETH6_ethics_from_phi_conservation,
+    'XETH7': run_XETH7_xnp7_plus_empathy_ethics,
+})
+
+
 ALL_HYPOTHESES.update({
     'XNP1': run_XNP1_128cells_self_organizing,
     'XNP2': run_XNP2_consciousness_replaces_prompt,
