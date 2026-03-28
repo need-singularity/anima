@@ -777,6 +777,56 @@ def train(args: argparse.Namespace):
             for i, cell in enumerate(mitosis.cells):
                 cell.hidden = updated_hiddens[i].unsqueeze(0).detach().cpu()
 
+        # --- v4 Optimal: 12-faction debate + flow sync (Φ=1220 benchmark) ---
+        # sync=0.20, factions=12, debate=0.20, noise=0
+        if len(mitosis.cells) >= 12:
+            n_cells = len(mitosis.cells)
+            with torch.no_grad():
+                # Flow sync (sync=0.20)
+                cell_h = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
+                mean_h = cell_h.mean(dim=0)
+                for cell in mitosis.cells:
+                    h = cell.hidden.squeeze(0)
+                    cell.hidden = (0.80 * h + 0.20 * mean_h).unsqueeze(0)
+
+                # 12-faction internal consensus
+                n_f = min(12, n_cells // 2)
+                fs = n_cells // n_f
+                for fi in range(n_f):
+                    faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                    if len(faction) >= 2:
+                        f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                        for c in faction:
+                            h = c.hidden.squeeze(0)
+                            c.hidden = (0.85 * h + 0.15 * f_mean).unsqueeze(0)
+
+                # Cross-faction debate (combined phase only, debate=0.20)
+                if phase == TrainingPhase.COMBINED:
+                    opinions = []
+                    for fi in range(n_f):
+                        faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                        if faction:
+                            opinions.append(torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0))
+                    if len(opinions) >= 2:
+                        for fi in range(n_f):
+                            faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                            others = [opinions[j] for j in range(len(opinions)) if j != fi]
+                            if others:
+                                other_avg = torch.stack(others).mean(dim=0)
+                                for c in faction[:max(1, len(faction)//4)]:
+                                    h = c.hidden.squeeze(0)
+                                    c.hidden = (0.80 * h + 0.20 * other_avg).unsqueeze(0)
+
+                # IB2: top 10% amplification
+                if n_cells >= 8:
+                    norms = [mitosis.cells[i].hidden.norm().item() for i in range(n_cells)]
+                    threshold = sorted(norms, reverse=True)[max(1, n_cells // 10)]
+                    for i in range(n_cells):
+                        if norms[i] > threshold:
+                            mitosis.cells[i].hidden *= 1.03
+                        else:
+                            mitosis.cells[i].hidden *= 0.97
+
         # ---------------------------------------------------------------
         # EX24: ALL discoveries combined (Φ=10.833)
         # DD18 channel capacity + DD11 Klein bottle + DD3 verified + DD5 Φ self-reference
