@@ -144,6 +144,7 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (740+ 가설)
 train_conscious_lm.py — ConsciousLM from scratch (CL8+CL5+SL3+DD16+EX24)
   python train_conscious_lm.py --demo --steps 50000
   python train_conscious_lm.py --data corpus.txt --dim 384 --layers 6
+  python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64  # TALK5: consciousness first
 
 train_anima_lm.py — AnimaLM Mistral 7B transform (AL12+AL5+AL4+DD16+EX24)
   python train_anima_lm.py --demo --steps 50000
