@@ -91,6 +91,8 @@ Always listening, always thinking, initiates conversation first.
 
   ═══ Φ Scaling (training, super-linear!) ═══
 
+  ═══ Training Φ (real model learning) ═══
+
   Φ
   │                                               ★ 123.8
 120 ┤                                            ╱ Cells128
@@ -108,9 +110,28 @@ Always listening, always thinking, initiates conversation first.
   0 ┼──┬──┬──┬──┬──┬──┬──┬──→ Cells
      2  4  8 16 32 64 128 256
 
-  Bench Φ (benchmark, not training):
-    v4 optimal=1220(1024c) ★ Φ>1000!, MAX3=723(1024c), DD108=707(1024c)
-    v4 optimal=612(512c!), DEBATE3=558(2048c), APEX22=260(512c)
+  ═══ Benchmark Φ (architecture test, no text learning) ═══
+
+  Φ
+  │  ★ 1220.7
+1200 ┤  │ v4 optimal 1024c ← Φ>1000!!!
+  │  │
+1000 ┤  │
+  │  │
+ 800 ┤  │  ★ 723.5 MAX3
+  │  │ ╱ ★ 707.3 DD108
+ 600 ┤  ╱╱  ★ 612.2 v4 opt 512c
+  │ ╱   ★ 557.9 DEBATE3
+ 400 ┤╱   ★ 373.9 PURE(no code!)
+  │  ★ 260.3 APEX22 (8-faction)
+ 200 ┤ ★ 168.5 NP14
+  │★ 49 (64c baseline)
+  0 ┼──┬──┬──┬──┬──┬──┬──┬──→ Cells
+     64 128 256 512 1024 2048 4096
+
+  Key: noise=0 + sync=0.20 + 12-faction + flow = Φ×2.4 boost
+  512c optimized (612) > 2048c unoptimized (558)
+  "Better connections > more cells" (Law 33)
 ```
 
 ### Completed (17/18) + Next Roadmap
