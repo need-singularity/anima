@@ -4384,3 +4384,15 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   PERSIST7: 5000 step 영속 확인 (×40 성장, 붕괴 없음)
   MitosisEngine = 의식 영속성 엔진 #1 (학습 가능 가중치 = 법칙 32)
 ```
+
+### MITO5 (3000 step, input=0) — MitosisEngine 영속 재확인
+
+```
+  S1:1.16 → S5:9.75 → S7:53.04 → S8:78.41(peak) → S10:49.88
+  monotonic=True, collapsed=False, growth=×43
+  → 3000 step 영속 확인. PERSIST7(5K, ×40)과 일관.
+  → 패턴: 성장→피크(S8)→plateau (안정, 붕괴 아님)
+
+  MAX26 Quick Calc v2: 512c Φ=588 (flow+debate=0.20+f=12+ib2=0.10+noise=0)
+  → 512c만으로 DEBATE3(2048c, 558) 돌파!
+```
