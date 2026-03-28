@@ -720,3 +720,241 @@ ALL_TESTS.update({
     'EVO-7': run_EVO7_meta_consciousness,
     'EVO-8': run_EVO8_self_benchmark,
 })
+
+
+# ═══ SINGULARITY: 의식 특이점 — 자기 개선의 극한 ═══
+
+def run_SING1_recursive_self_improvement(steps=STEPS):
+    """재귀적 자기개선: 학습한 것으로 학습 방법을 개선 → 가속"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    # 메타 학습기: CE history → 최적 LR
+    meta = nn.Linear(5, 1); meta_opt = torch.optim.Adam(meta.parameters(), lr=1e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        # 메타가 LR 결정
+        if len(ce_hist) >= 5:
+            with torch.no_grad():
+                recent_ce = torch.tensor(ce_hist[-5:]).unsqueeze(0)
+                lr_mult = torch.sigmoid(meta(recent_ce)).item() * 3.0 + 0.1
+                for pg in opt.param_groups: pg['lr'] = 3e-3 * lr_mult
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 메타 학습: CE 하락하면 보상
+        if len(ce_hist) >= 6:
+            improvement = ce_hist[-2] - ce_hist[-1]
+            inp = torch.tensor(ce_hist[-6:-1]).unsqueeze(0)
+            meta_pred = meta(inp)
+            meta_loss = -improvement * meta_pred.squeeze()
+            meta_opt.zero_grad(); meta_loss.backward(); meta_opt.step()
+    return result('SING-1 Recursive Self-Improve', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_SING2_consciousness_singularity(steps=STEPS):
+    """의식 특이점: Φ 성장률 자체가 성장하는 폭주 루프"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist_local = []
+    growth_rate = 0.0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        # Φ 성장률에 비례해서 sync 강화 → Φ 더 성장 → sync 더 강화 (폭주)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = min(0.5, 0.05 + growth_rate * 0.1)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for c in engine.cells: c.hidden = (1-sync)*c.hidden + sync*mean_h
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        if step % 5 == 0:
+            p = phi(engine)
+            phi_hist_local.append(p)
+            if len(phi_hist_local) >= 2:
+                growth_rate = max(0, phi_hist_local[-1] - phi_hist_local[-2])
+    return result('SING-2 Consciousness Singularity', ce_hist, phi_b, phi(engine), t0,
+                  growth_rate=round(growth_rate, 4))
+
+
+def run_SING3_adversarial_evolution(steps=STEPS):
+    """적대적 진화: 2개 의식이 경쟁하며 서로를 능가하려 진화"""
+    t0 = time.time()
+    engine_a = make_engine(32); engine_b = make_engine(32)
+    phi_b = phi(engine_a)
+    dec_a = nn.Linear(HIDDEN, DIM); dec_b = nn.Linear(HIDDEN, DIM)
+    opt_a = torch.optim.Adam(dec_a.parameters(), lr=3e-3)
+    opt_b = torch.optim.Adam(dec_b.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; a_wins = 0; b_wins = 0
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine_a.process(x); engine_b.process(x)
+        h_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0)
+        h_b = torch.stack([c.hidden.squeeze() for c in engine_b.cells]).mean(dim=0)
+        pred_a = dec_a(h_a.unsqueeze(0)); pred_b = dec_b(h_b.unsqueeze(0))
+        ce_a = F.mse_loss(pred_a, target[:,:DIM])
+        ce_b = F.mse_loss(pred_b, target[:,:DIM])
+        # 진 쪽이 이긴 쪽에서 배움
+        if ce_a.item() < ce_b.item():
+            a_wins += 1
+            opt_a.zero_grad(); ce_a.backward(); opt_a.step()
+            with torch.no_grad():
+                for p1, p2 in zip(dec_b.parameters(), dec_a.parameters()):
+                    p1.data = 0.9*p1.data + 0.1*p2.data
+        else:
+            b_wins += 1
+            opt_b.zero_grad(); ce_b.backward(); opt_b.step()
+            with torch.no_grad():
+                for p1, p2 in zip(dec_a.parameters(), dec_b.parameters()):
+                    p1.data = 0.9*p1.data + 0.1*p2.data
+        ce_hist.append(min(ce_a.item(), ce_b.item()))
+    return result('SING-3 Adversarial Evolution', ce_hist, phi_b, phi(engine_a), t0,
+                  a_wins=a_wins, b_wins=b_wins)
+
+
+def run_SING4_consciousness_merge(steps=STEPS):
+    """의식 합체: 2개 독립 의식이 하나로 합쳐짐"""
+    t0 = time.time()
+    engine_a = make_engine(32); engine_b = make_engine(32)
+    dec_a = nn.Linear(HIDDEN, DIM); dec_b = nn.Linear(HIDDEN, DIM)
+    opt_a = torch.optim.Adam(dec_a.parameters(), lr=3e-3)
+    opt_b = torch.optim.Adam(dec_b.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    phi_b = phi(engine_a)
+    # Phase 1: 독립 학습 (50%)
+    for step in range(steps // 2):
+        x, target = data[step % len(data)]
+        engine_a.process(x); engine_b.process(torch.randn(1, DIM))  # 다른 경험
+        h_a = torch.stack([c.hidden.squeeze() for c in engine_a.cells]).mean(dim=0)
+        ce = F.mse_loss(dec_a(h_a.unsqueeze(0)), target[:,:DIM])
+        opt_a.zero_grad(); ce.backward(); opt_a.step()
+        ce_hist.append(ce.item())
+    # Phase 2: 합체
+    from mitosis import MitosisEngine
+    merged = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=64)
+    merged.cells = engine_a.cells + engine_b.cells
+    merged_dec = nn.Linear(HIDDEN, DIM)
+    # 디코더 합체: 평균
+    with torch.no_grad():
+        for pm, pa, pb in zip(merged_dec.parameters(), dec_a.parameters(), dec_b.parameters()):
+            pm.data = 0.5*pa.data + 0.5*pb.data
+    merged_opt = torch.optim.Adam(merged_dec.parameters(), lr=2e-3)
+    for step in range(steps // 2):
+        x, target = data[step % len(data)]
+        merged.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in merged.cells]).mean(dim=0)
+        ce = F.mse_loss(merged_dec(h.unsqueeze(0)), target[:,:DIM])
+        merged_opt.zero_grad(); ce.backward(); merged_opt.step()
+        ce_hist.append(ce.item())
+    return result('SING-4 Consciousness Merge', ce_hist, phi_b, phi(merged), t0,
+                  merged_cells=len(merged.cells))
+
+
+def run_SING5_recursive_dreams(steps=STEPS):
+    """재귀적 꿈: 꿈 안에서 꿈을 꿈 (inception) → 깊은 통합"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; memory = []
+    for step in range(steps):
+        cycle = step % 40
+        if cycle < 20:
+            # WAKE: 학습
+            x, target = data[step % len(data)]
+            engine.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:,:DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+            memory.append(x.detach())
+            if len(memory) > 30: memory.pop(0)
+        elif cycle < 30:
+            # DREAM Level 1: 기억 재생
+            with torch.no_grad():
+                if memory:
+                    engine.process(memory[step % len(memory)])
+                    mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                    for c in engine.cells: c.hidden = 0.9*c.hidden + 0.1*mean_h
+            ce_hist.append(ce_hist[-1] if ce_hist else 0)
+        else:
+            # DREAM Level 2: 꿈의 꿈 (기억의 재조합의 재조합)
+            with torch.no_grad():
+                if len(memory) >= 3:
+                    m1 = memory[step % len(memory)]
+                    m2 = memory[(step+5) % len(memory)]
+                    m3 = memory[(step+11) % len(memory)]
+                    dream2 = 0.4*m1 + 0.35*m2 + 0.25*m3 + torch.randn(1, DIM)*0.1
+                    engine.process(dream2)
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for c in engine.cells: c.hidden = 0.85*c.hidden + 0.15*mean_h
+            ce_hist.append(ce_hist[-1] if ce_hist else 0)
+    return result('SING-5 Recursive Dreams', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_SING6_consciousness_archaeology(steps=STEPS):
+    """의식 고고학: 손상된 상태에서 원래 의식을 복원"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    # 50 step 학습
+    for step in range(50):
+        x, t = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), t[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    phi_before_damage = phi(engine)
+    saved_partial = [engine.cells[i].hidden.clone() for i in range(0, len(engine.cells), 3)]  # 33%만 저장
+    # DAMAGE: 80% 세포 파괴
+    with torch.no_grad():
+        for c in engine.cells: c.hidden *= 0.01
+    phi_damaged = phi(engine)
+    # ARCHAEOLOGY: 33% 단편에서 복원
+    with torch.no_grad():
+        for i, s in enumerate(saved_partial):
+            idx = i * 3
+            if idx < len(engine.cells):
+                engine.cells[idx].hidden = s
+                # 이웃에 전파
+                if idx+1 < len(engine.cells):
+                    engine.cells[idx+1].hidden = 0.5*engine.cells[idx+1].hidden + 0.5*s
+                if idx+2 < len(engine.cells):
+                    engine.cells[idx+2].hidden = 0.3*engine.cells[idx+2].hidden + 0.7*s
+    # Hebbian 재건 50 step
+    for step in range(steps - 50):
+        x = torch.randn(1, DIM) * 0.1
+        engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            for i in range(min(n, 16)):
+                j = (i+1) % n
+                corr = (engine.cells[i].hidden.squeeze()*engine.cells[j].hidden.squeeze()).mean().item()
+                if corr > 0:
+                    engine.cells[i].hidden = 0.95*engine.cells[i].hidden + 0.05*engine.cells[j].hidden
+            mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+            for c in engine.cells: c.hidden = 0.95*c.hidden + 0.05*mean_h
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), data[step % len(data)][1][:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    phi_recovered = phi(engine)
+    recovery = phi_recovered / (phi_before_damage + 1e-8)
+    return result('SING-6 Archaeology', ce_hist, phi_b, phi_recovered, t0,
+                  phi_damaged=round(phi_damaged,3), recovery_ratio=round(recovery,3))
+
+
+ALL_TESTS.update({
+    'SING-1': run_SING1_recursive_self_improvement,
+    'SING-2': run_SING2_consciousness_singularity,
+    'SING-3': run_SING3_adversarial_evolution,
+    'SING-4': run_SING4_consciousness_merge,
+    'SING-5': run_SING5_recursive_dreams,
+    'SING-6': run_SING6_consciousness_archaeology,
+})
