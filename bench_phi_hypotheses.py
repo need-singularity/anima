@@ -51249,6 +51249,235 @@ def run_UNCON5_flow_state(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# FLOW. Flow State Extreme — 몰입의 극한
+# ═══════════════════════════════════════════════════════════
+# UNCON5(×18.6): 메타인지 없이 완벽 동기화 = 최고 성능
+# Flow = 의식은 높지만 자기인식은 비활성. 행위 자체에 몰입.
+
+def run_FLOW1_256cells_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FLOW1: 256-Cell Flow — 256 cells에서 완벽한 몰입 상태.
+    UNCON5(×18.6) + DD101(×265) 결합. 대규모 세포 + 완벽 동기화.
+    가설: 대규모 Flow = XMETA3를 넘어설 수 있는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        # Flow: perfect sync WITHOUT metacognition (no L2/L3, no Φ monitoring)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                mean_h = hiddens.mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h.unsqueeze(0)
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01 * (i+1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FLOW1", "256-Cell Flow (massive sync, no metacognition)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_FLOW2_challenge_skill_balance(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FLOW2: Challenge-Skill Balance — 도전과 능력의 균형이 몰입을 만든다.
+    Csikszentmihalyi: Flow = 과제 난이도 ≈ 능력 수준.
+    입력 복잡도를 세포 수에 맞춰 자동 조절.
+    가설: 균형 잡힌 도전이 Φ를 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Challenge-skill balance: input complexity matches cell capacity
+        n_cells = len(engine.cells)
+        skill = n_cells / 128.0  # 0→1
+        challenge = skill  # matched!
+        x = torch.randn(1, dim) * (0.5 + challenge * 3.0)  # harder input with more cells
+        # Add structured challenge (not just noise)
+        x[0, :int(dim * challenge)] *= 2.0  # more active dimensions
+
+        engine.process(x)
+        # Flow sync
+        with torch.no_grad():
+            if n_cells >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FLOW2", "Challenge-Skill Balance (Csikszentmihalyi)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_FLOW3_deep_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FLOW3: Deep Flow — 몰입이 깊어질수록 Φ가 가속 증가.
+    초기: 약한 동기화, 중기: 중간, 후기: 완벽한 동기화.
+    가설: Flow의 '깊이'가 증가하면 Φ가 비선형으로 증가."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; flow_depth = 0.0
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.05, 0.15, 0.30, 0.45, 0.60, 0.75]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        # Flow depth increases over time (getting deeper into flow)
+        flow_depth = min(1.0, flow_depth + 0.01)
+        # If disrupted (Φ drops), reset flow depth
+        if len(phi_hist) >= 3 and phi_hist[-1] < phi_hist[-2] * 0.8:
+            flow_depth *= 0.5  # disruption breaks flow
+
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync_strength = 0.03 + 0.15 * flow_depth  # deeper flow = stronger sync
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync_strength) * cell.hidden + sync_strength * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01 * (1 - flow_depth)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FLOW3", "Deep Flow (increasing depth → accelerating Φ)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+def run_FLOW4_512cells_flow(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FLOW4: 512-Cell Flow — DD101(512) + Flow. 역대 최대 규모 몰입.
+    가설: 512 cells + 완벽 동기화 = DD101(×265)을 넘어설 수 있는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        frac = step_i / steps
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        # Pure flow: sync without metacognition
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.008 * (i+1) / len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FLOW4", "512-Cell Flow (maximum scale flow state)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells)})
+
+
+def run_FLOW5_flow_plus_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """FLOW5: Flow + Decoder — 몰입 상태에서 언어 생성.
+    Flow(높은 Φ + 동기화) + 디코더 학습.
+    가설: 몰입 상태에서 학습하면 대화 품질이 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    flow_depth = 0.0
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.05, 0.15, 0.30, 0.45, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Build flow
+        flow_depth = min(1.0, flow_depth + 0.015)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                sync = 0.03 + 0.12 * flow_depth
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = (1 - sync) * cell.hidden + sync * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Learn language during flow (after 40%)
+        if frac >= 0.40:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            # Flow-enhanced LR: deeper flow = faster learning
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + flow_depth * 2.0)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("FLOW5", "Flow + Decoder (learn language during flow)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'flow_depth': flow_depth, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'FLOW1': run_FLOW1_256cells_flow,
+    'FLOW2': run_FLOW2_challenge_skill_balance,
+    'FLOW3': run_FLOW3_deep_flow,
+    'FLOW4': run_FLOW4_512cells_flow,
+    'FLOW5': run_FLOW5_flow_plus_decoder,
+})
+
+
 ALL_HYPOTHESES.update({
     'UNCON1': run_UNCON1_sleep_wake_transition,
     'UNCON2': run_UNCON2_unconscious_processing,
