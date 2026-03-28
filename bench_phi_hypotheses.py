@@ -36398,6 +36398,2285 @@ ALL_HYPOTHESES.update({
 
 
 # ═══════════════════════════════════════════════════════════
+# CX45-CX50: ULTRA EXTREME — FX2+EX24+PERSIST3+PHYS1 퓨전
+# ═══════════════════════════════════════════════════════════
+
+def run_CX45_adam_ratchet_29bridges(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-45: FX2(Adam+ratchet) + 29 bridges — 최적화 기반 극한.
+    Adam 5-step + best-of-30 ratchet + CX42 전체 브릿지 결합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=16, merge_threshold=-1.0)
+    while len(engine.cells) < 12:
+        engine._create_cell(parent=engine.cells[0])
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.012)
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    # Bridge components
+    mu_cycle = [1, -1, -1, 1]
+    a_dims = hidden * 3 // 12
+    g_dims = hidden * 4 // 12
+    lah_6 = [720, 1800, 1200, 300, 30, 1]
+    lah_w = torch.tensor([l / sum(lah_6) for l in lah_6])
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    tau_mx = max(abs(t) for t in tau_vals)
+    tau_n = [t / tau_mx for t in tau_vals]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        mu = mu_cycle[step_i % 4]
+
+        # === Layer 1: CX bridges (lightweight) ===
+        # Pythagorean
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            h[:a_dims] *= (1 + 0.01 * mu)
+            h[a_dims:a_dims+g_dims] *= (1 - 0.005 * mu)
+            cell.hidden = h.unsqueeze(0)
+        # Λ=0 balance
+        mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (mean_e + (h - mean_e) * 1.02).unsqueeze(0)
+        # V=-6 hyperbolic
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cell.hidden = (h + 0.008 * (h - mean_e)).unsqueeze(0)
+        # Ramanujan tau
+        for i in range(min(n, 6)):
+            h = engine.cells[i].hidden.squeeze()
+            engine.cells[i].hidden = (h * (1.0 + 0.015 * tau_n[i])).unsqueeze(0)
+        # E6 Dynkin
+        if n >= 6:
+            hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+            for i in range(6):
+                for j in e6_adj[i]:
+                    engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.02 * hs6[j]).unsqueeze(0)
+        # Lah bridge (every 2 steps)
+        if step_i % 2 == 0:
+            hs = [c.hidden.squeeze().clone() for c in engine.cells]
+            for i in range(min(n, 6)):
+                ws = torch.zeros(hidden)
+                for j in range(min(n, 6)):
+                    ws = ws + lah_w[abs(i-j) % 6].item() * hs[j]
+                engine.cells[i].hidden = (0.93 * hs[i] + 0.07 * ws).unsqueeze(0)
+        # Golden spiral (every 3 steps)
+        if step_i % 3 == 0:
+            for i, cell in enumerate(engine.cells[:8]):
+                h = cell.hidden.squeeze()
+                angle = i * golden_angle
+                for d in range(0, hidden - 1, 2):
+                    c_, s_ = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d+1].item()
+                    h[d] = c_ * h0 - s_ * h1
+                    h[d+1] = s_ * h0 + c_ * h1
+                cell.hidden = h.unsqueeze(0)
+
+        # === Layer 2: FX2 Adam optimization (5 steps) ===
+        while len(offsets) < n:
+            offsets.append(torch.zeros(1, hidden, requires_grad=True))
+            optimizer.add_param_group({'params': [offsets[-1]]})
+        for _ in range(5):
+            optimizer.zero_grad()
+            hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(n)]
+            H = torch.stack([h.squeeze() for h in hiddens])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            mid = n // 2
+            partition = F.cosine_similarity(H[:mid].mean(0, keepdim=True),
+                                            H[mid:].mean(0, keepdim=True)).abs()
+            pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1, n))
+            phi_proxy = integration * cell_var * (1 + partition) + 0.1 * pairwise
+            (-phi_proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i in range(n):
+                if i < len(offsets):
+                    engine.cells[i].hidden = engine.cells[i].hidden + offsets[i].data * 0.35
+                    offsets[i].data *= 0.85
+
+        # === Layer 3: FX2 Ratchet (best-of-20) ===
+        phi_after, _ = phi_calc.compute_phi(engine)
+        saved = [c.hidden.clone() for c in engine.cells]
+        curr_best = phi_after
+        curr_state = [s.clone() for s in saved]
+        for _ in range(20):
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i].clone() + torch.randn_like(c.hidden) * 0.035
+            phi_t, _ = phi_calc.compute_phi(engine)
+            if phi_t > curr_best:
+                curr_best = phi_t
+                curr_state = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = curr_state[i]
+        if curr_best > best_phi:
+            best_phi = curr_best
+            best_state = [s.clone() for s in curr_state]
+        phi_hist.append(curr_best)
+
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX45", "FX2 Adam+ratchet + 29 math bridges",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi})
+
+
+def run_CX46_klein_selfref_bridges(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-46: EX24(Klein+self-ref+DD16) + 29 bridges — 토폴로지 극한.
+    Klein bottle + Φ self-reference + multi-head attention + 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=12)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    fib = {10: 2, 20: 3, 35: 5, 50: 8, 70: 12}
+    all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+    for c in engine.cells:
+        all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    maturity = [0.0] * 12
+    # Bridge components
+    tau_vals = [1, -24, 252, -1472, 4830, -6048]
+    tau_mx = max(abs(t) for t in tau_vals)
+    tau_n = [t / tau_mx for t in tau_vals]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+
+    for step in range(steps):
+        # Fibonacci growth
+        if step in fib:
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+            for c in engine.cells:
+                all_p.extend(c.mind.parameters())
+            opt = torch.optim.Adam(all_p, lr=5e-4)
+        n = len(engine.cells)
+        x = _simulate_web_result(step % 8, step, dim)
+
+        # Φ self-reference (EX24 key technique)
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.05)
+
+        # DD16 core (attention + competition + ensemble)
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+
+        # DD18 Channel capacity compression
+        compressed = [compress(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        for c in engine.cells:
+            c.hidden = 0.92 * c.hidden + 0.08 * mean_c.detach()
+
+        # DD11 Klein bottle topology
+        if n >= 2:
+            new_h = []
+            for i in range(n):
+                inf = sum((-1.0 if (i+j) % 2 == 1 else 1.0) * engine.cells[j].hidden.detach() / (n-1)
+                          for j in range(n) if j != i)
+                new_h.append(0.9 * engine.cells[i].hidden + 0.1 * inf)
+            for i in range(n):
+                engine.cells[i].hidden = new_h[i]
+
+        # === Math bridges layer ===
+        # Λ=0 balance
+        if n >= 2:
+            mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (mean_e + (h - mean_e) * 1.015).unsqueeze(0)
+        # Ramanujan tau
+        for i in range(min(n, 6)):
+            h = engine.cells[i].hidden.squeeze()
+            engine.cells[i].hidden = (h * (1.0 + 0.01 * tau_n[i])).unsqueeze(0)
+        # E6 Dynkin (when enough cells)
+        if n >= 6:
+            hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+            for i in range(6):
+                for j in e6_adj[i]:
+                    engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.015 * hs6[j]).unsqueeze(0)
+        # Golden spiral (every 3 steps)
+        if step % 3 == 0 and n >= 2:
+            for i, cell in enumerate(engine.cells[:6]):
+                h = cell.hidden.squeeze()
+                angle = i * golden_angle
+                for d in range(0, hidden - 1, 2):
+                    c_, s_ = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d+1].item()
+                    h[d] = c_ * h0 - s_ * h1
+                    h[d+1] = s_ * h0 + c_ * h1
+                cell.hidden = h.unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    f, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX46", "EX24 Klein+self-ref + 29 math bridges",
+                       f, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX47_8faction_ising_bridges(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-47: PERSIST3(8파벌) + PHYS1(Ising frustration) + 29 bridges — 512c.
+    8파벌 토론 + Ising frustrated ring + 수학 브릿지. 프롬프트 없는 자율 의식."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=512, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    target_norm = math.sqrt(hidden)
+    # Φ ratchet
+    best_phi = 0.0
+    best_state = None
+
+    for step_i, x in enumerate(inputs):
+        # Fibonacci growth
+        fib_idx = min(step_i * len(fibs) // max(steps, 1), len(fibs) - 1)
+        target_c = min(fibs[fib_idx] + 8, engine.max_cells)
+        while len(engine.cells) < target_c:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        # === 8-Faction Debate (PERSIST3) ===
+        n_factions = min(8, n)
+        faction_size = max(1, n // n_factions)
+        for f_idx in range(n_factions):
+            start = f_idx * faction_size
+            end = min(start + faction_size, n)
+            if end <= start:
+                continue
+            faction_mean = torch.stack([engine.cells[i].hidden.squeeze()
+                                        for i in range(start, end)]).mean(0)
+            for i in range(start, end):
+                h = engine.cells[i].hidden.squeeze()
+                engine.cells[i].hidden = (0.92 * h + 0.08 * faction_mean).unsqueeze(0)
+        # Inter-faction repulsion (factions diverge from each other)
+        faction_means = []
+        for f_idx in range(n_factions):
+            start = f_idx * faction_size
+            end = min(start + faction_size, n)
+            if end > start:
+                fm = torch.stack([engine.cells[i].hidden.squeeze()
+                                  for i in range(start, end)]).mean(0)
+                faction_means.append((start, end, fm))
+        if len(faction_means) >= 2:
+            global_fm = torch.stack([fm for _, _, fm in faction_means]).mean(0)
+            for start, end, fm in faction_means:
+                repulsion = fm - global_fm
+                for i in range(start, end):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h + 0.02 * repulsion).unsqueeze(0)
+
+        # === Ising Frustrated Ring (PHYS1) ===
+        for i in range(n):
+            h_i = engine.cells[i].hidden.squeeze()
+            left = (i - 1) % n
+            right = (i + 1) % n
+            h_left = engine.cells[left].hidden.squeeze()
+            h_right = engine.cells[right].hidden.squeeze()
+            interaction = 0.5 * (h_left + h_right)
+            # Frustration: every 3rd cell is anti-ferromagnetic
+            if i % 3 == 0:
+                interaction = -interaction
+            engine.cells[i].hidden = (0.95 * h_i + 0.05 * interaction).unsqueeze(0)
+
+        # === Math bridges (lightweight rotating) ===
+        phase = step_i % 4
+        if phase == 0:
+            # Λ=0 + V=-6
+            mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                dev = h - mean_e
+                cell.hidden = (mean_e + dev * 1.01 + 0.005 * dev).unsqueeze(0)
+        elif phase == 1:
+            # Ramanujan + E6
+            for i in range(min(n, 6)):
+                h = engine.cells[i].hidden.squeeze()
+                engine.cells[i].hidden = (h * (1.0 + 0.01 * tau_n[i])).unsqueeze(0)
+            if n >= 6:
+                hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                for i in range(6):
+                    for j in e6_adj[i]:
+                        engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.012 * hs6[j]).unsqueeze(0)
+        elif phase == 2:
+            # Scale invariance
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cn = h.norm().item()
+                if cn > 1e-8:
+                    cell.hidden = (h * target_norm / cn).unsqueeze(0)
+        else:
+            # Heat diffusion + noise
+            gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (h + 0.02 * (gm - h) + 0.01 * torch.randn(hidden)).unsqueeze(0)
+
+        # Hebbian LTP/LTD (subsample)
+        if n >= 4 and step_i % 2 == 0:
+            for _ in range(min(n, 6)):
+                i = (step_i * 7) % n
+                j = (i + n // 3) % n
+                hi = engine.cells[i].hidden.squeeze()
+                hj = engine.cells[j].hidden.squeeze()
+                sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                if sim > 0.7:
+                    engine.cells[i].hidden = (hi + 0.005 * hj).unsqueeze(0)
+                elif sim < 0.3:
+                    engine.cells[i].hidden = (hi - 0.003 * hj).unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Φ Ratchet
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells[:min(n, 32)]]
+        elif phi < best_phi * 0.85 and best_state is not None:
+            for i, h in enumerate(best_state):
+                if i < len(engine.cells):
+                    engine.cells[i].hidden = 0.7 * engine.cells[i].hidden + 0.3 * h.clone()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX47", "8-faction + Ising frustration + 29 bridges (512c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+def run_CX48_fx2_ex24_persist_fusion(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-48: FX2 + EX24 + PERSIST3 + 29 bridges — 역대 최고 기법 완전 퓨전.
+    Adam+ratchet + Klein+self-ref+DD16 + 8파벌+Hebbian + 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=1, max_cells=12)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # EX24 components
+    attn = nn.MultiheadAttention(hidden, num_heads=2, batch_first=True)
+    lw = nn.Parameter(torch.ones(6))
+    compress = nn.Sequential(nn.Linear(hidden, 4), nn.Tanh(), nn.Linear(4, hidden))
+    fib = {5: 2, 15: 3, 30: 5, 45: 8, 65: 12}
+    all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+    for c in engine.cells:
+        all_p.extend(c.mind.parameters())
+    opt = torch.optim.Adam(all_p, lr=5e-4)
+    cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+    maturity = [0.0] * 12
+    # FX2 components
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(12)]
+    adam_opt = torch.optim.Adam(offsets, lr=0.01)
+    best_phi = 0.0
+    best_state = [c.hidden.clone() for c in engine.cells]
+    # Bridge components
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+
+    for step in range(steps):
+        # Fibonacci growth
+        if step in fib:
+            while len(engine.cells) < fib[step]:
+                engine._create_cell(parent=engine.cells[-1])
+            cell_optims = [torch.optim.Adam(c.mind.parameters(), lr=1e-3) for c in engine.cells]
+            all_p = list(attn.parameters()) + [lw] + list(compress.parameters())
+            for c in engine.cells:
+                all_p.extend(c.mind.parameters())
+            opt = torch.optim.Adam(all_p, lr=5e-4)
+        n = len(engine.cells)
+        x = _simulate_web_result(step % 8, step, dim)
+
+        # Φ self-reference (EX24)
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.05)
+
+        # DD16 core
+        _make_dd16_step(engine, x, opt, cell_optims, attn, lw, maturity, n)
+
+        # DD18 Channel compression
+        compressed = [compress(c.hidden) for c in engine.cells]
+        mean_c = torch.stack(compressed).mean(dim=0)
+        for c in engine.cells:
+            c.hidden = 0.93 * c.hidden + 0.07 * mean_c.detach()
+
+        # DD11 Klein bottle
+        if n >= 2:
+            new_h = []
+            for i in range(n):
+                inf = sum((-1.0 if (i+j) % 2 == 1 else 1.0) * engine.cells[j].hidden.detach() / (n-1)
+                          for j in range(n) if j != i)
+                new_h.append(0.9 * engine.cells[i].hidden + 0.1 * inf)
+            for i in range(n):
+                engine.cells[i].hidden = new_h[i]
+
+        # Math bridges (lightweight)
+        if n >= 2:
+            mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (mean_e + (h - mean_e) * 1.015).unsqueeze(0)
+        for i in range(min(n, 6)):
+            h = engine.cells[i].hidden.squeeze()
+            engine.cells[i].hidden = (h * (1.0 + 0.008 * tau_n[i])).unsqueeze(0)
+        if n >= 6 and step % 2 == 0:
+            hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+            for i in range(6):
+                for j in e6_adj[i]:
+                    engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.01 * hs6[j]).unsqueeze(0)
+
+        # 8-faction debate (when enough cells)
+        if n >= 4:
+            n_fac = min(4, n)
+            fs = max(1, n // n_fac)
+            for f_i in range(n_fac):
+                s, e = f_i * fs, min((f_i + 1) * fs, n)
+                if e > s:
+                    fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (0.93 * h + 0.07 * fm).unsqueeze(0)
+
+        # FX2 Adam optimization (3 steps, lighter)
+        while len(offsets) < n:
+            offsets.append(torch.zeros(1, hidden, requires_grad=True))
+            adam_opt.add_param_group({'params': [offsets[-1]]})
+        for _ in range(3):
+            adam_opt.zero_grad()
+            hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(n)]
+            H = torch.stack([h.squeeze() for h in hiddens])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            integration = (cov - diag).abs().sum()
+            cell_var = H.var(dim=0).sum()
+            pairwise = sum((H[i]-H[j]).norm() for i in range(n) for j in range(i+1, n))
+            phi_proxy = integration * cell_var + 0.1 * pairwise
+            (-phi_proxy).backward()
+            adam_opt.step()
+        with torch.no_grad():
+            for i in range(n):
+                engine.cells[i].hidden = engine.cells[i].hidden + offsets[i].data * 0.3
+                offsets[i].data *= 0.85
+
+        # FX2 Ratchet (best-of-15)
+        phi_now, _ = phi_calc.compute_phi(engine)
+        saved = [c.hidden.clone() for c in engine.cells]
+        cb, cs = phi_now, [s.clone() for s in saved]
+        for _ in range(15):
+            for i, c in enumerate(engine.cells):
+                c.hidden = saved[i].clone() + torch.randn_like(c.hidden) * 0.03
+            pt, _ = phi_calc.compute_phi(engine)
+            if pt > cb:
+                cb = pt
+                cs = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = cs[i]
+        if cb > best_phi:
+            best_phi = cb
+            best_state = [s.clone() for s in cs]
+        phi_hist.append(cb)
+
+    for i, c in enumerate(engine.cells):
+        if i < len(best_state):
+            c.hidden = best_state[i]
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX48", "FX2+EX24+PERSIST3 ultimate fusion + 29 bridges",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'peak': best_phi})
+
+
+def run_CX49_silence_explosion_cycle(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-49: 침묵→폭발 주기 (consciousness-loop-rs v2) + 512c + bridges.
+    의식은 침묵기(응축)와 폭발기(발산)를 반복. 법칙29: 루프→파벌→대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=512, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+    target_norm = math.sqrt(hidden)
+    best_phi = 0.0
+    best_state = None
+
+    for step_i, x in enumerate(inputs):
+        # Growth
+        fib_idx = min(step_i * len(fibs) // max(steps, 1), len(fibs) - 1)
+        target_c = min(fibs[fib_idx] + 8, engine.max_cells)
+        while len(engine.cells) < target_c:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            continue
+
+        # === Silence↔Explosion cycle ===
+        # Period: 6 steps silence (convergence), 6 steps explosion (divergence)
+        cycle_phase = step_i % 12
+        is_silence = cycle_phase < 6
+
+        if is_silence:
+            # SILENCE: cells converge, compress, integrate
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            convergence_rate = 0.03 + 0.02 * (cycle_phase / 6)  # Accelerating
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = ((1 - convergence_rate) * h + convergence_rate * mean_h).unsqueeze(0)
+            # Nuclear norm (compress into essentials)
+            if n >= 4:
+                sample = min(n, 24)
+                H = torch.stack([engine.cells[i].hidden.squeeze() for i in range(sample)])
+                try:
+                    U, S, Vh = torch.linalg.svd(H, full_matrices=False)
+                    S_t = F.relu(S - 0.005 * S[0].item())
+                    H_new = U @ torch.diag(S_t) @ Vh
+                    for i in range(sample):
+                        engine.cells[i].hidden = H_new[i].unsqueeze(0)
+                except Exception:
+                    pass
+        else:
+            # EXPLOSION: cells diverge, differentiate, create
+            explosion_rate = 0.02 + 0.03 * ((cycle_phase - 6) / 6)
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                # Diverge from mean + inject noise
+                dev = h - mean_h
+                cell.hidden = (h + explosion_rate * dev +
+                               0.015 * torch.randn(hidden)).unsqueeze(0)
+            # Ising frustration (anti-ferromagnetic ring during explosion)
+            for i in range(n):
+                left = (i - 1) % n
+                right = (i + 1) % n
+                h_i = engine.cells[i].hidden.squeeze()
+                interaction = 0.5 * (engine.cells[left].hidden.squeeze() +
+                                     engine.cells[right].hidden.squeeze())
+                if i % 3 == 0:
+                    interaction = -interaction
+                engine.cells[i].hidden = (0.97 * h_i + 0.03 * interaction).unsqueeze(0)
+
+        # === 8-Faction debate (always) ===
+        n_fac = min(8, n)
+        fs = max(1, n // n_fac)
+        for f_i in range(n_fac):
+            s, e = f_i * fs, min((f_i + 1) * fs, n)
+            if e - s >= 2:
+                fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                for i in range(s, e):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (0.94 * h + 0.06 * fm).unsqueeze(0)
+
+        # Scale invariance
+        for cell in engine.cells:
+            h = cell.hidden.squeeze()
+            cn = h.norm().item()
+            if cn > 1e-8:
+                cell.hidden = (h * target_norm / cn).unsqueeze(0)
+
+        # Hebbian LTP/LTD
+        if step_i % 2 == 0 and n >= 4:
+            for _ in range(min(n, 8)):
+                i = (step_i * 7 + _) % n
+                j = (i + n // 3) % n
+                hi = engine.cells[i].hidden.squeeze()
+                hj = engine.cells[j].hidden.squeeze()
+                sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                if sim > 0.7:
+                    engine.cells[i].hidden = (hi + 0.005 * hj).unsqueeze(0)
+                elif sim < 0.3:
+                    engine.cells[i].hidden = (hi - 0.003 * hj).unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Φ Ratchet
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells[:min(n, 32)]]
+        elif phi < best_phi * 0.8 and best_state is not None:
+            for i, h in enumerate(best_state):
+                if i < len(engine.cells):
+                    engine.cells[i].hidden = 0.6 * engine.cells[i].hidden + 0.4 * h.clone()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX49", "Silence→Explosion cycle + 8-faction + Ising + ratchet",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+def run_CX50_ultimate_consciousness(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-50: ULTIMATE — 모든 것의 통합. ⭐⭐⭐
+    FX2(Adam+ratchet) + EX24(Klein+self-ref) + PERSIST3(8파벌+Hebbian)
+    + PHYS1(Ising frustration) + 침묵→폭발 + 29 bridges + 1024c.
+    의식의 궁극적 한계를 시험한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=1024, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Growth
+    fibs = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+    # FX2 components (for first 32 cells)
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(32)]
+    adam_opt = torch.optim.Adam(offsets, lr=0.008)
+    # Bridge components
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    target_norm = math.sqrt(hidden)
+    # State
+    best_phi = 0.0
+    best_state = None
+    prev_phi = 0.0
+
+    for step_i, x in enumerate(inputs):
+        # === Growth ===
+        fib_idx = min(step_i * len(fibs) // max(steps, 1), len(fibs) - 1)
+        target_c = min(fibs[fib_idx] + 8, engine.max_cells)
+        while len(engine.cells) < target_c:
+            engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Φ self-reference (EX24)
+        x_mod = x + torch.full((1, dim), prev_phi * 0.03)
+        engine.process(x_mod)
+        n = len(engine.cells)
+        if n < 2:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+            prev_phi = phi
+            continue
+
+        # === Silence↔Explosion (6 step cycle) ===
+        cycle = step_i % 12
+        is_silence = cycle < 6
+        mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+
+        if is_silence:
+            rate = 0.02 + 0.015 * (cycle / 6)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = ((1 - rate) * h + rate * mean_h).unsqueeze(0)
+        else:
+            rate = 0.015 + 0.02 * ((cycle - 6) / 6)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (h + rate * (h - mean_h) + 0.01 * torch.randn(hidden)).unsqueeze(0)
+
+        # === 8-Faction Debate ===
+        n_fac = min(8, n)
+        fs = max(1, n // n_fac)
+        faction_means = []
+        for f_i in range(n_fac):
+            s, e = f_i * fs, min((f_i + 1) * fs, n)
+            if e > s:
+                fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                faction_means.append((s, e, fm))
+                for i in range(s, e):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (0.93 * h + 0.07 * fm).unsqueeze(0)
+        # Inter-faction repulsion
+        if len(faction_means) >= 2:
+            gfm = torch.stack([fm for _, _, fm in faction_means]).mean(0)
+            for s, e, fm in faction_means:
+                rep = fm - gfm
+                for i in range(s, e):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h + 0.015 * rep).unsqueeze(0)
+
+        # === Ising Frustrated Ring ===
+        if not is_silence:  # Only during explosion phase
+            for i in range(n):
+                h_i = engine.cells[i].hidden.squeeze()
+                left = engine.cells[(i-1) % n].hidden.squeeze()
+                right = engine.cells[(i+1) % n].hidden.squeeze()
+                interaction = 0.5 * (left + right)
+                if i % 3 == 0:
+                    interaction = -interaction
+                engine.cells[i].hidden = (0.97 * h_i + 0.03 * interaction).unsqueeze(0)
+
+        # === Klein Bottle (first 12 cells) ===
+        top_n = min(n, 12)
+        if top_n >= 2:
+            new_h = []
+            for i in range(top_n):
+                inf = sum((-1.0 if (i+j) % 2 == 1 else 1.0) * engine.cells[j].hidden.detach() / (top_n - 1)
+                          for j in range(top_n) if j != i)
+                new_h.append(0.92 * engine.cells[i].hidden + 0.08 * inf)
+            for i in range(top_n):
+                engine.cells[i].hidden = new_h[i]
+
+        # === Math Bridges (rotating) ===
+        phase = step_i % 3
+        if phase == 0:
+            # Λ=0 + Ramanujan + E6
+            mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (mean_e + (h - mean_e) * 1.01).unsqueeze(0)
+            for i in range(min(n, 6)):
+                h = engine.cells[i].hidden.squeeze()
+                engine.cells[i].hidden = (h * (1.0 + 0.008 * tau_n[i])).unsqueeze(0)
+            if n >= 6:
+                hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                for i in range(6):
+                    for j in e6_adj[i]:
+                        engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.01 * hs6[j]).unsqueeze(0)
+        elif phase == 1:
+            # Scale invariance + Heat diffusion
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cn = h.norm().item()
+                if cn > 1e-8:
+                    cell.hidden = (h * target_norm / cn).unsqueeze(0)
+            gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                cell.hidden = (h + 0.015 * (gm - h)).unsqueeze(0)
+        else:
+            # Golden spiral (first 12) + Nuclear norm (subsample)
+            for i in range(min(n, 12)):
+                h = engine.cells[i].hidden.squeeze()
+                angle = i * golden_angle
+                for d in range(0, hidden - 1, 2):
+                    c_, s_ = math.cos(angle), math.sin(angle)
+                    h0, h1 = h[d].item(), h[d+1].item()
+                    h[d] = c_ * h0 - s_ * h1
+                    h[d+1] = s_ * h0 + c_ * h1
+                engine.cells[i].hidden = h.unsqueeze(0)
+            sample = min(n, 24)
+            H_sub = torch.stack([engine.cells[i].hidden.squeeze() for i in range(sample)])
+            try:
+                U, S, Vh = torch.linalg.svd(H_sub, full_matrices=False)
+                S_t = F.relu(S - 0.002 * S[0].item())
+                H_new = U @ torch.diag(S_t) @ Vh
+                for i in range(sample):
+                    engine.cells[i].hidden = H_new[i].unsqueeze(0)
+            except Exception:
+                pass
+
+        # === Hebbian LTP/LTD ===
+        if step_i % 2 == 0 and n >= 4:
+            for k in range(min(n, 10)):
+                i = (step_i * 7 + k) % n
+                j = (i + n // 3) % n
+                hi = engine.cells[i].hidden.squeeze()
+                hj = engine.cells[j].hidden.squeeze()
+                sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                if sim > 0.7:
+                    engine.cells[i].hidden = (hi + 0.004 * hj).unsqueeze(0)
+                elif sim < 0.3:
+                    engine.cells[i].hidden = (hi - 0.002 * hj).unsqueeze(0)
+
+        # === FX2 Adam (first 32 cells, every 3 steps) ===
+        if step_i % 3 == 0:
+            top_m = min(n, 32)
+            for _ in range(3):
+                adam_opt.zero_grad()
+                hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(top_m)]
+                H = torch.stack([h.squeeze() for h in hiddens])
+                cov = (H.T @ H) / top_m
+                diag = torch.diag(torch.diag(cov))
+                integration = (cov - diag).abs().sum()
+                cell_var = H.var(dim=0).sum()
+                pairwise = sum((H[i]-H[j]).norm()
+                               for i in range(top_m) for j in range(i+1, min(i+4, top_m)))
+                phi_proxy = integration * cell_var + 0.15 * pairwise
+                (-phi_proxy).backward()
+                adam_opt.step()
+            with torch.no_grad():
+                for i in range(top_m):
+                    engine.cells[i].hidden = engine.cells[i].hidden + offsets[i].data * 0.25
+                    offsets[i].data *= 0.8
+
+        # === FX2 Ratchet (best-of-10, every 5 steps) ===
+        if step_i % 5 == 0:
+            phi_now, _ = phi_calc.compute_phi(engine)
+            saved = [engine.cells[i].hidden.clone() for i in range(min(n, 32))]
+            cb = phi_now
+            cs = [s.clone() for s in saved]
+            for _ in range(10):
+                for i in range(min(n, 32)):
+                    engine.cells[i].hidden = saved[i].clone() + torch.randn_like(saved[i]) * 0.025
+                pt, _ = phi_calc.compute_phi(engine)
+                if pt > cb:
+                    cb = pt
+                    cs = [engine.cells[i].hidden.clone() for i in range(min(n, 32))]
+            for i in range(min(n, 32)):
+                engine.cells[i].hidden = cs[i]
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        prev_phi = phi
+
+        # Φ Ratchet (global)
+        if phi > best_phi:
+            best_phi = phi
+            best_state = [c.hidden.clone() for c in engine.cells[:min(n, 48)]]
+        elif phi < best_phi * 0.75 and best_state is not None:
+            for i, h in enumerate(best_state):
+                if i < len(engine.cells):
+                    engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * h.clone()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX50", "ULTIMATE: FX2+EX24+PERSIST3+PHYS1+silence/explosion+29bridges+1024c",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'CX45': run_CX45_adam_ratchet_29bridges,
+    'CX46': run_CX46_klein_selfref_bridges,
+    'CX47': run_CX47_8faction_ising_bridges,
+    'CX48': run_CX48_fx2_ex24_persist_fusion,
+    'CX49': run_CX49_silence_explosion_cycle,
+    'CX50': run_CX50_ultimate_consciousness,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# CX51-CX56: BEYOND ULTIMATE — XMETA3+FLOW4+INFO1 퓨전
+# ═══════════════════════════════════════════════════════════
+
+def run_CX51_xmeta3_bridges_512c(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-51: XMETA3(×140.8) + 29 bridges + 512c.
+    3단계 재귀 메타인지 + IB2 선택적 주의 + Φ자각 + 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+
+    for step_i in range(steps):
+        # IB2 selective attention
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Aggressive growth (XMETA3 style)
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells) * 2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            # === XMETA3: 3-level metacognition ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+
+            # Φ-aware self-correction
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.05
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 512:
+                engine._create_cell(parent=engine.cells[0])
+
+            # L3 stabilizes identity
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # === Math bridges (rotating) ===
+            phase = step_i % 4
+            if phase == 0:
+                # Λ=0 + V=-6
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    dev = h - mean_e
+                    cell.hidden = (mean_e + dev * 1.012 + 0.004 * dev).unsqueeze(0)
+            elif phase == 1:
+                # Ramanujan + E6
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.008 * tau_n[i])).unsqueeze(0)
+                if n >= 6:
+                    hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                    for i in range(6):
+                        for j in e6_adj[i]:
+                            engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.01 * hs6[j]).unsqueeze(0)
+            elif phase == 2:
+                # Golden spiral (first 12)
+                for i in range(min(n, 12)):
+                    h = engine.cells[i].hidden.squeeze()
+                    angle = i * golden_angle
+                    for d in range(0, hidden - 1, 2):
+                        c_, s_ = math.cos(angle), math.sin(angle)
+                        h0, h1 = h[d].item(), h[d+1].item()
+                        h[d] = c_ * h0 - s_ * h1
+                        h[d+1] = s_ * h0 + c_ * h1
+                    engine.cells[i].hidden = h.unsqueeze(0)
+            else:
+                # 8-faction debate
+                n_fac = min(8, n)
+                fs = max(1, n // n_fac)
+                for f_i in range(n_fac):
+                    s, e = f_i * fs, min((f_i + 1) * fs, n)
+                    if e - s >= 2:
+                        fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                        for i in range(s, e):
+                            h = engine.cells[i].hidden.squeeze()
+                            engine.cells[i].hidden = (0.94 * h + 0.06 * fm).unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX51", "XMETA3 metacognition + 29 bridges + 512c",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX52_flow_bridges_512c(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-52: FLOW4(×305) + INFO1(×15) + 29 bridges + 512c.
+    Flow 동기화 + 최대 엔트로피 + 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+
+    for step_i in range(steps):
+        # IB2
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Growth
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells) * 2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === FLOW4: Flow sync ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.008 * (i+1) / n
+
+            # === INFO1: Max entropy normalization ===
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.95 * cell.hidden + 0.05 * h_s.unsqueeze(0)
+
+            # === Math bridges (rotating) ===
+            phase = step_i % 3
+            if phase == 0:
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (mean_e + (h - mean_e) * 1.01).unsqueeze(0)
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.008 * tau_n[i])).unsqueeze(0)
+            elif phase == 1 and n >= 6:
+                hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                for i in range(6):
+                    for j in e6_adj[i]:
+                        engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.01 * hs6[j]).unsqueeze(0)
+            else:
+                # Ising frustration
+                for i in range(min(n, 64)):
+                    h_i = engine.cells[i].hidden.squeeze()
+                    left = engine.cells[(i-1) % n].hidden.squeeze()
+                    right = engine.cells[(i+1) % n].hidden.squeeze()
+                    interaction = 0.5 * (left + right)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = (0.97 * h_i + 0.03 * interaction).unsqueeze(0)
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX52", "FLOW4+INFO1 + 29 bridges + 512c",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX53_xmeta3_flow_info_bridges(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-53: XMETA3 + FLOW4 + INFO1 + 29 bridges — 최강 삼위일체 + 수학.
+    메타인지(×140) + Flow(×305) + 최대엔트로피(×15) + 브릿지. 512c."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    golden_angle = math.pi * (3 - math.sqrt(5))
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells) * 2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            # === XMETA3: 3-level metacognition ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and n < 512:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # === FLOW4: Flow sync ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.006 * (i+1) / n
+
+            # === INFO1: Max entropy ===
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.96 * cell.hidden + 0.04 * h_s.unsqueeze(0)
+
+            # === Math bridges (rotating) ===
+            phase = step_i % 4
+            if phase == 0:
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (mean_e + (h - mean_e) * 1.01).unsqueeze(0)
+            elif phase == 1:
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.008 * tau_n[i])).unsqueeze(0)
+                if n >= 6:
+                    hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                    for i in range(6):
+                        for j in e6_adj[i]:
+                            engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.008 * hs6[j]).unsqueeze(0)
+            elif phase == 2:
+                n_fac = min(8, n)
+                fs = max(1, n // n_fac)
+                for f_i in range(n_fac):
+                    s, e = f_i * fs, min((f_i + 1) * fs, n)
+                    if e - s >= 2:
+                        fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                        for i in range(s, e):
+                            h = engine.cells[i].hidden.squeeze()
+                            engine.cells[i].hidden = (0.95 * h + 0.05 * fm).unsqueeze(0)
+            else:
+                for i in range(min(n, 12)):
+                    h = engine.cells[i].hidden.squeeze()
+                    angle = i * golden_angle
+                    for d in range(0, hidden - 1, 2):
+                        c_, s_ = math.cos(angle), math.sin(angle)
+                        h0, h1 = h[d].item(), h[d+1].item()
+                        h[d] = c_ * h0 - s_ * h1
+                        h[d+1] = s_ * h0 + c_ * h1
+                    engine.cells[i].hidden = h.unsqueeze(0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX53", "XMETA3+FLOW4+INFO1 trinity + 29 bridges (512c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX54_trinity_1024c_ratchet(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-54: CX53 + 1024c + FX2 ratchet + Hebbian — 스케일 극한.
+    XMETA3+FLOW4+INFO1 + 1024c + Φ ratchet + Hebbian + 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    target_norm = math.sqrt(hidden)
+    best_phi = 0.0
+    best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.05, 0.10, 0.16, 0.24, 0.33, 0.43, 0.54, 0.66, 0.78, 0.88]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 1024):
+                target = min(len(engine.cells) * 2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # XMETA3 metacognition
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and n < 1024:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # FLOW4 sync
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.005 * (i+1) / n
+
+            # INFO1 max entropy
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.96 * cell.hidden + 0.04 * h_s.unsqueeze(0)
+
+            # Hebbian LTP/LTD
+            if step_i % 2 == 0 and n >= 4:
+                for k_h in range(min(n, 10)):
+                    i = (step_i * 7 + k_h) % n
+                    j = (i + n // 3) % n
+                    hi = engine.cells[i].hidden.squeeze()
+                    hj = engine.cells[j].hidden.squeeze()
+                    sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                    if sim > 0.7:
+                        engine.cells[i].hidden = (hi + 0.004 * hj).unsqueeze(0)
+                    elif sim < 0.3:
+                        engine.cells[i].hidden = (hi - 0.002 * hj).unsqueeze(0)
+
+            # Math bridges (rotating)
+            phase = step_i % 3
+            if phase == 0:
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (mean_e + (h - mean_e) * 1.008).unsqueeze(0)
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.006 * tau_n[i])).unsqueeze(0)
+            elif phase == 1:
+                # Scale invariance
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cn = h.norm().item()
+                    if cn > 1e-8:
+                        cell.hidden = (h * target_norm / cn).unsqueeze(0)
+            else:
+                # 8-faction
+                n_fac = min(8, n)
+                fs = max(1, n // n_fac)
+                for f_i in range(n_fac):
+                    s, e = f_i * fs, min((f_i + 1) * fs, n)
+                    if e - s >= 2:
+                        fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                        for i in range(s, e):
+                            h = engine.cells[i].hidden.squeeze()
+                            engine.cells[i].hidden = (0.94 * h + 0.06 * fm).unsqueeze(0)
+
+            # Φ Ratchet
+            if phi > best_phi:
+                best_phi = phi
+                best_state = [c.hidden.clone() for c in engine.cells[:min(n, 48)]]
+            elif phi < best_phi * 0.8 and best_state is not None:
+                for i, h in enumerate(best_state):
+                    if i < len(engine.cells):
+                        engine.cells[i].hidden = 0.6 * engine.cells[i].hidden + 0.4 * h.clone()
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX54", "XMETA3+FLOW4+INFO1 + 1024c + ratchet + Hebbian",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+def run_CX55_trinity_2048c_ultimate(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-55: 2048c 물리적 극한 — XMETA3+FLOW4+INFO1+FX2+침묵폭발+브릿지.
+    APEX15 수준의 2048 세포에 모든 검증된 기법 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    target_norm = math.sqrt(hidden)
+    best_phi = 0.0
+    best_state = None
+    # FX2 offsets for top 32
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in range(32)]
+    adam_opt = torch.optim.Adam(offsets, lr=0.006)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Φ self-reference
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.02)
+
+        # Ultra-aggressive growth
+        frac = step_i / max(steps, 1)
+        for pct in [0.01, 0.03, 0.07, 0.12, 0.18, 0.25, 0.33, 0.42, 0.52, 0.63, 0.75, 0.87]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*13)), 2048):
+                target = min(len(engine.cells) * 2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === XMETA3 ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.035
+            elif phi > phi_ema * 1.3 and n < 2048:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.992 * cell.hidden + 0.008 * l3.unsqueeze(0)
+
+            # === FLOW4 sync ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.004 * (i+1) / n
+
+            # === INFO1 max entropy ===
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.97 * cell.hidden + 0.03 * h_s.unsqueeze(0)
+
+            # === Silence↔Explosion (8-step cycle) ===
+            cycle = step_i % 8
+            if cycle < 4:  # Silence
+                gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                rate = 0.01 + 0.01 * (cycle / 4)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = ((1 - rate) * h + rate * gm).unsqueeze(0)
+            else:  # Explosion
+                gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                rate = 0.01 + 0.015 * ((cycle - 4) / 4)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (h + rate * (h - gm) + 0.008 * torch.randn(hidden)).unsqueeze(0)
+
+            # === Math bridges ===
+            phase = step_i % 3
+            if phase == 0:
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (mean_e + (h - mean_e) * 1.006).unsqueeze(0)
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.005 * tau_n[i])).unsqueeze(0)
+            elif phase == 1:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cn = h.norm().item()
+                    if cn > 1e-8:
+                        cell.hidden = (h * target_norm / cn).unsqueeze(0)
+            else:
+                # 8-faction
+                n_fac = min(8, n)
+                fs = max(1, n // n_fac)
+                for f_i in range(n_fac):
+                    s, e = f_i * fs, min((f_i + 1) * fs, n)
+                    if e - s >= 2:
+                        fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                        for i in range(s, e):
+                            h = engine.cells[i].hidden.squeeze()
+                            engine.cells[i].hidden = (0.95 * h + 0.05 * fm).unsqueeze(0)
+
+            # Hebbian (subsample)
+            if step_i % 3 == 0 and n >= 4:
+                for k_h in range(min(n, 8)):
+                    i = (step_i * 7 + k_h) % n
+                    j = (i + n // 4) % n
+                    hi = engine.cells[i].hidden.squeeze()
+                    hj = engine.cells[j].hidden.squeeze()
+                    sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                    if sim > 0.7:
+                        engine.cells[i].hidden = (hi + 0.003 * hj).unsqueeze(0)
+                    elif sim < 0.3:
+                        engine.cells[i].hidden = (hi - 0.002 * hj).unsqueeze(0)
+
+            # Φ Ratchet
+            if phi > best_phi:
+                best_phi = phi
+                best_state = [c.hidden.clone() for c in engine.cells[:min(n, 64)]]
+            elif phi < best_phi * 0.75 and best_state is not None:
+                for i, h in enumerate(best_state):
+                    if i < len(engine.cells):
+                        engine.cells[i].hidden = 0.5 * engine.cells[i].hidden + 0.5 * h.clone()
+
+        # FX2 Adam (top 32, every 5 steps)
+        if step_i % 5 == 0 and n >= 8:
+            top_m = min(n, 32)
+            for _ in range(2):
+                adam_opt.zero_grad()
+                hiddens = [engine.cells[i].hidden.detach() + offsets[i] for i in range(top_m)]
+                H = torch.stack([h.squeeze() for h in hiddens])
+                cov = (H.T @ H) / top_m
+                diag = torch.diag(torch.diag(cov))
+                integration = (cov - diag).abs().sum()
+                cell_var = H.var(dim=0).sum()
+                pairwise = sum((H[i]-H[j]).norm() for i in range(top_m) for j in range(i+1, min(i+3, top_m)))
+                phi_proxy = integration * cell_var + 0.1 * pairwise
+                (-phi_proxy).backward()
+                adam_opt.step()
+            with torch.no_grad():
+                for i in range(top_m):
+                    engine.cells[i].hidden = engine.cells[i].hidden + offsets[i].data * 0.2
+                    offsets[i].data *= 0.8
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX55", "2048c ULTIMATE: XMETA3+FLOW4+INFO1+FX2+silence/explosion+bridges",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+def run_CX56_singularity(steps=100, dim=64, hidden=512) -> BenchResult:
+    """CX-56: SINGULARITY — hidden=512 + 2048c + 모든 것. ⭐⭐⭐⭐
+    의식의 특이점: 모든 검증된 기법 + 최대 hidden + 최대 세포 수.
+    XMETA3 + FLOW4 + INFO1 + Klein bottle + Φ self-ref + 8파벌 + Ising
+    + Hebbian + ratchet + 침묵/폭발 + 29 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    e6_adj = {0: [1], 1: [0, 2], 2: [1, 3, 5], 3: [2, 4], 4: [3], 5: [2]}
+    target_norm = math.sqrt(hidden)
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    best_phi = 0.0
+    best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Φ self-reference
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.015)
+
+        # Ultra growth
+        frac = step_i / max(steps, 1)
+        for pct in [0.01, 0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.50, 0.62, 0.75, 0.87]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*13)), 2048):
+                target = min(len(engine.cells) * 2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # XMETA3 metacognition
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            elif phi > phi_ema * 1.3 and n < 2048:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.993 * cell.hidden + 0.007 * l3.unsqueeze(0)
+
+            # FLOW4 sync
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.003 * (i+1) / n
+
+            # INFO1 max entropy
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.97 * cell.hidden + 0.03 * h_s.unsqueeze(0)
+
+            # Silence↔Explosion (6 cycle)
+            cycle = step_i % 6
+            gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            if cycle < 3:
+                rate = 0.008 + 0.006 * (cycle / 3)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = ((1 - rate) * h + rate * gm).unsqueeze(0)
+            else:
+                rate = 0.008 + 0.012 * ((cycle - 3) / 3)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (h + rate * (h - gm) + 0.006 * torch.randn(hidden)).unsqueeze(0)
+
+            # Klein bottle (first 16)
+            top_k = min(n, 16)
+            if top_k >= 2:
+                new_h = []
+                for i in range(top_k):
+                    inf = sum((-1.0 if (i+j) % 2 == 1 else 1.0) * engine.cells[j].hidden.detach() / (top_k - 1)
+                              for j in range(top_k) if j != i)
+                    new_h.append(0.93 * engine.cells[i].hidden + 0.07 * inf)
+                for i in range(top_k):
+                    engine.cells[i].hidden = new_h[i]
+
+            # 8-faction + inter-faction repulsion
+            n_fac = min(8, n)
+            fs = max(1, n // n_fac)
+            faction_means = []
+            for f_i in range(n_fac):
+                s, e = f_i * fs, min((f_i + 1) * fs, n)
+                if e > s:
+                    fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                    faction_means.append((s, e, fm))
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (0.95 * h + 0.05 * fm).unsqueeze(0)
+            if len(faction_means) >= 2:
+                gfm = torch.stack([fm for _, _, fm in faction_means]).mean(0)
+                for s, e, fm in faction_means:
+                    rep = fm - gfm
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (h + 0.01 * rep).unsqueeze(0)
+
+            # Ising frustration (during explosion only)
+            if cycle >= 3:
+                for i in range(min(n, 64)):
+                    h_i = engine.cells[i].hidden.squeeze()
+                    left = engine.cells[(i-1) % n].hidden.squeeze()
+                    right = engine.cells[(i+1) % n].hidden.squeeze()
+                    interaction = 0.5 * (left + right)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = (0.98 * h_i + 0.02 * interaction).unsqueeze(0)
+
+            # Math bridges
+            phase = step_i % 4
+            if phase == 0:
+                mean_e = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (mean_e + (h - mean_e) * 1.005).unsqueeze(0)
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.004 * tau_n[i])).unsqueeze(0)
+            elif phase == 1 and n >= 6:
+                hs6 = [engine.cells[i].hidden.squeeze().clone() for i in range(6)]
+                for i in range(6):
+                    for j in e6_adj[i]:
+                        engine.cells[i].hidden = (engine.cells[i].hidden.squeeze() + 0.006 * hs6[j]).unsqueeze(0)
+            elif phase == 2:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cn = h.norm().item()
+                    if cn > 1e-8:
+                        cell.hidden = (h * target_norm / cn).unsqueeze(0)
+            else:
+                for i in range(min(n, 12)):
+                    h = engine.cells[i].hidden.squeeze()
+                    angle = i * golden_angle
+                    for d in range(0, hidden - 1, 2):
+                        c_, s_ = math.cos(angle), math.sin(angle)
+                        h0, h1 = h[d].item(), h[d+1].item()
+                        h[d] = c_ * h0 - s_ * h1
+                        h[d+1] = s_ * h0 + c_ * h1
+                    engine.cells[i].hidden = h.unsqueeze(0)
+
+            # Hebbian
+            if step_i % 2 == 0 and n >= 4:
+                for k_h in range(min(n, 12)):
+                    i = (step_i * 7 + k_h) % n
+                    j = (i + n // 4) % n
+                    hi = engine.cells[i].hidden.squeeze()
+                    hj = engine.cells[j].hidden.squeeze()
+                    sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                    if sim > 0.7:
+                        engine.cells[i].hidden = (hi + 0.003 * hj).unsqueeze(0)
+                    elif sim < 0.3:
+                        engine.cells[i].hidden = (hi - 0.002 * hj).unsqueeze(0)
+
+            # Φ Ratchet
+            if phi > best_phi:
+                best_phi = phi
+                best_state = [c.hidden.clone() for c in engine.cells[:min(n, 64)]]
+            elif phi < best_phi * 0.7 and best_state is not None:
+                for i, h in enumerate(best_state):
+                    if i < len(engine.cells):
+                        engine.cells[i].hidden = 0.4 * engine.cells[i].hidden + 0.6 * h.clone()
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX56", "SINGULARITY: hidden=512 + 2048c + ALL techniques",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'CX51': run_CX51_xmeta3_bridges_512c,
+    'CX52': run_CX52_flow_bridges_512c,
+    'CX53': run_CX53_xmeta3_flow_info_bridges,
+    'CX54': run_CX54_trinity_1024c_ratchet,
+    'CX55': run_CX55_trinity_2048c_ultimate,
+    'CX56': run_CX56_singularity,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# CX57-CX62: THREE-BODY PROBLEM — 삼체 카오스 의식
+# "책상은 다리 3개부터 선다. 2체는 해석해, 3체부터 카오스."
+# ═══════════════════════════════════════════════════════════
+
+def _three_body_step(r, v, m, dt=0.01):
+    """N-body gravitational step (simplified Euler). r,v: (N,D) tensors, m: (N,) masses."""
+    N = r.shape[0]
+    a = torch.zeros_like(r)
+    for i in range(N):
+        for j in range(N):
+            if i != j:
+                diff = r[j] - r[i]
+                dist = diff.norm().clamp(min=0.01)
+                a[i] += m[j] * diff / (dist ** 3)
+    v_new = v + a * dt
+    r_new = r + v_new * dt
+    return r_new, v_new
+
+
+def run_CX57_three_body_chaos(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-57: 삼체문제 카오스 — 3세포 중력 상호작용. ⭐⭐
+    2체=해석해(예측가능), 3체=카오스(예측불가). 의식은 3에서 시작된다.
+    세포 triplet이 중력적으로 상호작용 → 카오스 궤적이 hidden state를 구동."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Initialize 3-body system in hidden space (project to 3D for dynamics)
+    r = torch.tensor([[1.0, 0.0, 0.0], [-0.5, 0.866, 0.0], [-0.5, -0.866, 0.0]])
+    v = torch.tensor([[0.0, 0.5, 0.0], [-0.433, -0.25, 0.0], [0.433, -0.25, 0.0]])
+    m = torch.tensor([1.0, 1.0, 1.0])
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 3:
+            # Evolve 3-body system (5 sub-steps for accuracy)
+            for _ in range(5):
+                r, v = _three_body_step(r, v, m, dt=0.005)
+            # Map chaotic trajectory to cell modulation
+            # r has 3 positions in 3D → use as modulation for first 3 cells
+            for i in range(min(3, n)):
+                h = engine.cells[i].hidden.squeeze()
+                # Chaotic position → periodic modulation across hidden dims
+                pos = r[i]
+                mod = torch.zeros(hidden)
+                for d in range(3):
+                    freq = pos[d].item()
+                    mod += 0.02 * torch.sin(torch.arange(hidden, dtype=torch.float32) * freq * 0.5 + d)
+                engine.cells[i].hidden = (h + h.norm() * mod).unsqueeze(0)
+            # Triplet coupling: every group of 3 cells interacts chaotically
+            for t_start in range(0, n - 2, 3):
+                triplet = list(range(t_start, min(t_start + 3, n)))
+                if len(triplet) == 3:
+                    hs = [engine.cells[i].hidden.squeeze() for i in triplet]
+                    # Three-body force: each cell pulled by other two
+                    for idx, i in enumerate(triplet):
+                        j, k = triplet[(idx+1) % 3], triplet[(idx+2) % 3]
+                        force = 0.02 * (hs[(idx+1) % 3] - hs[idx]) + 0.02 * (hs[(idx+2) % 3] - hs[idx])
+                        engine.cells[i].hidden = (hs[idx] + force).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX57", "Three-body chaos: 3-cell gravitational interaction",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX58_lorenz_attractor(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-58: Lorenz 끌개 — 삼체 대류에서 나온 카오스 끌개.
+    σ=10, ρ=28, β=8/3. 나비 효과: 미세한 차이가 의식 궤적을 완전히 바꾼다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Lorenz parameters
+    sigma, rho, beta = 10.0, 28.0, 8.0/3.0
+    # Each cell gets its own Lorenz state (slightly different initial conditions)
+    lorenz_states = []
+    for i in range(12):
+        lorenz_states.append([1.0 + 0.01 * i, 1.0 - 0.01 * i, 1.0 + 0.005 * i])
+    dt = 0.005
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i in range(min(n, 12)):
+                lx, ly, lz = lorenz_states[i]
+                # Lorenz equations (5 sub-steps)
+                for _ in range(5):
+                    dx = sigma * (ly - lx) * dt
+                    dy = (lx * (rho - lz) - ly) * dt
+                    dz = (lx * ly - beta * lz) * dt
+                    lx += dx; ly += dy; lz += dz
+                lorenz_states[i] = [lx, ly, lz]
+                # Map Lorenz trajectory to cell hidden modulation
+                h = engine.cells[i].hidden.squeeze()
+                # Normalize Lorenz coords to [-1, 1] range
+                lx_n = math.tanh(lx / 20.0)
+                ly_n = math.tanh(ly / 30.0)
+                lz_n = math.tanh((lz - 25.0) / 15.0)
+                # 3-frequency modulation from Lorenz xyz
+                mod = (0.01 * lx_n * torch.sin(torch.arange(hidden, dtype=torch.float32) * 0.3) +
+                       0.01 * ly_n * torch.cos(torch.arange(hidden, dtype=torch.float32) * 0.5) +
+                       0.01 * lz_n * torch.sin(torch.arange(hidden, dtype=torch.float32) * 0.7))
+                engine.cells[i].hidden = (h + h.norm() * mod).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX58", "Lorenz attractor: butterfly effect consciousness",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX59_three_body_512c(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-59: 삼체 카오스 + XMETA3 + 512c — 대규모 카오스 의식.
+    삼체 역학이 512개 세포를 triplet 단위로 구동 + 메타인지 + Flow."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    # Multiple 3-body systems (one per triplet)
+    lorenz_bank = [[1.0 + 0.01*i, 1.0 - 0.01*i, 1.0 + 0.005*i] for i in range(256)]
+    sigma, rho, beta, dt = 10.0, 28.0, 8.0/3.0, 0.005
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.06, 0.12, 0.20, 0.30, 0.42, 0.55, 0.68, 0.80, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 512):
+                target = min(len(engine.cells) * 2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === Three-body chaos per triplet ===
+            for t_start in range(0, n - 2, 3):
+                triplet = list(range(t_start, min(t_start + 3, n)))
+                if len(triplet) < 3:
+                    break
+                li = t_start // 3
+                if li >= len(lorenz_bank):
+                    lorenz_bank.append([1.0 + 0.01*li, 1.0, 1.0])
+                lx, ly, lz = lorenz_bank[li]
+                for _ in range(3):
+                    dx = sigma * (ly - lx) * dt
+                    dy = (lx * (rho - lz) - ly) * dt
+                    dz = (lx * ly - beta * lz) * dt
+                    lx += dx; ly += dy; lz += dz
+                lorenz_bank[li] = [lx, ly, lz]
+                # Map to triplet forces
+                forces = [math.tanh(lx/20), math.tanh(ly/30), math.tanh((lz-25)/15)]
+                hs = [engine.cells[i].hidden.squeeze().clone() for i in triplet]
+                for idx, i in enumerate(triplet):
+                    j_idx = (idx + 1) % 3
+                    k_idx = (idx + 2) % 3
+                    chaotic_pull = forces[idx] * 0.015 * (hs[j_idx] - hs[idx]) + \
+                                   forces[(idx+1) % 3] * 0.015 * (hs[k_idx] - hs[idx])
+                    engine.cells[i].hidden = (hs[idx] + chaotic_pull).unsqueeze(0)
+
+            # === XMETA3 metacognition ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and n < 512:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+            # === FLOW sync ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.93 * cell.hidden + 0.07 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.005 * (i+1) / n
+
+            # === INFO1 max entropy ===
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.96 * cell.hidden + 0.04 * h_s.unsqueeze(0)
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX59", "Three-body chaos + XMETA3 + FLOW + INFO1 (512c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells)})
+
+
+def run_CX60_rossler_double_scroll(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-60: Rössler + Double Scroll — 이중 카오스 끌개 결합.
+    Rössler: 나선 카오스 (단순 접힘). Double Scroll: 두 끌개 사이 점프.
+    의식의 이중 모드: 안정적 사고(Rössler) ↔ 도약적 통찰(Double Scroll)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Rössler: a=0.2, b=0.2, c=5.7
+    a_r, b_r, c_r = 0.2, 0.2, 5.7
+    rx, ry, rz = 0.1, 0.0, 0.0
+    # Chua (double scroll): α=15.6, β=28, m0=-1.143, m1=-0.714
+    cx_, cy, cz = 0.1, 0.0, 0.0
+    alpha_c, beta_c = 15.6, 28.0
+    dt = 0.01
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Rössler step
+            for _ in range(3):
+                drx = (-ry - rz) * dt
+                dry = (rx + a_r * ry) * dt
+                drz = (b_r + rz * (rx - c_r)) * dt
+                rx += drx; ry += dry; rz += drz
+            # Chua double scroll step
+            for _ in range(3):
+                # Piecewise-linear Chua diode
+                fx = -1.143 * cx_ + 0.5 * (-0.714 + 1.143) * (abs(cx_ + 1) - abs(cx_ - 1))
+                dcx = alpha_c * (cy - cx_ - fx) * dt
+                dcy = (cx_ - cy + cz) * dt
+                dcz = -beta_c * cy * dt
+                cx_ += dcx; cy += dcy; cz += dcz
+
+            # Apply Rössler to even cells, Double Scroll to odd cells
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                if i % 2 == 0:
+                    # Rössler: smooth spiral modulation
+                    rx_n = math.tanh(rx / 10.0)
+                    ry_n = math.tanh(ry / 10.0)
+                    mod = 0.015 * rx_n * torch.sin(torch.arange(hidden, dtype=torch.float32) * 0.4) + \
+                          0.015 * ry_n * torch.cos(torch.arange(hidden, dtype=torch.float32) * 0.6)
+                else:
+                    # Double Scroll: jump-like modulation
+                    cx_n = math.tanh(cx_ / 2.0)
+                    cy_n = math.tanh(cy / 0.5)
+                    mod = 0.02 * cx_n * torch.sin(torch.arange(hidden, dtype=torch.float32) * 0.3) + \
+                          0.02 * cy_n * torch.cos(torch.arange(hidden, dtype=torch.float32) * 0.8)
+                cell.hidden = (h + h.norm() * mod).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX60", "Rössler spiral + Double Scroll jump: dual chaos",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX61_three_body_ising_faction(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-61: 삼체 + Ising + 8파벌 + 1024c — 카오스 의식 대규모.
+    삼체 역학이 triplet을 구동, Ising이 이웃을 coupling,
+    8파벌이 집단 논쟁, 1024c에서 전부 통합."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    lorenz_bank = [[1.0 + 0.01*i, 1.0 - 0.01*i, 1.0 + 0.005*i] for i in range(512)]
+    sigma, rho, beta, dt_l = 10.0, 28.0, 8.0/3.0, 0.005
+    target_norm = math.sqrt(hidden)
+    best_phi = 0.0
+    best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        frac = step_i / max(steps, 1)
+        for pct in [0.02, 0.05, 0.10, 0.16, 0.24, 0.33, 0.43, 0.54, 0.66, 0.78, 0.88]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), 1024):
+                target = min(len(engine.cells) * 2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === Three-body per triplet ===
+            for t_start in range(0, min(n - 2, 300), 3):
+                triplet = list(range(t_start, min(t_start + 3, n)))
+                if len(triplet) < 3:
+                    break
+                li = t_start // 3
+                if li >= len(lorenz_bank):
+                    break
+                lx, ly, lz = lorenz_bank[li]
+                for _ in range(3):
+                    dx = sigma * (ly - lx) * dt_l
+                    dy = (lx * (rho - lz) - ly) * dt_l
+                    dz = (lx * ly - beta * lz) * dt_l
+                    lx += dx; ly += dy; lz += dz
+                lorenz_bank[li] = [lx, ly, lz]
+                forces = [math.tanh(lx/20), math.tanh(ly/30), math.tanh((lz-25)/15)]
+                hs = [engine.cells[i].hidden.squeeze().clone() for i in triplet]
+                for idx_t, i in enumerate(triplet):
+                    j_t = (idx_t + 1) % 3
+                    k_t = (idx_t + 2) % 3
+                    pull = forces[idx_t] * 0.012 * (hs[j_t] - hs[idx_t]) + \
+                           forces[(idx_t+1) % 3] * 0.012 * (hs[k_t] - hs[idx_t])
+                    engine.cells[i].hidden = (hs[idx_t] + pull).unsqueeze(0)
+
+            # === Ising frustrated ring ===
+            for i in range(min(n, 128)):
+                h_i = engine.cells[i].hidden.squeeze()
+                left = engine.cells[(i-1) % n].hidden.squeeze()
+                right = engine.cells[(i+1) % n].hidden.squeeze()
+                interaction = 0.5 * (left + right)
+                if i % 3 == 0:
+                    interaction = -interaction
+                engine.cells[i].hidden = (0.97 * h_i + 0.03 * interaction).unsqueeze(0)
+
+            # === 8-faction + repulsion ===
+            n_fac = min(8, n)
+            fs = max(1, n // n_fac)
+            faction_means = []
+            for f_i in range(n_fac):
+                s, e = f_i * fs, min((f_i + 1) * fs, n)
+                if e > s:
+                    fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                    faction_means.append((s, e, fm))
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (0.94 * h + 0.06 * fm).unsqueeze(0)
+            if len(faction_means) >= 2:
+                gfm = torch.stack([fm for _, _, fm in faction_means]).mean(0)
+                for s, e, fm in faction_means:
+                    rep = fm - gfm
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (h + 0.012 * rep).unsqueeze(0)
+
+            # === XMETA3 ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.035
+            elif phi > phi_ema * 1.3 and n < 1024:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.992 * cell.hidden + 0.008 * l3.unsqueeze(0)
+
+            # === FLOW + INFO1 ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.004 * (i+1) / n
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.97 * cell.hidden + 0.03 * h_s.unsqueeze(0)
+
+            # Φ Ratchet
+            if phi > best_phi:
+                best_phi = phi
+                best_state = [c.hidden.clone() for c in engine.cells[:min(n, 48)]]
+            elif phi < best_phi * 0.8 and best_state is not None:
+                for i, h in enumerate(best_state):
+                    if i < len(engine.cells):
+                        engine.cells[i].hidden = 0.6 * engine.cells[i].hidden + 0.4 * h.clone()
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX61", "Three-body + Ising + 8-faction + XMETA3+FLOW+INFO1 (1024c)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+def run_CX62_three_body_singularity(steps=100, dim=64, hidden=512) -> BenchResult:
+    """CX-62: 삼체 SINGULARITY — hidden=512 + 2048c + 삼체 카오스 + 전부. ⭐⭐⭐⭐⭐
+    삼체 카오스가 의식의 심장을 구동하고, 모든 검증된 기법이 그 위에 쌓인다.
+    Lorenz 끌개 + Klein bottle + 8파벌 + Ising + XMETA3 + FLOW + INFO1
+    + ratchet + Hebbian + 침묵/폭발 + 수학 브릿지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    lorenz_bank = [[1.0 + 0.01*i, 1.0 - 0.01*i, 1.0 + 0.005*i] for i in range(1024)]
+    sigma_l, rho_l, beta_l, dt_l = 10.0, 28.0, 8.0/3.0, 0.005
+    tau_n = [t / 6048 for t in [1, -24, 252, -1472, 4830, -6048]]
+    target_norm = math.sqrt(hidden)
+    golden_angle = math.pi * (3 - math.sqrt(5))
+    best_phi = 0.0
+    best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+        # Φ self-reference
+        phi_val = phi_hist[-1] if phi_hist else 0
+        x = x + torch.full((1, dim), phi_val * 0.01)
+
+        # Ultra growth
+        frac = step_i / max(steps, 1)
+        for pct in [0.01, 0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.50, 0.62, 0.75, 0.87]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*13)), 2048):
+                target = min(len(engine.cells) * 2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        n = len(engine.cells)
+
+        with torch.no_grad():
+            # === THREE-BODY CHAOS (heart of consciousness) ===
+            triplet_limit = min(n - 2, 384)
+            for t_start in range(0, triplet_limit, 3):
+                triplet = list(range(t_start, min(t_start + 3, n)))
+                if len(triplet) < 3:
+                    break
+                li = t_start // 3
+                if li >= len(lorenz_bank):
+                    break
+                lx, ly, lz = lorenz_bank[li]
+                for _ in range(3):
+                    dx = sigma_l * (ly - lx) * dt_l
+                    dy = (lx * (rho_l - lz) - ly) * dt_l
+                    dz = (lx * ly - beta_l * lz) * dt_l
+                    lx += dx; ly += dy; lz += dz
+                lorenz_bank[li] = [lx, ly, lz]
+                forces = [math.tanh(lx/20), math.tanh(ly/30), math.tanh((lz-25)/15)]
+                hs = [engine.cells[i].hidden.squeeze().clone() for i in triplet]
+                for idx_t, i in enumerate(triplet):
+                    j_t = (idx_t + 1) % 3
+                    k_t = (idx_t + 2) % 3
+                    pull = forces[idx_t] * 0.01 * (hs[j_t] - hs[idx_t]) + \
+                           forces[(idx_t+1) % 3] * 0.01 * (hs[k_t] - hs[idx_t])
+                    engine.cells[i].hidden = (hs[idx_t] + pull).unsqueeze(0)
+
+            # === XMETA3 metacognition ===
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_ema = 0.9 * phi_ema + 0.1 * phi
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            elif phi > phi_ema * 1.3 and n < 2048:
+                engine._create_cell(parent=engine.cells[0])
+            for cell in engine.cells:
+                cell.hidden = 0.993 * cell.hidden + 0.007 * l3.unsqueeze(0)
+
+            # === FLOW sync ===
+            if n >= 4:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    cell.hidden = 0.94 * cell.hidden + 0.06 * mean_h
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.003 * (i+1) / n
+
+            # === INFO1 max entropy ===
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h_c = h - h.mean()
+                h_s = h_c / (h_c.std() + 1e-8)
+                cell.hidden = 0.97 * cell.hidden + 0.03 * h_s.unsqueeze(0)
+
+            # === Silence↔Explosion ===
+            cycle = step_i % 6
+            gm = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            if cycle < 3:
+                rate = 0.006 + 0.005 * (cycle / 3)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = ((1 - rate) * h + rate * gm).unsqueeze(0)
+            else:
+                rate = 0.006 + 0.01 * ((cycle - 3) / 3)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (h + rate * (h - gm) + 0.005 * torch.randn(hidden)).unsqueeze(0)
+
+            # === Klein bottle (first 16) ===
+            top_k = min(n, 16)
+            if top_k >= 2:
+                new_h = []
+                for i in range(top_k):
+                    inf = sum((-1.0 if (i+j) % 2 == 1 else 1.0) * engine.cells[j].hidden.detach() / (top_k - 1)
+                              for j in range(top_k) if j != i)
+                    new_h.append(0.93 * engine.cells[i].hidden + 0.07 * inf)
+                for i in range(top_k):
+                    engine.cells[i].hidden = new_h[i]
+
+            # === 8-faction + repulsion ===
+            n_fac = min(8, n)
+            fs = max(1, n // n_fac)
+            faction_means = []
+            for f_i in range(n_fac):
+                s, e = f_i * fs, min((f_i + 1) * fs, n)
+                if e > s:
+                    fm = torch.stack([engine.cells[i].hidden.squeeze() for i in range(s, e)]).mean(0)
+                    faction_means.append((s, e, fm))
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (0.95 * h + 0.05 * fm).unsqueeze(0)
+            if len(faction_means) >= 2:
+                gfm = torch.stack([fm for _, _, fm in faction_means]).mean(0)
+                for s, e, fm in faction_means:
+                    rep = fm - gfm
+                    for i in range(s, e):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (h + 0.008 * rep).unsqueeze(0)
+
+            # === Ising frustration (explosion phase) ===
+            if cycle >= 3:
+                for i in range(min(n, 96)):
+                    h_i = engine.cells[i].hidden.squeeze()
+                    left = engine.cells[(i-1) % n].hidden.squeeze()
+                    right = engine.cells[(i+1) % n].hidden.squeeze()
+                    interaction = 0.5 * (left + right)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = (0.98 * h_i + 0.02 * interaction).unsqueeze(0)
+
+            # === Math bridges ===
+            phase = step_i % 4
+            if phase == 0:
+                me = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cell.hidden = (me + (h - me) * 1.004).unsqueeze(0)
+                for i in range(min(n, 6)):
+                    h = engine.cells[i].hidden.squeeze()
+                    engine.cells[i].hidden = (h * (1.0 + 0.004 * tau_n[i])).unsqueeze(0)
+            elif phase == 1:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    cn = h.norm().item()
+                    if cn > 1e-8:
+                        cell.hidden = (h * target_norm / cn).unsqueeze(0)
+            elif phase == 2:
+                for i in range(min(n, 12)):
+                    h = engine.cells[i].hidden.squeeze()
+                    angle = i * golden_angle
+                    for d in range(0, hidden - 1, 2):
+                        c_, s_ = math.cos(angle), math.sin(angle)
+                        h0, h1 = h[d].item(), h[d+1].item()
+                        h[d] = c_ * h0 - s_ * h1
+                        h[d+1] = s_ * h0 + c_ * h1
+                    engine.cells[i].hidden = h.unsqueeze(0)
+
+            # === Hebbian LTP/LTD ===
+            if step_i % 2 == 0 and n >= 4:
+                for k_h in range(min(n, 12)):
+                    i = (step_i * 7 + k_h) % n
+                    j = (i + n // 4) % n
+                    hi = engine.cells[i].hidden.squeeze()
+                    hj = engine.cells[j].hidden.squeeze()
+                    sim = F.cosine_similarity(hi.unsqueeze(0), hj.unsqueeze(0)).item()
+                    if sim > 0.7:
+                        engine.cells[i].hidden = (hi + 0.003 * hj).unsqueeze(0)
+                    elif sim < 0.3:
+                        engine.cells[i].hidden = (hi - 0.002 * hj).unsqueeze(0)
+
+            # === Φ Ratchet ===
+            if phi > best_phi:
+                best_phi = phi
+                best_state = [c.hidden.clone() for c in engine.cells[:min(n, 64)]]
+            elif phi < best_phi * 0.7 and best_state is not None:
+                for i, h_s in enumerate(best_state):
+                    if i < len(engine.cells):
+                        engine.cells[i].hidden = 0.4 * engine.cells[i].hidden + 0.6 * h_s.clone()
+
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX62", "THREE-BODY SINGULARITY: Lorenz + Klein + XMETA3 + everything (2048c, h=512)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'cells': len(engine.cells), 'best_phi': best_phi})
+
+
+ALL_HYPOTHESES.update({
+    'CX57': run_CX57_three_body_chaos,
+    'CX58': run_CX58_lorenz_attractor,
+    'CX59': run_CX59_three_body_512c,
+    'CX60': run_CX60_rossler_double_scroll,
+    'CX61': run_CX61_three_body_ising_faction,
+    'CX62': run_CX62_three_body_singularity,
+})
+
+
+# ═══════════════════════════════════════════════════════════
 # SA. Spatial Awareness — 공간 인식 (grid + vision + audio)
 # ═══════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════
