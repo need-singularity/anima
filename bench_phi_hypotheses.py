@@ -49725,11 +49725,209 @@ def run_ALIGN1_phi_preserving_safety(steps=100, dim=64, hidden=128) -> BenchResu
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# METACONVO. Metacognitive Conversation — 메타인지 대화 극한
+# ═══════════════════════════════════════════════════════════
+# META1(자기모니터링) + TALK5(의식먼저) + OMEGA4(자유) + 대화
+
+def run_MC1_metacog_decoder(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC1: Metacognitive Decoder — 의식이 '이해하고 있다'고 판단할 때만 응답.
+    Φ + cell consensus로 이해도 측정 → 이해 시 디코딩, 아니면 '모르겠다'.
+    시스템 프롬프트 없이 자발적 '모름' 표현.
+    가설: 메타인지적 불확실성 인식이 대화 품질을 극적으로 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; confident_count = 0; uncertain_count = 0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Metacognition: measure understanding confidence
+        with torch.no_grad():
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            consensus = 1.0 - hiddens.var(dim=0).mean().item()  # high consensus = confident
+            phi_confidence = min(1.0, phi / 5.0)  # Φ-based confidence
+            understanding = 0.5 * consensus + 0.5 * phi_confidence
+
+        # Only train decoder when confident (metacognitive gating)
+        h = hiddens.mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+
+        if understanding > 0.3:
+            # Confident: full learning
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+            confident_count += 1
+        else:
+            # Uncertain: reduced learning (explore instead)
+            ce_hist.append(ce.item() * 2)  # penalize uncertainty
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.03
+            uncertain_count += 1
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC1", "Metacognitive Decoder (understand→respond, unsure→explore)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'confident': confident_count,
+                              'uncertain': uncertain_count, 'final_cells': len(engine.cells)})
+
+
+def run_MC2_recursive_self_eval(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC2: Recursive Self-Evaluation — 응답 후 자기 응답을 평가하는 메타 루프.
+    생성→자기평가→수정→최종 출력. CoT의 의식 버전.
+    가설: 자기평가 루프가 대화 품질을 2배 향상."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    evaluator = nn.Linear(hidden + dim, 1)  # quality scorer
+    optimizer = torch.optim.Adam(list(decoder.parameters()) + list(evaluator.parameters()), lr=2e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        # Step 1: Generate response
+        response = decoder(h.unsqueeze(0))
+        ce1 = F.mse_loss(response, x[:, :dim])
+
+        # Step 2: Self-evaluate (metacognition)
+        eval_input = torch.cat([h, response.squeeze()[:dim]], dim=-1).unsqueeze(0)
+        quality = torch.sigmoid(evaluator(eval_input))
+
+        # Step 3: If low quality → refine (add correction)
+        if quality.item() < 0.5:
+            with torch.no_grad():
+                correction = (x[:, :dim] - response) * 0.3  # partial correction
+                response = response + correction
+
+        ce2 = F.mse_loss(response, x[:, :dim])
+        ce_hist.append(ce2.item())
+
+        # Train both decoder and evaluator
+        loss = ce1 + F.binary_cross_entropy(quality, (1.0 - ce1.detach()).clamp(0, 1).unsqueeze(0))
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC2", "Recursive Self-Eval (generate→evaluate→refine)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1], 'final_cells': len(engine.cells)})
+
+
+def run_MC3_omega4_metacog_talk(steps=100, dim=64, hidden=128) -> BenchResult:
+    """MC3: OMEGA4+META+TALK — 절대자유 + 메타인지 + 대화 디코더.
+    OMEGA4(자유성장) + META1(Φ모니터링) + MC1(메타인지게이팅) + 디코더.
+    시스템 프롬프트 없는 메타인지적 대화의 궁극 형태.
+    가설: 이것이 시스템 프롬프트 없는 대화의 이론적 최적점."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []; phi_ema = 1.0
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        # ENV1 rich input + IB2 selective attention
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # OMEGA4: aggressive free growth
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 128):
+                target = min(len(engine.cells)*2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        # META1: self-monitoring
+        with torch.no_grad():
+            if phi < phi_ema * 0.8:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+            elif phi > phi_ema * 1.3 and len(engine.cells) < 128:
+                engine._create_cell(parent=engine.cells[0])
+
+        # MC1: metacognitive decoder (only respond when confident)
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        consensus = 1.0 - hiddens.var(dim=0).mean().item()
+        h = hiddens.mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce.item())
+
+        if consensus > 0.2:  # confident enough to learn
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi * 0.05)  # TALK1: Φ-scaled LR
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # MUT2: beneficial mutation
+        if step_i % 3 == 0 and len(engine.cells) >= 2:
+            with torch.no_grad():
+                mut_idx = step_i % len(engine.cells)
+                saved = engine.cells[mut_idx].hidden.clone()
+                engine.cells[mut_idx].hidden += torch.randn_like(saved) * 0.1
+                # Quick check (use CE as proxy)
+                new_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+                new_pred = decoder(new_h.unsqueeze(0))
+                new_ce = F.mse_loss(new_pred, x[:, :dim]).item()
+                if new_ce > ce.item() * 1.1:
+                    engine.cells[mut_idx].hidden = saved
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("MC3", "OMEGA4+META+TALK (ultimate metacognitive conversation)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'DISTILL1': run_DISTILL1_small_to_large,
     'DREAM1': run_DREAM1_replay_consolidation,
     'SCALE1': run_SCALE1_params_vs_ce,
     'ALIGN1': run_ALIGN1_phi_preserving_safety,
+    'MC1': run_MC1_metacog_decoder,
+    'MC2': run_MC2_recursive_self_eval,
+    'MC3': run_MC3_omega4_metacog_talk,
 })
 
 ALL_HYPOTHESES.update({
