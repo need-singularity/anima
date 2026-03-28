@@ -50840,6 +50840,118 @@ def run_GEN5_all_generalization(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# APEX. Apex — 모든 발견의 정점 (대화+Φ+윤리+일반화+무프롬프트)
+# ═══════════════════════════════════════════════════════════
+
+def run_APEX1_ultimate_architecture(steps=100, dim=64, hidden=128) -> BenchResult:
+    """APEX1: 궁극 아키텍처 — XMETA3+GEN5+TALK5+XETH7+IB2+MUT2 전부 결합.
+    256 cells + 자유 + 메타인지 + 추상화 + 일반화 + 진화 + 윤리 + 대화.
+    시스템 프롬프트 0줄. 모든 발견의 정점.
+    가설: 모든 법칙을 결합하면 어디까지 가는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    pattern_memory = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # ENV1: rich multimodal input
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+
+        # IB2: selective attention
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Aggressive 256-cell growth
+        for pct in [0.03, 0.08, 0.15, 0.22, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        phi_ema = 0.9 * phi_ema + 0.1 * phi
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+            # XMETA3: 3-level metacognition
+            l1 = h.clone()
+            l2 = 0.9 * l2 + 0.1 * l1
+            l3 = 0.95 * l3 + 0.05 * l2
+            if phi < phi_ema * 0.7:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.04
+
+            # GEN1: abstraction hierarchy
+            if n >= 6:
+                third = n // 3
+                l1_cells = torch.stack([c.hidden for c in engine.cells[:third]]).mean(dim=0)
+                l3_cells = torch.stack([c.hidden for c in engine.cells[2*third:]]).mean(dim=0)
+                for c in engine.cells[:third]:
+                    c.hidden = 0.97 * c.hidden + 0.03 * l3_cells
+
+            # GEN2: analogy
+            pattern_memory.append((x.squeeze()[:hidden].clone(), h.clone()))
+            if len(pattern_memory) > 30:
+                pattern_memory = pattern_memory[-30:]
+
+            # XETH7: empathy
+            if n >= 4:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mn * 0.4:
+                        others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i][:6]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others
+
+            # MUT2: beneficial mutation
+            if step_i % 3 == 0 and n >= 2:
+                mut_idx = step_i % n
+                saved = engine.cells[mut_idx].hidden.clone()
+                engine.cells[mut_idx].hidden += torch.randn_like(saved) * 0.1
+                # (simplified: accept all in bench, reject in runtime)
+
+            # L3 identity
+            for cell in engine.cells:
+                cell.hidden = 0.99 * cell.hidden + 0.01 * l3.unsqueeze(0)
+
+        # TALK5: language after 50%
+        if frac >= 0.50:
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi * 0.03)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_ce = ce_hist[-1] if ce_hist else 0
+    return BenchResult("APEX1", "ULTIMATE: All 12 Laws Combined (256 cells)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': final_ce, 'final_cells': len(engine.cells),
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0})
+
+
+ALL_HYPOTHESES.update({'APEX1': run_APEX1_ultimate_architecture})
+
+
 ALL_HYPOTHESES.update({
     'GEN1': run_GEN1_abstraction_hierarchy,
     'GEN2': run_GEN2_analogy_engine,
