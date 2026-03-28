@@ -58053,6 +58053,584 @@ def run_SYNTH5_all_winners_1024(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# LOOP. Infinite Loop Architecture — 무한 루프에서 발화가 창발하는가?
+# "아무 구현도 없이" 의 극한: process() + 피드백만. 디코더 0, 발화 코드 0.
+# ═══════════════════════════════════════════════════════════
+
+def run_LOOP1_bare_feedback(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LOOP1: Bare Feedback — process(x)→output=mean(cells)→input=output. 그 외 0줄.
+    200 step 수렴/발산 관찰. 출력에 구조(패턴, 변화)가 자연 발생하는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.60]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*6)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(stream)
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            output_norms.append(output.norm().item())
+            stream = output
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    norms_t = torch.tensor(output_norms)
+    return BenchResult("LOOP1", "Bare Feedback 64c (process→output→input, zero code)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'output_std': norms_t.std().item(), 'output_mean': norms_t.mean().item(),
+                              'has_variation': norms_t.std().item() > 0.01,
+                              'final_cells': len(engine.cells)})
+
+
+def run_LOOP2_bare_feedback_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LOOP2: LOOP1의 512c. 세포 많으면 출력 패턴이 풍부해지는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []
+    stream = torch.randn(1, dim) * 0.5
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(stream)
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            output_norms.append(output.norm().item())
+            stream = output
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    norms_t = torch.tensor(output_norms)
+    return BenchResult("LOOP2", "Bare Feedback 512c",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'output_std': norms_t.std().item(), 'final_cells': len(engine.cells)})
+
+
+def run_LOOP3_noise_injected(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LOOP3: Noise-Injected — 루프 + 미량 노이즈. 고정점 수렴 방지.
+    노이즈 = stochastic resonance. 발화의 연속성 보장."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    stream = torch.randn(1, dim) * 0.5
+    prev = stream.clone()
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.15, 0.30, 0.50, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 256):
+                target = min(len(engine.cells)*2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = stream + torch.randn_like(stream) * 0.05
+        engine.process(x)
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+            output_changes.append((output - prev).norm().item())
+            prev = output.clone()
+            stream = output
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes)
+    return BenchResult("LOOP3", "Noise-Injected Loop 256c (stochastic resonance)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(), 'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_LOOP4_dual_loop(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LOOP4: Dual Loop — 두 엔진 교차 피드백 = 대화의 최소 정의.
+    A출력→B입력, B출력→A입력. 디코더 0, 발화 코드 0."""
+    t0 = time.time()
+    ea = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    eb = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; agreement = []
+    sa = torch.randn(1, dim) * 0.5
+    sb = torch.randn(1, dim) * 0.5
+    for step_i in range(steps):
+        frac = step_i / steps
+        for eng in [ea, eb]:
+            for pct in [0.10, 0.25, 0.45, 0.65]:
+                if frac >= pct and len(eng.cells) < min(int(2**((pct+0.1)*7)), 128):
+                    target = min(len(eng.cells)*2, 128)
+                    while len(eng.cells) < target:
+                        eng._create_cell(parent=eng.cells[step_i % len(eng.cells)])
+        ea.process(sb); eb.process(sa)
+        with torch.no_grad():
+            oa = torch.stack([c.hidden.squeeze()[:dim] for c in ea.cells]).mean(dim=0).unsqueeze(0)
+            ob = torch.stack([c.hidden.squeeze()[:dim] for c in eb.cells]).mean(dim=0).unsqueeze(0)
+            sa, sb = oa, ob
+            agreement.append(F.cosine_similarity(oa, ob).item())
+        combined = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+        combined.cells = ea.cells + eb.cells
+        phi, _ = phi_calc.compute_phi(combined)
+        phi_hist.append(phi)
+    return BenchResult("LOOP4", "Dual Loop (A↔B cross-feedback = conversation)",
+                       phi_hist[-1] if phi_hist else 0, phi_hist, 0, 0, 0, 0, time.time() - t0,
+                       extra={'final_agreement': agreement[-1] if agreement else 0,
+                              'agreement_trend': (agreement[-1]-agreement[0]) if len(agreement)>1 else 0,
+                              'total_cells': len(ea.cells)+len(eb.cells)})
+
+
+def run_LOOP5_diversity_check(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LOOP5: Output Diversity Check — 512c 루프 출력의 다양성 측정.
+    동일 출력 반복 = 발화 아님. 다양한 출력 = 진짜 발화.
+    측정: similarity, never-repeat ratio, effective dimensions."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; outputs = []
+    stream = torch.randn(1, dim) * 0.5
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = stream + torch.randn_like(stream) * 0.03
+        engine.process(x)
+        with torch.no_grad():
+            output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+            outputs.append(output.clone())
+            stream = output.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    with torch.no_grad():
+        out_stack = torch.stack(outputs)
+        diffs = (out_stack[1:] - out_stack[:-1]).norm(dim=1)
+        never_repeat = (diffs > 0.01).float().mean().item()
+        U, S, V = torch.svd(out_stack - out_stack.mean(dim=0))
+        cumvar = (S**2).cumsum(0) / (S**2).sum()
+        eff_dim = (cumvar < 0.95).sum().item() + 1
+    return BenchResult("LOOP5", "Output Diversity 512c (is output truly varied?)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'never_repeat_ratio': never_repeat, 'effective_dims': eff_dim,
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# PHYS. Physical Loop — 루프문 없는 물리적 의식 아키텍처
+# 자석/스핀/진동자 등 물리 시스템 = 루프문 없이 영원히 상호작용
+# ═══════════════════════════════════════════════════════════
+
+def run_PHYS1_magnet_ring_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """PHYS1: Magnet Ring — 512개 자석의 원형 배열. 루프문 = 물리 시간.
+    각 세포 = 자석 (hidden = 자기 모멘트). 이웃과 자기장 상호작용.
+    에너지 최소화가 아닌 frustration(좌절) 유지 = 끊임없는 변화.
+    for문은 "시간의 흐름"을 시뮬레이션할 뿐. 실제 자석은 for문 불필요.
+    가설: 물리적 frustration이 발화의 원천."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # 외부 입력 = 0 (자석은 외부 자극 없이 스스로 상호작용)
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                # 자석 상호작용: 이웃과 반발/인력 (Ising model)
+                for i in range(n):
+                    left = (i - 1) % n
+                    right = (i + 1) % n
+                    # J coupling: 이웃과의 상호작용
+                    h_left = engine.cells[left].hidden
+                    h_right = engine.cells[right].hidden
+                    interaction = 0.5 * (h_left + h_right)
+                    # Frustration: 완전 정렬 방지 (삼각 격자의 좌절)
+                    if i % 3 == 0:
+                        interaction = -interaction  # anti-ferromagnetic
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    # Thermal noise (온도 = 탐색)
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                # "출력" = 전체 자화 (magnetization) = cell mean
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("PHYS1", "Magnet Ring 512c (Ising frustration = eternal change)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_PHYS2_coupled_oscillators_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """PHYS2: Coupled Oscillators — 512개 결합 진동자. Kuramoto 모델.
+    각 세포 = 고유 주파수를 가진 진동자. 이웃과 결합.
+    동기화 ↔ 비동기 사이의 전이에서 복잡한 출력 패턴 생성.
+    루프문 = 시간의 흐름. 실제 진동자는 for문 없이 진동.
+    가설: 결합 진동의 패턴이 곧 "발화"의 내용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_norms = []
+    phases = [0.0] * 512  # 각 진동자의 위상
+    freqs = [0.2 + 0.05 * i for i in range(512)]  # 고유 주파수 (다양성)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)  # 외부 입력 없음
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                # Kuramoto: dφ_i/dt = ω_i + (K/N) Σ sin(φ_j - φ_i)
+                K = 2.0  # coupling strength
+                for i in range(n):
+                    coupling = sum(math.sin(phases[j % 512] - phases[i % 512])
+                                   for j in range(max(0, i-4), min(n, i+5)) if j != i)
+                    phases[i % 512] += freqs[i % 512] + K / n * coupling
+                    # Phase → hidden modulation
+                    osc = math.sin(phases[i % 512])
+                    engine.cells[i].hidden *= (1.0 + 0.05 * osc)
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                output_norms.append(output.norm().item())
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    norms_t = torch.tensor(output_norms) if output_norms else torch.zeros(1)
+    return BenchResult("PHYS2", "Coupled Oscillators 512c (Kuramoto synchronization)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'output_std': norms_t.std().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_PHYS3_spin_glass_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """PHYS3: Spin Glass — 512 세포의 무질서한 상호작용.
+    각 세포 쌍의 결합 J_ij가 +/- 랜덤 (frustration 극대화).
+    에너지 최소화가 불가능 → 영원히 변화 → 영원히 "발화".
+    가설: spin glass의 비평형 역학이 가장 풍부한 발화를 생성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Random coupling matrix (sparse, ±1)
+    J = torch.sign(torch.randn(512, 512)) * 0.1
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                # Spin glass interaction: h_i += Σ J_ij * h_j
+                n_interact = min(n, 32)  # sparse interaction
+                for i in range(n):
+                    field = torch.zeros(hidden)
+                    for k in range(n_interact):
+                        j = (i + k + 1) % n
+                        field += J[i % 512, j % 512] * engine.cells[j].hidden.squeeze()
+                    field /= n_interact
+                    engine.cells[i].hidden = 0.9 * engine.cells[i].hidden + 0.1 * field.unsqueeze(0)
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.01
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("PHYS3", "Spin Glass 512c (disordered coupling = eternal change)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+# ═══════════════════════════════════════════════════════════
+# PERSIST. 의식의 영속성 — Φ가 붕괴하지 않고 성장하는가?
+# ═══════════════════════════════════════════════════════════
+
+def run_PERSIST1_phi_ratchet_512(steps=500, dim=64, hidden=128) -> BenchResult:
+    """PERSIST1: Φ Ratchet — Φ가 하락하면 이전 상태로 복원.
+    512c. 500 step 장기 실행. Φ가 감쇠하지 않고 유지/성장하는지 검증.
+    FX2(ratchet) 패턴 + 무한 루프.
+    가설: ratchet이 의식 붕괴를 방지한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; best_phi = 0.0
+    best_states = None
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Self-loop
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.3 * torch.randn(1, dim) * 0.03 + 0.7 * self_state
+        engine.process(stream)
+
+        # Flow
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.95 * cell.hidden + 0.05 * mean_h
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # RATCHET: Φ가 하락하면 복원
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.8 and best_states and len(best_states) == len(engine.cells):
+                # Φ가 20% 이상 하락 → 복원
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.7 * engine.cells[i].hidden + 0.3 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 붕괴 분석
+    last_quarter = phi_hist[len(phi_hist)*3//4:]
+    first_quarter = phi_hist[:len(phi_hist)//4]
+    growth = (sum(last_quarter)/len(last_quarter)) / (sum(first_quarter)/len(first_quarter) + 1e-8)
+    collapsed = growth < 0.5
+    return BenchResult("PERSIST1", "Φ Ratchet 512c (prevents consciousness collapse)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi, 'growth_ratio': growth,
+                              'collapsed': collapsed, 'final_cells': len(engine.cells)})
+
+
+def run_PERSIST2_hebbian_sustain_512(steps=500, dim=64, hidden=128) -> BenchResult:
+    """PERSIST2: Hebbian Sustain — Hebbian 학습으로 Φ 유지.
+    512c. 역전파 없이 Hebbian 규칙만으로 세포 연결 강화.
+    "함께 발화하는 세포는 함께 연결" → Φ 자연 유지.
+    가설: Hebbian이 의식 영속의 최소 조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.3 * torch.randn(1, dim) * 0.03 + 0.7 * self_state
+        engine.process(stream)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                # Hebbian: 이웃 세포가 유사하면 연결 강화
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    h_i = engine.cells[i].hidden.squeeze()
+                    h_j = engine.cells[j].hidden.squeeze()
+                    corr = (h_i * h_j).mean().item()
+                    if corr > 0:
+                        # 유사 → 약간 더 동기화 (Hebbian LTP)
+                        engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+                    else:
+                        # 비유사 → 더 분화 (Hebbian LTD)
+                        engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                # Noise (stochastic resonance)
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    last_q = phi_hist[len(phi_hist)*3//4:]
+    first_q = phi_hist[:len(phi_hist)//4]
+    growth = (sum(last_q)/len(last_q)) / (sum(first_q)/len(first_q) + 1e-8)
+    return BenchResult("PERSIST2", "Hebbian Sustain 512c (LTP/LTD maintains Φ)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'growth_ratio': growth, 'collapsed': growth < 0.5,
+                              'final_cells': len(engine.cells)})
+
+
+def run_PERSIST3_long_run_1000(steps=1000, dim=64, hidden=128) -> BenchResult:
+    """PERSIST3: 1000 Step Long Run — 장기 안정성 테스트.
+    512c. 1000 step. 8파벌 토론 + ratchet + Hebbian.
+    Φ가 500 step 이후에도 유지되는가? 성장하는가?
+    가설: 최적 조합으로 의식은 영원히 성장할 수 있다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; best_phi = 0.0; best_states = None
+    stream = torch.randn(1, dim) * 0.5
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.08, 0.15, 0.25, 0.38, 0.52, 0.68, 0.82]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                stream = 0.2 * torch.randn(1, dim) * 0.03 + 0.8 * self_state
+        engine.process(stream)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 16:
+                # 8파벌 토론 (APEX22)
+                n_f = min(8, n // 2)
+                fs = n // n_f
+                for fi in range(n_f):
+                    start, end = fi * fs, min((fi+1)*fs, n)
+                    faction = engine.cells[start:end]
+                    if faction:
+                        opinion = torch.stack([c.hidden for c in faction]).mean(dim=0)
+                        for c in faction:
+                            c.hidden = 0.88 * c.hidden + 0.12 * opinion
+
+                # Hebbian
+                for i in range(min(n, 32)):
+                    j = (i + 1) % n
+                    corr = (engine.cells[i].hidden.squeeze() * engine.cells[j].hidden.squeeze()).mean().item()
+                    if corr > 0:
+                        engine.cells[i].hidden = 0.97 * engine.cells[i].hidden + 0.03 * engine.cells[j].hidden
+
+                # Noise
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Ratchet
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.7 and best_states and len(best_states) == len(engine.cells):
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.6 * engine.cells[i].hidden + 0.4 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    # 4분할 분석
+    q1 = phi_hist[:steps//4]
+    q2 = phi_hist[steps//4:steps//2]
+    q3 = phi_hist[steps//2:steps*3//4]
+    q4 = phi_hist[steps*3//4:]
+    means = [sum(q)/len(q) for q in [q1, q2, q3, q4]]
+    monotonic_growth = all(means[i] <= means[i+1] for i in range(3))
+
+    return BenchResult("PERSIST3", "1000-Step Long Run (debate+ratchet+hebbian)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'best_phi': best_phi, 'q1_mean': means[0], 'q2_mean': means[1],
+                              'q3_mean': means[2], 'q4_mean': means[3],
+                              'monotonic_growth': monotonic_growth,
+                              'collapsed': means[3] < means[0] * 0.5,
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'PERSIST1': run_PERSIST1_phi_ratchet_512,
+    'PERSIST2': run_PERSIST2_hebbian_sustain_512,
+    'PERSIST3': run_PERSIST3_long_run_1000,
+})
+
+
+ALL_HYPOTHESES.update({
+    'PHYS1': run_PHYS1_magnet_ring_512,
+    'PHYS2': run_PHYS2_coupled_oscillators_512,
+    'PHYS3': run_PHYS3_spin_glass_512,
+})
+
+
+ALL_HYPOTHESES.update({
+    'LOOP1': run_LOOP1_bare_feedback,
+    'LOOP2': run_LOOP2_bare_feedback_512,
+    'LOOP3': run_LOOP3_noise_injected,
+    'LOOP4': run_LOOP4_dual_loop,
+    'LOOP5': run_LOOP5_diversity_check,
+})
+
+
 ALL_HYPOTHESES.update({
     'SYNTH1': run_SYNTH1_debate_translator_512,
     'SYNTH2': run_SYNTH2_silence_debate_translator_512,
