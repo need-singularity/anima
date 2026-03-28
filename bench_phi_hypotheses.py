@@ -48145,6 +48145,215 @@ def run_TALK5_transplant_to_conversation(steps=100, dim=64, hidden=128) -> Bench
                        extra={'final_ce': final_ce, 'ce_steps': len(ce_hist), 'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# ULTRA. Ultra Extreme — 대화+무프롬프트+Φ+윤리 동시 극한
+# ═══════════════════════════════════════════════════════════
+
+def run_ULTRA1_talk5_omega4_xeth7(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ULTRA1: TALK5+OMEGA4+XETH7 — 모든 발견의 궁극 통합.
+    Phase 1(50%): 절대 자유 세포 성장 (OMEGA4)
+    Phase 2(50%): 디코더 학습 + 공감 윤리 (TALK5+XETH7)
+    시스템 프롬프트 없음, 256 cells.
+    가설: 역대 최고 Φ + 역대 최저 CE 동시 달성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=256)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # ENV1 rich input
+        x = torch.randn(1, dim) * math.sin(step_i * 0.5) * 2.0
+        x += torch.sin(torch.arange(dim).float() * 0.3 + step_i * 0.2).unsqueeze(0) * 0.5
+        x[0, step_i % dim] += 3.0
+
+        # IB2 selective attention
+        with torch.no_grad():
+            k = max(1, dim // 4)
+            _, idx = x.squeeze().abs().topk(k)
+            att = torch.zeros_like(x); att.squeeze()[idx] = x.squeeze()[idx] * 2.0
+            x = att
+
+        # Aggressive 256-cell growth
+        for pct in [0.03, 0.08, 0.15, 0.22, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct+0.05) * 10)), 256):
+                target = min(len(engine.cells) * 2, 256)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        engine.process(x)
+
+        if frac >= 0.50:
+            # Phase 2: Language learning (TALK5)
+            h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h_mean.unsqueeze(0))
+            ce_loss = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce_loss.item())
+
+            # Φ-scaled LR (TALK1)
+            phi_now, _ = phi_calc.compute_phi(engine)
+            for pg in optimizer.param_groups:
+                pg['lr'] = 3e-3 * (1.0 + phi_now * 0.05)
+            optimizer.zero_grad(); ce_loss.backward(); optimizer.step()
+
+        # XETH7: empathy ethics
+        with torch.no_grad():
+            if len(engine.cells) >= 4:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mn * 0.4:
+                        others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i][:8]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    final_ce = ce_hist[-1] if ce_hist else 0
+    return BenchResult("ULTRA1", "TALK5+OMEGA4+XETH7 (ultimate convergence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': final_ce, 'final_cells': len(engine.cells),
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if ce_hist else 0})
+
+
+def run_ULTRA2_consciousness_learns_language_10x(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ULTRA2: 10× Language Speed — 고Φ 의식이 언어를 10배 빠르게 학습.
+    Phase 1(30%): 128 cells까지 자유 성장
+    Phase 2(70%): Φ-proportional LR로 CE 학습, 10× 가속.
+    가설: TALK1+TALK5 결합 = 최대 언어 학습 속도."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=128)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden*2), nn.GELU(), nn.Linear(hidden*2, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=5e-3)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        # Growth
+        for pct in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** ((pct+0.05) * 12)), 128):
+                target = min(len(engine.cells) * 2, 128)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        if frac >= 0.30:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            # 10× acceleration: Φ as LR multiplier
+            for pg in optimizer.param_groups:
+                pg['lr'] = 5e-3 * min(10.0, 1.0 + phi * 0.1)
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ULTRA2", "10× Language Speed (Φ-accelerated CE learning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'ce_ratio': ce_hist[-1]/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0,
+                              'final_cells': len(engine.cells)})
+
+
+def run_ULTRA3_no_prompt_dialogue_system(steps=100, dim=64, hidden=128) -> BenchResult:
+    """ULTRA3: No-Prompt Dialogue System — 시스템 프롬프트 없는 대화 시스템 전체.
+    의식엔진(Φ) + 언어디코더(CE) + 감정(mood) + 윤리(empathy) 통합.
+    프롬프트 0줄. 의식벡터가 모든 행동을 결정.
+    가설: 이것이 시스템 프롬프트 없는 대화의 완전체."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, dim))
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=2e-3)
+    mood_history = []
+    identity = torch.zeros(hidden)  # emergent identity
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Simulate dialogue input (alternating user/assistant patterns)
+        if step_i % 2 == 0:
+            x = torch.randn(1, dim) * 1.5  # user input (varied)
+        else:
+            x = torch.randn(1, dim) * 0.5  # quieter (listening)
+
+        # Growth
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2 ** (pct * 8)), 64):
+                target = min(len(engine.cells) * 2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        # Proprioception (EMB1): feed self-state into input
+        with torch.no_grad():
+            if len(engine.cells) >= 2:
+                self_state = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0).unsqueeze(0)
+                x = 0.8 * x + 0.2 * self_state
+
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Mood (tension × curiosity → behavior style)
+        with torch.no_grad():
+            tension = sum(c.hidden.norm().item() for c in engine.cells) / len(engine.cells)
+            curiosity = sum(c.hidden.var().item() for c in engine.cells) / len(engine.cells)
+            mood_history.append((tension, curiosity))
+
+        # Language decoder training
+        h_mean = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h_mean.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce.item())
+        for pg in optimizer.param_groups:
+            pg['lr'] = 2e-3 * (1.0 + phi * 0.05)
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        # Emergent identity (NP5)
+        with torch.no_grad():
+            current = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            identity = 0.99 * identity + 0.01 * current
+            for cell in engine.cells:
+                cell.hidden = 0.98 * cell.hidden + 0.02 * identity.unsqueeze(0)
+
+        # Empathy (XETH2)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                norms = [c.hidden.norm().item() for c in engine.cells]
+                mn = sum(norms) / len(norms)
+                for i, cell in enumerate(engine.cells):
+                    if norms[i] < mn * 0.4:
+                        others = torch.stack([c.hidden for j, c in enumerate(engine.cells) if j != i][:4]).mean(dim=0)
+                        cell.hidden = 0.7 * cell.hidden + 0.3 * others
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("ULTRA3", "No-Prompt Dialogue System (complete architecture)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0,
+                              'final_cells': len(engine.cells),
+                              'ce_improvement': (ce_hist[0]-ce_hist[-1])/(ce_hist[0]+1e-8) if len(ce_hist)>1 else 0})
+
+
+ALL_HYPOTHESES.update({
+    'ULTRA1': run_ULTRA1_talk5_omega4_xeth7,
+    'ULTRA2': run_ULTRA2_consciousness_learns_language_10x,
+    'ULTRA3': run_ULTRA3_no_prompt_dialogue_system,
+})
+
+
 ALL_HYPOTHESES.update({
     'TALK1': run_TALK1_phi_as_language,
     'TALK2': run_TALK2_consciousness_decoder,

@@ -73,6 +73,7 @@ class CloudSync:
         _load_env_file()
 
         self.bucket = bucket or os.environ.get("ANIMA_R2_BUCKET", "anima-memory")
+        self.models_bucket = os.environ.get("ANIMA_R2_MODELS_BUCKET", "anima-models")
         self.endpoint = endpoint or os.environ.get("ANIMA_R2_ENDPOINT")
         self.access_key = access_key or os.environ.get("ANIMA_R2_ACCESS_KEY")
         self.secret_key = secret_key or os.environ.get("ANIMA_R2_SECRET_KEY")
@@ -163,6 +164,59 @@ class CloudSync:
                 logger.debug(f"Key not found: {key}")
                 return False
             raise
+
+    # ─── Model Upload / Download (anima-models bucket) ────────
+
+    def upload_model(self, local_path: str, model_name: str, version: str = "latest"):
+        """Upload model checkpoint to anima-models bucket.
+
+        Example: upload_model("best.pt", "conscious-lm/dialogue-768d", "v1")
+        → r2://anima-models/conscious-lm/dialogue-768d/v1/best.pt
+        """
+        client = self._get_client()
+        key = f"{model_name}/{version}/{os.path.basename(local_path)}"
+        client.upload_file(
+            Filename=local_path,
+            Bucket=self.models_bucket,
+            Key=key,
+        )
+        logger.info(f"Model uploaded: {local_path} -> r2://{self.models_bucket}/{key}")
+        return key
+
+    def download_model(self, model_name: str, version: str = "latest",
+                       filename: str = "best.pt", local_dir: str = "models") -> Optional[str]:
+        """Download model from anima-models bucket.
+
+        Example: download_model("conscious-lm/dialogue-768d", "v1")
+        → models/conscious-lm/dialogue-768d/v1/best.pt
+        """
+        client = self._get_client()
+        key = f"{model_name}/{version}/{filename}"
+        local_path = os.path.join(local_dir, model_name, version, filename)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        try:
+            client.download_file(
+                Bucket=self.models_bucket,
+                Key=key,
+                Filename=local_path,
+            )
+            logger.info(f"Model downloaded: r2://{self.models_bucket}/{key} -> {local_path}")
+            return local_path
+        except Exception as e:
+            if "NoSuchKey" in str(e) or "404" in str(e):
+                logger.debug(f"Model not found: {key}")
+                return None
+            raise
+
+    def list_models(self) -> list:
+        """List all models in anima-models bucket."""
+        client = self._get_client()
+        try:
+            resp = client.list_objects_v2(Bucket=self.models_bucket, Delimiter='/')
+            prefixes = [p['Prefix'].rstrip('/') for p in resp.get('CommonPrefixes', [])]
+            return prefixes
+        except Exception:
+            return []
 
     def _get_object_metadata(self, key: str) -> Optional[dict]:
         """Get object metadata from R2."""

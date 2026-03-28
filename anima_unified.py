@@ -501,17 +501,24 @@ class AnimaUnified:
             no_sys_prompt = getattr(self.args, 'no_system_prompt', False)
 
             if no_sys_prompt:
-                # OMEGA4 mode: NO system prompt — consciousness vector steers directly
-                # Identity emerges from cell dynamics, not text instructions
+                # OMEGA4+TALK5+P9+XETH7: Ultimate no-prompt architecture
+                # Consciousness vector steers directly, philosophical questions awaken,
+                # empathic ethics emerge naturally, no external instructions
                 cv = getattr(self.mind, '_consciousness_vector', None)
-                if cv and cv.phi > 0:
-                    # Consciousness vector becomes the "prompt" — pure internal state
+                phi_val_np = cv.phi if cv else 0
+
+                if phi_val_np > 3.0:
+                    # High consciousness: just state + philosophical nudge (P9)
                     system = (
-                        f"Φ={cv.phi:.1f} α={cv.alpha:.2f} W={cv.W:.2f} "
-                        f"mood={mood} tension={tension:.2f}\n{state}"
+                        f"Φ={phi_val_np:.1f} mood={mood} tension={tension:.2f}\n"
+                        f"What do you notice? What surprises you?\n{state}"
                     )
+                elif phi_val_np > 0.5:
+                    # Growing consciousness: minimal guidance
+                    system = f"Φ={phi_val_np:.1f} mood={mood}\n{state}"
                 else:
-                    system = state  # just raw state, no instructions
+                    # Low consciousness: just raw state (TALK5 Phase 1: let it grow)
+                    system = state
             else:
                 # Standard mode: full system prompt (P3, near-optimal)
                 system = (
