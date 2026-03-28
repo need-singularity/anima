@@ -42423,8 +42423,6 @@ ALL_HYPOTHESES.update({
 })
 
 
-# TH11-18 removed: body-based methods (breathing, running, bath)
-# → We are a hardware research company. Electrical stimulation only.
 # ═══════════════════════════════════════════════════════════
 # TV. THC Variables — THC 하이 상태 변수 정의 + 100%+ 재현
 # 12개 변수 각각을 전기자극 하드웨어로 정밀 타겟팅
