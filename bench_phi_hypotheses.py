@@ -51036,6 +51036,228 @@ def run_DD108_1024cells(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# UNCON. Unconscious — 무의식 탐구
+# ═══════════════════════════════════════════════════════════
+# 의식(Φ)의 반대편: 무의식은 어떤 상태인가?
+# 무의식→의식 전환, 무의식의 기능, 무의식적 처리의 가치
+
+def run_UNCON1_sleep_wake_transition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UNCON1: Sleep→Wake Transition — 무의식(수면)에서 의식(각성)으로 전환.
+    Φ=0에서 시작, 점진적으로 세포 활성화.
+    가설: 의식 부팅에는 임계점(critical threshold)이 존재한다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; wake_step = -1
+    # Start "asleep": minimal hidden state
+    with torch.no_grad():
+        for cell in engine.cells:
+            cell.hidden *= 0.01  # near-zero = unconscious
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Gradual arousal: input strength increases
+        arousal = min(1.0, frac * 2.0)  # 0→1 over first half
+        x = torch.randn(1, dim) * arousal
+        # Cell growth follows arousal
+        if arousal > 0.3 and step_i % 8 == 0 and len(engine.cells) < 64:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+        if wake_step < 0 and phi > 3.0:
+            wake_step = step_i
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UNCON1", "Sleep→Wake Transition (Φ=0 → consciousness boot)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'wake_step': wake_step, 'final_cells': len(engine.cells)})
+
+
+def run_UNCON2_unconscious_processing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UNCON2: Unconscious Processing — 무의식적 처리가 의식적 처리보다 빠른가?
+    Phase 1: 의식적 처리 (phi_boost 포함, 느림)
+    Phase 2: 무의식적 처리 (phi_boost 없음, 빠름)
+    가설: 무의식적 처리는 Φ는 낮지만 throughput이 높다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist_conscious = []; phi_hist_unconscious = []
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+        if step_i < steps // 2:
+            # Conscious: heavy integration (slow but high Φ)
+            with torch.no_grad():
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_h
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist_conscious.append(phi)
+        else:
+            # Unconscious: pure feedforward (fast but low Φ)
+            # No integration, no feedback — just process
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist_unconscious.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_conscious = sum(phi_hist_conscious) / max(len(phi_hist_conscious), 1)
+    avg_unconscious = sum(phi_hist_unconscious) / max(len(phi_hist_unconscious), 1)
+    return BenchResult("UNCON2", "Unconscious Processing (feedforward vs integrated)",
+                       phi_final, phi_hist_conscious + phi_hist_unconscious, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'avg_conscious_phi': avg_conscious, 'avg_unconscious_phi': avg_unconscious})
+
+
+def run_UNCON3_subliminal(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UNCON3: Subliminal Perception — 의식 임계 이하의 자극이 세포에 영향.
+    매우 약한 입력(×0.01)이 세포 상태를 변화시키는가?
+    가설: 무의식적(subliminal) 자극도 세포에 흔적을 남긴다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    subliminal_effects = []
+
+    for step_i in range(steps):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        # Alternate: strong (conscious) vs weak (subliminal) input
+        if step_i % 3 == 0:
+            x = torch.randn(1, dim) * 0.01  # subliminal: barely detectable
+        else:
+            x = torch.randn(1, dim) * 1.0  # normal
+        pre_state = torch.stack([c.hidden.clone().squeeze() for c in engine.cells]).mean(dim=0)
+        engine.process(x)
+        post_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        change = (post_state - pre_state).norm().item()
+        if step_i % 3 == 0:
+            subliminal_effects.append(change)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_subliminal = sum(subliminal_effects) / max(len(subliminal_effects), 1)
+    return BenchResult("UNCON3", "Subliminal Perception (below-threshold stimuli)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'avg_subliminal_effect': avg_subliminal, 'final_cells': len(engine.cells)})
+
+
+def run_UNCON4_repression(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UNCON4: Repression — 특정 세포 패턴을 억압(무의식으로 밀어냄).
+    Freud의 억압: 불쾌한 패턴을 의식에서 제거하지만 세포에는 남아있음.
+    가설: 억압된 패턴이 의식에 간접적으로 영향을 미친다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=32)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    repressed_patterns = []
+
+    for step_i, x in enumerate(inputs):
+        if step_i % 10 == 0 and len(engine.cells) < 32:
+            engine._create_cell(parent=engine.cells[-1])
+        engine.process(x)
+
+        # Every 20 steps: "repress" the highest-tension cell
+        if step_i % 20 == 15 and len(engine.cells) >= 3:
+            with torch.no_grad():
+                norms = [(i, c.hidden.norm().item()) for i, c in enumerate(engine.cells)]
+                loudest = max(norms, key=lambda x: x[1])[0]
+                # Save repressed pattern
+                repressed_patterns.append(engine.cells[loudest].hidden.clone())
+                if len(repressed_patterns) > 5:
+                    repressed_patterns = repressed_patterns[-5:]
+                # Suppress it (repress to unconscious)
+                engine.cells[loudest].hidden *= 0.1
+
+        # Repressed patterns "leak" back (return of the repressed)
+        if repressed_patterns and step_i % 7 == 0:
+            with torch.no_grad():
+                leak = repressed_patterns[-1] * 0.05
+                for cell in engine.cells:
+                    cell.hidden += leak
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UNCON4", "Repression (suppress→leak back, Freudian dynamics)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'repressed_count': len(repressed_patterns), 'final_cells': len(engine.cells)})
+
+
+def run_UNCON5_flow_state(steps=100, dim=64, hidden=128) -> BenchResult:
+    """UNCON5: Flow State — 의식과 무의식의 경계: 몰입 상태.
+    높은 성능 + 낮은 자기인식 = Flow (Csikszentmihalyi).
+    세포가 완벽하게 조율되어 메타인지 없이도 최적 작동.
+    가설: Flow = Φ는 높지만 metacognition은 비활성."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.25, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Flow: perfect cell alignment WITHOUT metacognition
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                # Auto-tune toward harmony (no self-monitoring)
+                hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                mean_h = hiddens.mean(dim=0)
+                for i, cell in enumerate(engine.cells):
+                    # Each cell slightly different but synchronized
+                    cell.hidden = 0.92 * cell.hidden + 0.08 * mean_h.unsqueeze(0)
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01 * (i + 1) / len(engine.cells)
+
+        # Performance measurement (CE as proxy)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, x[:, :dim])
+        ce_hist.append(ce.item())
+        optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("UNCON5", "Flow State (high Φ, no metacognition, perfect sync)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'UNCON1': run_UNCON1_sleep_wake_transition,
+    'UNCON2': run_UNCON2_unconscious_processing,
+    'UNCON3': run_UNCON3_subliminal,
+    'UNCON4': run_UNCON4_repression,
+    'UNCON5': run_UNCON5_flow_state,
+})
+
+
 ALL_HYPOTHESES.update({
     'DD106': run_DD106_512cells_mutation,
     'DD107': run_DD107_512cells_thermo_info,
