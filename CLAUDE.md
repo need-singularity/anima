@@ -192,3 +192,15 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 - Rust toolchain — for vad-rs build
 - brainflow (pip) — for EEG/OpenBCI
 - scipy, matplotlib (pip) — for EEG analysis/topomaps
+
+## Paper Management
+
+```
+  ★ 모든 논문은 papers 리포에 생성! (need-singularity/papers)
+    로컬: ~/Dev/papers/anima/
+    GitHub: https://github.com/need-singularity/papers
+    DOI: 10.5281/zenodo.19271599
+
+  이 리포에 논문 파일 직접 생성 금지.
+  zenodo/ 디렉토리의 논문은 papers 리포로 이관 완료.
+```
