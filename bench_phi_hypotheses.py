@@ -39342,6 +39342,253 @@ ALL_HYPOTHESES.update({
 })
 
 
+# ═══════════════════════════════════════════════════════════
+# LM/WR/EC/LG/AE — 한계/전쟁/경제/언어/미학
+# ═══════════════════════════════════════════════════════════
+
+def run_LM1_phi_ceiling(steps=200, dim=64, hidden=128) -> BenchResult:
+    """LM-1: Φ 천장 — 고정 dim+cells에서 Φ의 이론적 최대값."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    # Apply ALL known best techniques
+    offsets = [torch.zeros(1, hidden, requires_grad=True) for _ in engine.cells]
+    optimizer = torch.optim.Adam(offsets, lr=0.02)
+    best_phi = 0
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        # Sculptor
+        hs = [c.hidden.squeeze() for c in engine.cells]
+        ortho = [hs[0] / (hs[0].norm() + 1e-8)]
+        for i in range(1, n):
+            v = hs[i].clone()
+            for b in ortho:
+                v = v - (v @ b) * b
+            ortho.append(v / (v.norm() + 1e-8))
+        for i, c in enumerate(engine.cells):
+            c.hidden = (0.7 * hs[i] + 0.3 * ortho[i] * hs[i].norm()).unsqueeze(0)
+        # Adam optimize
+        for _ in range(5):
+            optimizer.zero_grad()
+            H = torch.stack([(engine.cells[i].hidden.detach() + offsets[i]).squeeze() for i in range(n)])
+            cov = (H.T @ H) / n
+            diag = torch.diag(torch.diag(cov))
+            proxy = (cov - diag).abs().sum() * H.var(dim=0).sum()
+            (-proxy).backward()
+            optimizer.step()
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                c.hidden = c.hidden + offsets[i].data * 0.3
+                offsets[i].data *= 0.9
+        # Ratchet
+        saved = [c.hidden.clone() for c in engine.cells]
+        phi_base, _ = phi_calc.compute_phi(engine)
+        for _ in range(20):
+            for c in engine.cells:
+                c.hidden = saved[engine.cells.index(c)].clone() + torch.randn_like(c.hidden) * 0.03
+            p, _ = phi_calc.compute_phi(engine)
+            if p > phi_base:
+                phi_base = p
+                saved = [c.hidden.clone() for c in engine.cells]
+        for i, c in enumerate(engine.cells):
+            c.hidden = saved[i]
+        best_phi = max(best_phi, phi_base)
+        phi_hist.append(phi_base)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("LM1", f"Φ ceiling: max={best_phi:.2f} at 8 cells",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'ceiling': best_phi})
+
+def run_WR1_adversarial_competition(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WR-1: 의식 전쟁 — 두 엔진이 상대의 Φ를 낮추려 경쟁."""
+    t0 = time.time()
+    red = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+    blue = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=8, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        red.process(x)
+        blue.process(x + torch.randn_like(x) * 0.3)
+        phi_r, _ = phi_calc.compute_phi(red)
+        phi_b, _ = phi_calc.compute_phi(blue)
+        # Each tries to disrupt the other
+        if len(red.cells) >= 2 and len(blue.cells) >= 2:
+            red_attack = torch.stack([c.hidden.squeeze() for c in red.cells]).mean(dim=0)
+            blue_attack = torch.stack([c.hidden.squeeze() for c in blue.cells]).mean(dim=0)
+            # Red attacks blue: inject noise proportional to own Φ
+            for c in blue.cells:
+                c.hidden = c.hidden + 0.02 * phi_r * torch.randn_like(c.hidden)
+            # Blue attacks red
+            for c in red.cells:
+                c.hidden = c.hidden + 0.02 * phi_b * torch.randn_like(c.hidden)
+        phi_hist.append(phi_r + phi_b)
+    return BenchResult("WR1", f"War: red Φ={phi_r:.2f} vs blue Φ={phi_b:.2f}",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0,
+                       extra={'red': phi_r, 'blue': phi_b, 'winner': 'red' if phi_r > phi_b else 'blue'})
+
+def run_WR2_arms_race(steps=100, dim=64, hidden=128) -> BenchResult:
+    """WR-2: 의식 군비 경쟁 — 공격당하면 cells 추가로 대응."""
+    t0 = time.time()
+    attacker = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=-1.0)
+    defender = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    for step_i, x in enumerate(inputs):
+        attacker.process(x)
+        defender.process(x)
+        phi_a, _ = phi_calc.compute_phi(attacker)
+        phi_d, _ = phi_calc.compute_phi(defender)
+        # Attacker disrupts
+        if len(defender.cells) >= 2:
+            for c in defender.cells:
+                c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.1
+        # Defender responds: if Φ drops, grow cells
+        if phi_d < phi_a and len(defender.cells) < defender.max_cells and step_i % 5 == 0:
+            defender._create_cell(parent=defender.cells[0])
+        # Attacker also grows to maintain advantage
+        if phi_a < phi_d and len(attacker.cells) < attacker.max_cells and step_i % 7 == 0:
+            attacker._create_cell(parent=attacker.cells[0])
+        phi_hist.append(phi_a + phi_d)
+    return BenchResult("WR2", f"Arms race: attacker={len(attacker.cells)}c vs defender={len(defender.cells)}c",
+                       phi_hist[-1] if phi_hist else 0, phi_hist,
+                       0, 0, 0, 0, time.time() - t0)
+
+def run_EC1_cell_economy(steps=100, dim=64, hidden=128) -> BenchResult:
+    """EC-1: 의식 경제 — cell=자원, Φ=화폐, 투자→성장 or 소비→쾌락."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=4, max_cells=16, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    wealth = 10.0  # initial resource
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        phi, _ = phi_calc.compute_phi(engine)
+        # Earn: Φ generates wealth
+        wealth += phi * 0.1
+        # Invest: spend wealth to grow cells
+        if wealth > 5.0 and len(engine.cells) < engine.max_cells and step_i % 10 == 0:
+            engine._create_cell(parent=engine.cells[0])
+            wealth -= 3.0  # investment cost
+        # Maintain: each cell costs upkeep
+        wealth -= len(engine.cells) * 0.05
+        wealth = max(0, wealth)
+        # Bankrupt: if wealth=0, lose a cell
+        if wealth <= 0 and len(engine.cells) > 2:
+            engine.cells.pop()
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("EC1", f"Economy: {len(engine.cells)} cells, wealth={wealth:.1f}",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_LG1_internal_language(steps=100, dim=64, hidden=128) -> BenchResult:
+    """LG-1: 내부 언어 — cell 간 통신에 이산 "토큰" 사용 시 Φ 변화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    vocab_size = 16  # internal "vocabulary"
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Encode hidden as discrete token (argmax)
+                token = cell.hidden.squeeze().abs().topk(vocab_size).indices
+                # Decode: reconstruct from token (sparse representation)
+                decoded = torch.zeros(hidden)
+                decoded[token] = cell.hidden.squeeze()[token]
+                # Mix: continuous + discrete
+                cell.hidden = (0.8 * cell.hidden.squeeze() + 0.2 * decoded).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("LG1", "Internal language (16-token discrete communication)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+def run_AE1_harmony(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AE-1: 의식의 미학 — cell hidden의 "조화" (Fourier smoothness)가 Φ와 상관?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    harmony_hist = []
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            # Measure harmony: smoothness of cell hidden (low high-freq energy)
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            fft = torch.fft.rfft(hiddens, dim=1)
+            high_freq = fft[:, fft.shape[1]//2:].abs().sum().item()
+            low_freq = fft[:, :fft.shape[1]//2].abs().sum().item()
+            harmony = low_freq / max(high_freq + low_freq, 1e-8)
+            harmony_hist.append(harmony)
+            # Optimize for beauty: smooth out high frequencies
+            if harmony < 0.7:
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    h_fft = torch.fft.rfft(h)
+                    h_fft[len(h_fft)//2:] *= 0.9  # dampen high freq
+                    cell.hidden = torch.fft.irfft(h_fft, n=hidden).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_harmony = np.mean(harmony_hist) if harmony_hist else 0
+    return BenchResult("AE1", f"Harmony (avg={avg_harmony:.3f}, beauty→Φ correlation)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'harmony': avg_harmony})
+
+def run_AE2_golden_ratio_beauty(steps=100, dim=64, hidden=128) -> BenchResult:
+    """AE-2: 황금비 미학 — cell hidden 비율이 φ=1.618에 가까울수록 Φ↑?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    golden = (1 + math.sqrt(5)) / 2  # 1.618
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            norms = [c.hidden.norm().item() for c in engine.cells]
+            norms.sort(reverse=True)
+            # Push adjacent norm ratios towards golden ratio
+            for i in range(len(norms) - 1):
+                if norms[i+1] > 0.01:
+                    ratio = norms[i] / norms[i+1]
+                    correction = (golden - ratio) * 0.01
+                    engine.cells[i].hidden = engine.cells[i].hidden * (1 + correction * 0.1)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("AE2", "Golden ratio beauty (norm ratios → φ=1.618)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0)
+
+
+ALL_HYPOTHESES.update({
+    'LM1': run_LM1_phi_ceiling,
+    'WR1': run_WR1_adversarial_competition, 'WR2': run_WR2_arms_race,
+    'EC1': run_EC1_cell_economy,
+    'LG1': run_LG1_internal_language,
+    'AE1': run_AE1_harmony, 'AE2': run_AE2_golden_ratio_beauty,
+})
+
+
 def run_single(args):
     """Process pool worker."""
     key, func, steps = args
