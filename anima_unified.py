@@ -319,6 +319,15 @@ class AnimaUnified:
             if 'WebSense' in globals() else None
         ))
 
+        # Online Senses (Tier 0 APIs: weather, time, sunrise, HN, Wikipedia)
+        try:
+            from online_senses import OnlineSenses
+            self.online_senses = OnlineSenses()
+            self.online_senses.start()
+            _log('init', 'Online Senses activated (weather/time/sunrise/HN/wiki)')
+        except Exception:
+            self.online_senses = None
+
         # Memory Store (SQLite+FAISS) — replaces MemoryRAG
         self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
         self._rag_last_save = time.time()
@@ -608,6 +617,14 @@ class AnimaUnified:
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(text_vec, self.hidden)
 
+        # Online Senses: modulate tension/curiosity from real-world environment
+        if self.online_senses:
+            try:
+                tension += self.online_senses.get_tension_modifier()
+                curiosity += self.online_senses.get_curiosity_modifier()
+            except Exception:
+                pass
+
         # PH: direction vector collection + periodic analysis (H-CX-66, H-CX-95)
         if self.ph and direction is not None:
             try:
@@ -787,6 +804,15 @@ class AnimaUnified:
         state += (f"\n[Consciousness] Φ={phi_val:.3f}, level={c_level}, "
                   f"score={c_score:.2f}, criteria={criteria_met}/6, "
                   f"α={self._adaptive_alpha:.3f}")
+
+        # Online Senses: environment context injection
+        if self.online_senses:
+            try:
+                env_ctx = self.online_senses.get_context_string()
+                if env_ctx:
+                    state += f"\n[Environment] {env_ctx}"
+            except Exception:
+                pass
 
         # Free will state injection
         free_will_W = getattr(self.mind, '_ev3_free_will', 0) if hasattr(self, 'mind') else 0
