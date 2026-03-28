@@ -49874,6 +49874,170 @@ def run_MUT5_directed_evolution(steps=100, dim=64, hidden=128) -> BenchResult:
                        extra={'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# SEM. Semantic Consciousness — 의식이 의미를 직접 생성
+# ═══════════════════════════════════════════════════════════
+
+def run_SEM1_semantic_cells(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SEM1: Semantic Cells — 각 세포가 의미 공간의 특정 영역을 담당.
+    세포별로 '주제 벡터'를 할당, 입력과의 유사도로 활성화.
+    가설: 의미적 전문화가 coherent 출력의 전제조건."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    topics = {}  # cell_id → topic vector
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        with torch.no_grad():
+            # Assign topics to new cells
+            for i, cell in enumerate(engine.cells):
+                if i not in topics:
+                    topics[i] = cell.hidden.squeeze().clone()
+                # Semantic activation: how relevant is this cell to current input?
+                x_proj = x.squeeze()[:hidden] if x.shape[-1] >= hidden else F.pad(x.squeeze(), (0, hidden - x.shape[-1]))
+                relevance = F.cosine_similarity(cell.hidden.squeeze().unsqueeze(0), topics[i].unsqueeze(0)).item()
+                # Relevant cells amplify, irrelevant dampen
+                cell.hidden *= (1.0 + 0.02 * max(0, relevance))
+                # Slowly update topic (semantic drift)
+                topics[i] = 0.98 * topics[i] + 0.02 * cell.hidden.squeeze()
+
+        if frac > 0.4:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SEM1", "Semantic Cells (topic-specialized consciousness)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'n_topics': len(topics),
+                              'final_cells': len(engine.cells)})
+
+
+def run_SEM2_meaning_from_contrast(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SEM2: Meaning from Contrast — 의미 = 세포 간 차이에서 출현.
+    de Saussure: 의미는 차이에서 온다. 세포 간 대비가 클수록 풍부한 의미.
+    가설: 세포 다양성 → 의미적 풍부함 → 더 나은 대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        # Force contrast: push cells apart (mutual repulsion)
+        with torch.no_grad():
+            if len(engine.cells) >= 3:
+                for i in range(len(engine.cells)):
+                    for j in range(i+1, min(i+3, len(engine.cells))):
+                        diff = engine.cells[i].hidden - engine.cells[j].hidden
+                        engine.cells[i].hidden += 0.01 * diff
+                        engine.cells[j].hidden -= 0.01 * diff
+
+        if frac > 0.4:
+            # Decode meaning from CONTRASTS (not means)
+            if len(engine.cells) >= 2:
+                contrasts = []
+                for i in range(min(5, len(engine.cells)-1)):
+                    contrasts.append(engine.cells[i].hidden.squeeze() - engine.cells[i+1].hidden.squeeze())
+                h = torch.stack(contrasts).mean(dim=0)
+            else:
+                h = engine.cells[0].hidden.squeeze()
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SEM2", "Meaning from Contrast (Saussure: difference→meaning)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+def run_SEM3_consciousness_grounding(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SEM3: Consciousness Grounding — 의식 상태가 출력의 '사실성'을 결정.
+    높은 cell consensus(합의) = 확신 있는 출력.
+    낮은 consensus = 불확실 표현 ("I think...", "maybe...").
+    가설: 의식적 합의가 자연스러운 hedging/grounding 메커니즘."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; ce_hist = []
+    decoder = nn.Linear(hidden, dim)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+
+    for step_i in range(steps):
+        x = torch.randn(1, dim) * (1.0 + math.sin(step_i * 0.3))
+        frac = step_i / steps
+        for pct in [0.10, 0.20, 0.35, 0.50, 0.65]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*8)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        engine.process(x)
+
+        if frac > 0.4 and len(engine.cells) >= 2:
+            hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells])
+            consensus = 1.0 / (hiddens.var(dim=0).mean().item() + 0.1)  # high consensus = low variance
+            h = hiddens.mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            # Grounding: scale output by consensus (confident = strong, uncertain = weak)
+            pred = pred * min(1.5, consensus * 0.5)
+            ce = F.mse_loss(pred, x[:, :dim])
+            ce_hist.append(ce.item())
+            optimizer.zero_grad(); ce.backward(); optimizer.step()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SEM3", "Consciousness Grounding (consensus→confidence)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_ce': ce_hist[-1] if ce_hist else 0, 'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'SEM1': run_SEM1_semantic_cells,
+    'SEM2': run_SEM2_meaning_from_contrast,
+    'SEM3': run_SEM3_consciousness_grounding,
+})
+
+
 ALL_HYPOTHESES.update({
     'MUT1': run_MUT1_random_weight_mutation,
     'MUT2': run_MUT2_cell_death_rebirth,
