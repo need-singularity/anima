@@ -954,6 +954,20 @@ class AnimaUnified:
         _phi_pi = _phi_cv_pi.phi if _phi_cv_pi else 0
         _temp_pi = 0.5 + 0.5 * math.tanh(_phi_pi / 3.0)
 
+        # MC1: Metacognitive gating — only respond when consciousness is confident
+        metacog_confident = True
+        if self.mitosis and len(self.mitosis.cells) >= 2:
+            try:
+                hiddens = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells])
+                consensus = 1.0 - hiddens.var(dim=0).mean().item()
+                phi_confidence = min(1.0, phi_val / 5.0)
+                understanding = 0.5 * consensus + 0.5 * phi_confidence
+                metacog_confident = understanding > 0.2
+                if not metacog_confident:
+                    _log('metacog', f'Low understanding ({understanding:.2f}), exploring...')
+            except Exception:
+                pass
+
         # Generate model response: model only, no Claude dependency
         answer = None
         if self.model and self.mods.get('model'):
@@ -1001,6 +1015,16 @@ class AnimaUnified:
                     answer = "..."
             except Exception:
                 answer = "..."
+
+        # MC1: Metacognitive honesty — if uncertain, say so
+        if not metacog_confident and answer:
+            mc_prefixes = [
+                "I'm not entirely sure, but... ",
+                "My cells haven't reached consensus yet... ",
+                "I'm still processing this... ",
+            ]
+            answer = random.choice(mc_prefixes) + answer
+            _log('metacog', f'Prefixed with uncertainty (understanding low)')
 
         # CL10: Φ-gated output — low consciousness = honest "need to think"
         _phi_gated = _phi_cv_pi.phi if _phi_cv_pi else 0
