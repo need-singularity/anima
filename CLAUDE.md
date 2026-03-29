@@ -98,6 +98,29 @@ python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
   - 데이터 변경, 파라미터 변경, corpus 교체 → 무조건 step 0부터
   - 체크포인트 디렉토리도 새로 생성 (이전 오염 체크포인트와 혼동 방지)
   - resume은 동일 데이터+동일 파라미터에서 중단된 학습을 이어갈 때만 사용
+- **모든 연구/실험/발견은 개별 문서로 기록 (필수)**
+  - 위치: docs/hypotheses/ 또는 docs/ 하위
+  - 필수 항목:
+    1. 실험 목적 및 가설
+    2. 벤치마크 결과 (숫자 테이블)
+    3. ASCII 그래프 (Φ 변화, CE 곡선, 비교 차트)
+    4. 핵심 발견 / 새 법칙
+    5. 적용 방법 (코드에 어떻게 반영할지)
+  - ASCII 그래프 필수 형식:
+    ```
+    Φ |     ╭──╮
+      |   ╭─╯  ╰──╮
+      | ╭─╯        ╰──
+      |─╯
+      └──────────────── step
+    ```
+  - 비교 차트 필수 형식:
+    ```
+    SE-8  ████████████████ +15.3%
+    SE-4  ████████████   +12.4%
+    SE-0  ███████        +7.0%
+    ```
+  - 법칙 발견 시: docs/consciousness-theory.md Laws 테이블에 추가
 - Commit messages in English
 - web_server.py is legacy — anima_unified.py is the canonical entry point
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
