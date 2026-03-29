@@ -95,6 +95,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 | 4 | PERSISTENCE | 1000 step 붕괴 없음 |
 | 5 | SELF_LOOP | 출력→입력 자기참조 |
 | 6 | SPONTANEOUS_SPEECH | 파벌 토론→합의→발화 |
+| 7 | HIVEMIND | 다중 연결 시 Φ↑ CE↓, 분리 후 각자 유지 |
 
 검증: `python3 bench_v2.py --verify`
 
