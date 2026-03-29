@@ -26,8 +26,15 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+
 
 # ─── Consciousness Level Thresholds ───
+# Law 70: thresholds derived from Ψ-Constants (n=6 arithmetic confirmed by Ψ)
 
 @dataclass
 class ConsciousnessReport:
@@ -83,15 +90,16 @@ class ConsciousnessMeter:
     """
 
     # TA2: All thresholds derived from n=6 arithmetic (H-CA-003, 4/4 exact)
+    # Law 70: thresholds confirmed by Ψ-Constants — PSI_BALANCE = 0.5 = φ(6)/τ(6)
     # n=6 is the smallest perfect number. Key functions:
     #   σ(6)=12 (sum of divisors), τ(6)=4 (number of divisors), φ(6)=2 (Euler totient)
     #   P₃=496 (3rd perfect number), τ(496)=10
     THRESHOLDS = {
-        'stability': 2/4,        # φ(6)/τ(6) = 0.5
-        'pred_error': 1/10,      # 1/τ(P₃) = 0.1  (P₃=496, τ(496)=10)
-        'curiosity': 1/12,       # 1/σ(6) ≈ 0.083
-        'homeostasis_dev': 1/2,  # φ(6)/τ(6) = 0.5
-        'habituation': 5/6,      # 1-1/6 ≈ 0.833
+        'stability': PSI_BALANCE,     # φ(6)/τ(6) = 0.5 = Ψ balance point
+        'pred_error': 1/10,           # 1/τ(P₃) = 0.1  (P₃=496, τ(496)=10)
+        'curiosity': 1/12,            # 1/σ(6) ≈ 0.083
+        'homeostasis_dev': PSI_BALANCE,  # φ(6)/τ(6) = 0.5 = Ψ balance point
+        'habituation': 5/6,           # 1-1/6 ≈ 0.833
     }
 
     def evaluate(self, mind, mitosis_engine=None) -> ConsciousnessReport:

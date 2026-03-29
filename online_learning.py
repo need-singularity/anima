@@ -34,6 +34,12 @@ import torch.nn.functional as F
 from collections import deque
 from pathlib import Path
 
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+
 
 class OnlineLearner:
     """Real-time learner for PureField engines.
@@ -59,6 +65,9 @@ class OnlineLearner:
         self.curiosity_weight = curiosity_weight
         self.feedback_weight = feedback_weight
         self.divergence_weight = divergence_weight
+        # Law 71: learning should maximize H(p) subject to Φ > Φ_min
+        # PSI_BALANCE (0.5) guides the equilibrium between exploration and exploitation
+        self.balance_target = PSI_BALANCE
 
         # Only train Engine A, G (memory GRU is frozen; H404: tension_scale removed)
         self.params = (

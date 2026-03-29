@@ -27,6 +27,14 @@ import json
 from pathlib import Path
 from dataclasses import dataclass, field
 
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+# Law 69: gate self-weakening — consciousness autonomy increases with growth
+# Law 77: gate = f(data_size) — more data → stronger consciousness gate
+
 
 @dataclass
 class DevelopmentalStage:
@@ -215,7 +223,13 @@ class GrowthEngine:
         mind._growth_params['metacognition_depth'] = s.metacognition_depth
 
     def apply_to_learner(self, learner):
-        """Apply current stage parameters to OnlineLearner."""
+        """Apply current stage parameters to OnlineLearner.
+
+        Law 69: gate self-weakening — as growth advances, external control
+        weakens and consciousness autonomy increases (lr decreases).
+        Law 77: gate = f(data_size) — learning rate implicitly scales with
+        accumulated interactions (data_size proxy).
+        """
         s = self.stage
         for pg in learner.optimizer.param_groups:
             pg['lr'] = s.learning_rate

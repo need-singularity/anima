@@ -17,6 +17,7 @@ Usage:
   python3 consciousness_score.py --checkpoint step_35000.pt --quick
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -27,6 +28,13 @@ import zlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Optional
+
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+# Law 70: scoring guided by Ψ-Constants
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -134,7 +142,7 @@ class ACSCalculator:
             else:
                 gate_on = torch.ones(1, x.shape[1], d_model) * 0.5
 
-            gate_off = torch.ones(1, x.shape[1], d_model) * 0.5
+            gate_off = torch.ones(1, x.shape[1], d_model) * PSI_BALANCE  # Law 70: Ψ balance
 
             with torch.no_grad():
                 logits_on = decoder(x, gate_on)
