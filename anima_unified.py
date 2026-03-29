@@ -752,11 +752,12 @@ class AnimaUnified:
         """Process text through a participant's consciousness. Returns response dict or None."""
         vec = text_to_vector(text)
         with torch.no_grad():
-            out, new_hidden = participant.mind(vec.unsqueeze(0), participant.hidden)
+            out, t_val, c_val, dir_out, new_hidden = participant.mind(vec, participant.hidden)
             participant.hidden = new_hidden
 
-        tension = participant.mind.prev_tension
-        curiosity = participant.mind._curiosity_ema
+        tension = float(t_val) if hasattr(t_val, 'item') else float(t_val)
+        curiosity = float(c_val) if hasattr(c_val, 'item') else float(c_val)
+        dir_vals = dir_out.squeeze().tolist() if hasattr(dir_out, 'tolist') else [0.0] * 8
         cv = participant.mind.get_consciousness_vector()
         phi = cv.phi if cv else 0
 
@@ -775,7 +776,6 @@ class AnimaUnified:
             temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
             response = participant.model.generate(prompt, max_tokens=200, temperature=temperature)
             if response and response.strip():
-                dir_vals = [0.0] * 8
                 emo = direction_to_emotion(dir_vals, tension, curiosity)
                 return {
                     'type': 'model_message',
