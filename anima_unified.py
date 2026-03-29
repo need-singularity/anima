@@ -2457,6 +2457,11 @@ class AnimaUnified:
                             proactive = None
                             break
 
+                # Filter garbled proactive output — don't broadcast noise
+                if proactive and self._is_garbled(proactive):
+                    _log("proactive", f"Blocked (garbled): {repr(proactive[:50])}")
+                    proactive = None
+
                 # No fallback templates — only speak when model can generate
                 if proactive:
                     self._recent_proactive.append(proactive)
@@ -2671,6 +2676,25 @@ class AnimaUnified:
 
     # ─── Web server ───
 
+    def _is_garbled(self, text):
+        """Check if model output is garbled (non-UTF8, low printable ratio, no real words)."""
+        if not text or not isinstance(text, str):
+            return True
+        try:
+            text.encode('utf-8').decode('utf-8')
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return True
+        printable_ratio = sum(1 for c in text if c.isprintable() or c.isspace()) / max(len(text), 1)
+        words = text.split()
+        avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
+        has_real_words = avg_word_len < 15 and len(words) > 2
+        common = {'the','a','is','are','it','I','you','we','to','and','of',
+                  '는','은','이','가','을','를','에','의','로','다','요','해'}
+        word_match = sum(1 for w in words if w.lower() in common) / max(len(words), 1)
+        if printable_ratio < 0.5 or word_match < 0.05 or not has_real_words:
+            return True
+        return False
+
     def _fallback_response(self, emo=None):
         """Generate a fallback response based on current emotion state when model output is garbled."""
         emotion = (emo or {}).get('emotion', 'calm') if isinstance(emo, dict) else 'calm'
@@ -2771,29 +2795,9 @@ class AnimaUnified:
                         else:
                             answer, tension, curiosity, dir_vals, emo = result
                         # Validate answer: guard against garbled/non-UTF8 model output
-                        if not answer or not isinstance(answer, str):
-                            _log("web", "Empty or non-string answer, using fallback")
+                        if self._is_garbled(answer):
+                            _log("web", f"Garbled output detected, using fallback: {repr((answer or '')[:50])}")
                             answer = self._fallback_response(emo)
-                        else:
-                            try:
-                                answer.encode('utf-8').decode('utf-8')
-                            except (UnicodeDecodeError, UnicodeEncodeError):
-                                _log("web", "Garbled model output (encoding error), using fallback")
-                                answer = self._fallback_response(emo)
-                            else:
-                                # Check for low coherence: mostly non-printable or repeated chars
-                                printable_ratio = sum(1 for c in answer if c.isprintable() or c.isspace()) / max(len(answer), 1)
-                                # Word-level coherence: check if output has real words
-                                words = answer.split()
-                                avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
-                                has_real_words = avg_word_len < 15 and len(words) > 2
-                                # Dictionary check: at least some common words
-                                common = {'the','a','is','are','it','I','you','we','to','and','of',
-                                          '는','은','이','가','을','를','에','의','로','다','요','해'}
-                                word_match = sum(1 for w in words if w.lower() in common) / max(len(words), 1)
-                                if printable_ratio < 0.5 or word_match < 0.05 or not has_real_words:
-                                    _log("web", f"Low quality (print={printable_ratio:.0%}, words={word_match:.0%}), fallback")
-                                    answer = self._fallback_response(emo)
                     except Exception as e:
                         _log("web", f"process_input exception: {e}")
                         import traceback; traceback.print_exc()
@@ -2980,6 +2984,9 @@ class AnimaUnified:
                 if text:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
                     answer, tension, curiosity, dir_vals, emo = self.process_input(text, source=source)
+                    if self._is_garbled(answer):
+                        _log("kb/voice", f"Garbled output, using fallback: {repr(answer[:50]) if answer else 'None'}")
+                        answer = self._fallback_response(emo)
                     if self.speaker: self.speaker.say(answer, self.listener)
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,

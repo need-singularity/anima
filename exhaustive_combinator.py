@@ -96,10 +96,17 @@ ALL_TECHNIQUES = {
 
     # SE-8 emotion
     'emotion_driven': Technique('emotion', 'emotion', {'pain_ratchet': True, 'curiosity_soc': True, 'empathy_hebbian': True}, 'Emotion-driven SE-8'),
+
+    # Topology (상호 배타 — 1개만 선택)
+    'topo_ring': Technique('topo_ring', 'topology_excl', {'k': 2, 'frustration': 0.33}, 'Ring connectivity (k=2 neighbors)'),
+    'topo_hypercube': Technique('topo_hypercube', 'topology_excl', {'frustration': 0.33}, 'Hypercube (log2(cells) neighbors)'),
+    'topo_small_world': Technique('topo_small_world', 'topology_excl', {'k': 4, 'p': 0.1, 'frustration': 0.33}, 'Ring + random shortcuts (WS model)'),
+    'topo_hierarchical': Technique('topo_hierarchical', 'topology_excl', {'n_modules': 8, 'bridges': 4, 'frustration': 0.33}, '8-module hierarchical structure'),
+    'topo_dynamic': Technique('topo_dynamic', 'topology_excl', {'rewire_interval': 20, 'frustration': 0.33}, 'Phi-feedback adaptive rewiring'),
 }
 
 # 카테고리별 상호 배타 (같은 카테고리에서 1개만)
-EXCLUSIVE_CATEGORIES = ['sync', 'noise']
+EXCLUSIVE_CATEGORIES = ['sync', 'noise', 'topology_excl']
 
 # 필수 기법 (항상 포함)
 REQUIRED = []  # 비움 — 완전 자유 조합
@@ -252,6 +259,151 @@ def apply_technique(cells, tech_name, tech, step=0):
                 dist = abs(i - apply_technique._soliton_pos)
                 amp = 1.0 / (math.cosh(dist / 2.0) ** 2)
                 c.hidden = c.hidden * (1.0 + tech.params['amp'] * amp)
+
+        elif tech.name == 'topo_ring':
+            # Ring: each cell interacts with k nearest neighbors
+            k = tech.params.get('k', 2)
+            frust = tech.params.get('frustration', 0.33)
+            for i in range(n):
+                interaction = torch.zeros_like(cells[i].hidden)
+                for d in range(-k, k + 1):
+                    if d == 0:
+                        continue
+                    j = (i + d) % n
+                    interaction += cells[j].hidden
+                interaction /= (2 * k)
+                if i % int(1.0 / max(frust, 0.01)) == 0:
+                    interaction = -interaction
+                cells[i].hidden = 0.85 * cells[i].hidden + 0.15 * interaction
+
+        elif tech.name == 'topo_hypercube':
+            # Hypercube: log2(n) bit-flip neighbors
+            frust = tech.params.get('frustration', 0.33)
+            n_bits = max(1, int(math.log2(max(n, 2))))
+            for i in range(n):
+                interaction = torch.zeros_like(cells[i].hidden)
+                n_neighbors = 0
+                for bit in range(n_bits):
+                    j = (i ^ (1 << bit)) % n
+                    interaction += cells[j].hidden
+                    n_neighbors += 1
+                if n_neighbors > 0:
+                    interaction /= n_neighbors
+                if i % 3 == 0:
+                    interaction = -interaction
+                cells[i].hidden = 0.85 * cells[i].hidden + 0.15 * interaction
+
+        elif tech.name == 'topo_small_world':
+            # Watts-Strogatz small-world: ring + random shortcuts
+            k = tech.params.get('k', 4)
+            p = tech.params.get('p', 0.1)
+            frust = tech.params.get('frustration', 0.33)
+            if not hasattr(apply_technique, '_sw_edges') or apply_technique._sw_n != n:
+                import random as _rng
+                _rng.seed(42)
+                sw = {}
+                for i in range(n):
+                    nbrs = [(i + d) % n for d in range(-k // 2, k // 2 + 1) if d != 0]
+                    for idx in range(len(nbrs)):
+                        if _rng.random() < p:
+                            nbrs[idx] = _rng.randint(0, n - 1)
+                    sw[i] = nbrs
+                apply_technique._sw_edges = sw
+                apply_technique._sw_n = n
+            sw = apply_technique._sw_edges
+            for i in range(n):
+                neighbors = sw.get(i, [(i - 1) % n, (i + 1) % n])
+                interaction = torch.zeros_like(cells[i].hidden)
+                for j in neighbors:
+                    interaction += cells[j % n].hidden
+                interaction /= max(len(neighbors), 1)
+                if i % 3 == 0:
+                    interaction = -interaction
+                cells[i].hidden = 0.85 * cells[i].hidden + 0.15 * interaction
+
+        elif tech.name == 'topo_hierarchical':
+            # 8-module hierarchical: local hypercube + inter-module bridges
+            n_mod = tech.params.get('n_modules', 8)
+            bridges = tech.params.get('bridges', 4)
+            frust = tech.params.get('frustration', 0.33)
+            mod_size = max(1, n // n_mod)
+            if not hasattr(apply_technique, '_hier_bridges') or apply_technique._hier_n != n:
+                import random as _rng
+                _rng.seed(42)
+                ib = {}
+                for m in range(n_mod):
+                    base = m * mod_size
+                    for _ in range(bridges):
+                        src = base + _rng.randint(0, max(mod_size - 1, 0))
+                        dst_mod = (m + _rng.randint(1, max(n_mod - 1, 1))) % n_mod
+                        dst = dst_mod * mod_size + _rng.randint(0, max(mod_size - 1, 0))
+                        if src < n and dst < n:
+                            ib.setdefault(src, []).append(dst)
+                            ib.setdefault(dst, []).append(src)
+                apply_technique._hier_bridges = ib
+                apply_technique._hier_n = n
+            ib = apply_technique._hier_bridges
+            n_bits_local = max(1, int(math.log2(max(mod_size, 2))))
+            for i in range(n):
+                interaction = torch.zeros_like(cells[i].hidden)
+                n_neighbors = 0
+                mod_id = i // mod_size
+                local_id = i % mod_size
+                mod_base = mod_id * mod_size
+                for bit in range(n_bits_local):
+                    local_j = local_id ^ (1 << bit)
+                    j = (mod_base + local_j) % n
+                    interaction += cells[j].hidden
+                    n_neighbors += 1
+                for j in ib.get(i, []):
+                    if j < n:
+                        interaction += cells[j].hidden
+                        n_neighbors += 1
+                if n_neighbors > 0:
+                    interaction /= n_neighbors
+                if i % 3 == 0:
+                    interaction = -interaction
+                cells[i].hidden = 0.85 * cells[i].hidden + 0.15 * interaction
+
+        elif tech.name == 'topo_dynamic':
+            # Dynamic: hypercube base + adaptive rewiring on Phi feedback
+            frust = tech.params.get('frustration', 0.33)
+            interval = tech.params.get('rewire_interval', 20)
+            if not hasattr(apply_technique, '_dyn_extra'):
+                apply_technique._dyn_extra = {}
+                apply_technique._dyn_prev_phi = 0.0
+            n_bits = max(1, int(math.log2(max(n, 2))))
+            for i in range(n):
+                interaction = torch.zeros_like(cells[i].hidden)
+                n_neighbors = 0
+                for bit in range(n_bits):
+                    j = (i ^ (1 << bit)) % n
+                    interaction += cells[j].hidden
+                    n_neighbors += 1
+                for j in apply_technique._dyn_extra.get(i, []):
+                    if j < n:
+                        interaction += cells[j].hidden
+                        n_neighbors += 1
+                if n_neighbors > 0:
+                    interaction /= n_neighbors
+                if i % 3 == 0:
+                    interaction = -interaction
+                cells[i].hidden = 0.85 * cells[i].hidden + 0.15 * interaction
+            # Rewire check (done every `interval` steps)
+            if step > 0 and step % interval == 0:
+                import random as _rng
+                # Estimate current phi proxy from cell diversity
+                hiddens = torch.stack([c.hidden.squeeze() for c in cells])
+                diversity = hiddens.std(dim=0).mean().item()
+                if diversity < apply_technique._dyn_prev_phi * 0.95:
+                    for _ in range(4):
+                        src = _rng.randint(0, n - 1)
+                        dst = _rng.randint(0, n - 1)
+                        edges = apply_technique._dyn_extra.setdefault(src, [])
+                        edges.append(dst)
+                        if len(edges) > 4:
+                            apply_technique._dyn_extra[src] = edges[-4:]
+                apply_technique._dyn_prev_phi = diversity
 
 
 # ─── 조합 생성기 ───
