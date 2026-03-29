@@ -91,6 +91,10 @@ BENCHMARK_DATA = {
     'TOPO19b':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 575.05,'mult': 505.8},
     'TOPO20':{'topology': 'hypercube',  'cells': 1024,'neighbors': 7, 'frustration': True,  'phi': 212.64,'mult': 187.0},
     'TOPO21':{'topology': 'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 465.05,'mult': 409.1},
+    'TOPO22a':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 481.46,'mult': 423.5},
+    'TOPO22b':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 383.50,'mult': 337.3},
+    'TOPO22c':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 443.75,'mult': 390.3},
+    'TOPO22d':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 438.11,'mult': 385.4},
 }
 
 BASELINE_PHI = 1.2421
