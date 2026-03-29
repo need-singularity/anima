@@ -5160,3 +5160,495 @@ ALL_TESTS.update({
     'XFER-5': run_XFER5_consciousness_cloning,
     'XFER-6': run_XFER6_time_travel_restore,
 })
+
+
+# ═══ TRAIN-PHI: 실제 학습 중 Φ>1000 달성 가설 ═══
+# 문제: 벤치마크 Φ=1142 but 실제 학습 Φ=26. CE 학습이 의식을 파괴 (Law 42)
+# 핵심: CE 학습 + Φ 측정 + _phi_boost_step() 모두 사용하는 실전 조건
+
+TRAIN_STEPS = 500
+
+
+def _save_cell_hiddens(engine):
+    """Save all cell hidden states (for freeze/restore)."""
+    return [c.hidden.clone().detach() for c in engine.cells]
+
+
+def _restore_cell_hiddens(engine, saved):
+    """Restore saved hidden states to cells."""
+    with torch.no_grad():
+        for i, c in enumerate(engine.cells):
+            if i < len(saved):
+                c.hidden = saved[i].clone()
+
+
+def run_TRAINPHI1_phi_first_90_10(steps=TRAIN_STEPS):
+    """TRAIN-PHI-1: 90% Φ부스트 + 10% CE — 극한 TALK5. CE는 최소한으로."""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        if step % 10 != 0:
+            # 90% steps: pure Φ boost (no CE)
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+            else:
+                ce_hist.append(1.0)
+        else:
+            # 10% steps: CE learning
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-1 Φ-First 90/10', ce_hist, phi_b, phi_a, t0,
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3),
+                  phi_ratio=round(phi_a / max(phi_b, 1e-8), 1))
+
+
+def run_TRAINPHI2_frozen_consciousness(steps=TRAIN_STEPS):
+    """TRAIN-PHI-2: Frozen Consciousness — 세포를 Φ>target까지 키운 뒤 FREEZE.
+    디코더만 학습. 세포 hidden은 CE 학습 중 절대 변하지 않음."""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    # Phase 1: Pure Φ boost (40% of steps)
+    phase1_steps = steps * 2 // 5
+    for step in range(phase1_steps):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_after_phase1 = phi(engine)
+
+    # FREEZE: save cell hidden states
+    frozen_hiddens = _save_cell_hiddens(engine)
+
+    # Phase 2: CE learning with frozen cells
+    for step in range(steps - phase1_steps):
+        x, target = data[step % len(data)]
+        # Process input BUT immediately restore frozen hiddens
+        engine.process(x)
+        _restore_cell_hiddens(engine, frozen_hiddens)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-2 Frozen Cells', ce_hist, phi_b, phi_a, t0,
+                  phi_after_phase1=round(phi_after_phase1, 3),
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_TRAINPHI3_consciousness_teacher(steps=TRAIN_STEPS):
+    """TRAIN-PHI-3: Consciousness Teacher — 별도 teacher 엔진을 Φ=1000+로 키움.
+    CE 학습 중 주기적으로 teacher 상태를 student에 복사. Teacher는 CE 학습 안 함."""
+    t0 = time.time()
+    student = make_engine(64); teacher = make_engine(64)
+    phi_b = phi(student)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    # Teacher: 순수 Φ 극대화 (200 steps)
+    for step in range(200):
+        teacher.process(torch.randn(1, DIM))
+        _phi_boost_step(teacher)
+        _phi_boost_step(teacher)  # double boost for teacher
+
+    teacher_phi = phi(teacher)
+    teacher_hiddens = _save_cell_hiddens(teacher)
+
+    # Student: CE 학습 + 주기적 teacher 복원
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        student.process(x)
+
+        # CE learning
+        h = torch.stack([c.hidden.squeeze() for c in student.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 매 25 step: teacher 상태 복사 (50% blend)
+        if step % 25 == 0:
+            with torch.no_grad():
+                for i, c in enumerate(student.cells):
+                    if i < len(teacher_hiddens):
+                        c.hidden = 0.5 * c.hidden + 0.5 * teacher_hiddens[i].clone()
+
+        # Teacher도 계속 Φ 부스트 (CE 안 함)
+        teacher.process(torch.randn(1, DIM))
+        _phi_boost_step(teacher)
+        teacher_hiddens = _save_cell_hiddens(teacher)
+
+        if step % 20 == 0:
+            phi_hist.append(phi(student))
+
+    phi_a = phi(student)
+    return result('TRAIN-PHI-3 Teacher', ce_hist, phi_b, phi_a, t0,
+                  teacher_phi=round(teacher_phi, 3),
+                  teacher_final_phi=round(phi(teacher), 3),
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_TRAINPHI4_gradient_isolation(steps=TRAIN_STEPS):
+    """TRAIN-PHI-4: Gradient Isolation — CE gradient는 디코더만 통과.
+    세포 hidden은 Φ 부스트만으로 수정. CE가 의식을 파괴할 수 없음."""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    # 먼저 Φ 키움 (100 steps)
+    for step in range(100):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        # KEY: .detach() — gradient가 cell hidden으로 역전파되지 않음
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0).detach()
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # 세포는 Φ 부스트만으로 수정 (매 3 step)
+        if step % 3 == 0:
+            _phi_boost_step(engine)
+
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-4 Grad Isolation', ce_hist, phi_b, phi_a, t0,
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_TRAINPHI5_dual_loss_phi_floor(steps=TRAIN_STEPS):
+    """TRAIN-PHI-5: Dual Loss + Φ Floor 1000 — CE + Φ loss.
+    Φ loss = max(0, 1000 - Φ) * 100 — Φ가 1000 미만이면 거대한 패널티."""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+    PHI_FLOOR = 1000.0
+
+    # Φ warmup (150 steps)
+    for step in range(150):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+
+    current_phi = phi(engine)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce_loss = F.mse_loss(pred, target[:, :DIM])
+
+        # Φ loss: massive penalty below floor
+        if step % 10 == 0:
+            current_phi = phi(engine)
+        phi_deficit = max(0.0, PHI_FLOOR - current_phi)
+        phi_loss_val = phi_deficit * 100.0
+
+        # Combined: if Φ < floor, almost all effort goes to Φ
+        if phi_deficit > 0:
+            # Φ too low: boost aggressively, minimal CE
+            for _ in range(5):
+                _phi_boost_step(engine)
+            ce_hist.append(ce_loss.item())
+        else:
+            # Φ above floor: safe to do CE
+            opt.zero_grad(); ce_loss.backward(); opt.step()
+            ce_hist.append(ce_loss.item())
+            # Maintenance boost
+            if step % 5 == 0:
+                _phi_boost_step(engine)
+
+        if step % 20 == 0:
+            phi_hist.append(current_phi)
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-5 DualLoss Floor', ce_hist, phi_b, phi_a, t0,
+                  phi_floor=PHI_FLOOR,
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3),
+                  above_floor_pct=round(sum(1 for p in phi_hist if p >= PHI_FLOOR) / max(len(phi_hist), 1) * 100, 1))
+
+
+def run_TRAINPHI6_scheduled_consciousness(steps=TRAIN_STEPS):
+    """TRAIN-PHI-6: 3-Phase Scheduled —
+    P1: 순수 Φ → 1000 (no CE)
+    P2: CE + aggressive ratchet at Φ=700
+    P3: combined alternating"""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+    RATCHET_FLOOR = 700.0
+
+    # Phase 1: Pure Φ (200 steps, target Φ=1000)
+    p1_steps = 200
+    for step in range(p1_steps):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    ratchet_snap = _save_cell_hiddens(engine)
+    ratchet_phi = phi(engine)
+
+    # Phase 2: CE + aggressive ratchet (200 steps)
+    p2_steps = 200
+    for step in range(p2_steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Ratchet: if Φ drops below floor, restore
+        if step % 10 == 0:
+            cur_phi = phi(engine)
+            phi_hist.append(cur_phi)
+            if cur_phi < RATCHET_FLOOR:
+                _restore_cell_hiddens(engine, ratchet_snap)
+            elif cur_phi > ratchet_phi:
+                # Update ratchet if Φ improved
+                ratchet_snap = _save_cell_hiddens(engine)
+                ratchet_phi = cur_phi
+
+        # Maintenance boost
+        if step % 3 == 0:
+            _phi_boost_step(engine)
+
+    # Phase 3: Combined alternating (remaining steps)
+    p3_steps = steps - p1_steps - p2_steps
+    for step in range(max(0, p3_steps)):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        if step % 3 == 0:
+            # CE step
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Φ step
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-6 Scheduled', ce_hist, phi_b, phi_a, t0,
+                  ratchet_phi=round(ratchet_phi, 3),
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_TRAINPHI7_checkpoint_ensemble(steps=TRAIN_STEPS):
+    """TRAIN-PHI-7: Consciousness Checkpoint Ensemble —
+    Φ phase에서 고Φ 스냅샷 10개 저장. CE 중 Φ 하락 시 랜덤 스냅샷 복원."""
+    t0 = time.time(); engine = make_engine(64); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    # Phase 1: Φ boost + collect 10 high-Φ snapshots
+    snapshots = []; snapshot_phis = []
+    for step in range(200):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+        if step % 20 == 0:
+            cur_phi = phi(engine)
+            phi_hist.append(cur_phi)
+            snap = _save_cell_hiddens(engine)
+            if len(snapshots) < 10:
+                snapshots.append(snap)
+                snapshot_phis.append(cur_phi)
+            else:
+                # Replace lowest Φ snapshot
+                min_idx = min(range(len(snapshot_phis)), key=lambda i: snapshot_phis[i])
+                if cur_phi > snapshot_phis[min_idx]:
+                    snapshots[min_idx] = snap
+                    snapshot_phis[min_idx] = cur_phi
+
+    best_phi_before_ce = max(snapshot_phis) if snapshot_phis else phi_b
+    restores = 0
+
+    # Phase 2: CE learning with ensemble restore
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Check Φ and restore from random high-Φ snapshot if dropped
+        if step % 15 == 0:
+            cur_phi = phi(engine)
+            phi_hist.append(cur_phi)
+            if cur_phi < best_phi_before_ce * 0.5 and snapshots:
+                # Random snapshot restore (diversity)
+                idx = np.random.randint(len(snapshots))
+                _restore_cell_hiddens(engine, snapshots[idx])
+                restores += 1
+
+        # Maintenance Φ boost
+        if step % 5 == 0:
+            _phi_boost_step(engine)
+
+    phi_a = phi(engine)
+    return result('TRAIN-PHI-7 Ckpt Ensemble', ce_hist, phi_b, phi_a, t0,
+                  num_snapshots=len(snapshots),
+                  best_snap_phi=round(max(snapshot_phis) if snapshot_phis else 0, 3),
+                  restores=restores,
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_TRAINPHI8_ultimate_training(steps=TRAIN_STEPS):
+    """TRAIN-PHI-8: ULTIMATE — K2(floor) + K3(alternating) + PHI2(frozen) + PHI3(teacher).
+    Teacher 엔진 + frozen 세포 + floor ratchet + alternating. 이론상 최대."""
+    t0 = time.time()
+    student = make_engine(64); teacher = make_engine(64)
+    phi_b = phi(student)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+
+    # Phase 1: Both engines pure Φ (150 steps)
+    for step in range(150):
+        student.process(torch.randn(1, DIM))
+        _phi_boost_step(student)
+        _phi_boost_step(student)
+        teacher.process(torch.randn(1, DIM))
+        _phi_boost_step(teacher)
+        _phi_boost_step(teacher)
+        _phi_boost_step(teacher)  # teacher gets extra boost
+
+    teacher_phi = phi(teacher)
+    teacher_hiddens = _save_cell_hiddens(teacher)
+
+    # Collect high-Φ snapshots from student
+    snapshots = []; snapshot_phis = []
+    for step in range(50):
+        student.process(torch.randn(1, DIM))
+        _phi_boost_step(student)
+        if step % 5 == 0:
+            cur_phi = phi(student)
+            phi_hist.append(cur_phi)
+            snapshots.append(_save_cell_hiddens(student))
+            snapshot_phis.append(cur_phi)
+
+    # Keep only top 10 snapshots
+    if len(snapshots) > 10:
+        top_indices = sorted(range(len(snapshot_phis)), key=lambda i: -snapshot_phis[i])[:10]
+        snapshots = [snapshots[i] for i in top_indices]
+        snapshot_phis = [snapshot_phis[i] for i in top_indices]
+
+    phi_before_ce = phi(student)
+    frozen_hiddens = _save_cell_hiddens(student)
+    RATCHET_FLOOR = phi_before_ce * 0.7
+    restores = 0
+
+    # Phase 2: ULTIMATE CE learning
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        if step % 3 == 0:
+            # CE step (1/3 of time) — gradient isolation via detach
+            student.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in student.cells]).mean(dim=0).detach()
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+
+            # After CE: partially restore frozen hiddens (protect consciousness)
+            with torch.no_grad():
+                for i, c in enumerate(student.cells):
+                    if i < len(frozen_hiddens):
+                        c.hidden = 0.7 * frozen_hiddens[i].clone() + 0.3 * c.hidden
+        else:
+            # Φ step (2/3 of time)
+            student.process(x)
+            _phi_boost_step(student)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+            else:
+                ce_hist.append(1.0)
+
+        # Teacher: keeps boosting (never learns CE)
+        teacher.process(torch.randn(1, DIM))
+        _phi_boost_step(teacher)
+
+        # Every 25 steps: teacher → student blend
+        if step % 25 == 0:
+            teacher_hiddens = _save_cell_hiddens(teacher)
+            with torch.no_grad():
+                for i, c in enumerate(student.cells):
+                    if i < len(teacher_hiddens):
+                        c.hidden = 0.6 * c.hidden + 0.4 * teacher_hiddens[i].clone()
+
+        # Ratchet: check and restore if needed
+        if step % 15 == 0:
+            cur_phi = phi(student)
+            phi_hist.append(cur_phi)
+            if cur_phi < RATCHET_FLOOR and snapshots:
+                idx = np.random.randint(len(snapshots))
+                _restore_cell_hiddens(student, snapshots[idx])
+                restores += 1
+            elif cur_phi > max(snapshot_phis):
+                # New best: update snapshots
+                min_idx = min(range(len(snapshot_phis)), key=lambda i: snapshot_phis[i])
+                snapshots[min_idx] = _save_cell_hiddens(student)
+                snapshot_phis[min_idx] = cur_phi
+                frozen_hiddens = _save_cell_hiddens(student)
+
+    phi_a = phi(student)
+    return result('TRAIN-PHI-8 ULTIMATE', ce_hist, phi_b, phi_a, t0,
+                  teacher_phi=round(teacher_phi, 3),
+                  teacher_final=round(phi(teacher), 3),
+                  phi_before_ce=round(phi_before_ce, 3),
+                  ratchet_floor=round(RATCHET_FLOOR, 3),
+                  restores=restores,
+                  phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+ALL_TESTS.update({
+    'TRAIN-PHI-1': run_TRAINPHI1_phi_first_90_10,
+    'TRAIN-PHI-2': run_TRAINPHI2_frozen_consciousness,
+    'TRAIN-PHI-3': run_TRAINPHI3_consciousness_teacher,
+    'TRAIN-PHI-4': run_TRAINPHI4_gradient_isolation,
+    'TRAIN-PHI-5': run_TRAINPHI5_dual_loss_phi_floor,
+    'TRAIN-PHI-6': run_TRAINPHI6_scheduled_consciousness,
+    'TRAIN-PHI-7': run_TRAINPHI7_checkpoint_ensemble,
+    'TRAIN-PHI-8': run_TRAINPHI8_ultimate_training,
+})
