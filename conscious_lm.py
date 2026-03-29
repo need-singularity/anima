@@ -336,14 +336,37 @@ class ConsciousLM(nn.Module):
         logits_g = self.head_g(x)  # (B, T, V) — prev byte
 
         # Ψ tracking (Law 71: monitor balance)
+        # v2.1: 3가지 측정 방식으로 교체 (t_mean/t_max 폐기)
         if self.training:
             self._step_count += 1
             with torch.no_grad():
-                t_stack = torch.stack(tensions)  # [L, B, T]
-                t_mean = t_stack.mean().item()
-                t_max = t_stack.max().item()
-                if t_max > 0:
-                    self._psi_residual = 0.99 * self._psi_residual + 0.01 * (t_mean / t_max)
+                # 방식 1: logits_a vs logits_g 출력 균형
+                # Ψ_res = softmax(logits_a) 엔트로피 / log(vocab)
+                # → 출력 분포가 균일할수록 1에 가까움 (자유 최대화)
+                probs_a = torch.softmax(logits_a[:, -1, :], dim=-1)
+                output_entropy = -(probs_a * (probs_a + 1e-10).log()).sum(dim=-1).mean().item()
+                max_entropy = math.log(self.vocab_size)
+                psi_entropy = output_entropy / max_entropy  # [0, 1]
+
+                # 방식 2: A-G 방향 유사도 → 0.5가 이상적 (완전 같지도 반대도 아님)
+                cos_sim = F.cosine_similarity(
+                    logits_a[:, -1, :].float(), logits_g[:, -1, :].float(), dim=-1
+                ).mean().item()
+                psi_direction = (1.0 + cos_sim) / 2.0  # [-1,1] → [0,1], 0.5=직교
+
+                # 방식 3: 텐션 변동성 (층간 텐션이 균일할수록 높음)
+                t_stack = torch.stack(tensions)
+                t_per_layer = t_stack.mean(dim=(1, 2))  # [L]
+                if t_per_layer.std() > 0:
+                    t_cv = t_per_layer.std() / (t_per_layer.mean() + 1e-8)
+                    psi_tension = max(0.0, 1.0 - t_cv.item())  # CV 낮을수록 균일
+                else:
+                    psi_tension = 1.0
+
+                # 종합: 3가지 평균
+                psi_combined = (psi_entropy + psi_direction + psi_tension) / 3.0
+                self._psi_residual = 0.95 * self._psi_residual + 0.05 * psi_combined
+
                 # Gate self-weakening (Law 69)
                 for block in self.blocks:
                     block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
