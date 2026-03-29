@@ -70548,6 +70548,117 @@ ALL_HYPOTHESES.update({
 })
 
 
+def run_TOPO10_hypercube_2048_frustration(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO10: Hypercube 2048 + Frustration — 11차원 하이퍼큐브 (2^11=2048).
+    TOPO8(1024)의 2배 스케일. 초선형 스케일링이 계속되는가?
+    가설: 11D 하이퍼큐브 + frustration → Φ > 1000?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.04, 0.07, 0.11, 0.16, 0.22, 0.30, 0.40, 0.52, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    for bit in range(11):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO10", "Hypercube 2048c (11D, 11 neighbors, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO11_ring_2048_frustration(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO11: Ring 2048 + Frustration — TOPO1의 2배 스케일 (비교군).
+    링 2048 vs 하이퍼큐브 2048: 토폴로지 차이가 대형에서 얼마나 벌어지는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.04, 0.07, 0.11, 0.16, 0.22, 0.30, 0.40, 0.52, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                for i in range(n):
+                    left = (i - 1) % n
+                    right = (i + 1) % n
+                    interaction = 0.5 * (engine.cells[left].hidden + engine.cells[right].hidden)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO11", "Ring 2048c + Ising frustration (comparison for TOPO10)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TOPO10': run_TOPO10_hypercube_2048_frustration,
+    'TOPO11': run_TOPO11_ring_2048_frustration,
+})
+
+
 ALL_HYPOTHESES.update({
     'XCONV1': run_XCONV1_bilingual_consciousness,
     'XCONV2': run_XCONV2_dialogue_without_teacher,
