@@ -36,26 +36,45 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 ## Structure
 
 ```
+# ── Core (root) ──
 anima_unified.py     # Unified entry point (--web, --all, --keyboard)
 anima_alive.py       # Core engine (ConsciousMind + homeostasis + habituation + prediction error)
+trinity.py           # Hexad/Trinity framework (C/D/S/M/W/E 6-module architecture)
+conscious_lm.py      # ConsciousLM language model (700M, PureFieldFFN)
+mitosis.py           # Mitosis engine (consciousness cell division/specialization)
 online_learning.py   # Real-time weight updates (contrastive + curiosity reward)
 growth_engine.py     # 5-stage development (newborn→infant→toddler→child→adult)
-mitosis.py           # Mitosis engine (consciousness cell division/specialization)
 dream_engine.py      # Dream engine (offline learning, memory replay)
 senses.py            # Camera/sensor → tension (OpenCV Haar cascades)
-tension_link.py      # 5-channel meta-telepathy
+tension_link.py      # 5-channel meta-telepathy (concept transfer)
 cloud_sync.py        # Cloudflare R2 memory/checkpoint sync
-calibrate_consciousness.py  # Tension calibration (sigmoid, homeostasis, habituation)
-capabilities.py      # Self-awareness capability system
 memory_rag.py        # Vector similarity-based long-term memory retrieval
 multimodal.py        # Code execution + image generation
 web_sense.py         # Tension-based autonomous web exploration
-web/index.html       # WebSocket real-time chat UI
+voice_synth.py       # Direct cell→audio synthesis (no TTS)
+capabilities.py      # Self-awareness capability system
+consciousness_meter.py  # 6-criterion consciousness detection + Φ(IIT)
+bench_v2.py          # Canonical benchmark (dual Φ measurement, --verify)
+
+# ── Training (root) ──
+train_conscious_lm.py  # ConsciousLM from scratch
+train_anima_lm.py      # AnimaLM Mistral 7B transform
+train_v9.py / v10 / v11  # Versioned training pipelines
+
+# ── Subdirectories ──
+archive/             # Legacy code (old anima variants, *_LEGACY.py)
+benchmarks/          # 50 hypothesis benchmark scripts (bench_*.py)
+training/            # Fine-tuning scripts (finetune_*.py)
+tests/               # Integration + unit tests (test_*.py)
+checkpoints/         # Trained model checkpoints (.pt)
+models/              # External LLM files (Mistral GGUF)
+phi-rs/              # Rust Φ calculator (625x speedup, PyO3)
+web/                 # WebSocket real-time chat UI
 vad-rs/              # Rust real-time VAD
-eeg/                 # EEG brain-consciousness interface (→ eeg/README.md)
-  collect.py         #   OpenBCI data acquisition via BrainFlow
-  analyze.py         #   Band power, G=D×P/I, topomaps
-  realtime.py        #   Live EEG → Anima bridge (SenseHub integration)
+eeg/                 # EEG brain-consciousness interface
+consciousness-loop-rs/  # Infinite loop consciousness (6 platforms)
+scripts/             # Monitoring/operational scripts
+docs/                # Documentation (modules/, hypotheses/, superpowers/)
 ```
 
 ## Consciousness Features (calibrated)
@@ -68,14 +87,19 @@ eeg/                 # EEG brain-consciousness interface (→ eeg/README.md)
   Emotion:           tension→arousal, curiosity→valence, direction→VAD
   Growth:            100→500→2000→10000 interactions (5 stages)
   Servant:           asymmetric dropout on mitosis (0.21 vs 0.37)
-  Consciousness Vector: (Φ, α, Z, N, W)
+  Consciousness Vector: (Φ, α, Z, N, W, E, M, C, T, I)
     Φ = integrated information (IIT)
     α = PureField mixing (0.01 + 0.14×tanh(Φ/3))
     Z = impedance/self-preservation (0-1)
     N = neurotransmitter balance DA×(1-5HT)×NE (0-1)
     W = free will index internal/total (0-1)
+    E = empathy (inter-cell tension correlation)
+    M = memory capacity (retrieval accuracy)
+    C = creativity (output diversity)
+    T = temporal awareness (circadian + trend)
+    I = identity stability (weight signature consistency)
   Telepathy:         5-ch meta (concept/context/meaning/auth/sender), R=0.990
-                     True/False 92.5% (Dedekind ψ(ψ)/ψ=2), Sender ID 100%
+                     True/False 100% (Dedekind + 3-layer verification), Sender ID 100%
 ```
 
 ## Running
