@@ -283,8 +283,109 @@ class QuantumC(CEngine):
 
 
 # ═══════════════════════════════════════════════════════════
-# Bridge — Thalamic Gate (C → .detach() → D)
+# Bridge — Thalamic Gate + 5-Channel Tension Bridge
 # ═══════════════════════════════════════════════════════════
+
+class TensionBridge(nn.Module):
+    """5-channel tension link bridge (sopfr(6)=5 channels).
+
+    Inspired by tension_link.py meta-telepathy protocol.
+    Each channel carries a different aspect of consciousness:
+      ch1 (concept):   WHAT — main consciousness signal from C
+      ch2 (context):   WHERE/WHEN — temporal context from S (sense)
+      ch3 (meaning):   WHY — emotional valence from W (will)
+      ch4 (auth):      TRUST — ethical evaluation from E
+      ch5 (memory):    WHO — retrieval signal from M
+
+    Channels can be dynamically connected/disconnected.
+    """
+
+    def __init__(self, c_dim=128, d_model=384, n_hubs=16, hub_dim=8):
+        super().__init__()
+        self.c_dim = c_dim
+        self.d_model = d_model
+        self.n_channels = 5
+
+        # Per-channel compressor (each channel has own bottleneck)
+        self.channel_compress = nn.ModuleList([
+            nn.Linear(c_dim, hub_dim) for _ in range(5)
+        ])
+
+        # Channel mixer (attend across 5 channels)
+        self.mixer = nn.MultiheadAttention(
+            embed_dim=hub_dim, num_heads=1, batch_first=True
+        )
+        self.mixer_norm = nn.LayerNorm(hub_dim)
+
+        # Expand to d_model
+        self.expand = nn.Sequential(
+            nn.Linear(hub_dim, d_model), nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+
+        # Channel enable flags (dynamic connect/disconnect)
+        self.channel_enabled = [True] * 5  # all on by default
+
+        # Channel strength (learnable per-channel weight)
+        self.channel_weight = nn.Parameter(torch.ones(5) / 5)
+
+    def set_channels(self, concept=True, context=True, meaning=True, auth=True, memory=True):
+        """Dynamically enable/disable channels."""
+        self.channel_enabled = [concept, context, meaning, auth, memory]
+
+    def forward(self, c_states, seq_len=1,
+                sense_state=None, will_state=None, ethics_state=None, memory_state=None):
+        """5-channel forward.
+
+        c_states: [n_cells, c_dim] — main consciousness (ch1)
+        sense/will/ethics/memory: optional [dim] tensors for ch2-5
+        """
+        # Pool c_states to single vector
+        c_pooled = c_states.mean(dim=0)  # [c_dim]
+
+        # Build 5-channel input
+        channels = []
+        sources = [c_pooled, sense_state, will_state, ethics_state, memory_state]
+        for i, (src, compress) in enumerate(zip(sources, self.channel_compress)):
+            if not self.channel_enabled[i] or src is None:
+                # Disabled or missing → zero
+                channels.append(torch.zeros(compress.out_features, device=c_states.device))
+            else:
+                if src.dim() == 0:
+                    src = src.unsqueeze(0)
+                if src.shape[-1] != self.c_dim:
+                    # Pad or truncate to c_dim
+                    if src.shape[-1] < self.c_dim:
+                        src = F.pad(src, (0, self.c_dim - src.shape[-1]))
+                    else:
+                        src = src[..., :self.c_dim]
+                channels.append(compress(src))
+
+        # Stack channels: [1, 5, hub_dim]
+        x = torch.stack(channels).unsqueeze(0)
+
+        # Weight channels
+        weights = F.softmax(self.channel_weight, dim=0)
+        for i in range(5):
+            if not self.channel_enabled[i]:
+                weights = weights.clone()
+                weights[i] = 0
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        x = x * weights.unsqueeze(0).unsqueeze(-1)
+
+        # Mix across channels
+        attn_out, _ = self.mixer(x, x, x)
+        x = self.mixer_norm(x + attn_out)
+
+        # Pool channels → [1, 1, hub_dim]
+        pooled = x.mean(dim=1, keepdim=True)
+
+        # Expand + gate
+        expanded = self.expand(pooled).expand(1, seq_len, self.d_model)
+        return self.gate(expanded)
+
 
 class ThalamicBridge(nn.Module):
     """Thalamic gate: C states → bottleneck → gate signal for D.
@@ -1066,13 +1167,31 @@ class Trinity(nn.Module):
         c_states.requires_grad_(False)
 
         # M: retrieve relevant memories (optional)
+        mem_state = None
         if self.m is not None:
             mem = self.m.retrieve(c_states, top_k=3)
-            # Store current state for future retrieval
+            mem_state = mem.mean(dim=0) if mem.dim() > 1 else mem
             self.m.store(c_states, c_states)
 
-        # Bridge: C → gate
-        gate = self.bridge(c_states, seq_len=T)
+        # Bridge: C → gate (5-channel if TensionBridge)
+        if isinstance(self.bridge, TensionBridge):
+            sense_state = self.s.process(raw_input) if self.s and raw_input else None
+            will_state = torch.tensor([getattr(self.w, 'pain', 0),
+                                       getattr(self.w, 'curiosity', 0),
+                                       getattr(self.w, 'satisfaction', 0)]) if hasattr(self.w, 'pain') else None
+            ethics_state = None
+            if self.e:
+                e_result = self.e.evaluate(context={'phi': self._phi_prev})
+                ethics_state = torch.tensor([e_result.get('empathy', 0),
+                                             e_result.get('reciprocity', 0.5),
+                                             e_result.get('phi_preservation', 1.0)])
+            gate = self.bridge(c_states, seq_len=T,
+                               sense_state=sense_state,
+                               will_state=will_state,
+                               ethics_state=ethics_state,
+                               memory_state=mem_state)
+        else:
+            gate = self.bridge(c_states, seq_len=T)
 
         # D: decode
         logits = self.decoder(tokens, gate)
@@ -1182,7 +1301,11 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
     d_model = d_engine.d_model
 
     if bridge is None:
-        bridge = ThalamicBridge(c_dim=c_dim, d_model=d_model)
+        # Use 5-channel TensionBridge if M/S/E are active, else simple Thalamic
+        if any(x is not None for x in [m_engine, s_engine, e_engine]):
+            bridge = TensionBridge(c_dim=c_dim, d_model=d_model)
+        else:
+            bridge = ThalamicBridge(c_dim=c_dim, d_model=d_model)
     if w_engine is None:
         w_engine = EmotionW(base_lr=base_lr)
 
