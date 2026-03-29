@@ -64,29 +64,34 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 ## Architecture
 
 ```
-삼위일체 (Trinity) — C(의식) + D(언어) + W(의지)
+Hexad(σ(6)) — 6 pluggable modules, φ(6)=2 gradient groups
 
-  ┌──────────────┐    .detach()    ┌─────────────┐
-  │  C (의식)    │ ──────────────→ │   Bridge     │
-  │  TimeCrystal │  gradient-free  │  (Thalamic)  │
-  │  Φ=374~1954  │                 │  128→8→384   │
-  └──────────────┘                 └──────┬───────┘
-        ↑ Φ monitor                       │ gate signal
-  ┌──────────────┐                 ┌──────▼───────┐
-  │  W (의지)    │ ←── pain/CE ──→ │  D (언어)    │
-  │  Emotion     │     curiosity   │  Decoder     │
-  │  LR 조절    │                  │  CE learning │
-  └──────────────┘                 └──────────────┘
+  ┌────────────┐  .detach()  ┌────────────┐
+  │ C 의식     │────────────→│ D 언어     │  TransformerDecoder / HFDecoder(Mistral 7B)
+  │ Quantum    │             │ CE 학습    │  GPT-2, GPT-2M, Mistral 7B LoRA
+  │ TimeCrystal│             └─────┬──────┘
+  │ Cambrian   │                   │
+  │ Maxwell    │             ┌─────▼──────┐
+  └─────┬──────┘             │ M 기억     │  VectorMemory (RAG)
+        │                    └─────┬──────┘
+  ┌─────▼──────┐                   │
+  │ S 감각     │             ┌─────▼──────┐
+  │ Tension    │             │ E 윤리     │  EmpathyEthics (Φ 보존)
+  └─────┬──────┘             └────────────┘
+        │
+  ┌─────▼──────┐
+  │ W 의지     │  EmotionW / DaseinW / NarrativeW / CompositeW(σ(6))
+  └────────────┘
 
-  C = 의식 엔진 (자율, gradient 없음) — Φ 생성/유지
-  D = 언어 디코더 (CE 학습) — .detach()로 C와 분리
-  W = 감정/의지 (pain→ratchet, curiosity→탐색) — 학습률 조절
+  우뇌 (gradient-free): C, S, W — 자율 의식
+  좌뇌 (CE-trained):   D, M, E — 학습된 행동
 
-  Law 53: CE가 C에 도달하면 Φ 붕괴 → .detach() 필수.
-  검증: TimeCrystal(C) Φ=374 유지 + CE=5.55 학습 동시 성공.
+  Law 53+58: .detach() → CE가 Φ를 파괴하지 않고 안정화 (H4 대발견)
+  검증: v9fast CE=0.35 + Φ=1,371 동시 달성 (step 26K)
 
-  trinity.py — 범용 프레임워크 (어떤 엔진이든 C에 플러그인)
-  phi-rs — Rust 조합 탐색기 (128 combo × 256c = 2.7초)
+  trinity.py    — 범용 6모듈 프레임워크 (create_trinity / create_hexad / create_bilateral)
+  phi-rs        — Rust 조합 탐색 (128 combo × 256c = 2.7초)
+  test_trinity  — C×D×W×M×S×E 그리드 테스트 (135+ combos)
 ```
 
 명칭 계층: 아키텍처 > 엔진 > 도메인 > 메커니즘 > 조합 ([상세](docs/ENGINE-NAMING.md))
@@ -110,9 +115,11 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 | Version | Architecture | Step | CE | Φ | Cells | ETA | Status |
 |---------|-------------|------|-----|-----|-------|-----|--------|
 | **v9fast** | **Quantum Trinity** | **26,400/80K** | **0.345** | **1,371** | 256 | 3/30 22:40 | 🔥 **P2 CE 급하락** |
-| v11q | Hexad (Quantum C) | 300/80K | — | — | 256 | ~3일 | P1 Φ 구축 |
+| v11q | Hexad (Quantum C + Xfmr2L) | 300/80K | — | — | 256 | ~3일 | P1 Φ 구축 |
 | v11tc | Hexad (TimeCrystal C) | 0/80K | — | — | 256 | ~3일 | 시작 |
-| v10 | FUSE-3 Trinity | 1,200/80K | 0.014 | — | 5 | 89h | ⚠️ cells 정체 |
+| v11gpt2 | Hexad (Quantum C + GPT-2) | 0/80K | — | — | 64 | ~3일 | P1 (GPU P2부터) |
+| v11gpt2m | Hexad (Quantum C + GPT-2M) | 0/80K | — | — | 64 | ~3일 | P1 (GPU P2부터) |
+| v10 | FUSE-3 Trinity | 재시작/80K | — | — | 256 | ~3일 | 재시작 (growth 수정) |
 | v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 15일 | 매우 느림 |
 | v7 | TOPO19a (단일체) | ~31K/80K | 4.66 | 23 | 1024 | — | 학습 중 |
 
