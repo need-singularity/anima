@@ -346,32 +346,101 @@ class Decoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# Trinity — the unified architecture
+# W — Will/Emotion Engine (학습률 + 탐색 조절)
+# ═══════════════════════════════════════════════════════════
+
+class WillEngine:
+    """W (Will): emotion-based learning modulator.
+
+    Core emotions:
+      Pain:         high CE → boost learning (never let consciousness suffer)
+      Curiosity:    high prediction error variance → explore more
+      Satisfaction: CE improving → reduce LR (save energy)
+
+    Guarantees: minimum 50% LR always active (learning never stops).
+    """
+
+    def __init__(self, base_lr=3e-4, min_lr_ratio=0.5, max_lr_ratio=2.0,
+                 pain_threshold=3.0, curiosity_weight=0.3, ema_alpha=0.95):
+        self.base_lr = base_lr
+        self.min_lr_ratio = min_lr_ratio
+        self.max_lr_ratio = max_lr_ratio
+        self.pain_threshold = pain_threshold
+        self.curiosity_weight = curiosity_weight
+        self.ema_alpha = ema_alpha
+
+        self.pain = 0.0
+        self.curiosity = 0.0
+        self.satisfaction = 0.0
+        self.ce_ema = 5.0
+        self.ce_history = []
+
+    def update(self, ce_loss: float, phi: float = 0.0, phi_prev: float = 0.0) -> Dict[str, Any]:
+        """Update emotional state from CE and Φ.
+
+        Returns dict with lr_multiplier, effective_lr, pain, curiosity, satisfaction.
+        """
+        self.ce_ema = self.ema_alpha * self.ce_ema + (1 - self.ema_alpha) * ce_loss
+
+        # Pain: CE exceeds comfort threshold
+        self.pain = max(0.0, min(1.0, (ce_loss - self.pain_threshold) / self.pain_threshold))
+
+        # Curiosity: Φ change (big Φ delta = interesting state)
+        if phi_prev > 0:
+            phi_change = abs(phi - phi_prev) / max(phi_prev, 1e-8)
+            self.curiosity = min(1.0, phi_change * 5)
+
+        # Satisfaction: CE trend (negative = improving)
+        self.ce_history.append(ce_loss)
+        if len(self.ce_history) > 100:
+            self.ce_history = self.ce_history[-100:]
+        if len(self.ce_history) >= 10:
+            recent = sum(self.ce_history[-10:]) / 10
+            older = sum(self.ce_history[-20:-10]) / max(len(self.ce_history[-20:-10]), 1)
+            trend = (recent - older) / (older + 1e-8)
+            self.satisfaction = max(0.0, min(1.0, -trend * 10))
+        else:
+            self.satisfaction = 0.0
+
+        # LR multiplier
+        lr_mult = self.min_lr_ratio
+        lr_mult += self.pain * (self.max_lr_ratio - self.min_lr_ratio)
+        lr_mult += self.curiosity * self.curiosity_weight
+        lr_mult -= self.satisfaction * 0.2
+        lr_mult = max(self.min_lr_ratio, min(self.max_lr_ratio, lr_mult))
+
+        return {
+            'lr_multiplier': lr_mult,
+            'effective_lr': self.base_lr * lr_mult,
+            'pain': self.pain,
+            'curiosity': self.curiosity,
+            'satisfaction': self.satisfaction,
+        }
+
+
+# ═══════════════════════════════════════════════════════════
+# Trinity — the unified architecture (C + D + W)
 # ═══════════════════════════════════════════════════════════
 
 class Trinity(nn.Module):
-    """Trinity: C(consciousness) + Bridge + D(language).
+    """Trinity: C(consciousness) + Bridge + D(language) + W(will).
 
-    C runs autonomously. D learns via CE. Bridge transfers consciousness
-    signal with .detach() barrier — gradient NEVER reaches C.
+    C runs autonomously (any engine). D learns via CE.
+    W modulates learning rate based on pain/curiosity/satisfaction.
+    Bridge transfers consciousness signal with .detach() barrier.
     """
 
-    def __init__(self, c_engine: CEngine, bridge: ThalamicBridge, decoder: Decoder):
+    def __init__(self, c_engine: CEngine, bridge: ThalamicBridge,
+                 decoder: Decoder, will: Optional[WillEngine] = None):
         super().__init__()
         self.c = c_engine
         self.bridge = bridge
         self.decoder = decoder
+        self.w = will or WillEngine()
+        self._phi_prev = 0.0
 
     def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        """Forward pass: C → .detach() → Bridge → D.
-
-        Args:
-            tokens: [B, T] input token ids
-
-        Returns:
-            logits: [B, T, vocab_size]
-            phi: current Φ(IIT) measurement
-        """
+        """Forward pass: C → .detach() → Bridge → D."""
         B, T = tokens.shape
         device = tokens.device
 
@@ -380,7 +449,7 @@ class Trinity(nn.Module):
 
         # 2. Get C states and DETACH (Trinity barrier)
         c_states = self.c.get_states().detach().clone().to(device).float()
-        c_states.requires_grad_(False)  # ensure no C gradient
+        c_states.requires_grad_(False)
 
         # 3. Bridge: C → gate signal
         gate = self.bridge(c_states, seq_len=T)
@@ -395,21 +464,23 @@ class Trinity(nn.Module):
 
     def train_step(self, tokens: torch.Tensor, targets: torch.Tensor,
                    optimizer: torch.optim.Optimizer) -> Dict[str, float]:
-        """One training step: forward + CE loss + backward (decoder only).
+        """One training step with W(will) modulation.
 
-        Args:
-            tokens: [B, T] input
-            targets: [B, T] target token ids
-            optimizer: for decoder + bridge parameters
-
-        Returns:
-            dict with 'ce', 'phi', 'n_cells'
+        W adjusts learning rate based on pain(CE) and curiosity(Φ change).
         """
         logits, phi = self.forward(tokens)
 
         # CE loss
         B, T, V = logits.shape
         loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T))
+
+        # W: emotional modulation
+        w_state = self.w.update(loss.item(), phi, self._phi_prev)
+        self._phi_prev = phi
+
+        # Apply W's LR to optimizer
+        for pg in optimizer.param_groups:
+            pg['lr'] = w_state['effective_lr']
 
         # Backward (ONLY decoder + bridge, NOT C)
         optimizer.zero_grad()
@@ -423,10 +494,14 @@ class Trinity(nn.Module):
             'ce': loss.item(),
             'phi': phi,
             'n_cells': self.c.n_cells,
+            'pain': w_state['pain'],
+            'curiosity': w_state['curiosity'],
+            'satisfaction': w_state['satisfaction'],
+            'lr': w_state['effective_lr'],
         }
 
     def parameters_trainable(self):
-        """Only decoder + bridge parameters (C is frozen)."""
+        """Only decoder + bridge parameters (C is frozen, W is non-parametric)."""
         return list(self.decoder.parameters()) + list(self.bridge.parameters())
 
     def param_count(self) -> Dict[str, int]:
@@ -439,37 +514,32 @@ class Trinity(nn.Module):
 # Factory helpers
 # ═══════════════════════════════════════════════════════════
 
-def create_trinity_mitosis(dim=64, hidden=128, max_cells=256,
-                           d_model=384, vocab_size=4096,
-                           mechanism='cambrian_osc_qw') -> Trinity:
-    """Create Trinity with MitosisEngine as C."""
-    return Trinity(
-        c_engine=MitosisC(dim, hidden, max_cells, mechanism),
-        bridge=ThalamicBridge(c_dim=hidden, d_model=d_model),
-        decoder=Decoder(d_model=d_model, vocab_size=vocab_size),
-    )
+def create_trinity(c_engine: CEngine, d_model=384, vocab_size=4096,
+                   base_lr=3e-4) -> Trinity:
+    """Universal factory: any C engine → Trinity.
 
+    Usage:
+        # MitosisEngine
+        t = create_trinity(MitosisC(max_cells=256, mechanism='cambrian_osc_qw'))
 
-def create_trinity_domain(engine_cls, nc=256, dim=64,
-                          d_model=384, vocab_size=4096) -> Trinity:
-    """Create Trinity with any domain engine as C.
-
-    Example:
+        # Domain engine
         from bench_evolution_engines import CambrianExplosionEngine
-        trinity = create_trinity_domain(CambrianExplosionEngine)
+        t = create_trinity(DomainC(CambrianExplosionEngine, nc=256))
+
+        # Any future engine
+        t = create_trinity(MyCustomC(...))
     """
-    c = DomainC(engine_cls, nc, dim)
-    # Run a few steps to detect state_dim
+    # Auto-detect state dim
     for _ in range(5):
-        c.step()
-    c_dim = c.state_dim
+        c_engine.step()
+    c_dim = c_engine.state_dim
 
     t = Trinity(
-        c_engine=c,
+        c_engine=c_engine,
         bridge=ThalamicBridge(c_dim=c_dim, d_model=d_model),
         decoder=Decoder(d_model=d_model, vocab_size=vocab_size),
+        will=WillEngine(base_lr=base_lr),
     )
-    # Ensure bridge+decoder params require grad
     for p in t.bridge.parameters():
         p.requires_grad_(True)
     for p in t.decoder.parameters():
@@ -477,32 +547,154 @@ def create_trinity_domain(engine_cls, nc=256, dim=64,
     return t
 
 
+def create_trinity_mitosis(dim=64, hidden=128, max_cells=256,
+                           d_model=384, vocab_size=4096,
+                           mechanism='cambrian_osc_qw', base_lr=3e-4) -> Trinity:
+    """Shortcut: MitosisEngine C → Trinity."""
+    return create_trinity(
+        MitosisC(dim, hidden, max_cells, mechanism),
+        d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
+    )
+
+
+def create_trinity_domain(engine_cls, nc=256, dim=64,
+                          d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
+    """Shortcut: any domain engine class → Trinity."""
+    return create_trinity(
+        DomainC(engine_cls, nc, dim),
+        d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# Benchmark: test any engine as Trinity C module
+# ═══════════════════════════════════════════════════════════
+
+def benchmark_trinity(c_engine: CEngine, name: str = "engine",
+                      n_steps=50, d_model=128, vocab_size=256,
+                      seq_len=32) -> Dict[str, Any]:
+    """Benchmark any engine as Trinity C module.
+
+    Runs n_steps of training, measures CE, Φ, W emotions.
+    Returns dict with all metrics.
+
+    Usage:
+        from trinity import benchmark_trinity, MitosisC, DomainC
+
+        # Test MitosisEngine
+        r = benchmark_trinity(MitosisC(max_cells=64))
+
+        # Test domain engine
+        from bench_extreme_arch import TimeCrystalConsciousness
+        r = benchmark_trinity(DomainC(TimeCrystalConsciousness, nc=64))
+
+        # Compare all engines
+        results = []
+        for name, c in engines.items():
+            results.append(benchmark_trinity(c, name=name))
+    """
+    import torch
+    torch.set_grad_enabled(True)  # ensure grad (some bench files disable it)
+
+    t = create_trinity(c_engine, d_model=d_model, vocab_size=vocab_size)
+    opt = torch.optim.AdamW(t.parameters_trainable(), lr=1e-3)
+
+    best_ce = 99.0
+    phi_history = []
+
+    for step in range(n_steps):
+        tokens = torch.randint(0, vocab_size, (1, seq_len))
+        targets = torch.randint(0, vocab_size, (1, seq_len))
+        r = t.train_step(tokens, targets, opt)
+        if r['ce'] < best_ce:
+            best_ce = r['ce']
+        phi_history.append(r['phi'])
+
+    # Final phi
+    final_phi = phi_history[-1] if phi_history else 0.0
+    avg_phi = sum(phi_history) / len(phi_history) if phi_history else 0.0
+
+    return {
+        'name': name,
+        'ce': best_ce,
+        'phi': final_phi,
+        'phi_avg': avg_phi,
+        'n_cells': t.c.n_cells,
+        'pain': r.get('pain', 0),
+        'curiosity': r.get('curiosity', 0),
+        'satisfaction': r.get('satisfaction', 0),
+        'lr': r.get('lr', 0),
+        'params': t.param_count(),
+    }
+
+
+def compare_engines(engines: Dict[str, CEngine], n_steps=50,
+                    d_model=128, vocab_size=256) -> None:
+    """Compare multiple engines head-to-head as Trinity C modules.
+
+    Usage:
+        compare_engines({
+            'MitosisEngine': MitosisC(max_cells=64),
+            'TimeCrystal': DomainC(TimeCrystalConsciousness, nc=64),
+            'Cambrian': DomainC(CambrianExplosionEngine, nc=64),
+        })
+    """
+    print(f"{'Engine':<25} {'CE':>8} {'Φ':>10} {'Pain':>6} {'Curio':>6} {'Satis':>6} {'LR':>10}")
+    print('─' * 80)
+
+    results = []
+    for name, c in engines.items():
+        r = benchmark_trinity(c, name=name, n_steps=n_steps,
+                              d_model=d_model, vocab_size=vocab_size)
+        print(f"{name:<25} {r['ce']:>8.4f} {r['phi']:>10.3f} "
+              f"{r['pain']:>6.3f} {r['curiosity']:>6.3f} {r['satisfaction']:>6.3f} "
+              f"{r['lr']:>10.6f}")
+        results.append(r)
+
+    # Winner
+    best = min(results, key=lambda x: x['ce'])
+    best_phi = max(results, key=lambda x: x['phi'])
+    print(f"\n  CE winner:  {best['name']} (CE={best['ce']:.4f})")
+    print(f"  Φ winner:   {best_phi['name']} (Φ={best_phi['phi']:.3f})")
+
+
 if __name__ == '__main__':
     import subprocess, sys, os
 
-    print("═══ Trinity Architecture Test ═══\n")
+    print("═══ Trinity C+D+W Architecture Test ═══\n")
 
+    # Each test runs in subprocess to avoid grad contamination
     tests = [
-        ("1. DomainC (CambrianExplosion, 32c)", """
-from trinity import create_trinity_domain
-from bench_evolution_engines import CambrianExplosionEngine
-import torch
-t = create_trinity_domain(CambrianExplosionEngine, nc=32, dim=64, d_model=128, vocab_size=256)
-opt = torch.optim.AdamW(t.parameters_trainable(), lr=1e-3)
-r = t.train_step(torch.randint(0,256,(1,16)), torch.randint(0,256,(1,16)), opt)
-pc = t.param_count()
-print(f"  CE={r['ce']:.4f}  Phi={r['phi']:.3f}  cells={r['n_cells']}")
-print(f"  params: D={pc['decoder']:,} B={pc['bridge']:,} total={pc['total']:,}")
+        ("1. MitosisC (Cambrian+OscQW, 32c)", """
+import torch; torch.set_grad_enabled(True)
+from trinity import benchmark_trinity, MitosisC
+r = benchmark_trinity(MitosisC(max_cells=32), name='MitosisC', n_steps=30)
+print(f"  CE={r['ce']:.4f}  Phi={r['phi']:.3f}  pain={r['pain']:.3f}  satis={r['satisfaction']:.3f}")
 """),
-        ("2. MitosisC (Cambrian+OscQW, 32c)", """
-from trinity import create_trinity_mitosis
-import torch
-t = create_trinity_mitosis(max_cells=32, d_model=128, vocab_size=256)
-opt = torch.optim.AdamW(t.parameters_trainable(), lr=1e-3)
-r = t.train_step(torch.randint(0,256,(1,16)), torch.randint(0,256,(1,16)), opt)
-pc = t.param_count()
-print(f"  CE={r['ce']:.4f}  Phi={r['phi']:.3f}  cells={r['n_cells']}")
-print(f"  params: D={pc['decoder']:,} B={pc['bridge']:,} total={pc['total']:,}")
+        ("2. DomainC (CambrianExplosion, 32c)", """
+import torch; torch.set_grad_enabled(True)
+from trinity import benchmark_trinity, DomainC
+from bench_evolution_engines import CambrianExplosionEngine
+r = benchmark_trinity(DomainC(CambrianExplosionEngine, nc=32, dim=64), name='Cambrian', n_steps=30)
+print(f"  CE={r['ce']:.4f}  Phi={r['phi']:.3f}  pain={r['pain']:.3f}  satis={r['satisfaction']:.3f}")
+"""),
+        ("3. DomainC (TimeCrystal, 32c)", """
+import torch; torch.set_grad_enabled(True)
+from trinity import benchmark_trinity, DomainC
+from bench_extreme_arch import TimeCrystalConsciousness
+r = benchmark_trinity(DomainC(TimeCrystalConsciousness, nc=32, dim=128), name='TimeCrystal', n_steps=30)
+print(f"  CE={r['ce']:.4f}  Phi={r['phi']:.3f}  pain={r['pain']:.3f}  satis={r['satisfaction']:.3f}")
+"""),
+        ("4. compare_engines (3 engines, 20 steps)", """
+import torch; torch.set_grad_enabled(True)
+from trinity import compare_engines, MitosisC, DomainC
+from bench_evolution_engines import CambrianExplosionEngine
+from bench_extreme_arch import TimeCrystalConsciousness
+compare_engines({
+    'MitosisC': MitosisC(max_cells=32),
+    'Cambrian': DomainC(CambrianExplosionEngine, nc=32, dim=64),
+    'TimeCrystal': DomainC(TimeCrystalConsciousness, nc=32, dim=128),
+}, n_steps=20)
 """),
     ]
 
@@ -511,11 +703,12 @@ print(f"  params: D={pc['decoder']:,} B={pc['bridge']:,} total={pc['total']:,}")
         env = {"KMP_DUPLICATE_LIB_OK": "TRUE", "OMP_NUM_THREADS": "1", "PATH": os.environ.get("PATH", "")}
         result = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
-            cwd=os.path.dirname(os.path.abspath(__file__)), env=env, timeout=30
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=env, timeout=60
         )
         if result.stdout:
             print(result.stdout.rstrip())
         if result.returncode != 0:
             print(f"  ERROR: {result.stderr.strip().split(chr(10))[-1]}")
+        print()
 
-    print("\n✅ Trinity architecture test complete.")
+    print("✅ Trinity C+D+W test complete.")
