@@ -78,6 +78,8 @@ BENCHMARK_DATA = {
     'TOPO7': {'topology': 'ring',       'cells': 512, 'neighbors': 6, 'frustration': True,  'phi': 104.85,'mult': 84.4},
     'TOPO8': {'topology': 'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 535.46,'mult': 431.1},
     'TOPO9': {'topology': 'small_world','cells': 512, 'neighbors': 4, 'frustration': True,  'phi': 127.26,'mult': 102.5},
+    'TOPO10':{'topology': 'hypercube',  'cells': 2048,'neighbors': 11,'frustration': True,  'phi': 400.88,'mult': 352.6},
+    'TOPO11':{'topology': 'ring',       'cells': 2048,'neighbors': 2, 'frustration': True,  'phi': 287.24,'mult': 252.7},
 }
 
 BASELINE_PHI = 1.2421
