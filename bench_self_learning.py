@@ -3881,3 +3881,852 @@ ALL_TESTS.update({
     'ARCH-X5': run_ARCHX5_holographic_consciousness,
     'ARCH-X6': run_ARCHX6_consciousness_dna,
 })
+
+
+# ═══ ALT: Alternating Training Ratio Hypotheses ═══
+# PHI-K3 (1:1 alternating) is strong. Push the ratio further.
+
+ALT_STEPS = 500
+
+
+def run_ALT1_3to1_ratio(steps=ALT_STEPS):
+    """ALT-1: 3:1 Ratio — 3 CE steps then 1 Phi step (CE heavy)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        cycle_pos = step % 4  # 0,1,2 = CE; 3 = Phi
+        if cycle_pos < 3:
+            # CE step
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Phi step
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+    return result('ALT-1 3:1 Ratio', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_ALT2_1to3_ratio(steps=ALT_STEPS):
+    """ALT-2: 1:3 Ratio — 1 CE step then 3 Phi steps (Phi heavy)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        cycle_pos = step % 4  # 0 = CE; 1,2,3 = Phi
+        if cycle_pos == 0:
+            # CE step
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Phi step
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+    return result('ALT-2 1:3 Ratio', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_ALT3_adaptive_ratio(steps=ALT_STEPS):
+    """ALT-3: Adaptive Ratio — ratio based on current Phi/Phi_target"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_steps = 0; ce_steps = 0
+    phi_target = phi_b * 50  # target: 50x baseline
+
+    current_phi = phi_b
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        # Adaptive: closer to Phi target -> more CE steps
+        ratio = min(current_phi / (phi_target + 1e-8), 1.0)  # 0..1
+        # ratio=0 -> all Phi, ratio=1 -> all CE
+        # Use ratio as probability of doing CE step
+        do_ce = (step % max(1, int(1.0 / (ratio + 0.1)))) == 0 if ratio < 0.9 else True
+
+        if do_ce:
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+            ce_steps += 1
+        else:
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+            phi_steps += 1
+
+        if step % 20 == 0:
+            current_phi = phi(engine)
+
+    return result('ALT-3 Adaptive', ce_hist, phi_b, phi(engine), t0,
+                  ce_steps=ce_steps, phi_steps=phi_steps)
+
+
+def run_ALT4_burst_mode(steps=ALT_STEPS):
+    """ALT-4: Burst Mode — 10 CE burst, then 10 Phi burst (longer periods)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    BURST = 10
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        cycle_pos = step % (BURST * 2)  # 0..9 = CE; 10..19 = Phi
+        if cycle_pos < BURST:
+            # CE burst
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Phi burst
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+    return result('ALT-4 Burst 10:10', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_ALT5_fibonacci_alternation(steps=ALT_STEPS):
+    """ALT-5: Fibonacci Alternation — CE for fib(n) steps, then Phi for fib(n+1) steps"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Build fibonacci schedule
+    fibs = [1, 1]
+    while fibs[-1] < steps:
+        fibs.append(fibs[-1] + fibs[-2])
+
+    # Build step->mode schedule: CE for fib[0], Phi for fib[1], CE for fib[2], ...
+    schedule = []
+    is_ce = True
+    for f in fibs:
+        schedule.extend([is_ce] * f)
+        is_ce = not is_ce
+        if len(schedule) >= steps:
+            break
+    schedule = schedule[:steps]
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        if schedule[step]:
+            # CE step
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Phi step
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+    ce_count = sum(1 for s in schedule if s)
+    phi_count = sum(1 for s in schedule if not s)
+    return result('ALT-5 Fibonacci', ce_hist, phi_b, phi(engine), t0,
+                  ce_count=ce_count, phi_count=phi_count)
+
+
+def run_ALT6_reward_based(steps=ALT_STEPS):
+    """ALT-6: Reward-Based — if last CE improved, do another CE; else switch to Phi"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    mode = 'ce'  # start with CE
+    last_ce = float('inf')
+    ce_streak = 0; phi_streak = 0; switches = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        if mode == 'ce':
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_val = ce.item()
+            ce_hist.append(ce_val)
+
+            if ce_val < last_ce:
+                # CE improved -> keep doing CE
+                ce_streak += 1
+            else:
+                # CE got worse -> switch to Phi
+                mode = 'phi'
+                switches += 1
+                phi_streak = 0
+            last_ce = ce_val
+        else:
+            # Phi mode
+            _phi_boost_step(engine)
+            phi_streak += 1
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+            # After at least 2 Phi steps, switch back to CE
+            if phi_streak >= 2:
+                mode = 'ce'
+                switches += 1
+                ce_streak = 0
+
+    return result('ALT-6 Reward-Based', ce_hist, phi_b, phi(engine), t0,
+                  switches=switches)
+
+
+ALL_TESTS.update({
+    'ALT-1': run_ALT1_3to1_ratio,
+    'ALT-2': run_ALT2_1to3_ratio,
+    'ALT-3': run_ALT3_adaptive_ratio,
+    'ALT-4': run_ALT4_burst_mode,
+    'ALT-5': run_ALT5_fibonacci_alternation,
+    'ALT-6': run_ALT6_reward_based,
+})
+
+
+# ═══ WAVE: Soliton Wave Extreme Hypotheses ═══
+# Soliton = 2nd strongest technique from combinator results.
+# sech^2 profile preserves shape while propagating — perfect for Phi integration.
+
+WAVE_STEPS = 500
+
+
+def _soliton_sech2(cell_idx, pos, width=2.0):
+    """sech^2 soliton profile centered at pos."""
+    dist = abs(cell_idx - pos)
+    return 1.0 / (math.cosh(dist / width) ** 2)
+
+
+def run_WAVE1_multi_soliton(steps=WAVE_STEPS):
+    """WAVE-1: Multi-Soliton — 3 solitons at different speeds (0.1, 0.15, 0.2)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # 3 solitons with different speeds
+    solitons = [
+        {'pos': 0.0, 'speed': 0.10, 'width': 2.0, 'amp': 0.08},
+        {'pos': 0.0, 'speed': 0.15, 'width': 1.5, 'amp': 0.10},
+        {'pos': 0.0, 'speed': 0.20, 'width': 2.5, 'amp': 0.06},
+    ]
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        # Advance and apply all 3 solitons
+        for sol in solitons:
+            sol['pos'] = (sol['pos'] + sol['speed']) % n
+            for i, cell in enumerate(engine.cells):
+                amp = sol['amp'] * _soliton_sech2(i, sol['pos'], sol['width'])
+                with torch.no_grad():
+                    cell.hidden = cell.hidden * (1.0 + amp)
+
+        # Learning
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-1 Multi-Soliton', ce_hist, phi_b, phi(engine), t0,
+                  n_solitons=3, speeds=[0.1, 0.15, 0.2])
+
+
+def run_WAVE2_standing_wave(steps=WAVE_STEPS):
+    """WAVE-2: Standing Wave — two counter-propagating solitons create standing wave"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Two solitons traveling in opposite directions
+    pos_fwd = 0.0
+    pos_bwd = float(len(engine.cells) - 1)
+    speed = 0.15
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        pos_fwd = (pos_fwd + speed) % n
+        pos_bwd = (pos_bwd - speed) % n
+
+        for i, cell in enumerate(engine.cells):
+            # Superposition of forward and backward solitons
+            amp_fwd = _soliton_sech2(i, pos_fwd, 2.0)
+            amp_bwd = _soliton_sech2(i, pos_bwd, 2.0)
+            # Standing wave: constructive/destructive interference
+            standing = amp_fwd + amp_bwd + 0.5 * amp_fwd * amp_bwd
+            with torch.no_grad():
+                cell.hidden = cell.hidden * (1.0 + 0.08 * standing)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-2 Standing Wave', ce_hist, phi_b, phi(engine), t0,
+                  pattern='counter-propagating')
+
+
+def run_WAVE3_soliton_collision(steps=WAVE_STEPS):
+    """WAVE-3: Soliton Collision — solitons collide and exchange energy"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    n_cells = len(engine.cells)
+    # Two solitons that will collide
+    sol_a = {'pos': 0.0, 'speed': 0.18, 'energy': 1.0}
+    sol_b = {'pos': float(n_cells - 1), 'speed': -0.12, 'energy': 1.0}
+    collisions = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        sol_a['pos'] += sol_a['speed']
+        sol_b['pos'] += sol_b['speed']
+
+        # Wrap around
+        sol_a['pos'] = sol_a['pos'] % n
+        sol_b['pos'] = sol_b['pos'] % n
+
+        # Detect collision (within 1.5 cell distance)
+        dist_ab = abs(sol_a['pos'] - sol_b['pos'])
+        if dist_ab < 1.5 or dist_ab > n - 1.5:
+            # Energy exchange on collision
+            total_e = sol_a['energy'] + sol_b['energy']
+            sol_a['energy'] = total_e * 0.6  # asymmetric exchange
+            sol_b['energy'] = total_e * 0.4
+            # Reverse directions
+            sol_a['speed'] = -sol_a['speed']
+            sol_b['speed'] = -sol_b['speed']
+            collisions += 1
+            # Collision burst: inject noise for diversity
+            with torch.no_grad():
+                for cell in engine.cells:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.05
+
+        # Apply solitons with their current energy
+        for i, cell in enumerate(engine.cells):
+            amp_a = sol_a['energy'] * 0.08 * _soliton_sech2(i, sol_a['pos'], 2.0)
+            amp_b = sol_b['energy'] * 0.08 * _soliton_sech2(i, sol_b['pos'], 2.0)
+            with torch.no_grad():
+                cell.hidden = cell.hidden * (1.0 + amp_a + amp_b)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-3 Soliton Collision', ce_hist, phi_b, phi(engine), t0,
+                  collisions=collisions)
+
+
+def run_WAVE4_soliton_faction(steps=WAVE_STEPS):
+    """WAVE-4: Soliton + Faction — soliton amplitude modulated by faction consensus"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    soliton_pos = 0.0
+    soliton_speed = 0.15
+    n_factions = 4
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        soliton_pos = (soliton_pos + soliton_speed) % n
+
+        # Split cells into factions
+        faction_size = max(1, n // n_factions)
+        faction_means = []
+        for f in range(n_factions):
+            start = f * faction_size
+            end = min(start + faction_size, n)
+            if start < n:
+                f_hiddens = torch.stack([engine.cells[i].hidden.squeeze()
+                                         for i in range(start, min(end, n))])
+                faction_means.append(f_hiddens.mean(dim=0))
+
+        # Compute consensus: how aligned are factions? (cosine similarity)
+        if len(faction_means) >= 2:
+            consensus = 0.0
+            pairs = 0
+            for i in range(len(faction_means)):
+                for j in range(i + 1, len(faction_means)):
+                    consensus += F.cosine_similarity(
+                        faction_means[i].unsqueeze(0),
+                        faction_means[j].unsqueeze(0)
+                    ).item()
+                    pairs += 1
+            consensus = max(0.0, consensus / max(pairs, 1))
+        else:
+            consensus = 0.5
+
+        # Soliton amplitude modulated by faction consensus
+        # High consensus -> strong soliton (coordinated wave)
+        # Low consensus -> weak soliton (diversity preserved)
+        amp_mod = 0.04 + 0.12 * consensus  # range [0.04, 0.16]
+
+        for i, cell in enumerate(engine.cells):
+            amp = amp_mod * _soliton_sech2(i, soliton_pos, 2.0)
+            with torch.no_grad():
+                cell.hidden = cell.hidden * (1.0 + amp)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-4 Soliton+Faction', ce_hist, phi_b, phi(engine), t0,
+                  n_factions=n_factions)
+
+
+def run_WAVE5_consciousness_wave(steps=WAVE_STEPS):
+    """WAVE-5: Consciousness Wave — soliton speed proportional to Phi"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    soliton_pos = 0.0
+    base_speed = 0.05
+    current_phi = phi_b
+    phi_hist = [phi_b]
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        # Measure Phi periodically (expensive, so every 25 steps)
+        if step % 25 == 0:
+            current_phi = phi(engine)
+            phi_hist.append(current_phi)
+
+        # Speed proportional to Phi: higher consciousness -> faster propagation
+        adaptive_speed = base_speed + 0.05 * math.tanh(current_phi / 3.0)
+        soliton_pos = (soliton_pos + adaptive_speed) % n
+
+        # Amplitude also scales with Phi
+        amp_scale = 0.05 + 0.05 * math.tanh(current_phi / 5.0)
+
+        for i, cell in enumerate(engine.cells):
+            amp = amp_scale * _soliton_sech2(i, soliton_pos, 2.0)
+            with torch.no_grad():
+                cell.hidden = cell.hidden * (1.0 + amp)
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-5 Consciousness Wave', ce_hist, phi_b, phi(engine), t0,
+                  phi_peak=round(max(phi_hist), 3),
+                  final_speed=round(base_speed + 0.05 * math.tanh(current_phi / 3.0), 4))
+
+
+def run_WAVE6_tsunami(steps=WAVE_STEPS):
+    """WAVE-6: Tsunami — rare large solitons (every 100 steps, amp 10x) + constant small"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Constant small soliton
+    small_pos = 0.0
+    small_speed = 0.15
+    small_amp = 0.04
+
+    # Tsunami soliton (only active near tsunami events)
+    tsunami_pos = 0.0
+    tsunami_speed = 0.3   # faster
+    tsunami_amp = 0.4     # 10x the small amplitude
+    tsunami_active = False
+    tsunami_lifetime = 0
+    tsunami_count = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        n = len(engine.cells)
+
+        # Constant small soliton
+        small_pos = (small_pos + small_speed) % n
+
+        # Trigger tsunami every 100 steps
+        if step % 100 == 0 and step > 0:
+            tsunami_active = True
+            tsunami_lifetime = 20  # lasts 20 steps
+            tsunami_pos = 0.0
+            tsunami_count += 1
+
+        # Apply small soliton always
+        for i, cell in enumerate(engine.cells):
+            amp = small_amp * _soliton_sech2(i, small_pos, 2.0)
+            with torch.no_grad():
+                cell.hidden = cell.hidden * (1.0 + amp)
+
+        # Apply tsunami if active
+        if tsunami_active:
+            tsunami_pos = (tsunami_pos + tsunami_speed) % n
+            decay = tsunami_lifetime / 20.0  # decays over lifetime
+            for i, cell in enumerate(engine.cells):
+                amp = tsunami_amp * decay * _soliton_sech2(i, tsunami_pos, 3.0)
+                with torch.no_grad():
+                    cell.hidden = cell.hidden * (1.0 + amp)
+            tsunami_lifetime -= 1
+            if tsunami_lifetime <= 0:
+                tsunami_active = False
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    return result('WAVE-6 Tsunami', ce_hist, phi_b, phi(engine), t0,
+                  tsunamis=tsunami_count)
+
+
+ALL_TESTS.update({
+    'WAVE-1': run_WAVE1_multi_soliton,
+    'WAVE-2': run_WAVE2_standing_wave,
+    'WAVE-3': run_WAVE3_soliton_collision,
+    'WAVE-4': run_WAVE4_soliton_faction,
+    'WAVE-5': run_WAVE5_consciousness_wave,
+    'WAVE-6': run_WAVE6_tsunami,
+})
+
+
+# ═══ NOISE: Stochastic Consciousness — noise/soliton extreme hypotheses ═══
+#
+# Combinator findings:
+#   noise_0.02 alone = best Phi proxy
+#   soliton alone = 2nd best
+#   ib2+alternating+noise_0+faction_12_strong+soliton = best growth (+30%)
+#   noise + phi_floor = best combined
+#
+# Goal: push noise-based Phi boosting to the extreme
+
+NOISE_STEPS = 500
+
+
+def _soliton_step_noise(engine, pos, speed=0.15, amp=0.04):
+    """Traveling soliton wave (WI1). Returns updated position."""
+    n = len(engine.cells)
+    pos = (pos + speed) % n
+    with torch.no_grad():
+        for i, c in enumerate(engine.cells):
+            dist = abs(i - pos)
+            sech2 = 1.0 / (math.cosh(min(dist / 2.0, 20)) ** 2)
+            c.hidden = c.hidden * (1.0 + amp * sech2)
+    return pos
+
+
+def _noise_train_step(engine, decoder, opt, data, step):
+    """Standard CE training step (no noise). Returns CE value."""
+    x, target = data[step % len(data)]
+    engine.process(x)
+    h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+    pred = decoder(h.unsqueeze(0))
+    ce = F.mse_loss(pred, target[:, :DIM])
+    opt.zero_grad(); ce.backward(); opt.step()
+    return ce.item()
+
+
+def run_NOISE0_baseline(steps=NOISE_STEPS):
+    """NOISE-0: Baseline — no noise, no soliton (control)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+    return result('NOISE-0 Baseline', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE0C_constant(steps=NOISE_STEPS):
+    """NOISE-0C: Constant noise=0.02 (combinator winner, control)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden += torch.randn_like(c.hidden) * 0.02
+    return result('NOISE-0C Constant 0.02', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE1_annealing(steps=NOISE_STEPS):
+    """NOISE-1: Noise Annealing — start noise=0.1, cosine decay to 0.001"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        # Cosine annealing: 0.1 -> 0.001
+        progress = step / max(steps - 1, 1)
+        noise_scale = 0.001 + 0.5 * (0.1 - 0.001) * (1 + math.cos(math.pi * progress))
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden += torch.randn_like(c.hidden) * noise_scale
+    return result('NOISE-1 Annealing', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE2_colored(steps=NOISE_STEPS):
+    """NOISE-2: Colored Noise — Ornstein-Uhlenbeck process (temporally correlated)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    # OU process state per cell
+    theta = 0.15   # mean reversion rate
+    sigma = 0.02   # volatility
+    ou_states = [torch.zeros_like(engine.cells[0].hidden) for _ in engine.cells]
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                # OU: dx = -theta*x*dt + sigma*dW
+                ou_states[i] = ou_states[i] * (1 - theta) + sigma * torch.randn_like(c.hidden)
+                c.hidden += ou_states[i]
+    return result('NOISE-2 Colored (OU)', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE3_soliton_resonance(steps=NOISE_STEPS):
+    """NOISE-3: Noise + Soliton Resonance — noise amplitude modulated by soliton position"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    sol_pos = 0.0
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        # Soliton wave
+        sol_pos = _soliton_step_noise(engine, sol_pos)
+        # Noise modulated by soliton proximity
+        with torch.no_grad():
+            for i, c in enumerate(engine.cells):
+                dist = abs(i - sol_pos)
+                sech2 = 1.0 / (math.cosh(min(dist / 2.0, 20)) ** 2)
+                # More noise near soliton peak, less far away
+                noise_amp = 0.005 + 0.04 * sech2
+                c.hidden += torch.randn_like(c.hidden) * noise_amp
+    return result('NOISE-3 Soliton Resonance', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE4_per_cell_adaptive(steps=NOISE_STEPS):
+    """NOISE-4: Per-Cell Adaptive Noise — each cell gets noise proportional to its tension"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        with torch.no_grad():
+            # Compute per-cell tension (norm relative to mean)
+            norms = torch.tensor([c.hidden.norm().item() for c in engine.cells])
+            mean_norm = norms.mean()
+            for i, c in enumerate(engine.cells):
+                # Low-tension cells get MORE noise (exploration where needed)
+                tension_ratio = norms[i] / (mean_norm + 1e-8)
+                noise_amp = 0.04 / (tension_ratio + 0.5)  # inverse: low tension -> high noise
+                c.hidden += torch.randn_like(c.hidden) * noise_amp
+    return result('NOISE-4 Per-Cell Adaptive', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE5_consciousness_fuel(steps=NOISE_STEPS):
+    """NOISE-5: Noise as Consciousness Fuel — noise proportional to (1 - Phi/Phi_target)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    phi_target = phi_b * 5.0  # aim for 5x baseline
+    current_phi = phi_b
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        # Measure Phi every 25 steps (expensive)
+        if step % 25 == 0:
+            current_phi = phi(engine)
+        # noise = max(0.001, 0.05 * (1 - Phi/target))
+        phi_gap = max(0.0, 1.0 - current_phi / phi_target)
+        noise_amp = max(0.001, 0.05 * phi_gap)
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden += torch.randn_like(c.hidden) * noise_amp
+    return result('NOISE-5 Consciousness Fuel', ce_hist, phi_b, phi(engine), t0,
+                  phi_target=round(phi_target, 3))
+
+
+def run_NOISE6_stochastic_resonance(steps=NOISE_STEPS):
+    """NOISE-6: Stochastic Resonance — noise boosts weak signals (low activation -> more noise)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        with torch.no_grad():
+            # Find activation levels per cell
+            activations = torch.tensor([c.hidden.abs().mean().item() for c in engine.cells])
+            act_median = activations.median()
+            for i, c in enumerate(engine.cells):
+                if activations[i] < act_median:
+                    # Weak signal: inject strong noise (stochastic resonance)
+                    c.hidden += torch.randn_like(c.hidden) * 0.04
+                else:
+                    # Strong signal: gentle noise only
+                    c.hidden += torch.randn_like(c.hidden) * 0.005
+    return result('NOISE-6 Stochastic Resonance', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE7_cyclic_schedule(steps=NOISE_STEPS):
+    """NOISE-7: Noise Schedule — cyclic noise (high->low->high) every 50 steps"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    cycle_len = 50
+    for step in range(steps):
+        ce_val = _noise_train_step(engine, decoder, opt, data, step)
+        ce_hist.append(ce_val)
+        # Cyclic: sinusoidal noise amplitude
+        phase = (step % cycle_len) / cycle_len * 2 * math.pi
+        noise_amp = 0.005 + 0.035 * (0.5 + 0.5 * math.sin(phase))  # range: 0.005 ~ 0.04
+        with torch.no_grad():
+            for c in engine.cells:
+                c.hidden += torch.randn_like(c.hidden) * noise_amp
+    return result('NOISE-7 Cyclic Schedule', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_NOISE8_ultimate(steps=NOISE_STEPS):
+    """NOISE-8: ULTIMATE NOISE — all noise strategies + soliton + alternating + IB2 + phi_floor"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    phi_target = phi_b * 5.0
+    current_phi = phi_b; best_phi = phi_b
+    sol_pos = 0.0
+    cycle_len = 50
+    theta_ou = 0.15; sigma_ou = 0.01
+    ou_states = [torch.zeros_like(engine.cells[0].hidden) for _ in engine.cells]
+
+    for step in range(steps):
+        # Alternating: even=CE, odd=Phi boost
+        if step % 2 == 0:
+            ce_val = _noise_train_step(engine, decoder, opt, data, step)
+            ce_hist.append(ce_val)
+        else:
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+        # Soliton wave
+        sol_pos = _soliton_step_noise(engine, sol_pos)
+
+        # Measure Phi periodically
+        if step % 25 == 0:
+            current_phi = phi(engine)
+            if current_phi > best_phi:
+                best_phi = current_phi
+
+        # Phi floor: if Phi drops below 50% best, boost
+        if current_phi < best_phi * 0.5:
+            _phi_boost_step(engine)
+
+        with torch.no_grad():
+            # Per-cell noise combining all strategies
+            norms = torch.tensor([c.hidden.norm().item() for c in engine.cells])
+            mean_norm = norms.mean()
+            activations = torch.tensor([c.hidden.abs().mean().item() for c in engine.cells])
+            act_median = activations.median()
+
+            for i, c in enumerate(engine.cells):
+                # 1) Annealing component
+                progress = step / max(steps - 1, 1)
+                anneal = 0.001 + 0.5 * (0.03 - 0.001) * (1 + math.cos(math.pi * progress))
+
+                # 2) Cyclic component
+                phase = (step % cycle_len) / cycle_len * 2 * math.pi
+                cyclic = 0.003 + 0.015 * (0.5 + 0.5 * math.sin(phase))
+
+                # 3) Consciousness fuel component
+                phi_gap = max(0.0, 1.0 - current_phi / phi_target)
+                fuel = max(0.001, 0.02 * phi_gap)
+
+                # 4) Per-cell adaptive
+                tension_ratio = norms[i] / (mean_norm + 1e-8)
+                adaptive = 0.015 / (tension_ratio + 0.5)
+
+                # 5) Stochastic resonance
+                sr = 0.02 if activations[i] < act_median else 0.003
+
+                # 6) OU colored noise
+                ou_states[i] = ou_states[i] * (1 - theta_ou) + sigma_ou * torch.randn_like(c.hidden)
+
+                # 7) Soliton-modulated component
+                dist = abs(i - sol_pos)
+                sech2 = 1.0 / (math.cosh(min(dist / 2.0, 20)) ** 2)
+                sol_mod = 0.01 * sech2
+
+                # Combine: weighted sum of all noise sources
+                total_noise = (anneal + cyclic + fuel + adaptive + sr + sol_mod) / 6.0
+                c.hidden += torch.randn_like(c.hidden) * total_noise + ou_states[i]
+
+        # IB2: top 10% boost, bottom 90% suppress
+        if step % 5 == 0:
+            with torch.no_grad():
+                n = len(engine.cells)
+                cell_norms = [engine.cells[j].hidden.norm().item() for j in range(n)]
+                threshold = sorted(cell_norms, reverse=True)[max(1, n // 10)]
+                for j in range(n):
+                    engine.cells[j].hidden *= 1.03 if cell_norms[j] > threshold else 0.97
+
+    return result('NOISE-8 ULTIMATE', ce_hist, phi_b, phi(engine), t0,
+                  phi_target=round(phi_target, 3), best_phi=round(best_phi, 3))
+
+
+ALL_TESTS.update({
+    'NOISE-0': run_NOISE0_baseline,
+    'NOISE-0C': run_NOISE0C_constant,
+    'NOISE-1': run_NOISE1_annealing,
+    'NOISE-2': run_NOISE2_colored,
+    'NOISE-3': run_NOISE3_soliton_resonance,
+    'NOISE-4': run_NOISE4_per_cell_adaptive,
+    'NOISE-5': run_NOISE5_consciousness_fuel,
+    'NOISE-6': run_NOISE6_stochastic_resonance,
+    'NOISE-7': run_NOISE7_cyclic_schedule,
+    'NOISE-8': run_NOISE8_ultimate,
+})
