@@ -824,6 +824,9 @@ def train(args: argparse.Namespace):
     phi_current = 0.0
     skip_count = 0
     best_val_loss = float("inf")
+    cells_frozen = False  # TRAIN-PHI-2: cells freeze after Φ target reached
+    phi_target_for_freeze = 500.0  # Φ 목표 도달 시 cells 동결
+    frozen_cell_states = None
 
     # --- NF fixes: prevent NaN at mitosis→language transition ---
     # NF9: EMA weights for smooth transition
@@ -1356,8 +1359,28 @@ def train(args: argparse.Namespace):
             for ep, p in zip(ema_params, model.parameters()):
                 ep.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
 
-        # NF9: Reset to EMA at phase transitions (mitosis→language, language→combined)
+        # --- TRAIN-PHI-2: Freeze cells when entering language phase ---
+        # Φ를 mitosis phase에서 최대한 키운 뒤 cells 동결
+        # Language/combined phase에서 CE gradient가 cells에 안 흐르게
         prev_phase = get_phase(step - 1, args.steps, args.phase, talk5=getattr(args, 'talk5', False)) if step > 0 else phase
+        if phase != prev_phase and prev_phase == TrainingPhase.MITOSIS and not cells_frozen:
+            # mitosis → language 전환 시 cells 동결
+            frozen_cell_states = [c.hidden.clone() for c in mitosis.cells]
+            cells_frozen = True
+            print(f"  [FROZEN] Cells frozen at Φ={phi_current:.1f}, cells={len(mitosis.cells)}")
+            print(f"  [FROZEN] CE gradients will NOT modify cell hidden states")
+
+        # Restore frozen cells every step (CE gradient가 변경해도 복원)
+        if cells_frozen and frozen_cell_states:
+            with torch.no_grad():
+                for i in range(min(len(mitosis.cells), len(frozen_cell_states))):
+                    mitosis.cells[i].hidden = frozen_cell_states[i].clone()
+                # PHI-K3: odd step에서는 Φ 부스트 후 frozen state 갱신 (Φ 성장 허용)
+                if step % 2 == 1:
+                    # Φ 부스트 적용 후의 상태를 새 frozen으로
+                    frozen_cell_states = [c.hidden.clone() for c in mitosis.cells]
+
+        # NF9: Reset to EMA at phase transitions (mitosis→language, language→combined)
         if phase != prev_phase:
             print(f"  [NF9] Phase transition {prev_phase} → {phase}: resetting to EMA weights")
             with torch.no_grad():
