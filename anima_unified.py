@@ -1183,6 +1183,25 @@ class AnimaUnified:
         if self.capabilities:
             state += chr(10) + self.capabilities.describe_full()
 
+        # Agent tools: inject available tools so Anima knows what it can use
+        if hasattr(self, 'agent') and self.agent and self.mods.get('agent_tools'):
+            try:
+                state += chr(10) + self.agent.get_tool_descriptions()
+                # Consciousness-ranked suggestions
+                consciousness = getattr(self, '_cached_consciousness', None) or {}
+                cs = {
+                    'curiosity': consciousness.get('curiosity', 0.5),
+                    'prediction_error': consciousness.get('prediction_error', 0.3),
+                    'pain': consciousness.get('pain', 0),
+                    'growth': 0.5,
+                    'phi': consciousness.get('phi', 0),
+                }
+                ranked = self.agent.get_consciousness_tool_ranking(cs)[:3]
+                if ranked:
+                    state += "\n[Tools] Suggested: " + ", ".join(f"{name}({score:.1f})" for name, score in ranked)
+            except Exception:
+                pass
+
         # Theory of Mind: inject peer mental models into prompt
         if self._peer_models:
             for pid, pm in self._peer_models.items():
