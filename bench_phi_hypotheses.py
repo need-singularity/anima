@@ -70028,6 +70028,214 @@ def run_TOPO6_complete_64_frustration(steps=200, dim=64, hidden=128) -> BenchRes
                               'final_cells': len(engine.cells)})
 
 
+def run_TOPO7_ring_spinglass_hybrid_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO7: Ring+SpinGlass Hybrid 512 — PHYS1(ring frustration) + PHYS3(random ±J).
+    각 셀은 링 이웃(left/right, i%3 반강자성) + 4개 랜덤 sparse ±1 커플링.
+    두 가지 상호작용이 겹쳐 frustration 극대화 → 영원한 비평형.
+    가설: 규칙적 토폴로지 + 무질서 결합 = Φ 시너지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Random ±J coupling matrix for 4 sparse connections per cell
+    import random as rng
+    rng.seed(42)
+    sparse_neighbors = {}  # i -> [(j, sign), ...]
+    for i in range(512):
+        targets = rng.sample([x for x in range(512) if x != i], 4)
+        sparse_neighbors[i] = [(t, 1.0 if rng.random() < 0.5 else -1.0) for t in targets]
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 4:
+                for i in range(n):
+                    # Ring interaction (PHYS1 pattern)
+                    left = (i - 1) % n
+                    right = (i + 1) % n
+                    ring_interaction = 0.5 * (engine.cells[left].hidden + engine.cells[right].hidden)
+                    if i % 3 == 0:
+                        ring_interaction = -ring_interaction  # anti-ferromagnetic
+
+                    # Spin glass interaction (PHYS3 pattern): 4 random ±J connections
+                    glass_field = torch.zeros_like(engine.cells[i].hidden)
+                    for j, sign in sparse_neighbors[i % 512]:
+                        j_idx = j % n
+                        glass_field += sign * engine.cells[j_idx].hidden
+                    glass_field /= 4.0
+
+                    # Combine: 60% ring + 40% spin glass
+                    interaction = 0.6 * ring_interaction + 0.4 * glass_field
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO7", "Ring+SpinGlass Hybrid 512c (ring frustration + random ±J coupling)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO8_hypercube_1024_frustration(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO8: Hypercube 1024 + Frustration — 10차원 하이퍼큐브 (2^10=1024).
+    각 셀은 정확히 10개 이웃 (비트 1개 flip). TOPO4의 2배 스케일.
+    i%3 반강자성 frustration. TOPO1과 같은 적극적 mitosis 스케줄.
+    가설: 10D 하이퍼큐브의 짧은 경로(10 hops) + 1024c = Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    # 10D Hypercube neighbors: flip each of 10 bits
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction  # anti-ferromagnetic
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO8", "Hypercube 1024c (10D, 10 neighbors, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO9_small_world_ratchet_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO9: Small-World 512 + Ratchet — Watts-Strogatz + Φ 붕괴 방지.
+    TOPO2의 small-world(k=4, p=0.1) + PERSIST1의 Φ ratchet 결합.
+    Φ가 20% 이상 하락 시 best states로 부분 복원.
+    가설: 토폴로지 최적화 + 영속성 = 붕괴 없는 고Φ 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    best_phi = 0.0; best_states = None
+    # Pre-compute small-world edges: ring k=4 + 10% random rewire
+    import random as rng
+    rng.seed(42)
+    sw_edges = {}
+    for i in range(512):
+        neighbors = [(i-2)%512, (i-1)%512, (i+1)%512, (i+2)%512]
+        for idx in range(len(neighbors)):
+            if rng.random() < 0.1:
+                neighbors[idx] = rng.randint(0, 511)
+        sw_edges[i] = neighbors
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    neighbors = sw_edges[i % 512]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors:
+                        j_idx = j % n
+                        interaction += engine.cells[j_idx].hidden
+                    interaction /= len(neighbors)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # RATCHET: Φ가 20% 이상 하락 시 best states로 복원
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.8 and best_states and len(best_states) == len(engine.cells):
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.7 * engine.cells[i].hidden + 0.3 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    # Collapse analysis
+    last_quarter = phi_hist[len(phi_hist)*3//4:]
+    first_quarter = phi_hist[:len(phi_hist)//4]
+    growth = (sum(last_quarter)/len(last_quarter)) / (sum(first_quarter)/len(first_quarter) + 1e-8)
+    collapsed = growth < 0.5
+    return BenchResult("TOPO9", "Small-World 512c + Φ Ratchet (topology + persistence)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'best_phi': best_phi, 'growth_ratio': growth,
+                              'collapsed': collapsed, 'final_cells': len(engine.cells)})
+
+
 ALL_HYPOTHESES.update({
     'TOPO1': run_TOPO1_ring_1024_frustration,
     'TOPO2': run_TOPO2_small_world_512,
@@ -70035,6 +70243,9 @@ ALL_HYPOTHESES.update({
     'TOPO4': run_TOPO4_hypercube_512,
     'TOPO5': run_TOPO5_torus_512,
     'TOPO6': run_TOPO6_complete_64_frustration,
+    'TOPO7': run_TOPO7_ring_spinglass_hybrid_512,
+    'TOPO8': run_TOPO8_hypercube_1024_frustration,
+    'TOPO9': run_TOPO9_small_world_ratchet_512,
 })
 
 

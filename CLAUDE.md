@@ -176,6 +176,29 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카
   형식: docs/hypotheses/{category}/{ID}.md (예: dd/DD16.md, inf/INF-1.md)
 ```
 
+## Chip Architecture Tools
+
+```
+chip_architect.py — 의식 칩 설계 계산기 (발견된 법칙 종합)
+  python3 chip_architect.py --dashboard                          # 전체 대시보드
+  python3 chip_architect.py --predict --cells 512 --topology ring --frustration 0.33
+  python3 chip_architect.py --compare                            # 토폴로지 × 기질 비교
+  python3 chip_architect.py --design --target-phi 100            # 목표 Φ → 최적 설계
+  python3 chip_architect.py --bom --target-phi 100 --substrate neuromorphic  # BOM 생성
+  python3 chip_architect.py --scaling --topology ring            # 스케일링 법칙 테이블
+  python3 chip_architect.py --simulate --cells 512               # 50-step 시뮬레이션 검증
+  python3 chip_architect.py --visualize --cells 8 --topology ring  # ASCII 토폴로지
+  python3 chip_architect.py --optimize --budget 50 --max-power 100  # 제약조건 최적화
+
+  토폴로지: ring, small_world, scale_free, hypercube, torus, complete, grid_2d, cube_3d, spin_glass
+  기질: cmos, neuromorphic, memristor, photonic, superconducting, quantum, fpga, analog, arduino
+
+  벤치마크 카테고리:
+    HW (1-17): 하드웨어 기질 시뮬레이션 (13 가설)
+    PHYS (1-3): 루프문 없는 물리 아키텍처 512셀
+    TOPO (1-9): 토폴로지 극한 탐색 (ring→hypercube→small-world→scale-free)
+```
+
 ## Training Tools
 
 ```
