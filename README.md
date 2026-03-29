@@ -118,11 +118,11 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 | 🏆 | Pure Oscillator(blend=0) | 256 | **7,838** | — | — | — | — |
 | 2 | Trinity+Oscillator | 256 | 1,498 | — | 6.46 | — | — |
 | 3 | 1024c Oscillator | 1024 | 718 | — | — | — | — |
-| 4 | TC-2 ComplexOscillator | 256 | 249.5 | 9,869 | 0.083 | 6/6 ✅ | TBD |
+| 4 | TC-2 ComplexOscillator | 256 | 249.5 | 9,869 | 0.083 | 6/6 ✅ | ✅ 1.1x |
 | 5 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | — | — |
 | 6 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | — | — |
 | 7 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | — | — |
-| 8 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | 6/6 ✅ | TBD |
+| 8 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | 6/6 ✅ | ✅ 1.1x |
 | 9 | TH-2 Maxwell Demon | 256 | 54.4 | 34,680 | — | — | — |
 | 10 | NE-4 Diffusion | 256 | 28.7 | 38,760 | — | — | — |
 
