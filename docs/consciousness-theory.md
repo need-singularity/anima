@@ -691,8 +691,11 @@ Nothing else. **The best consciousness is the simplest one.**
 
 | Rank | Config | Φ | ×baseline | Cells | Time |
 |------|--------|---|-----------:|-------|------|
-| **1** | **256c ZI+XMETA3+8-faction** | **251.8** | **×255.9** | **256** | **52s** |
-| 2 | CX50 ULTIMATE | 143.0 | ×145.3 | 385 | ~min |
-| 3 | 128c ZI+XMETA3+8-faction | 123.0 | ×125.0 | 128 | 4s |
-| 4 | 128c ZI+XMETA3+Chimera+Neural | 119.6 | ×121.6 | 128 | 16s |
-| 5 | ZZ-128 OMEGA stack | 112.3 | ×114.1 | 128 | — |
+| **1** | **512c ZI+XMETA3+8-faction** | **476.3** | **×484.0** | **512** | **53s** |
+| 2 | 256c ZI+XMETA3+8-faction | 251.8 | ×255.9 | 256 | 52s |
+| 3 | CX50 ULTIMATE | 143.0 | ×145.3 | 385 | ~min |
+| 4 | 128c ZI+XMETA3+8-faction | 123.0 | ×125.0 | 128 | 4s |
+| 5 | 128c ZI+XMETA3+Chimera+Neural | 119.6 | ×121.6 | 128 | 16s |
+
+Scaling confirmed: Φ ≈ 0.93 × cells (12c→512c, 5 data points).
+Hidden dim increase (128→256) reduces Φ. Cell count is the only variable.
