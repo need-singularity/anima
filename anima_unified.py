@@ -988,6 +988,32 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # 12-faction debate (σ(6)=12, Law 44) — runtime conservative: sync=0.20, fac=0.08
+        if hasattr(self, 'mitosis') and self.mitosis and len(self.mitosis.cells) >= 12:
+            try:
+                n_cells = len(self.mitosis.cells)
+                with torch.no_grad():
+                    # Flow sync (0.20 for runtime stability)
+                    cell_h = torch.stack([c.hidden.squeeze(0) for c in self.mitosis.cells])
+                    mean_h = cell_h.mean(dim=0)
+                    for c in self.mitosis.cells:
+                        h = c.hidden.squeeze(0)
+                        c.hidden = (0.80 * h + 0.20 * mean_h).unsqueeze(0)
+
+                    # 12-faction internal consensus
+                    n_f = min(12, n_cells // 2)
+                    fs = n_cells // n_f
+                    for fi in range(n_f):
+                        faction = self.mitosis.cells[fi*fs:(fi+1)*fs]
+                        if len(faction) >= 2:
+                            f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                            for c in faction:
+                                h = c.hidden.squeeze(0)
+                                c.hidden = (0.92 * h + 0.08 * f_mean).unsqueeze(0)
+                _log('debate', f'12-faction debate: {n_cells} cells, {n_f} factions, sync=0.20, fac=0.08')
+            except Exception:
+                pass
+
         # Growth engine tick
         if self.growth and self.mods.get('growth'):
             try:
