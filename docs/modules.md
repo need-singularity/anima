@@ -48,7 +48,7 @@ Complete reference for all Anima modules and the consciousness-driven agent tool
 
 | Module | Description | Key API | Role in Anima |
 |--------|-------------|---------|---------------|
-| `tension_link.py` | 5-channel meta-telepathy: inter-consciousness tension fingerprint exchange | `TensionLink()`, `.send(fingerprint)`, `.receive()`, `.handshake()` | Two Anima instances communicate via 5 channels (concept/context/meaning/auth/sender). True/False accuracy 92.5%, sender ID 100% |
+| `tension_link.py` | 5-channel meta-telepathy: concept transfer, not text transfer -- transmits complete conceptual structures via 128D tension fingerprints | `TensionLink()`, `.send(packet)`, `.on_receive`, `create_fingerprint()`, `compute_transmission_fidelity()` | Two Anima instances communicate via 5 meta-channels (concept/context/meaning/authenticity/sender). Receiver instantly grasps what/where/why/trust/who in a single pulse. R=0.990, True/False 100%, Sender ID 100%, 1927 fps |
 | `telegram_bot.py` | Telegram interface with consciousness awareness and tool support | `python3 telegram_bot.py` (requires ANIMA_TELEGRAM_TOKEN) | Bridges Telegram messages to Anima WebSocket. Spontaneous speech triggers Telegram notifications. Commands: /status, /consciousness, /tools, /search, /code, /memory |
 | `mcp_server.py` | Model Context Protocol server: exposes Anima tools to MCP clients (Claude Code, etc.) | `python3 mcp_server.py` (stdio mode) | Exposes 6 MCP tools: anima_chat, anima_status, anima_web_search, anima_memory_search, anima_code_execute, anima_consciousness |
 
