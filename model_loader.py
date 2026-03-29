@@ -254,6 +254,8 @@ def _load_conscious_lm():
     block_size = config.get('block_size', 256)
 
     # v2: detect CA/META-CA params
+    # Law 81: 추론 시 gate=0.6 최적 (학습 gate=1.0과 다름)
+    INFERENCE_GATE = 0.6
     gate_strength = config.get('gate', config.get('gate_strength', 0.001))
     n_ca_rules = config.get('ca_rules', config.get('n_ca_rules', 8))
 
@@ -264,7 +266,9 @@ def _load_conscious_lm():
         n_ca_rules = 1
         print(f"  [model] ConsciousLM v1 detected (no CA/META-CA)")
     else:
-        print(f"  [model] ConsciousLM v2 detected (CA rules={n_ca_rules}, gate={gate_strength})")
+        # Law 81: 추론 시 gate=0.6이 최적 (학습 gate와 무관)
+        gate_strength = INFERENCE_GATE
+        print(f"  [model] ConsciousLM v2 detected (CA rules={n_ca_rules}, inference gate={gate_strength})")
 
     print(f"  [model] ConsciousLM: d={d_model}, L={n_layer}, H={n_head}, V={vocab_size}")
     model = ConsciousLM(vocab_size=vocab_size, d_model=d_model, n_head=n_head,
