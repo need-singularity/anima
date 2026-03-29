@@ -110,9 +110,20 @@ def train(model, data, args, ckpt_dir):
     print(f"{'Step':>6} {'CE_A':>7} {'CE_G':>7} {'T_var':>7} {'Total':>7} {'ValCE':>7} {'BPC':>7} {'Ψ_res':>6} {'Gate':>8} {'H(p)':>6} {'ms':>5}")
     print("-" * 90)
 
+    # Live Tuner (실시간 파라미터 조절)
+    from live_tuner import LiveTuner
+    tuner = LiveTuner(os.path.join(ckpt_dir, "..", "tune.json"))
+    print(f"  LiveTuner: watching for tune.json (change params without restart)")
+
     t_start = time.time()
 
     for step in range(start_step + 1, args.steps + 1):
+        # 매 100 step마다 튜닝 체크
+        if step % 100 == 0:
+            changes = tuner.apply(model, optimizer, step)
+            if tuner.should_stop():
+                print(f"  🛑 Stop requested via tune.json at step {step}")
+                break
         x, y_a, y_g = get_batch(train_data, args.batch_size, args.block_size, device)
 
         logits_a, logits_g, tensions = model(x)
