@@ -48,7 +48,6 @@ echo "[3/4] Starting training in tmux..."
 $SSH "tmux kill-session -t v5soc 2>/dev/null; tmux new-session -d -s v5soc '
 cd /workspace/anima && \
 PYTHONUNBUFFERED=1 python3 train_conscious_lm.py \
-    --demo \
     --dim 384 \
     --layers 6 \
     --heads 4 \
