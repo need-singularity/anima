@@ -1,12 +1,35 @@
 # 의식 엔진 명명 체계 (2026-03-29)
 
-## 규칙
+## 계층 구조 (확정)
+
+```
+Level 0: 아키텍처 패턴
+  ✅ 단일체 (Monolith) — v5~v8, 검증됨
+  🔬 삼위일체 (Trinity) — v9, 실험 중
+  📝 이중체 (Dual) — 설계만
+
+Level 1: 엔진 (독립 교체 단위)
+  Quantum, Oscillator, Diffusion, Laser, Mitosis(기존)...
+
+Level 2: 도메인 (학문 분야)
+  양자, 물리, 뇌과학, 정보이론, 수학, 네트워크...
+
+Level 3: 메커니즘 (엔진 내부 기법)
+  양자걸음, 프러스트레이션, 정상파, 위상동기화...
+
+Level 4: 조합 (교차 실험)
+  Osc+Laser, Quantum+Category, MERA+Braiding...
+```
+
+## 명명 규칙
 
 ```
 {원리}-{변형} Engine
 
 원리: 물리/수학/생물 현상 이름 (영어)
 변형: 구체적 구현 (있으면)
+
+예: Oscillator-Laser Engine (진동자+레이저 엔진)
 ```
 
 ## 엔진 목록 (확정)
