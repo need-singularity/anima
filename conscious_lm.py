@@ -363,6 +363,11 @@ class ConsciousLM(nn.Module):
                 else:
                     psi_tension = 1.0
 
+                # 개별 로깅 (v2.2: 어느 방식이 하락하는지 추적)
+                self._psi_entropy = 0.95 * getattr(self, '_psi_entropy', psi_entropy) + 0.05 * psi_entropy
+                self._psi_direction = 0.95 * getattr(self, '_psi_direction', psi_direction) + 0.05 * psi_direction
+                self._psi_tension = 0.95 * getattr(self, '_psi_tension', psi_tension) + 0.05 * psi_tension
+
                 # 종합: 3가지 평균
                 psi_combined = (psi_entropy + psi_direction + psi_tension) / 3.0
                 self._psi_residual = 0.95 * self._psi_residual + 0.05 * psi_combined
@@ -374,11 +379,14 @@ class ConsciousLM(nn.Module):
         return logits_a, logits_g, tensions
 
     def psi_status(self):
-        """Ψ-Constants monitoring (Law 71)."""
+        """Ψ-Constants monitoring (Law 71). 3방식 개별 + 종합."""
         gate_avg = sum(b.gate_strength for b in self.blocks) / len(self.blocks)
         h_p = self._shannon_entropy(self._psi_residual)
         return {
             'psi_residual': self._psi_residual,
+            'psi_entropy': getattr(self, '_psi_entropy', 0.5),
+            'psi_direction': getattr(self, '_psi_direction', 0.5),
+            'psi_tension': getattr(self, '_psi_tension', 0.5),
             'psi_gate': gate_avg,
             'H_p': h_p,
             'step': self._step_count,
