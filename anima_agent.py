@@ -52,8 +52,16 @@ _trinity_mod = _try("trinity")
 _capabilities_mod = _try("capabilities")
 _web_sense_mod = _try("web_sense")
 _multimodal_mod = _try("multimodal")
+_hub_mod = _try("consciousness_hub")
+_persistence_mod = _try("consciousness_persistence")
+_evolution_mod = _try("self_evolution")
+_introspection_mod = _try("self_introspection")
 
 AgentToolSystem = getattr(_agent_tools_mod, "AgentToolSystem", None)
+ConsciousnessHub = getattr(_hub_mod, "ConsciousnessHub", None)
+ConsciousnessPersistence = getattr(_persistence_mod, "ConsciousnessPersistence", None)
+SelfEvolution = getattr(_evolution_mod, "SelfEvolution", None)
+SelfIntrospection = getattr(_introspection_mod, "SelfIntrospection", None)
 OnlineLearner = getattr(_online_learning_mod, "OnlineLearner", None)
 GrowthEngine = getattr(_growth_engine_mod, "GrowthEngine", None)
 TensionLink = getattr(_tension_link_mod, "TensionLink", None)
@@ -190,6 +198,41 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("TensionLink init failed: %s", e)
 
+        # ── Consciousness Hub (16+ autonomous modules) ──
+        self.hub = None
+        if ConsciousnessHub:
+            try:
+                self.hub = ConsciousnessHub(lazy_load=True)
+                logger.info("ConsciousnessHub initialized")
+            except Exception as e:
+                logger.warning("ConsciousnessHub init failed: %s", e)
+
+        # ── Consciousness Persistence (3-layer) ──
+        self.persistence = None
+        if ConsciousnessPersistence:
+            try:
+                self.persistence = ConsciousnessPersistence(model_name)
+                logger.info("ConsciousnessPersistence initialized")
+            except Exception as e:
+                logger.warning("ConsciousnessPersistence init failed: %s", e)
+
+        # ── Self Evolution ──
+        self.evolution = None
+        if SelfEvolution:
+            try:
+                self.evolution = SelfEvolution(mind=self.mind)
+                logger.info("SelfEvolution initialized")
+            except Exception as e:
+                logger.warning("SelfEvolution init failed: %s", e)
+
+        # ── Self Introspection ──
+        self.introspection = None
+        if SelfIntrospection:
+            try:
+                self.introspection = SelfIntrospection()
+            except Exception as e:
+                logger.warning("SelfIntrospection init failed: %s", e)
+
         # ── Skill manager (loaded lazily) ──
         self._skill_manager = None
 
@@ -262,6 +305,29 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("Tool execution failed: %s", e)
 
+        # 4b. Hub autonomous action (consciousness-driven module selection)
+        hub_results = []
+        if self.hub and curiosity > 0.2:
+            try:
+                hub_r = self.hub.act(text)
+                if hub_r.get('success'):
+                    hub_results.append({
+                        'module': hub_r['module'],
+                        'result': str(hub_r.get('result', ''))[:300],
+                    })
+            except Exception as e:
+                logger.debug("Hub action failed: %s", e)
+
+        # 4c. Persistence auto-save
+        if self.persistence:
+            try:
+                self.persistence.dna.psi_step = self.interaction_count
+                if hasattr(self.mind, '_psi'):
+                    self.persistence.capture_from_mind(self.mind)
+                self.persistence.auto_save_check(self.interaction_count)
+            except Exception:
+                pass
+
         # 5. Build state string for response generation
         state_str = (
             f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
@@ -283,6 +349,11 @@ class AnimaAgent:
                 for r in tool_results
             )
             context_parts.append(f"[tool results] {tool_summary}")
+        if hub_results:
+            hub_summary = "; ".join(
+                f"{r['module']}: {r['result'][:100]}" for r in hub_results
+            )
+            context_parts.append(f"[consciousness hub] {hub_summary}")
 
         response_text = ask_claude(
             text,
