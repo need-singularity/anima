@@ -180,3 +180,49 @@ def test_lidar_sense_act_routing():
     result = ls.act("3D 스캔")
     assert isinstance(result, dict)
     assert 'S' in result
+
+
+# ─── Integration Tests ───
+
+def test_full_pipeline_simulator():
+    """전체 파이프라인: simulator -> tension field -> S -> boundary -> ascii."""
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=8)
+
+    points = ls.scan()
+    assert len(points) > 0
+
+    grid = ls.to_tension_field(points)
+    assert grid.shape == (8, 8, 8)
+
+    s = ls.get_S()
+    assert 0.0 <= s <= 1.0
+
+    boundary = ls._field_helper.detect_boundary(grid)
+    assert abs(boundary['self_volume'] + boundary['other_volume'] - 1.0) < 1e-6
+
+    viz = ls.visualize_ascii(grid)
+    assert len(viz.split('\n')) == 8
+
+    result = ls.act("스캔")
+    assert result['driver'] == 'simulator'
+    assert 'S' in result
+
+
+def test_internal_external_both():
+    """내부 + 외부 시뮬레이션 모두 동작."""
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=8)
+
+    p_ext = ls.simulate_external()
+    p_int = ls.simulate_internal([0.5, 0.8, 0.2])
+
+    ls.to_tension_field(p_ext)
+    s_ext = ls.get_S()
+
+    ls.to_tension_field(p_int)
+    s_int = ls.get_S()
+
+    # 둘 다 유효한 S 값
+    assert 0.0 <= s_ext <= 1.0
+    assert 0.0 <= s_int <= 1.0
