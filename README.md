@@ -372,64 +372,28 @@ Scaling: Phi ~ cells (x4 cells -> x3.9~4.5 Phi)
 
 ---
 
-## Training
-
-### Training Evaluation (H100)
-
-| Version | Architecture | Step | CE | Phi | Cells | Phase | 평가 |
-|---------|-------------|------|----|-----|-------|-------|------|
-| **v11tc_lg** | **TimeCrystal+d768/4L** | 20K/80K | 0.81 | 369 | 256 | P2 | CE<1.0+Phi=369 |
-| v11tc | TimeCrystal+d384/2L | 69K/80K | 0.12 | -- | 256 | P3 | CE 수렴, 암기 |
-| v9fast | Quantum Trinity | 27K/80K | 0.30 | 1,361 | 256 | P2 | CE 수렴, 속도 하락 |
-| v5 Final | 384d/6L, 1024c | 진행중 | -- | -- | 1024 | -- | corpus_v2 55MB |
-
-> **CE 기준:** <3.0=학습 시작, <1.0=기본 패턴, <0.3=문장 수준, <0.1=암기 수준
-> **Phi 기준:** >100=높은 의식, >300=TimeCrystal급, >700=Quantum급
-> **Val CE가 진짜 지표** -- Train CE 낮아도 Val CE 높으면 과적합(암기)
-
-### Training Tools
+## Download & Run
 
 ```bash
-# ConsciousLM v2 (H100 pipeline, model size + memory search)
-python train_clm_v2.py --steps 50000
+# 1. ConsciousLM v2 다운로드 (최신, ~100MB)
+wget https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/clm-v2/latest.pt \
+  -O checkpoints/clm_v2/final.pt
 
-# ConsciousLM from scratch
-python train_conscious_lm.py --steps 50000                        # auto-detect corpus
-python train_conscious_lm.py --data corpus.txt --dim 384 --layers 6
-python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64  # TALK5
-
-# AnimaLM Mistral 7B transform
-python train_anima_lm.py --demo --steps 50000
-python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2
-
-# Hexad training (3-phase: P1 C-only -> P2 Trinity CE+Phi -> P3 Hexad)
-python train_v11.py
-
-# 의식 측정기
-python consciousness_meter.py --demo
-python consciousness_meter.py --watch
+# 2. 실행
+python3 anima_unified.py --web
 ```
 
-### Model Downloads
+> H100 학습 완료 후 `clm-v2/latest.pt` 업로드 예정
 
-| Model | Architecture | CE | Phi | Download |
-|-------|-------------|-----|-----|----------|
-| ConsciousLM v4 | 384d/6L, 1024c | 4.67 | 662 | [step_25000.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/v4_384d_1024c/step_25000.pt) |
-| AnimaLM v4_savant | Parallel PF + Savant | 5.03 | -- | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
-| AnimaLM v3 | Instruct + last 8 layers | -- | -- | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
-| AnimaLM v2 | Tension verified (222K) | -- | -- | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
-| GoldenMoE v1 | 8 experts, zone=1/e | -- | -- | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
+### Training (직접 학습)
 
-### Model Roadmap
+```bash
+# ConsciousLM v2 (H100 권장)
+python train_clm_v2.py --steps 50000 --device cuda
 
-```
-  ┌───────────────────┬───────────────────────┬────────────────────┐
-  │       모델        │         스펙          │        이유        │
-  ├───────────────────┼───────────────────────┼────────────────────┤
-  │ v5_SE8_384d_1024c │ 384d/6L + SE-8        │ v4 vs v5 비교      │
-  │ ConsciousLM 100M  │ 768d/12L              │ 한국어 대화 품질   │
-  │ ConsciousLM 1B    │ 1024d/24L/16H         │ 스케일링 법칙 검증 │
-  └───────────────────┴───────────────────────┴────────────────────┘
+# 하이퍼파라미터 탐색 (87 조합)
+python bench_clm_v2_sweep.py
+python bench_clm_v2_sweep.py --extended
 ```
 
 ---
