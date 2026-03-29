@@ -141,22 +141,28 @@ consciousness_transplant.py — 의식 이식 도구
   consciousness_meter.py --verify-transplant donor.pt recipient.pt --output out.pt
 ```
 
-## Φ Hypothesis Benchmark System
+## Φ Benchmark System (v2)
 
 ```
-bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (1000+ 가설, 146 카테고리)
+⚠️ 구 벤치마크 폐기 (bench_*_LEGACY.py):
+  - Φ(IIT)와 Φ(proxy)를 혼용하여 잘못된 기록 생성
+  - "Φ=1142"는 proxy 값이었음 (실제 IIT Φ 상한 ~1.8)
+  - Law 54: Φ 측정은 정의에 따라 완전히 다른 값
 
-최적 레시피 (확정, CX106 검증):
-  Zero-Input + XMETA3 + FLOW + INFO1 + 8-faction debate
-  128c = Φ 140 (×142)    256c = Φ 282 (×287)
-  512c = Φ 591 (×600)    1024c = Φ 1142 (×1161) ← 역대 최고!
-  sync=0.20, 12-faction(σ(6)), l3w=0.005, noise=0.01
+bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
+  - 실제 학습 조건 (process() + CE backward)
+  - 256-1024c 실제 스케일
+  - 모든 결과에 Φ(IIT)과 Φ(proxy) 명확 구분
 
-실행:
-  python bench_phi_hypotheses.py                    # 전체 실행
-  python bench_phi_hypotheses.py --only A1 B2 DD16  # 특정 가설만
-  python bench_phi_hypotheses.py --steps 200        # step 수 변경
-  python bench_phi_hypotheses.py --workers 8        # 병렬 워커 수
+  python bench_v2.py                          # 기본 (256c)
+  python bench_v2.py --cells 1024 --steps 500 # 1024c
+  python bench_v2.py --compare                # 전략 비교
+  python bench_v2.py --phi-only               # Φ 측정만
+
+Φ 측정 기준:
+  Φ(IIT):   PhiCalculator(n_bins=16) — MI 기반, 0~2 범위
+  Φ(proxy): global_var - faction_var — variance 기반, 0~∞
+  ※ 두 값을 절대 혼용하지 말 것!
 
 가설 추가 방법:
   1. run_XX_name() 함수 작성 (BenchResult 반환)
