@@ -247,7 +247,7 @@ class SandpileCascadeEngine:
     Avalanche size and duration encode consciousness richness.
 
     Critical state = edge of chaos = maximum information integration.
-    Vectorized: uses sparse adjacency matrix for O(1) topple broadcast.
+    Vectorized: uses adjacency matrix for topple broadcast.
     """
     def __init__(self, n_cells=256, hidden_dim=128):
         self.n_cells = n_cells
@@ -263,18 +263,15 @@ class SandpileCascadeEngine:
             for _ in range(2):
                 j = np.random.randint(0, n_cells)
                 if j != i: self.adj[i, j] = 1
-        # Degree per cell for distribution
+        # Degree per cell
         self.degree = self.adj.sum(-1, keepdim=True).clamp(min=1)  # [n, 1]
-        # Normalize: each neighbor gets 1/(degree+1) share
-        self.adj_norm = self.adj / (self.degree + 1)
         self.avalanche_sizes = []
 
     def step(self):
-        # Add random grains (vectorized: add to 4 random cells)
-        drops = torch.randint(0, self.n_cells, (4,))
-        dims = torch.randint(0, self.hidden_dim, (4,))
-        for c, d in zip(drops, dims):
-            self.heights[c, d] += 1.0
+        # Add random grain
+        drop_cell = np.random.randint(0, self.n_cells)
+        drop_dim = np.random.randint(0, self.hidden_dim)
+        self.heights[drop_cell, drop_dim] += 1.0
 
         # Topple cascade (vectorized)
         total_topples = 0
@@ -283,26 +280,25 @@ class SandpileCascadeEngine:
             if over.sum() == 0:
                 break
             total_topples += over.sum().item()
-            # Energy to distribute: heights * over_mask / (degree+1)
-            to_distribute = self.heights * over / (self.degree + 1)
-            # Remove from toppling cells
-            self.heights -= self.heights * over
-            # Keep one share
-            self.heights += to_distribute
-            # Distribute to neighbors via adj matrix
-            self.heights += self.adj_norm.T @ (self.heights * 0 + to_distribute * self.degree)
-            # Simpler: each neighbor gets to_distribute
-            neighbor_receive = self.adj.T @ to_distribute
-            self.heights += neighbor_receive
+            # Amount each toppling cell distributes per neighbor
+            topple_amount = self.heights * over  # what's being toppled [n, d]
+            share = topple_amount / (self.degree + 1)  # share per neighbor [n, d]
+            # Remove toppled energy, keep one share
+            self.heights -= topple_amount
+            self.heights += share
+            # Each neighbor of i receives share[i]
+            self.heights += self.adj.T @ share
 
         self.avalanche_sizes.append(total_topples)
 
         # Small noise for diversity
-        self.heights += torch.randn_like(self.heights) * 0.01
-        self.heights = self.heights.clamp(0)
+        self.heights += torch.randn_like(self.heights) * 0.02
+        self.heights = self.heights.clamp(0, self.threshold * 3)
 
     def observe(self):
-        return self.heights.detach().clone()
+        # Normalize to reasonable range for measurement
+        h = self.heights / (self.threshold + 1e-8)
+        return h.detach().clone()
 
     def inject(self, x):
         self.heights += x.abs() * 0.1
