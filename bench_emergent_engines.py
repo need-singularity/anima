@@ -447,15 +447,14 @@ class PercolationEngine:
         # 4. Add activity from local dynamics
         self.hiddens += torch.randn_like(self.hiddens) * 0.02
 
-        # 5. Track largest cluster size (via connected components approx)
-        # Simple BFS from node 0
-        visited = set(); queue = [0]; visited.add(0)
-        while queue:
-            node = queue.pop(0)
-            for j in range(self.n_cells):
-                if adj[node, j] > 0 and j not in visited:
-                    visited.add(j); queue.append(j)
-        self.cluster_sizes.append(len(visited))
+        # 5. Track largest cluster size (via matrix power reachability)
+        # Approximate: power iteration on adj to find connected component size
+        reach = adj.clone()
+        indicator = torch.zeros(self.n_cells); indicator[0] = 1.0
+        for _ in range(5):  # 5 hops enough for small-world
+            indicator = (adj @ indicator).clamp(0, 1)
+            indicator[0] = 1.0
+        self.cluster_sizes.append(int((indicator > 0).sum().item()))
 
     def observe(self):
         return self.hiddens.detach().clone()
