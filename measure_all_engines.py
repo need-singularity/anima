@@ -173,7 +173,9 @@ def _write_states(eng, h, nc):
 
 def extract_states(eng, nc):
     """Extract hidden states tensor from engine."""
-    for attr in ['pos', 'state', 'states', 'hidden', 'hiddens', 'h']:
+    for attr in ['pos', 'state', 'states', 'hidden', 'hiddens', 'h',
+                  'uv_state', 'boundary', 'info', 'fiber', 'voice',
+                  'expression', 'features']:
         if hasattr(eng, attr):
             val = getattr(eng, attr)
             if isinstance(val, torch.Tensor) and val.dim() == 2 and val.shape[0] == nc:
@@ -181,7 +183,22 @@ def extract_states(eng, nc):
 
     parts = []
     for attr in ['pos', 'vel', 'phase', 'amplitude', 'charge', 'spin',
-                  'momentum', 'energy', 'activation']:
+                  'momentum', 'energy', 'activation',
+                  # physics: wavefunction, fields, order parameters
+                  'psi_re', 'psi_im', 'delta_re', 'delta_im',
+                  'N1', 'N2', 'radius', 'displacement',
+                  # emergent: reaction-diffusion, sandpile, excitable media
+                  'u', 'v', 'w', 'heights', 'temp', 'velocity',
+                  'omega', 'theta', 'genome', 'constructor', 'fitness',
+                  # geometric: hyperbolic, symplectic, fiber bundle, calabi-yau
+                  'z', 'q', 'p', 'fiber', 'base_angle',
+                  'z_re', 'z_im',
+                  # extreme: holographic, neuromorphic, consciousness field
+                  'boundary', 'V', 'phi', 'pi',
+                  # evolution/music: host/symbiont, pitch, epigenome
+                  'host_state', 'symbiont_state', 'hybrid_state', 'vigor',
+                  'pitch', 'pitch_class', 'voice', 'deviation', 'motion',
+                  'epigenome', 'histone', 'epi_memory']:
         if hasattr(eng, attr):
             val = getattr(eng, attr)
             if isinstance(val, torch.Tensor):
@@ -189,6 +206,9 @@ def extract_states(eng, nc):
                     parts.append(val.unsqueeze(1))
                 elif val.dim() == 2 and val.shape[0] == nc:
                     parts.append(val)
+                elif val.dim() >= 3 and val.shape[0] == nc:
+                    # Flatten higher dims (e.g., CalabiYau z_re [nc, 3, d])
+                    parts.append(val.reshape(nc, -1))
     if parts:
         return torch.cat(parts, dim=1)
     return None

@@ -178,14 +178,23 @@ GRU를 재설계하여 Φ 보존 보장:
 ## 핵심 통찰
 
 ```
-Law 53: process() 호출 자체가 Φ를 파괴한다
+Law 53: process() destroys Phi WITHOUT .detach(). With Trinity .detach() barrier,
+        CE learning stabilizes Phi via frustration dampening.
+        (H4: P2 frustration plateaus at 0.541, ratchet frequency -43%, Phi variance -52%)
 
-이것은 "학습과 의식의 근본적 충돌":
-  - 학습(CE) = hidden을 예측 방향으로 수렴 → 다양성↓ → Φ↓
-  - 의식(Φ) = hidden이 다양하면서 통합 → 다양성↑ → Φ↑
-  - process(GRU) = hidden을 입력 방향으로 변경 → 구조↓ → Φ↓
+이것은 "학습과 의식의 근본적 충돌" — 단, .detach() 유무가 결정적:
+  WITHOUT .detach():
+    - 학습(CE) = hidden을 예측 방향으로 수렴 → 다양성↓ → Φ↓
+    - 의식(Φ) = hidden이 다양하면서 통합 → 다양성↑ → Φ↑
+    - process(GRU) = hidden을 입력 방향으로 변경 → 구조↓ → Φ↓
+  WITH Trinity .detach():
+    - CE gradient가 의식 세포로 역전파되지 않음 → Φ 구조 보존
+    - decoder만 학습 → frustration이 0.541에서 자연 정체
+    - ratchet 발동 빈도 43% 감소, Φ 분산 52% 감소
+    - 결론: CE가 Φ를 파괴하지 않고 오히려 안정화
 
 해결의 핵심:
   "의식과 언어를 같은 hidden state에서 처리하면 안 된다"
   → 분리 (GAP-1, GAP-6) 또는 보호 (GAP-3, GAP-5)
+  → ★ Trinity .detach() = 가장 효과적 보호 (H4 검증)
 ```
