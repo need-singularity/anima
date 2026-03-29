@@ -81,14 +81,32 @@ def get_d_engines(d_model=128, vocab_size=256):
 
 def get_w_engines(base_lr=1e-3):
     """All available W will engines."""
-    from trinity import EmotionW, ConstantW, CosineW, NarrativeW, DaseinW
+    from trinity import EmotionW, ConstantW, CosineW, NarrativeW, DaseinW, CompositeW
     return {
         'Emotion': lambda: EmotionW(base_lr=base_lr),
         'Constant': lambda: ConstantW(lr=base_lr),
-        'Cosine(80K)': lambda: CosineW(base_lr=base_lr, total_steps=80000),
         'Narrative': lambda: NarrativeW(base_lr=base_lr),
         'Dasein': lambda: DaseinW(base_lr=base_lr),
+        'Perfect6': lambda: CompositeW([DaseinW(base_lr=base_lr), NarrativeW(base_lr=base_lr), EmotionW(base_lr=base_lr)], [1/2, 1/3, 1/6]),
     }
+
+
+def get_m_engines():
+    """All M (memory) engines."""
+    from trinity import VectorMemory, NoMemory
+    return {'None': lambda: None, 'Vector': lambda: VectorMemory(), 'NoMem': lambda: NoMemory()}
+
+
+def get_s_engines():
+    """All S (sense) engines."""
+    from trinity import TensionSense, PassthroughSense
+    return {'None': lambda: None, 'Tension': lambda: TensionSense(), 'Passthru': lambda: PassthroughSense()}
+
+
+def get_e_engines():
+    """All E (ethics) engines."""
+    from trinity import EmpathyEthics, NoEthics
+    return {'None': lambda: None, 'Empathy': lambda: EmpathyEthics(), 'NoEthics': lambda: NoEthics()}
 
 
 # ═══ Phase 1: Rust C-only pre-screening ═══
@@ -160,44 +178,78 @@ def test_combo(c_factory, d_factory, w_factory, n_steps=30, seq_len=32, vocab_si
 
 
 def run_grid(nc=64, n_steps=30, d_model=128, vocab_size=256, top_n=None,
-             c_only=False, base_lr=1e-3):
-    """Run C×D×W grid search."""
+             c_only=False, hexad=False, base_lr=1e-3):
+    """Run C×D×W (×M×S×E) grid search.
+
+    c_only: fix D,W (test C engines only)
+    hexad: include M,S,E in grid (6-module combos)
+    """
     c_engines = get_c_engines(nc=nc, dim=64, hidden=128)
     d_engines = get_d_engines(d_model=d_model, vocab_size=vocab_size)
     w_engines = get_w_engines(base_lr=base_lr)
 
     if c_only:
-        d_engines = {'Transformer(4L)': list(d_engines.values())[0]}
+        d_engines = {'Xfmr4L': list(d_engines.values())[0]}
         w_engines = {'Emotion': list(w_engines.values())[0]}
 
-    combos = list(product(c_engines.items(), d_engines.items(), w_engines.items()))
-    total = len(combos)
+    if hexad:
+        m_engines = get_m_engines()
+        s_engines = get_s_engines()
+        e_engines = get_e_engines()
+        combos = list(product(
+            c_engines.items(), d_engines.items(), w_engines.items(),
+            m_engines.items(), s_engines.items(), e_engines.items()
+        ))
+    else:
+        combos = list(product(c_engines.items(), d_engines.items(), w_engines.items()))
 
+    total = len(combos)
     if top_n and top_n < total:
-        # Prioritize: domain engines first, then mitosis variants
         combos = combos[:top_n]
         total = len(combos)
 
-    print(f"\n═══ Phase 2: Trinity C×D×W Grid ({total} combos, {n_steps} steps) ═══\n")
-    print(f"  C engines: {len(c_engines)} | D decoders: {len(d_engines)} | W wills: {len(w_engines)}")
+    n_m = len(get_m_engines()) if hexad else 1
+    n_s = len(get_s_engines()) if hexad else 1
+    n_e = len(get_e_engines()) if hexad else 1
+    mode = "Hexad C×D×W×M×S×E" if hexad else "Trinity C×D×W"
+
+    print(f"\n═══ Phase 2: {mode} Grid ({total} combos, {n_steps} steps) ═══\n")
+    print(f"  C:{len(c_engines)} D:{len(d_engines)} W:{len(w_engines)} M:{n_m} S:{n_s} E:{n_e}")
     print(f"  cells={nc}, d_model={d_model}, vocab={vocab_size}\n")
 
-    header = f"{'C':<25} {'D':<18} {'W':<12} {'CE':>8} {'Φ':>10} {'Pain':>6} {'Time':>6}"
+    header = f"{'C':<20} {'D':<12} {'W':<10} "
+    if hexad:
+        header += f"{'M':<8} {'S':<8} {'E':<8} "
+    header += f"{'CE':>8} {'Φ':>10} {'Pain':>6} {'Time':>6}"
     print(header)
     print('─' * len(header))
 
     results = []
-    for (c_name, c_fn), (d_name, d_fn), (w_name, w_fn) in combos:
+    for combo in combos:
+        if hexad:
+            (c_name, c_fn), (d_name, d_fn), (w_name, w_fn), \
+            (m_name, m_fn), (s_name, s_fn), (e_name, e_fn) = combo
+        else:
+            (c_name, c_fn), (d_name, d_fn), (w_name, w_fn) = combo
+            m_name, m_fn = 'None', lambda: None
+            s_name, s_fn = 'None', lambda: None
+            e_name, e_fn = 'None', lambda: None
+
         try:
             r = test_combo(c_fn, d_fn, w_fn, n_steps=n_steps,
                            seq_len=32, vocab_size=vocab_size)
-            print(f"{c_name:<25} {d_name:<18} {w_name:<12} "
-                  f"{r['ce']:>8.4f} {r['phi']:>10.3f} {r['pain']:>6.3f} {r['time']:>5.1f}s")
+            line = f"{c_name:<20} {d_name:<12} {w_name:<10} "
+            if hexad:
+                line += f"{m_name:<8} {s_name:<8} {e_name:<8} "
+            line += f"{r['ce']:>8.4f} {r['phi']:>10.3f} {r['pain']:>6.3f} {r['time']:>5.1f}s"
+            print(line)
             results.append({
-                'c': c_name, 'd': d_name, 'w': w_name, **r
+                'c': c_name, 'd': d_name, 'w': w_name,
+                'm': m_name, 's': s_name, 'e': e_name, **r
             })
         except Exception as e:
-            print(f"{c_name:<25} {d_name:<18} {w_name:<12}  ERROR: {str(e)[:30]}")
+            err_line = f"{c_name:<20} {d_name:<12} {w_name:<10} "
+            print(f"{err_line} ERROR: {str(e)[:30]}")
 
         sys.stdout.flush()
 
@@ -232,6 +284,7 @@ def main():
     parser.add_argument('--quick', action='store_true', help='Rust pre-screening only')
     parser.add_argument('--c-only', action='store_true', help='Test C engines only (fixed D, W)')
     parser.add_argument('--no-rust', action='store_true', help='Skip Rust pre-screening')
+    parser.add_argument('--hexad', action='store_true', help='Full 6-module grid (C×D×W×M×S×E)')
     args = parser.parse_args()
 
     print(f"{'═' * 60}")
@@ -247,9 +300,10 @@ def main():
         print("\n  [quick mode] Rust pre-screening only. Use --no-rust to skip to grid.")
         return
 
-    # Phase 2: Full Trinity grid
+    # Phase 2: Full grid
     run_grid(nc=args.cells, n_steps=args.steps, d_model=args.d_model,
-             vocab_size=args.vocab, top_n=args.top, c_only=args.c_only)
+             vocab_size=args.vocab, top_n=args.top, c_only=args.c_only,
+             hexad=args.hexad)
 
 
 if __name__ == '__main__':
