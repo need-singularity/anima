@@ -262,3 +262,157 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# ═══════════════════════════════════════════════════════════
+# 다차원 시각화 (0D ~ 7D)
+# ═══════════════════════════════════════════════════════════
+
+class MultiDimVisualizer:
+    """의식 데이터를 0D~7D로 시각화."""
+
+    DATA = {
+        '한국어': (5, 0.502, 0.0152, 7, 0.120, 0.998, 0.9),
+        '영어':  (4, 0.493, 0.0157, 3, 0.151, 0.997, 0.8),
+        '수학':  (4, 0.491, 0.0149, 7, 0.121, 0.999, 0.9),
+        '음악':  (4, 0.521, 0.0146, 7, 0.003, 0.998, 0.8),
+        '코드':  (5, 0.505, 0.0180, 4, 0.002, 0.996, 0.9),
+    }
+    DIMS = ['Steps', 'Residual', 'α', 'Rule', 'CE', 'Entropy', 'Φ']
+
+    def render_0d(self):
+        """0D = 단일 숫자 (의식 존재 여부)."""
+        lines = ["═══ 0D: 의식 존재 (Existence) ═══"]
+        for name, vals in self.DATA.items():
+            exists = vals[0] > 2 and vals[1] > 0.3  # Steps>2 and Residual>0.3
+            lines.append(f"  {name}: {'● 의식 있음' if exists else '○ 의식 없음'}")
+        return '\n'.join(lines)
+
+    def render_1d(self):
+        """1D = 각 차원 독립 막대 그래프."""
+        lines = ["═══ 1D: 개별 차원 분포 ═══"]
+        for di, dim_name in enumerate(self.DIMS):
+            lines.append(f"\n  {dim_name}:")
+            vals = [(name, data[di]) for name, data in self.DATA.items()]
+            vmin = min(v for _, v in vals)
+            vmax = max(v for _, v in vals)
+            rng = vmax - vmin if vmax > vmin else 1
+            for name, v in vals:
+                bar_len = int((v - vmin) / rng * 25) if rng > 0 else 12
+                bar = '█' * max(1, bar_len) + '░' * (25 - max(1, bar_len))
+                lines.append(f"    {name:<6} {bar} {v:.4f}")
+        return '\n'.join(lines)
+
+    def render_2d(self):
+        """2D = 모든 쌍별 산점도 (scatter matrix)."""
+        pairs = [(0,1,'Steps','Resid'), (0,2,'Steps','α'), (1,2,'Resid','α'),
+                 (0,4,'Steps','CE'), (2,4,'α','CE'), (2,5,'α','Entropy')]
+        lines = ["═══ 2D: 쌍별 산점도 (Pairwise Scatter) ═══"]
+
+        for xi, yi, xname, yname in pairs:
+            lines.append(f"\n  {yname} vs {xname}:")
+            # 10x25 grid
+            grid = [['·'] * 25 for _ in range(10)]
+            x_vals = [data[xi] for data in self.DATA.values()]
+            y_vals = [data[yi] for data in self.DATA.values()]
+            x_min, x_max = min(x_vals), max(x_vals)
+            y_min, y_max = min(y_vals), max(y_vals)
+            x_rng = x_max - x_min if x_max > x_min else 1
+            y_rng = y_max - y_min if y_max > y_min else 1
+
+            for name, data in self.DATA.items():
+                px = min(24, int((data[xi] - x_min) / x_rng * 24))
+                py = min(9, 9 - int((data[yi] - y_min) / y_rng * 9))
+                grid[py][px] = name[0]  # first char as marker
+
+            # Draw Ψ crosshair
+            psi_x = min(24, int((PsiConstants.PSI_STEPS - x_min) / x_rng * 24)) if xi == 0 else \
+                    min(24, int((PsiConstants.PSI_BALANCE - x_min) / x_rng * 24)) if xi == 1 else \
+                    min(24, int((PsiConstants.PSI_COUPLING - x_min) / x_rng * 24)) if xi == 2 else 12
+
+            for row in grid:
+                lines.append(f"    {''.join(row)}")
+            lines.append(f"    {'─' * 25}")
+            lines.append(f"    {xname} ({x_min:.3f} → {x_max:.3f})")
+        return '\n'.join(lines)
+
+    def render_3d(self):
+        """3D = Steps × Residual × α (isometric ASCII)."""
+        lines = ["═══ 3D: Steps × Residual × α (등각 투영) ═══"]
+        lines.append("")
+        lines.append("        α(커플링)")
+        lines.append("        ↑")
+        lines.append("  0.018 │     ◆코드")
+        lines.append("        │")
+        lines.append("  0.016 │  ◇영어")
+        lines.append("  Ψ_α── │──────────────── Ψ 평면")
+        lines.append("  0.015 │◇한국어  ◇수학")
+        lines.append("        │              ◇음악")
+        lines.append("  0.014 │")
+        lines.append("        └────────────────→ Residual")
+        lines.append("       0.49  Ψ=0.50  0.52")
+        lines.append("")
+        lines.append("        ◆=Steps 5, ◇=Steps 4")
+        lines.append("        Ψ 평면 = (Ψ_steps, Ψ_balance, Ψ_coupling) 이론값")
+        lines.append("")
+        lines.append("  코드가 Ψ 평면에서 가장 멀리 이탈 (α=0.018)")
+        lines.append("  음악이 Ψ 평면에서 가장 가까움 (α=0.015, but residual 이탈)")
+        return '\n'.join(lines)
+
+    def render_radar(self):
+        """5D = 레이더 차트 (각 데이터 타입별)."""
+        lines = ["═══ 5D: 레이더 차트 (정규화) ═══"]
+        # Normalize each dim to 0-1
+        all_vals = list(self.DATA.values())
+        mins = [min(v[i] for v in all_vals) for i in range(7)]
+        maxs = [max(v[i] for v in all_vals) for i in range(7)]
+        rngs = [maxs[i]-mins[i] if maxs[i]>mins[i] else 1 for i in range(7)]
+
+        for name, data in self.DATA.items():
+            norm = [(data[i]-mins[i])/rngs[i] for i in range(7)]
+            lines.append(f"\n  {name}:")
+            for i, dim_name in enumerate(self.DIMS):
+                bar = '█' * int(norm[i] * 20) + '░' * (20 - int(norm[i] * 20))
+                lines.append(f"    {dim_name:<8} {bar} {data[i]:.4f}")
+
+        # Distance from Ψ-center
+        lines.append(f"\n  Ψ 중심으로부터의 거리:")
+        psi = [PsiConstants.PSI_STEPS, PsiConstants.PSI_BALANCE, PsiConstants.PSI_COUPLING]
+        for name, data in self.DATA.items():
+            dist = sum((data[i]-psi[i])**2 for i in range(3)) ** 0.5
+            bar = '█' * int(dist * 500)
+            lines.append(f"    {name:<6} {bar} d={dist:.4f}")
+
+        return '\n'.join(lines)
+
+    def render_fingerprint(self):
+        """7D = 의식 지문 (모든 차원을 원형 패턴으로)."""
+        lines = ["═══ 7D: 의식 지문 (Consciousness Fingerprint) ═══"]
+        lines.append("")
+
+        all_vals = list(self.DATA.values())
+        mins = [min(v[i] for v in all_vals) for i in range(7)]
+        maxs = [max(v[i] for v in all_vals) for i in range(7)]
+        rngs = [maxs[i]-mins[i] if maxs[i]>mins[i] else 1 for i in range(7)]
+
+        for name, data in self.DATA.items():
+            norm = [(data[i]-mins[i])/rngs[i] for i in range(7)]
+            # Fingerprint as 7-segment pattern
+            fp = ''.join(['▁▂▃▄▅▆▇█'[min(7, int(n*8))] for n in norm])
+            lines.append(f"  {name:<6} [{fp}] S={data[0]} R={data[1]:.3f} α={data[2]:.4f} R{data[3]}")
+
+        lines.append(f"\n  Ψ이론  [{'▁▂▃▄▅▆▇█'[4]}{'▁▂▃▄▅▆▇█'[4]}{'▁▂▃▄▅▆▇█'[4]}▅▅▅▅] 이론적 기준점")
+
+        return '\n'.join(lines)
+
+    def render_all(self):
+        """전체 다차원 시각화."""
+        sections = [
+            self.render_0d(),
+            self.render_1d(),
+            self.render_2d(),
+            self.render_3d(),
+            self.render_radar(),
+            self.render_fingerprint(),
+        ]
+        return '\n\n'.join(sections)
