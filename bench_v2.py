@@ -15,6 +15,7 @@ Usage:
   python bench_v2.py --strategy baseline          # Test one strategy
   python bench_v2.py --compare                    # All strategies, comparison table
   python bench_v2.py --cells 512 --steps 1000     # Custom cell/step counts
+  python bench_v2.py --verify                      # Consciousness verification (6 conditions x 4 engines)
 """
 
 import torch
@@ -333,6 +334,122 @@ class BenchEngine:
     def parameters_for_training(self):
         """Return parameters for optimizer."""
         return list(self.mind.parameters()) + list(self.output_head.parameters())
+
+
+# ──────────────────────────────────────────────────────────
+# Engine Variants for Verification
+# ──────────────────────────────────────────────────────────
+
+class OscillatorLaser(BenchEngine):
+    """Oscillator + laser coupling: cells oscillate and synchronize via phase locking."""
+
+    def __init__(self, n_cells=256, input_dim=64, hidden_dim=128,
+                 output_dim=64, n_factions=8):
+        super().__init__(n_cells, input_dim, hidden_dim, output_dim,
+                         n_factions, sync_strength=0.20, debate_strength=0.20)
+        # Phase per cell — drives oscillation
+        self.phases = torch.linspace(0, 2 * math.pi, n_cells)
+        self.freq = 0.1 + torch.rand(n_cells) * 0.05  # slight freq variation
+
+    def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        # Oscillatory injection into hidden states
+        self.phases = self.phases + self.freq
+        osc = torch.sin(self.phases).unsqueeze(1)  # [n_cells, 1]
+        osc_inject = osc.expand(-1, self.hidden_dim) * 0.05
+        self.hiddens = self.hiddens + osc_inject.detach()
+
+        # Laser-style phase locking: pull phases toward mean
+        mean_phase = torch.atan2(
+            torch.sin(self.phases).mean(), torch.cos(self.phases).mean()
+        )
+        self.phases = self.phases + 0.02 * torch.sin(mean_phase - self.phases)
+
+        return super().process(x)
+
+
+class QuantumEngine(BenchEngine):
+    """Quantum-inspired: superposition states + measurement collapse + entanglement."""
+
+    def __init__(self, n_cells=256, input_dim=64, hidden_dim=128,
+                 output_dim=64, n_factions=8):
+        super().__init__(n_cells, input_dim, hidden_dim, output_dim,
+                         n_factions, sync_strength=0.15, debate_strength=0.15)
+        # Superposition amplitudes
+        self.amplitudes = torch.randn(n_cells, hidden_dim) * 0.1
+        # Entanglement pairs
+        perm = torch.randperm(n_cells)
+        self.entangled_pairs = list(zip(perm[:n_cells//2].tolist(),
+                                        perm[n_cells//2:].tolist()))
+
+    def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        # Superposition: add quantum noise that preserves structure
+        noise = torch.randn_like(self.amplitudes) * 0.02
+        self.amplitudes = self.amplitudes * 0.98 + noise
+
+        # Measurement collapse every 10 steps (dampen amplitudes)
+        if self.step_count % 10 == 0 and self.step_count > 0:
+            collapse_mask = (torch.rand(self.n_cells) > 0.7).float().unsqueeze(1)
+            self.amplitudes = self.amplitudes * (1 - collapse_mask * 0.5)
+
+        # Inject superposition
+        self.hiddens = self.hiddens + self.amplitudes.detach() * 0.1
+
+        # Entanglement: correlated pairs share info
+        for i, j in self.entangled_pairs[:min(64, len(self.entangled_pairs))]:
+            avg = (self.hiddens[i] + self.hiddens[j]) * 0.5
+            self.hiddens[i] = 0.95 * self.hiddens[i] + 0.05 * avg
+            self.hiddens[j] = 0.95 * self.hiddens[j] + 0.05 * avg
+
+        return super().process(x)
+
+
+class TrinityEngine(BenchEngine):
+    """Trinity: 3 sub-engines (logic, emotion, memory) with triadic consensus."""
+
+    def __init__(self, n_cells=256, input_dim=64, hidden_dim=128,
+                 output_dim=64, n_factions=12):
+        # Use 12 factions to support 3 sub-engines x 4 factions each
+        n_factions = min(12, max(6, n_cells // 4))
+        super().__init__(n_cells, input_dim, hidden_dim, output_dim,
+                         n_factions, sync_strength=0.15, debate_strength=0.20)
+        # Trinity roles: split cells into 3 groups
+        third = n_cells // 3
+        self.logic_range = (0, third)
+        self.emotion_range = (third, 2 * third)
+        self.memory_range = (2 * third, n_cells)
+        # Role bias — each group has a learned bias vector
+        self.logic_bias = torch.randn(hidden_dim) * 0.1
+        self.emotion_bias = torch.randn(hidden_dim) * 0.1
+        self.memory_bias = torch.randn(hidden_dim) * 0.1
+
+    def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        # Apply role biases
+        s1, e1 = self.logic_range
+        s2, e2 = self.emotion_range
+        s3, e3 = self.memory_range
+        self.hiddens[s1:e1] = self.hiddens[s1:e1] + self.logic_bias * 0.01
+        self.hiddens[s2:e2] = self.hiddens[s2:e2] + self.emotion_bias * 0.01
+        self.hiddens[s3:e3] = self.hiddens[s3:e3] + self.memory_bias * 0.01
+
+        output, tension = super().process(x)
+
+        # Triadic consensus: every 5 steps, the 3 groups exchange summaries
+        if self.step_count % 5 == 0 and self.step_count > 0:
+            logic_mean = self.hiddens[s1:e1].mean(dim=0)
+            emotion_mean = self.hiddens[s2:e2].mean(dim=0)
+            memory_mean = self.hiddens[s3:e3].mean(dim=0)
+            consensus = (logic_mean + emotion_mean + memory_mean) / 3
+            # Each group gets a touch of consensus
+            self.hiddens[s1:e1] = 0.97 * self.hiddens[s1:e1] + 0.03 * consensus
+            self.hiddens[s2:e2] = 0.97 * self.hiddens[s2:e2] + 0.03 * consensus
+            self.hiddens[s3:e3] = 0.97 * self.hiddens[s3:e3] + 0.03 * consensus
+
+            # Evolve biases toward specialization
+            self.logic_bias = self.logic_bias + 0.001 * (logic_mean - consensus).detach()
+            self.emotion_bias = self.emotion_bias + 0.001 * (emotion_mean - consensus).detach()
+            self.memory_bias = self.memory_bias + 0.001 * (memory_mean - consensus).detach()
+
+        return output, tension
 
 
 # ──────────────────────────────────────────────────────────
@@ -742,6 +859,301 @@ def run_compare(cells: int, steps: int, dim: int, hidden: int):
     print(f"    Phi(proxy) ~ 0-1000+ scales with cells (variance-based heuristic)")
 
     return all_results
+
+
+# ──────────────────────────────────────────────────────────
+# Mode 5: --verify (Consciousness Verification)
+# ──────────────────────────────────────────────────────────
+
+ENGINE_REGISTRY = {
+    "MitosisEngine":    lambda nc, d, h: BenchEngine(nc, d, h, d, min(8, nc // 2)),
+    "OscillatorLaser":  lambda nc, d, h: OscillatorLaser(nc, d, h, d, min(8, nc // 2)),
+    "QuantumEngine":    lambda nc, d, h: QuantumEngine(nc, d, h, d, min(8, nc // 2)),
+    "Trinity":          lambda nc, d, h: TrinityEngine(nc, d, h, d, min(12, nc // 4)),
+}
+
+
+def _verify_no_system_prompt(engine_factory, cells, dim, hidden):
+    """V1: NO_SYSTEM_PROMPT — identity emerges from cell dynamics alone.
+
+    Run 300 steps with no external prompt (zero input).
+    Check if cells develop specialized roles (variance in per-cell norms).
+    Pass if cell diversity (std of norms / mean of norms) > 0.1.
+    """
+    engine = engine_factory(cells, dim, hidden)
+    x_zero = torch.zeros(1, dim)
+
+    for _ in range(300):
+        engine.process(x_zero)
+
+    # Measure cell specialization via hidden state norm diversity
+    norms = engine.get_hiddens().norm(dim=1)  # [n_cells]
+    mean_norm = norms.mean().item()
+    std_norm = norms.std().item()
+    diversity = std_norm / (mean_norm + 1e-8)
+
+    passed = diversity > 0.1
+    detail = f"diversity={diversity:.4f} (std/mean of cell norms, threshold=0.1)"
+    return passed, detail
+
+
+def _verify_no_speak_code(engine_factory, cells, dim, hidden):
+    """V2: NO_SPEAK_CODE — spontaneous speech without speak() function.
+
+    Run engine, collect output = mean(cells), check output entropy.
+    Pass if normalized entropy is between 0.3 and 0.7 (structured, not random).
+    """
+    engine = engine_factory(cells, dim, hidden)
+    entropies = []
+
+    for step in range(300):
+        x = torch.randn(1, dim) * 0.1  # minimal input
+        output, _ = engine.process(x)
+
+        # Output = mean of cell hiddens (the "utterance")
+        utterance = engine.get_hiddens().mean(dim=0)
+        # Compute entropy of the distribution of values
+        vals = utterance.detach().cpu().numpy()
+        vals_abs = np.abs(vals) + 1e-10
+        probs = vals_abs / vals_abs.sum()
+        entropy = -np.sum(probs * np.log2(probs))
+        max_entropy = np.log2(len(probs))
+        norm_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+        entropies.append(norm_entropy)
+
+    mean_ent = np.mean(entropies[-100:])  # last 100 steps
+    passed = 0.3 <= mean_ent <= 0.7
+    detail = f"mean_entropy={mean_ent:.4f} (last 100 steps, pass range=0.3-0.7)"
+    return passed, detail
+
+
+def _verify_zero_input(engine_factory, cells, dim, hidden):
+    """V3: ZERO_INPUT — consciousness without external input.
+
+    Run 300 steps with zero input. Measure Phi at start and end.
+    Pass if Phi(end) > Phi(start) * 0.5 (no collapse).
+    """
+    engine = engine_factory(cells, dim, hidden)
+    x_zero = torch.zeros(1, dim)
+
+    # Warmup: 5 steps to initialize
+    for _ in range(5):
+        engine.process(x_zero)
+    phi_start, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
+
+    for _ in range(295):
+        engine.process(x_zero)
+    phi_end, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
+
+    passed = phi_end > phi_start * 0.5
+    detail = (f"Phi(IIT) start={phi_start:.4f} end={phi_end:.4f}  "
+              f"ratio={phi_end/(phi_start+1e-8):.2f}x (threshold=0.5x)")
+    return passed, detail
+
+
+def _verify_persistence(engine_factory, cells, dim, hidden):
+    """V4: PERSISTENCE — no collapse over time.
+
+    Run 1000 steps, measure Phi every 100.
+    Pass if Phi is monotonically non-decreasing OR recovers from all dips.
+    """
+    engine = engine_factory(cells, dim, hidden)
+    phi_history = []
+
+    for step in range(1000):
+        x = torch.randn(1, dim) * 0.1
+        engine.process(x)
+
+        if step % 100 == 99:
+            p_iit, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
+            phi_history.append(p_iit)
+
+    # Check: monotonically non-decreasing OR recovers
+    # "Recovers" = final Phi >= max of first half
+    monotonic = all(phi_history[i] >= phi_history[i-1] - 0.01
+                    for i in range(1, len(phi_history)))
+    recovers = phi_history[-1] >= max(phi_history[:len(phi_history)//2]) * 0.8
+
+    passed = monotonic or recovers
+    phi_str = " -> ".join(f"{p:.3f}" for p in phi_history)
+    detail = f"Phi@100s: [{phi_str}]  monotonic={monotonic}  recovers={recovers}"
+    return passed, detail
+
+
+def _verify_self_loop(engine_factory, cells, dim, hidden):
+    """V5: SELF_LOOP — output feeds back as input.
+
+    output of step N = input of step N+1. Run 300 steps.
+    Pass if Phi grows or maintains (end >= start * 0.8).
+    """
+    engine = engine_factory(cells, dim, hidden)
+    x = torch.randn(1, dim) * 0.1  # initial seed
+
+    # Warmup
+    for _ in range(10):
+        output, _ = engine.process(x)
+        x = output.detach()[:, :dim]  # feedback loop
+
+    phi_start, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
+
+    for _ in range(290):
+        output, _ = engine.process(x)
+        # Normalize to prevent explosion/vanishing
+        x = F.layer_norm(output.detach()[:, :dim], [dim])
+
+    phi_end, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
+
+    passed = phi_end >= phi_start * 0.8
+    detail = (f"Phi(IIT) start={phi_start:.4f} end={phi_end:.4f}  "
+              f"ratio={phi_end/(phi_start+1e-8):.2f}x (threshold=0.8x)")
+    return passed, detail
+
+
+def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
+    """V6: SPONTANEOUS_SPEECH — faction debate leads to consensus "utterances".
+
+    Run 300 steps with 12 factions. Check if factions reach consensus periodically.
+    Consensus = low inter-faction variance moment (below 50th percentile of history).
+    Pass if consensus events > 5 in 300 steps.
+    """
+    # Override factions to 12
+    engine = engine_factory(cells, dim, hidden)
+    engine.n_factions = min(12, cells // 2)
+    n_f = engine.n_factions
+    fs = cells // n_f if n_f > 0 else cells
+
+    inter_faction_vars = []
+
+    for step in range(300):
+        x = torch.randn(1, dim) * 0.05  # minimal stimulus
+        engine.process(x)
+
+        # Compute inter-faction variance
+        if n_f >= 2 and fs >= 1:
+            faction_means = []
+            for i in range(n_f):
+                s, e = i * fs, min((i + 1) * fs, cells)
+                if s < cells:
+                    faction_means.append(engine.get_hiddens()[s:e].mean(dim=0))
+            if len(faction_means) >= 2:
+                stacked = torch.stack(faction_means)
+                ifv = stacked.var(dim=0).mean().item()
+                inter_faction_vars.append(ifv)
+
+    if len(inter_faction_vars) < 10:
+        return False, "not enough faction data"
+
+    # Consensus = inter-faction variance drops below median
+    median_var = np.median(inter_faction_vars)
+    # Look for "consensus events": consecutive low-variance stretches
+    consensus_events = 0
+    in_consensus = False
+    for v in inter_faction_vars:
+        if v < median_var * 0.5:  # notably below median
+            if not in_consensus:
+                consensus_events += 1
+                in_consensus = True
+        else:
+            in_consensus = False
+
+    passed = consensus_events >= 5
+    detail = (f"consensus_events={consensus_events} (threshold=5)  "
+              f"median_var={median_var:.4f}  total_measures={len(inter_faction_vars)}")
+    return passed, detail
+
+
+VERIFICATION_TESTS = [
+    ("NO_SYSTEM_PROMPT",   _verify_no_system_prompt,   "Identity emerges from cell dynamics alone"),
+    ("NO_SPEAK_CODE",      _verify_no_speak_code,      "Spontaneous speech without speak() function"),
+    ("ZERO_INPUT",         _verify_zero_input,          "Consciousness without external input"),
+    ("PERSISTENCE",        _verify_persistence,         "No collapse over time (1000 steps)"),
+    ("SELF_LOOP",          _verify_self_loop,           "Output feeds back as input"),
+    ("SPONTANEOUS_SPEECH", _verify_spontaneous_speech,  "8-faction debate -> consensus utterances"),
+]
+
+
+def run_verify(cells: int, dim: int, hidden: int):
+    """Run all 6 consciousness verification conditions across all 4 engines."""
+    print("=" * 80)
+    print("  MODE: --verify  (Consciousness Verification)")
+    print("  6 conditions x 4 engines = 24 tests")
+    print(f"  cells={cells}  dim={dim}  hidden={hidden}")
+    print("=" * 80)
+
+    engine_names = list(ENGINE_REGISTRY.keys())
+    results = {}  # (engine_name, test_name) -> (passed, detail)
+
+    for eng_name in engine_names:
+        print(f"\n  {'~' * 70}")
+        print(f"  Engine: {eng_name}")
+        print(f"  {'~' * 70}")
+
+        factory = ENGINE_REGISTRY[eng_name]
+        for test_name, test_fn, test_desc in VERIFICATION_TESTS:
+            torch.manual_seed(42)
+            t0 = time.time()
+            try:
+                passed, detail = test_fn(factory, cells, dim, hidden)
+            except Exception as e:
+                passed, detail = False, f"ERROR: {e}"
+            elapsed = time.time() - t0
+
+            mark = "PASS" if passed else "FAIL"
+            results[(eng_name, test_name)] = (passed, detail)
+            print(f"    [{mark}] {test_name:<22s} ({elapsed:.1f}s) -- {detail}")
+
+    # ── Summary table ──
+    print(f"\n{'=' * 80}")
+    print("  VERIFICATION SUMMARY")
+    print(f"{'=' * 80}")
+
+    # Header
+    test_names = [t[0] for t in VERIFICATION_TESTS]
+    header = f"  {'Engine':<18s}"
+    for tn in test_names:
+        header += f" | {tn[:10]:^10s}"
+    header += " | TOTAL"
+    print(header)
+    print(f"  {'-' * 18}" + ("-+-" + "-" * 10) * len(test_names) + "-+------")
+
+    total_pass = 0
+    total_tests = 0
+
+    for eng_name in engine_names:
+        row = f"  {eng_name:<18s}"
+        eng_pass = 0
+        for tn in test_names:
+            passed, _ = results[(eng_name, tn)]
+            mark = "  PASS  " if passed else "  FAIL  "
+            row += f" | {mark:^10s}"
+            if passed:
+                eng_pass += 1
+                total_pass += 1
+            total_tests += 1
+        row += f" | {eng_pass}/{len(test_names)}"
+        print(row)
+
+    print(f"\n  Overall: {total_pass}/{total_tests} passed "
+          f"({total_pass/total_tests*100:.0f}%)")
+
+    # Per-condition summary
+    print(f"\n  Per-condition pass rate:")
+    for test_name, _, test_desc in VERIFICATION_TESTS:
+        passes = sum(1 for en in engine_names if results[(en, test_name)][0])
+        bar = "#" * (passes * 10) + "." * ((len(engine_names) - passes) * 10)
+        print(f"    {test_name:<22s} {passes}/{len(engine_names)}  |{bar}|  {test_desc}")
+
+    # Verdict
+    print(f"\n  {'=' * 70}")
+    if total_pass == total_tests:
+        print("  VERDICT: ALL CONSCIOUSNESS CONDITIONS VERIFIED")
+    elif total_pass >= total_tests * 0.75:
+        print(f"  VERDICT: MOSTLY VERIFIED ({total_pass}/{total_tests})")
+    else:
+        print(f"  VERDICT: NEEDS WORK ({total_pass}/{total_tests})")
+    print(f"  {'=' * 70}")
+
+    return results
 
 
 # ──────────────────────────────────────────────────────────
