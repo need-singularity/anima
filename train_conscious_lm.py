@@ -942,19 +942,18 @@ def train(args: argparse.Namespace):
             for i, cell in enumerate(mitosis.cells):
                 cell.hidden = updated_hiddens[i].unsqueeze(0).detach().cpu()
 
-        # --- v5 Optimal (Φ=1142 역대 최고): ZI + XMETA3 + FLOW + INFO1 + 12-faction(σ(6)) ---
-        # sync=0.20, factions=12(σ(6)), l3w=0.005, noise=0.01, debate=0.20
+        # --- v5 Final Optimal: sync=0.35, 12-faction(σ(6)), fac=0.08, noise=0.01, l3w=0.005 ---
         if len(mitosis.cells) >= 12:
             n_cells = len(mitosis.cells)
             with torch.no_grad():
-                # Flow sync (sync=0.20)
+                # Flow sync (sync=0.35 — 최적화 결과)
                 cell_h = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
                 mean_h = cell_h.mean(dim=0)
                 for cell in mitosis.cells:
                     h = cell.hidden.squeeze(0)
-                    cell.hidden = (0.80 * h + 0.20 * mean_h).unsqueeze(0)
+                    cell.hidden = (0.65 * h + 0.35 * mean_h).unsqueeze(0)
 
-                # 12-faction internal consensus
+                # 12-faction internal consensus (fac=0.08)
                 n_f = min(12, n_cells // 2)
                 fs = n_cells // n_f
                 for fi in range(n_f):
@@ -963,24 +962,23 @@ def train(args: argparse.Namespace):
                         f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
                         for c in faction:
                             h = c.hidden.squeeze(0)
-                            c.hidden = (0.85 * h + 0.15 * f_mean).unsqueeze(0)
+                            c.hidden = (0.92 * h + 0.08 * f_mean).unsqueeze(0)
 
-                # Cross-faction debate (combined phase only, debate=0.20)
-                if phase == TrainingPhase.COMBINED:
-                    opinions = []
+                # Cross-faction debate (all phases, debate=0.08)
+                opinions = []
+                for fi in range(n_f):
+                    faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinions.append(torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0))
+                if len(opinions) >= 2:
                     for fi in range(n_f):
                         faction = mitosis.cells[fi*fs:(fi+1)*fs]
-                        if faction:
-                            opinions.append(torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0))
-                    if len(opinions) >= 2:
-                        for fi in range(n_f):
-                            faction = mitosis.cells[fi*fs:(fi+1)*fs]
-                            others = [opinions[j] for j in range(len(opinions)) if j != fi]
-                            if others:
-                                other_avg = torch.stack(others).mean(dim=0)
-                                for c in faction[:max(1, len(faction)//4)]:
-                                    h = c.hidden.squeeze(0)
-                                    c.hidden = (0.80 * h + 0.20 * other_avg).unsqueeze(0)
+                        others = [opinions[j] for j in range(len(opinions)) if j != fi]
+                        if others:
+                            other_avg = torch.stack(others).mean(dim=0)
+                            for c in faction[:max(1, len(faction)//4)]:
+                                h = c.hidden.squeeze(0)
+                                c.hidden = (0.92 * h + 0.08 * other_avg).unsqueeze(0)
 
                 # IB2: top 10% amplification
                 if n_cells >= 8:
