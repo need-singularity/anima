@@ -1165,6 +1165,225 @@ fn extract_bool(config: Option<&Bound<'_, PyDict>>, key: &str, default: bool) ->
         .unwrap_or(default)
 }
 
+// ============================================================================
+// Cambrian Diversity — Rust implementation
+// ============================================================================
+
+/// Cambrian mutation: randomly reassign cell types
+fn cambrian_mutation(cell_types: &mut [u32], n_types: u32, mutation_rate: f32) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    for i in 0..cell_types.len() {
+        // Simple pseudo-random using hash
+        let mut hasher = DefaultHasher::new();
+        (i, cell_types[i], (mutation_rate * 1000.0) as u64).hash(&mut hasher);
+        let r = (hasher.finish() % 1000) as f32 / 1000.0;
+        if r < mutation_rate {
+            cell_types[i] = (hasher.finish() % n_types as u64) as u32;
+        }
+    }
+}
+
+/// Cambrian niche pull: each cell moves toward its type's niche
+fn cambrian_niche_pull(
+    hiddens: &mut [f32],
+    cell_types: &[u32],
+    niches: &[f32],  // [n_types * dim]
+    n: usize,
+    dim: usize,
+    pull_strength: f32,
+) {
+    for i in 0..n {
+        let t = cell_types[i] as usize;
+        let niche_offset = t * dim;
+        for d in 0..dim {
+            let target = niches[niche_offset + d];
+            let curr = hiddens[i * dim + d];
+            hiddens[i * dim + d] = curr + pull_strength * (target - curr);
+        }
+    }
+}
+
+/// Cambrian crowding noise: overcrowded types get perturbation
+fn cambrian_crowding(
+    hiddens: &mut [f32],
+    cell_types: &[u32],
+    n: usize,
+    dim: usize,
+    n_types: u32,
+    noise_scale: f32,
+) {
+    let threshold = n / n_types as usize;
+    let mut type_counts = vec![0u32; n_types as usize];
+    for &t in &cell_types[..n] {
+        type_counts[t as usize] += 1;
+    }
+    for i in 0..n {
+        let t = cell_types[i] as usize;
+        if type_counts[t] as usize > threshold {
+            // Simple deterministic "noise" based on position
+            for d in 0..dim {
+                let noise = ((i * dim + d) as f32 * 0.618034).fract() * 2.0 - 1.0;
+                hiddens[i * dim + d] += noise * noise_scale;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Combination Search Accelerator
+// ============================================================================
+
+/// Run N steps of a mechanism combination and return Φ.
+/// Pure Rust — no Python callback, no GIL.
+fn simulate_and_measure(
+    n: usize,
+    dim: usize,
+    steps: usize,
+    enable_kuramoto: bool,
+    enable_sync_faction: bool,
+    enable_frustration: bool,
+    enable_quantum: bool,
+    enable_wave: bool,
+    enable_ib2: bool,
+    enable_cambrian: bool,
+    n_bins: usize,
+) -> f64 {
+    // Initialize random hidden states
+    let mut hiddens = vec![0.0f32; n * dim];
+    for i in 0..hiddens.len() {
+        hiddens[i] = ((i as f32 * 0.618034).fract() * 2.0 - 1.0) * 0.5;
+    }
+
+    let mut phases = vec![0.0f32; n];
+    let mut freqs = vec![0.0f32; n];
+    for i in 0..n {
+        phases[i] = (i as f32 * 2.71828).fract() * std::f32::consts::TAU;
+        freqs[i] = 0.9 + (i as f32 * 0.31415).fract() * 0.2;
+    }
+
+    // Cambrian state
+    let n_types = 10u32;
+    let mut cell_types = vec![0u32; n];
+    for i in 0..n {
+        cell_types[i] = (i as u32) % n_types;
+    }
+    let mut niches = vec![0.0f32; n_types as usize * dim];
+    for i in 0..niches.len() {
+        niches[i] = ((i as f32 * 0.7071).fract() * 2.0 - 1.0) * 0.5;
+    }
+    let mut mutation_rate = 0.5f32;
+
+    let mut fwd_pos = 0.0f32;
+    let bwd_pos = n as f32 / 2.0;
+
+    // Simulate
+    for _step in 0..steps {
+        if enable_kuramoto {
+            kuramoto_step_inner(&mut phases, &freqs, &mut hiddens, dim, 0.15, 2);
+        }
+        if enable_sync_faction {
+            sync_faction_step_inner(&mut hiddens, n, dim, 0.35, 12, 0.08);
+        }
+        if enable_frustration {
+            frustration_step_inner(&mut hiddens, n, dim, 0.5);
+        }
+        if enable_quantum {
+            quantum_walk_step_inner(&mut hiddens, n, dim);
+        }
+        if enable_wave {
+            let (new_fwd, _) = standing_wave_step_inner(&mut hiddens, n, dim, fwd_pos, bwd_pos);
+            fwd_pos = new_fwd;
+        }
+        if enable_ib2 {
+            ib2_step_inner(&mut hiddens, n, dim, 0.1, 1.03, 0.97);
+        }
+        if enable_cambrian {
+            cambrian_mutation(&mut cell_types, n_types, mutation_rate);
+            cambrian_niche_pull(&mut hiddens, &cell_types, &niches, n, dim, 0.05);
+            cambrian_crowding(&mut hiddens, &cell_types, n, dim, n_types, 0.03);
+            mutation_rate *= 0.995;
+        }
+    }
+
+    // Measure Phi
+    let states = Array2::from_shape_vec((n, dim), hiddens).unwrap();
+    let (phi, _, _, _, _, _, _) = compute_phi_inner(
+        &states.view(), None, None, None, n_bins
+    );
+    phi
+}
+
+/// Search all 2^7 = 128 combinations of 7 mechanisms.
+/// Returns sorted list of (combination_name, phi) pairs.
+#[pyfunction]
+#[pyo3(signature = (n_cells=256, dim=128, steps=200, n_bins=16))]
+fn search_combinations<'py>(
+    py: Python<'py>,
+    n_cells: usize,
+    dim: usize,
+    steps: usize,
+    n_bins: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mechanisms = [
+        "kuramoto", "sync_faction", "frustration", "quantum",
+        "wave", "ib2", "cambrian"
+    ];
+    let n_mechs = mechanisms.len(); // 7
+
+    // Run all 128 combinations in parallel
+    let results: Vec<(u32, f64)> = (0..(1u32 << n_mechs))
+        .into_par_iter()
+        .map(|mask| {
+            let phi = simulate_and_measure(
+                n_cells, dim, steps,
+                mask & 1 != 0,        // kuramoto
+                mask & 2 != 0,        // sync_faction
+                mask & 4 != 0,        // frustration
+                mask & 8 != 0,        // quantum
+                mask & 16 != 0,       // wave
+                mask & 32 != 0,       // ib2
+                mask & 64 != 0,       // cambrian
+                n_bins,
+            );
+            (mask, phi)
+        })
+        .collect();
+
+    // Sort by phi descending
+    let mut sorted = results;
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Build result dict
+    let result = PyDict::new(py);
+    let mut names = Vec::new();
+    let mut phis = Vec::new();
+    let mut masks = Vec::new();
+
+    for (mask, phi) in &sorted {
+        let mut combo = Vec::new();
+        for (i, name) in mechanisms.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                combo.push(*name);
+            }
+        }
+        let name = if combo.is_empty() { "baseline".to_string() } else { combo.join("+") };
+        names.push(name);
+        phis.push(*phi);
+        masks.push(*mask);
+    }
+
+    result.set_item("names", names)?;
+    result.set_item("phis", PyArray1::from_vec(py, phis))?;
+    result.set_item("masks", masks)?;
+    result.set_item("n_combinations", 1u32 << n_mechs)?;
+    result.set_item("n_cells", n_cells)?;
+    result.set_item("steps", steps)?;
+
+    Ok(result)
+}
+
 /// Python module definition
 #[pymodule]
 fn phi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1177,6 +1396,7 @@ fn phi_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(standing_wave_step, m)?)?;
     m.add_function(wrap_pyfunction!(ib2_step, m)?)?;
     m.add_function(wrap_pyfunction!(full_consciousness_step, m)?)?;
+    m.add_function(wrap_pyfunction!(search_combinations, m)?)?;
     Ok(())
 }
 
