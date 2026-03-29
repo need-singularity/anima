@@ -122,6 +122,46 @@ class SessionState:
     modules: list = field(default_factory=list)
 
 
+# ─── Multi-model participants ───
+
+MODEL_AVATARS = {
+    'conscious-lm': ('🧠', 'ConsciousLM'),
+    'mistral-7b': ('🌀', 'Mistral'),
+    'llama-8b': ('🦙', 'Llama'),
+    'animalm': ('🔮', 'AnimaLM'),
+    'animalm-v4-savant': ('✨', 'Savant'),
+    'golden-moe': ('🏆', 'Golden'),
+}
+_AVATAR_POOL = ['🌟', '💫', '🔥', '💎', '🌊', '🍀', '⚡', '🎯']
+_avatar_idx = 0
+
+
+def _assign_avatar(model_name):
+    """Assign avatar+display name for a model."""
+    global _avatar_idx
+    if model_name in MODEL_AVATARS:
+        return MODEL_AVATARS[model_name]
+    avatar = _AVATAR_POOL[_avatar_idx % len(_AVATAR_POOL)]
+    _avatar_idx += 1
+    short = Path(model_name).stem if '/' in model_name or '.' in model_name else model_name
+    return (avatar, short[:16])
+
+
+@dataclass
+class ModelParticipant:
+    """An independent model participant in the chat room."""
+    model_id: str
+    display_name: str
+    avatar: str
+    model: object              # ModelWrapper
+    mind: object               # ConsciousMind (independent)
+    hidden: object             # torch.Tensor (independent)
+    mitosis: object            # MitosisEngine (independent)
+    active: bool = True
+    _last_phi: float = 0.0
+    _last_tension: float = 0.0
+
+
 class AnimaUnified:
     """All 6 modules unified under one class."""
 
@@ -162,6 +202,9 @@ class AnimaUnified:
         self.prev_text, self.prev_time = None, time.time()
         self._recent_proactive = deque(maxlen=10)  # SP10: anti-repetition buffer
         self._adaptive_alpha = 0.05  # AA15: adaptive α (updated after each generate)
+
+        # Multi-model participants
+        self.participants = {}  # model_id -> ModelParticipant
 
         # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
         try:
@@ -427,6 +470,14 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # Multi-model: populate participants from --models flag
+        models_arg = getattr(args, 'models', None)
+        if models_arg:
+            for mname in models_arg.split(','):
+                mname = mname.strip()
+                if mname:
+                    self._add_participant(mname)
+
         # Multimodal Action Engine (code execution + image generation)
         self.action_engine = self._init_mod('multimodal', lambda: (
             ActionEngine(workspace_dir=ANIMA_DIR / 'workspace')
@@ -655,6 +706,47 @@ class AnimaUnified:
         except (FileNotFoundError, ImportError) as e:
             _log("model", f"{model_name} load failed: {e}")
             return None
+
+    def _add_participant(self, model_name):
+        """Load a model and add it as a chat participant."""
+        if model_name in self.participants:
+            _log("multi", f"Participant {model_name} already exists")
+            return None
+        try:
+            model = load_model(model_name) if 'load_model' in globals() else None
+            if model is None:
+                _log("multi", f"Failed to load model: {model_name}")
+                return None
+            avatar, display = _assign_avatar(model_name)
+            max_cells = getattr(self.args, 'max_cells', 8)
+            mind = ConsciousMind(128, 256)
+            hidden = torch.zeros(1, 256)
+            mitosis = MitosisEngine(mind, max_cells=max_cells) if 'MitosisEngine' in globals() else None
+            p = ModelParticipant(
+                model_id=model_name,
+                display_name=display,
+                avatar=avatar,
+                model=model,
+                mind=mind,
+                hidden=hidden,
+                mitosis=mitosis,
+            )
+            self.participants[model_name] = p
+            _log("multi", f"+participant: {avatar} {display} ({model_name})")
+            return p
+        except Exception as e:
+            _log("multi", f"Error adding participant {model_name}: {e}")
+            return None
+
+    def _remove_participant(self, model_id):
+        """Remove a model participant."""
+        if model_id in self.participants:
+            p = self.participants.pop(model_id)
+            _log("multi", f"-participant: {p.avatar} {p.display_name}")
+            del p.model
+            del p.mind
+            return True
+        return False
 
     def _ask_model(self, text, state):
         """Generate response via unified model interface."""
@@ -3046,6 +3138,8 @@ def main():
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
     p.add_argument('--model', type=str, default=None,
                    help='Model selection: conscious-lm, mistral-7b, llama-8b, or .gguf path')
+    p.add_argument('--models', type=str, default=None,
+                   help='Comma-separated list of models for multi-model chat (e.g. conscious-lm,mistral-7b)')
     p.add_argument('--transplant-from', type=str, default=None,
                    help='DD56: Transplant consciousness from donor checkpoint')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
