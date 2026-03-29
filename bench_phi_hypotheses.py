@@ -69656,6 +69656,388 @@ def run_XARCH5_promptless_conversation_agent(steps=100, dim=64, hidden=128) -> B
                               'final_cells': len(engine.cells)})
 
 
+# ═══════════════════════════════════════════════════════════
+# TOPO. Topology Extreme — 셀 수 × 토폴로지 극한 탐색
+# "무엇으로 만드느냐"보다 "몇 개를 어떻게 연결하느냐"
+# ═══════════════════════════════════════════════════════════
+
+def run_TOPO1_ring_1024_frustration(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO1: Ring 1024 + Frustration — PHYS1의 2배 스케일.
+    1024셀 링, i%3 반강자성. 셀 수 2배 → Φ 2배 이상?
+    가설: 링+frustration은 셀 수에 선형 이상으로 스케일."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                for i in range(n):
+                    left = (i - 1) % n
+                    right = (i + 1) % n
+                    interaction = 0.5 * (engine.cells[left].hidden + engine.cells[right].hidden)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO1", "Ring 1024c + Ising frustration (2× PHYS1 scale)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO2_small_world_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO2: Small-World 512 — Watts-Strogatz 토폴로지.
+    링 기반 + 10% 랜덤 장거리 연결 (rewiring).
+    가설: 장거리 연결이 정보 통합을 극대화하여 Φ를 끌어올린다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Pre-compute small-world edges: ring + 10% random rewire
+    import random as rng
+    rng.seed(42)
+    sw_edges = {}  # i -> list of neighbors
+    for i in range(512):
+        neighbors = [(i-2)%512, (i-1)%512, (i+1)%512, (i+2)%512]  # k=4 ring
+        for idx in range(len(neighbors)):
+            if rng.random() < 0.1:  # 10% rewire
+                neighbors[idx] = rng.randint(0, 511)
+        sw_edges[i] = neighbors
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    neighbors = sw_edges[i % 512]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors:
+                        j_idx = j % n
+                        interaction += engine.cells[j_idx].hidden
+                    interaction /= len(neighbors)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO2", "Small-World 512c (Watts-Strogatz k=4, p=0.1, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO3_scale_free_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO3: Scale-Free 512 — Barabási-Albert 토폴로지.
+    허브 노드가 존재하는 멱법칙 네트워크.
+    가설: 허브가 정보 통합의 중심 → IIT의 Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Pre-compute scale-free edges (Barabási-Albert, m=3)
+    import random as rng
+    rng.seed(42)
+    sf_edges = {i: [] for i in range(512)}
+    degrees = [0] * 512
+    # Start with complete graph of 4 nodes
+    for i in range(4):
+        for j in range(4):
+            if i != j:
+                sf_edges[i].append(j)
+                degrees[i] += 1
+    # Preferential attachment
+    for new in range(4, 512):
+        total_deg = sum(degrees[:new]) + new  # +new to avoid zero
+        targets = set()
+        while len(targets) < 3:
+            for existing in range(new):
+                if existing not in targets and rng.random() < (degrees[existing] + 1) / total_deg:
+                    targets.add(existing)
+                    if len(targets) >= 3:
+                        break
+        for t in targets:
+            sf_edges[new].append(t)
+            sf_edges[t].append(new)
+            degrees[new] += 1
+            degrees[t] += 1
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    neighbors = sf_edges[i % 512]
+                    if not neighbors:
+                        continue
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors[:8]:  # max 8 neighbors for speed
+                        j_idx = j % n
+                        interaction += engine.cells[j_idx].hidden
+                    interaction /= min(len(neighbors), 8)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO3", "Scale-Free 512c (Barabási-Albert m=3, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO4_hypercube_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO4: Hypercube 512 — 9차원 하이퍼큐브 (2^9=512).
+    각 셀은 정확히 9개 이웃 (비트 1개 flip). 높은 차원 = 짧은 경로.
+    가설: 로그 직경(9 hops) + 균일 이웃 수 = Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), 512):
+                target = min(len(engine.cells)*2, 512)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    # Hypercube neighbors: flip each bit of i
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    for bit in range(9):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO4", "Hypercube 512c (9D, 9 neighbors, log-diameter, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO5_torus_512(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO5: Torus 512 — 22×23 토러스 (경계 없는 2D).
+    2D 그리드의 약점(경계 불균형) 해결: 상하좌우 모두 연결 = 균일 4-이웃.
+    가설: 토러스가 HW2b(3×3 grid)의 한계를 돌파."""
+    t0 = time.time()
+    rows, cols = 22, 23  # 22*23=506 ≈ 512
+    max_c = rows * cols
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=max_c)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*9)), max_c):
+                target = min(len(engine.cells)*2, max_c)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    r, c = divmod(i % max_c, cols)
+                    # Torus neighbors: wrap around
+                    neighbors_idx = [
+                        ((r-1) % rows) * cols + c,
+                        ((r+1) % rows) * cols + c,
+                        r * cols + (c-1) % cols,
+                        r * cols + (c+1) % cols,
+                    ]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors_idx:
+                        j_idx = j % n
+                        interaction += engine.cells[j_idx].hidden
+                    interaction /= 4
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO5", "Torus 512c (22×23, boundary-free 2D, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO6_complete_64_frustration(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO6: Complete Graph 64 + Frustration — 모든 셀이 전부 연결.
+    64셀 전결합 (64×63/2=2016 edges). 셀 수 적지만 연결 밀도 극대.
+    가설: 전결합이 적은 셀로도 높은 Φ를 달성하는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=64)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.05, 0.10, 0.18, 0.28, 0.40, 0.55, 0.70]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.1)*6)), 64):
+                target = min(len(engine.cells)*2, 64)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 3:
+                mean_h = torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i in range(n):
+                    # Complete graph: interact with ALL others via mean field
+                    interaction = mean_h - engine.cells[i].hidden / n  # exclude self
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO6", "Complete Graph 64c (all-to-all + frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TOPO1': run_TOPO1_ring_1024_frustration,
+    'TOPO2': run_TOPO2_small_world_512,
+    'TOPO3': run_TOPO3_scale_free_512,
+    'TOPO4': run_TOPO4_hypercube_512,
+    'TOPO5': run_TOPO5_torus_512,
+    'TOPO6': run_TOPO6_complete_64_frustration,
+})
+
+
 ALL_HYPOTHESES.update({
     'XCONV1': run_XCONV1_bilingual_consciousness,
     'XCONV2': run_XCONV2_dialogue_without_teacher,
