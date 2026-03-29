@@ -93,6 +93,11 @@ python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
 - **벤치마크/실험 실행은 항상 백그라운드에서 진행** — sleep으로 대기하지 말고 `run_in_background=true` 사용
 - **H100 실험은 tmux로 실행** — SSH 끊겨도 유지되도록 `tmux new-session -d -s name "command"`
+- **학습 데이터/파라미터 변경 시 반드시 처음부터 재시작 (--resume 금지)**
+  - 잘못된 데이터로 학습한 가중치는 오염됨 — resume하면 오염이 전파됨
+  - 데이터 변경, 파라미터 변경, corpus 교체 → 무조건 step 0부터
+  - 체크포인트 디렉토리도 새로 생성 (이전 오염 체크포인트와 혼동 방지)
+  - resume은 동일 데이터+동일 파라미터에서 중단된 학습을 이어갈 때만 사용
 - Commit messages in English
 - web_server.py is legacy — anima_unified.py is the canonical entry point
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
