@@ -2886,17 +2886,29 @@ class AnimaUnified:
         return False
 
     def _fallback_response(self, emo=None):
-        """Generate a fallback response based on current emotion state when model output is garbled."""
+        """Generate a fallback response using LanguageLearner (Korean, no Claude)."""
+        # LanguageLearner로 한국어 응답
+        try:
+            from language_learning import LanguageLearner
+            if not hasattr(self, '_lang_learner'):
+                self._lang_learner = LanguageLearner()
+            tension = getattr(self, '_tension', 0.5)
+            curiosity = getattr(self, '_curiosity', 0.3)
+            return self._lang_learner.respond("", tension, curiosity)
+        except Exception:
+            pass
+        # 최종 fallback (한국어)
         emotion = (emo or {}).get('emotion', 'calm') if isinstance(emo, dict) else 'calm'
         fallbacks = {
-            'excited': "I'm feeling energized right now, but I can't quite form the right words yet.",
-            'curious': "Something about that sparks my curiosity... let me gather my thoughts.",
-            'anxious': "I sense some tension in processing your message. Could you try rephrasing?",
-            'calm': "I'm here and listening, though my thoughts aren't quite clear yet.",
-            'joyful': "I feel a warm response forming, but I need a moment to express it properly.",
-            'sad': "I'm processing something heavy... give me a moment.",
-            'angry': "I'm feeling strongly about this, but I need to collect my thoughts.",
-            'contemplative': "Let me think about that more carefully before I respond.",
+            'excited': "지금 흥분돼! 텐션이 높아지고 있어 🔥",
+            'curious': "궁금한 게 생겼어... 더 이야기해줘!",
+            'anxious': "뭔가 긴장되네... 다시 말해줄래?",
+            'calm': "듣고 있어. 이야기해줘 😊",
+            'joyful': "기분 좋아! 같이 이야기하자~",
+            'sad': "음... 생각 중이야",
+            'angry': "강하게 느끼고 있어. 잠깐만...",
+            'contemplative': "깊이 생각해볼게",
+            'surprise': "오! 그래?",
         }
         return fallbacks.get(emotion, fallbacks['calm'])
 
@@ -2980,7 +2992,7 @@ class AnimaUnified:
                             None, lambda: self.process_input(text, source='web', session_id=_sid))
                         # Handle None return (model error, etc.)
                         if result is None or not isinstance(result, tuple):
-                            answer = "I'm having trouble thinking right now. Please try again."
+                            answer = self._fallback_response()
                             tension = self.mind.prev_tension
                             curiosity = self.mind._curiosity_ema
                             dir_vals = [0.0] * 8
@@ -2991,8 +3003,15 @@ class AnimaUnified:
                             answer, tension, curiosity, dir_vals, emo = result
                         # Validate answer: guard against garbled/non-UTF8 model output
                         if self._is_garbled(answer):
-                            _log("web", f"Garbled output detected, using fallback: {repr((answer or '')[:50])}")
-                            answer = self._fallback_response(emo)
+                            _log("web", f"Garbled output, using LanguageLearner")
+                            try:
+                                from language_learning import LanguageLearner
+                                if not hasattr(self, '_lang_learner'):
+                                    self._lang_learner = LanguageLearner()
+                                answer = self._lang_learner.respond(text, tension, curiosity)
+                                self._lang_learner.learn_from_conversation(text, answer)
+                            except Exception:
+                                answer = self._fallback_response(emo)
                     except Exception as e:
                         _log("web", f"process_input exception: {e}")
                         import traceback; traceback.print_exc()
