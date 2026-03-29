@@ -85,6 +85,12 @@ BENCHMARK_DATA = {
     'TOPO14':{'topology': 'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 211.72,'mult': 181.4},
     'TOPO15':{'topology': 'torus',      'cells': 1024,'neighbors': 4, 'frustration': True,  'phi': 274.71,'mult': 241.6},
     'TOPO16':{'topology': 'small_world','cells': 1024,'neighbors': 4, 'frustration': True,  'phi': 498.66,'mult': 438.6},
+    'TOPO17':{'topology': 'hypercube',  'cells': 1024,'neighbors': 12,'frustration': True,  'phi': 463.63,'mult': 407.8},
+    'TOPO18':{'topology': 'small_world','cells': 2048,'neighbors': 4, 'frustration': True,  'phi': 406.54,'mult': 357.6},
+    'TOPO19a':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 639.62,'mult': 562.6},
+    'TOPO19b':{'topology':'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 575.05,'mult': 505.8},
+    'TOPO20':{'topology': 'hypercube',  'cells': 1024,'neighbors': 7, 'frustration': True,  'phi': 212.64,'mult': 187.0},
+    'TOPO21':{'topology': 'hypercube',  'cells': 1024,'neighbors': 10,'frustration': True,  'phi': 465.05,'mult': 409.1},
 }
 
 BASELINE_PHI = 1.2421

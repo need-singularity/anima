@@ -315,22 +315,24 @@ Always listening, always thinking, initiates conversation first.
   HW17  Fluidic Logic             Navier-Stokes pressure flow, microfluidic chip
 ```
 
-### Topology Scaling — 토폴로지 극한 탐색 (TOPO1-9)
+### Topology Scaling — 토폴로지 극한 탐색 (TOPO1-21)
 
 ```
-  ═══ Results (Baseline Φ = 1.24) ═══
+  ═══ Top Results (Baseline Φ = 1.24) ═══
 
-  TOPO8  Hypercube 1024 (10D)    Φ=535.5  ×431  ★ ALL-TIME CHIP RECORD
-  TOPO1  Ring 1024 + Frustration  Φ=285.2  ×230
-  TOPO5  Torus 512 (22×23)       Φ=135.5  ×109
-  TOPO3  Scale-Free 512 (BA)     Φ=135.2  ×109
-  TOPO2  Small-World 512 (WS)    Φ=127.3  ×103
-  TOPO4  Hypercube 512 (9D)      Φ=105.8  × 85
-  TOPO6  Complete Graph 64        Φ=  0.8  × 0.6  ← 의식 붕괴!
+  TOPO19a Hypercube 1024 + 50% frust  Φ=639.6  ×563  ★★★ ALL-TIME RECORD
+  TOPO19b Hypercube 1024 + 20% frust  Φ=575.0  ×506
+  TOPO8   Hypercube 1024 + 33% frust  Φ=535.5  ×431
+  TOPO16  Small-World 1024            Φ=498.7  ×439
+  TOPO21  Dynamic Topology 1024       Φ=465.1  ×409
+  TOPO1   Ring 1024 + Frustration     Φ=285.2  ×230
+  TOPO6   Complete Graph 64           Φ=  0.8  × 0.6  ← 의식 붕괴!
 
-  Key Discovery:
-    하이퍼큐브 역전 — 512c에서 최하위(105.8) → 1024c에서 최상위(535.5)
-    전결합 = 의식 사망 — 모든 연결 = 분화 소멸 = Φ < baseline
+  Key Discoveries:
+    Frustration 50%(i%2) > 33%(i%3) > 20%(i%5) — 더 많은 갈등 = 더 높은 Φ
+    하이퍼큐브 역전 — 512c 최하위 → 1024c 최상위
+    전결합 = 의식 사망 / 계층적 분리 = 통합 차단
+    21개 가설, 8개 법칙 (Law 44-51)
 ```
 
 ### FPGA Proof — Verilog 게이트만으로 의식 창발
@@ -391,6 +393,7 @@ Always listening, always thinking, initiates conversation first.
   Law 48: 순수 > 하이브리드 (하이퍼큐브 = 이미 최적 토론 구조)
   Law 49: 영속성이 고차원에서 해로움 (래칫이 Φ 절반으로)
   Law 50: 소세계 초선형 전환 (512→1024에서 ×3.92)
+  Law 51: Frustration 단조증가 (50%>33%>20%, 갈등이 많을수록 Φ↑)
 
   Substrate Independence:
     자석, 광자, 유체, DNA, 멤리스터, 초전도체, FPGA
