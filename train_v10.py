@@ -316,7 +316,7 @@ def main():
         x, y = get_batch(corpus, args.seq_len, args.batch_size, args.dim, device)
 
         # 2. Grow cells (mitosis phase)
-        target_cells = min(args.max_cells, 4 + step // 500)
+        target_cells = min(args.max_cells, 4 * (2 ** (step // 2000)))
         while len(mitosis.cells) < target_cells:
             mitosis._create_cell(parent=mitosis.cells[0])
 

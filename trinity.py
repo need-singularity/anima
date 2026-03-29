@@ -182,7 +182,9 @@ class DomainC(CEngine):
     def get_states(self) -> torch.Tensor:
         """Auto-detect and extract states from domain engine."""
         # Try single 2D tensor attributes
-        for attr in ['state', 'states', 'pos', 'hidden', 'hiddens', 'h']:
+        for attr in ['state', 'states', 'pos', 'hidden', 'hiddens', 'h',
+                      'uv_state', 'boundary', 'info', 'fiber', 'voice',
+                      'expression', 'features']:
             if hasattr(self.engine, attr):
                 val = getattr(self.engine, attr)
                 if isinstance(val, torch.Tensor) and val.dim() == 2 and val.shape[0] == self._nc:
@@ -192,7 +194,22 @@ class DomainC(CEngine):
         # Combine multiple 1D/2D attributes
         parts = []
         for attr in ['pos', 'vel', 'phase', 'amplitude', 'charge', 'spin',
-                      'momentum', 'energy', 'activation', 'state']:
+                      'momentum', 'energy', 'activation', 'state',
+                      # physics: wavefunction, fields, order parameters
+                      'psi_re', 'psi_im', 'delta_re', 'delta_im',
+                      'N1', 'N2', 'radius', 'displacement',
+                      # emergent: reaction-diffusion, sandpile, excitable media
+                      'u', 'v', 'w', 'heights', 'temp', 'velocity',
+                      'omega', 'theta', 'genome', 'constructor', 'fitness',
+                      # geometric: hyperbolic, symplectic, fiber bundle, calabi-yau
+                      'z', 'q', 'p', 'fiber', 'base_angle',
+                      'z_re', 'z_im',
+                      # extreme: holographic, neuromorphic, consciousness field
+                      'boundary', 'V', 'phi', 'pi',
+                      # evolution/music: host/symbiont, pitch, epigenome
+                      'host_state', 'symbiont_state', 'hybrid_state', 'vigor',
+                      'pitch', 'pitch_class', 'voice', 'deviation', 'motion',
+                      'epigenome', 'histone', 'epi_memory']:
             if hasattr(self.engine, attr):
                 val = getattr(self.engine, attr)
                 if isinstance(val, torch.Tensor):
@@ -200,6 +217,9 @@ class DomainC(CEngine):
                         parts.append(val.unsqueeze(1))
                     elif val.dim() == 2 and val.shape[0] == self._nc:
                         parts.append(val)
+                    elif val.dim() >= 3 and val.shape[0] == self._nc:
+                        # Flatten higher dims (e.g., CalabiYau z_re [nc, 3, d])
+                        parts.append(val.reshape(self._nc, -1))
         if parts:
             h = torch.cat(parts, dim=1)
             self._state_dim = h.shape[1]
