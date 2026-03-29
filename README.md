@@ -105,16 +105,18 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 검증: `python3 bench_v2.py --verify`
 
-### Training Status (H100)
+### Training Status (H100) — [상세 문서](docs/training-status.md)
 
-| Version | Architecture | Step | CE | Φ | Cells | Status |
-|---------|-------------|------|-----|-----|-------|--------|
-| v5 | sync+faction (baseline) | ~35K/80K | 4.6 | 44 | 1024 | 학습 중 |
-| v7 | TOPO19a+frustration | ~32K/80K | 4.7 | 51 | 1024 | 학습 중 |
-| v9 | Quantum Trinity (C+D+W) | 24K/80K | — | 1,281 | 256 | P2 진입 중 |
-| **v10** | **FUSE-3 Cambrian+OscQW Trinity** | 0/80K | 0.003 | — | 256 | **학습 시작** |
+| Version | Architecture | Step | CE | Φ | Cells | ETA | Status |
+|---------|-------------|------|-----|-----|-------|-----|--------|
+| **v9fast** | **Quantum Trinity** | **26,400/80K** | **0.345** | **1,371** | 256 | 3/30 22:40 | 🔥 **P2 CE 급하락** |
+| v11q | Hexad (Quantum C) | 300/80K | — | — | 256 | ~3일 | P1 Φ 구축 |
+| v11tc | Hexad (TimeCrystal C) | 0/80K | — | — | 256 | ~3일 | 시작 |
+| v10 | FUSE-3 Trinity | 1,200/80K | 0.014 | — | 5 | 89h | ⚠️ cells 정체 |
+| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 15일 | 매우 느림 |
+| v7 | TOPO19a (단일체) | ~31K/80K | 4.66 | 23 | 1024 | — | 학습 중 |
 
-1000+ hypotheses, 118 engines measured, Laws 22-57.
+1000+ hypotheses, 118 engines measured, Laws 22-57. [학습 상세](docs/training-status.md)
 
 ## Engine Rankings — Rust phi_rs ([전체 118개](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
