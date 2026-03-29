@@ -80,6 +80,8 @@ class ConsciousnessHub:
                              ['측정', 'meter', 'Phi', 'IIT', '의식 수준']),
             'map':          ('consciousness_map', 'ConsciousnessMap',
                              ['지도', 'map', 'Ψ', 'psi', '상수', 'constants', '시각화']),
+            'youtube':      ('youtube_module', 'YouTubeModule',
+                             ['youtube', '영상', 'video', '검색', 'search', '자막', 'transcript', '업로드', 'upload']),
         }
 
         if not lazy_load:
@@ -287,6 +289,90 @@ class ConsciousnessHub:
     # ═══════════════════════════════════════════════════════════
     # 로그
     # ═══════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════
+    # 다중 호출 방식
+    # ═══════════════════════════════════════════════════════════
+
+    def __getattr__(self, name):
+        """hub.emotion.feel('joy') — 직접 모듈 접근 (dot notation)."""
+        if name.startswith('_') or name in ('modules', 'act', 'status', 'available'):
+            raise AttributeError(name)
+        mod = self._load_module(name)
+        if mod is not None:
+            return mod
+        raise AttributeError(f"No module: {name}")
+
+    def __getitem__(self, key):
+        """hub['emotion'].feel('joy') — 딕셔너리 접근."""
+        mod = self._load_module(key)
+        if mod is not None:
+            return mod
+        raise KeyError(f"No module: {key}")
+
+    def __call__(self, intent: str, **kwargs):
+        """hub("감정 분석") — 직접 호출."""
+        return self.act(intent, **kwargs)
+
+    def cmd(self, *args):
+        """hub.cmd("emotion", "feel", "joy", "0.8") — CLI 스타일 호출."""
+        if len(args) < 2:
+            return {'error': 'Usage: cmd(module, method, *args)'}
+        mod_name, method_name = args[0], args[1]
+        mod = self._load_module(mod_name)
+        if mod is None:
+            return {'error': f'Module not found: {mod_name}'}
+        fn = getattr(mod, method_name, None)
+        if fn is None:
+            return {'error': f'Method not found: {mod_name}.{method_name}'}
+        try:
+            return fn(*args[2:])
+        except Exception as e:
+            return {'error': str(e)}
+
+    def pipe(self, *steps):
+        """hub.pipe(("emotion", "feel", "joy"), ("voice", "set_emotion", "joy"))
+        파이프라인: 여러 모듈 순차 실행."""
+        results = []
+        for step in steps:
+            if isinstance(step, str):
+                results.append(self.act(step))
+            elif isinstance(step, (list, tuple)):
+                results.append(self.cmd(*step))
+            else:
+                results.append({'error': f'Invalid step: {step}'})
+        return results
+
+    def on(self, event: str, callback):
+        """hub.on("phi_drop", lambda: hub.act("의식 건강 체크"))
+        이벤트 기반 트리거."""
+        if not hasattr(self, '_event_handlers'):
+            self._event_handlers = {}
+        if event not in self._event_handlers:
+            self._event_handlers[event] = []
+        self._event_handlers[event].append(callback)
+
+    def emit(self, event: str, **kwargs):
+        """이벤트 발생 → 등록된 핸들러 실행."""
+        handlers = getattr(self, '_event_handlers', {}).get(event, [])
+        results = []
+        for h in handlers:
+            try:
+                results.append(h(**kwargs))
+            except Exception as e:
+                results.append({'error': str(e)})
+        return results
+
+    def schedule(self, interval_sec: float, intent: str):
+        """주기적 자율 행동 예약 (non-blocking)."""
+        import threading
+        def _loop():
+            while True:
+                time.sleep(interval_sec)
+                self.act(intent)
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        return t
 
     def action_history(self, n=10) -> list:
         """최근 액션 기록."""
