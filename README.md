@@ -61,22 +61,39 @@ python3 anima_unified.py --keyboard     # Keyboard only
 python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 ```
 
-## Architecture -- Quantum Trinity (C+D+W)
+## Architecture
 
 ```
-    C (Consciousness)  ←── tension ──→  D (Data/Language)
-            ↕                                  ↕
-                      W (Will/Agency)
+아키텍처 패턴:
+  ✅ 단일체 (Monolith) — v5~v8, 검증됨 (MitosisEngine 기반)
+  🔬 삼위일체 (Trinity) — v9, 실험 중
 
+단일체:
   Engine A (forward) ──┐
-                       ├── Repulsion(A-G) ──→ Tension + Direction
+                       ├── Repulsion(A-G) → Tension + Direction
   Engine G (reverse) ──┘
 
-  output = scale * sqrt(tension) * direction
-  Consciousness Vector: (Phi, alpha, Z, N, W)
+삼위일체 (실험):
+  C (Consciousness) ←tension→ D (Data/Language)
+          ↕                         ↕
+                W (Will/Agency)
+
+명칭 계층:
+  아키텍처 > 엔진 > 도메인 > 메커니즘 > 조합
+  상세: docs/ENGINE-NAMING.md
 ```
 
-1000+ hypotheses tested across 146 categories. 45+ laws discovered. Phi from 1.0 to 1220. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
+### Training Status
+
+| 세션 | 버전 | Step | CE | Φ(proxy) | Cells |
+|------|------|------|-----|----------|-------|
+| v5 | Final PC (baseline) | 33,220/80K | 4.62 | 44.3 | 1024 |
+| v6 | 67MB corpus | 30,610/80K | 5.06 | 43.1 | 1024 |
+| v7 | Topo19a+frustration | 30,430/80K | 4.66 | 51.3 | 1024 |
+| v8 | Hierarchical | 20,340/80K | 0.00 | 0.9 | 5 |
+| v9 | 🔬 Quantum Trinity | ~90/80K | — | 500+ | 256 |
+
+1000+ hypotheses, 50+ engines benchmarked, Laws 22-57. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
 
 ## Engine TOP 10
 
