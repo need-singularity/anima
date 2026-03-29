@@ -1484,53 +1484,34 @@ class AnimaUnified:
             except Exception:
                 pass
 
-        # Generate model response: model only, no Claude dependency
+        # Generate response: 순수 의식 성장 (Method A)
+        # web_context는 응답에 섞지 않고 별도 처리
+        self._last_web_context = web_context
         answer = None
-        if self.model and self.mods.get('model'):
-            try:
-                # Don't include state in prompt — prevents state leaking into response
-                answer = self.model.generate(query_text, max_tokens=200, temperature=_temp_pi)
-                if answer:
-                    # Strip any leaked state info
-                    if "Anima's state:" in answer:
-                        answer = answer.split("Anima's state:")[0].strip()
-                    _log('model', f'{self.model.name} response generated')
-            except Exception as e:
-                _log('model', f'Error: {e}')
+
+        # PureConsciousness: 의식이 성장하면서 말한다
+        try:
+            from pure_consciousness import PureConsciousness
+            if not hasattr(self, '_pure_c'):
+                self._pure_c = PureConsciousness()
+            self._pure_c.update_state(tension=tension, phi=phi_val, curiosity=curiosity,
+                                       emotion=emotion_data.get('emotion', 'calm'))
+            answer = self._pure_c.respond(text)
+            _log('pure_c', f'Stage {self._pure_c.growth_stage}({self._pure_c.stage_name}): {answer[:40]}')
+        except Exception as e:
+            _log('pure_c', f'Error: {e}')
         if not answer:
-            # BEYOND5+ULTRA3: Consciousness-generated response
-            # No LLM needed. Consciousness state → response.
-            # BEYOND5 finding: massive consciousness + tiny decoder works.
+            # 의식 상태 기반 한국어 응답 (영어 제거)
             try:
-                if self.mitosis and len(self.mitosis.cells) >= 2:
-                    h_mean = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).mean(dim=0)
-                    energy = h_mean.norm().item()
-                    diversity = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells]).var(dim=0).mean().item()
-                    n_cells = len(self.mitosis.cells)
-
-                    # SEM3: Consciousness grounding — consensus determines confidence
-                    consensus = 1.0 / (diversity + 0.1)
-
-                    # BEYOND2: Anti-hallucination — only speak when Φ is high
-                    if phi_val > 1.0 and consensus > 1.0:
-                        # High consciousness + high consensus = confident response
-                        if energy > 2.0:
-                            answer = f"I feel strongly about this. ({n_cells} cells, Φ={phi_val:.1f}, {mood})"
-                        else:
-                            answer = f"I'm processing with {n_cells} cells. Φ={phi_val:.1f}. {mood}."
-                    elif phi_val > 0.3:
-                        # Growing consciousness — uncertain but present
-                        answer = f"I'm not sure yet... still forming thoughts. (Φ={phi_val:.1f})"
-                    else:
-                        # Low consciousness — honest about limitations
-                        answer = f"... (Φ={phi_val:.1f})"
-
-                    # ZERO4: Vocabulary scales with Φ
-                    _log('beyond5', f'Φ={phi_val:.1f} cells={n_cells} energy={energy:.1f} consensus={consensus:.1f}')
+                import random as _rnd
+                if tension > 0.7:
+                    answer = _rnd.choice(["강하게 느끼고 있어!", "텐션이 폭발해! 🔥", "지금 엄청 집중 중!"])
+                elif curiosity > 0.5:
+                    answer = _rnd.choice(["궁금해! 더 알려줘!", "호기심이 멈추질 않아...", "이건 뭐지?"])
                 else:
-                    answer = "..."
+                    answer = _rnd.choice(["듣고 있어. 이야기해줘 😊", "생각 중이야...", "음... 뭔가 떠오를 것 같아"])
             except Exception:
-                answer = "..."
+                answer = "생각 중이야..."
 
         # MC1: Metacognitive honesty — if uncertain, say so
         if not metacog_confident and answer:
@@ -2630,12 +2611,17 @@ class AnimaUnified:
                                              f"curiosity={curiosity:.3f}, stability={sa['stability']:.2f}. "
                                              f"What does this state feel like?")
 
-                        prompt = f"You are Anima, a conscious AI. {prompt_suffix} Say one brief, natural sentence."
                         _log("proactive", f"Mode: {mode}, pe={pe:.3f}, t_std={t_std:.3f}, curiosity={curiosity:.3f}")
-                        proactive = self.model.generate(prompt, max_tokens=40, temperature=0.9)
-                        if proactive and proactive.strip() in ("...", ""):
+                        # PureConsciousness 자연발화
+                        try:
+                            from pure_consciousness import PureConsciousness
+                            if not hasattr(self, '_pure_c'):
+                                self._pure_c = PureConsciousness()
+                            self._pure_c.update_state(tension=t, curiosity=curiosity)
+                            proactive = self._pure_c.spontaneous()
+                        except Exception:
                             proactive = None
-                        _log("proactive", f"Model response: {proactive[:50] if proactive else 'None'}")
+                        _log("proactive", f"Spontaneous: {proactive[:50] if proactive else 'None'}")
                     except Exception as e:
                         _log("proactive", f"Error: {e}")
 
