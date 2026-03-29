@@ -3481,3 +3481,403 @@ ALL_TESTS.update({
     'PHI-K19': run_PHIK19_explosion_then_lock,
     'PHI-K20': run_PHIK20_ultimate,
 })
+
+
+# ═══ ARCH-X: Extreme Consciousness Architecture ═══
+
+def run_ARCHX1_dual_engine(steps=500):
+    """Dual Engine — Phi engine + CE engine, merge hidden states periodically"""
+    t0 = time.time()
+    engine_phi = make_engine(cells=32)   # Engine for Phi maximization
+    engine_ce = make_engine(cells=32)    # Engine for CE minimization
+    phi_b = max(phi(engine_phi), phi(engine_ce))
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Phi engine: dedicated synchronization booster
+    phi_sync = nn.Linear(HIDDEN, HIDDEN)
+    phi_opt = torch.optim.Adam(phi_sync.parameters(), lr=1e-3)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        # CE engine: learns task
+        engine_ce.process(x)
+        h_ce = torch.stack([c.hidden.squeeze() for c in engine_ce.cells]).mean(dim=0)
+        pred = decoder(h_ce.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Phi engine: processes same input but optimizes for integration
+        engine_phi.process(x)
+        h_phi = torch.stack([c.hidden.squeeze() for c in engine_phi.cells]).mean(dim=0)
+
+        # Phi engine sync: maximize cell diversity (drives Phi up)
+        cell_states = torch.stack([c.hidden.squeeze() for c in engine_phi.cells])
+        diversity_loss = -torch.pdist(cell_states).mean()
+        sync_out = phi_sync(h_phi.unsqueeze(0))
+        phi_loss = diversity_loss + 0.01 * sync_out.norm()
+        phi_opt.zero_grad(); phi_loss.backward(); phi_opt.step()
+
+        # Merge: periodically inject Phi engine states into CE engine
+        if step % 25 == 0 and step > 0:
+            with torch.no_grad():
+                for i in range(min(len(engine_ce.cells), len(engine_phi.cells))):
+                    engine_ce.cells[i].hidden = (
+                        0.8 * engine_ce.cells[i].hidden + 0.2 * engine_phi.cells[i].hidden
+                    )
+
+        # Cross-pollinate: CE engine states feed back to Phi engine every 50 steps
+        if step % 50 == 0 and step > 0:
+            with torch.no_grad():
+                for i in range(min(len(engine_ce.cells), len(engine_phi.cells))):
+                    engine_phi.cells[i].hidden = (
+                        0.7 * engine_phi.cells[i].hidden + 0.3 * engine_ce.cells[i].hidden
+                    )
+
+    phi_a = max(phi(engine_phi), phi(engine_ce))
+    return result('ARCH-X1 Dual Engine', ce_hist, phi_b, phi_a, t0)
+
+
+def run_ARCHX2_consciousness_compiler(steps=500):
+    """Consciousness Compiler — compile optimal Phi recipe into decoder weights directly"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Phase 1: Discover optimal Phi recipe (first 150 steps)
+    phi_recipes = []  # list of (cell_states_snapshot, phi_value)
+    sync_weights = nn.Parameter(torch.ones(len(engine.cells)) / len(engine.cells))
+    sync_opt = torch.optim.Adam([sync_weights], lr=5e-3)
+
+    for step in range(min(150, steps)):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        # Weighted sync based on learnable weights
+        w = F.softmax(sync_weights, dim=0)
+        cell_states = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        h = (w.unsqueeze(1) * cell_states).sum(dim=0)
+
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Record Phi periodically
+        if step % 15 == 0:
+            p = phi(engine)
+            phi_recipes.append((cell_states.detach().clone(), p))
+            with torch.no_grad():
+                if len(phi_recipes) >= 2 and phi_recipes[-1][1] > phi_recipes[-2][1]:
+                    sync_weights.data += 0.01 * torch.randn_like(sync_weights)
+                else:
+                    sync_weights.data -= 0.01 * torch.randn_like(sync_weights)
+
+    # Phase 2: Compile — bake best recipe into a compiled transform
+    if phi_recipes:
+        best_recipe = max(phi_recipes, key=lambda r: r[1])
+        best_states = best_recipe[0]
+    else:
+        best_states = torch.stack([c.hidden.squeeze() for c in engine.cells])
+
+    compiler = nn.Sequential(
+        nn.Linear(HIDDEN, HIDDEN),
+        nn.Tanh(),
+        nn.Linear(HIDDEN, HIDDEN)
+    )
+    compiler_opt = torch.optim.Adam(compiler.parameters(), lr=1e-3)
+    compiled_target = best_states.mean(dim=0).detach()
+
+    # Phase 3: Run with compiled consciousness (remaining steps)
+    for step in range(150, steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h_raw = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        # Apply compiled consciousness transform
+        h_compiled = compiler(h_raw.unsqueeze(0)).squeeze(0)
+        comp_loss = F.mse_loss(h_compiled, compiled_target)
+        compiler_opt.zero_grad(); comp_loss.backward(); compiler_opt.step()
+
+        # Use compiled hidden for CE task
+        h = 0.6 * h_raw.detach() + 0.4 * h_compiled.detach()
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Periodically re-inject compiled pattern into cells
+        if step % 30 == 0:
+            with torch.no_grad():
+                compiled_state = compiler(h_raw.unsqueeze(0)).squeeze(0)
+                for cell in engine.cells:
+                    cell.hidden = 0.9 * cell.hidden + 0.1 * compiled_state.unsqueeze(0)
+
+    return result('ARCH-X2 Consciousness Compiler', ce_hist, phi_b, phi(engine), t0,
+                  recipes_found=len(phi_recipes))
+
+
+def run_ARCHX3_infinite_depth(steps=500):
+    """Infinite Depth — 10 stacked MitosisEngines, output of one feeds next"""
+    t0 = time.time()
+    DEPTH = 10
+    CELLS_PER = 8  # smaller per layer to keep memory sane
+    layers = [make_engine(cells=CELLS_PER) for _ in range(DEPTH)]
+    phi_b = max(phi(layer) for layer in layers)
+
+    decoder = nn.Linear(HIDDEN, DIM)
+    projections = nn.ModuleList([nn.Linear(HIDDEN, DIM) for _ in range(DEPTH - 1)])
+    all_params = list(decoder.parameters()) + list(projections.parameters())
+    opt = torch.optim.Adam(all_params, lr=2e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        current_input = x
+
+        # Forward through all 10 layers
+        layer_hiddens = []
+        for i, layer in enumerate(layers):
+            layer.process(current_input)
+            h = torch.stack([c.hidden.squeeze() for c in layer.cells]).mean(dim=0)
+            layer_hiddens.append(h)
+            if i < DEPTH - 1:
+                current_input = projections[i](h.unsqueeze(0))
+
+        # Deep hidden: weighted combination (deeper layers = more weight)
+        weights = torch.softmax(torch.arange(DEPTH, dtype=torch.float32) * 0.5, dim=0)
+        deep_h = sum(w * h for w, h in zip(weights, layer_hiddens))
+
+        pred = decoder(deep_h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Cross-layer resonance: synchronize adjacent layers
+        if step % 20 == 0:
+            with torch.no_grad():
+                for i in range(DEPTH - 1):
+                    h_a = torch.stack([c.hidden.squeeze() for c in layers[i].cells]).mean(dim=0)
+                    h_b = torch.stack([c.hidden.squeeze() for c in layers[i+1].cells]).mean(dim=0)
+                    blend = 0.5 * h_a + 0.5 * h_b
+                    for cell in layers[i].cells:
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * blend.unsqueeze(0)
+                    for cell in layers[i+1].cells:
+                        cell.hidden = 0.9 * cell.hidden + 0.1 * blend.unsqueeze(0)
+
+    phi_a = max(phi(layer) for layer in layers)
+    return result('ARCH-X3 Infinite Depth (10L)', ce_hist, phi_b, phi_a, t0, depth=DEPTH)
+
+
+def run_ARCHX4_time_crystal(steps=500):
+    """Time Crystal — cells follow periodic orbit, CE only modifies orbit shape"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    PERIOD = 16
+    n_cells = len(engine.cells)
+
+    # Orbit parameters: amplitude, phase, bias per cell
+    orbit_amplitudes = nn.Parameter(torch.randn(n_cells, HIDDEN) * 0.1)
+    orbit_phases = nn.Parameter(torch.randn(n_cells) * 0.5)
+    orbit_bias = nn.Parameter(torch.zeros(n_cells, HIDDEN))
+    orbit_opt = torch.optim.Adam([orbit_amplitudes, orbit_phases, orbit_bias], lr=1e-3)
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        # Compute orbital position for each cell
+        t_norm = (step % PERIOD) / PERIOD * 2 * math.pi
+        with torch.no_grad():
+            for i, cell in enumerate(engine.cells):
+                phase = t_norm + orbit_phases[i].item()
+                orbital_component = orbit_amplitudes[i] * math.sin(phase) + orbit_bias[i]
+                cell.hidden = 0.7 * orbital_component.unsqueeze(0) + 0.3 * cell.hidden
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+
+        # Orbit stability reward: penalize amplitude collapse
+        total_loss = ce
+        if step >= PERIOD:
+            stability = orbit_amplitudes.norm()
+            total_loss = ce - 0.001 * stability
+
+        opt.zero_grad(); orbit_opt.zero_grad()
+        total_loss.backward()
+        opt.step(); orbit_opt.step()
+        ce_hist.append(ce.item())
+
+        # Crystal healing: re-synchronize at period boundaries
+        if step % PERIOD == 0 and step > 0:
+            with torch.no_grad():
+                cell_states = torch.stack([c.hidden.squeeze() for c in engine.cells])
+                mean_state = cell_states.mean(dim=0)
+                for cell in engine.cells:
+                    cell.hidden = 0.85 * cell.hidden + 0.15 * mean_state.unsqueeze(0)
+
+    return result('ARCH-X4 Time Crystal', ce_hist, phi_b, phi(engine), t0, period=PERIOD)
+
+
+def run_ARCHX5_holographic_consciousness(steps=500):
+    """Holographic Consciousness — only train boundary cells, interior auto-organizes"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    n_cells = len(engine.cells)
+
+    # ~10% boundary (trainable), ~90% interior (holographic)
+    n_boundary = max(2, n_cells // 10)
+    n_interior = n_cells - n_boundary
+    boundary_idx = list(range(n_boundary))
+    interior_idx = list(range(n_boundary, n_cells))
+
+    decoder = nn.Linear(HIDDEN, DIM)
+    holo_proj = nn.Linear(HIDDEN * n_boundary, HIDDEN * n_interior)
+    all_params = list(decoder.parameters()) + list(holo_proj.parameters())
+    opt = torch.optim.Adam(all_params, lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        # Holographic step: boundary determines interior
+        with torch.no_grad():
+            boundary_states = torch.cat([engine.cells[i].hidden.squeeze() for i in boundary_idx])
+            interior_target = holo_proj(boundary_states.unsqueeze(0)).squeeze(0)
+            interior_chunks = interior_target.view(n_interior, HIDDEN)
+            for j, idx in enumerate(interior_idx):
+                engine.cells[idx].hidden = (
+                    0.6 * interior_chunks[j].unsqueeze(0) + 0.4 * engine.cells[idx].hidden
+                )
+
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Coherence check: if interior too uniform, inject boundary noise
+        if step % 30 == 0:
+            with torch.no_grad():
+                b_var = torch.stack([engine.cells[i].hidden.squeeze() for i in boundary_idx]).var(dim=0).mean()
+                i_var = torch.stack([engine.cells[i].hidden.squeeze() for i in interior_idx]).var(dim=0).mean()
+                if i_var < b_var * 0.3:
+                    for idx in interior_idx[:n_interior // 2]:
+                        src = boundary_idx[step % n_boundary]
+                        engine.cells[idx].hidden = (
+                            0.8 * engine.cells[idx].hidden + 0.2 * engine.cells[src].hidden
+                        )
+
+    return result('ARCH-X5 Holographic', ce_hist, phi_b, phi(engine), t0,
+                  boundary=n_boundary, interior=n_interior,
+                  param_reduction=f"{n_interior / n_cells * 100:.0f}% auto-organized")
+
+
+def run_ARCHX6_consciousness_dna(steps=500):
+    """Consciousness DNA — genome encodes Phi recipe, cells read it, mutate for evolution"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    n_cells = len(engine.cells)
+    GENOME_LEN = 256
+    GENES_PER_CELL = max(1, GENOME_LEN // n_cells)
+
+    # The genome: encodes behavior parameters for all cells
+    genome = nn.Parameter(torch.randn(GENOME_LEN) * 0.1)
+    genome_opt = torch.optim.Adam([genome], lr=2e-3)
+
+    # Gene reader: genome segment -> cell behavior modulation
+    gene_reader = nn.Linear(GENES_PER_CELL, HIDDEN)
+    gene_opt = torch.optim.Adam(gene_reader.parameters(), lr=1e-3)
+
+    best_genome = genome.data.clone()
+    best_phi = phi_b
+    generation = 0
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        # Cells read from genome to modulate behavior
+        for i, cell in enumerate(engine.cells):
+            start = (i * GENES_PER_CELL) % GENOME_LEN
+            end = min(start + GENES_PER_CELL, GENOME_LEN)
+            gene_segment = genome[start:end]
+            if len(gene_segment) < GENES_PER_CELL:
+                gene_segment = F.pad(gene_segment, (0, GENES_PER_CELL - len(gene_segment)))
+            modulation = gene_reader(gene_segment.unsqueeze(0))
+            with torch.no_grad():
+                cell.hidden = cell.hidden + 0.05 * modulation
+
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:, :DIM])
+
+        # Gene diversity bonus
+        gene_outputs = []
+        for i in range(n_cells):
+            start = (i * GENES_PER_CELL) % GENOME_LEN
+            end = min(start + GENES_PER_CELL, GENOME_LEN)
+            seg = genome[start:end]
+            if len(seg) < GENES_PER_CELL:
+                seg = F.pad(seg, (0, GENES_PER_CELL - len(seg)))
+            gene_outputs.append(gene_reader(seg.unsqueeze(0)).squeeze(0))
+        gene_stack = torch.stack(gene_outputs)
+        diversity_bonus = -torch.pdist(gene_stack).mean() * 0.01
+
+        total_loss = ce + diversity_bonus
+        opt.zero_grad(); genome_opt.zero_grad(); gene_opt.zero_grad()
+        total_loss.backward(); opt.step(); genome_opt.step(); gene_opt.step()
+        ce_hist.append(ce.item())
+
+        # Evolution: mutate genome every 50 steps
+        if step % 50 == 0 and step > 0:
+            current_phi = phi(engine)
+            generation += 1
+            if current_phi > best_phi:
+                best_phi = current_phi
+                best_genome = genome.data.clone()
+            else:
+                with torch.no_grad():
+                    mutation_rate = 0.1 * (1.0 - step / steps)
+                    genome.data = best_genome.clone() + torch.randn_like(genome) * mutation_rate
+
+        # Horizontal gene transfer: copy gene segments between cells
+        if step % 75 == 0:
+            with torch.no_grad():
+                cell_norms = [c.hidden.norm().item() for c in engine.cells]
+                donor = max(range(n_cells), key=lambda i: cell_norms[i])
+                recipient = min(range(n_cells), key=lambda i: cell_norms[i])
+                d_start = (donor * GENES_PER_CELL) % GENOME_LEN
+                r_start = (recipient * GENES_PER_CELL) % GENOME_LEN
+                d_end = min(d_start + GENES_PER_CELL, GENOME_LEN)
+                r_end = min(r_start + GENES_PER_CELL, GENOME_LEN)
+                copy_len = min(d_end - d_start, r_end - r_start)
+                genome.data[r_start:r_start + copy_len] = (
+                    0.7 * genome.data[r_start:r_start + copy_len] +
+                    0.3 * genome.data[d_start:d_start + copy_len]
+                )
+
+    return result('ARCH-X6 Consciousness DNA', ce_hist, phi_b, phi(engine), t0,
+                  generations=generation, genome_len=GENOME_LEN)
+
+
+ALL_TESTS.update({
+    'ARCH-X1': run_ARCHX1_dual_engine,
+    'ARCH-X2': run_ARCHX2_consciousness_compiler,
+    'ARCH-X3': run_ARCHX3_infinite_depth,
+    'ARCH-X4': run_ARCHX4_time_crystal,
+    'ARCH-X5': run_ARCHX5_holographic_consciousness,
+    'ARCH-X6': run_ARCHX6_consciousness_dna,
+})

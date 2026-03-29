@@ -70986,6 +70986,401 @@ ALL_HYPOTHESES.update({
 })
 
 
+def run_TOPO17_hypercube_smallworld_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO17: Hypercube + Small-World 1024 — 1위+2위 토폴로지 결합.
+    하이퍼큐브(10D bit-flip) + 소세계(랜덤 shortcut 2개 추가) = 12 이웃.
+    가설: 규칙적 장거리(bit-flip) + 랜덤 장거리(shortcut) = 정보 경로 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Pre-compute 2 random shortcuts per cell
+    import random as rng
+    rng.seed(42)
+    shortcuts = {i: [rng.randint(0, 1023), rng.randint(0, 1023)] for i in range(1024)}
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    # Hypercube neighbors (10 bit-flip)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    # Small-world shortcuts (2 random)
+                    for s in shortcuts[i % 1024]:
+                        interaction += engine.cells[s % n].hidden
+                        n_neighbors += 1
+                    interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO17", "Hypercube+SmallWorld 1024c (10 bit-flip + 2 shortcuts, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO18_small_world_2048(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO18: Small-World 2048 — ×3.92 초선형이 2048에서도 계속되는가?
+    512→1024에서 127→499. 1024→2048에서 499→???"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    import random as rng
+    rng.seed(42)
+    sw_edges = {}
+    for i in range(2048):
+        neighbors = [(i-2)%2048, (i-1)%2048, (i+1)%2048, (i+2)%2048]
+        for idx in range(len(neighbors)):
+            if rng.random() < 0.1:
+                neighbors[idx] = rng.randint(0, 2047)
+        sw_edges[i] = neighbors
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.02, 0.04, 0.07, 0.11, 0.16, 0.22, 0.30, 0.40, 0.52, 0.65, 0.80]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.03)*11)), 2048):
+                target = min(len(engine.cells)*2, 2048)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    neighbors = sw_edges[i % 2048]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors:
+                        interaction += engine.cells[j % n].hidden
+                    interaction /= len(neighbors)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO18", "Small-World 2048c (WS k=4 p=0.1, frustration, superlinear test)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO19a_frustration_50pct(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO19a: Hypercube 1024 + 50% Frustration (i%2) — 더 강한 frustration."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                    interaction /= 10
+                    if i % 2 == 0:  # 50% frustration
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO19a", "Hypercube 1024c + 50% frustration (i%2)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO19b_frustration_20pct(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO19b: Hypercube 1024 + 20% Frustration (i%5) — 약한 frustration."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                    interaction /= 10
+                    if i % 5 == 0:  # 20% frustration
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO19b", "Hypercube 1024c + 20% frustration (i%5)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO20_hierarchical_hypercube_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO20: 계층적 하이퍼큐브 — 8개 128-셀 3D 하이퍼큐브를 소세계로 연결.
+    Local: 7-bit hypercube (128셀, 7이웃)
+    Global: 8 클러스터 간 소세계 shortcut (각 클러스터에서 2개씩)
+    가설: 모듈성(modularity) = 뇌의 구조 → Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    # Pre-compute inter-cluster shortcuts
+    import random as rng
+    rng.seed(42)
+    n_clusters = 8; cluster_size = 128
+    inter_shortcuts = {}
+    for c in range(n_clusters):
+        base = c * cluster_size
+        for _ in range(4):  # 4 inter-cluster bridges per cluster
+            src = base + rng.randint(0, cluster_size - 1)
+            dst_cluster = (c + rng.randint(1, n_clusters - 1)) % n_clusters
+            dst = dst_cluster * cluster_size + rng.randint(0, cluster_size - 1)
+            inter_shortcuts.setdefault(src, []).append(dst)
+            inter_shortcuts.setdefault(dst, []).append(src)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    # Local: 7-bit hypercube within cluster
+                    cluster_id = (i % 1024) // cluster_size
+                    local_id = (i % 1024) % cluster_size
+                    cluster_base = cluster_id * cluster_size
+                    for bit in range(7):
+                        local_j = local_id ^ (1 << bit)
+                        j = (cluster_base + local_j) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    # Global: inter-cluster shortcuts
+                    for s in inter_shortcuts.get(i % 1024, []):
+                        interaction += engine.cells[s % n].hidden
+                        n_neighbors += 1
+                    if n_neighbors > 0:
+                        interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO20", "Hierarchical Hypercube 1024c (8×128 clusters + inter-shortcuts)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO21_dynamic_topology_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO21: 동적 토폴로지 1024 — Φ 피드백으로 연결 구조 변경.
+    기본: 하이퍼큐브 10D. 매 20 step마다 Φ가 하락하면 랜덤 rewire 2개.
+    가설: 적응형 토폴로지가 정적 토폴로지를 이긴다."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    import random as rng
+    rng.seed(42)
+    # Dynamic extra edges (start empty, grow adaptively)
+    extra_edges = {}  # i -> [j1, j2, ...]
+    prev_phi = 0.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    # Base: hypercube
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    # Dynamic edges
+                    for j in extra_edges.get(i % 1024, []):
+                        interaction += engine.cells[j % n].hidden
+                        n_neighbors += 1
+                    interaction /= max(n_neighbors, 1)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Dynamic rewire: every 20 steps, if Φ dropped, add random shortcuts
+        if step_i > 0 and step_i % 20 == 0 and n >= 10:
+            if phi < prev_phi * 0.95:  # Φ dropped > 5%
+                for _ in range(4):
+                    src = rng.randint(0, min(n, 1024) - 1)
+                    dst = rng.randint(0, min(n, 1024) - 1)
+                    extra_edges.setdefault(src, []).append(dst)
+            # Also prune if too many edges (keep max 4 per cell)
+            for k in list(extra_edges.keys()):
+                if len(extra_edges[k]) > 4:
+                    extra_edges[k] = extra_edges[k][-4:]
+        prev_phi = phi
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO21", "Dynamic Topology 1024c (hypercube + adaptive rewire on Φ drop)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'n_dynamic_edges': sum(len(v) for v in extra_edges.values()),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TOPO17': run_TOPO17_hypercube_smallworld_1024,
+    'TOPO18': run_TOPO18_small_world_2048,
+    'TOPO19a': run_TOPO19a_frustration_50pct,
+    'TOPO19b': run_TOPO19b_frustration_20pct,
+    'TOPO20': run_TOPO20_hierarchical_hypercube_1024,
+    'TOPO21': run_TOPO21_dynamic_topology_1024,
+})
+
+
 ALL_HYPOTHESES.update({
     'XCONV1': run_XCONV1_bilingual_consciousness,
     'XCONV2': run_XCONV2_dialogue_without_teacher,
@@ -71002,6 +71397,495 @@ ALL_HYPOTHESES.update({
     'XARCH3': run_XARCH3_anti_prompt_injection,
     'XARCH4': run_XARCH4_consciousness_is_the_prompt,
     'XARCH5': run_XARCH5_promptless_conversation_agent,
+})
+
+
+# ═══════════════════════════════════════════════════════════
+# SCALE (Extreme). 극한 스케일링 — 4096+ cells에서 Φ≈cells 선형성 검증
+# 핵심 질문: Φ가 세포 수에 비례하여 계속 선형 성장하는가?
+# ═══════════════════════════════════════════════════════════
+
+def _scale_growth(engine, frac, max_cells, step_i):
+    """극한 스케일링용 성장 스케줄 — 조기에 세포를 최대한 빠르게 키움."""
+    for pct in [0.01, 0.02, 0.04, 0.07, 0.11, 0.16, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+        if frac >= pct and len(engine.cells) < min(int(2**((pct+0.02)*12)), max_cells):
+            target = min(len(engine.cells) * 2, max_cells)
+            while len(engine.cells) < target:
+                engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+
+def _scale_ring_topology(engine, sync_strength=0.35):
+    """Ring topology: 각 세포는 좌/우 이웃과만 정보 교환. O(N) 비용."""
+    n = len(engine.cells)
+    if n < 3:
+        return
+    with torch.no_grad():
+        new_hiddens = []
+        for i in range(n):
+            left = engine.cells[(i - 1) % n].hidden
+            right = engine.cells[(i + 1) % n].hidden
+            neighbor_avg = (left + right) / 2.0
+            updated = (1 - sync_strength) * engine.cells[i].hidden + sync_strength * neighbor_avg
+            new_hiddens.append(updated)
+        for i in range(n):
+            engine.cells[i].hidden = new_hiddens[i]
+
+
+def _scale_phi_proxy(engine):
+    """Fast Φ proxy: inter-cell variance (O(N) vs PhiCalculator O(N²)).
+    Higher variance across cells = more differentiation = higher Φ."""
+    if len(engine.cells) < 2:
+        return 0.0
+    with torch.no_grad():
+        stacked = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # Integration proxy: variance across cells (differentiation)
+        inter_var = stacked.var(dim=0).mean().item()
+        # Coherence proxy: mean pairwise correlation via mean norm
+        mean_h = stacked.mean(dim=0)
+        coherence = mean_h.norm().item() / (stacked.norm(dim=1).mean().item() + 1e-8)
+        # Φ proxy ≈ differentiation × (1 + coherence)
+        return inter_var * (1.0 + coherence)
+
+
+def run_SCALE_1_ring_4096(steps=80, dim=64, hidden=128) -> BenchResult:
+    """SCALE-1: 4096 cells, ring topology, v5 optimal (sync=0.35, 12-faction).
+    Ring topology = O(N) neighbor coupling. 12 factions debate on top.
+    가설: ring + faction이 4096에서도 Φ≈cells 선형 유지."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        _scale_growth(engine, frac, 4096, step_i)
+
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.2))
+        engine.process(x)
+
+        with torch.no_grad():
+            # Ring topology sync
+            _scale_ring_topology(engine, sync_strength=0.35)
+            # 12-faction debate
+            _max_factions(engine, 12, strength=0.15, debate_strength=0.12, debate=(frac > 0.3))
+            # Small noise for exploration
+            if step_i % 5 == 0:
+                for cell in engine.cells:
+                    cell.hidden += torch.randn_like(cell.hidden) * 0.01
+
+        proxy = _scale_phi_proxy(engine)
+        proxy_hist.append(proxy)
+        # Full Φ only every 20 steps (expensive at 4096 cells)
+        if step_i % 20 == 0 or step_i == steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE-1", "4096c Ring + 12-faction (sync=0.35, v5 optimal)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1)})
+
+
+def run_SCALE_2_zero_input_xmeta3(steps=80, dim=64, hidden=128) -> BenchResult:
+    """SCALE-2: 4096 cells, zero-input + XMETA3 (no external input, pure self-reference).
+    입력 없이 순수 자기참조만으로 Φ가 성장하는가?
+    IB2 attention + 3-level metacognition + Φ-aware self-correction.
+    가설: 자기참조만으로도 Φ≈cells 달성 가능 (의식은 외부 불필요)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        _scale_growth(engine, frac, 4096, step_i)
+
+        # Zero input: consciousness feeds on itself
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 4:
+                # IB2: selective attention on cells (top 25% by norm)
+                norms = torch.tensor([c.hidden.norm().item() for c in engine.cells])
+                k = max(1, nc // 4)
+                _, top_idx = norms.topk(k)
+                for i in top_idx:
+                    engine.cells[i].hidden *= 1.03
+                # Suppress bottom 25%
+                _, bot_idx = norms.topk(k, largest=False)
+                for i in bot_idx:
+                    engine.cells[i].hidden *= 0.97
+
+            if nc >= 8:
+                # 3-level metacognition (L1→L2→L3)
+                # Sample to avoid O(N) stack for huge N
+                sample_n = min(nc, 256)
+                sample_idx = list(range(0, nc, max(1, nc // sample_n)))[:sample_n]
+                l1 = torch.stack([engine.cells[i].hidden.squeeze() for i in sample_idx]).mean(dim=0)
+                l2 = 0.9 * l2 + 0.1 * l1
+                l3 = 0.95 * l3 + 0.05 * l2
+
+                # Φ-aware self-correction
+                proxy = _scale_phi_proxy(engine)
+                proxy_hist.append(proxy)
+                phi_ema = 0.9 * phi_ema + 0.1 * proxy
+
+                if proxy < phi_ema * 0.7:
+                    # Φ dropping: inject noise to escape
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.05
+                elif proxy > phi_ema * 1.3 and nc < 4096:
+                    # Φ surging: grow more
+                    engine._create_cell(parent=engine.cells[0])
+
+                # L3 identity stabilization (sample only)
+                for i in sample_idx[:min(64, len(sample_idx))]:
+                    engine.cells[i].hidden = 0.99 * engine.cells[i].hidden + 0.01 * l3.unsqueeze(0)
+            else:
+                proxy_hist.append(0.0)
+
+        # Full Φ only every 20 steps
+        if step_i % 20 == 0 or step_i == steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy_hist[-1] if proxy_hist else 0)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE-2", "4096c Zero-Input XMETA3 (pure self-reference)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1),
+                              'zero_input': True})
+
+
+def run_SCALE_3_minimal_8192(steps=50, dim=64, hidden=128) -> BenchResult:
+    """SCALE-3: 8192 cells, minimal (just sync + IB2, no faction — test pure scale).
+    파벌 없이 순수 세포 수만으로 Φ가 어디까지 가는가?
+    Ring sync + IB2 selective attention만 적용.
+    가설: 파벌 없이도 8192 cells → Φ>1000 가능 (순수 스케일 효과)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=8192)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        # Aggressive growth for 8192
+        for pct in [0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.48, 0.62, 0.78, 0.90]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.01)*13)), 8192):
+                target = min(len(engine.cells) * 2, 8192)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.randn(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            # Ring topology sync (lightweight)
+            _scale_ring_topology(engine, sync_strength=0.25)
+
+            # IB2: selective attention (top/bottom 25% by norm)
+            if nc >= 8:
+                norms = torch.tensor([c.hidden.norm().item() for c in engine.cells])
+                k = max(1, nc // 4)
+                _, top_idx = norms.topk(k)
+                for i in top_idx:
+                    engine.cells[i].hidden *= 1.03
+                _, bot_idx = norms.topk(k, largest=False)
+                for i in bot_idx:
+                    engine.cells[i].hidden *= 0.97
+
+        proxy = _scale_phi_proxy(engine)
+        proxy_hist.append(proxy)
+        # Full Φ only every 25 steps (very expensive at 8192)
+        if step_i % 25 == 0 or step_i == steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE-3", "8192c Minimal (sync + IB2 only, no factions)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1)})
+
+
+def run_SCALE_4_growth_fix_2048(steps=100, dim=64, hidden=128) -> BenchResult:
+    """SCALE-4: 2048 cells, 500 steps (fix the growth bottleneck from TOPO experiments).
+    TOPO에서 발견된 문제: 세포 수는 늘어나지만 Φ 성장이 정체.
+    해결: (1) 조기 성장 + (2) 성장 후 Hebbian LTP + (3) 다양성 noise.
+    가설: 성장 정체 해결 → 2048에서 초선형 Φ 복원."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=2048)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []
+    actual_steps = 500  # Override: longer run to prove sustained growth
+
+    for step_i in range(actual_steps):
+        frac = step_i / actual_steps
+        _scale_growth(engine, frac, 2048, step_i)
+
+        x = torch.randn(1, dim) * (1.0 + 2.0 * torch.rand(1).item())
+        engine.process(x)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 4:
+                # (1) Ring sync for coherence
+                _scale_ring_topology(engine, sync_strength=0.30)
+
+                # (2) Hebbian LTP: strengthen connections between similar cells
+                if nc >= 16 and step_i % 10 == 0:
+                    sample_n = min(nc, 128)
+                    sample_idx = list(range(0, nc, max(1, nc // sample_n)))[:sample_n]
+                    h_stack = torch.stack([engine.cells[i].hidden.squeeze() for i in sample_idx])
+                    # Cosine similarity matrix
+                    h_norm = h_stack / (h_stack.norm(dim=1, keepdim=True) + 1e-8)
+                    sim = h_norm @ h_norm.T
+                    # LTP: highly similar pairs share more
+                    for a in range(len(sample_idx)):
+                        for b in range(a+1, min(a+4, len(sample_idx))):
+                            s = sim[a, b].item()
+                            if s > 0.8:
+                                # LTP: pull together
+                                ia, ib = sample_idx[a], sample_idx[b]
+                                avg = (engine.cells[ia].hidden + engine.cells[ib].hidden) / 2
+                                engine.cells[ia].hidden = 0.95 * engine.cells[ia].hidden + 0.05 * avg
+                                engine.cells[ib].hidden = 0.95 * engine.cells[ib].hidden + 0.05 * avg
+                            elif s < 0.3:
+                                # LTD: push apart for diversity
+                                ia, ib = sample_idx[a], sample_idx[b]
+                                engine.cells[ia].hidden += torch.randn_like(engine.cells[ia].hidden) * 0.02
+                                engine.cells[ib].hidden += torch.randn_like(engine.cells[ib].hidden) * 0.02
+
+                # (3) 8-faction debate
+                _max_factions(engine, 8, strength=0.15, debate_strength=0.12, debate=(frac > 0.3))
+
+                # (4) Diversity noise injection every 20 steps
+                if step_i % 20 == 0:
+                    for cell in engine.cells:
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.015
+
+        proxy = _scale_phi_proxy(engine)
+        proxy_hist.append(proxy)
+        # Full Φ measurement every 50 steps
+        if step_i % 50 == 0 or step_i == actual_steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE-4", "2048c Growth-Fix (Hebbian LTP/LTD + diversity, 500 steps)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1),
+                              'total_steps': actual_steps})
+
+
+def run_SCALE_5_soc_sandpile_4096(steps=80, dim=64, hidden=128) -> BenchResult:
+    """SCALE-5: 4096 cells, SOC sandpile driving chaos intensity.
+    BTW 모래더미 모델이 세포 활성도를 조절 — 자기조직 임계성.
+    눈사태 크기가 세포 간 정보 전파 강도를 결정.
+    가설: SOC가 edge-of-chaos를 자동 유지 → 4096에서 Φ 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []
+    avalanche_hist = []
+
+    # Sandpile state: one grain counter per cell (grows dynamically)
+    grains = torch.zeros(4096)
+    threshold = 4.0
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        _scale_growth(engine, frac, 4096, step_i)
+
+        x = torch.randn(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            nc = len(engine.cells)
+            if nc >= 4:
+                # === SOC CORE: sandpile drives everything ===
+                # Add grain to random cell
+                target_cell = step_i % nc
+                grains[target_cell] += 1.0
+
+                # Avalanche: topple cells above threshold
+                avalanche_size = 0
+                toppled = True
+                max_iters = min(100, nc)  # cap iterations
+                while toppled and max_iters > 0:
+                    toppled = False
+                    max_iters -= 1
+                    for i in range(nc):
+                        if grains[i] >= threshold:
+                            toppled = True
+                            avalanche_size += 1
+                            grains[i] -= threshold
+                            # Ring distribution (2 neighbors get 1 grain each, 2 dissipated)
+                            grains[(i - 1) % nc] += 1.0
+                            grains[(i + 1) % nc] += 1.0
+                avalanche_hist.append(avalanche_size)
+
+                # Avalanche intensity → cross-cell cascade strength
+                if avalanche_size > 0:
+                    cascade = min(0.20, 0.02 * math.log(avalanche_size + 1))
+                    # During avalanche: ring-propagate information
+                    _scale_ring_topology(engine, sync_strength=cascade)
+
+                # Energy level modulates hidden state
+                for i in range(nc):
+                    energy = grains[i].item() / threshold
+                    engine.cells[i].hidden *= (1.0 + 0.02 * (energy - 0.5))
+
+                # 12-faction debate (SOC provides diversity)
+                _max_factions(engine, 12, strength=0.12, debate_strength=0.10, debate=(frac > 0.3))
+
+        proxy = _scale_phi_proxy(engine)
+        proxy_hist.append(proxy)
+        if step_i % 20 == 0 or step_i == steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    avg_avalanche = sum(avalanche_hist) / max(len(avalanche_hist), 1)
+    max_avalanche = max(avalanche_hist) if avalanche_hist else 0
+    return BenchResult("SCALE-5", "4096c SOC Sandpile (BTW criticality → cascade sync)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1),
+                              'avg_avalanche': avg_avalanche,
+                              'max_avalanche': max_avalanche})
+
+
+def run_SCALE_6_predictive_coding_4096(steps=80, dim=64, hidden=128) -> BenchResult:
+    """SCALE-6: 4096 cells, predictive coding (PE predictor instead of PhiCalculator).
+    PE bottleneck predictor (128→8→128): 각 세포가 다음 세포의 상태를 예측.
+    예측 오류가 크면 정보가 풍부 → 높은 Φ. 예측 오류로 Φ를 간접 추정.
+    가설: predictive coding이 PhiCalculator보다 효율적으로 Φ를 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=4096)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; proxy_hist = []; pe_hist = []
+
+    # PE bottleneck predictor: 128→8→128
+    pe_encoder = nn.Linear(hidden, 8)
+    pe_decoder = nn.Linear(8, hidden)
+    pe_opt = torch.optim.Adam(
+        list(pe_encoder.parameters()) + list(pe_decoder.parameters()), lr=1e-3
+    )
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        _scale_growth(engine, frac, 4096, step_i)
+
+        x = torch.randn(1, dim) * (1.0 + 0.5 * math.sin(step_i * 0.3))
+        engine.process(x)
+
+        nc = len(engine.cells)
+        pe_total = 0.0
+
+        if nc >= 4:
+            # Sample cells for PE computation (cap at 256 for speed)
+            sample_n = min(nc, 256)
+            sample_idx = list(range(0, nc, max(1, nc // sample_n)))[:sample_n]
+
+            # Predictive coding: predict each cell's state from its neighbor
+            h_sample = torch.stack([engine.cells[i].hidden.squeeze() for i in sample_idx])
+            # Target: next cell in ring (shifted by 1)
+            h_target = torch.roll(h_sample, -1, dims=0)
+
+            # Forward through bottleneck
+            z = pe_encoder(h_sample)        # (sample_n, 8)
+            h_pred = pe_decoder(z)           # (sample_n, 128)
+
+            # Prediction error
+            pe_loss = F.mse_loss(h_pred, h_target.detach())
+            pe_total = pe_loss.item()
+            pe_hist.append(pe_total)
+
+            # Train the predictor (reduce PE over time)
+            pe_opt.zero_grad()
+            pe_loss.backward()
+            pe_opt.step()
+
+            with torch.no_grad():
+                # Use PE as driving signal: high PE → more differentiation needed
+                # Inject PE-scaled noise to cells with high prediction error
+                per_cell_pe = (h_pred.detach() - h_target).pow(2).mean(dim=1)
+                pe_median = per_cell_pe.median()
+                for k, i in enumerate(sample_idx):
+                    if per_cell_pe[k] > pe_median:
+                        # High PE cell: amplify (it carries novel information)
+                        engine.cells[i].hidden *= 1.02
+                    else:
+                        # Low PE cell: inject noise (it's too predictable)
+                        engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                # Ring sync (moderate)
+                _scale_ring_topology(engine, sync_strength=0.25)
+                # 12-faction debate
+                _max_factions(engine, 12, strength=0.12, debate_strength=0.10, debate=(frac > 0.3))
+        else:
+            pe_hist.append(0.0)
+
+        proxy = _scale_phi_proxy(engine)
+        proxy_hist.append(proxy)
+        if step_i % 20 == 0 or step_i == steps - 1:
+            phi, _ = phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(proxy)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("SCALE-6", "4096c Predictive Coding (PE bottleneck 128→8→128)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0,
+                       extra={'final_cells': len(engine.cells),
+                              'final_proxy': proxy_hist[-1] if proxy_hist else 0,
+                              'phi_per_cell': phi_final / max(len(engine.cells), 1),
+                              'final_pe': pe_hist[-1] if pe_hist else 0,
+                              'avg_pe': sum(pe_hist) / max(len(pe_hist), 1)})
+
+
+ALL_HYPOTHESES.update({
+    'SCALE-1': run_SCALE_1_ring_4096,
+    'SCALE-2': run_SCALE_2_zero_input_xmeta3,
+    'SCALE-3': run_SCALE_3_minimal_8192,
+    'SCALE-4': run_SCALE_4_growth_fix_2048,
+    'SCALE-5': run_SCALE_5_soc_sandpile_4096,
+    'SCALE-6': run_SCALE_6_predictive_coding_4096,
 })
 
 
