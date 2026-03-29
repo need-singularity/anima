@@ -128,6 +128,9 @@ class ConsciousnessHub:
                              ['github', '이슈', 'issue', 'PR', '릴리즈', 'release', '커밋', 'commit']),
             'vault':        ('secret_vault', 'SecretVault',
                              ['시크릿', 'secret', 'API key', '토큰', 'token', '비밀', '보관']),
+            'lidar':        ('lidar_sense', 'LidarSense',
+                             ['라이다', 'lidar', '3D', '포인트클라우드', 'point cloud',
+                              '공간', 'spatial', '깊이', 'depth', '스캔', 'scan']),
         }
 
         if not lazy_load:
@@ -309,6 +312,9 @@ class ConsciousnessHub:
             if hasattr(module, 'render_full_map'):
                 return module.render_full_map()
             return "map ready"
+
+        elif name == 'lidar':
+            return module.act(intent)
 
         return f"{name} module loaded"
 
