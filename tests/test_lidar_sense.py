@@ -130,3 +130,53 @@ def test_depth_variance():
     grid = field.from_points(points)
     dv = field.depth_variance(grid)
     assert 0.0 <= dv <= 1.0
+
+
+def test_lidar_sense_auto_driver():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='auto')
+    assert ls.driver_name == 'simulator'
+
+
+def test_lidar_sense_scan_and_convert():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=16)
+    points = ls.scan()
+    assert points.shape[1] == 3
+    field = ls.to_tension_field(points)
+    assert field.shape == (16, 16, 16)
+    s = ls.get_S()
+    assert 0.0 <= s <= 1.0
+
+
+def test_lidar_sense_simulate_internal():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=16)
+    points = ls.simulate_internal([0.3, 0.7, 0.1, 0.9])
+    assert points.shape[1] == 3
+
+
+def test_lidar_sense_simulate_external():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=16)
+    points = ls.simulate_external(env='room')
+    assert points.shape[1] == 3
+    assert len(points) >= 100
+
+
+def test_lidar_sense_ascii_viz():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator', voxel_size=8)
+    points = ls.scan()
+    field = ls.to_tension_field(points)
+    ascii_map = ls.visualize_ascii(field)
+    assert isinstance(ascii_map, str)
+    assert len(ascii_map) > 0
+
+
+def test_lidar_sense_act_routing():
+    from lidar_sense import LidarSense
+    ls = LidarSense(driver='simulator')
+    result = ls.act("3D 스캔")
+    assert isinstance(result, dict)
+    assert 'S' in result

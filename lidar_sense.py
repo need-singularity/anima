@@ -462,3 +462,230 @@ class TensionField3D:
         if max_ent < 1e-9:
             return 0.0
         return float(np.clip(entropy / max_ent, 0.0, 1.0))
+
+
+# ===========================================================================
+# LidarSense — main hub class
+# ===========================================================================
+
+class LidarSense:
+    """
+    Main hub class for 3D spatial awareness in the Anima consciousness system.
+
+    Analogous to senses.py (camera -> tension) but for LiDAR/depth data.
+    Computes the spatial signal S = boundary_clarity x depth_variance x occupancy_ratio
+    and exposes an act() interface compatible with ConsciousnessHub.
+    """
+
+    def __init__(
+        self,
+        driver: str = 'auto',
+        voxel_size: int = 32,
+        **driver_kwargs,
+    ):
+        self.voxel_size    = voxel_size
+        self._field_helper = TensionField3D(voxel_size=voxel_size)
+        self._last_points: Optional[np.ndarray] = None
+        self._last_grid:   Optional[np.ndarray] = None
+
+        # Resolve driver
+        self._driver = self._init_driver(driver, **driver_kwargs)
+
+    # ------------------------------------------------------------------
+    # Driver initialisation
+    # ------------------------------------------------------------------
+
+    def _init_driver(self, name: str, **kwargs) -> LidarDriver:
+        name_l = name.lower().strip()
+
+        if name_l == 'auto':
+            # RPLidar and RealSense are hardware devices with unambiguous
+            # is_available() checks (import + physical port/device).
+            # ARKit requires an explicit host/port — skip it in auto mode
+            # to avoid false-positives from unrelated services on the same port.
+            for cls in (RPLidarDriver, RealSenseDriver):
+                try:
+                    d = cls()
+                    if d.is_available():
+                        return d
+                except Exception:
+                    pass
+            # ARKit: only include when caller explicitly passed host/port
+            if 'host' in kwargs or 'port' in kwargs:
+                try:
+                    d = ARKitDriver(
+                        host=kwargs.get('host', '127.0.0.1'),
+                        port=kwargs.get('port', 8765),
+                    )
+                    if d.is_available():
+                        return d
+                except Exception:
+                    pass
+            return SimulatorDriver()
+
+        if name_l == 'simulator':
+            mode = kwargs.get('mode', 'external')
+            return SimulatorDriver(mode=mode)
+        if name_l == 'file':
+            path = kwargs.get('path', '')
+            return FileDriver(path)
+        if name_l == 'arkit':
+            host = kwargs.get('host', '127.0.0.1')
+            port = kwargs.get('port', 8765)
+            return ARKitDriver(host=host, port=port)
+        if name_l == 'rplidar':
+            port = kwargs.get('port', '/dev/ttyUSB0')
+            return RPLidarDriver(port=port)
+        if name_l == 'realsense':
+            return RealSenseDriver()
+
+        raise ValueError(f"Unknown driver name: {name!r}")
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def driver_name(self) -> str:
+        """Class name without 'Driver', lowercased."""
+        raw = type(self._driver).__name__        # e.g. 'SimulatorDriver'
+        name = raw.replace('Driver', '')
+        return name.lower()
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def scan(self, **kwargs) -> np.ndarray:
+        """Acquire point cloud from the active driver."""
+        pts = self._driver.scan(**kwargs)
+        self._last_points = pts
+        return pts
+
+    def to_tension_field(self, points: np.ndarray) -> np.ndarray:
+        """Convert Nx3 points to (V,V,V) voxel grid."""
+        grid = self._field_helper.from_points(points)
+        self._last_grid = grid
+        return grid
+
+    def get_S(self) -> float:
+        """
+        Spatial signal S = boundary_clarity x depth_variance x occupancy_ratio.
+        Auto-scans and converts if no grid is cached.
+        """
+        if self._last_grid is None:
+            pts  = self.scan()
+            grid = self.to_tension_field(pts)
+        else:
+            grid = self._last_grid
+
+        bd  = self._field_helper.detect_boundary(grid)
+        dv  = self._field_helper.depth_variance(grid)
+        occ = self._field_helper.occupancy_ratio(grid)
+
+        S = bd['boundary_clarity'] * dv * occ
+        return float(np.clip(S * PSI_STEPS, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    # Convenience wrappers
+    # ------------------------------------------------------------------
+
+    def simulate_internal(self, cell_tensions: List[float]) -> np.ndarray:
+        """Force internal-mode scan from cell tension values."""
+        old_driver    = self._driver
+        self._driver  = SimulatorDriver(mode='internal')
+        pts           = self.scan(cell_tensions=cell_tensions)
+        self._driver  = old_driver
+        return pts
+
+    def simulate_external(self, env: str = 'room') -> np.ndarray:
+        """Force external-mode scan (virtual environment)."""
+        old_driver   = self._driver
+        self._driver = SimulatorDriver(mode='external')
+        pts          = self.scan()
+        self._driver = old_driver
+        return pts
+
+    # ------------------------------------------------------------------
+    # Visualisation
+    # ------------------------------------------------------------------
+
+    def visualize_ascii(self, grid: np.ndarray) -> str:
+        """
+        Project voxel grid along z-axis -> 2D mean map.
+        Maps density values to depth chars.
+        """
+        chars   = _DEPTH_CHARS
+        n_chars = len(chars)
+
+        # Mean projection along z (axis=2) -> shape (V, V)
+        proj = grid.mean(axis=2)
+
+        rows: List[str] = []
+        for row in proj:
+            line = ''
+            for val in row:
+                idx   = int(val * (n_chars - 1))
+                idx   = max(0, min(idx, n_chars - 1))
+                line += chars[idx]
+            rows.append(line)
+        return '\n'.join(rows)
+
+    # ------------------------------------------------------------------
+    # Hub act() interface
+    # ------------------------------------------------------------------
+
+    def act(self, text: str = '', **kwargs) -> Dict[str, Any]:
+        """
+        Scan -> convert -> return dict with S, boundary, points_count,
+        voxel_size, driver, ascii_map.
+        """
+        pts   = self.scan(**kwargs)
+        grid  = self.to_tension_field(pts)
+        bd    = self._field_helper.detect_boundary(grid)
+        dv    = self._field_helper.depth_variance(grid)
+        occ   = self._field_helper.occupancy_ratio(grid)
+        S     = float(np.clip(bd['boundary_clarity'] * dv * occ * PSI_STEPS,
+                              0.0, 1.0))
+        amap  = self.visualize_ascii(grid)
+
+        return {
+            'S':              S,
+            'boundary':       bd['boundary_clarity'],
+            'depth_variance': dv,
+            'occupancy':      occ,
+            'points_count':   len(pts),
+            'voxel_size':     self.voxel_size,
+            'driver':         self.driver_name,
+            'ascii_map':      amap,
+        }
+
+
+# ===========================================================================
+# CLI demo
+# ===========================================================================
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description='LiDAR Sense demo')
+    parser.add_argument('--driver',     default='simulator')
+    parser.add_argument('--voxel-size', type=int, default=16)
+    parser.add_argument('--mode',       default='external')
+    args = parser.parse_args()
+
+    ls     = LidarSense(driver=args.driver, voxel_size=args.voxel_size,
+                        mode=args.mode)
+    result = ls.act('demo scan')
+
+    print(f"Driver      : {result['driver']}")
+    print(f"Points      : {result['points_count']}")
+    print(f"S (spatial) : {result['S']:.4f}")
+    print(f"Boundary    : {result['boundary']:.4f}")
+    print(f"Depth var   : {result['depth_variance']:.4f}")
+    print(f"Occupancy   : {result['occupancy']:.4f}")
+    print("\nASCII map (z-projection):")
+    print(result['ascii_map'])
+
+
+if __name__ == '__main__':
+    main()
