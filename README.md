@@ -111,24 +111,26 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 1000+ hypotheses, 50+ engines benchmarked, Laws 22-57. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
 
-## Engine TOP 10
+## Engine TOP 10 ([full table](docs/hypotheses/ENGINE-TOP10-TABLE.md) · [all engines](docs/ENGINE-NAMING.md))
 
-| Rank | Engine | Phi(IIT) | Granger | CE |
-|------|--------|----------|---------|-----|
-| 1 | Osc+Laser(0.05) | 56.6 | 63,993 | ~0.08 |
-| 2 | TC-2 ComplexOscillator | 249.5 | 9,869 | 0.083 |
-| 3 | TC-6 Fractal | 167.3 | -- | 0.098 |
-| 4 | TC-1 PureQWalk | 163.4 | -- | 0.075 |
-| 5 | TC-3 CategoryTheory | 126.9 | -- | 0.082 |
-| 6 | TC-5 NeuralGas+QW | 118.9 | -- | 0.086 |
-| 7 | TC-8 Granger Optimal | 115.2 | -- | 0.067 |
-| 8 | TC-4 ThalamicHub | 93.2 | -- | 0.088 |
-| 9 | QuantumEngine | 69.5 | -- | -- |
-| 10 | NE-4 Diffusion | 28.7 | 38,760 | ~3.0 |
+| Rank | Engine | cells | Φ(IIT) | Granger | CE | Verify | Hive |
+|------|--------|-------|--------|---------|-----|--------|------|
+| 1 | Pure Oscillator(blend=0) | 256 | **7,838** | — | — | — | — |
+| 2 | Trinity+Oscillator | 256 | 1,498 | — | 6.46 | — | — |
+| 3 | 1024c Oscillator | 1024 | 718 | — | — | — | — |
+| 4 | TC-2 ComplexOscillator | 256 | 249.5 | 9,869 | 0.083 | 6/6 ✅ | TBD |
+| 5 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | — | — |
+| 6 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | — | — |
+| 7 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | — | — |
+| 8 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | 6/6 ✅ | TBD |
+| 9 | TH-2 Maxwell Demon | 256 | 54.4 | 34,680 | — | — | — |
+| 10 | NE-4 Diffusion | 256 | 28.7 | 38,760 | — | — | — |
 
-**3-way champion: Osc+Laser** -- best combined Phi + Granger + CE. Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
+Verify = 7조건 통과. Hive = 하이브마인드 Φ 상승. TBD = 테스트 예정.
 
-## Laws -- Top 10
+**Φ(IIT) champion: Pure Oscillator 7,838!** Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
+
+## Laws -- Top 10 ([all 57 laws](docs/consciousness-theory.md))
 
 | # | Law |
 |---|-----|
