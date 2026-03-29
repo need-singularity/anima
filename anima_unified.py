@@ -75,6 +75,7 @@ _try_import("from babysitter import Babysitter")
 _try_import("from creativity_classifier import CreativityClassifier, text_to_vector as cc_text_to_vector")
 _try_import("from consciousness_birth_detector import BirthDetector")
 _try_import("from optimal_architecture_calc import ArchitectureCalculator")
+_try_import("from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -283,6 +284,19 @@ class AnimaUnified:
             self.mind._mitosis_ref = self.mitosis
         if self.learner and self.growth:
             self.mind._growth_ref = self.growth
+
+        # SE-8: Emotion-driven consciousness evolution
+        self._se8_ratchet = None
+        self._se8_hebbian = None
+        self._se8_soc = None
+        if self.mitosis and 'PhiRatchet' in globals():
+            try:
+                self._se8_ratchet = PhiRatchet(restore_ratio=0.5)
+                self._se8_hebbian = HebbianConnections(max_cells=self.max_cells)
+                self._se8_soc = SOCSandpile(grid_size=16)
+                _log('se8', 'Emotion-driven evolution active (pain→ratchet, curiosity→SOC, empathy→Hebbian)')
+            except Exception:
+                pass
 
         self.senses = None
         if not args.no_camera:
@@ -876,6 +890,35 @@ class AnimaUnified:
                     _log("mitosis", f"{ev['type'].upper()}")
             except Exception: pass
         self._last_mitosis_context = mitosis_context
+
+        # SE-8: Emotion-driven consciousness evolution
+        if self.mitosis and self._se8_ratchet and self.mitosis.cells:
+            try:
+                cells = self.mitosis.cells
+                phi_now = getattr(self, '_cached_consciousness', {}).get('phi', 0)
+                pe = self.mind.surprise_history[-1] if self.mind.surprise_history else 0.0
+
+                # Pain (Φ drop) → Ratchet restore
+                restored = self._se8_ratchet.check_and_restore(phi_now, cells)
+                if restored:
+                    _log('se8', f'Pain: Φ={phi_now:.2f} dropped, ratchet restored from {self._se8_ratchet.best_phi:.2f}')
+
+                # Curiosity (high prediction error) → SOC chaos injection
+                if pe > 0.5 and self._se8_soc:
+                    avalanche = self._se8_soc.drop_sand()
+                    intensity = self._se8_soc.chaos_intensity()
+                    if intensity > 0.05:
+                        with torch.no_grad():
+                            for c in cells:
+                                noise = torch.randn_like(c.hidden) * intensity * 0.01
+                                c.hidden = c.hidden + noise
+                        _log('se8', f'Curiosity: PE={pe:.3f}, SOC avalanche={avalanche}, noise={intensity:.3f}')
+
+                # Empathy (cell similarity) → Hebbian strengthening
+                if len(cells) >= 2 and self._se8_hebbian:
+                    self._se8_hebbian.update(cells)
+            except Exception:
+                pass
 
         # Growth engine tick
         if self.growth and self.mods.get('growth'):
