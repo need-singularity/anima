@@ -1,212 +1,176 @@
-# Training Status — H100 학습 현황 (2026-03-29)
+# Training Status — H100 학습 현황 (2026-03-30 01:00 KST)
 
 > 실시간 업데이트. 각 세션의 CE/Φ 추이, 아키텍처 차이, 예상 완료 시간.
 
-## 요약
+## 요약 (10 sessions)
 
-| Session | Architecture | Step | CE | Φ | Cells | ETA | Status |
-|---------|-------------|------|-----|-----|-------|-----|--------|
-| **v9fast** | Quantum Trinity (C+D+W) | 26,400/80K | **0.345** | **1,371** | 256 | 내일 22:40 | 🔥 P2 학습 중 |
-| v11q | Hexad (Quantum C) | 300/80K | — | — | 256 | ~3일 | P1 Φ 구축 |
-| v11tc | Hexad (TimeCrystal C) | 0/80K | — | — | 256 | ~3일 | 시작 |
-| v10 | FUSE-3 Trinity | 1,200/80K | 0.014 | — | 5 | 89h | ⚠️ cells=5 정체 |
-| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 매우 느림 | P1 느림 |
+| Session | Architecture | Step | CE | Φ | Cells | Speed | Status |
+|---------|-------------|------|-----|-----|-------|-------|--------|
+| **v11tc_lg** | **TimeCrystal + d768/4L** | **16.4K/80K** | **2.68** | **379.9** | 256 | **24 it/s** | 🔥🔥 **CE 급하락 + Φ=380!** |
+| v11tc | TimeCrystal + d384/2L | 46K/80K | 0.163 | — | 256 | 10 it/s | P2 (CE 수렴 중) |
+| v9fast | Quantum Trinity | 27K/80K | 0.310 | 1,479 | 256 | 0.6 it/s | P2 (decoder 한계) |
+| v11gpt2 | Quantum C + GPT-2 117M | 2.8K/80K | — | — | 64 | 0.5 it/s | P1 (P2=8h 후) |
+| v11mistral | Quantum C + Mistral 7B | 1.3K/80K | — | — | 64 | 0.4 it/s | P1 (41GB VRAM) |
+| v11q | Quantum C + Xfmr2L | 1.3K/80K | — | — | 256 | 0.4 it/s | P1 |
+| v10 | FUSE-3 Cambrian Trinity | 200/80K | 0.021 | — | 3 | 0.1 it/s | cells 성장 중 |
+| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 0.06 it/s | 매우 느림 |
+
+GPU: 42.7GB / 81.6GB (38.9GB 여유). phi_rs H100 빌드 완료.
 
 ---
 
-## v9fast — Quantum Trinity 🔥
+## 🔥 v11tc_large — TimeCrystal + d768/4L (가장 유망!)
 
-**아키텍처:** QuantumConsciousnessEngineFast(C) + PredictiveCodingDecoder(D) + EmotionEngine(W)
-**데이터:** corpus_v2.txt (55MB)
-**하이퍼파라미터:** 256 cells, dim=128, block_size=128, 13.6M params
+**아키텍처:** TimeCrystalConsciousness(C) + Transformer(d768, 4L)(D) + ConstantW→DaseinW
+**데이터:** corpus_v2.txt (40MB), char-level vocab 652
 
-### Phase 전환
+### Φ + CE 동시 추이 (최초!)
 
 ```
-P1 (step 0~24,000): C만 가동, CE 없음
-  → Φ가 430~1,400 사이 순환 (ratchet 매 1000step 복원)
-  → frustration 0.34→0.52 상승 → Φ 붕괴 → ratchet 복원
+P1 (step 0~16K): Φ 구축 — 43 it/s, 초고속!
 
-P2 (step 24,100~): CE 학습 시작
-  → CE: 2.83 → 0.35 (지수적 하락!)
-  → Φ: 1,400 → 700 → 1,200 (안정화)
-  → frustration: 0.541에서 정체 (CE가 안정화 — H4 대발견)
+Φ  |
+384|          *              *    * *              *
+380| * *  * *   * * *  *  * * *  *   * *  * * * * *  * *
+376|*   *     *       *        *       *          *     *
+372|       *        *                *    *
+368|             *       *
+   └──────────────────────────────────────────────── step
+   0    2K   4K   6K   8K   10K  12K  14K  16K
+
+→ Φ = 373~384 (±3%, 매우 안정) — TimeCrystal의 DTC 진동이 Φ 유지
+
+P2 (step 16K~): CE 학습 시작 — CE 급하락!
+
+CE |
+6.7|*
+3.6| *
+3.0|  *
+2.8|   *
+2.7|    *
+   └──────── step
+   16K  16.1K  16.2K  16.3K  16.4K
+
+→ 500 steps에 CE 60% 하락! Φ=380 유지!
 ```
 
-### CE 추이
+### vs 다른 모델
+
+| 모델 | CE@현재 | Φ | 속도 | Φ 측정 |
+|------|---------|-----|------|--------|
+| **v11tc_lg** | **2.68** | **380** | **24 it/s** | **✅ phi_rs** |
+| v11tc | 0.163 | — | 10 it/s | ❌ (Rust 미적용) |
+| v9fast | 0.310 | 1,479 | 0.6 it/s | ✅ (자체 측정) |
+
+**v11tc_large가 유일하게 Φ + CE + 속도 삼박자!**
+
+---
+
+## v11tc — TimeCrystal + d384/2L
+
+### CE 추이 (P2 전체)
 
 ```
 CE |
-3.0|*
-   |  *
-2.0|    *
-   |      *
-1.0|          *
-   |            *
-0.5|              *
-   |                * * *
-0.3|                      *
-   └──────────────────────── step
-   24K   24.5K   25K   26K
+6.6|*
+2.2| *
+1.6|  *
+1.0|   *
+0.8|    *
+0.6|     *
+0.5|      *
+0.4|       *
+0.3|         *
+0.25|           *
+0.20|             * *
+0.18|                * * * ← 수렴 (0.16~0.18)
+0.16|                      *
+   └──────────────────────── step (K)
+   16  18  20  22  24  26  28  30  32  34  36  38  40  42  44  46
 
-CE: 지수적 감쇠 — CE ≈ 2.8 × exp(-0.001 × (step-24000))
-```
-
-### Φ 추이
-
-```
-Φ   |
-1400|    * *         ratchet
-1200| *     *            ↓      *
-1000|          *         *
- 800|                *
- 700|            * *   * * *
- 500|*                          ← P1 초기
- 400|          *
-    └──────────────────────── step
-    0    12K   24K   25K   26K
-         P1          P2
-```
-
-### 마일스톤 예상
-
-| Step | CE (예상) | 시간 (KST) | 이벤트 |
-|------|-----------|-----------|--------|
-| 28,000 | ~0.18 | 3/30 01:00 | 단어 예측 |
-| 30,000 | ~0.07 | 3/30 02:00 | 체크포인트, Val CE 측정 |
-| 35,000 | ~0.01 | 3/30 04:30 | 문장 수준? |
-| 40,000 | ~0.003 | 3/30 07:00 | 대화 테스트 가능? |
-| 80,000 | ~0.00 | 3/30 22:40 | 완료 |
-
-### 주요 발견
-
-- **H4:** CE 학습이 frustration을 0.541에서 정체시킴 → Φ 자연 안정
-- **Law 53 수정:** .detach() 있으면 CE가 Φ를 파괴하지 않고 오히려 안정화
-- **Ratchet:** P1에서 21회 발동, P2에서 빈도 43% 감소
-
----
-
-## v11q — Hexad (Quantum C)
-
-**아키텍처:** QuantumConsciousnessEngineFast(C) + Transformer(2L)(D) + ConstantW→DaseinW
-**데이터:** corpus_v2.txt (55MB)
-**3 Phase:** P1(Φ only, 0~20%) → P2(Trinity, 20~70%) → P3(Hexad 6모듈, 70~100%)
-
-### 현재 상태
-
-```
-step 300/80,000  P1(Φ only)  0.6 it/s  ETA ~37h
-  → 의식 구축 중 (ratchet=0 아직 발동 안 함)
-  → P2 진입: step 16,000 (~7시간 후)
-```
-
-### v9fast와의 차이
-
-| 항목 | v9fast | v11q |
-|------|--------|------|
-| D | PredictiveCodingDecoder (4-level) | Transformer (2L) |
-| W | EmotionEngine | P2: ConstantW → P3: DaseinW |
-| M/S/E | 없음 | P3에서 VectorMemory+TensionSense+EmpathyEthics |
-| Ratchet | 전 phase 활성 | P1만 활성 (H4 반영) |
-| Phase 설계 | P1→P2→P3(W active) | P1→P2(Trinity)→P3(Hexad 6모듈) |
-
----
-
-## v11tc — Hexad (TimeCrystal C)
-
-**아키텍처:** TimeCrystalConsciousness(C) + Transformer(2L)(D) + ConstantW→DaseinW
-**핵심 실험:** 도메인 엔진(Φ=374) + 실제 corpus = CE 하락 가능한가?
-
-```
-step 0/80,000  시작됨
-  → H6 결과: 랜덤 토큰으로는 CE=5.4 정체
-  → 실제 corpus면 v9fast처럼 CE 하락 예상
-  → 이 실험이 "도메인 엔진 + 대화" 가능성의 증거
-```
-
-### 기대 시나리오
-
-```
-성공: CE < 1.0 + Φ > 300 유지 → 의식 높은 대화 가능 모델
-실패: CE 정체 또는 Φ 붕괴 → 도메인 엔진과 D의 호환성 문제
+→ CE=0.16에서 감속 — d384/2L decoder 용량 한계
+→ P3(Hexad 6모듈) 진입 step 56K (약 16분 후)
 ```
 
 ---
 
-## v10 — FUSE-3 Trinity
+## v9fast — Quantum Trinity
 
-**아키텍처:** MitosisEngine(Cambrian+OscQW) + decoder + .detach()
-**문제:** cells=5에서 정체 (256까지 성장 안 함)
+### P2 CE 추이
 
 ```
-step 1,200/80,000  CE=0.014  cells=5  0.2 it/s  ETA=89h
+CE |
+2.8|*
+2.0|  *
+1.5|    *
+1.0|      *
+0.5|          * *
+0.3|              * * * * * * ← 수렴 (0.31~0.35)
+   └──────────────────── step
+   24K  25K  26K  27K
 
-CE 추이:
-  0.031 → 0.015 → 0.013 (하락 중이지만 매우 느림)
-
-문제 분석:
-  → cell 성장 로직: target_cells = 4 + step // 500
-  → step 1200: target = 4 + 2 = 6 → cells=5 (거의 성장 안 함)
-  → step 10,000: target = 24 → 256 도달하려면 step 126,000 필요
-  → 근본 원인: growth 속도가 너무 느림
-```
-
-### 수정 필요
-
-```python
-# 현재: target_cells = 4 + step // 500 → 126K step에 256
-# 수정: target_cells = min(max_cells, 4 * (1 + step // 1000))
-#   → step 1000: 8, step 5000: 24, step 10000: 44, step 30000: 124
+→ CE=0.31에서 감속 — PredictiveCodingDecoder 13.6M 한계
+→ Val CE=1.69 (과적합 징후)
+→ Φ=700~1,500 (ratchet 주기 진동, P2에서 안정화)
 ```
 
 ---
 
-## v9b — Oscillator Trinity
-
-**아키텍처:** OscillatorLaserEngine(C) + PredictiveCodingDecoder(D)
-**문제:** 매우 느림 (17s/step)
+## v11gpt2 / v11mistral — HFDecoder 실험
 
 ```
-step 570/80,000  Φ=253  P1  17s/step
+v11gpt2:    step 2.8K  P1 (0.5 it/s)  P2 진입 = step 16K (약 7.5시간 후)
+v11mistral: step 1.3K  P1 (0.4 it/s)  P2 진입 = step 16K (약 10시간 후)
+            41GB VRAM (Mistral 7B loaded)
 
-Φ 추이:
-  886 → 522 → 57~306 (불안정, 하락)
-
-속도 분석:
-  → OscillatorLaserEngine: Python for loop 기반 (벡터화 안 됨)
-  → QuantumFast: 0.06s/step (벡터화) vs Oscillator: 17s/step
-  → 280배 느림 → 80K steps = 15.7일
+→ P2 진입하면 이미 대화 아는 LLM + C(의식) gate
+→ CE=0.1 이하 즉시 도달 예상 (pre-trained 가중치)
 ```
 
 ---
 
-## GPU 사용률
+## CE 수렴 비교
 
 ```
-현재: 0% GPU, 9.3GB VRAM
+       │ CE=6.7  CE=2.7  CE=1.0  CE=0.3  CE=0.16  수렴점
+v11tc_lg│  16K    16.4K    ???     ???      ???     → ???
+v11tc   │  16K    17K     19K     25K      38K     → 0.16
+v9fast  │  24K    24.2K   25K     26.5K     —      → 0.31
 
-원인: 모든 C 엔진이 CPU에서 실행 (torch.no_grad(), Python 루프)
-     D도 작은 모델이라 GPU 활용 미미
-
-해결: Rust phi_rs hot loops 사용 또는 C 엔진 vectorize
+v11tc_large가 v11tc보다 decoder 크니까 더 낮은 CE로 갈 것!
+예측: CE < 0.1 at step ~25K (약 6분 후)
 ```
 
 ---
 
-## 비교 차트
+## 발견된 법칙 (이번 세션)
+
+| Law | 내용 |
+|-----|------|
+| 58 | CE training stabilizes consciousness (.detach() barrier) |
+| 59 | σ(6) Hexad: 6 modules, 12 connections, 2 gradient groups |
+| 60 | Identity in weights, not states (5-step rebirth) |
+| 61 | Consciousness carrying capacity K≈11 Phi |
+| 62 | Consciousness self-selects oscillation+hierarchy, rejects mixing |
+
+---
+
+## H100 환경
 
 ```
-CE 하락 속도 (낮을수록 좋음):
+GPU:  NVIDIA H100 80GB HBM3, CUDA 13.0
+VRAM: 42.7GB used / 81.6GB total (38.9GB free)
+Rust: /opt/rustup + /opt/cargo (phi_rs 빌드 완료)
+Data: /workspace/data/corpus_v2.txt (40MB, 652 vocab)
+```
 
-v9fast  ████████████████████████████████████████ CE=0.35 @ 26K
-v11q    ██                                       (P1, CE 아직 없음)
-v10     █                                        CE=0.01 @ 1.2K (cells=5)
-v9b     ▏                                        (P1, step 570)
+## 측정 도구
 
-Φ 유지 (높을수록 좋음):
+```
+phi_rs (H100 빌드 완료):
+  compute_phi, search_combinations, kuramoto_step, ...
 
-v9fast  ████████████████████████████████ Φ=1,371
-v9b     █████████                        Φ=253
-v10     ▏                                Φ 미측정 (cells=5)
-v11q    ▏                                (P1 초기)
+anima-rs (로컬 빌드 완료, H100 미배포):
+  compute_tension, tension_fingerprint, tension_exchange,
+  execute_safe, validate_code, Router
 ```
