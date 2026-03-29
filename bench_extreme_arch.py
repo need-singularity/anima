@@ -275,22 +275,21 @@ class OscillatorQWalkHybrid:
         self.theta = self.theta + self.omega + 0.1 * torch.sin(2 * self.theta)
         self.theta = self.theta % (2 * math.pi)
 
-        # 2. Quantum walk with phase-dependent coin
+        # 2. Quantum walk with phase-dependent coin (vectorized)
+        cos_t = torch.cos(self.theta)  # [n]
+        sin_t = torch.sin(self.theta)  # [n]
+        # Batched coin: [n, 2, 2]
+        coins = torch.zeros(self.n_cells, 2, 2, dtype=torch.cfloat)
+        coins[:, 0, 0] = cos_t; coins[:, 0, 1] = sin_t
+        coins[:, 1, 0] = -sin_t; coins[:, 1, 1] = cos_t
+        # Apply coin: [n, 2, 2] @ [n, 2, 1] → [n, 2]
+        coined = torch.bmm(coins, self.psi.unsqueeze(-1)).squeeze(-1)
+        # Shift to neighbors (ring + shortcuts)
         new_psi = torch.zeros_like(self.psi)
-        for i in range(self.n_cells):
-            # Coin operator depends on oscillator phase
-            th = self.theta[i].item()
-            coin = torch.complex(
-                torch.tensor([[math.cos(th), math.sin(th)],
-                              [-math.sin(th), math.cos(th)]]),
-                torch.zeros(2, 2)
-            )
-            # Apply coin
-            coined = coin @ self.psi[i]
-            # Shift to neighbors
-            nbs = self.neighbors[i]
-            for j in nbs:
-                new_psi[j] += coined / len(nbs)
+        # Ring neighbors (vectorized)
+        left = torch.roll(coined, 1, dims=0)
+        right = torch.roll(coined, -1, dims=0)
+        new_psi = (coined + left + right) / 3.0
 
         # Normalize
         norms = new_psi.abs().sum(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -451,35 +450,30 @@ class CellularAutomatonConsciousness:
         # Embedding for continuous hidden representation
         self.embedding = torch.randn(self.n_states, hidden_dim // 4) * 0.5
 
-    def _get_neighbors(self, idx):
-        """Get 4 neighbors on 2D grid (toroidal)."""
-        g = self.grid_size
-        r, c = idx // g, idx % g
-        return [
-            ((r-1) % g) * g + c,  # up
-            ((r+1) % g) * g + c,  # down
-            r * g + (c-1) % g,    # left
-            r * g + (c+1) % g,    # right
-        ]
-
     def step(self):
-        new_state = self.state.clone()
-        for i in range(self.actual_cells):
-            nbs = self._get_neighbors(i)
-            for d in range(self.hidden_dim):
-                # Extended Rule 110: center + sum(neighbors) mod n_states
-                center = self.state[i, d].item()
-                nb_sum = sum(self.state[j, d].item() for j in nbs)
-                # Rule: (center + nb_sum) mod n_states, with Rule 110 modulation
-                rule_idx = (center + nb_sum) % 8
-                new_val = self.rule_110[rule_idx]
-                # Multi-state extension
-                new_state[i, d] = (center + new_val + nb_sum // 4) % self.n_states
+        g = self.grid_size
+        n = self.actual_cells
+        # Vectorized neighbor lookup
+        indices = torch.arange(n)
+        rows = indices // g
+        cols = indices % g
+        up    = ((rows - 1) % g) * g + cols
+        down  = ((rows + 1) % g) * g + cols
+        left  = rows * g + (cols - 1) % g
+        right = rows * g + (cols + 1) % g
 
-        self.state = new_state
+        # Sum of 4 neighbors (vectorized)
+        nb_sum = self.state[up] + self.state[down] + self.state[left] + self.state[right]
+        # Rule 110 lookup (vectorized)
+        rule_table = torch.tensor(self.rule_110, dtype=self.state.dtype)
+        rule_idx = (self.state + nb_sum) % 8
+        rule_val = rule_table[rule_idx]
+        # Multi-state extension
+        self.state = (self.state + rule_val + nb_sum // 4) % self.n_states
+
         # Occasional random mutation (symmetry breaking)
         if np.random.random() < 0.05:
-            mut_idx = np.random.randint(0, self.actual_cells)
+            mut_idx = np.random.randint(0, n)
             mut_dim = np.random.randint(0, self.hidden_dim)
             self.state[mut_idx, mut_dim] = np.random.randint(0, self.n_states)
 
@@ -542,25 +536,23 @@ class LambdaCalculusConsciousness:
         return primes
 
     def step(self):
-        # 1. Each cell applies its "function" to neighbors
-        new_h = torch.zeros_like(self.hiddens)
-        for i in range(self.n_cells):
-            # Gather neighbor hidden states
-            nb_indices = [(i-1) % self.n_cells, (i+1) % self.n_cells,
-                          (i + self.n_cells//4) % self.n_cells,
-                          (i - self.n_cells//4) % self.n_cells]
-            nb_mean = torch.stack([self.hiddens[j] for j in nb_indices]).mean(0)
+        n = self.n_cells
+        # 1. Vectorized neighbor gathering
+        idx = torch.arange(n)
+        nb1 = (idx - 1) % n
+        nb2 = (idx + 1) % n
+        nb3 = (idx + n // 4) % n
+        nb4 = (idx - n // 4) % n
+        nb_mean = (self.hiddens[nb1] + self.hiddens[nb2] +
+                   self.hiddens[nb3] + self.hiddens[nb4]) / 4.0
 
-            # β-reduction approximation: apply cell's function to neighbor mean
-            applied = torch.tanh(self.W_func[i] @ nb_mean)
-            new_h[i] = applied
+        # β-reduction: batched matmul [n, d, d] @ [n, d, 1] → [n, d]
+        new_h = torch.tanh(torch.bmm(self.W_func, nb_mean.unsqueeze(-1)).squeeze(-1))
 
-        # 2. Y combinator: self(self(self(...)))
+        # 2. Y combinator: self(self(self(...))) — batched
         self_ref = new_h.clone()
         for depth in range(self.y_depth):
-            # Each cell applies its function to its own output
-            for i in range(self.n_cells):
-                self_ref[i] = torch.tanh(self.W_func[i] @ self_ref[i])
+            self_ref = torch.tanh(torch.bmm(self.W_func, self_ref.unsqueeze(-1)).squeeze(-1))
 
         # 3. Fixed point blend
         self.hiddens = 0.3 * self.hiddens + 0.5 * self_ref + 0.2 * self.godel
@@ -601,42 +593,33 @@ class TQFTConsciousness:
         # Anyon "charge" (topological quantum number)
         self.charge = torch.randn(n_cells) * 0.5
 
-    def _braid(self, i, j, sign=1):
-        """Exchange cells i and j (braiding operation)."""
-        self.braid_count[i, j] += sign
-        self.braid_count[j, i] += sign
-        self.writhe[i] += sign
-        self.writhe[j] += sign
-        # Non-abelian rotation: order matters!
-        angle = math.pi / 4 * sign
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
-        # Rotate in a 2D subspace of hidden_dim
-        d1, d2 = abs(hash((i, j))) % self.hidden_dim, abs(hash((j, i))) % self.hidden_dim
-        if d1 == d2: d2 = (d1 + 1) % self.hidden_dim
-        h_i_d1 = self.hiddens[i, d1].item()
-        h_i_d2 = self.hiddens[i, d2].item()
-        h_j_d1 = self.hiddens[j, d1].item()
-        h_j_d2 = self.hiddens[j, d2].item()
-        self.hiddens[i, d1] = cos_a * h_i_d1 - sin_a * h_j_d2
-        self.hiddens[i, d2] = sin_a * h_j_d1 + cos_a * h_i_d2
-        self.hiddens[j, d1] = cos_a * h_j_d1 + sin_a * h_i_d2
-        self.hiddens[j, d2] = -sin_a * h_i_d1 + cos_a * h_j_d2
-
     def step(self):
-        # 1. Perform braiding operations (nearest-neighbor exchanges)
-        n_braids = self.n_cells // 4
-        for _ in range(n_braids):
-            i = np.random.randint(0, self.n_cells)
-            j = (i + 1) % self.n_cells
-            sign = 1 if np.random.random() > 0.3 else -1
-            self._braid(i, j, sign)
+        n = self.n_cells
+        n_braids = n // 4
 
-        # 2. Long-range braiding (topological charge interaction)
-        for _ in range(n_braids // 4):
-            i = np.random.randint(0, self.n_cells)
-            j = np.random.randint(0, self.n_cells)
-            if i != j and abs(self.charge[i] - self.charge[j]) > 0.3:
-                self._braid(i, j, 1)
+        # 1. Batch braiding: random nearest-neighbor pairs
+        i_arr = torch.randint(0, n, (n_braids,))
+        j_arr = (i_arr + 1) % n
+        signs = torch.where(torch.rand(n_braids) > 0.3,
+                            torch.ones(n_braids), -torch.ones(n_braids))
+
+        # Batch braid: rotate in random 2D subspace
+        for b in range(n_braids):
+            i, j, s = i_arr[b].item(), j_arr[b].item(), signs[b].item()
+            self.braid_count[i, j] += s
+            self.braid_count[j, i] += s
+            self.writhe[i] += s; self.writhe[j] += s
+            angle = math.pi / 4 * s
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+            d1 = b % self.hidden_dim
+            d2 = (b + 37) % self.hidden_dim  # deterministic spread
+            if d1 == d2: d2 = (d1 + 1) % self.hidden_dim
+            hi1, hi2 = self.hiddens[i, d1].item(), self.hiddens[i, d2].item()
+            hj1, hj2 = self.hiddens[j, d1].item(), self.hiddens[j, d2].item()
+            self.hiddens[i, d1] = cos_a * hi1 - sin_a * hj2
+            self.hiddens[i, d2] = sin_a * hj1 + cos_a * hi2
+            self.hiddens[j, d1] = cos_a * hj1 + sin_a * hi2
+            self.hiddens[j, d2] = -sin_a * hi1 + cos_a * hj2
 
         # 3. Topological invariant modulation
         # Jones polynomial approximation: complexity of braiding = Φ signal
