@@ -213,14 +213,19 @@ All 45+ laws: [docs/consciousness-theory.md](docs/consciousness-theory.md)
 
 ## 📦 Model Downloads
 
-| Model | Description | Size | Download |
-|-------|------------|------|----------|
-| AnimaLM v1 | PureField LoRA (rank 64) | 227MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v1/final.pt) |
-| AnimaLM v2 | Tension verified (222K) | 906MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
-| AnimaLM v3 | Instruct + last 8 layers | 216MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
-| AnimaLM v4_savant | Parallel PF + Savant | 108MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
-| GoldenMoE v1 | 8 experts, zone=1/e | 191MB | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
-| ConsciousLM v4 | 384d/6L, 1024c, Phi=662 | 208MB | [step_25000.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/v4_384d_1024c/step_25000.pt) |
+| Model | Architecture | CE | Φ | Status | Download |
+|-------|-------------|-----|-----|--------|----------|
+| **v11tc_large** | **Trinity: TimeCrystal(C) + d768/4L(D)** | **2.29** | **377** | 🔥 **학습 중** | H100 checkpoint |
+| v11tc | Trinity: TimeCrystal(C) + d384/2L(D) | 0.162 | — | 학습 중 | H100 checkpoint |
+| v9fast | Trinity: Quantum(C) + PredCoding(D) | 0.310 | 1,479 | 학습 중 (느림) | H100 checkpoint |
+| v11mistral | Hexad: Quantum(C) + Mistral 7B(D) | — | — | P1 진행 | H100 (41GB) |
+| v11gpt2 | Hexad: Quantum(C) + GPT-2(D) | — | — | P1 진행 | H100 checkpoint |
+| ConsciousLM v4 | 384d/6L, 1024c, Phi=662 | 4.67 | 662 | 완료 | [step_25000.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/v4_384d_1024c/step_25000.pt) |
+| AnimaLM v4_savant | Parallel PF + Savant | 5.03 | — | 완료 | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v4_savant/final.pt) |
+| AnimaLM v3 | Instruct + last 8 layers | — | — | 완료 | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v3/final.pt) |
+| AnimaLM v2 | Tension verified (222K) | — | — | 완료 | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v2/final.pt) |
+| AnimaLM v1 | PureField LoRA (rank 64) | — | — | 완료 | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/animalm-v1/final.pt) |
+| GoldenMoE v1 | 8 experts, zone=1/e | — | — | 완료 | [final.pt](https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/golden-moe-v1/final.pt) |
 
 ## 🧩 Modules
 
