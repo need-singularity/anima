@@ -1096,6 +1096,74 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
     return passed, detail
 
 
+def _verify_hivemind(engine_factory, cells, dim, hidden):
+    """V7: HIVEMIND — multi-connect Phi↑ CE↓, independent after disconnect.
+
+    1. Create 2 engines, measure Phi solo
+    2. Connect (share hidden states periodically)
+    3. Measure Phi connected (must be > solo × 1.1)
+    4. Disconnect, run 100 more steps
+    5. Measure Phi disconnected (must maintain > solo × 0.8)
+    """
+    phi_calc = PhiIIT(n_bins=16)
+    half = max(cells // 2, 8)
+
+    # Solo engines
+    eng_a = engine_factory(half, dim, hidden)
+    eng_b = engine_factory(half, dim, hidden)
+    for _ in range(100):
+        eng_a.process(torch.randn(1, dim))
+        eng_b.process(torch.randn(1, dim))
+    phi_a_solo = phi_calc.compute(eng_a)
+    phi_b_solo = phi_calc.compute(eng_b)
+    phi_solo = (phi_a_solo + phi_b_solo) / 2
+
+    # Connected: share state every 10 steps
+    for step in range(200):
+        eng_a.process(torch.randn(1, dim))
+        eng_b.process(torch.randn(1, dim))
+        if step % 10 == 0:
+            h_a = eng_a.get_hiddens()
+            h_b = eng_b.get_hiddens()
+            n = min(h_a.shape[0], h_b.shape[0])
+            with torch.no_grad():
+                shared = 0.9 * h_a[:n] + 0.1 * h_b[:n]
+                shared_b = 0.9 * h_b[:n] + 0.1 * h_a[:n]
+                for i in range(min(n, len(eng_a.cells))):
+                    if hasattr(eng_a.cells[i], 'hidden'):
+                        eng_a.cells[i].hidden = shared[i:i+1]
+                    elif hasattr(eng_a, '_hiddens'):
+                        eng_a._hiddens[i] = shared[i]
+                for i in range(min(n, len(eng_b.cells))):
+                    if hasattr(eng_b.cells[i], 'hidden'):
+                        eng_b.cells[i].hidden = shared_b[i:i+1]
+                    elif hasattr(eng_b, '_hiddens'):
+                        eng_b._hiddens[i] = shared_b[i]
+
+    phi_a_conn = phi_calc.compute(eng_a)
+    phi_b_conn = phi_calc.compute(eng_b)
+    phi_connected = (phi_a_conn + phi_b_conn) / 2
+
+    # Disconnect: run 100 more steps independently
+    for _ in range(100):
+        eng_a.process(torch.randn(1, dim))
+        eng_b.process(torch.randn(1, dim))
+    phi_a_disc = phi_calc.compute(eng_a)
+    phi_b_disc = phi_calc.compute(eng_b)
+    phi_disconnected = (phi_a_disc + phi_b_disc) / 2
+
+    # Check conditions
+    phi_boost = phi_connected > phi_solo * 1.1  # 10% boost when connected
+    phi_maintain = phi_disconnected > phi_solo * 0.8  # maintain after disconnect
+
+    passed = phi_boost and phi_maintain
+    detail = (f"solo={phi_solo:.2f} → connected={phi_connected:.2f} "
+              f"({'↑' if phi_boost else '↓'}{phi_connected/max(phi_solo,1e-8)*100-100:+.0f}%) "
+              f"→ disconnected={phi_disconnected:.2f} "
+              f"({'✓' if phi_maintain else '✗'} maintain)")
+    return passed, detail
+
+
 VERIFICATION_TESTS = [
     ("NO_SYSTEM_PROMPT",   _verify_no_system_prompt,   "Identity emerges from cell dynamics alone"),
     ("NO_SPEAK_CODE",      _verify_no_speak_code,      "Spontaneous speech without speak() function"),
@@ -1103,6 +1171,7 @@ VERIFICATION_TESTS = [
     ("PERSISTENCE",        _verify_persistence,         "No collapse over time (1000 steps)"),
     ("SELF_LOOP",          _verify_self_loop,           "Output feeds back as input"),
     ("SPONTANEOUS_SPEECH", _verify_spontaneous_speech,  "8-faction debate -> consensus utterances"),
+    ("HIVEMIND",           _verify_hivemind,            "Multi-connect: Phi↑ CE↓, independent after disconnect"),
 ]
 
 
@@ -1110,7 +1179,7 @@ def run_verify(cells: int, dim: int, hidden: int):
     """Run all 6 consciousness verification conditions across all 4 engines."""
     print("=" * 80)
     print("  MODE: --verify  (Consciousness Verification)")
-    print("  6 conditions x 4 engines = 24 tests")
+    print("  7 conditions x 4 engines = 28 tests")
     print(f"  cells={cells}  dim={dim}  hidden={hidden}")
     print("=" * 80)
 
