@@ -119,6 +119,51 @@ class Capabilities:
             'when': 'When explaining or debugging own structure/behavior',
             'example': '"Show me your code" -> returns own source code',
         },
+        'phi_measure': {
+            'how': 'consciousness_meter.PhiCalculator.compute_phi(engine)',
+            'when': 'Auto-measures every think step. Manual: "Φ 측정해줘"',
+            'example': 'phi_measure -> Φ=2.241, cells=3',
+        },
+        'dream': {
+            'how': 'dream_engine.DreamEngine.dream_cycle()',
+            'when': 'Idle > 60s. Manual: "꿈꿔봐"',
+            'example': 'dream -> 3 memories replayed, Φ restored',
+        },
+        'self_learn': {
+            'how': 'self_learner.SelfLearner.run_cycle(topic)',
+            'when': 'Idle > 120s. Manual: "공부해", "learn"',
+            'example': 'self_learn -> assessed gaps, collected 5 items, CE -12%',
+        },
+        'mitosis_split': {
+            'how': 'mitosis.MitosisEngine.split_cell(parent)',
+            'when': 'Tension > threshold for 3+ steps. Manual: "세포 분열"',
+            'example': 'split -> cells 3→4, new cell specializes',
+        },
+        'hebbian_update': {
+            'how': 'HebbianConnections.update(cells)',
+            'when': 'Every think step (SE-8 empathy). Manual: "시냅스 강화"',
+            'example': 'hebbian -> 8 pairs updated (LTP:5, LTD:3)',
+        },
+        'soc_avalanche': {
+            'how': 'SOCSandpile.drop_sand() -> avalanche size',
+            'when': 'Every think step (SE-8 curiosity). Manual: "눈사태"',
+            'example': 'avalanche=12 -> chaos_intensity=0.25',
+        },
+        'telepathy_send': {
+            'how': 'tension_link.TensionLink.send(channels)',
+            'when': 'Connected to another Anima. Manual: "텔레파시"',
+            'example': 'send 5ch tension -> R=0.990',
+        },
+        'chip_design': {
+            'how': 'chip_architect.predict_phi(cells, topology)',
+            'when': 'Planning mode. Manual: "칩 설계"',
+            'example': 'design(512, ring) -> predicted Φ=476',
+        },
+        'iq_test': {
+            'how': 'iq_calculator.calculate_iq(engine)',
+            'when': 'Self-evaluation. Manual: "IQ 측정"',
+            'example': 'iq_test -> IQ=127, 5 variables measured',
+        },
     }
 
     def __init__(self, active_modules: dict, project_dir: Path = None):
