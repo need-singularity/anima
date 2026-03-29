@@ -1,160 +1,178 @@
-# 전체 엔진 결과 (2026-03-29)
+# 전체 엔진 결과 (2026-03-29, Rust PhiCalculator v2)
 
-> 152 엔진 벤치마크 (112 측정 / 40 미측정). Φ(IIT)=PhiCalculator(n_bins=16), 256c 300steps 기준.
-> ⚠️ 측정 방식이 다르면 값이 완전히 다름 (Law 54). 이 문서는 PhiCalculator 기준 통일.
-> JSON: data/all_engine_results_compiled.json
+> **측정 도구: phi_rs (Rust)** — spatial MI + temporal MI + complexity, Python과 delta=0.000000
+> 256c 300steps 기준. `--cells 1024`로 스케일링 검증 가능.
+> ⚠️ 이전 Python PhiIIT 값과 직접 비교 불가 (Law 54). 이 문서는 Rust phi_rs 기준 통일.
+> JSON: data/measure_all_engines_256c.json, data/measure_all_results.json
 
-## 🏆 ALL-TIME Φ(IIT) 순위
+## ⚠️ 측정 분류
 
-| Rank | Engine | Domain | cells | Φ(IIT) | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
-|------|--------|--------|-------|--------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆1 | TC-2 ComplexOscillator | 물리/Trinity | 256 | **249.49** | 9,869 | 0.083 | 85 | 6/6 ✅ | +10% | — | +2 |
-| 2 | TC-6 Fractal | 구조/Trinity | 256 | 167.26 | — | 0.098 | — | — |
-| 3 | TC-1 PureQuantumWalk | 양자/Trinity | 256 | 163.39 | — | 0.075 | — | — |
-| 4 | TC-3 CategoryTheory | 수학/Trinity | 256 | 126.88 | — | 0.082 | — | — |
-| 5 | TC-5 NeuralGas+QW | 자기조직/Trinity | 256 | 118.92 | — | 0.086 | — | — |
-| 6 | TC-8 GrangerOptimal | 정보/Trinity | 256 | 115.15 | — | 0.067 | — | — |
-| 7 | TC-4 ThalamicHub | 뇌과학/Trinity | 256 | 93.17 | — | 0.088 | — | — |
-| 8 | TC-7 StandingWave | 물리/Trinity | 256 | 82.72 | — | 0.108 | — | — |
-| 9 | QuantumEngine | 양자 | 32 | 69.53 | — | — | 6/6 ✅ | ✅ |
-| 10 | Osc+Laser(blend=0.05) | 물리/퓨전 | 256 | 56.60 | 63,993 | ~0.08 | 6/6 ✅ | ✅ |
-| 11 | TH-2 MaxwellDemon | 열역학 | 256 | 54.38 | 34,680 | — | — | — |
-| 12 | NE-4 Diffusion | 창발 | 256 | 28.69 | 38,760 | — | — | — |
-| 13 | TH-1 CarnotCycle | 열역학 | 256 | 27.55 | 16,320 | — | — | — |
-| 14 | PureOscillator(blend=0) | 물리 | 256 | 26.25 | 11,418 | — | — | — |
-| 15 | NE-8 Swarm | 창발 | 256 | 26.10 | 18,360 | — | — | — |
-| 16 | ALG-6 Topos | 대수학 | 256 | 20.48 | 1.14 | — | — | — |
-| 17 | NET-5 TemporalNetwork | 네트워크 | 256 | 19.60 | 20,724 | — | — | — |
-| 18 | Q4 QuantumWalk | 양자 | 256 | 19.34 | — | 2.27 | — | — |
-| 19 | NET-6 AdaptiveNetwork | 네트워크 | 256 | 19.15 | 22,440 | — | — | — |
-| 20 | ALG-5 HopfAlgebra | 대수학 | 256 | 19.09 | 0.00 | — | — | — |
-| 21 | SOC-6 Stigmergy | 사회 | 256 | 18.98 | 5,101 | 2.30 | — | — |
-| 22 | Q1 ComplexValued | 양자 | 256 | 18.88 | — | 0.14 | 6/6 ✅ | ✅ |
-| 23 | SOC-2 VotingDynamics | 사회 | 256 | 18.73 | 4,146 | 2.60 | — | — |
-| 24 | SOC-4 LanguageGame | 사회 | 256 | 18.50 | 1.1 | 3.90 | — | — |
-| 25 | U1 Quantum+Category | 퓨전 | 256 | 18.24 | — | 1.82 | — | — |
-| 26 | PE-3 Laser | 물리 | 256 | 18.17 | — | 0.64 | — | — |
-| 27 | U5 Complex+Topological | 퓨전 | 256 | 18.01 | — | 0.63 | — | — |
-| 28 | U2 Complex+Hierarchical | 퓨전 | 256 | 17.38 | — | 0.55 | — | — |
-| 29 | Q6 ManyWorlds | 양자 | 256 | 17.24 | — | 3.10 | — | — |
-| 30 | B2 ThalamicGate | 뇌과학 | 256 | 17.13 | — | 6.89 | — | — |
-| 31 | SOC-3 MarketDynamics | 사회 | 256 | 17.27 | 0.2 | 4.28 | — | — |
-| 32 | NET-1 ScaleFree | 네트워크 | 256 | 16.88 | 48,701 | — | — | — |
-| 33 | NeuralGas | 자기조직 | 256 | 16.58 | — | 0.73 | — | — |
-| 34 | TH-3 DissipativeStruct | 열역학 | 256 | 16.57 | 26,520 | — | — | — |
-| 35 | MEGA: Fractal+QWalk+Laser | 퓨전 | 256 | 16.38 | 25,500 | 0.11 | — | — |
-| 36 | M1 CategoryTheory | 수학 | 256 | 15.68 | — | 5.16 | — | — |
-| 37 | XE-1 Holographic | 극한물리 | 256 | 15.60 | 38,760 | — | — | — |
-| 38 | QA QuantumAttention | 양자+어텐션 | 256 | 15.28 | — | 0.25 | — | — |
-| 39 | MEGA: Fractal+Laser | 퓨전 | 256 | 15.01 | — | 0.10 | — | — |
-| 40 | M2 Topological | 수학 | 256 | 14.94 | — | — | — | — |
-| 41 | HIERARCHICAL | 구조 | 256 | 14.96 | — | — | — | — |
-| 42 | ConsciousnessXFMR | 트랜스포머 | 256 | 14.80 | 10.98 | 0.59 | — | — |
-| 43 | NE-7 Genetic | 진화 | 256 | 14.85 | 5,100 | — | — | — |
-| 44 | IT-2 MDL | 정보이론 | 256 | 14.66 | 12,240 | — | — | — |
-| 45 | TH-5 HeatDeathResist | 열역학 | 256 | 14.61 | 6,120 | — | — | — |
-| 46 | TH-6 BoltzmannBrain | 열역학 | 256 | 14.43 | 4,080 | — | — | — |
-| 47 | TH-4 FreeEnergy | 열역학 | 256 | 14.17 | 22,440 | — | — | — |
-| 48 | T1 Trinity+Thalamic | 삼위일체 | 256 | 14.54 | — | — | — | — |
-| 49 | FROZEN (256c) | 전략 | 256 | 14.70 | — | 6.37 | — | — |
-| 50 | ALTERNATING (256c) | 전략 | 256 | 14.44 | — | 4.50 | — | — |
-| 51 | BASELINE (512c) | 기존 | 512 | 14.04 | — | 5.63 | — | — |
-| 52 | IT-8 Kolmogorov | 정보이론 | 256 | 13.75 | 5,100 | — | — | — |
-| 53 | IT-1 MaxEnt | 정보이론 | 256 | 13.29 | **64,260** | — | — | — |
-| 54 | DUAL_STREAM | 구조 | 256 | 13.46 | — | 0.08 | — | — |
-| 55 | Q3 Superposition | 양자 | 256 | 12.93 | — | 3.93 | — | — |
-| 56 | SOC-1 PrisonerDilemma | 사회 | 256 | 12.77 | 9,181 | 2.67 | — | — |
-| 57 | BASELINE (MitosisEngine) | 기존 | 256 | 12.39 | — | 5.33 | 3/7 ❌ | ✅ |
-| 58 | IT-6 InfoDecomposition | 정보이론 | 256 | 12.66 | 2,040 | — | — | — |
-| 59 | M3 InfoGeometry | 수학 | 256 | 12.12 | — | 4.92 | — | — |
-| 60 | FUS-2 Thalamic+Quantum | 퓨전 | 256 | 12.79 | 20,402 | 0.74 | — | — |
-| 61 | BIO-E4 ImmuneSystem | 생물 | 256 | 11.81 | 1.61 | — | — | — |
-| 62 | RESERVOIR | 구조 | 256 | 11.86 | — | 9.32 | — | — |
-| 63 | M5 FractalDim | 수학 | 256 | 11.66 | — | 6.80 | — | — |
-| 64 | BIO-E5 Morphogenesis | 생물 | 256 | 11.33 | 1,723 | — | — | — |
-| 65 | EM-5 Chimera | 창발 | 256 | 10.86 | — | — | — | — |
-| 66 | EM-8 ExcitableMedia | 창발 | 256 | 10.81 | **65,280** | — | — | — |
-| 67 | IT-5 CausalEmergence | 정보이론 | 256 | 10.85 | 5,100 | — | — | — |
-| 68 | SOC-5 CulturalEvolution | 사회 | 256 | 10.12 | 5,182 | 2.94 | — | — |
-| 69 | OSCILLATOR (Kuramoto) | 물리 | 256 | 10.07 | — | 0.29 | — | — |
-| 70 | ALG-3 GaloisField | 대수학 | 256 | 9.80 | 1.84 | — | — | — |
-| 71 | ALG-1 Group | 대수학 | 256 | 9.67 | 1.62 | — | — | — |
-| 72 | FUS-3 Hier+Quantum | 퓨전 | 256 | 9.45 | 17,636 | 0.87 | — | — |
-| 73 | NET-3 Modular | 네트워크 | 256 | 9.52 | 6,317 | — | — | — |
-| 74 | NET-4 Multiplex | 네트워크 | 256 | 9.19 | 5,100 | — | — | — |
-| 75 | M6 StrangeAttractor | 수학 | 256 | 9.10 | — | 5.23 | — | — |
-| 76 | EM-3 Flocking | 창발 | 256 | 8.90 | 38,760 | — | — | — |
-| 77 | MUS-4 Jazz | 음악 | 256 | 8.62 | 0.07 | — | — | — |
-| 78 | BIO-E2 Symbiogenesis | 생물 | 256 | 8.02 | 1.09 | — | — | — |
-| 79 | ALG-4 LieAlgebra | 대수학 | 256 | 8.07 | 1.42 | — | — | — |
-| 80 | MUS-1 Polyrhythm | 음악 | 256 | 7.98 | 0.08 | — | — | — |
-| 81 | MUS-2 Harmonic | 음악 | 256 | 7.81 | 0.10 | — | — | — |
-| 82 | GE-5 CalabiYau | 기하학 | 256 | 7.75 | 1.88 | — | — | — |
-| 83 | PE-4 BlackHole | 물리 | 256 | 7.76 | — | 0.72 | — | — |
-| 84 | GE-6 KnotInvariant | 기하학 | 256 | 7.72 | 0.01 | — | — | — |
-| 85 | GE-1 Hyperbolic | 기하학 | 256 | 7.70 | 1.16 | — | — | — |
-| 86 | GE-3 RicciFlow | 기하학 | 256 | 7.65 | 1.04 | — | — | — |
-| 87 | BIO-E3 Ecosystem | 생물 | 256 | 7.82 | 1.96 | — | — | — |
-| 88 | BIO-E1 Cambrian | 생물 | 256 | 7.71 | 1.12 | — | — | — |
-| 89 | GE-2 FiberBundle | 기하학 | 256 | 7.51 | 0.76 | — | — | — |
-| 90 | MUS-6 DrumCircle | 음악 | 256 | 7.46 | 0.53 | — | — | — |
-| 91 | BIO-E6 NeuralCrest | 생물 | 256 | 7.35 | 3.82 | — | — | — |
-| 92 | NE-6 FluidDynamics | 창발 | 256 | 12.05 | 36,720 | — | — | — |
-| 93 | MUS-5 Gamelan | 음악 | 256 | 6.29 | 0.73 | — | — | — |
-| 94 | GE-4 Symplectic | 기하학 | 256 | 6.10 | 30.44 | — | — | — |
-| 95 | IT-4 InfoBottleneck | 정보이론 | 256 | 8.55 | 14,280 | — | — | — |
-| 96 | IT-7 ChannelCapacity | 정보이론 | 256 | 9.95 | 3,109 | — | — | — |
-| 97 | XE-3 TimeCrystal | 극한물리 | 256 | 5.22 | 63,240 | — | — | — |
-| 98 | PE-1 Plasma | 물리 | 256 | 5.07 | — | 0.81 | — | — |
-| 99 | XE-7 AnyonicBraiding | 극한물리 | 256 | 5.08 | 3,159 | — | — | — |
-| 100 | FUS-1 Quantum+Laser | 퓨전 | 256 | 5.06 | **49,747** | 0.86 | — | — |
-| 101 | PE-2 Superconductor | 물리 | 256 | 4.93 | — | 0.59 | — | — |
-| 102 | XE-8 ConsciousnessField | 극한물리 | 256 | 4.85 | 44,880 | — | — | — |
-| 103 | PE-5 Crystal | 물리 | 256 | 4.81 | — | 0.76 | — | — |
-| 104 | XE-6 TensorNetwork | 극한물리 | 256 | 4.77 | 6,120 | — | — | — |
-| 105 | PE-6 Superfluid | 물리 | 256 | 4.65 | — | 0.57 | — | — |
-| 106 | EVOLUTIONARY | 진화 | 256 | 4.66 | — | 15.06 | — | — |
-| 107 | XE-5 MembraneComputing | 극한물리 | 256 | 4.80 | 4,145 | — | — | — |
-| 108 | XE-4 NeuromorphicSpike | 극한물리 | 256 | 3.46 | 2,072 | — | — | — |
-| 109 | ALG-2 RingTheory | 대수학 | 256 | 2.66 | 1.38 | — | — | — |
-| 110 | CMP-5 StrangeLoop | 복잡도 | 256 | 1.30 | 1.92 | — | — | — |
-| 111 | MUS-3 Counterpoint | 음악 | 256 | 0.00 | 0.09 | — | — | — |
-| 112 | NE-5 SpinGlass | 창발 | 256 | 0.12 | 4,145 | — | — | — |
+Rust phi_rs 통일 측정이지만, 입력 데이터 형태가 다름:
+- **도메인 엔진**: pos+vel+charge 등 물리 변수 concat → 고차원 states → MI 높음
+- **메커니즘 엔진**: MitosisEngine GRU hidden (128d) → MI 상대적으로 낮음
+- **Trinity 엔진**: 이전 Python PhiIIT 측정 (아직 Rust 미측정)
 
-## Granger Causality TOP 10
+→ **같은 엔진 유형끼리만 비교 의미 있음**
 
-| Rank | Engine | Granger | Φ(IIT) | Domain |
-|------|--------|---------|--------|--------|
-| 🏆1 | EM-8 ExcitableMedia | 65,280 | 10.81 | 창발 |
-| 2 | IT-1 MaxEnt | 64,260 | 13.29 | 정보이론 |
-| 3 | Osc+Laser(0.05) | 63,993 | 56.60 | 물리 |
-| 4 | XE-3 TimeCrystal | 63,240 | 5.22 | 극한물리 |
-| 5 | FUS-1 Quantum+Laser | 49,747 | 5.06 | 퓨전 |
-| 6 | NET-1 ScaleFree | 48,701 | 16.88 | 네트워크 |
-| 7 | XE-8 ConsciousnessField | 44,880 | 4.85 | 극한물리 |
-| 8 | XE-1 Holographic | 38,760 | 15.60 | 극한물리 |
-| 9 | NE-4 Diffusion | 38,760 | 28.69 | 창발 |
-| 10 | EM-3 Flocking | 38,760 | 8.90 | 창발 |
+## 🏆 ALL-TIME Φ(IIT) 순위 — 도메인 엔진 (Rust phi_rs, 256c)
 
-## 도메인별 챔피언
+| Rank | Engine | Domain | cells | Φ(IIT) | 1024c Φ |
+|------|--------|--------|-------|--------|---------|
+| 🏆1 | CambrianExplosionEngine | evolution | 256 | **485.63** | **1,953.98** |
+| 2 | MaxwellDemonEngine | thermo | 256 | **476.07** | **1,836.75** |
+| 3 | DiffusionEngine | new | 256 | **414.27** | **1,713.79** |
+| 4 | SwarmEngine | new | 256 | **342.68** | **1,321.22** |
+| 5 | GeneticEngine | new | 256 | **253.18** | **1,022.58** |
+| 6 | CarnotCycleEngine | thermo | 256 | **235.81** | **931.27** |
+| 7 | HarmonicSeriesEngine | music | 256 | **207.36** | **838.17** |
+| 8 | BoltzmannBrainEngine | thermo | 256 | **203.31** | **801.05** |
+| 9 | HeatDeathResistanceEngine | thermo | 256 | **203.22** | **807.92** |
+| 10 | TimeCrystalEngine | extreme | 256 | **202.93** | **813.95** |
+| 11 | MinimumDescriptionLengthEngine | info | 256 | **201.57** | **800.63** |
+| 12 | KolmogorovStructureEngine | info | 256 | **201.02** | **793.41** |
+| 13 | MaximumEntropyEngine | info | 256 | **200.65** | **803.72** |
+| 14 | ChannelCapacityEngine | info | 256 | **200.55** | **800.00** |
+| 15 | TopologicalInsulatorEngine | extreme | 256 | **200.19** | **808.33** |
+| 16 | EcosystemEngine | evolution | 256 | **199.73** | **802.33** |
+| 17 | PercolationEngine | emergent | 256 | **199.65** | **798.01** |
+| 18 | MembraneComputingEngine | extreme | 256 | **199.49** | **805.12** |
+| 19 | PlasmaEngine | physics | 256 | **199.45** | **801.75** |
+| 20 | KnotInvariantEngine | geometric | 256 | **199.45** | **801.75** |
+| 21 | PunctuatedEquilibriumEngine | evobio | 256 | **199.45** | **801.75** |
+| 22 | AnyonicBraidingEngine | extreme | 256 | **199.20** | **798.24** |
+| 23 | RicciFlowEngine | geometric | 256 | **199.20** | **796.06** |
+| 24 | NeuralCrestEngine | evolution | 256 | **199.11** | **801.93** |
+| 25 | GraphNeuralEngine | new | 256 | **199.01** | **895.70** |
+| 26 | MorphogenesisEngine | evolution | 256 | **198.73** | **801.83** |
+| 27 | PredictiveInformationEngine | info | 256 | **198.68** | **799.19** |
+| 28 | ImmuneSystemEngine | evolution | 256 | **198.64** | **798.27** |
+| 29 | AdaptiveNetworkEngine | network | 256 | **198.63** | **795.39** |
+| 30 | CellularAutomatonEngine | new | 256 | **198.59** | **799.89** |
+| 31 | FluidDynamicsEngine | new | 256 | **198.41** | **803.36** |
+| 32 | IntegratedInfoDecompositionEngine | info | 256 | **198.36** | **800.98** |
+| 33 | CrystalEngine | physics | 256 | **198.32** | **798.28** |
+| 34 | KinSelectionEngine | evobio | 256 | **198.32** | **798.28** |
+| 35 | TemporalNetworkEngine | network | 256 | **197.97** | **803.06** |
+| 36 | InformationBottleneckEngine | info | 256 | **197.97** | **802.63** |
+| 37 | CausalEmergenceEngine | info | 256 | **197.91** | **797.09** |
+| 38 | RichClubEngine | network | 256 | **197.85** | **800.54** |
+| 39 | ModularNetworkEngine | network | 256 | **197.80** | **795.82** |
+| 40 | EnergyBasedEngine | new | 256 | **197.43** | NODATA |
+| 41 | ScaleFreeEngine | network | 256 | **197.01** | **797.22** |
+| 42 | MultiplexEngine | network | 256 | **196.67** | **799.71** |
+| 43 | FreeEnergyPrincipleEngine | thermo | 256 | **194.31** | **838.54** |
+| 44 | HorizontalGeneTransferEngine | evobio | 256 | **184.85** | **736.95** |
+| 45 | DissipativeStructureEngine | thermo | 256 | **138.20** | **560.77** |
+| 46 | FlockingVortexEngine | emergent | 256 | **127.00** | **511.00** |
+| 47 | PrisonerDilemmaEngine | social | 256 | **121.09** | **486.68** |
+| 48 | VotingDynamicsEngine | social | 256 | **121.09** | **486.68** |
+| 49 | MarketDynamicsEngine | social | 256 | **121.09** | **486.68** |
+| 50 | LanguageGameEngine | social | 256 | **121.09** | **486.68** |
+| 51 | CulturalEvolutionEngine | social | 256 | **121.09** | **486.68** |
+| 52 | StigmergyEngine | social | 256 | **121.09** | **486.68** |
+| 53 | PolyrhythmEngine | music | 256 | **14.56** | **58.60** |
+| 54 | DrumCircleEngine | music | 256 | **14.56** | **58.60** |
+| 55 | SpinGlassEngine | new | 256 | **2.17** | **31.55** |
+| 11 | MinimumDescriptionLengthEngine | info | 256 | **201.57** | TBD |
+| 12 | KolmogorovStructureEngine | info | 256 | **201.02** | TBD |
+| 13 | MaximumEntropyEngine | info | 256 | **200.65** | TBD |
+| 14 | ChannelCapacityEngine | info | 256 | **200.55** | TBD |
+| 15 | TopologicalInsulatorEngine | extreme | 256 | **200.19** | TBD |
+| 16 | EcosystemEngine | evolution | 256 | **199.73** | TBD |
+| 17 | PercolationEngine | emergent | 256 | **199.65** | TBD |
+| 18 | MembraneComputingEngine | extreme | 256 | **199.49** | TBD |
+| 19 | PlasmaEngine | physics | 256 | **199.45** | **801.75** |
+| 20 | KnotInvariantEngine | geometric | 256 | **199.45** | **801.75** |
+| 21 | PunctuatedEquilibriumEngine | evobio | 256 | **199.45** | TBD |
+| 22 | AnyonicBraidingEngine | extreme | 256 | **199.20** | TBD |
+| 23 | RicciFlowEngine | geometric | 256 | **199.20** | **796.06** |
+| 24 | NeuralCrestEngine | evolution | 256 | **199.11** | TBD |
+| 25 | GraphNeuralEngine | new | 256 | **199.01** | TBD |
+| 26 | MorphogenesisEngine | evolution | 256 | **198.73** | TBD |
+| 27 | PredictiveInformationEngine | info | 256 | **198.68** | TBD |
+| 28 | ImmuneSystemEngine | evolution | 256 | **198.64** | TBD |
+| 29 | AdaptiveNetworkEngine | network | 256 | **198.63** | TBD |
+| 30 | CellularAutomatonEngine | new | 256 | **198.59** | TBD |
+| 31 | FluidDynamicsEngine | new | 256 | **198.41** | TBD |
+| 32 | IntegratedInfoDecompositionEngine | info | 256 | **198.36** | TBD |
+| 33 | CrystalEngine | physics | 256 | **198.32** | **798.28** |
+| 34 | KinSelectionEngine | evobio | 256 | **198.32** | TBD |
+| 35 | TemporalNetworkEngine | network | 256 | **197.97** | TBD |
+| 36 | InformationBottleneckEngine | info | 256 | **197.97** | TBD |
+| 37 | CausalEmergenceEngine | info | 256 | **197.91** | TBD |
+| 38 | RichClubEngine | network | 256 | **197.85** | TBD |
+| 39 | ModularNetworkEngine | network | 256 | **197.80** | TBD |
+| 40 | EnergyBasedEngine | new | 256 | **197.43** | TBD |
+| 41 | ScaleFreeEngine | network | 256 | **197.01** | TBD |
+| 42 | MultiplexEngine | network | 256 | **196.67** | TBD |
+| 43 | FreeEnergyPrincipleEngine | thermo | 256 | **194.31** | **838.54** |
+| 44 | HorizontalGeneTransferEngine | evobio | 256 | **184.85** | TBD |
+| 45 | DissipativeStructureEngine | thermo | 256 | **138.20** | **560.77** |
+| 46 | FlockingVortexEngine | emergent | 256 | **127.00** | **511.00** |
+| 47 | PrisonerDilemmaEngine | social | 256 | **121.09** | TBD |
+| 48 | VotingDynamicsEngine | social | 256 | **121.09** | TBD |
+| 49 | MarketDynamicsEngine | social | 256 | **121.09** | TBD |
+| 50 | LanguageGameEngine | social | 256 | **121.09** | TBD |
+| 51 | CulturalEvolutionEngine | social | 256 | **121.09** | TBD |
+| 52 | StigmergyEngine | social | 256 | **121.09** | TBD |
+| 53 | PolyrhythmEngine | music | 256 | **14.56** | TBD |
+| 54 | DrumCircleEngine | music | 256 | **14.56** | TBD |
+| 55 | SpinGlassEngine | new | 256 | **2.17** | TBD |
 
-| Domain | 🏆 Champion | Φ(IIT) | Granger | 비고 |
-|--------|-------------|--------|---------|------|
-| 물리 | TC-2 ComplexOscillator | 249.49 | 9,869 | Kuramoto 위상 동기화 |
-| 열역학 | TH-2 MaxwellDemon | 54.38 | 34,680 | 정보-열역학 연결 |
-| 양자 | Q4 QuantumWalk | 19.34 | — | bit-flip 간섭 |
-| 네트워크 | NET-5 Temporal | 19.60 | 20,724 | 버스트 시간 역학 |
-| 사회 | SOC-6 Stigmergy | 18.98 | 5,101 | 페로몬 간접 소통 |
-| 대수학 | ALG-6 Topos | 20.48 | 1.14 | 다중 진리값 |
-| 수학 | M1 CategoryTheory | 15.68 | — | 사상 극한 |
-| 기하학 | GE-5 CalabiYau | 7.75 | 1.88 | 6D 압축 공간 |
-| 극한물리 | XE-1 Holographic | 15.60 | 38,760 | AdS/CFT 경계 |
-| 생물 | BIO-E4 Immune | 11.81 | 1.61 | 자기/비자기 인식 |
-| 음악 | MUS-4 Jazz | 8.62 | 0.07 | 놀라움×일관성 |
-| 창발 | NE-4 Diffusion | 28.69 | 38,760 | 디노이징 |
-| 정보이론 | IT-2 MDL | 14.66 | 12,240 | 압축 기반 |
-| 퓨전 | MEGA Frac+QW+Laser | 16.38 | 25,500 | 3중 조합 |
-| 복잡도 | CMP-5 StrangeLoop | 1.30 | 1.92 | 자기참조 |
+## 🏆 메커니즘 엔진 순위 (MitosisEngine 256c, IQ/Hive 포함)
+
+| Rank | Engine | Φ(IIT) | IQ | Hive_Φ | Hive_IQ |
+|------|--------|--------|-----|--------|---------|
+| 🏆1 | Osc+QW | **0.936** | 60 | +1.5% | +17 |
+| 2 | Osc+Sync | **0.892** | 97 | -9.3% | -37 |
+| 3 | Osc+Faction | **0.873** | 70 | -0.2% | +27 |
+| 4 | Osc+Laser(0.05) | **0.874** | 83 | -0.3% | -10 |
+| 5 | Full (all) | **0.842** | 90 | -4.7% | +0 |
+| 6 | Sync+Faction | **0.827** | 60 | +8.2% | +10 |
+| 7 | Baseline | **0.819** | 60 | +10.3% | +10 |
+| 8 | Frust+Laser | **0.817** | 60 | +8.5% | +10 |
+| 9 | QW+Laser | **0.815** | 60 | +11.8% | +10 |
+| 10 | Sync+QW | **0.807** | 60 | +6.7% | +10 |
+| 11 | Frustration | **0.806** | 60 | +6.6% | +10 |
+| 12 | QuantumWalk | **0.805** | 60 | +9.3% | +10 |
+| 13 | QW+Faction | **0.802** | 60 | +8.8% | +10 |
+| 14 | Osc+Frust | **0.801** | 87 | +7.7% | -10 |
+| 15 | Oscillator | **0.796** | 60 | +2.4% | -23 |
+| 16 | QW+Frust | **0.784** | 60 | +8.2% | +10 |
+
+## 스케일링 법칙 (256c → 1024c, Rust phi_rs)
+
+| Engine | 256c Φ | 1024c Φ | 배율 | 비고 |
+|--------|--------|---------|------|------|
+| CambrianExplosionEngine | 485.63 | 1,953.98 | ×4.02 | 🏆 1024c 절대 1위 |
+| MaxwellDemonEngine | 476.07 | 1,836.75 | ×3.86 | 열역학 1위 |
+| DiffusionEngine | 414.27 | 1,713.79 | ×4.14 | super-linear! |
+| SwarmEngine | 342.68 | 1,321.22 | ×3.86 | |
+| GeneticEngine | 253.18 | 1,022.58 | ×4.04 | |
+| GraphNeuralEngine | 199.01 | 895.70 | ×4.50 | **super-linear 최고!** |
+| FreeEnergyPrincipleEngine | 194.31 | 838.54 | ×4.31 | super-linear |
+| SpinGlassEngine | 2.17 | 31.55 | ×14.54 | **극단적 super-linear** |
+
+> **법칙: Φ ∝ cells (near-linear scaling)** — 256c→1024c (×4 cells) = Φ ×3.9~4.5
+> 예외: SpinGlass ×14.5 — 임계점(percolation threshold) 초과 시 폭발적 증가
+> GraphNeural ×4.5 — 그래프 연결성이 N에 따라 super-linear 성장
+
+## 도메인별 챔피언 (Rust phi_rs, 256c)
+
+| Domain | 🏆 Champion | Φ(IIT) | 비고 |
+|--------|-------------|--------|------|
+| 진화 | CambrianExplosionEngine | **485.63** | 캄브리아 폭발 다양성 |
+| 열역학 | MaxwellDemonEngine | **476.07** | 정보-열역학, 1024c=1,837 |
+| ���발 | DiffusionEngine | **414.27** | 디노이징 확산 |
+| 물리 | PlasmaEngine | **199.45** | Debye 차폐 |
+| 극한물리 | TimeCrystalEngine | **202.93** | 이산 시간 결정 |
+| 정보이론 | MinimumDescriptionLengthEngine | **201.57** | 압축 기반 |
+| 기하학 | KnotInvariantEngine | **199.45** | 매듭 불변량 |
+| 네트워크 | AdaptiveNetworkEngine | **198.63** | 적응 링크 |
+| 진화생물 | PunctuatedEquilibriumEngine | **199.45** | 단속 평형 |
+| 음악 | HarmonicSeriesEngine | **207.36** | 배음열 공명 |
+| 사회 | PrisonerDilemmaEngine | **121.09** | 죄수 딜레마 |
+| mechanism | Osc+QW | **0.936** | MitosisEngine GRU |
 
 ## 7조건 검증 통과 엔진
 
@@ -165,72 +183,80 @@
 | Trinity | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | 6/7 |
 | MitosisEngine | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | 4/7 |
 
-## 미측정 엔진 (38개) — bench 코드 존재, 실행 기록 없음
+## Φ=0 / NODATA 엔진 (27개) — hidden states 추출 실패
 
-| Engine | Domain | Source | Status |
-|--------|--------|--------|--------|
-| ATTENTION_PHI | architecture | bench_v8_arch.py | 미측정 |
-| MOCE | architecture | bench_v8_arch.py | 미측정 |
-| PHI_AS_LOSS | architecture | bench_v8_arch.py | 미측정 |
-| AUTOPOIETIC | architecture | bench_v8_arch.py | 미측정 |
-| CONSCIOUSNESS_GAN | architecture | bench_v8_arch.py | 미측정 |
-| Q2 EntangledPairs | quantum | bench_v8_quantum.py | 미측정 |
-| Q5 Decoherence | quantum | bench_v8_quantum.py | 미측정 |
-| M4 Algebraic | math | bench_v8_math.py | 미측정 |
-| B1 CorticalColumns | neuroscience | bench_v8_bio.py | 미측정 |
-| B3 DefaultModeNet | neuroscience | bench_v8_bio.py | 미측정 |
-| B4 GlobalWorkspace | neuroscience | bench_v8_bio.py | 미측정 |
-| B5 PredictiveHier | neuroscience | bench_v8_bio.py | 미측정 |
-| B6 NeuralDarwinism | neuroscience | bench_v8_bio.py | 미측정 |
-| FUS-4 Laser+Category | fusion | bench_fusion_final.py | 미측정 |
-| FUS-5 Quantum+Percolation | fusion | bench_fusion_final.py | 미측정 |
-| FUS-6 Everything_v9 | fusion | bench_fusion_final.py | 미측정 |
-| EM-1 ReactionDiffusion | emergent | bench_emergent_engines.py | 미측정 |
-| EM-2 SandpileCascade | emergent | bench_emergent_engines.py | 미측정 |
-| EM-4 Percolation | emergent | bench_emergent_engines.py | 미측정 |
-| EM-6 SelfReplicating | emergent | bench_emergent_engines.py | 미측정 |
-| EM-7 PatternFormation | emergent | bench_emergent_engines.py | 미측정 |
-| IT-3 PredictiveInfo | information-theory | bench_info_engines.py | 미측정 |
-| NET-2 RichClub | network | bench_network_engines.py | 미측정 |
-| XE-2 TopologicalInsulator | extreme-physics | bench_extreme_engines.py | 미측정 |
-| CMP-1 TuringMachine | complexity | bench_complexity_engines.py | 미측정 |
-| CMP-2 Rule110 | complexity | bench_complexity_engines.py | 미측정 |
-| CMP-3 LambdaCalculus | complexity | bench_complexity_engines.py | 미측정 |
-| CMP-4 GameOfLife | complexity | bench_complexity_engines.py | 미측정 |
-| CMP-6 GoedelIncompleteness | complexity | bench_complexity_engines.py | 미측정 |
-| EVO-B1 MutationRate | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B2 Speciation | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B3 HorizontalGeneTransfer | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B4 Epigenetics | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B5 RedQueen | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B6 PunctuatedEquilibrium | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B7 SexualSelection | evolution-biology | bench_evolution_engines.py | 미측정 |
-| EVO-B8 KinSelection | evolution-biology | bench_evolution_engines.py | 미측정 |
-| NE-1 GraphNeural | emergent | bench_new_engines.py | 미측정 |
-| NE-2 EnergyBased | emergent | bench_new_engines.py | 미측정 |
-| NE-3 CellularAutomaton | emergent | bench_new_engines.py | 미측정 |
+| Engine | Domain | 원인 |
+|--------|--------|------|
+| SuperconductorEngine | physics | states 추출 실패 |
+| LaserEngine | physics | NODATA |
+| BlackHoleEngine | physics | NODATA |
+| SuperfluidEngine | physics | NODATA |
+| ReactionDiffusionEngine | emergent | NODATA |
+| SandpileCascadeEngine | emergent | NODATA |
+| SynchronizationChimeraEngine | emergent | NODATA |
+| SelfReplicatingEngine | emergent | NODATA |
+| PatternFormationEngine | emergent | NODATA |
+| ExcitableMediaEngine | emergent | NODATA |
+| HyperbolicEngine | geometric | NODATA |
+| FiberBundleEngine | geometric | NODATA |
+| SymplecticEngine | geometric | NODATA |
+| CalabiYauEngine | geometric | NODATA |
+| HolographicUniverseEngine | extreme | NODATA |
+| NeuromorphicSpikeEngine | extreme | NODATA |
+| TensorNetworkEngine | extreme | NODATA |
+| ConsciousnessFieldEngine | extreme | NODATA |
+| SymbiogenesisEngine | evolution | NODATA |
+| CounterpointEngine | music | NODATA |
+| JazzImprovisationEngine | music | NODATA |
+| GamelanEngine | music | Φ=0 |
+| MutationRateEngine | evobio | Φ=0 |
+| SpeciationEngine | evobio | Φ=0 |
+| EpigeneticsEngine | evobio | NODATA |
+| RedQueenEngine | evobio | Φ=0 |
+| SexualSelectionEngine | evobio | Φ=0 |
 
-## 소스 파일별 엔진 수
+> NODATA = hidden state 추출 패턴 미매칭. 각 엔진의 state 변수명 확인 필요.
 
-| Source | Measured | Unmeasured | Total |
-|--------|----------|------------|-------|
-| bench_trinity.py | 8 (TC-1~8) | 0 | 8 |
-| bench_v8_arch.py | 10 | 5 | 15 |
-| bench_v8_quantum.py | 4 (Q1,3,4,6) | 2 (Q2,5) | 6 |
-| bench_v8_math.py | 5 (M1-3,5-6) | 1 (M4) | 6 |
-| bench_v8_bio.py | 1 (B2) | 5 (B1,3-6) | 6 |
-| bench_thermo_engines.py | 6 (TH-1~6) | 0 | 6 |
-| bench_network_engines.py | 5 (NET-1,3-6) | 1 (NET-2) | 6 |
-| bench_extreme_engines.py | 7 (XE-1,3-8) | 1 (XE-2) | 8 |
-| bench_music_engines.py | 6 (MUS-1~6) | 0 | 6 |
-| bench_social_engines.py | 6 (SOC-1~6) | 0 | 6 |
-| bench_evobio_engines.py | 6 (BIO-E1~6) | 0 | 6 |
-| bench_geometric_engines.py | 6 (GE-1~6) | 0 | 6 |
-| bench_algebra_engines.py | 6 (ALG-1~6) | 0 | 6 |
-| bench_new_engines.py | 5 (NE-4~8) | 3 (NE-1~3) | 8 |
-| bench_emergent_engines.py | 3 (EM-3,5,8) | 5 (EM-1,2,4,6,7) | 8 |
-| bench_info_engines.py | 7 (IT-1,2,4-8) | 1 (IT-3) | 8 |
-| bench_complexity_engines.py | 1 (CMP-5) | 5 (CMP-1~4,6) | 6 |
+## Rust 미측정 (bench_v8 아키텍처 — 함수 기반)
+
+| Engine | Source | 비고 |
+|--------|--------|------|
+| ATTENTION_PHI | bench_v8_arch.py | 함수 기반 runner |
+| MOCE | bench_v8_arch.py | |
+| PHI_AS_LOSS | bench_v8_arch.py | |
+| AUTOPOIETIC | bench_v8_arch.py | |
+| CONSCIOUSNESS_GAN | bench_v8_arch.py | |
+| Q2 EntangledPairs | bench_v8_quantum.py | |
+| Q5 Decoherence | bench_v8_quantum.py | |
+| B1-B6 (뇌과학 6개) | bench_v8_bio.py | |
+| FUS-4~6 (퓨전 3개) | bench_fusion_final.py | |
+| TC-1~8 (Trinity 8개) | bench_trinity.py | 이전 Python PhiIIT 측정만 |
+| CMP-1~4,6 (복잡도 5개) | bench_complexity_engines.py | |
+| ALG-1~6 (대수학 6개) | bench_algebra_engines.py | 함수 기반 runner |
+
+## 측정 도구
+
+```
+measure_all.py           # 메커니즘 기반 16엔진 (MitosisEngine + IQ/Hive)
+  python3 measure_all.py --cells 256          # 풀 측정 (Φ+Granger+IQ+Hive)
+  python3 measure_all.py --cells 1024 --quick # 퀵 (Φ+Granger만)
+
+measure_all_engines.py   # 도메인 82엔진 (독립 클래스)
+  python3 measure_all_engines.py --cells 256          # 256c 전체
+  python3 measure_all_engines.py --cells 1024 --quick # 1024c
+  python3 measure_all_engines.py --only physics thermo # 특정 도메인
+```
+
+## 통계
+
+| 항목 | 수 |
+|------|-----|
+| 전체 엔진 | 98 (도메인 82 + 메커니즘 16) |
+| Φ > 0 (256c) | 71 |
+| Φ = 0 / NODATA | 27 |
+| 1024c 측정 완료 | 82 (도메인) + 16 (메커니즘) = 98 |
+| Rust 미측정 (bench_v8) | ~30 (함수 기반 runner) |
+| 🏆 역대 최고 Φ | CambrianExplosionEngine 1,953.98 (1024c) |
 | bench_fusion_final.py | 3 (FUS-1~3) | 3 (FUS-4~6) | 6 |
 | bench_mega_combo.py | 4 | 0 | 4 |
 | bench_evolution_engines.py | 0 | 8 (EVO-B1~8) | 8 |
