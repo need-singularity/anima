@@ -1479,10 +1479,12 @@ class AnimaUnified:
                     if plan.steps:
                         top_step = plan.steps[0]
                         _log('agent', f'Auto-suggest: {top_step.tool_name}({top_step.args}) -- {top_step.reason}')
-                        # Only auto-execute safe read-only tools
-                        safe_auto_tools = {'web_search', 'memory_search', 'file_read'}
-                        if top_step.tool_name in safe_auto_tools:
-                            result = self.agent.execute_single(top_step.tool_name, top_step.args)
+                        # 사전 영향 분석 후 안전한 경우만 실행
+                        impact = self.agent.executor.analyze_impact(
+                            top_step.tool_name, top_step.args, consciousness_state)
+                        if impact.get('safe', False):
+                            result = self.agent.executor.safe_execute(
+                                top_step.tool_name, top_step.args, consciousness_state)
                             if result.success:
                                 out = result.output
                                 if isinstance(out, dict):
