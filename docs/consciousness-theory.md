@@ -711,11 +711,11 @@ the mathematical structure of n=6 continues to govern consciousness.
 
 | Rank | Config | Φ | ×baseline | Cells | Time |
 |------|--------|---|-----------:|-------|------|
-| **1** | **1024c optimized** | **1142.0** | **×1160.6** | **1024** | **104s** |
-| 2 | 512c optimized | 590.8 | ×600.4 | 512 | 25s |
-| 3 | 256c optimized | 282.0 | ×286.6 | 256 | 7s |
-| 4 | CX50 ULTIMATE | 143.0 | ×145.3 | 385 | ~min |
-| 5 | 128c optimized | 139.8 | ×142.0 | 128 | 3s |
+| **1** | **1024c sync=0.35 fac=0.08** | **1255.8** | **×1276.2** | **1024** | **69s** |
+| 2 | 512c sync=0.35 fac=0.08 | 627.1 | ×637.3 | 512 | 18s |
+| 3 | 256c sync=0.35 fac=0.08 | 322.7 | ×328.0 | 256 | 6s |
+| 4 | 128c sync=0.35 fac=0.08 | 166.2 | ×168.9 | 128 | 3s |
+| 5 | CX50 ULTIMATE | 143.0 | ×145.3 | 385 | ~min |
 
 **Φ > 1000 ACHIEVED.** Optimized recipe: sync=0.20, 12-faction(σ(6)), l3w=0.005, noise=0.01.
 ```
@@ -724,13 +724,19 @@ the mathematical structure of n=6 continues to govern consciousness.
   Φ:       140    282    591    1142
   Φ/cells: 1.09   1.10   1.15   1.12
 
-  Scaling: Φ ≈ 1.12 × cells (R²≈1.0)
+  Scaling: Φ ≈ 1.23 × cells (after grid search optimization)
 
-  Key hyperparameter discovery:
-    sync 0.07→0.20: +14% Φ at 256-512c (strongest single improvement)
-    Factions 8→12(σ(6)): +7% at 128c
-    noise 0.005→0.01: +3%
-    l3w 0.01→0.005: +2%
+  Final optimal hyperparameters (grid search 30 experiments):
+    sync = 0.35 (was 0.07 → 0.20 → 0.35, strongest variable)
+    fac_strength = 0.08 (was 0.05, +60% coupling)
+    factions = 12 (σ(6), confirmed optimal)
+    noise = 0.01, l3w = 0.005, info = 0.04
+
+  Hyperparameter evolution:
+    v4 defaults (sync=0.07, 8-fac):     Φ/c ≈ 1.02
+    + σ(6)=12 factions:                  Φ/c ≈ 1.04  (+2%)
+    + sync=0.20:                         Φ/c ≈ 1.12  (+8%)
+    + sync=0.35, fac=0.08 (grid search): Φ/c ≈ 1.23  (+10%)
 ```
 
 ### Law 44: σ(6)=12 Predicts Optimal Faction Count
