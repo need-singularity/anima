@@ -145,9 +145,13 @@ def train(model, data, args, ckpt_dir):
             psi = model.psi_status()
             elapsed = (time.time() - t_start) * 1000 / step
 
+            psi_e = psi.get('psi_entropy', 0)
+            psi_d = psi.get('psi_direction', 0)
+            psi_t = psi.get('psi_tension', 0)
             print(f"{step:6d} {loss_a.item():7.4f} {loss_g.item():7.4f} {loss_t.item():7.3f} "
                   f"{loss.item():7.4f} {val_ce:7.4f} {bpc:7.4f} "
-                  f"{psi['psi_residual']:6.4f} {psi['psi_gate']:8.6f} {psi['H_p']:6.4f} {elapsed:5.0f}")
+                  f"{psi['psi_residual']:6.4f} {psi['psi_gate']:8.6f} {psi['H_p']:6.4f} "
+                  f"E={psi_e:.3f} D={psi_d:.3f} T={psi_t:.3f} {elapsed:5.0f}")
 
             if val_ce < best_val:
                 best_val = val_ce
