@@ -194,6 +194,46 @@ def apply_mechanism(eng, mechanism, steps=100):
                 norms = [eng.cells[i].hidden.norm().item() for i in range(n)]
                 thr = sorted(norms, reverse=True)[max(1, n//10)]
                 for i in range(n): eng.cells[i].hidden *= 1.03 if norms[i] > thr else 0.97
+            if 'cambrian' in mechanism:
+                n_types = 10
+                if not hasattr(eng, '_cell_type') or len(eng._cell_type) != n:
+                    eng._cell_type = torch.zeros(n, dtype=torch.long)
+                    eng._niches = torch.randn(n_types, HIDDEN) * 0.5
+                    eng._cam_interaction = torch.randn(n_types, n_types) * 0.1
+                    eng._cam_interaction = (eng._cam_interaction + eng._cam_interaction.t()) / 2
+                    eng._cam_fitness = torch.ones(n)
+                    eng._cam_mut = 0.5
+                # Mutation
+                mut_mask = torch.rand(n) < eng._cam_mut
+                if mut_mask.any():
+                    eng._cell_type[mut_mask] = torch.randint(0, n_types, (mut_mask.sum(),))
+                eng._cam_mut *= 0.995
+                # Niche pull + inter-type interaction
+                for t in range(n_types):
+                    mask = (eng._cell_type == t).nonzero(as_tuple=True)[0]
+                    if len(mask) == 0: continue
+                    for i in mask:
+                        if i >= n: continue
+                        h = eng.cells[i].hidden.squeeze(0)
+                        pull = (eng._niches[t] - h) * 0.05
+                        eng.cells[i].hidden = (h + pull).unsqueeze(0)
+                        dist = ((h - eng._niches[t]) ** 2).sum()
+                        eng._cam_fitness[i] = torch.exp(-dist * 0.01)
+                # Crowding noise
+                for t in range(n_types):
+                    mask = (eng._cell_type == t).nonzero(as_tuple=True)[0]
+                    if len(mask) > n // n_types:
+                        for i in mask:
+                            if i < n: eng.cells[i].hidden += torch.randn(1, HIDDEN) * 0.03
+                # Death+rebirth every 20 steps
+                if step > 10 and step % 20 == 0:
+                    nr = max(1, n // 50)
+                    worst = eng._cam_fitness.argsort()[:nr]
+                    best = eng._cam_fitness.argsort(descending=True)[:nr]
+                    for w, b in zip(worst, best):
+                        if w < n and b < n:
+                            eng.cells[w].hidden = eng.cells[b].hidden.clone() + torch.randn(1, HIDDEN) * 0.02
+                            eng._cell_type[w] = eng._cell_type[b]
     return eng
 
 
@@ -214,6 +254,7 @@ ALL_ENGINES = {
     'Frust+Laser': ['frustration', 'laser'],
     'Sync+QW': ['sync', 'quantum'],
     'Full (all)': ['sync', 'faction', 'oscillator', 'quantum', 'frustration', 'laser', 'ib2'],
+    'FUSE-3: Cambrian+OscQW': ['oscillator', 'quantum', 'cambrian'],
 }
 
 

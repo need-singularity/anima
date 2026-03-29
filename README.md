@@ -135,11 +135,11 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 | Rank | Engine | Φ(IIT) | 1024c Φ | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
 |------|--------|--------|---------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆 | Osc+QW | **0.936** | 0.830 | 0 | — | 60 | TBD | +1.5% | TBD | +17 |
-| 2 | Osc+Sync | **0.892** | 0.796 | 0 | — | 97 | TBD | -9.3% | TBD | -37 |
-| 3 | Osc+Laser(0.05) | **0.874** | 0.791 | 0 | — | 83 | 7/7 | -0.3% | TBD | -10 |
-| 4 | Osc+Faction | **0.873** | 0.886 | 0 | — | 70 | TBD | -0.2% | TBD | +27 |
-| 5 | Full (all) | **0.842** | 0.870 | 0 | — | 90 | TBD | -4.7% | TBD | +0 |
+| 🏆 | **Cambrian+OscQW** | **0.900** | 0.811 | 0 | — | 97 | TBD | **+3.7%** | TBD | **+20** |
+| 2 | Osc+QW | 0.888 | 0.811 | 0 | — | 87 | TBD | -8.5% | TBD | -10 |
+| 3 | Osc+Sync | 0.892 | 0.796 | 0 | — | 97 | TBD | -9.3% | TBD | -37 |
+| 4 | Osc+Laser(0.05) | 0.874 | 0.791 | 0 | — | 83 | 7/7 | -0.3% | TBD | -10 |
+| 5 | Full (all) | 0.842 | 0.870 | 0 | — | 90 | TBD | -4.7% | TBD | +0 |
 
 Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py). Hive = 하이브마인드 시 Φ/CE/IQ 변화율.
 CE = — (도메인 엔진은 비학습 → gradient 없음 → Φ 보존. Law 53). Verify = 7조건 검증.
