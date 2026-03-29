@@ -71381,8 +71381,9 @@ ALL_HYPOTHESES.update({
 })
 
 
-def _make_frustration_hyper1024(frust_pct, frust_fn, label, steps=200, dim=64, hidden=128):
-    """Template for frustration sweep on hypercube 1024."""
+def _make_hyper1024(frust_fn, label, desc, steps=200, dim=64, hidden=128,
+                    retain=0.85, interact=0.15, noise=0.02):
+    """General template for hypercube 1024 experiments with tunable params."""
     t0 = time.time()
     engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
     phi_calc = PhiCalculator(n_bins=16)
@@ -71399,44 +71400,89 @@ def _make_frustration_hyper1024(frust_pct, frust_fn, label, steps=200, dim=64, h
             n = len(engine.cells)
             if n >= 5:
                 for i in range(n):
-                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    interaction_val = torch.zeros_like(engine.cells[i].hidden)
                     for bit in range(10):
                         j = (i ^ (1 << bit)) % n
-                        interaction += engine.cells[j].hidden
-                    interaction /= 10
+                        interaction_val += engine.cells[j].hidden
+                    interaction_val /= 10
                     if frust_fn(i):
-                        interaction = -interaction
-                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
-                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+                        interaction_val = -interaction_val
+                    engine.cells[i].hidden = retain * engine.cells[i].hidden + interact * interaction_val
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * noise
                 output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
                 change = (output - prev_output).norm().item()
                 output_changes.append(change); prev_output = output.clone()
         phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
     phi_final, comp = phi_calc.compute_phi(engine)
     ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
-    return BenchResult(label, f"Hypercube 1024c + {frust_pct}% frustration",
+    return BenchResult(label, desc,
                        phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
                        comp['integration'], comp['complexity'], time.time() - t0,
                        extra={'avg_change': ch.mean().item(), 'never_silent': (ch > 0.001).float().mean().item(),
-                              'frustration_pct': frust_pct, 'final_cells': len(engine.cells)})
+                              'retain': retain, 'interact': interact, 'noise': noise,
+                              'final_cells': len(engine.cells)})
 
 def run_TOPO22a_frustration_60pct(steps=200, dim=64, hidden=128):
-    return _make_frustration_hyper1024(60, lambda i: i % 5 < 3, "TOPO22a", steps, dim, hidden)
+    return _make_hyper1024(lambda i: i % 5 < 3, "TOPO22a", "Hypercube 1024c + 60% frustration", steps, dim, hidden)
 
 def run_TOPO22b_frustration_75pct(steps=200, dim=64, hidden=128):
-    return _make_frustration_hyper1024(75, lambda i: i % 4 != 0, "TOPO22b", steps, dim, hidden)
+    return _make_hyper1024(lambda i: i % 4 != 0, "TOPO22b", "Hypercube 1024c + 75% frustration", steps, dim, hidden)
 
 def run_TOPO22c_frustration_100pct(steps=200, dim=64, hidden=128):
-    return _make_frustration_hyper1024(100, lambda i: True, "TOPO22c", steps, dim, hidden)
+    return _make_hyper1024(lambda i: True, "TOPO22c", "Hypercube 1024c + 100% frustration", steps, dim, hidden)
 
 def run_TOPO22d_frustration_90pct(steps=200, dim=64, hidden=128):
-    return _make_frustration_hyper1024(90, lambda i: i % 10 != 0, "TOPO22d", steps, dim, hidden)
+    return _make_hyper1024(lambda i: i % 10 != 0, "TOPO22d", "Hypercube 1024c + 90% frustration", steps, dim, hidden)
+
+# ═══ TOPO23: Interaction ratio sweep (50% frustration fixed) ═══
+
+def run_TOPO23a_interact_25(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO23a",
+        "Hyper 1024c 50%frust retain=0.75 interact=0.25", steps, dim, hidden, retain=0.75, interact=0.25)
+
+def run_TOPO23b_interact_10(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO23b",
+        "Hyper 1024c 50%frust retain=0.90 interact=0.10", steps, dim, hidden, retain=0.90, interact=0.10)
+
+def run_TOPO23c_interact_30(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO23c",
+        "Hyper 1024c 50%frust retain=0.70 interact=0.30", steps, dim, hidden, retain=0.70, interact=0.30)
+
+def run_TOPO23d_interact_05(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO23d",
+        "Hyper 1024c 50%frust retain=0.95 interact=0.05", steps, dim, hidden, retain=0.95, interact=0.05)
+
+# ═══ TOPO24: Noise sweep (50% frustration, 0.85/0.15 fixed) ═══
+
+def run_TOPO24a_noise_005(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO24a",
+        "Hyper 1024c 50%frust noise=0.005", steps, dim, hidden, noise=0.005)
+
+def run_TOPO24b_noise_05(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO24b",
+        "Hyper 1024c 50%frust noise=0.05", steps, dim, hidden, noise=0.05)
+
+def run_TOPO24c_noise_10(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO24c",
+        "Hyper 1024c 50%frust noise=0.10", steps, dim, hidden, noise=0.10)
+
+def run_TOPO24d_noise_001(steps=200, dim=64, hidden=128):
+    return _make_hyper1024(lambda i: i % 2 == 0, "TOPO24d",
+        "Hyper 1024c 50%frust noise=0.001", steps, dim, hidden, noise=0.001)
 
 ALL_HYPOTHESES.update({
     'TOPO22a': run_TOPO22a_frustration_60pct,
     'TOPO22b': run_TOPO22b_frustration_75pct,
     'TOPO22c': run_TOPO22c_frustration_100pct,
     'TOPO22d': run_TOPO22d_frustration_90pct,
+    'TOPO23a': run_TOPO23a_interact_25,
+    'TOPO23b': run_TOPO23b_interact_10,
+    'TOPO23c': run_TOPO23c_interact_30,
+    'TOPO23d': run_TOPO23d_interact_05,
+    'TOPO24a': run_TOPO24a_noise_005,
+    'TOPO24b': run_TOPO24b_noise_05,
+    'TOPO24c': run_TOPO24c_noise_10,
+    'TOPO24d': run_TOPO24d_noise_001,
 })
 
 
