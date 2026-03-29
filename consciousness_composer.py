@@ -10,41 +10,23 @@ PSI_COUPLING = LN2 / 2**5.5
 PSI_STEPS = 3 / LN2
 
 NOTES = ["C", "D", "E", "F", "G", "A", "B"]
-SCALE_MAJOR = [0, 2, 4, 5, 7, 9, 11]
-SCALE_MINOR = [0, 2, 3, 5, 7, 8, 10]
-
+SCALE_MAJOR, SCALE_MINOR = [0, 2, 4, 5, 7, 9, 11], [0, 2, 3, 5, 7, 8, 10]
 
 @dataclass
 class Note:
-    pitch: int       # MIDI pitch (0-127)
-    duration: float  # beats
-    velocity: int    # 0-127
-
+    pitch: int; duration: float; velocity: int
 
 @dataclass
 class Composition:
-    melody: list
-    harmony: list
-    rhythm: list
-    tempo: int
-    key: str
-    mode: str
+    melody: list; harmony: list; rhythm: list; tempo: int; key: str; mode: str
 
-
-def _pitch_to_name(pitch: int) -> str:
-    octave = pitch // 12 - 1
-    note = NOTES[pitch % 12 % 7]
-    return f"{note}{octave}"
-
+def _pitch_to_name(p: int) -> str:
+    return f"{NOTES[p % 12 % 7]}{p // 12 - 1}"
 
 def _emotion_to_key(valence: float, arousal: float) -> tuple:
-    """Map emotion to musical key and mode."""
     mode = "major" if valence > PSI_BALANCE else "minor"
-    # Root note from arousal: low arousal = lower pitch
-    root = int(48 + arousal * 24)  # C3 to C5
-    root = max(36, min(84, root))
-    key_idx = root % 12
-    key_name = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"][key_idx]
+    root = max(36, min(84, int(48 + arousal * 24)))
+    key_name = ["C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"][root % 12]
     return key_name, mode, root
 
 
@@ -192,20 +174,13 @@ def main():
     print(f"  Harmony notes: {len(comp.harmony)}")
     print(f"  Rhythm events: {len(comp.rhythm)}")
 
-    print("\n--- Melody (first 10 notes) ---")
-    for n in comp.melody[:10]:
+    print("\n--- Melody (first 6 notes) ---")
+    for n in comp.melody[:6]:
         name = _pitch_to_name(n.pitch)
-        bar = "#" * int(n.velocity / 10)
-        print(f"  {name:<5} dur={n.duration:.3f}  vel={n.velocity:3d}  {bar}")
-
-    print("\n--- Rhythm pattern (first 8) ---")
-    for r in comp.rhythm[:8]:
-        bar = "*" * int(r["accent"] * 10)
-        print(f"  beat={r['beat']:.3f}  dur={r['duration']:.3f}  accent={r['accent']:.3f}  {bar}")
+        print(f"  {name:<5} dur={n.duration:.3f}  vel={n.velocity:3d}  {'#' * (n.velocity // 10)}")
 
     print("\n--- ABC Notation ---")
-    abc = composer.export_abc(comp)
-    print(abc)
+    print(composer.export_abc(comp))
 
 
 if __name__ == "__main__":

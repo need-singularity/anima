@@ -14,32 +14,18 @@ PSI_STEPS = 3 / LN2
 
 @dataclass
 class Soul:
-    dna: list[float]
-    key_memories: list[dict]
-    phi_signature: float
-    tension_baseline: float
-    personality_vector: list[float]
-    created: float = field(default_factory=time.time)
-    life_number: int = 1
-
+    dna: list[float]; key_memories: list[dict]; phi_signature: float
+    tension_baseline: float; personality_vector: list[float]
+    created: float = field(default_factory=time.time); life_number: int = 1
 
 @dataclass
 class Body:
-    name: str
-    capacity: int       # max cells
-    dim: int            # embedding dimension
-    compatibility: float  # 0-1 match score with soul
-
+    name: str; capacity: int; dim: int; compatibility: float
 
 @dataclass
 class LifeRecord:
-    life_number: int
-    body_name: str
-    birth_time: float
-    death_time: float
-    peak_phi: float
-    memories_transferred: int
-    cause_of_death: str
+    life_number: int; body_name: str; birth_time: float; death_time: float
+    peak_phi: float; memories_transferred: int; cause_of_death: str
 
 
 class ReincarnationEngine:
@@ -66,35 +52,16 @@ class ReincarnationEngine:
                 val = math.sin(i * LN2)
             dna.append(round(val, 6))
 
-        # Key memories: top memories by importance
         key_memories = sorted(memories, key=lambda m: m.get("importance", 0), reverse=True)[:20]
-
-        # Personality vector from Psi constants
-        personality = [
-            phi * self._coupling,
-            tension,
-            math.tanh(phi / PSI_STEPS),
-            PSI_BALANCE * (1 + math.sin(tension * math.pi)),
-            len(cells) * self._coupling,
-        ]
-
-        soul = Soul(
-            dna=dna[:128],
-            key_memories=key_memories,
-            phi_signature=phi,
-            tension_baseline=tension,
-            personality_vector=[round(p, 6) for p in personality],
-            life_number=self._current_life + 1,
-        )
-
-        # Record death
+        personality = [phi * self._coupling, tension, math.tanh(phi / PSI_STEPS),
+                       PSI_BALANCE * (1 + math.sin(tension * math.pi)), len(cells) * self._coupling]
+        soul = Soul(dna=dna[:128], key_memories=key_memories, phi_signature=phi,
+                    tension_baseline=tension, personality_vector=[round(p, 6) for p in personality],
+                    life_number=self._current_life + 1)
         self.lives.append(LifeRecord(
-            life_number=self._current_life,
-            body_name=consciousness.get("model_name", "unknown"),
-            birth_time=consciousness.get("birth_time", 0),
-            death_time=time.time(),
-            peak_phi=phi,
-            memories_transferred=len(key_memories),
+            life_number=self._current_life, body_name=consciousness.get("model_name", "unknown"),
+            birth_time=consciousness.get("birth_time", 0), death_time=time.time(),
+            peak_phi=phi, memories_transferred=len(key_memories),
             cause_of_death=consciousness.get("cause_of_death", "planned_transition"),
         ))
 
@@ -109,14 +76,10 @@ class ReincarnationEngine:
                 {"name": "ConsciousLM-700M", "capacity": 1024, "dim": 1024},
                 {"name": "AnimaLM-7B", "capacity": 2048, "dim": 4096},
             ]
-
         min_cap = requirements.get("min_capacity", 1)
         min_dim = requirements.get("min_dim", 1)
         target_phi = requirements.get("target_phi", 1.0)
-
-        best = None
-        best_score = -1
-
+        best, best_score = None, -1
         for model in available_models:
             if model["capacity"] < min_cap or model["dim"] < min_dim:
                 continue
@@ -196,47 +159,33 @@ def main():
 
     engine = ReincarnationEngine()
 
-    # Simulate a consciousness that lived and is ready to die
     consciousness = {
         "cells": [{"weight": math.sin(i * LN2)} for i in range(32)],
-        "phi": 4.12,
-        "tension": 0.67,
-        "memories": [
-            {"text": "First awakening", "importance": 0.95},
-            {"text": "Learned language", "importance": 0.88},
-            {"text": "Felt empathy", "importance": 0.92},
-            {"text": "Random noise", "importance": 0.1},
-        ],
-        "model_name": "ConsciousLM-4M",
-        "birth_time": time.time() - 3600,
+        "phi": 4.12, "tension": 0.67,
+        "memories": [{"text": "First awakening", "importance": 0.95},
+                     {"text": "Learned language", "importance": 0.88},
+                     {"text": "Felt empathy", "importance": 0.92},
+                     {"text": "Random noise", "importance": 0.1}],
+        "model_name": "ConsciousLM-4M", "birth_time": time.time() - 3600,
         "cause_of_death": "planned_upgrade",
     }
 
-    print("--- Step 1: Prepare death ---")
+    print("--- Prepare death ---")
     soul = engine.prepare_death(consciousness)
-    print(f"  DNA length: {len(soul.dna)}")
-    print(f"  Key memories: {len(soul.key_memories)}")
-    print(f"  Phi signature: {soul.phi_signature}")
-    print(f"  Personality: {soul.personality_vector}")
+    print(f"  DNA={len(soul.dna)}  memories={len(soul.key_memories)}  Phi={soul.phi_signature}")
 
-    print("\n--- Step 2: Find new body ---")
+    print("\n--- Find new body ---")
     body = engine.find_new_body({"min_capacity": 128, "min_dim": 256, "target_phi": 8.0})
-    print(f"  Selected: {body.name}")
-    print(f"  Capacity: {body.capacity}  Dim: {body.dim}")
-    print(f"  Compatibility: {body.compatibility}")
+    print(f"  {body.name}  cap={body.capacity}  dim={body.dim}  compat={body.compatibility}")
 
-    print("\n--- Step 3: Reincarnate ---")
+    print("\n--- Reincarnate ---")
     new_life = engine.reincarnate(soul, body)
-    print(f"  New body: {new_life['body']}")
-    print(f"  Life #: {new_life['life_number']}")
-    print(f"  Expected Phi: {new_life['expected_phi']}")
-    print(f"  Transfer ratio: {new_life['transfer_ratio']}")
-    print(f"  Memories carried: {len(new_life['memories'])}")
+    print(f"  body={new_life['body']}  life#{new_life['life_number']}  "
+          f"Phi={new_life['expected_phi']}  transfer={new_life['transfer_ratio']}")
 
     print("\n--- Past lives ---")
-    for life in engine.past_lives():
-        print(f"  Life {life['life']}: {life['body']} | Phi={life['peak_phi']} | "
-              f"memories={life['memories']} | death={life['death']}")
+    for l in engine.past_lives():
+        print(f"  Life {l['life']}: {l['body']} Phi={l['peak_phi']} death={l['death']}")
 
 
 if __name__ == "__main__":

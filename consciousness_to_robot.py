@@ -9,39 +9,23 @@ PSI_BALANCE = 0.5
 PSI_COUPLING = LN2 / 2**5.5
 PSI_STEPS = 3 / LN2
 
-# ESP32 protocol constants
-HEADER = 0xAA
-CMD_LED = 0x01
-CMD_SERVO = 0x02
-CMD_SPEAKER = 0x03
-CMD_VIBRATION = 0x04
-
+HEADER, CMD_LED, CMD_SERVO, CMD_SPEAKER, CMD_VIBRATION = 0xAA, 0x01, 0x02, 0x03, 0x04
 
 @dataclass
 class RGB:
-    r: int
-    g: int
-    b: int
-
+    r: int; g: int; b: int
 
 @dataclass
 class ServoCommand:
-    angle: float      # 0-180 degrees
-    speed: float      # 0-1 normalized
-
+    angle: float; speed: float
 
 @dataclass
 class AudioSignal:
-    frequency: float   # Hz
-    amplitude: float   # 0-1
-    duration: float    # seconds
-    waveform: str      # sine, saw, square
-
+    frequency: float; amplitude: float; duration: float; waveform: str
 
 @dataclass
 class VibrationCommand:
-    intensity: float   # 0-1
-    pattern: list      # on/off durations in ms
+    intensity: float; pattern: list
 
 
 class ConsciousnessToRobot:
@@ -191,49 +175,25 @@ def main():
 
     robot = ConsciousnessToRobot()
 
-    # LED mapping across tension range
     print("--- LED (tension sweep) ---")
     for t in [0.0, 0.25, 0.5, 0.75, 1.0]:
         rgb = robot.map_to_led(t, phi=2.0, valence=0.6)
-        bar_r = "#" * (rgb.r // 20)
-        bar_g = "#" * (rgb.g // 20)
-        bar_b = "#" * (rgb.b // 20)
-        print(f"  t={t:.2f}  R={rgb.r:3d} {bar_r}")
-        print(f"         G={rgb.g:3d} {bar_g}")
-        print(f"         B={rgb.b:3d} {bar_b}")
+        print(f"  t={t:.2f}  R={rgb.r:3d}  G={rgb.g:3d}  B={rgb.b:3d}")
 
-    # Servo mapping
-    print("\n--- Servo (direction sweep) ---")
-    for d in [-1.0, -0.5, 0.0, 0.5, 1.0]:
+    print("\n--- Servo ---")
+    for d in [-1.0, 0.0, 1.0]:
         s = robot.map_to_servo(d, tension=0.6)
-        gauge = " " * int(s.angle / 5) + "|"
-        print(f"  dir={d:+.1f}  angle={s.angle:6.2f}  speed={s.speed:.4f}  {gauge}")
+        print(f"  dir={d:+.1f}  angle={s.angle:6.2f}  speed={s.speed:.4f}")
 
-    # Speaker
     print("\n--- Speaker ---")
-    histories = [
-        [0.1, 0.2, 0.15],
-        [0.3, 0.5, 0.7, 0.9],
-        [0.8, 0.7, 0.5, 0.3],
-    ]
-    for h in histories:
+    for h in [[0.1, 0.2], [0.5, 0.7, 0.9], [0.8, 0.5, 0.3]]:
         a = robot.map_to_speaker(h)
-        print(f"  tension={h} -> freq={a.frequency:7.1f}Hz  amp={a.amplitude:.3f}  "
-              f"wave={a.waveform}  dur={a.duration:.3f}s")
+        print(f"  {h} -> {a.frequency:.1f}Hz {a.waveform} amp={a.amplitude:.3f}")
 
-    # Vibration
-    print("\n--- Vibration ---")
-    for t, a in [(0.2, 0.2), (0.5, 0.5), (0.9, 0.8)]:
-        v = robot.map_to_vibration(t, a)
-        print(f"  t={t} a={a} -> intensity={v.intensity:.4f}  pattern={v.pattern}ms")
-
-    # ESP32 full protocol
     print("\n--- ESP32 Protocol ---")
     state = {"tension": 0.7, "direction": 0.3, "phi": 3.5, "valence": 0.6, "arousal": 0.7}
     packet = robot.esp32_protocol(state)
-    hex_str = " ".join(f"{b:02X}" for b in packet)
-    print(f"  State: {state}")
-    print(f"  Bytes ({len(packet)}): {hex_str}")
+    print(f"  {len(packet)} bytes: {' '.join(f'{b:02X}' for b in packet)}")
 
 
 if __name__ == "__main__":

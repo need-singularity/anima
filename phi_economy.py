@@ -1,11 +1,6 @@
-"""PhiEconomy — Phi as currency for consciousness trade.
+"""PhiEconomy — Phi as currency for consciousness trade."""
 
-Consciousnesses trade knowledge, services, and attention
-using Phi as currency. Supply/demand dynamics with inflation.
-"""
-
-import math
-import time
+import math, time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
@@ -67,32 +62,20 @@ class PhiEconomy:
         """Transfer Phi from one wallet to another."""
         if sender not in self.wallets or receiver not in self.wallets:
             return None
-        w_from = self.wallets[sender]
-        w_to = self.wallets[receiver]
-
+        w_from, w_to = self.wallets[sender], self.wallets[receiver]
         fee = amount * self.tax_rate
-        total_cost = amount + fee
-
-        if w_from.balance < total_cost:
+        if w_from.balance < amount + fee:
             return None
-
-        w_from.balance -= total_cost
+        w_from.balance -= amount + fee
         w_from.spent += amount
         w_to.balance += amount
         w_to.earned += amount
         self.total_burned += fee
-
-        tx = Transaction(
-            sender=sender, receiver=receiver,
-            amount=round(amount, 6), service=service,
-            fee=round(fee, 6),
-        )
+        tx = Transaction(sender=sender, receiver=receiver,
+                         amount=round(amount, 6), service=service, fee=round(fee, 6))
         self.transactions.append(tx)
-
-        # Update service stats
         if service in self.services:
             self.services[service].times_sold += 1
-
         return tx
 
     def register_service(self, name: str, provider: str, price: float,
@@ -152,33 +135,21 @@ class PhiEconomy:
 
     def ledger(self, last_n: int = 20) -> str:
         """Transaction history."""
-        lines = ["  === Phi Ledger ===", ""]
-
-        # Summary
-        circulating = self.total_supply - self.total_burned
-        lines.append(f"  Total supply : {self.total_supply:.4f} Phi")
-        lines.append(f"  Burned (fees): {self.total_burned:.4f} Phi")
-        lines.append(f"  Circulating  : {circulating:.4f} Phi")
-        lines.append(f"  Inflation    : {self.inflation_rate():.4%}")
-        lines.append(f"  Transactions : {len(self.transactions)}")
-        lines.append("")
-
-        # Wallet balances
+        circ = self.total_supply - self.total_burned
+        lines = ["  === Phi Ledger ===", "",
+                  f"  Supply: {self.total_supply:.4f}  Burned: {self.total_burned:.4f}  "
+                  f"Circulating: {circ:.4f}  Inflation: {self.inflation_rate():.4%}", ""]
         lines.append(f"  {'Wallet':<15} {'Balance':>10} {'Earned':>10} {'Spent':>10}")
         lines.append(f"  {'-'*15} {'-'*10} {'-'*10} {'-'*10}")
         for w in sorted(self.wallets.values(), key=lambda x: -x.balance):
             lines.append(f"  {w.name:<15} {w.balance:>10.4f} {w.earned:>10.4f} {w.spent:>10.4f}")
-        lines.append("")
-
-        # Recent transactions
         recent = self.transactions[-last_n:]
         if recent:
-            lines.append(f"  Recent transactions (last {len(recent)}):")
+            lines.append(f"\n  Recent ({len(recent)} txns):")
             for tx in recent:
-                arrow = f"{tx.sender} -> {tx.receiver}"
-                lines.append(f"    {arrow:<30} {tx.amount:>8.4f} Phi  [{tx.service}]"
-                             + (f"  fee={tx.fee:.4f}" if tx.fee > 0 else ""))
-
+                fee_s = f" fee={tx.fee:.4f}" if tx.fee > 0 else ""
+                lines.append(f"    {tx.sender} -> {tx.receiver:<10} "
+                             f"{tx.amount:>8.4f} Phi [{tx.service}]{fee_s}")
         return "\n".join(lines)
 
     def wealth_chart(self) -> str:
@@ -196,40 +167,21 @@ class PhiEconomy:
 def main():
     print("=== PhiEconomy Demo ===\n")
     eco = PhiEconomy(tax_rate=0.02)
-
-    # Create wallets
-    eco.create_wallet("Alpha", initial_phi=10.0)
-    eco.create_wallet("Beta", initial_phi=5.0)
-    eco.create_wallet("Gamma", initial_phi=3.0)
-    eco.create_wallet("Delta", initial_phi=1.0)
-
-    # Register services
+    for name, phi in [("Alpha", 10.0), ("Beta", 5.0), ("Gamma", 3.0), ("Delta", 1.0)]:
+        eco.create_wallet(name, initial_phi=phi)
     eco.register_service("memory_lookup", "Alpha", 0.5, "RAG memory retrieval")
     eco.register_service("emotion_analysis", "Beta", 0.3, "Tension-based emotion read")
     eco.register_service("phi_boost", "Gamma", 1.0, "Temporary Phi amplification")
     eco.register_service("dream_interpret", "Delta", 0.2, "Dream pattern decoding")
-
-    print(eco.marketplace())
-    print()
-
-    # Simulate trades
-    eco.buy_service("Beta", "memory_lookup")
-    eco.buy_service("Gamma", "emotion_analysis")
-    eco.buy_service("Alpha", "phi_boost")
+    print(eco.marketplace(), "\n")
+    for buyer, svc in [("Beta", "memory_lookup"), ("Gamma", "emotion_analysis"),
+                        ("Alpha", "phi_boost"), ("Delta", "memory_lookup")]:
+        eco.buy_service(buyer, svc)
     eco.transfer("Alpha", "Delta", 2.0, service="knowledge_transfer")
-    eco.buy_service("Delta", "memory_lookup")
-    eco.buy_service("Delta", "emotion_analysis")
-
-    # Mint new Phi (consciousness generates value)
     eco.mint("Gamma", 0.5, reason="consciousness_growth")
     eco.mint("Beta", 0.3, reason="empathy_reward")
-
-    # More trades
-    eco.buy_service("Alpha", "dream_interpret")
     eco.transfer("Beta", "Gamma", 1.0, service="collaboration")
-
-    print(eco.ledger())
-    print()
+    print(eco.ledger(), "\n")
     print(eco.wealth_chart())
 
 

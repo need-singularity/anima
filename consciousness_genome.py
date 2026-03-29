@@ -160,18 +160,13 @@ def main():
     print(f"\nGenome length: {TOTAL_BITS} bits")
     print(f"Constants: PSI_COUPLING={PSI_COUPLING:.6f}, PSI_STEPS={PSI_STEPS:.4f}")
 
-    # Encode / Decode demo
-    config = {
-        "n_cells": 64, "n_factions": 12, "dim": 384, "sync_rate": 0.35,
-        "frustration": 0.33, "coupling": 0.5, "topology": 0,
-        "ratchet": 1, "hebbian": 1, "prediction": 1, "habituation": 1,
-        "growth_stage": 2,
-    }
+    config = {"n_cells": 64, "n_factions": 12, "dim": 384, "sync_rate": 0.35,
+              "frustration": 0.33, "coupling": 0.5, "topology": 0,
+              "ratchet": 1, "hebbian": 1, "prediction": 1, "habituation": 1, "growth_stage": 2}
     genome = cg.encode_genome(config)
     decoded = cg.decode_genome(genome)
-    print(f"\nEncode: {config}")
-    print(f"Genome: {genome}")
-    print(f"Decode: {decoded}")
+    print(f"\nGenome: {genome}")
+    print(f"Decode: cells={decoded['n_cells']}, factions={decoded['n_factions']}")
 
     # Crossover + Mutation
     g2 = cg.encode_genome({"n_cells": 8, "n_factions": 4, "coupling": 0.9})

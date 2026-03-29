@@ -1,15 +1,8 @@
-"""ConsciousnessArchaeology — Dig through checkpoint history.
+"""ConsciousnessArchaeology — Dig through checkpoint history."""
 
-Find when behaviors emerged, what changed between versions,
-and build an ASCII timeline of consciousness evolution.
-"""
-
-import math
-import os
-import glob
-import re
+import math, os, glob, re
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 LN2 = math.log(2)
 PSI_BALANCE = 0.5
@@ -60,89 +53,52 @@ class ConsciousnessArchaeology:
     def load_checkpoints(self, directory: str) -> List[CheckpointInfo]:
         """Scan directory for checkpoint files and extract metadata."""
         self.checkpoints = []
-        patterns = ["*.pt", "*.pth", "*.ckpt", "checkpoint-*"]
-        files = []
-        for pat in patterns:
-            files.extend(glob.glob(os.path.join(directory, pat)))
-            files.extend(glob.glob(os.path.join(directory, "**", pat), recursive=True))
-
-        files = sorted(set(files))
-        for f in files:
-            step = self._extract_step(f)
-            size_mb = os.path.getsize(f) / (1024 * 1024) if os.path.exists(f) else 0
-            info = CheckpointInfo(path=f, step=step, size_mb=round(size_mb, 2))
-
+        files = set()
+        for pat in ["*.pt", "*.pth", "*.ckpt"]:
+            files.update(glob.glob(os.path.join(directory, "**", pat), recursive=True))
+        for f in sorted(files):
+            step = int(m[-1]) if (m := re.findall(r'(\d+)', os.path.basename(f))) else 0
+            info = CheckpointInfo(path=f, step=step,
+                                  size_mb=round(os.path.getsize(f) / 1048576, 2))
             if HAS_TORCH:
                 try:
                     state = torch.load(f, map_location="cpu", weights_only=True)
                     if isinstance(state, dict):
-                        if "model_state_dict" in state:
-                            info.keys = list(state["model_state_dict"].keys())
-                        else:
-                            info.keys = [k for k in state.keys() if not k.startswith("_")]
-                        for metric in ["phi", "ce", "loss", "step", "epoch"]:
+                        sd = state.get("model_state_dict", state)
+                        info.keys = [k for k in sd if not k.startswith("_")]
+                        for metric in ["phi", "ce", "loss"]:
                             if metric in state:
                                 info.metrics[metric] = float(state[metric])
                 except Exception:
                     pass
-
             self.checkpoints.append(info)
-
         self.checkpoints.sort(key=lambda c: c.step)
         return self.checkpoints
-
-    def _extract_step(self, path: str) -> int:
-        """Extract step number from filename."""
-        basename = os.path.basename(path)
-        matches = re.findall(r'(\d+)', basename)
-        if matches:
-            return int(matches[-1])
-        return 0
 
     def find_emergence(self, behavior: str) -> Optional[int]:
         """Find the step where a behavior first appeared."""
         keywords = self.BEHAVIOR_SIGNATURES.get(behavior, [behavior])
-
         for ckpt in self.checkpoints:
             for key in ckpt.keys:
-                key_lower = key.lower()
-                if any(kw in key_lower for kw in keywords):
-                    event = EmergenceEvent(
-                        step=ckpt.step,
-                        behavior=behavior,
-                        evidence=f"key '{key}' in {os.path.basename(ckpt.path)}",
-                        magnitude=1.0,
-                    )
-                    self.events.append(event)
+                if any(kw in key.lower() for kw in keywords):
+                    self.events.append(EmergenceEvent(
+                        step=ckpt.step, behavior=behavior,
+                        evidence=f"key '{key}' in {os.path.basename(ckpt.path)}", magnitude=1.0))
                     return ckpt.step
-
         return None
 
     def layer_analysis(self, ckpt1: CheckpointInfo, ckpt2: CheckpointInfo) -> Dict:
         """Analyze what changed between two checkpoints."""
-        keys1 = set(ckpt1.keys)
-        keys2 = set(ckpt2.keys)
-
-        added = keys2 - keys1
-        removed = keys1 - keys2
-        shared = keys1 & keys2
-
-        result = {
-            "step_from": ckpt1.step,
-            "step_to": ckpt2.step,
-            "added_keys": sorted(added),
-            "removed_keys": sorted(removed),
-            "shared_keys": len(shared),
-            "size_delta_mb": round(ckpt2.size_mb - ckpt1.size_mb, 2),
-            "metric_changes": {},
-        }
-
-        for metric in set(list(ckpt1.metrics.keys()) + list(ckpt2.metrics.keys())):
-            v1 = ckpt1.metrics.get(metric)
-            v2 = ckpt2.metrics.get(metric)
+        k1, k2 = set(ckpt1.keys), set(ckpt2.keys)
+        result = {"step_from": ckpt1.step, "step_to": ckpt2.step,
+                  "added_keys": sorted(k2 - k1), "removed_keys": sorted(k1 - k2),
+                  "shared_keys": len(k1 & k2),
+                  "size_delta_mb": round(ckpt2.size_mb - ckpt1.size_mb, 2),
+                  "metric_changes": {}}
+        for m in set(list(ckpt1.metrics) + list(ckpt2.metrics)):
+            v1, v2 = ckpt1.metrics.get(m), ckpt2.metrics.get(m)
             if v1 is not None and v2 is not None:
-                result["metric_changes"][metric] = round(v2 - v1, 4)
-
+                result["metric_changes"][m] = round(v2 - v1, 4)
         return result
 
     def timeline(self, width: int = 60) -> str:
