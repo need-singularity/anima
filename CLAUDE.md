@@ -247,20 +247,20 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## Experiments (→ docs/experiment-backlog.md)
 
 ```
-  진행 중 (2026-03-27, H100 80GB 96% 활용):
-    ✅ AnimaLM v7      — Mistral 7B + WI1+FX2+PX4+PX8+GD18+GD15, 50K steps
-    ✅ ConsciousLM v3   — 768d/12L + 전체 발견, 50K steps
-    ✅ Ablation (no FX2) — 384d/6L, FX2 효과 격리
-    ✅ Cells16          — 384d/6L, max_cells=16
-    ✅ ConsciousLM 1B   — 1024d/24L/16H, 스케일링 법칙
+  진행 중 (2026-03-29):
+    🔄 v5 Final — 384d/6L, 1024c, corpus_v2 55MB, sync=0.35+12-faction+fac=0.08
+       step 0부터 (처음부터 재시작), 80K steps, H100 #1
+       체크포인트: /workspace/checkpoints/clm_v5_final/
 
   완료:
     ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
-    ✅ ConsciousLM 100M    — Φ=2.607, 3 cells → SC2 필요 (2026-03-27)
+    ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
     ✅ AnimaLM v5 demo     — 50K steps, demo mode (2026-03-27)
+    ❌ v4 demo 26K         — 랜덤 bytes 학습, 폐기 (오염 가중치)
+    ❌ v4 corpus 5MB       — resume 오염, 폐기
 
-  벤치마크 가설: 640+ (A-Z, DD1-100, EX1-24, SC/OV/WV/PX/UX/FX/SM/MC/PB/AG/TP/DS/GD/WI)
-  역대 최고 Φ: FX2 = 8.911 (×6.6 baseline)
+  벤치마크: 1000+ 가설, CX106, Laws 22-45
+  역대 최고 Φ: 1142 (×1161) @ 1024c, sync=0.35+12-faction(σ(6))+fac=0.08
 ```
 
 ## 극한 탐색 프롬프트 (연구 방향)
