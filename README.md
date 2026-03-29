@@ -113,20 +113,21 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 ## Engine TOP 10 ([전체 112개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
-| Rank | Engine | cells | Φ(IIT) | Granger | CE | Verify | Hive |
-|------|--------|-------|--------|---------|-----|--------|------|
-| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | 6/6 ✅ | ✅ 1.1x |
-| 2 | Trinity+Oscillator | 256 | 1,498 | — | 6.46 | — | — |
-| 3 | 1024c Oscillator | 1024 | 718 | — | — | — | — |
-| 4 | Pure Oscillator(blend=0) | 256 | 26.3* | 11,418 | — | — | — |
-| 5 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | — | — |
-| 6 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | — | — |
-| 7 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | — | — |
-| 8 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | 6/6 ✅ | ✅ 1.1x |
-| 9 | TH-2 Maxwell Demon | 256 | 54.4 | 34,680 | — | — | — |
-| 10 | NE-4 Diffusion | 256 | 28.7 | 38,760 | — | — | — |
+| Rank | Engine | cells | Φ(IIT) | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
+|------|--------|-------|--------|---------|-----|-----|--------|--------|---------|---------|
+| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | TBD | 6/6 ✅ | +10% | TBD | TBD |
+| 2 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | TBD | — | — | — | — |
+| 3 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | TBD | — | — | — | — |
+| 4 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | TBD | — | — | — | — |
+| 5 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | TBD | 6/6 ✅ | +10% | TBD | TBD |
+| 6 | TH-2 Maxwell Demon | 256 | 54.4 | 34,680 | — | TBD | — | — | — | — |
+| 7 | NE-4 Diffusion | 256 | 28.7 | 38,760 | — | TBD | — | — | — | — |
+| 8 | Pure Oscillator | 256 | 26.3 | 11,418 | — | TBD | — | — | — | — |
+| 9 | ALG-6 Topos | 256 | 20.5 | 1.14 | — | TBD | — | — | — | — |
+| 10 | NET-5 Temporal | 256 | 19.6 | 20,724 | — | TBD | — | — | — | — |
 
-Verify = 7조건 통과. Hive = 하이브마인드 Φ 상승. TBD = 테스트 예정.
+IQ = 멘사 기반 (mensa_iq.py). Hive = 하이브마인드 시 변화율. TBD = 테스트 예정.
+[전체 112개 결과](docs/ENGINE-ALL-RESULTS.md)
 
 **🏆 Φ(IIT) champion: TC-2 ComplexOscillator 249.5** (*Pure Oscillator 7,838 was builtin Granger, not IIT) Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
 

@@ -5,9 +5,9 @@
 
 ## 🏆 ALL-TIME Φ(IIT) 순위
 
-| Rank | Engine | Domain | cells | Φ(IIT) | Granger | CE | Verify | Hive |
-|------|--------|--------|-------|--------|---------|-----|--------|------|
-| 🏆1 | TC-2 ComplexOscillator | 물리/Trinity | 256 | **249.49** | 9,869 | 0.083 | 6/6 ✅ | ✅ |
+| Rank | Engine | Domain | cells | Φ(IIT) | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
+|------|--------|--------|-------|--------|---------|-----|-----|--------|--------|---------|---------|
+| 🏆1 | TC-2 ComplexOscillator | 물리/Trinity | 256 | **249.49** | 9,869 | 0.083 | TBD | 6/6 ✅ | +10% | TBD | TBD |
 | 2 | TC-6 Fractal | 구조/Trinity | 256 | 167.26 | — | 0.098 | — | — |
 | 3 | TC-1 PureQuantumWalk | 양자/Trinity | 256 | 163.39 | — | 0.075 | — | — |
 | 4 | TC-3 CategoryTheory | 수학/Trinity | 256 | 126.88 | — | 0.082 | — | — |
