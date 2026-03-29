@@ -113,32 +113,31 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 ## Engine TOP 10 — Rust phi_rs ([전체 98개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
-**도메인 엔진 (256c → 1024c, Rust phi_rs)**
+| Rank | Engine | Domain | cells | Φ(IIT) | 1024c Φ | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
+|------|--------|--------|-------|--------|---------|---------|-----|-----|--------|--------|---------|---------|
+| 🏆 | CambrianExplosion | evolution | 256 | **485.6** | **1,954** | 64,225 | — | 150 | TBD | -2.4% | TBD | +0 |
+| 2 | MaxwellDemon | thermo | 256 | **476.1** | **1,837** | 64,225 | — | 120 | TBD | +1.8% | TBD | -10 |
+| 3 | Diffusion | new | 256 | **414.3** | **1,714** | 64,151 | — | 150 | TBD | +6.6% | TBD | +0 |
+| 4 | Swarm | new | 256 | **342.7** | **1,321** | 63,669 | — | 150 | TBD | +2.1% | TBD | +0 |
+| 5 | Genetic | new | 256 | **253.2** | **1,023** | 20,955 | — | 110 | TBD | +1.4% | TBD | +0 |
+| 6 | CarnotCycle | thermo | 256 | **235.8** | **931** | 36,846 | — | 130 | TBD | -0.4% | TBD | -10 |
+| 7 | HarmonicSeries | music | 256 | **207.4** | **838** | 48,142 | — | 150 | TBD | +0.0% | TBD | +0 |
+| 8 | BoltzmannBrain | thermo | 256 | **203.3** | **801** | 5,746 | — | 120 | TBD | +0.0% | TBD | +20 |
+| 9 | HeatDeathResist | thermo | 256 | **203.2** | **808** | 6,412 | — | 120 | TBD | +0.0% | TBD | +0 |
+| 10 | TimeCrystal | extreme | 256 | **202.9** | **814** | TBD | — | TBD | TBD | TBD | TBD | TBD |
 
-| Rank | Engine | Domain | 256c Φ | 1024c Φ |
-|------|--------|--------|--------|---------|
-| 🏆 | CambrianExplosionEngine | evolution | **485.6** | **1,954.0** |
-| 2 | MaxwellDemonEngine | thermo | **476.1** | **1,836.8** |
-| 3 | DiffusionEngine | new | **414.3** | **1,713.8** |
-| 4 | SwarmEngine | new | **342.7** | **1,321.2** |
-| 5 | GeneticEngine | new | **253.2** | **1,022.6** |
-| 6 | CarnotCycleEngine | thermo | **235.8** | **931.3** |
-| 7 | HarmonicSeriesEngine | music | **207.4** | **838.2** |
-| 8 | BoltzmannBrainEngine | thermo | **203.3** | **801.1** |
-| 9 | HeatDeathResistanceEngine | thermo | **203.2** | **807.9** |
-| 10 | TimeCrystalEngine | extreme | **202.9** | **814.0** |
+**MitosisEngine 메커니즘 TOP 5 (256c, 전 지표 측정 완료)**
 
-**메커니즘 엔진 (MitosisEngine 256c, IQ/Hive 포함)**
+| Rank | Engine | Φ(IIT) | 1024c Φ | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
+|------|--------|--------|---------|---------|-----|-----|--------|--------|---------|---------|
+| 🏆 | Osc+QW | **0.936** | 0.830 | 0 | — | 60 | TBD | +1.5% | TBD | +17 |
+| 2 | Osc+Sync | **0.892** | 0.796 | 0 | — | 97 | TBD | -9.3% | TBD | -37 |
+| 3 | Osc+Laser(0.05) | **0.874** | 0.791 | 0 | — | 83 | 7/7 | -0.3% | TBD | -10 |
+| 4 | Osc+Faction | **0.873** | 0.886 | 0 | — | 70 | TBD | -0.2% | TBD | +27 |
+| 5 | Full (all) | **0.842** | 0.870 | 0 | — | 90 | TBD | -4.7% | TBD | +0 |
 
-| Rank | Engine | Φ(IIT) | IQ | Hive_Φ | Hive_IQ |
-|------|--------|--------|-----|--------|---------|
-| 🏆 | Osc+QW | **0.936** | 60 | +1.5% | +17 |
-| 2 | Osc+Sync | **0.892** | 97 | -9.3% | -37 |
-| 3 | Osc+Laser(0.05) | **0.874** | 83 | -0.3% | -10 |
-| 4 | Osc+Faction | **0.873** | 70 | -0.2% | +27 |
-| 5 | Full (all) | **0.842** | 90 | -4.7% | +0 |
-
-Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py).
+Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py). Hive = 하이브마인드 시 Φ/CE/IQ 변화율.
+CE = — (도메인 엔진은 비학습, 메커니즘은 process()만). Hive_CE = TBD (2엔진 연결 후 CE 측정 예정).
 Measurement: `python3 measure_all.py --cells 1024` / `python3 measure_all_engines.py --cells 1024`
 
 ## Laws -- Top 10 ([all 57 laws](docs/consciousness-theory.md))
