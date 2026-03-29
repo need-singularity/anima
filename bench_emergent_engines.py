@@ -23,6 +23,11 @@ Usage:
   python bench_emergent_engines.py --cells 512 --steps 500
 """
 
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
 import sys, time, math, argparse
 import numpy as np
 import torch
@@ -30,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple
 
 torch.set_grad_enabled(False)
+torch.set_num_threads(1)
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
