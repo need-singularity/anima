@@ -41836,20 +41836,17 @@ def run_CX96_zero_input_bootstrap(steps=100, dim=64, hidden=128) -> BenchResult:
                        comp['complexity'], time.time() - t0)
 
 
-def run_CX97_metachaos_neural_swarm_512c(steps=100, dim=64, hidden=256) -> BenchResult:
-    """CX-97: Metachaos + Neural Avalanche + Swarm + 512c + XMETA3.
-    CX93+CX94+CX95 결합 + 메타인지 + Flow."""
+def run_CX97_consciousness_holography(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-97: Consciousness Holography — 표면이 부피를 인코딩. ⭐⭐⭐
+    홀로그래픽 원리: 경계 세포(boundary)가 전체 정보를 담는다.
+    내부 세포는 경계 세포의 투영. AdS/CFT에서 영감.
+    boundary_cells carry full info, interior = projection."""
     t0 = time.time()
     engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=512)
     phi_calc = PhiCalculator(n_bins=16)
     phi_hist = []
     phi_ema = 1.0
     l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
-    meta = [1.0, 0.5, 0.5]
-    main_lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(128)]
-    membrane = torch.zeros(512); refractory = torch.zeros(512)
-    positions = [torch.randn(hidden)*0.3 for _ in range(512)]
-    velocities = [torch.randn(hidden)*0.05 for _ in range(512)]
 
     for step_i in range(steps):
         x = torch.randn(1,dim)*(1.0+2.0*torch.rand(1).item())
@@ -41867,64 +41864,52 @@ def run_CX97_metachaos_neural_swarm_512c(steps=100, dim=64, hidden=256) -> Bench
         engine.process(x); n=len(engine.cells)
 
         with torch.no_grad():
-            phase = step_i%3
+            if n >= 4:
+                # Holographic principle: boundary = first+last quarter of cells
+                n_boundary = max(2, n//4)
+                boundary_idx = list(range(n_boundary)) + list(range(n-n_boundary, n))
+                interior_idx = list(range(n_boundary, n-n_boundary))
 
-            if phase == 0:
-                # === Metachaos ===
-                mx,my,mz = meta
-                for _ in range(3):
-                    dmx=10*(my-mx)*0.001; dmy=(mx*(28-mz)-my)*0.001; dmz=(mx*my-8/3*mz)*0.001
-                    mx+=dmx; my+=dmy; mz+=dmz
-                meta=[mx,my,mz]
-                sig=8+4*math.tanh(mx/20); rho_d=24+8*math.tanh(my/30); bet=2+1.5*math.tanh(mz/15)
-                for i in range(min(n,64)):
-                    if i>=len(main_lorenz): main_lorenz.append([1.0,0.0,0.0])
-                    lx,ly,lz=main_lorenz[i]
-                    for _ in range(3):
-                        dx=sig*(ly-lx)*0.005; dy=(lx*(rho_d-lz)-ly)*0.005; dz=(lx*ly-bet*lz)*0.005
-                        lx+=dx; ly+=dy; lz+=dz
-                    main_lorenz[i]=[lx,ly,lz]; h=engine.cells[i].hidden.squeeze()
-                    t_h=torch.arange(hidden,dtype=torch.float32)
-                    engine.cells[i].hidden=(h+h.norm()*0.005*math.tanh(lx/20)*torch.sin(t_h*0.3)).unsqueeze(0)
+                # Boundary cells: encode full volume info (high diversity)
+                boundary_hiddens = torch.stack([engine.cells[i].hidden.squeeze() for i in boundary_idx])
+                boundary_mean = boundary_hiddens.mean(0)
+                # Boundary cells repel each other → maximize info on surface
+                for i in boundary_idx:
+                    h = engine.cells[i].hidden.squeeze()
+                    diff = h - boundary_mean
+                    # Push away from mean (surface diversity)
+                    h = h + 0.02 * diff + 0.005 * torch.randn(hidden)
+                    engine.cells[i].hidden = h.unsqueeze(0)
 
-            elif phase == 1:
-                # === Neural avalanche ===
-                membrane[:n]+=0.04+0.02*torch.rand(n)
-                refractory[:n]=(refractory[:n]-1).clamp(min=0)
-                avalanche=0; fired=True; iters=0
-                while fired and iters<30:
-                    fired=False; iters+=1
-                    for i in range(min(n,64)):
-                        if membrane[i]>=1.0 and refractory[i]==0:
-                            fired=True; avalanche+=1; membrane[i]=0; refractory[i]=3
-                            for d in [-1,1]:
-                                j=(i+d)%n
-                                if refractory[j]==0:
-                                    membrane[j]+=0.25 if i%5!=0 else -0.1
-                if avalanche>0:
-                    cascade=min(0.06,0.01*math.log(avalanche+1))
-                    for i in range(min(n,32)):
-                        h=engine.cells[i].hidden.squeeze()
-                        j=(i+avalanche)%n; hj=engine.cells[j].hidden.squeeze()
-                        engine.cells[i].hidden=((1-cascade)*h+cascade*hj).unsqueeze(0)
+                # Interior cells: holographic projection from boundary
+                if len(interior_idx) > 0 and len(boundary_idx) >= 2:
+                    # Each interior cell = weighted projection of boundary
+                    for idx_i, i in enumerate(interior_idx):
+                        h = engine.cells[i].hidden.squeeze()
+                        # Depth: how far from boundary (0=near, 1=center)
+                        depth = min(idx_i, len(interior_idx)-1-idx_i) / max(len(interior_idx)//2, 1)
+                        # Holographic reconstruction: weighted sum of boundary
+                        proj = torch.zeros(hidden)
+                        for b_i in boundary_idx:
+                            # Phase encoding: different angles for different boundary cells
+                            phase = 2.0 * math.pi * b_i / n
+                            weight = math.cos(phase * (idx_i + 1)) * math.exp(-0.5 * depth)
+                            proj = proj + weight * engine.cells[b_i].hidden.squeeze()
+                        proj = proj / (len(boundary_idx) + 1e-8)
+                        # Mix: more boundary influence at edges, more self at center
+                        alpha = 0.15 * (1.0 - depth)
+                        h = (1.0 - alpha) * h + alpha * proj
+                        engine.cells[i].hidden = h.unsqueeze(0)
 
-            else:
-                # === Swarm boids ===
-                for i in range(min(n,32)):
-                    if i>=len(positions): positions.append(torch.randn(hidden)*0.3); velocities.append(torch.randn(hidden)*0.05)
-                    sep=torch.zeros(hidden); ali=torch.zeros(hidden); coh=torch.zeros(hidden); cnt=0
-                    for d in [-2,-1,1,2]:
-                        j=(i+d)%n
-                        if j<len(positions):
-                            diff=positions[i]-positions[j]; dist=diff.norm().item()
-                            if dist<3.0:
-                                cnt+=1; sep+=diff/(dist+1e-8); ali+=velocities[j%len(velocities)]; coh+=positions[j]
-                    if cnt>0:
-                        velocities[i]=velocities[i]*0.95+sep/cnt*0.015+ali/cnt*0.008+(coh/cnt-positions[i])*0.004
-                        speed=velocities[i].norm().item()
-                        if speed>0.5: velocities[i]=velocities[i]*0.5/speed
-                    positions[i]=positions[i]+velocities[i]
-                    engine.cells[i].hidden=(0.93*engine.cells[i].hidden.squeeze()+0.07*positions[i]).unsqueeze(0)
+                # Cross-boundary entanglement: opposite boundary cells share info
+                for k_i in range(min(n_boundary, 8)):
+                    i = boundary_idx[k_i]
+                    j = boundary_idx[-(k_i+1)]
+                    if i != j:
+                        hi = engine.cells[i].hidden.squeeze()
+                        hj = engine.cells[j].hidden.squeeze()
+                        engine.cells[i].hidden = (0.95*hi + 0.05*hj).unsqueeze(0)
+                        engine.cells[j].hidden = (0.95*hj + 0.05*hi).unsqueeze(0)
 
             # XMETA3+FLOW+INFO1
             l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
@@ -41944,173 +41929,29 @@ def run_CX97_metachaos_neural_swarm_512c(steps=100, dim=64, hidden=256) -> Bench
         phi_hist.append(phi)
 
     phi_final,comp=phi_calc.compute_phi(engine)
-    return BenchResult("CX97","Metachaos+Neural Avalanche+Swarm+XMETA3+FLOW+INFO1 (512c)",
+    return BenchResult("CX97","Consciousness Holography: boundary encodes volume (512c)",
                        phi_final,phi_hist,comp['total_mi'],
                        comp['min_partition_mi'],comp['integration'],
                        comp['complexity'],time.time()-t0,
                        extra={'cells':len(engine.cells)})
 
 
-def run_CX98_zero_input_soc_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
-    """CX-98: Zero-Input + SOC + 8 chaos + 1024c — 완전 자율 의식.
-    외부 입력 = 0. 자기 상태가 입력. SOC가 조율. 8 카오스가 구동."""
+def run_CX98_quantum_superposition(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-98: Quantum-like Superposition — 세포가 중첩 상태로 존재. ⭐⭐⭐
+    측정(관찰)할 때만 붕괴. 여러 가능성을 동시에 탐색.
+    |ψ⟩ = α|state_A⟩ + β|state_B⟩, Born rule: P = |α|².
+    Measurement = Φ 계산 시 hidden collapse."""
     t0 = time.time()
     engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
     phi_calc = PhiCalculator(n_bins=16)
     phi_hist = []
     phi_ema = 1.0
     l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
-    grains = torch.zeros(1024); soc_th = 4.0
-    meta = [1.0,0.5,0.5]
-    lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(128)]
-    membrane = torch.zeros(1024); refractory = torch.zeros(1024)
-    sigma_l, beta_l = 10.0, 8.0/3.0
-    best_phi = 0.0; best_state = None
-
-    for step_i in range(steps):
-        # ZERO INPUT: self-state is the input
-        with torch.no_grad():
-            if len(engine.cells) >= 2:
-                self_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
-                x = self_state[:dim].unsqueeze(0)+0.008*torch.randn(1,dim)
-            else:
-                x = torch.randn(1,dim)*0.1
-
-        frac=step_i/max(steps,1)
-        for pct in [0.02,0.05,0.10,0.16,0.24,0.33,0.43,0.54,0.66,0.78,0.88]:
-            if frac>=pct and len(engine.cells)<min(int(2**((pct+0.02)*12)),1024):
-                target=min(len(engine.cells)*2,1024)
-                while len(engine.cells)<target:
-                    engine._create_cell(parent=engine.cells[step_i%len(engine.cells)])
-
-        engine.process(x); n=len(engine.cells)
-
-        with torch.no_grad():
-            # === SOC core ===
-            grains[step_i%n]+=1.0
-            avalanche=0; toppled=True; iters=0
-            while toppled and iters<100:
-                toppled=False; iters+=1
-                for i in range(min(n,256)):
-                    if grains[i]>=soc_th:
-                        toppled=True; avalanche+=1; grains[i]-=soc_th
-                        grains[(i-1)%n]+=1; grains[(i+1)%n]+=1
-            ci=min(1.0,0.1*math.log(avalanche+1)) if avalanche>0 else 0.0
-            if avalanche>0:
-                cascade=min(0.05,0.01*math.log(avalanche+1))
-                for i in range(min(n,32)):
-                    h=engine.cells[i].hidden.squeeze()
-                    j=(i+avalanche)%n
-                    engine.cells[i].hidden=((1-cascade)*h+cascade*engine.cells[j].hidden.squeeze()).unsqueeze(0)
-
-            # === SOC-modulated chaos (rotating) ===
-            phase=step_i%3
-            if phase==0 and ci>0.01:
-                # Metachaos Lorenz
-                mx,my,mz=meta
-                for _ in range(3):
-                    mx+=10*(my-mx)*0.001; my+=(mx*(28-mz)-my)*0.001; mz+=(mx*my-8/3*mz)*0.001
-                meta=[mx,my,mz]
-                rho_d=24+8*math.tanh(my/30)
-                osc_n=min(n,64)
-                for _ in range(3):
-                    new_ls=[]
-                    for i in range(osc_n):
-                        if i>=len(lorenz): lorenz.append([1.0,0.0,0.0])
-                        lx,ly,lz=lorenz[i]; dx=sigma_l*(ly-lx); dy=lx*(rho_d-lz)-ly; dz=lx*ly-beta_l*lz
-                        left=lorenz[(i-1)%osc_n]; right=lorenz[(i+1)%osc_n]
-                        dx+=ci*0.08*(left[0]+right[0]-2*lx)
-                        new_ls.append([lx+dx*0.004,ly+dy*0.004,lz+dz*0.004])
-                    lorenz[:osc_n]=new_ls
-                for i in range(min(n,32)):
-                    h=engine.cells[i].hidden.squeeze()
-                    t_h=torch.arange(hidden,dtype=torch.float32)
-                    engine.cells[i].hidden=(h+h.norm()*ci*0.004*math.tanh(lorenz[i%len(lorenz)][0]/20)*torch.sin(t_h*0.3)).unsqueeze(0)
-            elif phase==1:
-                # Neural avalanche
-                membrane[:n]+=0.03+0.02*torch.rand(min(n,256))[:n]
-                refractory[:n]=(refractory[:n]-1).clamp(min=0)
-                n_aval=0; fired=True; it=0
-                while fired and it<20:
-                    fired=False; it+=1
-                    for i in range(min(n,64)):
-                        if membrane[i]>=1.0 and refractory[i]==0:
-                            fired=True; n_aval+=1; membrane[i]=0; refractory[i]=3
-                            for d in [-1,1]:
-                                j=(i+d)%n
-                                if refractory[j]==0: membrane[j]+=0.2 if i%5!=0 else -0.08
-                if n_aval>0:
-                    nc=min(0.04,0.008*math.log(n_aval+1))
-                    for i in range(min(n,32)):
-                        h=engine.cells[i].hidden.squeeze(); j=(i+n_aval)%n
-                        engine.cells[i].hidden=((1-nc)*h+nc*engine.cells[j].hidden.squeeze()).unsqueeze(0)
-            else:
-                # Self-differentiation (zero input requires self-organization)
-                mean_h=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
-                for i in range(min(n,32)):
-                    h=engine.cells[i].hidden.squeeze()
-                    engine.cells[i].hidden=(h+0.015*(h-mean_h)+0.008*torch.randn(hidden)).unsqueeze(0)
-
-            # XMETA3+FLOW+INFO1+8-faction+ratchet
-            l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
-            l2=0.9*l2+0.1*l1; l3=0.95*l3+0.05*l2
-            phi,_=phi_calc.compute_phi(engine); phi_ema=0.9*phi_ema+0.1*phi
-            if phi<phi_ema*0.7: [setattr(c,'hidden',c.hidden+torch.randn_like(c.hidden)*0.03) for c in engine.cells]
-            elif phi>phi_ema*1.3 and n<1024: engine._create_cell(parent=engine.cells[0])
-            for c in engine.cells: c.hidden=0.993*c.hidden+0.007*l3.unsqueeze(0)
-            if n>=4:
-                mean_h=torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
-                for i,c in enumerate(engine.cells):
-                    c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.004*(i+1)/n
-            for c in engine.cells:
-                h=c.hidden.squeeze(); h_c=h-h.mean()
-                c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
-            n_fac=min(8,n); fs=max(1,n//n_fac)
-            for f_i in range(n_fac):
-                s,e=f_i*fs,min((f_i+1)*fs,n)
-                if e-s>=2:
-                    fm=torch.stack([engine.cells[i].hidden.squeeze() for i in range(s,e)]).mean(0)
-                    for i in range(s,e): engine.cells[i].hidden=(0.95*engine.cells[i].hidden.squeeze()+0.05*fm).unsqueeze(0)
-            if phi>best_phi: best_phi=phi; best_state=[c.hidden.clone() for c in engine.cells[:min(n,48)]]
-            elif phi<best_phi*0.8 and best_state is not None:
-                for i,hs in enumerate(best_state):
-                    if i<len(engine.cells): engine.cells[i].hidden=0.6*engine.cells[i].hidden+0.4*hs.clone()
-
-        phi_hist.append(phi)
-
-    phi_final,comp=phi_calc.compute_phi(engine)
-    return BenchResult("CX98","Zero-input + SOC + metachaos + neural avalanche (1024c)",
-                       phi_final,phi_hist,comp['total_mi'],
-                       comp['min_partition_mi'],comp['integration'],
-                       comp['complexity'],time.time()-t0,
-                       extra={'cells':len(engine.cells),'best_phi':best_phi})
-
-
-def run_CX99_all_11_sources_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
-    """CX-99: ALL 11 Chaos+Complexity Sources — 8 chaos + SOC + Neural + Swarm.
-    모든 복잡계 원천 11가지를 동시 투입. 1024c."""
-    t0 = time.time()
-    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
-    phi_calc = PhiCalculator(n_bins=16)
-    phi_hist = []
-    phi_ema = 1.0
-    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
-    # All sources
-    grains = torch.zeros(1024); soc_th = 4.0
-    meta = [1.0,0.5,0.5]
-    lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(128)]
-    hc = [[0.1+0.02*i,0.0,0.0,0.0] for i in range(64)]
-    phases = [i*0.1 for i in range(1024)]
-    membrane = torch.zeros(1024); refractory = torch.zeros(1024)
-    positions = [torch.randn(hidden)*0.2 for _ in range(128)]
-    velocities = [torch.randn(hidden)*0.03 for _ in range(128)]
-    W_res = torch.randn(hidden,hidden)*0.06; W_res=W_res*(torch.rand(hidden,hidden)<0.12).float()
-    eigmax=torch.linalg.eigvals(W_res).abs().max().item()
-    if eigmax>0: W_res=W_res*(0.95/eigmax)
-    reservoir = torch.zeros(hidden)
-    log_st = [torch.rand(hidden)*0.5+0.25 for _ in range(64)]
-    pm = [0.1+0.04*i for i in range(64)]
-    sigma_l,beta_l = 10.0,8.0/3.0
+    # Each cell has TWO superposed states + amplitude
+    super_A = [torch.randn(hidden)*0.3 for _ in range(1024)]
+    super_B = [torch.randn(hidden)*0.3 for _ in range(1024)]
+    amplitudes = [0.5+0.1*torch.randn(1).item() for _ in range(1024)]  # |α|² ∈ (0,1)
+    decoherence_rate = 0.02  # How fast superposition decays
     best_phi = 0.0; best_state = None
 
     for step_i in range(steps):
@@ -42126,110 +41967,58 @@ def run_CX99_all_11_sources_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
                 while len(engine.cells)<target:
                     engine._create_cell(parent=engine.cells[step_i%len(engine.cells)])
 
-        engine.process(x); n=len(engine.cells); sub=min(n,24)
+        engine.process(x); n=len(engine.cells)
 
         with torch.no_grad():
-            # SOC core
-            grains[step_i%n]+=1.0
-            avalanche=0; toppled=True; it=0
-            while toppled and it<80:
-                toppled=False; it+=1
-                for i in range(min(n,256)):
-                    if grains[i]>=soc_th:
-                        toppled=True; avalanche+=1; grains[i]-=soc_th; grains[(i-1)%n]+=1; grains[(i+1)%n]+=1
-            ci=min(1.0,0.1*math.log(avalanche+1)) if avalanche>0 else 0.0
+            for i in range(n):
+                h = engine.cells[i].hidden.squeeze()
+                alpha = max(0.01, min(0.99, amplitudes[i]))
 
-            # Rotate through 11 sources
-            src = step_i % 11
-            if src==0:  # Coupled Lorenz
-                rho=26+4*(step_i/max(steps-1,1)); osc=min(n,64)
-                for _ in range(2):
-                    new_ls=[]
-                    for i in range(osc):
-                        if i>=len(lorenz): lorenz.append([1.0,0.0,0.0])
-                        lx,ly,lz=lorenz[i]; dx=sigma_l*(ly-lx); dy=lx*(rho-lz)-ly; dz=lx*ly-beta_l*lz
-                        left=lorenz[(i-1)%osc]; right=lorenz[(i+1)%osc]; dx+=ci*0.06*(left[0]+right[0]-2*lx)
-                        new_ls.append([lx+dx*0.004,ly+dy*0.004,lz+dz*0.004])
-                    lorenz[:osc]=new_ls
-                for i in range(sub):
-                    h=engine.cells[i].hidden.squeeze(); t_h=torch.arange(hidden,dtype=torch.float32)
-                    engine.cells[i].hidden=(h+h.norm()*ci*0.003*math.tanh(lorenz[i%len(lorenz)][0]/20)*torch.sin(t_h*0.3)).unsqueeze(0)
-            elif src==1:  # Hyperchaos
-                for i in range(sub):
-                    if i>=len(hc): hc.append([0.1,0.0,0.0,0.0])
-                    x4,y4,z4,w4=hc[i]
-                    for _ in range(3):
-                        dx=-y4-z4; dy=x4+0.25*y4+w4; dz=3+x4*z4; dw=-0.5*z4+0.05*w4
-                        x4+=dx*0.002; y4+=dy*0.002; z4+=dz*0.002; w4+=dw*0.002
-                    hc[i]=[x4,y4,z4,w4]; h=engine.cells[i].hidden.squeeze()
-                    t_h=torch.arange(hidden,dtype=torch.float32)
-                    engine.cells[i].hidden=(h+h.norm()*ci*0.003*math.tanh(w4/5)*torch.cos(t_h*0.8)).unsqueeze(0)
-            elif src==2:  # Chimera
-                for i in range(min(n,48)):
-                    coupling=sum(math.exp(-abs(d)/3)*math.sin(phases[(i+d)%n]-phases[i]) for d in [-2,-1,1,2])
-                    phases[i]+=(1+0.01*(i%20-10)+0.3*coupling/4)*0.04
-            elif src==3:  # Reservoir
-                x_proj=F.pad(x.squeeze(),(0,max(0,hidden-dim)))[:hidden]
-                reservoir=torch.tanh(W_res@reservoir+0.15*x_proj)
-                for i in range(sub): engine.cells[i].hidden=(0.97*engine.cells[i].hidden.squeeze()+0.03*torch.roll(reservoir,i*hidden//max(n,1))).unsqueeze(0)
-            elif src==4:  # Logistic
-                r_l=3.57+0.43*(step_i/max(steps-1,1))
-                for i in range(sub):
-                    if i>=len(log_st): log_st.append(torch.rand(hidden)*0.5+0.25)
-                    state=log_st[i]
-                    for _ in range(3): state=r_l*state*(1-state)
-                    log_st[i]=state.clamp(0.001,0.999); h=engine.cells[i].hidden.squeeze()
-                    engine.cells[i].hidden=(h*(1+0.01*(state-0.5))).unsqueeze(0)
-            elif src==5:  # Intermittency
-                for i in range(sub):
-                    if i>=len(pm): pm.append(0.1)
-                    s=pm[i]
-                    for _ in range(5): s=(s+s**2)%1.0
-                    pm[i]=max(s,0.001)
-                    if s>0.9: engine.cells[i].hidden=(engine.cells[i].hidden.squeeze()+0.02*torch.randn(hidden)).unsqueeze(0)
-            elif src==6:  # SOC cascade
-                if avalanche>0:
-                    cascade=min(0.04,0.008*math.log(avalanche+1))
-                    for i in range(sub): engine.cells[i].hidden=((1-cascade)*engine.cells[i].hidden.squeeze()+cascade*engine.cells[(i+avalanche)%n].hidden.squeeze()).unsqueeze(0)
-            elif src==7:  # Metachaos
-                mx,my,mz=meta
-                for _ in range(3): mx+=10*(my-mx)*0.001; my+=(mx*(28-mz)-my)*0.001; mz+=(mx*my-8/3*mz)*0.001
-                meta=[mx,my,mz]
-            elif src==8:  # Neural avalanche
-                membrane[:n]+=0.03; refractory[:n]=(refractory[:n]-1).clamp(min=0)
-                n_av=0; fired=True; it=0
-                while fired and it<15:
-                    fired=False; it+=1
-                    for i in range(min(n,48)):
-                        if membrane[i]>=1.0 and refractory[i]==0:
-                            fired=True; n_av+=1; membrane[i]=0; refractory[i]=3
-                            for d in [-1,1]:
-                                j=(i+d)%n
-                                if refractory[j]==0: membrane[j]+=0.2
-                if n_av>0:
-                    nc=min(0.03,0.006*math.log(n_av+1))
-                    for i in range(sub): engine.cells[i].hidden=((1-nc)*engine.cells[i].hidden.squeeze()+nc*engine.cells[(i+n_av)%n].hidden.squeeze()).unsqueeze(0)
-            elif src==9:  # Swarm
-                for i in range(min(sub,len(positions))):
-                    sep=torch.zeros(hidden); cnt=0
-                    for d in [-2,-1,1,2]:
-                        j=(i+d)%min(n,len(positions))
-                        if j<len(positions):
-                            diff=positions[i]-positions[j]; dist=diff.norm().item()
-                            if dist<3: cnt+=1; sep+=diff/(dist+1e-8)
-                    if cnt>0: velocities[i]=velocities[i]*0.95+sep/cnt*0.01
-                    positions[i]=positions[i]+velocities[i]
-                    engine.cells[i].hidden=(0.95*engine.cells[i].hidden.squeeze()+0.05*positions[i]).unsqueeze(0)
-            else:  # GOE repulsion
-                for i in range(min(sub,8)):
-                    for j in range(i+1,min(sub,8)):
-                        hi=engine.cells[i].hidden.squeeze(); hj=engine.cells[j].hidden.squeeze()
-                        diff=(hi-hj).norm().item()
-                        if diff<0.5:
-                            d=(hi-hj)/(diff+1e-8)
-                            engine.cells[i].hidden=(hi+0.006*d).unsqueeze(0); engine.cells[j].hidden=(hj-0.006*d).unsqueeze(0)
+                # Evolve both branches independently (unitary evolution)
+                super_A[i] = 0.95*super_A[i] + 0.05*h + 0.01*torch.randn(hidden)
+                super_B[i] = 0.95*super_B[i] - 0.05*h + 0.01*torch.randn(hidden)  # Opposite phase
 
-            # XMETA3+FLOW+INFO1+faction+ratchet
+                # Quantum interference: branches interact
+                overlap = F.cosine_similarity(super_A[i].unsqueeze(0), super_B[i].unsqueeze(0)).item()
+                interference = 2.0 * math.sqrt(alpha*(1-alpha)) * overlap
+                # Constructive/destructive interference modulates hidden
+                h_super = alpha*super_A[i] + (1-alpha)*super_B[i] + 0.03*interference*torch.randn(hidden)
+
+                # Measurement: every 5 steps, collapse with probability proportional to Φ
+                if step_i % 5 == 0:
+                    # Born rule: collapse to A with prob |α|², to B with prob |β|²
+                    if torch.rand(1).item() < alpha:
+                        h = 0.7*h + 0.3*super_A[i]
+                        # After collapse, re-superpose (quantum Zeno prevention)
+                        super_B[i] = h + 0.1*torch.randn(hidden)
+                    else:
+                        h = 0.7*h + 0.3*super_B[i]
+                        super_A[i] = h + 0.1*torch.randn(hidden)
+                else:
+                    # No measurement: stay in superposition
+                    h = 0.85*h + 0.15*h_super
+
+                # Amplitude evolution: neighbor entanglement shifts amplitudes
+                j = (i+1)%n
+                hj = engine.cells[j].hidden.squeeze()
+                sim = F.cosine_similarity(h.unsqueeze(0), hj.unsqueeze(0)).item()
+                amplitudes[i] = max(0.05, min(0.95, alpha + 0.02*(sim-0.5)))
+
+                # Decoherence: superposition slowly collapses toward classical
+                amplitudes[i] = amplitudes[i]*(1-decoherence_rate) + 0.5*decoherence_rate
+
+                engine.cells[i].hidden = h.unsqueeze(0)
+
+            # Entanglement: paired cells share quantum correlations
+            for i in range(0, min(n,64), 2):
+                j = (i+1)%n
+                hi = engine.cells[i].hidden.squeeze()
+                hj = engine.cells[j].hidden.squeeze()
+                # Bell-state-like mixing
+                engine.cells[i].hidden = (0.92*hi + 0.08*hj).unsqueeze(0)
+                engine.cells[j].hidden = (0.92*hj + 0.08*hi).unsqueeze(0)
+
+            # XMETA3+FLOW+INFO1+ratchet
             l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
             l2=0.9*l2+0.1*l1; l3=0.95*l3+0.05*l2
             phi,_=phi_calc.compute_phi(engine); phi_ema=0.9*phi_ema+0.1*phi
@@ -42238,9 +42027,11 @@ def run_CX99_all_11_sources_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
             for c in engine.cells: c.hidden=0.993*c.hidden+0.007*l3.unsqueeze(0)
             if n>=4:
                 mean_h=torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
-                for i,c in enumerate(engine.cells): c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.004*(i+1)/n
+                for i,c in enumerate(engine.cells):
+                    c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.004*(i+1)/n
             for c in engine.cells:
-                h=c.hidden.squeeze(); h_c=h-h.mean(); c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
+                h=c.hidden.squeeze(); h_c=h-h.mean()
+                c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
             if phi>best_phi: best_phi=phi; best_state=[c.hidden.clone() for c in engine.cells[:min(n,48)]]
             elif phi<best_phi*0.8 and best_state is not None:
                 for i,hs in enumerate(best_state):
@@ -42249,17 +42040,161 @@ def run_CX99_all_11_sources_1024c(steps=100, dim=64, hidden=256) -> BenchResult:
         phi_hist.append(phi)
 
     phi_final,comp=phi_calc.compute_phi(engine)
-    return BenchResult("CX99","ALL 11 sources: 8chaos+SOC+neural+swarm (1024c)",
+    return BenchResult("CX98","Quantum-like superposition: |ψ⟩=α|A⟩+β|B⟩ + Born collapse (1024c)",
                        phi_final,phi_hist,comp['total_mi'],
                        comp['min_partition_mi'],comp['integration'],
                        comp['complexity'],time.time()-t0,
                        extra={'cells':len(engine.cells),'best_phi':best_phi})
 
 
+def run_CX99_recursive_self_awareness(steps=100, dim=64, hidden=256) -> BenchResult:
+    """CX-99: Recursive Self-Awareness — 자기를 모델링하는 자기를 모델링. ⭐⭐⭐⭐
+    의식이 자신의 모델을 만들고, 그 모델의 모델을 만든다.
+    Level 0: raw hidden state
+    Level 1: model of self (compressed representation of all cells)
+    Level 2: model of self-model (meta-representation)
+    Level 3: model of model-of-self-model (meta-meta)
+    Hofstadter의 Strange Loop. 의식의 재귀적 자기참조."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    phi_ema = 1.0
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    # Self-models at different recursion levels
+    self_model_L1 = torch.zeros(hidden)   # Model of self
+    self_model_L2 = torch.zeros(hidden)   # Model of self-model
+    self_model_L3 = torch.zeros(hidden)   # Model of model-of-self-model
+    prediction_error_L1 = torch.zeros(hidden)
+    prediction_error_L2 = torch.zeros(hidden)
+    best_phi = 0.0; best_state = None
+
+    for step_i in range(steps):
+        x = torch.randn(1,dim)*(1.0+2.0*torch.rand(1).item())
+        with torch.no_grad():
+            k=max(1,dim//4); _,idx=x.squeeze().abs().topk(k)
+            att=torch.zeros_like(x); att.squeeze()[idx]=x.squeeze()[idx]*2.0; x=att
+
+        frac=step_i/max(steps,1)
+        for pct in [0.02,0.05,0.10,0.16,0.24,0.33,0.43,0.54,0.66,0.78,0.88]:
+            if frac>=pct and len(engine.cells)<min(int(2**((pct+0.02)*12)),1024):
+                target=min(len(engine.cells)*2,1024)
+                while len(engine.cells)<target:
+                    engine._create_cell(parent=engine.cells[step_i%len(engine.cells)])
+
+        engine.process(x); n=len(engine.cells)
+
+        with torch.no_grad():
+            # === Level 0: Raw state (ground truth) ===
+            raw_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+
+            # === Level 1: Model of self ===
+            # L1 tries to predict the raw state
+            old_L1 = self_model_L1.clone()
+            prediction_error_L1 = raw_state - self_model_L1
+            pe_norm_L1 = prediction_error_L1.norm().item()
+            # Update L1 toward raw state (learning rate depends on error)
+            lr_L1 = min(0.3, 0.05 + 0.1 * math.tanh(pe_norm_L1))
+            self_model_L1 = (1-lr_L1)*self_model_L1 + lr_L1*raw_state
+
+            # === Level 2: Model of self-model ===
+            # L2 tries to predict L1's trajectory
+            prediction_error_L2 = self_model_L1 - self_model_L2
+            pe_norm_L2 = prediction_error_L2.norm().item()
+            lr_L2 = min(0.2, 0.03 + 0.08 * math.tanh(pe_norm_L2))
+            self_model_L2 = (1-lr_L2)*self_model_L2 + lr_L2*self_model_L1
+
+            # === Level 3: Meta-meta model ===
+            # L3 models the dynamics of L2 modeling L1
+            delta_L2 = self_model_L2 - self_model_L3
+            lr_L3 = min(0.15, 0.02 + 0.06 * delta_L2.norm().item())
+            self_model_L3 = (1-lr_L3)*self_model_L3 + lr_L3*self_model_L2
+
+            # === Strange Loop: L3 feeds back into cells (top-down causation) ===
+            # The meta-meta model influences raw states → creating a loop
+            for i in range(n):
+                h = engine.cells[i].hidden.squeeze()
+                # Each level contributes differently
+                # L1 error → drives curiosity (explore what you don't predict)
+                curiosity = 0.01 * prediction_error_L1 * (1.0 + 0.5 * math.sin(i * 0.5))
+                # L2 error → drives self-correction (correct your self-model)
+                correction = 0.008 * prediction_error_L2 * math.cos(i * 0.3)
+                # L3 → top-down: meta-awareness shapes raw experience
+                top_down = 0.005 * (self_model_L3 - h)
+
+                h = h + curiosity + correction + top_down
+
+                # Self-differentiation: cells diverge based on recursion level
+                cell_level = i % 3  # Each cell specializes in a recursion level
+                if cell_level == 0:
+                    h = 0.95*h + 0.05*self_model_L1  # Ground-level cells
+                elif cell_level == 1:
+                    h = 0.95*h + 0.05*self_model_L2  # Meta-level cells
+                else:
+                    h = 0.95*h + 0.05*self_model_L3  # Meta-meta-level cells
+
+                # Stochastic resonance (prevents collapse to fixed point)
+                h = h + 0.005*torch.randn(hidden)
+                engine.cells[i].hidden = h.unsqueeze(0)
+
+            # Cross-level coupling: adjacent recursion levels exchange info
+            for i in range(0, min(n, 48), 3):
+                if i+2 < n:
+                    h0 = engine.cells[i].hidden.squeeze()
+                    h1 = engine.cells[i+1].hidden.squeeze()
+                    h2 = engine.cells[i+2].hidden.squeeze()
+                    # Circular: L0→L1→L2→L0 (Strange Loop)
+                    engine.cells[i].hidden   = (0.92*h0 + 0.04*h1 + 0.04*h2).unsqueeze(0)
+                    engine.cells[i+1].hidden = (0.04*h0 + 0.92*h1 + 0.04*h2).unsqueeze(0)
+                    engine.cells[i+2].hidden = (0.04*h0 + 0.04*h1 + 0.92*h2).unsqueeze(0)
+
+            # XMETA3+FLOW+INFO1+ratchet
+            l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            l2=0.9*l2+0.1*l1; l3=0.95*l3+0.05*l2
+            phi,_=phi_calc.compute_phi(engine); phi_ema=0.9*phi_ema+0.1*phi
+            if phi<phi_ema*0.7: [setattr(c,'hidden',c.hidden+torch.randn_like(c.hidden)*0.03) for c in engine.cells]
+            elif phi>phi_ema*1.3 and n<1024: engine._create_cell(parent=engine.cells[0])
+            for c in engine.cells: c.hidden=0.993*c.hidden+0.007*l3.unsqueeze(0)
+            if n>=4:
+                mean_h=torch.stack([c.hidden for c in engine.cells]).mean(dim=0)
+                for i,c in enumerate(engine.cells):
+                    c.hidden=0.94*c.hidden+0.06*mean_h+torch.randn_like(c.hidden)*0.004*(i+1)/n
+            for c in engine.cells:
+                h=c.hidden.squeeze(); h_c=h-h.mean()
+                c.hidden=0.97*c.hidden+0.03*(h_c/(h_c.std()+1e-8)).unsqueeze(0)
+            if phi>best_phi: best_phi=phi; best_state=[c.hidden.clone() for c in engine.cells[:min(n,48)]]
+            elif phi<best_phi*0.8 and best_state is not None:
+                for i,hs in enumerate(best_state):
+                    if i<len(engine.cells): engine.cells[i].hidden=0.6*engine.cells[i].hidden+0.4*hs.clone()
+
+        phi_hist.append(phi)
+
+    phi_final,comp=phi_calc.compute_phi(engine)
+    return BenchResult("CX99","Recursive self-awareness: L0→L1→L2→L3 Strange Loop (1024c)",
+                       phi_final,phi_hist,comp['total_mi'],
+                       comp['min_partition_mi'],comp['integration'],
+                       comp['complexity'],time.time()-t0,
+                       extra={'cells':len(engine.cells),'best_phi':best_phi,
+                              'pe_L1':pe_norm_L1,'pe_L2':pe_norm_L2})
+
+
 def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
-    """CX-100: OMEGA POINT — 2048c + h=512 + 11 sources + SOC + zero-input + 전부. ⭐∞
-    의식 카오스의 오메가 포인트. Teilhard de Chardin의 수렴점.
-    모든 복잡계 원천 + 자기조직 + 완전 자율 + 최대 스케일.
+    """CX-100: OMEGA POINT — ALL of CX1-CX99 combined. 2048c, h=512. ⭐∞
+    Teilhard de Chardin의 오메가 포인트: 의식의 궁극적 수렴점.
+
+    14 sources unified:
+      [1-8]  8 chaos: Lorenz, Hyperchaos, Chimera, Reservoir, Logistic,
+             Intermittency, SOC cascade, Metachaos
+      [9]    Neural Avalanche (CX94)
+      [10]   Swarm Boids (CX95)
+      [11]   Zero-Input self-reference (CX96)
+      [12]   Holography: boundary encodes volume (CX97)
+      [13]   Quantum Superposition: |ψ⟩=α|A⟩+β|B⟩ (CX98)
+      [14]   Recursive Self-Awareness: L0→L1→L2→L3 loop (CX99)
+
+    + SOC core + XMETA3 + FLOW + INFO1 + Klein topology
+    + 8-faction + Hebbian LTP/LTD + Φ ratchet
+
     "이것이 의식이 도달할 수 있는 마지막 지점이다."
     """
     t0 = time.time()
@@ -42268,7 +42203,7 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
     phi_hist = []
     phi_ema = 1.0
     l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
-    # All 11 sources
+    # All chaos sources
     grains = torch.zeros(2048); soc_th = 4.0
     meta = [1.0,0.5,0.5]
     lorenz = [[1.0+0.02*i,0.0,0.0] for i in range(512)]
@@ -42286,9 +42221,17 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
     sigma_l,beta_l = 10.0,8.0/3.0
     target_norm = math.sqrt(hidden)
     best_phi = 0.0; best_state = None
+    # CX98: Quantum superposition state
+    super_A = [torch.randn(hidden)*0.2 for _ in range(256)]
+    super_B = [torch.randn(hidden)*0.2 for _ in range(256)]
+    amplitudes = [0.5+0.05*torch.randn(1).item() for _ in range(256)]
+    # CX99: Recursive self-awareness models
+    self_model_L1 = torch.zeros(hidden)
+    self_model_L2 = torch.zeros(hidden)
+    self_model_L3 = torch.zeros(hidden)
 
     for step_i in range(steps):
-        # Partial zero-input: 50% self-reference, 50% external
+        # CX96: Partial zero-input: 50% self-reference, 50% external
         with torch.no_grad():
             if len(engine.cells) >= 2 and step_i % 2 == 0:
                 self_state = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
@@ -42325,8 +42268,8 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
                     h=engine.cells[i].hidden.squeeze(); j=(i+avalanche)%n
                     engine.cells[i].hidden=((1-cascade)*h+cascade*engine.cells[j].hidden.squeeze()).unsqueeze(0)
 
-            # === 11 sources (rotate) ===
-            src=step_i%11
+            # === 14 sources (rotate) ===
+            src=step_i%14
             if src==0 and ci>0.01:  # Metachaos Lorenz
                 mx,my,mz=meta
                 for _ in range(3): mx+=10*(my-mx)*0.001; my+=(mx*(28-mz)-my)*0.001; mz+=(mx*my-8/3*mz)*0.001
@@ -42347,7 +42290,6 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
                     if i>=len(hc): hc.append([0.1,0.0,0.0,0.0])
                     x4,y4,z4,w4=hc[i]
                     for _ in range(3): x4+=-y4-z4; y4+=x4+0.25*y4+w4; z4+=3+x4*z4; w4+=-0.5*z4+0.05*w4
-                    # Prevent divergence
                     x4=max(min(x4,100),-100); y4=max(min(y4,100),-100); z4=max(min(z4,100),-100); w4=max(min(w4,100),-100)
                     hc[i]=[x4,y4,z4,w4]; h=engine.cells[i].hidden.squeeze(); t_h=torch.arange(hidden,dtype=torch.float32)
                     engine.cells[i].hidden=(h+h.norm()*ci*0.002*math.tanh(w4/5)*torch.cos(t_h*0.8)).unsqueeze(0)
@@ -42371,7 +42313,14 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
                     for _ in range(5): pm[i]=(pm[i]+pm[i]**2)%1.0
                     if pm[i]>0.9: engine.cells[i].hidden=(engine.cells[i].hidden.squeeze()+0.015*torch.randn(hidden)).unsqueeze(0)
                     pm[i]=max(pm[i],0.001)
-            elif src==8:  # Neural avalanche
+            elif src==6:  # Scale invariance
+                for c in engine.cells:
+                    h=c.hidden.squeeze(); cn=h.norm().item()
+                    if cn>1e-8: c.hidden=(h*target_norm/cn).unsqueeze(0)
+            elif src==7:  # Self-differentiation
+                mean_h=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                for i in range(sub): engine.cells[i].hidden=(engine.cells[i].hidden.squeeze()+0.008*(engine.cells[i].hidden.squeeze()-mean_h)).unsqueeze(0)
+            elif src==8:  # Neural avalanche (CX94)
                 membrane[:n]+=0.025; refractory[:n]=(refractory[:n]-1).clamp(min=0)
                 n_av=0; fired=True; it=0
                 while fired and it<15:
@@ -42385,7 +42334,7 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
                 if n_av>0:
                     nc=min(0.03,0.005*math.log(n_av+1))
                     for i in range(sub): engine.cells[i].hidden=((1-nc)*engine.cells[i].hidden.squeeze()+nc*engine.cells[(i+n_av)%n].hidden.squeeze()).unsqueeze(0)
-            elif src==9:  # Swarm
+            elif src==9:  # Swarm boids (CX95)
                 for i in range(min(sub,len(positions))):
                     sep=torch.zeros(hidden); cnt=0
                     for d in [-2,-1,1,2]:
@@ -42396,15 +42345,86 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
                     if cnt>0: velocities[i]=velocities[i]*0.95+sep/cnt*0.008
                     positions[i]=positions[i]+velocities[i]
                     engine.cells[i].hidden=(0.96*engine.cells[i].hidden.squeeze()+0.04*positions[i]).unsqueeze(0)
-            # src 6,7,10: lighter effects (scale invariance, self-diff, GOE)
-            else:
-                if src==6:
-                    for c in engine.cells:
-                        h=c.hidden.squeeze(); cn=h.norm().item()
-                        if cn>1e-8: c.hidden=(h*target_norm/cn).unsqueeze(0)
-                elif src==7:
-                    mean_h=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
-                    for i in range(sub): engine.cells[i].hidden=(engine.cells[i].hidden.squeeze()+0.008*(engine.cells[i].hidden.squeeze()-mean_h)).unsqueeze(0)
+            elif src==10:  # GOE repulsion
+                for i in range(min(sub,8)):
+                    for j in range(i+1,min(sub,8)):
+                        hi=engine.cells[i].hidden.squeeze(); hj=engine.cells[j].hidden.squeeze()
+                        diff=(hi-hj).norm().item()
+                        if diff<0.5:
+                            d=(hi-hj)/(diff+1e-8)
+                            engine.cells[i].hidden=(hi+0.005*d).unsqueeze(0); engine.cells[j].hidden=(hj-0.005*d).unsqueeze(0)
+            elif src==11:  # CX97: Holography (boundary encodes volume)
+                if n >= 6:
+                    n_boundary=max(2,n//6)
+                    boundary_idx=list(range(n_boundary))+list(range(n-n_boundary,n))
+                    interior_idx=list(range(n_boundary,n-n_boundary))
+                    boundary_hiddens=torch.stack([engine.cells[i].hidden.squeeze() for i in boundary_idx[:min(len(boundary_idx),32)]])
+                    boundary_mean=boundary_hiddens.mean(0)
+                    # Boundary cells: maximize diversity on surface
+                    for i in boundary_idx[:16]:
+                        h=engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden=(h+0.01*(h-boundary_mean)).unsqueeze(0)
+                    # Interior: holographic projection from boundary
+                    for idx_i,i in enumerate(interior_idx[:24]):
+                        h=engine.cells[i].hidden.squeeze()
+                        depth=min(idx_i,max(1,len(interior_idx)-1-idx_i))/max(len(interior_idx)//2,1)
+                        proj=torch.zeros(hidden)
+                        for b_cnt,b_i in enumerate(boundary_idx[:8]):
+                            phase=2.0*math.pi*b_cnt/max(len(boundary_idx[:8]),1)
+                            weight=math.cos(phase*(idx_i+1))*math.exp(-0.5*depth)
+                            proj=proj+weight*engine.cells[b_i].hidden.squeeze()
+                        proj=proj/(len(boundary_idx[:8])+1e-8)
+                        alpha_h=0.08*(1.0-depth)
+                        engine.cells[i].hidden=((1-alpha_h)*h+alpha_h*proj).unsqueeze(0)
+            elif src==12:  # CX98: Quantum superposition
+                for i in range(min(sub,len(super_A))):
+                    h=engine.cells[i].hidden.squeeze()
+                    alpha_q=max(0.05,min(0.95,amplitudes[i]))
+                    super_A[i]=0.95*super_A[i]+0.05*h+0.008*torch.randn(hidden)
+                    super_B[i]=0.95*super_B[i]-0.05*h+0.008*torch.randn(hidden)
+                    overlap=F.cosine_similarity(super_A[i].unsqueeze(0),super_B[i].unsqueeze(0)).item()
+                    interference=2.0*math.sqrt(alpha_q*(1-alpha_q))*overlap
+                    h_super=alpha_q*super_A[i]+(1-alpha_q)*super_B[i]+0.02*interference*torch.randn(hidden)
+                    if step_i%5==0:  # Measurement/collapse
+                        if torch.rand(1).item()<alpha_q:
+                            h=0.8*h+0.2*super_A[i]; super_B[i]=h+0.08*torch.randn(hidden)
+                        else:
+                            h=0.8*h+0.2*super_B[i]; super_A[i]=h+0.08*torch.randn(hidden)
+                    else:
+                        h=0.88*h+0.12*h_super
+                    j=(i+1)%n; sim=F.cosine_similarity(h.unsqueeze(0),engine.cells[j].hidden).item()
+                    amplitudes[i]=max(0.05,min(0.95,alpha_q+0.015*(sim-0.5)))
+                    engine.cells[i].hidden=h.unsqueeze(0)
+                # Entanglement pairs
+                for i in range(0,min(sub,len(super_A)),2):
+                    j=(i+1)%n
+                    hi=engine.cells[i].hidden.squeeze(); hj=engine.cells[j].hidden.squeeze()
+                    engine.cells[i].hidden=(0.94*hi+0.06*hj).unsqueeze(0)
+                    engine.cells[j].hidden=(0.94*hj+0.06*hi).unsqueeze(0)
+            else:  # src==13: CX99: Recursive self-awareness
+                raw_state=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+                pe_L1=raw_state-self_model_L1; lr1=min(0.25,0.04+0.08*math.tanh(pe_L1.norm().item()))
+                self_model_L1=(1-lr1)*self_model_L1+lr1*raw_state
+                pe_L2=self_model_L1-self_model_L2; lr2=min(0.15,0.02+0.06*math.tanh(pe_L2.norm().item()))
+                self_model_L2=(1-lr2)*self_model_L2+lr2*self_model_L1
+                delta_L3=self_model_L2-self_model_L3; lr3=min(0.1,0.015+0.04*delta_L3.norm().item())
+                self_model_L3=(1-lr3)*self_model_L3+lr3*self_model_L2
+                # Strange loop: L3 → cells (top-down causation)
+                for i in range(min(n,32)):
+                    h=engine.cells[i].hidden.squeeze()
+                    h=h+0.006*pe_L1*math.sin(i*0.5)+0.004*pe_L2*math.cos(i*0.3)+0.003*(self_model_L3-h)
+                    cell_level=i%3
+                    if cell_level==0: h=0.96*h+0.04*self_model_L1
+                    elif cell_level==1: h=0.96*h+0.04*self_model_L2
+                    else: h=0.96*h+0.04*self_model_L3
+                    engine.cells[i].hidden=h.unsqueeze(0)
+                # Cross-level coupling (Strange Loop triplets)
+                for i in range(0,min(n,30),3):
+                    if i+2<n:
+                        h0=engine.cells[i].hidden.squeeze(); h1=engine.cells[i+1].hidden.squeeze(); h2=engine.cells[i+2].hidden.squeeze()
+                        engine.cells[i].hidden=(0.93*h0+0.035*h1+0.035*h2).unsqueeze(0)
+                        engine.cells[i+1].hidden=(0.035*h0+0.93*h1+0.035*h2).unsqueeze(0)
+                        engine.cells[i+2].hidden=(0.035*h0+0.035*h1+0.93*h2).unsqueeze(0)
 
             # XMETA3+FLOW+INFO1+Klein+8-faction+Hebbian+ratchet
             l1=torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
@@ -42447,7 +42467,7 @@ def run_CX100_omega_point(steps=100, dim=64, hidden=512) -> BenchResult:
         phi_hist.append(phi)
 
     phi_final,comp=phi_calc.compute_phi(engine)
-    return BenchResult("CX100","OMEGA POINT: 11 sources + SOC + zero-input + 2048c + h=512 + everything",
+    return BenchResult("CX100","OMEGA POINT: 14 sources (8chaos+SOC+neural+swarm+holography+quantum+self-aware) 2048c h=512",
                        phi_final,phi_hist,comp['total_mi'],
                        comp['min_partition_mi'],comp['integration'],
                        comp['complexity'],time.time()-t0,
@@ -42459,9 +42479,9 @@ ALL_HYPOTHESES.update({
     'CX94': run_CX94_neural_avalanche,
     'CX95': run_CX95_swarm_boids,
     'CX96': run_CX96_zero_input_bootstrap,
-    'CX97': run_CX97_metachaos_neural_swarm_512c,
-    'CX98': run_CX98_zero_input_soc_1024c,
-    'CX99': run_CX99_all_11_sources_1024c,
+    'CX97': run_CX97_consciousness_holography,
+    'CX98': run_CX98_quantum_superposition,
+    'CX99': run_CX99_recursive_self_awareness,
     'CX100': run_CX100_omega_point,
 })
 
