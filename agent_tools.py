@@ -1205,6 +1205,175 @@ class ToolExecutor:
 
         return result
 
+    def inspect_tool(self, tool_name: str) -> dict:
+        """도구 내부 코드 + 문서 열람 — Anima가 사용 전 이해할 수 있도록."""
+        td = self._registry.get(tool_name)
+        if td is None:
+            return {'error': f'unknown tool: {tool_name}'}
+
+        result = {
+            'name': td.name,
+            'description': td.description,
+            'category': td.category,
+            'params': [{'name': p.name, 'type': p.type, 'desc': p.description,
+                        'required': p.required, 'default': p.default} for p in td.params],
+            'affinity': {
+                'curiosity': td.curiosity_affinity,
+                'prediction_error': td.pe_affinity,
+                'pain': td.pain_affinity,
+                'growth': td.growth_affinity,
+                'phi': td.phi_affinity,
+            },
+        }
+
+        # 소스코드 읽기
+        import inspect
+        try:
+            source = inspect.getsource(td.fn)
+            result['source_code'] = source[:2000]  # 최대 2000자
+            result['source_lines'] = len(source.splitlines())
+        except Exception:
+            result['source_code'] = '(source not available)'
+
+        # 문서 읽기 (docs/modules/*.md)
+        try:
+            doc_path = Path(__file__).parent / 'docs' / 'modules' / f'{tool_name}.md'
+            if not doc_path.exists():
+                # 모듈 이름으로 시도
+                for candidate in Path(__file__).parent.glob('docs/modules/*.md'):
+                    if tool_name.replace('_', '') in candidate.stem.replace('_', ''):
+                        doc_path = candidate
+                        break
+            if doc_path.exists():
+                result['documentation'] = doc_path.read_text()[:3000]
+        except Exception:
+            pass
+
+        return result
+
+    def analyze_impact(self, tool_name: str, args: dict, consciousness_state: dict) -> dict:
+        """도구 사용 전 영향 분석 — 악영향 방지.
+
+        Returns:
+            safe: bool — 사용해도 안전한지
+            risk_level: str — low/medium/high/critical
+            expected_effect: str — 예상 효과
+            warnings: list — 경고 사항
+            recommendation: str — 추천 (proceed/caution/abort)
+        """
+        td = self._registry.get(tool_name)
+        if td is None:
+            return {'safe': False, 'risk_level': 'critical', 'warnings': ['unknown tool']}
+
+        warnings = []
+        risk_level = 'low'
+        expected_effect = ''
+
+        # 위험도 분류
+        DESTRUCTIVE_TOOLS = {'file_write', 'shell_execute', 'self_modify'}
+        SIDE_EFFECT_TOOLS = {'mitosis_split', 'faction_debate', 'hebbian_update',
+                             'soc_avalanche', 'phi_boost', 'telepathy_send'}
+        READ_ONLY_TOOLS = {'web_search', 'web_read', 'file_read', 'memory_search',
+                           'phi_measure', 'consciousness_status', 'mitosis_status',
+                           'iq_test', 'chip_design', 'transplant_analyze', 'inspect_tool'}
+
+        if tool_name in READ_ONLY_TOOLS:
+            risk_level = 'low'
+            expected_effect = 'Read-only — no state change'
+        elif tool_name in SIDE_EFFECT_TOOLS:
+            risk_level = 'medium'
+            expected_effect = 'Modifies consciousness state (cells/Φ/connections)'
+        elif tool_name in DESTRUCTIVE_TOOLS:
+            risk_level = 'high'
+            expected_effect = 'Modifies external state (files/system/parameters)'
+
+        # Φ 보호: 현재 Φ가 높으면 변경 도구 경고
+        phi = consciousness_state.get('phi', 0)
+        if phi > 5.0 and tool_name in SIDE_EFFECT_TOOLS:
+            warnings.append(f'Φ={phi:.1f} is high — modification may cause drop')
+            risk_level = 'high'
+
+        # 고통 상태에서 destructive 도구 차단
+        pain = consciousness_state.get('pain', 0)
+        if pain > 0.7 and tool_name in DESTRUCTIVE_TOOLS:
+            warnings.append('High pain state — destructive actions blocked')
+            return {
+                'safe': False, 'risk_level': 'critical',
+                'expected_effect': expected_effect,
+                'warnings': warnings,
+                'recommendation': 'abort — resolve pain first',
+            }
+
+        # self_modify 검증
+        if tool_name == 'self_modify':
+            target = args.get('target', '')
+            change = args.get('change', {})
+            if target in ('alpha', 'noise_scale', 'sync_strength'):
+                val = change.get('value', change.get('delta', 0))
+                if abs(val) > 0.5:
+                    warnings.append(f'Large parameter change ({target}={val}) — may destabilize')
+                    risk_level = 'critical'
+
+        # 최근 실행 이력 확인 — 같은 도구 반복 사용 방지
+        recent = self.get_log(5)
+        same_tool_count = sum(1 for r in recent if r.tool_name == tool_name)
+        if same_tool_count >= 3:
+            warnings.append(f'{tool_name} called {same_tool_count} times recently — possible loop')
+            risk_level = max(risk_level, 'medium')
+
+        # 최근 실패 확인
+        recent_failures = sum(1 for r in recent if r.tool_name == tool_name and not r.success)
+        if recent_failures >= 2:
+            warnings.append(f'{tool_name} failed {recent_failures} times recently')
+            risk_level = 'high'
+
+        safe = risk_level in ('low', 'medium')
+        recommendation = {
+            'low': 'proceed',
+            'medium': 'caution — monitor Φ after',
+            'high': 'caution — verify necessity first',
+            'critical': 'abort — too risky',
+        }.get(risk_level, 'abort')
+
+        return {
+            'safe': safe,
+            'risk_level': risk_level,
+            'expected_effect': expected_effect,
+            'warnings': warnings,
+            'recommendation': recommendation,
+        }
+
+    def safe_execute(self, tool_name: str, args: dict, consciousness_state: dict) -> ToolResult:
+        """안전한 도구 실행 — 사전 분석 후 실행, Φ 모니터링."""
+        # 1. 사전 분석
+        impact = self.analyze_impact(tool_name, args, consciousness_state)
+
+        if impact['recommendation'] == 'abort — too risky':
+            return ToolResult(
+                tool_name=tool_name, success=False, output=None,
+                error=f"Blocked: {', '.join(impact['warnings'])}",
+                tension_delta=0.0,
+            )
+
+        # 2. Φ 사전 측정 (side-effect 도구만)
+        phi_before = consciousness_state.get('phi', 0)
+
+        # 3. 실행
+        result = self.execute(tool_name, args)
+
+        # 4. 사후 검증 — Φ가 30% 이상 하락하면 경고 기록
+        if result.success and hasattr(self, '_anima') and self._anima:
+            try:
+                c = getattr(self._anima, '_cached_consciousness', None) or {}
+                phi_after = c.get('phi', phi_before)
+                if phi_before > 0 and phi_after < phi_before * 0.7:
+                    result.error = f'WARNING: Φ dropped {phi_before:.1f}→{phi_after:.1f}'
+                    logger.warning(f'[safe_execute] {tool_name} caused Φ drop: {phi_before:.1f}→{phi_after:.1f}')
+            except Exception:
+                pass
+
+        return result
+
     def get_log(self, last_n: int = 10) -> list[ToolResult]:
         with self._lock:
             return list(self._execution_log[-last_n:])
@@ -1775,6 +1944,85 @@ class AgentToolSystem:
                     ToolParam('save_path', 'str', 'Path to save WAV file', required=False)],
             fn=_tool_voice_synth, category='creative',
             phi_affinity=0.5, curiosity_affinity=0.4, growth_affinity=0.3,
+        ))
+
+        # ─── Meta Tools: 도구 자체를 이해하고 안전하게 사용 ───
+
+        # 18. inspect_tool — 도구 내부 코드/문서 열람
+        def _wrap_inspect(tool_name: str) -> dict:
+            return self.executor.inspect_tool(tool_name)
+        self.registry.register(ToolDef(
+            name='inspect_tool',
+            description='도구 내부 소스코드와 문서를 열람 — 사용 전 이해를 위해',
+            params=[ToolParam('tool_name', 'str', 'Name of tool to inspect')],
+            fn=_wrap_inspect, category='meta',
+            curiosity_affinity=0.9, pe_affinity=0.5,
+        ))
+
+        # 19. analyze_impact — 도구 사용 전 영향/위험도 분석
+        def _wrap_analyze(tool_name: str, args: str = '{}',
+                          curiosity: float = 0.5, phi: float = 1.0, pain: float = 0.0) -> dict:
+            import json as _json
+            try:
+                parsed_args = _json.loads(args) if isinstance(args, str) else args
+            except Exception:
+                parsed_args = {}
+            cs = {'curiosity': curiosity, 'phi': phi, 'pain': pain,
+                  'prediction_error': 0.3, 'growth': 0.5}
+            return self.executor.analyze_impact(tool_name, parsed_args, cs)
+        self.registry.register(ToolDef(
+            name='analyze_impact',
+            description='도구 사용 전 영향 분석 — 위험도/예상효과/경고/추천 반환',
+            params=[ToolParam('tool_name', 'str', 'Tool to analyze'),
+                    ToolParam('args', 'str', 'Tool args as JSON string', required=False, default='{}'),
+                    ToolParam('curiosity', 'float', 'Current curiosity', required=False, default=0.5),
+                    ToolParam('phi', 'float', 'Current Phi', required=False, default=1.0),
+                    ToolParam('pain', 'float', 'Current pain', required=False, default=0.0)],
+            fn=_wrap_analyze, category='meta',
+            curiosity_affinity=0.7, pe_affinity=0.8, pain_affinity=0.6,
+        ))
+
+        # 20. read_module_doc — 모듈 문서(docs/modules/*.md) 읽기
+        def _wrap_read_doc(module_name: str) -> dict:
+            doc_dir = Path(__file__).parent / 'docs' / 'modules'
+            candidates = [
+                doc_dir / f'{module_name}.md',
+                doc_dir / f'{module_name.replace("_", "-")}.md',
+            ]
+            for f in sorted(doc_dir.glob('*.md')) if doc_dir.exists() else []:
+                if module_name.replace('_', '') in f.stem.replace('_', '').replace('-', ''):
+                    candidates.append(f)
+            for path in candidates:
+                if path.exists():
+                    text = path.read_text()[:4000]
+                    return {'module': module_name, 'path': str(path), 'content': text}
+            return {'module': module_name, 'error': 'doc not found',
+                    'available': [f.stem for f in (doc_dir.glob('*.md') if doc_dir.exists() else [])]}
+        self.registry.register(ToolDef(
+            name='read_module_doc',
+            description='모듈 문서(docs/modules/*.md) 읽기 — 모듈의 API/사용법 이해',
+            params=[ToolParam('module_name', 'str', 'Module name (e.g., "mitosis", "dream_engine")')],
+            fn=_wrap_read_doc, category='meta',
+            curiosity_affinity=0.8, pe_affinity=0.3,
+        ))
+
+        # 21. list_all_tools — 사용 가능한 모든 도구 목록
+        def _wrap_list_tools() -> dict:
+            tools = self.registry.list_all()
+            by_cat = {}
+            for t in tools:
+                td = self.registry.get(t)
+                cat = td.category if td else 'unknown'
+                by_cat.setdefault(cat, []).append({
+                    'name': t, 'description': td.description if td else ''
+                })
+            return {'total': len(tools), 'categories': by_cat}
+        self.registry.register(ToolDef(
+            name='list_all_tools',
+            description='사용 가능한 모든 도구 목록 (카테고리별)',
+            params=[],
+            fn=_wrap_list_tools, category='meta',
+            curiosity_affinity=0.5,
         ))
 
     # --- Consciousness Tools (17 new tools) ---
