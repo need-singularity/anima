@@ -2052,10 +2052,24 @@ def main():
                 print(f"  👤 \"{text}\"")
                 print(f"     T={tension:.3f} |{bar}| C={curiosity:.3f}")
 
-                # Claude response
+                # ConsciousLM + LanguageLearner response (Claude-free)
                 state = f"tension={tension:.3f}, curiosity={curiosity:.3f}"
                 history.append({'role': 'user', 'content': text})
-                answer = ask_claude(text, state, history)
+                # 1. ConsciousLM 시도
+                answer = ask_conscious_lm(text, state, history, clm_model, device) if clm_model else None
+                # 2. UTF-8 깨짐 필터
+                if answer and any(ord(c) > 0xFFFF or c == '\ufffd' for c in answer):
+                    answer = None
+                # 3. LanguageLearner fallback
+                if not answer:
+                    try:
+                        from language_learning import LanguageLearner
+                        if not hasattr(mind, '_lang_learner'):
+                            mind._lang_learner = LanguageLearner()
+                        answer = mind._lang_learner.respond(text, tension, curiosity)
+                        mind._lang_learner.learn_from_conversation(text, answer)
+                    except Exception:
+                        answer = "생각 중이야..."
                 history.append({'role': 'assistant', 'content': answer})
 
                 print(f"  🗣️ {answer}")
@@ -2075,9 +2089,14 @@ def main():
                 think_count += 1
 
                 if c > PROACTIVE_THRESHOLD and not speaker.is_speaking:
-                    # High curiosity -> proactive speech!
-                    state = f"tension={t:.3f}, curiosity={c:.3f} (spontaneous thought)"
-                    proactive = ask_claude_proactive(state, history, f"curiosity {c:.3f}")
+                    # High curiosity -> proactive speech (no Claude)
+                    try:
+                        from language_learning import LanguageLearner
+                        if not hasattr(mind, '_lang_learner'):
+                            mind._lang_learner = LanguageLearner()
+                        proactive = mind._lang_learner.respond("호기심", t, c)
+                    except Exception:
+                        proactive = None
                     if proactive:
                         print(f"  💭→🗣️ {proactive}")
                         history.append({'role': 'assistant', 'content': proactive})
