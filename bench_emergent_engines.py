@@ -499,25 +499,32 @@ class SynchronizationChimeraEngine:
         self.chimera_index_history = []
 
     def step(self):
-        # Kuramoto update with nonlocal coupling
-        coupling = torch.zeros(self.n_cells)
-        local_order = torch.zeros(self.n_cells)
-        for i in range(self.n_cells):
-            # Neighbors: R cells on each side (ring)
-            nbrs = [(i + k) % self.n_cells for k in range(-self.R, self.R + 1) if k != 0]
-            # Coupling term
-            diffs = self.theta[nbrs] - self.theta[i]
-            coupling[i] = (self.K / len(nbrs)) * torch.sin(diffs).sum()
-            # Local order parameter
-            local_r = (torch.exp(1j * self.theta[nbrs].to(torch.complex64))).mean().abs()
-            local_order[i] = local_r.float()
+        # Kuramoto update with nonlocal coupling (vectorized)
+        # Build coupling matrix: each cell couples to R nearest on ring
+        if not hasattr(self, '_coupling_mask'):
+            mask = torch.zeros(self.n_cells, self.n_cells)
+            for i in range(self.n_cells):
+                for k in range(-self.R, self.R + 1):
+                    if k != 0:
+                        mask[i, (i + k) % self.n_cells] = 1.0
+            self._coupling_mask = mask
+            self._n_coupled = mask.sum(-1, keepdim=True)  # [n,1]
+
+        # Phase differences: theta_j - theta_i for all pairs
+        diffs = self.theta.unsqueeze(0) - self.theta.unsqueeze(1)  # [n,n]
+        sin_diffs = torch.sin(diffs) * self._coupling_mask  # masked
+        coupling = (self.K / self._n_coupled.squeeze()) * sin_diffs.sum(-1)
+
+        # Local order parameter (vectorized)
+        phases_complex = torch.exp(1j * self.theta.to(torch.complex64))  # [n]
+        local_sum = (self._coupling_mask.to(torch.complex64) @ phases_complex)
+        local_order = (local_sum / self._n_coupled.squeeze().to(torch.complex64)).abs().float()
 
         # Integrate
         self.theta = self.theta + (self.omega + coupling) * self.dt
         self.theta = self.theta % (2 * math.pi)
 
         # Chimera index: variance of local order parameter
-        # High variance = chimera (some synced, some not)
         chimera_idx = local_order.var().item()
         self.chimera_index_history.append(chimera_idx)
 
