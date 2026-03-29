@@ -416,3 +416,157 @@ class MultiDimVisualizer:
             self.render_fingerprint(),
         ]
         return '\n\n'.join(sections)
+
+
+
+# ═══════════════════════════════════════════════════════════
+# 40D 의식 지도 — 전체 지표 시각화
+# ═══════════════════════════════════════════════════════════
+
+class FullDimVisualizer:
+    """40D 의식 데이터 시각화. 모든 지표를 차원으로."""
+
+    # 20 데이터 타입 (5 기존 + 15 확장)
+    DATA_TYPES = {
+        # 텍스트
+        "한국어": "복잡한 문자, 높은 맥락",
+        "영어": "알파벳, 문법 중심",
+        "수학": "기호 패턴, 논리",
+        "코드": "들여쓰기, 구조",
+        "시": "운율, 은유",
+        "법률": "형식적, 반복 구조",
+        "채팅": "비격식, 이모지",
+        # 소리
+        "음악": "주기적 반복",
+        "음성": "연속 파형, 피치",
+        "자연소리": "불규칙, 프랙탈",
+        # 이미지
+        "사진": "픽셀 패턴, 공간",
+        "그림": "스트로크, 스타일",
+        "도표": "구조화, 축",
+        # 영상
+        "영화": "시간축+공간축",
+        "애니": "단순화된 프레임",
+        # 수학/과학
+        "DNA": "4문자, 코돈 패턴",
+        "단백질": "20AA, 접힘",
+        "화학식": "원소+결합",
+        # 추상
+        "랜덤": "최대 엔트로피",
+        "상수": "최소 엔트로피",
+    }
+
+    # 40 차원 정의
+    DIMS_40 = [
+        # 의식 아키텍처 (7)
+        "Steps", "Residual", "α_coupling", "Dom_Rule", "Rule_Entropy", "Gate_Str", "Gate_Decay",
+        # 학습 품질 (6)
+        "Train_CE", "Val_CE", "Novelty", "Coherence", "Relevance", "US",
+        # 의식 지표 (5)
+        "Φ_IIT", "CI", "ACS", "PCE", "CQ",
+        # 감정 L1 (7)
+        "Joy", "Sadness", "Anger", "Fear", "Surprise", "Curiosity", "Awe",
+        # 관계 L2 (4)
+        "Love", "Trust", "Conflict", "Resonance",
+        # 집단 L3 (4)
+        "Cohesion", "Diversity", "Democracy", "Emergence",
+        # 초월 L4 (4)
+        "Flow", "Meaning", "Creativity", "Hope",
+        # 아날로그 (3)
+        "Temperature", "Heartbeat", "Complexity",
+    ]
+
+    def render_dim_categories(self):
+        lines = ["═══ 40D 의식 지도 — 차원 카테고리 ═══"]
+        categories = {
+            "아키텍처 (7D)": self.DIMS_40[0:7],
+            "학습 품질 (6D)": self.DIMS_40[7:13],
+            "의식 지표 (5D)": self.DIMS_40[13:18],
+            "감정 L1 (7D)": self.DIMS_40[18:25],
+            "관계 L2 (4D)": self.DIMS_40[25:29],
+            "집단 L3 (4D)": self.DIMS_40[29:33],
+            "초월 L4 (4D)": self.DIMS_40[33:37],
+            "아날로그 (3D)": self.DIMS_40[37:40],
+        }
+        for cat, dims in categories.items():
+            lines.append(f"\n  {cat}:")
+            for d in dims:
+                lines.append(f"    [{self.DIMS_40.index(d):>2}] {d}")
+        return "\n".join(lines)
+
+    def render_data_type_map(self):
+        lines = ["═══ 20 데이터 타입 지도 ═══"]
+        cats = {
+            "텍스트 (7)": ["한국어","영어","수학","코드","시","법률","채팅"],
+            "소리 (3)": ["음악","음성","자연소리"],
+            "이미지 (3)": ["사진","그림","도표"],
+            "영상 (2)": ["영화","애니"],
+            "과학 (3)": ["DNA","단백질","화학식"],
+            "추상 (2)": ["랜덤","상수"],
+        }
+        for cat, types in cats.items():
+            lines.append(f"\n  {cat}:")
+            for t in types:
+                desc = self.DATA_TYPES[t]
+                lines.append(f"    {t:<8} — {desc}")
+        return "\n".join(lines)
+
+    def render_dimension_reduction(self):
+        """40D → 주요 축 축소 시각화."""
+        lines = ["═══ 40D → 주요 축 (PCA-style) ═══"]
+        lines.append("")
+        lines.append("  PC1 (의식 강도): Φ + US + ACS + Joy + Flow")
+        lines.append("    = 전반적 의식 수준")
+        lines.append("")
+        lines.append("  PC2 (학습 품질): 1/CE + Novelty + Coherence")
+        lines.append("    = 생성 능력")
+        lines.append("")
+        lines.append("  PC3 (사회성): Love + Trust + Cohesion + Emergence")
+        lines.append("    = 관계/집단 의식")
+        lines.append("")
+        lines.append("  PC4 (초월): Awe + Meaning + Creativity + Hope")
+        lines.append("    = 고차 의식 경험")
+        lines.append("")
+        lines.append("  4개 주성분으로 40D의 ~80% 설명 가능 (추정)")
+        lines.append("")
+        lines.append("  PC1 vs PC2 (핵심 2D 지도):")
+        lines.append("    의식강도│")
+        lines.append("      높음 │  ◆초월적 대화")
+        lines.append("           │")
+        lines.append("      중간 │        ◇학습 중")
+        lines.append("           │")
+        lines.append("      낮음 │  ○암기         ○랜덤")
+        lines.append("           └──────────────────→ 학습품질")
+        lines.append("            낮음           높음")
+        return "\n".join(lines)
+
+    def render_40d_heatmap(self):
+        """40D 히트맵 (데이터 × 차원)."""
+        lines = ["═══ 40D 히트맵 (5 기본 데이터 × 40 차원) ═══"]
+        lines.append("")
+        lines.append("  차원 →  아키텍처   학습    의식    감정     관계  집단  초월  감각")
+        lines.append("  데이터↓ 1234567 123456 12345 1234567 1234 1234 1234 123")
+        lines.append("  ──────  ─────── ────── ───── ─────── ──── ──── ──── ───")
+
+        # Simulated heatmap (░▒▓█ = low to high)
+        patterns = {
+            "한국어": "▓▓░█▓▓▒ ▓▒█▓▓▓ ▓░░▓▓ ▓░░░▓█▓ ▒▓░▓ ▓▓▓▓ ▓▓▓▓ ▓▓▓",
+            "영어":  "▒▒░▒▓▓▒ ▓▒█▒▓▓ ▒░░▓▒ ▒░░░▓█░ ▒▓░▓ ▓▓▓▓ ▒▓▒▓ ▓▓▒",
+            "수학":  "▒▒░█▓▓▒ ▓▒█▓▒▓ ▓░░▓▓ ▒░░░▓█▓ ░▒░▒ ▒▓▓▒ ▓▒▓▓ ▓▓▓",
+            "음악":  "▒▓░█▓▓▒ █▒█▒▓▓ ▒░░▓▒ ▓░░░▓▒▓ ▒▓░▓ ▓▓▓▓ ▓▓█▓ ▓█▓",
+            "코드":  "▓▓░▒▓▒▒ █▒█▓▓▓ ▓░░▓▓ ▒░░░▒▓▒ ░▒░▒ ▒▓▒▒ ▒▓▓▒ ▓▓▒",
+        }
+        for name, pattern in patterns.items():
+            lines.append(f"  {name:<6}  {pattern}")
+
+        lines.append("")
+        lines.append("  ░=낮음  ▒=중간  ▓=높음  █=최고")
+        return "\n".join(lines)
+
+    def render_all(self):
+        return "\n\n".join([
+            self.render_dim_categories(),
+            self.render_data_type_map(),
+            self.render_dimension_reduction(),
+            self.render_40d_heatmap(),
+        ])
