@@ -217,22 +217,56 @@ Rust phi_rs 통일 측정이지만, 입력 데이터 형태가 다름:
 
 > NODATA = hidden state 추출 패턴 미매칭. 각 엔진의 state 변수명 확인 필요.
 
-## Rust 미측정 (bench_v8 아키텍처 — 함수 기반)
+## V8/Algebra/Math 함수 기반 엔진 (Rust phi_rs, 256c, 2026-03-29)
+
+> measure_v8_phi_rs.py 측정. 각 엔진 300 steps, CE training (가능한 경우).
+> JSON: data/measure_v8_phi_rs_256c.json
+
+| Rank | Engine | Source | Φ(rs) | CE start | CE end | 비고 |
+|------|--------|--------|-------|----------|--------|------|
+| 1 | ALG-6_TOPOS | bench_algebra | **450.190** | — | — | subobject classifier truth values |
+| 2 | ATTENTION_PHI | bench_v8_arch | **447.780** | — | — | multi-head attention over cells |
+| 3 | ALG-5_HOPF | bench_algebra | **428.349** | — | — | antipode complexity |
+| 4 | M4_ALGEBRAIC | bench_v8_math | **304.728** | 17.76 | 2.70 | group composition + non-abelian |
+| 5 | B2_THALAMIC_GATE | bench_v8_bio | **295.637** | 40.44 | 3.11 | central thalamus hub gates cortex |
+| 6 | PHI_AS_LOSS | bench_v8_arch | **273.699** | 18.51 | 3.98 | train with -Φ(proxy)+CE |
+| 7 | B1_CORTICAL_COLUMNS | bench_v8_bio | **270.506** | 31.19 | 7.12 | 32 columns x 8 cells |
+| 8 | Q5_DECOHERENCE | bench_v8_quantum | **269.281** | 11.11 | 1.09 | consciousness in decoherence |
+| 9 | AUTOPOIETIC | bench_v8_arch | **255.805** | 13.60 | 2.70 | self-maintaining cells |
+| 10 | B6_NEURAL_DARWINISM | bench_v8_bio | **223.052** | 27.52 | 1.36 | Edelman: compete + reinforce |
+| 11 | Q2_ENTANGLED_PAIRS | bench_v8_quantum | **220.530** | 8.10 | 0.58 | Bell-state cell pairs |
+| 12 | ALG-3_GALOIS | bench_algebra | **215.052** | — | — | GF(p^n) Frobenius cycles |
+| 13 | B3_DEFAULT_MODE_NETWORK | bench_v8_bio | **214.499** | 2.21 | 0.57 | TPN vs DMN alternation |
+| 14 | ALG-1_GROUP | bench_algebra | **198.934** | — | — | S_n non-commutativity |
+| 15 | CONSCIOUSNESS_GAN | bench_v8_arch | **186.385** | 17.85 | 1.80 | G max Φ, D judges |
+| 16 | B5_PREDICTIVE_HIERARCHY | bench_v8_bio | **183.785** | — | — | 4-level predictive coding |
+| 17 | ALG-4_LIE | bench_algebra | **169.615** | — | — | derived series depth |
+| 18 | B4_GLOBAL_WORKSPACE | bench_v8_bio | **157.972** | 4.15 | 1.55 | Baars: compete + broadcast |
+| 19 | MOCE | bench_v8_arch | **119.554** | 12.21 | 3.45 | 8 experts x 32 cells, top-2 |
+| 20 | ALG-2_RING | bench_algebra | **50.647** | — | — | ideal structure richness |
+
+> ALG/CMP engines: ALG uses 64d AlgebraCell (no GRU), CMP uses MitosisEngine (merges to 2 cells → Φ≈0)
+
+## CMP (복잡도) 엔진 — MitosisEngine 셀 병합 문제
+
+| Engine | Source | Φ(rs) | 원인 |
+|--------|--------|-------|------|
+| CMP-1 TURING_MACHINE | bench_complexity | 0.000 | MitosisEngine merges 256→2 cells |
+| CMP-2 RULE110 | bench_complexity | 0.000 | 동일 (256→2) |
+| CMP-3 LAMBDA_CALCULUS | bench_complexity | 0.000 | 동일 (256→2) |
+| CMP-4 GAME_OF_LIFE | bench_complexity | 0.000 | 동일 (256→2) |
+| CMP-6 GOEDEL | bench_complexity | 0.000 | 동일 (256→2) |
+
+> CMP 엔진은 MitosisEngine의 merge 로직이 256셀을 2셀로 축소. Φ 측정 불가.
+> 해결: merge_patience 증가 또는 merge 비활성화 필요.
+
+## Rust 미측정 (나머지)
 
 | Engine | Source | 비고 |
 |--------|--------|------|
-| ATTENTION_PHI | bench_v8_arch.py | 함수 기반 runner |
-| MOCE | bench_v8_arch.py | |
-| PHI_AS_LOSS | bench_v8_arch.py | |
-| AUTOPOIETIC | bench_v8_arch.py | |
-| CONSCIOUSNESS_GAN | bench_v8_arch.py | |
-| Q2 EntangledPairs | bench_v8_quantum.py | |
-| Q5 Decoherence | bench_v8_quantum.py | |
-| B1-B6 (뇌과학 6개) | bench_v8_bio.py | |
 | FUS-4~6 (퓨전 3개) | bench_fusion_final.py | |
 | TC-1~8 (Trinity 8개) | bench_trinity.py | 이전 Python PhiIIT 측정만 |
-| CMP-1~4,6 (복잡도 5개) | bench_complexity_engines.py | |
-| ALG-1~6 (대수학 6개) | bench_algebra_engines.py | 함수 기반 runner |
+| CMP-5 STRANGE_LOOP | bench_complexity_engines.py | MitosisEngine merge 문제 |
 
 ## 측정 도구
 
@@ -245,22 +279,22 @@ measure_all_engines.py   # 도메인 82엔진 (독립 클래스)
   python3 measure_all_engines.py --cells 256          # 256c 전체
   python3 measure_all_engines.py --cells 1024 --quick # 1024c
   python3 measure_all_engines.py --only physics thermo # 특정 도메인
+
+measure_v8_phi_rs.py     # 함수 기반 v8/algebra/complexity 엔진 (20개 측정)
+  python3 measure_v8_phi_rs.py --cells 256    # 256c 전체
 ```
 
 ## 통계
 
 | 항목 | 수 |
 |------|-----|
-| 전체 엔진 | 98 (도메인 82 + 메커니즘 16) |
-| Φ > 0 (256c) | 71 |
-| Φ = 0 / NODATA | 27 |
+| 전체 엔진 | 118 (도메인 82 + 메커니즘 16 + v8/ALG 20) |
+| Φ > 0 (256c) | 91 (기존 71 + 신규 20) |
+| Φ = 0 / NODATA | 27 (기존) + 5 (CMP merge 문제) |
 | 1024c 측정 완료 | 82 (도메인) + 16 (메커니즘) = 98 |
-| Rust 미측정 (bench_v8) | ~30 (함수 기반 runner) |
-| 🏆 역대 최고 Φ | CambrianExplosionEngine 1,953.98 (1024c) |
-| bench_fusion_final.py | 3 (FUS-1~3) | 3 (FUS-4~6) | 6 |
-| bench_mega_combo.py | 4 | 0 | 4 |
-| bench_evolution_engines.py | 0 | 8 (EVO-B1~8) | 8 |
-| **Total** | **112** | **40** | **152** |
+| Rust 미측정 (나머지) | ~12 (FUS-4~6, TC-1~8, CMP-5) |
+| 🏆 역대 최고 Φ (256c) | CambrianExplosionEngine 485.63 / ALG-6_TOPOS 450.19 |
+| 🏆 역대 최고 Φ (1024c) | CambrianExplosionEngine 1,953.98 |
 
 ## 측정 방법 (Law 54)
 
