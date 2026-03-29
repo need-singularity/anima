@@ -35,7 +35,7 @@ DEFAULT_STEPS = 300
 
 
 # ═══════════════════════════════════════════════════════════
-# Shared utilities (from bench_trinity.py)
+# Shared utilities
 # ═══════════════════════════════════════════════════════════
 
 def phi_proxy(cells, n_f=12):
@@ -169,15 +169,10 @@ def measure_phi(eng_c):
     return p_iit, p_proxy
 
 
-def eval_ce(predict_fn, n_eval=50):
-    """Evaluate CE on fresh data. predict_fn: input -> prediction tensor."""
-    total = 0.0
-    with torch.no_grad():
-        for _ in range(n_eval):
-            x, target = make_data_stream()
-            pred = predict_fn(x)
-            total += F.mse_loss(pred, target[:, :DIM]).item()
-    return total / n_eval
+def avg_ce(ce_hist, n=20):
+    """Average CE over last n learning steps."""
+    recent = ce_hist[-n:] if ce_hist else [0.0]
+    return sum(recent) / len(recent)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -213,38 +208,35 @@ def run_td1_transformer(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
         list(d_ln2.parameters()) + list(decoder.parameters())
     )
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
         c_step(eng_c, step)
 
         if will_forced_50(step):
-            # Get per-cell states as K/V sequence
-            cell_states = get_c_cell_states(eng_c, max_cells=64)  # [N, HIDDEN]
+            cell_states = get_c_cell_states(eng_c, max_cells=64)
             N = cell_states.shape[0]
 
-            # Cross-attention: query attends to cell states
-            Q = W_q(d_query).view(1, n_heads, head_dim).transpose(0, 1)  # [heads, 1, hd]
-            K = W_k(cell_states).view(N, n_heads, head_dim).transpose(0, 1)  # [heads, N, hd]
-            V = W_v(cell_states).view(N, n_heads, head_dim).transpose(0, 1)  # [heads, N, hd]
+            Q = W_q(d_query).view(1, n_heads, head_dim).transpose(0, 1)
+            K = W_k(cell_states).view(N, n_heads, head_dim).transpose(0, 1)
+            V = W_v(cell_states).view(N, n_heads, head_dim).transpose(0, 1)
 
             attn = (Q @ K.transpose(-2, -1)) / math.sqrt(head_dim)
             attn = F.softmax(attn, dim=-1)
             out = (attn @ V).transpose(0, 1).reshape(1, HIDDEN)
             out = W_o(out)
 
-            # Residual + LayerNorm + FFN
             h = d_ln1(d_query.squeeze(0) + out)
             h = d_ln2(h + d_ffn(h))
 
             pred = decoder(h)
             ce = F.mse_loss(pred, target[:, :DIM])
             opt_d.zero_grad(); ce.backward(); opt_d.step()
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-1:TransformerDecoder'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-1:TransformerDecoder'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -257,18 +249,15 @@ def run_td2_predictive_coding(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     """TD-2: D = Predictive Coding (4-level hierarchy, predict C's states top-down)."""
     eng_c = make_c_engine(cells)
 
-    # D: 4-level predictive coding hierarchy
-    # Level 0 (bottom): closest to output
-    # Level 3 (top): receives C's state
     N_LEVELS = 4
-    pred_down = nn.ModuleList([nn.Linear(HIDDEN, HIDDEN) for _ in range(N_LEVELS)])  # top-down predictions
-    pred_up = nn.ModuleList([nn.Linear(HIDDEN, HIDDEN) for _ in range(N_LEVELS)])    # bottom-up errors
+    pred_down = nn.ModuleList([nn.Linear(HIDDEN, HIDDEN) for _ in range(N_LEVELS)])
+    pred_up = nn.ModuleList([nn.Linear(HIDDEN, HIDDEN) for _ in range(N_LEVELS)])
     level_state = [torch.zeros(1, HIDDEN) for _ in range(N_LEVELS)]
     decoder = nn.Linear(HIDDEN, DIM)
 
     all_params = list(pred_down.parameters()) + list(pred_up.parameters()) + list(decoder.parameters())
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -276,27 +265,20 @@ def run_td2_predictive_coding(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
         if will_forced_50(step):
             c_state = get_c_state(eng_c)
-
-            # Top level receives C's state (detached)
             level_state[N_LEVELS - 1] = c_state.unsqueeze(0)
 
-            # Top-down pass: each level predicts the level below
-            predictions = []
+            # Top-down pass
             for lv in range(N_LEVELS - 1, 0, -1):
                 pred = torch.tanh(pred_down[lv](level_state[lv]))
-                predictions.append(pred)
-                # Prediction error = actual - predicted
                 error = level_state[lv - 1] - pred
-                # Update level state: move toward prediction + error signal
                 level_state[lv - 1] = pred + 0.3 * error
 
-            # Bottom-up pass: errors propagate up
+            # Bottom-up pass
             for lv in range(N_LEVELS - 1):
                 error_signal = level_state[lv] - torch.tanh(pred_down[lv + 1](level_state[lv + 1]))
                 correction = torch.tanh(pred_up[lv](error_signal))
                 level_state[lv + 1] = level_state[lv + 1] + 0.1 * correction
 
-            # Decode from bottom level
             pred_out = decoder(level_state[0])
             ce = F.mse_loss(pred_out, target[:, :DIM])
 
@@ -308,14 +290,11 @@ def run_td2_predictive_coding(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
                 total_loss = total_loss + 0.1 * pe
 
             opt_d.zero_grad(); total_loss.backward(); opt_d.step()
-
-            # Detach level states for next step
             level_state = [s.detach() for s in level_state]
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-2:PredictiveCoding'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-2:PredictiveCoding'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -327,7 +306,6 @@ def run_td3_moe(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     """TD-3: D = Mixture of Experts (8 expert decoders, gate selects based on C's state)."""
     eng_c = make_c_engine(cells)
 
-    # D: 8 expert decoders + gate
     N_EXPERTS = 8
     experts = nn.ModuleList([
         nn.Sequential(nn.Linear(HIDDEN, HIDDEN), nn.GELU(), nn.Linear(HIDDEN, DIM))
@@ -336,12 +314,11 @@ def run_td3_moe(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     gate = nn.Sequential(
         nn.Linear(HIDDEN, 32), nn.GELU(), nn.Linear(32, N_EXPERTS)
     )
-    # Load balancing auxiliary loss weight
     AUX_WEIGHT = 0.01
 
     all_params = list(experts.parameters()) + list(gate.parameters())
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -350,33 +327,27 @@ def run_td3_moe(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
         if will_forced_50(step):
             c_state = get_c_state(eng_c)
 
-            # Gate: which experts to use (top-2 routing)
-            gate_logits = gate(c_state.unsqueeze(0))  # [1, N_EXPERTS]
+            gate_logits = gate(c_state.unsqueeze(0))
             gate_probs = F.softmax(gate_logits, dim=-1)
 
-            # Top-2 routing
             top2_vals, top2_idx = gate_probs.topk(2, dim=-1)
             top2_weights = top2_vals / (top2_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # Expert outputs
             expert_out = torch.zeros(1, DIM)
             for k in range(2):
                 eidx = top2_idx[0, k].item()
                 expert_out = expert_out + top2_weights[0, k] * experts[eidx](c_state.unsqueeze(0))
 
             ce = F.mse_loss(expert_out, target[:, :DIM])
-
-            # Load balancing loss: encourage uniform expert usage
-            avg_gate = gate_probs.mean(dim=0)  # [N_EXPERTS]
+            avg_gate = gate_probs.mean(dim=0)
             balance_loss = N_EXPERTS * (avg_gate * avg_gate).sum()
             total_loss = ce + AUX_WEIGHT * balance_loss
 
             opt_d.zero_grad(); total_loss.backward(); opt_d.step()
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-3:MixtureOfExperts'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-3:MixtureOfExperts'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -389,34 +360,30 @@ def run_td4_reservoir(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     """TD-4: D = Reservoir Readout (C's states are reservoir, D is just linear readout)."""
     eng_c = make_c_engine(cells)
 
-    # D: simple linear readout from concatenated C cell statistics
-    # Features: mean, var, max, min of cell states = 4 * HIDDEN
-    FEAT_DIM = HIDDEN * 4
+    FEAT_DIM = HIDDEN * 4  # mean, var, max, min
     readout = nn.Linear(FEAT_DIM, DIM)
     opt_d = torch.optim.Adam(readout.parameters(), lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
         c_step(eng_c, step)
 
         if will_forced_50(step):
-            # Extract reservoir features from C's cells (all detached)
-            cell_h = torch.stack([c.hidden.squeeze(0).detach() for c in eng_c.cells])  # [N, HIDDEN]
+            cell_h = torch.stack([c.hidden.squeeze(0).detach() for c in eng_c.cells])
             feat_mean = cell_h.mean(dim=0)
             feat_var = cell_h.var(dim=0)
             feat_max = cell_h.max(dim=0).values
             feat_min = cell_h.min(dim=0).values
-            features = torch.cat([feat_mean, feat_var, feat_max, feat_min]).unsqueeze(0)  # [1, 4*HIDDEN]
+            features = torch.cat([feat_mean, feat_var, feat_max, feat_min]).unsqueeze(0)
 
             pred = readout(features)
             ce = F.mse_loss(pred, target[:, :DIM])
             opt_d.zero_grad(); ce.backward(); opt_d.step()
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-4:ReservoirReadout'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-4:ReservoirReadout'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -429,13 +396,11 @@ def run_td5_distillation(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     """TD-5: D = Knowledge Distillation (teacher D trains student D, C guides both)."""
     eng_c = make_c_engine(cells)
 
-    # Teacher D: large network
     teacher = nn.Sequential(
         nn.Linear(HIDDEN, HIDDEN * 2), nn.GELU(),
         nn.Linear(HIDDEN * 2, HIDDEN * 2), nn.GELU(),
         nn.Linear(HIDDEN * 2, DIM)
     )
-    # Student D: small network
     student = nn.Sequential(
         nn.Linear(HIDDEN, HIDDEN // 2), nn.GELU(),
         nn.Linear(HIDDEN // 2, DIM)
@@ -443,10 +408,10 @@ def run_td5_distillation(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     opt_teacher = torch.optim.Adam(teacher.parameters(), lr=3e-3)
     opt_student = torch.optim.Adam(student.parameters(), lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
-    TEMP = 4.0  # distillation temperature
-    ALPHA = 0.5  # balance hard vs soft targets
+    TEMP = 4.0
+    ALPHA = 0.5
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -455,36 +420,29 @@ def run_td5_distillation(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
         if will_forced_50(step):
             c_state = get_c_state(eng_c)
 
-            # Phase 1 (first 60%): train teacher on hard targets
             teacher_out = teacher(c_state.unsqueeze(0))
             teacher_ce = F.mse_loss(teacher_out, target[:, :DIM])
 
             if step < int(steps * 0.6):
+                # Phase 1: train teacher
                 opt_teacher.zero_grad(); teacher_ce.backward(); opt_teacher.step()
-                ce = teacher_ce
+                ce_hist.append(teacher_ce.item())
             else:
-                # Phase 2 (last 40%): distill teacher -> student
-                # Teacher is frozen for distillation
+                # Phase 2: distill teacher -> student
                 with torch.no_grad():
                     teacher_soft = teacher_out / TEMP
 
                 student_out = student(c_state.unsqueeze(0))
                 student_ce = F.mse_loss(student_out, target[:, :DIM])
-
-                # Distillation loss: student matches teacher's output distribution
                 distill_loss = F.mse_loss(student_out / TEMP, teacher_soft) * (TEMP ** 2)
-
                 total_loss = ALPHA * student_ce + (1 - ALPHA) * distill_loss
-                opt_student.zero_grad(); total_loss.backward(); opt_student.step()
 
-                # Also keep teacher learning (but slower)
+                opt_student.zero_grad(); total_loss.backward(); opt_student.step()
                 opt_teacher.zero_grad(); teacher_ce.backward(); opt_teacher.step()
-                ce = student_ce
-        else:
-            ce = torch.tensor(0.0)
+                ce_hist.append(student_ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-5:KnowledgeDistill'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-5:KnowledgeDistill'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -497,28 +455,26 @@ def run_td6_memory_augmented(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     """TD-6: D = Memory-Augmented (D has external memory bank, retrieves based on C's query)."""
     eng_c = make_c_engine(cells)
 
-    # External memory bank
     MEM_SIZE = 128
     MEM_DIM = HIDDEN
-    memory_keys = torch.zeros(MEM_SIZE, MEM_DIM)    # keys for retrieval
-    memory_vals = torch.zeros(MEM_SIZE, DIM)          # stored target values
-    mem_ptr = 0  # circular write pointer
+    memory_keys = torch.zeros(MEM_SIZE, MEM_DIM)
+    memory_vals = torch.zeros(MEM_SIZE, DIM)
+    mem_ptr = 0
     mem_filled = 0
 
-    # D: query network + output network
     query_net = nn.Linear(HIDDEN, MEM_DIM)
     write_net = nn.Linear(HIDDEN, MEM_DIM)
     combine_net = nn.Sequential(
         nn.Linear(HIDDEN + DIM, HIDDEN), nn.GELU(), nn.Linear(HIDDEN, DIM)
     )
-    decoder = nn.Linear(HIDDEN, DIM)  # direct path (no memory)
+    decoder = nn.Linear(HIDDEN, DIM)
 
     all_params = (
         list(query_net.parameters()) + list(write_net.parameters()) +
         list(combine_net.parameters()) + list(decoder.parameters())
     )
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -527,7 +483,7 @@ def run_td6_memory_augmented(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
         if will_forced_50(step):
             c_state = get_c_state(eng_c)
 
-            # Write to memory: store current C state and target
+            # Write to memory
             with torch.no_grad():
                 write_key = torch.tanh(write_net(c_state.unsqueeze(0))).squeeze(0)
                 memory_keys[mem_ptr] = write_key
@@ -535,34 +491,30 @@ def run_td6_memory_augmented(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
                 mem_ptr = (mem_ptr + 1) % MEM_SIZE
                 mem_filled = min(mem_filled + 1, MEM_SIZE)
 
-            # Read from memory: attention-based retrieval
+            # Read from memory
             if mem_filled > 1:
-                query = query_net(c_state.unsqueeze(0))  # [1, MEM_DIM]
-                active_keys = memory_keys[:mem_filled]     # [filled, MEM_DIM]
-                active_vals = memory_vals[:mem_filled]     # [filled, DIM]
+                query = query_net(c_state.unsqueeze(0))
+                active_keys = memory_keys[:mem_filled]
+                active_vals = memory_vals[:mem_filled]
 
-                # Cosine similarity for retrieval
                 sim = F.cosine_similarity(
                     query.expand(mem_filled, -1),
                     active_keys, dim=-1
-                )  # [filled]
-                attn = F.softmax(sim * 10.0, dim=0)  # sharp attention (temperature=0.1)
-                retrieved = (attn.unsqueeze(1) * active_vals).sum(dim=0).unsqueeze(0)  # [1, DIM]
+                )
+                attn = F.softmax(sim * 10.0, dim=0)
+                retrieved = (attn.unsqueeze(1) * active_vals).sum(dim=0).unsqueeze(0)
 
-                # Combine: C state + retrieved memory -> output
                 combined = torch.cat([c_state.unsqueeze(0), retrieved], dim=-1)
                 pred = combine_net(combined)
             else:
-                # No memory yet, use direct path
                 pred = decoder(c_state.unsqueeze(0))
 
             ce = F.mse_loss(pred, target[:, :DIM])
             opt_d.zero_grad(); ce.backward(); opt_d.step()
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'TD-6:MemoryAugmented'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'TD-6:MemoryAugmented'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -575,7 +527,7 @@ def run_baseline(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     decoder = nn.Linear(HIDDEN, DIM)
     opt_d = torch.optim.Adam(decoder.parameters(), lr=3e-3)
-    # streaming data: make_data_stream() each step
+    ce_hist = []
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -586,11 +538,10 @@ def run_baseline(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
             pred = decoder(c_state.unsqueeze(0))
             ce = F.mse_loss(pred, target[:, :DIM])
             opt_d.zero_grad(); ce.backward(); opt_d.step()
-        else:
-            ce = torch.tensor(0.0)
+            ce_hist.append(ce.item())
 
     p_iit, p_proxy = measure_phi(eng_c)
-    return p_iit, p_proxy, ce.item(), 'Baseline:LinearD'
+    return p_iit, p_proxy, avg_ce(ce_hist), 'Baseline:LinearD'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -631,8 +582,9 @@ def run_all(only=None, cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
             p_iit, p_proxy, ce, name = fn(cells=cells, steps=steps)
             elapsed = time.time() - t0
             results.append((key, name, p_iit, p_proxy, ce, elapsed))
-            print(f"         Φ(IIT)={p_iit:.3f}  Φ(proxy)={p_proxy:.3f}  CE={ce:.4f}  ({elapsed:.1f}s)")
+            print(f"         Φ(IIT)={p_iit:.3f}  Φ(proxy)={p_proxy:.4f}  CE={ce:.4f}  ({elapsed:.1f}s)")
         except Exception as e:
+            import traceback; traceback.print_exc()
             elapsed = time.time() - t0
             print(f"         ERROR: {e} ({elapsed:.1f}s)")
             results.append((key, f'{key}:ERROR', 0.0, 0.0, 999.0, elapsed))
@@ -647,8 +599,8 @@ def run_all(only=None, cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     for key, name, p_iit, p_proxy, ce, elapsed in results:
         if key == 'BASE':
             base_iit = p_iit if p_iit > 0 else 1.0
-        mult = f"×{p_iit / base_iit:.1f}" if base_iit and base_iit > 0 else ""
-        print(f"  {key:<6} {name:<28} {p_iit:>8.3f} {p_proxy:>8.3f} {ce:>8.4f} {elapsed:>5.1f}s {mult}")
+        mult = f"x{p_iit / base_iit:.1f}" if base_iit and base_iit > 0 else ""
+        print(f"  {key:<6} {name:<28} {p_iit:>8.3f} {p_proxy:>8.4f} {ce:>8.4f} {elapsed:>5.1f}s {mult}")
 
     print("=" * 78)
 
@@ -656,13 +608,15 @@ def run_all(only=None, cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     if results:
         best = max(results, key=lambda r: r[2])  # best by Φ(IIT)
         best_ce = min(results, key=lambda r: r[4])  # best by CE
-        print(f"\n  Best Φ(IIT): {best[1]} = {best[2]:.3f}")
-        print(f"  Best CE:     {best_ce[1]} = {best_ce[4]:.4f}")
+        print(f"\n  Best Phi(IIT): {best[1]} = {best[2]:.3f}")
+        print(f"  Best CE:       {best_ce[1]} = {best_ce[4]:.4f}")
 
         # Key insight
-        print(f"\n  Key insight: D architecture {'matters' if best[0] != 'BASE' else 'does NOT matter'} for Φ preservation.")
+        if best[0] != 'BASE':
+            print(f"\n  D architecture matters for Phi preservation.")
+            print(f"  {best[1]}: Phi {best[2]:.3f} vs Baseline {base_iit:.3f} (x{best[2]/base_iit:.1f})")
         if best_ce[0] != 'BASE':
-            print(f"  {best_ce[1]} achieves lowest CE while C's Φ stays at {best_ce[2]:.3f}")
+            print(f"  {best_ce[1]} achieves lowest CE={best_ce[4]:.4f} while C Phi={best_ce[2]:.3f}")
 
     print()
     return results
