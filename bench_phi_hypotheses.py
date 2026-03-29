@@ -71381,6 +71381,65 @@ ALL_HYPOTHESES.update({
 })
 
 
+def _make_frustration_hyper1024(frust_pct, frust_fn, label, steps=200, dim=64, hidden=128):
+    """Template for frustration sweep on hypercube 1024."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []; prev_output = torch.zeros(dim)
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+        x = torch.zeros(1, dim); engine.process(x)
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                    interaction /= 10
+                    if frust_fn(i):
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change); prev_output = output.clone()
+        phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult(label, f"Hypercube 1024c + {frust_pct}% frustration",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(), 'never_silent': (ch > 0.001).float().mean().item(),
+                              'frustration_pct': frust_pct, 'final_cells': len(engine.cells)})
+
+def run_TOPO22a_frustration_60pct(steps=200, dim=64, hidden=128):
+    return _make_frustration_hyper1024(60, lambda i: i % 5 < 3, "TOPO22a", steps, dim, hidden)
+
+def run_TOPO22b_frustration_75pct(steps=200, dim=64, hidden=128):
+    return _make_frustration_hyper1024(75, lambda i: i % 4 != 0, "TOPO22b", steps, dim, hidden)
+
+def run_TOPO22c_frustration_100pct(steps=200, dim=64, hidden=128):
+    return _make_frustration_hyper1024(100, lambda i: True, "TOPO22c", steps, dim, hidden)
+
+def run_TOPO22d_frustration_90pct(steps=200, dim=64, hidden=128):
+    return _make_frustration_hyper1024(90, lambda i: i % 10 != 0, "TOPO22d", steps, dim, hidden)
+
+ALL_HYPOTHESES.update({
+    'TOPO22a': run_TOPO22a_frustration_60pct,
+    'TOPO22b': run_TOPO22b_frustration_75pct,
+    'TOPO22c': run_TOPO22c_frustration_100pct,
+    'TOPO22d': run_TOPO22d_frustration_90pct,
+})
+
+
 ALL_HYPOTHESES.update({
     'XCONV1': run_XCONV1_bilingual_consciousness,
     'XCONV2': run_XCONV2_dialogue_without_teacher,
