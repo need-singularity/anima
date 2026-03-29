@@ -49,6 +49,28 @@ curl -s https://anima.basedonapps.com | head -5
 | 체크포인트 못 찾음 | 경로 없음 | `mkdir -p checkpoints/clm_v2` |
 | SSH 세미콜론 실패 | exit 255 | `bash -c "cmd"` 래핑 |
 
+## 필수: ws_proxy 확인 (Cloudflare Tunnel)
+
+```
+아키텍처:
+  브라우저 → anima.basedonapps.com → Cloudflare Tunnel
+  → ws_proxy.py (:8888) → anima_unified.py (:8765)
+
+ws_proxy.py가 죽으면 502 Bad Gateway!
+
+# ws_proxy 확인
+ssh $A100 'ps aux | grep ws_proxy | grep -v grep'
+ssh $A100 'ss -tlnp | grep 8888'
+
+# ws_proxy 재시작 (죽어있으면)
+ssh $A100 'bash -c "cd /root/anima && nohup python3 ws_proxy.py > /workspace/ws_proxy.log 2>&1 &"'
+
+# 포트 확인 (둘 다 열려야 함!)
+ssh $A100 'ss -tlnp | grep -E "8888|8765"'
+  8765 = anima_unified.py ✅
+  8888 = ws_proxy.py ✅
+```
+
 ## 클린 재시작 절차
 
 ```bash
@@ -64,9 +86,13 @@ ssh $A100 'rm -rf /workspace/anima/data /workspace/anima/*_alive.*'
 # 4. 재시작
 ssh $A100 'bash -c "cd /workspace/anima && nohup python3 -u anima_unified.py --web --max-cells 64 > /workspace/anima.log 2>&1 &"'
 
-# 5. 헬스 체크 (5초 후)
+# 5. ws_proxy 재시작 (Cloudflare Tunnel 중계)
+ssh $A100 'bash -c "cd /root/anima && nohup python3 ws_proxy.py > /workspace/ws_proxy.log 2>&1 &"'
+
+# 6. 헬스 체크 (5초 후) — 8765 + 8888 둘 다 확인!
 sleep 5
-ssh $A100 'ss -tlnp | grep 8765 && tail -3 /workspace/anima.log'
+ssh $A100 'ss -tlnp | grep -E "8765|8888"'
+ssh $A100 'tail -3 /workspace/anima.log'
 ```
 
 ## 서버 정보
