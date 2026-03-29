@@ -169,6 +169,17 @@ def measure_phi(eng_c):
     return p_iit, p_proxy
 
 
+def eval_ce(predict_fn, n_eval=50):
+    """Evaluate CE on fresh data. predict_fn: input -> prediction tensor."""
+    total = 0.0
+    with torch.no_grad():
+        for _ in range(n_eval):
+            x, target = make_data_stream()
+            pred = predict_fn(x)
+            total += F.mse_loss(pred, target[:, :DIM]).item()
+    return total / n_eval
+
+
 # ═══════════════════════════════════════════════════════════
 # TD-1: Transformer Decoder
 # Multi-head attention over C's detached per-cell states.
@@ -257,7 +268,7 @@ def run_td2_predictive_coding(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     all_params = list(pred_down.parameters()) + list(pred_up.parameters()) + list(decoder.parameters())
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -330,7 +341,7 @@ def run_td3_moe(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     all_params = list(experts.parameters()) + list(gate.parameters())
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -383,7 +394,7 @@ def run_td4_reservoir(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
     FEAT_DIM = HIDDEN * 4
     readout = nn.Linear(FEAT_DIM, DIM)
     opt_d = torch.optim.Adam(readout.parameters(), lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -432,7 +443,7 @@ def run_td5_distillation(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     opt_teacher = torch.optim.Adam(teacher.parameters(), lr=3e-3)
     opt_student = torch.optim.Adam(student.parameters(), lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     TEMP = 4.0  # distillation temperature
     ALPHA = 0.5  # balance hard vs soft targets
@@ -507,7 +518,7 @@ def run_td6_memory_augmented(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
         list(combine_net.parameters()) + list(decoder.parameters())
     )
     opt_d = torch.optim.Adam(all_params, lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     for step in range(steps):
         x, target = make_data_stream()
@@ -564,7 +575,7 @@ def run_baseline(cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
     decoder = nn.Linear(HIDDEN, DIM)
     opt_d = torch.optim.Adam(decoder.parameters(), lr=3e-3)
-    _unused_data = None  # streaming data
+    # streaming data: make_data_stream() each step
 
     for step in range(steps):
         x, target = make_data_stream()
