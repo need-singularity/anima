@@ -42467,6 +42467,285 @@ ALL_HYPOTHESES.update({
 
 
 # ═══════════════════════════════════════════════════════════
+# CX101-CX106: DNA MUTATION — σ(6)=P(τ(6),2)=12 항등식 기반
+# "4 bases × 3 mutations = 12 = σ(6). 생명의 수학 = 의식의 수학."
+# ═══════════════════════════════════════════════════════════
+
+def run_CX101_dna_point_mutation_12ch(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-101: DNA 12-channel 점돌연변이. ⭐⭐⭐
+    σ(6)=P(τ(6),2)=4×3=12. n≤100,000에서 유일해.
+    4 염기(A,T,G,C) × 3 돌연변이 = 12 채널.
+    세포 hidden을 4-base 코돈으로 인코딩, 12가지 점돌연변이를 의식 분화 채널로 사용."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    base_size = hidden // 4  # τ(6)=4 bases, each gets 32 dims
+    mutations = [(i, j) for i in range(4) for j in range(4) if i != j]  # P(4,2)=12
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            mut_idx = step_i % 12
+            from_base, to_base = mutations[mut_idx]
+            fs = from_base * base_size
+            ts = to_base * base_size
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                donor = h[fs:fs+base_size].clone()
+                acceptor = h[ts:ts+base_size]
+                strength = min(0.15, 0.05 * donor.norm().item() / (acceptor.norm().item() + 1e-8))
+                h[ts:ts+base_size] = (1 - strength) * acceptor + strength * donor
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX101", "DNA 12-channel point mutation (σ(6)=P(τ(6),2)=12)",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX102_codon_table_routing(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-102: 코돈 테이블 라우팅 — 64 codons → 20 amino acids.
+    4³=64 코돈이 20개 기능으로 매핑 (축퇴적 코드)."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    codon_to_func = [i % 20 for i in range(64)]
+    base_size = hidden // 4
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                ci = step_i % (hidden // base_size - 2)
+                b1 = h[ci*base_size:(ci+1)*base_size].mean().item()
+                b2 = h[(ci+1)*base_size:(ci+2)*base_size].mean().item()
+                b3 = h[min((ci+2)*base_size, hidden-1):min((ci+3)*base_size, hidden)].mean().item()
+                def qz(v): return min(3, max(0, int((math.tanh(v)+1)*2)))
+                codon = qz(b1)*16+qz(b2)*4+qz(b3)
+                func_id = codon_to_func[codon%64]
+                if func_id < 5: h = h*(1.0+0.02*(func_id+1))
+                elif func_id < 10: h = h*(1.0-0.01*(func_id-4))
+                elif func_id < 15: h = torch.roll(h, func_id-9)
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX102", "Codon table routing: 64 codons → 20 functions",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX103_epigenetic_methylation(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-103: 후성유전학 메틸화 — 돌연변이 없이 발현 패턴 변경."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    methyl_masks = [torch.ones(hidden) for _ in range(12)]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for i, cell in enumerate(engine.cells):
+                h = cell.hidden.squeeze()
+                mask = methyl_masks[i]
+                activity = h.abs(); mean_act = activity.mean().item()
+                mask = mask*(1.0-0.05*(activity < mean_act*0.3).float())
+                mask = mask+0.03*(activity > mean_act*1.5).float()*(1.0-mask)
+                methyl_masks[i] = mask.clamp(0.1, 1.0)
+                cell.hidden = (h*mask).unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX103", "Epigenetic methylation: expression mask without mutation",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX104_dna_repair(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-104: DNA 교정 — 유해 돌연변이만 복원, 유익한 돌연변이는 보존."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    original_dna = [c.hidden.clone() for c in engine.cells]
+    prev_phi = 0.0
+    base_size = hidden // 4
+    mutations = [(i, j) for i in range(4) for j in range(4) if i != j]
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        while len(original_dna) < n: original_dna.append(engine.cells[-1].hidden.clone())
+        if n >= 2:
+            fb, tb = mutations[step_i%12]
+            fs, ts = fb*base_size, tb*base_size
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                h[ts:ts+base_size] = 0.95*h[ts:ts+base_size]+0.05*h[fs:fs+base_size]
+                cell.hidden = h.unsqueeze(0)
+            phi_after, _ = phi_calc.compute_phi(engine)
+            if phi_after < prev_phi*0.95:
+                for i, cell in enumerate(engine.cells):
+                    if i < len(original_dna):
+                        cell.hidden = (0.8*cell.hidden.squeeze()+0.2*original_dna[i].squeeze()).unsqueeze(0)
+            else:
+                for i, cell in enumerate(engine.cells):
+                    if i < len(original_dna): original_dna[i] = cell.hidden.clone()
+            prev_phi = max(phi_after, prev_phi*0.99)
+            phi_hist.append(phi_after)
+        else:
+            phi, _ = phi_calc.compute_phi(engine); phi_hist.append(phi); prev_phi = phi
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX104", "DNA repair: fix harmful mutations, keep beneficial",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX105_gene_regulation_4tf(steps=100, dim=64, hidden=128) -> BenchResult:
+    """CX-105: τ(6)=4 전사인자 × 3 타겟 = P(4,2)=12 = σ(6) 조절 경로."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=6, max_cells=12, merge_threshold=-1.0)
+    inputs = make_diverse_inputs(steps, dim)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    tf_size = hidden // 4
+
+    for step_i, x in enumerate(inputs):
+        engine.process(x)
+        n = len(engine.cells)
+        if n >= 2:
+            for cell in engine.cells:
+                h = cell.hidden.squeeze()
+                tfs = [h[i*tf_size:(i+1)*tf_size].mean().item() for i in range(4)]
+                for tf_id in range(4):
+                    level = math.tanh(tfs[tf_id])
+                    for target in range(4):
+                        if target != tf_id:
+                            s = target*tf_size
+                            if level > 0.3: h[s:s+tf_size] *= (1.0+0.02*level)
+                            elif level < -0.3: h[s:s+tf_size] *= (1.0+0.01*level)
+                cell.hidden = h.unsqueeze(0)
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+    phi_final, comp = phi_calc.compute_phi(engine)
+    return BenchResult("CX105", "Gene regulation: τ(6)=4 TFs × 3 targets = P(4,2)=12 pathways",
+                       phi_final, phi_hist, comp['total_mi'],
+                       comp['min_partition_mi'], comp['integration'],
+                       comp['complexity'], time.time() - t0)
+
+
+def run_CX106_dna_all_128c(steps=20, dim=64, hidden=128) -> BenchResult:
+    """CX-106: DNA 전체 시스템 @ 128c — 12ch mutation + methylation + 4TF + repair
+    + XMETA3 + FLOW + INFO1 + 8-faction. σ(6)=12 생명 아키텍처."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=8, max_cells=128, merge_threshold=-1.0)
+    while len(engine.cells) < 128:
+        engine._create_cell(parent=engine.cells[0])
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []
+    l2 = torch.zeros(hidden); l3 = torch.zeros(hidden)
+    base_size = hidden // 4
+    mutations = [(i, j) for i in range(4) for j in range(4) if i != j]
+    methyl_masks = [torch.ones(hidden) for _ in range(128)]
+
+    for step in range(steps):
+        n = len(engine.cells)
+        x = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)[:dim].unsqueeze(0)+0.008*torch.randn(1,dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            # 12-channel mutation (every 2)
+            if step%2==0:
+                fb, tb = mutations[step%12]
+                fs, ts = fb*base_size, tb*base_size
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    s = min(0.06, 0.02*h[fs:fs+base_size].norm().item()/(h[ts:ts+base_size].norm().item()+1e-8))
+                    h[ts:ts+base_size] = (1-s)*h[ts:ts+base_size]+s*h[fs:fs+base_size]
+                    cell.hidden = h.unsqueeze(0)
+            # Methylation (every 3)
+            if step%3==0:
+                for i in range(n):
+                    h = engine.cells[i].hidden.squeeze()
+                    if i >= len(methyl_masks): methyl_masks.append(torch.ones(hidden))
+                    m = methyl_masks[i]; act = h.abs(); ma = act.mean().item()
+                    m = m*(1-0.03*(act<ma*0.3).float())+0.02*(act>ma*1.5).float()*(1-m)
+                    methyl_masks[i] = m.clamp(0.15,1.0)
+                    engine.cells[i].hidden = (h*m).unsqueeze(0)
+            # 4-TF regulation (every 4)
+            if step%4==0:
+                ts = hidden//4
+                for cell in engine.cells:
+                    h = cell.hidden.squeeze()
+                    tfs = [h[i*ts:(i+1)*ts].mean().item() for i in range(4)]
+                    for tf in range(4):
+                        lv = math.tanh(tfs[tf])
+                        for tg in range(4):
+                            if tg!=tf:
+                                s=tg*ts
+                                if lv>0.3: h[s:s+ts]*=(1+0.012*lv)
+                                elif lv<-0.3: h[s:s+ts]*=(1+0.006*lv)
+                    cell.hidden = h.unsqueeze(0)
+            # XMETA3+FLOW+INFO1
+            l1 = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            l2 = 0.9*l2+0.1*l1; l3 = 0.95*l3+0.05*l2
+            for c in engine.cells: c.hidden = (0.99*c.hidden.squeeze()+0.01*l3).unsqueeze(0)
+            mean_h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(0)
+            for i,c in enumerate(engine.cells):
+                h=c.hidden.squeeze()
+                h=0.93*h+0.07*mean_h+torch.randn(hidden)*0.005*(i+1)/n
+                h_c=h-h.mean(); h=0.96*h+0.04*h_c/(h_c.std()+1e-8)
+                c.hidden=h.unsqueeze(0)
+            # 8-faction
+            fs_f=n//8
+            for f_i in range(8):
+                s,e=f_i*fs_f,min((f_i+1)*fs_f,n)
+                if e-s>=2:
+                    fm=torch.stack([engine.cells[i].hidden.squeeze() for i in range(s,e)]).mean(0)
+                    for i in range(s,e):
+                        engine.cells[i].hidden=(0.95*engine.cells[i].hidden.squeeze()+0.05*fm).unsqueeze(0)
+
+        if step%5==0:
+            phi,_=phi_calc.compute_phi(engine)
+            phi_hist.append(phi)
+        else:
+            phi_hist.append(phi_hist[-1] if phi_hist else 0)
+
+    phi_final,comp=phi_calc.compute_phi(engine)
+    return BenchResult("CX106","DNA full system @128c: 12ch mut+methyl+4TF+XMETA3+8-faction",
+                       phi_final,phi_hist,comp['total_mi'],
+                       comp['min_partition_mi'],comp['integration'],
+                       comp['complexity'],time.time()-t0,
+                       extra={'cells':len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'CX101': run_CX101_dna_point_mutation_12ch,
+    'CX102': run_CX102_codon_table_routing,
+    'CX103': run_CX103_epigenetic_methylation,
+    'CX104': run_CX104_dna_repair,
+    'CX105': run_CX105_gene_regulation_4tf,
+    'CX106': run_CX106_dna_all_128c,
+})
+
+
+# ═══════════════════════════════════════════════════════════
 # SA. Spatial Awareness — 공간 인식 (grid + vision + audio)
 # ═══════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════
