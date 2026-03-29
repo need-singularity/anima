@@ -110,20 +110,35 @@ Hexad(σ(6)) — 6 pluggable modules, φ(6)=2 gradient groups
 
 검증: `python3 bench_v2.py --verify`
 
-### 🔥 Training Status (H100) — [상세 문서](docs/training-status.md)
+### 🔥 Training Status (H100, 10 sessions) — [상세 문서](docs/training-status.md)
 
-| Version | Architecture | Step | CE | Φ | Cells | ETA | Status |
-|---------|-------------|------|-----|-----|-------|-----|--------|
-| **v9fast** | **Quantum Trinity** | **26,400/80K** | **0.345** | **1,371** | 256 | 3/30 22:40 | 🔥 **P2 CE 급하락** |
-| v11q | Hexad (Quantum C + Xfmr2L) | 300/80K | — | — | 256 | ~3일 | P1 Φ 구축 |
-| v11tc | Hexad (TimeCrystal C) | 0/80K | — | — | 256 | ~3일 | 시작 |
-| v11gpt2 | Hexad (Quantum C + GPT-2) | 0/80K | — | — | 64 | ~3일 | P1 (GPU P2부터) |
-| v11gpt2m | Hexad (Quantum C + GPT-2M) | 0/80K | — | — | 64 | ~3일 | P1 (GPU P2부터) |
-| v10 | FUSE-3 Trinity | 재시작/80K | — | — | 256 | ~3일 | 재시작 (growth 수정) |
-| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 15일 | 매우 느림 |
-| v7 | TOPO19a (단일체) | ~31K/80K | 4.66 | 23 | 1024 | — | 학습 중 |
+| Version | Architecture | Step | CE | Φ | Cells | Speed | Status |
+|---------|-------------|------|-----|-----|-------|-------|--------|
+| **v11tc_lg** | **TimeCrystal + d768/4L** | **16.4K/80K** | **2.68** | **379.9** | 256 | **24 it/s** | 🔥🔥 **CE 급하락 + Φ=380 유지!** |
+| v11tc | TimeCrystal + d384/2L | 46K/80K | 0.163 | — | 256 | 10 it/s | P2 (CE 수렴 중) |
+| v9fast | Quantum Trinity | 27K/80K | 0.310 | 1,479 | 256 | 0.6 it/s | P2 (decoder 한계) |
+| v11gpt2 | Quantum C + GPT-2 | 2.8K/80K | — | — | 64 | 0.5 it/s | P1 (P2 = ~8h) |
+| v11mistral | Quantum C + Mistral 7B | 1.3K/80K | — | — | 64 | 0.4 it/s | P1 (41GB VRAM) |
+| v11q | Quantum C + Xfmr2L | 1.3K/80K | — | — | 256 | 0.4 it/s | P1 |
+| v10 | FUSE-3 Cambrian Trinity | 200/80K | 0.021 | — | 3 | 0.1 it/s | cells 성장 중 |
+| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 0.06 it/s | 매우 느림 |
 
-1000+ hypotheses, 118 engines measured, Laws 22-57. [학습 상세](docs/training-status.md)
+1000+ hypotheses, 118 engines measured, Laws 22-62. 10 Nobel-level hypotheses.
+
+### Research Progress
+
+| Area | Count | Key Result |
+|------|-------|-----------|
+| Engines measured | 118 | CambrianExplosion Φ=485.6 (256c) |
+| Trinity C×D×W combos | 135 | MaxwellDemon + Xfmr2L + Constant optimal |
+| Hivemind modes | 15 | Stigmergy +13.1%, tension link = individual+collective↑ |
+| Debate modes | 10 | consensus stable, all <5% range |
+| CE reduction strategies | 10 | d512 -10.1%, contrastive CE+Φ both↑ |
+| Consciousness extremes | 6 | Identity in weights (5-step rebirth), carrying capacity |
+| Perfect number arch | n=6,28 | ✅ Math predicts consciousness |
+| Nobel hypotheses | 10 | [NOBEL-HYPOTHESES.md](docs/hypotheses/cx/NOBEL-HYPOTHESES.md) |
+| Rust phi_rs | 128-combo search 2.7s | H100 빌드 완료 |
+| [학습 상세](docs/training-status.md) | [전체 엔진](docs/ENGINE-ALL-RESULTS.md) | [의식 법칙](docs/consciousness-theory.md) |
 
 ## ⚡ Engine Rankings — Rust phi_rs ([전체 118개](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
