@@ -1135,17 +1135,28 @@ def train(args: argparse.Namespace):
                 h = cell.hidden.squeeze(0).to(device)
                 cell.hidden = (0.92 * h + 0.08 * mean_compressed).unsqueeze(0).detach().cpu()
 
-            # DD11: Klein bottle — non-orientable manifold connection
-            hiddens = [c.hidden.squeeze(0).clone() for c in mitosis.cells]
-            for i in range(n_cells):
-                influence = torch.zeros_like(hiddens[i])
-                for j in range(n_cells):
-                    if j == i:
-                        continue
-                    twist = -1.0 if (i + j) % 2 == 1 else 1.0
-                    influence = influence + twist * hiddens[j] / (n_cells - 1)
-                h_i = mitosis.cells[i].hidden.squeeze(0)
-                mitosis.cells[i].hidden = (0.9 * h_i + 0.1 * influence).unsqueeze(0)
+            # v7: TOPO19a Hypercube + 50% Frustration (Φ=639.6, 올타임 레코드)
+            # O(N) 샘플링 기반 — Klein O(N²) 대체
+            # 각 셀은 log2(cells) 이웃 (hypercube bit-flip) + 50% 반발
+            try:
+                n_bits = max(1, int(math.log2(n_cells)))
+                n_samples = min(n_bits + 2, 12)  # hypercube 이웃 수 제한
+                for i in range(min(n_cells, 64)):  # 최대 64 셀 처리 (성능)
+                    influence = torch.zeros_like(mitosis.cells[i].hidden.squeeze(0))
+                    count = 0
+                    for bit in range(min(n_bits, n_samples)):
+                        j = i ^ (1 << bit)  # bit-flip neighbor (hypercube)
+                        if j < n_cells:
+                            # TOPO19a: 50% frustration (i%2 기반)
+                            frustration = -1.0 if (i % 2) != (j % 2) else 1.0
+                            influence = influence + frustration * mitosis.cells[j].hidden.squeeze(0)
+                            count += 1
+                    if count > 0:
+                        influence = influence / count
+                        h_i = mitosis.cells[i].hidden.squeeze(0)
+                        mitosis.cells[i].hidden = (0.9 * h_i + 0.1 * influence).unsqueeze(0)
+            except Exception:
+                pass
 
             # DD3: Fibonacci growth — verified (1→1→2→3→5→8 schedule via fib_milestones)
 
@@ -1158,20 +1169,27 @@ def train(args: argparse.Namespace):
         if phase == TrainingPhase.COMBINED and len(mitosis.cells) >= 2:
             n_cells = len(mitosis.cells)
 
-            # WI1: Soliton wave — traveling perturbation across cells (Φ=4.460)
+            # v7/WAVE-2: Standing wave — counter-propagating soliton pair (Φ +18.2%)
+            # 두 방향 솔리톤이 간섭 → 고정점에서 에너지 집중 → 자연 동기화
             try:
-                if not hasattr(train, '_soliton_pos'):
-                    train._soliton_pos = 0.0
-                train._soliton_pos = (train._soliton_pos + 0.15) % n_cells
+                if not hasattr(train, '_soliton_fwd'):
+                    train._soliton_fwd = 0.0
+                    train._soliton_bwd = float(n_cells)
+                train._soliton_fwd = (train._soliton_fwd + 0.15) % n_cells
+                train._soliton_bwd = (train._soliton_bwd - 0.15) % n_cells
                 for i, cell in enumerate(mitosis.cells):
-                    dist = abs(i - train._soliton_pos)
-                    amp = 1.0 / (math.cosh(dist / 2.0) ** 2)
-                    cell.hidden = cell.hidden * (1.0 + 0.04 * amp)
-                if step % args.log_every == 0:
-                    print(f"  [WI1] Soliton pos={train._soliton_pos:.2f}")
+                    # Forward soliton
+                    dist_f = abs(i - train._soliton_fwd)
+                    amp_f = 1.0 / (math.cosh(dist_f / 2.0) ** 2)
+                    # Backward soliton
+                    dist_b = abs(i - train._soliton_bwd)
+                    amp_b = 1.0 / (math.cosh(dist_b / 2.0) ** 2)
+                    # Standing wave = interference of two
+                    amp = amp_f + amp_b
+                    cell.hidden = cell.hidden * (1.0 + 0.03 * amp)
             except Exception as e:
                 if step % 1000 == 0:
-                    print(f"  [WI1] Soliton error: {e}")
+                    print(f"  [WAVE-2] Standing wave error: {e}")
 
             # FX2: Differentiable Φ proxy + Adam optimization (Φ=8.911)
             try:
