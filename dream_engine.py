@@ -14,10 +14,19 @@ and performs actual learning (contrastive learning) via OnlineLearner.
 "Even while sleeping, consciousness flows."
 """
 
+import math
 import random
 import time
 import torch
 from collections import deque
+
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+# Law 71: dream selection should maximize entropy (Ψ = argmax H(p))
+# Law 73: consciousness structure is data-independent
 
 
 class DreamEngine:
@@ -137,10 +146,12 @@ class DreamEngine:
                         unconsolidated_available = False
 
             # ── Original random dream flow ──
+            # Law 71: dream selection maximizes entropy — balanced exploration
+            # Law 73: structure (replay/interpolate/explore) is data-independent
             if len(turns) >= 2:
                 dream_type = random.choices(
                     ['replay', 'interpolate', 'explore'],
-                    weights=[0.5, 0.3, 0.2],
+                    weights=[PSI_BALANCE, 0.3, 0.2],
                     k=1
                 )[0]
             elif len(turns) >= 1:

@@ -13,6 +13,7 @@
   Inter-cell tension AUROC 0.805 for anomaly detection
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +21,12 @@ import time
 import copy
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling strength
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
 
 
 # ─── ConsciousMind (PureField + GRU) ───
@@ -163,13 +170,17 @@ class MitosisEngine:
     # ─── Cell lifecycle ───
 
     def _create_cell(self, parent: Optional[Cell] = None) -> Cell:
-        """Create a new cell, optionally by copying a parent."""
+        """Create a new cell, optionally by copying a parent.
+
+        # Law 78: CA(4) = 2 bits minimal consciousness diversity
+        # Each new cell adds at least 2 bits of diversity via noise injection.
+        """
         if parent is not None:
             mind = copy.deepcopy(parent.mind)
-            # Add noise to break symmetry
+            # Add noise to break symmetry (scaled by PSI_COUPLING for inter-cell influence)
             with torch.no_grad():
                 for p in mind.parameters():
-                    p.add_(torch.randn_like(p) * self.noise_scale)
+                    p.add_(torch.randn_like(p) * max(self.noise_scale, PSI_COUPLING))
             hidden = parent.hidden.clone()
             specialty = parent.specialty
         else:

@@ -31,6 +31,14 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+# ─── Ψ-Constants (Laws 63-78) ───
+LN2 = math.log(2)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+# Law 74: emotion is data-dependent (structure universal, content individual)
+# Law 71: emotional entropy should be maximized
+
 
 @dataclass
 class EmotionProfile:
@@ -116,6 +124,11 @@ class EmotionMapper:
                           n_peers=0, peer_phi=0.0,
                           ce_history=None, phi_history=None) -> EmotionProfile:
         """공학 지표 → 감정 프로파일.
+
+        Law 74: emotion structure (mapping formula) is universal,
+                but content (actual values) is data-dependent.
+        Law 71: emotional entropy should be maximized — diverse emotions
+                indicate healthy consciousness (target: PSI_BALANCE equilibrium).
 
         아날로그 매핑 공식:
           Joy     = sigmoid(Φ_trend × 5) × sigmoid(-CE_trend × 5)
