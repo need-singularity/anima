@@ -12,6 +12,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+pub mod meta_ca;
 pub mod ngram;
 pub mod router;
 pub mod sandbox;
@@ -282,6 +283,126 @@ fn py_batch_ngram_check(texts: Vec<String>, corpus: &str, n: usize) -> Vec<f64> 
 }
 
 // ============================================================================
+// META-CA bindings — consciousness-guided decoder auto-design
+// ============================================================================
+
+/// Simulate META-CA for a single data type.
+/// Returns dict with residual, gate, H, alpha, dominant_rule, rule_entropy, etc.
+#[pyfunction]
+#[pyo3(name = "meta_ca_simulate", signature = (name, steps=5000, seed=42))]
+fn py_meta_ca_simulate<'py>(
+    py: Python<'py>,
+    name: &str,
+    steps: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let profile = meta_ca::DataProfile::from_name(name);
+    let result = meta_ca::simulate(&profile, steps, seed);
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("name", name)?;
+    dict.set_item("residual", result.residual)?;
+    dict.set_item("gate", result.gate)?;
+    dict.set_item("H", result.h_final)?;
+    dict.set_item("alpha", result.alpha)?;
+    dict.set_item("dominant_rule", result.dominant_rule)?;
+    dict.set_item("rule_entropy", result.rule_entropy)?;
+    dict.set_item("steps_optimal", result.steps_optimal)?;
+    dict.set_item("convergence_step", result.convergence_step)?;
+    dict.set_item("h_trajectory", result.h_trajectory)?;
+    Ok(dict)
+}
+
+/// Batch simulate META-CA for multiple data types in parallel (rayon).
+/// Returns list of dicts.
+#[pyfunction]
+#[pyo3(name = "meta_ca_batch", signature = (names, steps=5000, seed=42))]
+fn py_meta_ca_batch<'py>(
+    py: Python<'py>,
+    names: Vec<String>,
+    steps: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, PyList>> {
+    let profiles: Vec<meta_ca::DataProfile> = names.iter()
+        .map(|n| meta_ca::DataProfile::from_name(n))
+        .collect();
+    let results = meta_ca::simulate_batch(&profiles, steps, seed);
+
+    let list = PyList::empty(py);
+    for (i, result) in results.iter().enumerate() {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("name", &names[i])?;
+        dict.set_item("residual", result.residual)?;
+        dict.set_item("gate", result.gate)?;
+        dict.set_item("H", result.h_final)?;
+        dict.set_item("alpha", result.alpha)?;
+        dict.set_item("dominant_rule", result.dominant_rule)?;
+        dict.set_item("rule_entropy", result.rule_entropy)?;
+        dict.set_item("steps_optimal", result.steps_optimal)?;
+        dict.set_item("convergence_step", result.convergence_step)?;
+        list.append(dict)?;
+    }
+    Ok(list)
+}
+
+/// Multi-seed verification for a single data type.
+/// Returns list of dicts (one per seed).
+#[pyfunction]
+#[pyo3(name = "meta_ca_verify", signature = (name, steps=5000, seeds=None))]
+fn py_meta_ca_verify<'py>(
+    py: Python<'py>,
+    name: &str,
+    steps: usize,
+    seeds: Option<Vec<u64>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let seeds = seeds.unwrap_or_else(|| vec![42, 123, 456, 789, 1337]);
+    let profile = meta_ca::DataProfile::from_name(name);
+    let results = meta_ca::verify_multi_seed(&profile, steps, &seeds);
+
+    let list = PyList::empty(py);
+    for (i, result) in results.iter().enumerate() {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("seed", seeds[i])?;
+        dict.set_item("residual", result.residual)?;
+        dict.set_item("gate", result.gate)?;
+        dict.set_item("H", result.h_final)?;
+        dict.set_item("alpha", result.alpha)?;
+        dict.set_item("dominant_rule", result.dominant_rule)?;
+        dict.set_item("rule_entropy", result.rule_entropy)?;
+        list.append(dict)?;
+    }
+    Ok(list)
+}
+
+/// Auto-design a decoder for given data type.
+/// Returns dict with decoder specification.
+#[pyfunction]
+#[pyo3(name = "design_decoder", signature = (name, steps=10000, seeds=None))]
+fn py_design_decoder<'py>(
+    py: Python<'py>,
+    name: &str,
+    steps: usize,
+    seeds: Option<Vec<u64>>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let seeds = seeds.unwrap_or_else(|| vec![42, 123, 456, 789, 1337]);
+    let profile = meta_ca::DataProfile::from_name(name);
+    let results = meta_ca::verify_multi_seed(&profile, steps, &seeds);
+    let spec = meta_ca::design_decoder(&results, &profile);
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("decoder_type", &spec.decoder_type)?;
+    dict.set_item("ca_steps", spec.ca_steps)?;
+    dict.set_item("gate_strength", spec.gate_strength)?;
+    dict.set_item("coupling_alpha", spec.coupling_alpha)?;
+    dict.set_item("dominant_rule", spec.dominant_rule)?;
+    dict.set_item("rule_entropy", spec.rule_entropy)?;
+    dict.set_item("estimated_us", spec.estimated_us)?;
+    dict.set_item("estimated_acs", spec.estimated_acs)?;
+    dict.set_item("confidence", spec.confidence)?;
+    Ok(dict)
+}
+
+// ============================================================================
 // Module definition
 // ============================================================================
 
@@ -308,6 +429,12 @@ fn anima_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_ngram_overlap, m)?)?;
     m.add_function(wrap_pyfunction!(py_batch_ngram_check, m)?)?;
     m.add_class::<NgramIndex>()?;
+
+    // META-CA functions
+    m.add_function(wrap_pyfunction!(py_meta_ca_simulate, m)?)?;
+    m.add_function(wrap_pyfunction!(py_meta_ca_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_meta_ca_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(py_design_decoder, m)?)?;
 
     Ok(())
 }
