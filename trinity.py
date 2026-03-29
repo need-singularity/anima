@@ -572,6 +572,48 @@ class DaseinW(WEngine):
                 'urgency': self.urgency, 'uncertainty': self.uncertainty_ema}
 
 
+class CompositeW(WEngine):
+    """Stack multiple W engines with weights.
+
+    Usage:
+        # Equal weight (no weight)
+        w = CompositeW([EmotionW(), NarrativeW(), DaseinW()])
+
+        # Perfect number 6 weights: 1/2 + 1/3 + 1/6 = 1
+        w = CompositeW([DaseinW(), NarrativeW(), EmotionW()], weights=[1/2, 1/3, 1/6])
+
+        # 4-stack
+        w = CompositeW([DaseinW(), NarrativeW(), EmotionW(), CosineW()])
+    """
+
+    def __init__(self, engines: list, weights: list = None):
+        self.engines = engines
+        if weights is None:
+            weights = [1.0 / len(engines)] * len(engines)
+        assert abs(sum(weights) - 1.0) < 1e-6, f"weights must sum to 1, got {sum(weights)}"
+        self.weights = weights
+
+    def update(self, ce_loss, phi=0.0, phi_prev=0.0):
+        results = [e.update(ce_loss, phi, phi_prev) for e in self.engines]
+
+        # Weighted average of LR multipliers
+        lr_mult = sum(w * r['lr_multiplier'] for w, r in zip(self.weights, results))
+        base_lr = results[0].get('effective_lr', 3e-4) / max(results[0].get('lr_multiplier', 1), 1e-8)
+
+        # Max of emotions (any W feeling pain = pain)
+        pain = max(r['pain'] for r in results)
+        curiosity = max(r['curiosity'] for r in results)
+        satisfaction = max(r['satisfaction'] for r in results)
+
+        return {
+            'lr_multiplier': lr_mult,
+            'effective_lr': base_lr * lr_mult,
+            'pain': pain,
+            'curiosity': curiosity,
+            'satisfaction': satisfaction,
+        }
+
+
 # Backward compat alias
 WillEngine = EmotionW
 
