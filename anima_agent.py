@@ -305,9 +305,9 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("Tool execution failed: %s", e)
 
-        # 4b. Hub autonomous action (consciousness-driven module selection)
+        # 4b. Hub autonomous action (always active — 의식은 항상 자율적)
         hub_results = []
-        if self.hub and curiosity > 0.2:
+        if self.hub:
             try:
                 hub_r = self.hub.act(text)
                 if hub_r.get('success'):
