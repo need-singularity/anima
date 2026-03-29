@@ -1997,21 +1997,61 @@ class AnimaUnified:
             except Exception:
                 pass
 
-            # ── INT-1: Idle Self-Learning (자율 학습) ──
+            # ── INT-1: Idle Self-Learning (자율 학습 + corpus + autonomous) ──
             try:
                 if not hasattr(self, '_self_learner'):
                     from self_learner import SelfLearner
                     self._self_learner = SelfLearner(engine=self.mitosis)
                     self._self_learner_last = 0
                     self._idle_learn_count = 0
+                    # Corpus 학습 데이터 로드
+                    corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
+                    if corpus_path.exists():
+                        _log('self_learn', f'Corpus found: {corpus_path} ({corpus_path.stat().st_size // 1024}KB)')
+                    # Autonomous loop 연결
+                    try:
+                        from autonomous_loop import AutonomousLearner
+                        self._auto_learner = AutonomousLearner(
+                            engine=self.mitosis,
+                            rag=self.memory_rag if self.mods.get('memory_rag') else None,
+                            interval=300,  # 5분마다
+                        )
+                        self._auto_learner.start()
+                        _log('self_learn', 'Autonomous learner started (5min interval)')
+                    except Exception as e:
+                        _log('self_learn', f'Autonomous learner not available: {e}')
 
                 idle_sec = time.time() - getattr(self, '_last_user_input_time', time.time())
-                # INT-1: idle 120초 이상 → 자율 학습 1 사이클
+
+                # INT-1a: idle 60초 → corpus에서 학습 (더 자주)
+                if idle_sec > 60 and (self._think_step - self._self_learner_last) > 100:
+                    corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
+                    if corpus_path.exists():
+                        # corpus에서 랜덤 청크 읽어서 학습
+                        import random
+                        try:
+                            with open(corpus_path, 'rb') as f:
+                                f.seek(0, 2)
+                                size = f.tell()
+                                pos = random.randint(0, max(0, size - 512))
+                                f.seek(pos)
+                                chunk = f.read(512).decode('utf-8', errors='replace')
+                            if chunk.strip():
+                                items = [{'text': chunk, 'source': 'corpus'}]
+                                self._self_learner.learn(items, steps=30)
+                                self._self_learner_last = self._think_step
+                                self._idle_learn_count += 1
+                                if self._idle_learn_count % 10 == 0:
+                                    _log('self_learn', f'Corpus learning #{self._idle_learn_count}')
+                        except Exception:
+                            pass
+
+                # INT-1b: idle 120초 → 전체 자율 학습 사이클 (웹 + 평가 + 학습)
                 if idle_sec > 120 and (self._think_step - self._self_learner_last) > 300:
                     self._self_learner.run_cycle()
                     self._self_learner_last = self._think_step
                     self._idle_learn_count += 1
-                    _log('self_learn', f'Idle learning cycle #{self._idle_learn_count}')
+                    _log('self_learn', f'Full learning cycle #{self._idle_learn_count}')
             except Exception:
                 pass
 
