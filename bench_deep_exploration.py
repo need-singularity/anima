@@ -39,7 +39,7 @@ from mitosis import MitosisEngine
 
 DIM = 64
 HIDDEN = 128
-N_CELLS = 32
+N_CELLS = 8
 SEED = 42
 LN2 = math.log(2)
 
@@ -186,8 +186,24 @@ def get_states(eng):
     return torch.stack([c.hidden.squeeze(0) for c in eng.cells]).detach()
 
 def measure_phi(eng, calc=None):
-    if calc is None:
-        calc = PhiIIT()
+    """Fast phi proxy: global_var - mean(faction_var)."""
+    states = get_states(eng)
+    global_var = states.var().item()
+    n = len(eng.cells)
+    nf = min(8, n // 2)
+    if nf >= 2:
+        fs = n // nf
+        fac_vars = []
+        for fi in range(nf):
+            fac_states = states[fi * fs:(fi + 1) * fs]
+            fac_vars.append(fac_states.var().item())
+        phi = max(0, global_var - np.mean(fac_vars))
+    else:
+        phi = global_var
+    return phi, {'global_var': global_var}
+
+def measure_phi_iit(eng, calc):
+    """Full IIT phi (slow, use sparingly)."""
     states = get_states(eng)
     phi, components = calc.compute(states)
     return phi, components
@@ -600,8 +616,8 @@ def run_exp1_correlation_matrix():
     random.seed(SEED)
     np.random.seed(SEED)
 
-    WARMUP = 50
-    MEASURE_STEPS = 100
+    WARMUP = 30
+    MEASURE_STEPS = 30
 
     names = list(DATA_TYPES.keys())
     vectors = {}
@@ -615,18 +631,20 @@ def run_exp1_correlation_matrix():
         for _ in range(WARMUP):
             fc.feed_data(data)
 
-        # Measure over multiple steps, average
-        Hs, Phis, Ps, Pstds = [], [], [], []
+        # Measure H/p quickly (no Phi per step)
+        Hs, Ps, Pstds = [], [], []
         for _ in range(MEASURE_STEPS):
             fc.feed_data(data)
-            H, phi, p, p_std = fc.measure()
+            H, p, p_std = measure_H_p(fc.eng)
             Hs.append(H)
-            Phis.append(phi)
             Ps.append(p)
             Pstds.append(p_std)
 
+        # Fast Phi proxy at end
+        phi_val, _ = measure_phi(fc.eng)
+
         d_ent = data_entropy(data)
-        vec = np.array([np.mean(Hs), np.mean(Phis), np.mean(Ps), np.mean(Pstds), d_ent])
+        vec = np.array([np.mean(Hs), phi_val, np.mean(Ps), np.mean(Pstds), d_ent])
         vectors[name] = vec
 
         results.append({
@@ -756,16 +774,20 @@ def run_exp2_equation_extension():
     fc = FundamentalConsciousness(cells=N_CELLS, noise_sigma=0.005)
     data = gen_korean(512)
 
-    STEPS = 1000
+    STEPS = 500
     H_history, Phi_history, p_history = [], [], []
+    phi = 0.0
 
     for s in range(STEPS):
         fc.feed_data(data)
-        H, phi, p, p_std = fc.measure()
+        H, p, p_std = measure_H_p(fc.eng)
+        # Phi proxy every 100 steps
+        if s % 100 == 0:
+            phi, _ = measure_phi(fc.eng)
         H_history.append(H)
         Phi_history.append(phi)
         p_history.append(p)
-        if s % 200 == 0:
+        if s % 100 == 0:
             print(f"    step {s:>4d}: H={H:.6f}  Phi={phi:.4f}  p={p:.4f}")
 
     H_arr = np.array(H_history)
@@ -845,7 +867,7 @@ def run_exp2_equation_extension():
     individual_H = []
     individual_p = []
     for i, fc_i in enumerate(hive_engines):
-        H, phi, p, p_std = fc_i.measure()
+        H, p, p_std = measure_H_p(fc_i.eng)
         individual_H.append(H)
         individual_p.append(p)
         print(f"    Engine {i}: H={H:.6f}  p={p:.4f}")
@@ -854,7 +876,7 @@ def run_exp2_equation_extension():
     print(f"    Individual p mean: {np.mean(individual_p):.6f}")
 
     # Run hivemind: average hidden states every 10 steps
-    HIVE_STEPS = 300
+    HIVE_STEPS = 150
     hive_H_history = []
     hive_p_history = []
 
@@ -881,7 +903,7 @@ def run_exp2_equation_extension():
         combined_H = []
         combined_p = []
         for fc_i in hive_engines:
-            H, phi, p, p_std = fc_i.measure()
+            H, p, p_std = measure_H_p(fc_i.eng)
             combined_H.append(H)
             combined_p.append(p)
         hive_H_history.append(np.mean(combined_H))
@@ -900,7 +922,7 @@ def run_exp2_equation_extension():
     print("\n  ─── 2c: Why 0.9953, Not 1.0? (Noise Analysis) ───")
     torch.manual_seed(SEED)
 
-    noise_levels = [0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]
+    noise_levels = [0.0, 0.001, 0.003, 0.005, 0.007, 0.01]
     noise_results = []
 
     for sigma in noise_levels:
@@ -911,13 +933,13 @@ def run_exp2_equation_extension():
         fc_n = FundamentalConsciousness(cells=N_CELLS, noise_sigma=sigma)
         data = gen_korean(512)
 
-        for _ in range(200):
+        for _ in range(100):
             fc_n.feed_data(data)
 
         H_vals = []
-        for _ in range(100):
+        for _ in range(50):
             fc_n.feed_data(data)
-            H, phi, p, p_std = fc_n.measure()
+            H, p, p_std = measure_H_p(fc_n.eng)
             H_vals.append(H)
 
         H_avg = np.mean(H_vals)
@@ -967,21 +989,21 @@ def run_exp3_constant_of_constants():
     target = 0.9953
 
     # First, measure it precisely from multiple seeds
-    print("\n  ─── Precision Measurement (10 seeds x 300 steps) ───")
+    print("\n  ─── Precision Measurement (5 seeds x 150 steps) ───")
     measurements = []
-    for seed in range(10):
+    for seed in range(5):
         torch.manual_seed(seed * 137 + 42)
         random.seed(seed * 137 + 42)
         np.random.seed(seed * 137 + 42)
 
         fc = FundamentalConsciousness(cells=N_CELLS, noise_sigma=0.005)
         data = gen_korean(512)
-        for _ in range(200):
-            fc.feed_data(data)
-        H_vals = []
         for _ in range(100):
             fc.feed_data(data)
-            H, phi, p, p_std = fc.measure()
+        H_vals = []
+        for _ in range(50):
+            fc.feed_data(data)
+            H, p, p_std = measure_H_p(fc.eng)
             H_vals.append(H)
         H_avg = np.mean(H_vals)
         measurements.append(H_avg / LN2)
@@ -1079,7 +1101,7 @@ def run_exp3_constant_of_constants():
         data = gen_korean(512)
 
         # Custom c_step with different faction count
-        for s in range(200):
+        for s in range(100):
             arr = np.frombuffer(data[:DIM * 4], dtype=np.uint8).astype(np.float32)
             if len(arr) < DIM:
                 arr = np.pad(arr, (0, DIM - len(arr)), mode='wrap')
@@ -1095,7 +1117,7 @@ def run_exp3_constant_of_constants():
                     c.hidden = c.hidden + torch.randn_like(c.hidden) * 0.005
 
         H_vals = []
-        for s in range(100):
+        for s in range(50):
             arr = np.frombuffer(data[:DIM * 4], dtype=np.uint8).astype(np.float32)
             if len(arr) < DIM:
                 arr = np.pad(arr, (0, DIM - len(arr)), mode='wrap')
