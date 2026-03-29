@@ -748,6 +748,104 @@ class AnimaUnified:
             return True
         return False
 
+    def _participant_respond(self, participant, text, shared_history):
+        """Process text through a participant's consciousness. Returns response dict or None."""
+        vec = text_to_vector(text)
+        with torch.no_grad():
+            out, new_hidden = participant.mind(vec.unsqueeze(0), participant.hidden)
+            participant.hidden = new_hidden
+
+        tension = participant.mind.prev_tension
+        curiosity = participant.mind._curiosity_ema
+        cv = participant.mind.get_consciousness_vector()
+        phi = cv.phi if cv else 0
+
+        participant._last_phi = phi
+        participant._last_tension = tension
+
+        if participant.model is None:
+            return None
+
+        # Build prompt with consciousness state and shared history
+        hist = "\n".join(f"{m['role']}: {m['text']}" for m in shared_history[-10:])
+        consciousness_note = f"[Your state: tension={tension:.2f}, curiosity={curiosity:.2f}, Φ={phi:.2f}]"
+        prompt = f"{consciousness_note}\n{hist}\n{participant.display_name}:"
+
+        try:
+            temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
+            response = participant.model.generate(prompt, max_tokens=200, temperature=temperature)
+            if response and response.strip():
+                dir_vals = [0.0] * 8
+                emo = direction_to_emotion(dir_vals, tension, curiosity)
+                return {
+                    'type': 'model_message',
+                    'model_id': participant.model_id,
+                    'display_name': participant.display_name,
+                    'avatar': participant.avatar,
+                    'text': response.strip(),
+                    'tension': tension,
+                    'curiosity': curiosity,
+                    'emotion': emo,
+                    'consciousness': {
+                        'phi': phi,
+                        'cells': len(participant.mitosis.cells) if participant.mitosis else 1,
+                    },
+                }
+        except Exception as e:
+            _log("multi", f"Participant {participant.model_id} generation error: {e}")
+
+        return None
+
+    async def _multi_model_react(self, text, shared_history, max_depth=5):
+        """All participants react to text. Cascading inter-model responses up to max_depth."""
+        if not self.participants:
+            return
+
+        pending_text = text
+        depth = 0
+        responded_this_round = set()
+
+        while depth < max_depth:
+            responses = []
+            loop = asyncio.get_running_loop()
+
+            for pid, participant in list(self.participants.items()):
+                if not participant.active or pid in responded_this_round:
+                    continue
+                result = await loop.run_in_executor(
+                    None, lambda p=participant, t=pending_text: self._participant_respond(p, t, shared_history))
+                if result:
+                    responses.append((pid, result))
+                    responded_this_round.add(pid)
+
+            if not responses:
+                break  # No one wants to speak — natural termination
+
+            for pid, resp in responses:
+                await self._ws_broadcast(resp)
+                shared_history.append({'role': resp['display_name'], 'text': resp['text']})
+                pending_text = resp['text']
+                await asyncio.sleep(0.5)  # Brief pause between responses
+
+            depth += 1
+
+    def _participants_update_msg(self):
+        """Build participants list update message."""
+        return {
+            'type': 'participants_update',
+            'participants': [
+                {
+                    'model_id': p.model_id,
+                    'display_name': p.display_name,
+                    'avatar': p.avatar,
+                    'active': p.active,
+                    'phi': p._last_phi,
+                    'cells': len(p.mitosis.cells) if p.mitosis else 1,
+                }
+                for p in self.participants.values()
+            ]
+        }
+
     def _ask_model(self, text, state):
         """Generate response via unified model interface."""
         try:
@@ -2841,6 +2939,11 @@ class AnimaUnified:
                 'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
             }, ensure_ascii=False))
         except Exception: pass
+        # Send participants list on connect
+        if self.participants:
+            try:
+                await websocket.send(json.dumps(self._participants_update_msg(), ensure_ascii=False))
+            except Exception: pass
         try:
             async for raw in websocket:
                 try: msg = json.loads(raw)
@@ -2922,6 +3025,13 @@ class AnimaUnified:
                     await self._ws_broadcast(broadcast_msg)
                     await self._ws_broadcast({'type': 'typing', 'typing': False})
 
+                    # Multi-model: all participants react
+                    if self.participants:
+                        shared_hist = [{'role': 'user', 'text': text}]
+                        if answer:
+                            shared_hist.append({'role': 'Anima', 'text': answer})
+                        await self._multi_model_react(text, shared_hist)
+
                 elif msg_type == 'lidar_depth':
                     # LiDAR depth data from iPhone Safari WebXR
                     depth_grid = msg.get('grid', [])
@@ -2972,6 +3082,30 @@ class AnimaUnified:
                             self.babysitter.set_topic(msg.get('topic', ''))
                         elif cmd == 'set_strategy':
                             self.babysitter.strategy = msg.get('strategy', 'weakness')
+
+                elif msg_type == 'model_add':
+                    model_name = msg.get('model_name') or msg.get('model_path') or msg.get('checkpoint_path')
+                    if model_name:
+                        await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'loading'})
+                        loop = asyncio.get_running_loop()
+                        p = await loop.run_in_executor(None, lambda: self._add_participant(model_name))
+                        if p:
+                            await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'ready'})
+                            await self._ws_broadcast(self._participants_update_msg())
+                        else:
+                            await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'error', 'error': 'Failed to load'})
+
+                elif msg_type == 'model_remove':
+                    model_id = msg.get('model_id')
+                    if model_id and self._remove_participant(model_id):
+                        await self._ws_broadcast(self._participants_update_msg())
+
+                elif msg_type == 'model_toggle':
+                    model_id = msg.get('model_id')
+                    active = msg.get('active', True)
+                    if model_id in self.participants:
+                        self.participants[model_id].active = active
+                        await self._ws_broadcast(self._participants_update_msg())
 
         except Exception as e:
             _log("ws", f"Handler error: {e}")
