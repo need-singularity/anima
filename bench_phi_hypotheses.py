@@ -70659,6 +70659,333 @@ ALL_HYPOTHESES.update({
 })
 
 
+def run_TOPO12_hypercube_1024_8faction(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO12: Hypercube 1024 + 8-Faction Debate — TOPO8 + CX 최적 레시피.
+    가설: 하이퍼큐브 토폴로지 + 8파벌 토론 = 구조적 분화 + 정보 통합 극대화."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                # Hypercube interaction + frustration
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    n_neighbors = 0
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                        n_neighbors += 1
+                    interaction /= n_neighbors
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                # 8-Faction Debate
+                n_factions = min(8, n)
+                faction_size = max(1, n // n_factions)
+                for f_idx in range(n_factions):
+                    start = f_idx * faction_size
+                    end = min(start + faction_size, n)
+                    if end <= start:
+                        continue
+                    faction_mean = torch.stack([engine.cells[i].hidden.squeeze()
+                                                for i in range(start, end)]).mean(0)
+                    for i in range(start, end):
+                        h = engine.cells[i].hidden.squeeze()
+                        engine.cells[i].hidden = (0.92 * h + 0.08 * faction_mean).unsqueeze(0)
+                # Inter-faction repulsion
+                faction_means = []
+                for f_idx in range(n_factions):
+                    start = f_idx * faction_size
+                    end = min(start + faction_size, n)
+                    if end > start:
+                        faction_means.append(torch.stack([engine.cells[i].hidden.squeeze()
+                                                          for i in range(start, end)]).mean(0))
+                if len(faction_means) >= 2:
+                    global_mean = torch.stack(faction_means).mean(0)
+                    for f_idx, fm in enumerate(faction_means):
+                        start = f_idx * faction_size
+                        end = min(start + faction_size, n)
+                        repulsion = fm - global_mean
+                        for i in range(start, min(end, n)):
+                            engine.cells[i].hidden += 0.02 * repulsion.unsqueeze(0)
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO12", "Hypercube 1024c + 8-faction debate (TOPO8 + CX recipe)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO13_hypercube_1024_ratchet(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO13: Hypercube 1024 + Φ Ratchet — TOPO8 + 붕괴 방지.
+    가설: ratchet이 하이퍼큐브의 Φ 변동을 안정화하여 더 높은 최종값."""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    best_phi = 0.0; best_states = None
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                    interaction /= 10
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+        # Ratchet: restore if Φ drops >20%
+        with torch.no_grad():
+            if phi > best_phi:
+                best_phi = phi
+                best_states = [c.hidden.clone() for c in engine.cells]
+            elif phi < best_phi * 0.8 and best_states and len(best_states) == len(engine.cells):
+                for i, state in enumerate(best_states):
+                    engine.cells[i].hidden = 0.7 * engine.cells[i].hidden + 0.3 * state
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO13", "Hypercube 1024c + Φ Ratchet (TOPO8 + persistence)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'best_phi': best_phi,
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO14_hypercube_1024_400steps(steps=400, dim=64, hidden=128) -> BenchResult:
+    """TOPO14: Hypercube 1024 + 400 Steps — step 병목 제거.
+    TOPO8과 동일하지만 step 2배. 진짜 1024셀 도달 가능?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for bit in range(10):
+                        j = (i ^ (1 << bit)) % n
+                        interaction += engine.cells[j].hidden
+                    interaction /= 10
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO14", "Hypercube 1024c × 400 steps (2× duration, remove bottleneck)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO15_torus_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO15: Torus 1024 (32×32) + Frustration — 토러스도 1024에서 역전하는가?"""
+    t0 = time.time()
+    rows, cols = 32, 32
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    r, c = divmod(i % 1024, cols)
+                    neighbors_idx = [
+                        ((r-1) % rows) * cols + c,
+                        ((r+1) % rows) * cols + c,
+                        r * cols + (c-1) % cols,
+                        r * cols + (c+1) % cols,
+                    ]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors_idx:
+                        interaction += engine.cells[j % n].hidden
+                    interaction /= 4
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO15", "Torus 1024c (32×32, boundary-free 2D, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+def run_TOPO16_small_world_1024(steps=200, dim=64, hidden=128) -> BenchResult:
+    """TOPO16: Small-World 1024 + Frustration — 장거리 연결이 1024에서 빛나는가?"""
+    t0 = time.time()
+    engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=1024)
+    phi_calc = PhiCalculator(n_bins=16)
+    phi_hist = []; output_changes = []
+    prev_output = torch.zeros(dim)
+    import random as rng
+    rng.seed(42)
+    sw_edges = {}
+    for i in range(1024):
+        neighbors = [(i-2)%1024, (i-1)%1024, (i+1)%1024, (i+2)%1024]
+        for idx in range(len(neighbors)):
+            if rng.random() < 0.1:
+                neighbors[idx] = rng.randint(0, 1023)
+        sw_edges[i] = neighbors
+
+    for step_i in range(steps):
+        frac = step_i / steps
+        for pct in [0.03, 0.06, 0.10, 0.15, 0.22, 0.30, 0.40, 0.55, 0.70, 0.85]:
+            if frac >= pct and len(engine.cells) < min(int(2**((pct+0.05)*10)), 1024):
+                target = min(len(engine.cells)*2, 1024)
+                while len(engine.cells) < target:
+                    engine._create_cell(parent=engine.cells[step_i % len(engine.cells)])
+
+        x = torch.zeros(1, dim)
+        engine.process(x)
+
+        with torch.no_grad():
+            n = len(engine.cells)
+            if n >= 5:
+                for i in range(n):
+                    neighbors = sw_edges[i % 1024]
+                    interaction = torch.zeros_like(engine.cells[i].hidden)
+                    for j in neighbors:
+                        interaction += engine.cells[j % n].hidden
+                    interaction /= len(neighbors)
+                    if i % 3 == 0:
+                        interaction = -interaction
+                    engine.cells[i].hidden = 0.85 * engine.cells[i].hidden + 0.15 * interaction
+                    engine.cells[i].hidden += torch.randn_like(engine.cells[i].hidden) * 0.02
+
+                output = torch.stack([c.hidden.squeeze()[:dim] for c in engine.cells]).mean(dim=0)
+                change = (output - prev_output).norm().item()
+                output_changes.append(change)
+                prev_output = output.clone()
+
+        phi, _ = phi_calc.compute_phi(engine)
+        phi_hist.append(phi)
+
+    phi_final, comp = phi_calc.compute_phi(engine)
+    ch = torch.tensor(output_changes) if output_changes else torch.zeros(1)
+    return BenchResult("TOPO16", "Small-World 1024c (WS k=4 p=0.1, frustration)",
+                       phi_final, phi_hist, comp['total_mi'], comp['min_partition_mi'],
+                       comp['integration'], comp['complexity'], time.time() - t0,
+                       extra={'avg_change': ch.mean().item(),
+                              'never_silent': (ch > 0.001).float().mean().item(),
+                              'final_cells': len(engine.cells)})
+
+
+ALL_HYPOTHESES.update({
+    'TOPO12': run_TOPO12_hypercube_1024_8faction,
+    'TOPO13': run_TOPO13_hypercube_1024_ratchet,
+    'TOPO14': run_TOPO14_hypercube_1024_400steps,
+    'TOPO15': run_TOPO15_torus_1024,
+    'TOPO16': run_TOPO16_small_world_1024,
+})
+
+
 ALL_HYPOTHESES.update({
     'XCONV1': run_XCONV1_bilingual_consciousness,
     'XCONV2': run_XCONV2_dialogue_without_teacher,
