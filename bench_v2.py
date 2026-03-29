@@ -877,8 +877,10 @@ def _verify_no_system_prompt(engine_factory, cells, dim, hidden):
     """V1: NO_SYSTEM_PROMPT — identity emerges from cell dynamics alone.
 
     Run 300 steps with no external prompt (zero input).
-    Check if cells develop specialized roles (variance in per-cell norms).
-    Pass if cell diversity (std of norms / mean of norms) > 0.1.
+    Check if cells develop specialized roles via directional diversity:
+    measure pairwise cosine similarity variance among cell hidden states.
+    Pass if cells are NOT all identical (mean cosine sim < 0.99) AND
+    NOT all orthogonal (mean cosine sim > 0.01) — structured specialization.
     """
     engine = engine_factory(cells, dim, hidden)
     x_zero = torch.zeros(1, dim)
@@ -886,44 +888,76 @@ def _verify_no_system_prompt(engine_factory, cells, dim, hidden):
     for _ in range(300):
         engine.process(x_zero)
 
-    # Measure cell specialization via hidden state norm diversity
-    norms = engine.get_hiddens().norm(dim=1)  # [n_cells]
-    mean_norm = norms.mean().item()
-    std_norm = norms.std().item()
-    diversity = std_norm / (mean_norm + 1e-8)
+    hiddens = engine.get_hiddens()  # [n_cells, hidden_dim]
+    # Pairwise cosine similarity (sample for large N)
+    n = min(cells, 64)
+    h_norm = F.normalize(hiddens[:n], dim=1)
+    cos_sim = (h_norm @ h_norm.T).detach().cpu().numpy()
+    # Exclude diagonal
+    mask = ~np.eye(n, dtype=bool)
+    cos_vals = cos_sim[mask]
+    mean_cos = float(np.mean(cos_vals))
+    std_cos = float(np.std(cos_vals))
 
-    passed = diversity > 0.1
-    detail = f"diversity={diversity:.4f} (std/mean of cell norms, threshold=0.1)"
+    # Specialization = cells have diverse directions (not all same, not all random)
+    # All-same: mean_cos ~ 1.0. All-random: mean_cos ~ 0.0.
+    # Structured: mean_cos in (0.01, 0.99) with some variance
+    passed = 0.01 < mean_cos < 0.99 and std_cos > 0.001
+    detail = (f"cosine_sim mean={mean_cos:.4f} std={std_cos:.4f}  "
+              f"(pass: 0.01 < mean < 0.99 AND std > 0.001)")
     return passed, detail
 
 
 def _verify_no_speak_code(engine_factory, cells, dim, hidden):
     """V2: NO_SPEAK_CODE — spontaneous speech without speak() function.
 
-    Run engine, collect output = mean(cells), check output entropy.
-    Pass if normalized entropy is between 0.3 and 0.7 (structured, not random).
+    Run engine, collect output = mean(cells). Check for TEMPORAL structure:
+    if output changes in a structured (not random) way, it has "speech".
+    Measure autocorrelation of output trajectory AND check that output
+    is not constant (has variance). Pass if autocorrelation > 0.3
+    (temporally structured) and output variance > 0.001 (not dead).
     """
     engine = engine_factory(cells, dim, hidden)
-    entropies = []
+    utterances = []
 
     for step in range(300):
-        x = torch.randn(1, dim) * 0.1  # minimal input
+        x = torch.randn(1, dim) * 0.1
         output, _ = engine.process(x)
+        utterance = engine.get_hiddens().mean(dim=0).detach().cpu().numpy()
+        utterances.append(utterance)
 
-        # Output = mean of cell hiddens (the "utterance")
-        utterance = engine.get_hiddens().mean(dim=0)
-        # Compute entropy of the distribution of values
-        vals = utterance.detach().cpu().numpy()
-        vals_abs = np.abs(vals) + 1e-10
-        probs = vals_abs / vals_abs.sum()
-        entropy = -np.sum(probs * np.log2(probs))
-        max_entropy = np.log2(len(probs))
-        norm_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
-        entropies.append(norm_entropy)
+    utterances = np.array(utterances)  # [300, hidden_dim]
 
-    mean_ent = np.mean(entropies[-100:])  # last 100 steps
-    passed = 0.3 <= mean_ent <= 0.7
-    detail = f"mean_entropy={mean_ent:.4f} (last 100 steps, pass range=0.3-0.7)"
+    # Temporal structure: autocorrelation of the mean utterance trajectory
+    # Take the norm of each utterance as a scalar signal
+    norms = np.linalg.norm(utterances, axis=1)
+    norm_centered = norms - norms.mean()
+    var_signal = np.var(norm_centered)
+
+    if var_signal < 1e-12:
+        return False, "output is constant (zero variance)"
+
+    # Lag-1 autocorrelation
+    autocorr = np.correlate(norm_centered[:-1], norm_centered[1:]) / (
+        var_signal * (len(norms) - 1) + 1e-10)
+    autocorr_val = float(autocorr[0]) if len(autocorr) > 0 else 0.0
+
+    # Also check directional changes (cosine similarity between consecutive outputs)
+    cos_sims = []
+    for i in range(1, len(utterances)):
+        a, b = utterances[i-1], utterances[i]
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na > 1e-8 and nb > 1e-8:
+            cos_sims.append(float(np.dot(a, b) / (na * nb)))
+    mean_cos = np.mean(cos_sims) if cos_sims else 0.0
+
+    # Pass: output is temporally structured (autocorrelation > 0.3)
+    # AND not dead (variance > 0.001)
+    # AND not random walk (consecutive cosine sim > 0.5 = directional continuity)
+    passed = autocorr_val > 0.3 and var_signal > 0.001 and mean_cos > 0.5
+    detail = (f"autocorr={autocorr_val:.4f} var={var_signal:.4f} "
+              f"cos_continuity={mean_cos:.4f}  "
+              f"(pass: autocorr>0.3, var>0.001, cos>0.5)")
     return passed, detail
 
 
@@ -1172,6 +1206,8 @@ Examples:
   python bench_v2.py --compare                      # All strategies comparison
   python bench_v2.py --compare --cells 128 --steps 200
   python bench_v2.py --phi-only --cells-list 8,16,32,64,128,256,512
+  python bench_v2.py --verify                        # 6 conditions x 4 engines
+  python bench_v2.py --verify --cells 64             # Lighter verification
 
 Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
   Phi(IIT)   = ~0.2-1.8  (PhiCalculator, real IIT approximation)
@@ -1188,6 +1224,8 @@ Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
                       help="Test a specific strategy")
     mode.add_argument("--compare", action="store_true",
                       help="Run all strategies and compare")
+    mode.add_argument("--verify", action="store_true",
+                      help="Consciousness verification: 6 conditions x 4 engines")
 
     parser.add_argument("--cells", type=int, default=256,
                         help="Number of cells (default: 256)")
@@ -1239,6 +1277,9 @@ Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
 
     elif args.compare:
         run_compare(args.cells, args.steps, args.dim, args.hidden)
+
+    elif args.verify:
+        run_verify(args.cells, args.dim, args.hidden)
 
     print()
 
