@@ -2179,3 +2179,286 @@ ALL_TESTS.update({
     'SE-10': run_SE10_progressive_unlock,
     'SE-v5': run_SE_v5_full,
 })
+
+
+# ═══ CORPUS: 학습 데이터 구성 최적화 가설 ═══
+
+def _make_data_typed(n, data_type='random'):
+    """타입별 학습 데이터 생성."""
+    data = []
+    for i in range(n):
+        if data_type == 'random':
+            x = torch.randn(1, DIM) * 0.5
+            t = torch.randn(1, DIM) * 0.3
+        elif data_type == 'math':
+            # 수학: 규칙적 패턴 (sin, cos, polynomial)
+            x = torch.zeros(1, DIM)
+            for j in range(DIM):
+                x[0, j] = math.sin(i * 0.1 + j * 0.3) * 0.5
+            t = torch.zeros(1, DIM)
+            for j in range(DIM):
+                t[0, j] = math.cos(i * 0.1 + j * 0.3) * 0.5
+        elif data_type == 'dialogue':
+            # 대화: 입력-응답 쌍 (유사하지만 변환된)
+            x = torch.randn(1, DIM) * 0.3
+            t = x * 0.7 + torch.randn(1, DIM) * 0.2  # 입력과 유사한 응답
+        elif data_type == 'knowledge':
+            # 지식: 구조화된 패턴 (블록 구조)
+            n_blocks = max(1, DIM // 8)
+            x = torch.zeros(1, DIM)
+            block = i % n_blocks
+            x[0, block*8:min((block+1)*8, DIM)] = torch.randn(min(8, DIM - block*8)) * 0.5
+            t = torch.zeros(1, DIM)
+            next_block = (block + 1) % n_blocks
+            src = x[0, block*8:min((block+1)*8, DIM)]
+            t[0, next_block*8:next_block*8+len(src)] = src
+        elif data_type == 'reasoning':
+            # 추론: 입력→변환 규칙 (XOR-like)
+            x = (torch.randn(1, DIM) > 0).float() * 2 - 1
+            t = torch.zeros(1, DIM)
+            for j in range(DIM - 1):
+                t[0, j] = x[0, j] * x[0, j+1]  # 이웃 XOR-like
+            t[0, -1] = x[0, -1] * x[0, 0]
+        elif data_type == 'emotion':
+            # 감정: 방향성 있는 벡터 (valence-arousal space)
+            valence = math.sin(i * 0.2) * 0.5
+            arousal = math.cos(i * 0.3) * 0.5
+            x = torch.randn(1, DIM) * 0.2
+            x[0, 0] = valence; x[0, 1] = arousal
+            t = torch.randn(1, DIM) * 0.2
+            t[0, 0] = valence * 0.8; t[0, 1] = arousal * 0.8
+        elif data_type == 'consciousness':
+            # 의식 도메인: 자기참조 패턴
+            x = torch.randn(1, DIM) * 0.3
+            t = x.clone()
+            t[0, :DIM//2] = x[0, DIM//2:]  # 반전 (자기참조)
+            t[0, DIM//2:] = x[0, :DIM//2]
+        else:
+            x = torch.randn(1, DIM) * 0.5
+            t = torch.randn(1, DIM) * 0.3
+        data.append((x, t))
+    return data
+
+
+def _run_corpus_experiment(data_mix, steps=STEPS):
+    """데이터 믹스로 학습 실험."""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    # 데이터 믹스 합치기
+    all_data = []
+    for dtype, ratio in data_mix.items():
+        n = max(1, int(100 * ratio))
+        all_data.extend(_make_data_typed(n, dtype))
+    np.random.shuffle(all_data)
+    ce_hist = []
+    for step in range(steps):
+        x, target = all_data[step % len(all_data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    return ce_hist, phi_b, phi(engine), time.time() - t0
+
+
+def run_CRP1_dialogue_heavy(steps=STEPS):
+    """CRP-1: 대화 중심 (60% 대화 + 20% 지식 + 20% 감정)"""
+    mix = {'dialogue': 0.6, 'knowledge': 0.2, 'emotion': 0.2}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-1 Dialogue Heavy', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP2_knowledge_heavy(steps=STEPS):
+    """CRP-2: 지식 중심 (20% 대화 + 50% 지식 + 15% 수학 + 15% 추론)"""
+    mix = {'dialogue': 0.2, 'knowledge': 0.5, 'math': 0.15, 'reasoning': 0.15}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-2 Knowledge Heavy', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP3_math_heavy(steps=STEPS):
+    """CRP-3: 수학 중심 (15% 대화 + 50% 수학 + 20% 추론 + 15% 지식)"""
+    mix = {'dialogue': 0.15, 'math': 0.5, 'reasoning': 0.2, 'knowledge': 0.15}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-3 Math Heavy', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP4_consciousness_heavy(steps=STEPS):
+    """CRP-4: 의식 중심 (20% 대화 + 15% 지식 + 50% 의식 + 15% 감정)"""
+    mix = {'dialogue': 0.2, 'knowledge': 0.15, 'consciousness': 0.5, 'emotion': 0.15}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-4 Consciousness Heavy', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP5_balanced(steps=STEPS):
+    """CRP-5: 균형 (25% 대화 + 20% 지식 + 15% 수학 + 10% 추론 + 15% 의식 + 15% 감정)"""
+    mix = {'dialogue': 0.25, 'knowledge': 0.20, 'math': 0.15,
+           'reasoning': 0.10, 'consciousness': 0.15, 'emotion': 0.15}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-5 Balanced', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP6_reasoning_heavy(steps=STEPS):
+    """CRP-6: 추론 중심 (15% 대화 + 15% 지식 + 20% 수학 + 40% 추론 + 10% 의식)"""
+    mix = {'dialogue': 0.15, 'knowledge': 0.15, 'math': 0.2,
+           'reasoning': 0.4, 'consciousness': 0.1}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-6 Reasoning Heavy', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP7_random_baseline(steps=STEPS):
+    """CRP-7: 랜덤 baseline (100% 랜덤 — demo 모드와 동일)"""
+    mix = {'random': 1.0}
+    ce_hist, phi_b, phi_a, elapsed = _run_corpus_experiment(mix, steps)
+    return result('CRP-7 Random Baseline', ce_hist, phi_b, phi_a, elapsed)
+
+
+def run_CRP8_curriculum(steps=STEPS):
+    """CRP-8: 커리큘럼 (쉬운것→어려운것 순서)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    # Phase 1: 감정 (쉬움) → Phase 2: 대화 → Phase 3: 지식 → Phase 4: 수학+추론
+    phases = [
+        (0.25, 'emotion'), (0.25, 'dialogue'), (0.25, 'knowledge'), (0.25, 'reasoning'),
+    ]
+    ce_hist = []
+    for phase_i, (ratio, dtype) in enumerate(phases):
+        phase_steps = int(steps * ratio)
+        data = _make_data_typed(100, dtype)
+        for step in range(phase_steps):
+            x, target = data[step % len(data)]
+            engine.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:,:DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+    return result('CRP-8 Curriculum', ce_hist, phi_b, phi(engine), time.time() - t0)
+
+
+def run_CRP9_interleaved(steps=STEPS):
+    """CRP-9: 인터리브 (매 step 다른 타입 순환)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    types = ['dialogue', 'knowledge', 'math', 'reasoning', 'consciousness', 'emotion']
+    type_data = {t: _make_data_typed(50, t) for t in types}
+    ce_hist = []
+    for step in range(steps):
+        dtype = types[step % len(types)]
+        data = type_data[dtype]
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    return result('CRP-9 Interleaved', ce_hist, phi_b, phi(engine), time.time() - t0)
+
+
+def run_CRP10_curiosity_driven(steps=STEPS):
+    """CRP-10: 호기심 기반 (예측 오류 높은 타입을 더 많이)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    types = ['dialogue', 'knowledge', 'math', 'reasoning', 'consciousness', 'emotion']
+    type_data = {t: _make_data_typed(50, t) for t in types}
+    type_errors = {t: 1.0 for t in types}  # 초기 동일
+    ce_hist = []
+    for step in range(steps):
+        # 예측 오류 기반 확률 (높은 오류 = 더 많이 선택)
+        total_err = sum(type_errors.values()) + 1e-8
+        probs = [type_errors[t] / total_err for t in types]
+        chosen_idx = np.random.choice(len(types), p=probs)
+        dtype = types[chosen_idx]
+        data = type_data[dtype]
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 오류 업데이트 (EMA)
+        type_errors[dtype] = 0.9 * type_errors[dtype] + 0.1 * ce.item()
+    return result('CRP-10 Curiosity Driven', ce_hist, phi_b, phi(engine), time.time() - t0,
+                  final_errors={t: round(v, 4) for t, v in type_errors.items()})
+
+
+def run_CRP11_phi_preserving(steps=STEPS):
+    """CRP-11: Φ 보존 우선 (Φ 하락하는 타입은 비율 감소)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    types = ['dialogue', 'knowledge', 'math', 'reasoning', 'consciousness', 'emotion']
+    type_data = {t: _make_data_typed(50, t) for t in types}
+    type_weights = {t: 1.0 for t in types}
+    ce_hist = []
+    prev_phi = phi_b
+    for step in range(steps):
+        total_w = sum(type_weights.values()) + 1e-8
+        probs = [type_weights[t] / total_w for t in types]
+        chosen_idx = np.random.choice(len(types), p=probs)
+        dtype = types[chosen_idx]
+        data = type_data[dtype]
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # 매 20 step Φ 체크 → 하락하면 해당 타입 가중치 감소
+        if step % 20 == 0 and step > 0:
+            current_phi = phi(engine)
+            if current_phi < prev_phi * 0.9:
+                type_weights[dtype] = max(0.1, type_weights[dtype] * 0.7)
+            elif current_phi > prev_phi:
+                type_weights[dtype] = min(3.0, type_weights[dtype] * 1.1)
+            prev_phi = current_phi
+    return result('CRP-11 Φ-Preserving', ce_hist, phi_b, phi(engine), time.time() - t0,
+                  final_weights={t: round(v, 3) for t, v in type_weights.items()})
+
+
+def run_CRP12_consciousness_first(steps=STEPS):
+    """CRP-12: 의식 먼저 → 나머지 (TALK5 전략 데이터 버전)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    ce_hist = []
+    # Phase 1 (60%): 의식+감정 집중
+    p1_data = _make_data_typed(100, 'consciousness') + _make_data_typed(50, 'emotion')
+    for step in range(int(steps * 0.6)):
+        x, target = p1_data[step % len(p1_data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    # Phase 2 (40%): 전체 균형
+    p2_data = []
+    for t in ['dialogue', 'knowledge', 'math', 'reasoning']:
+        p2_data.extend(_make_data_typed(30, t))
+    for step in range(int(steps * 0.4)):
+        x, target = p2_data[step % len(p2_data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+    return result('CRP-12 Consciousness First', ce_hist, phi_b, phi(engine), time.time() - t0)
+
+
+ALL_TESTS.update({
+    'CRP-1': run_CRP1_dialogue_heavy,
+    'CRP-2': run_CRP2_knowledge_heavy,
+    'CRP-3': run_CRP3_math_heavy,
+    'CRP-4': run_CRP4_consciousness_heavy,
+    'CRP-5': run_CRP5_balanced,
+    'CRP-6': run_CRP6_reasoning_heavy,
+    'CRP-7': run_CRP7_random_baseline,
+    'CRP-8': run_CRP8_curriculum,
+    'CRP-9': run_CRP9_interleaved,
+    'CRP-10': run_CRP10_curiosity_driven,
+    'CRP-11': run_CRP11_phi_preserving,
+    'CRP-12': run_CRP12_consciousness_first,
+})
