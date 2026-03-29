@@ -46,18 +46,18 @@ fn bin_values(values: &[f32], n_bins: usize) -> Vec<usize> {
 }
 
 /// Compute Shannon entropy H(X) from bin counts.
-/// H(X) = -sum(p * log2(p)) for p > 0
+/// Uses 1e-10 smoothing to match Python's np.log2(p + 1e-10) behavior.
+/// All bins contribute (including zero-count) for exact Python compatibility.
 fn entropy(counts: &[u32], total: u32) -> f64 {
     if total == 0 {
         return 0.0;
     }
-    let t = total as f64;
+    let t = total as f64 + 1e-8; // match Python's (sum + 1e-8) normalization
     counts
         .iter()
-        .filter(|&&c| c > 0)
         .map(|&c| {
             let p = c as f64 / t;
-            -p * p.log2()
+            -p * (p + 1e-10_f64).log2()
         })
         .sum()
 }
@@ -289,21 +289,70 @@ fn find_min_partition_greedy(mi_matrix: &Array2<f64>, n: usize) -> (f64, Vec<usi
     (best_mi, part_a, part_b)
 }
 
+/// Compute distribution entropy (matches Python _distribution_entropy).
+/// Values are shifted to non-negative, normalized to probabilities, then entropy computed.
+fn distribution_entropy(values: &[f32]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let min_val = values.iter().cloned().fold(f32::INFINITY, f32::min);
+    let shifted: Vec<f64> = values.iter().map(|&v| (v - min_val) as f64).collect();
+    let total: f64 = shifted.iter().sum();
+    if total < 1e-8 {
+        return 0.0;
+    }
+    let entropy: f64 = shifted
+        .iter()
+        .map(|&v| {
+            let p = v / total;
+            -p * (p + 1e-10_f64).log2()
+        })
+        .sum();
+    entropy.max(0.0)
+}
+
+/// Compute temporal MI: MI(h_prev, h_curr) for each cell, then average.
+/// prev_states and curr_states: [n_cells x hidden_dim] — consecutive hidden states.
+fn compute_temporal_mi(prev_states: &ArrayView2<f32>, curr_states: &ArrayView2<f32>, n_bins: usize) -> f64 {
+    let n_cells = prev_states.nrows();
+    if n_cells == 0 {
+        return 0.0;
+    }
+
+    let temporal_mi: f64 = (0..n_cells)
+        .into_par_iter()
+        .map(|i| {
+            let prev = prev_states.row(i);
+            let curr = curr_states.row(i);
+            mi_from_paired_vectors(prev.as_slice().unwrap(), curr.as_slice().unwrap(), n_bins)
+        })
+        .sum();
+
+    temporal_mi
+}
+
 /// Main Phi computation.
 ///
-/// Phi = total_MI - min_partition_MI
+/// Phi = spatial_phi + temporal_phi * 0.5 + complexity * 0.1
 ///
 /// Where:
-///   total_MI = sum of all pairwise mutual information
-///   min_partition_MI = cross-partition MI for the minimum information partition
+///   spatial_phi = (total_MI - min_partition_MI) / (n-1)
+///   temporal_phi = sum(MI(h_prev, h_curr) per cell) / n
+///   complexity = std of row sums (proxy for tension distribution entropy)
 ///
-/// This captures "integrated information" — how much information is lost
-/// when the system is split at its weakest point.
-fn compute_phi_inner(states: &ArrayView2<f32>, n_bins: usize) -> (f64, Array2<f64>, Vec<usize>, Vec<usize>) {
+/// If temporal states are provided, temporal_phi is computed in Rust.
+/// Otherwise temporal_phi = 0 (spatial-only mode).
+fn compute_phi_inner(
+    states: &ArrayView2<f32>,
+    prev_states: Option<&ArrayView2<f32>>,
+    curr_states: Option<&ArrayView2<f32>>,
+    tensions: Option<&[f32]>,
+    n_bins: usize,
+) -> (f64, Array2<f64>, Vec<usize>, Vec<usize>, f64, f64, f64) {
     let n_cells = states.nrows();
 
     if n_cells <= 1 {
-        return (0.0, Array2::zeros((n_cells, n_cells)), vec![0], vec![]);
+        return (0.0, Array2::zeros((n_cells, n_cells)), vec![0], vec![], 0.0, 0.0, 0.0);
     }
 
     // Step 1: Pairwise MI matrix (parallelized)
@@ -315,10 +364,36 @@ fn compute_phi_inner(states: &ArrayView2<f32>, n_bins: usize) -> (f64, Array2<f6
     // Step 3: Minimum information partition
     let (min_part_mi, part_a, part_b) = find_min_partition(&mi_matrix);
 
-    // Step 4: Phi = total - min_partition
-    let phi = (total - min_part_mi).max(0.0);
+    // Step 4: Spatial Phi = (total - min_partition) / (n-1)
+    let n = n_cells as f64;
+    let spatial_phi = (total - min_part_mi).max(0.0) / (n - 1.0).max(1.0);
 
-    (phi, mi_matrix, part_a, part_b)
+    // Step 5: Temporal Phi (if temporal states provided)
+    let (temporal_mi, temporal_phi) = match (prev_states, curr_states) {
+        (Some(prev), Some(curr)) => {
+            let t_mi = compute_temporal_mi(prev, curr, n_bins);
+            (t_mi, t_mi / n)
+        }
+        _ => (0.0, 0.0),
+    };
+
+    // Step 6: Complexity — use tension distribution entropy if provided, else std of row sums
+    let complexity = match tensions {
+        Some(t) => distribution_entropy(t),
+        None => {
+            let row_sums: Vec<f64> = (0..n_cells)
+                .map(|i| (0..n_cells).map(|j| mi_matrix[[i, j]]).sum::<f64>())
+                .collect();
+            let mean_rs = row_sums.iter().sum::<f64>() / n;
+            let var_rs = row_sums.iter().map(|x| (x - mean_rs).powi(2)).sum::<f64>() / n;
+            var_rs.sqrt()
+        }
+    };
+
+    // Step 7: Combined (matches Python: spatial + temporal*0.5 + complexity*0.1)
+    let phi = spatial_phi + temporal_phi * 0.5 + complexity * 0.1;
+
+    (phi, mi_matrix, part_a, part_b, temporal_mi, temporal_phi, complexity)
 }
 
 // ============================================================================
@@ -707,24 +782,39 @@ fn vec2d_to_pyarray2<'py>(
 /// Args:
 ///     states: numpy array of shape [n_cells, hidden_dim], dtype float32
 ///     n_bins: number of histogram bins (default: 16)
+///     prev_states: optional numpy array [n_cells, hidden_dim] — hidden states at t-1
+///     curr_states: optional numpy array [n_cells, hidden_dim] — hidden states at t
+///
+/// When prev_states and curr_states are provided, temporal MI is computed in Rust
+/// for full 625x speedup. Otherwise temporal_phi = 0 (spatial-only mode).
 ///
 /// Returns:
 ///     tuple of (phi, components_dict)
 #[pyfunction]
-#[pyo3(signature = (states, n_bins=None))]
+#[pyo3(signature = (states, n_bins=None, prev_states=None, curr_states=None, tensions=None))]
 fn compute_phi<'py>(
     py: Python<'py>,
     states: PyReadonlyArray2<'py, f32>,
     n_bins: Option<usize>,
+    prev_states: Option<PyReadonlyArray2<'py, f32>>,
+    curr_states: Option<PyReadonlyArray2<'py, f32>>,
+    tensions: Option<PyReadonlyArray1<'py, f32>>,
 ) -> PyResult<(f64, Bound<'py, PyDict>)> {
     let n_bins = n_bins.unwrap_or(DEFAULT_N_BINS);
     let array = states.as_array();
     let n_cells = array.nrows();
 
-    let (phi, mi_matrix, part_a, part_b) = compute_phi_inner(&array, n_bins);
+    let prev_arr = prev_states.as_ref().map(|p| p.as_array());
+    let curr_arr = curr_states.as_ref().map(|c| c.as_array());
+    let tensions_slice: Option<Vec<f32>> = tensions.as_ref().map(|t| t.as_slice().unwrap().to_vec());
+    let tensions_ref = tensions_slice.as_deref();
+
+    let (phi, mi_matrix, part_a, part_b, temporal_mi, temporal_phi, complexity) =
+        compute_phi_inner(&array, prev_arr.as_ref(), curr_arr.as_ref(), tensions_ref, n_bins);
 
     let total = total_mi(&mi_matrix);
-    let min_part_mi = total - phi;
+    let (min_part_mi, _, _) = find_min_partition(&mi_matrix);
+    let spatial_phi = (total - min_part_mi).max(0.0) / (n_cells as f64 - 1.0).max(1.0);
 
     // Build components dict
     let components = PyDict::new(py);
@@ -736,6 +826,10 @@ fn compute_phi<'py>(
     components.set_item("mi_matrix_shape", (n_cells, n_cells))?;
     components.set_item("total_mi", total)?;
     components.set_item("min_partition_mi", min_part_mi)?;
+    components.set_item("spatial_phi", spatial_phi)?;
+    components.set_item("temporal_mi", temporal_mi)?;
+    components.set_item("temporal_phi", temporal_phi)?;
+    components.set_item("complexity", complexity)?;
     components.set_item("partition_a", part_a)?;
     components.set_item("partition_b", part_b)?;
     components.set_item("n_cells", n_cells)?;

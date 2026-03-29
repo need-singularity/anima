@@ -26,23 +26,42 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ['OMP_NUM_THREADS'] = '1'
 
-from consciousness_meter import PhiCalculator
+import phi_rs
 from mitosis import MitosisEngine
 
-DIM, HIDDEN, CELLS = 64, 128, 32  # 32c for speed
-phi_calc = PhiCalculator(n_bins=16)
+DIM, HIDDEN = 64, 128
+DEFAULT_CELLS = 256
 
 
 # ═══ Quick Measurements ═══
 
-def make_engine(cells=CELLS):
+CELLS = DEFAULT_CELLS  # overridden by --cells
+
+def make_engine(cells=None):
+    if cells is None: cells = CELLS
     e = MitosisEngine(DIM, HIDDEN, DIM, initial_cells=2, max_cells=cells)
     while len(e.cells) < cells: e._create_cell(parent=e.cells[0])
     for _ in range(20): e.process(torch.randn(1, DIM))
     return e
 
 def phi_iit(eng):
-    return phi_calc.compute_phi(eng)[0]
+    """Rust PhiCalculator — spatial + temporal + complexity."""
+    cells = eng.cells
+    states = torch.stack([c.hidden.squeeze(0) for c in cells]).detach().numpy()
+    # Temporal MI from hidden_history
+    prev_s, curr_s = [], []
+    for c in cells:
+        if hasattr(c, 'hidden_history') and len(c.hidden_history) >= 2:
+            prev_s.append(c.hidden_history[-2].detach().squeeze().numpy())
+            curr_s.append(c.hidden_history[-1].detach().squeeze().numpy())
+        else:
+            prev_s.append(np.zeros(HIDDEN, dtype=np.float32))
+            curr_s.append(np.zeros(HIDDEN, dtype=np.float32))
+    prev_np = np.array(prev_s, dtype=np.float32)
+    curr_np = np.array(curr_s, dtype=np.float32)
+    tensions = np.array([c.tension_history[-1] if c.tension_history else 0.0 for c in cells], dtype=np.float32)
+    phi, _ = phi_rs.compute_phi(states, 16, prev_np, curr_np, tensions)
+    return phi
 
 def granger(eng, n=30):
     cells = eng.cells; nc = len(cells)
@@ -116,9 +135,9 @@ def measure_hive(eng_fn):
 
 def apply_mechanism(eng, mechanism, steps=100):
     """메커니즘 적용."""
-    n = len(eng.cells)
     for step in range(steps):
         eng.process(torch.randn(1, DIM))
+        n = len(eng.cells)
         if n < 4: continue
         with torch.no_grad():
             if 'sync' in mechanism:
@@ -135,10 +154,10 @@ def apply_mechanism(eng, mechanism, steps=100):
                             fm = torch.stack([c.hidden.squeeze(0) for c in f]).mean(dim=0)
                             for c in f: c.hidden = (0.92*c.hidden.squeeze(0)+0.08*fm).unsqueeze(0)
             if 'oscillator' in mechanism:
-                if not hasattr(eng, '_phases'):
+                if not hasattr(eng, '_phases') or len(eng._phases) != n:
                     eng._phases = torch.randn(n)*2*math.pi
                     eng._freqs = torch.randn(n)*0.1+1.0
-                for i in range(n):
+                for i in range(min(n, len(eng.cells))):
                     nb = [(i-1)%n, (i+1)%n]
                     pd = sum(math.sin(eng._phases[j].item()-eng._phases[i].item()) for j in nb)
                     eng._phases[i] += eng._freqs[i] + 0.15*pd/len(nb)
@@ -202,7 +221,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--cells', type=int, default=DEFAULT_CELLS,
+                        help='Number of cells (default: 256, try: 32/64/128/256/512/1024/2048/4096)')
     args = parser.parse_args()
+
+    global CELLS
+    CELLS = args.cells
 
     print(f"═══ 전체 엔진 측정 ({CELLS}c) ═══\n")
 
@@ -218,7 +242,8 @@ def main():
         torch.manual_seed(42); np.random.seed(42)
         t0 = time.time()
 
-        def eng_fn(c=CELLS):
+        def eng_fn(c=None):
+            if c is None: c = CELLS
             e = make_engine(c)
             apply_mechanism(e, mechs, steps=100)
             return e

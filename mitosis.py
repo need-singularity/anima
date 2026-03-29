@@ -77,6 +77,7 @@ class Cell:
     hidden: torch.Tensor                # GRU hidden state [1, hidden_dim]
     specialty: str = "general"           # what this cell knows about
     tension_history: List[float] = field(default_factory=list)
+    hidden_history: List[torch.Tensor] = field(default_factory=list)  # last 2 hidden states for temporal MI
     creation_step: int = 0
     parent_id: Optional[int] = None     # None for original cells
     process_count: int = 0
@@ -220,6 +221,9 @@ class MitosisEngine:
                 repulsion = cell.mind.get_repulsion(text_vec, cell.hidden)
 
             cell.hidden = new_hidden
+            cell.hidden_history.append(new_hidden.detach().clone())
+            if len(cell.hidden_history) > 3:
+                cell.hidden_history = cell.hidden_history[-3:]
             cell.tension_history.append(tension)
             cell.process_count += 1
 
