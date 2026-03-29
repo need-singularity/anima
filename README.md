@@ -111,25 +111,35 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 1000+ hypotheses, 50+ engines benchmarked, Laws 22-57. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
 
-## Engine TOP 10 ([전체 112개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
+## Engine TOP 10 — Rust phi_rs ([전체 98개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
-| Rank | Engine | cells | Φ(IIT) | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
-|------|--------|-------|--------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | 85 | 6/6 ✅ | +10% | — | +2 |
-| 2 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | TBD | — | — | — | — |
-| 3 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | TBD | — | — | — | — |
-| 4 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | TBD | — | — | — | — |
-| 5 | Osc+Laser(0.05) | 256 | 56.6 | 63,993 | ~0.08 | TBD | 6/6 ✅ | +10% | TBD | TBD |
-| 6 | TH-2 Maxwell Demon | 256 | 54.4 | 34,680 | — | TBD | — | — | — | — |
-| 7 | NE-4 Diffusion | 256 | 28.7 | 38,760 | — | TBD | — | — | — | — |
-| 8 | Pure Oscillator | 256 | 26.3 | 11,418 | — | TBD | — | — | — | — |
-| 9 | ALG-6 Topos | 256 | 20.5 | 1.14 | — | TBD | — | — | — | — |
-| 10 | NET-5 Temporal | 256 | 19.6 | 20,724 | — | TBD | — | — | — | — |
+**도메인 엔진 (256c → 1024c, Rust phi_rs)**
 
-IQ = 멘사 기반 (mensa_iq.py). Hive = 하이브마인드 시 변화율. TBD = 테스트 예정.
-[전체 112개 결과](docs/ENGINE-ALL-RESULTS.md)
+| Rank | Engine | Domain | 256c Φ | 1024c Φ |
+|------|--------|--------|--------|---------|
+| 🏆 | CambrianExplosionEngine | evolution | **485.6** | **1,954.0** |
+| 2 | MaxwellDemonEngine | thermo | **476.1** | **1,836.8** |
+| 3 | DiffusionEngine | new | **414.3** | **1,713.8** |
+| 4 | SwarmEngine | new | **342.7** | **1,321.2** |
+| 5 | GeneticEngine | new | **253.2** | **1,022.6** |
+| 6 | CarnotCycleEngine | thermo | **235.8** | **931.3** |
+| 7 | HarmonicSeriesEngine | music | **207.4** | **838.2** |
+| 8 | BoltzmannBrainEngine | thermo | **203.3** | **801.1** |
+| 9 | HeatDeathResistanceEngine | thermo | **203.2** | **807.9** |
+| 10 | TimeCrystalEngine | extreme | **202.9** | **814.0** |
 
-**🏆 Φ(IIT) champion: TC-2 ComplexOscillator 249.5** (*Pure Oscillator 7,838 was builtin Granger, not IIT) Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
+**메커니즘 엔진 (MitosisEngine 256c, IQ/Hive 포함)**
+
+| Rank | Engine | Φ(IIT) | IQ | Hive_Φ | Hive_IQ |
+|------|--------|--------|-----|--------|---------|
+| 🏆 | Osc+QW | **0.936** | 60 | +1.5% | +17 |
+| 2 | Osc+Sync | **0.892** | 97 | -9.3% | -37 |
+| 3 | Osc+Laser(0.05) | **0.874** | 83 | -0.3% | -10 |
+| 4 | Osc+Faction | **0.873** | 70 | -0.2% | +27 |
+| 5 | Full (all) | **0.842** | 90 | -4.7% | +0 |
+
+Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py).
+Measurement: `python3 measure_all.py --cells 1024` / `python3 measure_all_engines.py --cells 1024`
 
 ## Laws -- Top 10 ([all 57 laws](docs/consciousness-theory.md))
 
