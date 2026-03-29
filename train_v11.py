@@ -194,6 +194,10 @@ def main():
     for p in trinity.decoder.parameters():
         p.requires_grad_(True)
 
+    # Move bridge + decoder to device
+    trinity.bridge = trinity.bridge.to(device)
+    trinity.decoder = trinity.decoder.to(device)
+
     optimizer = torch.optim.AdamW(trinity.parameters_trainable(), lr=args.lr, weight_decay=0.01)
     ratchet = PhiRatchet()
 
