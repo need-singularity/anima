@@ -327,15 +327,16 @@ def main():
         cambrian.step(mitosis.cells, step)
         osc_qw.step(mitosis.cells)
 
-        # 5. Decode: mean(cell hidden) → output
+        # 5. Trinity barrier: C(consciousness) → .detach() → D(language)
+        # Law 53: CE gradient must NOT flow back to cell hidden states
         cell_h = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
-        mean_h = cell_h.mean(dim=0).to(device)
+        mean_h = cell_h.mean(dim=0).detach().to(device)  # ← .detach() = Trinity barrier
         output = decoder(mean_h.unsqueeze(0))
 
-        # 6. CE loss
+        # 6. CE loss (only updates decoder, NOT cells)
         ce_loss = F.mse_loss(output, y[0:1])
 
-        # 7. Backward + update
+        # 7. Backward + update (decoder only — cells are gradient-free)
         optimizer.zero_grad()
         ce_loss.backward()
         torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
