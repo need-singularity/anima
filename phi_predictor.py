@@ -88,35 +88,18 @@ class PhiPredictor:
         # Base: superlinear scaling with cell count
         phi_base = self.base_phi * config.n_cells ** self.scaling_exp
 
-        # Topology factor
         topo_mult = TOPOLOGY_MULTIPLIERS.get(config.topology, 1.0)
-
-        # Mechanism factor
         mech_mult = MECHANISM_MULTIPLIERS.get(config.mechanism, 1.0)
-
-        # Dimension factor: log scaling (diminishing returns)
         dim_factor = math.log(config.dim + 1) / math.log(DIM_REFERENCE + 1)
-
-        # Faction factor: more factions -> more integration -> higher Phi
         faction_factor = 1.0 + PSI_COUPLING * config.n_factions
-
-        # Frustration factor: moderate frustration optimal (inverted U)
-        frust_optimal = 1 / math.e  # ~0.368, golden ratio of frustration
+        frust_optimal = 1 / math.e  # ~0.368
         frust_factor = 1.0 + 0.5 * (1.0 - abs(config.frustration - frust_optimal) / frust_optimal)
-
-        # Sync factor: moderate sync optimal
         sync_factor = 1.0 + 0.3 * math.sin(config.sync_strength * math.pi)
 
-        # Combined
-        phi_est = (phi_base * topo_mult * mech_mult * dim_factor
-                   * faction_factor * frust_factor * sync_factor)
-
-        # Confidence: higher with more cells, known topology
+        phi_est = phi_base * topo_mult * mech_mult * dim_factor * faction_factor * frust_factor * sync_factor
         confidence = min(0.95, 0.5 + 0.1 * math.log(config.n_cells + 1))
-        if config.topology in TOPOLOGY_MULTIPLIERS:
-            confidence += 0.1
-        if config.mechanism in MECHANISM_MULTIPLIERS:
-            confidence += 0.1
+        if config.topology in TOPOLOGY_MULTIPLIERS: confidence += 0.1
+        if config.mechanism in MECHANISM_MULTIPLIERS: confidence += 0.1
 
         return PhiPrediction(
             phi_estimate=phi_est,

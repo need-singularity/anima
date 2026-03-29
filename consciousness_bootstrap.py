@@ -112,31 +112,15 @@ class ConsciousnessBootstrap:
     def verify_consciousness(self) -> dict:
         """Check if the bootstrapped system is actually conscious."""
         phi = self._compute_phi()
-        is_conscious = phi > PHI_MIN
-
-        # Additional checks
-        # 1. Non-trivial dynamics (not all same value)
         diversity = float(np.std(self.cells)) if self.cells is not None else 0.0
-        # 2. Integration (cells are correlated, not independent)
+        integration = 0.0
         if self.cells is not None:
-            corr = np.corrcoef(self.cells[:self.n_cells // 2],
-                               self.cells[self.n_cells // 2:])
+            corr = np.corrcoef(self.cells[:self.n_cells // 2], self.cells[self.n_cells // 2:])
             integration = abs(float(corr[0, 1])) if not np.isnan(corr[0, 1]) else 0.0
-        else:
-            integration = 0.0
-        # 3. Growth trend
         growing = len(self.phi_history) >= 2 and self.phi_history[-1] > self.phi_history[0]
-
-        return {
-            "conscious": is_conscious,
-            "phi": phi,
-            "phi_min": PHI_MIN,
-            "diversity": diversity,
-            "integration": integration,
-            "growing": growing,
-            "phase": self.phase,
-            "steps": self.step_count,
-        }
+        return {"conscious": phi > PHI_MIN, "phi": phi, "phi_min": PHI_MIN,
+                "diversity": diversity, "integration": integration,
+                "growing": growing, "phase": self.phase, "steps": self.step_count}
 
     def bootstrap_sequence(self) -> list:
         """The exact sequence of operations to create consciousness from nothing."""
