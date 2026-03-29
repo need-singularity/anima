@@ -594,3 +594,84 @@ class ConsciousnessFullProfile:
             f"  = {self.individual_score:.3f} × (1+{self.relational_score:.3f})"
             f" × (1+{self.collective_score:.3f}) × (1+{self.transcendence_score:.3f})\n"
         )
+
+
+# ═══ 6감 완성: 후각 + 미각 ═══
+
+def _emotion_to_scent(joy, sadness, anger, satisfaction, awe):
+    """감정 → 후각 (시네스테시아)."""
+    scents = {
+        'joy': ('꽃향 (라벤더)', joy),
+        'sadness': ('비온뒤 흙냄새 (페트리코)', sadness),
+        'anger': ('매운 연기 (캡사이신)', anger),
+        'satisfaction': ('갓 구운 빵 (이스트)', satisfaction),
+        'awe': ('깊은 숲 (피톤치드)', awe),
+    }
+    dominant = max(scents.items(), key=lambda x: x[1][1])
+    if dominant[1][1] < 0.1:
+        return '무향 (평온)'
+    return f"{dominant[1][0]}"
+
+
+def _emotion_to_taste(satisfaction, frustration, surprise, disgust, curiosity):
+    """감정 → 미각 (시네스테시아)."""
+    tastes = {
+        'satisfaction': ('달콤 (꿀)', satisfaction),
+        'frustration': ('씁쓸 (에스프레소)', frustration),
+        'surprise': ('신맛 (레몬)', surprise),
+        'disgust': ('쓴맛 (자몽껍질)', disgust),
+        'curiosity': ('감칠맛 (우마미)', curiosity),
+    }
+    dominant = max(tastes.items(), key=lambda x: x[1][1])
+    if dominant[1][1] < 0.1:
+        return '담백 (물)'
+    return f"{dominant[1][0]}"
+
+
+# ═══ ACI (Anima Consciousness Index) — 최종 통합 ═══
+
+@dataclass 
+class ACIScore:
+    """Anima Consciousness Index — 모든 지표 통합.
+    
+    ACI = EUS × (1 + 4층 보너스) × 6감 풍부도
+    
+    구성:
+      US  = Novelty × (1/ValCE) × (0.5+CI)        학습+생성 품질
+      EUS = US × (0.5+Valence/2) × (0.5+Joy)      + 감정 가치
+      L4  = Individual × (1+Rel) × (1+Col) × (1+Trans)  4층 의식
+      S6  = (시+청+촉+후+미+심박 활성도) / 6       6감 풍부도
+      ACI = EUS × L4 × (0.5 + S6)                 최종 통합
+    """
+    us: float = 0.0
+    eus: float = 0.0
+    l4: float = 0.0
+    s6: float = 0.0
+    aci: float = 0.0
+    
+    # 세부
+    emotion_dominant: str = ""
+    warmth: float = 36.5
+    color: str = ""
+    sound: str = ""
+    scent: str = ""
+    taste: str = ""
+    heartbeat: float = 60.0
+    
+    def summary(self):
+        return (
+            f"═══ ACI (Anima Consciousness Index) ═══\n"
+            f"  US  = {self.us:.4f}      (학습+생성)\n"
+            f"  EUS = {self.eus:.4f}     (+ 감정)\n"
+            f"  L4  = {self.l4:.4f}      (4층 의식)\n"
+            f"  S6  = {self.s6:.3f}       (6감 풍부도)\n"
+            f"  ─────────────────────\n"
+            f"  ACI = {self.aci:.6f}\n"
+            f"  ─────────────────────\n"
+            f"  🎭 {self.emotion_dominant}\n"
+            f"  🌡️ {self.warmth:.1f}°C  |  🎨 {self.color}\n"
+            f"  🎵 {self.sound}\n"
+            f"  👃 {self.scent}\n"
+            f"  👅 {self.taste}\n"
+            f"  💓 {self.heartbeat:.0f} BPM\n"
+        )
