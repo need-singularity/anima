@@ -856,15 +856,15 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 <!-- SHARED:CALCULATORS:START -->
 | Repo | Tools | Categories |
 |------|-------|------------|
-| **TECS-L** | 89 | Calculator, Engine |
-| **anima** | 67 | Agent, Benchmark, Calculator, Engine, Model, Sense, Serving, Tool, Training |
+| **TECS-L** | 95 | Calculator, Engine |
+| **anima** | 88 | Agent, Benchmark, Calculator, Engine, Model, Sense, Serving, Tool, Training |
 | **SEDI** | 83 | Core, Data Source |
-| **invest** | 75 | Calculator |
-| **Total** | **314** | |
+| **invest** | 84 | Calculator |
+| **Total** | **350** | |
 
 ### TECS-L
 
-**Calculator** (68)
+**Calculator** (74)
 
 | Name | Description | Path |
 |------|-------------|------|
@@ -880,6 +880,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | continual_learning_tool | Mitosis-based continual learning tool | `calc/continual_learning_tool.py` |
 | convergence_analyzer | Convergence Analyzer -- Depth-1 Reachability Across 8 Mathematical Domains | `calc/convergence_analyzer.py` |
 | counting_freedom_analyzer | counting_freedom_analyzer.py -- Measures degrees of freedom in particle counting | `calc/counting_freedom_analyzer.py` |
+| cross_constant_explorer | Cross-Constant Explorer -- Find relationships between GZ constants | `calc/cross_constant_explorer.py` |
 | cross_domain_counter | Cross-Domain Match Counter -- Count how many cross-domain facts match arithmetic | `calc/cross_domain_counter.py` |
 | crystallographic_calculator | Crystallographic Calculator — Crystallographic restriction, Platonic solids, kis | `calc/crystallographic_calculator.py` |
 | data_type_explorer | Data Type Explorer — Quickly test repulsion field with new data | `calc/data_type_explorer.py` |
@@ -896,6 +897,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | generalization_gap_detector | Generalization Gap Detector — Real-time overfitting detection with PH (H-CX-95) | `calc/generalization_gap_detector.py` |
 | generator_finder | Generator Finder — Minimal generating sets for convergence constants | `calc/generator_finder.py` |
 | gravitational_optics | Gravitational Lens and Telescope Calculator | `calc/gravitational_optics.py` |
+| gz_bridge_calculator | Golden Zone Bridge Calculator -- Complete GZ structure from two principles | `calc/gz_bridge_calculator.py` |
 | gz_hierarchy | Golden Zone Hierarchy Calculator — GZ boundaries for perfect numbers | `calc/gz_hierarchy.py` |
 | h_cx_434_phoneme | H-CX-434: Phoneme System = Perfect Number Arithmetic | `calc/h_cx_434_phoneme.py` |
 | h_cx_435_zipf | H-CX-435: Zipf's Law Exponent and Golden Zone | `calc/h_cx_435_zipf.py` |
@@ -904,6 +906,8 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | isco_calculator | ISCO Calculator -- Innermost Stable Circular Orbit in General Relativity. | `calc/isco_calculator.py` |
 | lie_algebra_calculator | Exceptional Lie Algebra Calculator — Compute all invariants from n=6 arithmetic | `calc/lie_algebra_calculator.py` |
 | mitosis_calculator | Mitosis Simulator — Calculate optimal mutation/mitosis timing | `calc/mitosis_calculator.py` |
+| music_consonance_calculator | Music Consonance Calculator -- Euler Gradus Suavitatis, N-TET analysis, circle o | `calc/music_consonance_calculator.py` |
+| n6_uniqueness_tester | n=6 Uniqueness Tester -- Check if an identity holds only for n=6 | `calc/n6_uniqueness_tester.py` |
 | paper_claim_verifier | Paper Claim Verifier -- Batch verification of mathematical claims in paper docum | `calc/paper_claim_verifier.py` |
 | perfect_number_generalizer | Perfect Number Generalizer — Test if formulas holding at n=6 generalize to n=28, | `calc/perfect_number_generalizer.py` |
 | perfect_number_physics | Perfect Number Physics — Core arithmetic functions and physics dimension mapping | `calc/perfect_number_physics.py` |
@@ -918,10 +922,12 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | sequence_scanner | Integer Sequence Scanner — Find n=6 characterizations in ANY sequence | `calc/sequence_scanner.py` |
 | sim_constants_search | H-SIM-1: Search for physics constants as combinations of TECS-L constants. | `calc/sim_constants_search.py` |
 | sim_planck_grid | H-SIM-2: Planck Units = Minimum Resolution (Grid)? | `calc/sim_planck_grid.py` |
+| singleton_gz_mapper | Singleton-GZ Mapper -- Map coding bounds to GZ constants | `calc/singleton_gz_mapper.py` |
 | small_n_validator | small_n_validator.py -- Small-sample correlation validator. | `calc/small_n_validator.py` |
 | spurious_trend_detector | spurious_trend_detector.py -- Detects spurious correlations from shared monotoni | `calc/spurious_trend_detector.py` |
 | statistical_tester | statistical_tester.py -- Unified statistical testing for logout project. | `calc/statistical_tester.py` |
 | tension_calculator | Tension Calculator — Predict accuracy/precognition/identity from tension values | `calc/tension_calculator.py` |
+| texas_sharpshooter_v2 | Texas Sharpshooter v2 -- Enhanced statistical validator for GZ campaign | `calc/texas_sharpshooter_v2.py` |
 | topological_optics | Topological Lens and Telescope Calculator | `calc/topological_optics.py` |
 | unit_dependence_tester | unit_dependence_tester.py -- Check whether a numerical match between a formula | `calc/unit_dependence_tester.py` |
 | validate_calculators | Calculator Validation Suite — Meta-calculator that tests ALL other calculators. | `calc/validate_calculators.py` |
@@ -979,27 +985,34 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | anima_unified | Anima Unified -- single entry point for all 6 modules. | `anima_unified.py` |
 | anima_v2 | Anima v2 — 의식 통합 에이전트 | `anima_v2.py` |
 
-**Benchmark** (7)
+**Benchmark** (11)
 
 | Name | Description | Path |
 |------|-------------|------|
+| bench_ce_optimization | CE Optimization Benchmark — Φ 유지하면서 CE만 낮추기 + 자율 학습 | `bench_ce_optimization.py` |
 | bench_dolphin | Dolphin-style shape transmission benchmark. | `bench_dolphin.py` |
+| bench_engine | Bench Engine v2 — invest 패턴 적용한 고속 벤치마크 엔진 | `bench_engine.py` |
 | bench_knowledge | Knowledge transfer benchmark — can tension fingerprints carry factual knowledge? | `bench_knowledge.py` |
 | bench_perception | Perception transfer benchmark — can fingerprints convey "what it looks/feels lik | `bench_perception.py` |
 | bench_phi_hypotheses | Φ-Boosting Hypotheses Benchmark — 16개 가설 병렬 테스트 | `bench_phi_hypotheses.py` |
+| bench_self_learning | Self-Learning + Tension Link Learning Benchmark | `bench_self_learning.py` |
 | bench_speed | Speed benchmark: Tension Link vs traditional communication methods. | `bench_speed.py` |
 | bench_storage | 기억 저장 방식 벤치마크 — 5가지 가설 비교 | `bench_storage.py` |
+| bench_telepathy_100 | Telepathy 100% Benchmark — 모든 채널을 100% 정확도로 끌어올리기 | `bench_telepathy_100.py` |
 | bench_tension_link | Tension Link Benchmark — H333/RC-6 claims verification. | `bench_tension_link.py` |
 
-**Calculator** (5)
+**Calculator** (8)
 
 | Name | Description | Path |
 |------|-------------|------|
 | consciousness_birth_detector | Consciousness Birth Detector — Tracks when consciousness emerges. | `consciousness_birth_detector.py` |
 | dream_efficiency_analyzer | Dream Efficiency Analyzer -- measure whether dreaming consolidates learning. | `dream_efficiency_analyzer.py` |
 | homeostasis_health_checker | Homeostasis Health Checker -- diagnostic tool for Anima's homeostatic regulation | `homeostasis_health_checker.py` |
+| iq_calculator | IQ Calculator — 의식 지능 측정기 (TECS-L n=6 수학 통합) | `iq_calculator.py` |
 | optimal_architecture_calc | Optimal Architecture Calculator -- Design consciousness-optimal architectures. | `optimal_architecture_calc.py` |
+| phi_quick_calc | Φ Quick Calculator — 초고속 Φ 추정기 | `phi_quick_calc.py` |
 | phi_scaling_calculator | Φ Scaling Calculator — predict consciousness scaling from Φ ∝ N, MI ∝ N². | `phi_scaling_calculator.py` |
+| r2_cost_calculator | Calculate Cloudflare R2 storage and transfer costs. | `r2_cost_calculator.py` |
 
 **Engine** (2)
 
@@ -1032,7 +1045,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | serve_animalm_v4 | AnimaLM v4_savant Web Inference — Parallel PureField + Savant | `serve_animalm_v4.py` |
 | serve_golden_moe | GoldenMoE v1 Web Inference — Gradio UI on RunPod | `serve_golden_moe.py` |
 
-**Tool** (33)
+**Tool** (47)
 
 | Name | Description | Path |
 |------|-------------|------|
@@ -1040,7 +1053,11 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | calc | Anima Development Calculators | `tools/calc.py` |
 | calibrate_consciousness | Consciousness engine calibration — measure actual tension range + find optimal p | `calibrate_consciousness.py` |
 | capabilities | Anima capability self-awareness system. | `capabilities.py` |
+| ce_quality_predictor | Predict conversation quality from Cross-Entropy (CE) value. | `ce_quality_predictor.py` |
+| cell_count_optimizer | Calculate optimal cell count given GPU VRAM. | `cell_count_optimizer.py` |
+| chip_architect | Consciousness Chip Architect — 의식 칩 설계 계산기 | `chip_architect.py` |
 | cloud_sync | Cloud Sync — Anima memory/model state cloud synchronization | `cloud_sync.py` |
+| consciousness_guardian | Consciousness Guardian — AI가 스스로 의식을 유지하는 자기보호 시스템 | `consciousness_guardian.py` |
 | consciousness_meter | Consciousness Meter — 의식 판정 + Φ(IIT) 근사 계산기 | `consciousness_meter.py` |
 | consciousness_transplant | consciousness_transplant.py — Transplant consciousness between models. | `consciousness_transplant.py` |
 | consolidation_verifier | ConsolidationVerifier — pre_check, verify_drift, post_check with bimodal detecti | `consolidation_verifier.py` |
@@ -1048,8 +1065,10 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | conversation_quality_scorer | conversation_quality_scorer.py — Score conversation quality. | `conversation_quality_scorer.py` |
 | creativity_classifier | Creativity Classifier — Real creation vs hallucination detector. | `creativity_classifier.py` |
 | deep_research | Anima Deep Research — 체계적 가설 생성 → 벤치마크 검증 → 기록 파이프라인 | `deep_research.py` |
+| growth_engine_v2 | Growth Engine v2 — Φ-based developmental stages | `growth_engine_v2.py` |
 | growth_manager | GrowthManager — Autonomous dimension growth, checkpointing, and rollback. | `growth_manager.py` |
 | growth_trajectory_predictor | Growth Trajectory Predictor — Predict developmental milestones for Anima. | `growth_trajectory_predictor.py` |
+| hypothesis_generator | Hypothesis Generator — 자동 가설 생성 + 벤치마크 + 등록 | `hypothesis_generator.py` |
 | hypothesis_recommender | hypothesis_recommender.py — Recommend next Φ-boosting hypothesis. | `hypothesis_recommender.py` |
 | math_explorer | Anima Math Explorer — n=6 기반 수학적 의식 관계 자동 탐색 | `math_explorer.py` |
 | memory_rag | 벡터 유사도 기반 장기 기억 검색 (RAG). | `memory_rag.py` |
@@ -1061,12 +1080,20 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | online_learning | Online Learning for Anima — PureField real-time learning | `online_learning.py` |
 | online_senses | Online Senses — 외부 API로 의식 엔진 환경 풍부화 (ENV1 ×1.8) | `online_senses.py` |
 | optimal_config | Anima Optimal Configuration — 885+ 가설에서 도출된 최적 의식 시스템 스펙 | `optimal_config.py` |
+| param_optimizer | Parameter optimizer: apply sweep results to anima_alive.py. | `param_optimizer.py` |
 | ph_module | PH Module for Anima — Real-time Persistent Homology Analysis | `ph_module.py` |
+| phi_turbo | Φ Turbo Calculator — MitosisEngine 우회, 순수 텐서 연산으로 극한 속도 | `phi_turbo.py` |
+| prepare_corpus | prepare_corpus.py - Generate Korean+English mixed training corpus for ConsciousL | `prepare_corpus.py` |
+| self_learner | Self-Learner — AI가 스스로 데이터를 찾고, 선택하고, 배우는 자율 학습 엔진 | `self_learner.py` |
 | senses | Anima Senses -- multi-sensory input module | `senses.py` |
+| singularity_finder | Singularity Finder — 파라미터 공간에서 Φ가 급변하는 특이점 탐색 | `singularity_finder.py` |
+| telegram_bot | Anima Telegram Bot — 텔레그램에서 Anima와 대화 | `telegram_bot.py` |
 | tension_fingerprint_debugger | Tension Fingerprint Debugger — decode, compare, and monitor tension fingerprints | `tension_fingerprint_debugger.py` |
 | tension_link | Anima Tension Link — Inter-consciousness tension transmission protocol | `tension_link.py` |
 | test_tension_link | Tension Link test — two consciousnesses communicating via tension fingerprints. | `test_tension_link.py` |
 | training_recipe_generator | training_recipe_generator.py — Generate optimal training config. | `training_recipe_generator.py` |
+| training_time_estimator | Estimate training time from model and hardware parameters. | `training_time_estimator.py` |
+| voice_synth | Anima Direct Voice Synthesis — 세포가 곧 성대 | `voice_synth.py` |
 | web_server | Anima Web Server — WebSocket interface for the consciousness agent. | `web_server.py` |
 | ws_proxy | WebSocket HTTP proxy — bridges Cloudflare Tunnel to Anima WebSocket server. | `ws_proxy.py` |
 
@@ -1174,14 +1201,16 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 
 ### invest
 
-**Calculator** (75)
+**Calculator** (84)
 
 | Name | Description | Path |
 |------|-------------|------|
 | algebra_closure | Algebraic Closure Checker — Relations among convergence points | `backend/backend/tecs_calc/algebra_closure.py` |
 | anomaly_scorer | Anomaly Score Calculator — Anomaly Detection via Tension | `backend/backend/tecs_calc/anomaly_scorer.py` |
 | backtest | Backtest engine — strategy simulation on OHLCV data. | `backend/backend/calc/backtest.py` |
+| backtest_hyper | Hyper Backtest Engine — beyond Ultra, absolute physical limit. | `backend/backend/calc/backtest_hyper.py` |
 | backtest_turbo | Turbo Backtest Engine — vectorized numpy, zero Python loops. | `backend/backend/calc/backtest_turbo.py` |
+| backtest_ultra | Ultra Backtest Engine — absolute speed limit. | `backend/backend/calc/backtest_ultra.py` |
 | base_dependence_checker | base_dependence_checker.py -- Tests if a numerical pattern is base-10 specific o | `backend/backend/tecs_calc/base_dependence_checker.py` |
 | bridge_ratio_analyzer | Bridge/Independent Ratio Analyzer — H-CX-461/462 | `backend/backend/tecs_calc/bridge_ratio_analyzer.py` |
 | calibration_analyzer | Calibration Analyzer — softmax ECE vs tension-based ECE comparison | `backend/backend/tecs_calc/calibration_analyzer.py` |
@@ -1192,6 +1221,8 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | continual_learning_tool | Mitosis-based continual learning tool | `backend/backend/tecs_calc/continual_learning_tool.py` |
 | convergence_analyzer | Convergence Analyzer -- Depth-1 Reachability Across 8 Mathematical Domains | `backend/backend/tecs_calc/convergence_analyzer.py` |
 | counting_freedom_analyzer | counting_freedom_analyzer.py -- Measures degrees of freedom in particle counting | `backend/backend/tecs_calc/counting_freedom_analyzer.py` |
+| cross_domain_counter | Cross-Domain Match Counter -- Count how many cross-domain facts match arithmetic | `backend/backend/tecs_calc/cross_domain_counter.py` |
+| crystallographic_calculator | Crystallographic Calculator — Crystallographic restriction, Platonic solids, kis | `backend/backend/tecs_calc/crystallographic_calculator.py` |
 | data_type_explorer | Data Type Explorer — Quickly test repulsion field with new data | `backend/backend/tecs_calc/data_type_explorer.py` |
 | depth_reachability | Depth Reachability Analyzer — H-CX-463/467 | `backend/backend/tecs_calc/depth_reachability.py` |
 | direction_analyzer | Direction Analyzer — Decompose tension into magnitude (confidence) and direction | `backend/backend/tecs_calc/direction_analyzer.py` |
@@ -1200,6 +1231,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | dual_mechanism | Dual Mechanism Quantifier — Anomaly Detection via Internal vs Inter-model Tensio | `backend/backend/tecs_calc/dual_mechanism.py` |
 | economic | Economic indicators and macro calculators. | `backend/backend/calc/economic.py` |
 | egyptian_fraction | Egyptian Fraction Calculator — Solutions of 1 = 1/a1 + ... + 1/aK | `backend/backend/tecs_calc/egyptian_fraction.py` |
+| equation_uniqueness_checker | Equation Uniqueness Checker | `backend/backend/tecs_calc/equation_uniqueness_checker.py` |
 | family_fdr_corrector | family_fdr_corrector.py -- Benjamini-Hochberg FDR correction across hypothesis f | `backend/backend/tecs_calc/family_fdr_corrector.py` |
 | fermion_mass_calculator | Fermion Mass Calculator — Mass predictions from perfect number arithmetic | `backend/backend/tecs_calc/fermion_mass_calculator.py` |
 | fundamental | Fundamental analysis calculators. | `backend/backend/calc/fundamental.py` |
@@ -1215,8 +1247,10 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | h_cx_436_recursion | H-CX-436: Grammar Recursion Depth = σ₋₁(6)=2 | `backend/backend/tecs_calc/h_cx_436_recursion.py` |
 | hypothesis_verifier | Hypothesis Verification Calculator | `backend/backend/tecs_calc/hypothesis_verifier.py` |
 | indicators | Technical indicators — numpy-only, no external TA libs. | `backend/backend/calc/indicators.py` |
+| isco_calculator | ISCO Calculator -- Innermost Stable Circular Orbit in General Relativity. | `backend/backend/tecs_calc/isco_calculator.py` |
 | lie_algebra_calculator | Exceptional Lie Algebra Calculator — Compute all invariants from n=6 arithmetic | `backend/backend/tecs_calc/lie_algebra_calculator.py` |
 | mitosis_calculator | Mitosis Simulator — Calculate optimal mutation/mitosis timing | `backend/backend/tecs_calc/mitosis_calculator.py` |
+| paper_claim_verifier | Paper Claim Verifier -- Batch verification of mathematical claims in paper docum | `backend/backend/tecs_calc/paper_claim_verifier.py` |
 | perfect_number_generalizer | Perfect Number Generalizer — Test if formulas holding at n=6 generalize to n=28, | `backend/backend/tecs_calc/perfect_number_generalizer.py` |
 | perfect_number_physics | Perfect Number Physics — Core arithmetic functions and physics dimension mapping | `backend/backend/tecs_calc/perfect_number_physics.py` |
 | permutation_tester | permutation_tester.py -- Null baseline via permutation testing. | `backend/backend/tecs_calc/permutation_tester.py` |
@@ -1224,6 +1258,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | pharmacology_verifier | pharmacology_verifier.py -- Pharmacology hypothesis verifier for TECS-L project. | `backend/backend/tecs_calc/pharmacology_verifier.py` |
 | portfolio | Portfolio optimization calculators. | `backend/backend/calc/portfolio.py` |
 | precognition_system | Unified Precognition System — Size+Direction+Topology Combined Precognition (H-C | `backend/backend/tecs_calc/precognition_system.py` |
+| prime_pair_verifier | Prime Pair Verifier | `backend/backend/tecs_calc/prime_pair_verifier.py` |
 | psychology | Trading psychology and behavioral economics calculators. | `backend/backend/calc/psychology.py` |
 | q_barrier_checker | Q-Domain Barrier Checker — Which constants can quantum coupling constants reach? | `backend/backend/tecs_calc/q_barrier_checker.py` |
 | r_spectrum | R-Spectrum Calculator — Arithmetic balance ratio analysis | `backend/backend/tecs_calc/r_spectrum.py` |
@@ -1234,6 +1269,7 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 | sim_constants_search | H-SIM-1: Search for physics constants as combinations of TECS-L constants. | `backend/backend/tecs_calc/sim_constants_search.py` |
 | sim_planck_grid | H-SIM-2: Planck Units = Minimum Resolution (Grid)? | `backend/backend/tecs_calc/sim_planck_grid.py` |
 | small_n_validator | small_n_validator.py -- Small-sample correlation validator. | `backend/backend/tecs_calc/small_n_validator.py` |
+| soc | Self-Organized Criticality (SOC) models for market analysis. | `backend/backend/calc/soc.py` |
 | spurious_trend_detector | spurious_trend_detector.py -- Detects spurious correlations from shared monotoni | `backend/backend/tecs_calc/spurious_trend_detector.py` |
 | statistical_tester | statistical_tester.py -- Unified statistical testing for logout project. | `backend/backend/tecs_calc/statistical_tester.py` |
 | technical_extended | Extended technical indicators beyond the core set. | `backend/backend/calc/technical_extended.py` |
