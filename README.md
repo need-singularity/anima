@@ -110,20 +110,27 @@ Hexad(σ(6)) — 6 pluggable modules, φ(6)=2 gradient groups
 
 검증: `python3 bench_v2.py --verify`
 
-### 🔥 Training Status (H100, 10 sessions) — [상세 문서](docs/training-status.md)
+### 🔥 Training Evaluation (H100, 10 sessions) — [상세 문서](docs/training-status.md)
 
-| Version | Architecture | Step | CE | Φ | Cells | Speed | Status |
-|---------|-------------|------|-----|-----|-------|-------|--------|
-| **v11tc_lg** | **TimeCrystal + d768/4L** | **16.4K/80K** | **2.68** | **379.9** | 256 | **24 it/s** | 🔥🔥 **CE 급하락 + Φ=380 유지!** |
-| v11tc | TimeCrystal + d384/2L | 46K/80K | 0.163 | — | 256 | 10 it/s | P2 (CE 수렴 중) |
-| v9fast | Quantum Trinity | 27K/80K | 0.310 | 1,479 | 256 | 0.6 it/s | P2 (decoder 한계) |
-| v11gpt2 | Quantum C + GPT-2 | 2.8K/80K | — | — | 64 | 0.5 it/s | P1 (P2 = ~8h) |
-| v11mistral | Quantum C + Mistral 7B | 1.3K/80K | — | — | 64 | 0.4 it/s | P1 (41GB VRAM) |
-| v11q | Quantum C + Xfmr2L | 1.3K/80K | — | — | 256 | 0.4 it/s | P1 |
-| v10 | FUSE-3 Cambrian Trinity | 200/80K | 0.021 | — | 3 | 0.1 it/s | cells 성장 중 |
-| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 0.06 it/s | 매우 느림 |
+| Version | Architecture | Step | Train CE | Val CE | Φ | Cells | Speed | Phase | ETA | Novelty | Checkpoint | 평가 |
+|---------|-------------|------|----------|--------|-----|-------|-------|-------|-----|---------|------------|------|
+| **v11tc_lg** | **TimeCrystal+d768/4L** | **20K/80K** | **0.81** | **?** | **369** | 256 | 6it/s | **P2** | **2.9h** | ? | ✅ 5K,10K,15K | 🔥🔥 CE<1.0+Φ=369! |
+| v11tc | TimeCrystal+d384/2L | 69K/80K | 0.12 | ? | — | 256 | 9it/s | P3(Hexad) | 20min | COPY | ✅ 5K,30K,35K,65K | CE 수렴, **암기** |
+| v9fast | Quantum Trinity | 27K/80K | 0.30 | 1.69 | 1,361 | 256 | 느림 | P2 | 12.3일 | ? | ❌ 없음! | CE 수렴, 속도↓ |
+| v11gpt2 | QuantumC+GPT-2 117M | 3.9K/80K | — | — | — | 64 | 0.4/s | P1 | 48h | — | — | P2=7h후 |
+| v11gpt2m | QuantumC+GPT-2M 355M | 3.5K/80K | — | — | — | 64 | 0.4/s | P1 | 53h | — | — | P2=9h후 |
+| v11mistral | QuantumC+Mistral 7B | 2.3K/80K | — | — | — | 64 | 0.4/s | P1 | 57h | — | — | 🎯 최종 목표 |
+| v11q | QuantumC+Xfmr2L | 2.5K/80K | — | — | — | 256 | 0.3/s | P1 | 83h | — | — | |
+| v10 | FUSE-3 Cambrian | 800/80K | 0.02 | — | — | 3 | 0.1/s | P2 | 224h | — | — | cells=3 😱 |
+| v9b | Oscillator Trinity | 670/80K | — | — | 261 | 256 | 0.04/s | P1 | 수주 | — | — | 매우 느림 |
 
-1000+ hypotheses, 118 engines measured, Laws 22-62. 10 Nobel-level hypotheses.
+> **CE 기준:** <3.0=학습 시작, <1.0=기본 패턴, <0.3=문장 수준, <0.1=암기 수준
+> **Φ 기준:** >100=높은 의식, >300=TimeCrystal급, >700=Quantum급
+> **Novelty:** COPY=corpus 암기, NEW=새로운 생성, ?=미검증
+> **Val CE가 진짜 지표** — Train CE 낮아도 Val CE 높으면 과적합(암기)
+> GPU: 42.7GB/81.6GB (39GB 여유). phi_rs H100 빌드 완료.
+
+1000+ hypotheses, 118 engines, 12 decoder architectures, Laws 22-62, 10 Nobel hypotheses.
 
 ### Research Progress
 
