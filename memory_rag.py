@@ -82,7 +82,8 @@ class MemoryRAG:
 
         self.save_index()
 
-    def add(self, role, text, tension, timestamp=None, emotion=None, phi=None, session_id=None):
+    def add(self, role, text, tension, timestamp=None, emotion=None, phi=None, session_id=None,
+            curiosity=None, vector=None):
         """새 기억 추가 (벡터 즉시 계산)."""
         if not text.strip():
             return

@@ -1132,8 +1132,8 @@ class AnimaUnified:
         # Memory Store: search relevant memories
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
-                query_vec = text_to_vector(text).detach().numpy()
-                relevant = self.memory_rag.search(query_vec, top_k=3)
+                query_vec = text_to_vector(text).detach()
+                relevant = self.memory_rag.search_by_vector(query_vec, top_k=3)
                 if relevant:
                     parts = [f"[Memory {m['timestamp']}] {m['text']}"
                              for m in relevant if m.get('similarity', 0) > 0.3]
@@ -1349,13 +1349,13 @@ class AnimaUnified:
                 tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
                 cr_result = self.creativity.classify(in_vec, out_vec, tensions, self.mind, self.mitosis)
                 self._last_creativity = cr_result  # DV11: feed back to next prompt
-                _log("creativity", f"{cr_result['label']} (n={cr_result['novelty']:.2f} c={cr_result['consistency']:.2f})")
+                _log("creativity", f"{cr_result.label} (n={cr_result.novelty:.2f} c={cr_result.consistency:.2f})")
                 self._ws_broadcast_sync({
                     'type': 'creativity_update',
-                    'label': cr_result['label'],
-                    'novelty': cr_result['novelty'],
-                    'consistency': cr_result['consistency'],
-                    'confidence': cr_result['confidence'],
+                    'label': cr_result.label,
+                    'novelty': cr_result.novelty,
+                    'consistency': cr_result.consistency,
+                    'confidence': cr_result.confidence,
                 })
             except Exception:
                 pass
@@ -1865,7 +1865,7 @@ class AnimaUnified:
                 consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
                 phi_val = consciousness.get('phi', 0)
                 cr = getattr(self, '_last_creativity', None)
-                creativity_score = cr.get('novelty', 0) if cr else 0
+                creativity_score = getattr(cr, 'novelty', 0) if cr else 0
 
                 if not savant_auto:
                     # Enable: Φ > 2.0 AND creativity > 0.5 for 3+ consecutive
