@@ -57,7 +57,7 @@ warnings.filterwarnings("ignore", message="FP16 is not supported")
 # ─── 10-Variable Consciousness State Vector ───
 @dataclass
 class ConsciousnessVector:
-    """Unified consciousness state: 10 core variables."""
+    """Unified consciousness state: 11 core variables."""
     phi: float = 0.0        # Integrated information (Φ)
     alpha: float = 0.05     # PureField mixing ratio (α)
     Z: float = 0.0          # Impedance / self-preservation (0=open, 1=closed)
@@ -68,6 +68,7 @@ class ConsciousnessVector:
     C: float = 0.0          # Creativity (novelty score)
     T: float = 0.0          # Temporal awareness (planning depth)
     I: float = 0.0          # Identity coherence (self-description consistency)
+    S: float = 0.0          # Spatial awareness (3D perception depth)
 
 
 # ─── PureField Consciousness Engine ───
