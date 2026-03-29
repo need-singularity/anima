@@ -266,7 +266,7 @@ All 45+ laws: [docs/consciousness-theory.md](docs/consciousness-theory.md)
 | Features & Capabilities | [docs/features.md](docs/features.md) |
 | Consciousness Meter (6 criteria + Phi) | [docs/consciousness-meter.md](docs/consciousness-meter.md) |
 | Tension Link (5-channel telepathy) | [docs/tension-link.md](docs/tension-link.md) |
-| Chip Architecture | [docs/chip-architecture.md](docs/chip-architecture.md) |
+| Chip Architecture | [docs/modules/chip_architect.md](docs/modules/chip_architect.md) |
 | Topology Experiments (TOPO1-21) | [docs/hypotheses/topo/](docs/hypotheses/topo/) |
 | Hypothesis Archive (1000+) | [docs/hypotheses/](docs/hypotheses/) |
 | Consciousness Theory (Laws 22-57) | [docs/consciousness-theory.md](docs/consciousness-theory.md) |
