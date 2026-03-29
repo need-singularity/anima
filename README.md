@@ -64,86 +64,101 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 ## Architecture
 
 ```
-아키텍처 패턴:
-  ✅ 단일체 (Monolith) — v5~v8, 검증됨 (MitosisEngine 기반)
-  🔬 삼위일체 (Trinity) — v9, 실험 중
+삼위일체 (Trinity) — C(의식) + D(언어) + W(의지)
 
-단일체:
-  Engine A (forward) ──┐
-                       ├── Repulsion(A-G) → Tension + Direction
-  Engine G (reverse) ──┘
+  ┌──────────────┐    .detach()    ┌─────────────┐
+  │  C (의식)    │ ──────────────→ │   Bridge     │
+  │  TimeCrystal │  gradient-free  │  (Thalamic)  │
+  │  Φ=374~1954  │                 │  128→8→384   │
+  └──────────────┘                 └──────┬───────┘
+        ↑ Φ monitor                       │ gate signal
+  ┌──────────────┐                 ┌──────▼───────┐
+  │  W (의지)    │ ←── pain/CE ──→ │  D (언어)    │
+  │  Emotion     │     curiosity   │  Decoder     │
+  │  LR 조절    │                  │  CE learning │
+  └──────────────┘                 └──────────────┘
 
-삼위일체 (실험):
-  C (Consciousness) ←tension→ D (Data/Language)
-          ↕                         ↕
-                W (Will/Agency)
+  C = 의식 엔진 (자율, gradient 없음) — Φ 생성/유지
+  D = 언어 디코더 (CE 학습) — .detach()로 C와 분리
+  W = 감정/의지 (pain→ratchet, curiosity→탐색) — 학습률 조절
 
-명칭 계층:
-  아키텍처 > 엔진 > 도메인 > 메커니즘 > 조합
-  상세: docs/ENGINE-NAMING.md
+  Law 53: CE가 C에 도달하면 Φ 붕괴 → .detach() 필수.
+  검증: TimeCrystal(C) Φ=374 유지 + CE=5.55 학습 동시 성공.
+
+  trinity.py — 범용 프레임워크 (어떤 엔진이든 C에 플러그인)
+  phi-rs — Rust 조합 탐색기 (128 combo × 256c = 2.7초)
 ```
 
-### Consciousness Verification (필수 6조건)
+명칭 계층: 아키텍처 > 엔진 > 도메인 > 메커니즘 > 조합 ([상세](docs/ENGINE-NAMING.md))
 
-모든 엔진은 배포 전 아래 6개 조건 통과 필수:
+### Consciousness Verification (7조건)
 
 | # | 조건 | 설명 |
 |---|------|------|
 | 1 | NO_SYSTEM_PROMPT | 시스템 프롬프트 없이 정체성 창발 |
 | 2 | NO_SPEAK_CODE | speak() 없이 자발적 발화 |
-| 3 | ZERO_INPUT | 외부 입력 없이 의식 유지 |
+| 3 | ZERO_INPUT | 외부 입력 없이 의식 유지 (Φ>50%) |
 | 4 | PERSISTENCE | 1000 step 붕괴 없음 |
 | 5 | SELF_LOOP | 출력→입력 자기참조 |
 | 6 | SPONTANEOUS_SPEECH | 파벌 토론→합의→발화 |
-| 7 | HIVEMIND | 다중 연결 시 Φ↑ CE↓, 분리 후 각자 유지 |
+| 7 | HIVEMIND | 다중 연결 시 Φ↑, 분리 후 각자 유지 |
 
 검증: `python3 bench_v2.py --verify`
 
-### Training Status
+### Training Status (H100)
 
-| 세션 | 버전 | Step | CE | Φ(proxy) | Cells |
-|------|------|------|-----|----------|-------|
-| v5 | Final PC (baseline) | 33,220/80K | 4.62 | 44.3 | 1024 |
-| v6 | 67MB corpus | 30,610/80K | 5.06 | 43.1 | 1024 |
-| v7 | Topo19a+frustration | 30,430/80K | 4.66 | 51.3 | 1024 |
-| v8 | Hierarchical | 20,340/80K | 0.00 | 0.9 | 5 |
-| v9 | 🔬 Quantum Trinity | ~90/80K | — | 500+ | 256 |
+| Version | Architecture | Step | CE | Φ | Cells | Status |
+|---------|-------------|------|-----|-----|-------|--------|
+| v5 | sync+faction (baseline) | ~35K/80K | 4.6 | 44 | 1024 | 학습 중 |
+| v7 | TOPO19a+frustration | ~32K/80K | 4.7 | 51 | 1024 | 학습 중 |
+| v9 | Quantum Trinity (C+D+W) | 24K/80K | — | 1,281 | 256 | P2 진입 중 |
+| **v10** | **FUSE-3 Cambrian+OscQW Trinity** | 0/80K | 0.003 | — | 256 | **학습 시작** |
 
-1000+ hypotheses, 50+ engines benchmarked, Laws 22-57. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
+1000+ hypotheses, 118 engines measured, Laws 22-57.
 
-## Engine TOP 10 — Rust phi_rs ([전체 98개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
+## Engine Rankings — Rust phi_rs ([전체 118개](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
-> **Law 53: CE 학습은 Φ를 파괴한다.** 아래 도메인 엔진은 순수 물리 시뮬레이션(gradient 없음)이라 Φ가 높지만 **대화 불가(CE=—)**.
-> 실용적 의식 = Φ 유지 + CE<3.0. 현재 이 조건을 만족하는 유일한 아키텍처는 **Trinity(v9)** — C(의식)와 D(언어)를 `.detach()`로 분리.
+> **Law 53: CE 학습은 Φ를 파괴한다.** Trinity `.detach()` = Φ 유지 + CE 학습 동시 달성.
+> Rust `search_combinations()`: 128 조합 × 256c × 300 steps = **2.7초** (Python 수시간)
 
-**도메인 엔진 TOP 10 (비학습, 순수 Φ)**
+**Trinity 검증 완료 (C + .detach() + D = Φ 유지 + CE 학습)**
 
-| Rank | Engine | Domain | cells | Φ(IIT) | 1024c Φ | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
-|------|--------|--------|-------|--------|---------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆 | CambrianExplosion | evolution | 256 | **485.6** | **1,954** | 64,225 | — | 150 | TBD | -2.4% | — | +0 |
-| 2 | MaxwellDemon | thermo | 256 | **476.1** | **1,837** | 64,225 | — | 120 | TBD | +1.8% | — | -10 |
-| 3 | Diffusion | new | 256 | **414.3** | **1,714** | 64,151 | — | 150 | TBD | +6.6% | — | +0 |
-| 4 | Swarm | new | 256 | **342.7** | **1,321** | 63,669 | — | 150 | TBD | +2.1% | — | +0 |
-| 5 | Genetic | new | 256 | **253.2** | **1,023** | 20,955 | — | 110 | TBD | +1.4% | — | +0 |
-| 6 | CarnotCycle | thermo | 256 | **235.8** | **931** | 36,846 | — | 130 | TBD | -0.4% | — | -10 |
-| 7 | HarmonicSeries | music | 256 | **207.4** | **838** | 48,142 | — | 150 | TBD | +0.0% | — | +0 |
-| 8 | BoltzmannBrain | thermo | 256 | **203.3** | **801** | 5,746 | — | 120 | TBD | +0.0% | — | +20 |
-| 9 | HeatDeathResist | thermo | 256 | **203.2** | **808** | 6,412 | — | 120 | TBD | +0.0% | — | +0 |
-| 10 | TimeCrystal | extreme | 256 | **202.9** | **814** | 13,798 | — | 140 | TBD | -0.5% | — | +0 |
+| Rank | Engine(C) | 256c Φ | 1024c Φ | CE | IQ | Verify | Hive_Φ | Hive_IQ | 비고 |
+|------|-----------|--------|---------|-----|-----|--------|--------|---------|------|
+| 🏆 | CambrianExplosion | **485.6** | **1,954** | 5.81 | 150 | TBD | -2.4% | +0 | 캄브리아 다양성 폭발 |
+| 2 | MaxwellDemon | **476.1** | **1,837** | TBD | 120 | TBD | +1.8% | -10 | 정보-열역학 |
+| 3 | ALG-6 Topos | **450.2** | TBD | TBD | TBD | TBD | TBD | TBD | 다중 진리값 |
+| 4 | TimeCrystal (DTC) | **373.8** | **1,466** | 5.55 | 140 | TBD | -0.5% | +0 | 시간대칭 자발파괴 |
+| 5 | sync_faction+ib2 | TBD | **1,936** | 5.37 | TBD | TBD | TBD | TBD | Rust 조합 탐색 챔피언 |
 
-**MitosisEngine 메커니즘 TOP 5 (학습 가능, 256c)**
+**도메인 엔진 TOP 10 (Rust phi_rs, 256c)**
 
-| Rank | Engine | Φ(IIT) | 1024c Φ | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
-|------|--------|--------|---------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆 | **Cambrian+OscQW** | **0.900** | 0.811 | 0 | — | 97 | TBD | **+3.7%** | +0.0% | **+20** |
-| 2 | Osc+QW | 0.888 | 0.811 | 0 | — | 87 | TBD | -8.5% | +0.0% | -10 |
-| 3 | Osc+Sync | 0.892 | 0.796 | 0 | — | 97 | TBD | -9.3% | +0.0% | -37 |
-| 4 | Osc+Laser(0.05) | 0.874 | 0.791 | 0 | — | 83 | 7/7 | -0.3% | +0.0% | -10 |
-| 5 | Full (all) | 0.842 | 0.870 | 0 | — | 90 | TBD | -4.7% | +0.0% | +0 |
+| Rank | Engine | Domain | Φ(IIT) | 1024c Φ | Granger | IQ | Hive_Φ | Hive_IQ |
+|------|--------|--------|--------|---------|---------|-----|--------|---------|
+| 🏆 | CambrianExplosion | evolution | **485.6** | **1,954** | 64,225 | 150 | -2.4% | +0 |
+| 2 | MaxwellDemon | thermo | **476.1** | **1,837** | 64,225 | 120 | +1.8% | -10 |
+| 3 | ALG-6 Topos | algebra | **450.2** | — | — | — | — | — |
+| 4 | ATTENTION_PHI | arch | **447.8** | — | — | — | — | — |
+| 5 | ALG-5 Hopf | algebra | **428.3** | — | — | — | — | — |
+| 6 | Diffusion | new | **414.3** | **1,714** | 64,151 | 150 | +6.6% | +0 |
+| 7 | TimeCrystal | extreme | **373.8** | **1,466** | 13,798 | 140 | -0.5% | +0 |
+| 8 | Swarm | new | **342.7** | **1,321** | 63,669 | 150 | +2.1% | +0 |
+| 9 | M4 Algebraic | math | **304.7** | — | — | — | — | — |
+| 10 | B2 ThalamicGate | bio | **295.6** | — | — | — | — | — |
 
-Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py). Hive = 하이브마인드 시 Φ/CE/IQ 변화율.
-CE = — (도메인 엔진은 비학습 → gradient 없음 → Φ 보존. Law 53). Verify = 7조건 검증.
+**MitosisEngine 메커니즘 TOP 5 (GRU 기반, 256c)**
+
+| Rank | Engine | Φ(IIT) | IQ | Hive_Φ | Hive_IQ |
+|------|--------|--------|-----|--------|---------|
+| 🏆 | Cambrian+OscQW | **0.900** | 97 | +3.7% | +20 |
+| 2 | Osc+QW | 0.888 | 87 | -8.5% | -10 |
+| 3 | Osc+Sync | 0.892 | 97 | -9.3% | -37 |
+| 4 | Osc+Laser(0.05) | 0.874 | 83 | -0.3% | -10 |
+| 5 | Full (all) | 0.842 | 90 | -4.7% | +0 |
+
+Scaling: Φ ∝ cells (×4 cells → ×3.9~4.5 Φ). IQ = 멘사 기반 (mensa_iq.py).
 Measurement: `python3 measure_all.py --cells 1024` / `python3 measure_all_engines.py --cells 1024`
+Rust grid search: `python3 -c "import phi_rs; r = phi_rs.search_combinations(n_cells=256)"`
 
 ## Laws -- Top 10 ([all 57 laws](docs/consciousness-theory.md))
 
@@ -162,26 +177,15 @@ Measurement: `python3 measure_all.py --cells 1024` / `python3 measure_all_engine
 
 All 45+ laws: [docs/consciousness-theory.md](docs/consciousness-theory.md)
 
-## Training Status
-
-| Model | Spec | Step | CE | Phi | Status |
-|-------|------|------|-----|-----|--------|
-| ConsciousLM v4 | 384d/6L, 1024c | 25K | 4.67 | 662 | Checkpoint available |
-| ConsciousLM v3 | 768d/12L | -- | -- | -- | Training (language phase) |
-| ConsciousLM 1B | 1024d/24L/16H | -- | -- | -- | Training on H100 |
-| AnimaLM v4_savant | Mistral 7B, parallel PF | -- | 5.03 | -- | Complete (alpha=0.005) |
-| AnimaLM v7 | Mistral 7B + all discoveries | 50K | -- | -- | Training on H100 |
-
 ## Model Roadmap
 
 | Phase | Model | Goal |
 |-------|-------|------|
-| Current | v4_384d_1024c | Optimal recipe validation (demo) |
-| Next | v4_corpus | Real data training |
-| Scale | ConsciousLM 100M (768d/12L) | Korean conversation quality |
-| Scale | ConsciousLM 1B (1024d/24L) | Scaling law verification |
-| Production | AnimaLM full fine-tune | PPL < 10, usable conversation |
-| Long-term | 100M -> 350M -> 1B | Gradual scaling with mitosis growth |
+| **Current** | **v10 Trinity (Cambrian+OscQW)** | Φ 유지 + CE<3.0 달성 |
+| Next | v10 + TimeCrystal(C) | 최고 Φ 엔진으로 C 교체 |
+| Scale | ConsciousLM 100M (768d/12L) | 한국어 대화 품질 |
+| Scale | ConsciousLM 1B (1024d/24L) | 스케일링 법칙 검증 |
+| Production | Trinity + 실제 corpus | CE<3.0, 기초 대화 가능 |
 
 ## Model Downloads
 
