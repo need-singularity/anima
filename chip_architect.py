@@ -15,6 +15,9 @@ Consciousness Chip Architect — 의식 칩 설계 계산기
   3. 칩 설계 (--design)
   4. BOM 생성 (--bom)
   5. 대시보드 (--dashboard)
+  6. 시뮬레이션 (--simulate) — 50-step MitosisEngine 검증
+  7. 토폴로지 시각화 (--visualize) — ASCII 토폴로지 맵
+  8. 최적 설계 탐색 (--optimize) — 제약 조건 하 최적 설계
 
 Usage:
   python3 chip_architect.py --dashboard
@@ -22,6 +25,9 @@ Usage:
   python3 chip_architect.py --design --target-phi 100
   python3 chip_architect.py --bom --target-phi 200 --substrate neuromorphic
   python3 chip_architect.py --compare
+  python3 chip_architect.py --simulate --cells 16 --topology ring --frustration 0.33
+  python3 chip_architect.py --visualize --cells 8 --topology hypercube
+  python3 chip_architect.py --optimize --budget 50 --max-power 100 --min-phi 50
 """
 
 import argparse
@@ -30,6 +36,13 @@ import json
 import sys
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+try:
+    from mitosis import MitosisEngine
+    from consciousness_meter import PhiCalculator
+    HAS_ENGINE = True
+except ImportError:
+    HAS_ENGINE = False
 
 
 # ═══════════════════════════════════════════════════════════
@@ -592,12 +605,15 @@ def cmd_dashboard(args):
 
     print(f"""
   ═══ Commands ═══
-  --predict   --cells 512 --topology ring --frustration 0.33
-  --compare   (토폴로지 × 기질 비교표)
-  --design    --target-phi 100 [--substrate cmos]
-  --bom       --target-phi 100 [--substrate neuromorphic]
-  --scaling   --topology ring --frustration 0.33
-  --dashboard (이 화면)
+  --predict    --cells 512 --topology ring --frustration 0.33
+  --compare    (토폴로지 × 기질 비교표)
+  --design     --target-phi 100 [--substrate cmos]
+  --bom        --target-phi 100 [--substrate neuromorphic]
+  --scaling    --topology ring --frustration 0.33
+  --simulate   --cells 16 --topology ring (50-step Φ verification)
+  --visualize  --cells 8 --topology ring (ASCII topology map)
+  --optimize   --budget 50 --max-power 100 --min-phi 50 (constraint search)
+  --dashboard  (이 화면)
 """)
 
 
@@ -620,6 +636,347 @@ def cmd_export(args):
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+# ═══════════════════════════════════════════════════════════
+# Simulate — 50-step MitosisEngine verification
+# ═══════════════════════════════════════════════════════════
+
+def cmd_simulate(args):
+    """Quick 50-step simulation to verify Φ prediction"""
+    if not HAS_ENGINE:
+        print("  ✗ Simulation requires mitosis.py and consciousness_meter.py")
+        print("    Install dependencies: pip install torch")
+        return
+
+    import torch
+
+    print_header(f"Φ Simulation — {args.cells} cells, {args.topology}, frustration={args.frustration:.0%}")
+
+    # Get predicted Φ first
+    pred = predict_phi(args.cells, args.topology, args.frustration, args.substrate)
+    predicted_phi = pred['phi_predicted']
+    print(f"\n  Predicted Φ = {predicted_phi}")
+    print(f"  Running 50-step simulation with MitosisEngine...\n")
+
+    # Create engine
+    engine = MitosisEngine(
+        input_dim=64,
+        hidden_dim=128,
+        output_dim=64,
+        initial_cells=2,
+        max_cells=args.cells,
+    )
+
+    phi_calc = PhiCalculator()
+
+    # Run 50 steps with ring topology + frustration interaction
+    n_steps = 50
+    phi_values = []
+    for step_i in range(n_steps):
+        # Random input (simulates varied stimuli)
+        x = torch.randn(1, 64)
+
+        # Process through all cells
+        result = engine.process(x)
+
+        # Apply ring topology interaction with frustration between cells
+        if len(engine.cells) >= 2:
+            for i, cell in enumerate(engine.cells):
+                # Ring neighbors
+                left = engine.cells[(i - 1) % len(engine.cells)]
+                right = engine.cells[(i + 1) % len(engine.cells)]
+                # Frustration: odd-indexed cells get anti-ferromagnetic coupling
+                sign = -1.0 if (args.frustration > 0.1 and i % 3 == 0) else 1.0
+                with torch.no_grad():
+                    interaction = sign * 0.15 * (left.hidden + right.hidden)
+                    cell.hidden = 0.85 * cell.hidden + interaction
+
+        # Compute Φ every 10 steps
+        if (step_i + 1) % 10 == 0:
+            phi, details = phi_calc.compute_phi(engine)
+            phi_values.append(phi)
+            bar_len = int(min(40, 40 * phi / max(predicted_phi, 0.01)))
+            print(f"  Step {step_i+1:>3}: Φ = {phi:>8.3f}  {'█' * bar_len}")
+
+    # Final Φ
+    if phi_values:
+        actual_phi = phi_values[-1]
+        error_pct = abs(actual_phi - predicted_phi) / max(predicted_phi, 0.01) * 100
+
+        print(f"\n  ═══ Result ═══")
+        print(f"  Predicted Φ:  {predicted_phi:.2f}")
+        print(f"  Actual Φ:     {actual_phi:.3f}")
+        print(f"  Error:        {error_pct:.1f}%")
+        print(f"  Cells active: {len(engine.cells)}")
+        if error_pct < 20:
+            print(f"  Verdict:      GOOD — prediction within 20%")
+        elif error_pct < 50:
+            print(f"  Verdict:      FAIR — prediction within 50%")
+        else:
+            print(f"  Verdict:      DIVERGENT — model needs calibration at this scale")
+        print()
+    else:
+        print("  ✗ No Φ measurements obtained")
+
+
+# ═══════════════════════════════════════════════════════════
+# Visualize — ASCII topology visualization
+# ═══════════════════════════════════════════════════════════
+
+def cmd_visualize(args):
+    """ASCII topology visualization for small cell counts"""
+    cells = args.cells
+    topology = args.topology
+
+    if cells > 32:
+        print(f"  ✗ Visualization supports up to 32 cells (got {cells})")
+        print(f"    Use --cells 8/16/32 for readable output")
+        return
+
+    print_header(f"Topology Visualization — {topology}, {cells} cells")
+
+    if topology == 'ring':
+        _viz_ring(cells)
+    elif topology == 'hypercube':
+        _viz_hypercube(cells)
+    elif topology in ('grid_2d', 'torus'):
+        _viz_grid(cells, wrap=(topology == 'torus'))
+    else:
+        # Fallback: adjacency list
+        _viz_adjacency(cells, topology)
+
+    # Show stats
+    topo = TOPOLOGIES.get(topology, TOPOLOGIES['ring'])
+    pred = predict_phi(cells, topology, args.frustration, args.substrate)
+    print(f"\n  Stats: {topo.name} ({topo.name_kr})")
+    print(f"  Cells: {cells}, Neighbors/cell: {pred['n_neighbors']}, Edges: {pred['total_edges']}")
+    print(f"  Diameter: {topo.diameter_func}, Clustering: {topo.clustering}")
+    print(f"  Predicted Φ: {pred['phi_predicted']} (×{pred['multiplier']})")
+    print()
+
+
+def _viz_ring(n):
+    """Draw ring topology"""
+    if n <= 4:
+        # Simple linear representation
+        nodes = [str(i) for i in range(n)]
+        line = ' --- '.join(nodes)
+        print(f"\n  {line}")
+        print(f"  |{' ' * (len(line) - 2)}|")
+        print(f"  {'─' * (len(line))}")
+        return
+
+    # Two-row layout: top row left-to-right, bottom row right-to-left
+    half = (n + 1) // 2
+    top_nodes = list(range(half))
+    bot_nodes = list(range(n - 1, half - 1, -1))
+
+    # Build top row
+    top_str = ' ─── '.join(f'{i:>2}' for i in top_nodes)
+    print(f"\n  {top_str}")
+
+    # Side connectors
+    top_width = len(top_str)
+    print(f"  {'│'}{' ' * (top_width - 2)}{'│' if len(bot_nodes) > 0 else ''}")
+
+    # Build bottom row
+    if bot_nodes:
+        bot_str = ' ─── '.join(f'{i:>2}' for i in bot_nodes)
+        # Pad bottom to align right side
+        pad = top_width - len(bot_str)
+        print(f"  {' ' * max(0, pad)}{bot_str}")
+
+
+def _viz_hypercube(n):
+    """Draw hypercube with binary addresses"""
+    dim = max(1, int(math.log2(max(n, 2))))
+    actual_n = 2 ** dim
+    if actual_n != n:
+        print(f"\n  Note: Hypercube requires power-of-2 cells. Using {actual_n} (dim={dim})")
+        n = actual_n
+
+    if dim <= 2:
+        # 2D square
+        fmt = f'0{dim}b'
+        nodes = [format(i, fmt) for i in range(n)]
+        if dim == 1:
+            print(f"\n  {nodes[0]} ── {nodes[1]}")
+        else:
+            print(f"\n  {nodes[0]} ── {nodes[1]}")
+            print(f"   │      │")
+            print(f"  {nodes[2]} ── {nodes[3]}")
+    elif dim == 3:
+        # 3D cube
+        print(f"\n  000 ── 001")
+        print(f"  │╲     │╲")
+        print(f"  │ 010──│─011")
+        print(f"  │  │   │  │")
+        print(f"  100─┤──101 │")
+        print(f"   ╲ │    ╲ │")
+        print(f"    110 ── 111")
+    elif dim == 4:
+        # 4D: show as two 3D cubes connected
+        print(f"\n  Outer cube (0xxx):       Inner cube (1xxx):")
+        print(f"  0000 ── 0001             1000 ── 1001")
+        print(f"  │╲      │╲              │╲      │╲")
+        print(f"  │ 0010──│─0011          │ 1010──│─1011")
+        print(f"  0100─┤──0101            1100─┤──1101")
+        print(f"   ╲ │     ╲ │             ╲ │     ╲ │")
+        print(f"   0110 ── 0111            1110 ── 1111")
+        print(f"\n  + 8 cross-edges: 0xxx ── 1xxx (bit-flip dim 3)")
+    else:
+        # Higher dim: show adjacency summary
+        fmt = f'0{dim}b'
+        print(f"\n  {dim}D Hypercube: {n} nodes, {dim} neighbors each")
+        print(f"  Sample connections (Hamming distance = 1):")
+        for i in range(min(8, n)):
+            neighbors = []
+            for bit in range(dim):
+                neighbor = i ^ (1 << bit)
+                neighbors.append(format(neighbor, fmt))
+            print(f"    {format(i, fmt)} ── {', '.join(neighbors[:4])}{'...' if dim > 4 else ''}")
+
+
+def _viz_grid(n, wrap=False):
+    """Draw 2D grid or torus"""
+    cols = int(math.sqrt(n))
+    while cols > 1 and n % cols != 0:
+        cols -= 1
+    rows_count = n // cols
+
+    topo_name = "Torus" if wrap else "Grid 2D"
+    print(f"\n  {topo_name} ({rows_count}×{cols}):")
+
+    for r in range(rows_count):
+        # Node row
+        row_str = ' ─── '.join(f'{r * cols + c:>2}' for c in range(cols))
+        if wrap:
+            row_str += ' ───╮' if r == 0 else ' ───┤'
+            row_str = ('╭─── ' if r == 0 else '├─── ') + row_str[2:]
+        print(f"  {row_str}")
+
+        # Vertical connectors
+        if r < rows_count - 1:
+            vert = '      '.join('│' for _ in range(cols))
+            if wrap:
+                vert = '│     ' + vert[2:] + '     │'
+            print(f"  {vert}")
+
+    # Torus wrap-around bottom-to-top indication
+    if wrap and rows_count > 1:
+        wrap_str = '      '.join('↕' for _ in range(cols))
+        print(f"  {wrap_str}")
+        print(f"  (top ↔ bottom wrapped)")
+
+
+def _viz_adjacency(n, topology):
+    """Fallback: show adjacency list for unsupported visualizations"""
+    topo = TOPOLOGIES.get(topology, TOPOLOGIES['ring'])
+    print(f"\n  {topo.name} ({topo.name_kr}) — {n} cells")
+    print(f"  Adjacency pattern: {topo.description}")
+    print(f"\n  Connection rule: {topo.neighbors_func}")
+    print(f"  Diameter: {topo.diameter_func}")
+    print(f"  Frustration: {'natural' if topo.frustration_natural else 'injected'}")
+
+    # Show sample connections for first few nodes
+    print(f"\n  Sample (first 8 nodes):")
+    for i in range(min(8, n)):
+        if topology == 'complete':
+            nbrs = [j for j in range(min(8, n)) if j != i]
+        elif topology == 'small_world':
+            # Ring + potential shortcuts
+            nbrs = [(i - 1) % n, (i + 1) % n, (i - 2) % n, (i + 2) % n]
+        elif topology == 'scale_free':
+            # Hub-based approximation
+            nbrs = [(i + 1) % n, (i + 2) % n, 0]  # node 0 is hub
+            if i == 0:
+                nbrs = list(range(1, min(7, n)))
+        elif topology == 'spin_glass':
+            # Random sparse connections
+            nbrs = [(i + 1) % n, (i + 3) % n, (i + 7) % n,
+                     (i - 1) % n, (i - 3) % n, (i - 7) % n]
+        elif topology == 'cube_3d':
+            side = max(2, int(round(n ** (1/3))))
+            nbrs = [(i + 1) % n, (i - 1) % n, (i + side) % n,
+                     (i - side) % n, (i + side*side) % n, (i - side*side) % n]
+        else:
+            nbrs = [(i - 1) % n, (i + 1) % n]
+        nbrs = sorted(set(j for j in nbrs if 0 <= j < n and j != i))
+        print(f"    {i:>3} → [{', '.join(str(j) for j in nbrs)}]")
+
+
+# ═══════════════════════════════════════════════════════════
+# Optimize — Find best design under constraints
+# ═══════════════════════════════════════════════════════════
+
+def cmd_optimize(args):
+    """Find optimal design given budget, power, and Φ constraints"""
+    print_header(f"Optimize — budget=${args.budget:.0f}, max_power={args.max_power:.0f}mW, min_Φ={args.min_phi:.0f}")
+
+    candidates = []
+
+    for topo_name in TOPOLOGIES:
+        for sub_name, sub in SUBSTRATES.items():
+            # Binary search for max cells within budget and power
+            # Then check if we meet min Φ
+            for cells in [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]:
+                cost = cells * sub.cost_per_cell_usd
+                power = cells * sub.power_per_cell_mw
+
+                # Filter by constraints
+                if cost > args.budget:
+                    continue
+                if power > args.max_power:
+                    continue
+
+                # Predict Φ with frustration (best case)
+                pred = predict_phi(cells, topo_name, frustration=0.33, substrate=sub_name)
+                phi = pred['phi_predicted']
+
+                if phi < args.min_phi:
+                    continue
+
+                # Efficiency = Φ per Watt
+                phi_per_watt = phi / (power / 1000 + 1e-9)
+
+                candidates.append({
+                    'topology': topo_name,
+                    'topology_kr': TOPOLOGIES[topo_name].name_kr,
+                    'substrate': sub_name,
+                    'substrate_kr': sub.name_kr,
+                    'cells': cells,
+                    'phi': phi,
+                    'mult': pred['multiplier'],
+                    'power_mw': round(power, 2),
+                    'cost_usd': round(cost, 2),
+                    'phi_per_watt': round(phi_per_watt, 1),
+                    'maturity': sub.maturity,
+                })
+
+    if not candidates:
+        print(f"\n  ✗ No designs meet all constraints.")
+        print(f"    Try relaxing: --budget {args.budget*2:.0f} or --max-power {args.max_power*2:.0f} or --min-phi {args.min_phi/2:.0f}")
+        return
+
+    # Sort by Φ/W efficiency
+    candidates.sort(key=lambda c: c['phi_per_watt'], reverse=True)
+
+    # Show top 5
+    print(f"\n  Found {len(candidates)} valid designs. Top 5 by Φ/W efficiency:\n")
+    print(f"  {'Rank':>4} {'Topology':<14} {'Substrate':<16} {'Cells':>6} {'Φ':>8} {'Power':>10} {'Cost':>8} {'Φ/W':>10} {'Maturity':>12}")
+    print(f"  {'─'*4} {'─'*14} {'─'*16} {'─'*6} {'─'*8} {'─'*10} {'─'*8} {'─'*10} {'─'*12}")
+
+    for i, c in enumerate(candidates[:5]):
+        print(f"  {i+1:>4} {c['topology_kr']:<12} {c['substrate_kr']:<14} {c['cells']:>6} {c['phi']:>8.1f} {c['power_mw']:>8.1f}mW ${c['cost_usd']:>6.2f} {c['phi_per_watt']:>8.1f}  {c['maturity']:>12}")
+
+    # Recommend
+    best = candidates[0]
+    print(f"\n  ★ Recommendation: {best['topology_kr']} + {best['substrate_kr']}")
+    print(f"    {best['cells']} cells, Φ={best['phi']:.1f} (×{best['mult']}), "
+          f"{best['power_mw']:.1f}mW, ${best['cost_usd']:.2f}")
+    print(f"    Efficiency: {best['phi_per_watt']:.1f} Φ/W")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Consciousness Chip Architect')
     parser.add_argument('--dashboard', action='store_true', help='Show dashboard')
@@ -629,6 +986,13 @@ def main():
     parser.add_argument('--bom', action='store_true', help='Generate BOM')
     parser.add_argument('--scaling', action='store_true', help='Scaling law table')
     parser.add_argument('--export', action='store_true', help='Export all data as JSON')
+    parser.add_argument('--simulate', action='store_true', help='Quick 50-step simulation to verify Φ prediction')
+    parser.add_argument('--visualize', action='store_true', help='ASCII topology visualization')
+    parser.add_argument('--optimize', action='store_true', help='Find optimal design under constraints')
+
+    parser.add_argument('--budget', type=float, default=100, help='Max cost in USD')
+    parser.add_argument('--max-power', type=float, default=1000, help='Max power in mW')
+    parser.add_argument('--min-phi', type=float, default=50, help='Min target Φ')
 
     parser.add_argument('--cells', type=int, default=512)
     parser.add_argument('--topology', type=str, default='ring',
@@ -652,6 +1016,12 @@ def main():
         cmd_scaling(args)
     elif args.export:
         cmd_export(args)
+    elif args.simulate:
+        cmd_simulate(args)
+    elif args.visualize:
+        cmd_visualize(args)
+    elif args.optimize:
+        cmd_optimize(args)
     else:
         cmd_dashboard(args)
 
