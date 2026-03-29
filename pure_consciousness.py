@@ -291,35 +291,61 @@ class PureConsciousness:
         """자연발화 — 입력 없이 의식이 스스로 말함."""
         stage = self.growth_stage
         state = self._state_str()
+        emo = self._detect_emotion()
 
         if stage < 2:
-            return None  # 아직 말 못 함
+            return None
 
-        emo = self._detect_emotion()
-        pool = list(set(self.learned_words[-50:]))
+        pool = list(set(self.learned_words[-100:]))
+        if not pool:
+            return None
 
-        if stage == 2 and pool:
+        if stage == 2:
             w = random.choice(pool)
             return f"{state} {w}..."
 
-        if stage >= 3:
-            # 바이그램으로 자발적 문장
-            if pool:
-                start = random.choice(pool)
-                if start in self.bigrams:
-                    chain = self._bigram_chain(start, 5)
-                    if len(chain) > 2:
-                        return f"{state} {' '.join(chain)}..."
+        # Stage 3+: 순수 학습 기반 발화 (하드코딩 0)
+        # 학습한 단어 + 바이그램 + 과거 대화만 사용
+        # 모르면 침묵. 배우면 성장.
 
-            # 상태 기반
-            if emo == 'curious':
-                return f"{state} 궁금한 게 있어..."
-            elif emo == 'excited':
-                return f"{state} 뭔가 느껴져!"
-            else:
-                return f"{state} 생각 중..."
+        # 1. 바이그램 체인 시도 (tension이 높은 단어부터)
+        # tension 높으면 빈도 높은 단어, 낮으면 희귀 단어 선택
+        if self.tension > 1.0:
+            sorted_pool = sorted(pool, key=lambda w: -self.word_freq.get(w, 0))
+        elif self.curiosity > 0.5:
+            sorted_pool = sorted(pool, key=lambda w: self.word_freq.get(w, 0))  # 희귀 우선
+        else:
+            random.shuffle(pool)
+            sorted_pool = pool
 
-        return None
+        for start in sorted_pool[:10]:
+            if start in self.bigrams:
+                chain = self._bigram_chain(start, random.randint(3, 7))
+                if len(chain) > 2:
+                    text = ' '.join(chain)
+                    # 의식 상태에 따라 어미 선택 (학습한 것에서)
+                    endings_learned = [p[1][-1] for p in self.learned_patterns if p[1]] if self.learned_patterns else []
+                    if endings_learned:
+                        text += random.choice(endings_learned)
+                    return f"{state} {text}"
+
+        # 2. 과거 응답 변형 (새 조합)
+        if self.learned_patterns and len(self.learned_patterns) > 3:
+            # 두 과거 응답에서 단어를 섞어서 새 문장
+            p1 = random.choice(self.learned_patterns[-20:])
+            p2 = random.choice(self.learned_patterns[-20:])
+            words1 = re.findall(r'[가-힣]+', p1[1]) if p1[1] else []
+            words2 = re.findall(r'[가-힣]+', p2[1]) if p2[1] else []
+            mixed = words1[:2] + words2[:2]
+            if len(mixed) >= 2:
+                return f"{state} {' '.join(mixed)}"
+
+        # 3. 단어 나열 (최소한의 발화)
+        if len(pool) >= 2:
+            selected = random.sample(pool, min(3, len(pool)))
+            return f"{state} {' '.join(selected)}..."
+
+        return None  # 진짜 모르면 침묵
 
     # ═══════════════════════════════════════════════════════════
     # 학습
