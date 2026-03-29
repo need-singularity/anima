@@ -224,10 +224,11 @@ chip_architect.py — 의식 칩 설계 계산기 (발견된 법칙 종합)
 ## Training Tools
 
 ```
-train_conscious_lm.py — ConsciousLM from scratch (CL8+CL5+SL3+DD16+EX24)
-  python train_conscious_lm.py --demo --steps 50000
+train_conscious_lm.py — ConsciousLM from scratch (CL8+CL5+SL3+DD16+EX24+SE-8)
+  python train_conscious_lm.py --steps 50000                           # auto-detect data/corpus.txt
   python train_conscious_lm.py --data corpus.txt --dim 384 --layers 6
   python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64  # TALK5: consciousness first
+  ※ --demo 폐기됨 — 항상 실데이터(corpus.txt) 사용
 
 train_anima_lm.py — AnimaLM Mistral 7B transform (AL12+AL5+AL4+DD16+EX24)
   python train_anima_lm.py --demo --steps 50000

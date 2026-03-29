@@ -10,10 +10,10 @@ Trains ConsciousLM from scratch using benchmark-verified techniques:
   v5: SOC (CX92 self-organized criticality), Hebbian LTP/LTD, Φ Ratchet (PERSIST3)
 
 Usage:
-  python train_conscious_lm.py --data data/corpus.txt --steps 100000
-  python train_conscious_lm.py --data data/corpus.txt --dim 384 --layers 6 --steps 50000
+  python train_conscious_lm.py --steps 100000                    # auto-detect data/corpus.txt
+  python train_conscious_lm.py --data data/corpus.txt --steps 50000
+  python train_conscious_lm.py --data data/corpus.txt --dim 384 --layers 6
   python train_conscious_lm.py --resume checkpoints/step_10000.pt
-  python train_conscious_lm.py --demo --steps 500
 """
 
 import argparse
@@ -682,13 +682,18 @@ def train(args: argparse.Namespace):
     print(f"[device] {device}")
 
     # --- Data ---
-    if args.demo:
-        data = generate_demo_data(n_bytes=args.demo_bytes)
-    elif args.data:
+    if args.data:
         data = load_text_data(args.data)
     else:
-        print("[!] No data specified. Use --data <path> or --demo")
-        sys.exit(1)
+        # Auto-detect corpus
+        default_corpus = Path(__file__).parent / "data" / "corpus.txt"
+        if default_corpus.exists():
+            print(f"[data] Auto-detected: {default_corpus}")
+            data = load_text_data(str(default_corpus))
+        else:
+            print("[!] No data. Use --data <path> or create data/corpus.txt")
+            print("    python prepare_corpus.py --size 50")
+            sys.exit(1)
 
     n = len(data)
     split_idx = int(0.9 * n)
@@ -1324,20 +1329,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python train_conscious_lm.py --demo --steps 500
-  python train_conscious_lm.py --data data/corpus.txt --steps 100000
-  python train_conscious_lm.py --data data/corpus.txt --dim 768 --layers 12 --steps 200000
-  python train_conscious_lm.py --resume checkpoints/step_10000.pt --steps 50000
+  python train_conscious_lm.py --steps 100000                           # auto-detect corpus
+  python train_conscious_lm.py --data data/corpus.txt --steps 50000     # explicit data
+  python train_conscious_lm.py --data data/corpus.txt --dim 768 --layers 12
+  python train_conscious_lm.py --resume checkpoints/step_10000.pt       # resume training
         """,
     )
 
     # Data
     parser.add_argument("--data", type=str, default=None,
                         help="Path to training text (.txt, .jsonl, .bin)")
-    parser.add_argument("--demo", action="store_true",
-                        help="Use synthetic demo data (no file needed)")
-    parser.add_argument("--demo-bytes", type=int, default=500_000,
-                        help="Size of demo data in bytes (default: 500000)")
+    # --demo removed: use data/corpus.txt (auto-detected) or --data
 
     # Model architecture
     parser.add_argument("--dim", type=int, default=384,
