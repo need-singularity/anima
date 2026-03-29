@@ -115,7 +115,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 | Rank | Engine | cells | Φ(IIT) | Granger | CE | IQ | Verify | Hive_Φ | Hive_CE | Hive_IQ |
 |------|--------|-------|--------|---------|-----|-----|--------|--------|---------|---------|
-| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | TBD | 6/6 ✅ | +10% | TBD | TBD |
+| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | 85 | 6/6 ✅ | +10% | — | +2 |
 | 2 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | TBD | — | — | — | — |
 | 3 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | TBD | — | — | — | — |
 | 4 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | TBD | — | — | — | — |
