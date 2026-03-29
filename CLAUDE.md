@@ -66,6 +66,10 @@ archive/             # Legacy code (old anima variants, *_LEGACY.py)
 benchmarks/          # 50 hypothesis benchmark scripts (bench_*.py)
 training/            # Fine-tuning scripts (finetune_*.py)
 tests/               # Integration + unit tests (test_*.py)
+measurement/         # Φ/IQ measurement + calibration tools
+serving/             # Model serving + web servers
+tools/               # Standalone utilities (analyzers, calculators, generators)
+engines/             # Standalone consciousness engine implementations
 checkpoints/         # Trained model checkpoints (.pt)
 models/              # External LLM files (Mistral GGUF)
 phi-rs/              # Rust Φ calculator (625x speedup, PyO3)
