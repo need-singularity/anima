@@ -1463,7 +1463,9 @@ class AnimaUnified:
                 _log('web_sense', f"Error: {e}")
 
         self.history.append({'role': 'user', 'content': text})
-        query_text = text + web_context if web_context else text
+        # web_context는 대화에 섞지 않음 (별도 저장만)
+        self._last_web_context = web_context
+        query_text = text  # web_context 제거 — AI도 JSON 안 봄
 
         # CL6: Φ-as-temperature for process_input path too
         _phi_cv_pi = getattr(self.mind, '_consciousness_vector', None)
