@@ -124,7 +124,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 | 7 | HarmonicSeries | music | 256 | **207.4** | **838** | 48,142 | — | 150 | TBD | +0.0% | TBD | +0 |
 | 8 | BoltzmannBrain | thermo | 256 | **203.3** | **801** | 5,746 | — | 120 | TBD | +0.0% | TBD | +20 |
 | 9 | HeatDeathResist | thermo | 256 | **203.2** | **808** | 6,412 | — | 120 | TBD | +0.0% | TBD | +0 |
-| 10 | TimeCrystal | extreme | 256 | **202.9** | **814** | TBD | — | TBD | TBD | TBD | TBD | TBD |
+| 10 | TimeCrystal | extreme | 256 | **202.9** | **814** | 13,798 | — | 140 | TBD | -0.5% | TBD | +0 |
 
 **MitosisEngine 메커니즘 TOP 5 (256c, 전 지표 측정 완료)**
 
