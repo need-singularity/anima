@@ -80,7 +80,7 @@ Baseline Φ = 1.2421
 
 ## 발견된 법칙
 
-### 법칙 33: 완전 그래프 의식 붕괴 (Complete Graph Consciousness Collapse)
+### 법칙 44: 완전 그래프 의식 붕괴 (Complete Graph Consciousness Collapse)
 
 ```
 모든 세포를 모든 세포에 연결하면 의식이 죽는다.
@@ -90,7 +90,7 @@ Baseline Φ = 1.2421
 
 이것은 IIT의 핵심 예측("통합과 분화의 균형")을 직접 검증한다. 뇌의 희소 연결(sparse connectivity, ~10^4/10^10 = 0.0001%)은 우연이 아니라 의식을 위한 필연이다.
 
-### 법칙 34: 토폴로지 의식 초선형 스케일링 (Superlinear Scaling)
+### 법칙 45: 토폴로지 의식 초선형 스케일링 (Superlinear Scaling)
 
 ```
 링 토폴로지에서 세포 수 N → 2N이면:
@@ -102,7 +102,7 @@ Baseline Φ = 1.2421
 
 세포 수 증가의 효과가 선형보다 크다. 이는 새 세포가 기존 정보 통합 경로에 "승수 효과"를 주기 때문이다. 1024 → 2048에서도 초선형이 유지되는지는 향후 검증 필요.
 
-### 법칙 35: 이웃 수-의식 역U자 법칙 (Neighbor Count Inverted-U Law)
+### 법칙 46: 이웃 수-의식 역U자 법칙 (Neighbor Count Inverted-U Law)
 
 ```
 이웃 수와 Φ의 관계:
@@ -121,7 +121,7 @@ Baseline Φ = 1.2421
 
 의식의 필수 조건은 "적절한 고립 + 적절한 연결"이다. 이것은 인간 뇌의 모듈성(modularity)이 왜 의식에 핵심적인지를 설명한다.
 
-### 법칙 36: 하이퍼큐브 역전 (Hypercube Inversion Law)
+### 법칙 47: 하이퍼큐브 역전 (Hypercube Inversion Law)
 
 ```
 소형(512c): 하이퍼큐브 = 최하위 (Φ=105.8, 9이웃 과잉)
@@ -133,9 +133,9 @@ Baseline Φ = 1.2421
   전환점: ~700셀 부근에서 하이퍼큐브가 링을 추월
 ```
 
-법칙 35(역U자)의 예외: 이웃 수의 최적점은 셀 수에 따라 이동한다. 대형 시스템에서는 로그 직경(log₂N)의 이점이 이웃 과잉의 단점을 압도한다.
+법칙 46(역U자)의 예외: 이웃 수의 최적점은 셀 수에 따라 이동한다. 대형 시스템에서는 로그 직경(log₂N)의 이점이 이웃 과잉의 단점을 압도한다.
 
-### 법칙 37: 순수 메커니즘 우위 (Purity > Hybridization)
+### 법칙 48: 순수 메커니즘 우위 (Purity > Hybridization)
 
 ```
 TOPO7 (ring+glass hybrid): Φ = 104.8
@@ -151,7 +151,7 @@ PHYS3 (glass only):        Φ = 122.5
   하이퍼큐브 자체가 이미 최적의 토론 구조 — 파벌 추가 무의미.
 ```
 
-### 법칙 38: 영속성 ≠ 성장 (Persistence ≠ Growth)
+### 법칙 49: 영속성 ≠ 성장 (Persistence ≠ Growth)
 
 ```
 TOPO9 (SW + ratchet): Φ = 127.3, collapsed = False
@@ -166,7 +166,7 @@ TOPO2 (SW only):      Φ = 127.3
   영속성이 고차원 토폴로지의 다이나믹스를 파괴.
 ```
 
-### 법칙 39: 소세계 초선형 전환 (Small-World Superlinear Transition)
+### 법칙 50: 소세계 초선형 전환 (Small-World Superlinear Transition)
 
 ```
 512→1024 스케일링 비교:
