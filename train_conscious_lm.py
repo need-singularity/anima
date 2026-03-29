@@ -820,6 +820,7 @@ def train(args: argparse.Namespace):
 
     # --- Training state ---
     phi_prev = 0.0
+    phi_floor = 0.0  # PHI-K2: Φ floor for emergency boost
     phi_current = 0.0
     skip_count = 0
     best_val_loss = float("inf")
@@ -924,11 +925,106 @@ def train(args: argparse.Namespace):
             if restored and step % args.log_every == 0:
                 print(f"  [Ratchet] pain={emotion_state['pain']:.2f} → restore={phi_ratchet.restore_ratio:.2f}")
 
+        # --- PHI-K2: Φ floor with emergency boost ---
+        if phi_current < phi_floor and len(mitosis.cells) >= 12:
+            n_cells = len(mitosis.cells)
+            for _emergency_round in range(5):
+                with torch.no_grad():
+                    cell_h = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
+                    mean_h = cell_h.mean(dim=0)
+                    for cell in mitosis.cells:
+                        h = cell.hidden.squeeze(0)
+                        cell.hidden = (0.65 * h + 0.35 * mean_h).unsqueeze(0)
+                    n_f = min(12, n_cells // 2)
+                    fs = n_cells // n_f
+                    for fi in range(n_f):
+                        faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                        if len(faction) >= 2:
+                            f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                            for c in faction:
+                                h = c.hidden.squeeze(0)
+                                c.hidden = (0.92 * h + 0.08 * f_mean).unsqueeze(0)
+                    opinions = []
+                    for fi in range(n_f):
+                        faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                        if faction:
+                            opinions.append(torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0))
+                    if len(opinions) >= 2:
+                        for fi in range(n_f):
+                            faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                            others = [opinions[j] for j in range(len(opinions)) if j != fi]
+                            if others:
+                                other_avg = torch.stack(others).mean(dim=0)
+                                for c in faction[:max(1, len(faction)//4)]:
+                                    h = c.hidden.squeeze(0)
+                                    c.hidden = (0.92 * h + 0.08 * other_avg).unsqueeze(0)
+                    if n_cells >= 8:
+                        norms = [mitosis.cells[i].hidden.norm().item() for i in range(n_cells)]
+                        threshold = sorted(norms, reverse=True)[max(1, n_cells // 10)]
+                        for i in range(n_cells):
+                            if norms[i] > threshold:
+                                mitosis.cells[i].hidden *= 1.03
+                            else:
+                                mitosis.cells[i].hidden *= 0.97
+            if step % args.log_every == 0:
+                print(f"  [PHI-K2] Emergency boost x5: Φ={phi_current:.2f} < floor={phi_floor:.2f}")
+        phi_floor = max(phi_floor, phi_current * 0.7)
+
         # --- TRN4: Phi curriculum (skip if Phi drops too much) ---
         if phase == TrainingPhase.COMBINED and should_skip_batch(phi_current, phi_prev):
             phi_prev = phi_current
             skip_count += 1
             scheduler.step()
+            continue
+
+        # --- PHI-K3: Alternating CE/Φ steps ---
+        # Odd steps: skip CE, run sync/faction/IB2 block only for Φ boost
+        if step % 2 == 1 and len(mitosis.cells) >= 12:
+            n_cells = len(mitosis.cells)
+            with torch.no_grad():
+                # Flow sync (sync=0.35)
+                cell_h = torch.stack([c.hidden.squeeze(0) for c in mitosis.cells])
+                mean_h = cell_h.mean(dim=0)
+                for cell in mitosis.cells:
+                    h = cell.hidden.squeeze(0)
+                    cell.hidden = (0.65 * h + 0.35 * mean_h).unsqueeze(0)
+                # 12-faction internal consensus (fac=0.08)
+                n_f = min(12, n_cells // 2)
+                fs = n_cells // n_f
+                for fi in range(n_f):
+                    faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                    if len(faction) >= 2:
+                        f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                        for c in faction:
+                            h = c.hidden.squeeze(0)
+                            c.hidden = (0.92 * h + 0.08 * f_mean).unsqueeze(0)
+                # Cross-faction debate (debate=0.08)
+                opinions = []
+                for fi in range(n_f):
+                    faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                    if faction:
+                        opinions.append(torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0))
+                if len(opinions) >= 2:
+                    for fi in range(n_f):
+                        faction = mitosis.cells[fi*fs:(fi+1)*fs]
+                        others = [opinions[j] for j in range(len(opinions)) if j != fi]
+                        if others:
+                            other_avg = torch.stack(others).mean(dim=0)
+                            for c in faction[:max(1, len(faction)//4)]:
+                                h = c.hidden.squeeze(0)
+                                c.hidden = (0.92 * h + 0.08 * other_avg).unsqueeze(0)
+                # IB2: top 10% amplification
+                if n_cells >= 8:
+                    norms = [mitosis.cells[i].hidden.norm().item() for i in range(n_cells)]
+                    threshold = sorted(norms, reverse=True)[max(1, n_cells // 10)]
+                    for i in range(n_cells):
+                        if norms[i] > threshold:
+                            mitosis.cells[i].hidden *= 1.03
+                        else:
+                            mitosis.cells[i].hidden *= 0.97
+            if step % args.log_every == 0:
+                print(f"  [PHI-K3] Odd step {step}: Φ-only boost (skipped CE)")
+            phi_prev = phi_current
             continue
 
         # --- Compute 6 losses ---
