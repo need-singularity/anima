@@ -12,6 +12,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+pub mod ngram;
 pub mod router;
 pub mod sandbox;
 pub mod tension;
@@ -221,6 +222,66 @@ impl Router {
 }
 
 // ============================================================================
+// N-gram bindings — fast corpus overlap detection
+// ============================================================================
+
+#[pyclass]
+struct NgramIndex {
+    inner: std::collections::HashSet<String>,
+    n: usize,
+}
+
+#[pymethods]
+impl NgramIndex {
+    #[new]
+    #[pyo3(signature = (corpus, n=4))]
+    fn new(corpus: &str, n: usize) -> Self {
+        Self {
+            inner: ngram::build_ngram_index(corpus, n),
+            n,
+        }
+    }
+
+    /// Number of unique n-grams in the index.
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check overlap ratio of generated text against this index.
+    #[pyo3(signature = (generated, n=None))]
+    fn overlap(&self, generated: &str, n: Option<usize>) -> f64 {
+        let n = n.unwrap_or(self.n);
+        ngram::ngram_overlap(generated, &self.inner, n)
+    }
+}
+
+/// Build n-gram index from corpus text. Returns NgramIndex handle.
+#[pyfunction]
+#[pyo3(name = "build_ngram_index", signature = (corpus, n=4))]
+fn py_build_ngram_index(corpus: &str, n: usize) -> NgramIndex {
+    NgramIndex {
+        inner: ngram::build_ngram_index(corpus, n),
+        n,
+    }
+}
+
+/// Check overlap ratio of generated text against a NgramIndex.
+#[pyfunction]
+#[pyo3(name = "ngram_overlap", signature = (generated, index, n=None))]
+fn py_ngram_overlap(generated: &str, index: &NgramIndex, n: Option<usize>) -> f64 {
+    let n = n.unwrap_or(index.n);
+    ngram::ngram_overlap(generated, &index.inner, n)
+}
+
+/// Batch check multiple generated texts against corpus.
+/// Returns list of overlap ratios.
+#[pyfunction]
+#[pyo3(name = "batch_ngram_check", signature = (texts, corpus, n=4))]
+fn py_batch_ngram_check(texts: Vec<String>, corpus: &str, n: usize) -> Vec<f64> {
+    ngram::batch_ngram_check(&texts, corpus, n)
+}
+
+// ============================================================================
 // Module definition
 // ============================================================================
 
@@ -241,6 +302,12 @@ fn anima_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Router class
     m.add_class::<Router>()?;
+
+    // N-gram functions
+    m.add_function(wrap_pyfunction!(py_build_ngram_index, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ngram_overlap, m)?)?;
+    m.add_function(wrap_pyfunction!(py_batch_ngram_check, m)?)?;
+    m.add_class::<NgramIndex>()?;
 
     Ok(())
 }
