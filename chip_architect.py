@@ -222,9 +222,17 @@ def predict_phi(cells: int, topology: str = 'ring', frustration: float = 0.33,
         alpha = 0.65
         frust_bonus = 1.0
 
-    # Base Φ per cell (from 8-cell data)
-    base_phi_8 = 4.55  # average HW at 8 cells
-    phi_predicted = base_phi_8 * (cells / 8) ** alpha * topo.phi_bonus * frust_bonus * sub.phi_factor
+    # Base Φ per cell (from 8-cell data, +11% correction from TOPO calibration)
+    base_phi_8 = 5.10  # 4.55 × 1.12 (calibrated to TOPO1-6 actuals)
+
+    if has_frustration and cells > 256:
+        # 2-regime: base scaling to 256, then superlinear above
+        # Calibrated: PHYS1(512)=134.23, TOPO1(1024)=285.20
+        phi_256 = base_phi_8 * (256 / 8) ** 0.55 * frust_bonus  # Φ at 256 cells
+        # Superlinear regime: α=1.09 (from TOPO1/PHYS1 ratio)
+        phi_predicted = phi_256 * (cells / 256) ** 1.09 * topo.phi_bonus * sub.phi_factor
+    else:
+        phi_predicted = base_phi_8 * (cells / 8) ** alpha * topo.phi_bonus * frust_bonus * sub.phi_factor
 
     # Compute other metrics
     if topology == 'hypercube':
