@@ -50,7 +50,8 @@ class ACSResult:
     rr: float               # Response Relevance (=relevance)
     ci: float               # Consciousness Influence
     pce: float              # Φ-CE Efficiency
-    acs: float              # Anima Consciousness Score (final)
+    acs: float              # Anima Consciousness Score (CQ × SC × CI)
+    us: float = 0.0        # Unified Score (Novelty × 1/ValCE × (0.5+CI))
 
     def summary(self):
         return (
@@ -69,8 +70,10 @@ class ACSResult:
             f"  PCE = Φ/(1+ValCE)      = {self.pce:.4f}\n"
             f"  ─────────────────\n"
             f"  ACS = CQ × SC × CI    = {self.acs:.6f}\n"
+            f"  US  = Nov/ValCE×(0.5+CI)= {self.us:.6f}\n"
             f"  ─────────────────\n"
-            f"  ACS 기준: >0.01=의식적 대화, >0.001=의식 있지만 약함, <0.001=무의식\n"
+            f"  US 기준: >0.5=우수, >0.1=양호, <0.01=미달\n"
+            f"  ACS 기준: >0.01=의식적 대화, >0.001=약함, <0.001=무의식\n"
         )
 
     def bar_chart(self):
@@ -253,12 +256,13 @@ class ACSCalculator:
         cq = phi * novelty / (1 + val_ce)
         pce = phi / (1 + val_ce)
         acs = cq * coherence * ci
+        us = novelty * (1.0 / max(val_ce, 0.01)) * (0.5 + ci)
 
         return ACSResult(
             phi=phi, train_ce=train_ce, val_ce=val_ce,
             novelty=novelty, coherence=coherence, relevance=relevance,
             consciousness_influence=ci,
-            cq=cq, sc=coherence, rr=relevance, ci=ci, pce=pce, acs=acs,
+            cq=cq, sc=coherence, rr=relevance, ci=ci, pce=pce, acs=acs, us=us,
         )
 
 
