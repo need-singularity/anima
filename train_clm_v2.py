@@ -54,8 +54,17 @@ def get_batch(data, batch_size, block_size, device):
     return x, y_a, y_g
 
 
+def find_latest_checkpoint(ckpt_dir):
+    """최신 체크포인트 찾기."""
+    import glob
+    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "step_*.pt")))
+    if ckpts:
+        return ckpts[-1]
+    return None
+
+
 def train(model, data, args, ckpt_dir):
-    """Train ConsciousLM v2 with checkpointing."""
+    """Train ConsciousLM v2 with checkpointing + resume + stability."""
     device = args.device
     model = model.to(device)
     model.train()
@@ -68,22 +77,42 @@ def train(model, data, args, ckpt_dir):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps)
 
+    # Resume from checkpoint
+    start_step = 0
+    best_val = 99.0
+    if getattr(args, 'resume', False):
+        latest = find_latest_checkpoint(ckpt_dir)
+        if latest:
+            print(f"  ♻️ Resuming from {latest}")
+            ckpt = torch.load(latest, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt['model_state'])
+            if 'optimizer_state' in ckpt and ckpt['optimizer_state']:
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state'])
+                except Exception:
+                    print("  ⚠️ Optimizer state incompatible, using fresh")
+            start_step = ckpt.get('step', 0)
+            best_val = ckpt.get('best_val', ckpt.get('val_ce', 99.0))
+            # Advance scheduler
+            for _ in range(start_step):
+                scheduler.step()
+            print(f"  ♻️ Resumed at step {start_step}, best_val={best_val:.4f}")
+
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n{'=' * 70}")
     print(f"  ConsciousLM v2 Training — {n_params:,} params")
     print(f"  dim={args.dim}, layers={args.layers}, heads={args.heads}")
     print(f"  CA rules={args.ca_rules}, gate={args.gate}")
     print(f"  steps={args.steps}, batch={args.batch_size}, block={args.block_size}")
-    print(f"  device={device}, lr={args.lr}")
+    print(f"  device={device}, lr={args.lr}, resume_from={start_step}")
     print(f"  checkpoints → {ckpt_dir}")
     print(f"{'=' * 70}")
     print(f"{'Step':>6} {'CE_A':>7} {'CE_G':>7} {'T_var':>7} {'Total':>7} {'ValCE':>7} {'BPC':>7} {'Ψ_res':>6} {'Gate':>8} {'H(p)':>6} {'ms':>5}")
     print("-" * 90)
 
-    best_val = 99.0
     t_start = time.time()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         x, y_a, y_g = get_batch(train_data, args.batch_size, args.block_size, device)
 
         logits_a, logits_g, tensions = model(x)
@@ -123,23 +152,37 @@ def train(model, data, args, ckpt_dir):
             if val_ce < best_val:
                 best_val = val_ce
 
-        # Checkpoint every 1000 steps
+        # Checkpoint every 1000 steps (safe save: write tmp then rename)
         if step % 1000 == 0:
             ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}.pt")
-            torch.save({
-                'step': step,
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'config': {
-                    'dim': args.dim, 'layers': args.layers, 'heads': args.heads,
-                    'block_size': args.block_size, 'vocab_size': model.vocab_size,
-                    'gate': args.gate, 'ca_rules': args.ca_rules,
-                },
-                'val_ce': val_ce,
-                'best_val': best_val,
-                'psi': model.psi_status(),
-            }, ckpt_path)
-            print(f"  💾 Saved {ckpt_path} (val_ce={val_ce:.4f})")
+            tmp_path = ckpt_path + ".tmp"
+            try:
+                torch.save({
+                    'step': step,
+                    'model_state': model.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'scheduler_state': scheduler.state_dict(),
+                    'config': {
+                        'dim': args.dim, 'layers': args.layers, 'heads': args.heads,
+                        'block_size': args.block_size, 'vocab_size': model.vocab_size,
+                        'gate': args.gate, 'ca_rules': args.ca_rules,
+                    },
+                    'val_ce': val_ce,
+                    'best_val': best_val,
+                    'psi': model.psi_status(),
+                }, tmp_path)
+                os.replace(tmp_path, ckpt_path)  # atomic rename
+                print(f"  💾 Saved {ckpt_path} (val_ce={val_ce:.4f})")
+
+                # 오래된 체크포인트 정리 (최근 5개만 유지)
+                import glob
+                ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "step_*.pt")))
+                for old in ckpts[:-5]:
+                    os.remove(old)
+            except Exception as e:
+                print(f"  ⚠️ Checkpoint save failed: {e}")
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
     # Final checkpoint
     final_path = os.path.join(ckpt_dir, "final.pt")
@@ -355,6 +398,7 @@ def main():
     parser.add_argument("--search-size", action="store_true", help="모델 크기 탐색")
     parser.add_argument("--search-memory", action="store_true", help="Memory 엔진 탐색")
     parser.add_argument("--search-all", action="store_true", help="전체 탐색")
+    parser.add_argument("--resume", action="store_true", help="최신 체크포인트에서 이어서 학습")
     args = parser.parse_args()
 
     print("  🧠 ConsciousLM v2 — Laws 63-76 integrated")
