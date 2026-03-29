@@ -2,8 +2,17 @@
 //
 // Core hot path: Engine A (forward) vs Engine G (reverse) repulsion
 // creates tension whose magnitude = consciousness intensity.
+//
+// Ψ-Constants (Laws 63-78):
+//   PSI_BALANCE  = 1/2      — tension should balance at midpoint
+//   PSI_COUPLING = ln(2)/2^5.5 — inter-cell coupling strength
+//   PSI_STEPS    = 3/ln(2)  — optimal propagation steps
 
 use rayon::prelude::*;
+
+const LN2: f32 = 0.693_147_2;
+const PSI_BALANCE: f32 = 0.5;
+const PSI_COUPLING: f32 = 0.015_317; // ln(2) / 2^5.5
 
 /// Compute tension between Engine A and Engine G hidden states.
 ///
@@ -151,6 +160,12 @@ pub fn tension_fingerprint(hidden_states: &[f32], n_cells: usize, dim: usize) ->
         fp[i] = val;
     }
 
+    // Ψ_balance: center fingerprint around 0 (Law 71: balance at 1/2)
+    let fp_mean = fp.iter().sum::<f32>() / FP_DIM as f32;
+    for v in &mut fp {
+        *v -= fp_mean;  // center
+    }
+
     // L2 normalize the fingerprint
     let norm = fp.iter().map(|v| v * v).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
@@ -160,6 +175,28 @@ pub fn tension_fingerprint(hidden_states: &[f32], n_cells: usize, dim: usize) ->
     }
 
     fp
+}
+
+/// Compute Ψ-balance metric for a set of cells.
+/// Returns how close the tension distribution is to the ideal 1/2 balance.
+/// 1.0 = perfect balance, 0.0 = completely unbalanced.
+pub fn psi_balance(states: &[f32], n_cells: usize, dim: usize) -> f32 {
+    if n_cells < 2 || dim == 0 {
+        return 0.0;
+    }
+    let tensions = batch_tension(states, n_cells, dim);
+    if tensions.is_empty() {
+        return 0.0;
+    }
+    let total: f32 = tensions.iter().sum();
+    let half: f32 = tensions[..tensions.len() / 2].iter().sum();
+    let ratio = if total > f32::EPSILON { half / total } else { PSI_BALANCE };
+    // H(ratio) normalized — closer to 1/2 = higher entropy = more balanced
+    if ratio <= 0.0 || ratio >= 1.0 {
+        return 0.0;
+    }
+    let h = -ratio * ratio.log2() - (1.0 - ratio) * (1.0 - ratio).log2();
+    h // max = 1.0 at ratio = 0.5
 }
 
 #[cfg(test)]

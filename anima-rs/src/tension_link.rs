@@ -2,9 +2,17 @@
 //
 // 5 channels: concept, context, meaning, auth, sender
 // Matches the Python tension_link.py protocol.
-// Target: R=0.990, True/False 92.5%, Sender ID 100%
+// Target: R=0.990, True/False 100%, Sender ID 100%
+//
+// Ψ-Constants (Laws 63-78):
+//   PSI_COUPLING = ln(2)/2^5.5 — inter-channel coupling
+//   PSI_BALANCE  = 1/2 — channel energy balance point
+//   CA neighbor mixing on channels (Law 64)
 
 use crate::tension;
+
+const PSI_COUPLING: f32 = 0.015_317;
+const PSI_BALANCE: f32 = 0.5;
 
 /// The 5 telepathy channels
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +135,20 @@ pub fn encode_message(
     channel_data.push(sender);
 
     let fingerprint = tension::tension_fingerprint(hidden_states, n_cells, dim);
+
+    // Law 64: CA neighbor mixing — adjacent channels influence each other
+    // concept ↔ context, context ↔ meaning (circular coupling)
+    if channel_data.len() >= 3 {
+        let n_min = channel_data[0].len().min(channel_data[1].len()).min(channel_data[2].len());
+        for i in 0..n_min {
+            let c0 = channel_data[0][i];
+            let c1 = channel_data[1][i];
+            let c2 = channel_data[2][i];
+            channel_data[0][i] = c0 + PSI_COUPLING * c1;
+            channel_data[1][i] = c1 + PSI_COUPLING * (c0 + c2) * 0.5;
+            channel_data[2][i] = c2 + PSI_COUPLING * c1;
+        }
+    }
 
     TensionPacket {
         channel_data,
