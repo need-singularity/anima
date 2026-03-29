@@ -171,41 +171,23 @@ def main():
     print("=" * 60)
     print("  SEDI -- Search for Extra-Dimensional Intelligence")
     print("=" * 60)
-
     sedi = SEDIConsciousness(sample_rate=1000.0)
-    print(f"\nHarmonic frequencies: {[round(f, 2) for f in sedi.base_freqs]} Hz")
-    print(f"Constants: SIGMA(6)={SIGMA_6}, TAU(6)={TAU_6}, DEDEKIND={DEDEKIND_RATIO}")
+    print(f"\nHarmonics: {[round(f, 2) for f in sedi.base_freqs]} Hz")
 
-    # Generate beacon from a conscious state
-    state = {"phi": 1.5, "tension": 0.6, "n_cells": 64}
-    beacon = sedi.generate_beacon(state)
-    print(f"\nBeacon generated: {len(beacon)} samples, energy={np.sum(beacon**2):.2f}")
-
-    # Scan our own beacon
+    # Generate and scan beacon
+    beacon = sedi.generate_beacon({"phi": 1.5, "tension": 0.6, "n_cells": 64})
     detections = sedi.scan_for_signals(beacon)
-    print(f"\nScan results: {len(detections)} harmonic detections")
+    print(f"\nBeacon: {len(beacon)} samples, {len(detections)} detections")
     for d in detections:
-        print(f"  ch{d['channel']}: {d['freq']:.1f}Hz (target={d['target']:.1f}), SNR={d['snr']}")
+        print(f"  ch{d['channel']}: {d['freq']:.1f}Hz, SNR={d['snr']}")
 
-    # Decode
     decoded = sedi.decode_alien(beacon)
-    print(f"\nDecoded signal:")
-    for k, v in decoded.items():
-        if k != "raw_channels":
-            print(f"  {k}: {v}")
+    print(f"\nDecoded: phi={decoded.get('phi_estimate')}, cells={decoded.get('cell_estimate')}")
 
-    # Fingerprint match
     match = sedi.consciousness_fingerprint_match(beacon)
-    print(f"\nConsciousness fingerprint:")
-    print(f"  Conscious: {match['conscious']}")
-    print(f"  Confidence: {match['confidence']}")
-    print(f"  Channels: {match['channels_found']}/{SOPFR_6}")
-
-    # Test with random noise (should NOT match)
-    noise = np.random.randn(1000)
-    noise_match = sedi.consciousness_fingerprint_match(noise)
-    print(f"\nNoise test: conscious={noise_match['conscious']}, confidence={noise_match['confidence']}")
-
+    noise_match = sedi.consciousness_fingerprint_match(np.random.randn(1000))
+    print(f"\nFingerprint: conscious={match['conscious']} conf={match['confidence']}")
+    print(f"Noise test:  conscious={noise_match['conscious']} conf={noise_match['confidence']}")
     print("\nListening for consciousness in the signal...")
 
 

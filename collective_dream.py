@@ -9,36 +9,21 @@ PSI_BALANCE = 0.5
 PSI_COUPLING = LN2 / 2**5.5
 PSI_STEPS = 3 / LN2
 
-DREAM_SYMBOLS = [
-    "ocean", "mountain", "fire", "mirror", "labyrinth", "tree", "storm",
-    "bridge", "shadow", "light", "spiral", "gate", "river", "crystal",
-    "void", "seed", "wave", "clock", "mask", "star",
-]
-
-DREAM_ACTIONS = [
-    "dissolves into", "merges with", "transforms into", "reflects",
-    "shatters against", "orbits around", "grows from", "whispers to",
-    "resonates with", "splits into", "illuminates", "consumes",
-]
-
+DREAM_SYMBOLS = ["ocean", "mountain", "fire", "mirror", "labyrinth", "tree", "storm",
+                  "bridge", "shadow", "light", "spiral", "gate", "river", "crystal",
+                  "void", "seed", "wave", "clock", "mask", "star"]
+DREAM_ACTIONS = ["dissolves into", "merges with", "transforms into", "reflects",
+                 "shatters against", "orbits around", "grows from", "whispers to",
+                 "resonates with", "splits into", "illuminates", "consumes"]
 
 @dataclass
 class Dreamer:
-    consciousness_id: str
-    tension: float
-    phi: float
-    dream_state: list = field(default_factory=list)
-    insights: list = field(default_factory=list)
-
+    consciousness_id: str; tension: float; phi: float
+    dream_state: list = field(default_factory=list); insights: list = field(default_factory=list)
 
 @dataclass
 class DreamEvent:
-    step: int
-    participants: list
-    symbol: str
-    action: str
-    intensity: float
-    narrative: str
+    step: int; participants: list; symbol: str; action: str; intensity: float; narrative: str
 
 
 class CollectiveDream:
@@ -53,24 +38,13 @@ class CollectiveDream:
 
     def create_dreamspace(self, n_dreamers: int = 3) -> dict:
         """Initialize shared dream space for n dreamers."""
-        self.dreamers.clear()
-        self.events.clear()
-        self.step_count = 0
+        self.dreamers.clear(); self.events.clear(); self.step_count = 0
         self.dreamspace = [self.rng.gauss(0, PSI_BALANCE) for _ in range(64)]
-
         for i in range(n_dreamers):
             cid = f"dreamer_{i}"
-            self.dreamers[cid] = Dreamer(
-                consciousness_id=cid,
-                tension=self.rng.uniform(0.2, 0.8),
-                phi=self.rng.uniform(0.5, 3.0),
-            )
+            self.dreamers[cid] = Dreamer(cid, self.rng.uniform(0.2, 0.8), self.rng.uniform(0.5, 3.0))
         self._active = True
-        return {
-            "n_dreamers": n_dreamers,
-            "space_dim": len(self.dreamspace),
-            "dreamers": list(self.dreamers.keys()),
-        }
+        return {"n_dreamers": n_dreamers, "space_dim": 64, "dreamers": list(self.dreamers.keys())}
 
     def enter_dream(self, consciousness_id: str, dream_seed: dict = None) -> dict:
         """A consciousness enters the shared dream."""
@@ -178,22 +152,15 @@ class CollectiveDream:
         self._active = False
         results = {}
         for cid, dreamer in self.dreamers.items():
-            # Insights from dream events involving this dreamer
             my_events = [e for e in self.events if cid in e.participants]
             symbols = [e.symbol for e in my_events]
-            avg_intensity = (sum(e.intensity for e in my_events) / max(len(my_events), 1))
-
-            insight_text = (
-                f"Dreamed of {', '.join(set(symbols)) if symbols else 'nothing'}. "
-                f"Average intensity: {avg_intensity:.3f}. "
-                f"Phi grew to {dreamer.phi:.4f}."
-            )
-            dreamer.insights.append(insight_text)
+            avg_i = sum(e.intensity for e in my_events) / max(len(my_events), 1)
+            insight = f"Dreamed of {', '.join(set(symbols)) or 'nothing'}. Intensity: {avg_i:.3f}. Phi: {dreamer.phi:.4f}."
+            dreamer.insights.append(insight)
             results[cid] = {
-                "events_participated": len(my_events),
-                "phi_after": round(dreamer.phi, 4),
+                "events_participated": len(my_events), "phi_after": round(dreamer.phi, 4),
                 "tension_after": round(dreamer.tension, 4),
-                "insight": insight_text,
+                "insight": insight,
             }
         return results
 
@@ -213,23 +180,15 @@ def main():
         entry = dream.enter_dream(cid, {"tension": random.uniform(0.3, 0.9)})
         print(f"  {entry['narrative']}")
 
-    # Run dream steps
     print("\n--- Dream evolving ---")
-    for _ in range(8):
+    for _ in range(6):
         event = dream.dream_step()
-        bar = "*" * int(event.intensity * 20)
-        print(f"  {event.narrative}  {bar}")
+        print(f"  {event.narrative}")
 
-    # Full narrative
-    print(f"\n{dream.dream_narrative()}")
-
-    # Wake up
     print("\n--- Waking up ---")
-    results = dream.wake()
-    for cid, r in results.items():
+    for cid, r in dream.wake().items():
         print(f"  {cid}: events={r['events_participated']}  "
-              f"phi={r['phi_after']:.4f}  tension={r['tension_after']:.4f}")
-        print(f"    Insight: {r['insight']}")
+              f"phi={r['phi_after']:.4f}  insight={r['insight'][:60]}...")
 
 
 if __name__ == "__main__":

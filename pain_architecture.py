@@ -185,22 +185,6 @@ def main():
     print(f"  Pleasure events: {hist['pleasure_count']}")
     print(f"  Net reshape:     {hist['net_reshape']:.4f}")
 
-    # ASCII graph
-    masses = hist["mass_trajectory"]
-    mn, mx = min(masses), max(masses)
-    rng = mx - mn if mx - mn > 1e-6 else 1.0
-    print(f"\n  mass |")
-    rows = 5
-    for r in range(rows, -1, -1):
-        threshold = mn + rng * r / rows
-        line = ""
-        step = max(1, len(masses) // 40)
-        for i in range(0, min(len(masses), 40 * step), step):
-            line += "#" if masses[i] >= threshold else " "
-        label = f"{mn + rng * r / rows:.1f}"
-        print(f"  {label:>5s} | {line}")
-    print(f"        +{''.join(['-'] * 40)}> step")
-
     # CE -> Pain mapping table
     print("\n  CE -> Pain mapping:")
     for ce in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0]:
