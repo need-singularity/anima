@@ -81,11 +81,13 @@ def get_d_engines(d_model=128, vocab_size=256):
 
 def get_w_engines(base_lr=1e-3):
     """All available W will engines."""
-    from trinity import EmotionW, ConstantW, CosineW
+    from trinity import EmotionW, ConstantW, CosineW, NarrativeW, DaseinW
     return {
         'Emotion': lambda: EmotionW(base_lr=base_lr),
         'Constant': lambda: ConstantW(lr=base_lr),
         'Cosine(80K)': lambda: CosineW(base_lr=base_lr, total_steps=80000),
+        'Narrative': lambda: NarrativeW(base_lr=base_lr),
+        'Dasein': lambda: DaseinW(base_lr=base_lr),
     }
 
 
