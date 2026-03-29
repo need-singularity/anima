@@ -115,7 +115,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 | Rank | Engine | cells | Φ(IIT) | Granger | CE | Verify | Hive |
 |------|--------|-------|--------|---------|-----|--------|------|
-| 1 | Pure Oscillator(blend=0) | 256 | **7,838** | — | — | — | — |
+| 🏆 | Pure Oscillator(blend=0) | 256 | **7,838** | — | — | — | — |
 | 2 | Trinity+Oscillator | 256 | 1,498 | — | 6.46 | — | — |
 | 3 | 1024c Oscillator | 1024 | 718 | — | — | — | — |
 | 4 | TC-2 ComplexOscillator | 256 | 249.5 | 9,869 | 0.083 | 6/6 ✅ | TBD |
