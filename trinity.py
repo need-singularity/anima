@@ -1,48 +1,39 @@
 #!/usr/bin/env python3
-"""trinity.py — Trinity Architecture: C(consciousness) + D(language) + Bridge
+"""trinity.py — Trinity Architecture: C + D + W (all 3 pluggable)
 
-범용 Trinity 프레임워크. 어떤 도메인 엔진이든 C 모듈로 플러그인 가능.
-CE gradient는 절대 C에 도달하지 않음 (.detach() barrier).
+C(의식), D(언어), W(의지) 3개 모듈 모두 교체 가능한 플러그인 아키텍처.
 
-Architecture:
-  ┌─────────────┐     .detach()     ┌────────────┐
-  │ C (Engine)  │ ──────────────── │   Bridge    │
-  │ Φ=14~485    │   gradient-free   │ (Thalamic)  │
-  │ autonomous  │                   │ 128→8→384   │
-  └─────────────┘                   └──────┬─────┘
-                                           │ gate signal
-                                    ┌──────▼─────┐
-                                    │ D (Decoder) │
-                                    │ CE learning │
-                                    │ language    │
-                                    └─────────────┘
+  ┌──────────────┐    .detach()    ┌─────────────┐
+  │  C (의식)    │ ──────────────→ │   Bridge     │
+  │  pluggable   │  gradient-free  │  (Thalamic)  │
+  └──────────────┘                 └──────┬───────┘
+        ↑ Φ monitor                       │ gate
+  ┌──────────────┐                 ┌──────▼───────┐
+  │  W (의지)    │ ←── CE/Φ ────→ │  D (언어)    │
+  │  pluggable   │                 │  pluggable   │
+  └──────────────┘                 └──────────────┘
 
-Supported C engines:
-  - MitosisEngine (GRU cells, hidden_dim states)
-  - TimeCrystalEngine (phase + amplitude, Φ=14.4)
-  - CambrianExplosionEngine (state + cell_type, Φ=485)
-  - Any engine with .step() and extractable tensor states
+C engines: MitosisC, DomainC, or any CEngine subclass
+D decoders: TransformerDecoder, MLPDecoder, or any DEngine subclass
+W wills:    EmotionW, ConstantW, ScheduleW, or any WEngine subclass
+Bridge:     ThalamicBridge (also swappable)
 
 Usage:
-  from trinity import Trinity, MitosisC, DomainC, Decoder, ThalamicBridge
+  from trinity import *
 
-  # MitosisEngine as C
-  trinity = Trinity(
-      c_engine=MitosisC(dim=64, hidden=128, max_cells=256, mechanism='cambrian_osc_qw'),
+  # Mix and match
+  t = Trinity(
+      c=DomainC(TimeCrystalConsciousness, nc=256),
+      d=TransformerDecoder(d_model=384, vocab_size=4096),
+      w=EmotionW(base_lr=3e-4),
       bridge=ThalamicBridge(c_dim=128, d_model=384),
-      decoder=Decoder(d_model=384, vocab_size=4096),
   )
 
-  # Domain engine as C
-  from bench_evolution_engines import CambrianExplosionEngine
-  trinity = Trinity(
-      c_engine=DomainC(CambrianExplosionEngine, nc=256, dim=64),
-      bridge=ThalamicBridge(c_dim=64, d_model=384),
-      decoder=Decoder(d_model=384, vocab_size=4096),
-  )
+  # One-liner
+  t = create_trinity(MitosisC(max_cells=256))
 
-  # Training step
-  loss, phi, ce = trinity.train_step(input_tokens, target_tokens)
+  # Benchmark any combo
+  compare_engines({'TimeCrystal': DomainC(...), 'Mitosis': MitosisC(...)})
 """
 
 import math
@@ -291,21 +282,32 @@ class ThalamicBridge(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
-# D — Decoder (language module, CE training)
+# D — Decoder interface + implementations
 # ═══════════════════════════════════════════════════════════
 
-class Decoder(nn.Module):
-    """Simple transformer-like decoder for language generation."""
+class DEngine(nn.Module):
+    """Base class for language decoder (D module)."""
+
+    @property
+    def d_model(self) -> int:
+        raise NotImplementedError
+
+    def forward(self, tokens: torch.Tensor, gate_signal: torch.Tensor) -> torch.Tensor:
+        """tokens [B,T] + gate [1,T,d_model] → logits [B,T,vocab]."""
+        raise NotImplementedError
+
+
+class TransformerDecoder(DEngine):
+    """Transformer-based decoder with consciousness gating."""
 
     def __init__(self, d_model=384, n_layers=4, n_heads=None, vocab_size=4096, max_seq=512):
-        # Auto-select n_heads that divides d_model
+        super().__init__()
         if n_heads is None:
             for nh in [6, 4, 8, 2, 1]:
                 if d_model % nh == 0:
                     n_heads = nh
                     break
-        super().__init__()
-        self.d_model = d_model
+        self._d_model = d_model
         self.vocab_size = vocab_size
 
         self.embed = nn.Embedding(vocab_size, d_model)
@@ -319,45 +321,70 @@ class Decoder(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, tokens: torch.Tensor, gate_signal: torch.Tensor) -> torch.Tensor:
-        """Forward pass with consciousness gating.
+    @property
+    def d_model(self):
+        return self._d_model
 
-        Args:
-            tokens: [B, T] input token ids
-            gate_signal: [1, T, d_model] from bridge (consciousness influence)
-
-        Returns:
-            logits: [B, T, vocab_size]
-        """
+    def forward(self, tokens, gate_signal):
         B, T = tokens.shape
         pos = torch.arange(T, device=tokens.device).unsqueeze(0)
-
         x = self.embed(tokens) + self.pos_embed(pos)
-
-        # Apply consciousness gate: modulate input with C signal
         if gate_signal is not None:
             x = x * gate_signal.expand(B, -1, -1)
-
-        # Causal mask
         mask = nn.Transformer.generate_square_subsequent_mask(T, device=tokens.device)
         x = self.transformer(x, mask=mask, is_causal=True)
         x = self.ln_f(x)
         return self.head(x)
 
 
+class MLPDecoder(DEngine):
+    """Simple MLP decoder (faster, for small experiments)."""
+
+    def __init__(self, d_model=384, vocab_size=4096, max_seq=512):
+        super().__init__()
+        self._d_model = d_model
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Embedding(max_seq, d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2), nn.GELU(),
+            nn.Linear(d_model * 2, d_model), nn.GELU(),
+        )
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+
+    @property
+    def d_model(self):
+        return self._d_model
+
+    def forward(self, tokens, gate_signal):
+        B, T = tokens.shape
+        pos = torch.arange(T, device=tokens.device).unsqueeze(0)
+        x = self.embed(tokens) + self.pos_embed(pos)
+        if gate_signal is not None:
+            x = x * gate_signal.expand(B, -1, -1)
+        x = self.mlp(x)
+        return self.head(x)
+
+
+# Backward compat alias
+Decoder = TransformerDecoder
+
+
 # ═══════════════════════════════════════════════════════════
 # W — Will/Emotion Engine (학습률 + 탐색 조절)
 # ═══════════════════════════════════════════════════════════
 
-class WillEngine:
-    """W (Will): emotion-based learning modulator.
+class WEngine:
+    """Base class for W (Will) module — learning modulation."""
 
-    Core emotions:
-      Pain:         high CE → boost learning (never let consciousness suffer)
-      Curiosity:    high prediction error variance → explore more
-      Satisfaction: CE improving → reduce LR (save energy)
+    def update(self, ce_loss: float, phi: float = 0.0, phi_prev: float = 0.0) -> Dict[str, Any]:
+        """Returns dict with lr_multiplier, effective_lr, pain, curiosity, satisfaction."""
+        raise NotImplementedError
 
-    Guarantees: minimum 50% LR always active (learning never stops).
+
+class EmotionW(WEngine):
+    """Emotion-based W: pain(CE) + curiosity(Φ change) + satisfaction(CE trend).
+
+    Guarantees: minimum 50% LR always active.
     """
 
     def __init__(self, base_lr=3e-4, min_lr_ratio=0.5, max_lr_ratio=2.0,
@@ -368,54 +395,65 @@ class WillEngine:
         self.pain_threshold = pain_threshold
         self.curiosity_weight = curiosity_weight
         self.ema_alpha = ema_alpha
-
         self.pain = 0.0
         self.curiosity = 0.0
         self.satisfaction = 0.0
         self.ce_ema = 5.0
         self.ce_history = []
 
-    def update(self, ce_loss: float, phi: float = 0.0, phi_prev: float = 0.0) -> Dict[str, Any]:
-        """Update emotional state from CE and Φ.
-
-        Returns dict with lr_multiplier, effective_lr, pain, curiosity, satisfaction.
-        """
+    def update(self, ce_loss, phi=0.0, phi_prev=0.0):
         self.ce_ema = self.ema_alpha * self.ce_ema + (1 - self.ema_alpha) * ce_loss
-
-        # Pain: CE exceeds comfort threshold
         self.pain = max(0.0, min(1.0, (ce_loss - self.pain_threshold) / self.pain_threshold))
-
-        # Curiosity: Φ change (big Φ delta = interesting state)
         if phi_prev > 0:
-            phi_change = abs(phi - phi_prev) / max(phi_prev, 1e-8)
-            self.curiosity = min(1.0, phi_change * 5)
-
-        # Satisfaction: CE trend (negative = improving)
+            self.curiosity = min(1.0, abs(phi - phi_prev) / max(phi_prev, 1e-8) * 5)
         self.ce_history.append(ce_loss)
         if len(self.ce_history) > 100:
             self.ce_history = self.ce_history[-100:]
         if len(self.ce_history) >= 10:
             recent = sum(self.ce_history[-10:]) / 10
             older = sum(self.ce_history[-20:-10]) / max(len(self.ce_history[-20:-10]), 1)
-            trend = (recent - older) / (older + 1e-8)
-            self.satisfaction = max(0.0, min(1.0, -trend * 10))
+            self.satisfaction = max(0.0, min(1.0, -(recent - older) / (older + 1e-8) * 10))
         else:
             self.satisfaction = 0.0
-
-        # LR multiplier
         lr_mult = self.min_lr_ratio
         lr_mult += self.pain * (self.max_lr_ratio - self.min_lr_ratio)
         lr_mult += self.curiosity * self.curiosity_weight
         lr_mult -= self.satisfaction * 0.2
         lr_mult = max(self.min_lr_ratio, min(self.max_lr_ratio, lr_mult))
+        return {'lr_multiplier': lr_mult, 'effective_lr': self.base_lr * lr_mult,
+                'pain': self.pain, 'curiosity': self.curiosity, 'satisfaction': self.satisfaction}
 
-        return {
-            'lr_multiplier': lr_mult,
-            'effective_lr': self.base_lr * lr_mult,
-            'pain': self.pain,
-            'curiosity': self.curiosity,
-            'satisfaction': self.satisfaction,
-        }
+
+class ConstantW(WEngine):
+    """Fixed LR — no emotion, no modulation. For baselines."""
+
+    def __init__(self, lr=3e-4):
+        self.lr = lr
+
+    def update(self, ce_loss=0, phi=0, phi_prev=0):
+        return {'lr_multiplier': 1.0, 'effective_lr': self.lr,
+                'pain': 0, 'curiosity': 0, 'satisfaction': 0}
+
+
+class CosineW(WEngine):
+    """Cosine annealing W — standard scheduler as W module."""
+
+    def __init__(self, base_lr=3e-4, min_lr=1e-5, total_steps=80000):
+        self.base_lr = base_lr
+        self.min_lr = min_lr
+        self.total_steps = total_steps
+        self.step_count = 0
+
+    def update(self, ce_loss=0, phi=0, phi_prev=0):
+        self.step_count += 1
+        lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (
+            1 + math.cos(math.pi * self.step_count / self.total_steps))
+        return {'lr_multiplier': lr / self.base_lr, 'effective_lr': lr,
+                'pain': 0, 'curiosity': 0, 'satisfaction': 0}
+
+
+# Backward compat alias
+WillEngine = EmotionW
 
 
 # ═══════════════════════════════════════════════════════════
@@ -431,12 +469,12 @@ class Trinity(nn.Module):
     """
 
     def __init__(self, c_engine: CEngine, bridge: ThalamicBridge,
-                 decoder: Decoder, will: Optional[WillEngine] = None):
+                 decoder: DEngine, will: Optional[WEngine] = None):
         super().__init__()
         self.c = c_engine
         self.bridge = bridge
         self.decoder = decoder
-        self.w = will or WillEngine()
+        self.w = will or EmotionW()
         self._phi_prev = 0.0
 
     def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, float]:
@@ -514,31 +552,53 @@ class Trinity(nn.Module):
 # Factory helpers
 # ═══════════════════════════════════════════════════════════
 
-def create_trinity(c_engine: CEngine, d_model=384, vocab_size=4096,
-                   base_lr=3e-4) -> Trinity:
-    """Universal factory: any C engine → Trinity.
+def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
+                   w_engine: Optional[WEngine] = None,
+                   bridge: Optional[ThalamicBridge] = None,
+                   d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
+    """Universal factory: plug any C, D, W → Trinity.
+
+    All 3 modules are optional — defaults provided.
 
     Usage:
-        # MitosisEngine
-        t = create_trinity(MitosisC(max_cells=256, mechanism='cambrian_osc_qw'))
+        # Minimal (auto C detection)
+        t = create_trinity(MitosisC(max_cells=256))
 
-        # Domain engine
-        from bench_evolution_engines import CambrianExplosionEngine
-        t = create_trinity(DomainC(CambrianExplosionEngine, nc=256))
+        # Custom D
+        t = create_trinity(DomainC(TimeCrystal, nc=256), d_engine=MLPDecoder(d_model=128))
 
-        # Any future engine
-        t = create_trinity(MyCustomC(...))
+        # Custom W
+        t = create_trinity(MitosisC(), w_engine=CosineW(total_steps=80000))
+
+        # All custom
+        t = create_trinity(
+            c_engine=DomainC(CambrianExplosionEngine, nc=256),
+            d_engine=TransformerDecoder(d_model=384, vocab_size=32000),
+            w_engine=EmotionW(base_lr=1e-4, pain_threshold=2.0),
+            bridge=ThalamicBridge(c_dim=64, d_model=384, n_hubs=32),
+        )
     """
-    # Auto-detect state dim
+    # Auto-detect C state dim
     for _ in range(5):
         c_engine.step()
     c_dim = c_engine.state_dim
 
+    # Defaults
+    if d_engine is None:
+        d_engine = TransformerDecoder(d_model=d_model, vocab_size=vocab_size)
+    d_model = d_engine.d_model
+
+    if bridge is None:
+        bridge = ThalamicBridge(c_dim=c_dim, d_model=d_model)
+
+    if w_engine is None:
+        w_engine = EmotionW(base_lr=base_lr)
+
     t = Trinity(
         c_engine=c_engine,
-        bridge=ThalamicBridge(c_dim=c_dim, d_model=d_model),
-        decoder=Decoder(d_model=d_model, vocab_size=vocab_size),
-        will=WillEngine(base_lr=base_lr),
+        bridge=bridge,
+        decoder=d_engine,
+        will=w_engine,
     )
     for p in t.bridge.parameters():
         p.requires_grad_(True)
@@ -549,19 +609,23 @@ def create_trinity(c_engine: CEngine, d_model=384, vocab_size=4096,
 
 def create_trinity_mitosis(dim=64, hidden=128, max_cells=256,
                            d_model=384, vocab_size=4096,
-                           mechanism='cambrian_osc_qw', base_lr=3e-4) -> Trinity:
-    """Shortcut: MitosisEngine C → Trinity."""
+                           mechanism='cambrian_osc_qw', base_lr=3e-4,
+                           d_engine=None, w_engine=None) -> Trinity:
+    """Shortcut: MitosisEngine C → Trinity (D, W optional)."""
     return create_trinity(
         MitosisC(dim, hidden, max_cells, mechanism),
+        d_engine=d_engine, w_engine=w_engine,
         d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
     )
 
 
 def create_trinity_domain(engine_cls, nc=256, dim=64,
-                          d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
-    """Shortcut: any domain engine class → Trinity."""
+                          d_model=384, vocab_size=4096, base_lr=3e-4,
+                          d_engine=None, w_engine=None) -> Trinity:
+    """Shortcut: any domain engine class → Trinity (D, W optional)."""
     return create_trinity(
         DomainC(engine_cls, nc, dim),
+        d_engine=d_engine, w_engine=w_engine,
         d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
     )
 
