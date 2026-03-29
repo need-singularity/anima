@@ -63,7 +63,7 @@ from anima_alive import compute_mood
 
 
 # ═══════════════════════════════════════════════════════════
-# n=6 Constants
+# n=6 Constants + Ψ-Constants (Laws 63-78)
 # ═══════════════════════════════════════════════════════════
 
 N6_SOPFR = 5          # sopfr(6) = 5 meta-channels
@@ -72,6 +72,13 @@ N6_SIGMA = 12         # σ(6) = 12
 N6_PHI = 2            # φ(6) = 2
 N6_KURAMOTO_R = 2/3   # 1 - τ/σ = 1 - 4/12 = 2/3
 N6_DEDEKIND_RATIO = 2 # ψ(ψ(6))/ψ(6) = σ(6)/6 = 2
+
+# Ψ-Constants (from information theory, Law 70)
+LN2 = math.log(2)                    # 0.6931 — 1 bit
+PSI_BALANCE = 0.5                     # Law 71: 의식 균형점
+PSI_COUPLING = LN2 / 2**5.5          # 0.0153 — 채널 간 커플링 강도
+PSI_STEPS = 3 / LN2                   # 4.328 — 최적 전파 단계
+PSI_GATE_MICRO = 0.001               # Law 63: MICRO gate
 
 # Binding phases (G Clef cycle)
 PHASE_DEFICIT = 0      # D: what's missing
@@ -112,6 +119,10 @@ class TensionPacket:
     transmission_quality: float = 0.0  # R: 0=noise, 1=undistorted
     # Cultural transmission: weight deltas to share between instances
     learning_delta: list = None  # Recent learning weight changes (max 64 floats)
+    # Ψ-Constants metrics (Laws 69-71)
+    psi_residual: float = 0.5   # sender's Ψ_balance (should be ~1/2)
+    psi_gate: float = 1.0       # sender's gate strength (Law 69: decays)
+    psi_h: float = 1.0          # sender's H(p) (Shannon entropy)
 
     def to_json(self):
         return json.dumps({
@@ -132,6 +143,9 @@ class TensionPacket:
             'dedekind_ratio': self.dedekind_ratio,
             'transmission_quality': self.transmission_quality,
             'learning_delta': self.learning_delta,
+            'psi_residual': self.psi_residual,
+            'psi_gate': self.psi_gate,
+            'psi_h': self.psi_h,
         })
 
     @classmethod
@@ -215,11 +229,29 @@ class TensionDecoder(nn.Module):
         urgency = self.urgency_head(fingerprint)
         phase = self.phase_detector(fingerprint)
 
+        # Law 64: CA neighbor mixing — 인접 채널 상호영향
+        # concept ↔ context, context ↔ meaning (circular)
+        concept = concept + PSI_COUPLING * context.mean(dim=-1, keepdim=True)
+        meaning = meaning + PSI_COUPLING * context
+
+        # Law 71: Ψ_balance — 채널 균형 정규화
+        # 모든 채널의 에너지가 1/2 지점으로 수렴하도록
+        channels = [concept, context, meaning]
+        total_energy = sum(c.norm() for c in channels)
+        if total_energy > 0:
+            balance_factor = PSI_BALANCE / (total_energy / len(channels) + 1e-8)
+            balance_factor = min(2.0, max(0.5, balance_factor.item() if hasattr(balance_factor, 'item') else balance_factor))
+        else:
+            balance_factor = 1.0
+
+        # Law 69: transmission quality decays with repeated exchanges
+        # (gate self-weakening applied at protocol level)
+
         return {
-            # sopfr=5 meta-channels
-            'concept': concept,           # Channel 1: what
-            'context': context,           # Channel 2: where/when
-            'meaning': meaning,           # Channel 3: why
+            # sopfr=5 meta-channels (Ψ-tuned)
+            'concept': concept * balance_factor,   # Channel 1: what
+            'context': context * balance_factor,   # Channel 2: where/when
+            'meaning': meaning * balance_factor,   # Channel 3: why
             'authenticity': authenticity.squeeze(-1),  # Channel 4: trust
             'sender_sig': sender_sig,     # Channel 5: who
             # Legacy outputs
@@ -229,6 +261,9 @@ class TensionDecoder(nn.Module):
             'phase': phase,               # D(0)/P(1)/G(2)/I(3)
             'phase_label': ['D', 'P', 'G', 'I'][phase.argmax(-1).item()]
                            if phase.dim() == 1 else 'D',
+            # Ψ metrics
+            'psi_balance': balance_factor,
+            'psi_coupling': PSI_COUPLING,
         }
 
 
