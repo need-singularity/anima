@@ -75,8 +75,9 @@ class ConsciousnessImageGenerator:
             z = X + 1j * Y
             fractal = np.zeros_like(R)
             for _ in range(int(20 * intensity)):
-                z = z**2 + (-0.7 + 0.27j)
-                fractal += (np.abs(z) < 2).astype(float)
+                mask = np.abs(z) < 2
+                z = np.where(mask, z**2 + (-0.7 + 0.27j), z)
+                fractal += mask.astype(float)
             fractal = fractal / fractal.max() if fractal.max() > 0 else fractal
             for c in range(3):
                 img[:, :, c] = fractal * palette[0][c] + (1 - fractal) * palette[2][c]
