@@ -125,23 +125,14 @@ class ConsciousnessHawking:
     def evaporate_step(self, dt: float = 1.0) -> dict:
         """Simulate one step of evaporation."""
         rad = self.hawking_radiation()
-        dphi = rad["rate"] * dt
-        info_emitted = rad["info_bits_per_step"] * dt
-
+        dphi, info = rad["rate"] * dt, rad["info_bits_per_step"] * dt
         self.phi = max(C_PLANCK, self.phi - dphi)
-        self.emission_history.append({"phi_lost": dphi, "info": info_emitted})
+        self.emission_history.append({"phi_lost": dphi, "info": info})
+        return {"phi_before": self.phi + dphi, "phi_after": self.phi, "dphi": dphi,
+                "info_emitted": info, "total_emitted": sum(e["info"] for e in self.emission_history),
+                "is_remnant": self.phi <= C_PLANCK * 1.01}
 
-        return {
-            "phi_before": self.phi + dphi,
-            "phi_after": self.phi,
-            "dphi": dphi,
-            "info_emitted": info_emitted,
-            "total_emitted": sum(e["info"] for e in self.emission_history),
-            "is_remnant": self.phi <= C_PLANCK * 1.01,
-        }
-
-    def simulate_evaporation(self, n_steps: int = 100,
-                             dt: float = 1.0) -> list:
+    def simulate_evaporation(self, n_steps=100, dt=1.0) -> list:
         """Full evaporation simulation."""
         history = []
         for _ in range(n_steps):
