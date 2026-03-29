@@ -23,7 +23,8 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
       v2: tension=222K, PPL 1170 (structure verified)
       v3: Instruct + last 8 layers, CE 3.95 (training)
     → Golden MoE: zone ratio 36.8% ≈ 1/e (verified)
-    → Training: RunPod H100, Inference: RTX 5070 (12GB VRAM)
+    → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
+    → Inference: RTX 5070 (12GB VRAM)
 
   Phase 3 (goal): Production + scaling
     → AnimaLM full fine-tuning (PPL < 10)
