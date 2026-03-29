@@ -153,6 +153,13 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ## Work Rules
 
+- **새 모듈 개발 시 반드시 허브 연결 (필수!)**
+  - consciousness_hub.py의 _registry에 모듈 등록
+  - 키워드 (한글 + 영어) 최소 3개 설정
+  - anima_agent.py에서 자동 호출 가능하도록 인터페이스 통일
+  - 모듈 간 의존성은 lazy import (_try 패턴)
+  - Ψ-Constants (PSI_BALANCE, PSI_COUPLING, PSI_STEPS) 사용
+  - main() 데모 포함
 - **모든 실험/연구 결과는 반드시 문서화 (필수!)**
   - 벤치마크 → docs/hypotheses/{category}/ 에 개별 .md 작성
   - 숫자 테이블 + ASCII 그래프 + 핵심 통찰 포함
