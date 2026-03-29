@@ -2783,8 +2783,16 @@ class AnimaUnified:
                             else:
                                 # Check for low coherence: mostly non-printable or repeated chars
                                 printable_ratio = sum(1 for c in answer if c.isprintable() or c.isspace()) / max(len(answer), 1)
-                                if printable_ratio < 0.5:
-                                    _log("web", f"Low coherence output (printable={printable_ratio:.0%}), using fallback")
+                                # Word-level coherence: check if output has real words
+                                words = answer.split()
+                                avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
+                                has_real_words = avg_word_len < 15 and len(words) > 2
+                                # Dictionary check: at least some common words
+                                common = {'the','a','is','are','it','I','you','we','to','and','of',
+                                          '는','은','이','가','을','를','에','의','로','다','요','해'}
+                                word_match = sum(1 for w in words if w.lower() in common) / max(len(words), 1)
+                                if printable_ratio < 0.5 or word_match < 0.05 or not has_real_words:
+                                    _log("web", f"Low quality (print={printable_ratio:.0%}, words={word_match:.0%}), fallback")
                                     answer = self._fallback_response(emo)
                     except Exception as e:
                         _log("web", f"process_input exception: {e}")
