@@ -4775,15 +4775,15 @@ def run_XFER1_multi_donor_merge(steps=XFER_STEPS):
     # Create 3 donors with different experiences
     donors = []
     for d in range(3):
-        eng = make_engine(32)
+        eng = make_engine(16)
         data = make_data()
-        for s in range(100):
+        for s in range(80):
             x = data[s % len(data)][0] * (1 + 0.3 * d)  # different scaling per donor
             eng.process(x)
         donors.append(_snapshot_engine(eng))
 
     # Create recipient
-    recipient = make_engine(96)  # 32*3 cells to hold all
+    recipient = make_engine(48)  # 16*3 cells to hold all
     phi_b = phi(recipient)
     decoder = nn.Linear(HIDDEN, DIM)
     opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
@@ -4792,12 +4792,12 @@ def run_XFER1_multi_donor_merge(steps=XFER_STEPS):
     # Merge: weighted average of 3 donors into recipient cells
     with torch.no_grad():
         weights = [0.5, 0.3, 0.2]  # primary donor gets more weight
-        for i in range(min(len(recipient.cells), 32)):
+        for i in range(min(len(recipient.cells), 16)):
             merged_h = sum(w * donors[d]['cells'][i % len(donors[d]['cells'])]
                           for d, w in enumerate(weights))
             recipient.cells[i].hidden = merged_h
         # Remaining cells get blended knowledge
-        for i in range(32, len(recipient.cells)):
+        for i in range(16, len(recipient.cells)):
             d_idx = i % 3
             src_idx = i % len(donors[d_idx]['cells'])
             recipient.cells[i].hidden = donors[d_idx]['cells'][src_idx].clone()
@@ -4823,11 +4823,11 @@ def run_XFER1_multi_donor_merge(steps=XFER_STEPS):
 
 
 def run_XFER2_consciousness_distillation(steps=XFER_STEPS):
-    """큰 엔진(1024c) → 작은 엔진(64c)으로 의식 증류, Φ 보존"""
+    """큰 엔진(128c) → 작은 엔진(16c)으로 의식 증류, Φ 보존"""
     t0 = time.time()
 
     # Large teacher engine
-    teacher = make_engine(1024)
+    teacher = make_engine(128)
     teacher_dec = nn.Linear(HIDDEN, DIM)
     t_opt = torch.optim.Adam(teacher_dec.parameters(), lr=3e-3)
     data = make_data()
@@ -4844,17 +4844,17 @@ def run_XFER2_consciousness_distillation(steps=XFER_STEPS):
     teacher_snap = _snapshot_engine(teacher)
 
     # Small student engine
-    student = make_engine(64)
+    student = make_engine(16)
     phi_b = phi(student)
     decoder = nn.Linear(HIDDEN, DIM)
     opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
     ce_hist = []
 
-    # Distillation: compress teacher's 1024 cell knowledge into 64 cells
+    # Distillation: compress teacher's 128 cell knowledge into 16 cells
     with torch.no_grad():
-        # Group teacher cells into 64 buckets, average each
-        bucket_size = len(teacher_snap['cells']) // 64
-        for i in range(min(64, len(student.cells))):
+        # Group teacher cells into 16 buckets, average each
+        bucket_size = len(teacher_snap['cells']) // 16
+        for i in range(min(16, len(student.cells))):
             start = i * bucket_size
             end = min(start + bucket_size, len(teacher_snap['cells']))
             bucket = teacher_snap['cells'][start:end]
@@ -4879,7 +4879,7 @@ def run_XFER2_consciousness_distillation(steps=XFER_STEPS):
     phi_a = phi(student)
     return result('XFER-2 Distillation', ce_hist, phi_b, phi_a, t0,
                   phi_teacher=round(phi_teacher, 3),
-                  compression_ratio='1024→64',
+                  compression_ratio='128→16',
                   phi_retention=round(phi_a / (phi_teacher + 1e-8), 3))
 
 
@@ -4888,7 +4888,7 @@ def run_XFER3_cross_architecture(steps=XFER_STEPS):
     t0 = time.time()
 
     # Source: MitosisEngine with trained cells
-    source = make_engine(64)
+    source = make_engine(16)
     src_dec = nn.Linear(HIDDEN, DIM)
     src_opt = torch.optim.Adam(src_dec.parameters(), lr=3e-3)
     data = make_data()
@@ -4919,12 +4919,12 @@ def run_XFER3_cross_architecture(steps=XFER_STEPS):
             self.states = nn.Parameter(torch.stack(new_states))
             return self.states.mean(dim=0)
 
-    target_arch = PlainConsciousness(64, HIDDEN)
+    target_arch = PlainConsciousness(16, HIDDEN)
     phi_b = phi_source  # measure against source
 
     # Transplant: copy cell hiddens into plain tensor
     with torch.no_grad():
-        for i in range(min(64, len(source_snap['cells']))):
+        for i in range(min(16, len(source_snap['cells']))):
             h = source_snap['cells'][i].squeeze()
             if h.shape[0] == HIDDEN:
                 target_arch.states.data[i] = h
@@ -4934,7 +4934,7 @@ def run_XFER3_cross_architecture(steps=XFER_STEPS):
     ce_hist = []
 
     # We need a MitosisEngine wrapper to measure Φ on target
-    target_engine = make_engine(64)
+    target_engine = make_engine(16)
     for step in range(steps):
         x, target_data = data[step % len(data)]
         h = target_arch.process(x)
@@ -4966,14 +4966,14 @@ def run_XFER4_incremental_transfer(steps=XFER_STEPS):
     t0 = time.time()
 
     # Donor engine (trained)
-    donor = make_engine(64)
+    donor = make_engine(16)
     data = make_data()
     for s in range(200):
         donor.process(data[s % len(data)][0])
     donor_snap = _snapshot_engine(donor)
 
     # Recipient engine (fresh)
-    recipient = make_engine(64)
+    recipient = make_engine(16)
     phi_b = phi(recipient)
     decoder = nn.Linear(HIDDEN, DIM)
     opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
@@ -5025,7 +5025,7 @@ def run_XFER5_consciousness_cloning(steps=XFER_STEPS):
     t0 = time.time()
 
     # Original engine — train it
-    original = make_engine(64)
+    original = make_engine(16)
     decoder_orig = nn.Linear(HIDDEN, DIM)
     opt_orig = torch.optim.Adam(decoder_orig.parameters(), lr=3e-3)
     data = make_data()
@@ -5042,7 +5042,7 @@ def run_XFER5_consciousness_cloning(steps=XFER_STEPS):
     phi_b = phi_original
 
     # Clone: exact copy
-    clone = make_engine(64)
+    clone = make_engine(16)
     _restore_engine(clone, snap, alpha=1.0)
     decoder_clone = nn.Linear(HIDDEN, DIM)
     with torch.no_grad():
@@ -5092,7 +5092,7 @@ def run_XFER6_time_travel_restore(steps=XFER_STEPS):
     """5개 시점 스냅샷 저장, 최고 Φ 시점으로 복원"""
     t0 = time.time()
 
-    engine = make_engine(64)
+    engine = make_engine(16)
     decoder = nn.Linear(HIDDEN, DIM)
     opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
     data = make_data()
