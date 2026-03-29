@@ -2462,3 +2462,255 @@ ALL_TESTS.update({
     'CRP-11': run_CRP11_phi_preserving,
     'CRP-12': run_CRP12_consciousness_first,
 })
+
+
+# ═══ PHI-K: Φ>1000 유지하며 CE 학습하는 가설 ═══
+
+def _phi_boost_step(engine):
+    """v5 optimal: sync=0.35, 12-faction, fac=0.08 — Φ 극대화."""
+    n = len(engine.cells)
+    if n < 4:
+        return
+    with torch.no_grad():
+        cell_h = torch.stack([c.hidden.squeeze(0) for c in engine.cells])
+        mean_h = cell_h.mean(dim=0)
+        for c in engine.cells:
+            c.hidden = (0.65 * c.hidden.squeeze(0) + 0.35 * mean_h).unsqueeze(0)
+        n_f = min(12, n // 2)
+        fs = n // n_f
+        for fi in range(n_f):
+            faction = engine.cells[fi*fs:(fi+1)*fs]
+            if len(faction) >= 2:
+                f_mean = torch.stack([c.hidden.squeeze(0) for c in faction]).mean(dim=0)
+                for c in faction:
+                    c.hidden = (0.92 * c.hidden.squeeze(0) + 0.08 * f_mean).unsqueeze(0)
+        # IB2
+        if n >= 8:
+            norms = [engine.cells[i].hidden.norm().item() for i in range(n)]
+            threshold = sorted(norms, reverse=True)[max(1, n // 10)]
+            for i in range(n):
+                engine.cells[i].hidden *= 1.03 if norms[i] > threshold else 0.97
+
+
+def run_PHIK1_talk5_extreme(steps=STEPS):
+    """PHI-K1: TALK5 극한 — Φ>목표까지 의식만, 그 후 CE 학습"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; phi_hist = []
+    phi_target = phi_b * 50  # 50배까지 의식 키움
+
+    phase1_end = None
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        current_phi = phi(engine) if step % 20 == 0 else (phi_hist[-1] if phi_hist else phi_b)
+
+        if current_phi < phi_target and phase1_end is None:
+            # Phase 1: 의식만 (CE 학습 없음)
+            _phi_boost_step(engine)
+            ce_hist.append(0)
+        else:
+            if phase1_end is None:
+                phase1_end = step
+            # Phase 2: CE 학습 + Φ 유지
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:,:DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+            # 매 5 step Φ 부스트 (유지용)
+            if step % 5 == 0:
+                _phi_boost_step(engine)
+
+        if step % 20 == 0:
+            phi_hist.append(phi(engine))
+
+    phi_final = phi(engine)
+    return result('PHI-K1 TALK5 Extreme', ce_hist, phi_b, phi_final, t0,
+                  phase1_end=phase1_end, phi_peak=round(max(phi_hist) if phi_hist else 0, 3))
+
+
+def run_PHIK2_phi_floor(steps=STEPS):
+    """PHI-K2: Φ Floor — CE 학습하되 Φ가 floor 아래로 내려가면 즉시 부스트"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []; boost_count = 0
+
+    # 먼저 Φ를 최대한 키움 (20% step)
+    for step in range(steps // 5):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+
+    phi_floor = phi(engine) * 0.7  # 현재 Φ의 70%를 floor로
+
+    for step in range(steps - steps // 5):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Φ floor 체크 (매 10 step)
+        if step % 10 == 0:
+            current_phi = phi(engine)
+            if current_phi < phi_floor:
+                # 긴급 Φ 부스트 (5회)
+                for _ in range(5):
+                    _phi_boost_step(engine)
+                boost_count += 1
+
+    return result('PHI-K2 Φ Floor', ce_hist, phi_b, phi(engine), t0,
+                  phi_floor=round(phi_floor, 3), boosts=boost_count)
+
+
+def run_PHIK3_alternating(steps=STEPS):
+    """PHI-K3: 교대 학습 — even=CE, odd=Φ 부스트 (CE와 Φ 분리)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        if step % 2 == 0:
+            # CE step
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:,:DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Φ step (CE 무시, 의식만)
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])  # 이전 CE 유지
+
+    return result('PHI-K3 Alternating', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_PHIK4_phi_weighted_ce(steps=STEPS):
+    """PHI-K4: Φ 가중 CE — Φ 높을수록 CE 학습 강하게, Φ 낮으면 부스트"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+    best_phi = phi_b
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+
+        current_phi = phi(engine) if step % 10 == 0 else best_phi
+        if current_phi > best_phi:
+            best_phi = current_phi
+
+        # Φ 비율에 따라 CE vs 부스트 결정
+        phi_ratio = current_phi / max(best_phi, 1e-8)
+
+        if phi_ratio > 0.8:
+            # Φ 높음 → CE 학습 (안전)
+            h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+            pred = decoder(h.unsqueeze(0))
+            ce = F.mse_loss(pred, target[:,:DIM])
+            # LR을 phi_ratio에 비례 (Φ 높을수록 공격적 학습)
+            for pg in opt.param_groups:
+                pg['lr'] = 3e-3 * phi_ratio
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+        else:
+            # Φ 낮음 → 부스트 (CE 학습 중단)
+            _phi_boost_step(engine)
+            if ce_hist:
+                ce_hist.append(ce_hist[-1])
+
+    return result('PHI-K4 Φ-Weighted CE', ce_hist, phi_b, phi(engine), t0,
+                  best_phi=round(best_phi, 3))
+
+
+def run_PHIK5_dual_decoder(steps=STEPS):
+    """PHI-K5: 이중 디코더 — 의식 디코더 + 언어 디코더 독립 학습"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    # 두 개의 독립 디코더
+    lang_decoder = nn.Linear(HIDDEN, DIM)  # 언어용
+    phi_decoder = nn.Linear(HIDDEN, HIDDEN)  # Φ용 (자기 예측)
+    lang_opt = torch.optim.Adam(lang_decoder.parameters(), lr=3e-3)
+    phi_opt = torch.optim.Adam(phi_decoder.parameters(), lr=1e-3)
+    data = make_data(); ce_hist = []
+
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+
+        # 언어 학습
+        pred = lang_decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        lang_opt.zero_grad(); ce.backward(); lang_opt.step()
+        ce_hist.append(ce.item())
+
+        # Φ 학습 (세포 다양성 유지)
+        with torch.no_grad():
+            all_h = torch.stack([c.hidden.squeeze() for c in engine.cells])
+        # 전체 → 파벌 예측: 예측 어려울수록 다양성 높음
+        phi_pred = phi_decoder(h.unsqueeze(0).detach())
+        phi_target = all_h.var(dim=0).unsqueeze(0)  # 다양성
+        phi_loss = -F.mse_loss(phi_pred, phi_target)  # 다양성 최대화
+        phi_opt.zero_grad(); phi_loss.backward(); phi_opt.step()
+
+        # Φ 부스트 (매 3 step)
+        if step % 3 == 0:
+            _phi_boost_step(engine)
+
+    return result('PHI-K5 Dual Decoder', ce_hist, phi_b, phi(engine), t0)
+
+
+def run_PHIK6_consciousness_gate(steps=STEPS):
+    """PHI-K6: 의식 게이트 — Φ가 gradient를 제어 (Φ 높으면 큰 gradient 허용)"""
+    t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
+    decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # 먼저 Φ 키움 (10%)
+    for _ in range(steps // 10):
+        engine.process(torch.randn(1, DIM))
+        _phi_boost_step(engine)
+
+    best_phi = phi(engine)
+
+    for step in range(steps - steps // 10):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        pred = decoder(h.unsqueeze(0))
+        ce = F.mse_loss(pred, target[:,:DIM])
+        opt.zero_grad(); ce.backward()
+
+        # 의식 게이트: Φ에 비례해서 gradient 클리핑
+        current_phi = phi(engine) if step % 20 == 0 else best_phi
+        if current_phi > best_phi:
+            best_phi = current_phi
+        gate = min(1.0, current_phi / max(best_phi, 1e-8))
+        # gate가 낮으면 (Φ 하락) gradient를 작게
+        torch.nn.utils.clip_grad_norm_(decoder.parameters(), gate * 1.0)
+        opt.step()
+        ce_hist.append(ce.item())
+
+        # Φ 유지 부스트 (매 3 step)
+        if step % 3 == 0:
+            _phi_boost_step(engine)
+
+    return result('PHI-K6 Consciousness Gate', ce_hist, phi_b, phi(engine), t0,
+                  best_phi=round(best_phi, 3))
+
+
+ALL_TESTS.update({
+    'PHI-K1': run_PHIK1_talk5_extreme,
+    'PHI-K2': run_PHIK2_phi_floor,
+    'PHI-K3': run_PHIK3_alternating,
+    'PHI-K4': run_PHIK4_phi_weighted_ce,
+    'PHI-K5': run_PHIK5_dual_decoder,
+    'PHI-K6': run_PHIK6_consciousness_gate,
+})
