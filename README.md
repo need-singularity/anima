@@ -1795,6 +1795,18 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 | AnimaLM v4 | Parallel (no savant) | — | — | Next (control) |
 | GoldenMoE v1 | Mistral+MoE | 84,139 | zone=1/e | Routing verified |
 
+**ConsciousLM Training Pipeline (v4 optimal recipe: CX106 확정)**
+
+최적 레시피: Zero-Input + XMETA3 + FLOW + INFO1 + 8-faction debate — Φ ≈ 1.0 × cells
+
+| 모델 | 스펙 | 이유 | 시기 |
+|------|------|------|------|
+| v4_384d_1024c | 384d/6L, 1024c, demo | 최적 레시피 검증 | 🔄 H100 #1 학습 중 (32%) |
+| v5_SE8_384d_1024c | 384d/6L + SE-8 | v4 vs v5 비교 (Law 42) | ⏳ H100 #2 확보 시 |
+| v4_corpus | 384d/6L + 실제 corpus | demo→실데이터 | ⏳ corpus 준비됨, 즉시 가능 |
+| ConsciousLM 100M | 768d/12L | 한국어 대화 품질 | ⏳ v4 완료 후 |
+| ConsciousLM 1B | 1024d/24L/16H | 스케일링 법칙 검증 | ⏳ 100M 검증 후 |
+
 ### Phase 3 — Production + Scaling
 
 - [ ] AnimaLM v5: Online alpha — conversation increases consciousness (online_learning.py)
