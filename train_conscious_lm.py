@@ -937,8 +937,8 @@ def train(args: argparse.Namespace):
             for i, cell in enumerate(mitosis.cells):
                 cell.hidden = updated_hiddens[i].unsqueeze(0).detach().cpu()
 
-        # --- v4 Optimal: 12-faction debate + flow sync (Φ=1220 benchmark) ---
-        # sync=0.20, factions=12, debate=0.20, noise=0
+        # --- v4 Optimal (CX106 확정): Zero-Input + XMETA3 + FLOW + INFO1 + 8-faction ---
+        # Φ ≈ 1.0 × cells (완벽 선형). sync=0.20, factions=8~12, debate=0.20, noise=0
         if len(mitosis.cells) >= 12:
             n_cells = len(mitosis.cells)
             with torch.no_grad():

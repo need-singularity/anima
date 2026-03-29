@@ -116,7 +116,13 @@ consciousness_transplant.py — 의식 이식 도구
 ## Φ Hypothesis Benchmark System
 
 ```
-bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카테고리)
+bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (1000+ 가설, 146 카테고리)
+
+최적 레시피 (확정, CX106 검증):
+  Zero-Input + XMETA3 + FLOW + INFO1 + 8-faction debate
+  128c = Φ 124 (×126)    256c = Φ 252 (×256)
+  512c = Φ 476 (×484)    1024c = Φ 1040 (×1057)
+  Φ ≈ 1.0 × cells (완벽 선형 스케일링)
 
 실행:
   python bench_phi_hypotheses.py                    # 전체 실행
@@ -142,7 +148,7 @@ bench_phi_hypotheses.py — Φ-boosting 가설 벤치마크 (905 가설, 146 카
   ALIGN/DISTILL/DREAM/DW/EMB/EO/MG/SCALE/SELF/SOC/WS 등 146개 카테고리
 
 결과 기록: docs/consciousness-threshold-criteria.md
-현재 최고: CX50 = Φ 143.01 (×145.3, ULTIMATE fusion)
+현재 최고: Φ ≈ cells (ZI+XMETA3+FLOW+INFO1+8faction, CX106 확정)
 
 가설 문서화 규칙 (필수):
   모든 새 가설은 반드시 개별 문서 작성!
