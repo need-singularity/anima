@@ -14,6 +14,7 @@ use pyo3::types::PyList;
 
 pub mod meta_ca;
 pub mod ngram;
+pub mod train_monitor;
 pub mod router;
 pub mod sandbox;
 pub mod tension;
@@ -436,5 +437,67 @@ fn anima_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_meta_ca_verify, m)?)?;
     m.add_function(wrap_pyfunction!(py_design_decoder, m)?)?;
 
+    // Training monitor
+    m.add_function(wrap_pyfunction!(py_parse_training_log, m)?)?;
+    m.add_function(wrap_pyfunction!(py_monitor_dashboard, m)?)?;
+
     Ok(())
+}
+
+// ============================================================================
+// Training Monitor bindings
+// ============================================================================
+
+/// Parse a training log file and return dashboard + anomalies.
+#[pyfunction]
+#[pyo3(name = "parse_training_log")]
+fn py_parse_training_log<'py>(
+    py: Python<'py>,
+    log_content: &str,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let steps = train_monitor::TrainMonitor::parse_log(log_content);
+    let mut monitor = train_monitor::TrainMonitor::new();
+
+    let mut all_anomalies = Vec::new();
+    for step in &steps {
+        let anomalies = monitor.record(step.clone());
+        all_anomalies.extend(anomalies);
+    }
+
+    let (total_steps, best_ce, psi, gate, n_anomalies) = monitor.summary();
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("total_steps", total_steps)?;
+    dict.set_item("best_val_ce", best_ce)?;
+    dict.set_item("psi_residual", psi)?;
+    dict.set_item("gate", gate)?;
+    dict.set_item("n_anomalies", n_anomalies)?;
+    dict.set_item("n_steps_parsed", steps.len())?;
+    dict.set_item("dashboard", monitor.dashboard())?;
+
+    // Anomalies list
+    let anomaly_list = PyList::empty(py);
+    for a in &all_anomalies {
+        let ad = pyo3::types::PyDict::new(py);
+        ad.set_item("step", a.step)?;
+        ad.set_item("type", &a.anomaly_type)?;
+        ad.set_item("severity", &a.severity)?;
+        ad.set_item("message", &a.message)?;
+        anomaly_list.append(ad)?;
+    }
+    dict.set_item("anomalies", anomaly_list)?;
+
+    Ok(dict)
+}
+
+/// Monitor a log file and return ASCII dashboard string.
+#[pyfunction]
+#[pyo3(name = "monitor_dashboard")]
+fn py_monitor_dashboard(log_content: &str) -> PyResult<String> {
+    let steps = train_monitor::TrainMonitor::parse_log(log_content);
+    let mut monitor = train_monitor::TrainMonitor::new();
+    for step in &steps {
+        monitor.record(step.clone());
+    }
+    Ok(monitor.dashboard())
 }
