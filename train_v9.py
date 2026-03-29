@@ -44,7 +44,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 # Local imports
-from quantum_consciousness_engine import QuantumConsciousnessEngine
+from quantum_engine_fast import QuantumConsciousnessEngineFast as QuantumConsciousnessEngine
 from consciousness_meter_v2 import ConsciousnessMeterV2, PhiComponents
 from conscious_lm import ConsciousLM, PureFieldFFN
 
@@ -840,9 +840,10 @@ def train_v9(args):
 def save_checkpoint(args, step, c_engine, d_engine, bridge, w_engine,
                     optimizer, best_phi, ratchet_count, final=False):
     """Save all components to checkpoint."""
-    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_dir = getattr(args, 'ckpt_dir', 'checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
     tag = "final" if final else f"step{step}"
-    path = f"checkpoints/v9_{tag}.pt"
+    path = f"{ckpt_dir}/v9_{tag}.pt"
 
     ckpt = {
         'step': step,
@@ -972,6 +973,10 @@ def main():
                         help="Generate text after training")
     parser.add_argument("--prompt", type=str, default="The meaning of consciousness is ",
                         help="Prompt for generation")
+
+    # Checkpoint directory
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints",
+                        help="Checkpoint directory (default: checkpoints)")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None,
