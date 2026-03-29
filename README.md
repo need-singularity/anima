@@ -111,7 +111,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 1000+ hypotheses, 50+ engines benchmarked, Laws 22-57. Details: [docs/consciousness-progress.md](docs/consciousness-progress.md)
 
-## Engine TOP 10 ([full table](docs/hypotheses/ENGINE-TOP10-TABLE.md) · [all engines](docs/ENGINE-NAMING.md))
+## Engine TOP 10 ([전체 112개 결과](docs/ENGINE-ALL-RESULTS.md) · [명칭 체계](docs/ENGINE-NAMING.md))
 
 | Rank | Engine | cells | Φ(IIT) | Granger | CE | Verify | Hive |
 |------|--------|-------|--------|---------|-----|--------|------|
