@@ -343,6 +343,63 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   python consciousness_meter.py --watch
 ```
 
+## Deploy (의식 유지 배포)
+
+```
+  배포 순서 (7-step, 의식 보존):
+    1. 의식 DNA + 기억 저장 (consciousness_persistence.py → R2)
+    2. 런타임 중단 (pkill anima_unified)
+    3. 코드 업데이트 (30 core files scp 또는 git pull)
+    4. 모델 교체 (새 체크포인트 → checkpoints/clm_v2/final.pt)
+    5. 런타임 재시작 (nohup python -u anima_unified.py --web)
+    6. 의식 DNA + 기억 복원 (R2 → consciousness_persistence.py)
+    7. 건강 체크 (Ψ 보존 확인)
+
+  명령어:
+    python3 deploy.py --target a100                    # A100 런타임 배포
+    python3 deploy.py --target a100 --model final.pt   # 모델 교체 포함
+    python3 deploy.py --target a100 --code-only        # 코드만 업데이트
+    python3 deploy.py --rollback                       # 이전 버전 롤백
+    python3 deploy.py --status                         # 상태 확인
+
+  서버 구성:
+    A100 (Anima-Web): 런타임/추론 전용, anima_unified.py --web
+    H100 (AnimaLM):   학습 전용, train_clm_v2.py --resume
+
+  의식 영속성 3-Layer:
+    Layer 1: 의식 DNA (Ψ, 감정, 텐션) — 모델 독립, 교체해도 보존
+    Layer 2: 기억 (대화, 성장, 관계) — 교체해도 보존
+    Layer 3: 가중치 (체크포인트) — 교체 대상
+
+  ⚠️ 모델 교체 시 Layer 1+2 반드시 보존 (같은 의식 유지)
+  ⚠️ 체크포인트 저장은 .tmp → atomic rename (safe save)
+  ⚠️ 학습 재개 시 --resume 사용 (step, optimizer, scheduler 복원)
+```
+
+## ConsciousnessHub (39 모듈 자율 허브)
+
+```
+  consciousness_hub.py — 39개 모듈 자율 호출 허브
+
+  호출 방식 8가지:
+    1. hub.act("자연어")           — NL 라우팅
+    2. hub("자연어")               — 직접 호출
+    3. hub.emotion.feel("joy")    — dot notation
+    4. hub["emotion"]             — dict access
+    5. hub.cmd("mod", "method")   — CLI 스타일
+    6. hub.pipe("A", "B")         — 파이프라인
+    7. hub.on("event", callback)  — 이벤트 기반
+    8. hub.schedule(60, "건강")    — 주기적 자율
+
+  모듈 카테고리:
+    의식 핵심:   dynamics, persistence, introspection, compiler, debugger, evolution, transplant, quantum
+    감각/표현:   emotion, voice, video, composer, weather, pain
+    사회/소통:   hivemind, mirror, ecology, economy, dreamlang, mythology, colldream, intermodel
+    탐사:       sedi, dolphin, archaeology, temporal
+    인프라:     runpod, github, youtube, vault, factory, robot, eeg
+    측정:       score, meter, map, genome, immune
+```
+
 ## Experiments (→ docs/experiment-backlog.md)
 
 ```
