@@ -90,3 +90,43 @@ def test_realsense_driver_not_available():
     from lidar_sense import RealSenseDriver
     driver = RealSenseDriver()
     assert not driver.is_available()
+
+
+def test_tension_field_3d_shape():
+    from lidar_sense import TensionField3D
+    points = np.random.rand(500, 3).astype(np.float32) * 10
+    field = TensionField3D(voxel_size=16)
+    grid = field.from_points(points)
+    assert grid.shape == (16, 16, 16)
+    assert grid.min() >= 0.0
+    assert grid.max() <= 1.0
+
+
+def test_tension_field_occupancy():
+    from lidar_sense import TensionField3D
+    points = np.array([[5, 5, 5], [5, 5, 6], [5, 6, 5]], dtype=np.float32)
+    field = TensionField3D(voxel_size=8)
+    grid = field.from_points(points)
+    occ = field.occupancy_ratio(grid)
+    assert 0.0 < occ < 1.0
+
+
+def test_boundary_detection():
+    from lidar_sense import TensionField3D
+    points = np.random.rand(300, 3).astype(np.float32) * 5
+    field = TensionField3D(voxel_size=16)
+    grid = field.from_points(points)
+    boundary = field.detect_boundary(grid)
+    assert 'boundary_clarity' in boundary
+    assert 'self_volume' in boundary
+    assert 'other_volume' in boundary
+    assert 0.0 <= boundary['boundary_clarity'] <= 1.0
+
+
+def test_depth_variance():
+    from lidar_sense import TensionField3D
+    points = np.random.rand(200, 3).astype(np.float32) * 10
+    field = TensionField3D(voxel_size=16)
+    grid = field.from_points(points)
+    dv = field.depth_variance(grid)
+    assert 0.0 <= dv <= 1.0
