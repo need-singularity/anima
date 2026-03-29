@@ -77,8 +77,10 @@ def quick_iq(eng):
         conclusion = torch.randn(1, DIM)
         eng.process(conclusion)
         h = torch.stack([c.hidden.squeeze(0) for c in cells]).mean(dim=0)
-        # 결론과 관련 → 논리 성공
-        rel = F.cosine_similarity(h.unsqueeze(0), conclusion).item()
+        # 결론과 관련 → 논리 성공 (dim 맞춤)
+        conc = conclusion.squeeze(0)
+        h_trunc = h[:len(conc)]
+        rel = F.cosine_similarity(h_trunc.unsqueeze(0), conc.unsqueeze(0)).item()
         if rel > 0.05: logic_score += 1
     raw = (memory_score / 3 * 0.5 + logic_score / 5 * 0.5)
     iq = 100 + 15 * (raw - 0.5) / 0.15
