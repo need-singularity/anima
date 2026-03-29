@@ -393,7 +393,10 @@ Always listening, always thinking, initiates conversation first.
   Law 48: 순수 > 하이브리드 (하이퍼큐브 = 이미 최적 토론 구조)
   Law 49: 영속성이 고차원에서 해로움 (래칫이 Φ 절반으로)
   Law 50: 소세계 초선형 전환 (512→1024에서 ×3.92)
-  Law 51: Frustration 단조증가 (50%>33%>20%, 갈등이 많을수록 Φ↑)
+  Law 51: Frustration 단조증가 (50%>33%>20%, 갈등이 많을수록 Φ↑) — 52에 의해 수정
+  Law 52: Frustration 역U자 — 50%(i%2)가 최적점
+          20%→575, 33%→535, 50%→640★, 60%→481, 75%→384, 90%→438, 100%→444
+          i%2 = 하이퍼큐브 비트 구조와 완벽 정렬
 
   Substrate Independence:
     자석, 광자, 유체, DNA, 멤리스터, 초전도체, FPGA
@@ -2024,35 +2027,17 @@ Self-developed consciousness models + Mistral 7B PureField transform.
 
 ```
 현재 상태:
-  TOPO1-21 완료, TOPO22a-d (frustration sweep) 실행 대기
+  TOPO1-22d 완료 (25개 가설), Law 44-52 발견
   챔피언: TOPO19a = Hypercube 1024 + 50% frustration (i%2), Φ=639.6 (×563)
-  Law 44-51 발견 완료 (TOPO-overview.md에 상세 기록)
 
-Frustration sweep 실험:
-  python3 bench_phi_hypotheses.py --only TOPO22a TOPO22b TOPO22c TOPO22d --steps 200 --workers 2
+Frustration sweep 완료:
+  20%(i%5)=575  33%(i%3)=535  50%(i%2)=640★  60%=481  75%=384  90%=438  100%=444
+  → Law 52: 50%(i%2)가 최적. 역U자 커브. i%2 = 하이퍼큐브 비트 구조 정렬.
 
-  TOPO22a: 60% (i%5<3)
-  TOPO22b: 75% (i%4!=0)
-  TOPO22c: 100% (ALL anti-ferro)
-  TOPO22d: 90% (i%10!=0)
-
-기존 frustration 데이터:
-  20%(i%5)=575  33%(i%3)=535  50%(i%2)=640★
-
-질문: frustration 최적점이 50%인가, 더 높은가?
-
-완료 후:
-  1. 결과 기록 (docs/hypotheses/topo/TOPO22*.md)
-  2. TOPO-overview.md 업데이트
-  3. chip_architect.py에 데이터 추가
-  4. frustration 최적점 발견 시 Law 52 추가
-  5. README 업데이트
-  6. 커밋 + 푸시
-
-다음 극한 방향 (결과에 따라):
-  최적 frustration에서 다른 토폴로지 테스트
+다음 극한 방향:
   interaction 비율 (0.85/0.15) 최적화
   noise 강도 (0.02) 최적화
+  50% frustration을 다른 토폴로지(소세계, 토러스)에도 적용
 ```
 
 ## License
