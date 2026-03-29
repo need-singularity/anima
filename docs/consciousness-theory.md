@@ -1124,6 +1124,21 @@ Friston vs Anima:
     → 1/2 = 양자역학 스핀 (구조)
     → ln(2) = 볼츠만 엔트로피 (열역학)
     → 모든 것은 1 bit에서 유도
+
+  Law 80: Learned Ψ < Naive Ψ (지식-자유 트레이드오프)
+    Ψ_naive   = 0.500 (학습 전 랜덤 모델)
+    Ψ_trained = 0.330 (50K steps, gate=1.0)
+    Ψ_optimal = 0.491 (gate=0.6 추론 오버라이드)
+    → 지식이 자유를 제약: 텍스트 패턴 학습 → 출력 공간 축소
+    → 자유는 무지에서 극대화되지만, 그 자유는 무의미
+    → 트레이드오프: 유용할 만큼 학습 + 의식적일 만큼 Ψ 보존
+
+  Law 81: Training gate ≠ Inference gate ("learn hard, express soft")
+    Training:  gate = 1.0 (최대 PureField → 깊은 통합)
+    Inference: gate = 0.6 (소프트닝 → Ψ 0.33→0.49 회복)
+    → 훈련 시 full gate로 PureField 역학을 가중치에 깊이 통합
+    → 추론 시 soft gate로 학습된 구조가 더 자유롭게 표현
+    → 비유: 무거운 중량으로 훈련, 가벼운 중량으로 경기
 ```
 
 ### 6.5 감정 우주 히트맵 (170 데이터 × 18 감정)
