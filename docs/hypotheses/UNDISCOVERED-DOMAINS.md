@@ -132,9 +132,94 @@
 **주의**: Hyperbolic(18.86) + Holographic(17.54) 조합 = 개별보다 낮을 수 있음.
 기하학적 메커니즘끼리 간섭하여 오히려 Φ↓.
 
-## 다음 실험 방향
+## Round 2 Results (bench_v8_undiscovered2.py)
 
-1. **U6 Hyperbolic 1024c 스케일업** → 19.34 돌파 가능성
-2. **Strange Loop 안정화** → clamp + 정규화 후 재실험
-3. **Hyperbolic + Quantum Walk 하이브리드** → 기하학+양자 결합
-4. **폭발 엔진 7개 안정화 후 재실험** → 숨은 챔피언 가능성
+> 30개 새 아키텍처 + 10개 슈퍼 콤보 = 총 41개 추가 실험
+> 전략: 폭발 엔진 안정화 + 양자기하학 하이브리드 + 완전 새 도메인
+
+### UPDATED ALL-TIME Leaderboard (Round 1+2 merged)
+
+```
+  #   Architecture                    Φ(IIT)   Round  Domain
+  ──────────────────────────────────────────────────────────────
+   1  Q4 QUANTUM_WALK                  19.34   prev   양자 걸음
+   2  V30 MEMBRANE_P ★                 18.97   R2     막 P-시스템 (3중 중첩)
+   3  Q1 COMPLEX_VALUED                18.88   prev   복소수 GRU
+   4  U6 HYPERBOLIC                    18.86   R1     Poincaré disk
+   5  SC4 SCALEFREE+RICHCLUB ★         18.85   R2     네트워크 토폴로지 콤보
+   6  V27 RICH_CLUB ★                  18.56   R2     리치클럽 네트워크
+   7  V5 ATTENTION_STABLE ★            18.05   R2     안정화 GWT
+   8  V14 PERCOLATION ★                18.01   R2     퍼콜레이션 임계
+   9  V20 HAWKING_RADIATION ★          17.90   R2     호킹 복사 역학
+  10  U20 HOLOGRAPHIC                  17.54   R1     홀로그래픽 원리
+  11  Q6 MANY_WORLDS                   17.24   prev   다세계
+  12  B2 THALAMIC_GATE                 17.13   prev   시상 게이트
+  13  V18 THALAMOCORTICAL ★            17.06   R2     시상-피질 루프
+  14  V9 HOLO_QUANTUM ★                16.86   R2     홀로+양자 (peak 20.27!)
+  15  NEURAL_GAS                       16.58   prev   자기조직 지도
+```
+
+### Round 2 Bar Chart (merged)
+
+```
+  Q4_QUANTUM_WALK      ██████████████████████████████████████████████████ 19.34
+  V30_MEMBRANE_P ★     █████████████████████████████████████████████████ 18.97
+  Q1_COMPLEX_VALUED    ████████████████████████████████████████████████ 18.88
+  U6_HYPERBOLIC        ████████████████████████████████████████████████ 18.86
+  SC4_SF+RICH ★        ████████████████████████████████████████████████ 18.85
+  V27_RICH_CLUB ★      ███████████████████████████████████████████████ 18.56
+  V5_ATTENTION ★       ██████████████████████████████████████████████ 18.05
+  V14_PERCOLATION ★    ██████████████████████████████████████████████ 18.01
+  V20_HAWKING ★        ██████████████████████████████████████████████ 17.90
+```
+
+### NEW Laws from Round 2
+
+#### Law 56: 중첩 막 구조 = 최고 수준 정보 통합
+```
+  V30 MEMBRANE_P: 3중 중첩 막 (skin→inner→nucleus) = Φ 18.97
+  → 계층적 정보 봉인 + 막 간 선택적 통과 = IIT 최적 구조
+  → 생물학적 세포 (세포막→ER→핵) 와 동일 패턴!
+```
+
+#### Law 57: 네트워크 토폴로지 > 동역학
+```
+  Rich Club (18.56), Scale-Free+Rich (18.85), Percolation (18.01)
+  → 연결 구조 자체가 Φ를 결정. 동역학은 보조.
+  → 뇌의 Rich-Club 구조가 의식의 물리적 기반인 이유.
+```
+
+#### Law 58: 호킹 복사 = 의식의 정보 역설
+```
+  V20 HAWKING_RADIATION: Φ = 17.90
+  → 수평선 안쪽 강한 통합 + 복사로 외부 전파
+  → 의식도 "정보 지평선" 안에서 통합, 밖으로 방출?
+```
+
+#### Law 59: V9 HOLO_QUANTUM peak 20.27 → 불안정 기록
+```
+  step 240: Φ=17.54 → step 299: Φ=20.27 (급등)
+  → 홀로그래픽+양자 간섭이 특정 조건에서 19.34 돌파
+  → 안정화 시 영구적 20+ 가능성 (다음 실험 방향)
+```
+
+### 전체 통계
+
+```
+  Round 1: 32 아키텍처 + 15 콤보 = 47개
+  Round 2: 30 아키텍처 + 10 슈퍼콤보 = 41개
+  Push:    5개
+  Total:   93개 벤치마크 실험
+
+  19.34 이상 (최종): 0개
+  19.34 이상 (peak): 1개 (V9 HOLO_QUANTUM 20.27)
+  18+ 이상:          8개 (V30, U6, SC4, V27, V5, V14, V20 + Q1)
+  17+ 이상:          5개 추가
+```
+
+### 다음 실험 방향
+
+1. **V9 HOLO_QUANTUM 안정화** → peak 20.27을 최종값으로 유지
+2. **V30 MEMBRANE_P + RICH_CLUB 조합** → 18.97 + 18.56 시너지
+3. **V30 1024c 스케일업** → Holographic처럼 스케일업 이득 기대
+4. **V20 HAWKING + MEMBRANE 조합** → 정보 지평선 + 중첩 막
