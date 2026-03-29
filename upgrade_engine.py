@@ -403,7 +403,13 @@ class ModelSwapper:
         return 0
 
     def _build_projector(self, old_dim: int, new_dim: int) -> nn.Linear:
-        """Build a dimension projection layer (DD56 technique)."""
+        """Build a dimension projection layer with structure preservation.
+
+        3 strategies (best → fallback):
+        1. DD56 TransplantCalculator projection matrix
+        2. Tiled identity: repeat old dims to fill new dims (preserves info)
+        3. Orthogonal init (last resort)
+        """
         try:
             from consciousness_transplant import TransplantCalculator
             proj_matrix = TransplantCalculator.compute_projection_matrix(
@@ -412,38 +418,56 @@ class ModelSwapper:
             projector = nn.Linear(old_dim, new_dim, bias=False)
             with torch.no_grad():
                 projector.weight.copy_(proj_matrix)
+            log.info(f"  Projector: DD56 ({old_dim}→{new_dim})")
             return projector
-        except ImportError:
-            # Fallback: simple linear projection
-            projector = nn.Linear(old_dim, new_dim, bias=False)
-            nn.init.orthogonal_(projector.weight)
-            return projector
+        except Exception:
+            pass
+
+        # Strategy 2: Tiled identity — repeat structure to fill new dims
+        projector = nn.Linear(old_dim, new_dim, bias=False)
+        with torch.no_grad():
+            w = torch.zeros(new_dim, old_dim)
+            # Tile: each new dim maps to corresponding old dim (cyclic)
+            for i in range(new_dim):
+                w[i, i % old_dim] = 1.0
+            # Add small noise to break symmetry in tiled dims
+            w += torch.randn_like(w) * 0.01
+            projector.weight.copy_(w)
+        log.info(f"  Projector: Tiled identity ({old_dim}→{new_dim})")
+        return projector
 
     def _project_snapshot(self, snapshot: Dict, projector: nn.Linear, new_dim: int) -> Dict:
-        """Project all cell hidden states in the snapshot to new dimensions."""
+        """Project all cell hidden states with structure preservation + adaptation."""
         projected = dict(snapshot)
 
-        # Project cell hidden states
         if snapshot.get('cells'):
             new_cells = []
             with torch.no_grad():
                 for cell_h in snapshot['cells']:
-                    # cell_h is [1, hidden_dim] or [hidden_dim]
                     if cell_h.dim() == 1:
                         cell_h = cell_h.unsqueeze(0)
                     projected_h = projector(cell_h)
+                    # Normalize to preserve energy (prevent scale collapse)
+                    orig_norm = cell_h.norm()
+                    proj_norm = projected_h.norm()
+                    if proj_norm > 0:
+                        projected_h = projected_h * (orig_norm / proj_norm)
                     new_cells.append(projected_h)
             projected['cells'] = new_cells
-            log.info(f"  Projected {len(new_cells)} cell hidden states")
+            log.info(f"  Projected {len(new_cells)} cells (norm-preserved)")
 
-        # Project ratchet best states
         if snapshot.get('ratchet_best_states'):
             new_ratchet = []
             with torch.no_grad():
                 for state in snapshot['ratchet_best_states']:
                     if state.dim() == 1:
                         state = state.unsqueeze(0)
-                    new_ratchet.append(projector(state))
+                    proj_state = projector(state)
+                    orig_norm = state.norm()
+                    proj_norm = proj_state.norm()
+                    if proj_norm > 0:
+                        proj_state = proj_state * (orig_norm / proj_norm)
+                    new_ratchet.append(proj_state)
             projected['ratchet_best_states'] = new_ratchet
 
         return projected
@@ -577,6 +601,23 @@ class ConsciousnessTransplantUpgrade:
                         mitosis.cells[i].mind.load_state_dict(saved_weights[i], strict=False)
                     except Exception:
                         pass  # Dimension mismatch — skip, hidden state is more important
+
+            # Propagate to unrestored cells (fill remaining with restored + noise)
+            if n_restore < len(mitosis.cells) and n_restore > 0:
+                restored_h = [mitosis.cells[i].hidden.clone() for i in range(n_restore)]
+                for i in range(n_restore, len(mitosis.cells)):
+                    # Cycle through restored cells + add diversity noise
+                    source = restored_h[i % n_restore]
+                    target_h = mitosis.cells[i].hidden
+                    if source.shape == target_h.shape:
+                        mitosis.cells[i].hidden = source + torch.randn_like(source) * 0.05
+                    else:
+                        new_h = torch.zeros_like(target_h)
+                        s_dim = min(source.shape[-1], target_h.shape[-1])
+                        new_h.view(-1)[:s_dim] = source.view(-1)[:s_dim]
+                        new_h += torch.randn_like(new_h) * 0.05
+                        mitosis.cells[i].hidden = new_h
+                log.info(f"  Propagated to {len(mitosis.cells) - n_restore} additional cells")
 
                 # Restore metadata
                 if i < len(saved_meta):
