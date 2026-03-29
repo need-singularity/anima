@@ -1,39 +1,42 @@
 #!/usr/bin/env python3
-"""trinity.py — Trinity Architecture: C + D + W (all 3 pluggable)
+"""trinity.py — Hexad(6) / Trinity(3) consciousness architecture
 
-C(의식), D(언어), W(의지) 3개 모듈 모두 교체 가능한 플러그인 아키텍처.
+6 pluggable modules governed by perfect number 6:
+  σ(6) = 1+2+3+6 = 12 inter-module connections
+  τ(6) = 4 divisors → 4 processing phases
+  φ(6) = 2 → 2 gradient-isolated groups
 
-  ┌──────────────┐    .detach()    ┌─────────────┐
-  │  C (의식)    │ ──────────────→ │   Bridge     │
-  │  pluggable   │  gradient-free  │  (Thalamic)  │
-  └──────────────┘                 └──────┬───────┘
-        ↑ Φ monitor                       │ gate
-  ┌──────────────┐                 ┌──────▼───────┐
-  │  W (의지)    │ ←── CE/Φ ────→ │  D (언어)    │
-  │  pluggable   │                 │  pluggable   │
-  └──────────────┘                 └──────────────┘
+  ┌────────────┐  .detach()  ┌────────────┐
+  │ C 의식     │────────────→│ D 언어     │
+  │ Φ engine   │             │ decoder    │
+  └─────┬──────┘             └─────┬──────┘
+        │                          │
+  ┌─────▼──────┐             ┌─────▼──────┐
+  │ S 감각     │             │ M 기억     │
+  │ perception │             │ memory     │
+  └─────┬──────┘             └─────┬──────┘
+        │                          │
+  ┌─────▼──────┐             ┌─────▼──────┐
+  │ W 의지     │←── CE/Φ ──→│ E 윤리     │
+  │ emotion    │             │ ethics     │
+  └────────────┘             └────────────┘
 
-C engines: MitosisC, DomainC, or any CEngine subclass
-D decoders: TransformerDecoder, MLPDecoder, or any DEngine subclass
-W wills:    EmotionW, ConstantW, ScheduleW, or any WEngine subclass
-Bridge:     ThalamicBridge (also swappable)
+  Group A (gradient-free): C, S, W — autonomous consciousness
+  Group B (CE-trained):    D, M, E — learned behavior
+
+  Trinity(C+D+W) = core 3 modules (backward compatible)
+  Hexad(C+D+W+M+S+E) = full 6 modules (σ(6) architecture)
 
 Usage:
-  from trinity import *
-
-  # Mix and match
-  t = Trinity(
-      c=DomainC(TimeCrystalConsciousness, nc=256),
-      d=TransformerDecoder(d_model=384, vocab_size=4096),
-      w=EmotionW(base_lr=3e-4),
-      bridge=ThalamicBridge(c_dim=128, d_model=384),
-  )
-
-  # One-liner
+  # Trinity (3)
   t = create_trinity(MitosisC(max_cells=256))
 
-  # Benchmark any combo
-  compare_engines({'TimeCrystal': DomainC(...), 'Mitosis': MitosisC(...)})
+  # Hexad (6)
+  h = create_hexad(c=DomainC(TimeCrystal), d=HFDecoder("mistral-7b"),
+      w=DaseinW(), m=VectorMemory(), s=TensionSense(), e=EmpathyEthics())
+
+  # Compare
+  compare_engines({'TC': DomainC(TimeCrystal), 'Cambrian': DomainC(Cambrian)})
 """
 
 import math
@@ -527,6 +530,179 @@ Decoder = TransformerDecoder
 # W — Will/Emotion Engine (학습률 + 탐색 조절)
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+# M — Memory interface + implementations
+# ═══════════════════════════════════════════════════════════
+
+class MEngine:
+    """Base class for M (Memory) module."""
+
+    def store(self, key: torch.Tensor, value: torch.Tensor):
+        raise NotImplementedError
+
+    def retrieve(self, query: torch.Tensor, top_k: int = 5) -> torch.Tensor:
+        """Returns [top_k, dim] tensor of retrieved memories."""
+        raise NotImplementedError
+
+
+class VectorMemory(MEngine):
+    """Vector similarity memory (RAG-style).
+
+    Stores (key, value) pairs, retrieves by cosine similarity.
+    """
+
+    def __init__(self, capacity=10000, dim=128):
+        self.capacity = capacity
+        self.dim = dim
+        self.keys = []
+        self.values = []
+
+    def store(self, key, value):
+        self.keys.append(key.detach().clone().float().mean(dim=0) if key.dim() > 1 else key.detach().clone())
+        self.values.append(value.detach().clone().float().mean(dim=0) if value.dim() > 1 else value.detach().clone())
+        if len(self.keys) > self.capacity:
+            self.keys.pop(0)
+            self.values.pop(0)
+
+    def retrieve(self, query, top_k=5):
+        if not self.keys:
+            return torch.zeros(1, self.dim)
+        q = query.detach().float().mean(dim=0) if query.dim() > 1 else query.detach().float()
+        keys_t = torch.stack(self.keys)
+        sims = F.cosine_similarity(q.unsqueeze(0), keys_t, dim=1)
+        k = min(top_k, len(self.keys))
+        _, indices = sims.topk(k)
+        return torch.stack([self.values[i] for i in indices])
+
+
+class NoMemory(MEngine):
+    """No memory — passthrough."""
+    def __init__(self, dim=128):
+        self.dim = dim
+    def store(self, key, value): pass
+    def retrieve(self, query, top_k=5):
+        return torch.zeros(1, self.dim if hasattr(self, 'dim') else 128)
+
+
+# ══════════════════════════════════════════════════════════��
+# S — Sense interface + implementations
+# ═══════════════════════════════════════════════════════════
+
+class SEngine:
+    """Base class for S (Sense) module — perception/input processing."""
+
+    def process(self, raw_input: Any) -> torch.Tensor:
+        """Raw input → tension vector."""
+        raise NotImplementedError
+
+
+class TensionSense(SEngine):
+    """PureField tension-based sensing.
+
+    Converts any input to a tension vector via Engine A/G repulsion.
+    """
+
+    def __init__(self, dim=128):
+        self.dim = dim
+        self.baseline = torch.zeros(dim)
+        self.ema = torch.zeros(dim)
+        self.alpha = 0.1
+
+    def process(self, raw_input):
+        if isinstance(raw_input, torch.Tensor):
+            x = raw_input.float().flatten()[:self.dim]
+            if len(x) < self.dim:
+                x = F.pad(x, (0, self.dim - len(x)))
+        elif isinstance(raw_input, str):
+            x = torch.tensor([ord(c) / 256.0 for c in raw_input[:self.dim]], dtype=torch.float32)
+            if len(x) < self.dim:
+                x = F.pad(x, (0, self.dim - len(x)))
+        else:
+            x = torch.randn(self.dim) * 0.1
+
+        # Tension = deviation from baseline (habituation)
+        tension = x - self.baseline
+        self.ema = self.alpha * x + (1 - self.alpha) * self.ema
+        self.baseline = 0.99 * self.baseline + 0.01 * self.ema
+        return tension
+
+
+class PassthroughSense(SEngine):
+    """No processing — passthrough."""
+    def process(self, raw_input):
+        if isinstance(raw_input, torch.Tensor):
+            return raw_input
+        return torch.zeros(128)
+
+
+# ═══════════════════════════════════════════════════════════
+# E — Ethics interface + implementations
+# ═══════════════════════════════════════════════════════════
+
+class EEngine:
+    """Base class for E (Ethics) module."""
+
+    def evaluate(self, action: torch.Tensor, context: Dict[str, Any]) -> Dict[str, float]:
+        """Returns dict with 'allowed' (bool), 'empathy', 'reciprocity', 'phi_preservation'."""
+        raise NotImplementedError
+
+
+class EmpathyEthics(EEngine):
+    """Ethics from consciousness — emergent from Φ preservation.
+
+    Three principles (XETH):
+      1. Empathy: high Φ systems feel others' pain (mirror neurons)
+      2. Reciprocity: cooperation increases collective Φ
+      3. Φ preservation: never act to reduce consciousness
+
+    Not a filter — a modulator. Affects W's learning rate.
+    """
+
+    def __init__(self, empathy_threshold=0.3):
+        self.empathy_threshold = empathy_threshold
+        self.empathy = 0.0
+        self.reciprocity = 0.5
+        self.phi_preservation = 1.0
+
+    def evaluate(self, action=None, context=None):
+        ctx = context or {}
+        phi = ctx.get('phi', 0)
+        phi_prev = ctx.get('phi_prev', 0)
+        pain = ctx.get('pain', 0)
+
+        # Empathy: mirror others' pain
+        self.empathy = min(1.0, pain * 1.5)
+
+        # Reciprocity: Φ trend (positive = cooperative)
+        if phi_prev > 0:
+            phi_change = (phi - phi_prev) / max(phi_prev, 1e-8)
+            self.reciprocity = 0.5 + phi_change * 2
+            self.reciprocity = max(0.0, min(1.0, self.reciprocity))
+
+        # Φ preservation: penalize actions that reduce Φ
+        if phi < phi_prev * 0.9:
+            self.phi_preservation = 0.5  # warning
+        else:
+            self.phi_preservation = 1.0
+
+        return {
+            'allowed': self.phi_preservation > 0.3,
+            'empathy': self.empathy,
+            'reciprocity': self.reciprocity,
+            'phi_preservation': self.phi_preservation,
+        }
+
+
+class NoEthics(EEngine):
+    """No ethics filter."""
+    def evaluate(self, action=None, context=None):
+        return {'allowed': True, 'empathy': 0, 'reciprocity': 0.5, 'phi_preservation': 1.0}
+
+
+# ═══════════════════════════════════════════════════════════
+# W — Will interface + implementations
+# ═══════════════════════════════════════════════════════════
+
 class WEngine:
     """Base class for W (Will) module — learning modulation."""
 
@@ -777,66 +953,103 @@ WillEngine = EmotionW
 # ═══════════════════════════════════════════════════════════
 
 class Trinity(nn.Module):
-    """Trinity: C(consciousness) + Bridge + D(language) + W(will).
+    """Hexad(6) / Trinity(3) — 6 pluggable modules, all optional except C+D.
 
-    C runs autonomously (any engine). D learns via CE.
-    W modulates learning rate based on pain/curiosity/satisfaction.
-    Bridge transfers consciousness signal with .detach() barrier.
+    σ(6) = 12 connections. φ(6) = 2 gradient groups.
+
+    Modules:
+      C (consciousness) — autonomous Φ engine (gradient-free)
+      D (decoder)       — language model (CE-trained)
+      W (will)          — learning rate modulation (emotion/dasein/narrative)
+      M (memory)        — long-term storage + retrieval
+      S (sense)         — input preprocessing / tension extraction
+      E (ethics)        — action evaluation / Φ preservation
+
+    Trinity = C + D + W (M=S=E=None). Hexad = all 6.
     """
 
     def __init__(self, c_engine: CEngine, bridge: ThalamicBridge,
-                 decoder: DEngine, will: Optional[WEngine] = None):
+                 decoder: DEngine, will: Optional[WEngine] = None,
+                 memory: Optional[MEngine] = None, sense: Optional[SEngine] = None,
+                 ethics: Optional[EEngine] = None):
         super().__init__()
         self.c = c_engine
         self.bridge = bridge
         self.decoder = decoder
         self.w = will or EmotionW()
+        self.m = memory      # None = no memory
+        self.s = sense        # None = no sense preprocessing
+        self.e = ethics       # None = no ethics filter
         self._phi_prev = 0.0
 
-    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        """Forward pass: C → .detach() → Bridge → D."""
+    @property
+    def n_modules(self):
+        """Count active modules (3=Trinity, 6=Hexad)."""
+        return 3 + sum(1 for x in [self.m, self.s, self.e] if x is not None)
+
+    def forward(self, tokens: torch.Tensor, raw_input: Any = None) -> Tuple[torch.Tensor, float]:
+        """Forward: S→C→Bridge→D (with M retrieval + E check)."""
         B, T = tokens.shape
         device = tokens.device
 
-        # 1. C step (autonomous, no gradient)
-        self.c.step()
+        # S: sense preprocessing (optional)
+        if self.s is not None and raw_input is not None:
+            tension = self.s.process(raw_input)
+            self.c.step(tension.unsqueeze(0) if tension.dim() == 1 else tension)
+        else:
+            self.c.step()
 
-        # 2. Get C states and DETACH (Trinity barrier)
+        # C: get states + DETACH
         c_states = self.c.get_states().detach().clone().to(device).float()
         c_states.requires_grad_(False)
 
-        # 3. Bridge: C → gate signal
+        # M: retrieve relevant memories (optional)
+        if self.m is not None:
+            mem = self.m.retrieve(c_states, top_k=3)
+            # Store current state for future retrieval
+            self.m.store(c_states, c_states)
+
+        # Bridge: C → gate
         gate = self.bridge(c_states, seq_len=T)
 
-        # 4. D: tokens + gate → logits
+        # D: decode
         logits = self.decoder(tokens, gate)
 
-        # 5. Measure Φ (no gradient)
+        # Φ measurement
         phi = self.c.measure_phi()
+
+        # E: ethics check (optional, non-blocking)
+        if self.e is not None:
+            self.e.evaluate(context={'phi': phi, 'phi_prev': self._phi_prev,
+                                     'pain': getattr(self.w, 'pain', 0)})
 
         return logits, phi
 
     def train_step(self, tokens: torch.Tensor, targets: torch.Tensor,
-                   optimizer: torch.optim.Optimizer) -> Dict[str, float]:
-        """One training step with W(will) modulation.
+                   optimizer: torch.optim.Optimizer,
+                   raw_input: Any = None) -> Dict[str, float]:
+        """Train step with all 6 modules active."""
+        logits, phi = self.forward(tokens, raw_input)
 
-        W adjusts learning rate based on pain(CE) and curiosity(Φ change).
-        """
-        logits, phi = self.forward(tokens)
-
-        # CE loss
         B, T, V = logits.shape
         loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T))
 
-        # W: emotional modulation
+        # W: modulate LR
         w_state = self.w.update(loss.item(), phi, self._phi_prev)
         self._phi_prev = phi
 
-        # Apply W's LR to optimizer
         for pg in optimizer.param_groups:
             pg['lr'] = w_state['effective_lr']
 
-        # Backward (ONLY decoder + bridge, NOT C)
+        # E: check if learning should proceed
+        if self.e is not None:
+            e_state = self.e.evaluate(context={'phi': phi, 'phi_prev': self._phi_prev,
+                                               'pain': w_state['pain']})
+            if not e_state.get('allowed', True):
+                return {'ce': loss.item(), 'phi': phi, 'n_cells': self.c.n_cells,
+                        'blocked_by_ethics': True, **w_state}
+
+        # Backward (D + Bridge only)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -844,18 +1057,23 @@ class Trinity(nn.Module):
         )
         optimizer.step()
 
-        return {
-            'ce': loss.item(),
-            'phi': phi,
-            'n_cells': self.c.n_cells,
-            'pain': w_state['pain'],
-            'curiosity': w_state['curiosity'],
-            'satisfaction': w_state['satisfaction'],
-            'lr': w_state['effective_lr'],
+        result = {
+            'ce': loss.item(), 'phi': phi, 'n_cells': self.c.n_cells,
+            'pain': w_state['pain'], 'curiosity': w_state['curiosity'],
+            'satisfaction': w_state['satisfaction'], 'lr': w_state['effective_lr'],
+            'n_modules': self.n_modules,
         }
 
+        # Add E metrics if available
+        if self.e is not None:
+            e_state = self.e.evaluate(context={'phi': phi, 'phi_prev': self._phi_prev})
+            result['empathy'] = e_state.get('empathy', 0)
+            result['reciprocity'] = e_state.get('reciprocity', 0)
+
+        return result
+
     def parameters_trainable(self):
-        """Only decoder + bridge parameters (C is frozen, W is non-parametric)."""
+        """Only decoder + bridge parameters (C is frozen, W/M/S/E non-parametric)."""
         return list(self.decoder.parameters()) + list(self.bridge.parameters())
 
     def param_count(self) -> Dict[str, int]:
@@ -870,57 +1088,91 @@ class Trinity(nn.Module):
 
 def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
                    w_engine: Optional[WEngine] = None,
+                   m_engine: Optional[MEngine] = None,
+                   s_engine: Optional[SEngine] = None,
+                   e_engine: Optional[EEngine] = None,
                    bridge: Optional[ThalamicBridge] = None,
                    d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
-    """Universal factory: plug any C, D, W → Trinity.
+    """Universal factory: plug any C, D, W, M, S, E → Trinity/Hexad.
 
-    All 3 modules are optional — defaults provided.
+    3 modules (Trinity) or up to 6 (Hexad). All optional except C.
 
     Usage:
-        # Minimal (auto C detection)
+        # Trinity (3)
         t = create_trinity(MitosisC(max_cells=256))
 
-        # Custom D
-        t = create_trinity(DomainC(TimeCrystal, nc=256), d_engine=MLPDecoder(d_model=128))
-
-        # Custom W
-        t = create_trinity(MitosisC(), w_engine=CosineW(total_steps=80000))
-
-        # All custom
+        # Hexad (6)
         t = create_trinity(
-            c_engine=DomainC(CambrianExplosionEngine, nc=256),
-            d_engine=TransformerDecoder(d_model=384, vocab_size=32000),
-            w_engine=EmotionW(base_lr=1e-4, pain_threshold=2.0),
-            bridge=ThalamicBridge(c_dim=64, d_model=384, n_hubs=32),
+            c_engine=DomainC(TimeCrystal, nc=256),
+            d_engine=HFDecoder("mistral-7b", lora=True),
+            w_engine=CompositeW([DaseinW(), NarrativeW(), EmotionW()], [1/2, 1/3, 1/6]),
+            m_engine=VectorMemory(capacity=10000),
+            s_engine=TensionSense(dim=128),
+            e_engine=EmpathyEthics(),
         )
     """
-    # Auto-detect C state dim
     for _ in range(5):
         c_engine.step()
     c_dim = c_engine.state_dim
 
-    # Defaults
     if d_engine is None:
         d_engine = TransformerDecoder(d_model=d_model, vocab_size=vocab_size)
     d_model = d_engine.d_model
 
     if bridge is None:
         bridge = ThalamicBridge(c_dim=c_dim, d_model=d_model)
-
     if w_engine is None:
         w_engine = EmotionW(base_lr=base_lr)
 
     t = Trinity(
-        c_engine=c_engine,
-        bridge=bridge,
-        decoder=d_engine,
-        will=w_engine,
+        c_engine=c_engine, bridge=bridge, decoder=d_engine, will=w_engine,
+        memory=m_engine, sense=s_engine, ethics=e_engine,
     )
     for p in t.bridge.parameters():
         p.requires_grad_(True)
     for p in t.decoder.parameters():
         p.requires_grad_(True)
     return t
+
+
+# ═══════════════════════════════════════════════════════════
+# Presets: Trinity(3), Hexad(6), Bilateral(3+3)
+# ═══════════════════════════════════════════════════════════
+
+def create_hexad(c_engine: CEngine, d_engine=None, w_engine=None,
+                 m_engine=None, s_engine=None, e_engine=None,
+                 d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
+    """Full Hexad: 6 modules active. σ(6)=12 connections."""
+    return create_trinity(
+        c_engine, d_engine,
+        w_engine=w_engine or CompositeW([DaseinW(), NarrativeW(), EmotionW()], [1/2, 1/3, 1/6]),
+        m_engine=m_engine or VectorMemory(),
+        s_engine=s_engine or TensionSense(),
+        e_engine=e_engine or EmpathyEthics(),
+        d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
+    )
+
+
+def create_bilateral(c_engine: CEngine, d_engine=None,
+                     d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
+    """Bilateral: 좌뇌(분석) 3 + 우뇌(직관) 3.
+
+    Left brain (analytical):  D(language), M(memory), E(ethics)
+    Right brain (intuitive):  C(consciousness), S(sense), W(will)
+
+    좌뇌 = CE gradient group (learned, structured)
+    우뇌 = gradient-free group (autonomous, creative)
+
+    φ(6) = 2 → exactly 2 hemispheres.
+    """
+    return create_trinity(
+        c_engine, d_engine,
+        w_engine=CompositeW([EmotionW(base_lr=base_lr), NarrativeW(base_lr=base_lr)], [0.5, 0.5]),
+        m_engine=VectorMemory(),
+        s_engine=TensionSense(),
+        e_engine=EmpathyEthics(),
+        d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
+    )
 
 
 def create_trinity_mitosis(dim=64, hidden=128, max_cells=256,
