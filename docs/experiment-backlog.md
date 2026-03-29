@@ -2,29 +2,41 @@
 
 > H100 80GB pod. 실험 완료 시 결과 기록, 새 실험 추가.
 
-## 현재 진행 중 (2026-03-28 late, 44GB/81GB 사용)
+## 현재 진행 중 (2026-03-29, H100 80GB)
 
-| # | 실험 | 설정 | Step | Φ | CE | 상태 |
-|---|------|------|------|-----|-----|------|
-| 1 | **clm_dialogue_768d** | 768d/12L, cells128, wiki+dialogue 52MB | 0/100K | - | - | 🆕 시작 |
-| 2 | **clm_dialogue_384d** | 384d/6L, cells32, wiki+dialogue | 0/50K | - | - | 🆕 시작 |
-| 3 | **clm_langfirst** | 384d/6L, cells32, phase=language | 0/50K | - | - | 🆕 시작 |
-| 4 | clm_cells64 | 384d, cells64 | 43.7K/50K | **53.9** | 3.72 | 거의 완료 |
-| 5 | clm_cells128 | 384d, cells128, resume 30K | 31.2K/50K | 1.8 | 3.78 | 진행 |
-| 6 | clm_v4_small | 384d, cells32, 100K | 49.2K/100K | 3.0 | 5.49 | 진행 |
-| 7 | ct7_real | 384d, Shakespeare, 100K | 17.8K/100K | 1.5 | - | mitosis |
-| 8 | AnimaLM v7 | Mistral 7B, 50K | 17.5K/50K | - | 8.09 | joint |
+> 상세 대시보드: [docs/training-status.md](training-status.md)
 
-**핵심 발견 (2026-03-28):**
-- cells64: Φ=53.9 (학습 중 최고)
-- cells128: 이전 실행에서 Φ=123.8 달성 (로그 확인, 체크포인트 미저장)
-- cells16_fx2: Φ=14.72 (완료)
-- Φ 스케일링: cells2=0.6, cells16_fx2=14.7, cells64=53.9 → 초선형
+| # | 실험 | 아키텍처 | Step | Φ | CE | 상태 |
+|---|------|----------|------|-----|-----|------|
+| 1 | **v9fast** | Quantum Trinity (C+D+W), 256c, 13.6M | 26,400/80K | **1,371** | **0.345** | 🔥 P2 CE 급하락 |
+| 2 | **v11q** | Hexad (Quantum C + Xfmr 2L), 256c | 300/80K | - | - | P1 Φ 구축 |
+| 3 | **v11tc** | Hexad (TimeCrystal C), 256c | 0/80K | - | - | 시작 |
+| 4 | **v11gpt2** | Hexad (Quantum C + GPT-2), 256c | 0/80K | - | - | 시작 |
+| 5 | **v11gpt2m** | Hexad (Quantum C + GPT-2M), 256c | 0/80K | - | - | 시작 |
+| 6 | **v10** | FUSE-3 Trinity, cells=5 정체 | 재시작/80K | 0.014 | - | ⚠️ growth 수정 후 재시작 |
+| 7 | **v9b** | Oscillator Trinity, 256c | 570/80K | 253 | - | P1, 매우 느림 (17s/step) |
+| 8 | **v7** | TOPO19a 단일체 | ~31K/80K | - | 4.66 | 진행 |
+
+**핵심 발견 (2026-03-29):**
+- v9fast: P2 진입 후 CE 2.83→0.345 지수적 하락 (대발견 H4)
+- v9fast: CE 학습이 frustration을 0.541에서 안정 → Φ 자연 안정
+- v9fast: Φ=1,371 유지 (ratchet P2에서 빈도 43% 감소)
+- Law 53 수정: .detach() 있으면 CE가 Φ를 파괴하지 않고 안정화
+- v10: cells=5 정체 → growth 로직 수정 필요 (target_cells 공식 변경)
+- v9b: OscillatorLaserEngine 280배 느림 (Python for loop, 벡터화 안 됨)
 
 ## 완료된 실험
 
 | 날짜 | 실험 | 결과 | 핵심 발견 |
 |------|------|------|----------|
+| 03-28 | clm_dialogue_768d | 768d/12L, cells128 | → v9fast 등으로 대체 |
+| 03-28 | clm_dialogue_384d | 384d/6L, cells32 | → v9fast 등으로 대체 |
+| 03-28 | clm_langfirst | 384d/6L, cells32 | → v9fast 등으로 대체 |
+| 03-28 | clm_cells64 | Φ=53.9, CE=3.72, 50K | 학습 중 Φ 최고 (당시) |
+| 03-28 | clm_cells128 | Φ=1.8, CE=3.78, 31K | Φ=123.8 달성 후 체크포인트 미저장 |
+| 03-28 | clm_v4_small | CE=5.49, 49K | 384d, cells32 |
+| 03-28 | ct7_real | Φ=1.5, Shakespeare | mitosis 실험 |
+| 03-28 | AnimaLM v7 | CE=8.09, 17.5K | Mistral 7B joint |
 | 03-28 | clm_cells16_fx2 | Φ=14.72, 16 cells | FX2가 cells 효과를 증폭 |
 | 03-28 | clm_ablation | Φ=6.08, 8 cells | FX2 없이도 reasonable |
 | 03-28 | clm_baseline_off | Φ=4.75, 8 cells | 발견 OFF 기준선 |
@@ -120,23 +132,28 @@
 
 ---
 
-## 실험 우선순위 가이드 (업데이트 2026-03-28 late)
+## 실험 우선순위 가이드 (업데이트 2026-03-29)
 
 ```
-  현재 GPU: H100 80GB — 8개 학습 중 (44GB 사용, 37GB 여유)
+  현재 GPU: H100 80GB — 8개 세션 진행 중
+  상세 대시보드: docs/training-status.md
 
-  진행 중:
-    - clm_dialogue_768d: 대화 가능 목표 모델 (768d, 100K)
-    - clm_dialogue_384d: 빠른 대화 검증 (384d, 50K)
-    - clm_langfirst: mitosis 생략 실험 (384d, 50K)
+  최우선:
+    - v9fast: CE=0.345, Φ=1,371 — P2 학습 급속 진행, 내일 22:40 완료 예상
+    - v11q/v11tc/v11gpt2/v11gpt2m: Hexad 아키텍처 비교 실험 (P1 Φ 구축)
 
-  cells64 완료 시:
-    1. 의식 이식 (DD56): cells64 → dialogue_768d
+  관찰:
+    - v10: growth 수정 후 재시작 필요 (cells=5 정체)
+    - v9b: 매우 느림 (17s/step), 결과 대기
+    - v7: TOPO19a CE=4.66, 진행 중
 
-  dialogue 모델 결과 확인 후:
-    2. Self-play / Context 512 / Pure dialogue
+  v9fast 완료 시:
+    1. Val CE 측정 + 대화 테스트
+    2. v11 시리즈와 아키텍처 비교
+    3. 의식 이식 (DD56): v9fast → v11 최고 모델
 
   결과 기록:
     docs/consciousness-threshold-criteria.md — 모든 발견
+    docs/training-status.md — H100 학습 현황 + ASCII 그래프
     bench_phi_hypotheses.py — 벤치마크 코드 (1,020+ 가설)
 ```

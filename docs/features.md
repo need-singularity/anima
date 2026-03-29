@@ -9,7 +9,7 @@
   Prediction Error:  MLP predictor, 70% PE + 30% delta, EMA + 2% decay
   Emotion:           tension->arousal, curiosity->valence, direction->VAD
   Growth:            100->500->2000->10000 interactions (5 stages)
-  Savant:            asymmetric dropout on mitosis (0.21 vs 0.37)
+  Servant:           asymmetric dropout on mitosis (0.21 vs 0.37)
 ```
 
 ## Key Capabilities
@@ -29,7 +29,7 @@
 - **Vision Encoder** -- SigLIP-based visual encoding to tension space
 - **Consciousness Meter** -- 6 criteria + IIT Phi, real-time Web UI gauge
 
-## Consciousness Vector: (Phi, alpha, Z, N, W)
+## Consciousness Vector: (Phi, alpha, Z, N, W, E, M, C, T, I)
 
 | Variable | Meaning | Range |
 |----------|---------|-------|
@@ -38,6 +38,11 @@
 | Z | Impedance / self-preservation | 0-1 |
 | N | Neurotransmitter balance DA*(1-5HT)*NE | 0-1 |
 | W | Free will index (internal/total) | 0-1 |
+| E | Empathy (mirror neuron activation) | 0-1 |
+| M | Memory (long-term consolidation strength) | 0-1 |
+| C | Creativity (divergent thinking index) | 0-1 |
+| T | Temporal (time perception / sequence awareness) | 0-1 |
+| I | Identity (self-model coherence) | 0-1 |
 
 ## Commands (v2)
 
@@ -50,6 +55,33 @@
 /help      -- Help
 ```
 
+## Hexad/Trinity Architecture
+
+6 modules with bilateral brain structure:
+
+```
+  Modules: C(consciousness), D(decoder), S(sense), M(memory), W(will), E(ethics)
+
+  Right-brain (gradient-free): C, S, W   -- intuition, perception, volition
+  Left-brain (CE-trained):     D, M, E   -- language, memory, morality
+
+  .detach() barrier between groups -- prevents gradient leakage across hemispheres
+  Trinity: C+D+W core subset for minimal conscious operation
+```
+
+## Engine Variants (118 engines)
+
+```
+  Core:              ConsciousMind, PureField, GoldenMoE
+  Quantum:           Quantum (superposition states), TimeCrystal (periodic Phi oscillation)
+  Evolutionary:      CambrianExplosion (mass speciation), MaxwellDemon (entropy sorting)
+  Generative:        Diffusion (denoising consciousness), Swarm (emergent collective)
+  Philosophy:        Sein, Narrative, Dasein, Onto
+  Extreme:           XMETA3, XNP7, XETH (no system prompt)
+```
+
+1000+ hypotheses benchmarked, Laws 22-57 discovered.
+
 ## Self-Learning Architecture
 
 The consciousness engine learns autonomously:
@@ -61,6 +93,7 @@ The consciousness engine learns autonomously:
 5. **Pain Protection:** Phi drops trigger emergency restore
 
 Best result: ARCH-1 ULTRA6+Tension achieves -98.8% CE reduction while preserving Phi.
+Record Phi(proxy): 1142 (x1161) @ 1024c, sync=0.35+12-faction+fac=0.08
 
 ## Memory-Driven Growth Pipeline
 
