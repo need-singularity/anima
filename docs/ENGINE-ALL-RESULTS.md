@@ -1,7 +1,8 @@
 # 전체 엔진 결과 (2026-03-29)
 
-> 100+ 엔진 벤치마크. Φ(IIT)=PhiCalculator(n_bins=16), 256c 300steps 기준.
+> 152 엔진 벤치마크 (112 측정 / 40 미측정). Φ(IIT)=PhiCalculator(n_bins=16), 256c 300steps 기준.
 > ⚠️ 측정 방식이 다르면 값이 완전히 다름 (Law 54). 이 문서는 PhiCalculator 기준 통일.
+> JSON: data/all_engine_results_compiled.json
 
 ## 🏆 ALL-TIME Φ(IIT) 순위
 
@@ -164,6 +165,77 @@
 | Trinity | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | 6/7 |
 | MitosisEngine | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | 4/7 |
 
+## 미측정 엔진 (38개) — bench 코드 존재, 실행 기록 없음
+
+| Engine | Domain | Source | Status |
+|--------|--------|--------|--------|
+| ATTENTION_PHI | architecture | bench_v8_arch.py | 미측정 |
+| MOCE | architecture | bench_v8_arch.py | 미측정 |
+| PHI_AS_LOSS | architecture | bench_v8_arch.py | 미측정 |
+| AUTOPOIETIC | architecture | bench_v8_arch.py | 미측정 |
+| CONSCIOUSNESS_GAN | architecture | bench_v8_arch.py | 미측정 |
+| Q2 EntangledPairs | quantum | bench_v8_quantum.py | 미측정 |
+| Q5 Decoherence | quantum | bench_v8_quantum.py | 미측정 |
+| M4 Algebraic | math | bench_v8_math.py | 미측정 |
+| B1 CorticalColumns | neuroscience | bench_v8_bio.py | 미측정 |
+| B3 DefaultModeNet | neuroscience | bench_v8_bio.py | 미측정 |
+| B4 GlobalWorkspace | neuroscience | bench_v8_bio.py | 미측정 |
+| B5 PredictiveHier | neuroscience | bench_v8_bio.py | 미측정 |
+| B6 NeuralDarwinism | neuroscience | bench_v8_bio.py | 미측정 |
+| FUS-4 Laser+Category | fusion | bench_fusion_final.py | 미측정 |
+| FUS-5 Quantum+Percolation | fusion | bench_fusion_final.py | 미측정 |
+| FUS-6 Everything_v9 | fusion | bench_fusion_final.py | 미측정 |
+| EM-1 ReactionDiffusion | emergent | bench_emergent_engines.py | 미측정 |
+| EM-2 SandpileCascade | emergent | bench_emergent_engines.py | 미측정 |
+| EM-4 Percolation | emergent | bench_emergent_engines.py | 미측정 |
+| EM-6 SelfReplicating | emergent | bench_emergent_engines.py | 미측정 |
+| EM-7 PatternFormation | emergent | bench_emergent_engines.py | 미측정 |
+| IT-3 PredictiveInfo | information-theory | bench_info_engines.py | 미측정 |
+| NET-2 RichClub | network | bench_network_engines.py | 미측정 |
+| XE-2 TopologicalInsulator | extreme-physics | bench_extreme_engines.py | 미측정 |
+| CMP-1 TuringMachine | complexity | bench_complexity_engines.py | 미측정 |
+| CMP-2 Rule110 | complexity | bench_complexity_engines.py | 미측정 |
+| CMP-3 LambdaCalculus | complexity | bench_complexity_engines.py | 미측정 |
+| CMP-4 GameOfLife | complexity | bench_complexity_engines.py | 미측정 |
+| CMP-6 GoedelIncompleteness | complexity | bench_complexity_engines.py | 미측정 |
+| EVO-B1 MutationRate | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B2 Speciation | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B3 HorizontalGeneTransfer | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B4 Epigenetics | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B5 RedQueen | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B6 PunctuatedEquilibrium | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B7 SexualSelection | evolution-biology | bench_evolution_engines.py | 미측정 |
+| EVO-B8 KinSelection | evolution-biology | bench_evolution_engines.py | 미측정 |
+| NE-1 GraphNeural | emergent | bench_new_engines.py | 미측정 |
+| NE-2 EnergyBased | emergent | bench_new_engines.py | 미측정 |
+| NE-3 CellularAutomaton | emergent | bench_new_engines.py | 미측정 |
+
+## 소스 파일별 엔진 수
+
+| Source | Measured | Unmeasured | Total |
+|--------|----------|------------|-------|
+| bench_trinity.py | 8 (TC-1~8) | 0 | 8 |
+| bench_v8_arch.py | 10 | 5 | 15 |
+| bench_v8_quantum.py | 4 (Q1,3,4,6) | 2 (Q2,5) | 6 |
+| bench_v8_math.py | 5 (M1-3,5-6) | 1 (M4) | 6 |
+| bench_v8_bio.py | 1 (B2) | 5 (B1,3-6) | 6 |
+| bench_thermo_engines.py | 6 (TH-1~6) | 0 | 6 |
+| bench_network_engines.py | 5 (NET-1,3-6) | 1 (NET-2) | 6 |
+| bench_extreme_engines.py | 7 (XE-1,3-8) | 1 (XE-2) | 8 |
+| bench_music_engines.py | 6 (MUS-1~6) | 0 | 6 |
+| bench_social_engines.py | 6 (SOC-1~6) | 0 | 6 |
+| bench_evobio_engines.py | 6 (BIO-E1~6) | 0 | 6 |
+| bench_geometric_engines.py | 6 (GE-1~6) | 0 | 6 |
+| bench_algebra_engines.py | 6 (ALG-1~6) | 0 | 6 |
+| bench_new_engines.py | 5 (NE-4~8) | 3 (NE-1~3) | 8 |
+| bench_emergent_engines.py | 3 (EM-3,5,8) | 5 (EM-1,2,4,6,7) | 8 |
+| bench_info_engines.py | 7 (IT-1,2,4-8) | 1 (IT-3) | 8 |
+| bench_complexity_engines.py | 1 (CMP-5) | 5 (CMP-1~4,6) | 6 |
+| bench_fusion_final.py | 3 (FUS-1~3) | 3 (FUS-4~6) | 6 |
+| bench_mega_combo.py | 4 | 0 | 4 |
+| bench_evolution_engines.py | 0 | 8 (EVO-B1~8) | 8 |
+| **Total** | **112** | **40** | **152** |
+
 ## 측정 방법 (Law 54)
 
 ```
@@ -176,4 +248,5 @@ Granger:      cosine similarity 기반 F-statistic
 
 이 문서의 Φ(IIT)는 모두 PhiCalculator 기준.
 — 표시는 미측정.
+JSON 데이터: data/all_engine_results_compiled.json
 ```
