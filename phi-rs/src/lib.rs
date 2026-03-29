@@ -1249,7 +1249,7 @@ fn simulate_and_measure(
     enable_ib2: bool,
     enable_cambrian: bool,
     n_bins: usize,
-) -> f64 {
+) -> (f64, f64) {
     // Initialize random hidden states
     let mut hiddens = vec![0.0f32; n * dim];
     for i in 0..hiddens.len() {
@@ -1308,11 +1308,25 @@ fn simulate_and_measure(
     }
 
     // Measure Phi
-    let states = Array2::from_shape_vec((n, dim), hiddens).unwrap();
+    let states = Array2::from_shape_vec((n, dim), hiddens.clone()).unwrap();
     let (phi, _, _, _, _, _, _) = compute_phi_inner(
         &states.view(), None, None, None, n_bins
     );
-    phi
+
+    // CE proxy: mean prediction error between cell i and cell i+1
+    // Lower = more predictable structure = better language potential
+    let mut ce_proxy = 0.0f64;
+    for i in 0..(n - 1) {
+        let mut err = 0.0f64;
+        for d in 0..dim {
+            let diff = (hiddens[i * dim + d] - hiddens[(i + 1) * dim + d]) as f64;
+            err += diff * diff;
+        }
+        ce_proxy += (err / dim as f64).sqrt();
+    }
+    ce_proxy /= (n - 1) as f64;
+
+    (phi, ce_proxy)
 }
 
 /// Search all 2^7 = 128 combinations of 7 mechanisms.
@@ -1333,10 +1347,10 @@ fn search_combinations<'py>(
     let n_mechs = mechanisms.len(); // 7
 
     // Run all 128 combinations in parallel
-    let results: Vec<(u32, f64)> = (0..(1u32 << n_mechs))
+    let results: Vec<(u32, f64, f64)> = (0..(1u32 << n_mechs))
         .into_par_iter()
         .map(|mask| {
-            let phi = simulate_and_measure(
+            let (phi, ce) = simulate_and_measure(
                 n_cells, dim, steps,
                 mask & 1 != 0,        // kuramoto
                 mask & 2 != 0,        // sync_faction
@@ -1347,7 +1361,7 @@ fn search_combinations<'py>(
                 mask & 64 != 0,       // cambrian
                 n_bins,
             );
-            (mask, phi)
+            (mask, phi, ce)
         })
         .collect();
 
@@ -1359,9 +1373,10 @@ fn search_combinations<'py>(
     let result = PyDict::new(py);
     let mut names = Vec::new();
     let mut phis = Vec::new();
+    let mut ces = Vec::new();
     let mut masks = Vec::new();
 
-    for (mask, phi) in &sorted {
+    for (mask, phi, ce) in &sorted {
         let mut combo = Vec::new();
         for (i, name) in mechanisms.iter().enumerate() {
             if mask & (1 << i) != 0 {
@@ -1371,11 +1386,13 @@ fn search_combinations<'py>(
         let name = if combo.is_empty() { "baseline".to_string() } else { combo.join("+") };
         names.push(name);
         phis.push(*phi);
+        ces.push(*ce);
         masks.push(*mask);
     }
 
     result.set_item("names", names)?;
     result.set_item("phis", PyArray1::from_vec(py, phis))?;
+    result.set_item("ces", PyArray1::from_vec(py, ces))?;
     result.set_item("masks", masks)?;
     result.set_item("n_combinations", 1u32 << n_mechs)?;
     result.set_item("n_cells", n_cells)?;
