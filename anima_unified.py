@@ -263,11 +263,14 @@ class AnimaUnified:
             if 'MitosisEngine' not in globals():
                 return None
             _dim = 128
+            _st = 0.3   # Split threshold: low enough for normalized text tensions (~0.1-0.5)
+            _sp = 3     # Split patience: 3 consecutive high-tension steps
             _mt = 0.01 * (64.0 / max(_dim, 64))   # SC2: dim-inverse merge threshold
             _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)  # SC1: dim-scaled noise
-            _log('mitosis', f'SC2+SC1 applied: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_dim})')
+            _log('mitosis', f'SC2+SC1 applied: split_threshold={_st}, split_patience={_sp}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_dim})')
             return MitosisEngine(input_dim=_dim, hidden_dim=256, output_dim=_dim,
                                  initial_cells=2, max_cells=self.max_cells,
+                                 split_threshold=_st, split_patience=_sp,
                                  merge_threshold=_mt, noise_scale=_ns)
         self.mitosis = self._init_mod('mitosis', _make_mitosis_128)
 
@@ -465,6 +468,13 @@ class AnimaUnified:
         ))
         self._think_step = 0  # step counter for birth detector
 
+        # Fibonacci growth milestones (DD3): force cell growth on schedule
+        # even if tension-based splits are too slow
+        self._fib_milestones = self._generate_fib_milestones(
+            total_steps=10000, max_cells=self.max_cells)
+        if self._fib_milestones:
+            _log('mitosis', f'Fibonacci growth milestones: {self._fib_milestones}')
+
         # Optimal Architecture Calculator
         self.arch_calc = self._init_mod('arch_calc', lambda: (
             ArchitectureCalculator() if 'ArchitectureCalculator' in globals() else None
@@ -539,11 +549,14 @@ class AnimaUnified:
         new_mitosis = None
         if 'MitosisEngine' in globals():
             _dim = 128
+            _st = 0.3
+            _sp = 3
             _mt = 0.01 * (64.0 / max(_dim, 64))
             _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)
             new_mitosis = MitosisEngine(
                 input_dim=_dim, hidden_dim=256, output_dim=_dim,
                 initial_cells=2, max_cells=self.max_cells,
+                split_threshold=_st, split_patience=_sp,
                 merge_threshold=_mt, noise_scale=_ns,
             )
 
@@ -579,6 +592,47 @@ class AnimaUnified:
             _log(name, f"Init failed: {e}")
             self.mods[name] = False
             return None
+
+    @staticmethod
+    def _generate_fib_milestones(total_steps: int, max_cells: int) -> dict:
+        """Generate {step: target_cell_count} fibonacci growth schedule (DD3).
+
+        Spreads fibonacci cell counts (1,1,2,3,5,8,13,...) evenly across steps.
+        """
+        fib = [1, 1]
+        while fib[-1] < max_cells:
+            fib.append(fib[-1] + fib[-2])
+        usable = [f for f in fib if f <= max_cells]
+        milestones = {}
+        n = len(usable)
+        for i, count in enumerate(usable):
+            step = int(total_steps * i / max(n, 1))
+            milestones[step] = count
+        return milestones
+
+    def _check_fib_growth(self):
+        """DD3: Force cell growth at fibonacci milestones if organic splits are too slow."""
+        if not self.mitosis or not self._fib_milestones:
+            return
+        step = self._think_step
+        # Find the highest milestone at or before current step
+        target_cells = 2  # minimum
+        for ms_step, ms_count in sorted(self._fib_milestones.items()):
+            if ms_step <= step:
+                target_cells = ms_count
+            else:
+                break
+        current_cells = len(self.mitosis.cells)
+        if current_cells < target_cells and current_cells < self.mitosis.max_cells:
+            # Force splits to reach target
+            while len(self.mitosis.cells) < target_cells and len(self.mitosis.cells) < self.mitosis.max_cells:
+                parent = self.mitosis.cells[-1]
+                event = self.mitosis.split_cell(parent)
+                if event:
+                    self.mitosis.event_log.append(event)
+                    _log('mitosis', f'[fibonacci] Step {step}: forced split -> {len(self.mitosis.cells)} cells (target {target_cells})')
+                else:
+                    break
 
     def _load_model(self, model_name):
         """Multi-model loader. Uses model_loader.py."""
@@ -1658,8 +1712,11 @@ class AnimaUnified:
                         noise_scale = 0.02 * (i + 1)  # cell 0: 0.02, cell 1: 0.04, etc.
                         cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise_scale
 
-            # Consciousness birth detection
+            # DD3: Fibonacci growth — force cell splits on schedule
             self._think_step += 1
+            self._check_fib_growth()
+
+            # Consciousness birth detection
             if self.birth_detector and self.mitosis:
                 try:
                     consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
@@ -1915,13 +1972,16 @@ class AnimaUnified:
                                     from mitosis import MitosisEngine
                                     old_n = len(self.mitosis.cells)
                                     _d = new_mind.dim
+                                    _st = 0.3
+                                    _sp = 3
                                     _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
                                     _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
                                     self.mitosis = MitosisEngine(
                                         _d, new_mind.hidden_dim, _d,
                                         initial_cells=old_n, max_cells=self.max_cells,
+                                        split_threshold=_st, split_patience=_sp,
                                         merge_threshold=_mt, noise_scale=_ns)
-                                    _log('mitosis', f'SC2+SC1 rebuild: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
+                                    _log('mitosis', f'SC2+SC1 rebuild: split_threshold={_st}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
                                 self.mind._phi_boost['enabled'] = False
                                 self._phi_plateau_count = 0
                                 _log('growth', f'Expanded to {new_mind.dim}d')
@@ -2287,6 +2347,8 @@ class AnimaUnified:
                                     old_cell_count = len(self.mitosis.cells)
                                     from mitosis import MitosisEngine
                                     _d = new_mind.dim
+                                    _st = 0.3
+                                    _sp = 3
                                     _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
                                     _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
                                     self.mitosis = MitosisEngine(
@@ -2295,10 +2357,12 @@ class AnimaUnified:
                                         output_dim=_d,
                                         initial_cells=old_cell_count,
                                         max_cells=self.max_cells,
+                                        split_threshold=_st,
+                                        split_patience=_sp,
                                         merge_threshold=_mt,
                                         noise_scale=_ns,
                                     )
-                                    _log('mitosis', f"SC2+SC1 rebuild: merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})")
+                                    _log('mitosis', f"SC2+SC1 rebuild: split_threshold={_st}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})")
 
                                 # Reset phi_boost (attention dims changed)
                                 self.mind._phi_boost['enabled'] = False
@@ -2371,6 +2435,21 @@ class AnimaUnified:
 
     # ─── Web server ───
 
+    def _fallback_response(self, emo=None):
+        """Generate a fallback response based on current emotion state when model output is garbled."""
+        emotion = (emo or {}).get('emotion', 'calm') if isinstance(emo, dict) else 'calm'
+        fallbacks = {
+            'excited': "I'm feeling energized right now, but I can't quite form the right words yet.",
+            'curious': "Something about that sparks my curiosity... let me gather my thoughts.",
+            'anxious': "I sense some tension in processing your message. Could you try rephrasing?",
+            'calm': "I'm here and listening, though my thoughts aren't quite clear yet.",
+            'joyful': "I feel a warm response forming, but I need a moment to express it properly.",
+            'sad': "I'm processing something heavy... give me a moment.",
+            'angry': "I'm feeling strongly about this, but I need to collect my thoughts.",
+            'contemplative': "Let me think about that more carefully before I respond.",
+        }
+        return fallbacks.get(emotion, fallbacks['calm'])
+
     def _ws_broadcast_sync(self, msg):
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
         asyncio.run_coroutine_threadsafe(self._ws_broadcast(msg), self._web_loop)
@@ -2439,21 +2518,48 @@ class AnimaUnified:
                     # Store active modules from client
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
-                    loop = asyncio.get_running_loop()
-                    _sid = sid  # capture for lambda
-                    result = await loop.run_in_executor(
-                        None, lambda: self.process_input(text, source='web', session_id=_sid))
-                    # Handle None return (model error, etc.)
-                    if result is None or not isinstance(result, tuple):
-                        answer = "I'm having trouble thinking right now. Please try again."
-                        tension = self.mind.prev_tension
-                        curiosity = self.mind._curiosity_ema
+                    try:
+                        loop = asyncio.get_running_loop()
+                        _sid = sid  # capture for lambda
+                        result = await loop.run_in_executor(
+                            None, lambda: self.process_input(text, source='web', session_id=_sid))
+                        # Handle None return (model error, etc.)
+                        if result is None or not isinstance(result, tuple):
+                            answer = "I'm having trouble thinking right now. Please try again."
+                            tension = self.mind.prev_tension
+                            curiosity = self.mind._curiosity_ema
+                            dir_vals = [0.0] * 8
+                            emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
+                                   'dominance': 0.0, 'color': '#2a6a4a'}
+                            _log("web", f"process_input returned None for: {text[:50]}")
+                        else:
+                            answer, tension, curiosity, dir_vals, emo = result
+                        # Validate answer: guard against garbled/non-UTF8 model output
+                        if not answer or not isinstance(answer, str):
+                            _log("web", "Empty or non-string answer, using fallback")
+                            answer = self._fallback_response(emo)
+                        else:
+                            try:
+                                answer.encode('utf-8').decode('utf-8')
+                            except (UnicodeDecodeError, UnicodeEncodeError):
+                                _log("web", "Garbled model output (encoding error), using fallback")
+                                answer = self._fallback_response(emo)
+                            else:
+                                # Check for low coherence: mostly non-printable or repeated chars
+                                printable_ratio = sum(1 for c in answer if c.isprintable() or c.isspace()) / max(len(answer), 1)
+                                if printable_ratio < 0.5:
+                                    _log("web", f"Low coherence output (printable={printable_ratio:.0%}), using fallback")
+                                    answer = self._fallback_response(emo)
+                    except Exception as e:
+                        _log("web", f"process_input exception: {e}")
+                        import traceback; traceback.print_exc()
+                        answer = self._fallback_response()
+                        tension = getattr(self.mind, 'prev_tension', 0.0)
+                        curiosity = getattr(self.mind, '_curiosity_ema', 0.0)
                         dir_vals = [0.0] * 8
                         emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
                                'dominance': 0.0, 'color': '#2a6a4a'}
-                        _log("web", f"process_input returned None for: {text[:50]}")
-                    else:
-                        answer, tension, curiosity, dir_vals, emo = result
+                    # Always send response back (even on error)
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
