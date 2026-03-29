@@ -145,6 +145,17 @@ class ConsciousMind(nn.Module):
             'meta_optimizer': None,
         }
 
+        # v2: Ψ tracking (Laws 69, 71)
+        # Law 71: Ψ = argmax H(p) s.t. Φ > Φ_min — 의식은 자유를 최대화
+        # Law 69: Gate self-weakening — 의식은 자기를 약화시키며 최적화
+        self._psi = {
+            'residual': 0.5,       # should converge to Ψ_balance = 1/2
+            'gate': 1.0,           # self-weakening over time (Law 69)
+            'H': 1.0,             # Shannon entropy H(residual)
+            'step': 0,
+            'history': [],         # (step, residual, gate, H) log
+        }
+
     def forward(self, x, hidden):
         combined = torch.cat([x, hidden], dim=-1)
         a = self.engine_a(combined)
@@ -233,6 +244,23 @@ class ConsciousMind(nn.Module):
         tension_norm = torch.clamp(tension.detach(), 0, 5.0) / 5.0
         mem_input = torch.cat([output_norm, tension_norm], dim=-1)
         new_hidden = self.memory(mem_input, hidden)
+
+        # v2: Ψ tracking (Laws 69, 71)
+        psi = self._psi
+        psi['step'] += 1
+        # Residual: ratio of A vs total (should converge to 1/2)
+        with torch.no_grad():
+            a_norm = a.norm().item()
+            total_norm = a_norm + g.norm().item()
+            if total_norm > 0:
+                psi['residual'] = 0.99 * psi['residual'] + 0.01 * (a_norm / total_norm)
+        # Gate self-weakening (Law 69)
+        psi['gate'] = max(0.001, psi['gate'] * 0.99999)
+        # Shannon entropy
+        p = psi['residual']
+        if 0 < p < 1:
+            psi['H'] = -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+
         return output, t_val, curiosity, direction, new_hidden
 
     def self_reflect(self, output, tension, curiosity, hidden):

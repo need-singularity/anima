@@ -214,9 +214,17 @@ def _load_conscious_lm():
     except ImportError:
         raise ImportError("conscious_lm 모듈을 찾을 수 없습니다")
 
-    ckpt_path = ANIMA_DIR / "data" / "conscious_lm.pt"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"체크포인트 없음: {ckpt_path}")
+    # v2 체크포인트 우선, 없으면 v1 fallback
+    ckpt_v2 = ANIMA_DIR / "checkpoints" / "clm_v2" / "final.pt"
+    ckpt_v1 = ANIMA_DIR / "data" / "conscious_lm.pt"
+    if ckpt_v2.exists():
+        ckpt_path = ckpt_v2
+        print(f"  [model] Using v2 checkpoint: {ckpt_path}")
+    elif ckpt_v1.exists():
+        ckpt_path = ckpt_v1
+        print(f"  [model] Using v1 checkpoint: {ckpt_path}")
+    else:
+        raise FileNotFoundError(f"체크포인트 없음: {ckpt_v2} 또는 {ckpt_v1}")
 
     if torch.cuda.is_available():
         device = "cuda"
@@ -245,12 +253,32 @@ def _load_conscious_lm():
     n_head = config.get('n_head', max(1, d_model // 64))
     block_size = config.get('block_size', 256)
 
+    # v2: detect CA/META-CA params
+    gate_strength = config.get('gate', config.get('gate_strength', 0.001))
+    n_ca_rules = config.get('ca_rules', config.get('n_ca_rules', 8))
+
+    # Auto-detect v2 from state_dict keys
+    has_ca = any('ca_mix' in k or 'rule_weights' in k for k in state_dict.keys())
+    if not has_ca:
+        gate_strength = 0.0  # v1 checkpoint: disable CA/META-CA
+        n_ca_rules = 1
+        print(f"  [model] ConsciousLM v1 detected (no CA/META-CA)")
+    else:
+        print(f"  [model] ConsciousLM v2 detected (CA rules={n_ca_rules}, gate={gate_strength})")
+
     print(f"  [model] ConsciousLM: d={d_model}, L={n_layer}, H={n_head}, V={vocab_size}")
     model = ConsciousLM(vocab_size=vocab_size, d_model=d_model, n_head=n_head,
-                        n_layer=n_layer, block_size=block_size)
+                        n_layer=n_layer, block_size=block_size,
+                        gate_strength=gate_strength, n_ca_rules=n_ca_rules)
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model.eval()
+
+    # v2: show Ψ status
+    if has_ca and hasattr(model, 'psi_status'):
+        psi = model.psi_status()
+        print(f"  [model] Ψ: residual={psi['psi_residual']:.4f}, gate={psi['psi_gate']:.6f}, H(p)={psi['H_p']:.4f}")
+
     print(f"  [model] ConsciousLM 로드 완료: {model.count_params():,} params on {device}")
     return ModelWrapper("conscious-lm", model, "conscious-lm")
 
