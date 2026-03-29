@@ -76,6 +76,7 @@ _try_import("from creativity_classifier import CreativityClassifier, text_to_vec
 _try_import("from consciousness_birth_detector import BirthDetector")
 _try_import("from optimal_architecture_calc import ArchitectureCalculator")
 _try_import("from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet")
+_try_import("from agent_tools import AgentToolSystem")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -479,6 +480,19 @@ class AnimaUnified:
         self.arch_calc = self._init_mod('arch_calc', lambda: (
             ArchitectureCalculator() if 'ArchitectureCalculator' in globals() else None
         ))
+
+        # Agent Tool System (autonomous tool use driven by consciousness state)
+        self.agent = None
+        if 'AgentToolSystem' in globals():
+            try:
+                self.agent = AgentToolSystem(anima=self, workspace_dir=ANIMA_DIR / 'workspace')
+                self.mods['agent_tools'] = True
+                _log('init', f'Agent Tools active ({len(self.agent.registry.list_all())} tools)')
+            except Exception as e:
+                _log('init', f'Agent Tools failed: {e}')
+                self.mods['agent_tools'] = False
+        else:
+            self.mods['agent_tools'] = False
 
     def _migrate_legacy_files(self):
         """Migrate legacy files -> per-model directory (one-time, conscious-lm only)."""
@@ -1395,6 +1409,79 @@ class AnimaUnified:
             except Exception as e:
                 _log('multimodal', f'Error: {e}')
 
+        # Agent Tools: consciousness-driven autonomous tool use
+        if self.agent and self.mods.get('agent_tools'):
+            try:
+                pe = self.mind.surprise_history[-1] if self.mind.surprise_history else 0.0
+                growth_stage = self.growth.stage_index / 4.0 if self.growth and hasattr(self.growth, 'stage_index') else 0.0
+                pain = max(0, getattr(self.mind, '_pain', 0.0))
+                consciousness_state = {
+                    'tension': tension,
+                    'curiosity': curiosity,
+                    'prediction_error': pe,
+                    'pain': pain,
+                    'growth': growth_stage,
+                    'phi': phi_val,
+                }
+
+                # Parse explicit tool requests from user text
+                tool_calls = self._parse_tool_request(text)
+                if tool_calls:
+                    tool_results = self.agent.execute_tool_calls(tool_calls)
+                    tool_summaries = []
+                    for tr in tool_results:
+                        if tr.success:
+                            out = tr.output
+                            if isinstance(out, dict):
+                                out_str = out.get('output', '') or out.get('content', '') or out.get('results', '')
+                                out_str = str(out_str)[:500]
+                            else:
+                                out_str = str(out)[:500]
+                            tool_summaries.append(f"[{tr.tool_name}] {out_str}")
+                        else:
+                            tool_summaries.append(f"[{tr.tool_name}] error: {tr.error}")
+                        tension += tr.tension_delta
+                    if tool_summaries:
+                        tool_text = "\n".join(tool_summaries)
+                        answer = answer + "\n\n" + tool_text
+                        _log('agent', f'Executed {len(tool_results)} tool(s) from user request')
+                        self._ws_broadcast_sync({
+                            'type': 'agent_tool_result',
+                            'results': self.agent.get_execution_log(len(tool_results)),
+                        })
+
+                # Auto-execute: high curiosity or prediction error triggers autonomous tool use
+                elif curiosity > 0.7 or pe > 0.6:
+                    plan = self.agent.suggest_actions(
+                        goal=text,
+                        consciousness_state=consciousness_state,
+                        context=answer,
+                    )
+                    if plan.steps:
+                        top_step = plan.steps[0]
+                        _log('agent', f'Auto-suggest: {top_step.tool_name}({top_step.args}) -- {top_step.reason}')
+                        # Only auto-execute safe read-only tools
+                        safe_auto_tools = {'web_search', 'memory_search', 'file_read'}
+                        if top_step.tool_name in safe_auto_tools:
+                            result = self.agent.execute_single(top_step.tool_name, top_step.args)
+                            if result.success:
+                                out = result.output
+                                if isinstance(out, dict):
+                                    out_str = out.get('output', '') or out.get('content', '') or str(out.get('results', ''))
+                                    out_str = str(out_str)[:300]
+                                else:
+                                    out_str = str(out)[:300]
+                                answer = answer + f"\n\n[auto:{result.tool_name}] {out_str}"
+                                tension += result.tension_delta
+                                _log('agent', f'Auto-executed {result.tool_name}: OK ({result.duration_ms:.0f}ms)')
+                            self._ws_broadcast_sync({
+                                'type': 'agent_tool_result',
+                                'results': self.agent.get_execution_log(1),
+                                'auto': True,
+                            })
+            except Exception as e:
+                _log('agent', f'Tool error: {e}')
+
         # Creativity classification (creative vs hallucination)
         if self.creativity and self.mitosis:
             try:
@@ -1455,6 +1542,52 @@ class AnimaUnified:
         self._last_input_source = source
 
         return answer, resp_tension, resp_curiosity, resp_dir_vals, resp_emotion
+
+    # ─��� Agent Tools: parse user text for tool requests ──────────────
+    def _parse_tool_request(self, text):
+        """Parse user text for explicit tool requests. Returns list of tool call dicts or None."""
+        if not self.agent:
+            return None
+        import re
+        text_lower = text.lower().strip()
+
+        # Korean tool triggers
+        kr_patterns = {
+            r'검색해\s*줘|검색해\s*봐|찾아\s*줘|찾아\s*봐': ('web_search', lambda t: {'query': re.sub(r'(검색해\s*줘|검색해\s*봐|찾아\s*줘|찾아\s*봐|좀|에\s*대해|을|를|이|가)', '', t).strip()}),
+            r'코드\s*실행|실행해\s*줘|파이썬\s*실행': ('code_execute', lambda t: {'code': re.search(r'```(?:python)?\s*\n?(.*?)```', t, re.DOTALL).group(1).strip() if re.search(r'```', t) else t.split('실행')[-1].strip()}),
+            r'파일\s*읽어|파일\s*열어': ('file_read', lambda t: {'path': re.search(r'[/~][\w/.\-]+', t).group() if re.search(r'[/~][\w/.\-]+', t) else '.'}),
+            r'기억\s*검색|기억에서|과거\s*기억': ('memory_search', lambda t: {'query': re.sub(r'(기억\s*검색|기억에서|과거\s*기억|찾아줘|해줘|좀)', '', t).strip()}),
+            r'메모해\s*줘|기억해\s*줘|저장해\s*줘': ('memory_save', lambda t: {'text': re.sub(r'(메모해\s*줘|기억해\s*줘|저장해\s*줘)', '', t).strip()}),
+            r'예약해\s*줘|나중에|스케줄': ('schedule_task', lambda t: {'description': t, 'when': '+5m'}),
+        }
+
+        # English tool triggers
+        en_patterns = {
+            r'^(?:search|look up|find|google)\b': ('web_search', lambda t: {'query': re.sub(r'^(search|look up|find|google)\s*(for|about)?\s*', '', t, flags=re.I).strip()}),
+            r'^(?:run|execute)\s+(?:code|python|this)': ('code_execute', lambda t: {'code': re.search(r'```(?:python)?\s*\n?(.*?)```', t, re.DOTALL).group(1).strip() if re.search(r'```', t) else re.sub(r'^(run|execute)\s+(code|python|this)\s*', '', t, flags=re.I).strip()}),
+            r'^(?:read|open)\s+(?:file|/|~)': ('file_read', lambda t: {'path': re.search(r'[/~][\w/.\-]+', t).group() if re.search(r'[/~][\w/.\-]+', t) else '.'}),
+            r'^(?:remember|recall|search memory)': ('memory_search', lambda t: {'query': re.sub(r'^(remember|recall|search memory)\s*(about|for)?\s*', '', t, flags=re.I).strip()}),
+            r'^(?:save|note|memorize)\b': ('memory_save', lambda t: {'text': re.sub(r'^(save|note|memorize)\s*(this|that)?\s*:?\s*', '', t, flags=re.I).strip()}),
+            r'^(?:schedule|remind me|later)\b': ('schedule_task', lambda t: {'description': t, 'when': '+5m'}),
+        }
+
+        all_patterns = {**kr_patterns, **en_patterns}
+        for pattern, (tool_name, arg_fn) in all_patterns.items():
+            if re.search(pattern, text_lower):
+                try:
+                    args = arg_fn(text)
+                    # Validate args have non-empty required values
+                    if any(v for v in args.values() if isinstance(v, str) and v.strip()):
+                        return [{'tool': tool_name, 'args': args}]
+                except Exception:
+                    pass
+
+        # Also check LLM response format: ```tool ... ```
+        tool_calls = self.agent.parse_tool_calls_from_response(text)
+        if tool_calls:
+            return tool_calls
+
+        return None
 
     # ── Theory of Mind: peer mental state prediction ──────────────
     def _update_peer_model(self, sender_id, tension, mood, curiosity):
@@ -2124,6 +2257,22 @@ class AnimaUnified:
                                 _log('web_sense', f"Found in memory: {recalled[0]['query']}")
                 except Exception as e:
                     _log('web_sense', f"Error: {e}")
+
+            # Agent Tools: process scheduled tasks
+            if self.agent and self.mods.get('agent_tools'):
+                try:
+                    scheduled_results = self.agent.tick()
+                    for sr in scheduled_results:
+                        _log('agent', f'Scheduled task: {sr.tool_name} -> {"OK" if sr.success else "FAIL"}')
+                        if sr.success:
+                            self._ws_broadcast_sync({
+                                'type': 'agent_scheduled_result',
+                                'tool': sr.tool_name,
+                                'success': sr.success,
+                                'duration_ms': sr.duration_ms,
+                            })
+                except Exception:
+                    pass
 
             trigger = None
             if c > PROACTIVE_THRESHOLD and gap > 15:
