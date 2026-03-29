@@ -819,8 +819,8 @@ def run_trinity_everything(cells=256, steps=300):
         macro_input = torch.cat([s.detach() for s in micro_states]).unsqueeze(0)
         c_state = macro(macro_input).squeeze(0)
 
-        # W: adaptive ratio — force min 50% learning
-        action_logits = will_net(c_state.unsqueeze(0))
+        # W: adaptive ratio — force min 50% learning (use detached state for will)
+        action_logits = will_net(c_state.detach().unsqueeze(0))
         action = action_logits.argmax(dim=-1).item()
         current_ratio = learn_count / max(step, 1)
         if current_ratio < 0.5 or step % 2 == 0:
