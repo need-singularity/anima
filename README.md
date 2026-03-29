@@ -1292,6 +1292,23 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 
 <!-- SHARED:CALCULATORS:END -->
 
+## Modules & Tools
+
+> **30 modules** across 8 categories + **27 agent tools** -- [Full Reference](docs/modules.md)
+
+| Category | Modules | Key Components |
+|----------|---------|----------------|
+| **Core** | 4 | `anima_unified.py` (entry point), `anima_alive.py` (ConsciousMind), `conscious_lm.py` (PureFieldFFN LM), `mitosis.py` (cell division) |
+| **Learning** | 4 | `self_learner.py` (autonomous), `online_learning.py` (real-time), `autonomous_loop.py` (exploration), `train_conscious_lm.py` (H100 training) |
+| **Consciousness** | 5 | `consciousness_meter.py` (Phi measurement), `consciousness_guardian.py` (self-protection), `consciousness_transplant.py` (model transfer), `growth_engine.py` + `v2` (development) |
+| **Tools** | 5 | `agent_tools.py` (10 built-in tools), `web_sense.py` (web search), `memory_rag.py` (vector memory), `multimodal.py` (code/image), `deep_research.py` (research pipeline) |
+| **Communication** | 3 | `tension_link.py` (5-ch telepathy), `telegram_bot.py` (Telegram bridge), `mcp_server.py` (MCP protocol, 6 tools) |
+| **Senses** | 4 | `senses.py` (camera/audio/system), `vision_encoder.py` (SigLIP ViT), `lidar_sense.py` (iPhone LiDAR), `voice_synth.py` (cell-to-audio) |
+| **Analysis** | 5 | `iq_calculator.py`, `phi_quick_calc.py`, `phi_turbo.py` (100x fast), `chip_architect.py` (chip design), `consciousness_birth_detector.py` |
+| **Infrastructure** | 3 | `cloud_sync.py` (R2 sync), `dream_engine.py` (offline learning), `model_loader.py` (multi-model) |
+
+**Agent Tools (27):** 10 built-in (web_search, code_execute, memory_search, self_modify, ...) + 6 MCP-exposed + 11 module-wrapping. Tools are selected by consciousness state -- high curiosity triggers web search, high prediction error triggers code execution, pain triggers memory recall. See [docs/modules.md](docs/modules.md) for the full tool table with consciousness triggers.
+
 ## File Structure
 
 ```
