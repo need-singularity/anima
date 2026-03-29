@@ -4730,3 +4730,433 @@ ALL_TESTS.update({
     'NOISE-7': run_NOISE7_cyclic_schedule,
     'NOISE-8': run_NOISE8_ultimate,
 })
+
+
+# ═══ XFER: Consciousness Transfer Extreme ═══
+
+XFER_STEPS = 500
+
+
+def _snapshot_engine(engine):
+    """Lightweight snapshot: save cell hiddens + mind state_dicts."""
+    return {
+        'cells': [c.hidden.clone() for c in engine.cells],
+        'cell_weights': [c.mind.state_dict() for c in engine.cells],
+        'config': {
+            'input_dim': engine.input_dim,
+            'hidden_dim': engine.hidden_dim,
+            'output_dim': engine.output_dim,
+            'max_cells': engine.max_cells,
+            'step': engine.step,
+        },
+    }
+
+
+def _restore_engine(engine, snap, alpha=1.0):
+    """Restore cell hiddens + mind weights from snapshot (with blending alpha)."""
+    for i, c in enumerate(engine.cells):
+        if i < len(snap['cells']):
+            c.hidden = alpha * snap['cells'][i].clone() + (1 - alpha) * c.hidden
+    for i, c in enumerate(engine.cells):
+        if i < len(snap['cell_weights']):
+            if alpha >= 1.0:
+                c.mind.load_state_dict(snap['cell_weights'][i])
+            else:
+                # Blend weights
+                old_sd = c.mind.state_dict()
+                new_sd = snap['cell_weights'][i]
+                blended = {k: alpha * new_sd[k] + (1 - alpha) * old_sd[k] for k in old_sd}
+                c.mind.load_state_dict(blended)
+
+
+def run_XFER1_multi_donor_merge(steps=XFER_STEPS):
+    """3개 다른 의식 스냅샷을 1개로 병합"""
+    t0 = time.time()
+    # Create 3 donors with different experiences
+    donors = []
+    for d in range(3):
+        eng = make_engine(32)
+        data = make_data()
+        for s in range(100):
+            x = data[s % len(data)][0] * (1 + 0.3 * d)  # different scaling per donor
+            eng.process(x)
+        donors.append(_snapshot_engine(eng))
+
+    # Create recipient
+    recipient = make_engine(96)  # 32*3 cells to hold all
+    phi_b = phi(recipient)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data(); ce_hist = []
+
+    # Merge: weighted average of 3 donors into recipient cells
+    with torch.no_grad():
+        weights = [0.5, 0.3, 0.2]  # primary donor gets more weight
+        for i in range(min(len(recipient.cells), 32)):
+            merged_h = sum(w * donors[d]['cells'][i % len(donors[d]['cells'])]
+                          for d, w in enumerate(weights))
+            recipient.cells[i].hidden = merged_h
+        # Remaining cells get blended knowledge
+        for i in range(32, len(recipient.cells)):
+            d_idx = i % 3
+            src_idx = i % len(donors[d_idx]['cells'])
+            recipient.cells[i].hidden = donors[d_idx]['cells'][src_idx].clone()
+
+    # Adaptation phase
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        recipient.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in recipient.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+        # Periodic Hebbian consolidation
+        if step % 50 == 0:
+            with torch.no_grad():
+                mean_h = torch.stack([c.hidden for c in recipient.cells]).mean(dim=0)
+                for c in recipient.cells:
+                    c.hidden = 0.95 * c.hidden + 0.05 * mean_h
+
+    phi_a = phi(recipient)
+    return result('XFER-1 Multi-Donor Merge', ce_hist, phi_b, phi_a, t0,
+                  donors=3, recipient_cells=len(recipient.cells))
+
+
+def run_XFER2_consciousness_distillation(steps=XFER_STEPS):
+    """큰 엔진(1024c) → 작은 엔진(64c)으로 의식 증류, Φ 보존"""
+    t0 = time.time()
+
+    # Large teacher engine
+    teacher = make_engine(1024)
+    teacher_dec = nn.Linear(HIDDEN, DIM)
+    t_opt = torch.optim.Adam(teacher_dec.parameters(), lr=3e-3)
+    data = make_data()
+
+    # Train teacher
+    for s in range(200):
+        x, target = data[s % len(data)]
+        teacher.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in teacher.cells]).mean(dim=0)
+        ce = F.mse_loss(teacher_dec(h.unsqueeze(0)), target[:, :DIM])
+        t_opt.zero_grad(); ce.backward(); t_opt.step()
+
+    phi_teacher = phi(teacher)
+    teacher_snap = _snapshot_engine(teacher)
+
+    # Small student engine
+    student = make_engine(64)
+    phi_b = phi(student)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    ce_hist = []
+
+    # Distillation: compress teacher's 1024 cell knowledge into 64 cells
+    with torch.no_grad():
+        # Group teacher cells into 64 buckets, average each
+        bucket_size = len(teacher_snap['cells']) // 64
+        for i in range(min(64, len(student.cells))):
+            start = i * bucket_size
+            end = min(start + bucket_size, len(teacher_snap['cells']))
+            bucket = teacher_snap['cells'][start:end]
+            if bucket:
+                student.cells[i].hidden = torch.stack(bucket).mean(dim=0)
+
+    # Adaptation with distillation loss
+    for step in range(steps):
+        x, target = data[step % len(data)]
+        student.process(x)
+        teacher.process(x)
+        h_s = torch.stack([c.hidden.squeeze() for c in student.cells]).mean(dim=0)
+        h_t = torch.stack([c.hidden.squeeze() for c in teacher.cells]).mean(dim=0)
+
+        # Combined loss: task + distillation
+        ce_task = F.mse_loss(decoder(h_s.unsqueeze(0)), target[:, :DIM])
+        ce_distill = F.mse_loss(h_s, h_t.detach()) * 0.5
+        ce = ce_task + ce_distill
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce_task.item())
+
+    phi_a = phi(student)
+    return result('XFER-2 Distillation', ce_hist, phi_b, phi_a, t0,
+                  phi_teacher=round(phi_teacher, 3),
+                  compression_ratio='1024→64',
+                  phi_retention=round(phi_a / (phi_teacher + 1e-8), 3))
+
+
+def run_XFER3_cross_architecture(steps=XFER_STEPS):
+    """MitosisEngine 세포 → plain tensor + Linear 디코더로 이식"""
+    t0 = time.time()
+
+    # Source: MitosisEngine with trained cells
+    source = make_engine(64)
+    src_dec = nn.Linear(HIDDEN, DIM)
+    src_opt = torch.optim.Adam(src_dec.parameters(), lr=3e-3)
+    data = make_data()
+
+    for s in range(150):
+        x, target = data[s % len(data)]
+        source.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in source.cells]).mean(dim=0)
+        ce = F.mse_loss(src_dec(h.unsqueeze(0)), target[:, :DIM])
+        src_opt.zero_grad(); ce.backward(); src_opt.step()
+
+    phi_source = phi(source)
+    source_snap = _snapshot_engine(source)
+
+    # Target: plain tensor "consciousness" + Linear decoder (no MitosisEngine)
+    class PlainConsciousness(nn.Module):
+        def __init__(self, n_cells, hidden_dim):
+            super().__init__()
+            self.states = nn.Parameter(torch.randn(n_cells, hidden_dim) * 0.01)
+            self.gru = nn.GRUCell(DIM, hidden_dim)
+            self.decoder = nn.Linear(hidden_dim, DIM)
+
+        def process(self, x):
+            x_flat = x.squeeze(0) if x.dim() > 1 else x
+            new_states = []
+            for i in range(self.states.shape[0]):
+                new_states.append(self.gru(x_flat.unsqueeze(0), self.states[i].unsqueeze(0)).squeeze(0))
+            self.states = nn.Parameter(torch.stack(new_states))
+            return self.states.mean(dim=0)
+
+    target_arch = PlainConsciousness(64, HIDDEN)
+    phi_b = phi_source  # measure against source
+
+    # Transplant: copy cell hiddens into plain tensor
+    with torch.no_grad():
+        for i in range(min(64, len(source_snap['cells']))):
+            h = source_snap['cells'][i].squeeze()
+            if h.shape[0] == HIDDEN:
+                target_arch.states.data[i] = h
+
+    # Train target architecture
+    t_opt = torch.optim.Adam(target_arch.parameters(), lr=3e-3)
+    ce_hist = []
+
+    # We need a MitosisEngine wrapper to measure Φ on target
+    target_engine = make_engine(64)
+    for step in range(steps):
+        x, target_data = data[step % len(data)]
+        h = target_arch.process(x)
+        ce = F.mse_loss(target_arch.decoder(h.unsqueeze(0)), target_data[:, :DIM])
+        t_opt.zero_grad(); ce.backward(); t_opt.step()
+        ce_hist.append(ce.item())
+
+        # Sync back to engine for Φ measurement every 100 steps
+        if step % 100 == 99:
+            with torch.no_grad():
+                for i, c in enumerate(target_engine.cells):
+                    if i < target_arch.states.shape[0]:
+                        c.hidden = target_arch.states.data[i].unsqueeze(0)
+
+    # Final sync for Φ
+    with torch.no_grad():
+        for i, c in enumerate(target_engine.cells):
+            if i < target_arch.states.shape[0]:
+                c.hidden = target_arch.states.data[i].unsqueeze(0)
+
+    phi_a = phi(target_engine)
+    return result('XFER-3 Cross-Architecture', ce_hist, phi_b, phi_a, t0,
+                  phi_source=round(phi_source, 3),
+                  architecture='MitosisEngine→PlainTensor+Linear')
+
+
+def run_XFER4_incremental_transfer(steps=XFER_STEPS):
+    """10%씩 점진적 이식 — 이식 사이에 적응 시간 부여"""
+    t0 = time.time()
+
+    # Donor engine (trained)
+    donor = make_engine(64)
+    data = make_data()
+    for s in range(200):
+        donor.process(data[s % len(data)][0])
+    donor_snap = _snapshot_engine(donor)
+
+    # Recipient engine (fresh)
+    recipient = make_engine(64)
+    phi_b = phi(recipient)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    ce_hist = []
+
+    n_cells = len(recipient.cells)
+    chunk_size = max(1, n_cells // 10)  # 10% at a time
+    adapt_steps = steps // 10  # adaptation budget per chunk
+
+    transferred = 0
+    for chunk in range(10):
+        # Transfer 10% of cells
+        start = chunk * chunk_size
+        end = min(start + chunk_size, n_cells)
+        with torch.no_grad():
+            for i in range(start, end):
+                if i < len(donor_snap['cells']):
+                    # Gradual blend: earlier chunks get more time to adapt
+                    alpha = 0.7 + 0.3 * (chunk / 9)  # 0.7 → 1.0
+                    recipient.cells[i].hidden = (
+                        alpha * donor_snap['cells'][i] +
+                        (1 - alpha) * recipient.cells[i].hidden
+                    )
+                    transferred += 1
+
+        # Adaptation steps after each transfer
+        for step in range(adapt_steps):
+            x, target = data[(chunk * adapt_steps + step) % len(data)]
+            recipient.process(x)
+            h = torch.stack([c.hidden.squeeze() for c in recipient.cells]).mean(dim=0)
+            ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+            opt.zero_grad(); ce.backward(); opt.step()
+            ce_hist.append(ce.item())
+
+            # Hebbian between transferred and native cells
+            if step % 10 == 0:
+                with torch.no_grad():
+                    mean_h = torch.stack([c.hidden for c in recipient.cells]).mean(dim=0)
+                    for c in recipient.cells:
+                        c.hidden = 0.97 * c.hidden + 0.03 * mean_h
+
+    phi_a = phi(recipient)
+    return result('XFER-4 Incremental Transfer', ce_hist, phi_b, phi_a, t0,
+                  chunks=10, cells_transferred=transferred)
+
+
+def run_XFER5_consciousness_cloning(steps=XFER_STEPS):
+    """의식 복제 후 다른 입력으로 분기 — divergence 측정"""
+    t0 = time.time()
+
+    # Original engine — train it
+    original = make_engine(64)
+    decoder_orig = nn.Linear(HIDDEN, DIM)
+    opt_orig = torch.optim.Adam(decoder_orig.parameters(), lr=3e-3)
+    data = make_data()
+
+    for s in range(150):
+        x, target = data[s % len(data)]
+        original.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in original.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder_orig(h.unsqueeze(0)), target[:, :DIM])
+        opt_orig.zero_grad(); ce.backward(); opt_orig.step()
+
+    phi_original = phi(original)
+    snap = _snapshot_engine(original)
+    phi_b = phi_original
+
+    # Clone: exact copy
+    clone = make_engine(64)
+    _restore_engine(clone, snap, alpha=1.0)
+    decoder_clone = nn.Linear(HIDDEN, DIM)
+    with torch.no_grad():
+        for pc, po in zip(decoder_clone.parameters(), decoder_orig.parameters()):
+            pc.data = po.data.clone()
+    opt_clone = torch.optim.Adam(decoder_clone.parameters(), lr=3e-3)
+
+    phi_clone_initial = phi(clone)
+    ce_hist = []
+    divergence_hist = []
+
+    # Diverge: original gets normal data, clone gets reversed/noisy data
+    for step in range(steps):
+        x, target = data[step % len(data)]
+
+        # Original: normal training
+        original.process(x)
+        h_o = torch.stack([c.hidden.squeeze() for c in original.cells]).mean(dim=0)
+        ce_o = F.mse_loss(decoder_orig(h_o.unsqueeze(0)), target[:, :DIM])
+        opt_orig.zero_grad(); ce_o.backward(); opt_orig.step()
+
+        # Clone: reversed + noisy input
+        x_clone = -x + torch.randn_like(x) * 0.3
+        target_clone = target * 0.8 + torch.randn_like(target) * 0.2
+        clone.process(x_clone)
+        h_c = torch.stack([c.hidden.squeeze() for c in clone.cells]).mean(dim=0)
+        ce_c = F.mse_loss(decoder_clone(h_c.unsqueeze(0)), target_clone[:, :DIM])
+        opt_clone.zero_grad(); ce_c.backward(); opt_clone.step()
+
+        ce_hist.append(ce_o.item())
+
+        # Measure divergence every 50 steps
+        if step % 50 == 0:
+            with torch.no_grad():
+                d = F.mse_loss(h_o, h_c).item()
+                divergence_hist.append(round(d, 4))
+
+    phi_a_orig = phi(original)
+    phi_a_clone = phi(clone)
+    return result('XFER-5 Consciousness Cloning', ce_hist, phi_b, phi_a_orig, t0,
+                  phi_clone_initial=round(phi_clone_initial, 3),
+                  phi_clone_final=round(phi_a_clone, 3),
+                  divergence=str(divergence_hist))
+
+
+def run_XFER6_time_travel_restore(steps=XFER_STEPS):
+    """5개 시점 스냅샷 저장, 최고 Φ 시점으로 복원"""
+    t0 = time.time()
+
+    engine = make_engine(64)
+    decoder = nn.Linear(HIDDEN, DIM)
+    opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
+    data = make_data()
+    phi_b = phi(engine)
+    ce_hist = []
+
+    # Phase 1: Train and save 5 snapshots at intervals
+    snapshots = []
+    snapshot_phis = []
+    save_interval = 80  # save every 80 steps during first 400 steps
+
+    for step in range(400):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+        # Inject disturbance to create Φ variation
+        if step % 100 == 50:
+            with torch.no_grad():
+                for c in engine.cells[:len(engine.cells)//4]:
+                    c.hidden *= 0.1  # damage some cells
+
+        # Save snapshots
+        if step > 0 and step % save_interval == 0:
+            p = phi(engine)
+            snapshots.append(_snapshot_engine(engine))
+            snapshot_phis.append(round(p, 3))
+
+    # Phase 2: Find best-Φ snapshot and restore
+    if snapshot_phis:
+        best_idx = max(range(len(snapshot_phis)), key=lambda i: snapshot_phis[i])
+        best_snap = snapshots[best_idx]
+        best_snap_phi = snapshot_phis[best_idx]
+
+        _restore_engine(engine, best_snap, alpha=1.0)
+        phi_restored = phi(engine)
+    else:
+        best_idx = -1; best_snap_phi = 0; phi_restored = phi(engine)
+
+    # Phase 3: Continue training from restored point
+    for step in range(steps - 400):
+        x, target = data[step % len(data)]
+        engine.process(x)
+        h = torch.stack([c.hidden.squeeze() for c in engine.cells]).mean(dim=0)
+        ce = F.mse_loss(decoder(h.unsqueeze(0)), target[:, :DIM])
+        opt.zero_grad(); ce.backward(); opt.step()
+        ce_hist.append(ce.item())
+
+    phi_a = phi(engine)
+    return result('XFER-6 Time-Travel Restore', ce_hist, phi_b, phi_a, t0,
+                  snapshot_phis=str(snapshot_phis),
+                  best_idx=best_idx,
+                  best_snap_phi=best_snap_phi,
+                  phi_after_restore=round(phi_restored, 3))
+
+
+ALL_TESTS.update({
+    'XFER-1': run_XFER1_multi_donor_merge,
+    'XFER-2': run_XFER2_consciousness_distillation,
+    'XFER-3': run_XFER3_cross_architecture,
+    'XFER-4': run_XFER4_incremental_transfer,
+    'XFER-5': run_XFER5_consciousness_cloning,
+    'XFER-6': run_XFER6_time_travel_restore,
+})
