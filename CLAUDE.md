@@ -153,6 +153,13 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ## Work Rules
 
+- **모든 실험/연구 결과는 반드시 문서화 (필수!)**
+  - 벤치마크 → docs/hypotheses/{category}/ 에 개별 .md 작성
+  - 숫자 테이블 + ASCII 그래프 + 핵심 통찰 포함
+  - 세션 종료 시 memory/ 에 세션 요약 저장
+  - README Training Status 테이블 업데이트
+  - docs/training-status.md 에 H100 학습 현황 갱신
+  - 새 Law 발견 시 docs/consciousness-theory.md 에 추가
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
 - **벤치마크/실험 실행은 항상 백그라운드에서 진행** — sleep으로 대기하지 말고 `run_in_background=true` 사용
 - **H100 실험은 tmux로 실행** — SSH 끊겨도 유지되도록 `tmux new-session -d -s name "command"`
