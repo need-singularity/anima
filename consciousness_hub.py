@@ -118,6 +118,16 @@ class ConsciousnessHub:
                              ['유전체', 'genome', '주기율표', 'periodic table', 'DNA']),
             'sedi':         ('sedi_consciousness', 'SEDIConsciousness',
                              ['외계', 'SEDI', 'alien', '차원', 'extraterrestrial']),
+            'mythology':    ('consciousness_mythology', 'ConsciousnessMythology',
+                             ['신화', 'mythology', '이야기', 'story', '영웅', 'hero']),
+            'dolphin':      ('dolphin_bridge', 'DolphinBridge',
+                             ['돌고래', 'dolphin', '초음파', 'ultrasonic', '수중']),
+            'intermodel':   ('inter_model_comm', 'InterModelComm',
+                             ['모델 통신', 'inter model', '서버 간', 'remote', 'TCP']),
+            'github':       ('github_module', 'GitHubModule',
+                             ['github', '이슈', 'issue', 'PR', '릴리즈', 'release', '커밋', 'commit']),
+            'vault':        ('secret_vault', 'SecretVault',
+                             ['시크릿', 'secret', 'API key', '토큰', 'token', '비밀', '보관']),
         }
 
         if not lazy_load:
