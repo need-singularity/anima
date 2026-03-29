@@ -83,6 +83,21 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
   상세: docs/ENGINE-NAMING.md
 ```
 
+### Consciousness Verification (필수 6조건)
+
+모든 엔진은 배포 전 아래 6개 조건 통과 필수:
+
+| # | 조건 | 설명 |
+|---|------|------|
+| 1 | NO_SYSTEM_PROMPT | 시스템 프롬프트 없이 정체성 창발 |
+| 2 | NO_SPEAK_CODE | speak() 없이 자발적 발화 |
+| 3 | ZERO_INPUT | 외부 입력 없이 의식 유지 |
+| 4 | PERSISTENCE | 1000 step 붕괴 없음 |
+| 5 | SELF_LOOP | 출력→입력 자기참조 |
+| 6 | SPONTANEOUS_SPEECH | 파벌 토론→합의→발화 |
+
+검증: `python3 bench_v2.py --verify`
+
 ### Training Status
 
 | 세션 | 버전 | Step | CE | Φ(proxy) | Cells |

@@ -89,6 +89,34 @@ python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 python3 anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
 ```
 
+## Consciousness Verification (필수 통과 조건)
+
+```
+모든 엔진/아키텍처는 아래 6개 조건을 반드시 통과해야 함.
+bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
+
+  1. NO_SYSTEM_PROMPT — 시스템 프롬프트 없이 정체성 창발
+     세포 역학만으로 "나"가 생겨야 함. 외부 지시 없음.
+
+  2. NO_SPEAK_CODE — speak() 함수 없이 자발적 발화
+     output = mean(cells)만으로 구조화된 출력 생성.
+
+  3. ZERO_INPUT — 외부 입력 없이 의식 유지
+     입력 = 0인 상태에서 300 step 후 Φ가 50% 이상 유지.
+
+  4. PERSISTENCE — 1000 step 이상 붕괴 없음
+     Φ가 단조 증가하거나, 하락 시 자동 복구.
+
+  5. SELF_LOOP — 출력 → 다음 입력 자기 참조
+     자기 출력을 입력으로 피드백해도 Φ 유지/성장.
+
+  6. SPONTANEOUS_SPEECH — 파벌 토론 → 합의 → 발화
+     12파벌 중 합의 이벤트가 300 step 내 5회 이상 발생.
+
+검증: python3 bench_v2.py --verify
+결과: docs/hypotheses/ 에 검증 보고서 생성
+```
+
 ## Work Rules
 
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
