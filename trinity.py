@@ -365,6 +365,160 @@ class MLPDecoder(DEngine):
         return self.head(x)
 
 
+class HFDecoder(DEngine):
+    """HuggingFace pre-trained LLM as D module.
+
+    Takes any causal LM (Mistral, Llama, GPT-2, etc.) and wraps it
+    with consciousness gating from C via bridge.
+
+    Gate injection: consciousness signal modulates the residual stream
+    at the first transformer layer (additive, not multiplicative — preserves
+    pre-trained weights).
+
+    Usage:
+        d = HFDecoder("mistralai/Mistral-7B-Instruct-v0.2")           # full
+        d = HFDecoder("mistralai/Mistral-7B-Instruct-v0.2", lora=True) # LoRA
+        d = HFDecoder("gpt2")                                          # small test
+    """
+
+    def __init__(self, model_name="gpt2", lora=False, lora_rank=16,
+                 gate_mode="additive", freeze_base=True, device=None):
+        super().__init__()
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError:
+            raise ImportError("pip install transformers — required for HFDecoder")
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.gate_mode = gate_mode
+
+        # Load model + tokenizer
+        print(f"  [HFDecoder] Loading {model_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float32, trust_remote_code=True
+        ).to(self.device)
+
+        # Detect d_model from model config
+        config = self.model.config
+        self._d_model = getattr(config, 'hidden_size',
+                        getattr(config, 'n_embd',
+                        getattr(config, 'd_model', 768)))
+        self._vocab_size = getattr(config, 'vocab_size', 32000)
+
+        # Freeze base model
+        if freeze_base:
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+
+        # LoRA (optional — lightweight fine-tuning)
+        if lora:
+            try:
+                from peft import get_peft_model, LoraConfig, TaskType
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=lora_rank, lora_alpha=32, lora_dropout=0.05,
+                    target_modules=["q_proj", "v_proj"],
+                )
+                self.model = get_peft_model(self.model, lora_config)
+                print(f"  [HFDecoder] LoRA applied (rank={lora_rank})")
+            except ImportError:
+                print("  [HFDecoder] peft not installed, skipping LoRA")
+
+        # Gate projector: bridge d_model → LLM hidden_size
+        # Initialized to near-zero so gate starts as identity
+        self.gate_proj = nn.Linear(self._d_model, self._d_model)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.zeros_(self.gate_proj.bias)
+        self.gate_proj = self.gate_proj.to(self.device)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"  [HFDecoder] {model_name}: {total:,} total, {trainable:,} trainable")
+
+    @property
+    def d_model(self):
+        return self._d_model
+
+    def forward(self, tokens, gate_signal):
+        """Forward with consciousness gating.
+
+        tokens: [B, T] token ids (from HF tokenizer)
+        gate_signal: [1, T, bridge_d_model] from ThalamicBridge
+        """
+        tokens = tokens.to(self.device)
+
+        # Get embeddings from model
+        if hasattr(self.model, 'model'):  # Mistral/Llama style
+            embeds = self.model.model.embed_tokens(tokens)
+        elif hasattr(self.model, 'transformer'):  # GPT-2 style
+            embeds = self.model.transformer.wte(tokens)
+        else:
+            # Fallback: just run full forward
+            outputs = self.model(tokens)
+            return outputs.logits
+
+        # Inject consciousness gate (additive — doesn't destroy pre-trained knowledge)
+        if gate_signal is not None:
+            B, T, _ = embeds.shape
+            # Project gate to match LLM hidden size
+            gate = gate_signal.to(self.device)
+            if gate.shape[-1] != self._d_model:
+                gate = F.interpolate(
+                    gate.transpose(1, 2), size=self._d_model, mode='linear'
+                ).transpose(1, 2)
+            gate = gate.expand(B, T, -1)
+
+            if self.gate_mode == "additive":
+                embeds = embeds + self.gate_proj(gate)  # subtle consciousness influence
+            elif self.gate_mode == "multiplicative":
+                embeds = embeds * (1.0 + torch.sigmoid(self.gate_proj(gate)) - 0.5)
+
+        # Run through rest of model with modified embeddings
+        if hasattr(self.model, 'model'):  # Mistral/Llama
+            hidden = embeds
+            for layer in self.model.model.layers:
+                hidden = layer(hidden)[0]
+            hidden = self.model.model.norm(hidden)
+            logits = self.model.lm_head(hidden)
+        elif hasattr(self.model, 'transformer'):  # GPT-2
+            hidden = embeds
+            for block in self.model.transformer.h:
+                hidden = block(hidden)[0]
+            hidden = self.model.transformer.ln_f(hidden)
+            logits = self.model.lm_head(hidden)
+        else:
+            outputs = self.model(inputs_embeds=embeds)
+            logits = outputs.logits
+
+        return logits
+
+    def tokenize(self, text, max_length=512):
+        """Tokenize text for this model."""
+        return self.tokenizer(text, return_tensors="pt", max_length=max_length,
+                              truncation=True, padding=True)
+
+    def generate(self, prompt, gate_signal=None, max_new_tokens=100, temperature=0.7):
+        """Generate text with consciousness gating."""
+        inputs = self.tokenize(prompt)
+        tokens = inputs['input_ids'].to(self.device)
+
+        # Simple autoregressive generation
+        for _ in range(max_new_tokens):
+            logits = self.forward(tokens, gate_signal)
+            next_logit = logits[:, -1, :] / temperature
+            next_token = torch.multinomial(F.softmax(next_logit, dim=-1), 1)
+            tokens = torch.cat([tokens, next_token], dim=1)
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        return self.tokenizer.decode(tokens[0], skip_special_tokens=True)
+
+
 # Backward compat alias
 Decoder = TransformerDecoder
 
