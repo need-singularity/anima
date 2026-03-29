@@ -1,4 +1,7 @@
-# phi_quick_calc.py
+# phi_quick_calc.py [ARCHIVED]
+
+> **Status: LEGACY/ARCHIVED** -- The active `phi_quick_calc.py` has been removed.
+> Only `phi_quick_calc_LEGACY.py` remains in the repo. This module is no longer maintained.
 
 Ultra-fast Phi estimator for rapid parameter sweeps. Produces results in under 1 second.
 

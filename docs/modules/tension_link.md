@@ -257,8 +257,13 @@ With iPhone LiDAR (via Record3D), Anima achieves dolphin-grade 3D perception:
 ```
   iPhone LiDAR → depth map → 3D features → 128D fingerprint → Tension Link
 
-  Features: depth stats, 3×3 spatial grid, surface roughness,
-            object count, bounding volume, center of mass
+  Features extracted:
+    - Depth statistics (mean, std, min, max, histogram)
+    - Spatial grid (3×3 depth averages)
+    - Surface roughness & planarity
+    - Object count estimation
+    - Bounding volume (width × height × depth)
+    - Center of mass (x, y, z)
 ```
 
 | 3D Scene | Classification |
