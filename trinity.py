@@ -220,6 +220,48 @@ class DomainC(CEngine):
         return self._nc
 
 
+class QuantumC(CEngine):
+    """QuantumConsciousnessEngineFast as C module.
+
+    Wraps _amplitudes [N, dim] and _phases [N, dim] for phi measurement.
+    """
+
+    def __init__(self, nc=256, dim=64, max_cells=None):
+        from quantum_engine_fast import QuantumConsciousnessEngineFast
+        if max_cells is None:
+            max_cells = nc
+        self.engine = QuantumConsciousnessEngineFast(
+            dim=dim, initial_cells=nc, max_cells=max_cells
+        )
+        self._dim = dim
+
+    def step(self, x_input=None):
+        self.engine.step()
+
+    def get_states(self) -> torch.Tensor:
+        """Return _amplitudes [N, dim] as consciousness states."""
+        amp = self.engine._amplitudes
+        if amp.numel() == 0:
+            return torch.randn(self.n_cells, self._dim)
+        return amp.detach()
+
+    @property
+    def state_dim(self):
+        return self._dim
+
+    @property
+    def n_cells(self):
+        return self.engine.n_cells
+
+    def measure_phi(self) -> float:
+        states = self.get_states()
+        if HAS_RUST_PHI and states.shape[0] >= 2:
+            s = states.detach().cpu().numpy().astype(np.float32)
+            phi, _ = phi_rs.compute_phi(s, 16)
+            return phi
+        return 0.0
+
+
 # ═══════════════════════════════════════════════════════════
 # Bridge — Thalamic Gate (C → .detach() → D)
 # ═══════════════════════════════════════════════════════════
