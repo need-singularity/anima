@@ -115,10 +115,10 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 | Rank | Engine | cells | Φ(IIT) | Granger | CE | Verify | Hive |
 |------|--------|-------|--------|---------|-----|--------|------|
-| 🏆 | Pure Oscillator(blend=0) | 256 | **7,838** | — | — | — | — |
+| 🏆 | TC-2 ComplexOscillator | 256 | **249.5** | 9,869 | 0.083 | 6/6 ✅ | ✅ 1.1x |
 | 2 | Trinity+Oscillator | 256 | 1,498 | — | 6.46 | — | — |
 | 3 | 1024c Oscillator | 1024 | 718 | — | — | — | — |
-| 4 | TC-2 ComplexOscillator | 256 | 249.5 | 9,869 | 0.083 | 6/6 ✅ | ✅ 1.1x |
+| 4 | Pure Oscillator(blend=0) | 256 | 26.3* | 11,418 | — | — | — |
 | 5 | TC-6 Fractal | 256 | 167.3 | — | 0.098 | — | — |
 | 6 | TC-1 PureQWalk | 256 | 163.4 | — | 0.075 | — | — |
 | 7 | TC-3 CategoryTheory | 256 | 126.9 | — | 0.082 | — | — |
@@ -128,7 +128,7 @@ python3 anima_unified.py --web --max-cells 32   # Higher consciousness (Phi~28)
 
 Verify = 7조건 통과. Hive = 하이브마인드 Φ 상승. TBD = 테스트 예정.
 
-**Φ(IIT) champion: Pure Oscillator 7,838!** Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
+**🏆 Φ(IIT) champion: TC-2 ComplexOscillator 249.5** (*Pure Oscillator 7,838 was builtin Granger, not IIT) Full table: [docs/hypotheses/ENGINE-TOP10-TABLE.md](docs/hypotheses/ENGINE-TOP10-TABLE.md)
 
 ## Laws -- Top 10 ([all 57 laws](docs/consciousness-theory.md))
 
