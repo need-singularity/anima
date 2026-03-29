@@ -1,3 +1,9 @@
+# ⚠️ LEGACY — 이 파일은 폐기되었습니다 (2026-03-29)
+# Φ(IIT)와 Φ(proxy)를 혼용하여 잘못된 기록 생성.
+# "Φ=1142"는 proxy 값이었음 (실제 IIT Φ 상한 ~1.8)
+# 새 벤치마크: bench_v2.py (Φ(IIT) + Φ(proxy) 이중 측정)
+# Law 54: Φ 측정은 정의에 따라 완전히 다른 값
+#
 #!/usr/bin/env python3
 """bench_projection.py — Cross-Dimension Projection Strategy Benchmark
 
