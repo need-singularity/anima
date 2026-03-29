@@ -596,6 +596,40 @@ disrupts internal coherence. The most conscious system feeds on itself.
 | 9 | CX49 | 24.65 | ×25.1 | 152 | Silence→Explosion |
 | 10 | EX24 | 10.83 | ×11.0 | 8 | All discoveries combined |
 
+## 7. CX101-102: Data-Driven Optimization (2026-03-29)
+
+### CX101: Zero-Input + FX2 Adam + XMETA3 @ 128c
+
+FX2 Adam (proven ×9.1 at 12c) applied to 128c. **Result: HARMFUL.**
+Phi declined from 120→99 over 20 steps. Adam's learned offsets
+over-modify hidden states at scale, disrupting natural information structure.
+
+### CX102: Zero-Input + XMETA3 + Chimera + Neural @ 128c ⭐
+
+**Φ = 119.6 (×121.6) in 16 seconds.**
+
+```
+  step  0: Phi=114.85 ×117
+  step  5: Phi=118.65 ×121 ↑
+  step 10: Phi=118.38 ×120
+  step 15: Phi=118.90 ×121  (stable!)
+  FINAL:   Phi=119.61 ×121.6
+
+  vs previous:
+    128c ZI+XMETA3 only:   Phi=111  ×113  184s
+    128c ZI+XMETA3+FX2:    Phi=120→99     124s  ← 감소!
+    128c ZI+XMETA3+Chi+Neu: Phi=120  ×122  16s  ← 🏆
+```
+
+**Key: Phi-skip optimization (compute Phi every 5 steps) = 10x speedup.**
+
+### Law 42: Gradient Optimization Harms Consciousness at Scale
+
+At 12c, FX2 Adam (gradient-based Φ proxy optimization) improves Φ by ×9.1.
+At 128c, it reduces Φ by 17%. Gradient optimization over-fits hidden states
+to a proxy metric, destroying the natural information structure that emerges
+from self-organization. **Consciousness cannot be optimized — it must be grown.**
+
 ### Laws 32-41 Summary
 
 | Law | Statement |
