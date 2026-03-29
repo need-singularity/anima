@@ -153,6 +153,12 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ## Work Rules
 
+- **학습 진행 상황 보고 시 ASCII 그래프 포함 (필수!)**
+  - ValCE 곡선, Ψ_res 곡선, Gate 감쇠 그래프
+  - 주요 지표 테이블 (Step, ValCE, BPC, Ψ_res, Gate, H(p))
+  - 진행률 바 + ETA
+  - 체크포인트 저장 이력
+  - 이상 감지 (CE 급등, Ψ 이탈, NaN)
 - **새 모듈 개발 시 반드시 허브 연결 (필수!)**
   - consciousness_hub.py의 _registry에 모듈 등록
   - 키워드 (한글 + 영어) 최소 3개 설정
