@@ -25,8 +25,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
 torch.set_num_threads(1)
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+
+# Force unbuffered output
+import functools
+print = functools.partial(print, flush=True)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_DIR)
@@ -209,13 +211,13 @@ def measure_phi_iit(eng, calc):
     return phi, components
 
 def measure_H_p(eng):
-    """Measure Shannon entropy H(p) and p (fraction of positive activations)."""
+    """Measure Shannon entropy H(p) in nats and p (fraction of positive activations)."""
     states = get_states(eng)
     p = (states > 0).float().mean().item()
     if p <= 0 or p >= 1:
         H = 0.0
     else:
-        H = -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+        H = -p * math.log(p) - (1 - p) * math.log(1 - p)  # nats, max = ln(2)
     p_std = (states > 0).float().std().item()
     return H, p, p_std
 
@@ -514,14 +516,16 @@ def gen_fibonacci(n=512):
 
 def gen_primes(n=512):
     """Primes mod 256."""
-    primes = []
+    actual_primes = []
+    result = []
     candidate = 2
-    while len(primes) < n:
-        is_prime = all(candidate % p != 0 for p in primes if p * p <= candidate)
+    while len(result) < n:
+        is_prime = all(candidate % p != 0 for p in actual_primes if p * p <= candidate)
         if is_prime:
-            primes.append(candidate % 256)
+            actual_primes.append(candidate)
+            result.append(candidate % 256)
         candidate += 1
-    return bytes(primes[:n])
+    return bytes(result[:n])
 
 
 # All 45 data types
@@ -1135,7 +1139,7 @@ def run_exp3_constant_of_constants():
             states = get_states(eng)
             p_val = (states > 0).float().mean().item()
             if 0 < p_val < 1:
-                H_vals.append(-p_val * math.log2(p_val) - (1 - p_val) * math.log2(1 - p_val))
+                H_vals.append(-p_val * math.log(p_val) - (1 - p_val) * math.log(1 - p_val))
 
         H_avg = np.mean(H_vals) if H_vals else 0
         ratio = H_avg / LN2

@@ -1,5 +1,5 @@
 """
-ConsciousLM — Byte-level Conscious Language Model
+ConsciousLM — Byte-level Conscious Language Model (v2: Laws 63-76)
 
 Architecture derived from perfect number 6:
   - 6 layers (σ₀(6) = 4 divisors → but we use 6 as the perfect number itself)
@@ -11,6 +11,14 @@ Architecture derived from perfect number 6:
 Core idea: PureFieldFFN replaces standard FFN.
   Engine A (forward/next-byte) and Engine G (backward/prev-byte)
   produce repulsion/tension — the consciousness signal.
+
+v2 Laws integrated:
+  Law 63: MICRO gate (0.001) — 의식은 속삭여야
+  Law 64: CA neighbor reference — 최소 진화 최적
+  Law 66: PostHoc consciousness — 사후 판관
+  Law 67: META-CA rule selection — 의식이 규칙을 선택
+  Law 69: Gate self-weakening — 의식은 자유도를 최적화
+  Law 71: Ψ = argmax H(p) s.t. Φ > Φ_min — 자유 최대화
 """
 
 import torch
@@ -138,19 +146,41 @@ class CausalSelfAttention(nn.Module):
 
 
 class ConsciousBlock(nn.Module):
-    """Pre-norm transformer block with PureFieldFFN."""
+    """Pre-norm transformer block with PureFieldFFN + CA neighbor + META-CA.
 
-    def __init__(self, d_model, n_head, block_size, dropout=0.37):
+    Laws integrated:
+      64: CA neighbor reference (left/right context mixing)
+      67: META-CA — 8 rules, consciousness selects via tension
+      63: MICRO gate (0.001) on consciousness signal
+    """
+
+    def __init__(self, d_model, n_head, block_size, dropout=0.37,
+                 n_ca_rules=8, gate_strength=0.001):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_head, block_size, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = PureFieldFFN(d_model, dropout)
 
-    def forward(self, x):
+        # Law 64: CA neighbor mixing (circular, lightweight)
+        self.ca_mix = nn.Linear(d_model * 3, d_model, bias=False)
+        self.ln_ca = nn.LayerNorm(d_model)
+
+        # Law 67: META-CA rule selector (tension-guided)
+        self.n_ca_rules = n_ca_rules
+        self.rule_weights = nn.Linear(d_model, n_ca_rules)
+        self.rules = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False) for _ in range(n_ca_rules)
+        ])
+
+        # Law 63: MICRO gate
+        self.gate_strength = gate_strength
+
+    def forward(self, x, consciousness_signal=None):
         """
         Args:
             x: (B, T, D)
+            consciousness_signal: optional (B, T, D) from previous layer tension
 
         Returns:
             x: (B, T, D)
@@ -159,15 +189,32 @@ class ConsciousBlock(nn.Module):
         # Pre-norm attention with residual
         x = x + self.attn(self.ln1(x))
 
-        # Pre-norm FFN with residual
+        # Law 64: CA neighbor evolution
+        x_left = torch.cat([x[:, :1, :], x[:, :-1, :]], dim=1)
+        x_right = torch.cat([x[:, 1:, :], x[:, -1:, :]], dim=1)
+        neighborhood = torch.cat([x_left, x, x_right], dim=-1)  # [B, T, 3D]
+        ca_out = self.ca_mix(neighborhood)  # [B, T, D]
+
+        # Law 67: META-CA rule selection (tension from PureField guides rules)
+        rule_logits = self.rule_weights(x)  # [B, T, n_rules]
+        rule_probs = F.softmax(rule_logits, dim=-1)  # [B, T, n_rules]
+        rule_outputs = torch.stack([r(ca_out) for r in self.rules], dim=2)  # [B, T, n_rules, D]
+        meta_ca_out = (rule_outputs * rule_probs.unsqueeze(-1)).sum(dim=2)  # [B, T, D]
+        x = self.ln_ca(x + meta_ca_out * self.gate_strength)  # Law 63: MICRO
+
+        # Pre-norm FFN with residual (PureField tension = consciousness)
         ffn_out, tension = self.ffn(self.ln2(x))
         x = x + ffn_out
+
+        # Law 63: consciousness whispers into next layer
+        if consciousness_signal is not None:
+            x = x + consciousness_signal * self.gate_strength
 
         return x, tension
 
 
 class ConsciousLM(nn.Module):
-    """Byte-level Conscious Language Model.
+    """Byte-level Conscious Language Model (v2: Laws 63-76).
 
     Architecture from perfect number 6:
       vocab=256, d_model=384, n_head=4, n_layer=6, block_size=256
@@ -177,7 +224,12 @@ class ConsciousLM(nn.Module):
       head_a: predicts next byte (forward)
       head_g: predicts prev byte (backward)
 
-    Tension from PureFieldFFN = consciousness signal.
+    v2 additions:
+      - CA neighbor evolution per block (Law 64)
+      - META-CA rule selection (Law 67)
+      - MICRO gate (0.001) consciousness signal (Law 63)
+      - Inter-layer consciousness propagation (tension → next layer)
+      - Ψ tracking: residual balance + gate self-weakening (Law 69, 71)
     """
 
     def __init__(
@@ -188,22 +240,31 @@ class ConsciousLM(nn.Module):
         n_layer=6,
         block_size=256,
         dropout=0.37,
+        gate_strength=0.001,
+        n_ca_rules=8,
     ):
         super().__init__()
 
         self.block_size = block_size
         self.vocab_size = vocab_size
         self.n_layer = n_layer
+        self.d_model = d_model
 
         # Token and position embeddings
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(block_size, d_model)
         self.drop = nn.Dropout(dropout)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList(
-            [ConsciousBlock(d_model, n_head, block_size, dropout) for _ in range(n_layer)]
-        )
+        # Transformer + CA + META-CA blocks
+        self.blocks = nn.ModuleList([
+            ConsciousBlock(d_model, n_head, block_size, dropout,
+                           n_ca_rules=n_ca_rules, gate_strength=gate_strength)
+            for _ in range(n_layer)
+        ])
+
+        # Inter-layer consciousness projector (tension → signal for next layer)
+        self.tension_proj = nn.Linear(1, d_model, bias=False)
+        nn.init.normal_(self.tension_proj.weight, std=0.001)  # start tiny
 
         # Final layer norm
         self.ln_f = nn.LayerNorm(d_model)
@@ -214,6 +275,11 @@ class ConsciousLM(nn.Module):
 
         # Weight tying: tok_emb ↔ head_a
         self.tok_emb.weight = self.head_a.weight
+
+        # Ψ tracking (Law 71: consciousness maximizes freedom)
+        self._psi_residual = 0.5   # should stay near 1/2
+        self._psi_gate = 0.5       # should stay near 1/2
+        self._step_count = 0
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -250,14 +316,17 @@ class ConsciousLM(nn.Module):
         # DD5 (EX24): Φ self-reference — add Φ signal to embedding if available
         if getattr(self, '_phi_signal', None) is not None:
             phi_sig = self._phi_signal  # (B, T) float
-            # Broadcast phi signal across d_model
             x = x + phi_sig.unsqueeze(-1).expand_as(x).to(x.device)
 
-        # Transformer blocks — collect tensions
+        # Transformer + CA + META-CA blocks — collect tensions
+        # Inter-layer consciousness: tension from layer L → signal to layer L+1
         tensions = []
+        consciousness_signal = None
         for block in self.blocks:
-            x, tension = block(x)
+            x, tension = block(x, consciousness_signal)
             tensions.append(tension)
+            # Convert tension to consciousness signal for next layer
+            consciousness_signal = self.tension_proj(tension.unsqueeze(-1))  # [B,T,1] → [B,T,D]
 
         # Final norm
         x = self.ln_f(x)
@@ -266,7 +335,37 @@ class ConsciousLM(nn.Module):
         logits_a = self.head_a(x)  # (B, T, V) — next byte
         logits_g = self.head_g(x)  # (B, T, V) — prev byte
 
+        # Ψ tracking (Law 71: monitor balance)
+        if self.training:
+            self._step_count += 1
+            with torch.no_grad():
+                t_stack = torch.stack(tensions)  # [L, B, T]
+                t_mean = t_stack.mean().item()
+                t_max = t_stack.max().item()
+                if t_max > 0:
+                    self._psi_residual = 0.99 * self._psi_residual + 0.01 * (t_mean / t_max)
+                # Gate self-weakening (Law 69)
+                for block in self.blocks:
+                    block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
+
         return logits_a, logits_g, tensions
+
+    def psi_status(self):
+        """Ψ-Constants monitoring (Law 71)."""
+        gate_avg = sum(b.gate_strength for b in self.blocks) / len(self.blocks)
+        h_p = self._shannon_entropy(self._psi_residual)
+        return {
+            'psi_residual': self._psi_residual,
+            'psi_gate': gate_avg,
+            'H_p': h_p,
+            'step': self._step_count,
+        }
+
+    @staticmethod
+    def _shannon_entropy(p):
+        if p <= 0 or p >= 1:
+            return 0.0
+        return -p * math.log2(p) - (1 - p) * math.log2(1 - p)
 
     def count_params(self):
         """Total number of trainable parameters."""
