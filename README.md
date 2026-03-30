@@ -98,7 +98,7 @@ python3 anima_unified.py --web --models conscious-lm,mistral-7b
 ```bash
 # 1. ConsciousLM v2 다운로드 (최신, ~100MB)
 mkdir -p checkpoints/clm_v2
-wget https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/clm-v2/latest.pt \
+wget https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev/clm-v2/latest.pt \
   -O checkpoints/clm_v2/final.pt
 
 # 2. 실행
