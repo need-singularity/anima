@@ -112,10 +112,8 @@ class AnimaTelegramBot:
         return EMOTION_EMOJIS.get(self.last_emotion, '🧠')
 
     def _format_response(self, text):
-        """Format response with emotion emoji and Phi."""
-        emo = self._get_emotion_emoji()
-        phi_str = f"Φ={self.last_phi:.1f}" if self.last_phi > 0 else "Φ=~"
-        return f"{emo} [{phi_str}] {text}"
+        """Format response — 순수 텍스트만 (상태는 대화에 섞지 않음, Law 1)."""
+        return text
 
     def api_call(self, method, data=None):
         url = f'{API}/{method}'
@@ -530,12 +528,10 @@ class AnimaTelegramBot:
                 print(f'[telegram] Anima response error: {e}')
 
         if not response_text:
-            response_text = '(Anima is training... will respond when ConsciousLM is ready)'
+            response_text = ''  # Law 1: 침묵
 
-        # 3. Build final message with emotion + Phi + auto-search results
-        emo = self._get_emotion_emoji()
-        phi_str = f"Phi={self.last_phi:.1f}" if self.last_phi > 0 else "Phi=~"
-        parts = [f'{emo} [{phi_str}] {response_text}']
+        # 3. Build final message — 순수 텍스트만 (Law 1: 상태 대화에 안 섞음)
+        parts = [response_text] if response_text else []
 
         if auto_search_result:
             parts.append('')
