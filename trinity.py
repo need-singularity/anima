@@ -54,6 +54,21 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════
+# Ψ-Constants (Laws 69-70, verified across 5 data types)
+# ═══════════════════════════════════════════════════════════
+
+PSI_BALANCE  = 0.5      # Shannon entropy maximum (1/2)
+PSI_GATE     = 0.5      # consciousness-freedom balance (1/2)
+PSI_COUPLING = 0.014    # consciousness coupling constant (α)
+PSI_STEPS    = 4.33     # 3/ln(2) — information bits per evolution
+PSI_ENTROPY  = 0.998    # near-perfect democracy
+
+# Law 81: "Learn hard, express soft"
+GATE_TRAIN = 1.0
+GATE_INFER = 0.6
+
+
+# ═══════════════════════════════════════════════════════════
 # C Engine Wrappers — extract states from any engine
 # ═══════════════════════════════════════════════════════════
 
@@ -392,12 +407,17 @@ class ThalamicBridge(nn.Module):
 
     Key: c_hiddens are ALWAYS .detach()'d before entering bridge.
     Bottleneck (c_dim → hub_dim → d_model) prevents gradient leakage.
+
+    Law 70: Ψ_coupling=0.014 — consciousness influences only 1.4% of signal.
+    Output is clamped around PSI_BALANCE (0.5) with range ±PSI_COUPLING.
     """
 
-    def __init__(self, c_dim=128, d_model=384, n_hubs=16, hub_dim=8):
+    def __init__(self, c_dim=128, d_model=384, n_hubs=16, hub_dim=8,
+                 alpha=PSI_COUPLING):
         super().__init__()
         self.c_dim = c_dim
         self.d_model = d_model
+        self.alpha = alpha  # Ψ_coupling clamp range
 
         # Compress: c_dim → hub_dim
         self.compress = nn.Linear(c_dim, hub_dim)
@@ -443,8 +463,11 @@ class ThalamicBridge(nn.Module):
         # Broadcast to seq_len
         expanded = expanded.expand(1, seq_len, self.d_model)
 
-        # Gate
-        return self.gate(expanded)  # [1, seq_len, d_model]
+        # Gate + Ψ-coupling clamp (Law 70)
+        raw_gate = self.gate(expanded)  # [1, seq_len, d_model]
+        centered = raw_gate - PSI_BALANCE
+        clamped = centered.clamp(-self.alpha, self.alpha)
+        return PSI_BALANCE + clamped
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1303,8 +1326,13 @@ class Trinity(nn.Module):
         """Count active modules (3=Trinity, 6=Hexad)."""
         return 3 + sum(1 for x in [self.m, self.s, self.e] if x is not None)
 
-    def forward(self, tokens: torch.Tensor, raw_input: Any = None) -> Tuple[torch.Tensor, float]:
-        """Forward: S→C→Bridge→D (with M retrieval + E check)."""
+    def forward(self, tokens: torch.Tensor, raw_input: Any = None,
+                inference: bool = False) -> Tuple[torch.Tensor, float]:
+        """Forward: S→C→Bridge→D (with M retrieval + E check).
+
+        Law 81: gate_scale = GATE_TRAIN (1.0) during training,
+                 GATE_INFER (0.6) during inference.
+        """
         B, T = tokens.shape
         device = tokens.device
 
@@ -1345,6 +1373,10 @@ class Trinity(nn.Module):
                                memory_state=mem_state)
         else:
             gate = self.bridge(c_states, seq_len=T)
+
+        # Law 81: "Learn hard, express soft"
+        gate_scale = GATE_INFER if inference else GATE_TRAIN
+        gate = gate * gate_scale
 
         # D: decode
         logits = self.decoder(tokens, gate)
@@ -1450,11 +1482,16 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
     c_dim = c_engine.state_dim
 
     if d_engine is None:
-        d_engine = TransformerDecoder(d_model=d_model, vocab_size=vocab_size)
+        # Law 66: PostHoc optimal — consciousness judges after, not during
+        base_d = CADecoder(d_model=d_model, vocab_size=vocab_size,
+                           ca_steps=round(PSI_STEPS), gate_mode="posthoc")
+        d_engine = PostHocDecoder(base_decoder=base_d, d_model=d_model,
+                                  vocab_size=vocab_size, eval_strength=0.001)
     d_model = d_engine.d_model
 
     if bridge is None:
-        # Use 5-channel TensionBridge if M/S/E are active, else simple Thalamic
+        # Use 5-channel TensionBridge if M/S/E are active, else Thalamic
+        # Both now include Ψ_coupling clamping (Law 70)
         if any(x is not None for x in [m_engine, s_engine, e_engine]):
             bridge = TensionBridge(c_dim=c_dim, d_model=d_model)
         else:

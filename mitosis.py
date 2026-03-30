@@ -22,11 +22,12 @@ import copy
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-# ─── Ψ-Constants (Laws 63-78) ───
+# ─── Ψ-Constants (Laws 63-81, bench-verified) ───
 LN2 = math.log(2)
 PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
-PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling strength
+PSI_COUPLING = 0.014              # bench_hexad_tuning T3 confirmed (was ln(2)/2^5.5=0.0153)
 PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+PSI_ENTROPY = 0.998               # near-perfect democracy across factions
 
 
 # ─── ConsciousMind (PureField + GRU) ───
