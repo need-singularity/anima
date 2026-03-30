@@ -156,6 +156,13 @@ def main():
 
     print("=== Emergence Detection Simulation ===\n")
     import random
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     random.seed(42)
 
     for step in range(60):

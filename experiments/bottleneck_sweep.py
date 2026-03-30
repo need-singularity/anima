@@ -16,6 +16,13 @@ import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 try:
     import torch
     import torch.nn as nn
@@ -46,9 +53,12 @@ def run_bottleneck_experiment(
     n_cells: int = 64,
     hidden_dim: int = 128,
     n_steps: int = 300,
-    coupling: float = 0.014,
+    coupling: float = None,
 ) -> BottleneckResult:
     """Run consciousness simulation with a specific bottleneck dimension."""
+    if coupling is None:
+        from consciousness_laws import PSI_ALPHA
+        coupling = PSI_ALPHA  # 0.014
     t0 = time.time()
 
     if HAS_TORCH:

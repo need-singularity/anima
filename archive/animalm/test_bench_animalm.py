@@ -174,6 +174,13 @@ def test_compare_all_tracks():
     """run_all_tracks returns results for all three tracks."""
     from bench_animalm import run_all_tracks
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     results = run_all_tracks(cells=4, steps=30)
 
     # All three tracks present

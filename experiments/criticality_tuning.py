@@ -29,6 +29,13 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Brain reference ranges (from EEG validation)
@@ -162,7 +169,8 @@ def run_critical_consciousness(
     """
     rng = np.random.default_rng(42)
     hidden_dim = dim * 2
-    coupling = 0.014  # PSI_COUPLING
+    from consciousness_laws import PSI_ALPHA
+    coupling = PSI_ALPHA  # 0.014
 
     # Initialize cells
     hiddens = rng.standard_normal((n_cells, hidden_dim)).astype(np.float64) * 0.1

@@ -71308,6 +71308,13 @@ def run_TOPO21_dynamic_topology_1024(steps=200, dim=64, hidden=128) -> BenchResu
     phi_hist = []; output_changes = []
     prev_output = torch.zeros(dim)
     import random as rng
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     rng.seed(42)
     # Dynamic extra edges (start empty, grow adaptively)
     extra_edges = {}  # i -> [j1, j2, ...]

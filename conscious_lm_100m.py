@@ -18,6 +18,13 @@ import urllib.request
 
 from conscious_lm import PureFieldFFN, CausalSelfAttention, ConsciousBlock, ConsciousLM
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def prepare_large_data(min_bytes=100_000_000):
     """100M+ 학습 데이터: 영어 + 한국어 + 코드.

@@ -75,6 +75,13 @@ def reset_remote(target, keep_growth=False, restart=False):
     print("    ✅ 프로세스 중단")
 
     import time
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     time.sleep(2)
 
     # 데이터 삭제

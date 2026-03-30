@@ -6,6 +6,13 @@ Uses Ising model analogy: below Tc=random (unconscious), above Tc=ordered (consc
 import math
 import numpy as np
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 LN2 = math.log(2)
 PSI_BALANCE = 0.5
 PSI_COUPLING = LN2 / 2**5.5
@@ -151,7 +158,8 @@ def main():
     temps = np.array([0.5, 1.0, 1.5, 2.0])
     phis_test = np.array([1.0, 3.0, 5.0, 8.0])
     diagram = cpt.phase_diagram(temps, phis_test)
-    print(f"  {'T\\Phi':>6s}", end="")
+    header = 'T/Phi'
+    print(f"  {header:>6s}", end="")
     for p in phis_test:
         print(f"  {p:5.1f}", end="")
     print()

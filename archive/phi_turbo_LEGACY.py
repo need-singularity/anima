@@ -27,6 +27,13 @@ import time
 import math
 import argparse
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def phi_proxy(hiddens: torch.Tensor, n_factions: int = 8) -> float:
     """Φ 근사 — 순수 텐서 연산. GPU 가능.

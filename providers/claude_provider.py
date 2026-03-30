@@ -44,6 +44,13 @@ class ClaudeProvider:
         """
         from anima_alive import ask_claude
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
         # Build history in the format ask_claude expects
         history = [
             {"role": m.role, "content": m.content}

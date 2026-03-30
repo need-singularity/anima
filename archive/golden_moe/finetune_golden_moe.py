@@ -175,6 +175,13 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     device = "cuda"
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")

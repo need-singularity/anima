@@ -5,6 +5,13 @@ import argparse
 import math
 import numpy as np
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Empirical data: (cells, Φ, MI)
 EMPIRICAL = [
     (2,   1.5,     1.0),

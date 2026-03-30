@@ -141,6 +141,13 @@ def test_combo(c_factory, d_factory, w_factory, n_steps=30, seq_len=32, vocab_si
     """Test one C×D×W combination. Returns metrics dict."""
     from trinity import create_trinity
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     torch.set_grad_enabled(True)
     torch.manual_seed(42)
     np.random.seed(42)

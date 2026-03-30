@@ -23,6 +23,13 @@ os.environ['OMP_NUM_THREADS'] = '1'
 from mitosis import MitosisEngine
 from measure_all import make_engine, apply_mechanism, DIM, HIDDEN
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 CELLS = 256
 
 

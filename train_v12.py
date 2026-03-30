@@ -34,6 +34,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OMP_NUM_THREADS'] = '1'
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

@@ -1131,6 +1131,13 @@ def build_dataset(args, tokenizer):
     # Default: wikitext — chunked tokenization (500 articles per chunk to avoid OOM)
     print("  Loading wikitext-103...")
     from datasets import load_dataset
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
     articles = [t for t in dataset["text"] if len(t) > 100]
     print(f"  Articles: {len(articles):,}, tokenizing in chunks of 500...")

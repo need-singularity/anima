@@ -7,6 +7,13 @@ LLM(Claude API)으로 실제 대화.
 import torch, torch.nn as nn, torch.nn.functional as F
 import subprocess, os, sys, json, time
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 class ConsciousMind(nn.Module):
     def __init__(self, dim=64, hidden=64):
         super().__init__()

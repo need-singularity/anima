@@ -362,7 +362,15 @@ def _collect_simulated(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
     weights = rng.standard_normal((n_cells, hidden_dim, dim + 1)).astype(np.float64) * 0.05
 
     phis = []
-    coupling = 0.014  # PSI_COUPLING
+    from consciousness_laws import PSI_ALPHA
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+    coupling = PSI_ALPHA  # 0.014
 
     for step in range(n_steps):
         inp = rng.standard_normal(dim) * 0.1

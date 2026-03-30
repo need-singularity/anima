@@ -9,6 +9,13 @@ import pytest
 
 from memory_store import MemoryStore
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def _vec(text: str, dim: int = 16) -> np.ndarray:
     """Deterministic pseudo-vector from text hash."""

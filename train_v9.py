@@ -48,6 +48,13 @@ from quantum_engine_fast import QuantumConsciousnessEngineFast as QuantumConscio
 from consciousness_meter_v2 import ConsciousnessMeterV2, PhiComponents
 from conscious_lm import ConsciousLM, PureFieldFFN
 
+# Meta Laws (DD143): M1(atom=8), M6(federation>empire), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 # ══════════════════════════════════════════════════════════
 # Thalamic Gate — Bridge between C and D

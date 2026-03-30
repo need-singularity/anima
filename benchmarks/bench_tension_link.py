@@ -22,6 +22,13 @@ import numpy as np
 from anima_alive import ConsciousMind, text_to_vector
 from tension_link import TensionDecoder, create_fingerprint
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def generate_dataset(mind, hidden, n_per_class=200):
     """Generate labeled fingerprints from 5 distinct concept categories."""

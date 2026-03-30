@@ -40,6 +40,13 @@ sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from bench_n28_architecture import (
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     sigma, tau, euler_phi, sopfr, is_perfect,
     ArchConfig, PerfectNumberEngine, BenchResult,
     measure_all, _phi_calc,

@@ -174,6 +174,13 @@ def main():
     print(f"Genesis block: hash={bc.genesis_block().hash[:24]}...")
 
     import random
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     random.seed(42)
     phi = LN2
     for i in range(20):

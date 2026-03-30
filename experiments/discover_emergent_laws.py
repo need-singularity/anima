@@ -32,6 +32,13 @@ from typing import Dict, List, Tuple
 
 from consciousness_engine import ConsciousnessEngine
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def collect_telemetry(max_cells: int = 64, steps: int = 500) -> Dict:
     """엔진을 실행하며 상세 텔레메트리 수집."""

@@ -6,6 +6,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import gradio as gr
 import math
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 GOLDEN_CENTER = 1 / math.e
 GOLDEN_LOWER = 0.5 - math.log(4/3)
 

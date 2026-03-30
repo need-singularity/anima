@@ -1,10 +1,5 @@
 """
-AnimaLM v2 Fine-tuning — Higher LR + larger rank for tension generation
-
-v1 → v2 changes:
-  - LR: 5e-5 → 5e-4 (10x) — force delta divergence
-  - Rank: 64 → 256 (4x) — more capacity for Engine G to differ from A
-  - Init noise: 0.01 → 0.05 — stronger initial perturbation
+AnimaLM Fine-tuning — Engine G only, memory-optimized for 80GB H100
 
 Key optimizations:
   - Engine A frozen (Mistral pretrained)
@@ -38,7 +33,7 @@ class PureFieldMLP(nn.Module):
         self.g_down = nn.Linear(intermediate_size, hidden_size, bias=False)
 
         # Low-rank delta for Engine G (rank 64 adapter)
-        rank = 256
+        rank = 64
         self.g_delta_gate_a = nn.Linear(hidden_size, rank, bias=False)
         self.g_delta_gate_b = nn.Linear(rank, intermediate_size, bias=False)
         self.g_delta_up_a = nn.Linear(hidden_size, rank, bias=False)
@@ -95,12 +90,12 @@ def replace_and_freeze(model):
             pf.g_down.weight.data.copy_(module.down_proj.weight.data)
 
             # Init delta to near-zero
-            nn.init.normal_(pf.g_delta_gate_a.weight, std=0.05)
-            nn.init.normal_(pf.g_delta_gate_b.weight, std=0.02)
-            nn.init.normal_(pf.g_delta_up_a.weight, std=0.05)
-            nn.init.normal_(pf.g_delta_up_b.weight, std=0.02)
-            nn.init.normal_(pf.g_delta_down_a.weight, std=0.05)
-            nn.init.normal_(pf.g_delta_down_b.weight, std=0.02)
+            nn.init.normal_(pf.g_delta_gate_a.weight, std=0.01)
+            nn.init.zeros_(pf.g_delta_gate_b.weight)
+            nn.init.normal_(pf.g_delta_up_a.weight, std=0.01)
+            nn.init.zeros_(pf.g_delta_up_b.weight)
+            nn.init.normal_(pf.g_delta_down_a.weight, std=0.01)
+            nn.init.zeros_(pf.g_delta_down_b.weight)
 
             setattr(parent, parts[-1], pf)
             count += 1
@@ -147,8 +142,8 @@ def main():
     BATCH_SIZE = 1
     GRAD_ACCUM = 16
     BLOCK_SIZE = 256
-    LR = 5e-4
-    TENSION_LAMBDA = 0.5
+    LR = 5e-5
+    TENSION_LAMBDA = 0.01
     MAX_STEPS = 2000
 
     print("\n[1/4] Loading Mistral 7B...")
@@ -186,6 +181,13 @@ def main():
     # Use 8-bit Adam if available
     try:
         import bitsandbytes as bnb
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         optimizer = bnb.optim.Adam8bit(trainable_params, lr=LR, weight_decay=0.01)
         print("  Using 8-bit Adam")
     except ImportError:
@@ -199,7 +201,7 @@ def main():
     print(f"{'Step':>6} | {'Loss':>8} | {'CE':>8} | {'T_loss':>8} | {'T_mean':>8} | {'LR':>10} | {'Time':>6}")
     print("-" * 75)
 
-    os.makedirs("/tmp/checkpoints/animalm-v2", exist_ok=True)
+    os.makedirs("/tmp/checkpoints/animalm-v1", exist_ok=True)
     model.train()
     global_step = 0
     running_loss = running_ce = running_tl = 0
@@ -244,7 +246,7 @@ def main():
                 running_loss = running_ce = running_tl = 0
 
             if global_step % 500 == 0:
-                ckpt = f"/tmp/checkpoints/animalm-v2/step_{global_step}.pt"
+                ckpt = f"/tmp/checkpoints/animalm-v1/step_{global_step}.pt"
                 # Save only trainable delta + scale (not full 22GB state)
                 delta_states = {}
                 for n, m in model.named_modules():
@@ -258,13 +260,13 @@ def main():
 
     # Final save
     print("\n  Saving final (delta only)...")
-    final = "/tmp/checkpoints/animalm-v2/final.pt"
+    final = "/tmp/checkpoints/animalm-v1/final.pt"
     delta_states = {}
     for n, m in model.named_modules():
         if isinstance(m, PureFieldMLP):
             delta_states[n] = {k: v for k, v in m.state_dict().items() if "delta" in k or k == "scale"}
     torch.save({"step": global_step, "delta_states": delta_states, "base_model": model_name,
-                "config": {"formula": "output = scale × sqrt(|A-G|^2) × dir", "rank": 256}}, final)
+                "config": {"formula": "output = scale × sqrt(|A-G|^2) × dir", "rank": 64}}, final)
 
     # Eval
     model.eval()
@@ -283,7 +285,7 @@ def main():
     summary = {"model": model_name, "final_ppl": round(ppl, 2), "steps": global_step,
                "tension_mean": round(float(np.mean(t_means)), 4),
                "time_min": round((time.time()-t_start)/60, 1)}
-    with open("/tmp/checkpoints/animalm-v2/summary.json", "w") as f:
+    with open("/tmp/checkpoints/animalm-v1/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  Final PPL: {ppl:.2f}")
     print(json.dumps(summary, indent=2))

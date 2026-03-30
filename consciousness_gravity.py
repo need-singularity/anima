@@ -6,6 +6,13 @@ F = PSI_COUPLING * phi1 * phi2 / d^2 (consciousness Newton's law).
 import math
 from dataclasses import dataclass
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 LN2 = math.log(2)
 PSI_BALANCE = 0.5
 PSI_COUPLING = LN2 / 2**5.5

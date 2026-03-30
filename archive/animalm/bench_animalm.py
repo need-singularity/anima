@@ -409,6 +409,13 @@ def run_all_tracks(
     # --- Track 1B: TALK5 ---
     from animalm_talk5 import Talk5Engine
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     engine_1b = Talk5Engine(
         n_cells=cells,
         cell_dim=64,

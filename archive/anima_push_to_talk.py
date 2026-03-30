@@ -42,6 +42,13 @@ speak("아니마 푸시투톡 모드입니다.")
 # Whisper 미리 로드
 print("  Whisper 로딩...")
 import whisper
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 whisper_model = whisper.load_model("tiny")
 print("  준비 완료!\n")
 

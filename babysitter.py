@@ -13,6 +13,13 @@ import time
 import threading
 import logging
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 _log = logging.getLogger('babysitter').info
 
 

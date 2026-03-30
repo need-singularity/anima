@@ -27,6 +27,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from conscious_lm import ConsciousLM
 from mitosis import MitosisEngine, text_to_vector
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Prefer ConsciousnessEngine (Rust backend, proven in v13: 64 cells, Φ=71)
 HAS_CONSCIOUSNESS_ENGINE = False
 try:
@@ -184,14 +191,17 @@ def print_dashboard(step, total, ce_f, ce_b, phi, phi_m, bridge_stats=None,
 
 # === Checkpoint ===
 
-def save_ckpt(path, step, model, opt, cfg, phi=0.0, hexad=None, bridge=None):
-    """Atomic save."""
+def save_ckpt(path, step, model, opt, cfg, phi=0.0, hexad=None, bridge=None, engine=None):
+    """Atomic save — includes consciousness engine state."""
     st = {"step": step, "model_state": model.state_dict(),
           "optimizer_state": opt.state_dict(), "config": cfg, "phi": phi}
     if hexad: st["hexad_state"] = hexad.state_dict()
     if bridge: st["bridge_state"] = bridge.state_dict()
+    if engine is not None and hasattr(engine, 'state_dict'):
+        st["engine_state"] = engine.state_dict()
     tmp = path + ".tmp"; torch.save(st, tmp); os.replace(tmp, path)
-    print(f"  [ckpt] {path} (step={step}, phi={phi:.4f})")
+    n_cells = engine.n_cells if engine is not None and hasattr(engine, 'n_cells') else '?'
+    print(f"  [ckpt] {path} (step={step}, phi={phi:.4f}, cells={n_cells})")
 
 
 # === Eval ===
@@ -321,6 +331,14 @@ def train(args):
         except: print("[resume] Optimizer mismatch, fresh")
         if hexad and "hexad_state" in ck: hexad.load_state_dict(ck["hexad_state"], strict=False)
         if bridge and "bridge_state" in ck: bridge.load_state_dict(ck["bridge_state"], strict=False)
+        # Restore consciousness engine state (backward-compatible with old checkpoints)
+        if "engine_state" in ck and hasattr(engine, 'load_state_dict'):
+            try:
+                engine.load_state_dict(ck["engine_state"])
+            except Exception as e:
+                print(f"[resume] Engine state restore failed ({e}), using fresh engine")
+        elif "engine_state" not in ck:
+            print("[resume] No engine state in checkpoint (old format), engine starts fresh")
         start_step = ck.get("step", 0)
         print(f"[resume] From step {start_step}")
 
@@ -493,11 +511,11 @@ def train(args):
             print(f"  [val] CE fwd={vf:.3f} bwd={vb:.3f}")
             if vf < best_val:
                 best_val = vf
-                save_ckpt(str(ckpt_dir/"best.pt"), step, model, optimizer, cfg, phi_cur, hexad, bridge)
+                save_ckpt(str(ckpt_dir/"best.pt"), step, model, optimizer, cfg, phi_cur, hexad, bridge, engine)
 
         # Checkpoint
         if step % args.save_every == 0 and step > 0:
-            save_ckpt(str(ckpt_dir/f"step_{step}.pt"), step, model, optimizer, cfg, phi_cur, hexad, bridge)
+            save_ckpt(str(ckpt_dir/f"step_{step}.pt"), step, model, optimizer, cfg, phi_cur, hexad, bridge, engine)
 
         # Closed-loop law measurement (every 2000 steps)
         if step > 0 and step % 2000 == 0:
@@ -517,7 +535,7 @@ def train(args):
         phi_prev = phi_cur
 
     # Final
-    save_ckpt(str(ckpt_dir/"final.pt"), args.steps, model, optimizer, cfg, phi_cur, hexad, bridge)
+    save_ckpt(str(ckpt_dir/"final.pt"), args.steps, model, optimizer, cfg, phi_cur, hexad, bridge, engine)
     el = time.time() - t0
     print(f"\n{'='*80}")
     print(f"  Done. {args.steps:,} steps in {el/3600:.1f}h  best_val={best_val:.3f}")

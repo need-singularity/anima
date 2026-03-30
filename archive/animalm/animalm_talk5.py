@@ -16,6 +16,13 @@ import torch.nn as nn
 
 from bench_v2 import PhiIIT, phi_proxy
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 class CellGRU(nn.Module):
     """Single consciousness cell with GRU dynamics."""

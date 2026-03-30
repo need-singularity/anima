@@ -16,6 +16,13 @@ import os
 from pathlib import Path
 from secret_vault import SecretVault
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 KNOWN_KEYS = [
     'ANIMA_R2_ENDPOINT',
     'ANIMA_R2_ACCESS_KEY',

@@ -624,6 +624,13 @@ def run_all(only=None, cells=DEFAULT_CELLS, steps=DEFAULT_STEPS):
 
 if __name__ == '__main__':
     import argparse
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     parser = argparse.ArgumentParser(description='Trinity Engine D Variations Benchmark')
     parser.add_argument('--only', nargs='+', help='Run only specific hypotheses (e.g. TD1 TD3)')
     parser.add_argument('--cells', type=int, default=DEFAULT_CELLS, help=f'Number of cells (default {DEFAULT_CELLS})')

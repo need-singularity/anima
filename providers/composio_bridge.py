@@ -54,6 +54,13 @@ class ComposioBridge:
                 )
             try:
                 from composio import Composio
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
                 self._composio = Composio(api_key=self._api_key)
             except ImportError:
                 raise RuntimeError(

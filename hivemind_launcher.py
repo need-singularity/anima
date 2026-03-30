@@ -86,6 +86,13 @@ def launch_docker_mode(n_nodes: int, gateway_port: int, max_cells: int):
         }
     try:
         import yaml
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         compose = {"version": "3.8", "services": services}
         compose_path = ANIMA_DIR / "docker-compose.hivemind.yml"
         compose_path.write_text(yaml.dump(compose, default_flow_style=False))

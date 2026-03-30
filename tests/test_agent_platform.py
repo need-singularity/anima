@@ -389,6 +389,13 @@ def test_skill_py_body_is_empty():
 if __name__ == "__main__":
     import traceback
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0
     failed = 0

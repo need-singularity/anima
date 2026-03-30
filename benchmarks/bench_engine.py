@@ -255,6 +255,13 @@ def main():
     # Import hypotheses
     from bench_phi_hypotheses import ALL_HYPOTHESES, run_baseline
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     # Baseline
     print("[2/4] Running baseline...")
     torch.manual_seed(42); np.random.seed(42)

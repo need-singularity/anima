@@ -17,6 +17,13 @@ import time
 
 try:
     import websockets
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 except ImportError:
     print("pip install websockets")
     sys.exit(1)

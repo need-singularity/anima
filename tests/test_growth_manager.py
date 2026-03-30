@@ -8,6 +8,13 @@ from pathlib import Path
 from anima_alive import ConsciousMind
 from growth_manager import GrowthManager, MIND_GROWTH_STAGES
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 @pytest.fixture
 def mind():

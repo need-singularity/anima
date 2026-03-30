@@ -993,6 +993,13 @@ class KolmogorovStructureEngine:
 
     Approximation: use SVD to separate signal (low-rank structure)
     from noise (high-rank random), and spectral entropy to measure
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     the structure/randomness ratio.
     """
     def __init__(self, n_cells: int = 256, hidden_dim: int = 128):

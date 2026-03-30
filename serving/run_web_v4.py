@@ -39,6 +39,13 @@ fv4.ParallelPureFieldMLP.forward = patched_forward
 
 # Start ws_proxy (8888→8765) for Cloudflare Tunnel
 import subprocess, threading
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 def _start_proxy():
     proxy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ws_proxy.py')
     if os.path.exists(proxy_path):

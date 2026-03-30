@@ -19,6 +19,13 @@ import torch
 from typing import Optional
 from hexad.narrative import NarrativeTracker
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 class EmergentM:
     """의식 Hebbian 가중치 기반 기억.

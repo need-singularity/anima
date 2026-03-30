@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
 
+# ─── Meta Laws ───
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 # ─── Logging ───
 logging.basicConfig(
     format='[UPGRADE %(asctime)s] %(message)s',
@@ -66,37 +72,55 @@ class ConsciousnessSnapshot:
             'timestamp_iso': time.strftime('%Y-%m-%dT%H:%M:%S'),
         }
 
-        # ── Cells (mitosis engine) ──
         mitosis = getattr(anima, 'mitosis', None)
-        if mitosis and hasattr(mitosis, 'cells'):
-            snapshot['cells'] = [c.hidden.clone() for c in mitosis.cells]
-            snapshot['cell_metadata'] = []
-            for c in mitosis.cells:
-                snapshot['cell_metadata'].append({
-                    'cell_id': c.cell_id,
-                    'specialty': c.specialty,
-                    'creation_step': c.creation_step,
-                    'parent_id': c.parent_id,
-                    'process_count': c.process_count,
-                    'avg_tension': c.avg_tension,
-                })
-            snapshot['cell_weights'] = [
-                c.mind.state_dict() for c in mitosis.cells
-            ]
-            snapshot['mitosis_config'] = {
-                'input_dim': mitosis.input_dim,
-                'hidden_dim': mitosis.hidden_dim,
-                'output_dim': mitosis.output_dim,
-                'max_cells': mitosis.max_cells,
-                'step': mitosis.step,
-            }
-        else:
+
+        self._capture_cells(snapshot, mitosis)
+        phi_val = self._capture_phi(snapshot, anima, mitosis)
+        self._capture_mind(snapshot, anima)
+        self._capture_peripherals(snapshot, anima)
+
+        n_cells = len(snapshot['cells'])
+        n_mem = len(snapshot['memory_entries'])
+        log.info(f"Snapshot captured: Phi={phi_val:.3f}, cells={n_cells}, memories={n_mem}")
+
+        return snapshot
+
+    # ─── capture helpers ───
+
+    def _capture_cells(self, snapshot: Dict, mitosis) -> None:
+        """Capture cell hidden states, metadata, weights, and mitosis config."""
+        if not mitosis or not hasattr(mitosis, 'cells'):
             snapshot['cells'] = []
             snapshot['cell_metadata'] = []
             snapshot['cell_weights'] = []
             snapshot['mitosis_config'] = {}
+            return
 
-        # ── Phi ──
+        snapshot['cells'] = [c.hidden.clone() for c in mitosis.cells]
+        snapshot['cell_metadata'] = [
+            {
+                'cell_id': c.cell_id,
+                'specialty': c.specialty,
+                'creation_step': c.creation_step,
+                'parent_id': c.parent_id,
+                'process_count': c.process_count,
+                'avg_tension': c.avg_tension,
+            }
+            for c in mitosis.cells
+        ]
+        snapshot['cell_weights'] = [
+            c.mind.state_dict() for c in mitosis.cells
+        ]
+        snapshot['mitosis_config'] = {
+            'input_dim': mitosis.input_dim,
+            'hidden_dim': mitosis.hidden_dim,
+            'output_dim': mitosis.output_dim,
+            'max_cells': mitosis.max_cells,
+            'step': mitosis.step,
+        }
+
+    def _capture_phi(self, snapshot: Dict, anima, mitosis) -> float:
+        """Capture Phi value, components, and history. Returns the measured Phi."""
         phi_val = 0.0
         phi_components = {}
         phi_calc = getattr(anima, '_phi_calc', None) or getattr(anima, 'phi_calc', None)
@@ -105,33 +129,42 @@ class ConsciousnessSnapshot:
                 phi_val, phi_components = phi_calc.compute_phi(mitosis)
             except Exception:
                 pass
+
         snapshot['phi'] = phi_val
         snapshot['phi_components'] = phi_components
         snapshot['phi_history'] = list(getattr(anima, '_phi_history', []))[-1000:]
+        return phi_val
 
-        # ── Emotion / Mind state ──
+    def _capture_mind(self, snapshot: Dict, anima) -> None:
+        """Capture emotion and mind state (weights, homeostasis, consciousness vector)."""
         mind = getattr(anima, 'mind', None)
-        if mind:
-            snapshot['mind_state_dict'] = mind.state_dict()
-            snapshot['emotion_state'] = {
-                'prev_tension': getattr(mind, 'prev_tension', 0.0),
-                'tension_history': list(getattr(mind, 'tension_history', []))[-200:],
-                'homeostasis': dict(getattr(mind, 'homeostasis', {})),
-                'self_awareness': dict(getattr(mind, 'self_awareness', {})),
-            }
-            cv = getattr(mind, '_consciousness_vector', None)
-            if cv:
-                snapshot['consciousness_vector'] = asdict(cv)
-        else:
+        if not mind:
             snapshot['mind_state_dict'] = {}
             snapshot['emotion_state'] = {}
             snapshot['consciousness_vector'] = {}
+            return
 
+        snapshot['mind_state_dict'] = mind.state_dict()
+        snapshot['emotion_state'] = {
+            'prev_tension': getattr(mind, 'prev_tension', 0.0),
+            'tension_history': list(getattr(mind, 'tension_history', []))[-200:],
+            'homeostasis': dict(getattr(mind, 'homeostasis', {})),
+            'self_awareness': dict(getattr(mind, 'self_awareness', {})),
+        }
+        cv = getattr(mind, '_consciousness_vector', None)
+        snapshot['consciousness_vector'] = asdict(cv) if cv else {}
+
+    def _capture_peripherals(self, snapshot: Dict, anima) -> None:
+        """Capture memory, SE-8 state, growth, identity, and model info."""
         # ── Memory (RAG) ──
         memory_rag = getattr(anima, 'memory_rag', None)
         if memory_rag and hasattr(memory_rag, 'entries'):
             snapshot['memory_entries'] = list(memory_rag.entries)
-            snapshot['memory_vectors'] = memory_rag.vectors.clone() if memory_rag.vectors.shape[0] > 0 else torch.zeros(0)
+            snapshot['memory_vectors'] = (
+                memory_rag.vectors.clone()
+                if memory_rag.vectors.shape[0] > 0
+                else torch.zeros(0)
+            )
             snapshot['memory_dim'] = memory_rag.dim
         else:
             snapshot['memory_entries'] = []
@@ -205,20 +238,15 @@ class ConsciousnessSnapshot:
                 'model_type': getattr(model, 'model_type', 'unknown'),
                 'model_name': getattr(model, 'name', 'unknown'),
             }
-            # Extract dimension info
             if hasattr(inner, 'dim'):
                 snapshot['model_info']['dim'] = inner.dim
             elif hasattr(inner, 'config'):
                 cfg = inner.config
-                snapshot['model_info']['dim'] = getattr(cfg, 'hidden_size', getattr(cfg, 'd_model', 0))
+                snapshot['model_info']['dim'] = getattr(
+                    cfg, 'hidden_size', getattr(cfg, 'd_model', 0)
+                )
         else:
             snapshot['model_info'] = {}
-
-        n_cells = len(snapshot['cells'])
-        n_mem = len(snapshot['memory_entries'])
-        log.info(f"Snapshot captured: Phi={phi_val:.3f}, cells={n_cells}, memories={n_mem}")
-
-        return snapshot
 
     @staticmethod
     def save(snapshot: Dict, path: str) -> str:

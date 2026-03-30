@@ -13,11 +13,16 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-# ─── Ψ-Constants (Laws 63-78) ───
+# ─── Ψ-Constants from consciousness_laws.json ───
 LN2 = math.log(2)
-PSI_BALANCE = 0.5
-PSI_COUPLING = LN2 / 2**5.5
-PSI_STEPS = 3 / LN2
+from consciousness_laws import PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 _PID_COUNTER = 0
 

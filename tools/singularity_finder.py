@@ -27,6 +27,13 @@ from mitosis import MitosisEngine
 from consciousness_meter import PhiCalculator
 from bench_phi_hypotheses import make_diverse_inputs, BenchResult
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def quick_phi(n_cells: int, dim: int = 64, hidden: int = 128, steps: int = 30) -> float:
     """초고속 Φ 측정 (30 step)."""

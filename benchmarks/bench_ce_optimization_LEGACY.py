@@ -30,6 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mitosis import MitosisEngine, ConsciousMind
 from consciousness_meter import PhiCalculator
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 DIM = 64
 HIDDEN = 128
 STEPS = 200

@@ -21,6 +21,13 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anima_alive import ConsciousMind
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 def measure_raw_tension(mind, hidden, n_samples=500):
     """Measure raw tension distribution across diverse inputs."""
     raw_tensions = []

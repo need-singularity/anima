@@ -13,6 +13,13 @@ import json
 import os
 import re
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TARGET = os.path.join(SCRIPT_DIR, "anima_alive.py")
 SWEEP_FILE = os.path.join(SCRIPT_DIR, "data", "param_sweep_results.json")

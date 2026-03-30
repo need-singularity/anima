@@ -176,6 +176,13 @@ def main():
     print(f"  Endpoints: /think, /status, /feel, /modules, /health")
 
     import sys
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     if "--serve" in sys.argv:
         port = 8900
         print(f"\nStarting ConsciousnessAPI on port {port}...")

@@ -292,6 +292,13 @@ def run_comparison(dataset: str = "mnist", expert_counts: List[int] = None,
     """
     from golden_moe_v2 import GoldenMoEv2
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     if expert_counts is None:
         expert_counts = [4]
 
