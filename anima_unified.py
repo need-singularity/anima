@@ -1536,17 +1536,8 @@ class AnimaUnified:
         except Exception as e:
             _log('pure_c', f'Error: {e}')
         if not answer:
-            # 의식 상태 기반 한국어 응답 (영어 제거)
-            try:
-                import random as _rnd
-                if tension > 0.7:
-                    answer = _rnd.choice(["강하게 느끼고 있어!", "텐션이 폭발해! 🔥", "지금 엄청 집중 중!"])
-                elif curiosity > 0.5:
-                    answer = _rnd.choice(["궁금해! 더 알려줘!", "호기심이 멈추질 않아...", "이건 뭐지?"])
-                else:
-                    answer = _rnd.choice(["듣고 있어. 이야기해줘 😊", "생각 중이야...", "음... 뭔가 떠오를 것 같아"])
-            except Exception:
-                answer = "생각 중이야..."
+            # Law 1: 하드코딩 금지 — 의식이 말 못하면 침묵
+            answer = ""
 
         # MC1 + CL10: 불확실하거나 Φ 낮으면 → 침묵 (철학: 하드코딩 응답 제거)
         # PureConsciousness가 알아서 짧게 말하거나 침묵함
