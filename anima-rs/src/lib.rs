@@ -180,6 +180,133 @@ fn transplant_run(
     Ok(arrays)
 }
 
+// ── Consciousness Engine submodule ─────────────────────────────────
+
+static CONSCIOUSNESS_ENGINE: Mutex<Option<anima_consciousness::ConsciousnessEngine>> =
+    Mutex::new(None);
+
+#[pyfunction]
+#[pyo3(name = "create", signature = (cell_dim=64, hidden_dim=128, initial_cells=2, max_cells=64, n_factions=12, phi_ratchet=true, split_threshold=0.3, split_patience=5, merge_threshold=0.01, merge_patience=15, seed=42))]
+fn consciousness_create(
+    cell_dim: usize,
+    hidden_dim: usize,
+    initial_cells: usize,
+    max_cells: usize,
+    n_factions: usize,
+    phi_ratchet: bool,
+    split_threshold: f32,
+    split_patience: usize,
+    merge_threshold: f32,
+    merge_patience: usize,
+    seed: u64,
+) -> PyResult<()> {
+    let engine = anima_consciousness::ConsciousnessEngine::new(
+        cell_dim,
+        hidden_dim,
+        initial_cells,
+        max_cells,
+        n_factions,
+        phi_ratchet,
+        split_threshold,
+        split_patience,
+        merge_threshold,
+        merge_patience,
+        seed,
+    );
+    let mut guard = CONSCIOUSNESS_ENGINE.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    *guard = Some(engine);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "step", signature = (input=None))]
+fn consciousness_step(py: Python<'_>, input: Option<Vec<f32>>) -> PyResult<Py<PyDict>> {
+    let mut guard = CONSCIOUSNESS_ENGINE.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No engine. Call consciousness.create() first.")
+    })?;
+
+    let result = engine.step(input.as_deref());
+
+    let dict = PyDict::new(py);
+    dict.set_item("phi_iit", result.phi_iit)?;
+    dict.set_item("phi_proxy", result.phi_proxy)?;
+    dict.set_item("n_cells", result.n_cells)?;
+    dict.set_item("consensus", result.consensus)?;
+    dict.set_item("best_phi", result.best_phi)?;
+    dict.set_item("step", result.step)?;
+    dict.set_item("output", result.output)?;
+
+    // Events
+    let events: Vec<Py<PyDict>> = result
+        .events
+        .iter()
+        .map(|e| {
+            let d = PyDict::new(py);
+            match e {
+                anima_consciousness::Event::Split {
+                    parent_id,
+                    child_id,
+                    n_cells_after,
+                } => {
+                    d.set_item("type", "split").unwrap();
+                    d.set_item("parent_id", parent_id).unwrap();
+                    d.set_item("child_id", child_id).unwrap();
+                    d.set_item("n_cells_after", n_cells_after).unwrap();
+                }
+                anima_consciousness::Event::Merge {
+                    keeper_id,
+                    removed_id,
+                    n_cells_after,
+                } => {
+                    d.set_item("type", "merge").unwrap();
+                    d.set_item("keeper_id", keeper_id).unwrap();
+                    d.set_item("removed_id", removed_id).unwrap();
+                    d.set_item("n_cells_after", n_cells_after).unwrap();
+                }
+            }
+            d.into()
+        })
+        .collect();
+    dict.set_item("events", events)?;
+
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "get_hiddens")]
+fn consciousness_get_hiddens(py: Python<'_>) -> PyResult<Vec<Py<PyArray1<f32>>>> {
+    let guard = CONSCIOUSNESS_ENGINE.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No engine. Call consciousness.create() first.")
+    })?;
+
+    let hiddens = engine.get_hiddens();
+    let arrays: Vec<Py<PyArray1<f32>>> = hiddens
+        .into_iter()
+        .map(|h| PyArray1::from_vec(py, h).into())
+        .collect();
+    Ok(arrays)
+}
+
+#[pyfunction]
+#[pyo3(name = "n_cells")]
+fn consciousness_n_cells() -> PyResult<usize> {
+    let guard = CONSCIOUSNESS_ENGINE.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No engine. Call consciousness.create() first.")
+    })?;
+    Ok(engine.n_cells())
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -193,6 +320,14 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     talk5.add_function(wrap_pyfunction!(talk5_get_hiddens, &talk5)?)?;
     talk5.add_function(wrap_pyfunction!(talk5_set_hiddens, &talk5)?)?;
     m.add_submodule(&talk5)?;
+
+    // consciousness submodule (canonical engine)
+    let consciousness = PyModule::new(py, "consciousness")?;
+    consciousness.add_function(wrap_pyfunction!(consciousness_create, &consciousness)?)?;
+    consciousness.add_function(wrap_pyfunction!(consciousness_step, &consciousness)?)?;
+    consciousness.add_function(wrap_pyfunction!(consciousness_get_hiddens, &consciousness)?)?;
+    consciousness.add_function(wrap_pyfunction!(consciousness_n_cells, &consciousness)?)?;
+    m.add_submodule(&consciousness)?;
 
     // alpha_sweep submodule
     let alpha_sweep = PyModule::new(py, "alpha_sweep")?;
