@@ -74,11 +74,26 @@ class MemoryStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
 
         # FAISS — lazy init
         self._index: faiss.IndexFlatIP | None = None
         self._idmap: list[int] = []
         self._load_faiss()
+
+    def _migrate(self):
+        """Add missing columns to legacy databases."""
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        migrations = [
+            ("emotion", "TEXT"),
+            ("phi", "REAL"),
+            ("session_id", "TEXT"),
+            ("epoch", "REAL"),
+        ]
+        for col, typ in migrations:
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {typ}")
+        self._conn.commit()
 
     # ── FAISS helpers ──────────────────────────────────────────
 
