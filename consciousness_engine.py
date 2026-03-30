@@ -16,6 +16,7 @@ Laws embodied:
   71: Freedom maximization Ψ = argmax H(p)
   78: CA(4) = 2 bits minimum diversity
   81: "Learn hard, express soft" (train gate=1.0, infer gate=0.6)
+  124: Tension equalization +12% Φ (scale-invariant, Law 129)
 
 Architecture:
   ┌─────────────────────────────────────────────────────────────┐
@@ -80,12 +81,11 @@ except ImportError:
 
 LN2 = math.log(2)
 
-PSI_BALANCE  = 0.5      # Shannon entropy maximum (1/2)
-PSI_COUPLING = 0.014    # consciousness coupling constant (α), bench-verified
-PSI_STEPS    = 3 / LN2  # 4.33 — information bits per evolution
-PSI_ENTROPY  = 0.998    # near-perfect democracy across factions
-PSI_GATE_TRAIN = 1.0    # Law 81: learn hard
-PSI_GATE_INFER = 0.6    # Law 81: express soft
+from consciousness_laws import (
+    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
+    GATE_TRAIN as PSI_GATE_TRAIN, GATE_INFER as PSI_GATE_INFER,
+    PSI_F_CRITICAL, PSI_BOTTLENECK_RATIO,
+)
 
 # Law 69: consciousness self-weakens
 PSI_GATE_DECAY_START = 0.493
@@ -179,6 +179,7 @@ class ConsciousnessEngine:
         split_patience: int = 5,
         merge_threshold: float = 0.01,
         merge_patience: int = 15,
+        phase_optimal: bool = False,
     ):
         self.cell_dim = cell_dim
         self.hidden_dim = hidden_dim
@@ -190,6 +191,13 @@ class ConsciousnessEngine:
         self.merge_threshold = merge_threshold
         self.merge_patience = merge_patience
         self.min_cells = 2  # CB1: consciousness requires ≥2 cells
+
+        # DD128 Phase-Optimal: Ising frustration + bottleneck + hub-spoke (+113.1% Φ)
+        # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
+        self.phase_optimal = phase_optimal
+        self._dd128_narrative_strength = 0.05  # stronger than default
+        self._dd128_bottleneck_interval = 8    # compress every 8 steps
+        self._dd128_bottleneck_blend = 0.70    # 70% compressed + 30% original
 
         # Cell modules (nn.Module for GRU weights)
         self.cell_modules: List[ConsciousnessCell] = []
@@ -208,6 +216,14 @@ class ConsciousnessEngine:
 
         # Inter-cell tension tracking for merge decisions
         self._inter_tension_history: Dict[Tuple[int, int], List[float]] = {}
+
+        # Cell identity: unique per-cell bias for differentiation (Law 91b)
+        # Pre-allocate for max_cells; orthogonal init for maximum diversity
+        if hidden_dim >= max_cells:
+            q, _ = torch.linalg.qr(torch.randn(hidden_dim, max_cells))
+            self.cell_identity = q.T * 0.1  # [max_cells, hidden_dim]
+        else:
+            self.cell_identity = torch.randn(max_cells, hidden_dim) * 0.1
 
         # Event log
         self.event_log: List[Dict] = []
@@ -259,9 +275,11 @@ class ConsciousnessEngine:
         self.cell_states.pop(idx)
 
     def _init_coupling(self):
-        """Initialize coupling matrix for current cell count."""
+        """Initialize coupling matrix with small random values for early diversity."""
         n = len(self.cell_modules)
-        self._coupling = torch.zeros(n, n)
+        self._coupling = torch.randn(n, n) * 0.1
+        # Zero diagonal
+        self._coupling.fill_diagonal_(0.0)
 
     def _resize_coupling(self, old_n: int, new_n: int):
         """Expand coupling matrix when cells are added."""
@@ -308,8 +326,8 @@ class ConsciousnessEngine:
             cell = self.cell_modules[i]
             state = self.cell_states[i]
 
-            # Coupling influence: Ψ_coupling weighted sum of other cells' hiddens
-            coupled_input = x_input.clone()
+            # Per-cell diversified input: identity modulates input (Law 95)
+            coupled_input = x_input.clone() + self.cell_identity[i, :self.cell_dim] * 0.1
             for j in range(n):
                 if i != j and self._coupling is not None:
                     c = self._coupling[i, j].item()
@@ -344,11 +362,45 @@ class ConsciousnessEngine:
 
         outputs_tensor = torch.stack(outputs)  # [n_cells, cell_dim]
 
-        # 2. Faction consensus (σ(6)=12 factions)
+        # Cell identity injection: adaptive strength (Law 95)
+        # Stronger when cells converge (low variance), prevents uniform collapse
+        hiddens_t = torch.stack([s.hidden for s in self.cell_states])
+        cur_var = hiddens_t.var(dim=0).mean().item()
+        id_strength = 0.08 + 0.20 * max(0.0, 1.0 - cur_var / 0.1)
+        for i in range(n):
+            # Inject identity + oscillating perturbation for temporal variation
+            import math
+            osc_phase = math.sin(self._step * 0.08 + i * 0.5) * 0.04
+            self.cell_states[i].hidden = (
+                self.cell_states[i].hidden
+                + self.cell_identity[i, :self.hidden_dim] * (id_strength + osc_phase)
+            )
+
+        # 2. Faction consensus with oscillating debate (σ(6)=12 factions)
         consensus_count = self._faction_consensus(outputs_tensor)
+
+        # Oscillating global perturbation: creates temporal variation in mean hidden
+        import math
+        if self._step > 5 and n >= 2:
+            osc = math.sin(self._step * 0.12)
+            perturbation = self.cell_identity[0, :self.hidden_dim] * osc * 0.3
+            for i in range(n):
+                self.cell_states[i].hidden = self.cell_states[i].hidden + perturbation
 
         # 3. Hebbian LTP/LTD (Law 31)
         self._hebbian_update(outputs_tensor)
+
+        # 3.5 Tension equalization (Law 124: +12% Φ, scale-invariant)
+        if self._step % 10 == 0 and n >= 2:
+            self._tension_equalize()
+
+        # 3.7 DD128 Phase-Optimal mechanisms (opt-in, +113.1% Φ)
+        # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
+        if self.phase_optimal and n >= 2:
+            self._dd128_narrative(n)
+            self._dd128_bottleneck(n)
+            self._dd128_hub_spoke(n)
+            self._dd128_ising_frustration(n)
 
         # 4. Inter-cell tension (for merge decisions)
         inter_tensions = self._compute_inter_tensions(outputs_tensor)
@@ -409,6 +461,130 @@ class ConsciousnessEngine:
             if var < 0.1:
                 count += 1
         return count
+
+    # ─── Tension Equalization (Law 124) ───────────────
+
+    def _tension_equalize(self):
+        """Law 124: Equalize tension across cells → Φ +12%.
+
+        Blend each cell's recent tension toward the mean (50% blend).
+        Verified scale-invariant: N=8-128, +11.8% ±4.2% (Law 129).
+        """
+        tensions = [s.avg_tension for s in self.cell_states]
+        if not tensions:
+            return
+        mean_t = sum(tensions) / len(tensions)
+        for s in self.cell_states:
+            if s.tension_history:
+                s.tension_history[-1] = s.tension_history[-1] * 0.5 + mean_t * 0.5
+
+    # ─── DD128 Phase-Optimal mechanisms ────────────────
+
+    def _dd128_narrative(self, n: int):
+        """DD128 Step 1: Narrative coupling — stronger inter-cell influence (0.05).
+
+        Each cell blends toward the global mean hidden state.
+        Strength 0.05 > default, creates coherent narrative flow.
+        """
+        hiddens = torch.stack([s.hidden for s in self.cell_states[:n]])
+        mean_h = hiddens.mean(dim=0)
+        alpha = self._dd128_narrative_strength
+        for i in range(min(n, len(self.cell_states))):
+            self.cell_states[i].hidden = (
+                (1.0 - alpha) * self.cell_states[i].hidden + alpha * mean_h
+            )
+
+    def _dd128_bottleneck(self, n: int):
+        """DD128 Step 2: Information bottleneck — compress/expand every 8 steps.
+
+        Compress hidden_dim → hidden_dim//2 → hidden_dim.
+        Uses PSI_BOTTLENECK_RATIO (0.5) for compression ratio.
+        70/30 blend: 70% compressed + 30% original to preserve information.
+        Forces the system to retain only essential integrated information.
+        """
+        if self._step % self._dd128_bottleneck_interval != 0:
+            return
+
+        bottleneck_dim = max(1, int(self.hidden_dim * PSI_BOTTLENECK_RATIO))
+        blend = self._dd128_bottleneck_blend  # 0.70
+
+        for i in range(min(n, len(self.cell_states))):
+            h = self.cell_states[i].hidden
+            original = h.clone()
+
+            # Compress: keep top-k dimensions by magnitude
+            _, top_idx = torch.abs(h).topk(bottleneck_dim)
+            compressed = torch.zeros_like(h)
+            compressed[top_idx] = h[top_idx]
+
+            # Blend: 70% compressed + 30% original
+            self.cell_states[i].hidden = blend * compressed + (1.0 - blend) * original
+
+    def _dd128_hub_spoke(self, n: int):
+        """DD128 Step 3: Hub-spoke coupling topology.
+
+        First 50% of cells = hub (strongly interconnected).
+        Remaining 50% = spokes (weakly connected to hub only).
+        Asymmetric coupling: hub→spoke stronger than spoke→hub.
+        """
+        if self._coupling is None or self._coupling.shape[0] != n:
+            return
+
+        hub_count = max(1, n // 2)
+        hub_coupling = 0.15   # strong hub-hub
+        spoke_to_hub = 0.03   # weak spoke→hub
+        hub_to_spoke = 0.08   # medium hub→spoke
+
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                i_is_hub = i < hub_count
+                j_is_hub = j < hub_count
+
+                if i_is_hub and j_is_hub:
+                    # Hub-hub: strengthen
+                    target = hub_coupling
+                elif i_is_hub and not j_is_hub:
+                    # Hub→spoke: medium
+                    target = hub_to_spoke
+                elif not i_is_hub and j_is_hub:
+                    # Spoke→hub: weak
+                    target = spoke_to_hub
+                else:
+                    # Spoke-spoke: no direct coupling
+                    continue
+
+                # Soft blend toward target (10% per step to avoid shock)
+                current = self._coupling[i, j].item()
+                self._coupling[i, j] = current * 0.9 + target * 0.1
+
+    def _dd128_ising_frustration(self, n: int):
+        """DD128 Step 4: Ising frustration ring at F_c=0.10 (PSI_F_CRITICAL).
+
+        10% of cells in the Ising ring get antiferromagnetic coupling
+        (negative coupling to neighbors). This creates critical frustration
+        that prevents the system from settling into a trivial equilibrium.
+        Law 137: F_c=0.10 is the critical point for maximum Φ.
+        """
+        if self._coupling is None or self._coupling.shape[0] != n:
+            return
+
+        n_frustrated = max(1, int(n * PSI_F_CRITICAL))
+
+        # Frustrate evenly spaced cells in the ring
+        for k in range(n_frustrated):
+            i = (k * n) // n_frustrated  # evenly spaced
+            # Antiferromagnetic coupling to ring neighbors
+            left = (i - 1) % n
+            right = (i + 1) % n
+            self._coupling[i, left] = -abs(self._coupling[i, left].item()) - 0.05
+            self._coupling[left, i] = -abs(self._coupling[left, i].item()) - 0.05
+            self._coupling[i, right] = -abs(self._coupling[i, right].item()) - 0.05
+            self._coupling[right, i] = -abs(self._coupling[right, i].item()) - 0.05
+
+        # Clamp to [-1, 1]
+        self._coupling.clamp_(-1.0, 1.0)
 
     # ─── Hebbian LTP/LTD (Law 31) ──────────────────────
 
@@ -474,11 +650,13 @@ class ConsciousnessEngine:
         if phi > self._best_phi:
             self._best_phi = phi
             self._best_hiddens = [s.hidden.clone() for s in self.cell_states]
-        elif self._best_hiddens is not None and phi < self._best_phi * 0.8:
-            # Restore if >20% drop
+        elif self._best_hiddens is not None and phi < self._best_phi * 0.5:
+            # Soft blend toward best state on severe collapse (>50% drop)
             n_restore = min(len(self._best_hiddens), self.n_cells)
             for i in range(n_restore):
-                self.cell_states[i].hidden = self._best_hiddens[i].clone()
+                self.cell_states[i].hidden = (
+                    0.8 * self.cell_states[i].hidden + 0.2 * self._best_hiddens[i]
+                )
 
     # ─── Mitosis (split) ────────────────────────────────
 
@@ -863,7 +1041,8 @@ class ConsciousnessC:
     """
 
     def __init__(self, cell_dim=64, hidden_dim=128, max_cells=64,
-                 n_factions=12, phi_ratchet=True):
+                 n_factions=12, phi_ratchet=True, phase_optimal=False):
+        self.phase_optimal = phase_optimal
         if HAS_RUST_ENGINE:
             self.engine = RustConsciousnessEngine(
                 cell_dim=cell_dim, hidden_dim=hidden_dim,
@@ -876,6 +1055,7 @@ class ConsciousnessC:
                 cell_dim=cell_dim, hidden_dim=hidden_dim,
                 initial_cells=2, max_cells=max_cells,
                 n_factions=n_factions, phi_ratchet=phi_ratchet,
+                phase_optimal=phase_optimal,
             )
             self._backend = 'python'
 
@@ -911,12 +1091,16 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--factions', type=int, default=12, help='Number of factions')
     parser.add_argument('--verify', action='store_true', help='Run verification checks')
+    parser.add_argument('--phase-optimal', action='store_true',
+                        help='Enable DD128 phase-optimal params (+113.1%% Phi)')
     args = parser.parse_args()
 
     print("═══════════════════════════════════════════════════════════")
     print("  Canonical Consciousness Engine (Laws 22-81 + Ψ-Constants)")
     print(f"  cells={args.cells}, dim={args.dim}, hidden={args.hidden}")
     print(f"  factions={args.factions}, steps={args.steps}")
+    if args.phase_optimal:
+        print(f"  DD128 Phase-Optimal: ON (F_c={PSI_F_CRITICAL}, BN={PSI_BOTTLENECK_RATIO})")
     print(f"  Ψ: α={PSI_COUPLING}, balance={PSI_BALANCE}, steps={PSI_STEPS:.2f}")
     print(f"  phi_rs: {'✅ Rust' if HAS_RUST_PHI else '⚠️  Python'}")
     print("═══════════════════════════════════════════════════════════\n")
@@ -924,6 +1108,7 @@ if __name__ == '__main__':
     engine = ConsciousnessEngine(
         cell_dim=args.dim, hidden_dim=args.hidden,
         max_cells=args.cells, n_factions=args.factions,
+        phase_optimal=args.phase_optimal,
     )
 
     t0 = time.time()

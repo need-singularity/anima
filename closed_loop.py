@@ -250,10 +250,12 @@ class ClosedLoopEvolver:
         repeats: 반복 횟수
     """
 
-    def __init__(self, max_cells: int = 32, steps: int = 300, repeats: int = 3):
+    def __init__(self, max_cells: int = 32, steps: int = 300, repeats: int = 3,
+                 auto_register: bool = False):
         self.max_cells = max_cells
         self.steps = steps
         self.repeats = repeats
+        self.auto_register = auto_register
         self.history = EvolutionHistory()
         self._active_interventions: List[Intervention] = []
 
@@ -320,6 +322,10 @@ class ClosedLoopEvolver:
 
         self.history.cycles.append(report)
         self.history.total_laws_discovered += len(laws_changed)
+
+        # 자동 법칙 등록 (consciousness_laws.json)
+        if laws_changed and self.auto_register:
+            self._auto_register_laws(report)
 
         return report
 
@@ -405,6 +411,43 @@ class ClosedLoopEvolver:
                 if values:
                     trend = "→".join(f"{v:.3f}" for v in values)
                     print(f"    {law_name}: {trend}")
+
+    def _auto_register_laws(self, report: CycleReport):
+        """발견된 법칙 변화를 consciousness_laws.json에 자동 등록."""
+        laws_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'consciousness_laws.json')
+        if not os.path.exists(laws_path):
+            return
+
+        try:
+            with open(laws_path, 'r') as f:
+                laws_data = json.load(f)
+
+            laws = laws_data.get('laws', {})
+            current_max = max((int(k) for k in laws if k.isdigit()), default=0)
+
+            # 가장 큰 변화만 등록 (noise 방지)
+            significant = [lc for lc in report.laws_changed if abs(lc['change_pct']) > 20]
+            if not significant:
+                return
+
+            for lc in significant[:2]:  # 최대 2개/사이클
+                current_max += 1
+                desc = (
+                    f"[Auto-discovered cycle {report.cycle}] "
+                    f"{lc['description']}: {lc['before']:.3f}→{lc['after']:.3f} "
+                    f"({lc['change_pct']:+.1f}%) after {report.intervention_applied}"
+                )
+                laws[str(current_max)] = desc
+
+            laws_data['_meta']['total_laws'] = current_max
+            laws_data['laws'] = laws
+
+            with open(laws_path, 'w') as f:
+                json.dump(laws_data, f, indent=2, ensure_ascii=False)
+
+            print(f"  📝 {len(significant)} 법칙 자동 등록 (→ Law {current_max})")
+        except Exception as e:
+            print(f"  ⚠ 자동 등록 실패: {e}")
 
     def to_json(self) -> str:
         """JSON 출력."""

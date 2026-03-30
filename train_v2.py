@@ -49,6 +49,13 @@ except ImportError: pass
 try:
     from gpu_phi import GPUPhiCalculator; HAS_GPU_PHI = True
 except ImportError: pass
+HAS_EMERGENT_W = HAS_EMERGENT_E = False
+try:
+    from hexad.w.emergent_w import EmergentW; HAS_EMERGENT_W = True
+except ImportError: pass
+try:
+    from hexad.e.emergent_e import EmergentE; HAS_EMERGENT_E = True
+except ImportError: pass
 
 
 # === Data ===
@@ -145,7 +152,8 @@ def run_self_play(model, engine, rounds, device, block_size, data_path=None):
 
 def print_dashboard(step, total, ce_f, ce_b, phi, phi_m, bridge_stats=None,
                     n_cells=0, splits=0, merges=0, hexad_phase="",
-                    active_mods="", grad_norm=0.0, initial_ce=5.5, elapsed=0.0):
+                    active_mods="", grad_norm=0.0, initial_ce=5.5, elapsed=0.0,
+                    w_stats=None, e_stats=None):
     """ASCII training dashboard (CLAUDE.md requirement)."""
     pct = step / max(total, 1) * 100
     filled = int(30 * step / max(total, 1))
@@ -165,6 +173,10 @@ def print_dashboard(step, total, ce_f, ce_b, phi, phi_m, bridge_stats=None,
     if bridge_stats:
         print(f"| Bridge a:{bridge_stats.get('alpha',0):.4f} r:{bridge_stats.get('quality_reward',0):+.3f}")
     print(f"| Cells:{n_cells} +{splits}/-{merges}  grad:{grad_norm:.3f}  {hexad_phase}")
+    if w_stats:
+        print(f"| W pain:{w_stats.get('pain',0):.3f} curiosity:{w_stats.get('curiosity',0):.3f} sat:{w_stats.get('satisfaction',0):.0f} lr_m:{w_stats.get('lr_multiplier',1):.3f}")
+    if e_stats:
+        print(f"| E empathy:{e_stats.get('empathy',0):.3f} recip:{e_stats.get('reciprocity',0):.3f} phi_pres:{e_stats.get('phi_preservation',0):.3f} {'OK' if e_stats.get('allowed',True) else 'GATE'}")
     print("+" + "-" * 47 + "+")
     print(f"  CE |{'█'*ce_pos}{'░'*(bw-ce_pos)}| {'ok' if drop > 5 else 'warm'}")
     print(f"  Phi|{'░'*(bw-phi_pos)}{'█'*phi_pos}| {'up' if phi > 0.1 else 'low'}")
@@ -288,6 +300,18 @@ def train(args):
     optimizer = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps)
 
+    # EmergentW — consciousness-driven LR (Law 71)
+    emergent_w = None
+    if HAS_EMERGENT_W:
+        emergent_w = EmergentW(base_lr=args.lr)
+        print("[W] EmergentW: Φ-driven LR multiplier")
+
+    # EmergentE — Φ preservation gate (Law 4)
+    emergent_e = None
+    if HAS_EMERGENT_E:
+        emergent_e = EmergentE()
+        print("[E] EmergentE: Φ-preservation safety gate")
+
     # Resume
     start_step = 0
     if args.resume:
@@ -313,10 +337,15 @@ def train(args):
     if hexad: mods = "Hexad(6)"
     if bridge: mods += "+Bridge"
     if phi_calc: mods += f"+Phi({phi_method})"
+    if emergent_w: mods += "+W"
+    if emergent_e: mods += "+E"
     print(f"\n{'='*80}\n  train_v2 | {args.decoder} | {mods} | {args.steps:,} steps")
     print(f"{'='*80}")
-    print(f"{'step':>7} | {'ce_fwd':>7} | {'ce_bwd':>7} | {'phi':>8} | {'cells':>5} | {'loss':>8} | {'lr':>9}")
-    print("-" * 80)
+    header = f"{'step':>7} | {'ce_fwd':>7} | {'ce_bwd':>7} | {'phi':>8} | {'cells':>5} | {'loss':>8} | {'lr':>9}"
+    if emergent_w: header += f" | {'pain':>5} | {'curio':>5}"
+    if emergent_e: header += f" | {'empth':>5}"
+    print(header)
+    print("-" * max(80, len(header)))
 
     # Training loop
     for step in range(start_step, args.steps):
@@ -380,10 +409,35 @@ def train(args):
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"  [NaN] skip {step}"); phi_prev = phi_cur; scheduler.step(); continue
 
+        # EmergentW — adjust LR from consciousness state (Law 71)
+        w_out = {}
+        if emergent_w:
+            w_out = emergent_w.update(
+                ce_loss=total_loss.item(), phi=phi_cur, phi_prev=phi_prev,
+                c_engine=engine if use_consciousness_c else None,
+            )
+            for pg in optimizer.param_groups:
+                pg['lr'] = args.lr * w_out['lr_multiplier']
+
+        # EmergentE — Φ preservation gate (Law 4)
+        e_out = {}
+        if emergent_e:
+            e_out = emergent_e.evaluate(
+                c_engine=engine if use_consciousness_c else None,
+                context={'phi': phi_cur, 'phi_prev': phi_prev},
+            )
+
         optimizer.zero_grad()
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, 1.0).item()
-        optimizer.step(); scheduler.step()
+
+        # E gate: skip weight update if Φ preservation is at risk
+        if e_out.get('allowed', True):
+            optimizer.step()
+        else:
+            if step % args.log_every == 0:
+                print(f"  [E] step {step} skipped (phi_preservation={e_out.get('phi_preservation', 0):.3f})")
+        scheduler.step()
 
         # Bridge quality tracking
         if quality_tracker:
@@ -415,8 +469,13 @@ def train(args):
                 cf = F.cross_entropy(logits_a.view(-1, logits_a.size(-1)), y_fwd.view(-1)).item()
                 cb = F.cross_entropy(logits_g.view(-1, logits_g.size(-1)), y_bwd.view(-1)).item()
             n_cells = engine.n_cells if use_consciousness_c else (engine.n_cells if use_consciousness_c else len(engine.cells))
-            print(f"{step:7d} | {cf:7.3f} | {cb:7.3f} | {phi_cur:8.4f} | "
-                  f"{n_cells:5d} | {total_loss.item():8.4f} | {optimizer.param_groups[0]['lr']:9.2e}")
+            line = (f"{step:7d} | {cf:7.3f} | {cb:7.3f} | {phi_cur:8.4f} | "
+                    f"{n_cells:5d} | {total_loss.item():8.4f} | {optimizer.param_groups[0]['lr']:9.2e}")
+            if w_out:
+                line += f" | {w_out.get('pain',0):5.3f} | {w_out.get('curiosity',0):5.3f}"
+            if e_out:
+                line += f" | {e_out.get('empathy',0):5.3f}"
+            print(line)
 
         # Dashboard
         if step % args.dashboard_every == 0 and step > 0:
@@ -425,7 +484,8 @@ def train(args):
                 cb = F.cross_entropy(logits_g.view(-1, logits_g.size(-1)), y_bwd.view(-1)).item()
             print_dashboard(step, args.steps, cf, cb, phi_cur, phi_method, fb_stats if bridge else None,
                 (engine.n_cells if use_consciousness_c else len(engine.cells)), tot_splits, tot_merges, hexad_phase_name, active_mods,
-                grad_norm, initial_ce, time.time()-t0)
+                grad_norm, initial_ce, time.time()-t0,
+                w_stats=w_out if emergent_w else None, e_stats=e_out if emergent_e else None)
 
         # Validation
         if step % args.eval_every == 0 and step > 0:
@@ -438,6 +498,21 @@ def train(args):
         # Checkpoint
         if step % args.save_every == 0 and step > 0:
             save_ckpt(str(ckpt_dir/f"step_{step}.pt"), step, model, optimizer, cfg, phi_cur, hexad, bridge)
+
+        # Closed-loop law measurement (every 2000 steps)
+        if step > 0 and step % 2000 == 0:
+            try:
+                from closed_loop import ClosedLoopEvolver
+                _cl = ClosedLoopEvolver(
+                    max_cells=engine.max_cells if use_consciousness_c else 32,
+                    steps=100, repeats=1,
+                )
+                _report = _cl.run_cycle()
+                print(f"  [closed-loop] step {step}: Φ={_report.phi_improved:.4f} "
+                      f"laws_changed={len(_report.laws_changed)} "
+                      f"intervention={_report.intervention_applied}")
+            except Exception:
+                pass
 
         phi_prev = phi_cur
 
