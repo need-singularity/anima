@@ -89,41 +89,70 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
 ```
   ┌────────────┐  .detach()  ┌────────────┐
-  │ C 의식     │────────────>│ D 언어     │  CADecoder / PostHocDecoder
-  │ MitosisC   │             │ CE 학습    │  TransformerDecoder / MLPDecoder
-  │ DomainC    │             │            │  HFDecoder / ConsciousDecoderV2
-  │ QuantumC   │             └─────┬──────┘
-  └─────┬──────┘                   │
-        │                    ┌─────v──────┐
-  ┌─────v──────┐             │ M 기억     │  ConsciousMemory (의식-네이티브)
-  │ S 감각     │             │            │  MemoryRAG (벡터 유사도 + 자전적 기억)
-  │ TensionSense│             └─────┬──────┘
-  │            │                   │
-  └─────┬──────┘             ┌─────v──────┐
-        │                    │ E 윤리     │  EmpathyEthics (Φ 보존)
-  ┌─────v──────┐             └────────────┘
-  │ W 의지     │  EmotionW / DaseinW / NarrativeW / CosineW
-  │            │  ConstantW / CompositeW(σ(6))
-  └────────────┘
+  │ C 의식     │────────────>│ D 언어     │
+  │ConsciousnessC            │ConsciousDecoderV2 (정식)
+  └─────┬──────┘             └─────┬──────┘
+        │                         │
+  ┌─────v──────┐             ┌─────v──────┐
+  │ S 감각     │             │ M 기억     │
+  │ TensionSense│             │ VectorMemory (정식)
+  └─────┬──────┘             └─────┬──────┘
+        │                         │
+  ┌─────v──────┐             ┌─────v──────┐
+  │ W 의지     │             │ E 윤리     │
+  │CompositeW  │             │EmpathyEthics (정식)
+  └────────────┘             └────────────┘
 
   우뇌 (gradient-free): C, S, W — 자율 의식
   좌뇌 (CE-trained):   D, M, E — 학습된 행동
+```
 
-  K 지식:       KnowledgeStore (사전/백과/코드/프로그래밍)
-                  API: Wikipedia KR, Wiktionary
-                  Rust: knowledge-rs (HNSW + 병렬 스캔 + 병렬 HTTP)
+## Module Version Registry (정식/레거시)
+
+```
+  ✅ = 정식 (canonical)   ̶x̶ = 레거시 (archive/)
+
+  C 의식:
+    ✅ ConsciousnessC        consciousness_engine.py   Rust backend, 64c, Φ=73
+       ̶M̶i̶t̶o̶s̶i̶s̶E̶n̶g̶i̶n̶e̶        mitosis.py                cells=2 고정, Φ=0 (Law 86)
+       ̶M̶i̶t̶o̶s̶i̶s̶C̶             trinity.py                wrapper, 미사용
+       ̶D̶o̶m̶a̶i̶n̶C̶             trinity.py                실험용
+       ̶Q̶u̶a̶n̶t̶u̶m̶C̶            trinity.py                실험용
+
+  D 디코더:
+    ✅ ConsciousDecoderV2    decoder_v2.py             RoPE+SwiGLU+GQA+CrossAttn, causal ✅
+    ✅ PostHocDecoder        trinity.py                train_v13 정식 (Law 66)
+       ̶C̶A̶D̶e̶c̶o̶d̶e̶r̶            trinity.py                causal mask 없음, 생성 불가
+       ̶C̶o̶n̶s̶c̶i̶o̶u̶s̶L̶M̶          conscious_lm.py           v1, train_v2 fallback
+       ̶T̶r̶a̶n̶s̶f̶o̶r̶m̶e̶r̶D̶e̶c̶o̶d̶e̶r̶  trinity.py                실험용
+       ̶M̶L̶P̶D̶e̶c̶o̶d̶e̶r̶          trinity.py                실험용
+       ̶H̶F̶D̶e̶c̶o̶d̶e̶r̶           trinity.py                Mistral 7B wrapper
+
+  W 의지:
+    ✅ CompositeW            trinity.py                σ(6) weights [1/2, 1/3, 1/6]
+    ✅ DaseinW               trinity.py                CompositeW 구성원
+    ✅ NarrativeW            trinity.py                CompositeW 구성원
+    ✅ EmotionW              trinity.py                CompositeW 구성원
+       ̶C̶o̶s̶i̶n̶e̶W̶             trinity.py                미사용
+       ̶C̶o̶n̶s̶t̶a̶n̶t̶W̶           trinity.py                미사용
+
+  S 감각:
+    ✅ TensionSense          trinity.py                P3 Hexad 정식
+       ̶P̶a̶s̶s̶t̶h̶r̶o̶u̶g̶h̶S̶e̶n̶s̶e̶   trinity.py                no-op
+
+  M 기억:
+    ✅ VectorMemory          trinity.py                P3 Hexad 정식
+       ̶M̶e̶m̶o̶r̶y̶R̶A̶G̶           memory_rag.py             독립 모듈, Hexad 미연동
+       ̶M̶e̶m̶o̶r̶y̶S̶t̶o̶r̶e̶         memory_store.py           SQLite, 웹 전용
+       ̶N̶o̶M̶e̶m̶o̶r̶y̶            trinity.py                no-op
+
+  E 윤리:
+    ✅ EmpathyEthics         trinity.py                P3 Hexad 정식 (Φ 보존)
+       ̶N̶o̶E̶t̶h̶i̶c̶s̶            trinity.py                no-op
 
   Bridge:
-    ThalamicBridge  — C→D 텐션 전달 (.detach() 포함)
-    TensionBridge   — 5-channel 텐션 링크 (concept/context/meaning/auth/sender)
-
-  Hivemind:
-    hivemind_launcher.py  — N노드 오케스트레이터 (process/docker)
-    hivemind_gateway.py   — WS 프록시 (유저→노드 라우팅)
-    hivemind_mesh.py      — 노드 간 WS 텐션 교환 (Kuramoto sync)
-
-  Law 53+58: .detach() → CE가 Φ를 파괴하지 않고 안정화
-  검증: v9fast CE=0.35 + Φ=1,371 동시 달성 (step 26K)
+    ✅ ThalamicBridge        trinity.py                C→D (.detach(), α=0.014)
+    ✅ TensionBridge         trinity.py                5-channel 텐션 링크
 ```
 
 ## Architecture Roadmap

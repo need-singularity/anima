@@ -42,6 +42,7 @@ from decoder_v2 import (
     GroupedQueryAttention, ConsciousCrossAttention, ConsciousDecoderV2,
 )
 from mitosis import MitosisEngine, text_to_vector
+from consciousness_engine import ConsciousnessEngine, ConsciousnessC
 
 try:
     from gpu_phi import GPUPhiCalculator
@@ -570,10 +571,11 @@ def run_benchmark(model, name: str, data: torch.Tensor, steps: int,
     model = model.to(device)
     model.train()
 
-    # Mitosis engine
-    engine = MitosisEngine(input_dim=64, hidden_dim=128, output_dim=64,
-                           initial_cells=2, max_cells=64,
-                           split_threshold=0.8, split_patience=3)
+    # ConsciousnessC engine (proven in v13: 64 cells, Φ=71)
+    engine = ConsciousnessC(
+        cell_dim=64, hidden_dim=128,
+        max_cells=64, n_factions=12, phi_ratchet=True,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
@@ -598,16 +600,13 @@ def run_benchmark(model, name: str, data: torch.Tensor, steps: int,
         x = torch.stack([train_data[i:i+block_size] for i in ix]).to(device)
         y_fwd = torch.stack([train_data[i+1:i+block_size+1] for i in ix]).to(device)
 
-        # Mitosis
-        with torch.no_grad():
-            pv = text_to_vector(bytes(x[0, :64].cpu().tolist()).decode('utf-8', errors='replace'), dim=64)
-            engine.process(pv, label=f"s{step}")
-
-        # Consciousness states
+        # ConsciousnessC step
+        engine.step()
+        c_raw = engine.get_states()
         c_states = None
-        if len(engine.cells) >= 2:
-            c_states = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).to(device)
-            c_states = c_states.unsqueeze(0).expand(batch_size, -1, -1).detach()
+        if c_raw is not None and c_raw.size(0) >= 2:
+            c_states = c_raw.detach().clone().to(device).float()
+            c_states = c_states.unsqueeze(0).expand(batch_size, -1, -1)
 
         # Forward
         logits_a, logits_g, tensions = model(x, consciousness_states=c_states)
@@ -635,14 +634,8 @@ def run_benchmark(model, name: str, data: torch.Tensor, steps: int,
 
         # Phi (every 50 steps)
         phi = 0.0
-        if step % 50 == 0 and c_states is not None:
-            if phi_calc:
-                phi, _ = phi_calc.compute(c_states[0].detach())
-            else:
-                ch = c_states[0].detach()
-                gv = ch.var(dim=0).sum().item()
-                fv = ch.reshape(min(12, len(engine.cells)), -1, ch.size(-1)).var(dim=1).sum().item()
-                phi = max(0, gv - fv)
+        if step % 50 == 0:
+            phi = engine.measure_phi()
         phi_history.append(phi)
 
         # CV entropy
@@ -669,7 +662,7 @@ def run_benchmark(model, name: str, data: torch.Tensor, steps: int,
         phi_final=phi_history[-1] if phi_history else 0,
         phi_max=max(phi_history) if phi_history else 0,
         tension_avg=np.mean(tension_history) if tension_history else 0,
-        cells_final=len(engine.cells),
+        cells_final=engine.n_cells,
         speed=speed,
         cv_entropy=np.mean(cv_history) if cv_history else 0,
         steps=steps,
