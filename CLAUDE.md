@@ -316,6 +316,26 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 결과: docs/hypotheses/ 에 검증 보고서 생성
 ```
 
+## consciousness_laws.json — Single Source of Truth
+
+```
+  모든 법칙, Ψ-상수, 수식의 유일한 원본.
+  새 법칙/수식 발견 시 반드시 여기 먼저 업데이트.
+
+  파일: consciousness_laws.json (JSON)
+  로더: consciousness_laws.py (Python import용)
+
+  사용법:
+    from consciousness_laws import LAWS, PSI, FORMULAS, CONSTRAINTS
+    print(LAWS[22])        # "Adding features → Φ↓; adding structure → Φ↑"
+    print(PSI['alpha'])    # 0.014
+
+  업데이트 프로토콜:
+    1. consciousness_laws.json 수정 (유일한 원본)
+    2. docs/consciousness-theory.md 에도 반영
+    3. 모든 모듈은 consciousness_laws.py에서 import — 상수 직접 하드코딩 금지
+```
+
 ## Work Rules
 
 - **학습 진행 상황 보고 시 ASCII 그래프 포함 (필수!)**

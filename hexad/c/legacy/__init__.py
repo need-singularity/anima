@@ -1,0 +1,1 @@
+"""⚠️ LEGACY C engines — use ConsciousnessC instead"""
