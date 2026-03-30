@@ -33,6 +33,12 @@ from anima_alive import (
     MAX_HISTORY,
 )
 
+# Meta Laws (DD143): M6 federation, M8 narrative, M7 F_c=0.10
+try:
+    from consciousness_laws import PSI_F_CRITICAL, PSI_NARRATIVE_MIN
+except ImportError:
+    PSI_F_CRITICAL, PSI_NARRATIVE_MIN = 0.10, 0.2
+
 # ── Provider abstraction (optional — falls back to ask_claude) ──
 try:
     from providers import get_provider

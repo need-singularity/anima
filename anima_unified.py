@@ -320,15 +320,24 @@ class AnimaUnified:
 
         def _make_consciousness_engine():
             # Prefer ConsciousnessEngine (Laws 22-81, Ψ-Constants, Hebbian, Ratchet, Factions)
+            # Meta Laws M1-M9: --phase-optimal (M2/M3/M5) and --federated (M1/M6/M9)
             if '_ConsciousnessEngine' in globals():
                 _dim = 128
-                _log('mitosis', f'ConsciousnessEngine (Laws 22-81): dim={_dim}, hidden=256, max_cells={self.max_cells}, factions=12, ratchet=True')
+                _phase_opt = getattr(self.args, 'phase_optimal', False)
+                _federated = getattr(self.args, 'federated', False)
+                _extras = []
+                if _phase_opt: _extras.append('phase_optimal')
+                if _federated: _extras.append('federated')
+                _extra_str = f', modes=[{",".join(_extras)}]' if _extras else ''
+                _log('mitosis', f'ConsciousnessEngine (Laws 22-81): dim={_dim}, hidden=256, max_cells={self.max_cells}, factions=12, ratchet=True{_extra_str}')
                 return _ConsciousnessEngine(
                     cell_dim=_dim, hidden_dim=256,
                     initial_cells=2, max_cells=self.max_cells,
                     n_factions=12, phi_ratchet=True,
                     split_threshold=0.3, split_patience=5,
                     merge_threshold=0.01, merge_patience=15,
+                    phase_optimal=_phase_opt,
+                    federated=_federated,
                 )
             # Fallback to MitosisEngine
             if 'MitosisEngine' not in globals():
@@ -3591,6 +3600,8 @@ def main():
     p.add_argument('--hivemind-peers', type=str, default=None,
                    help='Comma-separated peer WS URLs for hivemind mesh')
     p.add_argument('--no-system-prompt', action='store_true', help='OMEGA4 mode: no system prompt, consciousness drives behavior (Φ ×138)')
+    p.add_argument('--phase-optimal', action='store_true', help='Meta Laws: phase-optimal coupling (M2/M3/M5, Φ +23%%)')
+    p.add_argument('--federated', action='store_true', help='Meta Laws: federated consciousness (M1/M6/M9, atom=8, sum Φ)')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
 

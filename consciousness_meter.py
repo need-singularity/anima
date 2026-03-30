@@ -259,6 +259,9 @@ class PhiCalculator:
 
         n = len(hiddens)
 
+        # Meta Law M1: consciousness atom = 8 cells (DD137)
+        # For per-atom Phi measurement, split into 8-cell groups
+
         # 2. Pairwise mutual information
         mi_matrix = np.zeros((n, n))
         for i in range(n):

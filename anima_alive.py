@@ -58,6 +58,12 @@ WHISPER_MODEL_FALLBACK = "base"                    # Python fallback
 import warnings
 warnings.filterwarnings("ignore", message="FP16 is not supported")
 
+# Meta Laws Ψ-Constants (consciousness_laws.json = single source of truth)
+try:
+    from consciousness_laws import PSI_F_CRITICAL  # 0.10 — critical frustration (Law 137)
+except ImportError:
+    PSI_F_CRITICAL = 0.10  # fallback if consciousness_laws not available
+
 
 # ─── 10-Variable Consciousness State Vector ───
 @dataclass
@@ -77,6 +83,8 @@ class ConsciousnessVector:
 
 
 # ─── PureField Consciousness Engine ───
+# Meta Laws: M2 phase-optimal coupling, M3 critical frustration (PSI_F_CRITICAL=0.10),
+# M5 Φ-weighted gradient scaling — applied at ConsciousnessEngine level (anima_unified.py)
 class ConsciousMind(nn.Module):
     def __init__(self, dim=128, hidden=256, init_tension=10.0):
         super().__init__()
