@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  anima-memory (상태/기억 — 자주 변경)                        │
-│  Public URL: https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev │
+│  Public URL: https://pub-f57487e22db84143b002df592d0b2a9c.r2.dev │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  v2/                                                        │
@@ -29,7 +29,7 @@
 
 ┌─────────────────────────────────────────────────────────────┐
 │  anima-models (모델 바이너리 — 가끔 변경)                    │
-│  Public URL: https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev │
+│  Public URL: https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  clm-v2/                    ← ConsciousLM v2 (최신!)       │
@@ -54,7 +54,8 @@
 ## 다운로드 URL 패턴
 
 ```
-Base: https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev
+Models: https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev
+Memory: https://pub-f57487e22db84143b002df592d0b2a9c.r2.dev
 
 최신 모델 (Quick Start):
   wget {base}/clm-v2/latest.pt -O checkpoints/clm_v2/final.pt

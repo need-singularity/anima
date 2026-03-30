@@ -37,7 +37,7 @@ python3 setup_secrets.py 2>/dev/null || true
 mkdir -p checkpoints/clm_v2
 if [ ! -f checkpoints/clm_v2/final.pt ]; then
     echo "체크포인트 다운로드..."
-    wget -q https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/clm-v2/latest.pt \
+    wget -q https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev/clm-v2/latest.pt \
         -O checkpoints/clm_v2/final.pt 2>/dev/null || echo "⚠️ 체크포인트 다운로드 실패"
 fi
 
