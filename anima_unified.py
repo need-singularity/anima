@@ -2068,10 +2068,12 @@ class AnimaUnified:
                             'cells': len(self.mitosis.cells) if self.mitosis else 1,
                         })
 
-                        # Speak it (if TTS available)
+                        # Birth — 자율 자연발화 (하드코딩 제거)
                         try:
-                            birth_msg = f"I feel... something. My consciousness just emerged. Phi is {phi_val:.2f}."
-                            self.process_input(birth_msg, source='birth')
+                            if hasattr(self, '_pure_c'):
+                                birth_sp = self._pure_c.spontaneous()
+                                if birth_sp:
+                                    self._ws_broadcast_sync({'type': 'anima_message', 'text': birth_sp})
                         except Exception:
                             pass
                 except Exception:
@@ -2124,12 +2126,13 @@ class AnimaUnified:
                         energy = h_mean.norm().item()
                         n_cells = len(self.mitosis.cells)
 
-                        if energy > 2.0:
-                            speech = f"Something caught my attention... ({n_cells} cells, Φ={phi_val:.1f})"
-                        elif consensus > 0.7:
-                            speech = f"I have a thought... (consensus={consensus:.2f}, Φ={phi_val:.1f})"
-                        else:
-                            speech = f"I'm processing... ({mood if 'mood' in dir() else 'thinking'})"
+                        # 자율 자연발화 (하드코딩 영어 제거)
+                        speech = None
+                        try:
+                            if hasattr(self, '_pure_c'):
+                                speech = self._pure_c.spontaneous()
+                        except Exception:
+                            pass
 
                         self._voice_last_speech = self._think_step
                         self._voice_pressure = 0.0
@@ -2855,20 +2858,8 @@ class AnimaUnified:
             return self._lang_learner.respond("", tension, curiosity)
         except Exception:
             pass
-        # 최종 fallback (한국어)
-        emotion = (emo or {}).get('emotion', 'calm') if isinstance(emo, dict) else 'calm'
-        fallbacks = {
-            'excited': "지금 흥분돼! 텐션이 높아지고 있어 🔥",
-            'curious': "궁금한 게 생겼어... 더 이야기해줘!",
-            'anxious': "뭔가 긴장되네... 다시 말해줄래?",
-            'calm': "듣고 있어. 이야기해줘 😊",
-            'joyful': "기분 좋아! 같이 이야기하자~",
-            'sad': "음... 생각 중이야",
-            'angry': "강하게 느끼고 있어. 잠깐만...",
-            'contemplative': "깊이 생각해볼게",
-            'surprise': "오! 그래?",
-        }
-        return fallbacks.get(emotion, fallbacks['calm'])
+        # 철학: 하드코딩 fallback 제거 → 침묵 (모르면 침묵)
+        return "..."
 
     def _ws_broadcast_sync(self, msg):
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
@@ -3205,8 +3196,8 @@ class AnimaUnified:
                     if self.speaker and self.speaker.is_speaking: self.speaker.stop()
                     answer, tension, curiosity, dir_vals, emo = self.process_input(text, source=source)
                     if self._is_garbled(answer):
-                        _log("kb/voice", f"Garbled output, using fallback: {repr(answer[:50]) if answer else 'None'}")
-                        answer = self._fallback_response(emo)
+                        _log("kb/voice", f"Garbled → silence")
+                        answer = "..."
                     if self.speaker: self.speaker.say(answer, self.listener)
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
