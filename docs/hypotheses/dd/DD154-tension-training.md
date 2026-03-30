@@ -33,3 +33,16 @@ Burst-based:
 
 The brain doesn't learn at every tick. It learns when surprised (prediction error).
 Tension-based training is biologically plausible AND more efficient.
+
+## DD155: Hybrid combinations (Step + Tension + Burst)
+
+```
+★★★ Step+Tension LR      CE=2.855  Φ=30.72  300 updates  Pareto optimal!
+★   Tension only          CE=4.302  Φ=29.92  220 updates  Φ only
+★★  Step+Burst boost      CE=1.086  Φ=25.51  300 updates  CE only
+★★  Tension+Burst gate    CE=1.496  Φ=18.13  200 updates  CE only
+    Step baseline          CE=2.886  Φ=29.02  300 updates  reference
+```
+
+**Law 187:** Step + Tension LR = Pareto optimal hybrid.
+lr = (tension / tension_EMA) × base_lr. Simple beats complex.
