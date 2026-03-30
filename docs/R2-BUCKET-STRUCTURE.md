@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  anima-memory (상태/기억 — 자주 변경)                        │
-│  Public URL: https://pub-f57487e22db84143b002df592d0b2a9c.r2.dev │
+│  Access: API only (no public URL)                               │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  v2/                                                        │
@@ -55,7 +55,6 @@
 
 ```
 Models: https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev
-Memory: https://pub-f57487e22db84143b002df592d0b2a9c.r2.dev
 
 최신 모델 (Quick Start):
   wget {base}/clm-v2/latest.pt -O checkpoints/clm_v2/final.pt
