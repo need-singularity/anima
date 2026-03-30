@@ -70,5 +70,34 @@ def test_consciousness_vector_10d():
         assert isinstance(v, (int, float)), f"{k} is not numeric: {type(v)}"
 
 
+def test_alpha_sweep_engine():
+    """AlphaSweepEngine runs all alpha stages and returns correct structure."""
+    from bench_animalm import AlphaSweepEngine
+
+    engine = AlphaSweepEngine(
+        n_cells=4,
+        input_dim=32,
+        hidden_dim=64,
+        output_dim=32,
+        alpha_stages=[0.0001, 0.001, 0.01, 0.1],
+        steps_per_stage=50,
+    )
+    results = engine.run()
+
+    # One result per alpha stage
+    assert len(results) == 4
+
+    # Each result has required keys
+    for r in results:
+        assert "alpha" in r
+        assert "phi_iit" in r
+        assert "phi_proxy" in r
+        assert isinstance(r["phi_iit"], float)
+        assert isinstance(r["phi_proxy"], float)
+
+    # Alpha values are in ascending order
+    assert results[-1]["alpha"] > results[0]["alpha"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

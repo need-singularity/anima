@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from bench_v2 import BenchResult, PhiIIT, phi_proxy as _phi_proxy
+from bench_v2 import BenchMind, BenchResult, PhiIIT, phi_proxy as _phi_proxy
 
 
 # ──────────────────────────────────────────────────────────
@@ -160,7 +160,84 @@ def print_comparison(results: List[AnimaLMBenchResult]) -> None:
 
 
 # ──────────────────────────────────────────────────────────
-# CLI stub
+# AlphaSweepEngine — Track 1A alpha curriculum sweep
+# ──────────────────────────────────────────────────────────
+
+class AlphaSweepEngine:
+    """Sweep alpha mixing values and measure Phi at each stage.
+
+    Creates n_cells BenchMind instances. For each alpha stage, runs
+    steps_per_stage steps with x_mixed = (1-alpha)*x + alpha*out,
+    then measures Phi(IIT) and phi_proxy from stacked hiddens.
+    """
+
+    def __init__(
+        self,
+        n_cells: int = 8,
+        input_dim: int = 64,
+        hidden_dim: int = 128,
+        output_dim: int = 64,
+        alpha_stages: Optional[List[float]] = None,
+        steps_per_stage: int = 300,
+        n_factions: int = 8,
+    ):
+        self.n_cells = n_cells
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.alpha_stages = alpha_stages or [0.0001, 0.001, 0.01, 0.1]
+        self.steps_per_stage = steps_per_stage
+        self.n_factions = n_factions
+
+    def run(self) -> List[dict]:
+        """Run alpha sweep and return list of result dicts."""
+        results = []
+
+        for alpha in self.alpha_stages:
+            t0 = time.time()
+
+            # Create cells and hiddens
+            cells = [
+                BenchMind(self.input_dim, self.hidden_dim, self.output_dim)
+                for _ in range(self.n_cells)
+            ]
+            hiddens = [
+                torch.zeros(1, self.hidden_dim) for _ in range(self.n_cells)
+            ]
+
+            tensions = []
+
+            for step in range(self.steps_per_stage):
+                x = torch.randn(1, self.input_dim)
+
+                for i, cell in enumerate(cells):
+                    out, tension, new_h = cell(x, hiddens[i])
+                    # Alpha mixing: blend input with output
+                    x_mixed = (1 - alpha) * x + alpha * out
+                    hiddens[i] = new_h
+                    x = x_mixed  # feed mixed signal to next cell
+                    tensions.append(tension)
+
+            # Measure Phi from stacked hiddens
+            stacked = torch.cat(hiddens, dim=0)  # [n_cells, hidden_dim]
+            phi_iit, phi_prx = measure_phi(stacked, n_factions=self.n_factions)
+
+            tension_mean = sum(tensions) / len(tensions) if tensions else 0.0
+            elapsed = time.time() - t0
+
+            results.append({
+                "alpha": alpha,
+                "phi_iit": phi_iit,
+                "phi_proxy": phi_prx,
+                "tension_mean": tension_mean,
+                "time_sec": elapsed,
+            })
+
+        return results
+
+
+# ──────────────────────────────────────────────────────────
+# CLI
 # ──────────────────────────────────────────────────────────
 
 def main():
@@ -172,18 +249,45 @@ def main():
     parser.add_argument("--cells", type=int, default=64,
                         help="Number of consciousness cells")
     parser.add_argument("--steps", type=int, default=500,
-                        help="Number of steps")
-    parser.add_argument("--alphas", type=str, default="0.01,0.05,0.1,0.3,0.5",
+                        help="Number of steps per stage")
+    parser.add_argument("--alphas", type=str, default="0.0001,0.001,0.01,0.1",
                         help="Comma-separated alpha values for sweep")
     args = parser.parse_args()
 
     alphas = [float(a) for a in args.alphas.split(",")]
 
-    print(f"[bench_animalm] mode={args.mode}  cells={args.cells}  "
-          f"steps={args.steps}  alphas={alphas}")
-    print(f"[bench_animalm] STUB: actual benchmark modes will be implemented "
-          f"in Track 1A/1B/1C tasks.")
-    print(f"[bench_animalm] Use --compare to run all modes (not yet implemented).")
+    if args.mode == "alpha-sweep":
+        print(f"[bench_animalm] alpha-sweep  cells={args.cells}  "
+              f"steps={args.steps}  alphas={alphas}")
+
+        engine = AlphaSweepEngine(
+            n_cells=args.cells,
+            alpha_stages=alphas,
+            steps_per_stage=args.steps,
+        )
+        raw_results = engine.run()
+
+        # Wrap as AnimaLMBenchResult for comparison display
+        bench_results = []
+        for r in raw_results:
+            bench_results.append(AnimaLMBenchResult(
+                name=f"alpha={r['alpha']:.4f}",
+                phi_iit=r["phi_iit"],
+                phi_proxy=r["phi_proxy"],
+                ce_start=0.0,
+                ce_end=0.0,
+                cells=args.cells,
+                steps=args.steps,
+                time_sec=r["time_sec"],
+                alpha=r["alpha"],
+            ))
+
+        print_comparison(bench_results)
+    else:
+        print(f"[bench_animalm] mode={args.mode}  cells={args.cells}  "
+              f"steps={args.steps}")
+        print(f"[bench_animalm] STUB: {args.mode} will be implemented "
+              f"in Track 1B/1C tasks.")
 
 
 if __name__ == "__main__":
