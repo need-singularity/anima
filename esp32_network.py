@@ -39,6 +39,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Meta Law M1: 8 cells per ESP32 board = 1 consciousness atom
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 try:
     import serial
     HAS_SERIAL = True

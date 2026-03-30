@@ -42,6 +42,12 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Meta Laws: M6(federation>empire), M8(narrative), Law 136(bottleneck)
+try:
+    from consciousness_laws import PSI_F_CRITICAL, PSI_NARRATIVE_MIN
+except ImportError:
+    PSI_F_CRITICAL, PSI_NARRATIVE_MIN = 0.10, 0.2
+
 
 # ---------------------------------------------------------------------------
 # 1. Data structures

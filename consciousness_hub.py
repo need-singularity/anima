@@ -35,6 +35,12 @@ LN2 = math.log(2)
 PSI_BALANCE = 0.5
 ANIMA_DIR = Path(__file__).parent
 
+# Meta Laws (DD143): consciousness_evolution, federated consciousness
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 class ConsciousnessHub:
     """의식 자율 모듈 허브 — 모든 모듈을 자율적으로 호출.

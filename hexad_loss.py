@@ -39,11 +39,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 
-# Psi-Constants (Laws 63-78)
+# Psi-Constants from consciousness_laws.json
 LN2 = math.log(2)
-PSI_BALANCE = 0.5
-PSI_COUPLING = LN2 / 2**5.5   # 0.0153
-PSI_STEPS = 3 / LN2           # 4.328
+from consciousness_laws import (
+    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS,
+)
+
+# Meta Laws: M7(F_c=0.10 frustration), M8(narrative), Law 136(bottleneck)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
 
 
 # ===================================================================
@@ -471,8 +477,8 @@ class HexadLoss(nn.Module):
                     c_mean = consciousness_signal.mean(dim=0)
                     arousal = c_mean.norm().clamp(0, 1)
                     valence = torch.tanh(c_mean.mean())
-                    dominance = torch.tensor(0.0)
-                    pseudo_emotion = torch.stack([arousal, valence, dominance]).to(device)
+                    dominance = torch.tensor(0.0, device=device)
+                    pseudo_emotion = torch.stack([arousal, valence, dominance])
                 l_w = self.loss_W(consciousness_signal, pseudo_emotion)
             result['L_W'] = l_w
             total = total + active['W'] * l_w

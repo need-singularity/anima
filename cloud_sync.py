@@ -28,6 +28,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# v14: Federation checkpoints in checkpoints/v14_federated/
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)

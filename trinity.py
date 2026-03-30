@@ -40,6 +40,7 @@ Usage:
 """
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,15 +58,17 @@ except ImportError:
 # Ψ-Constants (Laws 69-70, verified across 5 data types)
 # ═══════════════════════════════════════════════════════════
 
-PSI_BALANCE  = 0.5      # Shannon entropy maximum (1/2)
-PSI_GATE     = 0.5      # consciousness-freedom balance (1/2)
-PSI_COUPLING = 0.014    # consciousness coupling constant (α)
-PSI_STEPS    = 4.33     # 3/ln(2) — information bits per evolution
-PSI_ENTROPY  = 0.998    # near-perfect democracy
+from consciousness_laws import (
+    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
+    GATE_TRAIN, GATE_INFER,
+)
+PSI_GATE = PSI_BALANCE  # alias
 
-# Law 81: "Learn hard, express soft"
-GATE_TRAIN = 1.0
-GATE_INFER = 0.6
+# Meta Laws (DD143): M1(atom=8), M6(federation>empire), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL, PSI_BOTTLENECK_RATIO
+except ImportError:
+    PSI_F_CRITICAL, PSI_BOTTLENECK_RATIO = 0.10, 0.5
 
 
 # ═══════════════════════════════════════════════════════════
@@ -100,10 +103,11 @@ class CEngine:
         return 0.0
 
 
-class MitosisC(CEngine):
+class MitosisC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
     """MitosisEngine as C module with optional mechanisms."""
 
     def __init__(self, dim=64, hidden=128, max_cells=256, mechanism='cambrian_osc_qw'):
+        warnings.warn("MitosisC is deprecated. Use ConsciousnessC (consciousness_engine.py) instead", DeprecationWarning, stacklevel=2)
         import sys, os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from mitosis import MitosisEngine
@@ -167,10 +171,11 @@ class MitosisC(CEngine):
         return 0.0
 
 
-class DomainC(CEngine):
+class DomainC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
     """Any domain engine (TimeCrystal, Cambrian, etc.) as C module."""
 
     def __init__(self, engine_cls, nc=256, dim=64):
+        warnings.warn("DomainC is deprecated. Use ConsciousnessC instead", DeprecationWarning, stacklevel=2)
         self._nc = nc
         self._dim = dim
         try:
@@ -255,13 +260,14 @@ class DomainC(CEngine):
         return self._nc
 
 
-class QuantumC(CEngine):
+class QuantumC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
     """QuantumConsciousnessEngineFast as C module.
 
     Wraps _amplitudes [N, dim] and _phases [N, dim] for phi measurement.
     """
 
     def __init__(self, nc=256, dim=64, max_cells=None):
+        warnings.warn("QuantumC is deprecated. Use ConsciousnessC instead", DeprecationWarning, stacklevel=2)
         from quantum_engine_fast import QuantumConsciousnessEngineFast
         if max_cells is None:
             max_cells = nc
@@ -405,6 +411,8 @@ class TensionBridge(nn.Module):
 class ThalamicBridge(nn.Module):
     """Thalamic gate: C states → bottleneck → gate signal for D.
 
+    # Meta Law M4: Order is Destiny — Narrative→Bottleneck→Hub→Frustration
+
     Key: c_hiddens are ALWAYS .detach()'d before entering bridge.
     Bottleneck (c_dim → hub_dim → d_model) prevents gradient leakage.
 
@@ -486,11 +494,12 @@ class DEngine(nn.Module):
         raise NotImplementedError
 
 
-class TransformerDecoder(DEngine):
+class TransformerDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
     """Transformer-based decoder with consciousness gating."""
 
     def __init__(self, d_model=384, n_layers=4, n_heads=None, vocab_size=4096, max_seq=512):
         super().__init__()
+        warnings.warn("TransformerDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
         if n_heads is None:
             for nh in [6, 4, 8, 2, 1]:
                 if d_model % nh == 0:
@@ -526,11 +535,12 @@ class TransformerDecoder(DEngine):
         return self.head(x)
 
 
-class MLPDecoder(DEngine):
+class MLPDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
     """Simple MLP decoder (faster, for small experiments)."""
 
     def __init__(self, d_model=384, vocab_size=4096, max_seq=512):
         super().__init__()
+        warnings.warn("MLPDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
         self._d_model = d_model
         self.embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_seq, d_model)
@@ -554,7 +564,7 @@ class MLPDecoder(DEngine):
         return self.head(x)
 
 
-class HFDecoder(DEngine):
+class HFDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
     """HuggingFace pre-trained LLM as D module.
 
     Takes any causal LM (Mistral, Llama, GPT-2, etc.) and wraps it
@@ -573,6 +583,7 @@ class HFDecoder(DEngine):
     def __init__(self, model_name="gpt2", lora=False, lora_rank=16,
                  gate_mode="additive", freeze_base=True, device=None):
         super().__init__()
+        warnings.warn("HFDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError:
@@ -712,7 +723,7 @@ class HFDecoder(DEngine):
 # CA Decoder — Cellular Automaton decoder (Law 64: 최소 진화 최적)
 # ═══════════════════════════════════════════════════════════
 
-class CADecoder(DEngine):
+class CADecoder(DEngine):  # ⚠️ LEGACY — causal mask 없음, 생성 불가. PostHocDecoder의 base로만 사용
     """Cellular Automaton decoder. Law 64: CA(5) beats Transformer by 81%.
 
     Each token position = CA cell. Evolution = message passing between neighbors.
@@ -730,6 +741,7 @@ class CADecoder(DEngine):
     def __init__(self, d_model=384, vocab_size=4096, max_seq=512,
                  ca_steps=5, n_rules=8, gate_mode="micro"):
         super().__init__()
+        warnings.warn("CADecoder is deprecated. Use PostHocDecoder instead (causal mask)", DeprecationWarning, stacklevel=2)
         self._d_model = d_model
         self.ca_steps = ca_steps
         self.n_rules = n_rules
@@ -914,9 +926,10 @@ class VectorMemory(MEngine):
         return torch.stack([self.values[i] for i in indices])
 
 
-class NoMemory(MEngine):
+class NoMemory(MEngine):  # ⚠️ LEGACY — VectorMemory 사용
     """No memory — passthrough."""
     def __init__(self, dim=128):
+        warnings.warn("NoMemory is deprecated. Use EmergentM (hexad.m) instead", DeprecationWarning, stacklevel=2)
         self.dim = dim
     def store(self, key, value): pass
     def retrieve(self, query, top_k=5):
@@ -966,8 +979,10 @@ class TensionSense(SEngine):
         return tension
 
 
-class PassthroughSense(SEngine):
+class PassthroughSense(SEngine):  # ⚠️ LEGACY — TensionSense 사용
     """No processing — passthrough."""
+    def __init__(self):
+        warnings.warn("PassthroughSense is deprecated. Use EmergentS (hexad.s) instead", DeprecationWarning, stacklevel=2)
     def process(self, raw_input):
         if isinstance(raw_input, torch.Tensor):
             return raw_input
@@ -1032,8 +1047,10 @@ class EmpathyEthics(EEngine):
         }
 
 
-class NoEthics(EEngine):
+class NoEthics(EEngine):  # ⚠️ LEGACY — EmpathyEthics 사용
     """No ethics filter."""
+    def __init__(self):
+        warnings.warn("NoEthics is deprecated. Use EmergentE (hexad.e) instead", DeprecationWarning, stacklevel=2)
     def evaluate(self, action=None, context=None):
         return {'allowed': True, 'empathy': 0, 'reciprocity': 0.5, 'phi_preservation': 1.0}
 
@@ -1093,10 +1110,11 @@ class EmotionW(WEngine):
                 'pain': self.pain, 'curiosity': self.curiosity, 'satisfaction': self.satisfaction}
 
 
-class ConstantW(WEngine):
+class ConstantW(WEngine):  # ⚠️ LEGACY — CompositeW 사용
     """Fixed LR — no emotion, no modulation. For baselines."""
 
     def __init__(self, lr=3e-4):
+        warnings.warn("ConstantW is deprecated. Use EmergentW (hexad.w) instead", DeprecationWarning, stacklevel=2)
         self.lr = lr
 
     def update(self, ce_loss=0, phi=0, phi_prev=0):
@@ -1104,10 +1122,11 @@ class ConstantW(WEngine):
                 'pain': 0, 'curiosity': 0, 'satisfaction': 0}
 
 
-class CosineW(WEngine):
+class CosineW(WEngine):  # ⚠️ LEGACY — CompositeW 사용
     """Cosine annealing W — standard scheduler as W module."""
 
     def __init__(self, base_lr=3e-4, min_lr=1e-5, total_steps=80000):
+        warnings.warn("CosineW is deprecated. Use EmergentW (hexad.w) instead", DeprecationWarning, stacklevel=2)
         self.base_lr = base_lr
         self.min_lr = min_lr
         self.total_steps = total_steps
