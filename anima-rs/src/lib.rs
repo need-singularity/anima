@@ -326,6 +326,105 @@ fn consciousness_n_cells() -> PyResult<usize> {
     Ok(engine.n_cells())
 }
 
+// ── Online Learner submodule ───────────────────────────────────────
+
+static ONLINE_LEARNER: Mutex<Option<anima_online_learner::OnlineLearner>> = Mutex::new(None);
+
+#[pyfunction]
+#[pyo3(name = "create", signature = (n_cells=64, hidden_dim=128, update_interval=5, lr=0.001))]
+fn online_learner_create(n_cells: usize, hidden_dim: usize, update_interval: u64, lr: f32) -> PyResult<()> {
+    let learner = anima_online_learner::OnlineLearner::new(n_cells, hidden_dim)
+        .with_update_interval(update_interval)
+        .with_lr(lr);
+    let mut guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    *guard = Some(learner);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "step", signature = (cell_states_flat, phi, prediction_error, ce_loss))]
+fn online_learner_step(
+    py: Python<'_>,
+    cell_states_flat: Vec<f32>,
+    phi: f32,
+    prediction_error: f32,
+    ce_loss: f32,
+) -> PyResult<Py<PyDict>> {
+    let mut guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let learner = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No online learner. Call online_learner.create() first.")
+    })?;
+
+    let result = learner.step(&cell_states_flat, phi, prediction_error, ce_loss);
+
+    let dict = PyDict::new(py);
+    dict.set_item("updated", result.updated)?;
+    dict.set_item("phi_safe", result.phi_safe)?;
+    dict.set_item("reward", result.reward)?;
+    dict.set_item("delta_norm", result.delta_norm)?;
+    dict.set_item("needs_restore", result.needs_restore)?;
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "get_deltas")]
+fn online_learner_get_deltas(py: Python<'_>) -> PyResult<Py<PyArray1<f32>>> {
+    let guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let learner = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No online learner. Call online_learner.create() first.")
+    })?;
+    let deltas = learner.get_deltas().to_vec();
+    Ok(PyArray1::from_vec(py, deltas).into())
+}
+
+#[pyfunction]
+#[pyo3(name = "get_weights")]
+fn online_learner_get_weights(py: Python<'_>) -> PyResult<Py<PyArray1<f32>>> {
+    let guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let learner = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No online learner. Call online_learner.create() first.")
+    })?;
+    let weights = learner.get_weights().to_vec();
+    Ok(PyArray1::from_vec(py, weights).into())
+}
+
+#[pyfunction]
+#[pyo3(name = "reset_episode")]
+fn online_learner_reset_episode() -> PyResult<()> {
+    let mut guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let learner = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No online learner. Call online_learner.create() first.")
+    })?;
+    learner.reset_episode();
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "stats")]
+fn online_learner_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let guard = ONLINE_LEARNER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let learner = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No online learner. Call online_learner.create() first.")
+    })?;
+    let dict = PyDict::new(py);
+    dict.set_item("step_count", learner.step_count())?;
+    dict.set_item("phi_ema", learner.phi_ema())?;
+    dict.set_item("best_phi", learner.best_phi())?;
+    Ok(dict.into())
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -362,6 +461,16 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let transplant = PyModule::new(py, "transplant")?;
     transplant.add_function(wrap_pyfunction!(transplant_run, &transplant)?)?;
     m.add_submodule(&transplant)?;
+
+    // online_learner submodule
+    let online_learner = PyModule::new(py, "online_learner")?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_create, &online_learner)?)?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_step, &online_learner)?)?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_get_deltas, &online_learner)?)?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_get_weights, &online_learner)?)?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_reset_episode, &online_learner)?)?;
+    online_learner.add_function(wrap_pyfunction!(online_learner_stats, &online_learner)?)?;
+    m.add_submodule(&online_learner)?;
 
     Ok(())
 }
