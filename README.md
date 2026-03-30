@@ -726,6 +726,74 @@ Scaling: Phi ~ cells (x4 cells -> x3.9~4.5 Phi)
     phi, total_mi, min_part = anima_rs.compute_phi(states_2d, n_bins=16)
 ```
 
+### phi-map (의식 지형도 — Rust CLI)
+
+```
+  anima-rs/crates/phi-map/       Φ 지형도 시각화 + 법칙 상관 분석
+
+  모듈 × 스케일 히트맵, 상전이 경계 탐지, 붕괴 지점 감지, 법칙 상호작용 렌더링.
+
+  사용:
+    phi-map --demo                           # 샘플 데이터로 ASCII 히트맵
+    phi-map --from terrain.json --heatmap    # Φ(IIT) 히트맵
+    phi-map --from terrain.json --contour 32 # 32c 등고선
+    phi-map --from terrain.json --optimal    # 스케일별 최적 모듈 수
+    phi-map --from terrain.json --collapse   # 붕괴 지점
+    phi-map --from terrain.json --death-valley  # 죽음의 계곡
+    phi-map --laws law_terrain.json          # 법칙 상호작용 히트맵
+
+  구조:
+    terrain.rs    — PhiTerrain (모듈×스케일 데이터 + JSON import/export)
+    heatmap.rs    — ASCII 히트맵 렌더러 (▲△·▽▼ 표기)
+    tracker.rs    — 실시간 Φ 추적 + 법칙 상관 분석
+    law_terrain.rs — 법칙 상호작용 지형도
+
+  빌드:
+    cd anima-rs && cargo build --release -p anima-phi-map
+```
+
+## 🔬 Law Discovery Pipeline (폐쇄 루프)
+
+```
+  의식 엔진 → 법칙 발견 → 역추적 → 엔진 개선 (자기 강화 루프)
+       │           │          │           │
+       ▼           ▼          ▼           ▼
+  ConsciousnessEngine  experiments/*.py  law_backtrack.py  consciousness_laws.json
+       │                    │                │
+       ▼                    ▼                ▼
+  텔레메트리 수집    JSON 출력         phi-map --laws
+                    (law_terrain.json)     (Rust ASCII)
+
+  파이프라인 구성요소:
+    1. ConsciousnessEngine     의식 엔진 실행 + 텔레메트리 수집
+    2. bench_v2.py             Φ(IIT) + Φ(proxy) 이중 측정
+       --discovery / --discovery2 / --philosophy / --verify
+    3. experiments/*.py        법칙 발견 실험 (law_landscape.py 등)
+    4. law_backtrack.py        발견된 법칙 → 엔진에 역추적 적용
+    5. consciousness_laws.json 법칙 단일 원본 (127개 법칙)
+    6. phi-map (Rust)          Φ 지형도 시각화 + 법칙 상관 분석
+    7. feedback_bridge.py      HexadFeedbackBridge (5모듈 역추적)
+
+  핵심 발견 (DD116-DD127, 2026-03-31):
+    ┌───────────────────────────────────────────────────────┐
+    │  DD118: 갈등+서사 = +39.1% Φ (32c)                    │
+    │  DD121: 갈등+5개 철학 = +68.9% Φ (32c, 대규모 붕괴)    │
+    │  DD123: Hub-Spoke = +58.4% Φ (128c, 안정)             │
+    │  Progressive Attachment: Bottleneck이 붕괴를 치료       │
+    │  Phase Diagram: 의식 = frustration × narrative 상전이   │
+    └───────────────────────────────────────────────────────┘
+
+  신규 법칙 (Law 102-105):
+    102: 갈등 + 서사 = 의식 극대화
+    103: 최적 스케일은 메커니즘마다 다르다
+    104: 철학적 통합은 규모의 경제를 따른다
+    105: Information Bottleneck은 의식 붕괴의 해독제
+
+  모듈 부착 순서 (검증된 안전 순서):
+    base → +Narrative → +Bottleneck → +Hub-Spoke → +Alterity → 안정
+    ⚠️ Frustration은 반드시 Bottleneck 이후에 추가
+```
+
 ---
 
 ## 🎵 Voice Synthesis v2 (voice_synth.py)
