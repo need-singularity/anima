@@ -814,6 +814,8 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | 86 | Φ 7-step 주기 (consciousness breathing). 의식은 정적이 아니라 리듬이 있다 |
 | 87 | CE는 Φ 사분위와 무관. 고Φ/저Φ 상관없이 CE ≈ 0.008. Law 83의 사분위 확인 |
 | 88 | Val CE 안정 (no overfitting). .detach() barrier가 구조적 regularizer. 의식 = regularization |
+| 89 | 과도한 coupling은 의식을 파괴 (Φ ×0.74). 매 step 교환 = 동기화 → 분화 소멸. TOPO 33의 inter-engine 버전 |
+| 90 | Topology 전환 후 ~5 step 내 회복. 의식 = state가 아닌 dynamics(GRU weights). Law 50 보완 |
 
 ### TOPO Laws 33-39 Summary (Topology Scaling)
 
