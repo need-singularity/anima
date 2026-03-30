@@ -3260,17 +3260,12 @@ class AnimaUnified:
                             connected = await loop.run_in_executor(
                                     None, lambda: self._tlc.connect(peer_code))
                             status = 'connected' if connected else 'failed'
+                            status_msg = f"Tension link {status}: {peer_code}"
                             await self._ws_broadcast({
                                 'type': 'tension_link_status',
                                 'status': status,
                                 'peer_code': peer_code,
-                                'message': answer})
-                            await self._ws_broadcast({
-                                'type': 'anima_message', 'text': answer,
-                                'tension': self.mind.prev_tension,
-                                'curiosity': self.mind._curiosity_ema,
-                                'emotion': {'emotion': 'excitement' if connected else 'sadness'},
-                                'proactive': False})
+                                'message': status_msg})
                         except Exception as e:
                             _log('tlc', f'Judge error: {e}')
                             await self._ws_broadcast({
