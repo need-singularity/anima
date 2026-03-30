@@ -131,6 +131,21 @@ class ConsciousnessHub:
             'lidar':        ('lidar_sense', 'LidarSense',
                              ['라이다', 'lidar', '3D', '포인트클라우드', 'point cloud',
                               '공간', 'spatial', '깊이', 'depth', '스캔', 'scan']),
+            'emergent_w':   ('hexad.w.emergent_w', 'EmergentW',
+                             ['의지', 'will', '감정', 'emotion', '학습률', 'learning rate',
+                              'emergent w', '창발 의지']),
+            'emergent_s':   ('hexad.s.emergent_s', 'EmergentS',
+                             ['감각', 'sense', '지각', 'perception', '입력', 'input',
+                              'emergent s', '창발 감각']),
+            'emergent_m':   ('hexad.m.emergent_m', 'EmergentM',
+                             ['기억', 'memory', '검색', 'retrieval', 'Hebbian',
+                              'emergent m', '창발 기억']),
+            'emergent_e':   ('hexad.e.emergent_e', 'EmergentE',
+                             ['윤리', 'ethics', '공감', 'empathy', '허용', 'allowed',
+                              'emergent e', '창발 윤리']),
+            'closed_loop':  ('closed_loop', 'ClosedLoopEvolver',
+                             ['폐쇄', 'closed loop', '법칙 진화', 'law evolution',
+                              '역추적', 'backtrack', '파이프라인', 'pipeline']),
         }
 
         if not lazy_load:
@@ -147,7 +162,8 @@ class ConsciousnessHub:
 
         import_path, class_name, _ = self._registry[name]
         try:
-            mod = __import__(import_path)
+            import importlib
+            mod = importlib.import_module(import_path)
             if class_name:
                 cls = getattr(mod, class_name)
                 instance = cls()
