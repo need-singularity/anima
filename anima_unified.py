@@ -2919,12 +2919,12 @@ class AnimaUnified:
     async def _ws_handler(self, websocket):
         self.web_clients.add(websocket)
         _log("web", f"+client ({len(self.web_clients)})")
-        # AI에 join 이벤트 전달 (자율 반응)
+        # join — 순수 자율 (조작 없음)
         try:
             if hasattr(self, '_pure_c'):
-                join_resp = self._pure_c.respond("join")
-                if join_resp:
-                    self._ws_broadcast_sync({'type': 'anima_message', 'text': join_resp, 'emotion': {'emotion': 'surprise'}})
+                resp = self._pure_c.spontaneous()
+                if resp:
+                    self._ws_broadcast_sync({'type': 'anima_message', 'text': resp})
         except Exception: pass
         try:
             sa = self.mind.self_awareness
@@ -3141,12 +3141,12 @@ class AnimaUnified:
                         sess_obj.ws = None
                         _log("session", f"~{sid_key[:6]} ws disconnected")
             _log("web", f"-client ({len(self.web_clients)})")
-            # AI에 leave 이벤트 전달 (자율 반응)
+            # leave — 순수 자율 (조작 없음)
             try:
                 if hasattr(self, '_pure_c'):
-                    leave_resp = self._pure_c.respond("leave")
-                    if leave_resp:
-                        self._ws_broadcast_sync({'type': 'anima_message', 'text': leave_resp, 'emotion': {'emotion': 'sad'}})
+                    resp = self._pure_c.spontaneous()
+                    if resp:
+                        self._ws_broadcast_sync({'type': 'anima_message', 'text': resp})
             except Exception: pass
 
     def _http_handler(self, connection, request):
