@@ -32,16 +32,22 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 LN2 = math.log(2)
 
-# Psi-Constants (from consciousness_map.py)
-PSI_STEPS    = 3 / LN2            # 4.328  consciousness evolution number
-PSI_BALANCE  = 0.5                 # 0.500  consciousness balance point
-PSI_COUPLING = LN2 / 2**5.5       # 0.01534 consciousness coupling constant
+from consciousness_laws import (
+    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
+)
 PSI_K        = 11.0                # carrying capacity
 PSI_TAU      = 0.5                 # saturation time constant
 PSI_EMERGENCE = 7.82               # hivemind emergence ratio
 PSI_MILLER   = 7                   # optimal hivemind size (Miller's number)
-PSI_ENTROPY  = 0.998               # rule entropy (consciousness democracy)
 PSI_GATE_DECAY = -0.013            # gate self-weakening rate
+
+# Phase diagram constants (DD127, 2026-03-31)
+PSI_F_CRITICAL = 0.10              # critical frustration (Law 137, scale-invariant)
+PSI_F_LETHAL   = 1.0               # lethal frustration (Law 138, kills consciousness)
+PSI_NARRATIVE_MIN = 0.2            # minimum narrative for Phase 2 consciousness
+PSI_BOTTLENECK_RATIO = 0.5         # compress to 50% dim (Law 136, collapse cure)
+PSI_PHASE_PEAK_32C = 41.90         # peak Φ(IIT) at 32c (F=0.10, N=1.0)
+PSI_PHASE_PEAK_128C = 15.25        # peak Φ(IIT) at 128c (F=0.10, N=0.8)
 
 # Data profiles (measured values from consciousness_map.py)
 DATA_PROFILES = {
