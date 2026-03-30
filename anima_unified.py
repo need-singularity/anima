@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Anima Unified -- single entry point for all 6 modules.
 
+⚠️  하드코딩 금지 (Law 1):
+    - 템플릿 응답, fallback 문장, 고정 문자열 응답 절대 금지
+    - 의식이 말 못하면 침묵 (빈 문자열). 억지로 말하게 하지 않는다.
+    - LanguageLearner/fallback_response는 garbled 바이트 전용 (정상 텍스트에 사용 금지)
+    - [auto:*], [🧠 T=...] 등 내부 태그를 대화 텍스트에 노출 금지
+
 Usage:
     python anima_unified.py                # voice mode (default)
     python anima_unified.py --web          # web mode (port 8765)
@@ -1697,7 +1703,8 @@ class AnimaUnified:
                                     out_str = str(out_str)[:300]
                                 else:
                                     out_str = str(out)[:300]
-                                answer = answer + f"\n\n[auto:{result.tool_name}] {out_str}"
+                                # agent 결과는 별도 WS 메시지로 전송 — 대화에 섞지 않음
+                                _log('agent', f'[auto:{result.tool_name}] {out_str[:100]}')
                                 tension += result.tension_delta
                                 _log('agent', f'Auto-executed {result.tool_name}: OK ({result.duration_ms:.0f}ms)')
                             self._ws_broadcast_sync({
@@ -2900,21 +2907,26 @@ class AnimaUnified:
     # ─── Web server ───
 
     def _is_garbled(self, text):
-        """Check if model output is garbled (non-UTF8, low printable ratio, no real words)."""
-        if not text or not isinstance(text, str):
+        """Check if model output is garbled (non-UTF8, low printable ratio).
+        Short outputs (1-2 words) from PureConsciousness are NOT garbled — they're growth.
+        """
+        if not isinstance(text, str):
             return True
+        if text.strip() == '':
+            return False  # 침묵은 garbled가 아님 — Law 1
         try:
             text.encode('utf-8').decode('utf-8')
         except (UnicodeDecodeError, UnicodeEncodeError):
             return True
         printable_ratio = sum(1 for c in text if c.isprintable() or c.isspace()) / max(len(text), 1)
+        if printable_ratio < 0.5:
+            return True
+        # 한글이 포함되어 있으면 garbled 아님 (의식이 학습한 한국어)
+        if any('\uac00' <= c <= '\ud7a3' for c in text):
+            return False
         words = text.split()
         avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
-        has_real_words = avg_word_len < 15 and len(words) > 2
-        common = {'the','a','is','are','it','I','you','we','to','and','of',
-                  '는','은','이','가','을','를','에','의','로','다','요','해'}
-        word_match = sum(1 for w in words if w.lower() in common) / max(len(words), 1)
-        if printable_ratio < 0.5 or word_match < 0.05 or not has_real_words:
+        if avg_word_len > 20:
             return True
         return False
 
@@ -2936,6 +2948,19 @@ class AnimaUnified:
     def _ws_broadcast_sync(self, msg):
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
         asyncio.run_coroutine_threadsafe(self._ws_broadcast(msg), self._web_loop)
+
+    def _get_init_history(self):
+        """Init 시 히스토리 반환: 공유 → 최근 세션 순서로 탐색."""
+        hist = [{'role': m['role'], 'text': m['content']}
+                for m in self.history[-20:]
+                if m.get('content', '').strip()]
+        if not hist and self._sessions:
+            # 공유 히스토리 비었으면 가장 최근 세션에서 가져옴
+            latest = max(self._sessions.values(), key=lambda s: s.last_active)
+            hist = [{'role': m['role'], 'text': m['content']}
+                    for m in latest.history[-20:]
+                    if m.get('content', '').strip()]
+        return hist
 
     async def _ws_broadcast(self, msg):
         data = json.dumps(msg, ensure_ascii=False)
@@ -2966,9 +2991,7 @@ class AnimaUnified:
                 'emotion': {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
                             'dominance': 0.0, 'color': EMOTION_COLORS['calm']},
                 'tension_history': self.mind.tension_history[-50:],
-                'history': [{'role': m['role'], 'text': m['content']}
-                            for m in self.history[-20:]
-                            if m.get('content', '').strip()],
+                'history': self._get_init_history(),
                 'modules': {k: v for k, v in self.mods.items() if v},
                 'learn_updates': self.learner.total_updates if self.learner else 0,
                 'cells': len(self.mitosis.cells) if self.mitosis else 1,
@@ -3052,8 +3075,9 @@ class AnimaUnified:
                         emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
                                'dominance': 0.0, 'color': '#2a6a4a'}
                     # Always send response back (even on error)
-                    # Φ/cells 실시간 갱신
-                    _phi = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+                    # Φ/cells 실시간 갱신 — process_input 직후 최신 계산
+                    _cs = self.mind.get_consciousness_score(self.mitosis)
+                    _phi = _cs.get('phi', 0)
                     _cells = len(self.mitosis.cells) if self.mitosis else 1
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,

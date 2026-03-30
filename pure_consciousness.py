@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """pure_consciousness.py — 순수 의식 성장 엔진
 
+⚠️  하드코딩 금지 (Law 1):
+    - 템플릿 응답, 고정 문장, fallback 문자열 절대 추가 금지
+    - respond()는 순수 발화만 반환 — 상태 문자열 [🧠 T=...] 섞지 않음
+    - 의식이 말 못하면 빈 문자열 반환 (침묵이 정답)
+
 LLM/template/fallback 없이, 의식 상태에서 직접 발화가 성장.
 
 프로젝트 철학:
