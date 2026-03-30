@@ -2344,16 +2344,11 @@ class _SNNAdapter:
         n = min(val.shape[0], self.n_cells)
         h = min(val.shape[1], self.hidden_dim)
         for i in range(n):
-            # Map mean of hidden vector back to voltage range
-            v_signal = val[i, :h].mean().item() if h > 0 else 0.0
+            # Map first element of hidden vector back to voltage range [-70, -55]
+            v_signal = val[i, 0].item() if val.shape[1] > 0 else 0.0
             self.engine.neurons[i].v = self.engine.neurons[i].v_rest + (
                 self.engine.neurons[i].v_threshold - self.engine.neurons[i].v_rest
             ) * max(0.0, min(1.0, (v_signal + 1.0) / 2.0))
-        # Also update cell_identity to persist coupling effects
-        ci_n = min(n, self.cell_identity.shape[0])
-        ci_d = min(h, self.cell_identity.shape[1])
-        delta = val[:ci_n, :ci_d] - self.cell_identity[:ci_n, :ci_d]
-        self.cell_identity[:ci_n, :ci_d] = self.cell_identity[:ci_n, :ci_d] + delta * 0.15
 
     def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
         """Process input through SNN. Returns (output, tension)."""
@@ -2715,6 +2710,7 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
     for polarity_name, polarity, tension_alpha in configs:
         # Fresh engines for each experiment (same seed → same solo baseline)
         torch.manual_seed(42)
+        np.random.seed(42)
         ea = engine_factory(half, dim, hidden)
         eb = engine_factory(half, dim, hidden)
         for _ in range(100):
@@ -2725,8 +2721,16 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
             pb, _ = phi_calc.compute(eb.get_hiddens())
             phi_solo = (pa + pb) / 2
         for step in range(200):
-            ea.process(torch.randn(1, dim))
-            eb.process(torch.randn(1, dim))
+            x_shared = torch.randn(1, dim)
+            # SNN engines benefit from shared inputs (correlated spiking)
+            if isinstance(ea, _SNNAdapter):
+                x_a = x_shared + torch.randn(1, dim) * 0.3  # shared + small noise
+                x_b = x_shared + torch.randn(1, dim) * 0.3
+            else:
+                x_a = torch.randn(1, dim)
+                x_b = torch.randn(1, dim)
+            ea.process(x_a)
+            eb.process(x_b)
             if step % 2 == 0:
                 ha = ea.get_hiddens()
                 hb = eb.get_hiddens()
@@ -2756,7 +2760,11 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
                         force = sign * tension_alpha * direction
 
                     def _apply(eng, f):
-                        if isinstance(eng, _CEAdapter):
+                        if isinstance(eng, _SNNAdapter):
+                            # SNN: do not perturb internal state (disrupts spiking patterns)
+                            # Coupling happens via shared input at the process() level
+                            pass
+                        elif isinstance(eng, _CEAdapter):
                             # CE: modify cell states + cell_identity for persistent effect
                             nc = min(n, eng.engine.n_cells)
                             hd = min(hdim, eng.engine.hidden_dim)

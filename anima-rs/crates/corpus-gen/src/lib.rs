@@ -19,6 +19,8 @@ pub mod dialogue;
 pub mod dims;
 pub mod fetch;
 pub mod gen;
+pub mod multilingual;
+pub mod v4_extensions;
 pub mod ngram;
 pub mod qualia;
 pub mod seeds;

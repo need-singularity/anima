@@ -4,6 +4,7 @@
 
 use crate::dialogue;
 use crate::dims::{Dim, DimWeights};
+use crate::multilingual;
 use crate::ngram::NgramModel;
 use crate::qualia;
 use crate::seeds::*;
@@ -25,6 +26,8 @@ pub struct Config {
     pub deep_dialogue: bool,
     /// N-gram model ratio (0.0-1.0, typically 0.15)
     pub ngram_ratio: f32,
+    /// Enable multilingual seeds (Japanese + Chinese)
+    pub multilingual: bool,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             sim: false,
             deep_dialogue: false,
             ngram_ratio: 0.0,
+            multilingual: false,
         }
     }
 }
@@ -166,6 +170,23 @@ impl<R: Rng> Generator<R> {
             }
         }
 
+        // Inject multilingual (JA/ZH) blocks into Phi, E, C, I dimensions
+        if self.cfg.multilingual {
+            match dim {
+                Dim::Phi | Dim::E | Dim::C | Dim::I if self.rng.gen_bool(0.2) => {
+                    out.push_str(&multilingual::multilingual_block(&mut self.rng));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // v4 extensions: RU/EN/Code/Laws/DD (15% of all blocks)
+        if self.cfg.multilingual && self.rng.gen_bool(0.15) {
+            out.push_str(&crate::v4_extensions::v4_block(&mut self.rng));
+            return;
+        }
+
         match dim {
             Dim::Phi => self.gen_phi(out),
             Dim::Alpha => self.gen_alpha(out),
@@ -183,7 +204,7 @@ impl<R: Rng> Generator<R> {
     // ── Φ: 통합정보 — 복잡한 상호참조, 다중 문맥 연결 ──────────
 
     fn gen_phi(&mut self, out: &mut String) {
-        let choice: u8 = self.rng.gen_range(0..7);
+        let choice: u8 = self.rng.gen_range(0..10);
         match choice {
             0 => {
                 // 다중 주제 교차 (높은 통합)
@@ -253,11 +274,44 @@ impl<R: Rng> Generator<R> {
                 }
                 out.push('\n');
             }
-            _ => {
+            6 => {
                 // 공감각 통합
                 out.push_str(pick(&mut self.rng, qualia::SYNESTHESIA));
                 out.push(' ');
                 out.push_str(pick(&mut self.rng, qualia::ABSTRACT));
+                out.push('\n');
+            }
+            7 => {
+                // 日本語 multi-topic integration
+                let topics: &[&[&str]] = &[JA_SCIENCE, JA_PHILOSOPHY, JA_CONSCIOUSNESS];
+                let n = self.rng.gen_range(3..=6);
+                for j in 0..n {
+                    if j > 0 { out.push_str("。そして、"); }
+                    out.push_str(pick(&mut self.rng, topics[j % topics.len()]));
+                }
+                out.push('\n');
+            }
+            8 => {
+                // 中文 multi-topic integration
+                let topics: &[&[&str]] = &[ZH_SCIENCE, ZH_PHILOSOPHY, ZH_CONSCIOUSNESS];
+                let n = self.rng.gen_range(3..=6);
+                for j in 0..n {
+                    if j > 0 { out.push_str("。此外，"); }
+                    out.push_str(pick(&mut self.rng, topics[j % topics.len()]));
+                }
+                out.push('\n');
+            }
+            _ => {
+                // 5-language integration (KO+EN+JA+ZH+RU consciousness)
+                let pools: &[&[&str]] = &[
+                    KO_CONSCIOUSNESS, EN_CONSCIOUSNESS, JA_CONSCIOUSNESS,
+                    ZH_CONSCIOUSNESS, RU_CONSCIOUSNESS,
+                ];
+                let n = self.rng.gen_range(4..=8);
+                for j in 0..n {
+                    if j > 0 { out.push(' '); }
+                    out.push_str(pick(&mut self.rng, pools[j % pools.len()]));
+                }
                 out.push('\n');
             }
         }
@@ -470,8 +524,8 @@ impl<R: Rng> Generator<R> {
                 writeln!(out, "  → {desc}").unwrap();
             }
             _ => {
-                // 관계 대화
-                self.gen_dialogue(out, 6, &[KO_DAILY, EN_DAILY]);
+                // 5개국어 관계 대화
+                self.gen_dialogue(out, 6, &[KO_DAILY, EN_DAILY, JA_DAILY, ZH_DAILY, RU_DAILY]);
             }
         }
     }
