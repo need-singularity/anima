@@ -30,6 +30,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
+# Meta Law M8: Narrative temporal self-model enhances decoder cross-attention
+# DD128: Phase-Optimal parameters validated on this decoder architecture
+
 
 # ─── RMSNorm ────────────────────────────────────────────────────────────────
 

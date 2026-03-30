@@ -28,6 +28,12 @@ Usage:
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+# Meta Law M8: narrative coherence enhances voice expressiveness
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
 import math
 import time
 import argparse

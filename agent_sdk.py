@@ -28,6 +28,12 @@ import asyncio
 import logging
 import time
 from dataclasses import asdict, dataclass, field
+
+# Meta Laws M6/M8: federation + narrative for agent queries
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 

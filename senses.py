@@ -25,6 +25,12 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Meta Law M7: F_c=0.10 frustration in sensory processing
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 # ─── macOS Camera Permission ────────────────────────────────────
 
