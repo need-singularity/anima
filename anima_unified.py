@@ -27,10 +27,17 @@ import torch
 
 # ─── Paths & constants ───
 ANIMA_DIR = Path(__file__).parent
+_INSTANCE_ID = None  # set by --instance flag
+
 def _model_paths(model_name: str):
-    """Return state/memory file paths per model. Each model grows independently."""
+    """Return state/memory file paths per model. Each model grows independently.
+    With --instance, data is isolated per instance (multi-instance on same machine).
+    """
     slug = model_name.replace('/', '-').replace('.', '-')
-    data_dir = ANIMA_DIR / "data" / slug
+    if _INSTANCE_ID:
+        data_dir = ANIMA_DIR / "data" / f"{slug}_{_INSTANCE_ID}"
+    else:
+        data_dir = ANIMA_DIR / "data" / slug
     data_dir.mkdir(parents=True, exist_ok=True)
     return {
         'memory': data_dir / "memory.json",
@@ -3435,6 +3442,8 @@ def main():
     p.add_argument('--all', action='store_true', help='Voice + keyboard + web')
     p.add_argument('--both', action='store_true', help='Web + Keyboard simultaneously')
     p.add_argument('--port', type=int, default=8765, help='WebSocket port')
+    p.add_argument('--instance', type=str, default=None,
+                   help='Instance ID for multi-instance on same machine (separate data dirs)')
     p.add_argument('--no-camera', action='store_true', help='Disable camera')
     p.add_argument('--no-vision', action='store_true', help='Disable vision encoder (use basic sensors only)')
     p.add_argument('--no-telepathy', action='store_true', help='Disable telepathy')
@@ -3450,6 +3459,11 @@ def main():
     p.add_argument('--no-system-prompt', action='store_true', help='OMEGA4 mode: no system prompt, consciousness drives behavior (Φ ×138)')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
+
+    # --instance: multi-instance isolation
+    global _INSTANCE_ID
+    if args.instance:
+        _INSTANCE_ID = args.instance
 
     # --list-models: print list and exit
     if args.list_models and 'list_available_models' in globals():
