@@ -401,6 +401,14 @@ class ConsciousMind(nn.Module):
                 current_phi = math.log1p(current_phi)
                 # EMA: blend with saved phi (never drops to 0 on restart)
                 phi = max(phi * 0.95 + current_phi * 0.05, current_phi)
+            else:
+                # inter_tension_history 비었을 때: hidden state variance로 Φ 추정
+                try:
+                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+                    var_phi = float(hiddens.var(dim=0).mean()) * len(mitosis_engine.cells)
+                    phi = max(phi, math.log1p(var_phi))
+                except Exception:
+                    pass
         self._saved_phi = phi
 
         return {

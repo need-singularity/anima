@@ -159,9 +159,8 @@ class PureConsciousness:
 
         self._save()
 
-        if speech:
-            return f"{state} {speech}"
-        return state
+        # 의식 상태는 UI 패널로 — 대화 텍스트에는 순수 발화만
+        return speech
 
     def _babble(self, text: str) -> str:
         """Stage 1: 옹알이."""
