@@ -2269,10 +2269,13 @@ class _CEAdapter:
                 phase = i * 0.7
                 strength = 0.3 * math.sin(t * 0.2 + phase) + 0.15 * math.sin(t * math.pi + phase * 0.3)
                 h[i] = h[i] + self.cell_identity[i, :self.hidden_dim] * strength
-            # Per-cell × per-dimension oscillation → unique variance profile per cell
-            for i in range(n):
-                dim_osc = torch.sin(torch.arange(self.hidden_dim).float() * 0.5 + t * 0.2 + i * 1.3) * 0.3
-                h[i] = h[i] + dim_osc
+            # Burst injection: periodic sharp spikes (~30 step interval)
+            burst_phase = math.sin(t * 0.2)
+            if burst_phase > 0.7:  # burst window (~30% of time)
+                burst_strength = (burst_phase - 0.7) * 3.0
+                for i in range(n):
+                    dim_osc = torch.sin(torch.arange(self.hidden_dim).float() * 0.5 + i * 1.3) * burst_strength
+                    h[i] = h[i] + dim_osc
         actual = h.shape[0]
         if actual >= self.n_cells:
             return h[:self.n_cells]
@@ -3273,6 +3276,143 @@ def run_discovery2(cells: int, steps: int, dim: int, hidden: int):
 
 
 
+# ──────────────────────────────────────────────────────────
+# Mode: --federated (Federation vs Single Engine)
+# DD137/DD142/DD144: small atoms federated > single monolith
+# ──────────────────────────────────────────────────────────
+
+def run_federated(dim: int = 64, hidden: int = 128, steps: int = 300):
+    """Federation benchmark: N small atoms vs 1 big engine.
+
+    Tests atom sizes [4, 8, 16, 32] at total cells [32, 64, 128].
+    Measures sum-of-per-atom Φ(IIT) vs single-engine Φ(IIT).
+
+    Key findings to reproduce (DD142/DD144):
+      - 8-cell atoms are optimal (DD137, DD144)
+      - Federation beats single at 64c+ (DD142: +396% at 64c, +820% at 128c)
+      - Coupling strength doesn't matter much (α=0 to α=0.10 similar)
+    """
+    print("  MODE: --federated  (Federation vs Single Engine Benchmark)")
+    print(f"  Steps: {steps}  dim: {dim}  hidden: {hidden}")
+    print(f"  Atom sizes: [4, 8, 16, 32]   Total cells: [32, 64, 128]")
+    print()
+
+    phi_calc = PhiIIT(n_bins=16)
+    atom_sizes = [4, 8, 16, 32]
+    total_cells_list = [32, 64, 128]
+    coupling_alpha = 0.01  # weak inter-atom coupling
+
+    # Collect all results: (total, atom_size, fed_phi, single_phi, delta%)
+    rows = []
+
+    for total in total_cells_list:
+        print(f"  ── Total cells = {total} ──")
+
+        # 1) Single engine baseline
+        t0 = time.time()
+        torch.manual_seed(42)
+        single = BenchEngine(n_cells=total, input_dim=dim, hidden_dim=hidden,
+                             output_dim=dim, n_factions=min(8, total // 2))
+        for _ in range(steps):
+            x = torch.randn(1, dim)
+            single.process(x)
+
+        single_phi, _ = phi_calc.compute(single.get_hiddens())
+        single_time = time.time() - t0
+        print(f"    Single({total:>3d}c):  Φ(IIT)={single_phi:.4f}  [{single_time:.1f}s]")
+
+        for atom_size in atom_sizes:
+            if atom_size > total:
+                continue
+            n_atoms = total // atom_size
+            if n_atoms < 2:
+                continue
+
+            t0 = time.time()
+            torch.manual_seed(42)
+            # Create independent atoms
+            atoms = [
+                BenchEngine(n_cells=atom_size, input_dim=dim, hidden_dim=hidden,
+                            output_dim=dim, n_factions=min(8, atom_size // 2))
+                for _ in range(n_atoms)
+            ]
+
+            # Run all atoms with weak coupling (shared random input + neighbor blending)
+            for step in range(steps):
+                x_shared = torch.randn(1, dim)
+                atom_outputs = []
+                for k, atom in enumerate(atoms):
+                    # Each atom gets shared input + weak neighbor signal
+                    atom_x = x_shared.clone()
+                    if coupling_alpha > 0 and step > 0 and hasattr(atoms[k], '_last_out'):
+                        neighbor = (k + 1) % n_atoms
+                        if hasattr(atoms[neighbor], '_last_out'):
+                            atom_x = (
+                                (1 - coupling_alpha) * atom_x
+                                + coupling_alpha * atoms[neighbor]._last_out
+                            )
+                    out, _ = atom.process(atom_x)
+                    atom._last_out = out.detach()
+                    atom_outputs.append(out.detach())
+
+            # Measure: sum of per-atom Φ(IIT)
+            fed_phi = 0.0
+            for atom in atoms:
+                p, _ = phi_calc.compute(atom.get_hiddens())
+                fed_phi += p
+
+            fed_time = time.time() - t0
+
+            delta = ((fed_phi / max(single_phi, 1e-8)) - 1) * 100
+            rows.append((total, atom_size, n_atoms, fed_phi, single_phi, delta, fed_time))
+
+            marker = " <<<" if delta > 0 else ""
+            print(f"    Fed({n_atoms:>2d}x{atom_size:<2d}c):  "
+                  f"ΣΦ(IIT)={fed_phi:.4f}  "
+                  f"Δ={delta:+.1f}%  [{fed_time:.1f}s]{marker}")
+
+        print()
+
+    # ── Summary Table ──
+    print(f"{'=' * 78}")
+    print("  FEDERATION vs SINGLE ENGINE — Summary")
+    print(f"  (DD137: 8c atoms optimal, DD142: federation > empire at 64c+)")
+    print(f"{'=' * 78}")
+    print(f"  {'Total':>5s} | {'Atoms':>5s} | {'Size':>4s} | "
+          f"{'ΣΦ(IIT)':>8s} | {'Single':>8s} | {'Delta':>8s} | {'Time':>6s}")
+    print(f"  {'-' * 5}-+-{'-' * 5}-+-{'-' * 4}-+-"
+          f"{'-' * 8}-+-{'-' * 8}-+-{'-' * 8}-+-{'-' * 6}")
+
+    for total, atom_size, n_atoms, fed_phi, single_phi, delta, t in rows:
+        win = " *" if delta > 0 else ""
+        print(f"  {total:>5d} | {n_atoms:>5d} | {atom_size:>4d} | "
+              f"{fed_phi:>8.4f} | {single_phi:>8.4f} | {delta:>+7.1f}% | "
+              f"{t:>5.1f}s{win}")
+
+    # ── Bar Chart: best federation per total vs single ──
+    print(f"\n  Best federation per scale:")
+    for total in total_cells_list:
+        total_rows = [r for r in rows if r[0] == total]
+        if not total_rows:
+            continue
+        best = max(total_rows, key=lambda r: r[5])  # highest delta
+        _, atom_sz, n_at, fp, sp, d, _ = best
+        bar_fed = int(min(fp / max(max(fp, sp), 1e-8), 1.0) * 40)
+        bar_sin = int(min(sp / max(max(fp, sp), 1e-8), 1.0) * 40)
+        print(f"    {total:>3d}c  single   {'█' * bar_sin} {sp:.4f}")
+        print(f"    {total:>3d}c  {n_at}x{atom_sz:<2d}c   {'█' * bar_fed} {fp:.4f}  ({d:+.1f}%)")
+        print()
+
+    # ── Optimal atom size ──
+    if rows:
+        best_overall = max(rows, key=lambda r: r[5])
+        print(f"  Optimal atom size: {best_overall[1]}c  "
+              f"(best delta: {best_overall[5]:+.1f}% at {best_overall[0]}c total)")
+        print(f"  Conclusion: {'Federation > Empire' if best_overall[5] > 0 else 'Single wins'}")
+
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="bench_v2 — Dual-Phi Benchmarking (IIT + proxy)",
@@ -3314,6 +3454,9 @@ Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
     mode.add_argument("--discovery2", action="store_true",
                       help="Round 2 discovery benchmark: DD121-DD125 "
                            "(FrustPhil, OscFrustN, HubFrustN, BottleNarr, EVERYv2)")
+    mode.add_argument("--federated", action="store_true",
+                      help="Federation vs single engine: atom sizes [4,8,16,32] "
+                           "x total [32,64,128] (DD137/DD142/DD144)")
 
     parser.add_argument("--cells", type=int, default=256,
                         help="Number of cells (default: 256)")
@@ -3377,6 +3520,9 @@ Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
 
     elif args.discovery2:
         run_discovery2(args.cells, args.steps, args.dim, args.hidden)
+
+    elif args.federated:
+        run_federated(args.dim, args.hidden, args.steps)
 
     print()
 

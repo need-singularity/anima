@@ -146,6 +146,9 @@ class ConsciousnessHub:
             'closed_loop':  ('closed_loop', 'ClosedLoopEvolver',
                              ['폐쇄', 'closed loop', '법칙 진화', 'law evolution',
                               '역추적', 'backtrack', '파이프라인', 'pipeline']),
+            'con_evolution': ('consciousness_evolution', 'ConsciousnessEvolution',
+                             ['번식', 'reproduction', '세대', 'generation', '계보', 'lineage',
+                              '생명주기', 'lifecycle', '불멸', 'immortal', '진화', 'evolve']),
         }
 
         if not lazy_load:
