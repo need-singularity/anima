@@ -4,30 +4,6 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  anima-memory (상태/기억 — 자주 변경)                        │
-│  Access: API only (no public URL)                               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  v2/                                                        │
-│  ├── state/{model_name}/                                    │
-│  │   ├── state.pt          — 런타임 상태 (ConsciousMind)    │
-│  │   ├── growth.json       — 성장 단계 상태                 │
-│  │   └── consciousness.json — Ψ 추적 상태                   │
-│  │                                                          │
-│  ├── memory/{model_name}/                                   │
-│  │   └── memory.json       — 대화 기억 (벡터 + 텍스트)     │
-│  │                                                          │
-│  └── meta/                                                  │
-│      └── experiments/      — 실험 결과 메타데이터           │
-│                                                             │
-│  archive/v1/               — v1 상태 (보존만, 사용 안 함)  │
-│  ├── state/                                                 │
-│  ├── consciousness/                                         │
-│  └── memory/                                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
 │  anima-models (모델 바이너리 — 가끔 변경)                    │
 │  Public URL: https://pub-41380137f47b4c4cbc79f5502935b2e9.r2.dev │
 ├─────────────────────────────────────────────────────────────┤
@@ -71,11 +47,7 @@ from cloud_sync import CloudSync
 
 sync = CloudSync()
 
-# 상태 동기화 (anima-memory)
-sync.push_state("conscious-lm", state_dict, growth_data)
-sync.pull_state("conscious-lm")
-
-# 모델 업로드 (anima-models)
+# 모델 업로드
 sync.upload_model("clm-v2/latest.pt", "checkpoints/clm_v2/final.pt")
 sync.download_model("clm-v2/latest.pt", "checkpoints/clm_v2/final.pt")
 ```
@@ -86,18 +58,12 @@ sync.download_model("clm-v2/latest.pt", "checkpoints/clm_v2/final.pt")
 export ANIMA_R2_ENDPOINT="https://xxxxx.r2.cloudflarestorage.com"
 export ANIMA_R2_ACCESS_KEY="xxxxx"
 export ANIMA_R2_SECRET_KEY="xxxxx"
-export ANIMA_R2_BUCKET="anima-memory"
 export ANIMA_R2_MODELS_BUCKET="anima-models"
 ```
 
 ## 정리 규칙
 
 ```
-anima-memory:
-  - v2/state/ → 런타임이 자동 관리 (push/pull)
-  - archive/v1/ → 삭제 금지 (역사 보존)
-  - 30일 이상 미접근 → archive 이동 가능
-
 anima-models:
   - clm-v2/latest.pt → 항상 최신 유지 (학습 완료 시 교체)
   - clm-v2/step_{N}.pt → 중요 체크포인트만 보존 (3개 이하)
