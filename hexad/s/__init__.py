@@ -1,5 +1,5 @@
-"""S 감각 — TensionSense (canonical)"""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from trinity import TensionSense
-__all__ = ['TensionSense']
+"""S 감각 — EmergentS (canonical, Law 4 준수)
+Legacy: TensionSense → hexad/s/ (kept for backward compat)
+"""
+from hexad.s.emergent_s import EmergentS
+__all__ = ['EmergentS']
