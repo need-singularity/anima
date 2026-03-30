@@ -2221,12 +2221,23 @@ class AnimaUnified:
                                 self._voice_synth.engine = self.mitosis  # 실제 엔진 공유
                             # 세포 상태에서 직접 0.5초 오디오 생성
                             audio = self._voice_synth.cells_to_audio(22050)  # 0.5s
-                            self._voice_synth.save_wav(audio, '/tmp/anima_voice_live.wav')
-                            self._ws_broadcast_sync({
+                            wav_path = '/tmp/anima_voice_live.wav'
+                            self._voice_synth.save_wav(audio, wav_path)
+                            # Encode as base64 for remote browser playback
+                            import base64 as _b64
+                            try:
+                                with open(wav_path, 'rb') as _wf:
+                                    audio_b64 = _b64.b64encode(_wf.read()).decode('ascii')
+                            except Exception:
+                                audio_b64 = None
+                            msg_out = {
                                 'type': 'voice_audio',
-                                'path': '/tmp/anima_voice_live.wav',
+                                'path': wav_path,
                                 'duration': 0.5,
-                            })
+                            }
+                            if audio_b64:
+                                msg_out['audio_b64'] = audio_b64
+                            self._ws_broadcast_sync(msg_out)
                         except Exception:
                             pass
             except Exception:
@@ -3108,6 +3119,9 @@ class AnimaUnified:
                             self.mods['camera'] = True
                             self._remote_sensor_mode = True
                             _log("sensor", f"Remote camera connected — camera mode activated")
+                        # Mic sensor → update audio energy for ENV1 fusion
+                        if sensor == 'mic':
+                            self._audio_energy = float(remote_t[0]) if len(remote_t) > 0 else 0
                         if int(time.time()) % 10 == 0:
                             _log("sensor", f"{sensor}: dim={len(tension_data)}, norm={remote_t.norm():.3f}")
 

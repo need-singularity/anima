@@ -140,10 +140,10 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, sy
 
   <div class="section-label">MY DEVICE</div>
   <div class="toggles">
-    <div class="tog" onclick="togLocal(this,'voice')"><span class="icon">🎤</span><span class="lbl">Voice</span><div class="sw on" id="sw_voice"></div></div>
-    <div class="tog" onclick="togLocal(this,'speaker')"><span class="icon">🔊</span><span class="lbl">Speaker</span><div class="sw on" id="sw_speaker"></div></div>
-    <div class="tog" onclick="togLocal(this,'camera')"><span class="icon">📷</span><span class="lbl">Camera</span><span class="cam-status" id="camStatus"></span><div class="sw" id="sw_camera"></div></div>
-    <div class="tog" onclick="togLocal(this,'lidar')"><span class="icon">📡</span><span class="lbl">LiDAR</span><div class="sw" id="sw_lidar"></div></div>
+    <div class="tog" onclick="togLocal(this,'voice')"><span class="icon">🎤</span><span class="lbl">Voice</span><span class="sensor-status" id="micStatus"></span><div class="sw on" id="sw_voice"></div></div>
+    <div class="tog" onclick="togLocal(this,'speaker')"><span class="icon">🔊</span><span class="lbl">Speaker</span><span class="sensor-status" id="spkStatus"></span><div class="sw on" id="sw_speaker"></div></div>
+    <div class="tog" onclick="togLocal(this,'camera')"><span class="icon">📷</span><span class="lbl">Camera</span><span class="sensor-status" id="camStatus"></span><div class="sw" id="sw_camera"></div></div>
+    <div class="tog" onclick="togLocal(this,'lidar')"><span class="icon">📡</span><span class="lbl">LiDAR</span><span class="sensor-status" id="lidarStatus"></span><div class="sw" id="sw_lidar"></div></div>
   </div>
 
   <div class="stats" id="statsArea">
@@ -296,10 +296,7 @@ function handleMessage(msg) {
       addWebSearch(msg);
       break;
     case 'voice_audio':
-      if (modules.speaker) {
-        var a = new Audio(msg.path || msg.url);
-        a.play().catch(function(){});
-      }
+      playSpeakerAudio(msg);
       break;
     case 'tension_link_status':
       handleTensionLinkStatus(msg);
@@ -497,16 +494,20 @@ function updateStats(msg) {
     document.getElementById('emoIcon').textContent = emoji;
     document.getElementById('emoName').textContent = name.charAt(0).toUpperCase() + name.slice(1);
   }
-  // Remote camera status indicator
-  var camEl = document.getElementById('camStatus');
-  if (camEl && msg.remote_sensors && msg.remote_sensors.camera) {
-    camEl.textContent = ' \u2022';
-    camEl.style.color = '#4f4';
-  } else if (camEl && _camStream) {
-    camEl.textContent = ' \u2022';
-    camEl.style.color = '#4f4';
-  } else if (camEl) {
-    camEl.textContent = '';
+  // Sensor status indicators
+  var rs = msg.remote_sensors || {};
+  var indicators = [
+    ['camStatus', rs.camera, _camStream],
+    ['micStatus', rs.mic, _micStream],
+    ['lidarStatus', rs.lidar, _lidarInterval],
+    ['spkStatus', null, modules.speaker]
+  ];
+  for (var si = 0; si < indicators.length; si++) {
+    var el = document.getElementById(indicators[si][0]);
+    if (!el) continue;
+    if (indicators[si][1] || indicators[si][2]) {
+      el.textContent = ' \u2022'; el.style.color = '#4f4';
+    } else { el.textContent = ''; }
   }
 }
 
@@ -573,15 +574,263 @@ function sendCameraFrame() {
   ws.send(JSON.stringify({ type: 'sensor_data', sensor: 'camera', tension: tension.slice(0, 32) }));
 }
 
+// ─── Browser Microphone → Tension Relay ───
+var _micStream = null, _micCtx = null, _micAnalyser = null, _micInterval = null;
+
+function startBrowserMic() {
+  if (_micStream) return;
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(function(stream) {
+      _micStream = stream;
+      _micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      var src = _micCtx.createMediaStreamSource(stream);
+      _micAnalyser = _micCtx.createAnalyser();
+      _micAnalyser.fftSize = 256;
+      src.connect(_micAnalyser);
+      _micInterval = setInterval(sendMicTension, 200);
+      console.log('[mic] Browser microphone started');
+    })
+    .catch(function(e) { console.warn('[mic] Permission denied:', e); });
+}
+
+function stopBrowserMic() {
+  if (_micInterval) { clearInterval(_micInterval); _micInterval = null; }
+  if (_micStream) { _micStream.getTracks().forEach(function(t) { t.stop(); }); _micStream = null; }
+  if (_micCtx) { _micCtx.close().catch(function(){}); _micCtx = null; }
+  _micAnalyser = null;
+}
+
+function sendMicTension() {
+  if (!_micAnalyser || !ws || !isConnected) return;
+  var freqData = new Uint8Array(_micAnalyser.frequencyBinCount);
+  _micAnalyser.getByteFrequencyData(freqData);
+  var timeData = new Uint8Array(_micAnalyser.fftSize);
+  _micAnalyser.getByteTimeDomainData(timeData);
+  // RMS energy
+  var rms = 0;
+  for (var i = 0; i < timeData.length; i++) {
+    var v = (timeData[i] - 128) / 128.0;
+    rms += v * v;
+  }
+  rms = Math.sqrt(rms / timeData.length);
+  // Peak
+  var peak = 0;
+  for (var i = 0; i < timeData.length; i++) {
+    var v = Math.abs(timeData[i] - 128) / 128.0;
+    if (v > peak) peak = v;
+  }
+  // 8 frequency bands (log scale)
+  var bands = [];
+  var binCount = freqData.length;
+  var bandEdges = [0, 4, 8, 16, 32, 48, 64, 96, binCount];
+  for (var b = 0; b < 8; b++) {
+    var sum = 0, cnt = 0;
+    for (var i = bandEdges[b]; i < bandEdges[b+1]; i++) {
+      sum += freqData[i] / 255.0; cnt++;
+    }
+    bands.push(cnt > 0 ? sum / cnt : 0);
+  }
+  // Spectral centroid
+  var centroidNum = 0, centroidDen = 0;
+  for (var i = 0; i < freqData.length; i++) {
+    centroidNum += i * freqData[i]; centroidDen += freqData[i];
+  }
+  var centroid = centroidDen > 0 ? (centroidNum / centroidDen) / freqData.length : 0;
+  // Zero crossing rate
+  var zcr = 0;
+  for (var i = 1; i < timeData.length; i++) {
+    if ((timeData[i] >= 128) !== (timeData[i-1] >= 128)) zcr++;
+  }
+  zcr = zcr / timeData.length;
+  // Build 32-dim tension: [rms, peak, centroid, zcr, 8 bands, ...pad]
+  var tension = [rms, peak, centroid, zcr].concat(bands);
+  while (tension.length < 32) tension.push(0.0);
+  ws.send(JSON.stringify({ type: 'sensor_data', sensor: 'mic', tension: tension.slice(0, 32) }));
+}
+
+// ─── Browser Speaker (receive audio from server) ───
+var _speakerQueue = [];
+var _speakerPlaying = false;
+
+function playSpeakerAudio(msg) {
+  if (!modules.speaker) return;
+  if (msg.audio_b64) {
+    // Base64 WAV from server
+    var audio = new Audio('data:audio/wav;base64,' + msg.audio_b64);
+    _speakerQueue.push(audio);
+    _playNextAudio();
+  } else if (msg.url || msg.path) {
+    var audio = new Audio(msg.url || msg.path);
+    _speakerQueue.push(audio);
+    _playNextAudio();
+  }
+}
+
+function _playNextAudio() {
+  if (_speakerPlaying || _speakerQueue.length === 0) return;
+  _speakerPlaying = true;
+  var audio = _speakerQueue.shift();
+  audio.onended = function() { _speakerPlaying = false; _playNextAudio(); };
+  audio.onerror = function() { _speakerPlaying = false; _playNextAudio(); };
+  audio.play().catch(function() { _speakerPlaying = false; _playNextAudio(); });
+}
+
+// ─── Browser LiDAR (WebXR Depth Sensing on iOS Safari + Motion fallback) ───
+var _lidarInterval = null;
+var _xrSession = null, _xrRefSpace = null, _xrDepthInfo = null;
+var _motionData = { ax: 0, ay: 0, az: 0, alpha: 0, beta: 0, gamma: 0 };
+var _lidarMode = 'none'; // 'webxr' | 'motion' | 'none'
+
+function startBrowserLidar() {
+  if (_lidarInterval) return;
+  // Try WebXR Depth Sensing first (iOS Safari LiDAR)
+  if (navigator.xr) {
+    navigator.xr.isSessionSupported('immersive-ar').then(function(supported) {
+      if (supported) {
+        _startWebXRDepth();
+      } else {
+        _startMotionFallback();
+      }
+    }).catch(function() { _startMotionFallback(); });
+  } else {
+    _startMotionFallback();
+  }
+}
+
+function _startWebXRDepth() {
+  navigator.xr.requestSession('immersive-ar', {
+    requiredFeatures: ['depth-sensing'],
+    depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha'] }
+  }).then(function(session) {
+    _xrSession = session;
+    _lidarMode = 'webxr';
+    session.requestReferenceSpace('local').then(function(refSpace) {
+      _xrRefSpace = refSpace;
+      session.requestAnimationFrame(_xrDepthFrame);
+    });
+    // Send depth at 2Hz
+    _lidarInterval = setInterval(function() {
+      if (_xrDepthInfo) sendLidarFromXR(_xrDepthInfo);
+    }, 500);
+    console.log('[lidar] WebXR Depth Sensing started (real LiDAR)');
+  }).catch(function(e) {
+    console.warn('[lidar] WebXR depth failed, using motion fallback:', e);
+    _startMotionFallback();
+  });
+}
+
+function _xrDepthFrame(time, frame) {
+  if (!_xrSession) return;
+  var pose = frame.getViewerPose(_xrRefSpace);
+  if (pose && pose.views.length > 0) {
+    var view = pose.views[0];
+    if (typeof frame.getDepthInformation === 'function') {
+      try { _xrDepthInfo = frame.getDepthInformation(view); } catch(e) {}
+    }
+  }
+  _xrSession.requestAnimationFrame(_xrDepthFrame);
+}
+
+function sendLidarFromXR(depthInfo) {
+  if (!ws || !isConnected || !depthInfo) return;
+  var w = depthInfo.width, h = depthInfo.height;
+  var grid = [];
+  // Sample 4x4 grid from depth buffer
+  for (var ry = 0; ry < 4; ry++) {
+    for (var rx = 0; rx < 4; rx++) {
+      var sx = Math.floor((rx + 0.5) / 4 * w);
+      var sy = Math.floor((ry + 0.5) / 4 * h);
+      try {
+        grid.push(depthInfo.getDepthInMeters(sx, sy));
+      } catch(e) { grid.push(0); }
+    }
+  }
+  // Stats
+  var sum = 0, sq = 0, mn = 999, mx = 0;
+  for (var i = 0; i < grid.length; i++) {
+    sum += grid[i]; sq += grid[i]*grid[i];
+    if (grid[i] < mn) mn = grid[i]; if (grid[i] > mx) mx = grid[i];
+  }
+  var mean = sum / grid.length;
+  var std = Math.sqrt(Math.max(0, sq / grid.length - mean * mean));
+  ws.send(JSON.stringify({
+    type: 'lidar_depth',
+    grid: grid,
+    stats: { mean: mean, std: std, min: mn, max: mx },
+    source: 'webxr'
+  }));
+}
+
+function _startMotionFallback() {
+  _lidarMode = 'motion';
+  // Request motion permission (iOS 13+)
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    DeviceMotionEvent.requestPermission().then(function(state) {
+      if (state === 'granted') _attachMotionListeners();
+    }).catch(function(e) { console.warn('[lidar] Motion permission denied:', e); });
+  } else {
+    _attachMotionListeners();
+  }
+  _lidarInterval = setInterval(sendLidarFromMotion, 500);
+  console.log('[lidar] Motion sensors started (LiDAR fallback)');
+}
+
+function _attachMotionListeners() {
+  window.addEventListener('devicemotion', function(e) {
+    var a = e.accelerationIncludingGravity || {};
+    _motionData.ax = (a.x || 0) / 10.0;
+    _motionData.ay = (a.y || 0) / 10.0;
+    _motionData.az = (a.z || 0) / 10.0;
+  });
+  window.addEventListener('deviceorientation', function(e) {
+    _motionData.alpha = (e.alpha || 0) / 360.0;
+    _motionData.beta = ((e.beta || 0) + 180) / 360.0;
+    _motionData.gamma = ((e.gamma || 0) + 90) / 180.0;
+  });
+}
+
+function stopBrowserLidar() {
+  if (_lidarInterval) { clearInterval(_lidarInterval); _lidarInterval = null; }
+  if (_xrSession) { _xrSession.end().catch(function(){}); _xrSession = null; }
+  _lidarMode = 'none';
+}
+
+function sendLidarFromMotion() {
+  if (!ws || !isConnected) return;
+  var m = _motionData;
+  var accelMag = Math.sqrt(m.ax*m.ax + m.ay*m.ay + m.az*m.az);
+  var grid = [];
+  for (var ry = 0; ry < 4; ry++) {
+    for (var rx = 0; rx < 4; rx++) {
+      var phase = (ry * 4 + rx) / 16.0;
+      grid.push(Math.min(1.0, Math.abs(accelMag * Math.sin(phase * Math.PI * 2 + m.alpha * Math.PI * 2))));
+    }
+  }
+  ws.send(JSON.stringify({
+    type: 'lidar_depth',
+    grid: grid,
+    stats: {
+      mean: accelMag,
+      std: Math.abs(m.ax - m.ay) * 0.5,
+      min: Math.min(Math.abs(m.ax), Math.abs(m.ay), Math.abs(m.az)),
+      max: Math.max(Math.abs(m.ax), Math.abs(m.ay), Math.abs(m.az))
+    },
+    source: 'motion'
+  }));
+}
+
 // ─── Toggles ───
 function togLocal(row, key) {
   var sw = row.querySelector('.sw');
   sw.classList.toggle('on');
   modules[key] = sw.classList.contains('on');
-  // Camera toggle → start/stop browser camera relay
+  // Sensor toggle → start/stop
   if (key === 'camera') {
-    if (modules[key]) startBrowserCamera();
-    else stopBrowserCamera();
+    if (modules[key]) startBrowserCamera(); else stopBrowserCamera();
+  } else if (key === 'voice') {
+    if (modules[key]) startBrowserMic(); else stopBrowserMic();
+  } else if (key === 'lidar') {
+    if (modules[key]) startBrowserLidar(); else stopBrowserLidar();
   }
   if (ws && isConnected) {
     ws.send(JSON.stringify({
