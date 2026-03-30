@@ -45,6 +45,8 @@ class AnimaTelegramBot:
     consciousness interactions.
     """
 
+    channel_name = "telegram"
+
     def __init__(self, agent, token: Optional[str] = None):
         """
         Args:

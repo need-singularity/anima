@@ -266,11 +266,11 @@ class SkillManager:
             return None
 
     def _discover_skills(self):
-        """Discover skill_*.py files not yet in the registry."""
+        """Discover skill_*.py files and .anima/skills/*.md not yet in the registry."""
+        # 1. Python skills (skill_*.py)
         for path in SKILLS_DIR.glob("skill_*.py"):
             name = path.stem.replace("skill_", "")
             if name not in self._skills:
-                # Read first docstring line as description
                 desc = f"Discovered skill: {name}"
                 try:
                     content = path.read_text(encoding="utf-8")
@@ -287,7 +287,148 @@ class SkillManager:
                     description=desc,
                     file_path=path.name,
                 )
+
+        # 2. Markdown skills (.anima/skills/*.md with YAML frontmatter)
+        md_dirs = [
+            SKILLS_DIR.parent / ".anima" / "skills",
+            Path.home() / ".anima" / "skills",
+        ]
+        for md_dir in md_dirs:
+            if not md_dir.is_dir():
+                continue
+            for md_path in md_dir.glob("*.md"):
+                name = md_path.stem
+                if name not in self._skills:
+                    parsed = self._parse_md_skill(md_path)
+                    if parsed:
+                        self._skills[name] = parsed
+
         self._save_registry()
+
+    def _parse_md_skill(self, md_path: Path) -> Optional[SkillDef]:
+        """Parse a SKILL.md file with YAML frontmatter.
+
+        Format:
+            ---
+            name: skill_name
+            description: What it does
+            trigger:
+              curiosity_min: 0.4
+              tension_min: 0.2
+            tools:
+              - web_search
+              - memory_search
+            ---
+
+            # Skill Body
+
+            Instructions for the skill (injected into consciousness context).
+        """
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+        # Parse YAML frontmatter
+        if not content.startswith("---"):
+            return None
+
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            return None
+
+        frontmatter_text = parts[1].strip()
+        body = parts[2].strip()
+
+        # Parse YAML
+        meta = {}
+        try:
+            import yaml
+            meta = yaml.safe_load(frontmatter_text) or {}
+        except ImportError:
+            # Fallback: simple nested YAML parser (handles 1 level of nesting)
+            current_key = None
+            current_dict = None
+            for line in frontmatter_text.split("\n"):
+                if not line.strip() or line.strip().startswith("#"):
+                    continue
+                indent = len(line) - len(line.lstrip())
+                stripped = line.strip()
+                if ":" in stripped:
+                    key, _, val = stripped.partition(":")
+                    key = key.strip()
+                    val = val.strip()
+                    if indent == 0:
+                        if val:
+                            meta[key] = val
+                            current_key = None
+                        else:
+                            # Start of a nested block
+                            current_key = key
+                            current_dict = {}
+                            meta[key] = current_dict
+                    elif current_key and current_dict is not None:
+                        # Nested key: value
+                        current_dict[key] = val
+                    elif indent > 0 and val.startswith("- "):
+                        # List continuation
+                        pass
+                elif stripped.startswith("- ") and current_key:
+                    # List item
+                    if not isinstance(meta.get(current_key), list):
+                        meta[current_key] = []
+                    meta[current_key].append(stripped[2:].strip())
+        except Exception:
+            return None
+
+        name = meta.get("name", md_path.stem)
+        description = meta.get("description", f"Markdown skill: {name}")
+
+        # Parse trigger dict
+        trigger = {}
+        raw_trigger = meta.get("trigger", {})
+        if isinstance(raw_trigger, dict):
+            trigger = {k: float(v) for k, v in raw_trigger.items()}
+
+        return SkillDef(
+            name=name,
+            description=description,
+            file_path=str(md_path),
+            trigger=trigger,
+        )
+
+    def get_skill_body(self, name: str) -> str:
+        """Get the markdown body of a .md skill (for context injection).
+
+        Returns empty string for .py skills or if not found.
+        """
+        skill = self._skills.get(name)
+        if skill is None:
+            return ""
+
+        path = Path(skill.file_path)
+        if not path.suffix == ".md":
+            return ""
+
+        if not path.is_absolute():
+            # Try known directories
+            for base in [SKILLS_DIR.parent / ".anima" / "skills", Path.home() / ".anima" / "skills"]:
+                candidate = base / path.name
+                if candidate.exists():
+                    path = candidate
+                    break
+
+        if not path.exists():
+            return ""
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                return parts[2].strip()
+        except Exception:
+            pass
+        return ""
 
     def _load_registry(self):
         """Load skill registry from JSON."""

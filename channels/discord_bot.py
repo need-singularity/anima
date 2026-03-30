@@ -33,6 +33,8 @@ class AnimaDiscordBot:
     Responds to messages in channels where it is mentioned or in DMs.
     """
 
+    channel_name = "discord"
+
     def __init__(self, agent, token: Optional[str] = None):
         """
         Args:

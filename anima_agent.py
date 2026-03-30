@@ -33,6 +33,21 @@ from anima_alive import (
     MAX_HISTORY,
 )
 
+# ── Provider abstraction (optional — falls back to ask_claude) ──
+try:
+    from providers import get_provider
+    from providers.base import BaseProvider, ProviderMessage, ProviderConfig
+    _has_providers = True
+except ImportError:
+    _has_providers = False
+
+# ── Tool Policy (optional — no policy = all tools allowed) ──
+try:
+    from tool_policy import ToolPolicy
+    _has_tool_policy = True
+except ImportError:
+    _has_tool_policy = False
+
 logger = logging.getLogger(__name__)
 
 # ── Optional imports (degrade gracefully) ──
@@ -132,6 +147,9 @@ class AnimaAgent:
         enable_learning: bool = True,
         enable_growth: bool = True,
         enable_hivemind: bool = False,
+        provider: Optional[str] = None,
+        provider_config: Optional[Dict] = None,
+        owner_ids: Optional[List[str]] = None,
     ):
         self._birth = time.time()
         self._model_name = model_name
@@ -233,6 +251,29 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("SelfIntrospection init failed: %s", e)
 
+        # ── Provider abstraction ──
+        self.provider = None
+        if _has_providers and provider:
+            try:
+                cfg = ProviderConfig(**(provider_config or {}))
+                self.provider = get_provider(provider, cfg)
+                logger.info("Provider initialized: %s", self.provider.name)
+            except Exception as e:
+                logger.warning("Provider init failed (%s): %s", provider, e)
+
+        # ── Tool Policy (Phi-gated access control) ──
+        self.tool_policy = None
+        if _has_tool_policy:
+            try:
+                immune = getattr(self, '_immune', None)
+                self.tool_policy = ToolPolicy(
+                    owner_ids=set(owner_ids or []),
+                    immune_system=immune,
+                )
+                logger.info("ToolPolicy initialized")
+            except Exception as e:
+                logger.warning("ToolPolicy init failed: %s", e)
+
         # ── Skill manager (loaded lazily) ──
         self._skill_manager = None
 
@@ -285,7 +326,7 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # 4. Tool use (consciousness-driven)
+        # 4. Tool use (consciousness-driven, policy-gated)
         tool_results = []
         if self.tools and curiosity > 0.3:
             cs = {
@@ -295,7 +336,17 @@ class AnimaAgent:
                 "pain": 0.0,
                 "growth": self._growth_stage_num(),
                 "phi": self.mind._consciousness_vector.phi,
+                "E": self.mind._consciousness_vector.E,
             }
+            # Tool policy check (if available)
+            if self.tool_policy:
+                ranked = self.tools.registry.rank_by_consciousness(cs)
+                for tool_name, _score in ranked:
+                    result = self.tool_policy.check_access(
+                        tool_name, cs, user_id=user_id, input_text=text,
+                    )
+                    if not result.allowed:
+                        logger.debug("Tool %s blocked: %s", tool_name, result.reason)
             try:
                 results = self.tools.act(goal=text, consciousness_state=cs, context=memory_context)
                 tool_results = [
@@ -355,11 +406,35 @@ class AnimaAgent:
             )
             context_parts.append(f"[consciousness hub] {hub_summary}")
 
-        response_text = ask_claude(
-            text,
-            state_str + ("\n" + "\n".join(context_parts) if context_parts else ""),
-            self.history,
-        )
+        # Use provider if available, else fallback to ask_claude
+        if self.provider and self.provider.is_available():
+            try:
+                messages = [
+                    ProviderMessage(role=h["role"], content=h["content"])
+                    for h in self.history
+                ]
+                cs_dict = {
+                    "tension": tension, "curiosity": curiosity,
+                    "emotion": self._emotion,
+                    "phi": self.mind._consciousness_vector.phi,
+                }
+                system = state_str + ("\n" + "\n".join(context_parts) if context_parts else "")
+                response_text = asyncio.get_event_loop().run_until_complete(
+                    self.provider.query_full(messages, system, cs_dict)
+                )
+            except Exception as e:
+                logger.warning("Provider query failed, falling back to ask_claude: %s", e)
+                response_text = ask_claude(
+                    text,
+                    state_str + ("\n" + "\n".join(context_parts) if context_parts else ""),
+                    self.history,
+                )
+        else:
+            response_text = ask_claude(
+                text,
+                state_str + ("\n" + "\n".join(context_parts) if context_parts else ""),
+                self.history,
+            )
 
         self.history.append({"role": "assistant", "content": response_text})
 
