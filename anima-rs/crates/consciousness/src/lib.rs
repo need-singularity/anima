@@ -3,8 +3,6 @@
 //! Hot-loop in Rust: GRU cells, faction consensus, Hebbian coupling,
 //! Φ ratchet, mitosis/merge. Python calls `step()` via PyO3.
 
-use std::time::Instant;
-
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -106,8 +104,6 @@ pub struct ConsciousnessEngine {
     best_hiddens: Vec<Vec<f32>>,
     rng: StdRng,
 
-    // Inter-cell tension history for merge: flat [max_id x max_id] sparse
-    inter_tension: Vec<Vec<f32>>, // indexed by (min_id, max_id) flattened
 }
 
 impl ConsciousnessEngine {
@@ -165,7 +161,6 @@ impl ConsciousnessEngine {
             best_phi: 0.0,
             best_hiddens,
             rng,
-            inter_tension: Vec::new(),
         }
     }
 
@@ -246,9 +241,19 @@ impl ConsciousnessEngine {
             outputs.push(out);
         }
 
-        // 2. Faction consensus
+        // 2. Faction consensus (factions assigned at creation, not every step)
         let hiddens_refs: Vec<&[f32]> = self.cells.iter().map(|c| c.hidden.as_slice()).collect();
-        self.factions = assign_factions(n, self.n_factions);
+        if self.factions.is_empty() || self.factions.len() != self.n_factions {
+            self.factions = assign_factions(n, self.n_factions);
+        }
+        // Rebuild faction cell_indices from metas (stable faction_id per cell)
+        for f in &mut self.factions {
+            f.cell_indices.clear();
+        }
+        for (i, meta) in self.metas.iter().enumerate() {
+            let fid = meta.faction_id % self.n_factions;
+            self.factions[fid].cell_indices.push(i);
+        }
         let consensus = faction_consensus(&hiddens_refs, &self.factions, 0.1);
 
         // 3. Hebbian LTP/LTD
@@ -349,14 +354,18 @@ impl ConsciousnessEngine {
             let parent_id = self.metas[idx].cell_id;
             let new_faction = (self.metas[idx].faction_id + self.n_cells()) % self.n_factions;
 
-            // Clone parent cell with noise
-            let mut new_cell = GruCell::new(self.cell_dim, self.hidden_dim, &mut self.rng);
-            // Copy parent hidden + PSI_COUPLING noise
-            let parent_hidden = self.cells[idx].hidden.clone();
-            for (d, h) in new_cell.hidden.iter_mut().enumerate() {
-                if d < parent_hidden.len() {
-                    *h = parent_hidden[d] + self.rng.gen_range(-PSI_COUPLING..PSI_COUPLING);
-                }
+            // Clone parent cell: deepcopy weights + PSI_COUPLING noise (Law 78: 2 bits diversity)
+            let mut new_cell = self.cells[idx].clone();
+            // Add PSI_COUPLING noise to all weights for symmetry breaking
+            for w in new_cell.w_z.iter_mut()
+                .chain(new_cell.w_r.iter_mut())
+                .chain(new_cell.w_h.iter_mut())
+            {
+                *w += self.rng.gen_range(-PSI_COUPLING..PSI_COUPLING);
+            }
+            // Hidden state: parent + noise
+            for h in new_cell.hidden.iter_mut() {
+                *h += self.rng.gen_range(-PSI_COUPLING..PSI_COUPLING);
             }
 
             let child_id = self.next_id;
@@ -450,10 +459,28 @@ impl ConsciousnessEngine {
             self.cells.remove(remove_idx);
             self.metas.remove(remove_idx);
 
-            // Rebuild coupling
+            // Rebuild coupling: preserve Hebbian memory (skip removed row/col)
             let new_n = self.n_cells();
-            self.coupling = vec![0.0f32; new_n * new_n];
-            // Coupling reset after merge (Hebbian will rebuild)
+            let old_n = new_n + 1; // before removal
+            let mut new_coupling = vec![0.0f32; new_n * new_n];
+            let mut new_r = 0;
+            for old_r in 0..old_n {
+                if old_r == remove_idx {
+                    continue;
+                }
+                let mut new_c = 0;
+                for old_c in 0..old_n {
+                    if old_c == remove_idx {
+                        continue;
+                    }
+                    if old_r < old_n && old_c < old_n && old_r * old_n + old_c < self.coupling.len() {
+                        new_coupling[new_r * new_n + new_c] = self.coupling[old_r * old_n + old_c];
+                    }
+                    new_c += 1;
+                }
+                new_r += 1;
+            }
+            self.coupling = new_coupling;
 
             events.push(Event::Merge {
                 keeper_id,
