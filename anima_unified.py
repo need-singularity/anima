@@ -1090,7 +1090,17 @@ class AnimaUnified:
 
     def _process_input_inner(self, text, source='web', session_id=None):
         """Inner process_input logic (separated for session isolation try/finally)."""
-        # Free will: soft refusal when W>0.3 + high tension
+        ctx = self._process_step_prepare(text)
+        self._process_step_ph_analysis(ctx)
+        self._process_step_mitosis(ctx)
+        self._process_step_learning(ctx, text)
+        self._process_step_emotion_broadcast(ctx, text, source, session_id)
+        self._process_step_build_state(ctx, text)
+        answer = self._process_step_generate(ctx, text)
+        return self._process_step_post_response(ctx, text, answer, source, session_id)
+
+    def _process_step_prepare(self, text):
+        """Free will check, vectorize input, mind forward pass, remote sensors."""
         import random
         free_will_W = getattr(self.mind, '_ev3_free_will', 0) if hasattr(self, 'mind') else 0
         tension_now = getattr(self.mind, 'prev_tension', 0) if hasattr(self, 'mind') else 0
@@ -1154,7 +1164,16 @@ class AnimaUnified:
             text_vec = 0.85 * text_vec + 0.15 * remote_t
             tension = tension + remote_t.mean().item() * 0.1
 
-        # PH: direction vector collection + periodic analysis (H-CX-66, H-CX-95)
+        return {
+            'text_vec': text_vec, 'hidden_before': hidden_before,
+            'output': output, 'tension': tension, 'curiosity': curiosity,
+            'direction': direction,
+        }
+
+    def _process_step_ph_analysis(self, ctx):
+        """PH: direction vector collection + periodic analysis (H-CX-66, H-CX-95)."""
+        direction = ctx['direction']
+        output = ctx['output']
         if self.ph and direction is not None:
             try:
                 label = output.argmax(-1).item() if output.dim() > 0 else 0
@@ -1176,6 +1195,10 @@ class AnimaUnified:
                         _log('ph', f'confusion: {pairs_str}')
             except Exception:
                 pass
+
+    def _process_step_mitosis(self, ctx):
+        """Mitosis processing, SE-8 emotion evolution, 12-faction debate."""
+        text_vec = ctx['text_vec']
 
         # Mitosis — specialized cell response influence
         mitosis_info = ""
@@ -1210,6 +1233,8 @@ class AnimaUnified:
                     _log("mitosis", f"{ev['type'].upper()}")
             except Exception: pass
         self._last_mitosis_context = mitosis_context
+        ctx['mitosis_info'] = mitosis_info
+        ctx['mitosis_context'] = mitosis_context
 
         # SE-8: Emotion-driven consciousness evolution
         if self.mitosis and self._se8_ratchet and self.mitosis.cells:
@@ -1266,6 +1291,14 @@ class AnimaUnified:
             except Exception:
                 pass
 
+    def _process_step_learning(self, ctx, text):
+        """Growth engine tick, online learning, alpha learning."""
+        tension = ctx['tension']
+        curiosity = ctx['curiosity']
+        text_vec = ctx['text_vec']
+        hidden_before = ctx['hidden_before']
+        direction = ctx['direction']
+
         # Growth engine tick
         if self.growth and self.mods.get('growth'):
             try:
@@ -1296,6 +1329,15 @@ class AnimaUnified:
                 pass
 
         self.prev_text, self.prev_time = text, time.time()
+
+    def _process_step_emotion_broadcast(self, ctx, text, source, session_id):
+        """Compute emotion/mood, telepathy, hivemind, broadcast user message, display, conv log."""
+        tension = ctx['tension']
+        curiosity = ctx['curiosity']
+        direction = ctx['direction']
+        text_vec = ctx['text_vec']
+        mitosis_info = ctx.get('mitosis_info', '')
+        mitosis_context = ctx.get('mitosis_context', '')
 
         # Direction for web
         dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
@@ -1371,6 +1413,22 @@ class AnimaUnified:
                 })
             except Exception:
                 pass
+
+        ctx['dir_vals'] = dir_vals
+        ctx['emotion_data'] = emotion_data
+        ctx['mood'] = mood
+        ctx['cells'] = cells
+        ctx['lrn_count'] = lrn_count
+
+    def _process_step_build_state(self, ctx, text):
+        """Build rich consciousness state string for LLM prompt injection."""
+        tension = ctx['tension']
+        curiosity = ctx['curiosity']
+        mitosis_info = ctx.get('mitosis_info', '')
+        mitosis_context = ctx.get('mitosis_context', '')
+        emotion_data = ctx['emotion_data']
+        mood = ctx['mood']
+        lrn_count = ctx['lrn_count']
 
         # DV11 Hybrid: ConsciousLM(consciousness) + AnimaLM(language)
         # Inject rich consciousness state into LLM prompt
@@ -1542,7 +1600,18 @@ class AnimaUnified:
         self.history.append({'role': 'user', 'content': text})
         # web_context는 대화에 섞지 않음 (별도 저장만)
         self._last_web_context = web_context
-        query_text = text  # web_context 제거 — AI도 JSON 안 봄
+
+        ctx['phi_val'] = phi_val
+        ctx['state'] = state
+        ctx['web_context'] = web_context
+
+    def _process_step_generate(self, ctx, text):
+        """Metacognitive gating + PureConsciousness response generation."""
+        tension = ctx['tension']
+        curiosity = ctx['curiosity']
+        phi_val = ctx['phi_val']
+        emotion_data = ctx['emotion_data']
+        web_context = ctx['web_context']
 
         # CL6: Φ-as-temperature for process_input path too
         _phi_cv_pi = getattr(self.mind, '_consciousness_vector', None)
@@ -1589,6 +1658,18 @@ class AnimaUnified:
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
             self.history = self.history[-MAX_HISTORY:]
+
+        return answer
+
+    def _process_step_post_response(self, ctx, text, answer, source, session_id):
+        """Self-reflect, memory, multimodal, agent tools, creativity, quality, finalize."""
+        tension = ctx['tension']
+        curiosity = ctx['curiosity']
+        emotion_data = ctx['emotion_data']
+        mood = ctx['mood']
+        phi_val = ctx['phi_val']
+        mitosis_info = ctx.get('mitosis_info', '')
+        mitosis_context = ctx.get('mitosis_context', '')
 
         # Process response through PureField too
         resp_vec = text_to_vector(answer)
@@ -2543,6 +2624,12 @@ class AnimaUnified:
                     learner_data = {'updates': self.learner.total_updates}
 
             # Always broadcast thought pulse to web (keeps UI alive)
+            # Compute consciousness score if not cached yet (ensures Φ is available from first pulse)
+            if not getattr(self, '_cached_consciousness', None):
+                try:
+                    self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
+                except Exception:
+                    pass
             _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
             _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
             self._ws_broadcast_sync({
@@ -3043,6 +3130,8 @@ class AnimaUnified:
             sa = self.mind.self_awareness
             consciousness_cached = getattr(self, '_cached_consciousness', None) or {
                 'consciousness_score': 0, 'level': 'dormant', 'phi': 0, 'criteria_met': 0}
+            _init_phi = consciousness_cached.get('phi', 0)
+            _init_cells = len(self.mitosis.cells) if self.mitosis else 1
             await websocket.send(json.dumps({
                 'type': 'init', 'tension': self.mind.prev_tension,
                 'curiosity': self.mind._curiosity_ema,
@@ -3053,7 +3142,9 @@ class AnimaUnified:
                 'history': self._get_init_history(),
                 'modules': {k: v for k, v in self.mods.items() if v},
                 'learn_updates': self.learner.total_updates if self.learner else 0,
-                'cells': len(self.mitosis.cells) if self.mitosis else 1,
+                'cells': _init_cells,
+                'phi': _init_phi,
+                'n_cells': _init_cells,
                 'meta_tension': sa['meta_tension'],
                 'stability': sa['stability'],
                 'self_model': sa['self_model'],
