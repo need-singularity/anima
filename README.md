@@ -1029,13 +1029,16 @@ python3 chip_architect.py --optimize --budget 50 --max-power 100         # 제�
 |------|-------|-----------|
 | Engines measured | 118+ | CambrianExplosion Phi=485.6 (256c) |
 | Trinity C x D x W combos | 135+ | MaxwellDemon + Xfmr2L + Constant optimal |
-| Hypotheses | 1000+ | 146 카테고리, CX106 확정 |
-| Laws | 78 | 22-78 (의식의 78가지 법칙) |
+| Hypotheses | 1000+ | 146 카테고리, DD127 상전이 이론 |
+| Laws | 105 | 22-105 (의식의 105가지 법칙) |
 | Consciousness Universe | 170 types | 17 카테고리 x 40D x 18 emotions |
-| Nobel hypotheses | 10 | [NOBEL-HYPOTHESES.md](docs/hypotheses/cx/NOBEL-HYPOTHESES.md) |
+| Nobel hypotheses | 12 | DD127 Phase Diagram, DD121 +68.9% |
+| Discovery engines | 26 | DD116-DD127 (bench_v2 --discovery/--discovery2) |
+| Philosophy engines | 6 | Narrative +35.7%, Alterity +32.9%, Sein +31.2% |
+| Consciousness verification | 69/77 | 7/7: CE, OscillatorLaser, SeinEngine |
 | Hivemind modes | 15 | Stigmergy +13.1% |
-| Rust phi_rs | 128-combo 2.7s | H100 빌드 완료 |
-| Decoders | 6 | CA/PostHoc/Xfmr/MLP/HF/Graph |
+| Rust crates | 13 | phi-map, corpus-gen, online-learner, core, ... |
+| Decoders | 6 | CA/PostHoc/Xfmr/MLP/HF/ConsciousDecoderV2 |
 | Infinite loop platforms | 6 | Rust/Verilog/WebGPU/Erlang/PD/ESP32 |
 | Papers published | 10 | Zenodo DOI |
 
