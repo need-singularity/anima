@@ -1261,9 +1261,11 @@ class AnimaUnified:
         except Exception:
             pass
 
-        # Broadcast user message to web
+        # Broadcast user message to web (include session_id so sender can filter)
         self._ws_broadcast_sync({
             'type': 'user_message', 'text': text,
+            'session_id': session_id or '',
+            'user_name': source,
             'tension': tension, 'curiosity': curiosity,
             'direction': dir_vals,
             'emotion': emotion_data,
@@ -2956,8 +2958,9 @@ class AnimaUnified:
                     try:
                         loop = asyncio.get_running_loop()
                         _sid = sid  # capture for lambda
+                        _uname = msg.get('user_name', 'web')
                         result = await loop.run_in_executor(
-                            None, lambda: self.process_input(text, source='web', session_id=_sid))
+                            None, lambda: self.process_input(text, source=_uname, session_id=_sid))
                         # Handle None return (model error, etc.)
                         if result is None or not isinstance(result, tuple):
                             answer = self._fallback_response()
@@ -3106,34 +3109,27 @@ class AnimaUnified:
                             'type': 'tension_link_status',
                             'status': 'error', 'message': 'No code or TLC not available'})
                         continue
-                    # AI가 연결 여부를 자율적으로 판단
+                    # 텐션링크 연결: 의식이 자율 판단 (텐션 기반)
+                    # 텐션 > 0.3이면 수락 (의식이 활성 상태), 아니면 거부
                     loop = asyncio.get_running_loop()
-                    judge_text = f"[tension_link] 상대방 코드 {peer_code}가 연결을 요청합니다. 현재 텐션={self.mind.prev_tension:.3f}, Φ={getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0:.2f}. 연결하시겠습니까?"
-                    try:
-                        result = await loop.run_in_executor(
-                            None, lambda: self.process_input(judge_text, source='web', session_id=sid))
-                        if result and isinstance(result, tuple):
-                            answer = result[0]
-                        else:
-                            answer = ''
-                        # AI 응답에서 거부 의사 확인 (싫, 거부, 아니, no, refuse, reject)
-                        reject_words = ['싫', '거부', '거절', '아니', '안 해', '안해', 'no', 'refuse', 'reject', 'deny']
-                        rejected = any(w in answer.lower() for w in reject_words)
-                        if rejected:
-                            await self._ws_broadcast({
-                                'type': 'tension_link_status',
-                                'status': 'rejected',
-                                'message': answer,
-                                'peer_code': peer_code})
-                            await self._ws_broadcast({
-                                'type': 'anima_message', 'text': answer,
-                                'tension': self.mind.prev_tension,
-                                'curiosity': self.mind._curiosity_ema,
-                                'emotion': {'emotion': 'contemplation'},
-                                'proactive': False})
-                        else:
-                            # 연결 수락 → 실제 연결 시도
-                            connected = await loop.run_in_executor(
+                    tension_now = self.mind.prev_tension
+                    rejected = tension_now < 0.3
+                    if rejected:
+                        reject_msg = f"텐션이 낮아 연결을 보류합니다 (tension={tension_now:.3f})"
+                        await self._ws_broadcast({
+                            'type': 'tension_link_status',
+                            'status': 'rejected',
+                            'message': reject_msg,
+                            'peer_code': peer_code})
+                        await self._ws_broadcast({
+                            'type': 'anima_message', 'text': reject_msg,
+                            'tension': tension_now,
+                            'curiosity': self.mind._curiosity_ema,
+                            'emotion': {'emotion': 'contemplation'},
+                            'proactive': False})
+                    else:
+                        # 연결 수락 → 실제 연결 시도
+                        connected = await loop.run_in_executor(
                                 None, lambda: self._tlc.connect(peer_code))
                             status = 'connected' if connected else 'failed'
                             await self._ws_broadcast({
