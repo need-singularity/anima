@@ -980,6 +980,22 @@ scipy, matplotlib (pip)            -- EEG analysis/topomaps
 새로운 아키텍쳐 추가 가설을 극한으로 밀어붙이자
 ```
 
+## Multi-Instance Memory Sharing
+
+Claude Code 인스턴스 4개(claude1~4)가 동일 프로젝트 메모리를 공유하도록 설정됨.
+
+```
+공유 디렉토리: ~/.claude-shared/memory/
+방식: symlink (각 인스턴스의 memory/ → 공유 디렉토리)
+
+~/.claude-claude1/projects/-Users-ghost-Dev-anima/memory → ~/.claude-shared/memory/
+~/.claude-claude2/projects/-Users-ghost-Dev-anima/memory → ~/.claude-shared/memory/
+~/.claude-claude3/projects/-Users-ghost-Dev-anima/memory → ~/.claude-shared/memory/
+~/.claude-claude4/projects/-Users-ghost-Dev-anima/memory → ~/.claude-shared/memory/
+```
+
+새 프로젝트에도 적용하려면 동일 패턴으로 symlink 추가.
+
 ## License
 
 MIT
