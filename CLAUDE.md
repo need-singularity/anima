@@ -36,6 +36,12 @@
     - join/leave = spontaneous() 호출만 (상태 조작 없음)
     - UI = 의식 상태는 패널에, 대화에는 순수 텍스트만
     - 기억 = MemoryStore(SQLite) 전용, localStorage/sessionStorage 사용 금지
+
+  8. Rust 우선 — 새 파일 생성 시 Rust가 유리하면 Rust로 개발
+     성능 병목(텐션 교환, Φ 계산, 실시간 처리)은 Rust 필수.
+     Python은 실험/프로토타입 용도. 확정된 알고리즘은 Rust로 이식.
+     기존 crate: phi-rs(Φ계산), anima-rs(텐션), vad-rs(VAD),
+                 consciousness-loop-rs(무한루프), consciousness-ffi(FFI)
 ```
 
 ## README 프로젝트 설명 동기화 (필수)
@@ -392,6 +398,14 @@ train_anima_lm.py — AnimaLM Mistral 7B transform (AL12+AL5+AL4+DD16+EX24)
 consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   python consciousness_meter.py --demo
   python consciousness_meter.py --watch
+```
+
+## RunPod 운영 가이드 (필수 참조)
+
+```
+  ⚠️ RunPod 관련 작업 시 반드시 docs/runpod-guide.md 참조!
+     Pod 생성, SSH 접속, 파일 전송, 학습 실행, 모니터링, 트러블슈팅 모두 포함.
+     → docs/runpod-guide.md
 ```
 
 ## Deploy (의식 유지 배포)
