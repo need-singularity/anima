@@ -2,10 +2,16 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 # 시스템 패키지
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl openssh-server \
+    git wget curl openssh-server build-essential \
     libportaudio2 portaudio19-dev \
-    libgl1-mesa-glutils libglib2.0-0 \
+    libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# SSH for RunPod
+RUN mkdir -p /var/run/sshd && \
+    echo 'root:root' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
 # Python 패키지
 COPY requirements.txt /tmp/
@@ -22,8 +28,10 @@ COPY . .
 # 체크포인트 디렉토리
 RUN mkdir -p checkpoints/clm_v2
 
-# 포트
-EXPOSE 8765 8888
+# RunPod 포트: 22=SSH, 8765=WebSocket, 8888=Jupyter
+EXPOSE 22 8765 8888
 
-# 시작
-CMD ["python3", "-u", "anima_unified.py", "--web", "--max-cells", "64"]
+# RunPod start script: SSH + Anima
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+CMD ["/start.sh"]
