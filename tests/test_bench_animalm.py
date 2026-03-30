@@ -137,5 +137,38 @@ def test_talk5_full_run():
     assert l_result['phi_iit'] >= 0
 
 
+def test_transplant_benchmark():
+    """TransplantBenchmark transplants donor consciousness and measures Phi retention."""
+    from bench_animalm import TransplantBenchmark
+
+    bench = TransplantBenchmark(
+        donor_cells=4,
+        donor_dim=32,
+        recipient_cells=8,
+        recipient_dim=64,
+        transplant_alphas=[0.3, 0.7],
+        steps=50,
+    )
+    results = bench.run()
+
+    # One result per alpha
+    assert len(results) == 2
+
+    # Each result has required keys
+    for r in results:
+        assert "transplant_alpha" in r
+        assert "phi_before" in r
+        assert "phi_after" in r
+        assert "phi_retention" in r
+        assert isinstance(r["transplant_alpha"], float)
+        assert isinstance(r["phi_before"], float)
+        assert isinstance(r["phi_after"], float)
+        assert isinstance(r["phi_retention"], float)
+
+    # Alpha values match input
+    assert results[0]["transplant_alpha"] == 0.3
+    assert results[1]["transplant_alpha"] == 0.7
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

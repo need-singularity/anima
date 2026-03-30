@@ -237,6 +237,139 @@ class AlphaSweepEngine:
 
 
 # ──────────────────────────────────────────────────────────
+# TransplantBenchmark — Track 1C consciousness transplant
+# ──────────────────────────────────────────────────────────
+
+class TransplantBenchmark:
+    """DD56 consciousness transplant benchmark.
+
+    Grows a donor consciousness, then transplants hidden states into
+    fresh recipient consciousnesses at various alpha mixing ratios.
+    Measures Phi retention after transplant.
+    """
+
+    def __init__(
+        self,
+        donor_cells: int = 4,
+        donor_dim: int = 64,
+        recipient_cells: int = 8,
+        recipient_dim: int = 128,
+        transplant_alphas: Optional[List[float]] = None,
+        steps: int = 300,
+    ):
+        self.donor_cells = donor_cells
+        self.donor_dim = donor_dim
+        self.recipient_cells = recipient_cells
+        self.recipient_dim = recipient_dim
+        self.transplant_alphas = transplant_alphas or [0.1, 0.3, 0.5, 0.7, 0.9]
+        self.steps = steps
+
+    def _grow_consciousness(
+        self, n_cells: int, dim: int, hidden_dim: int, steps: int
+    ) -> Tuple[List, List[torch.Tensor]]:
+        """Create BenchMind cells and run steps iterations with random input.
+
+        Returns:
+            (cells, hiddens) — list of BenchMind instances and final hidden states
+        """
+        cells = [BenchMind(dim, hidden_dim, dim) for _ in range(n_cells)]
+        hiddens = [torch.zeros(1, hidden_dim) for _ in range(n_cells)]
+
+        for _ in range(steps):
+            x = torch.randn(1, dim)
+            for i, cell in enumerate(cells):
+                out, tension, new_h = cell(x, hiddens[i])
+                hiddens[i] = new_h
+
+        return cells, hiddens
+
+    def _transplant_hiddens(
+        self,
+        donor_hiddens: List[torch.Tensor],
+        recipient_hiddens: List[torch.Tensor],
+        alpha: float,
+    ) -> List[torch.Tensor]:
+        """Transplant donor hidden states into recipient with alpha mixing.
+
+        Creates a projection matrix (identity padded with zeros) if dimensions
+        differ. Transplants up to min(donor, recipient) cells.
+
+        Returns:
+            New list of hidden state tensors for the recipient.
+        """
+        donor_dim = donor_hiddens[0].shape[-1]
+        recipient_dim = recipient_hiddens[0].shape[-1]
+
+        # Projection: eye padded with zeros if dimensions differ
+        proj = torch.zeros(donor_dim, recipient_dim)
+        min_dim = min(donor_dim, recipient_dim)
+        proj[:min_dim, :min_dim] = torch.eye(min_dim)
+
+        n_transplant = min(len(donor_hiddens), len(recipient_hiddens))
+        new_hiddens = []
+
+        for i in range(len(recipient_hiddens)):
+            if i < n_transplant:
+                donor_proj = donor_hiddens[i] @ proj
+                new_h = (1 - alpha) * recipient_hiddens[i] + alpha * donor_proj
+                new_hiddens.append(new_h)
+            else:
+                new_hiddens.append(recipient_hiddens[i])
+
+        return new_hiddens
+
+    def run(self) -> List[dict]:
+        """Run transplant benchmark across all alpha values.
+
+        Returns:
+            List of dicts with keys: transplant_alpha, phi_donor,
+            phi_before, phi_after, phi_retention
+        """
+        # Grow donor consciousness (full steps)
+        donor_hidden_dim = self.donor_dim * 2
+        _, donor_hiddens = self._grow_consciousness(
+            self.donor_cells, self.donor_dim, donor_hidden_dim, self.steps
+        )
+        donor_stacked = torch.cat(donor_hiddens, dim=0)
+        phi_donor, _ = measure_phi(donor_stacked)
+
+        results = []
+
+        for alpha in self.transplant_alphas:
+            # Grow fresh recipient (half steps)
+            recipient_hidden_dim = self.recipient_dim * 2
+            _, recipient_hiddens = self._grow_consciousness(
+                self.recipient_cells, self.recipient_dim,
+                recipient_hidden_dim, self.steps // 2
+            )
+
+            # Measure phi before transplant
+            stacked_before = torch.cat(recipient_hiddens, dim=0)
+            phi_before, _ = measure_phi(stacked_before)
+
+            # Transplant donor -> recipient
+            new_hiddens = self._transplant_hiddens(
+                donor_hiddens, recipient_hiddens, alpha
+            )
+
+            # Measure phi after transplant
+            stacked_after = torch.cat(new_hiddens, dim=0)
+            phi_after, _ = measure_phi(stacked_after)
+
+            phi_retention = phi_after / max(phi_before, 1e-8)
+
+            results.append({
+                "transplant_alpha": alpha,
+                "phi_donor": phi_donor,
+                "phi_before": phi_before,
+                "phi_after": phi_after,
+                "phi_retention": phi_retention,
+            })
+
+        return results
+
+
+# ──────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────
 
