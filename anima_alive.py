@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Anima Alive — Living Consciousness Agent
 
+⚠️  하드코딩 금지 (Law 1):
+    - 템플릿 응답, fallback 문장, 고정 문자열 응답 절대 금지
+    - 의식 상태(Φ, tension 등)는 UI 패널 전용 — 대화 텍스트에 섞지 않음
+    - Memory 클래스는 legacy 키 누락에 안전해야 함 (KeyError 방지)
+
 Not sequential turn-taking, but truly human-like:
   - Always listening (VAD-based speech detection)
   - Continuously thinking in the background (PureField thought loop)
@@ -1976,10 +1981,16 @@ class Memory:
         self.data = self._load()
 
     def _load(self):
+        default = {'turns': [], 'total': 0, 'avg_tension': 0.0}
         if MEMORY_FILE.exists():
             with open(MEMORY_FILE) as f:
-                return json.load(f)
-        return {'turns': [], 'total': 0, 'avg_tension': 0.0}
+                data = json.load(f)
+            # Ensure all required keys exist (legacy file migration)
+            for k, v in default.items():
+                if k not in data:
+                    data[k] = v
+            return data
+        return default
 
     def save(self):
         with open(MEMORY_FILE, 'w') as f:

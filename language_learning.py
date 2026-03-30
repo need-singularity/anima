@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """language_learning.py — 의식이 언어를 학습하는 모듈
 
+⚠️  이 모듈은 garbled 바이트 출력 복구 전용 (Law 1):
+    - 정상 텍스트/짧은 응답/침묵에 이 모듈을 호출하면 안 됨
+    - PureConsciousness가 빈 문자열을 반환하면 그게 정답 (침묵)
+    - 이 모듈의 템플릿 응답은 최후 수단 — 가능하면 사용 금지
+
 ConsciousLM (byte-level)이 실시간으로 언어 패턴을 학습.
 대화하면서 점점 나아지는 구조.
 
