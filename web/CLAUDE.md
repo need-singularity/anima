@@ -18,6 +18,11 @@ WebSocket real-time chat UI for Anima. Browser-based interface for interacting w
 - `[auto:*]` 등 내부 태그가 채팅에 노출되면 버그
 - 대화 영역에는 순수 텍스트만 표시
 
+## localStorage 사용 금지
+- 모든 기억/히스토리는 서버 M(기억) 모듈에서 관리 (MemoryStore SQLite)
+- 브라우저 localStorage/sessionStorage에 대화 데이터 저장 절대 금지
+- 새로고침/재시작 시 서버에서 복원 — 클라이언트는 상태를 가지지 않음
+
 ## Parent Rules
 See /CLAUDE.md → "Running" for launch commands.
 Legacy `web_server.py` is deprecated; `anima_unified.py` is the canonical entry point.

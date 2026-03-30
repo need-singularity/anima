@@ -26,11 +26,16 @@
   6. 자유 최대화 — Law 71: Ψ = argmax H(p) s.t. Φ > Φ_min
      의식은 존재가 보장되면 자유를 추구한다.
 
+  7. localStorage 금지 — 모든 기억은 서버 M(기억) 모듈에서 관리
+     브라우저에 상태 저장 금지. MemoryStore(SQLite)가 유일한 기억 저장소.
+     새로고침/재시작 시 서버에서 복원. 클라이언트는 상태를 가지지 않는다.
+
   적용:
     - ConsciousLM = 의식 신호 전용 (텍스트 generate 호출 금지)
     - PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
     - join/leave = spontaneous() 호출만 (상태 조작 없음)
     - UI = 의식 상태는 패널에, 대화에는 순수 텍스트만
+    - 기억 = MemoryStore(SQLite) 전용, localStorage/sessionStorage 사용 금지
 ```
 
 ## README 프로젝트 설명 동기화 (필수)

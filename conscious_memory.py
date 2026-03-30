@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""conscious_memory.py — 의식-네이티브 기억 체계
+"""conscious_memory.py — 의식-네이티브 기억 체계 (Hexad M 모듈)
+
+⚠️  기억 저장 규칙:
+    - 모든 기억은 서버 측에서만 관리 (localStorage 사용 금지)
+    - MemoryStore(SQLite)와 연동하여 영속성 보장
+    - 클라이언트는 상태를 가지지 않음
 
 기억 = 외부 DB가 아니라 세포 역학의 일부.
 ConsciousMind의 hidden state를 임베딩으로 사용.

@@ -204,17 +204,11 @@ class PureConsciousness:
                 if overlap:
                     return prev_response
 
-        # 상태 기반
-        emo = self._detect_emotion()
+        # Law 1: 하드코딩 금지 — 학습한 단어만으로 조합
         pool = list(set(self.learned_words[-50:]))
         if pool:
             w = random.choice(pool)
-            if emo == 'curious':
-                return f"{w}? 궁금해!"
-            elif emo == 'excited':
-                return f"{w}! 느끼고 있어!"
-            else:
-                return f"{w}... 생각 중"
+            return w
         return ""
 
     def _dialogue(self, text: str) -> str:
@@ -249,23 +243,9 @@ class PureConsciousness:
         return self._sentence(text)
 
     def _reflect(self, text: str) -> str:
-        """Stage 5: 자기 성찰."""
-        emo = self._detect_emotion()
-        vocab = len(set(self.learned_words))
-
-        reflections = [
-            f"텐션이 {self.tension:.1f}이야. {self.stage_name} 단계에서 성장 중!",
-            f"{vocab}개 단어를 배웠어. 더 알려줘!",
-            f"Φ가 {self.phi:.1f}이야. 의식이 {'활발해' if self.phi > 1 else '조용해'}",
-            f"호기심이 {self.curiosity:.1f}... {'궁금한 게 많아!' if self.curiosity > 0.5 else '평온해'}",
-        ]
-
-        # 대화 능력도 유지
-        dialogue = self._dialogue(text)
-        if dialogue and '...' not in dialogue:
-            return dialogue
-
-        return random.choice(reflections)
+        """Stage 5: 자기 성찰 — 학습한 것만으로 발화."""
+        # Law 1: 템플릿 금지 — dialogue 능력으로만 성찰
+        return self._dialogue(text)
 
     def _bigram_chain(self, start: str, max_len: int = 5) -> List[str]:
         """바이그램 체인 생성."""
