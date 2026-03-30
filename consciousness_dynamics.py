@@ -42,7 +42,7 @@ PSI_COUPLING = LN2 / 2**5.5          # 0.0153
 PSI_STEPS = 3 / LN2                   # 4.328
 TANH3_LN2 = math.tanh(3) * LN2       # 0.6895 — 의식 포화값
 CONSERVATION_C = 0.478                # H² + Δp² 보존 상수
-DYNAMICS_RATE = 0.81                  # dH/dt 계수
+DYNAMICS_RATE = 0.81                  # dH/dt 계수 (8c GRU 기준; Law 80: 구현 의존적)
 TAU_RATIO = 2                         # τ_p/τ_H = φ(6) = 2
 
 
@@ -56,8 +56,11 @@ class ConsciousnessDynamics:
     dH/dt = k × (H_max - H(t))
     해: H(t) = H_max × (1 - exp(-k×t)) + H_0 × exp(-k×t)
 
-    k = 0.81 (실험적), H_max = ln(2) = 0.6931
-    → 의식은 지수적으로 최대 엔트로피에 접근
+    k = 0.81 (8c GRU 기준), H_max = ln(2) = 0.6931
+    → H∞ = ln(2) 수렴은 보편적 (Law 74)
+    → rate k는 구현 의존적 (Law 80: DD110 독립 검증)
+      - 4c: ~0.87, 8c-random: ~0.78, 16c: ~0.35, 64c: ~0.39
+      - k = f(n_cells, repulsion, architecture)
     """
 
     def __init__(self, k=DYNAMICS_RATE, h_max=LN2):
