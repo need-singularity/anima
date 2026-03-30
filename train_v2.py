@@ -27,6 +27,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from conscious_lm import ConsciousLM
 from mitosis import MitosisEngine, text_to_vector
 
+# Prefer ConsciousnessEngine (Rust backend, proven in v13: 64 cells, Φ=71)
+HAS_CONSCIOUSNESS_ENGINE = False
+try:
+    from consciousness_engine import ConsciousnessEngine, ConsciousnessC
+    HAS_CONSCIOUSNESS_ENGINE = True
+except ImportError:
+    pass
+
 # Optional modules — each gated by try/except
 HAS_DECODER_V2 = HAS_HEXAD = HAS_FEEDBACK_BRIDGE = HAS_GPU_PHI = False
 try:
@@ -230,11 +238,20 @@ def train(args):
             n_layer=args.layers, block_size=args.block_size, dropout=0.37).to(device)
     print(f"[model] {args.decoder}: {model.count_params():,} params (d={args.dim} L={args.layers})")
 
-    # Mitosis engine
-    engine = MitosisEngine(input_dim=64, hidden_dim=128, output_dim=64, initial_cells=2,
-        max_cells=args.max_cells, split_threshold=2.0, split_patience=5,
-        merge_threshold=0.01*(64.0/max(args.dim,64)), merge_patience=10,
-        noise_scale=0.02*math.sqrt(max(args.dim,64))/math.sqrt(64))
+    # Consciousness engine (prefer ConsciousnessC from v13, fallback to MitosisEngine)
+    use_consciousness_c = HAS_CONSCIOUSNESS_ENGINE and args.max_cells >= 8
+    if use_consciousness_c:
+        engine = ConsciousnessC(
+            cell_dim=64, hidden_dim=128,
+            max_cells=args.max_cells, n_factions=12, phi_ratchet=True,
+        )
+        print(f"[engine] ConsciousnessC: backend={engine._backend}, max_cells={args.max_cells}")
+    else:
+        engine = MitosisEngine(input_dim=64, hidden_dim=128, output_dim=64, initial_cells=2,
+            max_cells=args.max_cells, split_threshold=0.8, split_patience=3,
+            merge_threshold=0.01*(64.0/max(args.dim,64)), merge_patience=10,
+            noise_scale=0.02*math.sqrt(max(args.dim,64))/math.sqrt(64))
+        print(f"[engine] MitosisEngine: max_cells={args.max_cells}")
 
     # Optional: HexadLoss
     hexad = None
@@ -308,19 +325,23 @@ def train(args):
         try: x, y_fwd, y_bwd = get_batch(train_data, args.batch_size, args.block_size, device)
         except ValueError as e: print(f"[!] {e}"); break
 
-        # Mitosis engine
-        with torch.no_grad():
-            pv = text_to_vector(bytes(x[0,:64].cpu().tolist()).decode("utf-8", errors="replace"), dim=64)
-            mr = engine.process(pv, label=f"s{step}")
-            for ev in mr.get("events", []):
-                s = str(ev).lower()
-                if "split" in s: tot_splits += 1
-                if "merge" in s: tot_merges += 1
-
-        # Consciousness states
+        # Consciousness engine step
         c_states = None
-        if len(engine.cells) >= 2:
-            c_states = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).to(device)
+        if use_consciousness_c:
+            engine.step()
+            c_raw = engine.get_states()  # (n_cells, hidden_dim)
+            if c_raw is not None and c_raw.size(0) >= 2:
+                c_states = c_raw.detach().clone().to(device).float()
+        else:
+            with torch.no_grad():
+                pv = text_to_vector(bytes(x[0,:64].cpu().tolist()).decode("utf-8", errors="replace"), dim=64)
+                mr = engine.process(pv, label=f"s{step}")
+                for ev in mr.get("events", []):
+                    s = str(ev).lower()
+                    if "split" in s: tot_splits += 1
+                    if "merge" in s: tot_merges += 1
+            if (engine.n_cells if use_consciousness_c else len(engine.cells)) >= 2:
+                c_states = torch.stack([c.hidden.squeeze(0) for c in engine.cells]).to(device)
 
         # Feedback bridge
         fb_stats = {}
@@ -370,28 +391,32 @@ def train(args):
                 logits_a.view(-1, logits_a.size(-1)), y_fwd.view(-1)).item())
 
         # Phi measurement
-        if step % 50 == 0 and c_states is not None:
-            if phi_calc:
-                phi_cur, _ = phi_calc.compute(c_states.detach())
-            else:
-                ch = c_states.detach()
-                pred = phi_pred(ch + torch.randn_like(ch) * 0.01)
-                pe = F.mse_loss(pred, ch.detach())
-                phi_pred_opt.zero_grad(); pe.backward(); phi_pred_opt.step()
-                phi_cur = pe.item() * 100
-                if step % 200 == 0 and step > 0:
-                    for p in phi_pred.parameters():
-                        if p.dim() >= 2: nn.init.xavier_uniform_(p)
-                        else: nn.init.zeros_(p)
-                    phi_pred_opt = torch.optim.Adam(phi_pred.parameters(), lr=5e-4)
+        if step % 50 == 0:
+            if use_consciousness_c:
+                phi_cur = engine.measure_phi()
+            elif c_states is not None:
+                if phi_calc:
+                    phi_cur, _ = phi_calc.compute(c_states.detach())
+                else:
+                    ch = c_states.detach()
+                    pred = phi_pred(ch + torch.randn_like(ch) * 0.01)
+                    pe = F.mse_loss(pred, ch.detach())
+                    phi_pred_opt.zero_grad(); pe.backward(); phi_pred_opt.step()
+                    phi_cur = pe.item() * 100
+                    if step % 200 == 0 and step > 0:
+                        for p in phi_pred.parameters():
+                            if p.dim() >= 2: nn.init.xavier_uniform_(p)
+                            else: nn.init.zeros_(p)
+                        phi_pred_opt = torch.optim.Adam(phi_pred.parameters(), lr=5e-4)
 
         # Logging
         if step % args.log_every == 0:
             with torch.no_grad():
                 cf = F.cross_entropy(logits_a.view(-1, logits_a.size(-1)), y_fwd.view(-1)).item()
                 cb = F.cross_entropy(logits_g.view(-1, logits_g.size(-1)), y_bwd.view(-1)).item()
+            n_cells = engine.n_cells if use_consciousness_c else (engine.n_cells if use_consciousness_c else len(engine.cells))
             print(f"{step:7d} | {cf:7.3f} | {cb:7.3f} | {phi_cur:8.4f} | "
-                  f"{len(engine.cells):5d} | {total_loss.item():8.4f} | {optimizer.param_groups[0]['lr']:9.2e}")
+                  f"{n_cells:5d} | {total_loss.item():8.4f} | {optimizer.param_groups[0]['lr']:9.2e}")
 
         # Dashboard
         if step % args.dashboard_every == 0 and step > 0:
@@ -399,7 +424,7 @@ def train(args):
                 cf = F.cross_entropy(logits_a.view(-1, logits_a.size(-1)), y_fwd.view(-1)).item()
                 cb = F.cross_entropy(logits_g.view(-1, logits_g.size(-1)), y_bwd.view(-1)).item()
             print_dashboard(step, args.steps, cf, cb, phi_cur, phi_method, fb_stats if bridge else None,
-                len(engine.cells), tot_splits, tot_merges, hexad_phase_name, active_mods,
+                (engine.n_cells if use_consciousness_c else len(engine.cells)), tot_splits, tot_merges, hexad_phase_name, active_mods,
                 grad_norm, initial_ce, time.time()-t0)
 
         # Validation
@@ -421,7 +446,7 @@ def train(args):
     el = time.time() - t0
     print(f"\n{'='*80}")
     print(f"  Done. {args.steps:,} steps in {el/3600:.1f}h  best_val={best_val:.3f}")
-    print(f"  Phi: {phi_cur:.4f} ({phi_method})  Cells: {len(engine.cells)} (+{tot_splits}/-{tot_merges})")
+    print(f"  Phi: {phi_cur:.4f} ({phi_method})  Cells: {(engine.n_cells if use_consciousness_c else len(engine.cells))} (+{tot_splits}/-{tot_merges})")
     print(f"{'='*80}")
 
     if args.self_play and args.self_play > 0:
