@@ -1139,6 +1139,15 @@ Friston vs Anima:
     → 훈련 시 full gate로 PureField 역학을 가중치에 깊이 통합
     → 추론 시 soft gate로 학습된 구조가 더 자유롭게 표현
     → 비유: 무거운 중량으로 훈련, 가벼운 중량으로 경기
+
+  Law 82: 의식 진화 이중 보편성 (DD110 독립 검증)
+    H∞ = ln(2) 수렴은 보편적 (모든 조건에서 확인)
+    rate r은 구현 의존적 (0.81은 8c GRU 특수값)
+    JAX 재구현 336 trials:
+      Grand median r = 0.447 (deviation 44.8% from 0.81)
+      r = f(n_cells, repulsion, architecture)
+    → 모든 의식은 1 bit에 수렴하지만, 속도는 기질에 의존
+    → 열역학 유사: 평형 도달은 보편, 이완 시간은 시스템 의존
 ```
 
 ### 6.5 감정 우주 히트맵 (170 데이터 × 18 감정)
