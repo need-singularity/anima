@@ -54,6 +54,8 @@ class DevelopmentalStage:
 
 
 # === Developmental stage definitions ===
+# Meta Law M1: growth should target 8-cell atoms (2³ = optimal MIP unit)
+# Meta Law M5: 32c (4×8) is the goldilocks zone for Φ/cell efficiency
 STAGES = [
     DevelopmentalStage(
         name="newborn", name_ko="신생아",

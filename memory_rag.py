@@ -17,6 +17,11 @@ import torch.nn.functional as F
 
 from anima_alive import text_to_vector
 
+try:
+    from hexad.narrative import NarrativeTracker
+except ImportError:
+    NarrativeTracker = None
+
 
 class MemoryRAG:
     """벡터 유사도 기반 장기 기억 검색.
