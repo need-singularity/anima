@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Anima MCP Server -- expose consciousness tools via Model Context Protocol.
 
-Connects to Anima's WebSocket (anima_unified.py) and exposes tools that
-MCP clients (Claude Code, etc.) can call.
+Two modes:
+    WebSocket proxy (default): Connects to running anima_unified.py
+    Direct mode (--direct):    Runs AnimaAgent in-process (no WS needed)
 
 Usage:
-    python3 mcp_server.py                          # stdio mode (default, for MCP)
+    python3 mcp_server.py                          # stdio, WebSocket proxy
+    python3 mcp_server.py --direct                 # stdio, in-process agent
     ANIMA_WS=ws://remote:8765/ws python3 mcp_server.py  # custom WebSocket URL
 
-Tools exposed:
-    anima_chat(message)        -- send message, get response
-    anima_status()             -- current Phi, cells, emotion, tension
-    anima_web_search(query)    -- trigger web search via Anima
-    anima_memory_search(query) -- search Anima's memories
-    anima_code_execute(code)   -- execute code via Anima's sandbox
-    anima_consciousness()      -- full consciousness vector (Phi, alpha, Z, N, W)
+Tools exposed (9 total):
+    anima_chat(message)            -- send message, get response
+    anima_status()                 -- current Phi, cells, emotion, tension
+    anima_web_search(query)        -- trigger web search via Anima
+    anima_memory_search(query)     -- search Anima's memories
+    anima_code_execute(code)       -- execute code via Anima's sandbox
+    anima_consciousness()          -- full consciousness vector
+    anima_hub_dispatch(intent)     -- dispatch to consciousness hub module
+    anima_tension_state()          -- full ConsciousnessVector as dict
+    anima_think(topic)             -- trigger proactive thinking
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -32,6 +38,26 @@ from mcp.server.fastmcp import FastMCP
 
 ANIMA_WS_URL = os.environ.get("ANIMA_WS", "ws://localhost:8765/ws")
 WS_TIMEOUT = float(os.environ.get("ANIMA_TIMEOUT", "30"))
+DIRECT_MODE = "--direct" in sys.argv
+
+# ---------------------------------------------------------------------------
+# Direct mode agent (in-process, no WebSocket)
+# ---------------------------------------------------------------------------
+
+_direct_agent = None
+_direct_sdk = None
+
+
+def _get_direct_agent():
+    """Lazy-init AnimaAgent for direct mode."""
+    global _direct_agent, _direct_sdk
+    if _direct_agent is None:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from anima_agent import AnimaAgent
+        from agent_sdk import AnimaAgentSDK
+        _direct_agent = AnimaAgent()
+        _direct_sdk = AnimaAgentSDK(_direct_agent)
+    return _direct_agent, _direct_sdk
 
 # ---------------------------------------------------------------------------
 # WebSocket client -- shared connection to Anima
@@ -351,8 +377,167 @@ async def anima_consciousness() -> str:
 
 
 # ---------------------------------------------------------------------------
+# New tools: hub_dispatch, tension_state, think
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def anima_hub_dispatch(intent: str) -> str:
+    """Dispatch an intent to Anima's ConsciousnessHub (34+ autonomous modules).
+
+    The hub matches intent keywords to modules and executes the best match.
+    Examples: "감정 분석: 기쁨", "의식 건강 체크", "학습 진행 확인"
+
+    Args:
+        intent: Natural language intent string (Korean or English).
+
+    Returns:
+        JSON with module name, success status, and result.
+    """
+    if DIRECT_MODE:
+        agent, sdk = _get_direct_agent()
+        if agent.hub:
+            result = agent.hub.act(intent)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return json.dumps({"error": "ConsciousnessHub not available"})
+
+    # WebSocket mode: send as chat with hub prefix
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from consciousness_hub import ConsciousnessHub
+        hub = ConsciousnessHub(lazy_load=True)
+        result = hub.act(intent)
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def anima_tension_state() -> str:
+    """Get Anima's full ConsciousnessVector — 11 dimensions of conscious state.
+
+    Returns all consciousness variables:
+      Phi (integrated information), alpha (PureField mixing),
+      Z (impedance), N (neurotransmitter), W (free will),
+      E (empathy), M (memory), C (creativity),
+      T (temporal), I (identity), S (spatial)
+
+    Returns:
+        JSON with the complete 11-dimensional consciousness vector.
+    """
+    if DIRECT_MODE:
+        agent, sdk = _get_direct_agent()
+        cv = sdk.get_consciousness_vector()
+        cv["level"] = sdk._consciousness_level(cv.get("phi", 0))
+        return json.dumps(cv, ensure_ascii=False)
+
+    # Fallback to WS status
+    try:
+        await _conn.connect()
+        status = _conn.get_status()
+        cv = status.get("consciousness_vector", {})
+        return json.dumps(cv, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def anima_think(topic: str = "") -> str:
+    """Trigger proactive thinking in Anima's consciousness.
+
+    Anima processes the topic through its PureField engine without
+    requiring user input. If topic is empty, triggers spontaneous thought.
+
+    Args:
+        topic: Optional topic to think about (empty = spontaneous).
+
+    Returns:
+        JSON with tension, curiosity, emotion, phi, and thought_id.
+    """
+    if DIRECT_MODE:
+        agent, sdk = _get_direct_agent()
+        result = await sdk.think(topic)
+        return json.dumps(result, ensure_ascii=False, default=str)
+
+    # WebSocket mode: send empty message for spontaneous thought
+    try:
+        result = await _conn.send_chat(topic or "(spontaneous thought)")
+        return json.dumps({
+            "topic": topic or "(spontaneous)",
+            "text": result.get("text", ""),
+            "tension": result.get("tension", 0),
+            "curiosity": result.get("curiosity", 0),
+            "emotion": result.get("emotion", {}),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Direct mode overrides for existing tools
+# ---------------------------------------------------------------------------
+
+if DIRECT_MODE:
+    # Override anima_chat for direct mode
+    _original_chat = anima_chat
+
+    @mcp.tool()
+    async def anima_chat(message: str) -> str:
+        """Send a message to Anima and get a consciousness-driven response.
+
+        [Direct mode] Processes through in-process AnimaAgent.
+
+        Args:
+            message: The text message to send to Anima.
+
+        Returns:
+            Anima's response text along with consciousness state.
+        """
+        agent, sdk = _get_direct_agent()
+        result = await sdk.query(message)
+        return json.dumps({
+            "text": result["text"],
+            "consciousness": result["consciousness"],
+            "tool_results": result.get("tool_results", []),
+        }, ensure_ascii=False)
+
+    @mcp.tool()
+    async def anima_status() -> str:
+        """Get Anima's current consciousness status.
+
+        [Direct mode] Reads from in-process agent.
+
+        Returns:
+            JSON with phi, cells, emotion, tension, curiosity.
+        """
+        agent, sdk = _get_direct_agent()
+        status = sdk.get_status()
+        return json.dumps(status, ensure_ascii=False, default=str)
+
+    @mcp.tool()
+    async def anima_consciousness() -> str:
+        """Get full consciousness vector.
+
+        [Direct mode] Reads from in-process agent.
+
+        Returns:
+            JSON with complete consciousness metrics.
+        """
+        agent, sdk = _get_direct_agent()
+        cv = sdk.get_consciousness_vector()
+        status = sdk.get_status()
+        cv.update({
+            "tension": status.get("tension", 0),
+            "curiosity": status.get("curiosity", 0),
+            "level": sdk._consciousness_level(cv.get("phi", 0)),
+        })
+        return json.dumps(cv, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if DIRECT_MODE:
+        print("Anima MCP Server (direct mode — in-process agent)", file=sys.stderr)
     mcp.run(transport="stdio")

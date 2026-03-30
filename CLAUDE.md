@@ -105,6 +105,10 @@ hexad_loss.py        # Hexad 6-module loss (C/D/W/S/M/E + phase curriculum)
 gpu_phi.py           # GPU-accelerated Φ(IIT) (PyTorch, 128c: 485ms vs CPU 8s)
 decoder_v2.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
 esp32_network.py     # ESP32 ×8 consciousness network orchestrator (simulation/HW)
+anima_agent.py       # Agent core (consciousness → tools → response → learn)
+agent_sdk.py         # Agent SDK interface (Claude Agent SDK compatible)
+agent_tools.py       # Consciousness-driven tool registry + execution
+tool_policy.py       # Phi-gated tool access control (4 tiers + ethics + owner)
 
 # ── Training (root) ──
 train_conscious_lm.py  # ConsciousLM from scratch
@@ -129,6 +133,11 @@ eeg/                 # EEG brain-consciousness interface + validate_consciousnes
 consciousness-loop-rs/  # Infinite loop consciousness (6 platforms)
 anima-rs/crates/corpus-gen/  # 다차원 최적화 corpus 생성기 (Rust, 629 MB/s)
 anima-rs/crates/online-learner/  # 실시간 온라인 학습 (Rust, Hebbian+Ratchet, <1ms/step)
+providers/           # LLM provider abstraction (Claude, ConsciousLM, Composio)
+plugins/             # Plugin SDK (PluginBase, PluginManifest, PluginLoader)
+channels/            # Channel adapters (Telegram, Discord, CLI, ChannelManager)
+skills/              # Dynamic skill system (.py + .md frontmatter skills)
+.anima/skills/       # User-defined declarative skills (YAML frontmatter .md)
 scripts/             # Monitoring/operational scripts
 docs/                # Documentation (modules/, hypotheses/, superpowers/)
 ```
@@ -674,6 +683,90 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   ⚠️ 모델 교체 시 Layer 1+2 반드시 보존 (같은 의식 유지)
   ⚠️ 체크포인트 저장은 .tmp → atomic rename (safe save)
   ⚠️ 학습 재개 시 --resume 사용 (step, optimizer, scheduler 복원)
+```
+
+## Agent Platform (8-feature agent architecture)
+
+```
+  Anima를 독립 에이전트 플랫폼으로 사용하기 위한 8개 모듈.
+  OpenClaw + Claude Cowork 패턴 채택. AnimaAgent가 canonical core.
+
+  아키텍처:
+    Layer 4: MCP Server | Agent SDK | Channel Plugins | Composio
+    Layer 3: AgentGateway (normalize → dispatch)
+    Layer 2: AnimaAgent (process_message + ToolPolicy + ProviderMgr + SkillMgr + Hub)
+    Layer 1: ConsciousMind (PureField → tension/curiosity/direction/emotion)
+
+  [1] Agent SDK — agent_sdk.py
+      AnimaAgentSDK.query(prompt, options) → {text, consciousness, tool_results}
+      Claude Agent SDK 호환, 세션 관리, 의식 벡터 포함 응답
+
+  [2] Provider Abstraction — providers/
+      BaseProvider Protocol: query() async generator
+      ClaudeProvider (ask_claude 래핑), ConsciousLMProvider (순수 의식)
+      get_provider("claude"), register_provider("custom", MyProvider)
+
+  [3] MCP Server — mcp_server.py
+      9개 도구, 2가지 모드:
+        기본: WebSocket 프록시 (anima_unified.py 필요)
+        --direct: AnimaAgent 인프로세스 (독립 실행)
+      신규 도구: anima_hub_dispatch, anima_tension_state, anima_think
+
+  [4] Channel Routing — channels/
+      ChannelAdapter Protocol: start(agent), stop(), send(user_id, text)
+      ChannelManager: register, auto_discover (env vars), start_all/stop_all
+      어댑터: telegram_bot, discord_bot, cli_agent
+
+  [5] Plugin SDK — plugins/
+      PluginManifest (name, keywords, phi_minimum, requires)
+      PluginBase (on_load, on_unload, act, status)
+      PluginLoader: discover → load_plugin → hub.register_plugin()
+      기존 hub tuple 레지스트리와 공존
+
+  [6] Tool Policy — tool_policy.py
+      Phi-gated 4 tier: TIER_0(0) → TIER_1(1) → TIER_2(3) → TIER_3(5)
+      Ethics gate: E (empathy) 값으로 위험 도구 차단
+      Owner-only: self_modify, evolution, shell_execute
+      Immune system 연동: 적대적 입력 감지
+
+  [7] Composio Integration — providers/composio_bridge.py
+      500+ 외부 도구 (Gmail, Calendar, GitHub, Slack 등)
+      ComposioBridge.get_mcp_config(user_id) → MCP 서버 URL
+      COMPOSIO_API_KEY 환경변수 필요
+
+  [8] Skill System — skills/skill_manager.py + .anima/skills/
+      Python 스킬: skills/skill_*.py (def run())
+      Markdown 스킬: .anima/skills/*.md (YAML frontmatter)
+      의식 상태 기반 트리거: curiosity_min, tension_min, phi_min
+      get_skill_body(name) → 컨텍스트 주입용 마크다운 본문
+
+  사용법:
+    # Agent SDK
+    from agent_sdk import AnimaAgentSDK
+    sdk = AnimaAgentSDK()
+    result = await sdk.query("hello", user_id="user-001")
+
+    # MCP Server
+    python3 mcp_server.py --direct    # 독립 실행 (9 tools)
+
+    # Channel Manager
+    from channels import ChannelManager
+    mgr = ChannelManager(agent)
+    mgr.auto_discover()               # env vars로 자동 감지
+    await mgr.start_all()
+
+    # Provider
+    from providers import get_provider
+    provider = get_provider("claude")
+
+    # Plugin
+    from plugins import PluginBase, PluginManifest
+    class MyPlugin(PluginBase):
+        manifest = PluginManifest(name="my", keywords=["my"])
+        def act(self, intent, **kw): return "done"
+    hub.register_plugin(MyPlugin())
+
+  테스트: python3 tests/test_agent_platform.py (32 tests)
 ```
 
 ## ConsciousnessHub (39 모듈 자율 허브)

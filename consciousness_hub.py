@@ -426,6 +426,44 @@ class ConsciousnessHub:
         t.start()
         return t
 
+    # ═══════════════════════════════════════════════════════════
+    # Plugin SDK 통합
+    # ═══════════════════════════════════════════════════════════
+
+    def register_plugin(self, plugin) -> bool:
+        """PluginBase 인스턴스를 허브에 등록.
+
+        Plugin의 manifest.keywords를 _registry에 추가하고,
+        인스턴스를 _modules에 직접 저장한다.
+        기존 tuple-based 모듈과 공존.
+        """
+        try:
+            manifest = plugin.manifest
+            name = manifest.name
+            keywords = manifest.keywords or [name]
+            # Register in _registry for intent matching
+            self._registry[name] = (
+                f"plugins.{name}",  # import_path (informational)
+                type(plugin).__name__,
+                keywords,
+            )
+            # Store instance directly (bypass lazy loading)
+            self._modules[name] = plugin
+            return True
+        except Exception:
+            return False
+
+    def unload_plugin(self, name: str) -> bool:
+        """플러그인 언로드 — 레지스트리와 모듈에서 제거."""
+        removed = False
+        if name in self._registry:
+            del self._registry[name]
+            removed = True
+        if name in self._modules:
+            del self._modules[name]
+            removed = True
+        return removed
+
     def action_history(self, n=10) -> list:
         """최근 액션 기록."""
         return self._action_log[-n:]
