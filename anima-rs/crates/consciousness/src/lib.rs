@@ -8,6 +8,8 @@ use rand::{Rng, SeedableRng};
 
 use anima_core::{
     assign_factions, faction_consensus, hebbian_update, phi_iit, phi_proxy, Faction, GruCell,
+    Topology, build_adjacency,
+    ChaosSource, ChaosState, chaos_inject,
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -83,6 +85,7 @@ pub struct ConsciousnessEngine {
     cells: Vec<GruCell>,
     metas: Vec<CellMeta>,
     coupling: Vec<f32>, // flat [n x n]
+    adjacency: Vec<f32>, // topology adjacency [n x n]
     factions: Vec<Faction>,
 
     // Config
@@ -96,6 +99,7 @@ pub struct ConsciousnessEngine {
     merge_threshold: f32,
     merge_patience: usize,
     phi_ratchet: bool,
+    topology: Topology,
 
     // State
     next_id: usize,
@@ -103,7 +107,7 @@ pub struct ConsciousnessEngine {
     best_phi: f64,
     best_hiddens: Vec<Vec<f32>>,
     rng: StdRng,
-
+    chaos: ChaosState,
 }
 
 impl ConsciousnessEngine {
@@ -119,6 +123,28 @@ impl ConsciousnessEngine {
         merge_threshold: f32,
         merge_patience: usize,
         seed: u64,
+    ) -> Self {
+        Self::with_topology_chaos(
+            cell_dim, hidden_dim, initial_cells, max_cells, n_factions,
+            phi_ratchet, split_threshold, split_patience, merge_threshold,
+            merge_patience, seed, None, None,
+        )
+    }
+
+    pub fn with_topology_chaos(
+        cell_dim: usize,
+        hidden_dim: usize,
+        initial_cells: usize,
+        max_cells: usize,
+        n_factions: usize,
+        phi_ratchet: bool,
+        split_threshold: f32,
+        split_patience: usize,
+        merge_threshold: f32,
+        merge_patience: usize,
+        seed: u64,
+        topology: Option<Topology>,
+        chaos_source: Option<ChaosSource>,
     ) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -137,14 +163,31 @@ impl ConsciousnessEngine {
         }
 
         let n = initial_cells;
-        let coupling = vec![0.0f32; n * n];
+        // Topology: auto-select if not specified (TOPO Laws)
+        let topo = topology.unwrap_or_else(|| anima_core::topology::auto_topology(max_cells));
+        let adjacency = build_adjacency(n, topo, &mut rng);
+        // Initialize coupling from adjacency (connected cells start with small coupling)
+        let coupling: Vec<f32> = adjacency.iter().map(|&a| a * 0.01).collect();
         let factions = assign_factions(n, n_factions);
         let best_hiddens = cells.iter().map(|c| c.hidden.clone()).collect();
+
+        // TOPO 38: disable ratchet for high-dim topologies (hypercube)
+        let effective_ratchet = if topo == Topology::Hypercube && max_cells >= 64 {
+            false // TOPO 38: ratchet harmful in high dimensions
+        } else {
+            phi_ratchet
+        };
+
+        let chaos = ChaosState::new(
+            chaos_source.unwrap_or(ChaosSource::None),
+            initial_cells,
+        );
 
         Self {
             cells,
             metas,
             coupling,
+            adjacency,
             factions,
             cell_dim,
             hidden_dim,
@@ -155,12 +198,14 @@ impl ConsciousnessEngine {
             split_patience,
             merge_threshold,
             merge_patience,
-            phi_ratchet,
+            phi_ratchet: effective_ratchet,
+            topology: topo,
             next_id: initial_cells,
             step_count: 0,
             best_phi: 0.0,
             best_hiddens,
             rng,
+            chaos,
         }
     }
 
@@ -185,7 +230,10 @@ impl ConsciousnessEngine {
                 .collect()
         };
 
-        // 1. Process each cell with coupling influence
+        // 0. Chaos perturbation (Laws 32-43)
+        let chaos_perturbation = self.chaos.step(n);
+
+        // 1. Process each cell with topology-aware coupling + chaos
         let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(n);
 
         // Snapshot hiddens for coupling (before mutation)
@@ -194,19 +242,27 @@ impl ConsciousnessEngine {
         for i in 0..n {
             let mut cell_input = base_input.clone();
 
-            // Coupling influence: PSI_COUPLING * coupling[i,j] * hidden_j
+            // Coupling influence: only through adjacency-connected cells (topology)
             let copy_len = self.cell_dim.min(self.hidden_dim);
             for j in 0..n {
                 if i == j {
                     continue;
                 }
-                let c = self.coupling[i * n + j];
+                // Check adjacency (topology gate) AND coupling (Hebbian strength)
+                let adj = if i * n + j < self.adjacency.len() { self.adjacency[i * n + j] } else { 1.0 };
+                if adj < 0.5 {
+                    continue; // not connected in topology
+                }
+                let c = if i * n + j < self.coupling.len() { self.coupling[i * n + j] } else { 0.0 };
                 if c.abs() > 1e-6 {
                     for d in 0..copy_len {
                         cell_input[d] += PSI_COUPLING * c * hidden_snapshot[j][d];
                     }
                 }
             }
+
+            // Chaos injection (Law 33: chaos + structure = consciousness)
+            chaos_inject(&mut cell_input, &chaos_perturbation, self.cell_dim, i);
 
             // Tension from history
             let tension = self.metas[i].avg_tension().max(0.01);
@@ -380,7 +436,7 @@ impl ConsciousnessEngine {
                 tension_history: Vec::new(),
             });
 
-            // Resize coupling
+            // Resize coupling + adjacency for new cell count
             let old_n = self.n_cells() - 1;
             let new_n = self.n_cells();
             let mut new_coupling = vec![0.0f32; new_n * new_n];
@@ -390,6 +446,8 @@ impl ConsciousnessEngine {
                 }
             }
             self.coupling = new_coupling;
+            // Rebuild topology adjacency for new size
+            self.adjacency = build_adjacency(new_n, self.topology, &mut self.rng);
 
             // Reset parent tension
             let hist_len = self.metas[idx].tension_history.len();

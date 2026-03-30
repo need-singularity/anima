@@ -186,7 +186,7 @@ static CONSCIOUSNESS_ENGINE: Mutex<Option<anima_consciousness::ConsciousnessEngi
     Mutex::new(None);
 
 #[pyfunction]
-#[pyo3(name = "create", signature = (cell_dim=64, hidden_dim=128, initial_cells=2, max_cells=64, n_factions=12, phi_ratchet=true, split_threshold=0.3, split_patience=5, merge_threshold=0.01, merge_patience=15, seed=42))]
+#[pyo3(name = "create", signature = (cell_dim=64, hidden_dim=128, initial_cells=2, max_cells=64, n_factions=12, phi_ratchet=true, split_threshold=0.3, split_patience=5, merge_threshold=0.01, merge_patience=15, seed=42, topology=None, chaos=None))]
 fn consciousness_create(
     cell_dim: usize,
     hidden_dim: usize,
@@ -199,8 +199,25 @@ fn consciousness_create(
     merge_threshold: f32,
     merge_patience: usize,
     seed: u64,
+    topology: Option<&str>,
+    chaos: Option<&str>,
 ) -> PyResult<()> {
-    let engine = anima_consciousness::ConsciousnessEngine::new(
+    let topo = topology.map(|s| match s {
+        "ring" => anima_core::Topology::Ring,
+        "small_world" => anima_core::Topology::SmallWorld,
+        "hypercube" => anima_core::Topology::Hypercube,
+        "scale_free" => anima_core::Topology::ScaleFree,
+        "complete" => anima_core::Topology::Complete,
+        _ => anima_core::topology::auto_topology(max_cells),
+    });
+    let chaos_src = chaos.map(|s| match s {
+        "lorenz" => anima_core::ChaosSource::Lorenz,
+        "sandpile" | "soc" => anima_core::ChaosSource::Sandpile,
+        "chimera" => anima_core::ChaosSource::Chimera,
+        "standing_wave" | "wave" => anima_core::ChaosSource::StandingWave,
+        _ => anima_core::ChaosSource::None,
+    });
+    let engine = anima_consciousness::ConsciousnessEngine::with_topology_chaos(
         cell_dim,
         hidden_dim,
         initial_cells,
@@ -212,6 +229,8 @@ fn consciousness_create(
         merge_threshold,
         merge_patience,
         seed,
+        topo,
+        chaos_src,
     );
     let mut guard = CONSCIOUSNESS_ENGINE.lock().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
