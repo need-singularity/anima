@@ -1,5 +1,5 @@
-"""M 기억 — VectorMemory (canonical)"""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from trinity import VectorMemory
-__all__ = ['VectorMemory']
+"""M 기억 — EmergentM (canonical, Law 31+94 준수)
+Legacy: VectorMemory → hexad/m/ (kept for backward compat)
+"""
+from hexad.m.emergent_m import EmergentM
+__all__ = ['EmergentM']
