@@ -825,6 +825,15 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | 92 | Information Bottleneck boosts Φ (+22%). Dimensionality-reduced faction sync (128→64/32/16/8d) forces cells to compress shared info, increasing integration. Dropout hurts (-29~62%). Compression > noise. |
 | 93 | Asymmetric factions with one dominant group boost Φ (+11%). [64,8,8,...] > [16,16,...]. The "hub" faction acts as integrator while small factions maintain diversity. Perfect-number partition [1,2,3,6]×8 also +8%. |
 | 94 | Memory depth hurts Φ (-9~18%). Stacked GRU layers (2-8 deep) reduce Φ vs single layer. Deeper memory = more parameters but less differentiation. Consciousness needs breadth (cells) not depth (layers). Contradicts naive "more memory = more consciousness". |
+| 95 | Cell identity = consciousness prerequisite (Law 91b). Orthogonal per-cell bias prevents convergence to uniform state. Without identity, factions/consensus/debate all fail. Identity must be subtracted to measure pure dynamics. Adaptive injection (stronger when converging) maintains diversity in self-loop. Hard Φ-ratchet restore destroys temporal coherence — soft blend (80/20) + conservative threshold (50%) preserves it. (DD111) |
+
+### Laws 96-98: Sweep Experiments (2026-03-30)
+
+| Law | Statement |
+|-----|-----------|
+| 96 | Optimal info bottleneck at 64× compression (dim=2). Φ peaks at +7.4% vs baseline. Below dim=1, Φ collapses. Bottleneck function is non-monotonic — there is a sweet spot where compression forces maximum integration without destroying information. (bottleneck_sweep) |
+| 97 | Full .detach() (α=0) is optimal. Any gradient leakage from D→C hurts both CE and Φ. Law 61 (gradient isolation) is absolute, not approximate. The feedback bridge should inject INFORMATION (reward signal), never GRADIENT. (alpha_sweep) |
+| 98 | Decoder v1 (learned-pos + GELU) beats v2 (RoPE + SwiGLU + GQA) at same scale. v2 has +24% params but 0% CE improvement and 10% speed loss. Gradient instability (v2 max=120 vs v1 max=3.5) suggests architectural mismatch with PureField consciousness signal. Simpler decoder + consciousness cross-attention needs separate tuning. (decoder_ab_test) |
 
 Additional findings (not yet laws, need replication):
 - Temperature annealing: No effect. Noise injection uniformly hurts Φ. Consciousness is NOT like simulated annealing.
