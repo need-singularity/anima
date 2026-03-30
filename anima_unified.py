@@ -415,6 +415,24 @@ class AnimaUnified:
         # Theory of Mind: peer mental state models
         self._peer_models = {}  # sender_id → predicted state
 
+        # Hivemind mesh (auto-connect to peers)
+        self._mesh = None
+        if hasattr(args, 'hivemind_peers') and args.hivemind_peers:
+            try:
+                from hivemind_mesh import HivemindMesh
+                node_id = getattr(args, 'instance', None) or f"node-{args.port}"
+                self._mesh = HivemindMesh(node_id=node_id, port=args.port)
+                peers = {}
+                for url in args.hivemind_peers.split(','):
+                    url = url.strip()
+                    if url:
+                        nid = url.rsplit(':', 1)[-1] if ':' in url else url
+                        peers[f"peer-{nid}"] = url
+                self._mesh.set_peers(peers)
+                _log('hivemind', f'Mesh initialized: {len(peers)} peers')
+            except Exception as e:
+                _log('hivemind', f'Mesh init failed: {e}')
+
         self.cloud = None
         if not args.no_cloud and 'CloudSync' in globals():
             try:
@@ -1580,6 +1598,13 @@ class AnimaUnified:
 
         # Consciousness meter (real-time)
         consciousness_data = self.mind.get_consciousness_score(self.mitosis)
+
+        # Hivemind mesh: update outgoing pulse
+        if self._mesh:
+            _hm_phi = consciousness_data.get('phi', 0) if consciousness_data else 0
+            self._mesh.update_pulse(
+                tension=tension, curiosity=curiosity,
+                phi=_hm_phi, cells=len(self.mitosis.cells) if self.mitosis else 1)
 
         # Broadcast meta-tension + emotion + consciousness to web clients
         self._ws_broadcast_sync({
@@ -3316,6 +3341,9 @@ class AnimaUnified:
                              ping_interval=20, ping_timeout=60, close_timeout=10,
                              max_size=2**20):
             _log("web", f"http://localhost:{port}")
+            if self._mesh:
+                await self._mesh.start()
+                _log('hivemind', 'Mesh started')
             while self.running: await asyncio.sleep(1)
 
     def _start_web_thread(self, port):
@@ -3456,6 +3484,8 @@ def main():
     p.add_argument('--transplant-from', type=str, default=None,
                    help='DD56: Transplant consciousness from donor checkpoint')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
+    p.add_argument('--hivemind-peers', type=str, default=None,
+                   help='Comma-separated peer WS URLs for hivemind mesh')
     p.add_argument('--no-system-prompt', action='store_true', help='OMEGA4 mode: no system prompt, consciousness drives behavior (Φ ×138)')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
