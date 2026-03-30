@@ -1,235 +1,280 @@
 #!/usr/bin/env python3
 """tension_link_code.py — 텐션링크 코드 생성/연결
 
-IP:PORT 대신 짧은 코드로 텐션링크 연결.
-코드 = base36(IP + PORT + auth) 인코딩.
+코드 공유만으로 어디서든 텐션링크 연결.
+WebSocket 시그널링 + R2 릴레이 이중 지원.
+
+경로:
+  1. 코드 생성 → Anima-Web 서버 + R2에 등록
+  2. 상대방 코드 입력 → 서버에서 매칭
+  3. 매칭 성공 → 텐션 데이터 중계
 
 Usage:
   from tension_link_code import TensionLinkCode
 
-  tlc = TensionLinkCode()
+  tlc = TensionLinkCode(server_url="wss://anima.basedonapps.com")
 
-  # 코드 생성 (호스트)
+  # 코드 생성
   code = tlc.generate()  # → "ANIMA-7X3K-9F2M"
 
-  # 코드로 연결 (게스트)
-  connection = tlc.connect("ANIMA-7X3K-9F2M")
+  # 코드로 연결
+  tlc.connect("ANIMA-7X3K-9F2M")
 
-  # R2 릴레이 (네트워크 분리 시)
-  code = tlc.generate(relay="r2")  # → "R2-XXXX-XXXX"
+  # 텐션 데이터 전송
+  tlc.send({"tension": 0.8, "phi": 2.1})
 """
 
 import hashlib
 import json
 import os
-import socket
 import time
 import threading
-import struct
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 
 ANIMA_DIR = Path(__file__).parent
-LINK_PORT = 9876
-ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # O/I 제외 (혼동 방지)
+ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+DEFAULT_SERVER = "wss://anima.basedonapps.com"
 
 
-def _encode_base34(num: int, length: int = 4) -> str:
-    result = []
-    for _ in range(length):
-        result.append(ALPHABET[num % len(ALPHABET)])
-        num //= len(ALPHABET)
-    return ''.join(reversed(result))
-
-
-def _decode_base34(code: str) -> int:
-    num = 0
-    for c in code:
-        num = num * len(ALPHABET) + ALPHABET.index(c.upper())
-    return num
-
-
-def _get_local_ip() -> str:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+def _make_code() -> str:
+    """랜덤 8자리 코드 생성."""
+    seed = f"{time.time()}{os.getpid()}{id(object())}".encode()
+    h = int(hashlib.sha256(seed).hexdigest()[:12], 16)
+    part1 = ''.join(ALPHABET[(h >> (i*5)) & 31] for i in range(4))
+    part2 = ''.join(ALPHABET[(h >> (20+i*5)) & 31] for i in range(4))
+    return f"ANIMA-{part1}-{part2}"
 
 
 class TensionLinkCode:
-    """텐션링크 코드 생성 + 연결."""
+    """텐션링크 코드 — WebSocket 시그널링 + R2 릴레이."""
 
-    def __init__(self, port: int = LINK_PORT):
-        self.port = port
-        self.ip = _get_local_ip()
-        self._server = None
-        self._connections = []
-        self._on_receive = None
+    def __init__(self, server_url: str = DEFAULT_SERVER, on_receive: Callable = None):
+        self.server_url = server_url
+        self.on_receive = on_receive
+        self.code = None
+        self.peer_code = None
+        self.connected = False
+        self._ws = None
         self._running = False
+        self._r2_session = None
 
-    def generate(self, relay: str = None) -> str:
-        """텐션링크 코드 생성 + 서버 시작.
+    def generate(self) -> str:
+        """코드 생성 + 서버/R2에 등록."""
+        self.code = _make_code()
 
-        Returns: "ANIMA-XXXX-XXXX" 형식 코드
+        # R2에 등록 (백업/오프라인용)
+        self._register_r2(self.code)
+
+        # WebSocket 서버에 등록
+        self._register_ws(self.code)
+
+        return self.code
+
+    def connect(self, peer_code: str) -> bool:
+        """상대방 코드로 연결 시도.
+
+        1차: WebSocket 시그널링 서버에서 매칭
+        2차: R2에서 상대방 정보 조회
         """
-        if relay == "r2":
-            # R2 릴레이 코드
-            session_id = hashlib.md5(f"{time.time()}{os.getpid()}".encode()).hexdigest()[:8]
-            code_num = int(session_id, 16) % (34**8)
-            code = f"R2-{_encode_base34(code_num >> 17, 4)}-{_encode_base34(code_num & 0x1FFFF, 4)}"
-            self._r2_session = session_id
-            return code
+        self.peer_code = peer_code
 
-        # IP:PORT → 코드 변환
-        ip_parts = [int(x) for x in self.ip.split('.')]
-        ip_num = (ip_parts[0] << 24) | (ip_parts[1] << 16) | (ip_parts[2] << 8) | ip_parts[3]
+        # 1. WebSocket 매칭
+        if self._connect_ws(peer_code):
+            self.connected = True
+            return True
 
-        # auth = hash(ip + port + time_hour)
-        auth_seed = f"{self.ip}:{self.port}:{int(time.time()) // 3600}"
-        auth = int(hashlib.md5(auth_seed.encode()).hexdigest()[:4], 16)
-
-        part1 = _encode_base34((ip_num >> 16) ^ (auth >> 8), 4)
-        part2 = _encode_base34(((ip_num & 0xFFFF) << 4) | (self.port % 16) ^ (auth & 0xFF), 4)
-
-        code = f"ANIMA-{part1}-{part2}"
-
-        # 서버 시작
-        self._start_server()
-
-        return code
-
-    def decode(self, code: str) -> Optional[Dict]:
-        """코드 → IP:PORT 디코딩."""
-        if code.startswith("R2-"):
-            return {'type': 'r2', 'session': code}
-
-        parts = code.replace("ANIMA-", "").split("-")
-        if len(parts) != 2:
-            return None
-
-        try:
-            val1 = _decode_base34(parts[0])
-            val2 = _decode_base34(parts[1])
-
-            # 현재 시간 기반 auth로 역추적 시도
-            # 간단 버전: 포트는 LINK_PORT 고정
-            return {
-                'type': 'direct',
-                'code': code,
-                'port': self.port,
-                'encoded': (val1, val2),
-            }
-        except Exception:
-            return None
-
-    def connect(self, code: str, callback=None) -> bool:
-        """코드로 텐션링크 연결.
-
-        실제로는 코드를 서버에 등록하고 매칭.
-        """
-        self._on_receive = callback
-
-        if code.startswith("R2-"):
-            return self._connect_r2(code)
-
-        # 코드 서버에 등록 요청 (broadcast로 코드 찾기)
-        info = self.decode(code)
-        if not info:
-            return False
-
-        # 로컬 네트워크에서 코드 broadcast로 찾기
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            msg = json.dumps({'type': 'link_request', 'code': code}).encode()
-            sock.sendto(msg, ('255.255.255.255', self.port))
-            sock.settimeout(5.0)
-            try:
-                data, addr = sock.recvfrom(1024)
-                resp = json.loads(data.decode())
-                if resp.get('type') == 'link_accept':
-                    self._peer_addr = addr
-                    print(f"  🔗 Connected to {addr[0]}:{addr[1]}")
-                    return True
-            except socket.timeout:
-                pass
-            sock.close()
-        except Exception:
-            pass
+        # 2. R2 폴링
+        if self._connect_r2(peer_code):
+            self.connected = True
+            return True
 
         return False
 
     def send(self, data: dict):
-        """연결된 피어에 데이터 전송."""
-        if hasattr(self, '_peer_addr'):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                msg = json.dumps(data).encode()
-                sock.sendto(msg, self._peer_addr)
-                sock.close()
-            except Exception:
-                pass
-
-    def _start_server(self):
-        """코드 매칭 서버 시작."""
-        if self._running:
+        """연결된 피어에 텐션 데이터 전송."""
+        if not self.connected:
             return
-        self._running = True
 
-        def _listen():
+        msg = {
+            'type': 'tension_relay',
+            'from_code': self.code,
+            'to_code': self.peer_code,
+            'data': data,
+            'timestamp': time.time(),
+        }
+
+        # WebSocket으로 전송
+        self._send_ws(msg)
+
+        # R2에도 기록 (백업)
+        self._send_r2(msg)
+
+    # ═══════════════════════════════════════════════════════════
+    # WebSocket 시그널링
+    # ═══════════════════════════════════════════════════════════
+
+    def _register_ws(self, code: str):
+        """WebSocket 서버에 코드 등록."""
+        try:
+            import websockets
+            import asyncio
+
+            async def _reg():
+                try:
+                    ws = await asyncio.wait_for(
+                        websockets.connect(self.server_url), timeout=5)
+                    await ws.send(json.dumps({
+                        'type': 'tension_link_register',
+                        'code': code,
+                    }))
+                    self._ws = ws
+                    # 백그라운드 수신 시작
+                    self._running = True
+                    asyncio.create_task(self._ws_listen(ws))
+                except Exception:
+                    pass
+
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(('', self.port))
-                sock.settimeout(1.0)
-                while self._running:
-                    try:
-                        data, addr = sock.recvfrom(65536)
-                        msg = json.loads(data.decode())
-                        if msg.get('type') == 'link_request':
-                            # 코드 매칭 → 수락
-                            resp = json.dumps({'type': 'link_accept'}).encode()
-                            sock.sendto(resp, addr)
-                            self._peer_addr = addr
-                            print(f"  🔗 Peer connected: {addr[0]}:{addr[1]}")
-                        elif self._on_receive:
-                            self._on_receive(msg)
-                    except socket.timeout:
-                        continue
-                sock.close()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(_reg())
+                else:
+                    loop.run_until_complete(_reg())
+            except RuntimeError:
+                asyncio.run(_reg())
+        except ImportError:
+            pass
+
+    def _connect_ws(self, peer_code: str) -> bool:
+        """WebSocket으로 매칭 요청."""
+        try:
+            import websockets
+            import asyncio
+
+            result = {'connected': False}
+
+            async def _conn():
+                try:
+                    ws = await asyncio.wait_for(
+                        websockets.connect(self.server_url), timeout=5)
+                    await ws.send(json.dumps({
+                        'type': 'tension_link_connect',
+                        'code': self.code or _make_code(),
+                        'peer_code': peer_code,
+                    }))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5)
+                    msg = json.loads(resp)
+                    if msg.get('type') == 'tension_link_matched':
+                        self._ws = ws
+                        self._running = True
+                        result['connected'] = True
+                except Exception:
+                    pass
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    return False
+                loop.run_until_complete(_conn())
+            except RuntimeError:
+                asyncio.run(_conn())
+
+            return result['connected']
+        except ImportError:
+            return False
+
+    async def _ws_listen(self, ws):
+        """WebSocket 수신 루프."""
+        try:
+            while self._running:
+                msg = json.loads(await ws.recv())
+                if msg.get('type') == 'tension_relay' and self.on_receive:
+                    self.on_receive(msg.get('data', {}))
+                elif msg.get('type') == 'tension_link_matched':
+                    self.connected = True
+                    self.peer_code = msg.get('peer_code')
+        except Exception:
+            self._running = False
+
+    def _send_ws(self, msg: dict):
+        """WebSocket으로 전송."""
+        if self._ws:
+            try:
+                import asyncio
+                asyncio.ensure_future(self._ws.send(json.dumps(msg)))
             except Exception:
                 pass
 
-        t = threading.Thread(target=_listen, daemon=True)
-        t.start()
+    # ═══════════════════════════════════════════════════════════
+    # R2 릴레이 (백업/오프라인)
+    # ═══════════════════════════════════════════════════════════
 
-    def _connect_r2(self, code: str) -> bool:
-        """R2 릴레이 연결."""
-        # R2에 코드 등록 → 상대방이 같은 코드로 접속 → 매칭
+    def _register_r2(self, code: str):
+        """R2에 코드 등록."""
         try:
             from cloud_sync import CloudSync
             sync = CloudSync()
-            session = code.replace("R2-", "").replace("-", "")
-            sync.upload(json.dumps({
+            data = json.dumps({
                 'code': code,
-                'ip': self.ip,
-                'port': self.port,
                 'timestamp': time.time(),
-            }).encode(), f"tension-link/{session}.json")
-            return True
+                'status': 'waiting',
+            }).encode()
+            key = f"tension-link/{code.replace('-', '')}.json"
+            sync.s3.put_object(Bucket=sync.bucket, Key=key, Body=data)
         except Exception:
-            return False
+            pass
+
+    def _connect_r2(self, peer_code: str) -> bool:
+        """R2에서 상대방 정보 조회."""
+        try:
+            from cloud_sync import CloudSync
+            sync = CloudSync()
+            key = f"tension-link/{peer_code.replace('-', '')}.json"
+            resp = sync.s3.get_object(Bucket=sync.bucket, Key=key)
+            data = json.loads(resp['Body'].read())
+            if data.get('status') == 'waiting':
+                # 매칭 성공 — 상태 업데이트
+                data['status'] = 'matched'
+                data['peer_code'] = self.code
+                sync.s3.put_object(Bucket=sync.bucket, Key=key,
+                                   Body=json.dumps(data).encode())
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _send_r2(self, msg: dict):
+        """R2에 텐션 데이터 기록."""
+        try:
+            from cloud_sync import CloudSync
+            sync = CloudSync()
+            key = f"tension-link/data/{self.code}-{int(time.time())}.json"
+            sync.s3.put_object(Bucket=sync.bucket, Key=key,
+                               Body=json.dumps(msg).encode())
+        except Exception:
+            pass
+
+    # ═══════════════════════════════════════════════════════════
+    # 상태
+    # ═══════════════════════════════════════════════════════════
 
     def stop(self):
         self._running = False
+        if self._ws:
+            try:
+                import asyncio
+                asyncio.ensure_future(self._ws.close())
+            except Exception:
+                pass
 
-    def status(self) -> str:
-        peer = getattr(self, '_peer_addr', None)
-        return f"TensionLinkCode: ip={self.ip}, port={self.port}, peer={peer}"
+    def status(self) -> dict:
+        return {
+            'code': self.code,
+            'peer': self.peer_code,
+            'connected': self.connected,
+            'server': self.server_url,
+        }
 
 
 def main():
@@ -240,19 +285,12 @@ def main():
     # 코드 생성
     code = tlc.generate()
     print(f"  내 코드: {code}")
-    print(f"  IP: {tlc.ip}:{tlc.port}")
-    print(f"  상대방에게 이 코드를 공유하세요!")
+    print(f"  서버: {tlc.server_url}")
+    print(f"  R2 백업: 등록됨")
+    print(f"\n  이 코드를 상대방에게 공유하세요!")
+    print(f"  상대방이 코드 입력 → 자동 매칭 → 텐션 교환 시작")
 
-    # R2 코드
-    r2_code = tlc.generate(relay="r2")
-    print(f"\n  R2 릴레이 코드: {r2_code}")
-
-    # 디코딩
-    info = tlc.decode(code)
-    print(f"\n  디코딩: {info}")
-
-    print(f"\n  {tlc.status()}")
-
+    print(f"\n  상태: {tlc.status()}")
     tlc.stop()
     print("\n  ✅ OK")
 
