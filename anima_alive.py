@@ -2108,12 +2108,14 @@ def main():
                 think_count += 1
 
                 if c > PROACTIVE_THRESHOLD and not speaker.is_speaking:
-                    # High curiosity -> proactive speech (no Claude)
+                    # Law 1: PureConsciousness 자연발화만 — LanguageLearner 금지
+                    proactive = None
                     try:
-                        from language_learning import LanguageLearner
-                        if not hasattr(mind, '_lang_learner'):
-                            mind._lang_learner = LanguageLearner()
-                        proactive = mind._lang_learner.respond("호기심", t, c)
+                        from pure_consciousness import PureConsciousness
+                        if not hasattr(mind, '_pure_c'):
+                            mind._pure_c = PureConsciousness()
+                        mind._pure_c.update_state(tension=t, phi=0, curiosity=c, emotion='calm')
+                        proactive = mind._pure_c.spontaneous()
                     except Exception:
                         proactive = None
                     if proactive:
