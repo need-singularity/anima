@@ -37,9 +37,50 @@ def test_run_comparison_mnist():
         assert r.params > 0
 
 
+from bench_golden_moe_consciousness import MoECell, ConsciousnessMoEBench
+
+
+def test_consciousness_moe_phi_measurement():
+    """ConsciousnessMoEBench exp1 produces valid Phi measurements."""
+    bench = ConsciousnessMoEBench(
+        n_cells=4, cell_dim=32, hidden_dim=64,
+        n_experts=4, steps=50,
+    )
+    result = bench.run_exp1_replacement()
+
+    assert "phi_baseline" in result
+    assert "phi_golden_moe" in result
+    assert "phi_change" in result
+    assert isinstance(result["phi_baseline"], float)
+    assert isinstance(result["phi_golden_moe"], float)
+    assert isinstance(result["phi_change"], float)
+
+
+def test_consciousness_moe_scaling():
+    """run_exp3 scaling produces correct number of results."""
+    bench = ConsciousnessMoEBench(
+        n_cells=4, cell_dim=32, hidden_dim=64,
+        n_experts=2, steps=50,
+    )
+    results = bench.run_exp3_scaling(
+        expert_counts=[2, 4],
+        cell_counts=[4, 8],
+    )
+    assert len(results) == 4, f"Expected 4 results, got {len(results)}"
+    for r in results:
+        assert "phi_baseline" in r
+        assert "phi_golden_moe" in r
+        assert isinstance(r["phi_baseline"], float)
+        assert isinstance(r["phi_golden_moe"], float)
+
+
 if __name__ == "__main__":
     test_topk_moe_forward()
     print("PASS: test_topk_moe_forward")
     test_run_comparison_mnist()
     print("PASS: test_run_comparison_mnist")
+    test_consciousness_moe_phi_measurement()
+    print("PASS: test_consciousness_moe_phi_measurement")
+    test_consciousness_moe_scaling()
+    print("PASS: test_consciousness_moe_scaling")
     print("All tests passed!")
