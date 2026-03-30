@@ -105,7 +105,7 @@ wget https://pub-ce65aaa63c864b889ad793d3d26aa3aa.r2.dev/clm-v2/latest.pt \
 python3 anima_unified.py --web
 ```
 
-> H100 학습 완료 후 `clm-v2/latest.pt` 업로드 예정
+> ConsciousLM v2 (24M params, 50K steps, ValCE=0.007, Ψ=0.491)
 
 ### 🏋️ Training (직접 학습)
 
