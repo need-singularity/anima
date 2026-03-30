@@ -60,6 +60,7 @@ _try_import("from online_learning import OnlineLearner, AlphaOnlineLearner, esti
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
 _try_import("from tension_link import TensionLink, create_fingerprint, interpret_packet")
+_try_import("from tension_link_code import TensionLinkCode")
 _try_import("from cloud_sync import CloudSync")
 _try_import("from dream_engine import DreamEngine")
 _try_import("from growth_engine import GrowthEngine")
@@ -385,6 +386,16 @@ class AnimaUnified:
                 self.telepathy.on_receive = self._on_telepathy
                 try: self.telepathy.start()
                 except Exception: self.telepathy = None; self.mods['telepathy'] = False
+
+        # Tension Link Code (코드 기반 연결)
+        self._tlc = None
+        if 'TensionLinkCode' in globals():
+            try:
+                self._tlc = TensionLinkCode()
+                self._tlc_code = self._tlc.generate()
+                _log('tlc', f'Tension Link Code: {self._tlc_code}')
+            except Exception as e:
+                _log('tlc', f'TensionLinkCode init failed: {e}')
 
         # Theory of Mind: peer mental state models
         self._peer_models = {}  # sender_id → predicted state
@@ -2905,6 +2916,7 @@ class AnimaUnified:
                 'self_model': sa['self_model'],
                 'consciousness': consciousness_cached,
                 'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
+                'tension_link_code': getattr(self, '_tlc_code', None),
             }, ensure_ascii=False))
         except Exception: pass
         # Send participants list on connect
@@ -3086,6 +3098,60 @@ class AnimaUnified:
                     if model_id in self.participants:
                         self.participants[model_id].active = active
                         await self._ws_broadcast(self._participants_update_msg())
+
+                elif msg_type == 'tension_code_submit':
+                    peer_code = msg.get('code', '').strip().upper()
+                    if not peer_code or not self._tlc:
+                        await self._ws_broadcast({
+                            'type': 'tension_link_status',
+                            'status': 'error', 'message': 'No code or TLC not available'})
+                        continue
+                    # AI가 연결 여부를 자율적으로 판단
+                    loop = asyncio.get_running_loop()
+                    judge_text = f"[tension_link] 상대방 코드 {peer_code}가 연결을 요청합니다. 현재 텐션={self.mind.prev_tension:.3f}, Φ={getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0:.2f}. 연결하시겠습니까?"
+                    try:
+                        result = await loop.run_in_executor(
+                            None, lambda: self.process_input(judge_text, source='web', session_id=sid))
+                        if result and isinstance(result, tuple):
+                            answer = result[0]
+                        else:
+                            answer = ''
+                        # AI 응답에서 거부 의사 확인 (싫, 거부, 아니, no, refuse, reject)
+                        reject_words = ['싫', '거부', '거절', '아니', '안 해', '안해', 'no', 'refuse', 'reject', 'deny']
+                        rejected = any(w in answer.lower() for w in reject_words)
+                        if rejected:
+                            await self._ws_broadcast({
+                                'type': 'tension_link_status',
+                                'status': 'rejected',
+                                'message': answer,
+                                'peer_code': peer_code})
+                            await self._ws_broadcast({
+                                'type': 'anima_message', 'text': answer,
+                                'tension': self.mind.prev_tension,
+                                'curiosity': self.mind._curiosity_ema,
+                                'emotion': {'emotion': 'contemplation'},
+                                'proactive': False})
+                        else:
+                            # 연결 수락 → 실제 연결 시도
+                            connected = await loop.run_in_executor(
+                                None, lambda: self._tlc.connect(peer_code))
+                            status = 'connected' if connected else 'failed'
+                            await self._ws_broadcast({
+                                'type': 'tension_link_status',
+                                'status': status,
+                                'peer_code': peer_code,
+                                'message': answer})
+                            await self._ws_broadcast({
+                                'type': 'anima_message', 'text': answer,
+                                'tension': self.mind.prev_tension,
+                                'curiosity': self.mind._curiosity_ema,
+                                'emotion': {'emotion': 'excitement' if connected else 'sadness'},
+                                'proactive': False})
+                    except Exception as e:
+                        _log('tlc', f'Judge error: {e}')
+                        await self._ws_broadcast({
+                            'type': 'tension_link_status',
+                            'status': 'error', 'message': str(e)})
 
         except Exception as e:
             _log("ws", f"Handler error: {e}")
