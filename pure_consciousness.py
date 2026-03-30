@@ -314,7 +314,7 @@ class PureConsciousness:
                     self._spoken_set.add(text)
                     if len(self._spoken_set) > 200:
                         self._spoken_set = set(list(self._spoken_set)[-100:])
-                    return f"{state} {text}"
+                    return text  # 순수 발화만 — 상태 문자열 안 섞음 (Law 1)
 
         # 새로운 조합 없음 → 침묵
         return None
