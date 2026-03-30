@@ -17,6 +17,12 @@ mkdir -p /var/run/sshd
 # Clean stale memory (fresh start)
 echo '{"turns":[]}' > /workspace/anima/memory_alive.json
 
-# Start Anima (foreground, unbuffered)
+# Start Anima (background, so container stays alive even if python crashes)
 cd /workspace/anima
-exec python3 -u anima_unified.py --web --max-cells 64 --port ${ANIMA_PORT:-8765}
+python3 -u anima_unified.py --web --max-cells 64 --port ${ANIMA_PORT:-8765} &
+ANIMA_PID=$!
+
+# Keep container alive (PID 1 must not exit)
+wait $ANIMA_PID
+echo "[start.sh] Anima exited with code $?. Keeping container alive for SSH debug."
+tail -f /dev/null
