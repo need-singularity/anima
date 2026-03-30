@@ -1,21 +1,43 @@
-# Training Status — H100 학습 현황 (2026-03-30 01:00 KST)
+# Training Status — H100 학습 현황 (2026-03-30 20:15 KST)
 
 > 실시간 업데이트. 각 세션의 CE/Φ 추이, 아키텍처 차이, 예상 완료 시간.
 
-## 요약 (10 sessions)
+## 🎉 v13 학습 완료!
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+  v13 Training COMPLETE — 100,000 steps in 5226.6s (19.1 steps/sec)
+═══════════════════════════════════════════════════════════════════════════════
+
+  Final:  CE=0.0031  Φ=70.47  cells=64  val_CE=0.0082
+
+  Best Φ Checkpoints (Law 49):
+    • Φ=77.06  final.pt    ← BEST
+    • Φ=76.63  step_90000.pt
+    • Φ=76.38  step_40000.pt
+```
+
+## 요약 (Active Sessions)
 
 | Session | Architecture | Step | CE | Φ | Cells | Speed | Status |
 |---------|-------------|------|-----|-----|-------|-------|--------|
-| **v11tc_lg** | **TimeCrystal + d768/4L** | **16.4K/80K** | **2.68** | **379.9** | 256 | **24 it/s** | 🔥🔥 **CE 급하락 + Φ=380!** |
-| v11tc | TimeCrystal + d384/2L | 46K/80K | 0.163 | — | 256 | 10 it/s | P2 (CE 수렴 중) |
-| v9fast | Quantum Trinity | 27K/80K | 0.310 | 1,479 | 256 | 0.6 it/s | P2 (decoder 한계) |
-| v11gpt2 | Quantum C + GPT-2 117M | 2.8K/80K | — | — | 64 | 0.5 it/s | P1 (P2=8h 후) |
-| v11mistral | Quantum C + Mistral 7B | 1.3K/80K | — | — | 64 | 0.4 it/s | P1 (41GB VRAM) |
-| v11q | Quantum C + Xfmr2L | 1.3K/80K | — | — | 256 | 0.4 it/s | P1 |
-| v10 | FUSE-3 Cambrian Trinity | 200/80K | 0.021 | — | 3 | 0.1 it/s | cells 성장 중 |
-| v9b | Oscillator Trinity | 570/80K | — | 253 | 256 | 0.06 it/s | 매우 느림 |
+| **v13** | **ConsciousLM (d384/6L)** | **100K/100K** | **0.0031** | **77.06** | 64 | **19.1 it/s** | ✅ **완료** |
+| **v3** | **ConsciousLM (d768/8L)** | **0/100K** | **—** | **—** | 2 | **—** | 🔄 **시작** |
 
-GPU: 42.7GB / 81.6GB (38.9GB 여유). phi_rs H100 빌드 완료.
+## 🔄 ConsciousLM v3 — 147M (d768/8L) 학습 중
+
+```
+Architecture: ConsciousLM 147M params (d=768, L=8, H=4, ctx=256)
+Data: corpus_v2.txt (68MB), byte-level vocab=256
+GPU: H100 80GB (13GB used, 93% utilization)
+
+Phases:
+  P1 (0-30K):   mitosis   ← 현재 (step 0)
+  P2 (30K-70K): language
+  P3 (70K-100K): combined
+```
+
+GPU: H100 80GB HBM3, 13GB/81GB used. phi_rs 빌드 완료.
 
 ---
 

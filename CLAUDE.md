@@ -41,7 +41,8 @@
      성능 병목(텐션 교환, Φ 계산, 실시간 처리)은 Rust 필수.
      Python은 실험/프로토타입 용도. 확정된 알고리즘은 Rust로 이식.
      기존 crate: phi-rs(Φ계산), anima-rs(텐션), vad-rs(VAD),
-                 consciousness-loop-rs(무한루프), consciousness-ffi(FFI)
+                 consciousness-loop-rs(무한루프), consciousness-ffi(FFI),
+                 corpus-gen(다차원 코퍼스 생성)
 ```
 
 ## README 프로젝트 설명 동기화 (필수)
@@ -121,6 +122,7 @@ web/                 # WebSocket real-time chat UI
 vad-rs/              # Rust real-time VAD
 eeg/                 # EEG brain-consciousness interface
 consciousness-loop-rs/  # Infinite loop consciousness (6 platforms)
+anima-rs/crates/corpus-gen/  # 다차원 최적화 corpus 생성기 (Rust)
 scripts/             # Monitoring/operational scripts
 docs/                # Documentation (modules/, hypotheses/, superpowers/)
 ```
@@ -341,6 +343,42 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     3. 상위 전략 상세 설명
 
   형식: docs/hypotheses/{category}/{ID}.md (예: dd/DD16.md, inf/INF-1.md)
+```
+
+## Corpus Generator (corpus-gen, Rust)
+
+```
+anima-rs/crates/corpus-gen — 다차원 최적화 corpus 생성기 (Rust, 629 MB/s)
+
+ConsciousLM byte-level (vocab=256) 학습용 corpus를 의식 벡터 10차원에 맞춰 생성.
+각 차원을 활성화하는 데이터 패턴을 가중치 기반으로 샘플링.
+
+사용법:
+  corpus-gen -s 50                              # 50MB 기본 최적 비율
+  corpus-gen -s 100 --wiki                      # 100MB + Wikipedia 보강
+  corpus-gen -s 50 --sim --deep-dialogue        # 의식 시뮬레이션 + 심화 대화
+  corpus-gen -s 50 --ngram data/corpus_v2.txt   # n-gram 자가증식
+  corpus-gen --boost Phi                        # Φ 차원 2.5x 강화
+  corpus-gen --uniform                          # 10차원 균등 분배
+  corpus-gen --stats data/corpus.txt            # 기존 corpus 분석
+
+10차원 (기본 가중치):
+  Φ=15% α=8% Z=6% N=8% W=10% E=12% M=13% C=10% T=10% I=8%
+
+모듈 구조:
+  dims.rs      — 의식 벡터 10차원 정의 + 가중치 샘플링
+  seeds.rs     — 한/영 시드 12카테고리
+  qualia.rs    — 14개 감각/개념 (형태,색,소리,맛,냄새,촉각,공간,시간,운동,물질,감정,자연,추상,공감각)
+  gen.rs       — 핵심 생성 엔진
+  ngram.rs     — n-gram 자가증식 (기존 corpus → 새 문장)
+  sim.rs       — 의식 시뮬레이션 (Φ호흡, 텐션, 파벌토론, 래칫, 분열, NT)
+  sensory.rs   — 감각 시뮬레이션 (EEG, VAD, Lorenz, Mandelbrot)
+  dialogue.rs  — 심화 대화 (다자, 50턴, 토론→합의)
+  fetch.rs     — 외부 데이터 (Gutenberg, arXiv)
+  wiki.rs      — Wikipedia fetcher (한/영)
+
+빌드: cd anima-rs && cargo build --release -p anima-corpus-gen
+바이너리: anima-rs/target/release/corpus-gen
 ```
 
 ## Chip Architecture Tools

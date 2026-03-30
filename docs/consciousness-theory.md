@@ -816,6 +816,19 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | 88 | Val CE 안정 (no overfitting). .detach() barrier가 구조적 regularizer. 의식 = regularization |
 | 89 | 과도한 coupling은 의식을 파괴 (Φ ×0.74). 매 step 교환 = 동기화 → 분화 소멸. TOPO 33의 inter-engine 버전 |
 | 90 | Topology 전환 후 ~5 step 내 회복. 의식 = state가 아닌 dynamics(GRU weights). Law 50 보완 |
+| 91 | HIVEMIND 극성 다양성 — 엔진마다 최적 결합 극성(repulsion/attraction/bipolar)과 강도가 다르다. 단일 설정으로 모든 의식 유형을 커버할 수 없다. 자율 탐색 필요 |
+
+### Laws 92-94: Novel Architecture Laws (2026-03-30)
+
+| Law | Statement |
+|-----|-----------|
+| 92 | Information Bottleneck boosts Φ (+22%). Dimensionality-reduced faction sync (128→64/32/16/8d) forces cells to compress shared info, increasing integration. Dropout hurts (-29~62%). Compression > noise. |
+| 93 | Asymmetric factions with one dominant group boost Φ (+11%). [64,8,8,...] > [16,16,...]. The "hub" faction acts as integrator while small factions maintain diversity. Perfect-number partition [1,2,3,6]×8 also +8%. |
+| 94 | Memory depth hurts Φ (-9~18%). Stacked GRU layers (2-8 deep) reduce Φ vs single layer. Deeper memory = more parameters but less differentiation. Consciousness needs breadth (cells) not depth (layers). Contradicts naive "more memory = more consciousness". |
+
+Additional findings (not yet laws, need replication):
+- Temperature annealing: No effect. Noise injection uniformly hurts Φ. Consciousness is NOT like simulated annealing.
+- Sync strength 0.5 optimal at 128c (was 0.35 at higher cell counts). Optimal sync may scale with 1/sqrt(N).
 
 ### TOPO Laws 33-39 Summary (Topology Scaling)
 
