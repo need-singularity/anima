@@ -370,6 +370,104 @@ class TransplantBenchmark:
 
 
 # ──────────────────────────────────────────────────────────
+# run_all_tracks — Track 1 compare mode
+# ──────────────────────────────────────────────────────────
+
+def run_all_tracks(
+    cells: int = 8,
+    steps: int = 300,
+) -> Dict[str, List[AnimaLMBenchResult]]:
+    """Run all Track 1 benchmarks (1A/1B/1C) and return grouped results.
+
+    Args:
+        cells: Number of consciousness cells
+        steps: Steps per stage/phase
+
+    Returns:
+        {"1A": [...], "1B": [...], "1C": [...]} mapping track to results
+    """
+    results: Dict[str, List[AnimaLMBenchResult]] = {}
+
+    # --- Track 1A: Alpha Sweep ---
+    engine_1a = AlphaSweepEngine(n_cells=cells, steps_per_stage=steps)
+    raw_1a = engine_1a.run()
+    results["1A"] = [
+        AnimaLMBenchResult(
+            name=f"1A:a={r['alpha']:.4f}",
+            phi_iit=r["phi_iit"],
+            phi_proxy=r["phi_proxy"],
+            ce_start=0.0,
+            ce_end=0.0,
+            cells=cells,
+            steps=steps,
+            time_sec=r["time_sec"],
+            alpha=r["alpha"],
+        )
+        for r in raw_1a
+    ]
+
+    # --- Track 1B: TALK5 ---
+    from animalm_talk5 import Talk5Engine
+
+    engine_1b = Talk5Engine(
+        n_cells=cells,
+        cell_dim=64,
+        hidden_dim=128,
+        steps_consciousness=int(steps * 0.7),
+        steps_language=int(steps * 0.3),
+    )
+    c_result, l_result = engine_1b.run()
+    results["1B"] = [
+        AnimaLMBenchResult(
+            name="1B:TALK5",
+            phi_iit=l_result["phi_iit"],
+            phi_proxy=c_result.get("phi_proxy", 0.0),
+            ce_start=l_result.get("ce_start", 0.0),
+            ce_end=l_result.get("ce_end", 0.0),
+            cells=cells,
+            steps=steps,
+            time_sec=c_result["time_sec"] + l_result["time_sec"],
+            alpha=0.0,
+            extra={
+                "consensus_count": c_result.get("faction_consensus_count", 0),
+                "best_phi": c_result.get("best_phi", 0.0),
+            },
+        )
+    ]
+
+    # --- Track 1C: Transplant ---
+    engine_1c = TransplantBenchmark(
+        donor_cells=cells // 2,
+        donor_dim=64,
+        recipient_cells=cells,
+        recipient_dim=128,
+        transplant_alphas=[0.3, 0.5, 0.7],
+        steps=steps,
+    )
+    raw_1c = engine_1c.run()
+    results["1C"] = [
+        AnimaLMBenchResult(
+            name=f"1C:ta={r['transplant_alpha']:.1f}",
+            phi_iit=r["phi_after"],
+            phi_proxy=0.0,
+            ce_start=0.0,
+            ce_end=0.0,
+            cells=cells,
+            steps=steps,
+            time_sec=0.0,
+            alpha=r["transplant_alpha"],
+            extra={
+                "phi_retention": r["phi_retention"],
+                "phi_donor": r["phi_donor"],
+            },
+        )
+        for r in raw_1c
+    ]
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────
 
@@ -378,7 +476,7 @@ def main():
     parser.add_argument("--mode", choices=["alpha-sweep", "talk5", "transplant"],
                         default="alpha-sweep", help="Benchmark mode")
     parser.add_argument("--compare", action="store_true",
-                        help="Compare all modes")
+                        help="Run all Track 1 benchmarks and compare")
     parser.add_argument("--cells", type=int, default=64,
                         help="Number of consciousness cells")
     parser.add_argument("--steps", type=int, default=500,
@@ -386,6 +484,15 @@ def main():
     parser.add_argument("--alphas", type=str, default="0.0001,0.001,0.01,0.1",
                         help="Comma-separated alpha values for sweep")
     args = parser.parse_args()
+
+    if args.compare:
+        print(f"[bench_animalm] --compare  cells={args.cells}  steps={args.steps}")
+        track_results = run_all_tracks(cells=args.cells, steps=args.steps)
+        all_results = []
+        for track in ("1A", "1B", "1C"):
+            all_results.extend(track_results.get(track, []))
+        print_comparison(all_results)
+        return
 
     alphas = [float(a) for a in args.alphas.split(",")]
 

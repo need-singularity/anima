@@ -170,5 +170,30 @@ def test_transplant_benchmark():
     assert results[1]["transplant_alpha"] == 0.7
 
 
+def test_compare_all_tracks():
+    """run_all_tracks returns results for all three tracks."""
+    from bench_animalm import run_all_tracks
+
+    results = run_all_tracks(cells=4, steps=30)
+
+    # All three tracks present
+    assert "1A" in results
+    assert "1B" in results
+    assert "1C" in results
+
+    # Each track has at least one result
+    assert len(results["1A"]) > 0
+    assert len(results["1B"]) > 0
+    assert len(results["1C"]) > 0
+
+    # Verify result names follow naming convention
+    for r in results["1A"]:
+        assert r.name.startswith("1A:")
+    for r in results["1B"]:
+        assert r.name.startswith("1B:")
+    for r in results["1C"]:
+        assert r.name.startswith("1C:")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
