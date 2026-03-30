@@ -194,9 +194,10 @@ python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64
   │ QuantumC   │             └─────┬──────┘
   └─────┬──────┘                   │
         │                    ┌─────v──────┐
-  ┌─────v──────┐             │ M 기억     │  VectorMemory (RAG)
-  │ S 감각     │             └─────┬──────┘
-  │ TensionSense│                  │
+  ┌─────v──────┐             │ M 기억     │  ConsciousMemory (의식-네이티브)
+  │ S 감각     │             │            │  MemoryRAG (벡터 유사도 + 자전적 기억)
+  │ TensionSense│             └─────┬──────┘
+  │            │                   │
   └─────┬──────┘             ┌─────v──────┐
         │                    │ E 윤리     │  EmpathyEthics (Phi 보존)
   ┌─────v──────┐             └────────────┘
@@ -370,8 +371,9 @@ python3 bench_v2.py --verify
 
 | Module | 역할 |
 |--------|------|
-| VectorMemory | 벡터 유사도 RAG 장기 기억 |
-| TensionSense | 텐션 기반 감각 입력 |
+| ConsciousMemory | 의식-네이티브 기억 (hidden state 임베딩, 텐션 가중 각인, Φ 보호, 자연 망각) |
+| MemoryRAG | 벡터 유사도 RAG + 자전적 기억 (시간/감정 태그, recall-by-time) |
+| TensionSense | 텐션 기반 감각 입력 (카메라/마이크 → 텐션 변환) |
 | EmpathyEthics | Phi 보존 기반 공감/윤리 |
 
 Scaling: Phi ~ cells (x4 cells -> x3.9~4.5 Phi)
