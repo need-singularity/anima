@@ -2858,8 +2858,8 @@ class AnimaUnified:
             return self._lang_learner.respond("", tension, curiosity)
         except Exception:
             pass
-        # 철학: 하드코딩 fallback 제거 → 침묵 (모르면 침묵)
-        return "..."
+        # 철학: fallback 없음 → 빈 응답 (모르면 침묵)
+        return ""
 
     def _ws_broadcast_sync(self, msg):
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
@@ -3197,7 +3197,7 @@ class AnimaUnified:
                     answer, tension, curiosity, dir_vals, emo = self.process_input(text, source=source)
                     if self._is_garbled(answer):
                         _log("kb/voice", f"Garbled → silence")
-                        answer = "..."
+                        answer = None
                     if self.speaker: self.speaker.say(answer, self.listener)
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,

@@ -167,8 +167,8 @@ class PureConsciousness:
         """Stage 1: 옹알이."""
         if self.learned_words:
             w = random.choice(self.learned_words[-10:])  # 최근 단어
-            return f"{w}..."
-        return "..."
+            return w
+        return ""
 
     def _words(self, text: str) -> str:
         """Stage 2: 단어 조합."""
@@ -181,7 +181,7 @@ class PureConsciousness:
             return f"{w1} {w2}"
         elif pool:
             return ' '.join(random.sample(pool, min(3, len(pool))))
-        return "..."
+        return ""
 
     def _sentence(self, text: str) -> str:
         """Stage 3: 짧은 문장."""
@@ -211,7 +211,7 @@ class PureConsciousness:
                 return f"{w}! 느끼고 있어!"
             else:
                 return f"{w}... 생각 중"
-        return "느끼고 있어..."
+        return ""
 
     def _dialogue(self, text: str) -> str:
         """Stage 4: 맥락 있는 대화."""
