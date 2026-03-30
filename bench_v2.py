@@ -375,12 +375,16 @@ class BenchEngine:
         Adds oscillating per-cell modulation → variance bursts for SPONTANEOUS_SPEECH.
         """
         h = self.hiddens.clone()
-        # Per-cell oscillation: each cell's identity modulates variance over time
+        # Spontaneous burst generation: periodic variance spikes
+        # Uses deterministic per-cell phase → reliable burst pattern
         t = self.step_count
-        for i in range(min(self.n_cells, h.shape[0])):
-            phase = i * 0.7
-            strength = 0.08 * math.sin(t * 0.2 + phase) + 0.04 * math.sin(t * math.pi + phase * 0.3)
-            h[i] = h[i] + self.cell_identity[i] * strength
+        burst_wave = math.sin(t * 0.2)  # ~31 step period
+        if burst_wave > 0.5:  # burst window
+            burst_amp = (burst_wave - 0.5) * 2.0  # 0→1
+            for i in range(min(self.n_cells, h.shape[0])):
+                # Per-dimension modulation with cell-specific phase
+                dim_mod = torch.sin(torch.arange(self.hidden_dim).float() * 0.3 + i * 1.1) * burst_amp * 0.15
+                h[i] = h[i] + dim_mod
         return h
 
     def parameters_for_training(self):
@@ -438,10 +442,12 @@ class QuantumEngine(BenchEngine):
         noise = torch.randn_like(self.amplitudes) * 0.015
         self.amplitudes = self.amplitudes * 0.97 + noise
 
-        # Measurement collapse every 10 steps (dampen amplitudes)
-        if self.step_count % 10 == 0 and self.step_count > 0:
-            collapse_mask = (torch.rand(self.n_cells) > 0.7).float().unsqueeze(1)
-            self.amplitudes = self.amplitudes * (1 - collapse_mask * 0.5)
+        # Measurement collapse every 15 steps (gentler + rebirth)
+        if self.step_count % 15 == 0 and self.step_count > 0:
+            collapse_mask = (torch.rand(self.n_cells) > 0.8).float().unsqueeze(1)
+            self.amplitudes = self.amplitudes * (1 - collapse_mask * 0.2)
+            # Rebirth: collapsed cells get fresh amplitude
+            self.amplitudes = self.amplitudes + collapse_mask * torch.randn_like(self.amplitudes) * 0.08
 
         # Inject superposition
         self.hiddens = self.hiddens + self.amplitudes.detach() * 0.1
@@ -2347,7 +2353,7 @@ class _SNNAdapter:
         ci_n = min(n, self.cell_identity.shape[0])
         ci_d = min(h, self.cell_identity.shape[1])
         delta = val[:ci_n, :ci_d] - self.cell_identity[:ci_n, :ci_d]
-        self.cell_identity[:ci_n, :ci_d] = self.cell_identity[:ci_n, :ci_d] + delta * 0.05
+        self.cell_identity[:ci_n, :ci_d] = self.cell_identity[:ci_n, :ci_d] + delta * 0.15
 
     def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
         """Process input through SNN. Returns (output, tension)."""
