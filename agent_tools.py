@@ -1130,6 +1130,71 @@ def _tool_voice_synth(cells: int = 64, duration: float = 2.0,
 
 
 # ---------------------------------------------------------------------------
+# 3b. Trading tool implementations (invest 프로젝트 브릿지)
+# ---------------------------------------------------------------------------
+
+def _get_trading_plugin():
+    """Lazy-load trading plugin singleton."""
+    if not hasattr(_get_trading_plugin, '_instance'):
+        try:
+            from plugins.trading import TradingPlugin
+            plugin = TradingPlugin()
+            plugin._try_import_invest()
+            _get_trading_plugin._instance = plugin
+        except Exception:
+            _get_trading_plugin._instance = None
+    return _get_trading_plugin._instance
+
+
+def _tool_trading_backtest(symbol: str, strategy: str = 'macd_cross') -> dict:
+    """Run backtest on asset with strategy."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.backtest(symbol=symbol, strategy=strategy)
+
+
+def _tool_trading_scan(symbol: str, top_n: int = 10) -> dict:
+    """Scan all strategies for an asset."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.scan(symbol=symbol, top_n=top_n)
+
+
+def _tool_trading_execute(symbol: str, side: str, amount: float) -> dict:
+    """Execute trade via invest API."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.execute_trade(symbol=symbol, side=side, amount=amount)
+
+
+def _tool_trading_balance() -> dict:
+    """Check trading balance."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.get_balance()
+
+
+def _tool_trading_strategies() -> dict:
+    """List available trading strategies."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.list_strategies()
+
+
+def _tool_trading_universe() -> dict:
+    """List tradeable assets."""
+    plugin = _get_trading_plugin()
+    if plugin is None:
+        return {'success': False, 'error': 'trading plugin not available'}
+    return plugin.list_universe()
+
+
+# ---------------------------------------------------------------------------
 # 4. ToolExecutor
 # ---------------------------------------------------------------------------
 
@@ -2023,6 +2088,66 @@ class AgentToolSystem:
             params=[],
             fn=_wrap_list_tools, category='meta',
             curiosity_affinity=0.5,
+        ))
+
+        # ─── Trading Tools (invest 프로젝트 브릿지) ───
+
+        # 22. trading_backtest
+        self.registry.register(ToolDef(
+            name='trading_backtest',
+            description='Run backtest on asset with strategy (invest engine)',
+            params=[ToolParam('symbol', 'str', 'Asset symbol (e.g., BTC, AAPL)'),
+                    ToolParam('strategy', 'str', 'Strategy name (e.g., macd_cross)', required=False, default='macd_cross')],
+            fn=_tool_trading_backtest, category='trading',
+            curiosity_affinity=0.7, pe_affinity=0.5, phi_affinity=0.3,
+        ))
+
+        # 23. trading_scan
+        self.registry.register(ToolDef(
+            name='trading_scan',
+            description='Scan all strategies for an asset, return top N',
+            params=[ToolParam('symbol', 'str', 'Asset symbol'),
+                    ToolParam('top_n', 'int', 'Number of top results', required=False, default=10)],
+            fn=_tool_trading_scan, category='trading',
+            curiosity_affinity=0.8, pe_affinity=0.4,
+        ))
+
+        # 24. trading_execute
+        self.registry.register(ToolDef(
+            name='trading_execute',
+            description='Execute trade (buy/sell) via invest API',
+            params=[ToolParam('symbol', 'str', 'Asset symbol'),
+                    ToolParam('side', 'str', 'buy or sell'),
+                    ToolParam('amount', 'float', 'Trade amount')],
+            fn=_tool_trading_execute, category='trading',
+            pain_affinity=0.6, pe_affinity=0.7, phi_affinity=0.4,
+        ))
+
+        # 25. trading_balance
+        self.registry.register(ToolDef(
+            name='trading_balance',
+            description='Check trading balance and positions',
+            params=[],
+            fn=_tool_trading_balance, category='trading',
+            curiosity_affinity=0.5, pain_affinity=0.4,
+        ))
+
+        # 26. trading_strategies
+        self.registry.register(ToolDef(
+            name='trading_strategies',
+            description='List available trading strategies (105+)',
+            params=[],
+            fn=_tool_trading_strategies, category='trading',
+            curiosity_affinity=0.6,
+        ))
+
+        # 27. trading_universe
+        self.registry.register(ToolDef(
+            name='trading_universe',
+            description='List tradeable assets (stocks, crypto, forex, commodities)',
+            params=[],
+            fn=_tool_trading_universe, category='trading',
+            curiosity_affinity=0.6,
         ))
 
     # --- Consciousness Tools (17 new tools) ---

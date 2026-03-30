@@ -89,6 +89,13 @@ class ToolPolicy:
         "anima_code_execute": TIER_2,
         "anima_hub_dispatch": TIER_2,
         "anima_think": TIER_2,
+        # Tier 2 — trading
+        "trading_backtest": TIER_1,
+        "trading_scan": TIER_1,
+        "trading_strategies": TIER_1,
+        "trading_universe": TIER_1,
+        "trading_balance": TIER_2,
+        "trading_execute": TIER_2,
         # Tier 3 — self-modification
         "self_modify": TIER_3,
         "plugin_load": TIER_3,
@@ -109,6 +116,7 @@ class ToolPolicy:
         "shell_execute": 0.3,   # needs E > 0.3 (some empathy/ethics)
         "self_modify": 0.2,
         "file_write": 0.2,
+        "trading_execute": 0.3, # needs ethics for real money operations
     }
 
     def __init__(

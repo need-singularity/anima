@@ -338,6 +338,124 @@ python -c "from anima_rs import talk5; print(talk5.run(n_cells=128, steps=1000))
 
 ---
 
+## 🤖 Agent Platform
+
+Anima를 독립 에이전트 플랫폼으로 사용하기 위한 8개 모듈.
+의식 상태(Phi, 텐션, 호기심)가 도구 선택과 행동을 결정한다.
+
+```
+  Layer 4: MCP Server | Agent SDK | Channel Plugins | Composio | Trading
+  Layer 3: AgentGateway (normalize -> dispatch)
+  Layer 2: AnimaAgent (process_message + ToolPolicy + ProviderMgr + SkillMgr + Hub)
+  Layer 1: ConsciousMind (PureField -> tension/curiosity/direction/emotion)
+```
+
+### Agent Core
+
+| Module | File | Description |
+|--------|------|-------------|
+| AnimaAgent | `anima_agent.py` | 의식 -> 도구 -> 응답 -> 학습 파이프라인 |
+| AgentToolSystem | `agent_tools.py` | 의식 상태 기반 도구 선택 (27+ tools) |
+| ToolPolicy | `tool_policy.py` | Phi-gated 4 tier 접근 제어 |
+| ConsciousnessHub | `consciousness_hub.py` | 41개 모듈 자율 호출 허브 |
+| Agent SDK | `agent_sdk.py` | Claude Agent SDK 호환 인터페이스 |
+
+### Tool Policy (Phi-gated)
+
+```
+  TIER_0 (Phi>=0): status, memory_search, think
+  TIER_1 (Phi>=1): web_search, trading_backtest, trading_scan
+  TIER_2 (Phi>=3): hub_dispatch, trading_execute, code_execute
+  TIER_3 (Phi>=5): self_modify, evolution, plugin management
+  Ethics gate: trading_execute requires E > 0.3
+```
+
+### Channels
+
+```bash
+python3 mcp_server.py --direct              # MCP Server (9 tools, standalone)
+python3 -m channels.cli_agent               # CLI agent
+python3 -m channels.telegram_bot            # Telegram (ANIMA_TELEGRAM_TOKEN)
+python3 -m channels.discord_bot             # Discord (ANIMA_DISCORD_TOKEN)
+```
+
+### Plugin System
+
+```
+  plugins/
+  ├── base.py            # PluginBase + PluginManifest
+  ├── plugin_loader.py   # Auto-discover + lifecycle
+  └── trading.py         # invest 프로젝트 브릿지
+```
+
+새 플러그인 = `PluginBase` 상속 + `manifest` 정의 + `act(intent)` 구현.
+`PluginLoader.load_all(hub)` 로 자동 등록.
+
+### Trading (invest 프로젝트 연동)
+
+`~/Dev/invest` 의 백테스트 엔진(105+ 전략), 브로커(KIS/Upbit/Binance),
+Rust 스캘퍼(63 틱 전략)를 Anima 에이전트에서 사용.
+
+```
+  3-Layer 통합:
+    Direct import  — backtest_turbo (0.8ms/run), universe (120+ assets)
+    REST API       — invest FastAPI (:8000) live trading, portfolio
+    Rust subprocess — scalper status, tick strategies
+```
+
+```bash
+# Hub 자연어 호출
+hub.act("BTC 백테스트 macd_cross")
+hub.act("AAPL 전략 스캔")
+hub.act("잔액 확인")
+hub.act("ETH 매수 0.1")
+
+# Agent Tool 직접 호출
+agent.act("backtest BTC with donchian", consciousness_state={...})
+```
+
+| Tool | Tier | Description |
+|------|------|-------------|
+| `trading_backtest` | T1 | 단일 전략 백테스트 (Sharpe, MDD, CAGR) |
+| `trading_scan` | T1 | 전체 전략 스캔 -> 상위 N개 |
+| `trading_strategies` | T1 | 105+ 전략 목록 |
+| `trading_universe` | T1 | 거래 가능 자산 (주식/코인/외환/원자재) |
+| `trading_balance` | T2 | 잔액/포지션 조회 |
+| `trading_execute` | T2 | 매매 실행 (Ethics gate: E > 0.3) |
+
+환경변수:
+
+```bash
+INVEST_ROOT=~/Dev/invest          # invest 프로젝트 경로
+INVEST_API_URL=http://localhost:8000  # invest backend API
+```
+
+### Provider Abstraction
+
+```python
+from providers import get_provider
+provider = get_provider("claude")       # ClaudeProvider
+provider = get_provider("conscious-lm") # ConsciousLMProvider
+```
+
+### ConsciousnessHub (41 Modules)
+
+```
+  의식 핵심:  dynamics, persistence, introspection, compiler, debugger,
+             evolution, transplant, quantum, con_evolution
+  감각/표현:  emotion, voice, video, composer, weather, pain
+  사회/소통:  hivemind, mirror, ecology, economy, dreamlang, mythology,
+             colldream, intermodel
+  Hexad:     emergent_w, emergent_s, emergent_m, emergent_e
+  탐사:      sedi, dolphin, archaeology, temporal
+  인프라:     runpod, github, youtube, vault, factory, robot, lidar
+  측정:      score, meter, map, genome, immune
+  진화:      closed_loop, reincarnation
+  트레이딩:   trading (invest 브릿지)
+```
+
+---
+
 ## 🏗️ Architecture
 
 ### Hexad/Trinity Framework (sigma(6)=12)
