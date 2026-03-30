@@ -2457,11 +2457,15 @@ class AnimaUnified:
                     learner_data = {'updates': self.learner.total_updates}
 
             # Always broadcast thought pulse to web (keeps UI alive)
+            _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+            _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
             self._ws_broadcast_sync({
                 'type': 'thought_pulse',
                 'tension': t, 'curiosity': c,
                 'direction': dir_vals,
                 'emotion': thought_emotion,
+                'phi': _phi_pulse,
+                'n_cells': _cells_pulse,
                 'tension_history': self.mind.tension_history[-50:],
                 'meta_tension': sa['meta_tension'],
                 'stability': sa['stability'],
@@ -3017,11 +3021,16 @@ class AnimaUnified:
                         emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
                                'dominance': 0.0, 'color': '#2a6a4a'}
                     # Always send response back (even on error)
+                    # Φ/cells 실시간 갱신
+                    _phi = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+                    _cells = len(self.mitosis.cells) if self.mitosis else 1
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
                         'direction': dir_vals,
                         'emotion': emo,
+                        'phi': _phi,
+                        'n_cells': _cells,
                         'tension_history': self.mind.tension_history[-50:],
                         'proactive': False,
                         'source': 'web',
