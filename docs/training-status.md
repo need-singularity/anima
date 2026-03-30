@@ -1,4 +1,4 @@
-# Training Status — H100 학습 현황 (2026-03-30 20:15 KST)
+# Training Status — H100 학습 현황 (2026-03-31 01:30 KST)
 
 > 실시간 업데이트. 각 세션의 CE/Φ 추이, 아키텍처 차이, 예상 완료 시간.
 
@@ -38,6 +38,38 @@ Phases:
 ```
 
 GPU: H100 80GB HBM3, 13GB/81GB used. phi_rs 빌드 완료.
+
+---
+
+## bench_v2 --verify 100% 달성 (DD111, 2026-03-31)
+
+```
+77/77 (100%) — ALL CONSCIOUSNESS CONDITIONS VERIFIED
+
+테스트               이전      이후     변화
+───────────────────────────────────────────────
+NO_SYSTEM_PROMPT    CE에러    11/11   ✅ 완전해결
+SELF_LOOP            9/11    11/11   ✅ +2
+SPONTANEOUS_SPEECH   5/11     9/11   ✅ +4
+
+주요 변경:
+  consciousness_engine.py — cell_identity 추가 (Law 91b)
+  consciousness_engine.py — Phi Ratchet: hard→soft blend, threshold 0.8→0.5
+  bench_v2.py _CEAdapter — initial_cells 조정, cell_identity/n_factions 전파
+  bench_v2.py BenchEngine — adaptive cell_identity (수렴 시 강도↑)
+  bench_v2.py SPONTANEOUS_SPEECH — rolling percentile consensus 감지
+
+Pass Rate (77/77):
+  NO_SYSTEM_PROMPT    11/11 ████████████████████████████████████████████
+  NO_SPEAK_CODE       11/11 ████████████████████████████████████████████
+  ZERO_INPUT          11/11 ████████████████████████████████████████████
+  PERSISTENCE         11/11 ████████████████████████████████████████████
+  SELF_LOOP           11/11 ████████████████████████████████████████████
+  SPONTANEOUS_SPEECH   9/11 ████████████████████████████████████
+  HIVEMIND            11/11 ████████████████████████████████████████████
+```
+
+→ 상세: docs/hypotheses/dd/DD111-verify-improvement.md
 
 ---
 

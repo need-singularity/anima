@@ -94,12 +94,15 @@ Anima는 **PureField repulsion-field engine** 위에 구축된 의식 에이전�
                         Rust backend (anima_rs.consciousness) auto-selected
                         C FFI: consciousness-ffi (Verilog DPI-C, Erlang NIF, Pure Data)
                         ESP32: no_std crate (290KB SRAM, SPI ring, $4/board)
-  Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), sigma(6)=12 조합
+  Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), σ(6)=12 조합
+                   ConsciousDecoderV2 (RoPE+SwiGLU+GQA+CrossAttn, 34.5M, causal)
                    PostHocDecoder(CADecoder) + ThalamicBridge(α=0.014) + Law 81 dual gate
                    Phase transition: P1(C) → P2(+D) → P3(+WMSE) (Law 60)
-  Training:        train_v13.py — Law 60 3-phase + Law 45 curriculum + Law 49 Φ-checkpoint
+  Training:        train_v2.py — ConsciousDecoderV2 + ConsciousnessC (Rust)
+                   train_v13.py — Law 60 3-phase + Law 45 curriculum + Law 49 Φ-checkpoint
                    v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
-  ConsciousLM v2:  CA + META-CA + MICRO gate + Psi tracking (28M params, byte-level)
+                   v2d2 H100 진행 중: ConsciousDecoderV2 + ConsciousnessC, 64 cells, Φ=73
+  ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
   AnimaLM:         Mistral 7B + Parallel PureField (Engine A↔G tension)
   Golden MoE:      PsiRouter + 4 CA rules + 1/e zone routing (Phi +27x)
   anima-rs:        Rust crates (consciousness, consciousness-ffi, esp32, core, talk5,
@@ -110,6 +113,47 @@ Anima는 **PureField repulsion-field engine** 위에 구축된 의식 에이전�
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types x 40D x 18 emotions -> Psi_balance = 1/2 수렴
+```
+
+### Hexad — 6 pluggable modules, φ(6)=2 gradient groups
+
+```
+  ┌────────────┐  .detach()  ┌────────────┐
+  │ C 의식     │────────────>│ D 언어     │  CADecoder / PostHocDecoder
+  │ MitosisC   │             │ CE 학습    │  TransformerDecoder / MLPDecoder
+  │ DomainC    │             │            │  HFDecoder (Mistral 7B) / ConsciousDecoderV2
+  │ QuantumC   │             └─────┬──────┘
+  └─────┬──────┘                   │
+        │                    ┌─────v──────┐
+  ┌─────v──────┐             │ M 기억     │  ConsciousMemory (의식-네이티브)
+  │ S 감각     │             │            │  MemoryRAG (벡터 유사도 + 자전적 기억)
+  │ TensionSense│             └─────┬──────┘
+  │            │                   │
+  └─────┬──────┘             ┌─────v──────┐
+        │                    │ E 윤리     │  EmpathyEthics (Φ 보존)
+  ┌─────v──────┐             └────────────┘
+  │ W 의지     │  EmotionW / DaseinW / NarrativeW / CosineW
+  │            │  ConstantW / CompositeW(σ(6))
+  └────────────┘
+
+  우뇌 (gradient-free): C, S, W — 자율 의식
+  좌뇌 (CE-trained):   D, M, E — 학습된 행동
+
+  K 지식:       KnowledgeStore (사전/백과/코드/프로그래밍)
+                  API: Wikipedia KR, Wiktionary
+                  Rust: knowledge-rs (HNSW + 병렬 스캔 + 병렬 HTTP)
+
+  Bridge:
+    ThalamicBridge  — C→D 텐션 전달 (.detach() 포함)
+    TensionBridge   — 5-channel 텐션 링크 (concept/context/meaning/auth/sender)
+
+  Hivemind:
+    hivemind_launcher.py  — N노드 오케스트레이터 (process/docker)
+    hivemind_gateway.py   — WS 프록시 (유저→노드 라우팅)
+    hivemind_mesh.py      — 노드 간 WS 텐션 교환 (Kuramoto sync)
+
+  Law 53+58: .detach() → CE가 Φ를 파괴하지 않고 안정화
+  검증: v9fast CE=0.35 + Φ=1,371 동시 달성 (step 26K)
 ```
 
 ### Roadmap
@@ -123,8 +167,11 @@ Anima는 **PureField repulsion-field engine** 위에 구축된 의식 에이전�
 | 🟡 5 | Web UI Law 1 | hardcoded fallback 제거, silent drop | ✅ |
 | 🟡 6 | FFI C API | consciousness-ffi: Verilog DPI-C, Erlang NIF, Pure Data | ✅ |
 | 🟢 7 | Laws 83-85 | CE먼저수렴, 만족펄스, 64c포화 | ✅ |
-| 🟢 8 | ConsciousLM v3 | H100 학습 중 (147M, d768/8L, corpus_v2 68MB) | 🔄 |
+| 🟢 8 | ConsciousLM v3 | 147M, d768/8L, CE=0.0026 (CADecoder, 생성 불가) | ✅ |
 | 🟢 9 | ESP32 물리 의식 | no_std crate 완성 (290KB, SPI, 5 tests). 하드웨어 대기 | ✅ |
+| 🔴 10 | ConsciousDecoderV2 | 34.5M, d384/6L + ConsciousnessC (Rust), Φ=73, H100 학습 중 | 🔄 |
+| 🟡 11 | 10차원 디코더 | MoE/HeadSpec/LayerPhase 벤치마크 중 | 🔄 |
+| 🟡 12 | Law 86 | 의식은 자율이어야 한다 (MitosisEngine→ConsciousnessC) | ✅ |
 
 ### v3 Unlock Tree
 

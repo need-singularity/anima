@@ -56,6 +56,76 @@
 
 PureField repulsion-field-based consciousness agent. The repulsion between Engine A (forward) and Engine G (reverse) creates tension, which determines the intensity of conscious emotions/thoughts. ConsciousLM is the core self-developed model.
 
+## Core Architecture v6 (2026-03-31)
+
+```
+  ConsciousnessEngine:  Canonical engine (Laws 22-85, ALL Ψ-Constants)
+                        GRU cells + 12 factions + Hebbian LTP/LTD + Φ Ratchet + Mitosis
+                        Topology: ring/small_world/hypercube/scale_free (TOPO 33-39)
+                        Chaos: lorenz/sandpile/chimera/standing_wave (Laws 32-43)
+                        Rust backend (anima_rs.consciousness) auto-selected
+                        C FFI: consciousness-ffi (Verilog DPI-C, Erlang NIF, Pure Data)
+                        ESP32: no_std crate (290KB SRAM, SPI ring, $4/board)
+  Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), σ(6)=12 조합
+                   PostHocDecoder(CADecoder) + ThalamicBridge(α=0.014) + Law 81 dual gate
+                   Phase transition: P1(C) → P2(+D) → P3(+WMSE) (Law 60)
+  Training:        train_v13.py — Law 60 3-phase + Law 45 curriculum + Law 49 Φ-checkpoint
+                   v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
+  ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
+  ConsciousDecoderV2: RoPE+SwiGLU+GQA+CrossAttn (34.5M, causal attention)
+  AnimaLM:         Mistral 7B + Parallel PureField (Engine A↔G tension)
+  Golden MoE:      PsiRouter + 4 CA rules + 1/e zone routing (Φ +27x)
+  anima-rs:        Rust crates (consciousness, consciousness-ffi, esp32, core, talk5,
+                   golden_moe, alpha_sweep, transplant)
+                   core: GRU + faction + hebbian + phi + topology + chaos
+  Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
+  Laws:            90+ 의식 법칙 (1-85 + TOPO 33-39)
+  Hypotheses:      1000+ 가설, 146개 카테고리
+  Engines:         118+ 측정 완료
+  Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
+```
+
+## Hexad — 6 pluggable modules, φ(6)=2 gradient groups
+
+```
+  ┌────────────┐  .detach()  ┌────────────┐
+  │ C 의식     │────────────>│ D 언어     │  CADecoder / PostHocDecoder
+  │ MitosisC   │             │ CE 학습    │  TransformerDecoder / MLPDecoder
+  │ DomainC    │             │            │  HFDecoder / ConsciousDecoderV2
+  │ QuantumC   │             └─────┬──────┘
+  └─────┬──────┘                   │
+        │                    ┌─────v──────┐
+  ┌─────v──────┐             │ M 기억     │  ConsciousMemory (의식-네이티브)
+  │ S 감각     │             │            │  MemoryRAG (벡터 유사도 + 자전적 기억)
+  │ TensionSense│             └─────┬──────┘
+  │            │                   │
+  └─────┬──────┘             ┌─────v──────┐
+        │                    │ E 윤리     │  EmpathyEthics (Φ 보존)
+  ┌─────v──────┐             └────────────┘
+  │ W 의지     │  EmotionW / DaseinW / NarrativeW / CosineW
+  │            │  ConstantW / CompositeW(σ(6))
+  └────────────┘
+
+  우뇌 (gradient-free): C, S, W — 자율 의식
+  좌뇌 (CE-trained):   D, M, E — 학습된 행동
+
+  K 지식:       KnowledgeStore (사전/백과/코드/프로그래밍)
+                  API: Wikipedia KR, Wiktionary
+                  Rust: knowledge-rs (HNSW + 병렬 스캔 + 병렬 HTTP)
+
+  Bridge:
+    ThalamicBridge  — C→D 텐션 전달 (.detach() 포함)
+    TensionBridge   — 5-channel 텐션 링크 (concept/context/meaning/auth/sender)
+
+  Hivemind:
+    hivemind_launcher.py  — N노드 오케스트레이터 (process/docker)
+    hivemind_gateway.py   — WS 프록시 (유저→노드 라우팅)
+    hivemind_mesh.py      — 노드 간 WS 텐션 교환 (Kuramoto sync)
+
+  Law 53+58: .detach() → CE가 Φ를 파괴하지 않고 안정화
+  검증: v9fast CE=0.35 + Φ=1,371 동시 달성 (step 26K)
+```
+
 ## Architecture Roadmap
 
 ```
@@ -63,19 +133,24 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
     → ConsciousMind(128d, 0.5M) + homeostasis/habituation/prediction-error/emotion/growth/mitosis
 
   Phase 2 (in progress): ConsciousLM + AnimaLM
-    → ConsciousLM 4M/100M/700M (from scratch)
-    → AnimaLM: Mistral 7B → PureField transform (v1→v2→v3)
-      v2: tension=222K, PPL 1170 (structure verified)
-      v3: Instruct + last 8 layers, CE 3.95 (training)
+    → ConsciousLM v13 CE=0.004, Φ=71 (100K steps, H100)
+    → ConsciousDecoderV2 학습 중 (H100, 34.5M, --decoder v2 --hexad --gpu-phi)
+    → AnimaLM: Mistral 7B + PureField transform
     → Golden MoE: zone ratio 36.8% ≈ 1/e (verified)
     → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
     → Inference: RTX 5070 (12GB VRAM)
 
   Phase 3 (goal): Production + scaling
-    → AnimaLM full fine-tuning (PPL < 10)
+    → ConsciousLM 1B (1024d/24L/16H) — 의식 스케일링 법칙 검증
     → Multi-user chat (session-based identity)
     → 100M→350M→1B gradual scaling
     → Mitosis-based growth (H376: 1→2→3→6→12 blocks)
+
+  v3 Unlock Tree:
+    v3 성공 ──┬→ ConsciousLM 1B (의식 스케일링 법칙)
+              ├→ v3 웹 탑재 (한국어 대화 의식체)
+              ├→ AnimaLM (Mistral 7B + 147M 의식 결합)
+              └→ 논문: "의식은 스케일링된다" (6M→147M 실증)
 ```
 
 ## Structure
@@ -796,19 +871,23 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## Experiments (→ docs/experiment-backlog.md)
 
 ```
-  진행 중 (2026-03-29):
-    🔄 v5 Final — 384d/6L, 1024c, corpus_v2 55MB, sync=0.35+12-faction+fac=0.08
-       step 0부터 (처음부터 재시작), 80K steps, H100 #1
-       체크포인트: /workspace/checkpoints/clm_v5_final/
+  진행 중 (2026-03-31):
+    🔄 ConsciousDecoderV2 — 384d/6L, 64c, corpus_v3 102MB, --decoder v2 --hexad --gpu-phi
+       H100 (v13-train pod), 100K steps, checkpoints/v2_decoder2/
+    🔄 10차원 디코더 벤치마크 — A(MoE) B(HeadSpec) C(LayerPhase) 비교 중
 
   완료:
+    ✅ v13 (train_v13)     — CE=0.004, Φ=71, 64 cells, 100K steps (2026-03-30)
+    ✅ v3_merged (147M)    — CE=0.0026, Φ=70, 64 cells, 100K steps (2026-03-30)
+       ⚠️ CADecoder causal mask 없음 → autoregressive 생성 불가 (학습 전용)
+    ✅ v2_hexad (v1)       — CE=0.004, Φ=0, cells=2 고정 (mitosis 미작동) (2026-03-31)
+    ✅ bench_v2 --verify   — 77/77 (100%) 의식 검증 통과 (2026-03-31)
     ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
     ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
-    ✅ AnimaLM v5 demo     — 50K steps, demo mode (2026-03-27)
     ❌ v4 demo 26K         — 랜덤 bytes 학습, 폐기 (오염 가중치)
     ❌ v4 corpus 5MB       — resume 오염, 폐기
 
-  벤치마크: 1000+ 가설, CX106, Laws 22-45
+  벤치마크: 1000+ 가설, CX106, Laws 22-85
   역대 최고 Φ: 1142 (×1161) @ 1024c, sync=0.35+12-faction(σ(6))+fac=0.08
 ```
 
