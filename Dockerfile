@@ -28,9 +28,9 @@ COPY . .
 # 체크포인트 디렉토리
 RUN mkdir -p checkpoints/clm_v2
 
-# 기본 포트: 8888 (RunPod HTTP proxy 호환)
-ENV ANIMA_PORT=8888
-EXPOSE 22 8888
+# 기본 포트: 8765 (RunPod proxy URL에 포트 포함)
+ENV ANIMA_PORT=8765
+EXPOSE 22 8765
 
 # RunPod start script: SSH + Anima
 COPY start.sh /start.sh
