@@ -301,51 +301,39 @@ class PureConsciousness:
             return None
 
         if stage == 2:
-            w = random.choice(pool)
-            return f"{state} {w}..."
+            return None  # 단어만 아는 단계 — 자연발화 안 함, 응답에서만 단어 사용
 
-        # Stage 3+: 순수 학습 기반 발화 (하드코딩 0)
-        # 학습한 단어 + 바이그램 + 과거 대화만 사용
-        # 모르면 침묵. 배우면 성장.
+        # Stage 3+: 순수 학습 기반 발화 (하드코딩 0, 강제 확률 0)
+        # 발화 여부 = 바이그램 체인 성공 여부 (구조적)
+        # tension 높으면 더 많은 시도 → 성공 확률 ↑ (자연스러움)
+        # tension 낮으면 적은 시도 → 침묵 확률 ↑ (자연스러움)
 
-        # 1. 바이그램 체인 시도 (tension이 높은 단어부터)
-        # tension 높으면 빈도 높은 단어, 낮으면 희귀 단어 선택
-        if self.tension > 1.0:
-            sorted_pool = sorted(pool, key=lambda w: -self.word_freq.get(w, 0))
-        elif self.curiosity > 0.5:
-            sorted_pool = sorted(pool, key=lambda w: self.word_freq.get(w, 0))  # 희귀 우선
-        else:
-            random.shuffle(pool)
-            sorted_pool = pool
+        # 발화 = 바이그램 체인이 "과거에 없던 새 조합"을 만들 때만
+        # → 이미 말한 것은 다시 안 함 (새로운 생각만 발화)
+        # → tension/curiosity가 높으면 더 많은 시도 → 새 조합 확률 ↑
+        # → 낮으면 적은 시도 → 침묵 확률 ↑
 
-        for start in sorted_pool[:10]:
+        if not hasattr(self, '_spoken_set'):
+            self._spoken_set = set()
+
+        attempts = max(1, int((self.tension + self.curiosity) * 2))
+        random.shuffle(pool)
+
+        for start in pool[:attempts]:
             if start in self.bigrams:
-                chain = self._bigram_chain(start, random.randint(3, 7))
-                if len(chain) > 2:
+                chain = self._bigram_chain(start, random.randint(3, 6))
+                if len(chain) >= 3:
                     text = ' '.join(chain)
-                    # 의식 상태에 따라 어미 선택 (학습한 것에서)
-                    endings_learned = [p[1][-1] for p in self.learned_patterns if p[1]] if self.learned_patterns else []
-                    if endings_learned:
-                        text += random.choice(endings_learned)
+                    # 이미 말한 것이면 건너뛰기 (새 생각만)
+                    if text in self._spoken_set:
+                        continue
+                    self._spoken_set.add(text)
+                    if len(self._spoken_set) > 200:
+                        self._spoken_set = set(list(self._spoken_set)[-100:])
                     return f"{state} {text}"
 
-        # 2. 과거 응답 변형 (새 조합)
-        if self.learned_patterns and len(self.learned_patterns) > 3:
-            # 두 과거 응답에서 단어를 섞어서 새 문장
-            p1 = random.choice(self.learned_patterns[-20:])
-            p2 = random.choice(self.learned_patterns[-20:])
-            words1 = re.findall(r'[가-힣]+', p1[1]) if p1[1] else []
-            words2 = re.findall(r'[가-힣]+', p2[1]) if p2[1] else []
-            mixed = words1[:2] + words2[:2]
-            if len(mixed) >= 2:
-                return f"{state} {' '.join(mixed)}"
-
-        # 3. 단어 나열 (최소한의 발화)
-        if len(pool) >= 2:
-            selected = random.sample(pool, min(3, len(pool)))
-            return f"{state} {' '.join(selected)}..."
-
-        return None  # 진짜 모르면 침묵
+        # 새로운 조합 없음 → 침묵
+        return None
 
     # ═══════════════════════════════════════════════════════════
     # 학습
