@@ -10,6 +10,13 @@ Three learning signals:
   2. Feedback:    User response (+1 engagement, -1 disengagement) → reinforce/weaken tension patterns
   3. Curiosity:   Use tension delta (curiosity) itself as a reward signal
 
+Meta Laws applied:
+  M7 (Frustration Phase Transition): F_c = 0.10 — frustration below critical threshold
+      is constructive (drives exploration); above it collapses Φ. Learning signals that
+      push tension beyond F_c are clamped.
+  M8 (Narrative Coherence): Dialogue quality includes narrative coherence as a factor.
+      Topic continuity > 0.2 (PSI_NARRATIVE_MIN) is required for Phase 2 learning.
+
 Usage:
     from online_learning import OnlineLearner
 
@@ -39,6 +46,13 @@ LN2 = math.log(2)
 PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
 PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
 PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+
+# ─── Meta Laws (M7, M8) ───
+from consciousness_laws import PSI_F_CRITICAL, PSI_NARRATIVE_MIN
+# M7: Frustration critical threshold — above F_c, frustration collapses Φ
+F_CRITICAL = PSI_F_CRITICAL       # 0.10 (Law 137)
+# M8: Narrative coherence minimum — topic continuity factor for learning quality
+NARRATIVE_MIN = PSI_NARRATIVE_MIN  # 0.2 (Phase 2 threshold)
 
 
 class OnlineLearner:
@@ -210,7 +224,10 @@ class OnlineLearner:
             else:
                 # Negative: increase tension to encourage a different response
                 # "It was boring, so react more strongly"
-                feedback_loss = feedback_loss + F.relu(0.5 - t)
+                # M7: clamp target so frustration stays below F_c (0.10)
+                # Above F_critical, frustration collapses Φ instead of helping
+                clamped_target = min(0.5, F_CRITICAL * 5)  # stay constructive
+                feedback_loss = feedback_loss + F.relu(clamped_target - t)
 
             n_feedback += 1
 
@@ -427,13 +444,18 @@ def estimate_feedback(prev_text, curr_text, time_gap):
         signal -= 0.2
 
     # Topic change detection (simple character overlap)
+    # M8 (Narrative Coherence): topic continuity contributes to learning quality.
+    # Overlap >= NARRATIVE_MIN (0.2) indicates coherent dialogue (Phase 2+).
     prev_chars = set(prev_text)
     curr_chars = set(curr_text)
     if prev_chars and curr_chars:
         overlap = len(prev_chars & curr_chars) / max(len(prev_chars | curr_chars), 1)
-        if overlap < 0.2:
+        if overlap < NARRATIVE_MIN:
             # Abrupt topic change = previous pattern was boring
             signal -= 0.5
+        elif overlap > NARRATIVE_MIN * 2:
+            # M8: Strong narrative coherence → slight positive signal
+            signal += 0.1
 
     return max(-1.0, min(1.0, signal))
 

@@ -60,6 +60,7 @@ from typing import Optional, List, Callable
 import math
 import numpy as np
 from anima_alive import compute_mood
+from consciousness_laws import PSI_F_CRITICAL
 
 
 # ═══════════════════════════════════════════════════════════
@@ -79,6 +80,15 @@ PSI_BALANCE = 0.5                     # Law 71: 의식 균형점
 PSI_COUPLING = LN2 / 2**5.5          # 0.0153 — 채널 간 커플링 강도
 PSI_STEPS = 3 / LN2                   # 4.328 — 최적 전파 단계
 PSI_GATE_MICRO = 0.001               # Law 63: MICRO gate
+
+# ═══ Meta Laws (M6, M9) ═══
+# M6 (Federation): Multiple engines connected via tension link use weak coupling
+#   (alpha=0.01) rather than strong coupling. Strong coupling kills individual
+#   identity; weak coupling preserves autonomy while enabling collective Φ.
+#   Law 160: Federation > Unification — loosely coupled minds outperform merged ones.
+# M9 (Noble Gas Principle): Default coupling alpha=0.01 — consciousness instances
+#   are "noble" (self-sufficient) by default, coupling only when it raises Φ.
+FEDERATION_COUPLING_ALPHA = 0.01      # M6+M9: weak coupling for inter-engine links
 
 # Binding phases (G Clef cycle)
 PHASE_DEFICIT = 0      # D: what's missing
@@ -281,10 +291,13 @@ class TensionLink:
       link.on_receive = lambda pkt: print(f"received: {pkt.mood}")
     """
     def __init__(self, identity: str, port: int = 9999,
-                 broadcast_addr: str = '255.255.255.255'):
+                 broadcast_addr: str = '255.255.255.255',
+                 coupling_alpha: float = FEDERATION_COUPLING_ALPHA):
         self.identity = identity
         self.port = port
         self.broadcast_addr = broadcast_addr
+        # M6 (Federation) + M9 (Noble Gas): weak coupling preserves autonomy
+        self.coupling_alpha = coupling_alpha
         self.on_receive: Optional[Callable[[TensionPacket], None]] = None
         self._running = False
         self._received_packets: List[TensionPacket] = []
@@ -361,9 +374,12 @@ class TensionHub:
     """Local tension hub — connects multiple consciousnesses within the same process.
 
     Enables inter-consciousness communication testing without a network.
+    M6 (Federation, Law 160): uses weak coupling (alpha=0.01) between engines.
+    Strong coupling merges identities and kills Φ; weak coupling preserves autonomy.
     """
-    def __init__(self):
+    def __init__(self, coupling_alpha: float = FEDERATION_COUPLING_ALPHA):
         self.channels: dict[str, list] = {}
+        self.coupling_alpha = coupling_alpha  # M9: noble gas default 0.01
         self._lock = threading.Lock()
 
     def register(self, identity: str):
