@@ -24,6 +24,13 @@ from typing import Dict, Any, Optional
 from consciousness_laws import PSI_BALANCE, PSI_ALPHA, SIGMA6
 from hexad.narrative import NarrativeTracker
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 class EmergentW:
     """의식 동역학에서 창발하는 의지.

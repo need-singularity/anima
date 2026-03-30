@@ -30,6 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mitosis import ConsciousMind, Cell, MitosisEngine
 from consciousness_meter import PhiCalculator
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 # ─── Hypercube topology helper ───
 

@@ -37,6 +37,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 LN2 = math.log(2)
 PSI_BALANCE = 0.5
 ANIMA_DIR = Path(__file__).parent

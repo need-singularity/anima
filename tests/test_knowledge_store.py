@@ -2,6 +2,13 @@ import pytest
 from pathlib import Path
 from knowledge_store import KnowledgeStore
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 @pytest.fixture
 def ks(tmp_path):
     return KnowledgeStore(db_path=tmp_path / "test.db")

@@ -10,6 +10,13 @@ import torch
 import time
 from consciousness_engine import ConsciousnessEngine
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 def run_solo(engine, steps=300):
     """Run engine alone, return final Φ."""
     for _ in range(steps):

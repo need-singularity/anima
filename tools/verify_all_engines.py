@@ -27,6 +27,13 @@ os.environ['OMP_NUM_THREADS'] = '1'
 from consciousness_meter import PhiCalculator
 from mitosis import MitosisEngine
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 DIM, HIDDEN, CELLS, STEPS = 64, 128, 64, 300  # 64c for PhiCalculator speed
 phi_calc = PhiCalculator(n_bins=16)
 

@@ -56,6 +56,13 @@ from typing import List, Dict, Optional, Tuple
 # Import BenchEngine and Φ measurement from bench_v2
 from bench_v2 import BenchEngine, measure_dual_phi, PhiIIT
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Atom size constant (Law M1)
 ATOM_SIZE = 8
 # Inter-atom coupling (Law M9: noble gas — weak boundary)

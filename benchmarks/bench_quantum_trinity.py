@@ -61,6 +61,13 @@ print(f"3. DomainC (CambrianExplosionEngine, {NC}c, dim={DIM})")
 print("=" * 60)
 try:
     from bench_evolution_engines import CambrianExplosionEngine
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     r3 = benchmark_trinity(DomainC(CambrianExplosionEngine, nc=NC, dim=DIM), name='Cambrian', n_steps=N_STEPS)
     print(f"   CE={r3['ce']:.4f}  Phi={r3['phi']:.3f}  Phi_avg={r3['phi_avg']:.3f}")
     print(f"   pain={r3['pain']:.3f}  curiosity={r3['curiosity']:.3f}  satisfaction={r3['satisfaction']:.3f}")

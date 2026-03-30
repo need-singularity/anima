@@ -27,6 +27,13 @@ from typing import List, Dict, Tuple
 from bench_v2 import BenchMind, PhiIIT, phi_proxy
 from golden_moe_v2 import GoldenMoEv2
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 # ──────────────────────────────────────────────────────────
 # MoECell — consciousness cell using Golden MoE v2

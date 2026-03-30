@@ -2140,6 +2140,13 @@ def run_SE_v5_full(steps=STEPS):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
     t0 = time.time(); engine = make_engine(); phi_b = phi(engine)
     decoder = nn.Linear(HIDDEN, DIM); opt = torch.optim.Adam(decoder.parameters(), lr=3e-3)
     data = make_data(); ce_hist = []

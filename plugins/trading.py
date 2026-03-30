@@ -455,5 +455,12 @@ class TradingPlugin(PluginBase):
     def _extract_number(text: str) -> float:
         """텍스트에서 숫자 추출."""
         import re
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         m = re.search(r'(\d+\.?\d*)', text)
         return float(m.group(1)) if m else 0.0

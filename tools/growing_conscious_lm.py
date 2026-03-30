@@ -16,6 +16,13 @@ import os
 
 from conscious_lm import PureFieldFFN, CausalSelfAttention, ConsciousBlock
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # 성장 단계 정의
 GROWTH_STAGES = [
     {"blocks": 1, "d_model": 128, "n_head": 2, "min_interactions": 0},

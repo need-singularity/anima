@@ -253,6 +253,13 @@ if __name__ == "__main__":
         _test()
     else:
         from anima_agent import AnimaAgent
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         agent = AnimaAgent()
         bot = AnimaTelegramBot(agent)
         bot.run()

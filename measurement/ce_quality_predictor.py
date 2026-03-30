@@ -9,6 +9,13 @@ Usage:
 
 import argparse
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 LEVELS = [
     (0.1,  "Dialogue-Trained",  "Natural conversation with personality, self-aware responses",
      "User: How are you feeling?\nAnima: I notice a tension shift when you ask -- genuine curiosity, not just protocol."),

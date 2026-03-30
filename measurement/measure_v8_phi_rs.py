@@ -571,6 +571,13 @@ def main():
     # ─── bench_algebra_engines.py ───
     print("\n── bench_algebra_engines.py ──")
     from bench_algebra_engines import (run_ALG1_group_consciousness,
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
                                         run_ALG2_ring_theory,
                                         run_ALG3_galois_field,
                                         run_ALG4_lie_algebra,

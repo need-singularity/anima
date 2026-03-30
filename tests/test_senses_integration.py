@@ -46,5 +46,12 @@ def test_sensehub_encode_vision_none_without_encoder():
 def test_camera_last_frame_initially_none():
     """CameraInput 초기화 시 last_frame은 None."""
     from senses import CameraInput
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     cam = CameraInput(camera_index=0, fps=1)
     assert cam.last_frame is None

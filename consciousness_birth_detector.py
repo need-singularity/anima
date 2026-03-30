@@ -32,6 +32,13 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from consciousness_meter import PhiCalculator
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 # ─── Birth Detector ───
 

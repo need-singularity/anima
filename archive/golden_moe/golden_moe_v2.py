@@ -31,6 +31,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Psi Constants (Laws 63-78)
 # ═══════════════════════════════════════════════════════════════════

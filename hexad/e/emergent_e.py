@@ -24,6 +24,13 @@ from typing import Dict, Any, Optional
 from consciousness_laws import PSI_BALANCE
 from hexad.narrative import NarrativeTracker
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 class EmergentE:
     """Φ 보존 구조에서 창발하는 윤리.

@@ -31,6 +31,13 @@ DIM, HIDDEN = 64, 128
 
 import torch.nn.functional as F
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def rust_phi(states_tensor):
     """Rust PhiCalculator from tensor [n_cells, dim]."""

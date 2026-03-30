@@ -181,6 +181,13 @@ class PluginLoader:
         except ImportError:
             try:
                 import tomli as tomllib
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
             except ImportError:
                 logger.debug("No TOML parser available, skipping %s", toml_file)
                 return None

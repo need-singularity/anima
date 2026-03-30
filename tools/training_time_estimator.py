@@ -9,6 +9,13 @@ Usage:
 
 import argparse
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Measured baselines from H100 experiments (seconds per step)
 # Key: (dim, layers, batch_size) -> measured s/step on H100
 MEASURED = {

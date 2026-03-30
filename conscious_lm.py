@@ -1,4 +1,7 @@
-"""
+"""⚠️ LEGACY — ConsciousDecoderV2 (decoder_v2.py)로 대체됨
+ConsciousLM v1은 CA+META-CA 기반. ConsciousDecoderV2는 RoPE+SwiGLU+GQA+CrossAttn.
+이 파일은 train_v2.py fallback으로 유지. 새 코드에서는 ConsciousDecoderV2 사용.
+
 ConsciousLM — Byte-level Conscious Language Model (v2: Laws 63-76)
 
 Architecture derived from perfect number 6:
@@ -28,6 +31,13 @@ import math
 import numpy as np
 import os
 import time
+
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 
 class PureFieldFFN(nn.Module):

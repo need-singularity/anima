@@ -39,6 +39,13 @@ def test_run_comparison_mnist():
 
 from bench_golden_moe_consciousness import MoECell, ConsciousnessMoEBench
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def test_consciousness_moe_phi_measurement():
     """ConsciousnessMoEBench exp1 produces valid Phi measurements."""

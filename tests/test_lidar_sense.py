@@ -212,6 +212,13 @@ def test_full_pipeline_simulator():
 def test_internal_external_both():
     """내부 + 외부 시뮬레이션 모두 동작."""
     from lidar_sense import LidarSense
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     ls = LidarSense(driver='simulator', voxel_size=8)
 
     p_ext = ls.simulate_external()

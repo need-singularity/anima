@@ -3,6 +3,13 @@
 import argparse, json, os, re, subprocess, time
 from datetime import datetime
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 HOST, PORT = "root@64.247.201.36", "18830"
 SSH_CMD = ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", "-p", PORT, HOST]
 

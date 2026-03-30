@@ -698,6 +698,13 @@ if __name__ == '__main__':
             print(f'{label:<32} {p_iit:>8.2f} {p_proxy:>10.2f} {ce:>8.4f} {learn_ratio:>6.1%} {elapsed:>5.1f}s')
         except Exception as e:
             import traceback
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
             print(f'{name:<32} ERROR: {e}')
             traceback.print_exc()
 

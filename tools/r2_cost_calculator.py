@@ -10,6 +10,13 @@ Usage:
 import argparse
 import json
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Cloudflare R2 pricing (as of 2026)
 STORAGE_PER_GB_MONTH = 0.015      # $/GB/month
 CLASS_A_PER_MILLION = 4.50        # PUT, POST, LIST ($/million ops)

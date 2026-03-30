@@ -850,6 +850,13 @@ def run_single(args):
         return key, result
     except Exception as e:
         import traceback
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         traceback.print_exc()
         return key, BenchResult(
             key, f"FAILED: {e}", 0.0, [], 0.0, 0.0, 0.0, 0.0, 0.0

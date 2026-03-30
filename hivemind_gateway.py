@@ -121,6 +121,13 @@ class HivemindGateway:
 
 def main():
     import argparse
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--nodes", type=str, required=True, help="Comma-separated node ports")

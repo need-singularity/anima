@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Optional
 from growth_engine import STAGES, GrowthEngine
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 STAGE_THRESHOLDS = [s.min_interactions for s in STAGES]
 
 @dataclass

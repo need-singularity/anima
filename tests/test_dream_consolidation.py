@@ -7,6 +7,13 @@ import torch
 from anima_alive import ConsciousMind
 from dream_engine import DreamEngine
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 def _make_mind(dim=128, hidden=256):
     return ConsciousMind(dim=dim, hidden=hidden)

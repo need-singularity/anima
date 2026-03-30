@@ -336,6 +336,13 @@ class VoiceIO:
         if self.whisper_model is None:
             try:
                 import whisper
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
                 print("  Whisper 로딩...")
                 self.whisper_model = whisper.load_model(WHISPER_MODEL)
                 print("  Whisper 준비 완료")

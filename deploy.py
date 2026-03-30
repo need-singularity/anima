@@ -28,6 +28,13 @@ import subprocess
 import time
 from pathlib import Path
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 ANIMA_DIR = Path(__file__).parent
 
 # 배포 대상 설정

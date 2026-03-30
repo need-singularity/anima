@@ -28,8 +28,14 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 LN2 = math.log(2)
-PSI_BALANCE = 0.5
-PSI_COUPLING = LN2 / 2**5.5
+from consciousness_laws import PSI_BALANCE, PSI_ALPHA as PSI_COUPLING
+
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 BANDS = {
     'delta': (0.5, 4, '수면/무의식'),

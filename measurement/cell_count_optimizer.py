@@ -12,6 +12,13 @@ Usage:
 import argparse
 import math
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Scaling law from optimal_config.py experiments
 PHI_COEFF = 0.608
 PHI_EXPONENT = 1.071

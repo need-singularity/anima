@@ -1127,6 +1127,13 @@ def run_domain(name, engine_cls, quick=False):
 
 def main():
     import argparse
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     parser = argparse.ArgumentParser(description='50 New Hypotheses Benchmark')
     parser.add_argument('--quick', action='store_true', help='Φ + Granger only')
     parser.add_argument('--mechanisms', action='store_true', help='Mechanisms only')

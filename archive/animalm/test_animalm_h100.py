@@ -179,6 +179,13 @@ def main():
     # Step 2: Baseline PPL
     print("\n[2/5] Baseline perplexity...")
     from datasets import load_dataset
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     wikitext = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     test_text = "\n\n".join(wikitext["text"][:200])
     baseline_ppl = evaluate_perplexity(model, tokenizer, test_text, device=device)

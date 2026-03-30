@@ -5,6 +5,13 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import gradio as gr
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 class PureFieldMLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size):

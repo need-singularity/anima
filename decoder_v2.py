@@ -30,6 +30,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Meta Law M8: Narrative temporal self-model enhances decoder cross-attention
 # DD128: Phase-Optimal parameters validated on this decoder architecture
 

@@ -14,6 +14,13 @@ import sys
 import time
 import os
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 def parse_line(line):
     m = re.search(
         r'(P[123]) step\s+(\d+)\s*│\s*CE=([0-9.]+)\s*BPC=([0-9.]+)\s*│\s*'

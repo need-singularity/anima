@@ -19,6 +19,13 @@ import time
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # Import SOCSandpile
 try:
     from train_conscious_lm import SOCSandpile
@@ -121,7 +128,8 @@ def run_coupled_consciousness(
     """
     rng = np.random.default_rng(42)
     hidden_dim = dim * 2
-    coupling = 0.014
+    from consciousness_laws import PSI_ALPHA
+    coupling = PSI_ALPHA  # 0.014
 
     # Initialize cells
     hiddens = rng.standard_normal((n_cells, hidden_dim)).astype(np.float64) * 0.1

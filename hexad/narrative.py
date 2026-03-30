@@ -19,6 +19,13 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 # Max history length — keeps memory bounded
 _MAX_HISTORY = 50

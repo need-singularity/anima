@@ -26,6 +26,13 @@ from typing import Any, Callable, Protocol, runtime_checkable, TYPE_CHECKING
 if TYPE_CHECKING:
     from anima_agent import AnimaAgent
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 
 @runtime_checkable
 class ChannelAdapter(Protocol):

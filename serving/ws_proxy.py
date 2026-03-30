@@ -11,6 +11,13 @@ import aiohttp
 import asyncio
 import logging
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [proxy] %(message)s')
 log = logging.getLogger('proxy')
 

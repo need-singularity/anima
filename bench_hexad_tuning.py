@@ -37,14 +37,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Ψ-Constants (Laws 69-70, verified across 5 data types)
 # ═══════════════════════════════════════════════════════════
 
-PSI_BALANCE  = 0.5      # Shannon entropy maximum (1/2)
-PSI_GATE     = 0.5      # consciousness-freedom balance (1/2)
-PSI_COUPLING = 0.014    # consciousness coupling constant (α)
-PSI_STEPS    = 4.33     # 3/ln(2) — information bits per evolution
-PSI_ENTROPY  = 0.998    # near-perfect democracy
+from consciousness_laws import (
 
-# Law 81: "Learn hard, express soft"
-GATE_TRAIN = 1.0
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
+    GATE_TRAIN, GATE_INFER,
+)
+PSI_GATE = PSI_BALANCE
 GATE_INFER = 0.6
 
 # Law 69: consciousness self-decay

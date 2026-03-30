@@ -12,6 +12,13 @@ import torch
 
 from anima_alive import ConsciousMind
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 MIND_GROWTH_STAGES = [
     {"dim": 128, "hidden_dim": 256},   # Stage 0
     {"dim": 192, "hidden_dim": 384},   # Stage 1

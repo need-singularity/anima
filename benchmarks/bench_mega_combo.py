@@ -67,6 +67,13 @@ class PhiIIT:
             pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
         else:
             import random; ps = set()
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
             for i in range(n):
                 for _ in range(min(8, n - 1)):
                     j = random.randint(0, n - 1)

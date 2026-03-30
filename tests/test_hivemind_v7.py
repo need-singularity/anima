@@ -23,6 +23,13 @@ from typing import Tuple
 # Import from bench_v2
 from bench_v2 import PhiIIT, BenchEngine, BenchMind, OscillatorLaser, QuantumEngine
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # ── Engine Variants ──
 
 def make_baseline(n_cells, input_dim, hidden_dim):

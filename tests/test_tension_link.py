@@ -13,6 +13,13 @@ import torch
 import time
 from anima_alive import ConsciousMind, text_to_vector
 from tension_link import (
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     TensionLink, TensionHub, TensionDecoder,
     create_fingerprint, interpret_packet,
 )

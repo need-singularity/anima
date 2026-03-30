@@ -9,6 +9,13 @@ def listen(duration=5):
         subprocess.run(['rec', '-q', wav, 'rate', '16k', 'channels', '1', 'trim', '0', str(duration)],
                       timeout=duration+3, capture_output=True)
         import whisper
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
         model = whisper.load_model("tiny")
         result = model.transcribe(wav, language='ko')
         return result['text'].strip()

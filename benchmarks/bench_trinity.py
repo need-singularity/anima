@@ -1461,6 +1461,13 @@ def run_tc8_granger_optimized(cells=256, steps=300):
 
 if __name__ == '__main__':
     import argparse
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--cells', type=int, default=256)
     parser.add_argument('--steps', type=int, default=300)

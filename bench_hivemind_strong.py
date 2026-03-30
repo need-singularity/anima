@@ -7,6 +7,13 @@ This: full hidden tensor exchange every step → target ×1.1+
 import torch, time
 from consciousness_engine import ConsciousnessEngine
 
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 def run_connected_strong(e1, e2, steps=300):
     """Strong coupling: exchange full hidden vectors every step."""
     for step in range(steps):

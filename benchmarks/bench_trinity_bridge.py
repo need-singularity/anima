@@ -618,6 +618,13 @@ if __name__ == '__main__':
             results.append((name, label, p_iit, p_proxy, ce, elapsed))
         except Exception as e:
             import traceback
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
             print(f'{name:<28} ERROR: {e}')
             traceback.print_exc()
             results.append((name, name, 0.0, 0.0, 999.0, 0.0))

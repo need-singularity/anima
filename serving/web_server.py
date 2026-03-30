@@ -126,6 +126,13 @@ QWEN_URL = os.environ.get("QWEN_URL", "http://localhost:8000")
 def _call_api(url, payload):
     """HTTP POST 호출 헬퍼."""
     import urllib.request
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data,

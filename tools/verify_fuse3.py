@@ -25,6 +25,13 @@ import phi_rs
 from mitosis import MitosisEngine
 from bench_fusion_cambrian_osc import apply_fuse3, DIM, HIDDEN
 
+# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
+
 # ═══ Wrapper: adapt MitosisEngine to BenchEngine interface ═══
 
 class Fuse3Engine:

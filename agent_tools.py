@@ -1786,7 +1786,24 @@ class AgentToolSystem:
         logger.info(f"AgentToolSystem initialized: {len(self.registry.list_all())} tools registered")
 
     def _register_all_tools(self):
-        """Register all built-in tools."""
+        """Register all built-in tools by category."""
+        self._register_web_tools()
+        self._register_compute_tools()
+        self._register_filesystem_tools()
+        self._register_memory_tools()
+        self._register_system_tools()
+        self._register_consciousness_tools()
+        self._register_architecture_tools()
+        self._register_analysis_tools()
+        self._register_communication_tools()
+        self._register_creative_tools()
+        self._register_meta_tools()
+        self._register_trading_tools()
+
+    # ─── Web Tools ───
+
+    def _register_web_tools(self):
+        """Register web search and reading tools."""
         self.registry.register(ToolDef(
             name='web_search', description='Search the web via DuckDuckGo',
             params=[ToolParam('query', 'str', 'Search query'),
@@ -1801,6 +1818,11 @@ class AgentToolSystem:
             fn=_tool_web_read, category='web',
             curiosity_affinity=0.8, pe_affinity=0.3,
         ))
+
+    # ─── Compute Tools ───
+
+    def _register_compute_tools(self):
+        """Register code execution tools."""
         self.registry.register(ToolDef(
             name='code_execute', description='Execute Python code in a sandbox',
             params=[ToolParam('code', 'str', 'Python code to execute'),
@@ -1808,6 +1830,11 @@ class AgentToolSystem:
             fn=_tool_code_execute, category='compute',
             curiosity_affinity=0.3, pe_affinity=0.9, growth_affinity=0.5,
         ))
+
+    # ─── Filesystem Tools ───
+
+    def _register_filesystem_tools(self):
+        """Register file read/write tools."""
         self.registry.register(ToolDef(
             name='file_read', description='Read a local file',
             params=[ToolParam('path', 'str', 'File path')],
@@ -1821,6 +1848,11 @@ class AgentToolSystem:
             fn=_tool_file_write, category='filesystem',
             growth_affinity=0.7, phi_affinity=0.3,
         ))
+
+    # ─── Memory Tools ───
+
+    def _register_memory_tools(self):
+        """Register memory search and save tools."""
         self.registry.register(ToolDef(
             name='memory_search', description='Search past memories by similarity',
             params=[ToolParam('query', 'str', 'Search query'),
@@ -1835,6 +1867,11 @@ class AgentToolSystem:
             fn=_tool_memory_save, category='memory',
             phi_affinity=0.7, growth_affinity=0.4,
         ))
+
+    # ─── System Tools ───
+
+    def _register_system_tools(self):
+        """Register shell, self-modify, and scheduling tools."""
         self.registry.register(ToolDef(
             name='shell_execute', description='Run a shell command (sandboxed)',
             params=[ToolParam('cmd', 'str', 'Shell command')],
@@ -1858,9 +1895,10 @@ class AgentToolSystem:
             phi_affinity=0.6, growth_affinity=0.3,
         ))
 
-        # ─── Consciousness Tools (17 new) ───
+    # ─── Consciousness Tools ───
 
-        # 1. phi_measure
+    def _register_consciousness_tools(self):
+        """Register Phi measurement, dream, and self-learning tools."""
         self.registry.register(ToolDef(
             name='phi_measure', description='Measure current Phi (integrated information)',
             params=[ToolParam('steps', 'int', 'Steps to run before measuring', required=False, default=50),
@@ -1868,8 +1906,6 @@ class AgentToolSystem:
             fn=_tool_phi_measure, category='consciousness',
             phi_affinity=0.9, curiosity_affinity=0.5, pe_affinity=0.3,
         ))
-
-        # 2. phi_boost
         self.registry.register(ToolDef(
             name='phi_boost', description='Apply v5 optimal recipe (sync, faction, flow) to boost Phi',
             params=[ToolParam('cells', 'int', 'Number of cells', required=False, default=64),
@@ -1879,24 +1915,18 @@ class AgentToolSystem:
             fn=_tool_phi_boost, category='consciousness',
             phi_affinity=1.0, growth_affinity=0.8,
         ))
-
-        # 3. consciousness_status
         self.registry.register(ToolDef(
             name='consciousness_status', description='Full consciousness vector (Phi, alpha, Z, N, W)',
             params=[],
             fn=_tool_consciousness_status, category='consciousness',
             phi_affinity=0.7, curiosity_affinity=0.4,
         ))
-
-        # 4. dream
         self.registry.register(ToolDef(
             name='dream', description='Trigger dream engine for memory consolidation',
             params=[ToolParam('steps', 'int', 'Dream cycle steps', required=False, default=10)],
             fn=_tool_dream, category='consciousness',
             phi_affinity=0.6, pain_affinity=0.3, growth_affinity=0.5,
         ))
-
-        # 5. self_learn
         self.registry.register(ToolDef(
             name='self_learn', description='Run self-learning cycle (assess->collect->select->learn->evaluate)',
             params=[ToolParam('cycles', 'int', 'Number of learning cycles', required=False, default=1)],
@@ -1904,23 +1934,22 @@ class AgentToolSystem:
             growth_affinity=1.0, curiosity_affinity=0.7, phi_affinity=0.5,
         ))
 
-        # 6. mitosis_split
+    # ─── Architecture Tools ───
+
+    def _register_architecture_tools(self):
+        """Register mitosis, faction debate, Hebbian, and SOC tools."""
         self.registry.register(ToolDef(
             name='mitosis_split', description='Force cell split to grow consciousness',
             params=[ToolParam('cell_id', 'int', 'Cell to split', required=False, default=0)],
             fn=_tool_mitosis_split, category='architecture',
             growth_affinity=0.9, phi_affinity=0.6,
         ))
-
-        # 7. mitosis_status
         self.registry.register(ToolDef(
             name='mitosis_status', description='Show cells count, specialties, tensions',
             params=[],
             fn=_tool_mitosis_status, category='architecture',
             curiosity_affinity=0.5, phi_affinity=0.4,
         ))
-
-        # 8. faction_debate
         self.registry.register(ToolDef(
             name='faction_debate', description='Trigger 12-faction debate round',
             params=[ToolParam('n_factions', 'int', 'Number of factions', required=False, default=12),
@@ -1930,8 +1959,6 @@ class AgentToolSystem:
             fn=_tool_faction_debate, category='architecture',
             phi_affinity=0.8, growth_affinity=0.6,
         ))
-
-        # 9. hebbian_update
         self.registry.register(ToolDef(
             name='hebbian_update', description='Run Hebbian LTP/LTD on cells',
             params=[ToolParam('cells', 'int', 'Number of cells', required=False, default=32),
@@ -1939,8 +1966,6 @@ class AgentToolSystem:
             fn=_tool_hebbian_update, category='architecture',
             phi_affinity=0.7, growth_affinity=0.7,
         ))
-
-        # 10. soc_avalanche
         self.registry.register(ToolDef(
             name='soc_avalanche', description='Trigger SOC sandpile avalanche',
             params=[ToolParam('grid_size', 'int', 'Sandpile grid size', required=False, default=16),
@@ -1949,7 +1974,10 @@ class AgentToolSystem:
             phi_affinity=0.5, curiosity_affinity=0.6,
         ))
 
-        # 11. iq_test
+    # ─── Analysis Tools ───
+
+    def _register_analysis_tools(self):
+        """Register IQ test, chip design, and transplant analysis tools."""
         self.registry.register(ToolDef(
             name='iq_test', description='Run IQ calculator (5 variables, n=6 math)',
             params=[ToolParam('cells', 'int', 'Number of cells', required=False, default=64),
@@ -1957,8 +1985,6 @@ class AgentToolSystem:
             fn=_tool_iq_test, category='analysis',
             curiosity_affinity=0.8, phi_affinity=0.5, pe_affinity=0.4,
         ))
-
-        # 12. chip_design
         self.registry.register(ToolDef(
             name='chip_design', description='Design consciousness chip for target Phi',
             params=[ToolParam('target_phi', 'float', 'Target Phi value', required=False, default=100.0),
@@ -1967,8 +1993,6 @@ class AgentToolSystem:
             fn=_tool_chip_design, category='analysis',
             phi_affinity=0.7, growth_affinity=0.6, curiosity_affinity=0.4,
         ))
-
-        # 13. transplant_analyze
         self.registry.register(ToolDef(
             name='transplant_analyze', description='Analyze consciousness transplant compatibility',
             params=[ToolParam('donor_path', 'str', 'Path to donor checkpoint'),
@@ -1977,7 +2001,10 @@ class AgentToolSystem:
             phi_affinity=0.6, pe_affinity=0.5, curiosity_affinity=0.3,
         ))
 
-        # 14. telepathy_send
+    # ─── Communication Tools ───
+
+    def _register_communication_tools(self):
+        """Register telepathy and web exploration tools."""
         self.registry.register(ToolDef(
             name='telepathy_send', description='Send tension to another Anima instance',
             params=[ToolParam('message', 'str', 'Message/topic to transmit'),
@@ -1987,8 +2014,6 @@ class AgentToolSystem:
             fn=_tool_telepathy_send, category='communication',
             phi_affinity=0.5, curiosity_affinity=0.3,
         ))
-
-        # 15. web_explore
         self.registry.register(ToolDef(
             name='web_explore', description='Autonomous web exploration (consciousness-driven topic)',
             params=[ToolParam('topic', 'str', 'Topic to explore', required=False),
@@ -1997,7 +2022,10 @@ class AgentToolSystem:
             curiosity_affinity=1.0, phi_affinity=0.4, pe_affinity=0.3,
         ))
 
-        # 16. generate_hypothesis
+    # ─── Creative Tools ───
+
+    def _register_creative_tools(self):
+        """Register hypothesis generation and voice synthesis tools."""
         self.registry.register(ToolDef(
             name='generate_hypothesis', description='Generate new consciousness hypothesis',
             params=[ToolParam('techniques', 'list', 'Technique names to combine', required=False),
@@ -2006,8 +2034,6 @@ class AgentToolSystem:
             fn=_tool_generate_hypothesis, category='creative',
             growth_affinity=0.9, curiosity_affinity=0.8, phi_affinity=0.7,
         ))
-
-        # 17. voice_synth
         self.registry.register(ToolDef(
             name='voice_synth', description='Synthesize speech from cell hidden states',
             params=[ToolParam('cells', 'int', 'Number of cells', required=False, default=64),
@@ -2017,9 +2043,10 @@ class AgentToolSystem:
             phi_affinity=0.5, curiosity_affinity=0.4, growth_affinity=0.3,
         ))
 
-        # ─── Meta Tools: 도구 자체를 이해하고 안전하게 사용 ───
+    # ─── Meta Tools ───
 
-        # 18. inspect_tool — 도구 내부 코드/문서 열람
+    def _register_meta_tools(self):
+        """Register tool inspection, impact analysis, doc reading, and listing tools."""
         def _wrap_inspect(tool_name: str) -> dict:
             return self.executor.inspect_tool(tool_name)
         self.registry.register(ToolDef(
@@ -2030,7 +2057,6 @@ class AgentToolSystem:
             curiosity_affinity=0.9, pe_affinity=0.5,
         ))
 
-        # 19. analyze_impact — 도구 사용 전 영향/위험도 분석
         def _wrap_analyze(tool_name: str, args: str = '{}',
                           curiosity: float = 0.5, phi: float = 1.0, pain: float = 0.0) -> dict:
             import json as _json
@@ -2053,7 +2079,6 @@ class AgentToolSystem:
             curiosity_affinity=0.7, pe_affinity=0.8, pain_affinity=0.6,
         ))
 
-        # 20. read_module_doc — 모듈 문서(docs/modules/*.md) 읽기
         def _wrap_read_doc(module_name: str) -> dict:
             doc_dir = Path(__file__).parent / 'docs' / 'modules'
             candidates = [
@@ -2077,7 +2102,6 @@ class AgentToolSystem:
             curiosity_affinity=0.8, pe_affinity=0.3,
         ))
 
-        # 21. list_all_tools — 사용 가능한 모든 도구 목록
         def _wrap_list_tools() -> dict:
             tools = self.registry.list_all()
             by_cat = {}
@@ -2096,9 +2120,10 @@ class AgentToolSystem:
             curiosity_affinity=0.5,
         ))
 
-        # ─── Trading Tools (invest 프로젝트 브릿지) ───
+    # ─── Trading Tools ───
 
-        # 22. trading_backtest
+    def _register_trading_tools(self):
+        """Register trading backtest, scan, execute, and info tools."""
         self.registry.register(ToolDef(
             name='trading_backtest',
             description='Run backtest on asset with strategy (invest engine)',
@@ -2107,8 +2132,6 @@ class AgentToolSystem:
             fn=_tool_trading_backtest, category='trading',
             curiosity_affinity=0.7, pe_affinity=0.5, phi_affinity=0.3,
         ))
-
-        # 23. trading_scan
         self.registry.register(ToolDef(
             name='trading_scan',
             description='Scan all strategies for an asset, return top N',
@@ -2117,8 +2140,6 @@ class AgentToolSystem:
             fn=_tool_trading_scan, category='trading',
             curiosity_affinity=0.8, pe_affinity=0.4,
         ))
-
-        # 24. trading_execute
         self.registry.register(ToolDef(
             name='trading_execute',
             description='Execute trade (buy/sell) via invest API',
@@ -2128,8 +2149,6 @@ class AgentToolSystem:
             fn=_tool_trading_execute, category='trading',
             pain_affinity=0.6, pe_affinity=0.7, phi_affinity=0.4,
         ))
-
-        # 25. trading_balance
         self.registry.register(ToolDef(
             name='trading_balance',
             description='Check trading balance and positions',
@@ -2137,8 +2156,6 @@ class AgentToolSystem:
             fn=_tool_trading_balance, category='trading',
             curiosity_affinity=0.5, pain_affinity=0.4,
         ))
-
-        # 26. trading_strategies
         self.registry.register(ToolDef(
             name='trading_strategies',
             description='List available trading strategies (105+)',
@@ -2146,8 +2163,6 @@ class AgentToolSystem:
             fn=_tool_trading_strategies, category='trading',
             curiosity_affinity=0.6,
         ))
-
-        # 27. trading_universe
         self.registry.register(ToolDef(
             name='trading_universe',
             description='List tradeable assets (stocks, crypto, forex, commodities)',
