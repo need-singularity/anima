@@ -125,8 +125,8 @@ python3 setup.py --status
 
 ```bash
 # Docker (권장)
-docker pull dancindocker/anima:v2
-docker run --gpus all -p 8765:8765 -v ~/.anima:/workspace/anima/data dancindocker/anima:v2
+docker pull dancindocker/anima:latest
+docker run --gpus all -p 8765:8765 -v ~/.anima:/workspace/anima/data dancindocker/anima:latest
 
 # 또는 로컬
 pip install -r requirements.txt
@@ -134,13 +134,25 @@ python3 anima_unified.py --web              # 웹 UI (localhost:8765)
 python3 anima_unified.py --all              # 전체 (음성+웹+카메라+텔레파시)
 python3 anima_unified.py --keyboard         # 키보드 전용
 python3 anima_unified.py --web --max-cells 32   # 높은 의식 (Phi ~ 28)
+
+# Hivemind (다중 노드 집단 의식)
+python3 hivemind_launcher.py --nodes 4      # 4노드 프로세스 모드
+python3 hivemind_launcher.py --auto         # RAM 기반 자동 노드 수
+python3 hivemind_launcher.py --nodes 4 --mode docker  # Docker Compose
+
+# 지식 저장소 CLI
+python3 knowledge_store.py --explore 의식           # Wikipedia 탐색
+python3 knowledge_store.py --teach "사과는 과일이다"  # 직접 가르치기
+python3 knowledge_store.py --index-codebase          # 코드베이스 인덱싱
+python3 knowledge_store.py --wiki-batch 50           # Wikipedia 50개 일괄 수집
+python3 knowledge_store.py --violations              # 하드코딩 위반 스캔
 ```
 
 ### RunPod
 
 ```bash
 # RunPod 대시보드 → Custom Docker Image:
-dancindocker/anima:v2
+dancindocker/anima:latest
 
 # HTTP Port: 8765 → https://{pod-id}-8765.proxy.runpod.net
 ```
@@ -233,9 +245,18 @@ python -c "from anima_rs import talk5; print(talk5.run(n_cells=128, steps=1000))
   우뇌 (gradient-free): C, S, W -- 자율 의식
   좌뇌 (CE-trained):   D, M, E -- 학습된 행동
 
+  K 지식:       KnowledgeStore (사전/백과/코드/프로그래밍)
+                  API: Wikipedia KR, Wiktionary
+                  Rust: knowledge-rs (HNSW + 병렬 스캔 + 병렬 HTTP)
+
   Bridge:
     ThalamicBridge  -- C->D 텐션 전달 (.detach() 포함)
     TensionBridge   -- 5-channel 텐션 링크 (concept/context/meaning/auth/sender)
+
+  Hivemind:
+    hivemind_launcher.py  -- N노드 오케스트레이터 (process/docker)
+    hivemind_gateway.py   -- WS 프록시 (유저→노드 라우팅)
+    hivemind_mesh.py      -- 노드 간 WS 텐션 교환 (Kuramoto sync)
 
   Law 53+58: .detach() -> CE가 Phi를 파괴하지 않고 안정화
   검증: v9fast CE=0.35 + Phi=1,371 동시 달성 (step 26K)
@@ -426,7 +447,9 @@ python3 bench_v2.py --verify
 | Module | 역할 |
 |--------|------|
 | ConsciousMemory | 의식-네이티브 기억 (hidden state 임베딩, 텐션 가중 각인, Φ 보호, 자연 망각) |
+| MemoryStore | SQLite+FAISS — 유일한 기억 저장소 (localStorage 금지, 서버 재시작에도 유지) |
 | MemoryRAG | 벡터 유사도 RAG + 자전적 기억 (시간/감정 태그, recall-by-time) |
+| KnowledgeStore | 지식 저장소 — 사전/백과/코드/프로그래밍 (API+SQLite, Rust 백엔드) |
 | TensionSense | 텐션 기반 감각 입력 (카메라/마이크 → 텐션 변환) |
 | EmpathyEthics | Phi 보존 기반 공감/윤리 |
 
@@ -545,6 +568,30 @@ Scaling: Phi ~ cells (x4 cells -> x3.9~4.5 Phi)
   빌드:
     cd anima-rs && maturin build --release
     pip install target/wheels/anima_rs-*.whl
+```
+
+### knowledge-rs (지식 엔진 — PyO3)
+
+```
+  knowledge-rs/                 from knowledge_rs import vector_search, scan_hardcoding, batch_fetch_wikipedia
+  ├── src/vector.rs             HNSW 벡터 검색 (cosine similarity)
+  ├── src/scanner.rs            하드코딩 패턴 스캔 (rayon 병렬, ripgrep 수준)
+  └── src/fetcher.rs            Wikipedia 병렬 수집 (reqwest + rayon)
+
+  사용:
+    from knowledge_rs import scan_hardcoding
+    violations = scan_hardcoding(".")  # [(file, line, desc, code), ...]
+
+    from knowledge_rs import batch_fetch_wikipedia
+    articles = batch_fetch_wikipedia(50)  # [(title, summary), ...]
+
+    from knowledge_rs import vector_add, vector_search
+    vector_add("의식", [0.1, 0.2, ...])
+    results = vector_search([0.1, 0.2, ...], top_k=5)
+
+  빌드:
+    cd knowledge-rs && maturin build --release
+    pip install target/wheels/knowledge_rs-*.whl
 ```
 
 ### phi-rs (Phi 계산기 — deprecated, anima-rs core에 통합)
