@@ -222,6 +222,13 @@ class SensorRelay:
             self._ws = await websockets.connect(self.server_url)
             init = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=10))
             print(f"  ✅ 서버 연결 OK (cells={init.get('cells', '?')})")
+            # Register as sensor relay client
+            await self._ws.send(json.dumps({
+                'type': 'session_register',
+                'session_id': f'relay-{int(time.time())}',
+                'device': 'sensor_relay',
+                'modules': ['camera', 'mic', 'speaker'],
+            }))
             return True
         except Exception as e:
             print(f"  ❌ 서버 연결 실패: {e}")

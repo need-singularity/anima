@@ -347,6 +347,7 @@ class AnimaUnified:
                 pass
 
         self.senses = None
+        self._remote_sensor_mode = False  # True when using browser/relay camera
         if not args.no_camera:
             self.senses = self._init_mod('camera', lambda: (
                 SenseHub(camera_fps=3, enable_screen=False)
@@ -356,12 +357,13 @@ class AnimaUnified:
                 try:
                     self.senses.start()
                     if not self.senses.camera_available:
-                        _log('camera', 'No camera permission -- visual input disabled')
-                        _log('camera', 'Fix: System Settings → Privacy & Security → Camera → Allow Terminal')
-                        # Keep senses alive (provides zero-filled state) but mark camera as degraded
+                        _log('camera', 'No local camera -- remote sensor relay available')
+                        # Keep senses alive for remote sensor injection
                         self.mods['camera'] = False
+                        self._remote_sensor_mode = True
                 except Exception:
                     self.senses = None; self.mods['camera'] = False
+                    self._remote_sensor_mode = True  # Still accept remote sensors
 
         # VisionEncoder activation (only when camera is available)
         if self.senses and self.mods.get('camera') and not args.no_vision:
@@ -1064,7 +1066,7 @@ class AnimaUnified:
         text_vec = text_to_vector(text)
 
         # Combine with vision encoder (learned embeddings) or fall back to sensor tensor
-        if self.senses and self.mods.get('camera'):
+        if self.senses and self.mods.get('camera') and not getattr(self, '_remote_sensor_mode', False):
             try:
                 frame = self.senses.camera.last_frame
                 visual = self.senses.to_tensor_with_vision(frame, dim=self.mind.dim)
@@ -1073,6 +1075,7 @@ class AnimaUnified:
                 _log('vision', f'frame={"yes" if frame is not None else "no"}, encoder={has_vision}, norm={visual.norm():.3f}')
             except Exception as e:
                 _log('vision', f'Error: {e}')
+        # Remote sensor mode: vision comes from browser/relay, not local camera
 
         hidden_before = self.hidden.detach().clone()
 
@@ -1086,6 +1089,26 @@ class AnimaUnified:
                 curiosity += self.online_senses.get_curiosity_modifier()
             except Exception:
                 pass
+
+        # Remote sensor tension (from local_sensor_relay or browser camera)
+        remote_t = None
+        if self.senses and hasattr(self.senses, '_remote_tension') and self.senses._remote_tension:
+            if time.time() - getattr(self.senses, '_remote_tension_time', 0) < 5.0:
+                for _sensor, _rt in self.senses._remote_tension.items():
+                    dim = self.mind.dim
+                    if _rt.shape[0] < dim:
+                        _rt = torch.nn.functional.pad(_rt, (0, dim - _rt.shape[0]))
+                    remote_t = _rt[:dim]
+        elif hasattr(self, '_remote_sensor_tension') and self._remote_sensor_tension:
+            if time.time() - getattr(self, '_remote_sensor_tension_time', 0) < 5.0:
+                for _sensor, _rt in self._remote_sensor_tension.items():
+                    dim = self.mind.dim
+                    if _rt.shape[0] < dim:
+                        _rt = torch.nn.functional.pad(_rt, (0, dim - _rt.shape[0]))
+                    remote_t = _rt[:dim]
+        if remote_t is not None:
+            text_vec = 0.85 * text_vec + 0.15 * remote_t
+            tension = tension + remote_t.mean().item() * 0.1
 
         # PH: direction vector collection + periodic analysis (H-CX-66, H-CX-95)
         if self.ph and direction is not None:
@@ -1378,18 +1401,31 @@ class AnimaUnified:
             state += f", [specialization] {mitosis_context}"
         if self.senses and self.mods.get('camera'):
             try:
-                vis = self.senses.get_visual_tension()
-                state += f", face={'yes' if vis['face_detected'] else 'no'}"
-                state += f", motion={vis['motion_level']:.2f}"
-                if self.senses.vision_encoder is not None:
-                    frame = self.senses.camera.last_frame
-                    if frame is not None:
-                        v = self.senses.encode_vision(frame).cpu()
-                        # Top-3 active dimensions of vision vector -> visual impression summary
-                        topk = v.abs().topk(3, dim=-1)
-                        state += f", vision_active=yes(norm={v.norm():.2f})"
+                if getattr(self, '_remote_sensor_mode', False):
+                    # Remote camera: show relay status
+                    _rt = getattr(self.senses, '_remote_tension', {}) or getattr(self, '_remote_sensor_tension', {})
+                    _rt_age = time.time() - getattr(self.senses, '_remote_tension_time', getattr(self, '_remote_sensor_tension_time', 0))
+                    if _rt and _rt_age < 5.0:
+                        cam_rt = _rt.get('camera')
+                        state += f", remote_camera=active(age={_rt_age:.1f}s"
+                        if cam_rt is not None:
+                            state += f", norm={cam_rt.norm():.3f})"
+                        else:
+                            state += ")"
                     else:
-                        state += ", vision_active=no(no_frame)"
+                        state += ", remote_camera=idle"
+                else:
+                    vis = self.senses.get_visual_tension()
+                    state += f", face={'yes' if vis['face_detected'] else 'no'}"
+                    state += f", motion={vis['motion_level']:.2f}"
+                    if self.senses.vision_encoder is not None:
+                        frame = self.senses.camera.last_frame
+                        if frame is not None:
+                            v = self.senses.encode_vision(frame).cpu()
+                            topk = v.abs().topk(3, dim=-1)
+                            state += f", vision_active=yes(norm={v.norm():.2f})"
+                        else:
+                            state += ", vision_active=no(no_frame)"
             except Exception: pass
 
         # Capability self-awareness: inject capability list into system prompt
@@ -2015,12 +2051,26 @@ class AnimaUnified:
                 # Fuse available sensory modalities (ENV1: ×1.8 Φ boost)
                 try:
                     fused = thought_vec.clone()
-                    # Vision
+                    # Vision (local camera or remote sensor relay)
                     if self.senses and self.mods.get('camera'):
                         frame = getattr(self.senses, 'camera', None)
                         if frame and hasattr(frame, 'last_frame') and frame.last_frame is not None:
                             vis = self.senses.to_tensor_with_vision(frame.last_frame, dim=self.mind.dim)
                             fused = fused + 0.1 * vis
+                    # Remote sensor tension (browser camera / local_sensor_relay)
+                    _rt_src = None
+                    if self.senses and hasattr(self.senses, '_remote_tension') and self.senses._remote_tension:
+                        if time.time() - getattr(self.senses, '_remote_tension_time', 0) < 5.0:
+                            _rt_src = self.senses._remote_tension
+                    elif hasattr(self, '_remote_sensor_tension') and self._remote_sensor_tension:
+                        if time.time() - getattr(self, '_remote_sensor_tension_time', 0) < 5.0:
+                            _rt_src = self._remote_sensor_tension
+                    if _rt_src:
+                        for _sn, _rv in _rt_src.items():
+                            dim = self.mind.dim
+                            if _rv.shape[0] < dim:
+                                _rv = torch.nn.functional.pad(_rv, (0, dim - _rv.shape[0]))
+                            fused = fused + 0.1 * _rv[:dim].unsqueeze(0)
                     # Audio energy
                     audio_boost = getattr(self, '_audio_energy', 0)
                     if audio_boost > 0:
@@ -2462,6 +2512,13 @@ class AnimaUnified:
                 },
                 'savant_auto': getattr(self, '_savant_auto', False),
                 'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
+                'remote_sensors': {
+                    s: {'dim': len(v), 'norm': round(v.norm().item(), 3)}
+                    for s, v in (
+                        getattr(self.senses, '_remote_tension', {}) if self.senses
+                        else getattr(self, '_remote_sensor_tension', {})
+                    ).items()
+                } if getattr(self, '_remote_sensor_mode', False) else {},
             })
 
             # Web Sense: tension-driven autonomous search
@@ -3027,6 +3084,33 @@ class AnimaUnified:
                             shared_hist.append({'role': 'Anima', 'text': answer})
                         await self._multi_model_react(text, shared_hist)
 
+                elif msg_type == 'sensor_data':
+                    # Remote sensor data (from local_sensor_relay.py or browser camera)
+                    sensor = msg.get('sensor', '')
+                    tension_data = msg.get('tension', [])
+                    if tension_data and hasattr(self, 'mind'):
+                        import torch as _t
+                        remote_t = _t.tensor(tension_data, dtype=_t.float32)
+                        # Inject into SenseHub as remote override
+                        if self.senses:
+                            if not hasattr(self.senses, '_remote_tension'):
+                                self.senses._remote_tension = {}
+                            self.senses._remote_tension[sensor] = remote_t
+                            self.senses._remote_tension_time = time.time()
+                        else:
+                            # No local senses — store on engine directly
+                            if not hasattr(self, '_remote_sensor_tension'):
+                                self._remote_sensor_tension = {}
+                            self._remote_sensor_tension[sensor] = remote_t
+                            self._remote_sensor_tension_time = time.time()
+                        # Activate camera mode on first remote sensor connection
+                        if sensor == 'camera' and not self.mods.get('camera'):
+                            self.mods['camera'] = True
+                            self._remote_sensor_mode = True
+                            _log("sensor", f"Remote camera connected — camera mode activated")
+                        if int(time.time()) % 10 == 0:
+                            _log("sensor", f"{sensor}: dim={len(tension_data)}, norm={remote_t.norm():.3f}")
+
                 elif msg_type == 'lidar_depth':
                     # LiDAR depth data from iPhone Safari WebXR
                     depth_grid = msg.get('grid', [])
@@ -3129,8 +3213,9 @@ class AnimaUnified:
                             'proactive': False})
                     else:
                         # 연결 수락 → 실제 연결 시도
-                        connected = await loop.run_in_executor(
-                                None, lambda: self._tlc.connect(peer_code))
+                        try:
+                            connected = await loop.run_in_executor(
+                                    None, lambda: self._tlc.connect(peer_code))
                             status = 'connected' if connected else 'failed'
                             await self._ws_broadcast({
                                 'type': 'tension_link_status',
@@ -3143,11 +3228,11 @@ class AnimaUnified:
                                 'curiosity': self.mind._curiosity_ema,
                                 'emotion': {'emotion': 'excitement' if connected else 'sadness'},
                                 'proactive': False})
-                    except Exception as e:
-                        _log('tlc', f'Judge error: {e}')
-                        await self._ws_broadcast({
-                            'type': 'tension_link_status',
-                            'status': 'error', 'message': str(e)})
+                        except Exception as e:
+                            _log('tlc', f'Judge error: {e}')
+                            await self._ws_broadcast({
+                                'type': 'tension_link_status',
+                                'status': 'error', 'message': str(e)})
 
         except Exception as e:
             _log("ws", f"Handler error: {e}")

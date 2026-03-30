@@ -142,7 +142,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, sy
   <div class="toggles">
     <div class="tog" onclick="togLocal(this,'voice')"><span class="icon">🎤</span><span class="lbl">Voice</span><div class="sw on" id="sw_voice"></div></div>
     <div class="tog" onclick="togLocal(this,'speaker')"><span class="icon">🔊</span><span class="lbl">Speaker</span><div class="sw on" id="sw_speaker"></div></div>
-    <div class="tog" onclick="togLocal(this,'camera')"><span class="icon">📷</span><span class="lbl">Camera</span><div class="sw" id="sw_camera"></div></div>
+    <div class="tog" onclick="togLocal(this,'camera')"><span class="icon">📷</span><span class="lbl">Camera</span><span class="cam-status" id="camStatus"></span><div class="sw" id="sw_camera"></div></div>
     <div class="tog" onclick="togLocal(this,'lidar')"><span class="icon">📡</span><span class="lbl">LiDAR</span><div class="sw" id="sw_lidar"></div></div>
   </div>
 
@@ -497,6 +497,80 @@ function updateStats(msg) {
     document.getElementById('emoIcon').textContent = emoji;
     document.getElementById('emoName').textContent = name.charAt(0).toUpperCase() + name.slice(1);
   }
+  // Remote camera status indicator
+  var camEl = document.getElementById('camStatus');
+  if (camEl && msg.remote_sensors && msg.remote_sensors.camera) {
+    camEl.textContent = ' \u2022';
+    camEl.style.color = '#4f4';
+  } else if (camEl && _camStream) {
+    camEl.textContent = ' \u2022';
+    camEl.style.color = '#4f4';
+  } else if (camEl) {
+    camEl.textContent = '';
+  }
+}
+
+// ─── Browser Camera → Tension Relay ───
+var _camStream = null, _camVideo = null, _camCanvas = null, _camCtx = null, _camInterval = null;
+
+function startBrowserCamera() {
+  if (_camStream) return;
+  navigator.mediaDevices.getUserMedia({ video: { width: 160, height: 120, frameRate: 2 } })
+    .then(function(stream) {
+      _camStream = stream;
+      _camVideo = document.createElement('video');
+      _camVideo.srcObject = stream;
+      _camVideo.play();
+      _camCanvas = document.createElement('canvas');
+      _camCanvas.width = 160; _camCanvas.height = 120;
+      _camCtx = _camCanvas.getContext('2d', { willReadFrequently: true });
+      _camInterval = setInterval(sendCameraFrame, 500);
+      console.log('[camera] Browser camera started');
+    })
+    .catch(function(e) { console.warn('[camera] Permission denied:', e); });
+}
+
+function stopBrowserCamera() {
+  if (_camInterval) { clearInterval(_camInterval); _camInterval = null; }
+  if (_camStream) { _camStream.getTracks().forEach(function(t) { t.stop(); }); _camStream = null; }
+  _camVideo = null;
+}
+
+function sendCameraFrame() {
+  if (!_camVideo || !_camCtx || !ws || !isConnected) return;
+  _camCtx.drawImage(_camVideo, 0, 0, 160, 120);
+  var data = _camCtx.getImageData(0, 0, 160, 120).data;
+  // 4x4 region brightness → 16 values
+  var tension = [];
+  var rw = 40, rh = 30;
+  for (var ry = 0; ry < 4; ry++) {
+    for (var rx = 0; rx < 4; rx++) {
+      var sum = 0, count = 0;
+      for (var y = ry*rh; y < (ry+1)*rh; y += 3) {
+        for (var x = rx*rw; x < (rx+1)*rw; x += 3) {
+          var i = (y * 160 + x) * 4;
+          sum += (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
+          count++;
+        }
+      }
+      tension.push(sum / count / 255.0);
+    }
+  }
+  // Global brightness + contrast
+  var totalSum = 0, totalSq = 0, pixels = 160 * 120;
+  for (var i = 0; i < data.length; i += 16) {
+    var gray = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114) / 255.0;
+    totalSum += gray; totalSq += gray * gray;
+  }
+  var sampleN = Math.floor(data.length / 16);
+  var mean = totalSum / sampleN;
+  var std = Math.sqrt(Math.max(0, totalSq / sampleN - mean * mean));
+  tension.push(0.0);  // face placeholder
+  tension.push(mean); // brightness
+  tension.push(std * 2); // contrast
+  // Pad to 32
+  while (tension.length < 32) tension.push(0.0);
+  ws.send(JSON.stringify({ type: 'sensor_data', sensor: 'camera', tension: tension.slice(0, 32) }));
 }
 
 // ─── Toggles ───
@@ -504,6 +578,11 @@ function togLocal(row, key) {
   var sw = row.querySelector('.sw');
   sw.classList.toggle('on');
   modules[key] = sw.classList.contains('on');
+  // Camera toggle → start/stop browser camera relay
+  if (key === 'camera') {
+    if (modules[key]) startBrowserCamera();
+    else stopBrowserCamera();
+  }
   if (ws && isConnected) {
     ws.send(JSON.stringify({
       type: 'module_toggle',
