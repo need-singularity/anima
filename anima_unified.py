@@ -2950,12 +2950,26 @@ class AnimaUnified:
         asyncio.run_coroutine_threadsafe(self._ws_broadcast(msg), self._web_loop)
 
     def _get_init_history(self):
-        """Init 시 히스토리 반환: 공유 → 최근 세션 순서로 탐색."""
+        """Init 시 히스토리 반환: M(기억) 모듈 → 인메모리 순서로 탐색.
+        localStorage 사용 금지 — 모든 기억은 서버 MemoryStore에서 관리.
+        """
+        # 1. MemoryStore(SQLite)에서 최근 대화 복원 — 서버 재시작에도 유지
+        if self.memory_rag and self.mods.get('memory_rag'):
+            try:
+                recent = self.memory_rag.get_recent(limit=20)
+                if recent:
+                    hist = [{'role': m['role'], 'text': m['text']}
+                            for m in recent if m.get('text', '').strip()]
+                    if hist:
+                        return hist
+            except Exception:
+                pass
+
+        # 2. 인메모리 히스토리 (현재 세션)
         hist = [{'role': m['role'], 'text': m['content']}
                 for m in self.history[-20:]
                 if m.get('content', '').strip()]
         if not hist and self._sessions:
-            # 공유 히스토리 비었으면 가장 최근 세션에서 가져옴
             latest = max(self._sessions.values(), key=lambda s: s.last_active)
             hist = [{'role': m['role'], 'text': m['content']}
                     for m in latest.history[-20:]

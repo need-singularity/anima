@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """SQLite + FAISS memory storage for Anima.
 
+⚠️  이 모듈이 Anima의 유일한 기억 저장소 (Hexad M 모듈):
+    - 대화 히스토리, 감정, Φ, 세션 모두 여기에 저장
+    - 서버 재시작 후에도 히스토리 복원 (get_recent)
+    - localStorage/sessionStorage 사용 금지 — 클라이언트는 상태를 가지지 않음
+    - 모든 기억 접근은 이 모듈을 통해야 함
+
 Replaces JSON-based MemoryRAG with persistent, indexed storage.
 Supports two model types:
   - 'conscious' (ConsciousMind): tension, curiosity, consolidation fields
@@ -195,6 +201,16 @@ class MemoryStore:
         if row is None:
             return None
         return dict(row)
+
+    def get_recent(self, limit: int = 20) -> list[dict]:
+        """최근 대화 가져오기 — 서버 재시작 후 히스토리 복원용."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, text, emotion, phi, timestamp FROM memories "
+                "WHERE role IN ('user', 'assistant') AND text != '' "
+                "ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
         with self._lock:

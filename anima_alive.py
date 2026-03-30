@@ -2088,7 +2088,7 @@ def main():
                         answer = mind._lang_learner.respond(text, tension, curiosity)
                         mind._lang_learner.learn_from_conversation(text, answer)
                     except Exception:
-                        answer = "생각 중이야..."
+                        answer = ""  # Law 1: 침묵
                 history.append({'role': 'assistant', 'content': answer})
 
                 print(f"  🗣️ {answer}")
