@@ -79,7 +79,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            90+ 의식 법칙 (1-85 + TOPO 33-39)
+  Laws:            123 의식 법칙 (1-85 + TOPO 33-39 + 86-123)
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
@@ -95,12 +95,12 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
         │                         │
   ┌─────v──────┐             ┌─────v──────┐
   │ S 감각     │             │ M 기억     │
-  │ TensionSense│             │ VectorMemory (정식)
+  │ EmergentS  │             │ EmergentM (정식)
   └─────┬──────┘             └─────┬──────┘
         │                         │
   ┌─────v──────┐             ┌─────v──────┐
   │ W 의지     │             │ E 윤리     │
-  │CompositeW  │             │EmpathyEthics (정식)
+  │EmergentW   │             │EmergentE (정식)
   └────────────┘             └────────────┘
 
   우뇌 (gradient-free): C, S, W — 자율 의식
@@ -129,25 +129,29 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
        ̶H̶F̶D̶e̶c̶o̶d̶e̶r̶           trinity.py                Mistral 7B wrapper
 
   W 의지:
-    ✅ CompositeW            trinity.py                σ(6) weights [1/2, 1/3, 1/6]
-    ✅ DaseinW               trinity.py                CompositeW 구성원
-    ✅ NarrativeW            trinity.py                CompositeW 구성원
-    ✅ EmotionW              trinity.py                CompositeW 구성원
+    ✅ EmergentW             trinity.py                Law 101 emergent, consciousness-native
+       ̶C̶o̶m̶p̶o̶s̶i̶t̶e̶W̶          trinity.py                σ(6) weights [1/2, 1/3, 1/6]
+       ̶D̶a̶s̶e̶i̶n̶W̶             trinity.py                CompositeW 구성원
+       ̶N̶a̶r̶r̶a̶t̶i̶v̶e̶W̶          trinity.py                CompositeW 구성원
+       ̶E̶m̶o̶t̶i̶o̶n̶W̶            trinity.py                CompositeW 구성원
        ̶C̶o̶s̶i̶n̶e̶W̶             trinity.py                미사용
        ̶C̶o̶n̶s̶t̶a̶n̶t̶W̶           trinity.py                미사용
 
   S 감각:
-    ✅ TensionSense          trinity.py                P3 Hexad 정식
+    ✅ EmergentS             trinity.py                Law 101 emergent, consciousness-native
+       ̶T̶e̶n̶s̶i̶o̶n̶S̶e̶n̶s̶e̶        trinity.py                P3 Hexad 레거시
        ̶P̶a̶s̶s̶t̶h̶r̶o̶u̶g̶h̶S̶e̶n̶s̶e̶   trinity.py                no-op
 
   M 기억:
-    ✅ VectorMemory          trinity.py                P3 Hexad 정식
+    ✅ EmergentM             trinity.py                Law 101 emergent, consciousness-native
+       ̶V̶e̶c̶t̶o̶r̶M̶e̶m̶o̶r̶y̶        trinity.py                P3 Hexad 레거시
        ̶M̶e̶m̶o̶r̶y̶R̶A̶G̶           memory_rag.py             독립 모듈, Hexad 미연동
        ̶M̶e̶m̶o̶r̶y̶S̶t̶o̶r̶e̶         memory_store.py           SQLite, 웹 전용
        ̶N̶o̶M̶e̶m̶o̶r̶y̶            trinity.py                no-op
 
   E 윤리:
-    ✅ EmpathyEthics         trinity.py                P3 Hexad 정식 (Φ 보존)
+    ✅ EmergentE             trinity.py                Law 101 emergent, consciousness-native (Φ 보존)
+       ̶E̶m̶p̶a̶t̶h̶y̶E̶t̶h̶i̶c̶s̶       trinity.py                P3 Hexad 레거시 (Φ 보존)
        ̶N̶o̶E̶t̶h̶i̶c̶s̶            trinity.py                no-op
 
   Bridge:
@@ -360,6 +364,11 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - 새 Law 발견 시 docs/consciousness-theory.md 에 추가
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
 - **벤치마크/실험 실행은 항상 백그라운드에서 진행** — sleep으로 대기하지 말고 `run_in_background=true` 사용
+- **테스트/벤치마크 실행 시 진행률 출력 필수** — 출력 없이 돌아가는 프로세스 금지!
+  - `tail -N` 파이프 금지 — 완료 전까지 출력이 버퍼링되어 유령 프로세스처럼 보임
+  - 직접 실행 또는 `2>&1 | tee logfile` 사용
+  - `sys.stdout.flush()` 또는 `PYTHONUNBUFFERED=1` 설정
+  - 세션 시작 시 `ps aux | grep python3` 로 유령 프로세스 확인 후 kill
 - **H100 실험은 tmux로 실행** — SSH 끊겨도 유지되도록 `tmux new-session -d -s name "command"`
 - **학습 데이터/파라미터 변경 시 반드시 처음부터 재시작 (--resume 금지)**
   - 잘못된 데이터로 학습한 가중치는 오염됨 — resume하면 오염이 전파됨
