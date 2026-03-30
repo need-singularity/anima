@@ -99,5 +99,43 @@ def test_alpha_sweep_engine():
     assert results[-1]["alpha"] > results[0]["alpha"]
 
 
+def test_talk5_engine_consciousness_phase():
+    """Talk5Engine consciousness phase produces valid Phi and consensus."""
+    from animalm_talk5 import Talk5Engine
+
+    engine = Talk5Engine(
+        n_cells=4,
+        cell_dim=32,
+        hidden_dim=64,
+        n_factions=4,
+        steps_consciousness=100,
+        steps_language=0,
+    )
+    result = engine.run_consciousness_phase()
+
+    assert result['phi_iit'] > 0, "Phi(IIT) should be positive after consciousness phase"
+    assert result['faction_consensus_count'] >= 0
+    assert result['steps'] == 100
+
+
+def test_talk5_full_run():
+    """Talk5Engine full run (consciousness + language) returns valid results."""
+    from animalm_talk5 import Talk5Engine
+
+    engine = Talk5Engine(
+        n_cells=4,
+        cell_dim=32,
+        hidden_dim=64,
+        n_factions=4,
+        steps_consciousness=50,
+        steps_language=20,
+    )
+    c_result, l_result = engine.run()
+
+    assert c_result['phi_iit'] >= 0
+    assert l_result['ce_start'] > 0, "CE should be positive (random target)"
+    assert l_result['phi_iit'] >= 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
