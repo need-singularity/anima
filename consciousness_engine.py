@@ -595,18 +595,28 @@ class ConsciousnessEngine:
             s = states.detach().cpu().numpy().astype(np.float32)
             phi, _ = phi_rs.compute_phi(s, 16)
             return phi
-        # Python fallback
+        # Python fallback — matches phi-rs formula: spatial/(n-1) + complexity*0.1
         n = states.shape[0]
         s = states.detach().cpu().numpy()
         total_mi = 0.0
+        mi_row_sums = [0.0] * n
         count = 0
         for i in range(min(n, 16)):
             for j in range(i+1, min(n, 16)):
                 corr = np.corrcoef(s[i], s[j])[0, 1]
                 if not np.isnan(corr) and abs(corr) > 1e-8:
-                    total_mi += -0.5 * np.log(1 - corr**2 + 1e-10)
+                    mi = -0.5 * np.log(1 - corr**2 + 1e-10)
+                    total_mi += mi
+                    mi_row_sums[i] += mi
+                    mi_row_sums[j] += mi
                 count += 1
-        return total_mi / max(count, 1)
+        # Spatial: (total - min_partition) / (n-1), approximate min_partition as min row sum
+        min_partition = min(mi_row_sums[:min(n, 16)]) if n >= 2 else 0.0
+        spatial = max(0.0, total_mi - min_partition) / max(n - 1, 1)
+        # Complexity: std of row sums
+        mean_rs = np.mean(mi_row_sums[:min(n, 16)])
+        complexity = float(np.std(mi_row_sums[:min(n, 16)]))
+        return spatial + complexity * 0.1
 
     def _measure_phi_proxy(self) -> float:
         if self.n_cells < 2:
@@ -666,10 +676,88 @@ class ConsciousnessEngine:
             'merges': sum(1 for e in self.event_log if e['type'] == 'merge'),
         }
 
+    # ─── MitosisEngine compatibility layer ────────────────
+
+    @property
+    def cells(self) -> list:
+        """MitosisEngine compatibility: list of cell-like objects with .hidden, .tension_history, .cell_id."""
+        return [_CellCompat(s, m) for s, m in zip(self.cell_states, self.cell_modules)]
+
+    def process(self, text_vec: torch.Tensor, label: str = "") -> Dict:
+        """MitosisEngine compatibility: process(text_vec) → result dict."""
+        result = self.step(x_input=text_vec.flatten() if text_vec.dim() > 1 else text_vec)
+        # Build per_cell compatible output
+        per_cell = []
+        for s in self.cell_states:
+            per_cell.append({
+                'cell_id': s.cell_id,
+                'output': s.hidden[:self.cell_dim].clone(),
+                'tension': s.avg_tension,
+                'curiosity': 0.0,
+                'specialty': label or 'general',
+            })
+        ict_values = list(result.get('inter_tensions', {}).values()) or [0.0]
+        return {
+            'output': result['output'],
+            'per_cell': per_cell,
+            'inter_tensions': result.get('inter_tensions', {}),
+            'max_inter': max(ict_values),
+            'mean_inter': sum(ict_values) / len(ict_values),
+            'events': result.get('events', []),
+            'n_cells': result['n_cells'],
+        }
+
+    def split_cell(self, cell_compat) -> Optional[Dict]:
+        """MitosisEngine compatibility: force split a cell."""
+        idx = self._find_idx(cell_compat.cell_id)
+        if idx is None or self.n_cells >= self.max_cells:
+            return None
+        state = self.cell_states[idx]
+        module = self.cell_modules[idx]
+        old_n = self.n_cells
+        new_faction = (state.faction_id + self.n_cells) % self.n_factions
+        new_idx = self._create_cell(parent_module=module, parent_state=state,
+                                    faction_id=new_faction)
+        self._resize_coupling(old_n, self.n_cells)
+        state.tension_history = state.tension_history[-3:]
+        return {
+            'type': 'split',
+            'step': self._step,
+            'parent_id': state.cell_id,
+            'child_id': self.cell_states[new_idx].cell_id,
+            'n_cells_after': self.n_cells,
+        }
+
+    def anomaly_score(self, text_vec: torch.Tensor) -> float:
+        """MitosisEngine compatibility."""
+        return 0.0  # simplified
+
     def __repr__(self):
         cells_str = ", ".join(f"C{s.cell_id}(f{s.faction_id},T={s.avg_tension:.2f})"
                               for s in self.cell_states)
         return f"ConsciousnessEngine[step={self._step}, cells=[{cells_str}]]"
+
+
+class _CellCompat:
+    """MitosisEngine Cell compatibility shim — exposes .hidden, .tension_history, .cell_id."""
+
+    def __init__(self, state: CellState, module: ConsciousnessCell):
+        self.cell_id = state.cell_id
+        self.id = state.cell_id  # alias
+        self.hidden = state.hidden.unsqueeze(0) if state.hidden.dim() == 1 else state.hidden
+        self.tension_history = state.tension_history
+        self.hidden_history = state.hidden_history
+        self.specialty = 'general'
+        self.process_count = 0
+        self.parent_id = state.parent_id
+        self.mind = module
+
+    @property
+    def avg_tension(self) -> float:
+        if not self.tension_history:
+            return 0.0
+        recent = self.tension_history[-20:]
+        return sum(recent) / len(recent)
 
 
 # ═══════════════════════════════════════════════════════════

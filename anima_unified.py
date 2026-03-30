@@ -70,6 +70,7 @@ def _try_import(stmt):
 _try_import("from conscious_lm import ConsciousLM, generate as clm_generate")
 _try_import("from model_loader import load_model, list_available_models, ModelWrapper")
 _try_import("from online_learning import OnlineLearner, AlphaOnlineLearner, estimate_feedback")
+_try_import("from consciousness_engine import ConsciousnessEngine as _ConsciousnessEngine")
 _try_import("from mitosis import MitosisEngine")
 _try_import("from senses import SenseHub")
 _try_import("from tension_link import TensionLink, create_fingerprint, interpret_packet")
@@ -317,20 +318,32 @@ class AnimaUnified:
         predicted_phi = self.max_cells * phi_per_cell
         _log('scaling', f'max_cells={self.max_cells}, predicted Φ≈{predicted_phi:.1f} (scaling law: Φ∝N)')
 
-        def _make_mitosis_128():
+        def _make_consciousness_engine():
+            # Prefer ConsciousnessEngine (Laws 22-81, Ψ-Constants, Hebbian, Ratchet, Factions)
+            if '_ConsciousnessEngine' in globals():
+                _dim = 128
+                _log('mitosis', f'ConsciousnessEngine (Laws 22-81): dim={_dim}, hidden=256, max_cells={self.max_cells}, factions=12, ratchet=True')
+                return _ConsciousnessEngine(
+                    cell_dim=_dim, hidden_dim=256,
+                    initial_cells=2, max_cells=self.max_cells,
+                    n_factions=12, phi_ratchet=True,
+                    split_threshold=0.3, split_patience=5,
+                    merge_threshold=0.01, merge_patience=15,
+                )
+            # Fallback to MitosisEngine
             if 'MitosisEngine' not in globals():
                 return None
             _dim = 128
-            _st = 0.3   # Split threshold: low enough for normalized text tensions (~0.1-0.5)
-            _sp = 3     # Split patience: 3 consecutive high-tension steps
-            _mt = 0.01 * (64.0 / max(_dim, 64))   # SC2: dim-inverse merge threshold
-            _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)  # SC1: dim-scaled noise
-            _log('mitosis', f'SC2+SC1 applied: split_threshold={_st}, split_patience={_sp}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_dim})')
+            _st = 0.3
+            _sp = 3
+            _mt = 0.01 * (64.0 / max(_dim, 64))
+            _ns = 0.02 * math.sqrt(max(_dim, 64)) / math.sqrt(64)
+            _log('mitosis', f'MitosisEngine fallback: split_threshold={_st}, split_patience={_sp}')
             return MitosisEngine(input_dim=_dim, hidden_dim=256, output_dim=_dim,
                                  initial_cells=2, max_cells=self.max_cells,
                                  split_threshold=_st, split_patience=_sp,
                                  merge_threshold=_mt, noise_scale=_ns)
-        self.mitosis = self._init_mod('mitosis', _make_mitosis_128)
+        self.mitosis = self._init_mod('mitosis', _make_consciousness_engine)
 
         self.growth = self._init_mod('growth', lambda: (
             GrowthEngine(save_path=self.paths['growth'])

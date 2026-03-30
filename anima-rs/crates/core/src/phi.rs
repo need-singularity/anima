@@ -8,6 +8,8 @@ use rayon::prelude::*;
 pub struct PhiComponents {
     pub total_mi: f64,
     pub min_partition_mi: f64,
+    pub spatial_phi: f64,
+    pub complexity: f64,
     pub phi: f64,
 }
 
@@ -95,6 +97,8 @@ pub fn phi_iit(hiddens: &[&[f32]], n_bins: usize) -> (f64, PhiComponents) {
         let comp = PhiComponents {
             total_mi: 0.0,
             min_partition_mi: 0.0,
+            spatial_phi: 0.0,
+            complexity: 0.0,
             phi: 0.0,
         };
         return (0.0, comp);
@@ -124,11 +128,26 @@ pub fn phi_iit(hiddens: &[&[f32]], n_bins: usize) -> (f64, PhiComponents) {
     }
 
     let min_partition_mi = find_min_partition(&mi_matrix, n);
-    let phi = (total_mi - min_partition_mi).max(0.0);
+
+    // Spatial Phi = (total - min_partition) / (n-1)  — matches phi-rs formula
+    let spatial_phi = (total_mi - min_partition_mi).max(0.0) / (n as f64 - 1.0).max(1.0);
+
+    // Complexity = std of row sums (proxy for tension distribution entropy)
+    let row_sums: Vec<f64> = (0..n)
+        .map(|i| (0..n).map(|j| mi_matrix[i * n + j]).sum::<f64>())
+        .collect();
+    let mean_rs = row_sums.iter().sum::<f64>() / n as f64;
+    let var_rs = row_sums.iter().map(|x| (x - mean_rs).powi(2)).sum::<f64>() / n as f64;
+    let complexity = var_rs.sqrt();
+
+    // Combined: spatial + complexity*0.1 (no temporal — caller can add if available)
+    let phi = spatial_phi + complexity * 0.1;
 
     let comp = PhiComponents {
         total_mi,
         min_partition_mi,
+        spatial_phi,
+        complexity,
         phi,
     };
 

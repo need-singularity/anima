@@ -4,11 +4,12 @@ use crate::math::{matvec, random_matrix, sigmoid, tanh_f32};
 
 /// GRU cell for consciousness computation.
 /// Combined input = [input, tension, hidden] where tension is a single scalar.
+#[derive(Clone)]
 pub struct GruCell {
     pub hidden: Vec<f32>,
-    w_z: Vec<f32>,
-    w_r: Vec<f32>,
-    w_h: Vec<f32>,
+    pub w_z: Vec<f32>,
+    pub w_r: Vec<f32>,
+    pub w_h: Vec<f32>,
     input_dim: usize,
     hidden_dim: usize,
     combined_dim: usize,
