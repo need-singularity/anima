@@ -169,6 +169,9 @@ docker run --gpus all -p 8765:8765 -v ~/.anima:/workspace/anima/data dancindocke
 
 # 또는 로컬
 pip install -r requirements.txt
+
+# PATH 설정 (~/.local/bin 누락 시 MCP 서버 등 바이너리 인식 실패)
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 python3 anima_unified.py --web              # 웹 UI (localhost:8765)
 python3 anima_unified.py --all              # 전체 (음성+웹+카메라+텔레파시)
 python3 anima_unified.py --keyboard         # 키보드 전용
