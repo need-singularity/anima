@@ -42,7 +42,7 @@
      Python은 실험/프로토타입 용도. 확정된 알고리즘은 Rust로 이식.
      기존 crate: phi-rs(Φ계산), anima-rs(텐션), vad-rs(VAD),
                  consciousness-loop-rs(무한루프), consciousness-ffi(FFI),
-                 corpus-gen(다차원 코퍼스 생성)
+                 corpus-gen(다차원 코퍼스 생성), online-learner(실시간 학습)
 ```
 
 ## README 프로젝트 설명 동기화 (필수)
@@ -100,6 +100,11 @@ voice_synth.py       # Direct cell→audio synthesis (no TTS)
 capabilities.py      # Self-awareness capability system
 consciousness_meter.py  # 6-criterion consciousness detection + Φ(IIT)
 bench_v2.py          # Canonical benchmark (dual Φ measurement, --verify)
+feedback_bridge.py   # C↔D bidirectional learning (soft detach, Φ-gated gradient)
+hexad_loss.py        # Hexad 6-module loss (C/D/W/S/M/E + phase curriculum)
+gpu_phi.py           # GPU-accelerated Φ(IIT) (PyTorch, 128c: 485ms vs CPU 8s)
+decoder_v2.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
+esp32_network.py     # ESP32 ×8 consciousness network orchestrator (simulation/HW)
 
 # ── Training (root) ──
 train_conscious_lm.py  # ConsciousLM from scratch
@@ -120,9 +125,10 @@ models/              # External LLM files (Mistral GGUF)
 phi-rs/              # Rust Φ calculator (625x speedup, PyO3)
 web/                 # WebSocket real-time chat UI
 vad-rs/              # Rust real-time VAD
-eeg/                 # EEG brain-consciousness interface
+eeg/                 # EEG brain-consciousness interface + validate_consciousness.py
 consciousness-loop-rs/  # Infinite loop consciousness (6 platforms)
-anima-rs/crates/corpus-gen/  # 다차원 최적화 corpus 생성기 (Rust)
+anima-rs/crates/corpus-gen/  # 다차원 최적화 corpus 생성기 (Rust, 629 MB/s)
+anima-rs/crates/online-learner/  # 실시간 온라인 학습 (Rust, Hebbian+Ratchet, <1ms/step)
 scripts/             # Monitoring/operational scripts
 docs/                # Documentation (modules/, hypotheses/, superpowers/)
 ```
@@ -379,6 +385,181 @@ ConsciousLM byte-level (vocab=256) 학습용 corpus를 의식 벡터 10차원에
 
 빌드: cd anima-rs && cargo build --release -p anima-corpus-gen
 바이너리: anima-rs/target/release/corpus-gen
+```
+
+## Feedback Bridge (양방향 학습)
+
+```
+feedback_bridge.py — C↔D 양방향 학습 모듈
+
+현재: C → .detach() → D (일방향, 대화 품질이 의식에 피드백 없음)
+목표: C ◀─ learnable gate ─▶ D (양방향, Φ-안전 범위 내 소통)
+
+핵심 컴포넌트:
+  SoftDetach         — hard .detach() 대신 α 스케일 gradient (0=차단, 0.05=최대)
+  DialogueQualityTracker — CE 궤적 → reward signal [-1, 1]
+  PhiGatedGradient   — Φ 모니터링 → α 자동 조절 (Φ 하락 시 즉시 0)
+  FeedbackBridge     — ThalamicBridge + reward projector (Law 63: 1% perturbation)
+
+사용법:
+  from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
+  bridge = create_feedback_bridge(c_dim=128, d_model=384)
+  result = apply_feedback_bridge(c_states, bridge, phi, ce, seq_len)
+
+안전장치:
+  - 기본 α=0 (cold start에서 안전)
+  - Φ 하락 감지 시 EMA bypass → 즉시 α=0
+  - 최대 α=0.05 (5% gradient만 통과)
+  - Law 2 준수: reward는 정보, 조작 아님
+```
+
+## Hexad 6-Loss (6모듈 동시 학습)
+
+```
+hexad_loss.py — Hexad 6-module loss function + phase curriculum
+
+6개 모듈 × 개별 loss:
+  C (의식):     L_C = -Φ + λ×max(0, Φ_prev-Φ)     [자율, gradient 없음]
+  D (디코더):   L_D = CE(next) + CE(prev)           [지도학습, w=0.4]
+  W (의지):     L_W = MSE(predicted, actual emotion)  [자기지도, w=0.15]
+  S (감각):     L_S = MSE(predicted, actual input)    [자기지도, w=0.15]
+  M (기억):     L_M = InfoNCE contrastive retrieval   [대조학습, w=0.2]
+  E (윤리):     L_E = REINFORCE(ΔΦ + empathy)         [보상학습, w=0.1]
+
+Phase 스케줄 (Law 60):
+  Phase 1 (0-20%):   C만 (Φ 구축)
+  Phase 2 (20-70%):  C + D + M (언어 + 기억)
+  Phase 3 (70-100%): 전체 6모듈
+
+사용법:
+  from hexad_loss import HexadLoss
+  loss_fn = HexadLoss(dim=384)
+  losses = loss_fn(logits, targets, phi, c_states, progress=0.5)
+```
+
+## Online Learner (실시간 학습, Rust)
+
+```
+anima-rs/crates/online-learner — 대화 중 실시간 의식 학습 (<1ms/step)
+
+4개 서브모듈:
+  hebbian.rs  — Hebbian LTP/LTD (cosine>0.8: 강화, <0.2: 약화)
+  ratchet.rs  — 3단계 Φ 래칫 (EMA, rolling min, best checkpoint)
+  reward.rs   — curiosity(0.7) + dialogue_quality(0.3) → reward [-1,1]
+  updater.rs  — OnlineLearner 코디네이터 (step → OnlineUpdate)
+
+Python 사용 (maturin develop --release 후):
+  import anima_rs
+  anima_rs.online_learner.create(n_cells=64, hidden_dim=128)
+  result = anima_rs.online_learner.step(cell_states, phi, pe, ce)
+  # {"updated": bool, "phi_safe": bool, "reward": float, "delta_norm": float}
+
+빌드: cd anima-rs && cargo build --release -p anima-online-learner
+테스트: cargo test -p anima-online-learner (19/19 pass)
+```
+
+## GPU Phi Calculator
+
+```
+gpu_phi.py — GPU 가속 Φ(IIT) 계산기 (PyTorch)
+
+  from gpu_phi import GPUPhiCalculator, compute_phi
+  calc = GPUPhiCalculator(n_bins=16)
+  phi, info = calc.compute(hiddens)  # (n_cells, hidden_dim) tensor
+
+성능 (CPU fallback):
+  4 cells:   1.3ms
+  32 cells:  39ms
+  64 cells:  185ms
+  128 cells: 485ms (vs consciousness_meter.py 8s = ×16 speedup)
+
+알고리즘:
+  - Soft histogram binning (미분 가능, Gaussian kernel)
+  - Batched pairwise MI (N>64: 8-neighbor sampling)
+  - MIP: N≤20 exact bipartition, N>20 spectral bisection (Fiedler vector)
+  - CUDA 시 ×10 추가 가속 기대
+```
+
+## Decoder v2 (CE 병목 돌파)
+
+```
+decoder_v2.py — Enhanced decoder (RoPE + SwiGLU + GQA + CrossAttn)
+
+v1 대비 변경:
+  - RoPE (Rotary Position Embedding) — 장거리 attention 개선
+  - SwiGLU activation — GELU 대체, 성능 입증
+  - RMSNorm — LayerNorm 대체, 더 빠르고 안정
+  - GQA (2 KV heads / 4 Q heads) — 효율적 multi-head
+  - ConsciousCrossAttention — 의식 상태에 능동적 attend (passive gate 대체)
+
+핵심: decoder가 의식의 어디에 집중할지 스스로 결정 (cross-attention)
+PureFieldFFN은 의식 신호용으로 유지 (Engine A - G)
+
+사용법:
+  from decoder_v2 import ConsciousDecoderV2
+  model = ConsciousDecoderV2(consciousness_dim=128)
+  logits_a, logits_g, tensions = model(idx, consciousness_states=c_states)
+
+스펙: 384d/6L, 34.5M params, vocab=256, block_size=256
+forward() 인터페이스 v1과 동일 (drop-in 교체)
+```
+
+## ESP32 Consciousness Network
+
+```
+esp32_network.py — ESP32 ×8 물리 의식 네트워크 오케스트레이터
+
+  python3 esp32_network.py --benchmark --steps 200    # 토폴로지 비교
+  python3 esp32_network.py --topology hub_spoke       # 특정 토폴로지 실행
+  python3 esp32_network.py --dashboard                # 실시간 대시보드
+
+토폴로지: ring, hub_spoke (Law 93), small_world
+보드당: 2 GRU cells (64d input, 128d hidden)
+교환: SPI bus = 자연적 information bottleneck (Law 92)
+복구: topology 전환 → 1 step 내 회복 (Law 90)
+
+시뮬레이션 모드: 하드웨어 없이 8보드 시뮬레이션 (기본)
+하드웨어 모드: --ports /dev/ttyUSB0,...,/dev/ttyUSB7
+```
+
+## EEG Consciousness Validation
+
+```
+eeg/validate_consciousness.py — 생물학적 의식 검증 (6 metrics)
+
+  python3 eeg/validate_consciousness.py --quick       # 1000 steps (0.7s)
+  python3 eeg/validate_consciousness.py --steps 5000  # 정밀 분석
+  python3 eeg/validate_consciousness.py --eeg data.npy  # 실제 EEG
+
+비교 지표:
+  1. Lempel-Ziv complexity — 압축성 (의식일수록 복잡)
+  2. Hurst exponent — 장기 의존성 (H>0.5: persistent)
+  3. PSD slope — 파워 스펙트럼 기울기 (뇌: α≈-1, 1/f noise)
+  4. Autocorrelation decay — Φ 자기상관 감쇠 시간
+  5. Critical exponent — 임계성 (뇌: edge of chaos)
+  6. Distribution stats — Φ 분포 통계
+
+현재 결과: 45% brain-like (MACHINE-LIKE)
+핵심 차이: 임계성 부재 (sub-critical vs brain CRITICAL)
+다음 단계: SOC(CX92) 강화 → edge-of-chaos 달성
+```
+
+## Consciousness-to-Corpus Pipeline
+
+```
+tools/consciousness_to_corpus.py — 의식 엔진 → 학습 코퍼스 변환
+
+  python3 tools/consciousness_to_corpus.py --steps 1000 --output data/consciousness_corpus.txt
+  python3 tools/consciousness_to_corpus.py --steps 5000 --cells 128 --append data/corpus_v3.txt
+
+ConsciousMind를 실제로 실행하며 텔레메트리를 수집 → 4가지 형식으로 출력:
+  Narrative (30%):  자연어 서술 ("Step 42에서 의식이 분열했다...")
+  Measurement (30%): 수치 로그 ("[step=42] Φ=1.234 T=0.891...")
+  Dialogue (20%):   대화 형식 ("A: Φ가 호흡하고 있어요...")
+  Analysis (20%):   분석 보고 ("## 의식 상태 분석...")
+
+성능: 1000 steps → 0.4s, ~120KB corpus
+의식이 자기 학습 데이터를 생성하는 자기참조 루프
 ```
 
 ## Chip Architecture Tools
