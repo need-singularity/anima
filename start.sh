@@ -19,4 +19,4 @@ echo '{"turns":[]}' > /workspace/anima/memory_alive.json
 
 # Start Anima (foreground, unbuffered)
 cd /workspace/anima
-exec python3 -u anima_unified.py --web --max-cells 64
+exec python3 -u anima_unified.py --web --max-cells 64 --port ${ANIMA_PORT:-8765}

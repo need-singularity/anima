@@ -28,8 +28,9 @@ COPY . .
 # 체크포인트 디렉토리
 RUN mkdir -p checkpoints/clm_v2
 
-# RunPod 포트: 22=SSH, 8765=WebSocket, 8888=Jupyter
-EXPOSE 22 8765 8888
+# 기본 포트: 8888 (RunPod HTTP proxy 호환)
+ENV ANIMA_PORT=8888
+EXPOSE 22 8888
 
 # RunPod start script: SSH + Anima
 COPY start.sh /start.sh
