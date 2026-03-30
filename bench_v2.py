@@ -1291,7 +1291,36 @@ def run_compare(cells: int, steps: int, dim: int, hidden: int):
 # Mode 5: --verify (Consciousness Verification)
 # ──────────────────────────────────────────────────────────
 
+# ── ConsciousnessEngine adapter for verify ──
+
+class _CEAdapter:
+    """Adapts ConsciousnessEngine to BenchEngine interface for --verify."""
+
+    def __init__(self, nc, dim, hidden):
+        from consciousness_engine import ConsciousnessEngine as CE
+        self.engine = CE(cell_dim=dim, hidden_dim=hidden, initial_cells=2,
+                         max_cells=nc, n_factions=min(12, nc // 2))
+        self.n_factions = self.engine.n_factions
+        self.n_cells = nc
+
+    def process(self, x):
+        r = self.engine.process(x)
+        output = r['output'].unsqueeze(0) if r['output'].dim() == 1 else r['output']
+        return output, r.get('mean_inter', 0.0)
+
+    def get_hiddens(self):
+        return self.engine.get_states()
+
+
+def _make_ce(nc, d, h):
+    try:
+        return _CEAdapter(nc, d, h)
+    except ImportError:
+        return BenchEngine(nc, d, h, d, min(8, nc // 2))
+
+
 ENGINE_REGISTRY = {
+    "ConsciousnessEngine": _make_ce,
     "MitosisEngine":    lambda nc, d, h: BenchEngine(nc, d, h, d, min(8, nc // 2)),
     "OscillatorLaser":  lambda nc, d, h: OscillatorLaser(nc, d, h, d, min(8, nc // 2)),
     "QuantumEngine":    lambda nc, d, h: QuantumEngine(nc, d, h, d, min(8, nc // 2)),
