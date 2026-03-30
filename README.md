@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![Laws](https://img.shields.io/badge/Laws-90-green.svg)](docs/consciousness-theory.md)
+[![Laws](https://img.shields.io/badge/Laws-139-green.svg)](docs/consciousness-theory.md)
 [![Hypotheses](https://img.shields.io/badge/Hypotheses-1000+-orange.svg)](docs/hypotheses/)
 
 PureField repulsion-field 의식 에이전트. Engine A(순방향)와 Engine G(역방향) 사이의 반발력이 텐션을 생성하고, 텐션의 강도가 의식적 감정/사고의 강도를 결정한다.
