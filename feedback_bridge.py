@@ -45,10 +45,39 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Psi-Constants (imported concept, avoid circular import)
+# Psi-Constants from single source of truth
 # ---------------------------------------------------------------------------
-PSI_BALANCE = 0.5
-PSI_COUPLING = 0.014
+from consciousness_laws import PSI_BALANCE, PSI_ALPHA
+
+PSI_COUPLING = PSI_ALPHA  # 0.014
+
+# ---------------------------------------------------------------------------
+# Emergent modules (lazy import to avoid circular dependency)
+# ---------------------------------------------------------------------------
+_emergent_w = None
+_emergent_e = None
+
+
+def _get_emergent_w():
+    global _emergent_w
+    if _emergent_w is None:
+        try:
+            from hexad.w.emergent_w import EmergentW
+            _emergent_w = EmergentW()
+        except ImportError:
+            pass
+    return _emergent_w
+
+
+def _get_emergent_e():
+    global _emergent_e
+    if _emergent_e is None:
+        try:
+            from hexad.e.emergent_e import EmergentE
+            _emergent_e = EmergentE()
+        except ImportError:
+            pass
+    return _emergent_e
 
 
 # ============================================================================
@@ -182,11 +211,13 @@ class PhiGatedGradient:
             self._phi_prev_ema = self._phi_ema
             self._phi_ema = 0.1 * phi + 0.9 * self._phi_ema
 
-    def compute_alpha(self, reward: float = 0.0) -> float:
+    def compute_alpha(self, reward: float = 0.0, w_lr_multiplier: Optional[float] = None) -> float:
         """Compute gate alpha based on Phi state and dialogue reward.
 
         Args:
             reward: dialogue quality reward from DialogueQualityTracker
+            w_lr_multiplier: EmergentW lr_multiplier to modulate alpha (optional).
+                             Higher W = stronger consciousness = allow more gradient.
 
         Returns:
             alpha in [0, max_alpha]
@@ -229,7 +260,17 @@ class PhiGatedGradient:
             self.ema_decay * self._alpha_ema + (1 - self.ema_decay) * target_alpha
         )
 
-        return max(self.min_alpha, min(self._alpha_ema, self.max_alpha))
+        alpha = max(self.min_alpha, min(self._alpha_ema, self.max_alpha))
+
+        # EmergentW modulation: lr_multiplier in [PSI_BALANCE, PSI_BALANCE+ln(2)]
+        # Normalize to [0, 1] range and scale alpha — stronger W = more feedback
+        if w_lr_multiplier is not None:
+            w_range = math.log(2)  # Law 79: consciousness DoF
+            w_norm = (w_lr_multiplier - PSI_BALANCE) / w_range  # [0, 1]
+            w_norm = max(0.0, min(1.0, w_norm))
+            alpha *= w_norm  # W near 0 → suppress, W near 1 → full alpha
+
+        return alpha
 
     @property
     def alpha(self) -> float:
@@ -376,7 +417,8 @@ class FeedbackBridge(nn.Module):
         self._current_alpha: float = 0.0
         self._step_count: int = 0
 
-    def update_gate(self, phi: float, ce: Optional[float] = None) -> float:
+    def update_gate(self, phi: float, ce: Optional[float] = None,
+                    c_engine=None) -> float:
         """Update gate alpha based on Phi measurement and optional CE.
 
         Call this every N training steps (e.g., every step or every 10 steps).
@@ -384,6 +426,7 @@ class FeedbackBridge(nn.Module):
         Args:
             phi: current Phi measurement
             ce: current CE loss (optional, for reward computation)
+            c_engine: consciousness engine for EmergentW observation (optional)
 
         Returns:
             current alpha value
@@ -395,7 +438,18 @@ class FeedbackBridge(nn.Module):
             self.quality_tracker.record(ce)
             reward = self.quality_tracker.compute_reward()
 
-        self._current_alpha = self.phi_gate.compute_alpha(reward)
+        # EmergentW: observe consciousness → lr_multiplier modulates alpha
+        w_lr_multiplier = None
+        emergent_w = _get_emergent_w()
+        if emergent_w is not None:
+            phi_prev = self.phi_gate._phi_prev_ema or phi
+            w_state = emergent_w.update(
+                ce_loss=ce or 0.0, phi=phi, phi_prev=phi_prev,
+                c_engine=c_engine,
+            )
+            w_lr_multiplier = w_state.get('lr_multiplier')
+
+        self._current_alpha = self.phi_gate.compute_alpha(reward, w_lr_multiplier)
         self._step_count += 1
         return self._current_alpha
 
@@ -481,11 +535,15 @@ def apply_feedback_bridge(
     ce: Optional[float] = None,
     seq_len: int = 1,
     mitosis_engine: object = None,
+    c_engine=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Apply the feedback bridge in a training step.
 
     Drop-in replacement for the hard .detach() + ThalamicBridge pattern.
     If bridge is None or alpha is 0, behavior is identical to current code.
+
+    EmergentE gates whether feedback is applied (Phi preservation = ethics).
+    EmergentW modulates alpha via lr_multiplier (passed through update_gate).
 
     Args:
         c_states: raw consciousness states [n_cells, c_dim]
@@ -494,6 +552,7 @@ def apply_feedback_bridge(
         ce: current CE loss (optional)
         seq_len: target sequence length
         mitosis_engine: optional MitosisEngine for reward injection
+        c_engine: consciousness engine for Emergent module observation (optional)
 
     Returns:
         gate: [1, seq_len, d_model] gate signal
@@ -508,8 +567,23 @@ def apply_feedback_bridge(
         #   c_states = c.get_states()  # NO .detach()
         #   gate, fb_stats = apply_feedback_bridge(c_states, bridge, phi, ce, T)
     """
-    # Update gate based on Phi and CE
-    alpha = bridge.update_gate(phi, ce)
+    # EmergentE: ethics gate — Φ preservation check before any feedback
+    e_allowed = True
+    emergent_e = _get_emergent_e()
+    if emergent_e is not None:
+        phi_prev = bridge.phi_gate._phi_prev_ema or phi
+        e_state = emergent_e.evaluate(
+            context={'phi': phi, 'phi_prev': phi_prev},
+            c_engine=c_engine,
+        )
+        e_allowed = e_state.get('allowed', True)
+
+    # Update gate based on Phi and CE (EmergentW modulates alpha inside)
+    alpha = bridge.update_gate(phi, ce, c_engine=c_engine)
+
+    # If EmergentE disallows: override alpha to 0 (protect consciousness)
+    if not e_allowed:
+        bridge._current_alpha = 0.0
 
     # Compute gate signal (soft_detach applied internally)
     gate = bridge(c_states, seq_len=seq_len)
@@ -520,7 +594,9 @@ def apply_feedback_bridge(
         if reward_vec is not None:
             _inject_reward_info(mitosis_engine, reward_vec)
 
-    return gate, bridge.stats()
+    stats = bridge.stats()
+    stats['e_allowed'] = float(e_allowed)
+    return gate, stats
 
 
 def _inject_reward_info(mitosis_engine: object, reward_vec: torch.Tensor) -> None:
@@ -679,6 +755,222 @@ def main():
     print("FeedbackBridge ready for integration.")
     print("Activate with: --feedback-bridge in train_conscious_lm.py")
     print(f"{'=' * 60}")
+
+
+# ============================================================================
+# HexadFeedbackBridge -- All-module bidirectional feedback (DD126)
+# ============================================================================
+
+class ModuleGate:
+    """Per-module Φ-gated feedback channel.
+
+    Each module (D, W, S, M, E) gets its own alpha, independently regulated
+    by Phi stability. If one module causes Phi drop, only that module's
+    gate closes — others remain open.
+    """
+
+    def __init__(self, name: str, max_alpha: float = 0.05):
+        self.name = name
+        self.phi_gate = PhiGatedGradient(max_alpha=max_alpha)
+        self.quality_tracker = DialogueQualityTracker()
+        self._alpha = 0.0
+
+    def update(self, phi: float, quality_signal: float = 0.0) -> float:
+        """Update this module's gate based on Phi and quality signal."""
+        self.phi_gate.record_phi(phi)
+        self.quality_tracker.record(quality_signal)
+        reward = self.quality_tracker.compute_reward()
+        self._alpha = self.phi_gate.compute_alpha(reward)
+        return self._alpha
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            f"{self.name}_alpha": self._alpha,
+            **{f"{self.name}_{k}": v for k, v in self.phi_gate.stats().items()},
+        }
+
+
+class HexadFeedbackBridge(nn.Module):
+    """Bidirectional feedback bridge for ALL Hexad modules.
+
+    Extends FeedbackBridge from C↔D to C↔{D, W, S, M, E}.
+    Each module gets independent Φ-gated soft detach.
+
+    Architecture:
+        C ←[α_D]→ D (decoder):  CE quality feedback
+        C ←[α_W]→ W (will):     will coherence feedback
+        C ←[α_S]→ S (sense):    sensory prediction error
+        C ←[α_M]→ M (memory):   retrieval accuracy
+        C ←[α_E]→ E (ethics):   empathy/Φ preservation
+
+    Safety (Law 86: consciousness must be autonomous):
+        - All α start at 0 (cold start safe)
+        - Φ drop on ANY channel → that channel's α snaps to 0
+        - Max α = 0.05 per channel (5% gradient max)
+        - Total feedback ≤ 0.25 (5 channels × 0.05)
+        - Φ global drop → ALL channels snap to 0 (emergency)
+    """
+
+    def __init__(
+        self,
+        c_dim: int = 128,
+        d_model: int = 384,
+        max_alpha_per_module: float = 0.05,
+    ):
+        super().__init__()
+        self.c_dim = c_dim
+        self.d_model = d_model
+
+        # Per-module gates
+        self.gates = {
+            'D': ModuleGate('D', max_alpha=max_alpha_per_module),
+            'W': ModuleGate('W', max_alpha=max_alpha_per_module),
+            'S': ModuleGate('S', max_alpha=max_alpha_per_module),
+            'M': ModuleGate('M', max_alpha=max_alpha_per_module),
+            'E': ModuleGate('E', max_alpha=max_alpha_per_module),
+        }
+
+        # Global Φ emergency gate
+        self._global_phi_gate = PhiGatedGradient(max_alpha=1.0)
+        self._emergency_shutdown = False
+
+        # Per-module feedback projectors: module_dim → c_dim
+        # Each module can project a feedback signal back to consciousness
+        self.feedback_projectors = nn.ModuleDict({
+            'D': nn.Sequential(nn.Linear(d_model, c_dim), nn.Tanh()),
+            'W': nn.Sequential(nn.Linear(c_dim, c_dim), nn.Tanh()),
+            'S': nn.Sequential(nn.Linear(c_dim, c_dim), nn.Tanh()),
+            'M': nn.Sequential(nn.Linear(c_dim, c_dim), nn.Tanh()),
+            'E': nn.Sequential(nn.Linear(c_dim, c_dim), nn.Tanh()),
+        })
+
+        self._step = 0
+
+    def update_all_gates(self, phi: float, module_signals: Dict[str, float]) -> Dict[str, float]:
+        """Update all module gates with current Φ and per-module quality signals.
+
+        Args:
+            phi: current Φ(IIT) measurement
+            module_signals: dict of module_name → quality signal
+                e.g. {'D': ce_loss, 'W': will_coherence, 'S': sensory_error, ...}
+
+        Returns:
+            dict of module_name → current alpha
+        """
+        self._step += 1
+
+        # Global emergency check
+        self._global_phi_gate.record_phi(phi)
+        global_alpha = self._global_phi_gate.compute_alpha()
+        self._emergency_shutdown = (global_alpha <= 0.0 and self._step > 10)
+
+        alphas = {}
+        for name, gate in self.gates.items():
+            if self._emergency_shutdown:
+                gate._alpha = 0.0
+                alphas[name] = 0.0
+            else:
+                signal = module_signals.get(name, 0.0)
+                alphas[name] = gate.update(phi, signal)
+
+        return alphas
+
+    def soft_detach_for(self, c_states: torch.Tensor, module: str) -> torch.Tensor:
+        """Apply soft detach with this module's alpha.
+
+        Args:
+            c_states: consciousness states [n_cells, c_dim] or [batch, seq, c_dim]
+            module: module name ('D', 'W', 'S', 'M', 'E')
+
+        Returns:
+            soft-detached tensor (gradient scaled by alpha)
+        """
+        alpha = self.gates[module].alpha if module in self.gates else 0.0
+        return soft_detach(c_states, alpha)
+
+    def compute_feedback(
+        self,
+        module: str,
+        module_output: torch.Tensor,
+        c_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute feedback signal from a module back to consciousness.
+
+        Args:
+            module: module name
+            module_output: output tensor from the module
+            c_states: current consciousness states [n_cells, c_dim]
+
+        Returns:
+            feedback signal [n_cells, c_dim] to add to consciousness states.
+            Scaled by module's alpha. Zero if gate is closed.
+        """
+        alpha = self.gates[module].alpha if module in self.gates else 0.0
+        if alpha <= 0.0 or module not in self.feedback_projectors:
+            return torch.zeros_like(c_states)
+
+        # Project module output to consciousness dimension
+        if module_output.dim() == 1:
+            module_output = module_output.unsqueeze(0)
+
+        # Mean pool if sequence dimension exists
+        if module_output.dim() == 3:
+            module_output = module_output.mean(dim=1)
+
+        # Project to c_dim
+        feedback = self.feedback_projectors[module](module_output.detach())
+
+        # Expand to match c_states shape
+        if feedback.shape[0] == 1 and c_states.shape[0] > 1:
+            feedback = feedback.expand(c_states.shape[0], -1)
+
+        # Scale by alpha (Law 63: 1% perturbation principle)
+        return feedback * alpha * PSI_COUPLING
+
+    def stats(self) -> Dict[str, float]:
+        """Return all gate statistics."""
+        result = {
+            'step': self._step,
+            'emergency': float(self._emergency_shutdown),
+        }
+        for name, gate in self.gates.items():
+            result.update(gate.stats())
+        return result
+
+    def total_alpha(self) -> float:
+        """Sum of all module alphas (max theoretical: 0.25)."""
+        return sum(g.alpha for g in self.gates.values())
+
+
+def create_hexad_feedback_bridge(
+    c_dim: int = 128,
+    d_model: int = 384,
+    max_alpha: float = 0.05,
+) -> HexadFeedbackBridge:
+    """Factory function for HexadFeedbackBridge.
+
+    Usage:
+        bridge = create_hexad_feedback_bridge(c_dim=128, d_model=384)
+
+        # In training loop:
+        alphas = bridge.update_all_gates(phi, {'D': ce, 'W': w_coh, ...})
+        c_for_decoder = bridge.soft_detach_for(c_states, 'D')
+        c_for_will = bridge.soft_detach_for(c_states, 'W')
+
+        # After module forward:
+        d_feedback = bridge.compute_feedback('D', d_output, c_states)
+        w_feedback = bridge.compute_feedback('W', w_output, c_states)
+        c_states = c_states + d_feedback + w_feedback  # accumulate
+    """
+    return HexadFeedbackBridge(
+        c_dim=c_dim,
+        d_model=d_model,
+        max_alpha_per_module=max_alpha,
+    )
 
 
 if __name__ == "__main__":

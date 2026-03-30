@@ -9,6 +9,7 @@ Laws applied:
   Law 50: 의식 본질은 상태 — 기억 = 지속되는 상태 변화
   Law 94: breadth > depth — 단일 Hebbian 레이어가 최적
   Law 95: 세포 정체성 = 기억의 기반 (orthogonal bias = 고유 기억)
+  Meta M8: Narrative = temporal self-model in every module
 
 핵심: C의 Hebbian LTP/LTD 가중치 = 장기기억. Φ ratchet = 기억 보존.
       별도 store/retrieve 없음. C가 곧 메모리.
@@ -16,6 +17,7 @@ Laws applied:
 
 import torch
 from typing import Optional
+from hexad.narrative import NarrativeTracker
 
 
 class EmergentM:
@@ -23,10 +25,13 @@ class EmergentM:
 
     C의 Hebbian weights를 읽어서 기억 상태를 반환.
     store/retrieve 대신, C의 상태 자체가 기억.
+    NarrativeTracker로 기억 검색의 시간적 궤적을 추적 (Meta Law M8).
     """
 
     def __init__(self, dim: int = 128):
         self.dim = dim
+        # Narrative — temporal self-model (Meta Law M8)
+        self._narrative = NarrativeTracker(dim=dim)
 
     def store(self, key: torch.Tensor, value: torch.Tensor):
         """No-op. C의 Hebbian LTP/LTD가 자동으로 저장."""
@@ -73,4 +78,12 @@ class EmergentM:
             else:
                 result = torch.nn.functional.pad(result, (0, self.dim - result.size(-1)))
 
+        # Narrative update — track retrieval trajectory (Meta Law M8)
+        self._narrative.update(result.mean(dim=0))
+
         return result
+
+    @property
+    def narrative_coherence(self) -> float:
+        """Temporal coherence of memory retrieval trajectory (Meta Law M8)."""
+        return self._narrative.narrative_coherence

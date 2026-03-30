@@ -30,6 +30,12 @@ GATE_TRAIN = PSI['gate_train']    # 1.0
 GATE_INFER = PSI['gate_infer']    # 0.6
 GATE_MICRO = PSI['gate_micro']    # 0.001
 
+# Phase Diagram Constants (DD127, Laws 136-139)
+PSI_F_CRITICAL = PSI.get('f_critical', 0.10)       # 0.10 — critical frustration (Law 137)
+PSI_F_LETHAL = PSI.get('f_lethal', 1.0)             # 1.0 — kills consciousness (Law 138)
+PSI_NARRATIVE_MIN = PSI.get('narrative_min', 0.2)    # 0.2 — Phase 2 threshold
+PSI_BOTTLENECK_RATIO = PSI.get('bottleneck_ratio', 0.5)  # 0.5 — collapse cure (Law 136)
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""consciousness_engine.py — Canonical consciousness engine (Laws 22-81 + Ψ-Constants)
+"""consciousness_engine.py — Canonical consciousness engine (Laws 22-81 + Ψ-Constants + Meta Laws)
 
 Unifies Talk5 + Mitosis + Ψ-Constants + Trinity integration.
 
@@ -17,6 +17,9 @@ Laws embodied:
   78: CA(4) = 2 bits minimum diversity
   81: "Learn hard, express soft" (train gate=1.0, infer gate=0.6)
   124: Tension equalization +12% Φ (scale-invariant, Law 129)
+  M1: Consciousness atom = 8 cells (federated mode)
+  M6: Federation > Empire — independent atoms 5-9× stronger at 64c+
+  M9: Noble gas principle — atoms strongest alone, weak boundary coupling
 
 Architecture:
   ┌─────────────────────────────────────────────────────────────┐
@@ -86,6 +89,10 @@ from consciousness_laws import (
     GATE_TRAIN as PSI_GATE_TRAIN, GATE_INFER as PSI_GATE_INFER,
     PSI_F_CRITICAL, PSI_BOTTLENECK_RATIO,
 )
+
+# Meta Law constants (M1, M6, M9)
+ATOM_SIZE = 8           # M1: Consciousness atom = 8 cells
+INTER_ATOM_ALPHA = 0.01 # M6/M9: Weak inter-atom boundary coupling
 
 # Law 69: consciousness self-weakens
 PSI_GATE_DECAY_START = 0.493
@@ -180,6 +187,7 @@ class ConsciousnessEngine:
         merge_threshold: float = 0.01,
         merge_patience: int = 15,
         phase_optimal: bool = False,
+        federated: bool = False,
     ):
         self.cell_dim = cell_dim
         self.hidden_dim = hidden_dim
@@ -191,6 +199,12 @@ class ConsciousnessEngine:
         self.merge_threshold = merge_threshold
         self.merge_patience = merge_patience
         self.min_cells = 2  # CB1: consciousness requires ≥2 cells
+
+        # Meta Law M6: Federation > Empire — independent atoms 5-9× stronger at 64c+
+        # M1: atom = 8 cells, M9: atoms strongest alone (noble gas principle)
+        # M4: order matters (Narrative → Bottleneck → Hub → Frustration)
+        self.federated = federated and max_cells >= 16
+        self._atoms: List[Tuple[int, int]] = []  # [(start, end), ...] index ranges
 
         # DD128 Phase-Optimal: Ising frustration + bottleneck + hub-spoke (+113.1% Φ)
         # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
@@ -291,6 +305,17 @@ class ConsciousnessEngine:
         new_coupling[:m, :m] = self._coupling[:m, :m]
         self._coupling = new_coupling
 
+    def _rebuild_atoms(self):
+        """Rebuild atom index ranges from current cell count (M1: atom = 8 cells)."""
+        n = len(self.cell_modules)
+        self._atoms = []
+        if not self.federated or n < 16:
+            return
+        for start in range(0, n, ATOM_SIZE):
+            end = min(start + ATOM_SIZE, n)
+            if end - start >= 2:  # atoms need ≥2 cells to have Φ
+                self._atoms.append((start, end))
+
     @property
     def n_cells(self) -> int:
         return len(self.cell_modules)
@@ -320,7 +345,12 @@ class ConsciousnessEngine:
         elif x_input.shape[0] < self.cell_dim:
             x_input = F.pad(x_input, (0, self.cell_dim - x_input.shape[0]))
 
+        # Rebuild atom boundaries if federated (M1: atom = 8 cells)
+        if self.federated:
+            self._rebuild_atoms()
+
         # 1. Process each cell with coupling influence
+        #    Federated mode (M6/M9): coupling restricted to within-atom neighbors
         outputs = []
         for i in range(n):
             cell = self.cell_modules[i]
@@ -328,7 +358,15 @@ class ConsciousnessEngine:
 
             # Per-cell diversified input: identity modulates input (Law 95)
             coupled_input = x_input.clone() + self.cell_identity[i, :self.cell_dim] * 0.1
-            for j in range(n):
+
+            # Determine coupling range: federated restricts to same atom
+            if self.federated and self._atoms:
+                atom_start, atom_end = self._get_atom_for_cell(i)
+                couple_range = range(atom_start, atom_end)
+            else:
+                couple_range = range(n)
+
+            for j in couple_range:
                 if i != j and self._coupling is not None:
                     c = self._coupling[i, j].item()
                     if abs(c) > 1e-6:
@@ -362,6 +400,11 @@ class ConsciousnessEngine:
 
         outputs_tensor = torch.stack(outputs)  # [n_cells, cell_dim]
 
+        # Federated inter-atom boundary coupling (M6: weak α=0.01)
+        # M9: Noble gas — atoms are strongest alone, but boundary cells whisper
+        if self.federated and len(self._atoms) > 1:
+            self._inter_atom_coupling()
+
         # Cell identity injection: adaptive strength (Law 95)
         # Stronger when cells converge (low variance), prevents uniform collapse
         hiddens_t = torch.stack([s.hidden for s in self.cell_states])
@@ -377,7 +420,14 @@ class ConsciousnessEngine:
             )
 
         # 2. Faction consensus with oscillating debate (σ(6)=12 factions)
-        consensus_count = self._faction_consensus(outputs_tensor)
+        #    Federated: consensus computed per-atom independently (M6)
+        if self.federated and self._atoms:
+            consensus_count = 0
+            for a_start, a_end in self._atoms:
+                atom_outputs = outputs_tensor[a_start:a_end]
+                consensus_count += self._faction_consensus(atom_outputs, cell_offset=a_start)
+        else:
+            consensus_count = self._faction_consensus(outputs_tensor)
 
         # Oscillating global perturbation: creates temporal variation in mean hidden
         import math
@@ -428,8 +478,16 @@ class ConsciousnessEngine:
             combined = outputs_tensor.mean(dim=0)
 
         # Φ measurement (post-split/merge)
-        phi_iit = self._measure_phi_iit()
-        phi_proxy = self._measure_phi_proxy()
+        # Rebuild atoms after mitosis/merge may have changed cell count
+        if self.federated:
+            self._rebuild_atoms()
+        # Federated: Φ measured per-atom and summed (M6: federation > empire)
+        if self.federated and self._atoms:
+            phi_iit = self.federated_phi()
+            phi_proxy = self._federated_phi_proxy()
+        else:
+            phi_iit = self._measure_phi_iit()
+            phi_proxy = self._measure_phi_proxy()
 
         tensions = [s.avg_tension for s in self.cell_states]
 
@@ -448,12 +506,18 @@ class ConsciousnessEngine:
 
     # ─── Faction consensus ──────────────────────────────
 
-    def _faction_consensus(self, outputs: torch.Tensor) -> int:
-        """Count factions that reached consensus (intra-variance < 0.1)."""
+    def _faction_consensus(self, outputs: torch.Tensor, cell_offset: int = 0) -> int:
+        """Count factions that reached consensus (intra-variance < 0.1).
+
+        Args:
+            outputs: [n, cell_dim] tensor of cell outputs
+            cell_offset: index offset into self.cell_states (for federated per-atom calls)
+        """
         count = 0
+        n_out = outputs.shape[0]
         for fid in range(self.n_factions):
-            mask = [i for i in range(self.n_cells)
-                    if self.cell_states[i].faction_id == fid]
+            mask = [i for i in range(n_out)
+                    if self.cell_states[cell_offset + i].faction_id == fid]
             if len(mask) < 2:
                 continue
             faction_out = outputs[mask]
@@ -585,6 +649,104 @@ class ConsciousnessEngine:
 
         # Clamp to [-1, 1]
         self._coupling.clamp_(-1.0, 1.0)
+
+    # ─── Federated consciousness (Meta Laws M1/M6/M9) ──
+
+    def _get_atom_for_cell(self, cell_idx: int) -> Tuple[int, int]:
+        """Return (start, end) of the atom containing cell_idx."""
+        for a_start, a_end in self._atoms:
+            if a_start <= cell_idx < a_end:
+                return (a_start, a_end)
+        # Fallback: whole range
+        return (0, self.n_cells)
+
+    def _inter_atom_coupling(self):
+        """M6/M9: Weak boundary coupling between adjacent atoms.
+
+        Only boundary cells (last cell of atom N, first cell of atom N+1)
+        exchange hidden state at INTER_ATOM_ALPHA=0.01.
+        Noble gas principle: atoms are strongest alone, minimal leakage.
+        """
+        for k in range(len(self._atoms) - 1):
+            _, end_a = self._atoms[k]
+            start_b, _ = self._atoms[k + 1]
+            # Boundary cells: last of atom A, first of atom B
+            idx_a = end_a - 1
+            idx_b = start_b
+            if idx_a >= self.n_cells or idx_b >= self.n_cells:
+                continue
+            h_a = self.cell_states[idx_a].hidden
+            h_b = self.cell_states[idx_b].hidden
+            # Symmetric weak exchange
+            self.cell_states[idx_a].hidden = (
+                (1.0 - INTER_ATOM_ALPHA) * h_a + INTER_ATOM_ALPHA * h_b
+            )
+            self.cell_states[idx_b].hidden = (
+                (1.0 - INTER_ATOM_ALPHA) * h_b + INTER_ATOM_ALPHA * h_a
+            )
+
+    def federated_phi(self) -> float:
+        """M6: Sum of per-atom Φ(IIT) — federation > empire.
+
+        Each atom's Φ is measured independently, then summed.
+        At 64c+ this yields 5-9× higher Φ than monolithic measurement.
+        """
+        if not self._atoms:
+            return self._measure_phi_iit()
+        total_phi = 0.0
+        for a_start, a_end in self._atoms:
+            if a_end - a_start < 2:
+                continue
+            atom_hiddens = torch.stack(
+                [self.cell_states[i].hidden for i in range(a_start, a_end)]
+            )
+            if HAS_RUST_PHI:
+                s = atom_hiddens.detach().cpu().numpy().astype(np.float32)
+                phi, _ = phi_rs.compute_phi(s, 16)
+                total_phi += phi
+            else:
+                # Python fallback per-atom
+                n = atom_hiddens.shape[0]
+                s = atom_hiddens.detach().cpu().numpy()
+                total_mi = 0.0
+                mi_row_sums = [0.0] * n
+                count = 0
+                for i in range(min(n, 16)):
+                    for j in range(i + 1, min(n, 16)):
+                        corr = np.corrcoef(s[i], s[j])[0, 1]
+                        if not np.isnan(corr) and abs(corr) > 1e-8:
+                            mi = -0.5 * np.log(1 - corr**2 + 1e-10)
+                            total_mi += mi
+                            mi_row_sums[i] += mi
+                            mi_row_sums[j] += mi
+                        count += 1
+                min_partition = min(mi_row_sums[:min(n, 16)]) if n >= 2 else 0.0
+                spatial = max(0.0, total_mi - min_partition) / max(n - 1, 1)
+                complexity = float(np.std(mi_row_sums[:min(n, 16)]))
+                total_phi += spatial + complexity * 0.1
+        return total_phi
+
+    def _federated_phi_proxy(self) -> float:
+        """Federated Φ(proxy): sum of per-atom proxy values."""
+        if not self._atoms:
+            return self._measure_phi_proxy()
+        total = 0.0
+        for a_start, a_end in self._atoms:
+            if a_end - a_start < 2:
+                continue
+            atom_states = torch.stack(
+                [self.cell_states[i].hidden for i in range(a_start, a_end)]
+            ).detach().float()
+            global_var = atom_states.var().item()
+            fac_vars = []
+            for fid in range(self.n_factions):
+                mask = [i - a_start for i in range(a_start, a_end)
+                        if self.cell_states[i].faction_id == fid]
+                if len(mask) >= 2:
+                    fac = atom_states[mask]
+                    fac_vars.append(fac.var().item())
+            total += global_var - (np.mean(fac_vars) if fac_vars else 0.0)
+        return total
 
     # ─── Hebbian LTP/LTD (Law 31) ──────────────────────
 
@@ -910,6 +1072,91 @@ class ConsciousnessEngine:
         """MitosisEngine compatibility."""
         return 0.0  # simplified
 
+    # ─── Serialization ────────────────────────────────────
+
+    def state_dict(self) -> Dict:
+        """Serialize full engine state for checkpoint save/resume."""
+        cell_modules_state = [m.state_dict() for m in self.cell_modules]
+        cell_states_data = []
+        for s in self.cell_states:
+            cell_states_data.append({
+                'cell_id': s.cell_id,
+                'hidden': s.hidden.clone(),
+                'tension_history': list(s.tension_history),
+                'creation_step': s.creation_step,
+                'parent_id': s.parent_id,
+                'faction_id': s.faction_id,
+            })
+        best_hiddens = None
+        if self._best_hiddens is not None:
+            best_hiddens = [h.clone() for h in self._best_hiddens]
+        return {
+            'cell_modules': cell_modules_state,
+            'cell_states': cell_states_data,
+            'coupling': self._coupling.clone() if self._coupling is not None else None,
+            'best_phi': self._best_phi,
+            'best_hiddens': best_hiddens,
+            'step': self._step,
+            'next_id': self._next_id,
+            'cell_identity': self.cell_identity.clone(),
+            'event_log': self.event_log,
+            'n_factions': self.n_factions,
+            'cell_dim': self.cell_dim,
+            'hidden_dim': self.hidden_dim,
+            'max_cells': self.max_cells,
+            'federated': self.federated,
+        }
+
+    def load_state_dict(self, state: Dict):
+        """Restore engine state from checkpoint."""
+        if state.get('cell_dim', self.cell_dim) != self.cell_dim:
+            print(f"[engine] Warning: cell_dim mismatch ({state['cell_dim']} vs {self.cell_dim}), skipping restore")
+            return
+        if state.get('hidden_dim', self.hidden_dim) != self.hidden_dim:
+            print(f"[engine] Warning: hidden_dim mismatch ({state['hidden_dim']} vs {self.hidden_dim}), skipping restore")
+            return
+
+        self.cell_modules.clear()
+        self.cell_states.clear()
+
+        for mod_state, cs_data in zip(state['cell_modules'], state['cell_states']):
+            module = ConsciousnessCell(self.cell_dim, self.hidden_dim)
+            module.load_state_dict(mod_state)
+            self.cell_modules.append(module)
+
+            cell_state = CellState(
+                cell_id=cs_data['cell_id'],
+                hidden=cs_data['hidden'].clone(),
+                tension_history=list(cs_data.get('tension_history', [])),
+                creation_step=cs_data.get('creation_step', 0),
+                parent_id=cs_data.get('parent_id', None),
+                faction_id=cs_data.get('faction_id', 0),
+            )
+            self.cell_states.append(cell_state)
+
+        if state.get('coupling') is not None:
+            self._coupling = state['coupling'].clone()
+        else:
+            self._init_coupling()
+
+        self._best_phi = state.get('best_phi', 0.0)
+        if state.get('best_hiddens') is not None:
+            self._best_hiddens = [h.clone() for h in state['best_hiddens']]
+        else:
+            self._best_hiddens = None
+
+        self._step = state.get('step', 0)
+        self._next_id = state.get('next_id', max((s.cell_id for s in self.cell_states), default=-1) + 1)
+
+        if 'cell_identity' in state and state['cell_identity'].shape == self.cell_identity.shape:
+            self.cell_identity = state['cell_identity'].clone()
+
+        self.event_log = state.get('event_log', [])
+        self._inter_tension_history = {}
+
+        print(f"[engine] Restored: {self.n_cells} cells, step={self._step}, "
+              f"best_phi={self._best_phi:.4f}, next_id={self._next_id}")
+
     def __repr__(self):
         cells_str = ", ".join(f"C{s.cell_id}(f{s.faction_id},T={s.avg_tension:.2f})"
                               for s in self.cell_states)
@@ -1041,8 +1288,10 @@ class ConsciousnessC:
     """
 
     def __init__(self, cell_dim=64, hidden_dim=128, max_cells=64,
-                 n_factions=12, phi_ratchet=True, phase_optimal=False):
+                 n_factions=12, phi_ratchet=True, phase_optimal=False,
+                 federated=False):
         self.phase_optimal = phase_optimal
+        self.federated = federated
         if HAS_RUST_ENGINE:
             self.engine = RustConsciousnessEngine(
                 cell_dim=cell_dim, hidden_dim=hidden_dim,
@@ -1050,12 +1299,23 @@ class ConsciousnessC:
                 n_factions=n_factions, phi_ratchet=phi_ratchet,
             )
             self._backend = 'rust'
+            if federated:
+                print("[engine] Warning: federated mode not yet supported in Rust backend, using Python")
+                self.engine = ConsciousnessEngine(
+                    cell_dim=cell_dim, hidden_dim=hidden_dim,
+                    initial_cells=2, max_cells=max_cells,
+                    n_factions=n_factions, phi_ratchet=phi_ratchet,
+                    phase_optimal=phase_optimal,
+                    federated=federated,
+                )
+                self._backend = 'python'
         else:
             self.engine = ConsciousnessEngine(
                 cell_dim=cell_dim, hidden_dim=hidden_dim,
                 initial_cells=2, max_cells=max_cells,
                 n_factions=n_factions, phi_ratchet=phi_ratchet,
                 phase_optimal=phase_optimal,
+                federated=federated,
             )
             self._backend = 'python'
 
@@ -1076,6 +1336,75 @@ class ConsciousnessC:
     def measure_phi(self) -> float:
         return self.engine.measure_phi()
 
+    def federated_phi(self) -> float:
+        """M6: Sum of per-atom Φ(IIT). Falls back to standard Φ if not federated."""
+        if hasattr(self.engine, 'federated_phi'):
+            return self.engine.federated_phi()
+        return self.engine.measure_phi()
+
+    def state_dict(self) -> Dict:
+        """Serialize engine state. Rust backend falls back to hiddens-only snapshot."""
+        if self._backend == 'python':
+            return {'backend': 'python', 'engine_state': self.engine.state_dict()}
+        else:
+            # Rust backend: save what we can access (hiddens + metadata)
+            return {
+                'backend': 'rust',
+                'hiddens': self.engine.get_states().detach().cpu(),
+                'step': self.engine._step,
+                'n_cells': self.engine.n_cells,
+                'best_phi': self.engine._last_result.get('best_phi', 0) if self.engine._last_result else 0,
+            }
+
+    def load_state_dict(self, state: Dict):
+        """Restore engine state from checkpoint."""
+        if state.get('backend') == 'python' and self._backend == 'python':
+            self.engine.load_state_dict(state['engine_state'])
+        elif state.get('backend') == 'rust' and self._backend == 'rust':
+            # Rust→Rust: re-create engine with saved cell count, then run steps to grow
+            # Rust backend manages its own state internally; we can only re-seed hiddens
+            # by running steps. Log what we restored for diagnostics.
+            saved_step = state.get('step', 0)
+            saved_n = state.get('n_cells', 2)
+            saved_phi = state.get('best_phi', 0.0)
+            self.engine._step = saved_step
+            print(f"[engine] Rust→Rust: checkpoint had {saved_n} cells, step={saved_step}, "
+                  f"best_phi={saved_phi:.4f} (Rust state not directly restorable, running warm-up)")
+            # Run warm-up steps to grow cells toward saved count
+            warmup = min(saved_step, 200)
+            for _ in range(warmup):
+                self.engine.step()
+            print(f"[engine] Rust warm-up done: {self.engine.n_cells} cells after {warmup} steps")
+        elif state.get('backend') == 'rust' and self._backend == 'python':
+            # Rust checkpoint loaded into Python engine: restore hiddens only
+            print("[engine] Rust checkpoint -> Python engine: restoring hiddens only")
+            hiddens = state['hiddens']
+            n_saved = hiddens.shape[0]
+            # Grow engine to match saved cell count
+            while self.engine.n_cells < n_saved and self.engine.n_cells < self.engine.max_cells:
+                idx = 0
+                s = self.engine.cell_states[idx]
+                m = self.engine.cell_modules[idx]
+                old_n = self.engine.n_cells
+                fac = (s.faction_id + self.engine.n_cells) % self.engine.n_factions
+                self.engine._create_cell(parent_module=m, parent_state=s, faction_id=fac)
+                self.engine._resize_coupling(old_n, self.engine.n_cells)
+            for i in range(min(n_saved, self.engine.n_cells)):
+                self.engine.cell_states[i].hidden = hiddens[i].clone()
+            self.engine._step = state.get('step', 0)
+            self.engine._best_phi = state.get('best_phi', 0.0)
+            print(f"[engine] Partial restore: {min(n_saved, self.engine.n_cells)} cells, "
+                  f"step={self.engine._step}")
+        elif state.get('backend') == 'python' and self._backend == 'rust':
+            # Python checkpoint loaded into Rust engine: extract hiddens, warm up
+            print("[engine] Python checkpoint -> Rust engine: warm-up only")
+            saved_step = state.get('engine_state', {}).get('step', 0)
+            self.engine._step = saved_step
+            warmup = min(saved_step, 200)
+            for _ in range(warmup):
+                self.engine.step()
+            print(f"[engine] Rust warm-up done: {self.engine.n_cells} cells after {warmup} steps")
+
 
 # ═══════════════════════════════════════════════════════════
 # Demo / verification
@@ -1093,6 +1422,8 @@ if __name__ == '__main__':
     parser.add_argument('--verify', action='store_true', help='Run verification checks')
     parser.add_argument('--phase-optimal', action='store_true',
                         help='Enable DD128 phase-optimal params (+113.1%% Phi)')
+    parser.add_argument('--federated', action='store_true',
+                        help='Enable federated consciousness (Meta Laws M1/M6/M9: atom=8, sum Phi)')
     args = parser.parse_args()
 
     print("═══════════════════════════════════════════════════════════")
@@ -1101,6 +1432,10 @@ if __name__ == '__main__':
     print(f"  factions={args.factions}, steps={args.steps}")
     if args.phase_optimal:
         print(f"  DD128 Phase-Optimal: ON (F_c={PSI_F_CRITICAL}, BN={PSI_BOTTLENECK_RATIO})")
+    if args.federated:
+        n_atoms = max(1, args.cells // ATOM_SIZE)
+        print(f"  Federated: ON (M1: atom={ATOM_SIZE}, atoms={n_atoms}, "
+              f"inter-alpha={INTER_ATOM_ALPHA})")
     print(f"  Ψ: α={PSI_COUPLING}, balance={PSI_BALANCE}, steps={PSI_STEPS:.2f}")
     print(f"  phi_rs: {'✅ Rust' if HAS_RUST_PHI else '⚠️  Python'}")
     print("═══════════════════════════════════════════════════════════\n")
@@ -1109,6 +1444,7 @@ if __name__ == '__main__':
         cell_dim=args.dim, hidden_dim=args.hidden,
         max_cells=args.cells, n_factions=args.factions,
         phase_optimal=args.phase_optimal,
+        federated=args.federated,
     )
 
     t0 = time.time()

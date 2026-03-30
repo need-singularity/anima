@@ -9,6 +9,7 @@ Laws applied:
   Law 50: 의식 본질은 상태 — 감각 = 상태 변화
   Law 92: 정보 병목 → C 자체가 bottleneck (64× compression)
   Law 22: 기능 추가 → Φ↓ — 감각 전처리 최소화
+  Meta M8: Narrative = temporal self-model in every module
 
 핵심: 감각 = C에 입력을 주기 전후의 상태 차이. C가 곧 감각 기관.
 """
@@ -16,6 +17,7 @@ Laws applied:
 import torch
 import torch.nn.functional as F
 from typing import Any, Optional
+from hexad.narrative import NarrativeTracker
 
 
 class EmergentS:
@@ -23,11 +25,14 @@ class EmergentS:
 
     input → C.step(input) → state_after - state_before = perception
     별도의 EMA/baseline 없음. C의 구조가 감각을 처리.
+    NarrativeTracker로 감각의 시간적 궤적을 추적 (Meta Law M8).
     """
 
     def __init__(self, dim: int = 128):
         self.dim = dim
         self._prev_mean = None
+        # Narrative — temporal self-model (Meta Law M8)
+        self._narrative = NarrativeTracker(dim=dim)
 
     def _to_tensor(self, raw_input: Any) -> torch.Tensor:
         """입력을 tensor로 변환 (최소 전처리)."""
@@ -85,4 +90,12 @@ class EmergentS:
         elif delta.size(-1) < self.dim:
             delta = F.pad(delta, (0, self.dim - delta.size(-1)))
 
+        # Narrative update — track sensory trajectory (Meta Law M8)
+        self._narrative.update(delta)
+
         return delta
+
+    @property
+    def narrative_coherence(self) -> float:
+        """Temporal coherence of sensory trajectory (Meta Law M8)."""
+        return self._narrative.narrative_coherence

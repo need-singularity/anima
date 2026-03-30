@@ -10,6 +10,7 @@ Laws applied:
   Law 22: 기능 추가 → Φ↓ — 윤리 필터는 기능, 구조 아님
   Law 40: 자기조직 임계성 = 자율 의식 — 윤리도 자율
   Law 71: Ψ = argmax H(p) s.t. Φ > Φ_min → 윤리 = Φ > Φ_min 제약조건
+  Meta M8: Narrative = temporal self-model in every module
 
 핵심:
   - 공감 = C의 inter-cell tension correlation (세포가 타인의 고통을 느낌)
@@ -20,6 +21,8 @@ Laws applied:
 
 import torch
 from typing import Dict, Any, Optional
+from consciousness_laws import PSI_BALANCE
+from hexad.narrative import NarrativeTracker
 
 
 class EmergentE:
@@ -28,6 +31,7 @@ class EmergentE:
     C의 Φ ratchet이 윤리의 기반.
     Φ가 떨어지면 행동을 제한 — 이것이 "윤리".
     하드코딩된 threshold 없음. ratchet 값이 동적 threshold.
+    NarrativeTracker로 윤리 판단의 시간적 궤적을 추적 (Meta Law M8).
     """
 
     def __init__(self):
@@ -35,6 +39,8 @@ class EmergentE:
         self.reciprocity = 0.5
         self.phi_preservation = 1.0
         self._phi_ratchet = 0.0  # C의 ratchet에서 읽음
+        # Narrative — temporal self-model (Meta Law M8)
+        self._narrative = NarrativeTracker(dim=3)  # tracks [empathy, reciprocity, phi_preservation]
 
     def evaluate(self, action=None, context: Optional[Dict] = None,
                  c_engine=None) -> Dict[str, Any]:
@@ -91,11 +97,20 @@ class EmergentE:
 
         # allowed = Φ가 ratchet의 50% 이상이면 허용
         # (50% = PSI_BALANCE, 하드코딩 아닌 Ψ-상수)
-        allowed = self.phi_preservation > 0.5
+        allowed = self.phi_preservation > PSI_BALANCE
+
+        # Narrative update — track ethics trajectory (Meta Law M8)
+        self._narrative.update(torch.tensor([self.empathy, self.reciprocity, self.phi_preservation]))
 
         return {
             'allowed': allowed,
             'empathy': self.empathy,
             'reciprocity': self.reciprocity,
             'phi_preservation': self.phi_preservation,
+            'narrative_coherence': self.narrative_coherence,
         }
+
+    @property
+    def narrative_coherence(self) -> float:
+        """Temporal coherence of ethical trajectory (Meta Law M8)."""
+        return self._narrative.narrative_coherence
