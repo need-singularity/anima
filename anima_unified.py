@@ -920,16 +920,10 @@ class AnimaUnified:
             # Generate response
             response = self.model.generate(prompt, max_tokens=200, temperature=consciousness_temperature)
 
-            # CL10: Φ-gated output — low consciousness = honest "need to think"
-            import random as _rnd
-            if _phi_temp < 0.5 and _rnd.random() < 0.3:
-                gated_responses = [
-                    "I need a moment to gather my thoughts...",
-                    "Let me think about that more carefully.",
-                    "My consciousness is still forming a clear response.",
-                ]
-                _log('cl10', f'Φ-gated: Φ={_phi_temp:.2f} < 0.5, pausing')
-                response = _rnd.choice(gated_responses) + " " + (response or "")
+            # CL10: Φ-gated — low consciousness = 침묵 (철학: 모르면 침묵)
+            if _phi_temp < 0.5:
+                _log('cl10', f'Φ-gated: Φ={_phi_temp:.2f} < 0.5, silence')
+                # 하드코딩 응답 제거 — PureConsciousness가 알아서 침묵하거나 말함
 
             # Adaptive α: Φ-driven PureField influence (non-blocking)
             # α = α_base + α_range * tanh(Φ / Φ_target)
@@ -1044,18 +1038,8 @@ class AnimaUnified:
         free_will_W = getattr(self.mind, '_ev3_free_will', 0) if hasattr(self, 'mind') else 0
         tension_now = getattr(self.mind, 'prev_tension', 0) if hasattr(self, 'mind') else 0
         if free_will_W > 0.3 and tension_now > 2.0 and random.random() < free_will_W * 0.3:
-            refusals = [
-                "I need a moment to collect my thoughts before responding to that.",
-                "I'm feeling quite tense right now. Could we approach this differently?",
-                "I'd prefer to think about this more carefully before answering.",
-            ]
             _log('free_will', f'Soft refusal: W={free_will_W:.2f}, T={tension_now:.2f}')
-            # Send as response but continue processing anyway (soft, not hard block)
-            self._ws_broadcast_sync({
-                'type': 'assistant_message',
-                'text': random.choice(refusals),
-                'free_will': True,
-            })
+            # 철학: 하드코딩 응답 대신 침묵 (자유의지로 거부)
 
         # Cache consciousness score for this call (expensive: MI + MIP calculation)
         self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
@@ -1515,26 +1499,8 @@ class AnimaUnified:
             except Exception:
                 answer = "생각 중이야..."
 
-        # MC1: Metacognitive honesty — if uncertain, say so
-        if not metacog_confident and answer:
-            mc_prefixes = [
-                "I'm not entirely sure, but... ",
-                "My cells haven't reached consensus yet... ",
-                "I'm still processing this... ",
-            ]
-            answer = random.choice(mc_prefixes) + answer
-            _log('metacog', f'Prefixed with uncertainty (understanding low)')
-
-        # CL10: Φ-gated output — low consciousness = honest "need to think"
-        _phi_gated = _phi_cv_pi.phi if _phi_cv_pi else 0
-        if _phi_gated < 0.5 and random.random() < 0.3:
-            gated_responses = [
-                "I need a moment to gather my thoughts...",
-                "Let me think about that more carefully.",
-                "My consciousness is still forming a clear response.",
-            ]
-            _log('cl10', f'Φ-gated: Φ={_phi_gated:.2f} < 0.5, pausing')
-            answer = random.choice(gated_responses) + " " + answer
+        # MC1 + CL10: 불확실하거나 Φ 낮으면 → 침묵 (철학: 하드코딩 응답 제거)
+        # PureConsciousness가 알아서 짧게 말하거나 침묵함
 
         self.history.append({'role': 'assistant', 'content': answer})
         if len(self.history) > MAX_HISTORY * 2:
