@@ -1,0 +1,9 @@
+"""Ψ-Constants (Laws 69-70)"""
+
+PSI_BALANCE  = 0.5
+PSI_GATE     = 0.5
+PSI_COUPLING = 0.014
+PSI_STEPS    = 4.33
+PSI_ENTROPY  = 0.998
+GATE_TRAIN = 1.0
+GATE_INFER = 0.6
