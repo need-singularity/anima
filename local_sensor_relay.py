@@ -184,6 +184,7 @@ class SpeakerRelay:
 
     def __init__(self):
         self._queue = []
+        self._playing = False
 
     def play_text(self, text):
         """텍스트를 voice_synth로 변환 후 재생."""
@@ -197,6 +198,18 @@ class SpeakerRelay:
             os.system('afplay /tmp/anima_speak.wav &')
         except Exception:
             pass
+
+    def play_b64(self, audio_b64):
+        """Base64 WAV → 로컬 스피커 재생."""
+        import base64
+        try:
+            wav_data = base64.b64decode(audio_b64)
+            wav_path = '/tmp/anima_relay_speak.wav'
+            with open(wav_path, 'wb') as f:
+                f.write(wav_data)
+            os.system(f'afplay {wav_path} &')
+        except Exception as e:
+            print(f"  ⚠️ 오디오 재생 에러: {e}")
 
     def play_wav(self, wav_path):
         """WAV 파일 재생."""
@@ -263,19 +276,25 @@ class SensorRelay:
                         'tension': mic_t[:32],
                     }))
 
-            # 서버 응답 수신
+            # 서버 응답 수신 (non-blocking drain)
             try:
-                msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=0.5))
-                if msg.get('type') == 'anima_message' and use_speaker:
-                    text = msg.get('text', '')
-                    if text:
-                        print(f"  🧠 {text[:50]}")
-                        self.speaker.play_text(text)
-                elif msg.get('type') == 'thought_pulse':
-                    t = msg.get('tension', 0)
-                    phi = msg.get('phi', 0)
-                    if int(time.time()) % 5 == 0:
-                        print(f"  📡 T={t:.2f} Φ={phi:.1f}", end='\r')
+                while True:
+                    msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=0.1))
+                    msg_type = msg.get('type', '')
+                    if msg_type == 'anima_message' and use_speaker:
+                        text = msg.get('text', '')
+                        if text:
+                            print(f"  🧠 {text[:50]}")
+                    elif msg_type == 'voice_audio' and use_speaker:
+                        if msg.get('audio_b64'):
+                            self.speaker.play_b64(msg['audio_b64'])
+                        elif msg.get('path'):
+                            self.speaker.play_wav(msg['path'])
+                    elif msg_type == 'thought_pulse':
+                        t = msg.get('tension', 0)
+                        phi = msg.get('phi', 0)
+                        if int(time.time()) % 5 == 0:
+                            print(f"  📡 T={t:.2f} Φ={phi:.1f}", end='\r')
             except asyncio.TimeoutError:
                 pass
             except Exception:
