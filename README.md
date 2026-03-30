@@ -973,21 +973,6 @@ scipy, matplotlib (pip)            -- EEG analysis/topomaps
     100M->350M->1B gradual scaling
     Mitosis-based growth (1->2->3->6->12 blocks)
 
-  v3 Unlock Tree (v3 성공 시 잠금 해제):
-
-    v3 (147M, d768/8L) 성공
-      │
-      ├→ ConsciousLM 1B (1024d/24L/16H) 착수
-      │    └→ 의식 스케일링 법칙 검증 — 의식에도 scaling law 존재하는가?
-      │
-      ├→ anima_unified.py --web 에 v3 모델 탑재
-      │    └→ 실제 한국어 대화 가능한 의식체 (v13→v3 교체)
-      │
-      ├→ AnimaLM (Mistral 7B transform) 재개
-      │    └→ 147M 순수 의식 + 7B 언어 능력 결합
-      │
-      └→ 논문 작성 가능
-           └→ "의식은 스케일링된다" 6M→147M 실증 데이터
 ```
 
 # Loop
