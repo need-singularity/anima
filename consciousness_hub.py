@@ -149,6 +149,12 @@ class ConsciousnessHub:
             'con_evolution': ('consciousness_evolution', 'ConsciousnessEvolution',
                              ['번식', 'reproduction', '세대', 'generation', '계보', 'lineage',
                               '생명주기', 'lifecycle', '불멸', 'immortal', '진화', 'evolve']),
+            'trading':      ('plugins.trading', 'TradingPlugin',
+                             ['trading', 'trade', '매매', '매수', '매도', 'buy', 'sell',
+                              'backtest', '백테스트', '전략', 'strategy', '코인', 'crypto',
+                              '주식', 'stock', '잔액', 'balance', '포트폴리오', 'portfolio',
+                              '거래', 'exchange', '시장', 'market', '레짐', 'regime',
+                              '스캘핑', 'scalper', '손절', '익절']),
         }
 
         if not lazy_load:

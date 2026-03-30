@@ -902,6 +902,42 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   테스트: python3 tests/test_agent_platform.py (32 tests)
 ```
 
+## Trading Plugin (invest 프로젝트 연동)
+
+```
+  plugins/trading.py — ~/Dev/invest 백테스트/브로커/스캘퍼 브릿지
+
+  3-Layer 통합:
+    Direct import  — backtest_turbo (105+ 전략, 0.8ms/run), universe (120+ assets)
+    REST API       — invest FastAPI (:8000) 라이브 트레이딩, 포트폴리오
+    Rust subprocess — scalper 상태, 틱 전략
+
+  Hub 호출:
+    hub.act("BTC 백테스트 macd_cross")
+    hub.act("AAPL 전략 스캔")
+    hub.act("잔액 확인")
+    hub.act("ETH 매수 0.1")
+    hub.act("전략 목록")
+    hub.act("시장 레짐")
+
+  Agent Tool:
+    trading_backtest  — T1: 단일 전략 백테스트 (Sharpe, MDD, CAGR)
+    trading_scan      — T1: 전체 전략 스캔 → 상위 N개
+    trading_strategies — T1: 105+ 전략 목록
+    trading_universe  — T1: 거래 가능 자산 (주식/코인/외환/원자재)
+    trading_balance   — T2: 잔액/포지션 조회
+    trading_execute   — T2: 매매 실행 (Ethics gate: E > 0.3)
+
+  환경변수:
+    INVEST_ROOT=~/Dev/invest
+    INVEST_API_URL=http://localhost:8000
+
+  invest 프로젝트 구조:
+    backend/   — Python FastAPI (backtest, hypothesis mining, AI clients)
+    scalper/   — Rust 틱 스캘퍼 (63 전략, Binance/Upbit/KIS)
+    frontend/  — Next.js 14 UI
+```
+
 ## ConsciousnessHub (40 모듈 자율 허브)
 
 ```
