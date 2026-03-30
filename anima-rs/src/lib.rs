@@ -37,7 +37,7 @@ fn compute_phi(states: PyReadonlyArray2<f32>, n_bins: usize) -> PyResult<(f64, f
 // ── Talk5 submodule ────────────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (n_cells=8, cell_dim=64, hidden_dim=128, n_factions=12, steps=1000, phi_ratchet=true, seed=42))]
+#[pyo3(name = "run", signature = (n_cells=8, cell_dim=64, hidden_dim=128, n_factions=12, steps=1000, phi_ratchet=true, seed=42))]
 fn talk5_run(
     py: Python<'_>,
     n_cells: usize,
@@ -70,6 +70,7 @@ fn talk5_run(
 }
 
 #[pyfunction]
+#[pyo3(name = "get_hiddens")]
 fn talk5_get_hiddens(py: Python<'_>) -> PyResult<Vec<Py<PyArray1<f32>>>> {
     let guard = TALK5_ENGINE.lock().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
@@ -87,6 +88,7 @@ fn talk5_get_hiddens(py: Python<'_>) -> PyResult<Vec<Py<PyArray1<f32>>>> {
 }
 
 #[pyfunction]
+#[pyo3(name = "set_hiddens")]
 fn talk5_set_hiddens(hiddens: Vec<Vec<f32>>) -> PyResult<()> {
     let mut guard = TALK5_ENGINE.lock().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
@@ -102,7 +104,7 @@ fn talk5_set_hiddens(hiddens: Vec<Vec<f32>>) -> PyResult<()> {
 // ── Alpha-sweep submodule ──────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (n_cells=8, input_dim=64, hidden_dim=128, output_dim=64, n_factions=8, alphas=None, steps_per_stage=300, seed=42))]
+#[pyo3(name = "run", signature = (n_cells=8, input_dim=64, hidden_dim=128, output_dim=64, n_factions=8, alphas=None, steps_per_stage=300, seed=42))]
 fn alpha_sweep_run(
     py: Python<'_>,
     n_cells: usize,
@@ -139,7 +141,7 @@ fn alpha_sweep_run(
 // ── Golden-MoE submodule ───────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (input, n_experts=4, hidden_dim=128, output_dim=10, training=true, seed=42))]
+#[pyo3(name = "forward", signature = (input, n_experts=4, hidden_dim=128, output_dim=10, training=true, seed=42))]
 fn golden_moe_forward(
     py: Python<'_>,
     input: Vec<f32>,
@@ -160,7 +162,7 @@ fn golden_moe_forward(
 // ── Transplant submodule ───────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (donor, recipient, d_from, d_to, alpha=0.5))]
+#[pyo3(name = "run", signature = (donor, recipient, d_from, d_to, alpha=0.5))]
 fn transplant_run(
     py: Python<'_>,
     donor: Vec<Vec<f32>>,
