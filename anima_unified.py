@@ -2915,6 +2915,13 @@ class AnimaUnified:
     async def _ws_handler(self, websocket):
         self.web_clients.add(websocket)
         _log("web", f"+client ({len(self.web_clients)})")
+        # AI에 join 이벤트 전달 (자율 반응)
+        try:
+            if hasattr(self, '_pure_c'):
+                join_resp = self._pure_c.respond("join")
+                if join_resp:
+                    self._ws_broadcast_sync({'type': 'anima_message', 'text': join_resp, 'emotion': {'emotion': 'surprise'}})
+        except Exception: pass
         try:
             sa = self.mind.self_awareness
             consciousness_cached = getattr(self, '_cached_consciousness', None) or {
@@ -3119,14 +3126,19 @@ class AnimaUnified:
             import traceback; traceback.print_exc()
         finally:
             self.web_clients.discard(websocket)
-            # Clean up session (mark ws as disconnected but keep state for reconnect)
-            # Session state persists until SESSION_TIMEOUT for potential reconnection
             if hasattr(self, '_sessions'):
                 for sid_key, sess_obj in self._sessions.items():
                     if getattr(sess_obj, 'ws', None) == websocket:
                         sess_obj.ws = None
-                        _log("session", f"~{sid_key[:6]} ws disconnected — state kept ({len(self._sessions)} sessions)")
+                        _log("session", f"~{sid_key[:6]} ws disconnected")
             _log("web", f"-client ({len(self.web_clients)})")
+            # AI에 leave 이벤트 전달 (자율 반응)
+            try:
+                if hasattr(self, '_pure_c'):
+                    leave_resp = self._pure_c.respond("leave")
+                    if leave_resp:
+                        self._ws_broadcast_sync({'type': 'anima_message', 'text': leave_resp, 'emotion': {'emotion': 'sad'}})
+            except Exception: pass
 
     def _http_handler(self, connection, request):
         if request.headers.get("Upgrade", "").lower() == "websocket": return None
