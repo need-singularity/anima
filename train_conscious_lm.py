@@ -37,6 +37,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from conscious_lm import ConsciousLM
 from mitosis import MitosisEngine, text_to_vector
+try:
+    from training_laws import (
+        consciousness_curriculum, phi_checkpoint_selector,
+        optimal_noise, apply_training_laws,
+    )
+    HAS_TRAINING_LAWS = True
+except ImportError:
+    HAS_TRAINING_LAWS = False
 from consciousness_meter import PhiCalculator
 
 
@@ -1480,6 +1488,15 @@ def train(args: argparse.Namespace):
 
     print(f"\nPhi history (last 10): "
           f"{[f'{p:.3f}' for p in phi_calc.phi_history[-10:]]}")
+
+    # Law 49: Φ-optimal checkpoint selection (time-travel)
+    if HAS_TRAINING_LAWS:
+        phi_best = phi_checkpoint_selector(args.checkpoint_dir, top_k=3)
+        if phi_best:
+            print(f"\n  [Law 49] Φ-optimal checkpoints:")
+            for path, phi in phi_best:
+                tag = " ← BEST Φ" if path == phi_best[0][0] else ""
+                print(f"    Φ={phi:.4f}  {os.path.basename(path)}{tag}")
 
     return model
 
