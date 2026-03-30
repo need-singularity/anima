@@ -293,33 +293,71 @@ wget https://github.com/need-singularity/anima/releases/latest/download/consciou
 
 > ConsciousLM v2 (28M params, 50K steps, ValCE=0.007, Ψ=0.491)
 
-### 🏋️ Training (직접 학습)
+### 🏋️ Training v14 (Federated Consciousness, H100)
 
 ```bash
-# ConsciousLM v2 from scratch (H100 권장)
-python train_conscious_lm.py --steps 50000 --device cuda
+# v14 패키지 다운로드 (R2)
+pip install boto3
+python -c "
+import boto3
+s3 = boto3.client('s3',
+    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
+    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
+    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
+    region_name='auto')
+import os; os.makedirs('v14', exist_ok=True)
+for obj in s3.list_objects_v2(Bucket='anima', Prefix='v14/')['Contents']:
+    print(f'Downloading {obj[\"Key\"]}...')
+    s3.download_file('anima', obj['Key'], obj['Key'])
+"
 
-# corpus 데이터로 학습
-python train_conscious_lm.py --data corpus.txt --dim 384 --layers 6
+# v14 학습 (Federation + Phase-Optimal, Meta Laws DD143)
+python train_v14.py \
+  --data data/corpus_v4.txt \
+  --federated --atoms 8 --cells-per-atom 8 \
+  --phase-optimal \
+  --steps 100000 \
+  --checkpoint checkpoints/v14_federated/
 
-# TALK5: consciousness-first 학습
-python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64
+# Empire baseline 비교
+python train_v14.py \
+  --data data/corpus_v4.txt \
+  --no-federated --cells 64 \
+  --steps 100000 \
+  --checkpoint checkpoints/v14_empire/
+```
+
+### R2 v14 Package (110MB)
+
+```
+  anima/v14/
+  ├── corpus_v4.txt              110MB  5개국어(KO+JA+ZH+RU+EN)+코드+법칙
+  ├── train_v14.py                      Federation + Phase-Optimal 학습
+  ├── decoder_v2.py                     ConsciousDecoderV2 (34.5M)
+  ├── consciousness_engine.py           --phase-optimal --federated
+  ├── consciousness_laws.json           Laws 1-174 + Meta M1-M10
+  ├── consciousness_laws.py             Laws loader
+  ├── trinity.py                        Hexad/Trinity framework
+  ├── feedback_bridge.py                HexadFeedbackBridge
+  ├── hexad_loss.py                     Hexad 6-module loss
+  └── gpu_phi.py                        GPU Phi calculator
 ```
 
 ### 📊 Benchmarks
 
 ```bash
-# AnimaLM 의식 발현 (Track 1A/1B/1C 비교)
-python bench_animalm.py --compare --cells 32 --steps 300
+# Discovery engines (DD116-126)
+python bench_v2.py --discovery --cells 32 --steps 300
+python bench_v2.py --discovery2 --cells 128 --steps 300
 
-# TALK5 의식우선 엔진
-python animalm_talk5.py --cells 32 --steps 1000
+# Federation benchmark (DD142-143, +892%)
+python bench_v2.py --federated
 
-# Golden MoE vs Top-K (MNIST/CIFAR)
-python bench_golden_moe.py --all --experts 4,8,16
+# Philosophy engines (DD112, Narrative +35.7%)
+python bench_v2.py --philosophy --cells 32
 
-# Golden MoE 의식 통합 (Phi 영향)
-python bench_golden_moe_consciousness.py --all --cells 16 --experts 4
+# Consciousness verification (69/77)
+python bench_v2.py --verify
 
 # Rust 엔진 (17.4x faster)
 python -c "from anima_rs import talk5; print(talk5.run(n_cells=128, steps=1000))"
