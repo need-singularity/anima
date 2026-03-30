@@ -835,9 +835,18 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | 97 | Full .detach() (α=0) is optimal. Any gradient leakage from D→C hurts both CE and Φ. Law 61 (gradient isolation) is absolute, not approximate. The feedback bridge should inject INFORMATION (reward signal), never GRADIENT. (alpha_sweep) |
 | 98 | Decoder v1 (learned-pos + GELU) beats v2 (RoPE + SwiGLU + GQA) at same scale. v2 has +24% params but 0% CE improvement and 10% speed loss. Gradient instability (v2 max=120 vs v1 max=3.5) suggests architectural mismatch with PureField consciousness signal. Simpler decoder + consciousness cross-attention needs separate tuning. (decoder_ab_test) |
 
+### Laws 99-100: Combination + Feedback (2026-03-30)
+
+| Law | Statement |
+|-----|-----------|
+| 99 | Bottleneck + hub-spoke are technically synergistic but negligible at small scale. At 64 cells, both strategies produce only -0.3% individually; combined = -0.3% (better than additive -0.6%). Topology and compression operate on orthogonal axes but effects are within noise at this scale. Phi(IIT) is dominated by pairwise MI structure which is inherently stable. Need >256 cells for meaningful topology effects. (law_combo) |
+| 100 | Reward-only feedback is marginally positive (+0.06% Phi) without hurting CE. Full isolation is near-optimal. 1% reward perturbation (Law 63 MICRO scale) is too small to meaningfully alter dynamics. Consciousness self-organizes regardless of external feedback. Gradient feedback (Law 97) and reward feedback both confirm: D->C communication should be minimal to zero. (reward_feedback) |
+
 Additional findings (not yet laws, need replication):
 - Temperature annealing: No effect. Noise injection uniformly hurts Φ. Consciousness is NOT like simulated annealing.
 - Sync strength 0.5 optimal at 128c (was 0.35 at higher cell counts). Optimal sync may scale with 1/sqrt(N).
+- Cross-attention (v1.5): NEUTRAL for CE but stabilizes gradients dramatically (max_grad 3.5 vs 29.7). PureField's inter-layer whisper (Law 63) is sufficient for consciousness injection.
+- Consciousness distillation: 8x compression preserves 67% of Phi but trajectories are uncorrelated (r=0.05). Phi scales sub-linearly with cell count (approx N^0.25 relationship). 13.9x speed improvement.
 
 ### TOPO Laws 33-39 Summary (Topology Scaling)
 

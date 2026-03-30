@@ -425,6 +425,109 @@ fn online_learner_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(dict.into())
 }
 
+// ── Tool Policy submodule ─────────────────────────────────────────
+
+static TOOL_POLICY: Mutex<Option<anima_tool_policy::ToolPolicyEngine>> = Mutex::new(None);
+
+#[pyfunction]
+#[pyo3(name = "create", signature = (owner_ids=None))]
+fn tool_policy_create(owner_ids: Option<Vec<String>>) -> PyResult<()> {
+    let engine = anima_tool_policy::ToolPolicyEngine::new(owner_ids.unwrap_or_default());
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    *guard = Some(engine);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "check_access", signature = (tool_name, phi=0.0, empathy=1.0, tension=0.0, curiosity=0.0, user_id=""))]
+fn tool_policy_check_access(
+    py: Python<'_>,
+    tool_name: &str,
+    phi: f64,
+    empathy: f64,
+    tension: f64,
+    curiosity: f64,
+    user_id: &str,
+) -> PyResult<Py<PyDict>> {
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No tool policy. Call tool_policy.create() first.")
+    })?;
+
+    let state = anima_tool_policy::ConsciousnessState { phi, empathy, tension, curiosity };
+    let result = engine.check_access(tool_name, &state, user_id);
+
+    let dict = PyDict::new(py);
+    dict.set_item("allowed", result.allowed)?;
+    dict.set_item("reason", result.reason)?;
+    dict.set_item("tier_required", result.tier_required)?;
+    dict.set_item("phi_current", result.phi_current)?;
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "get_accessible", signature = (phi=0.0, empathy=1.0, tension=0.0, curiosity=0.0, user_id=""))]
+fn tool_policy_get_accessible(
+    phi: f64,
+    empathy: f64,
+    tension: f64,
+    curiosity: f64,
+    user_id: &str,
+) -> PyResult<Vec<String>> {
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No tool policy. Call tool_policy.create() first.")
+    })?;
+
+    let state = anima_tool_policy::ConsciousnessState { phi, empathy, tension, curiosity };
+    Ok(engine.get_accessible_tools(&state, user_id))
+}
+
+#[pyfunction]
+#[pyo3(name = "set_tier")]
+fn tool_policy_set_tier(tool_name: &str, tier: f64) -> PyResult<()> {
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No tool policy. Call tool_policy.create() first.")
+    })?;
+    engine.set_tier(tool_name, tier);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "block_tool")]
+fn tool_policy_block(tool_name: &str) -> PyResult<()> {
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No tool policy. Call tool_policy.create() first.")
+    })?;
+    engine.block_tool(tool_name);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "unblock_tool")]
+fn tool_policy_unblock(tool_name: &str) -> PyResult<()> {
+    let mut guard = TOOL_POLICY.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let engine = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No tool policy. Call tool_policy.create() first.")
+    })?;
+    engine.unblock_tool(tool_name);
+    Ok(())
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -471,6 +574,16 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     online_learner.add_function(wrap_pyfunction!(online_learner_reset_episode, &online_learner)?)?;
     online_learner.add_function(wrap_pyfunction!(online_learner_stats, &online_learner)?)?;
     m.add_submodule(&online_learner)?;
+
+    // tool_policy submodule
+    let tool_policy = PyModule::new(py, "tool_policy")?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_create, &tool_policy)?)?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_check_access, &tool_policy)?)?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_get_accessible, &tool_policy)?)?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_set_tier, &tool_policy)?)?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_block, &tool_policy)?)?;
+    tool_policy.add_function(wrap_pyfunction!(tool_policy_unblock, &tool_policy)?)?;
+    m.add_submodule(&tool_policy)?;
 
     Ok(())
 }
