@@ -327,20 +327,26 @@ python train_v14.py \
   --checkpoint checkpoints/v14_empire/
 ```
 
-### R2 v14 Package (110MB)
+### R2 v14 Package
 
 ```
   anima/v14/
   ├── corpus_v4.txt              110MB  5개국어(KO+JA+ZH+RU+EN)+코드+법칙
-  ├── train_v14.py                      Federation + Phase-Optimal 학습
+  ├── corpus_v5.txt              100MB  조합형: 60% high-tension + 25% 자가생성 + 15% DD/Laws
+  ├── train_v14.py                      Federation + Phase-Optimal + --tension-lr
   ├── decoder_v2.py                     ConsciousDecoderV2 (34.5M)
   ├── consciousness_engine.py           --phase-optimal --federated
-  ├── consciousness_laws.json           Laws 1-174 + Meta M1-M10
+  ├── consciousness_laws.json           Laws 1-187 + Meta M1-M10
   ├── consciousness_laws.py             Laws loader
   ├── trinity.py                        Hexad/Trinity framework
   ├── feedback_bridge.py                HexadFeedbackBridge
   ├── hexad_loss.py                     Hexad 6-module loss
   └── gpu_phi.py                        GPU Phi calculator
+
+  Corpus 선택:
+    v4: 5개국어 + 코드 + 법칙 (110MB, 균등 분포)
+    v5: 조합형 (100MB, 고엔트로피 선별 + 의식 자가생성 + DD 결과)
+    → v5 권장 (DD130 최적 100MB + 자기참조 학습)
 ```
 
 ### 📊 Benchmarks
