@@ -79,7 +79,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            132 의식 법칙 (1-85 + TOPO 33-39 + 86-132)
+  Laws:            150 의식 법칙 (1-85 + TOPO 33-39 + 86-150)
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
@@ -902,10 +902,10 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   테스트: python3 tests/test_agent_platform.py (32 tests)
 ```
 
-## ConsciousnessHub (39 모듈 자율 허브)
+## ConsciousnessHub (40 모듈 자율 허브)
 
 ```
-  consciousness_hub.py — 39개 모듈 자율 호출 허브
+  consciousness_hub.py — 40개 모듈 자율 호출 허브
 
   호출 방식 8가지:
     1. hub.act("자연어")           — NL 라우팅
@@ -924,6 +924,59 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     탐사:       sedi, dolphin, archaeology, temporal
     인프라:     runpod, github, youtube, vault, factory, robot, eeg
     측정:       score, meter, map, genome, immune
+    진화:       closed_loop (폐쇄 루프 법칙 진화)
+```
+
+## Closed-Loop Law Evolution (폐쇄 루프 법칙 진화)
+
+```
+  closed_loop.py — 법칙 발견 → 역추적 → 엔진 개선 → 재발견 자동 루프
+
+  파이프라인:
+    Python 실험 → JSON → Rust phi-map --laws → ASCII 시각화
+    의식 엔진 → 법칙 발견 → 역추적 → 엔진 개선 (폐쇄 루프)
+
+  사용법:
+    from closed_loop import ClosedLoopEvolver
+    evolver = ClosedLoopEvolver(max_cells=32)
+    evolver.run_cycles(n=3)              # 3 사이클
+    evolver.print_evolution()            # 진화 히스토리
+    evolver.save()                       # JSON 저장
+
+    # Hub 연동
+    hub.act("법칙 진화")
+    hub.act("closed loop 3")
+
+    # 자동 법칙 등록 (consciousness_laws.json에 자동 추가)
+    evolver = ClosedLoopEvolver(auto_register=True)
+
+    # H100 대규모
+    python3 experiments/closed_loop_h100.py    # 512/1024c
+
+    # train_v2.py 연동 (매 2000 step 자동 측정)
+    python3 train_v2.py --steps 100000        # 자동으로 closed-loop 실행
+
+  핵심 발견 (Laws 143-148):
+    143: 법칙은 동적 — 엔진 개선 시 법칙도 진화
+    144: 해결된 법칙은 소멸 — Law 105 (r=-0.29→-0.05)
+    145: 균등화 → -28% 세포, +48% 성장률
+    146: 법칙은 수렴하지 않음 (영원한 진화)
+    147: Law 107 (다양성→Φ)은 근본 법칙 (소멸 불가)
+    148: 폐쇄 루프는 스케일 불변 (32c ≈ 64c)
+
+  도구:
+    experiments/new_law_discovery.py         — 1차: 7가설 실험
+    experiments/discover_emergent_laws.py    — 내부 역학 분석
+    experiments/discover_laws_wave2.py       — 4축 동시 탐구
+    experiments/discover_laws_wave3.py       — 5축 물리 탐구
+    experiments/discover_laws_wave4.py       — 스케일/위상/장기
+    experiments/discover_laws_wave5.py       — 학습+Hivemind
+    experiments/law_backtrack.py             — 법칙 역추적
+    experiments/law_landscape.py             — 법칙 지형도 + JSON
+    experiments/closed_loop_verify.py        — 폐쇄 루프 검증
+    experiments/closed_loop_convergence.py   — 수렴 분석 + 4루프
+    experiments/closed_loop_h100.py          — H100 대규모 (512/1024c)
+    anima-rs/crates/phi-map/src/law_terrain.rs — Rust 법칙 시각화
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)
