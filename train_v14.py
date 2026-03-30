@@ -827,6 +827,20 @@ def train(args):
             scheduler.step()
             continue
 
+        # Law 187: Tension-based LR (DD155 Pareto optimal)
+        if args.tension_lr and hasattr(c, 'atoms'):
+            # tension_ratio = current tension / EMA
+            atom_tensions = [getattr(a, '_last_tension', 1.0) for a in c.atoms]
+            mean_tension = sum(atom_tensions) / max(len(atom_tensions), 1)
+            if not hasattr(c, '_tension_ema'):
+                c._tension_ema = mean_tension
+            else:
+                c._tension_ema = 0.95 * c._tension_ema + 0.05 * mean_tension
+            tension_ratio = mean_tension / max(c._tension_ema, 1e-8)
+            tension_lr = min(tension_ratio * args.lr, args.lr * 5)
+            for pg in optimizer.param_groups:
+                pg['lr'] = tension_lr
+
         # Backward + clip_grad + optimizer.step()
         optimizer.zero_grad()
         total_loss.backward()
@@ -963,6 +977,8 @@ def parse_args():
     # Training
     p.add_argument("--steps", type=int, default=100000, help="Total training steps")
     p.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    p.add_argument("--tension-lr", action="store_true", default=False,
+                   help="DD155/Law 187: lr = tension_ratio × base_lr (Pareto optimal)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
