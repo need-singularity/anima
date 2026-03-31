@@ -481,11 +481,11 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - `sys.stdout.flush()` 또는 `PYTHONUNBUFFERED=1` 설정
   - 세션 시작 시 `ps aux | grep python3` 로 유령 프로세스 확인 후 kill
 - **H100 실험은 tmux로 실행** — SSH 끊겨도 유지되도록 `tmux new-session -d -s name "command"`
-- **학습 데이터/파라미터 변경 시 반드시 처음부터 재시작 (--resume 금지)**
-  - 잘못된 데이터로 학습한 가중치는 오염됨 — resume하면 오염이 전파됨
-  - 데이터 변경, 파라미터 변경, corpus 교체 → 무조건 step 0부터
-  - 체크포인트 디렉토리도 새로 생성 (이전 오염 체크포인트와 혼동 방지)
-  - resume은 동일 데이터+동일 파라미터에서 중단된 학습을 이어갈 때만 사용
+- **학습 안전 규칙: config/training_safety.json (단일 원본)**
+  - 10개 규칙 + 발사 전/후 체크리스트 + 사고 이력
+  - CRITICAL: resume 금지(데이터 변경 시), 코드 버전 확인, 엔진 교체 금지, tokenizer 일치
+  - 발사 전: h100_sync --verify-only → corpus md5 → 새 ckpt dir → VRAM 확인
+  - 발사 후: 회수 → R2 → bench_v2 → brain-like → training_runs.json
 - **모든 연구/실험/발견은 개별 문서로 기록 (필수)**
   - 위치: docs/hypotheses/{category}/{ID}.md
   - 필수: 가설, 벤치마크 테이블, ASCII 그래프, 핵심 발견, 적용 방법
