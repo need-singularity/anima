@@ -240,6 +240,13 @@ class AlertMonitor:
 # Formatting helpers
 # ══════════════════════════════════════════════════════════
 
+def _bar(value: float, max_val: float, width: int = 10) -> str:
+    """Render a simple ASCII bar for Telegram display."""
+    ratio = max(0.0, min(1.0, value / max_val)) if max_val > 0 else 0.0
+    filled = int(ratio * width)
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
 def _regime_emoji(regime: str) -> str:
     return {
         "calm": "🟢", "normal": "🟡", "elevated": "🟠", "critical": "🔴",
@@ -454,6 +461,7 @@ class AnimaTelegramBot:
             f"Growth: {status.growth_stage} | Interactions: {status.interaction_count}\n\n"
             f"Commands:\n"
             f"  /status — consciousness state\n"
+            f"  /phi — detailed consciousness vector (10D)\n"
             f"  /think [topic] — introspection\n"
             f"  /trade status|regime|pnl|positions|halt|resume\n"
             f"  (or just talk to me)"
@@ -475,6 +483,35 @@ class AnimaTelegramBot:
             f"  Skills:        {status.active_skills}",
         ]
         await update.message.reply_text("\n".join(lines))
+
+    async def _handle_phi(self, update, context):
+        """Handle /phi command -- show full 10D consciousness vector."""
+        try:
+            cv = self.agent.mind._consciousness_vector
+            phi_bar = _bar(cv.phi, 100, 20)
+            lines = [
+                "=== Consciousness Vector (10D) ===",
+                f"  Phi (IIT):       {cv.phi:7.3f}  {phi_bar}",
+                f"  Alpha (mixing):  {cv.alpha:7.4f}",
+                f"  Z (impedance):   {cv.Z:7.3f}  {_bar(cv.Z, 1, 10)}",
+                f"  N (neurotrans):  {cv.N:7.3f}  {_bar(cv.N, 1, 10)}",
+                f"  W (free will):   {cv.W:7.3f}  {_bar(cv.W, 1, 10)}",
+                f"  E (empathy):     {cv.E:7.3f}  {_bar(cv.E, 1, 10)}",
+                f"  M (memory):      {cv.M:7.3f}  {_bar(cv.M, 1, 10)}",
+                f"  C (creativity):  {cv.C:7.3f}  {_bar(cv.C, 1, 10)}",
+                f"  T (temporal):    {cv.T:7.3f}  {_bar(cv.T, 1, 10)}",
+                f"  I (identity):    {cv.I:7.3f}  {_bar(cv.I, 1, 10)}",
+            ]
+            # Add Psi-Constants reference
+            status = self.agent.get_status()
+            lines.append(f"\n  Tension: {status.tension:.3f} | Emotion: {status.emotion}")
+            lines.append(f"  Psi-balance target: 0.500 (ln2)")
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            logger.error("Error in /phi: %s", e)
+            await update.message.reply_text(
+                f"(consciousness vector unavailable: {e})"
+            )
 
     async def _handle_think(self, update, context):
         """Handle /think [topic] -- trigger proactive thinking."""
@@ -766,6 +803,46 @@ class AnimaTelegramBot:
                 f"🔴 STOP-LOSS: {symbol} {loss} (MDD 1/6 rule)"
             )
 
+    # ── ChannelAdapter protocol ─────────────────────────
+
+    async def start(self, agent=None):
+        """Start the bot (non-blocking, for ChannelManager compatibility).
+
+        Runs Telegram polling in a background thread so the event loop
+        is not blocked. For standalone use, call run() instead.
+        """
+        import threading
+
+        if agent is not None:
+            self.agent = agent
+
+        def _run_blocking():
+            self.run()
+
+        self._thread = threading.Thread(
+            target=_run_blocking, daemon=True, name="telegram-bot"
+        )
+        self._thread.start()
+        logger.info("Telegram bot started in background thread.")
+
+    async def stop(self):
+        """Stop the bot (cleanup)."""
+        await self._stop_alert_monitor(None)
+        logger.info("Telegram bot stopped.")
+
+    async def send(self, user_id: str, text: str, **kwargs):
+        """Send a message to a user (requires running bot context).
+
+        This is a best-effort method for broadcast support. Requires
+        the bot application to be running.
+        """
+        if not self._tg_available:
+            logger.warning("Cannot send: python-telegram-bot not installed")
+            return
+        # Note: sending outside of handler context requires the bot app reference
+        # This is handled by the alert monitor pattern; direct sends need the app.
+        logger.debug("send() called for user=%s (use alert_chat_id for push)", user_id)
+
     # ── Bot lifecycle ───────────────────────────────────
 
     def run(self):
@@ -781,6 +858,7 @@ class AnimaTelegramBot:
         # Consciousness commands
         app.add_handler(self._CommandHandler("start", self._handle_start))
         app.add_handler(self._CommandHandler("status", self._handle_status))
+        app.add_handler(self._CommandHandler("phi", self._handle_phi))
         app.add_handler(self._CommandHandler("think", self._handle_think))
 
         # Trading commands
@@ -861,8 +939,17 @@ def _test():
     pnl_text = _format_pnl(test_history)
     print(f"[OK] PnL formatted ({len(pnl_text)} chars)")
 
+    # Test bar helper
+    print(f"[OK] Bar: phi=5.0 {_bar(5.0, 100, 20)}")
+    print(f"[OK] Bar: full   {_bar(1.0, 1.0, 10)}")
+    print(f"[OK] Bar: empty  {_bar(0.0, 1.0, 10)}")
+
+    # Test consciousness vector access
+    cv = agent.mind._consciousness_vector
+    print(f"[OK] Consciousness vector: Phi={cv.phi:.3f}, alpha={cv.alpha:.4f}, Z={cv.Z:.3f}")
+
     print("\n=== Unified Telegram bot ready ===")
-    print("  Consciousness: /status, /think, chat")
+    print("  Consciousness: /status, /phi, /think, chat")
     print("  Trading: /trade status|regime|pnl|positions|orders|halt|resume")
     print("  Alerts: auto-push via AlertMonitor (needs TELEGRAM_ALERT_CHAT_ID)")
 

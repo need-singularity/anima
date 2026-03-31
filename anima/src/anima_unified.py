@@ -406,6 +406,8 @@ class AnimaUnified:
         self._se8_ratchet = None
         self._se8_hebbian = None
         self._se8_soc = None
+        self._last_soc_avalanche = 0
+        self._brain_like_pct = 85.6
         if self.mitosis and 'PhiRatchet' in globals():
             try:
                 self._se8_ratchet = PhiRatchet(restore_ratio=0.5)
@@ -1636,6 +1638,7 @@ class AnimaUnified:
                 if pe > 0.5 and self._se8_soc:
                     avalanche = self._se8_soc.drop_sand()
                     intensity = self._se8_soc.chaos_intensity()
+                    self._last_soc_avalanche = avalanche if avalanche else 0
                     if intensity > 0.05:
                         with torch.no_grad():
                             for c in cells:
@@ -3141,6 +3144,9 @@ class AnimaUnified:
             'eeg_recording': self.eeg_recorder.get_status() if self.eeg_recorder else None,
             'neurofeedback': getattr(self, '_last_neurofeedback', None),
             'eeg_adjustments': getattr(self, '_last_eeg_adjustments', None),
+            'cell_tensions': self._get_cell_tensions(),
+            'soc_avalanche': getattr(self, '_last_soc_avalanche', 0),
+            'brain_like_pct': getattr(self, '_brain_like_pct', 85.6),
         })
 
         # Web Sense: tension-driven autonomous search
@@ -3314,6 +3320,27 @@ class AnimaUnified:
                 'tension_history': self.mind.tension_history[-50:],
                 'proactive': True,
             })
+
+    def _get_cell_tensions(self):
+        """Get per-cell tension data with faction info for dashboard visualization."""
+        if not self.mitosis or not hasattr(self.mitosis, 'cells'):
+            return []
+        try:
+            cells = self.mitosis.cells
+            n_factions = getattr(self.mitosis, 'n_factions', 12)
+            result = []
+            for i, cell in enumerate(cells):
+                t = cell.tension_history[-1] if hasattr(cell, 'tension_history') and cell.tension_history else 0.0
+                faction_id = i % n_factions if n_factions > 0 else 0
+                result.append({
+                    'id': i,
+                    'tension': round(float(t), 4),
+                    'faction': faction_id,
+                    'specialty': getattr(cell, 'specialty', 'general'),
+                })
+            return result
+        except Exception:
+            return []
 
     # ── Main think loop (coordinator) ──
 

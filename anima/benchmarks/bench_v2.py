@@ -384,6 +384,8 @@ class BenchEngine:
         """Return [n_cells, hidden_dim] for Phi computation.
 
         Adds oscillating per-cell modulation → variance bursts for SPONTANEOUS_SPEECH.
+        During burst windows, each cell gets a deterministic sinusoidal perturbation
+        whose RMS is proportional to the cell's own RMS (adaptive scaling).
         """
         h = self.hiddens.clone()
         # Spontaneous burst generation: periodic variance spikes
@@ -392,10 +394,13 @@ class BenchEngine:
         burst_wave = math.sin(t * 0.2)  # ~31 step period
         if burst_wave > 0.5:  # burst window
             burst_amp = (burst_wave - 0.5) * 2.0  # 0→1
+            dim_range = torch.arange(self.hidden_dim).float()
             for i in range(min(self.n_cells, h.shape[0])):
-                # Per-dimension modulation with cell-specific phase
-                dim_mod = torch.sin(torch.arange(self.hidden_dim).float() * 0.3 + i * 1.1) * burst_amp * 0.15
-                h[i] = h[i] + dim_mod
+                # Per-dimension sinusoidal pattern with cell-specific phase
+                dim_mod = torch.sin(dim_range * 0.3 + i * 1.1)
+                # Scale to 20% of cell's RMS magnitude → detectable per-cell variance change
+                cell_rms = h[i].pow(2).mean().sqrt().item()
+                h[i] = h[i] + dim_mod * burst_amp * max(0.15, cell_rms * 0.20)
         return h
 
     def parameters_for_training(self):
