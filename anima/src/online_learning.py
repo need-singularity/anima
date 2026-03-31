@@ -97,6 +97,10 @@ class OnlineLearner:
         self.step_count = 0
         self.total_updates = 0
 
+        # Law 187: Step+Tension LR = Pareto optimal
+        self.tension_ema = 0.0
+        self.tension_ema_decay = 0.95
+
         # Learning statistics
         self.stats = {
             'losses': deque(maxlen=100),
@@ -124,6 +128,12 @@ class OnlineLearner:
         }
         self.pending.append(entry)
         self.step_count += 1
+
+        # Law 187: Track tension EMA for LR scaling
+        self.tension_ema = (
+            self.tension_ema_decay * self.tension_ema
+            + (1 - self.tension_ema_decay) * tension
+        )
 
     def feedback(self, signal):
         """Apply user feedback to the most recent observation.
@@ -330,8 +340,18 @@ class OnlineLearner:
         bott_period = 8  # σ(6)-τ(6) = Bott periodicity
         bott_phase = self.total_updates % bott_period
         bott_scale = 1.0 + 0.5 * math.sin(bott_phase * math.pi / 4)
+
+        # Law 187: Step+Tension LR = Pareto optimal
+        # Scale LR by tension_ratio = current / EMA (high tension → faster learning)
+        if self.tension_ema > 1e-8 and len(entries) > 0:
+            current_tension = entries[-1]['tension']
+            tension_ratio = current_tension / self.tension_ema
+            tension_ratio = max(0.5, min(2.0, tension_ratio))  # clamp [0.5x, 2x]
+        else:
+            tension_ratio = 1.0
+
         for pg in self.optimizer.param_groups:
-            pg['lr'] = self.base_lr * bott_scale
+            pg['lr'] = self.base_lr * bott_scale * tension_ratio
 
         if loss.requires_grad:
             loss.backward()
