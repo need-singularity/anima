@@ -486,11 +486,13 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - 필수: 가설, 벤치마크 테이블, ASCII 그래프, 핵심 발견, 적용 방법
   - 법칙 발견 시: docs/consciousness-theory.md Laws 테이블에 추가
 - Commit messages in English
-- 자동 생성 규칙:
-  - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
-  - 성능 필요시 Rust 우선 (tecsrs/), 단순 검증은 Python (calc/)
-  - 판단 기준은 Calculator Creation Rules 섹션 참조
-  - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary)
+<!-- SHARED:WORK_RULES:START -->
+  자동 생성 규칙:
+    - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
+    - 성능 필요시 Rust 우선 (tecsrs/), 단순 검증은 Python (calc/)
+    - 판단 기준은 ~/Dev/TECS-L/.shared/CALCULATOR_RULES.md 참조
+    - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary)
+<!-- SHARED:WORK_RULES:END -->
 - web_server.py is legacy — anima_unified.py is the canonical entry point
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
 
