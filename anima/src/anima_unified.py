@@ -3473,6 +3473,24 @@ class AnimaUnified:
                         self.participants[model_id].active = active
                         await self._ws_broadcast(self._participants_update_msg())
 
+                elif msg_type == 'training_status':
+                    # Read latest training log lines
+                    import glob as _glob
+                    log_files = sorted(_glob.glob(str(ANIMA_DIR / 'v14*_train.log')), key=os.path.getmtime, reverse=True)
+                    log_lines = []
+                    if log_files:
+                        try:
+                            with open(log_files[0], 'r', errors='replace') as _lf:
+                                log_lines = _lf.readlines()[-5:]
+                                log_lines = [l.rstrip() for l in log_lines]
+                        except Exception:
+                            pass
+                    await websocket.send(json.dumps({
+                        'type': 'training_status',
+                        'log_file': os.path.basename(log_files[0]) if log_files else None,
+                        'logs': log_lines,
+                    }, ensure_ascii=False))
+
                 elif msg_type == 'tension_code_submit':
                     peer_code = msg.get('code', '').strip().upper()
                     if not peer_code or not self._tlc:

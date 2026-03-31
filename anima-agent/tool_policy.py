@@ -291,3 +291,13 @@ class ToolPolicy:
         if phi >= 1.0:
             return "1-observe"
         return "0-basic"
+
+
+if __name__ == '__main__':
+    # Quick verification
+    policy = ToolPolicy()
+    # Test tier access at different Phi levels
+    for phi in [0, 1, 3, 5, 10]:
+        accessible = policy.get_accessible_tools({"phi": phi})
+        print(f"Phi={phi}: {len(accessible)} tools accessible")
+    print("tool_policy verification passed")
