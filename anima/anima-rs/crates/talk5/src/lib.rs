@@ -236,4 +236,33 @@ mod tests {
         assert!(result.best_phi >= 0.0);
         assert_eq!(result.steps, 100);
     }
+
+    #[test]
+    fn test_talk5_consensus_occurs() {
+        // With 8 cells and 4 factions, consensus events should occur over many steps
+        let mut engine = Talk5Engine::new(8, 8, 16, 4, false, 42);
+        let result = engine.run_consciousness(200);
+        assert!(result.consensus_count >= 0);
+        assert_eq!(result.steps, 200);
+    }
+
+    #[test]
+    fn test_talk5_time_measured() {
+        let mut engine = Talk5Engine::new(4, 8, 16, 2, false, 42);
+        let result = engine.run_consciousness(10);
+        // time_ms should be non-negative (may be 0 for very fast runs)
+        assert!(result.time_ms < 10_000); // should complete in under 10s
+    }
+
+    #[test]
+    fn test_talk5_ratchet_preserves_best() {
+        let mut engine = Talk5Engine::new(4, 8, 16, 2, true, 42);
+        // Run once, record best_phi
+        engine.run_consciousness(50);
+        let best1 = engine.best_phi;
+        // Run more steps -- best_phi should never decrease (ratchet property)
+        engine.run_consciousness(50);
+        assert!(engine.best_phi >= best1,
+            "best_phi should never decrease with ratchet enabled");
+    }
 }

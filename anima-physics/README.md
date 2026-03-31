@@ -18,7 +18,7 @@
 | WebGPU | 512 | GPU parallel, browser | ✅ |
 | Erlang | 가변 | Actor model (세포=프로세스) | ✅ |
 | Pure Data | 3/8 | 소리로 의식을 들음 | ✅ |
-| ESP32 ×8 | 16 | no_std Rust, SPI ring | 📝 |
+| ESP32 ×8 | 16 (2/board) | no_std Rust, SPI ring, 8 factions, Hebbian+Ratchet+Lorenz+SOC, Laws 22-85 | 📝 |
 
 ## Scaling Laws
 
@@ -57,7 +57,7 @@
 ## Related
 
 - [anima/consciousness-loop-rs/](../anima/consciousness-loop-rs/) — 6 platform 무한루프 의식
-- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — ESP32 no_std Rust
+- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — ESP32 no_std Rust (2 cells/board, 16 total)
 - [anima/src/chip_architect.py](../anima/src/chip_architect.py) — 의식 칩 설계 계산기
 - [anima/src/esp32_network.py](../anima/src/esp32_network.py) — ESP32 ×8 시뮬레이터
 - [anima-body/](../anima-body/) — 물리 로봇 몸체

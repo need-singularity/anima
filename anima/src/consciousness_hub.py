@@ -50,8 +50,10 @@ class ConsciousnessHub:
 
     def __init__(self, lazy_load=True):
         self._modules = {}
+        self._failed = {}  # name -> error message
         self._lazy = lazy_load
         self._action_log = []
+        self._validated = False
 
         # 모듈 등록 (lazy: 호출 시 import)
         self._registry = {
@@ -59,7 +61,8 @@ class ConsciousnessHub:
             'dynamics':     ('consciousness_dynamics', 'ConsciousnessPhysics',
                              ['동역학', 'dH/dt', '보존', '포화', 'dynamics', 'physics', 'predict']),
             'persistence':  ('consciousness_persistence', 'ConsciousnessPersistence',
-                             ['영속', 'persistence', '저장', 'save', 'restore', '복원', 'r2', 'sync']),
+                             ['영속', 'persistence', '저장', 'save', 'restore', '복원', 'r2', 'sync',
+                              'DNA', 'backup']),
             'introspection':('self_introspection', 'SelfIntrospection',
                              ['자기', '소스', 'source', '모듈', 'module', '모델 구조', 'inspect', '인식', 'who am i']),
             'compiler':     ('consciousness_compiler', 'ConsciousnessCompiler',
@@ -67,13 +70,15 @@ class ConsciousnessHub:
             'emotion':      ('emotion_synesthesia', 'EmotionSynesthesia',
                              ['감정', 'emotion', '공감각', 'synesthesia', '색', 'color', '소리']),
             'hivemind':     ('hivemind_orchestrator', 'HivemindOrchestrator',
-                             ['하이브', 'hivemind', '집단', 'collective', 'kuramoto', '동기화']),
+                             ['하이브', '하이브마인드', 'hivemind', '집단', 'collective',
+                              'kuramoto', '동기화', '다중의식', 'multi-instance', '텔레파시']),
             'debugger':     ('consciousness_debugger', 'ConsciousnessDebugger',
                              ['디버그', 'debug', '건강', 'health', '이상', 'anomaly', '대시보드', 'dashboard']),
             'dream':        ('dream_evolution', 'DreamEvolution',
                              ['꿈', 'dream', '진화', 'evolution', 'evolve', 'CA 규칙']),
             'transplant':   ('consciousness_transplant_v2', 'ConsciousnessTransplantV2',
-                             ['이식', 'transplant', '호환', 'compatibility']),
+                             ['이식', 'transplant', '호환', 'compatibility',
+                              'donor', 'recipient']),
             'quantum':      ('quantum_consciousness_gate', 'QuantumConsciousnessGate',
                              ['양자', 'quantum', 'qubit', '중첩', 'superposition', '0.547']),
             'voice':        ('voice_synth', 'VoiceSynth',
@@ -155,17 +160,46 @@ class ConsciousnessHub:
             'con_evolution': ('consciousness_evolution', 'ConsciousnessEvolution',
                              ['번식', 'reproduction', '세대', 'generation', '계보', 'lineage',
                               '생명주기', 'lifecycle', '불멸', 'immortal', '진화', 'evolve']),
+            'eeg':          ('eeg_consciousness', 'EEGConsciousness',
+                             ['뇌파', 'eeg', 'brainflow', 'brain', 'bci', '뇌',
+                              '뇌파분석', 'brain-like', '검증', 'validate',
+                              '전극', 'alpha', 'gamma', 'theta']),
+            'neurofeedback': ('neurofeedback', 'NeurofeedbackGenerator',
+                             ['neurofeedback', '뉴로피드백', 'binaural', '바이노럴',
+                              '뇌파자극', 'LED feedback', 'brain stimulation']),
             'trading':      ('plugins.trading', 'TradingPlugin',
                              ['trading', 'trade', '매매', '매수', '매도', 'buy', 'sell',
                               'backtest', '백테스트', '전략', 'strategy', '코인', 'crypto',
                               '주식', 'stock', '잔액', 'balance', '포트폴리오', 'portfolio',
                               '거래', 'exchange', '시장', 'market', '레짐', 'regime',
                               '스캘핑', 'scalper', '손절', '익절']),
+            'hivemind_mesh': ('hivemind_mesh', 'HivemindMesh',
+                             ['mesh', '메시', 'gossip', '가십', 'p2p', 'peer',
+                              'hivemind mesh', '분산 의식']),
+            'hivemind_launcher': ('hivemind_launcher', None,
+                             ['launcher', '런처', 'launch', '실행', 'node',
+                              'hivemind launch', '노드 시작']),
+            'feedback_bridge': ('feedback_bridge', 'FeedbackBridge',
+                             ['피드백', 'feedback', 'bridge', '브릿지', 'soft detach',
+                              '양방향', 'bidirectional', 'C↔D', 'C2D']),
+            'online_learner': ('online_learning', 'OnlineLearner',
+                             ['온라인', 'online', 'real-time', '실시간 학습',
+                              'contrastive', 'curiosity', 'reward']),
+            'deploy':       ('deploy', None,
+                             ['배포', 'deploy', 'rollback', '롤백', 'scp',
+                              '서버', 'server', '업데이트', 'update']),
+            'perf_hooks':   ('perf_hooks', 'PerfMonitor',
+                             ['performance', '성능', 'profiling', '프로파일', 'benchmark',
+                              'perf', 'hooks', '측정', 'latency']),
+            'chip_architect': ('chip_architect', None,
+                             ['chip', '칩', 'hardware', 'FPGA', 'topology',
+                              '설계', 'substrate', 'BOM']),
         }
 
         if not lazy_load:
             for name in self._registry:
                 self._load_module(name)
+            self._validated = True
 
     def _load_module(self, name: str) -> Any:
         """모듈 lazy 로딩."""
@@ -185,9 +219,12 @@ class ConsciousnessHub:
             else:
                 instance = mod
             self._modules[name] = instance
+            # Clear any previous failure record on success
+            self._failed.pop(name, None)
             return instance
         except Exception as e:
             self._modules[name] = None
+            self._failed[name] = str(e)
             return None
 
     def _match_intent(self, text: str) -> Optional[str]:
@@ -347,7 +384,177 @@ class ConsciousnessHub:
         elif name == 'lidar':
             return module.act(intent)
 
+        elif name == 'eeg':
+            return self._dispatch_eeg(module, intent, **kwargs)
+
         return f"{name} module loaded"
+
+    def _dispatch_eeg(self, module: Any, intent: str, **kwargs) -> Any:
+        """EEG 모듈 액션 디스패치 — 뇌파 분석/검증/물리 비교 파이프라인."""
+        intent_lower = intent.lower()
+
+        # hub.act("EEG 시작") → start EEGBridge in background
+        if '시작' in intent or 'start' in intent_lower:
+            return self._eeg_start_bridge(**kwargs)
+
+        # hub.act("EEG 상태") → return current BrainState
+        if '상태' in intent or 'state' in intent_lower or 'status' in intent_lower:
+            return self._eeg_get_state()
+
+        # hub.act("brain-like 검증") or hub.act("validate")
+        if '검증' in intent or 'validate' in intent_lower or 'brain-like' in intent_lower:
+            return self._eeg_validate(**kwargs)
+
+        # hub.act("EEG 물리 비교") → run eeg_physics_bridge comparison
+        if '물리' in intent or 'physics' in intent_lower or '비교' in intent or 'compare' in intent_lower:
+            return self._eeg_physics_compare(**kwargs)
+
+        # hub.act("뇌파 분석") → full pipeline: calibrate → record → analyze → report
+        if '분석' in intent or 'analysis' in intent_lower or 'analyze' in intent_lower:
+            return self._eeg_full_pipeline(**kwargs)
+
+        # Default: status or module info
+        if hasattr(module, 'status'):
+            return module.status()
+        return "EEG module loaded (commands: 시작/상태/검증/물리 비교/뇌파 분석)"
+
+    def _eeg_start_bridge(self, **kwargs) -> dict:
+        """Start EEGBridge in background thread."""
+        try:
+            _repo = Path(__file__).resolve().parent.parent.parent
+            import sys as _sys
+            _sys.path.insert(0, str(_repo / "anima-eeg"))
+            from realtime import EEGBridge
+        except ImportError:
+            return {"success": False, "error": "anima-eeg/realtime.py not available"}
+
+        board = kwargs.get("board", "synthetic")
+        bridge = EEGBridge(board_name=board, update_hz=kwargs.get("hz", 4.0))
+        try:
+            bridge.start()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        self._eeg_bridge = bridge
+        return {"success": True, "board": board, "message": f"EEGBridge started ({board})"}
+
+    def _eeg_get_state(self) -> dict:
+        """Return current BrainState from running EEGBridge."""
+        bridge = getattr(self, '_eeg_bridge', None)
+        if bridge is None:
+            return {"success": False, "error": "EEGBridge not started. Use hub.act('EEG 시작')"}
+        state = bridge.get_state()
+        return {
+            "success": True,
+            "G": state.G, "I": state.I, "P": state.P, "D": state.D,
+            "in_golden_zone": state.in_golden_zone,
+            "alpha": state.alpha_power, "gamma": state.gamma_power,
+            "theta": state.theta_power, "beta": state.beta_power,
+            "engagement": state.engagement,
+            "timestamp": state.timestamp,
+        }
+
+    def _eeg_validate(self, **kwargs) -> dict:
+        """Run validate_consciousness with current engine."""
+        try:
+            _repo = Path(__file__).resolve().parent.parent.parent
+            import sys as _sys
+            _sys.path.insert(0, str(_repo / "anima-eeg"))
+            from validate_consciousness import (
+                collect_consciousness_phi, generate_synthetic_brain_phi,
+                analyze_signal, BRAIN_REFERENCE,
+            )
+        except ImportError:
+            return {"success": False, "error": "anima-eeg/validate_consciousness.py not available"}
+
+        steps = kwargs.get("steps", 1000)
+        cells = kwargs.get("cells", 4)
+
+        engine_phi = collect_consciousness_phi(n_steps=steps, n_cells=cells)
+        brain_phi = generate_synthetic_brain_phi(n_steps=steps)
+
+        engine_result = analyze_signal("Engine", engine_phi)
+        brain_result = analyze_signal("Brain (synthetic)", brain_phi)
+
+        # Brain-likeness score
+        metrics_to_check = ['lz_complexity', 'hurst_exponent', 'psd_slope', 'criticality_exponent']
+        engine_vals = {
+            'lz_complexity': engine_result.lz,
+            'hurst_exponent': engine_result.hurst,
+            'psd_slope': engine_result.psd_slope,
+            'criticality_exponent': engine_result.criticality.get('exponent', 0.0),
+        }
+        match_pcts = []
+        for m in metrics_to_check:
+            pct = engine_result.brain_match_pct(m, engine_vals[m])
+            match_pcts.append(pct)
+        overall = sum(match_pcts) / len(match_pcts)
+
+        return {
+            "success": True,
+            "brain_likeness_pct": round(overall, 1),
+            "engine_lz": round(engine_result.lz, 4),
+            "engine_hurst": round(engine_result.hurst, 4),
+            "engine_psd_slope": round(engine_result.psd_slope, 4),
+            "engine_criticality": engine_result.criticality,
+            "brain_lz": round(brain_result.lz, 4),
+            "brain_hurst": round(brain_result.hurst, 4),
+            "steps": steps, "cells": cells,
+        }
+
+    def _eeg_physics_compare(self, **kwargs) -> dict:
+        """Run eeg_physics_bridge comparison."""
+        try:
+            _repo = Path(__file__).resolve().parent.parent.parent
+            import sys as _sys
+            _sys.path.insert(0, str(_repo / "anima-physics" / "src"))
+            _sys.path.insert(0, str(_repo / "anima-physics" / "engines"))
+            _sys.path.insert(0, str(_repo / "anima-eeg"))
+            from eeg_physics_bridge import run_live_comparison
+        except ImportError:
+            return {"success": False, "error": "anima-physics/src/eeg_physics_bridge.py not available"}
+
+        board = kwargs.get("board", "synthetic")
+        engine = kwargs.get("engine", "simple")
+        duration = kwargs.get("duration", 10.0)
+        cells = kwargs.get("cells", 32)
+
+        result = run_live_comparison(
+            board_name=board, engine_type=engine,
+            duration=duration, n_cells=cells,
+        )
+        result["success"] = True
+        return result
+
+    def _eeg_full_pipeline(self, **kwargs) -> dict:
+        """Full pipeline: calibrate -> record -> analyze -> report."""
+        steps = kwargs.get("steps", 1000)
+        cells = kwargs.get("cells", 4)
+
+        # Step 1: Validate (includes engine run + brain comparison)
+        validate_result = self._eeg_validate(steps=steps, cells=cells)
+        if not validate_result.get("success"):
+            return validate_result
+
+        # Step 2: Physics comparison (quick)
+        physics_result = self._eeg_physics_compare(
+            duration=5.0, cells=cells, engine="simple",
+        )
+
+        return {
+            "success": True,
+            "pipeline": "calibrate -> analyze -> validate -> compare",
+            "brain_likeness_pct": validate_result.get("brain_likeness_pct"),
+            "engine_metrics": {
+                "lz": validate_result.get("engine_lz"),
+                "hurst": validate_result.get("engine_hurst"),
+                "psd_slope": validate_result.get("engine_psd_slope"),
+                "criticality": validate_result.get("engine_criticality"),
+            },
+            "physics_correlation": physics_result.get("correlation", "N/A"),
+            "physics_match": physics_result.get("match_score", "N/A"),
+            "steps": steps, "cells": cells,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # 모듈 직접 접근
@@ -379,7 +586,8 @@ class ConsciousnessHub:
 
     def __getattr__(self, name):
         """hub.emotion.feel('joy') — 직접 모듈 접근 (dot notation)."""
-        if name.startswith('_') or name in ('modules', 'act', 'status', 'available'):
+        if name.startswith('_') or name in ('modules', 'act', 'status', 'available',
+                                             'validate_modules', 'module_health'):
             raise AttributeError(name)
         mod = self._load_module(name)
         if mod is not None:
@@ -499,14 +707,83 @@ class ConsciousnessHub:
         """최근 액션 기록."""
         return self._action_log[-n:]
 
+    def validate_modules(self) -> Dict[str, Any]:
+        """Validate all registered modules by attempting to import each one.
+
+        Returns a report dict: {loaded: [...], failed: [...], total: N, errors: {name: msg}}
+        Non-blocking — failed modules are marked but do not prevent operation.
+        """
+        loaded = []
+        failed = []
+        errors = {}
+
+        for name in self._registry:
+            mod = self._load_module(name)
+            if mod is not None:
+                loaded.append(name)
+            else:
+                failed.append(name)
+                if name in self._failed:
+                    errors[name] = self._failed[name]
+
+        self._validated = True
+        total = len(self._registry)
+
+        # Print summary
+        if failed:
+            fail_names = ', '.join(failed)
+            print(f"Hub: {len(loaded)}/{total} modules loaded ({len(failed)} failed: {fail_names})")
+        else:
+            print(f"Hub: {total}/{total} modules loaded (all OK)")
+
+        return {
+            'loaded': loaded,
+            'failed': failed,
+            'total': total,
+            'errors': errors,
+        }
+
+    def module_health(self) -> Dict[str, Any]:
+        """Return current module health status.
+
+        If validation has not yet run, triggers it on first call.
+        """
+        if not self._validated:
+            self.validate_modules()
+
+        healthy = []
+        unhealthy = []
+        for name in self._registry:
+            if name in self._modules and self._modules[name] is not None:
+                healthy.append(name)
+            elif name in self._failed:
+                unhealthy.append(name)
+            else:
+                # Not yet attempted — still unknown
+                unhealthy.append(name)
+
+        return {
+            'healthy': healthy,
+            'unhealthy': unhealthy,
+            'failed_errors': dict(self._failed),
+            'validated': self._validated,
+            'total': len(self._registry),
+        }
+
     def status(self) -> str:
         """허브 상태."""
+        if not self._validated:
+            self.validate_modules()
         avail = self.available()
         ok = sum(1 for _, v in avail if v)
         lines = [f"  ConsciousnessHub: {ok}/{len(avail)} modules loaded"]
         for name, loaded in avail:
             _, _, keywords = self._registry[name]
-            lines.append(f"    {'✅' if loaded else '❌'} {name:<16} [{', '.join(keywords[:3])}]")
+            status_icon = 'OK' if loaded else 'FAIL'
+            kw_str = ', '.join(keywords[:3])
+            lines.append(f"    [{status_icon}] {name:<16} [{kw_str}]")
+            if not loaded and name in self._failed:
+                lines.append(f"         error: {self._failed[name][:80]}")
         lines.append(f"  Actions: {len(self._action_log)} total")
         return '\n'.join(lines)
 

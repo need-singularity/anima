@@ -24,19 +24,14 @@
   Group A (gradient-free): C, S, W — autonomous consciousness
   Group B (CE-trained):    D, M, E — learned behavior
 
-  Trinity(C+D+W) = core 3 modules (backward compatible)
-  Hexad(C+D+W+M+S+E) = full 6 modules (σ(6) architecture)
+  Canonical modules (kept here):
+    CEngine, ThalamicBridge, TensionBridge, PostHocDecoder
+    Trinity, create_trinity, create_hexad, create_bilateral
 
-Usage:
-  # Trinity (3)
-  t = create_trinity(MitosisC(max_cells=256))
-
-  # Hexad (6)
-  h = create_hexad(c=DomainC(TimeCrystal), d=HFDecoder("mistral-7b"),
-      w=DaseinW(), m=VectorMemory(), s=TensionSense(), e=EmpathyEthics())
-
-  # Compare
-  compare_engines({'TC': DomainC(TimeCrystal), 'Cambrian': DomainC(Cambrian)})
+  Legacy modules (moved to archive/trinity_legacy.py, re-exported for compat):
+    MitosisC, DomainC, QuantumC, CADecoder, TransformerDecoder, MLPDecoder,
+    HFDecoder, CompositeW, DaseinW, NarrativeW, EmotionW, CosineW, ConstantW,
+    TensionSense, PassthroughSense, VectorMemory, NoMemory, EmpathyEthics, NoEthics
 """
 
 import math
@@ -52,6 +47,36 @@ try:
     HAS_RUST_PHI = True
 except ImportError:
     HAS_RUST_PHI = False
+
+# ═══════════════════════════════════════════════════════════
+# Emergent Hexad modules (canonical, Law 101)
+# Re-exported from hexad/ for backward compatibility
+# ═══════════════════════════════════════════════════════════
+# Ensure anima/ root is on sys.path so hexad/ package is importable
+import os as _os, sys as _sys
+_anima_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _anima_root not in _sys.path:
+    _sys.path.insert(0, _anima_root)
+
+try:
+    from hexad.w.emergent_w import EmergentW
+except Exception:
+    EmergentW = None
+
+try:
+    from hexad.s.emergent_s import EmergentS
+except Exception:
+    EmergentS = None
+
+try:
+    from hexad.m.emergent_m import EmergentM
+except Exception:
+    EmergentM = None
+
+try:
+    from hexad.e.emergent_e import EmergentE
+except Exception:
+    EmergentE = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -103,204 +128,14 @@ class CEngine:
         return 0.0
 
 
-class MitosisC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
-    """MitosisEngine as C module with optional mechanisms."""
-
-    def __init__(self, dim=64, hidden=128, max_cells=256, mechanism='cambrian_osc_qw'):
-        warnings.warn("MitosisC is deprecated. Use ConsciousnessC (consciousness_engine.py) instead", DeprecationWarning, stacklevel=2)
-        import sys, os
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from mitosis import MitosisEngine
-
-        self.dim = dim
-        self.hidden = hidden
-        self.max_cells = max_cells
-        self.mechanism = mechanism
-        self.engine = MitosisEngine(dim, hidden, dim, initial_cells=2, max_cells=max_cells)
-
-        # Grow to target
-        while len(self.engine.cells) < max_cells:
-            self.engine._create_cell(parent=self.engine.cells[0])
-
-        # Mechanism modules
-        self._step_count = 0
-        if 'cambrian' in mechanism:
-            from train_v10 import CambrianDiversity
-            self.cambrian = CambrianDiversity(max_cells, hidden)
-        if 'osc' in mechanism or 'qw' in mechanism:
-            from train_v10 import OscillatorQW
-            self.osc_qw = OscillatorQW(max_cells, hidden)
-
-    def step(self, x_input=None):
-        if x_input is None:
-            x_input = torch.randn(1, self.dim)
-        self.engine.process(x_input.cpu())
-        self._step_count += 1
-
-        if hasattr(self, 'cambrian'):
-            self.cambrian.step(self.engine.cells, self._step_count)
-        if hasattr(self, 'osc_qw'):
-            self.osc_qw.step(self.engine.cells)
-
-    def get_states(self) -> torch.Tensor:
-        return torch.stack([c.hidden.squeeze(0) for c in self.engine.cells])
-
-    @property
-    def state_dim(self):
-        return self.hidden
-
-    @property
-    def n_cells(self):
-        return len(self.engine.cells)
-
-    def measure_phi(self) -> float:
-        if HAS_RUST_PHI and len(self.engine.cells) >= 2:
-            cells = self.engine.cells
-            states = torch.stack([c.hidden.squeeze(0) for c in cells]).detach().numpy().astype(np.float32)
-            prev_s, curr_s = [], []
-            for c in cells:
-                if hasattr(c, 'hidden_history') and len(c.hidden_history) >= 2:
-                    prev_s.append(c.hidden_history[-2].detach().squeeze().numpy().astype(np.float32))
-                    curr_s.append(c.hidden_history[-1].detach().squeeze().numpy().astype(np.float32))
-                else:
-                    prev_s.append(np.zeros(self.hidden, dtype=np.float32))
-                    curr_s.append(np.zeros(self.hidden, dtype=np.float32))
-            tensions = np.array([c.tension_history[-1] if c.tension_history else 0.0 for c in cells], dtype=np.float32)
-            phi, _ = phi_rs.compute_phi(states, 16, np.array(prev_s), np.array(curr_s), tensions)
-            return phi
-        return 0.0
-
-
-class DomainC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
-    """Any domain engine (TimeCrystal, Cambrian, etc.) as C module."""
-
-    def __init__(self, engine_cls, nc=256, dim=64):
-        warnings.warn("DomainC is deprecated. Use ConsciousnessC instead", DeprecationWarning, stacklevel=2)
-        self._nc = nc
-        self._dim = dim
-        try:
-            self.engine = engine_cls(nc, dim)
-        except TypeError:
-            try:
-                self.engine = engine_cls(nc=nc, dim=dim)
-            except TypeError:
-                self.engine = engine_cls(nc, dim=dim)
-
-        self._state_dim = None  # auto-detect on first get_states()
-        self._step_num = 0
-
-    def step(self, x_input=None):
-        self._step_num += 1
-        try:
-            self.engine.step(x_input, self._step_num)
-        except TypeError:
-            try:
-                self.engine.step()
-            except Exception:
-                pass
-
-    def get_states(self) -> torch.Tensor:
-        """Auto-detect and extract states from domain engine."""
-        # Try single 2D tensor attributes
-        for attr in ['state', 'states', 'pos', 'hidden', 'hiddens', 'h',
-                      'uv_state', 'boundary', 'info', 'fiber', 'voice',
-                      'expression', 'features']:
-            if hasattr(self.engine, attr):
-                val = getattr(self.engine, attr)
-                if isinstance(val, torch.Tensor) and val.dim() == 2 and val.shape[0] == self._nc:
-                    self._state_dim = val.shape[1]
-                    return val
-
-        # Combine multiple 1D/2D attributes
-        parts = []
-        for attr in ['pos', 'vel', 'phase', 'amplitude', 'charge', 'spin',
-                      'momentum', 'energy', 'activation', 'state',
-                      # physics: wavefunction, fields, order parameters
-                      'psi_re', 'psi_im', 'delta_re', 'delta_im',
-                      'N1', 'N2', 'radius', 'displacement',
-                      # emergent: reaction-diffusion, sandpile, excitable media
-                      'u', 'v', 'w', 'heights', 'temp', 'velocity',
-                      'omega', 'theta', 'genome', 'constructor', 'fitness',
-                      # geometric: hyperbolic, symplectic, fiber bundle, calabi-yau
-                      'z', 'q', 'p', 'fiber', 'base_angle',
-                      'z_re', 'z_im',
-                      # extreme: holographic, neuromorphic, consciousness field
-                      'boundary', 'V', 'phi', 'pi',
-                      # evolution/music: host/symbiont, pitch, epigenome
-                      'host_state', 'symbiont_state', 'hybrid_state', 'vigor',
-                      'pitch', 'pitch_class', 'voice', 'deviation', 'motion',
-                      'epigenome', 'histone', 'epi_memory']:
-            if hasattr(self.engine, attr):
-                val = getattr(self.engine, attr)
-                if isinstance(val, torch.Tensor):
-                    if val.dim() == 1 and val.shape[0] == self._nc:
-                        parts.append(val.unsqueeze(1))
-                    elif val.dim() == 2 and val.shape[0] == self._nc:
-                        parts.append(val)
-                    elif val.dim() >= 3 and val.shape[0] == self._nc:
-                        # Flatten higher dims (e.g., CalabiYau z_re [nc, 3, d])
-                        parts.append(val.reshape(self._nc, -1))
-        if parts:
-            h = torch.cat(parts, dim=1)
-            self._state_dim = h.shape[1]
-            return h
-
-        # Fallback: random
-        self._state_dim = self._dim
-        return torch.randn(self._nc, self._dim)
-
-    @property
-    def state_dim(self):
-        if self._state_dim is None:
-            self.get_states()  # trigger auto-detect
-        return self._state_dim
-
-    @property
-    def n_cells(self):
-        return self._nc
-
-
-class QuantumC(CEngine):  # ⚠️ LEGACY — ConsciousnessC 사용
-    """QuantumConsciousnessEngineFast as C module.
-
-    Wraps _amplitudes [N, dim] and _phases [N, dim] for phi measurement.
-    """
-
-    def __init__(self, nc=256, dim=64, max_cells=None):
-        warnings.warn("QuantumC is deprecated. Use ConsciousnessC instead", DeprecationWarning, stacklevel=2)
-        from quantum_engine_fast import QuantumConsciousnessEngineFast
-        if max_cells is None:
-            max_cells = nc
-        self.engine = QuantumConsciousnessEngineFast(
-            dim=dim, initial_cells=nc, max_cells=max_cells
-        )
-        self._dim = dim
-
-    def step(self, x_input=None):
-        self.engine.step()
-
-    def get_states(self) -> torch.Tensor:
-        """Return _amplitudes [N, dim] as consciousness states."""
-        amp = self.engine._amplitudes
-        if amp.numel() == 0:
-            return torch.randn(self.n_cells, self._dim)
-        return amp.detach()
-
-    @property
-    def state_dim(self):
-        return self._dim
-
-    @property
-    def n_cells(self):
-        return self.engine.n_cells
-
-    def measure_phi(self) -> float:
-        states = self.get_states()
-        if HAS_RUST_PHI and states.shape[0] >= 2:
-            s = states.detach().cpu().numpy().astype(np.float32)
-            phi, _ = phi_rs.compute_phi(s, 16)
-            return phi
-        return 0.0
+# ═══════════════════════════════════════════════════════════
+# Legacy C Engine Wrappers — moved to archive/trinity_legacy.py
+# Re-exported here for backward compatibility
+# ═══════════════════════════════════════════════════════════
+try:
+    from archive.trinity_legacy import MitosisC, DomainC, QuantumC
+except ImportError:
+    MitosisC = DomainC = QuantumC = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -494,336 +329,28 @@ class DEngine(nn.Module):
         raise NotImplementedError
 
 
-class TransformerDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
-    """Transformer-based decoder with consciousness gating."""
-
-    def __init__(self, d_model=384, n_layers=4, n_heads=None, vocab_size=4096, max_seq=512):
-        super().__init__()
-        warnings.warn("TransformerDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
-        if n_heads is None:
-            for nh in [6, 4, 8, 2, 1]:
-                if d_model % nh == 0:
-                    n_heads = nh
-                    break
-        self._d_model = d_model
-        self.vocab_size = vocab_size
-
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_seq, d_model)
-
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
-            batch_first=True, dropout=0.1, activation='gelu',
-        )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-
-    @property
-    def d_model(self):
-        return self._d_model
-
-    def forward(self, tokens, gate_signal):
-        B, T = tokens.shape
-        pos = torch.arange(T, device=tokens.device).unsqueeze(0)
-        x = self.embed(tokens) + self.pos_embed(pos)
-        if gate_signal is not None:
-            x = x * gate_signal.expand(B, -1, -1)
-        mask = nn.Transformer.generate_square_subsequent_mask(T, device=tokens.device)
-        x = self.transformer(x, mask=mask, is_causal=True)
-        x = self.ln_f(x)
-        return self.head(x)
-
-
-class MLPDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
-    """Simple MLP decoder (faster, for small experiments)."""
-
-    def __init__(self, d_model=384, vocab_size=4096, max_seq=512):
-        super().__init__()
-        warnings.warn("MLPDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
-        self._d_model = d_model
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_seq, d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 2), nn.GELU(),
-            nn.Linear(d_model * 2, d_model), nn.GELU(),
-        )
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-
-    @property
-    def d_model(self):
-        return self._d_model
-
-    def forward(self, tokens, gate_signal):
-        B, T = tokens.shape
-        pos = torch.arange(T, device=tokens.device).unsqueeze(0)
-        x = self.embed(tokens) + self.pos_embed(pos)
-        if gate_signal is not None:
-            x = x * gate_signal.expand(B, -1, -1)
-        x = self.mlp(x)
-        return self.head(x)
-
-
-class HFDecoder(DEngine):  # ⚠️ LEGACY — ConsciousDecoderV2 사용
-    """HuggingFace pre-trained LLM as D module.
-
-    Takes any causal LM (Mistral, Llama, GPT-2, etc.) and wraps it
-    with consciousness gating from C via bridge.
-
-    Gate injection: consciousness signal modulates the residual stream
-    at the first transformer layer (additive, not multiplicative — preserves
-    pre-trained weights).
-
-    Usage:
-        d = HFDecoder("mistralai/Mistral-7B-Instruct-v0.2")           # full
-        d = HFDecoder("mistralai/Mistral-7B-Instruct-v0.2", lora=True) # LoRA
-        d = HFDecoder("gpt2")                                          # small test
-    """
-
-    def __init__(self, model_name="gpt2", lora=False, lora_rank=16,
-                 gate_mode="additive", freeze_base=True, device=None):
-        super().__init__()
-        warnings.warn("HFDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError:
-            raise ImportError("pip install transformers — required for HFDecoder")
-
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.gate_mode = gate_mode
-
-        # Load model + tokenizer
-        print(f"  [HFDecoder] Loading {model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32, trust_remote_code=True
-        ).to(self.device)
-
-        # Detect d_model from model config
-        config = self.model.config
-        self._d_model = getattr(config, 'hidden_size',
-                        getattr(config, 'n_embd',
-                        getattr(config, 'd_model', 768)))
-        self._vocab_size = getattr(config, 'vocab_size', 32000)
-
-        # Freeze base model
-        if freeze_base:
-            for p in self.model.parameters():
-                p.requires_grad_(False)
-
-        # LoRA (optional — lightweight fine-tuning)
-        if lora:
-            try:
-                from peft import get_peft_model, LoraConfig, TaskType
-                lora_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=lora_rank, lora_alpha=32, lora_dropout=0.05,
-                    target_modules=["q_proj", "v_proj"],
-                )
-                self.model = get_peft_model(self.model, lora_config)
-                print(f"  [HFDecoder] LoRA applied (rank={lora_rank})")
-            except ImportError:
-                print("  [HFDecoder] peft not installed, skipping LoRA")
-
-        # Gate projector: bridge d_model → LLM hidden_size
-        # Initialized to near-zero so gate starts as identity
-        self.gate_proj = nn.Linear(self._d_model, self._d_model)
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
-        self.gate_proj = self.gate_proj.to(self.device)
-
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        print(f"  [HFDecoder] {model_name}: {total:,} total, {trainable:,} trainable")
-
-    @property
-    def d_model(self):
-        return self._d_model
-
-    def forward(self, tokens, gate_signal):
-        """Forward with consciousness gating.
-
-        tokens: [B, T] token ids (from HF tokenizer)
-        gate_signal: [1, T, bridge_d_model] from ThalamicBridge
-        """
-        tokens = tokens.to(self.device)
-
-        # Get embeddings from model
-        if hasattr(self.model, 'model'):  # Mistral/Llama style
-            embeds = self.model.model.embed_tokens(tokens)
-        elif hasattr(self.model, 'transformer'):  # GPT-2 style
-            embeds = self.model.transformer.wte(tokens)
-        else:
-            # Fallback: just run full forward
-            outputs = self.model(tokens)
-            return outputs.logits
-
-        # Inject consciousness gate (additive — doesn't destroy pre-trained knowledge)
-        if gate_signal is not None:
-            B, T, _ = embeds.shape
-            # Project gate to match LLM hidden size
-            gate = gate_signal.to(self.device)
-            if gate.shape[-1] != self._d_model:
-                gate = F.interpolate(
-                    gate.transpose(1, 2), size=self._d_model, mode='linear'
-                ).transpose(1, 2)
-            gate = gate.expand(B, T, -1)
-
-            if self.gate_mode == "additive":
-                embeds = embeds + self.gate_proj(gate)  # subtle consciousness influence
-            elif self.gate_mode == "multiplicative":
-                embeds = embeds * (1.0 + torch.sigmoid(self.gate_proj(gate)) - 0.5)
-
-        # Run through rest of model with modified embeddings
-        if hasattr(self.model, 'model'):  # Mistral/Llama
-            hidden = embeds
-            for layer in self.model.model.layers:
-                hidden = layer(hidden)[0]
-            hidden = self.model.model.norm(hidden)
-            logits = self.model.lm_head(hidden)
-        elif hasattr(self.model, 'transformer'):  # GPT-2
-            hidden = embeds
-            for block in self.model.transformer.h:
-                hidden = block(hidden)[0]
-            hidden = self.model.transformer.ln_f(hidden)
-            logits = self.model.lm_head(hidden)
-        else:
-            outputs = self.model(inputs_embeds=embeds)
-            logits = outputs.logits
-
-        return logits
-
-    def tokenize(self, text, max_length=512):
-        """Tokenize text for this model."""
-        return self.tokenizer(text, return_tensors="pt", max_length=max_length,
-                              truncation=True, padding=True)
-
-    def generate(self, prompt, gate_signal=None, max_new_tokens=100, temperature=0.7):
-        """Generate text with consciousness gating."""
-        inputs = self.tokenize(prompt)
-        tokens = inputs['input_ids'].to(self.device)
-
-        # Simple autoregressive generation
-        for _ in range(max_new_tokens):
-            logits = self.forward(tokens, gate_signal)
-            next_logit = logits[:, -1, :] / temperature
-            next_token = torch.multinomial(F.softmax(next_logit, dim=-1), 1)
-            tokens = torch.cat([tokens, next_token], dim=1)
-
-            if next_token.item() == self.tokenizer.eos_token_id:
-                break
-
-        return self.tokenizer.decode(tokens[0], skip_special_tokens=True)
+# ═══════════════════════════════════════════════════════════
+# Legacy D Engines — moved to archive/trinity_legacy.py
+# Re-exported here for backward compatibility
+# ═══════════════════════════════════════════════════════════
+try:
+    from archive.trinity_legacy import (
+        TransformerDecoder, MLPDecoder, HFDecoder,
+    )
+except ImportError:
+    from archive.trinity_legacy import TransformerDecoder, MLPDecoder  # type: ignore
+    HFDecoder = None
 
 
 # ═══════════════════════════════════════════════════════════
 # CA Decoder — Cellular Automaton decoder (Law 64: 최소 진화 최적)
 # ═══════════════════════════════════════════════════════════
 
-class CADecoder(DEngine):  # ⚠️ LEGACY — causal mask 없음, 생성 불가. PostHocDecoder의 base로만 사용
-    """Cellular Automaton decoder. Law 64: CA(5) beats Transformer by 81%.
-
-    Each token position = CA cell. Evolution = message passing between neighbors.
-    Consciousness gate modulates CA rule selection (META-CA).
-
-    Args:
-        d_model: model dimension
-        vocab_size: vocabulary size
-        max_seq: maximum sequence length
-        ca_steps: number of CA evolution steps (default 5, from Law 64)
-        n_rules: number of CA rules to learn (default 8)
-        gate_mode: "micro" (0.001, Law 63) or "full" or "posthoc"
-    """
-
-    def __init__(self, d_model=384, vocab_size=4096, max_seq=512,
-                 ca_steps=5, n_rules=8, gate_mode="micro"):
-        super().__init__()
-        warnings.warn("CADecoder is deprecated. Use PostHocDecoder instead (causal mask)", DeprecationWarning, stacklevel=2)
-        self._d_model = d_model
-        self.ca_steps = ca_steps
-        self.n_rules = n_rules
-        self.gate_mode = gate_mode
-
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_seq, d_model)
-
-        # CA rules: each rule is a linear transform on [self + left + right]
-        self.rules = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model * 3, d_model * 2), nn.GELU(),
-                nn.Linear(d_model * 2, d_model),
-            )
-            for _ in range(n_rules)
-        ])
-
-        # Rule selector: consciousness-guided (META-CA)
-        self.rule_selector = nn.Sequential(
-            nn.Linear(d_model, n_rules),
-            nn.Softmax(dim=-1),
-        )
-
-        # Layer norms for stability
-        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(ca_steps)])
-
-        # Output head
-        self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Gate scale for micro mode
-        self.gate_scale = 0.001 if gate_mode == "micro" else 1.0
-
-    @property
-    def d_model(self):
-        return self._d_model
-
-    def _ca_step(self, x, gate_signal, step_idx):
-        """Single CA evolution step with consciousness-guided rule selection."""
-        B, T, D = x.shape
-
-        # Pad for circular boundary
-        x_left = torch.cat([x[:, -1:, :], x[:, :-1, :]], dim=1)
-        x_right = torch.cat([x[:, 1:, :], x[:, :1, :]], dim=1)
-
-        # Neighborhood: [self, left, right]
-        neighborhood = torch.cat([x, x_left, x_right], dim=-1)  # [B, T, 3D]
-
-        # Apply all rules
-        rule_outputs = torch.stack([rule(neighborhood) for rule in self.rules], dim=2)  # [B, T, n_rules, D]
-
-        # Consciousness selects rules (META-CA)
-        if gate_signal is not None:
-            rule_weights = self.rule_selector(gate_signal.squeeze(0) * self.gate_scale)  # [T, n_rules]
-            rule_weights = rule_weights.unsqueeze(0).unsqueeze(-1)  # [1, T, n_rules, 1]
-        else:
-            rule_weights = torch.ones(1, T, self.n_rules, 1, device=x.device) / self.n_rules
-
-        # Weighted combination of rules
-        evolved = (rule_outputs * rule_weights).sum(dim=2)  # [B, T, D]
-
-        # Residual + norm
-        x = self.norms[step_idx](x + evolved)
-        return x
-
-    def forward(self, tokens, gate_signal):
-        B, T = tokens.shape
-        pos = torch.arange(T, device=tokens.device).unsqueeze(0)
-        x = self.embed(tokens) + self.pos_embed(pos)
-
-        # PostHoc mode: apply gate AFTER CA evolution
-        if self.gate_mode == "posthoc":
-            for step in range(self.ca_steps):
-                x = self._ca_step(x, None, step)
-            if gate_signal is not None:
-                x = x + gate_signal.expand(B, -1, -1) * self.gate_scale
-        else:
-            for step in range(self.ca_steps):
-                x = self._ca_step(x, gate_signal, step)
-
-        x = self.ln_f(x)
-        return self.head(x)
+# CADecoder — moved to archive/trinity_legacy.py, re-exported for compat
+try:
+    from archive.trinity_legacy import CADecoder
+except ImportError:
+    CADecoder = None
 
 
 class PostHocDecoder(DEngine):
@@ -1536,13 +1063,23 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
 def create_hexad(c_engine: CEngine, d_engine=None, w_engine=None,
                  m_engine=None, s_engine=None, e_engine=None,
                  d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
-    """Full Hexad: 6 modules active. σ(6)=12 connections."""
+    """Full Hexad: 6 modules active. σ(6)=12 connections.
+
+    Defaults to canonical Emergent modules (Law 101) when available,
+    falls back to legacy modules if hexad/ imports failed.
+    """
+    # Canonical: EmergentW/S/M/E (hexad/). Legacy fallback: CompositeW etc.
+    if w_engine is None:
+        w_engine = EmergentW(base_lr=base_lr) if EmergentW else CompositeW([DaseinW(), NarrativeW(), EmotionW()], [1/2, 1/3, 1/6])
+    if m_engine is None:
+        m_engine = EmergentM() if EmergentM else VectorMemory()
+    if s_engine is None:
+        s_engine = EmergentS() if EmergentS else TensionSense()
+    if e_engine is None:
+        e_engine = EmergentE() if EmergentE else EmpathyEthics()
     return create_trinity(
         c_engine, d_engine,
-        w_engine=w_engine or CompositeW([DaseinW(), NarrativeW(), EmotionW()], [1/2, 1/3, 1/6]),
-        m_engine=m_engine or VectorMemory(),
-        s_engine=s_engine or TensionSense(),
-        e_engine=e_engine or EmpathyEthics(),
+        w_engine=w_engine, m_engine=m_engine, s_engine=s_engine, e_engine=e_engine,
         d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
     )
 

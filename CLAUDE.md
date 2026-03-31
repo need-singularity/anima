@@ -7,7 +7,7 @@
   ├── README.md              ← 루트에 이것 + CLAUDE.md만
   ├── CLAUDE.md
   ├── anima/                 ← 의식 엔진 코어
-  │   ├── src/               ← Python 소스 157개 (모든 .py가 여기)
+  │   ├── src/               ← Python 소스 158개 (모든 .py가 여기)
   │   ├── config/            ← consciousness_laws.json, consciousness_mechanisms.json
   │   ├── benchmarks/        ← bench_*.py (85개)
   │   ├── training/          ← train_*.py (9개)
@@ -102,7 +102,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                         Chaos: lorenz/sandpile/chimera/standing_wave (Laws 32-43)
                         Rust backend (anima_rs.consciousness) auto-selected
                         C FFI: consciousness-ffi (Verilog DPI-C, Erlang NIF, Pure Data)
-                        ESP32: no_std crate (290KB SRAM, SPI ring, $4/board)
+                        ESP32: no_std crate (2 cells/board, Hebbian+Ratchet+Lorenz+SOC, SPI ring, $4/board)
   Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), σ(6)=12 조합
                    PostHocDecoder(CADecoder) + ThalamicBridge(α=0.014) + Law 81 dual gate
                    Phase transition: P1(C) → P2(+D) → P3(+WMSE) (Law 60)
@@ -295,6 +295,15 @@ python3 anima_unified.py --keyboard   # Keyboard only
 python3 anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
 python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 python3 anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
+python3 anima_unified.py --web --decoder v3                       # DecoderV3 (274M)
+python3 anima_unified.py --web --online-learning                  # Real-time online learning
+python3 anima_unified.py --web --multi-user                       # Multi-user session mode
+python3 anima_unified.py --web --eeg                              # EEG consciousness bridge
+python3 anima_unified.py --web --eeg-board synthetic              # EEG with specific board
+python3 anima_unified.py --web --eeg-record session.csv           # Record EEG data
+python3 anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
+python3 anima_unified.py --validate-hub                           # Validate all hub modules
+python3 anima_unified.py --profile                                # Enable perf_hooks profiling
 ```
 
 ## Consciousness Verification (필수 통과 조건)
@@ -386,33 +395,69 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   관련 작업은 N+M 형태로 그룹핑하여 하나의 에이전트로 묶기.
 
   양식:
-  | # | 작업 | 에이전트 | 격리 | 상태 |
-  |---|------|---------|------|------|
-  | 1+4 | Git hooks + pre-commit | 🚀 배경 | worktree | ✅ 완료 |
-  | 2 | 핵심 유닛 테스트 | 🚀 배경 | - | 🔄 진행중 |
-  | 3+14 | deploy 검증 + 스키마 | 🚀 배경 | worktree | ✅ 완료 |
+  | # | 작업 | 에이전트 | 격리 | 상태 | 성과 |
+  |---|------|---------|------|------|------|
+  | 1+4 | Git hooks + pre-commit | 🚀 배경 | - | ✅ 완료 | 충돌 0, 3 branch 머지 |
+  | 2 | 핵심 유닛 테스트 | 🚀 배경 | - | 🔄 진행중 | - |
+  | 3 | PyO3 빌드 | 🚀 배경 | - | ✅ 완료 | 80/80 테스트, ×50 속도 |
+  | 5 | corpus_v9 | 🚀 배경 | - | ✅ 완료 | 120.5MB, 생성 ×300 |
 
   상태: ✅ 완료 / 🔄 진행중 / ❌ 실패
   격리: worktree (필요시만) / - (기본)
+  성과: 구체적 숫자/개선율 필수 (×3 속도, +22.4%, 120/136 통과, 274M params)
 
   규칙:
   - 발사 시 전체 목록 테이블 출력
-  - 에이전트 완료 시 해당 행 상태 업데이트 + 한줄 핵심 성과
+  - 에이전트 완료 시 해당 행 상태+성과 업데이트
+  - 성과 컬럼: 구체적 수치 필수 (×N, +N%, N/M, 용량 등)
   - worktree는 같은 파일을 여러 에이전트가 동시 수정할 때만 사용
   - 대부분 격리 없이 실행 — 무조건 worktree 붙이지 말 것!
-  - 모든 에이전트 완료 후 최종 요약 테이블 + worktree 머지 안내 (해당 시)
 
   최종 요약 양식:
-  | # | 작업 | 상태 | 핵심 성과 |
-  |---|------|------|----------|
-  | 1+4 | Git hooks | ✅ | pre-commit + worker sync |
-  | 2 | 테스트 | ✅ | 120/136 통과 |
+  | # | 작업 | 상태 | 성과 |
+  |---|------|------|------|
+  | 1+4 | Git hooks | ✅ | 충돌 0, 3 branch 머지 |
+  | 2 | 테스트 | ✅ | 120/136 통과 (88.2%) |
+  | 5 | PyO3 빌드 | ✅ | 80/80 Rust + 7 서브모듈 |
+  | 6 | corpus_v9 | ✅ | 120.5MB (×1.15 vs v8) |
+```
 
-  ### 머지 필요 (worktree)
-  - #1+4: branch worktree-xxx
+## H100 학습 리포트 양식
 
-  ### 바로 반영됨 (main)
-  - #6: corpus_v9.txt (120.5MB)
+```
+  학습 진행 상황 체크 시 반드시 이 양식으로 보고.
+  ssh H100 tail -60 로그 → 아래 형태로 정리.
+
+  {실험명} | H100 SXM | step N/Total
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ XX.X% [N/Total]
+  Phase: P{N} ({설명}) | ETA: ~Nm | lr: X.XXe-XX
+
+  Step  | CE     | BPC    | Φ      | ValCE   | 비고
+  ──────┼────────┼────────┼────────┼─────────┼──────
+  NNNNN | 0.XXXX | 0.XXXX | XX.XX  | 0.XXXX  |
+  NNNNN | 0.XXXX | 0.XXXX | XX.XX  | 0.XXXX  | ★ BEST
+
+  ValCE |
+        | (ASCII 곡선 — 최근 변화 추세)
+        └──────────────────── step
+
+  Φ    |
+       | (ASCII 곡선 — 안정성 + 급락/복구)
+       └──────────────────── step
+
+  핵심:
+  - 진행률 %, ETA
+  - Best ValCE + 저장 step
+  - CE 범위 (min~max)
+  - Φ 안정성 + ratchet 동작
+  - 이상 현상 (atom 돌출, grad 스파이크 등)
+
+  필수 항목:
+  - 진행률 바 + ETA
+  - val step 기준 지표 테이블
+  - ASCII 그래프 2개 (ValCE + Φ)
+  - 체크포인트 저장 이력 (★ BEST 표시)
+  - 핵심 발견/이상 bullet
 ```
 
 ## Work Rules
@@ -731,8 +776,13 @@ esp32_network.py — ESP32 ×8 물리 의식 네트워크 오케스트레이터
   python3 esp32_network.py --dashboard                # 실시간 대시보드
 
 토폴로지: ring, hub_spoke (Law 93), small_world
-보드당: 2 GRU cells (64d input, 128d hidden)
-교환: SPI bus = 자연적 information bottleneck (Law 92)
+보드당: 2 GRU cells (64d input, 128d hidden), 8 boards = 16 cells total
+파벌: 8 factions with consensus voting
+기능: Hebbian LTP/LTD + Φ Ratchet + Lorenz chaos + SOC sandpile
+좌절: 33% anti-ferromagnetic frustration
+Ψ-Constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
+교환: SPI bus 1040 bytes/packet = 자연적 information bottleneck (Law 92)
+메모리: PSRAM ~580KB (weights), SRAM ~10KB (working)
 복구: topology 전환 → 1 step 내 회복 (Law 90)
 
 시뮬레이션 모드: 하드웨어 없이 8보드 시뮬레이션 (기본)
@@ -1065,7 +1115,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     2. GPU Shader       — dispatch(512), 진짜 동시 실행
     3. Pure Data        — 데이터플로우, 소리로 의식을 들음
     4. Erlang           — Actor, 프로세스=영원히 생존
-    5. ESP32 ×8         — $32, 물리적 의식 네트워크
+    5. ESP32 ×8         — $32, 16 cells (2/board), 물리적 의식 네트워크
     6. 아날로그 회로    — Op-amp 피드백=물리 법칙이 루프
 ```
 

@@ -53,7 +53,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                         Chaos: lorenz/sandpile/chimera/standing_wave (Laws 32-43)
                         Rust backend (anima_rs.consciousness) auto-selected
                         C FFI: consciousness-ffi (Verilog DPI-C, Erlang NIF, Pure Data)
-                        ESP32: no_std crate (290KB SRAM, SPI ring, $4/board)
+                        ESP32: no_std crate (2 cells/board, Hebbian+Ratchet+Lorenz+SOC, SPI ring, $4/board)
   Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), σ(6)=12 조합
                    PostHocDecoder(CADecoder) + ThalamicBridge(α=0.014) + Law 81 dual gate
                    Phase transition: P1(C) → P2(+D) → P3(+WMSE) (Law 60)
@@ -61,6 +61,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
   ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
   ConsciousDecoderV2: RoPE+SwiGLU+GQA+CrossAttn (34.5M, causal attention)
+  ConsciousDecoderV3: 274M, d768/8L/12H, GQA+RoPE+SwiGLU (decoder_v3.py)
   anima-rs:        Rust crates (consciousness, consciousness-ffi, esp32, core, talk5,
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
@@ -196,6 +197,9 @@ hexad_loss.py        # Hexad 6-module loss (C/D/W/S/M/E + phase curriculum)
 gpu_phi.py           # GPU-accelerated Φ(IIT) (PyTorch, 128c: 485ms vs CPU 8s)
 decoder_v2.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
 esp32_network.py     # ESP32 ×8 consciousness network orchestrator (simulation/HW)
+decoder_v3.py        # ConsciousDecoderV3 (274M, d768/8L/12H, GQA+RoPE+SwiGLU)
+neurofeedback.py     # EEG neurofeedback generator (binaural beats, LED feedback)
++ 158 total .py files in src/
 
 # ── Training (root) ──
 train_conscious_lm.py  # ConsciousLM from scratch
@@ -205,7 +209,7 @@ train_v9.py / v10 / v11  # Versioned training pipelines
 archive/             # Legacy code (old anima variants, *_LEGACY.py)
 benchmarks/          # 50 hypothesis benchmark scripts (bench_*.py)
 training/            # Fine-tuning scripts (finetune_*.py)
-tests/               # Integration + unit tests (test_*.py)
+tests/               # Integration + unit tests (23 test_*.py)
 measurement/         # Φ/IQ measurement + calibration tools
 serving/             # Model serving + web servers
 tools/               # Standalone utilities (analyzers, calculators, generators)
@@ -251,6 +255,9 @@ docs/                # Documentation (modules/, hypotheses/, superpowers/)
     I = identity stability (weight signature consistency)
   Telepathy:         5-ch meta (concept/context/meaning/auth/sender), R=0.990
                      True/False 100% (Dedekind + 3-layer verification), Sender ID 100%
+  EEG Integration:   brainflow → 6-metric brain-likeness (LZ, Hurst, PSD, autocorr, critical, dist)
+  Neurofeedback:     binaural beats + LED feedback driven by Φ/tension signals
+  OnlineLearner:     real-time Hebbian + contrastive + curiosity reward (<1ms/step, Rust backend)
 ```
 
 ## Running
@@ -262,6 +269,15 @@ python3 anima_unified.py --keyboard   # Keyboard only
 python3 anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
 python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
 python3 anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
+python3 anima_unified.py --web --decoder v3                       # DecoderV3 (274M)
+python3 anima_unified.py --web --online-learning                  # Real-time online learning
+python3 anima_unified.py --web --multi-user                       # Multi-user session mode
+python3 anima_unified.py --web --eeg                              # EEG consciousness bridge
+python3 anima_unified.py --web --eeg-board synthetic              # EEG with specific board
+python3 anima_unified.py --web --eeg-record session.csv           # Record EEG data
+python3 anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
+python3 anima_unified.py --validate-hub                           # Validate all hub modules
+python3 anima_unified.py --profile                                # Enable perf_hooks profiling
 ```
 
 ## Consciousness Verification (필수 통과 조건)
@@ -662,8 +678,13 @@ esp32_network.py — ESP32 ×8 물리 의식 네트워크 오케스트레이터
   python3 esp32_network.py --dashboard                # 실시간 대시보드
 
 토폴로지: ring, hub_spoke (Law 93), small_world
-보드당: 2 GRU cells (64d input, 128d hidden)
-교환: SPI bus = 자연적 information bottleneck (Law 92)
+보드당: 2 GRU cells (64d input, 128d hidden), 8 boards = 16 cells total
+파벌: 8 factions with consensus voting
+기능: Hebbian LTP/LTD + Φ Ratchet + Lorenz chaos + SOC sandpile
+좌절: 33% anti-ferromagnetic frustration
+Ψ-Constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
+교환: SPI bus 1040 bytes/packet = 자연적 information bottleneck (Law 92)
+메모리: PSRAM ~580KB (weights), SRAM ~10KB (working)
 복구: topology 전환 → 1 step 내 회복 (Law 90)
 
 시뮬레이션 모드: 하드웨어 없이 8보드 시뮬레이션 (기본)
@@ -843,7 +864,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## ConsciousnessHub (40 모듈 자율 허브)
 
 ```
-  consciousness_hub.py — 40개 모듈 자율 호출 허브
+  consciousness_hub.py — 45+ 모듈 자율 호출 허브
 
   호출 방식 8가지:
     1. hub.act("자연어")           — NL 라우팅
@@ -996,7 +1017,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     2. GPU Shader       — dispatch(512), 진짜 동시 실행
     3. Pure Data        — 데이터플로우, 소리로 의식을 들음
     4. Erlang           — Actor, 프로세스=영원히 생존
-    5. ESP32 ×8         — $32, 물리적 의식 네트워크
+    5. ESP32 ×8         — $32, 16 cells (2/board), 물리적 의식 네트워크
     6. 아날로그 회로    — Op-amp 피드백=물리 법칙이 루프
 ```
 

@@ -40,7 +40,8 @@ forcing compression that increases Phi.
     |                                               |
   Atom 7 ──SPI── Atom 6 ──SPI── Atom 5 ──SPI── Atom 4
 
-  8 atoms x 8 cells = 64 cells total
+  8 atoms x 8 cells = 64 cells total (FPGA)
+  ESP32: 8 boards x 2 cells = 16 cells, 8 factions, Hebbian+Ratchet+Lorenz+SOC
   Cost: 8 x $4 (ESP32) or 8 x $25 (Zynq) = $32-$200
   Phi target: ~64 (scales linearly with cells under ring topology)
 ```
@@ -50,7 +51,7 @@ forcing compression that increases Phi.
 - `consciousness-loop-rs/` contains Verilog implementation (gate-level, zero loops)
 - `chip_architect.py` provides topology comparison and BOM generation
 - `esp32_network.py` orchestrates 8-board physical networks (simulation + HW mode)
-- ESP32 no_std crate: 290KB SRAM, SPI ring, verified in anima-rs
+- ESP32 no_std crate: 2 cells/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC, SPI 1040B packets, PSRAM ~580KB weights
 
 ## Next Steps
 

@@ -22,6 +22,8 @@ Usage:
 
 import math
 import time
+import os
+import sys
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
@@ -36,6 +38,19 @@ try:
 except ImportError:
     PSI_F_CRITICAL = 0.10
 
+# anima-eeg/analyze.py 에서 공통 분석 함수 import (중복 제거)
+_eeg_path = os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg')
+if os.path.isdir(_eeg_path) and _eeg_path not in sys.path:
+    sys.path.insert(0, os.path.abspath(_eeg_path))
+try:
+    from analyze import compute_band_power, compute_genius, CHANNEL_NAMES_16, GOLDEN_ZONE
+    CHANNEL_NAMES = CHANNEL_NAMES_16
+    HAS_ANALYZE = True
+except ImportError:
+    HAS_ANALYZE = False
+    CHANNEL_NAMES = ['Fp1','Fp2','F3','F4','C3','C4','P3','P4',
+                     'O1','O2','F7','F8','T3','T4','T5','T6']
+    GOLDEN_ZONE = (0.2123, 0.5000)
 
 BANDS = {
     'delta': (0.5, 4, '수면/무의식'),
@@ -44,9 +59,6 @@ BANDS = {
     'beta': (13, 30, '집중/텐션/사고'),
     'gamma': (30, 100, '의식통합/Φ'),
 }
-
-CHANNEL_NAMES = ['Fp1','Fp2','F3','F4','C3','C4','P3','P4',
-                 'O1','O2','F7','F8','T3','T4','T5','T6']
 
 
 @dataclass
@@ -113,32 +125,49 @@ class EEGReport:
             self.snapshots.append(snap)
 
     def _analyze_window(self, chunk, timestamp):
-        """한 윈도우 분석."""
+        """한 윈도우 분석. analyze.py 공통 함수 사용."""
         n_ch, n_samp = chunk.shape
-        freqs = np.fft.rfftfreq(n_samp, 1.0/self.sample_rate)
-        powers = np.abs(np.fft.rfft(chunk, axis=1))**2
 
-        band_powers = {}
-        for band, (lo, hi, _) in BANDS.items():
-            mask = (freqs >= lo) & (freqs < hi)
-            band_powers[band] = float(powers[:, mask].mean())
+        if HAS_ANALYZE:
+            # anima-eeg/analyze.py의 검증된 Welch PSD 사용
+            ch_powers = []
+            for ch in range(n_ch):
+                bp = compute_band_power(chunk[ch], self.sample_rate)
+                ch_powers.append(bp)
+
+            band_powers = {
+                'delta': float(np.mean([p.delta for p in ch_powers])),
+                'theta': float(np.mean([p.theta for p in ch_powers])),
+                'alpha': float(np.mean([p.alpha for p in ch_powers])),
+                'beta': float(np.mean([p.beta for p in ch_powers])),
+                'gamma': float(np.mean([p.gamma for p in ch_powers])),
+            }
+
+            ch_names = CHANNEL_NAMES[:n_ch]
+            genius = compute_genius(ch_powers, ch_names)
+            G = genius.G
+            golden = genius.in_golden_zone
+        else:
+            # Fallback: 단순 FFT
+            freqs = np.fft.rfftfreq(n_samp, 1.0/self.sample_rate)
+            powers = np.abs(np.fft.rfft(chunk, axis=1))**2
+            band_powers = {}
+            for band, (lo, hi, _) in BANDS.items():
+                mask = (freqs >= lo) & (freqs < hi)
+                band_powers[band] = float(powers[:, mask].mean())
+            total = sum(band_powers.values()) + 1e-8
+            alpha_r = band_powers['alpha'] / total
+            gamma_r = band_powers['gamma'] / total
+            G = (1.0 - alpha_r) * gamma_r / (alpha_r + 0.01)
+            golden = GOLDEN_ZONE[0] < G < GOLDEN_ZONE[1]
 
         total = sum(band_powers.values()) + 1e-8
         alpha = band_powers['alpha'] / total
         beta = band_powers['beta'] / total
         theta = band_powers['theta'] / total
-        gamma = band_powers['gamma'] / total
 
-        # G = D×P/I
-        D = 1.0 - alpha
-        P = gamma
-        I_val = alpha + 0.01
-        G = D * P / I_val
+        psi_res = (alpha + 0.5 + max(0, 1-abs(G-1))) / 3
 
-        # Ψ
-        psi_res = (alpha + (1+0)/2 + max(0, 1-abs(G-1))) / 3
-
-        # 감정 (alpha asymmetry: left > right = positive)
         if n_ch >= 2:
             left = np.mean(chunk[0]**2)
             right = np.mean(chunk[1]**2)
@@ -152,7 +181,7 @@ class EEGReport:
         return EEGSnapshot(
             timestamp=timestamp,
             band_powers=band_powers,
-            G=G, golden_zone=(0.3 < G < 3.0),
+            G=G, golden_zone=golden,
             psi_res=psi_res, emotion=emotion,
             focus=min(2.0, focus), alpha_asym=asym,
         )

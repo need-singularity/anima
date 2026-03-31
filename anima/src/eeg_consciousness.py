@@ -365,12 +365,16 @@ class EEGConsciousness:
     def connect_openbci(self, board_type: str = "cyton_daisy"):
         """OpenBCI 보드 연결."""
         try:
-            from eeg.realtime import EEGBridge
+            import os, sys
+            eeg_path = os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg')
+            if os.path.isdir(eeg_path) and eeg_path not in sys.path:
+                sys.path.insert(0, os.path.abspath(eeg_path))
+            from realtime import EEGBridge
             self._bridge = EEGBridge(board_type=board_type)
             self._bridge.start()
             return True
         except ImportError:
-            print("  ⚠️ eeg.realtime not available (pip install brainflow)")
+            print("  ⚠️ anima-eeg/realtime not available (pip install brainflow)")
             return False
         except Exception as e:
             print(f"  ⚠️ OpenBCI connection failed: {e}")

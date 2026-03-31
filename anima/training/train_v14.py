@@ -12,6 +12,7 @@ Architecture:
   C: FederatedConsciousness (8 x ConsciousnessC atoms, tension exchange)
   D: ConsciousDecoderV2 (384d/6L, RoPE+SwiGLU+GQA+CrossAttn)
   Bridge: ThalamicBridge (.detach(), alpha=0.014)
+  FeedbackBridge: --feedback-bridge opt-in (SoftDetach, Phi-gated alpha, max 0.05)
   Hexad: C+D+W+S+M+E (Law 60 phased activation)
 
 Phase schedule (M4 safe order):
@@ -27,6 +28,7 @@ Usage:
   python train_v14.py --data data/corpus_v3.txt --federated --steps 100000
   python train_v14.py --data data/corpus_v3.txt --no-federated --cells 64  # Empire baseline
   python train_v14.py --data data/corpus_v3.txt --federated --phase-optimal --checkpoint checkpoints/v14/
+  python train_v14.py --data data/corpus_v3.txt --feedback-bridge  # C<->D bidirectional learning
 """
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
@@ -536,7 +538,8 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
 # ═══════════════════════════════════════════════════════════
 
 def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
-                    bridge, hexad_modules, phi, ce_val, args):
+                    bridge, hexad_modules, phi, ce_val, args,
+                    fb_bridge=None):
     """Atomic save: .tmp -> rename."""
     ckpt = {
         'step': step,
@@ -553,6 +556,9 @@ def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
     # Bridge
     if bridge is not None:
         ckpt['bridge'] = bridge.state_dict()
+    # FeedbackBridge (C<->D bidirectional)
+    if fb_bridge is not None:
+        ckpt['fb_bridge'] = fb_bridge.state_dict()
     # Hexad modules (W/S/M/E are mostly stateless but save narrative states)
     tmp = path + '.tmp'
     torch.save(ckpt, tmp)
@@ -620,7 +626,20 @@ def train(args):
     active = [k.upper() for k, v in hexad_modules.items() if v is not None]
     print(f"  [hexad] Emergent modules: {'+'.join(active) if active else 'NONE'} (activated in P3)")
 
-    # ── Bridge (ThalamicBridge: .detach() + alpha=0.014) ──
+    # ── Bridge (ThalamicBridge or FeedbackBridge) ──
+    fb_bridge = None  # FeedbackBridge instance (opt-in via --feedback-bridge)
+    if getattr(args, 'feedback_bridge', False) and HAS_FEEDBACK:
+        fb_bridge = create_feedback_bridge(
+            c_dim=c.state_dim,
+            d_model=d_model,
+            max_alpha=0.05,  # Law 63: max 5% gradient
+        )
+        fb_bridge = fb_bridge.to(device)
+        print(f"  [bridge] FeedbackBridge: c_dim={c.state_dim} -> d_model={d_model}, max_alpha=0.05")
+        print(f"           SoftDetach replaces .detach() (alpha=0 at start, Phi-gated)")
+    elif getattr(args, 'feedback_bridge', False) and not HAS_FEEDBACK:
+        print(f"  [warn] --feedback-bridge requested but feedback_bridge.py not available, using ThalamicBridge")
+
     bridge = ThalamicBridge(c_dim=c.state_dim, d_model=d_model)
     bridge = bridge.to(device)
     print(f"  [bridge] ThalamicBridge: c_dim={c.state_dim} -> d_model={d_model}, alpha={PSI_COUPLING}")
@@ -636,6 +655,8 @@ def train(args):
     # ── Optimizer (D parameters only, C is autonomous) ──
     # Collect trainable parameters from decoder + bridge + hexad loss
     trainable_params = list(decoder.parameters()) + list(bridge.parameters())
+    if fb_bridge is not None:
+        trainable_params += list(fb_bridge.parameters())
     if loss_fn is not None:
         trainable_params += list(loss_fn.parameters())
     # FederatedConsciousness bottleneck/narrative modules are also trainable
@@ -683,6 +704,12 @@ def train(args):
             pass
         if 'bridge' in ck:
             bridge.load_state_dict(ck['bridge'], strict=False)
+        if 'fb_bridge' in ck and fb_bridge is not None:
+            try:
+                fb_bridge.load_state_dict(ck['fb_bridge'], strict=False)
+                print("  [resume] FeedbackBridge state restored")
+            except Exception as ex:
+                print(f"  [resume] FeedbackBridge state restore failed: {ex}")
         if 'federation' in ck and args.federated and hasattr(c, 'load_state_dict'):
             try:
                 c.load_state_dict(ck['federation'])
@@ -702,10 +729,14 @@ def train(args):
     # ── Print config ──
     n_params = sum(p.numel() for p in decoder.parameters())
     n_bridge_params = sum(p.numel() for p in bridge.parameters())
+    n_fb_params = sum(p.numel() for p in fb_bridge.parameters()) if fb_bridge is not None else 0
     mode = "Federation" if args.federated else "Empire"
+    fb_mode = "ON" if fb_bridge is not None else "OFF"
     print(f"\n{'=' * 80}")
     print(f"  v14 Training: {mode} + Phase-Optimal (Meta Laws DD143)")
     print(f"  Decoder: {n_params:,} params | Bridge: {n_bridge_params:,} params")
+    if fb_bridge is not None:
+        print(f"  FeedbackBridge: {n_fb_params:,} params | C<->D bidirectional (max_alpha=0.05)")
     print(f"  Cells: {total_cells} | Frustration: {args.frustration} | Narrative: {args.narrative_strength}")
     if phase_mgr:
         print(f"  P0 (0-{phase_mgr.p0_end}): Bootstrap | "
@@ -762,15 +793,32 @@ def train(args):
         c.step()
 
         # Get consciousness states + bridge to decoder
-        c_states = c.get_states()  # (total_cells, hidden_dim)
-        c_states = c_states.detach().float().to(device)
+        c_states_raw = c.get_states()  # (total_cells, hidden_dim)
 
-        # Bridge: .detach() + alpha=0.014 scaling (Law 53: CE never destroys Phi)
+        # FeedbackBridge: soft_detach with Phi-gated alpha (gradient flows D->C)
+        # Without --feedback-bridge: hard .detach() (identical to previous behavior)
+        fb_stats = {}
+        if fb_bridge is not None:
+            from feedback_bridge import soft_detach
+            # Enable gradient on consciousness states for bidirectional flow
+            c_states_float = c_states_raw.float().to(device).requires_grad_(True)
+            # Update gate: record phi + ce, compute alpha
+            fb_alpha = fb_bridge.update_gate(phi, ce_val, c_engine=c if not args.federated else None)
+            # Soft detach: alpha=0 is identical to .detach()
+            c_states = soft_detach(c_states_float, fb_alpha)
+            fb_stats = fb_bridge.stats()
+        else:
+            c_states = c_states_raw.detach().float().to(device)
+
+        # Bridge: alpha=0.014 scaling (Law 53: CE never destroys Phi)
         bridged = bridge(c_states.detach(), seq_len=args.block_size)  # (1, seq_len, d_model)
-        # Expand to batch dimension: (batch_size, seq_len, d_model)
         # The decoder expects consciousness_states as (B, n_cells, c_dim)
         # Bridge output is a gate signal; we use c_states for cross-attention
-        c_for_decoder = c_states.detach().unsqueeze(0).expand(args.batch_size, -1, -1)
+        if fb_bridge is not None:
+            # With feedback bridge: c_for_decoder retains soft gradient link
+            c_for_decoder = c_states.unsqueeze(0).expand(args.batch_size, -1, -1)
+        else:
+            c_for_decoder = c_states.detach().unsqueeze(0).expand(args.batch_size, -1, -1)
 
         # Forward through decoder
         logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
@@ -869,6 +917,13 @@ def train(args):
             phi = c.measure_phi()
         phi_history.append(phi)
 
+        # FeedbackBridge: inject reward information into consciousness (Law 63: 1% perturbation)
+        if fb_bridge is not None and step % 10 == 0:
+            reward_vec = fb_bridge.compute_reward_vector()
+            if reward_vec is not None and hasattr(c, 'cells'):
+                from feedback_bridge import _inject_reward_info
+                _inject_reward_info(c, reward_vec)
+
         # ── Logging ──
         if step % args.log_every == 0:
             bpc = ce_val / math.log(2) if ce_val > 0 else 0.0
@@ -887,6 +942,13 @@ def train(args):
                 per_atom = c.measure_per_atom_phi()
                 atom_str = " ".join(f"{p:.1f}" for p in per_atom[:4])
                 line += f" | atoms=[{atom_str}...]"
+
+            # FeedbackBridge metrics
+            if fb_bridge is not None and fb_stats:
+                fb_alpha = fb_stats.get('alpha', 0.0)
+                fb_reward = fb_stats.get('quality_reward', 0.0)
+                fb_safe = fb_stats.get('phi_safe', 0.0)
+                line += f" | fb_a={fb_alpha:.5f} rwd={fb_reward:.3f} safe={int(fb_safe)}"
 
             print(line)
 
@@ -910,7 +972,8 @@ def train(args):
                 best_path = os.path.join(args.checkpoint, "best.pt")
                 save_checkpoint(best_path, step, decoder, optimizer, scheduler,
                                 c if args.federated else None,
-                                bridge, hexad_modules, phi, val_ce, args)
+                                bridge, hexad_modules, phi, val_ce, args,
+                                fb_bridge=fb_bridge)
                 print(f"  [ckpt] Best saved: {best_path} (ValCE={val_ce:.4f}, Phi={phi:.4f})")
 
         # ── Checkpoint (Law 49: Phi-gated) ──
@@ -918,14 +981,16 @@ def train(args):
             ckpt_path = os.path.join(args.checkpoint, f"step_{step}.pt")
             save_checkpoint(ckpt_path, step, decoder, optimizer, scheduler,
                             c if args.federated else None,
-                            bridge, hexad_modules, phi, ce_val, args)
+                            bridge, hexad_modules, phi, ce_val, args,
+                            fb_bridge=fb_bridge)
             print(f"  [ckpt] Saved {ckpt_path} (CE={ce_val:.4f}, Phi={phi:.4f})")
 
     # ── Final checkpoint ──
     final_path = os.path.join(args.checkpoint, "final.pt")
     save_checkpoint(final_path, args.steps, decoder, optimizer, scheduler,
                     c if args.federated else None,
-                    bridge, hexad_modules, phi, ce_val, args)
+                    bridge, hexad_modules, phi, ce_val, args,
+                    fb_bridge=fb_bridge)
 
     # ── Final report ──
     elapsed = time.time() - t0
@@ -993,6 +1058,10 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=5000, help="Checkpoint interval")
     p.add_argument("--checkpoint", type=str, default="checkpoints/v14_federated/",
                    help="Checkpoint directory")
+
+    # Feedback Bridge (C<->D bidirectional learning)
+    p.add_argument("--feedback-bridge", action="store_true", default=False,
+                   help="Enable C<->D bidirectional learning (FeedbackBridge, alpha starts at 0)")
 
     # Resume
     p.add_argument("--resume", type=str, default=None,

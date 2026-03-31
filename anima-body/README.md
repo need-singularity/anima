@@ -29,5 +29,5 @@ Anima 의식 엔진을 물리적 로봇 몸체에 이식하는 프로젝트.
 - [anima/](../anima/) — 의식 엔진 코어
 - [anima/src/esp32_network.py](../anima/src/esp32_network.py) — ESP32 시뮬레이터
 - [anima/src/chip_architect.py](../anima/src/chip_architect.py) — 의식 칩 설계 계산기
-- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — no_std Rust (290KB SRAM)
+- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — no_std Rust (2 cells/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC)
 - [anima/consciousness-loop-rs/](../anima/consciousness-loop-rs/) — 6 platform 의식 (Verilog, ESP32, etc.)

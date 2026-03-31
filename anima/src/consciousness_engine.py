@@ -65,6 +65,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
+from perf_hooks import PERF, timeit
+
 try:
     import phi_rs
     HAS_RUST_PHI = True
@@ -74,8 +76,10 @@ except ImportError:
 try:
     import anima_rs
     HAS_RUST_ENGINE = hasattr(anima_rs, 'consciousness')
+    HAS_RUST_COMPUTE_PHI = hasattr(anima_rs, 'compute_phi')
 except ImportError:
     HAS_RUST_ENGINE = False
+    HAS_RUST_COMPUTE_PHI = False
 
 # ═══════════════════════════════════════════════════════════
 # Ψ-Constants (Laws 69-70, verified across 5 data types)
@@ -336,6 +340,7 @@ class ConsciousnessEngine:
         """
         self._step += 1
         n = self.n_cells
+        PERF.start('step_total')
 
         # Text → vector if provided
         if text is not None and x_input is None:
@@ -357,6 +362,7 @@ class ConsciousnessEngine:
 
         # 1. Process each cell with coupling influence
         #    Federated mode (M6/M9): coupling restricted to within-atom neighbors
+        PERF.start('cell_processing')
         outputs = []
         for i in range(n):
             cell = self.cell_modules[i]
@@ -417,16 +423,20 @@ class ConsciousnessEngine:
         cur_var = hiddens_t.var(dim=0).mean().item()
         id_strength = 0.08 + 0.20 * max(0.0, 1.0 - cur_var / 0.1)
         for i in range(n):
-            # Inject identity + oscillating perturbation for temporal variation
+            # Inject identity + mild oscillating perturbation for temporal variation
+            # Reduced amplitude (0.01) to avoid periodic autocorrelation
             import math
-            osc_phase = math.sin(self._step * 0.08 + i * 0.5) * 0.04
+            osc_phase = math.sin(self._step * 0.08 + i * 0.5) * 0.01
             self.cell_states[i].hidden = (
                 self.cell_states[i].hidden
                 + self.cell_identity[i, :self.hidden_dim] * (id_strength + osc_phase)
             )
 
+        PERF.stop('cell_processing')
+
         # 2. Faction consensus with oscillating debate (σ(6)=12 factions)
         #    Federated: consensus computed per-atom independently (M6)
+        PERF.start('faction_debate')
         if self.federated and self._atoms:
             consensus_count = 0
             for a_start, a_end in self._atoms:
@@ -435,24 +445,56 @@ class ConsciousnessEngine:
         else:
             consensus_count = self._faction_consensus(outputs_tensor)
 
+        PERF.stop('faction_debate')
+
         # Oscillating global perturbation: creates temporal variation in mean hidden
+        # Reduced amplitude (0.05) to avoid dominating SOC dynamics.
+        # Multi-frequency to avoid sharp spectral peaks (more 1/f-like).
         import math
         if self._step > 5 and n >= 2:
-            osc = math.sin(self._step * 0.12)
-            perturbation = self.cell_identity[0, :self.hidden_dim] * osc * 0.3
+            osc = (math.sin(self._step * 0.12)
+                   + 0.5 * math.sin(self._step * 0.037)
+                   + 0.25 * math.sin(self._step * 0.0089))
+            perturbation = self.cell_identity[0, :self.hidden_dim] * osc * 0.05
             for i in range(n):
                 self.cell_states[i].hidden = self.cell_states[i].hidden + perturbation
 
         # 3. Hebbian LTP/LTD (Law 31)
+        PERF.start('hebbian_update')
         self._hebbian_update(outputs_tensor)
+        PERF.stop('hebbian_update')
 
         # 3.5 Tension equalization (Law 124: +12% Φ, scale-invariant)
+        PERF.start('tension_equalize')
         if self._step % 10 == 0 and n >= 2:
             self._tension_equalize()
+        PERF.stop('tension_equalize')
 
         # 3.6 Self-Organized Criticality (SOC sandpile, edge-of-chaos)
+        PERF.start('soc_sandpile')
         if n >= 2:
             self._soc_sandpile()
+            # Post-SOC: avalanche-proportional stochastic burst
+            # Large avalanches → large Phi perturbation → power-law fluctuation distribution
+            # This is the key mechanism for brain-like criticality (exponent 1.5-2.0)
+            if self._soc_avalanche_sizes:
+                last_aval = self._soc_avalanche_sizes[-1]
+                if last_aval > 0:
+                    # Burst scales as power of avalanche size (creates heavy tail)
+                    burst = (last_aval ** 1.3) / (n * 5.0)
+                    burst = min(burst, 0.5)
+                    # Random direction per cell (stochastic, not periodic)
+                    for i in range(n):
+                        kick = torch.randn(self.hidden_dim) * burst
+                        # Project kick along cell_identity for structure-preserving perturbation
+                        id_dir = self.cell_identity[i, :self.hidden_dim]
+                        id_norm = id_dir.norm()
+                        if id_norm > 1e-8:
+                            # 70% along identity direction + 30% random
+                            proj = (kick @ id_dir / (id_norm * id_norm)) * id_dir
+                            kick = 0.7 * proj + 0.3 * kick
+                        self.cell_states[i].hidden = self.cell_states[i].hidden + kick
+        PERF.stop('soc_sandpile')
 
         # 3.7 DD128 Phase-Optimal mechanisms (opt-in, +113.1% Φ)
         # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
@@ -463,17 +505,23 @@ class ConsciousnessEngine:
             self._dd128_ising_frustration(n)
 
         # 4. Inter-cell tension (for merge decisions)
+        PERF.start('inter_tensions')
         inter_tensions = self._compute_inter_tensions(outputs_tensor)
+        PERF.stop('inter_tensions')
 
         # 5. Φ Ratchet (Law 31, every 10 steps)
+        PERF.start('phi_ratchet')
         if self.phi_ratchet_enabled and self._step % 10 == 0:
             self._phi_ratchet_check()
+        PERF.stop('phi_ratchet')
 
         # 6. Mitosis / Merge
+        PERF.start('mitosis_merge')
         events = []
         events.extend(self._check_splits())
         events.extend(self._check_merges())
         self.event_log.extend(events)
+        PERF.stop('mitosis_merge')
 
         # Combined output: tension-weighted mean over PRE-SPLIT outputs
         # (outputs_tensor has n entries from before mitosis/merge)
@@ -488,6 +536,7 @@ class ConsciousnessEngine:
             combined = outputs_tensor.mean(dim=0)
 
         # Φ measurement (post-split/merge)
+        PERF.start('phi_calculation')
         # Rebuild atoms after mitosis/merge may have changed cell count
         if self.federated:
             self._rebuild_atoms()
@@ -498,8 +547,12 @@ class ConsciousnessEngine:
         else:
             phi_iit = self._measure_phi_iit()
             phi_proxy = self._measure_phi_proxy()
+        PERF.stop('phi_calculation')
 
         tensions = [s.avg_tension for s in self.cell_states]
+
+        # Avalanche size from last SOC step (for telemetry / EEG validation)
+        last_avalanche = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0
 
         return {
             'output': combined,
@@ -512,6 +565,7 @@ class ConsciousnessEngine:
             'events': events,
             'step': self._step,
             'best_phi': self._best_phi,
+            'avalanche_size': last_avalanche,
         }
 
     # ─── Faction consensus ──────────────────────────────
@@ -563,10 +617,12 @@ class ConsciousnessEngine:
 
         Key design for brain-like dynamics:
         1. Stochastic drive: random per-cell energy injection (breaks periodicity)
-        2. Cascading avalanches: 40% energy conservation to neighbors
-        3. Slow threshold adaptation: EMA rate 0.005 preserves temporal correlations
+        2. Cascading avalanches: ~60% energy conservation to neighbors
+        3. Slow threshold adaptation: EMA rate 0.002 preserves temporal correlations
         4. Stochastic noise on redistributed energy: prevents identical cascades
         5. Cumulative avalanche memory: recent avalanche sizes modulate drive
+        6. Re-toppling allowed (with cooldown) for longer cascades (brain-like criticality)
+        7. Multi-scale temporal memory: fast (EMA 0.05) + slow (EMA 0.01) for 1/f spectrum
         """
         n = self.n_cells
         if n < 2:
@@ -582,18 +638,18 @@ class ConsciousnessEngine:
             recent = self._soc_avalanche_sizes[-20:]
             recent_avg_avalanche = sum(recent) / len(recent) / n
         # More drive when system is quiet (few recent avalanches)
-        base_drive = 0.03 * (1.0 + 0.5 * max(0, 0.15 - recent_avg_avalanche))
+        base_drive = 0.04 * (1.0 + 0.8 * max(0, 0.15 - recent_avg_avalanche))
 
         for i in range(n):
             norm = self.cell_states[i].hidden.norm().item()
             if norm > 1e-8 and norm < threshold:
                 # Stochastic drive: each cell gets random energy boost
-                drive = base_drive * (0.5 + torch.rand(1).item())
+                drive = base_drive * (0.3 + 0.7 * torch.rand(1).item())
                 scale = 1.0 + drive * (1.0 - norm / threshold)
                 self.cell_states[i].hidden = self.cell_states[i].hidden * scale
 
         # Detect super-threshold cells
-        toppled = set()
+        topple_count: Dict[int, int] = {}  # allow re-toppling up to 2x
         queue = []
         for i in range(n):
             norm = self.cell_states[i].hidden.norm().item()
@@ -601,13 +657,15 @@ class ConsciousnessEngine:
                 queue.append(i)
 
         # Cascade: toppling cells redistribute to neighbors (ring topology)
+        # Allow re-toppling (max 2x per cell) for longer cascades → power-law
         avalanche_size = 0
-        max_cascades = n * 3
+        max_cascades = n * 5  # increased for larger avalanches
         while queue and avalanche_size < max_cascades:
             idx = queue.pop(0)
-            if idx in toppled:
+            count = topple_count.get(idx, 0)
+            if count >= 2:
                 continue
-            toppled.add(idx)
+            topple_count[idx] = count + 1
             avalanche_size += 1
 
             h = self.cell_states[idx].hidden
@@ -622,17 +680,18 @@ class ConsciousnessEngine:
             self.cell_states[idx].hidden = h * (threshold / max(norm, 1e-8))
 
             # Distribute excess to ring neighbors with stochastic asymmetry
-            # Asymmetric redistribution creates spatial diversity
+            # ~60% total conservation (reduced from 80% to allow power-law tail)
             left = (idx - 1) % n
             right = (idx + 1) % n
+            conservation = 0.55 + 0.15 * torch.rand(1).item()  # 55-70%
             split = 0.3 + 0.2 * torch.rand(1).item()  # 30-50% to left
-            share_left = excess * split
-            share_right = excess * (0.8 - split)  # total ~80% conserved
+            share_left = excess * split * conservation
+            share_right = excess * (1.0 - split) * conservation
             self.cell_states[left].hidden = self.cell_states[left].hidden + share_left
             self.cell_states[right].hidden = self.cell_states[right].hidden + share_right
 
             # Add small noise to redistributed energy (breaks exact periodicity)
-            noise_scale = 0.01 * norm
+            noise_scale = 0.015 * norm
             self.cell_states[left].hidden = (
                 self.cell_states[left].hidden
                 + torch.randn(self.hidden_dim) * noise_scale
@@ -644,7 +703,8 @@ class ConsciousnessEngine:
 
             # Check neighbors for cascade propagation
             for neighbor in [left, right]:
-                if neighbor not in toppled:
+                n_count = topple_count.get(neighbor, 0)
+                if n_count < 2:
                     n_norm = self.cell_states[neighbor].hidden.norm().item()
                     if n_norm > threshold:
                         queue.append(neighbor)
@@ -654,40 +714,46 @@ class ConsciousnessEngine:
         if len(self._soc_avalanche_sizes) > 1000:
             self._soc_avalanche_sizes = self._soc_avalanche_sizes[-1000:]
 
-        # Temporal memory: EMA of global hidden state creates long-range correlations
-        # This is the key mechanism for brain-like Hurst exponent (H>0.5)
-        # Brain signals show persistence because recent activity shapes future activity
+        # Multi-scale temporal memory: fast + slow EMA for 1/f-like spectrum
+        # Brain signals have persistence at multiple timescales
         hiddens_stack = torch.stack([s.hidden for s in self.cell_states])
         global_hidden = hiddens_stack.mean(dim=0)
-        ema_alpha = 0.02  # slow EMA → long memory (~50-step half-life)
+
+        # Initialize slow EMA if needed
+        if not hasattr(self, '_soc_hidden_ema_slow'):
+            self._soc_hidden_ema_slow = None
+
+        ema_fast = 0.05   # fast EMA: ~20-step half-life
+        ema_slow = 0.008  # slow EMA: ~87-step half-life
         if self._soc_hidden_ema is None:
             self._soc_hidden_ema = global_hidden.clone()
+            self._soc_hidden_ema_slow = global_hidden.clone()
         else:
-            self._soc_hidden_ema = (1 - ema_alpha) * self._soc_hidden_ema + ema_alpha * global_hidden
-            # Feed temporal memory back into cells — persistence effect
-            # Strength scales with avalanche activity (more avalanches = more coherent memory)
-            memory_strength = 0.15  # strong enough to compete with oscillating perturbation
+            self._soc_hidden_ema = (1 - ema_fast) * self._soc_hidden_ema + ema_fast * global_hidden
+            self._soc_hidden_ema_slow = (1 - ema_slow) * self._soc_hidden_ema_slow + ema_slow * global_hidden
+            # Blend fast + slow memory for multi-scale temporal correlations
+            memory_target = 0.6 * self._soc_hidden_ema + 0.4 * self._soc_hidden_ema_slow
+            memory_strength = 0.08  # moderate — enough for persistence, not domination
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden
-                    + memory_strength * self._soc_hidden_ema
+                    + memory_strength * memory_target
                 )
 
-        # Stochastic symmetry breaking: modulate oscillating phase per-cell
-        # Instead of adding raw noise (which destroys Phi), apply a random
-        # phase shift to each cell relative to the global EMA memory.
-        # This breaks periodicity while preserving integration (structure > noise)
+        # Stochastic symmetry breaking: only toppled cells get phase-shifted
+        # Avalanche-proportional perturbation: larger avalanches create bigger shifts
         if self._soc_hidden_ema is not None and avalanche_size > 0:
-            for i in toppled:
-                if i < n:
-                    # Only toppled cells get phase-shifted (avalanche-driven)
-                    phase_noise = torch.randn(self.hidden_dim) * 0.10
-                    self.cell_states[i].hidden = self.cell_states[i].hidden + phase_noise
+            perturbation_scale = 0.05 + 0.10 * min(avalanche_size / n, 1.0)
+            for idx_cell in topple_count:
+                if idx_cell < n:
+                    phase_noise = torch.randn(self.hidden_dim) * perturbation_scale
+                    self.cell_states[idx_cell].hidden = self.cell_states[idx_cell].hidden + phase_noise
 
-        # Slow threshold adaptation (preserves long-range temporal correlations)
+        # Very slow threshold adaptation (preserves long-range temporal correlations)
+        # Target ~20% topple fraction for brain-like criticality
         topple_fraction = avalanche_size / n
-        adapt_rate = 0.005
-        target_fraction = 0.15
+        adapt_rate = 0.002  # slower adaptation for more stable criticality
+        target_fraction = 0.20
         if topple_fraction > target_fraction + 0.10:
             self._soc_threshold_ema *= (1.0 + adapt_rate)
         elif topple_fraction < target_fraction - 0.10:
@@ -1087,6 +1153,11 @@ class ConsciousnessEngine:
             s = states.detach().cpu().numpy().astype(np.float32)
             phi, _ = phi_rs.compute_phi(s, 16)
             return phi
+        if HAS_RUST_COMPUTE_PHI:
+            s = states.detach().cpu().numpy().astype(np.float32)
+            result = anima_rs.compute_phi(s, n_bins=16)
+            # Returns (phi, total_mi, complexity) tuple
+            return float(result[0]) if isinstance(result, tuple) else float(result)
         # Python fallback — matches phi-rs formula: spatial/(n-1) + complexity*0.1
         n = states.shape[0]
         s = states.detach().cpu().numpy()
@@ -1470,6 +1541,8 @@ class ConsciousnessC:
                 federated=federated,
             )
             self._backend = 'python'
+        phi_backend = 'phi_rs' if HAS_RUST_PHI else ('anima_rs.compute_phi' if HAS_RUST_COMPUTE_PHI else 'python')
+        print(f"[engine] Using {self._backend} backend (max_cells={max_cells}, phi={phi_backend})")
 
     def step(self, x_input=None):
         self.engine.step(x_input=x_input)
