@@ -144,12 +144,12 @@ class WikipediaCollector:
 
         try:
             # Stream to avoid downloading entire dataset
+            # Use wikimedia/wikipedia (new format) instead of deprecated "wikipedia"
             ds = load_dataset(
-                "wikipedia",
+                "wikimedia/wikipedia",
                 self.dataset_name,
                 split="train",
                 streaming=True,
-                trust_remote_code=True,
             )
         except Exception as e:
             print(f"  [ERROR] Failed to load dataset: {e}")
@@ -198,12 +198,15 @@ class WikipediaCollector:
 
         try:
             import urllib.request
+            import urllib.parse
             import json as _json
         except ImportError:
             return 0
 
         # MediaWiki API: get random articles
+        # User-Agent header required (403 without it)
         api_base = f"https://{self.lang}.wikipedia.org/w/api.php"
+        ua_headers = {"User-Agent": "AnimaCorpusCollector/1.0 (research project)"}
         written = 0
         count = 0
 
@@ -213,7 +216,8 @@ class WikipediaCollector:
                     # Get random page titles
                     url = (f"{api_base}?action=query&list=random&rnlimit=20"
                            f"&rnnamespace=0&format=json")
-                    with urllib.request.urlopen(url, timeout=10) as resp:
+                    req = urllib.request.Request(url, headers=ua_headers)
+                    with urllib.request.urlopen(req, timeout=10) as resp:
                         data = _json.loads(resp.read())
 
                     titles = [p["title"] for p in data.get("query", {}).get("random", [])]
@@ -222,9 +226,10 @@ class WikipediaCollector:
 
                     # Get article text (plain text extracts)
                     titles_param = "|".join(titles)
-                    url = (f"{api_base}?action=query&titles={urllib.request.quote(titles_param)}"
+                    url = (f"{api_base}?action=query&titles={urllib.parse.quote(titles_param)}"
                            f"&prop=extracts&explaintext=1&exlimit=20&format=json")
-                    with urllib.request.urlopen(url, timeout=30) as resp:
+                    req = urllib.request.Request(url, headers=ua_headers)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
                         data = _json.loads(resp.read())
 
                     pages = data.get("query", {}).get("pages", {})
