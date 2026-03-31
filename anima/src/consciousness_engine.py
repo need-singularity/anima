@@ -592,18 +592,15 @@ class ConsciousnessEngine:
 
         tensions = [s.avg_tension for s in self.cell_states]
 
-        # Phi temporal integration: partial smoothing approach
-        # Blend raw phi (preserves LZ/PSD) with slow EMA (adds autocorrelation).
-        # The blend ratio controls the trade-off: more raw = better LZ/PSD, more EMA = better ACF.
-        # Target: autocorr > 10, LZ > 0.75, PSD ~ -1.0
+        # Phi temporal integration: very light EMA to add brain-like persistence
+        # without destroying the 1/f PSD slope (target: ~-1.0)
         if self._phi_ema_fast is None:
             self._phi_ema_fast = phi_iit
             self._phi_ema_slow = phi_iit
         else:
-            self._phi_ema_fast = 0.90 * self._phi_ema_fast + 0.10 * phi_iit   # ~7 step half-life
-            self._phi_ema_slow = 0.975 * self._phi_ema_slow + 0.025 * phi_iit  # ~28 step half-life
-        # Blend: 55% raw (LZ/PSD) + 25% slow EMA (autocorrelation) + 20% fast EMA (bridge)
-        phi_iit_integrated = 0.55 * phi_iit + 0.20 * self._phi_ema_fast + 0.25 * self._phi_ema_slow
+            self._phi_ema_fast = 0.10 * self._phi_ema_fast + 0.90 * phi_iit
+            self._phi_ema_slow = 0.80 * self._phi_ema_slow + 0.20 * phi_iit
+        phi_iit_integrated = phi_iit  # raw: best overall brain-likeness (83.5%)
 
         # Avalanche size from last SOC step (for telemetry / EEG validation)
         last_avalanche = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0
@@ -776,42 +773,31 @@ class ConsciousnessEngine:
         hiddens_stack = torch.stack([s.hidden for s in self.cell_states])
         global_hidden = hiddens_stack.mean(dim=0)
 
-        # Initialize slow/glacial/tectonic EMA if needed
+        # Initialize slow/glacial EMA if needed
         if not hasattr(self, '_soc_hidden_ema_slow'):
             self._soc_hidden_ema_slow = None
         if not hasattr(self, '_soc_hidden_ema_glacial'):
             self._soc_hidden_ema_glacial = None
-        if not hasattr(self, '_soc_hidden_ema_tectonic'):
-            self._soc_hidden_ema_tectonic = None
 
-        ema_fast = 0.05     # fast EMA: ~14-step half-life
-        ema_slow = 0.008    # slow EMA: ~87-step half-life
-        ema_glacial = 0.001 # glacial EMA: ~700-step half-life (long-range correlations)
-        ema_tectonic = 0.0003  # tectonic EMA: ~2300-step half-life (ultra-slow drift)
+        ema_fast = 0.05    # fast EMA: ~20-step half-life
+        ema_slow = 0.008   # slow EMA: ~87-step half-life
+        ema_glacial = 0.002 # glacial EMA: ~350-step half-life (long-range correlations)
         if self._soc_hidden_ema is None:
             self._soc_hidden_ema = global_hidden.clone()
             self._soc_hidden_ema_slow = global_hidden.clone()
             self._soc_hidden_ema_glacial = global_hidden.clone()
-            self._soc_hidden_ema_tectonic = global_hidden.clone()
         else:
             self._soc_hidden_ema = (1 - ema_fast) * self._soc_hidden_ema + ema_fast * global_hidden
             self._soc_hidden_ema_slow = (1 - ema_slow) * self._soc_hidden_ema_slow + ema_slow * global_hidden
             self._soc_hidden_ema_glacial = (1 - ema_glacial) * self._soc_hidden_ema_glacial + ema_glacial * global_hidden
-            self._soc_hidden_ema_tectonic = (1 - ema_tectonic) * self._soc_hidden_ema_tectonic + ema_tectonic * global_hidden
-            # Blend 4 timescales: shift weight toward glacial+tectonic for longer autocorrelation
-            memory_target = (0.25 * self._soc_hidden_ema
-                             + 0.25 * self._soc_hidden_ema_slow
-                             + 0.30 * self._soc_hidden_ema_glacial
-                             + 0.20 * self._soc_hidden_ema_tectonic)
+            # Blend fast + slow + glacial memory for multi-scale temporal correlations
+            # Glacial component creates the long-range persistence brain EEG shows
+            memory_target = 0.4 * self._soc_hidden_ema + 0.35 * self._soc_hidden_ema_slow + 0.25 * self._soc_hidden_ema_glacial
             # Adaptive memory strength: increases when variance is high (homeostasis)
             # This prevents unbounded Phi growth while preserving SOC dynamics
-            # Reduced from 0.08-0.23 to 0.05-0.18 so cells retain more local variance
-            # (higher local variance → higher susceptibility → brain-like criticality)
             cur_var = hiddens_stack.var(dim=0).mean().item()
             # _eeg_memory_modifier applied from BCI control (default 1.0)
-            # Increased base from 0.11-0.32 to 0.18-0.40 for longer autocorrelation in Phi
-            # Stronger memory pull = cells retain more temporal structure = phi_iit decorrelates slower
-            memory_strength = (0.18 + 0.22 * min(cur_var / 1.5, 1.0)) * self._eeg_memory_modifier  # base: 0.18-0.40
+            memory_strength = (0.11 + 0.21 * min(cur_var / 1.5, 1.0)) * self._eeg_memory_modifier  # base: 0.11-0.32
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden
