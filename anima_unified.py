@@ -3591,8 +3591,10 @@ def main():
     p.add_argument('--port', type=int, default=8765, help='WebSocket port')
     p.add_argument('--instance', type=str, default=None,
                    help='Instance ID for multi-instance on same machine (separate data dirs)')
-    p.add_argument('--no-camera', action='store_true', help='Disable camera')
-    p.add_argument('--no-vision', action='store_true', help='Disable vision encoder (use basic sensors only)')
+    p.add_argument('--no-camera', action='store_true', default=True, help='Disable camera (default: OFF)')
+    p.add_argument('--camera', action='store_true', help='Enable camera')
+    p.add_argument('--no-vision', action='store_true', default=True, help='Disable vision encoder (default: OFF)')
+    p.add_argument('--vision', action='store_true', help='Enable vision encoder')
     p.add_argument('--no-telepathy', action='store_true', help='Disable telepathy')
     p.add_argument('--no-cloud', action='store_true', help='Disable cloud sync')
     p.add_argument('--no-conscious-lm', action='store_true', help='Disable ConsciousLM (Claude only)')
@@ -3610,6 +3612,12 @@ def main():
     p.add_argument('--federated', action='store_true', help='Meta Laws: federated consciousness (M1/M6/M9, atom=8, sum Φ)')
     p.add_argument('--list-models', action='store_true', help='List available models')
     args = p.parse_args()
+
+    # Hardware defaults: OFF unless explicitly enabled
+    if hasattr(args, 'camera') and args.camera:
+        args.no_camera = False
+    if hasattr(args, 'vision') and args.vision:
+        args.no_vision = False
 
     # --instance: multi-instance isolation
     global _INSTANCE_ID
