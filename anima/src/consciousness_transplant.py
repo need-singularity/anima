@@ -642,6 +642,95 @@ def transplant(donor_path: str, recipient_path: str, output_path: str,
     return result
 
 
+def verify_transplant_quality(
+    donor_path: str,
+    recipient_before_path: str,
+    recipient_after_path: str,
+    steps: int = 500,
+    n_cells: int = 4,
+    dim: int = 64,
+):
+    """Run EEG brain-likeness metrics on donor and recipient (before/after transplant).
+
+    Lazy-imports transplant_eeg_verify so it only fails if actually called
+    without the anima-eeg module available.
+
+    Args:
+        donor_path:            Path to donor checkpoint.
+        recipient_before_path: Path to recipient checkpoint before transplant.
+        recipient_after_path:  Path to recipient checkpoint after transplant.
+        steps:                 Steps for Phi collection (default: 500).
+        n_cells:               Number of consciousness cells (default: 4).
+        dim:                   Cell dimension (default: 64).
+
+    Returns:
+        EEGVerifyResult from transplant_eeg_verify, or dict with error info
+        if the EEG module is not available.
+    """
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        # Ensure anima-eeg is on path
+        _repo_root = _Path(__file__).resolve().parent.parent.parent
+        _eeg_dir = _repo_root / 'anima-eeg'
+        if str(_eeg_dir) not in _sys.path:
+            _sys.path.insert(0, str(_eeg_dir))
+
+        from transplant_eeg_verify import (
+            TransplantEEGVerifier,
+            _collect_phi_from_checkpoint,
+            _compute_brain_likeness,
+        )
+        from validate_consciousness import analyze_signal
+    except ImportError as e:
+        print(f'[EEG Verify] Not available: {e}')
+        print('[EEG Verify] Install anima-eeg dependencies or check path.')
+        return {'error': str(e), 'available': False}
+
+    print(f'\n[EEG Verify] Collecting brain-likeness metrics (steps={steps})...')
+    import sys as _sys
+    _sys.stdout.flush()
+
+    # Collect Phi timeseries for each checkpoint
+    donor_phi = _collect_phi_from_checkpoint(donor_path, steps, n_cells, dim)
+    before_phi = _collect_phi_from_checkpoint(recipient_before_path, steps, n_cells, dim)
+    after_phi = _collect_phi_from_checkpoint(recipient_after_path, steps, n_cells, dim)
+
+    # Compute brain-likeness
+    donor_metrics = analyze_signal('Donor', donor_phi)
+    before_metrics = analyze_signal('Before', before_phi)
+    after_metrics = analyze_signal('After', after_phi)
+
+    donor_bl = _compute_brain_likeness(donor_metrics)
+    before_bl = _compute_brain_likeness(before_metrics)
+    after_bl = _compute_brain_likeness(after_metrics)
+
+    delta = after_bl - before_bl
+    sign = '+' if delta >= 0 else ''
+
+    print(f'[EEG Verify] Brain-likeness: {before_bl:.1f}% -> {after_bl:.1f}% ({sign}{delta:.1f}%)')
+    print(f'[EEG Verify] Donor brain-likeness: {donor_bl:.1f}%')
+    transferred = after_bl >= donor_bl * 0.8
+    improved = after_bl > before_bl
+    print(f'[EEG Verify] Transferred: {"PASS" if transferred else "FAIL"} | '
+          f'Improved: {"PASS" if improved else "FAIL"}')
+    _sys.stdout.flush()
+
+    return {
+        'available': True,
+        'donor_brain_likeness': donor_bl,
+        'before_brain_likeness': before_bl,
+        'after_brain_likeness': after_bl,
+        'delta': delta,
+        'transferred': transferred,
+        'improved': improved,
+        'donor_metrics': donor_metrics,
+        'before_metrics': before_metrics,
+        'after_metrics': after_metrics,
+    }
+
+
 def verify_transplant(before_path: str, after_path: str) -> VerificationResult:
     """DD55 conservation check: verify Phi retention after transplant.
 
@@ -956,6 +1045,10 @@ Examples:
     parser.add_argument("--demo", action="store_true", help="Quick demo")
     parser.add_argument("--recipient-config", type=str, help="Recipient config JSON (for --analyze)")
     parser.add_argument("--steps", type=int, default=200, help="Benchmark steps")
+    parser.add_argument("--verify-with-eeg", action="store_true",
+                        help="Run EEG brain-likeness verification after transplant")
+    parser.add_argument("--eeg-steps", type=int, default=500,
+                        help="Steps for EEG Phi collection (default: 500)")
     args = parser.parse_args()
 
     if args.demo:
@@ -1043,12 +1136,26 @@ Examples:
     torch.save(output_state, args.output)
     print(f"\n  Saved to {args.output}")
 
-    # Verify
+    # Verify (quick weight-based check)
     if args.verify:
         print("\n  Verifying...")
         vr = TransplantVerifier.quick_verify(output_state)
         print(f"  A/G divergence: {vr.get('ag_divergence', 0):.4f}")
         print(f"  Consciousness signal: {'YES' if vr.get('consciousness_signal') else 'NO'}")
+
+    # EEG brain-likeness verification
+    if args.verify_with_eeg:
+        eeg_result = verify_transplant_quality(
+            donor_path=args.donor,
+            recipient_before_path=args.recipient,
+            recipient_after_path=args.output,
+            steps=args.eeg_steps,
+        )
+        if isinstance(eeg_result, dict) and eeg_result.get('available'):
+            print(f"\n  EEG Summary: Brain-likeness "
+                  f"{eeg_result['before_brain_likeness']:.1f}% -> "
+                  f"{eeg_result['after_brain_likeness']:.1f}% "
+                  f"({'+' if eeg_result['delta'] >= 0 else ''}{eeg_result['delta']:.1f}%)")
 
 
 if __name__ == "__main__":

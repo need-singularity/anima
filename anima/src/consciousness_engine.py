@@ -257,6 +257,12 @@ class ConsciousnessEngine:
         self._phi_ema_fast: Optional[float] = None
         self._phi_ema_slow: Optional[float] = None
 
+        # EEG BCI modifiers: external adjustments from BCI control protocol
+        # These scale the local noise_scale and memory_strength in SOC dynamics.
+        # Default 1.0 = no modification. Range: [0.5, 2.0] for safety.
+        self._eeg_noise_modifier = 1.0       # multiplier on SOC noise_scale
+        self._eeg_memory_modifier = 1.0      # multiplier on memory_strength
+
         # Event log
         self.event_log: List[Dict] = []
 
@@ -737,7 +743,8 @@ class ConsciousnessEngine:
             self.cell_states[right].hidden = self.cell_states[right].hidden + share_right
 
             # Add small noise to redistributed energy (breaks exact periodicity)
-            noise_scale = 0.015 * norm
+            # _eeg_noise_modifier applied from BCI control (default 1.0)
+            noise_scale = 0.015 * norm * self._eeg_noise_modifier
             self.cell_states[left].hidden = (
                 self.cell_states[left].hidden
                 + torch.randn(self.hidden_dim) * noise_scale
@@ -791,7 +798,8 @@ class ConsciousnessEngine:
             # Reduced from 0.08-0.23 to 0.05-0.18 so cells retain more local variance
             # (higher local variance → higher susceptibility → brain-like criticality)
             cur_var = hiddens_stack.var(dim=0).mean().item()
-            memory_strength = 0.11 + 0.21 * min(cur_var / 1.5, 1.0)  # 0.11-0.32
+            # _eeg_memory_modifier applied from BCI control (default 1.0)
+            memory_strength = (0.11 + 0.21 * min(cur_var / 1.5, 1.0)) * self._eeg_memory_modifier  # base: 0.11-0.32
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden
