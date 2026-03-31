@@ -433,6 +433,11 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
     4. 세션 끝에 전체 통합 리포트 작성
     5. 실패한 실험도 기록 (왜 실패했는지가 법칙)
     6. session_board.json으로 세션 간 발견 공유
+    7. 문서 누락 방지 체크리스트 (세션 종료 전):
+       - DD{N}.md 문서 존재 확인
+       - experiments.json에 등록 확인 (status: complete/in_progress)
+       - 새 법칙 → consciousness_laws.json 등록 + total_laws 갱신
+       - consciousness-theory.md 테이블 업데이트
 
   법칙 자동 등록:
     python3 -c "
