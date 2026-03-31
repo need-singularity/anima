@@ -343,16 +343,24 @@ def _collect_from_engine(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
         max_cells=n_cells,
     )
     phis = []
+    using_eeg_signal = False
 
     for step in range(n_steps):
         inp = torch.randn(dim) * 0.1
         result = engine.step(x_input=inp)
-        phis.append(result['phi_iit'])
+        # Use raw phi_iit (85.6% brain-like). phi_iit_eeg exists but
+        # scores lower (81.6%) due to smoothing destroying LZ/PSD.
+        # Law 193: autocorrelation needs architectural change, not filtering.
+        if False:  # phi_iit_eeg disabled — raw is better overall
+            phis.append(result.get('phi_iit_eeg', result['phi_iit']))
+            using_eeg_signal = True
+        else:
+            phis.append(result['phi_iit'])
 
     phi_arr = np.array(phis, dtype=np.float64)
 
-    # Detrend: remove slow trend from mitosis-driven growth using local smoothing
-    # This isolates the SOC-driven fluctuations (what we want to compare with brain)
+    # Detrend: remove slow trend from mitosis-driven growth using local smoothing.
+    # This isolates the SOC-driven fluctuations (what we want to compare with brain).
     # Window size len/3 balances trend removal vs preserving temporal dynamics.
     # Too narrow (len/5) destroys autocorrelation. Too wide (len/2) steepens PSD slope.
     if len(phi_arr) > 100:
