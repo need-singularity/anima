@@ -1,1 +1,0 @@
-# Anima Agent Platform -- dynamic skill system
