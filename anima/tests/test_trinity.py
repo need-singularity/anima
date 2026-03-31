@@ -137,7 +137,7 @@ def rust_prescreening(nc=256, dim=128, steps=200):
 
 # ═══ Phase 2: Trinity C×D×W grid test ═══
 
-def test_combo(c_factory, d_factory, w_factory, n_steps=30, seq_len=32, vocab_size=256):
+def run_combo(c_factory, d_factory, w_factory, n_steps=30, seq_len=32, vocab_size=256):
     """Test one C×D×W combination. Returns metrics dict."""
     from trinity import create_trinity
 
@@ -236,7 +236,7 @@ def run_grid(nc=64, n_steps=30, d_model=128, vocab_size=256, top_n=None,
             e_name, e_fn = 'None', lambda: None
 
         try:
-            r = test_combo(c_fn, d_fn, w_fn, n_steps=n_steps,
+            r = run_combo(c_fn, d_fn, w_fn, n_steps=n_steps,
                            seq_len=32, vocab_size=vocab_size)
             line = f"{c_name:<20} {d_name:<12} {w_name:<10} "
             if hexad:

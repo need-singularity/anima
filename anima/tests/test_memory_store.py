@@ -7,6 +7,7 @@ import hashlib
 import numpy as np
 import pytest
 
+faiss = pytest.importorskip("faiss", reason="faiss not installed")
 from memory_store import MemoryStore
 
 # Meta Laws (DD143)

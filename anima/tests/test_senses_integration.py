@@ -3,6 +3,8 @@ import pytest
 import torch
 import numpy as np
 
+cv2 = pytest.importorskip("cv2", reason="OpenCV (cv2) not installed — senses.py requires it")
+
 
 def test_sensehub_to_tensor_without_encoder():
     """VisionEncoder 없으면 기존 to_tensor() 동작 유지."""
