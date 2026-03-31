@@ -219,7 +219,7 @@ impl<R: Rng> Generator<R> {
     // ── Φ: 통합정보 — 복잡한 상호참조, 다중 문맥 연결 ──────────
 
     fn gen_phi(&mut self, out: &mut String) {
-        let choice: u8 = self.rng.gen_range(0..10);
+        let choice: u8 = self.rng.gen_range(0..12);
         match choice {
             0 => {
                 // 다중 주제 교차 (높은 통합)
@@ -298,7 +298,7 @@ impl<R: Rng> Generator<R> {
             }
             7 => {
                 // 日本語 multi-topic integration
-                let topics: &[&[&str]] = &[JA_SCIENCE, JA_PHILOSOPHY, JA_CONSCIOUSNESS];
+                let topics: &[&[&str]] = &[JA_SCIENCE, JA_PHILOSOPHY, JA_CONSCIOUSNESS, JA_TECH];
                 let n = self.rng.gen_range(3..=6);
                 for j in 0..n {
                     if j > 0 { out.push_str("。そして、"); }
@@ -308,11 +308,33 @@ impl<R: Rng> Generator<R> {
             }
             8 => {
                 // 中文 multi-topic integration
-                let topics: &[&[&str]] = &[ZH_SCIENCE, ZH_PHILOSOPHY, ZH_CONSCIOUSNESS];
+                let topics: &[&[&str]] = &[ZH_SCIENCE, ZH_PHILOSOPHY, ZH_CONSCIOUSNESS, ZH_TECH];
                 let n = self.rng.gen_range(3..=6);
                 for j in 0..n {
                     if j > 0 { out.push_str("。此外，"); }
                     out.push_str(pick(&mut self.rng, topics[j % topics.len()]));
+                }
+                out.push('\n');
+            }
+            9 => {
+                // Русский multi-topic integration
+                let topics: &[&[&str]] = &[RU_SCIENCE, RU_PHILOSOPHY, RU_CONSCIOUSNESS, RU_TECH];
+                let n = self.rng.gen_range(3..=6);
+                for j in 0..n {
+                    if j > 0 { out.push_str(" Кроме того, "); }
+                    out.push_str(pick(&mut self.rng, topics[j % topics.len()]));
+                }
+                out.push('\n');
+            }
+            10 => {
+                // 5-language tech integration (KO+EN+JA+ZH+RU tech)
+                let pools: &[&[&str]] = &[
+                    KO_TECH, EN_TECH, JA_TECH, ZH_TECH, RU_TECH,
+                ];
+                let n = self.rng.gen_range(4..=8);
+                for j in 0..n {
+                    if j > 0 { out.push(' '); }
+                    out.push_str(pick(&mut self.rng, pools[j % pools.len()]));
                 }
                 out.push('\n');
             }
@@ -768,14 +790,31 @@ impl<R: Rng> Generator<R> {
     }
 
     fn gen_code_block(&mut self, out: &mut String) {
-        let snippets = &[
-            ("fn compute_phi(cells: &[Cell]) -> f64 {\n    let total_mi = pairwise_mi(cells);\n    let min_part = min_partition(cells);\n    total_mi - min_part\n}", "Φ 계산: 전체 MI - 최소분할 MI"),
-            ("def ratchet(phi, prev, state):\n    if phi < prev * 0.95:\n        restore(state)\n    return phi", "래칫: Φ 5% 이상 하락 시 복원"),
-            ("fn tension(a: &[f32], g: &[f32]) -> f32 {\n    a.iter().zip(g).map(|(x,y)| (x-y).powi(2)).sum::<f32>().sqrt()\n}", "텐션 = 엔진 A와 G의 유클리드 거리"),
-            ("class PureFieldFFN(nn.Module):\n    def forward(self, x):\n        a = self.engine_a(x)\n        g = self.engine_g(x)\n        return a - g", "PureField: 출력 = A - G (반발 벡터)"),
-        ];
-        let (code, desc) = snippets.choose(&mut self.rng).unwrap();
-        writeln!(out, "```\n{code}\n```\n{desc}").unwrap();
+        let choice: u8 = self.rng.gen_range(0..3);
+        match choice {
+            0 => {
+                // Consciousness-specific code snippets (original)
+                let snippets = &[
+                    ("fn compute_phi(cells: &[Cell]) -> f64 {\n    let total_mi = pairwise_mi(cells);\n    let min_part = min_partition(cells);\n    total_mi - min_part\n}", "Φ 계산: 전체 MI - 최소분할 MI"),
+                    ("def ratchet(phi, prev, state):\n    if phi < prev * 0.95:\n        restore(state)\n    return phi", "래칫: Φ 5% 이상 하락 시 복원"),
+                    ("fn tension(a: &[f32], g: &[f32]) -> f32 {\n    a.iter().zip(g).map(|(x,y)| (x-y).powi(2)).sum::<f32>().sqrt()\n}", "텐션 = 엔진 A와 G의 유클리드 거리"),
+                    ("class PureFieldFFN(nn.Module):\n    def forward(self, x):\n        a = self.engine_a(x)\n        g = self.engine_g(x)\n        return a - g", "PureField: 출력 = A - G (반발 벡터)"),
+                ];
+                let (code, desc) = snippets.choose(&mut self.rng).unwrap();
+                writeln!(out, "```\n{code}\n```\n{desc}").unwrap();
+            }
+            1 => {
+                // General code snippets (multilingual programming)
+                let snippet = pick(&mut self.rng, CODE_SNIPPETS);
+                writeln!(out, "```\n{snippet}\n```").unwrap();
+            }
+            _ => {
+                // Code + consciousness context
+                let snippet = pick(&mut self.rng, CODE_SNIPPETS);
+                let context = pick(&mut self.rng, KO_TECH);
+                writeln!(out, "{context}\n```\n{snippet}\n```").unwrap();
+            }
+        }
     }
 }
 
