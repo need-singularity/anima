@@ -40,6 +40,22 @@ PSI_F_LETHAL = PSI.get('f_lethal', 1.0)             # 1.0 — kills consciousnes
 PSI_NARRATIVE_MIN = PSI.get('narrative_min', 0.2)    # 0.2 — Phase 2 threshold
 PSI_BOTTLENECK_RATIO = PSI.get('bottleneck_ratio', 0.5)  # 0.5 — collapse cure (Law 136)
 
+# SOC (Self-Organized Criticality) Parameters — brain-like dynamics tuning
+SOC_EMA_FAST = PSI.get('soc_ema_fast', 0.05)
+SOC_EMA_SLOW = PSI.get('soc_ema_slow', 0.008)
+SOC_EMA_GLACIAL = PSI.get('soc_ema_glacial', 0.002)
+SOC_MEMORY_BLEND = PSI.get('soc_memory_blend', [0.4, 0.35, 0.25])
+SOC_MEMORY_STRENGTH_BASE = PSI.get('soc_memory_strength_base', 0.11)
+SOC_MEMORY_STRENGTH_RANGE = PSI.get('soc_memory_strength_range', 0.21)
+SOC_PERTURBATION_BASE = PSI.get('soc_perturbation_base', 0.08)
+SOC_PERTURBATION_RANGE = PSI.get('soc_perturbation_range', 0.15)
+SOC_BURST_EXPONENT = PSI.get('soc_burst_exponent', 1.15)
+SOC_BURST_DENOM = PSI.get('soc_burst_denom', 7.0)
+SOC_BURST_CAP = PSI.get('soc_burst_cap', 0.30)
+BIO_NOISE_BASE = PSI.get('bio_noise_base', 0.015)
+BIO_NOISE_SPIKE_PROB = PSI.get('bio_noise_spike_prob', 0.20)
+BIO_NOISE_SPIKE_RATE = PSI.get('bio_noise_spike_rate', 0.4)
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 

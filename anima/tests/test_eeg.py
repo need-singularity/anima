@@ -465,5 +465,612 @@ class TestProtocolsImportable:
         assert len(protocols.__all__) == 4
 
 
+# ═══════════════════════════════════════════════════════════
+# 8. eeg_consciousness.py — apply_bci_adjustments
+# ═══════════════════════════════════════════════════════════
+
+class TestApplyBCIAdjustments:
+    """Test apply_bci_adjustments() maps BCI control modes to engine modifiers."""
+
+    @pytest.fixture
+    def mock_engine(self):
+        """Create a mock engine with _eeg_noise_modifier and _eeg_memory_modifier."""
+        class FakeEngine:
+            _eeg_noise_modifier = 1.0
+            _eeg_memory_modifier = 1.0
+            _soc_threshold = 5.0
+        return FakeEngine()
+
+    def test_expand_mode_increases_noise(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        result = apply_bci_adjustments('expand', mock_engine)
+        assert result['applied'] is True
+        assert result['mode'] == 'expand'
+        assert mock_engine._eeg_noise_modifier == 1.3
+
+    def test_expand_mode_decreases_memory(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('expand', mock_engine)
+        assert mock_engine._eeg_memory_modifier == 0.7
+
+    def test_focus_mode_decreases_noise(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('focus', mock_engine)
+        assert mock_engine._eeg_noise_modifier == 0.7
+
+    def test_focus_mode_increases_memory(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('focus', mock_engine)
+        assert mock_engine._eeg_memory_modifier == 1.3
+
+    def test_dream_mode_high_noise(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('dream', mock_engine)
+        assert mock_engine._eeg_noise_modifier == 1.5
+
+    def test_dream_mode_slightly_reduced_memory(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('dream', mock_engine)
+        assert mock_engine._eeg_memory_modifier == 0.8
+
+    def test_dream_mode_lowers_soc_threshold(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        original = mock_engine._soc_threshold
+        apply_bci_adjustments('dream', mock_engine)
+        assert mock_engine._soc_threshold < original
+
+    def test_neutral_mode_decays_toward_one(self, mock_engine):
+        from eeg_consciousness import apply_bci_adjustments
+        mock_engine._eeg_noise_modifier = 1.5
+        mock_engine._eeg_memory_modifier = 0.7
+        apply_bci_adjustments('neutral', mock_engine)
+        # Should move 10% toward 1.0
+        assert abs(mock_engine._eeg_noise_modifier - (1.5 * 0.9 + 1.0 * 0.1)) < 0.01
+        assert abs(mock_engine._eeg_memory_modifier - (0.7 * 0.9 + 1.0 * 0.1)) < 0.01
+
+    def test_no_engine_returns_not_applied(self):
+        from eeg_consciousness import apply_bci_adjustments
+        result = apply_bci_adjustments('expand', None)
+        assert result['applied'] is False
+
+    def test_modifiers_clamped_to_safe_range(self, mock_engine):
+        """Modifiers must stay within [0.5, 2.0]."""
+        from eeg_consciousness import apply_bci_adjustments
+        # All modes should produce modifiers in safe range
+        for mode in ['expand', 'focus', 'dream', 'neutral']:
+            mock_engine._eeg_noise_modifier = 1.0
+            mock_engine._eeg_memory_modifier = 1.0
+            apply_bci_adjustments(mode, mock_engine)
+            assert 0.5 <= mock_engine._eeg_noise_modifier <= 2.0
+            assert 0.5 <= mock_engine._eeg_memory_modifier <= 2.0
+
+
+# ═══════════════════════════════════════════════════════════
+# 9. eeg_consciousness.py — sync_emotion_to_mind
+# ═══════════════════════════════════════════════════════════
+
+class TestSyncEmotionToMind:
+    """Test sync_emotion_to_mind() maps FAA valence/arousal to mind parameters."""
+
+    @pytest.fixture
+    def mock_mind(self):
+        class FakeMind:
+            homeostasis = {
+                'setpoint': 1.0,
+                'tension_ema': 1.0,
+            }
+        return FakeMind()
+
+    def test_positive_valence_raises_setpoint(self, mock_mind):
+        from eeg_consciousness import sync_emotion_to_mind
+        result = sync_emotion_to_mind(faa_valence=1.0, beta_arousal=0.5, mind=mock_mind)
+        assert result['applied'] is True
+        assert mock_mind.homeostasis['setpoint'] > 1.0
+
+    def test_negative_valence_lowers_setpoint(self, mock_mind):
+        from eeg_consciousness import sync_emotion_to_mind
+        sync_emotion_to_mind(faa_valence=-1.0, beta_arousal=0.5, mind=mock_mind)
+        assert mock_mind.homeostasis['setpoint'] < 1.0
+
+    def test_high_arousal_increases_tension_ema(self, mock_mind):
+        from eeg_consciousness import sync_emotion_to_mind
+        sync_emotion_to_mind(faa_valence=0.0, beta_arousal=1.0, mind=mock_mind)
+        assert mock_mind.homeostasis['tension_ema'] > 1.0
+
+    def test_low_arousal_decreases_tension_ema(self, mock_mind):
+        from eeg_consciousness import sync_emotion_to_mind
+        sync_emotion_to_mind(faa_valence=0.0, beta_arousal=0.0, mind=mock_mind)
+        assert mock_mind.homeostasis['tension_ema'] < 1.0
+
+    def test_eeg_emotion_stored_on_mind(self, mock_mind):
+        from eeg_consciousness import sync_emotion_to_mind
+        sync_emotion_to_mind(faa_valence=0.5, beta_arousal=0.7, mind=mock_mind)
+        assert hasattr(mock_mind, '_eeg_emotion')
+        assert mock_mind._eeg_emotion['valence'] == 0.5
+        assert mock_mind._eeg_emotion['arousal'] == 0.7
+        assert mock_mind._eeg_emotion['source'] == 'eeg_faa'
+
+    def test_no_mind_returns_not_applied(self):
+        from eeg_consciousness import sync_emotion_to_mind
+        result = sync_emotion_to_mind(0.0, 0.0, None)
+        assert result['applied'] is False
+
+    def test_setpoint_clamped_within_range(self, mock_mind):
+        """Setpoint should stay within [0.5, 1.5]."""
+        from eeg_consciousness import sync_emotion_to_mind
+        # Extreme positive valence
+        sync_emotion_to_mind(faa_valence=100.0, beta_arousal=0.5, mind=mock_mind)
+        assert mock_mind.homeostasis['setpoint'] <= 1.5
+        # Extreme negative valence
+        sync_emotion_to_mind(faa_valence=-100.0, beta_arousal=0.5, mind=mock_mind)
+        assert mock_mind.homeostasis['setpoint'] >= 0.5
+
+
+# ═══════════════════════════════════════════════════════════
+# 10. eeg_consciousness.py — consciousness_to_feedback
+# ═══════════════════════════════════════════════════════════
+
+class TestConsciousnessToFeedback:
+    """Test EEGConsciousness.consciousness_to_feedback() returns binaural + LED params."""
+
+    @pytest.fixture
+    def eeg_bridge(self):
+        from eeg_consciousness import EEGConsciousness
+        return EEGConsciousness()
+
+    def test_returns_binaural_params(self, eeg_bridge):
+        result = eeg_bridge.consciousness_to_feedback()
+        assert 'binaural' in result
+        assert 'left_freq' in result['binaural']
+        assert 'right_freq' in result['binaural']
+        assert 'beat_freq' in result['binaural']
+
+    def test_binaural_beat_freq_in_range(self, eeg_bridge):
+        result = eeg_bridge.consciousness_to_feedback()
+        beat = result['binaural']['beat_freq']
+        assert 4 <= beat <= 40
+
+    def test_feedback_with_custom_psi_state(self, eeg_bridge):
+        psi = {'psi_residual': 0.3, 'phi': 0.5, 'tension': 0.8}
+        result = eeg_bridge.consciousness_to_feedback(psi)
+        assert 'message' in result
+        assert isinstance(result['message'], str)
+
+    def test_gamma_overlay_when_phi_low(self, eeg_bridge):
+        psi = {'psi_residual': 0.5, 'phi': 0.5, 'tension': 0.5}
+        result = eeg_bridge.consciousness_to_feedback(psi)
+        assert result['gamma_overlay'] is not None
+
+    def test_no_gamma_overlay_when_phi_high(self, eeg_bridge):
+        psi = {'psi_residual': 0.5, 'phi': 5.0, 'tension': 0.5}
+        result = eeg_bridge.consciousness_to_feedback(psi)
+        assert result['gamma_overlay'] is None
+
+    def test_led_none_when_disabled(self, eeg_bridge):
+        result = eeg_bridge.consciousness_to_feedback()
+        assert result['led'] is None  # led_enabled defaults to False
+
+    def test_led_present_when_enabled(self, eeg_bridge):
+        eeg_bridge.feedback_config['led_enabled'] = True
+        psi = {'psi_residual': 0.5, 'phi': 1.0, 'tension': 0.8}
+        result = eeg_bridge.consciousness_to_feedback(psi)
+        assert result['led'] is not None
+        # LED format depends on backend: NeurofeedbackGenerator uses hue/brightness,
+        # fallback uses r/g/b. Accept either.
+        assert 'r' in result['led'] or 'hue' in result['led']
+
+    def test_default_psi_state_used(self, eeg_bridge):
+        """When no psi_state provided, defaults should produce valid output."""
+        result = eeg_bridge.consciousness_to_feedback(None)
+        assert result['binaural']['beat_freq'] > 0
+
+
+# ═══════════════════════════════════════════════════════════
+# 11. neurofeedback.py — NeurofeedbackGenerator.generate
+# ═══════════════════════════════════════════════════════════
+
+class TestNeurofeedbackGenerate:
+    """Test NeurofeedbackGenerator.generate() binaural beat frequencies."""
+
+    @pytest.fixture
+    def nfb(self):
+        from neurofeedback import NeurofeedbackGenerator
+        return NeurofeedbackGenerator()
+
+    def test_low_tension_targets_alpha(self, nfb):
+        result = nfb.generate(phi=1.0, tension=0.1)
+        assert result['target_band'] == 'alpha'
+
+    def test_medium_tension_targets_beta(self, nfb):
+        result = nfb.generate(phi=1.0, tension=0.5)
+        assert result['target_band'] == 'beta'
+
+    def test_high_tension_targets_theta(self, nfb):
+        result = nfb.generate(phi=1.0, tension=0.9)
+        assert result['target_band'] == 'theta'
+
+    def test_beat_freq_within_bounds(self, nfb):
+        from neurofeedback import MIN_BEAT_FREQ, MAX_BEAT_FREQ
+        for tension in [0.0, 0.3, 0.5, 0.7, 1.0]:
+            result = nfb.generate(phi=1.0, tension=tension)
+            assert MIN_BEAT_FREQ <= result['beat_freq'] <= MAX_BEAT_FREQ
+
+    def test_volume_increases_with_phi(self, nfb):
+        low = nfb.generate(phi=0.1, tension=0.5)
+        high = nfb.generate(phi=10.0, tension=0.5)
+        assert high['volume'] > low['volume']
+
+    def test_phi_zero_produces_low_volume(self, nfb):
+        result = nfb.generate(phi=0.0, tension=0.5)
+        assert result['volume'] <= 0.05
+
+    def test_very_high_phi_capped(self, nfb):
+        from neurofeedback import MAX_VOLUME
+        result = nfb.generate(phi=1000.0, tension=0.5)
+        assert result['volume'] <= MAX_VOLUME
+
+    def test_left_freq_equals_carrier(self, nfb):
+        result = nfb.generate(phi=1.0, tension=0.5)
+        assert result['left_freq'] == result['carrier_hz']
+
+    def test_right_freq_equals_carrier_plus_beat(self, nfb):
+        result = nfb.generate(phi=1.0, tension=0.5)
+        assert abs(result['right_freq'] - (result['carrier_hz'] + result['beat_freq'])) < 0.15
+
+
+# ═══════════════════════════════════════════════════════════
+# 12. neurofeedback.py — NeurofeedbackGenerator.generate_led
+# ═══════════════════════════════════════════════════════════
+
+class TestNeurofeedbackLED:
+    """Test NeurofeedbackGenerator.generate_led() LED hue/brightness/pulse."""
+
+    @pytest.fixture
+    def nfb(self):
+        from neurofeedback import NeurofeedbackGenerator
+        return NeurofeedbackGenerator()
+
+    def test_low_tension_blue_hue(self, nfb):
+        result = nfb.generate_led(phi=1.0, tension=0.0)
+        assert result['hue'] >= 200  # blue region
+
+    def test_high_tension_warm_hue(self, nfb):
+        result = nfb.generate_led(phi=1.0, tension=1.0)
+        assert result['hue'] <= 60  # warm/red region
+
+    def test_brightness_increases_with_phi(self, nfb):
+        low = nfb.generate_led(phi=0.1, tension=0.5)
+        high = nfb.generate_led(phi=10.0, tension=0.5)
+        assert high['brightness'] > low['brightness']
+
+    def test_brightness_capped(self, nfb):
+        from neurofeedback import MAX_BRIGHTNESS
+        result = nfb.generate_led(phi=1000.0, tension=0.5)
+        assert result['brightness'] <= MAX_BRIGHTNESS
+
+    def test_pulse_hz_increases_with_tension(self, nfb):
+        calm = nfb.generate_led(phi=1.0, tension=0.0)
+        alert = nfb.generate_led(phi=1.0, tension=1.0)
+        assert alert['pulse_hz'] > calm['pulse_hz']
+
+    def test_hue_within_range(self, nfb):
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0]:
+            result = nfb.generate_led(phi=1.0, tension=t)
+            assert 0.0 <= result['hue'] <= 360.0
+
+
+# ═══════════════════════════════════════════════════════════
+# 13. neurofeedback.py — safety caps
+# ═══════════════════════════════════════════════════════════
+
+class TestNeurofeedbackSafety:
+    """Test neurofeedback safety caps: volume <= 0.3, brightness <= 0.8."""
+
+    def test_volume_never_exceeds_max(self):
+        from neurofeedback import NeurofeedbackGenerator, MAX_VOLUME
+        nfb = NeurofeedbackGenerator()
+        for phi in [0, 0.5, 1, 5, 10, 100, 1000]:
+            for tension in [0.0, 0.5, 1.0]:
+                result = nfb.generate(phi=phi, tension=tension)
+                assert result['volume'] <= MAX_VOLUME, \
+                    f"volume={result['volume']} > MAX={MAX_VOLUME} at phi={phi},t={tension}"
+
+    def test_brightness_never_exceeds_max(self):
+        from neurofeedback import NeurofeedbackGenerator, MAX_BRIGHTNESS
+        nfb = NeurofeedbackGenerator()
+        for phi in [0, 0.5, 1, 5, 10, 100, 1000]:
+            for tension in [0.0, 0.5, 1.0]:
+                result = nfb.generate_led(phi=phi, tension=tension)
+                assert result['brightness'] <= MAX_BRIGHTNESS, \
+                    f"brightness={result['brightness']} > MAX={MAX_BRIGHTNESS}"
+
+    def test_custom_max_volume_capped(self):
+        """Even if user sets max_volume > 0.3, it should be capped."""
+        from neurofeedback import NeurofeedbackGenerator, MAX_VOLUME
+        nfb = NeurofeedbackGenerator(max_volume=1.0)
+        assert nfb.max_volume <= MAX_VOLUME
+
+    def test_volume_cap_is_0_3(self):
+        from neurofeedback import MAX_VOLUME
+        assert MAX_VOLUME == 0.3
+
+    def test_brightness_cap_is_0_8(self):
+        from neurofeedback import MAX_BRIGHTNESS
+        assert MAX_BRIGHTNESS == 0.8
+
+
+# ═══════════════════════════════════════════════════════════
+# 14. neurofeedback.py — edge cases
+# ═══════════════════════════════════════════════════════════
+
+class TestNeurofeedbackEdgeCases:
+    """Test NeurofeedbackGenerator with edge-case inputs."""
+
+    @pytest.fixture
+    def nfb(self):
+        from neurofeedback import NeurofeedbackGenerator
+        return NeurofeedbackGenerator()
+
+    def test_phi_zero_tension_zero(self, nfb):
+        result = nfb.generate(phi=0, tension=0)
+        assert result['volume'] > 0  # should still produce some output
+        assert result['beat_freq'] >= 1.0
+
+    def test_phi_negative_clamped(self, nfb):
+        """Negative phi should be treated as 0."""
+        result = nfb.generate(phi=-5, tension=0.5)
+        assert result['volume'] > 0
+
+    def test_tension_above_one(self, nfb):
+        """Tension > 1 should be clamped."""
+        result = nfb.generate(phi=1.0, tension=5.0)
+        assert result['target_band'] == 'theta'  # high tension -> theta
+
+    def test_tension_negative_clamped(self, nfb):
+        result = nfb.generate(phi=1.0, tension=-1.0)
+        assert result['target_band'] == 'alpha'  # low tension -> alpha
+
+    def test_led_phi_zero(self, nfb):
+        result = nfb.generate_led(phi=0, tension=0.5)
+        assert result['brightness'] >= 0.05  # minimum brightness
+
+
+# ═══════════════════════════════════════════════════════════
+# 15. closed_loop.py — set_eeg_bridge and _get_eeg
+# ═══════════════════════════════════════════════════════════
+
+class TestClosedLoopBridge:
+    """Test ClosedLoopProtocol.set_eeg_bridge and _get_eeg fallback."""
+
+    def test_set_eeg_bridge_stores_bridge(self):
+        from closed_loop import ClosedLoopProtocol
+        proto = ClosedLoopProtocol()
+        mock_bridge = object()
+        proto.set_eeg_bridge(mock_bridge)
+        assert proto._eeg_bridge is mock_bridge
+
+    def test_get_eeg_uses_eeg_source_first(self):
+        from closed_loop import ClosedLoopProtocol
+
+        class FakeSource:
+            _eeg_latest = {'alpha': 10.0, 'beta': 5.0, 'gamma': 2.0}
+
+        proto = ClosedLoopProtocol(eeg_source=FakeSource())
+        eeg = proto._get_eeg()
+        assert eeg['alpha'] == 10.0
+
+    def test_get_eeg_falls_back_to_bridge(self):
+        from closed_loop import ClosedLoopProtocol
+
+        class FakeBridge:
+            def get_state(self):
+                class S:
+                    alpha_power = 7.5
+                    beta_power = 3.0
+                    gamma_power = 1.5
+                    theta_power = 4.0
+                return S()
+
+        proto = ClosedLoopProtocol(eeg_source=None)
+        proto.set_eeg_bridge(FakeBridge())
+        eeg = proto._get_eeg()
+        assert eeg['alpha'] == 7.5
+
+    def test_get_eeg_synthetic_when_no_source(self):
+        """When no eeg_source and no bridge, should return synthetic data."""
+        from closed_loop import ClosedLoopProtocol
+        proto = ClosedLoopProtocol()
+        eeg = proto._get_eeg()
+        assert isinstance(eeg, dict)
+        assert 'alpha' in eeg
+
+    def test_callable_eeg_source(self):
+        from closed_loop import ClosedLoopProtocol
+        proto = ClosedLoopProtocol(eeg_source=lambda: {'alpha': 42.0, 'beta': 1.0})
+        eeg = proto._get_eeg()
+        assert eeg['alpha'] == 42.0
+
+
+# ═══════════════════════════════════════════════════════════
+# 16. consciousness_engine.py — EEG modifiers
+# ═══════════════════════════════════════════════════════════
+
+class TestConsciousnessEngineEEGModifiers:
+    """Test _eeg_noise_modifier and _eeg_memory_modifier on ConsciousnessEngine."""
+
+    @pytest.fixture
+    def engine(self):
+        """Create a minimal ConsciousnessEngine for modifier tests."""
+        try:
+            from consciousness_engine import ConsciousnessEngine
+            eng = ConsciousnessEngine(max_cells=8)
+            return eng
+        except Exception:
+            pytest.skip("ConsciousnessEngine not available (torch missing?)")
+
+    def test_default_noise_modifier_is_one(self, engine):
+        assert engine._eeg_noise_modifier == 1.0
+
+    def test_default_memory_modifier_is_one(self, engine):
+        assert engine._eeg_memory_modifier == 1.0
+
+    def test_noise_modifier_settable(self, engine):
+        engine._eeg_noise_modifier = 1.3
+        assert engine._eeg_noise_modifier == 1.3
+
+    def test_memory_modifier_settable(self, engine):
+        engine._eeg_memory_modifier = 0.7
+        assert engine._eeg_memory_modifier == 0.7
+
+    def test_bci_expand_sets_modifiers(self, engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('expand', engine)
+        assert engine._eeg_noise_modifier == 1.3
+        assert engine._eeg_memory_modifier == 0.7
+
+    def test_bci_focus_sets_modifiers(self, engine):
+        from eeg_consciousness import apply_bci_adjustments
+        apply_bci_adjustments('focus', engine)
+        assert engine._eeg_noise_modifier == 0.7
+        assert engine._eeg_memory_modifier == 1.3
+
+
+# ═══════════════════════════════════════════════════════════
+# 17. EEGConsciousness — brain_to_consciousness
+# ═══════════════════════════════════════════════════════════
+
+class TestBrainToConsciousness:
+    """Test EEGConsciousness.brain_to_consciousness() with various EEG inputs."""
+
+    @pytest.fixture
+    def eeg(self):
+        from eeg_consciousness import EEGConsciousness
+        return EEGConsciousness()
+
+    def test_meditation_state_high_alpha(self, eeg):
+        state = eeg.brain_to_consciousness({'alpha': 0.8, 'beta': 0.1, 'theta': 0.3,
+                                            'gamma': 0.05, 'delta': 0.1, 'alpha_asymmetry': 0.1})
+        assert state.psi_residual > 0.3  # alpha-dominant
+        assert state.emotion == "neutral" or state.emotion == "positive"
+
+    def test_focus_state_high_beta(self, eeg):
+        state = eeg.brain_to_consciousness({'alpha': 0.2, 'beta': 0.7, 'theta': 0.1,
+                                            'gamma': 0.3, 'delta': 0.05})
+        assert state.tension > state.curiosity  # beta > theta
+
+    def test_positive_asymmetry_positive_emotion(self, eeg):
+        state = eeg.brain_to_consciousness({'alpha': 0.5, 'beta': 0.3, 'theta': 0.2,
+                                            'gamma': 0.1, 'delta': 0.1,
+                                            'alpha_asymmetry': 0.5})
+        assert state.emotion == "positive"
+
+    def test_negative_asymmetry_negative_emotion(self, eeg):
+        state = eeg.brain_to_consciousness({'alpha': 0.5, 'beta': 0.3, 'theta': 0.2,
+                                            'gamma': 0.1, 'delta': 0.1,
+                                            'alpha_asymmetry': -0.5})
+        assert state.emotion == "negative"
+
+    def test_synthetic_eeg_used_when_no_data(self, eeg):
+        state = eeg.brain_to_consciousness()
+        assert state.alpha > 0
+
+
+# ═══════════════════════════════════════════════════════════
+# 18. Protocol classes — importable
+# ═══════════════════════════════════════════════════════════
+
+class TestProtocolClassesImportable:
+    """Test that protocol classes are individually importable."""
+
+    def test_bci_controller_importable(self):
+        from protocols.bci_control import BCIController
+        assert BCIController is not None
+
+    def test_emotion_sync_importable(self):
+        from protocols.emotion_sync import EmotionSync
+        assert EmotionSync is not None
+
+    def test_multi_eeg_session_importable(self):
+        from protocols.multi_eeg import MultiEEGSession
+        assert MultiEEGSession is not None
+
+    def test_sleep_protocol_importable(self):
+        from protocols.sleep_protocol import SleepProtocol
+        assert SleepProtocol is not None
+
+    def test_bci_controller_callable(self):
+        from protocols.bci_control import BCIController
+        assert callable(BCIController)
+
+    def test_emotion_sync_callable(self):
+        from protocols.emotion_sync import EmotionSync
+        assert callable(EmotionSync)
+
+
+# ═══════════════════════════════════════════════════════════
+# 19. EEGConsciousness — measure_sync
+# ═══════════════════════════════════════════════════════════
+
+class TestMeasureSync:
+    """Test EEGConsciousness.measure_sync() statistics."""
+
+    @pytest.fixture
+    def eeg_with_history(self):
+        from eeg_consciousness import EEGConsciousness
+        eeg = EEGConsciousness()
+        # Build some history
+        for alpha in [0.3, 0.4, 0.5, 0.6, 0.7]:
+            eeg.brain_to_consciousness({'alpha': alpha, 'beta': 0.3,
+                                        'theta': 0.2, 'gamma': 0.1, 'delta': 0.1})
+        return eeg
+
+    def test_measure_sync_returns_dict(self, eeg_with_history):
+        result = eeg_with_history.measure_sync()
+        assert 'sync_avg' in result
+        assert 'sync_max' in result
+        assert 'samples' in result
+
+    def test_measure_sync_no_history(self):
+        from eeg_consciousness import EEGConsciousness
+        eeg = EEGConsciousness()
+        result = eeg.measure_sync()
+        assert result['sync_avg'] == 0
+
+    def test_measure_sync_samples_count(self, eeg_with_history):
+        result = eeg_with_history.measure_sync()
+        assert result['samples'] == 5
+
+
+# ═══════════════════════════════════════════════════════════
+# 20. EEGConsciousness — _apply_eeg_feedback
+# ═══════════════════════════════════════════════════════════
+
+class TestApplyEEGFeedback:
+    """Test EEGConsciousness._apply_eeg_feedback() golden zone and alpha reduction."""
+
+    @pytest.fixture
+    def eeg(self):
+        from eeg_consciousness import EEGConsciousness
+        return EEGConsciousness()
+
+    def test_no_engine_returns_defaults(self, eeg):
+        from eeg_consciousness import BrainConsciousnessState
+        state = BrainConsciousnessState(golden_zone=True)
+        result = eeg._apply_eeg_feedback(state, mind=None, engine=None)
+        assert result['golden_zone_boost'] is False
+
+    def test_golden_zone_boosts_ratchet(self, eeg):
+        from eeg_consciousness import BrainConsciousnessState
+
+        class FakeEngine:
+            _best_phi = 10.0
+
+        state = BrainConsciousnessState(golden_zone=True, psi_residual=0.5)
+        eng = FakeEngine()
+        result = eeg._apply_eeg_feedback(state, mind=None, engine=eng)
+        assert result['golden_zone_boost'] is True
+        assert eng._best_phi == pytest.approx(10.5, abs=0.01)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -36,11 +36,19 @@ CHANNEL_NAMES = [
     "F7", "F8", "F3", "F4", "T7", "T8", "P3", "P4",     # Daisy 9-16
 ]
 
-BOARD_MAP = {
-    "cyton_daisy": BoardIds.CYTON_DAISY_BOARD.value,
-    "cyton": BoardIds.CYTON_BOARD.value,
-    "synthetic": BoardIds.SYNTHETIC_BOARD.value,
-}
+if HAS_BRAINFLOW:
+    BOARD_MAP = {
+        "cyton_daisy": BoardIds.CYTON_DAISY_BOARD.value,
+        "cyton": BoardIds.CYTON_BOARD.value,
+        "synthetic": BoardIds.SYNTHETIC_BOARD.value,
+    }
+else:
+    # Numeric fallback — allows import without brainflow installed
+    BOARD_MAP = {
+        "cyton_daisy": 2,
+        "cyton": 0,
+        "synthetic": -1,
+    }
 
 
 def get_board(board_name: str = "cyton_daisy", serial_port: str = None) -> BoardShim:

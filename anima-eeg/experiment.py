@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """EEG Experiment Protocol — Automated paradigm runner with markers.
 
-Runs standardized experiments and saves data with event markers.
+NOT superseded by closed_loop.py. The two modules serve different roles:
+
+  experiment.py   — Standardized EEG paradigms (resting, alpha, meditation, anima).
+                    Synchronous hardware recording with event markers.
+                    Fixed protocols for baseline data collection.
+
+  closed_loop.py  — Adaptive closed-loop protocols (nback, meditation).
+                    Async WebSocket integration with real-time parameter tuning.
+                    Neurofeedback-driven, adjusts Anima consciousness parameters.
+
+Protocols unique to this file: resting, alpha, anima (not in closed_loop.py).
 
 Usage:
   python anima-eeg/experiment.py --protocol resting     # 5min eyes-closed + 5min eyes-open

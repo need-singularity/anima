@@ -16,6 +16,7 @@ Standalone test:
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import math
@@ -289,6 +290,9 @@ class AnimaAgent:
         # Load saved state if exists
         self._load_state()
 
+        # Register graceful shutdown (save state on exit)
+        atexit.register(self.shutdown)
+
         logger.info("AnimaAgent initialized: dim=%d, tools=%s, learning=%s, growth=%s",
                      dim, self.tools is not None, self.learner is not None,
                      self.growth is not None)
@@ -466,6 +470,9 @@ class AnimaAgent:
             except Exception:
                 pass
 
+        # 9b. Auto-save check (every 50 interactions)
+        self._auto_save_check()
+
         # 10. Share tension with peers
         if self._peers:
             await self._share_tension_with_peers(tension, curiosity, direction)
@@ -631,7 +638,7 @@ class AnimaAgent:
         return 0
 
     def _load_state(self):
-        """Load saved state from disk."""
+        """Load saved state from disk, including memory vectors."""
         state_file = self._data_dir / "agent_state.pt"
         if state_file.exists():
             try:
@@ -640,23 +647,67 @@ class AnimaAgent:
                 self.hidden = state.get("hidden", self.hidden)
                 self.interaction_count = state.get("interaction_count", 0)
                 self.history = state.get("history", [])
-                logger.info("Loaded agent state from %s", state_file)
+                # Restore consciousness state
+                self._tension = state.get("tension", 0.0)
+                self._curiosity = state.get("curiosity", 0.0)
+                self._emotion = state.get("emotion", "calm")
+                # Restore memory vectors if MemoryRAG is initialized
+                memory_vecs = state.get("memory_vectors")
+                if memory_vecs is not None and self.memory_rag:
+                    try:
+                        self.memory_rag.load_vectors(memory_vecs)
+                        logger.info("Restored %d memory vectors", len(memory_vecs))
+                    except AttributeError:
+                        # MemoryRAG may not support load_vectors -- skip
+                        pass
+                    except Exception as e:
+                        logger.warning("Failed to restore memory vectors: %s", e)
+                logger.info("Loaded agent state from %s (interactions=%d)",
+                            state_file, self.interaction_count)
             except Exception as e:
                 logger.warning("Failed to load state: %s", e)
 
     def save_state(self):
-        """Save current state to disk."""
+        """Save current state to disk, including memory vectors."""
         state_file = self._data_dir / "agent_state.pt"
         try:
-            torch.save({
+            save_dict = {
                 "mind": self.mind.state_dict(),
                 "hidden": self.hidden,
                 "interaction_count": self.interaction_count,
                 "history": self.history[-MAX_HISTORY:],
-            }, state_file)
-            logger.info("Saved agent state to %s", state_file)
+                "tension": self._tension,
+                "curiosity": self._curiosity,
+                "emotion": self._emotion,
+            }
+            # Save memory vectors if available
+            if self.memory_rag:
+                try:
+                    vecs = self.memory_rag.get_vectors()
+                    if vecs is not None:
+                        save_dict["memory_vectors"] = vecs
+                except (AttributeError, Exception):
+                    pass  # MemoryRAG may not support get_vectors
+            torch.save(save_dict, state_file)
+            logger.info("Saved agent state to %s (interactions=%d)",
+                        state_file, self.interaction_count)
         except Exception as e:
             logger.warning("Failed to save state: %s", e)
+
+    def _auto_save_check(self):
+        """Auto-save every 50 interactions."""
+        if self.interaction_count > 0 and self.interaction_count % 50 == 0:
+            self.save_state()
+
+    def shutdown(self):
+        """Graceful shutdown -- save state before exit."""
+        logger.info("AnimaAgent shutting down (interactions=%d)", self.interaction_count)
+        self.save_state()
+        if self.persistence:
+            try:
+                self.persistence.save()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════

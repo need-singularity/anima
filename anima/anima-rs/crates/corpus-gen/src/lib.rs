@@ -27,4 +27,5 @@ pub mod seeds;
 pub mod sensory;
 pub mod sim;
 pub mod wiki;
+pub mod ko_longform;
 pub mod korean_dialogue;

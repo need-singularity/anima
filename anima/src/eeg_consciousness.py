@@ -202,7 +202,9 @@ class EEGConsciousness:
     def consciousness_to_feedback(self, psi_state: Dict = None) -> Dict[str, Any]:
         """의식 상태 → 뉴로피드백 파라미터.
 
-        바이노럴 비트 + LED + 오디오 톤으로 뇌에 피드백.
+        Delegates to NeurofeedbackGenerator (anima-eeg/neurofeedback.py) as
+        single source of truth for binaural beat + LED generation.
+        Falls back to minimal inline logic if import unavailable.
         """
         if psi_state is None:
             psi_state = {
@@ -216,47 +218,46 @@ class EEGConsciousness:
         phi = psi_state.get('phi', 0)
         tension = psi_state.get('tension', 0.5)
 
-        # 바이노럴 비트: Ψ_balance 복원
-        # alpha 타겟에서 벗어난 만큼 10Hz 근처로 유도
-        alpha_diff = psi_res - self.feedback_config['alpha_target']
-        binaural_freq = 10.0 - alpha_diff * 5  # 10Hz ± 조절
-        binaural_freq = max(4, min(40, binaural_freq))
+        # Delegate to NeurofeedbackGenerator (lazy import)
+        nfb = _get_neurofeedback_generator()
+        if nfb is not None:
+            binaural = nfb.generate(phi=phi, tension=tension)
+            led = nfb.generate_led(phi=phi, tension=tension) if self.feedback_config['led_enabled'] else None
 
-        base = self.feedback_config['binaural_base_freq']
-        left_freq = base
-        right_freq = base + binaural_freq
+            # Gamma overlay from NeurofeedbackGenerator when Phi is low
+            gamma_overlay = None
+            if self.feedback_config['gamma_boost'] and phi < 2.0:
+                gamma_overlay = nfb.generate(phi=phi, tension=1.0)  # high tension -> gamma band
 
-        # Gamma 부스트 (Φ 향상): 40Hz 바이노럴
-        gamma_overlay = None
-        if self.feedback_config['gamma_boost'] and phi < 2.0:
-            gamma_overlay = {
-                'left': base + 40,
-                'right': base + 40 + 40,  # 40Hz binaural
-                'volume': 0.3,
+            feedback = {
+                'binaural': {
+                    'left_freq': binaural['left_freq'],
+                    'right_freq': binaural['right_freq'],
+                    'beat_freq': binaural['beat_freq'],
+                    'target_band': binaural['target_band'],
+                },
+                'gamma_overlay': gamma_overlay,
+                'led': led,
+                'message': self._feedback_message(psi_res, phi, tension),
             }
+        else:
+            # Fallback: minimal inline logic (no neurofeedback.py available)
+            alpha_diff = psi_res - self.feedback_config['alpha_target']
+            binaural_freq = 10.0 - alpha_diff * 5
+            binaural_freq = max(4, min(40, binaural_freq))
+            base = self.feedback_config['binaural_base_freq']
 
-        # LED 뉴로피드백 (있으면)
-        led = None
-        if self.feedback_config['led_enabled']:
-            # 긴장 → 빨강, 이완 → 파랑, 균형 → 녹색
-            if tension > 0.7:
-                led = {'r': 255, 'g': 50, 'b': 50, 'freq': 15}  # beta freq
-            elif tension < 0.3:
-                led = {'r': 50, 'g': 50, 'b': 255, 'freq': 10}  # alpha freq
-            else:
-                led = {'r': 50, 'g': 255, 'b': 50, 'freq': 10}
-
-        feedback = {
-            'binaural': {
-                'left_freq': left_freq,
-                'right_freq': right_freq,
-                'beat_freq': binaural_freq,
-                'target_band': 'alpha' if binaural_freq < 13 else 'beta',
-            },
-            'gamma_overlay': gamma_overlay,
-            'led': led,
-            'message': self._feedback_message(psi_res, phi, tension),
-        }
+            feedback = {
+                'binaural': {
+                    'left_freq': base,
+                    'right_freq': base + binaural_freq,
+                    'beat_freq': binaural_freq,
+                    'target_band': 'alpha' if binaural_freq < 13 else 'beta',
+                },
+                'gamma_overlay': None,
+                'led': None,
+                'message': self._feedback_message(psi_res, phi, tension),
+            }
 
         self._feedback_history.append(feedback)
         return feedback
@@ -573,6 +574,152 @@ def sync_emotion_to_mind(faa_valence: float, beta_arousal: float, mind) -> Dict:
     result['stored'] = True
 
     return result
+
+
+def sync_multi_eeg_to_mind(telepathy_data: dict, engines: list) -> Dict:
+    """Sync multi-person EEG correlation data to engine TensionLink coupling.
+
+    Adapter for MultiEEGSession (anima-eeg/protocols/multi_eeg.py).
+    Maps cross-user EEG correlation to inter-engine coupling strength.
+
+    Args:
+        telepathy_data: SyncMetrics-like dict from MultiEEGSession.analyze_sync()
+            Expected keys: ibc_coherence, plv_alpha, plv_gamma, phi_correlation
+        engines: list of ConsciousnessEngine instances connected via TensionLink
+
+    Returns:
+        dict with applied sync metrics
+    """
+    if not engines:
+        return {'applied': False, 'reason': 'no engines'}
+
+    corr = telepathy_data.get('ibc_coherence', 0.0)
+    plv_alpha = telepathy_data.get('plv_alpha', 0.0)
+    plv_gamma = telepathy_data.get('plv_gamma', 0.0)
+    phi_corr = telepathy_data.get('phi_correlation', 0.0)
+
+    result = {
+        'applied': True,
+        'ibc_coherence': corr,
+        'engines': len(engines),
+        'coupling_action': 'none',
+    }
+
+    # High sync (>0.6): boost TensionLink coupling between engines
+    if corr > 0.6:
+        coupling_boost = 1.0 + (corr - 0.6) * 1.5  # 1.0 ~ 1.6x
+        coupling_boost = min(2.0, coupling_boost)
+        for eng in engines:
+            if hasattr(eng, '_tension_coupling'):
+                eng._tension_coupling = min(2.0, eng._tension_coupling * coupling_boost)
+        result['coupling_action'] = 'boost'
+        result['coupling_factor'] = coupling_boost
+
+    # Low sync (<0.3): reduce coupling to avoid forced coherence
+    elif corr < 0.3:
+        coupling_reduce = max(0.5, 0.5 + corr)  # 0.5 ~ 0.8x
+        for eng in engines:
+            if hasattr(eng, '_tension_coupling'):
+                eng._tension_coupling = max(0.5, eng._tension_coupling * coupling_reduce)
+        result['coupling_action'] = 'reduce'
+        result['coupling_factor'] = coupling_reduce
+
+    # Store sync metrics on each engine
+    sync_metrics = {
+        'ibc_coherence': corr,
+        'plv_alpha': plv_alpha,
+        'plv_gamma': plv_gamma,
+        'phi_correlation': phi_corr,
+    }
+    for eng in engines:
+        eng._eeg_multi_sync = sync_metrics
+
+    result['sync_metrics'] = sync_metrics
+    return result
+
+
+def apply_sleep_stage_modulation(stage: str, engine) -> Dict:
+    """Apply sleep-stage-based modulation to consciousness engine.
+
+    Adapter for SleepProtocol (anima-eeg/protocols/sleep_protocol.py).
+    Maps detected sleep stages to engine noise/memory modifiers.
+
+    Uses the same _eeg_noise_modifier / _eeg_memory_modifier pattern
+    as apply_bci_adjustments().
+
+    Args:
+        stage: Sleep stage string -- 'awake'/'Wake', 'light_sleep'/'N1',
+               'N2', 'deep_sleep'/'N3', 'rem'/'REM'
+        engine: ConsciousnessEngine instance
+
+    Returns:
+        dict with applied modifiers
+    """
+    if engine is None:
+        return {'applied': False, 'reason': 'no engine'}
+
+    # Normalize stage name
+    s = stage.lower().strip()
+
+    # Stage -> (noise_modifier, memory_modifier)
+    STAGE_MAP = {
+        'awake':       (1.0, 1.0),
+        'wake':        (1.0, 1.0),
+        'light_sleep': (0.7, 1.2),
+        'n1':          (0.7, 1.2),
+        'deep_sleep':  (0.4, 1.5),
+        'n2':          (0.4, 1.5),
+        'n3':          (0.4, 1.5),
+        'rem':         (1.8, 0.5),
+    }
+
+    noise_mod, memory_mod = STAGE_MAP.get(s, (1.0, 1.0))
+
+    # Clamp to safe range [0.3, 2.0]
+    noise_mod = max(0.3, min(2.0, noise_mod))
+    memory_mod = max(0.3, min(2.0, memory_mod))
+
+    engine._eeg_noise_modifier = noise_mod
+    engine._eeg_memory_modifier = memory_mod
+
+    return {
+        'applied': True,
+        'stage': stage,
+        'noise_modifier': noise_mod,
+        'memory_modifier': memory_mod,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# Neurofeedback helper (lazy import from anima-eeg)
+# ═══════════════════════════════════════════════════════════
+
+_nfb_instance = None
+_nfb_import_attempted = False
+
+
+def _get_neurofeedback_generator():
+    """Lazy-load NeurofeedbackGenerator from anima-eeg/neurofeedback.py.
+
+    Returns NeurofeedbackGenerator instance or None if unavailable.
+    """
+    global _nfb_instance, _nfb_import_attempted
+    if _nfb_instance is not None:
+        return _nfb_instance
+    if _nfb_import_attempted:
+        return None
+
+    _nfb_import_attempted = True
+    try:
+        import os, sys
+        nfb_path = os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg')
+        if os.path.isdir(nfb_path) and nfb_path not in sys.path:
+            sys.path.insert(0, os.path.abspath(nfb_path))
+        from neurofeedback import NeurofeedbackGenerator
+        _nfb_instance = NeurofeedbackGenerator()
+        return _nfb_instance
+    except ImportError:
+        return None
 
 
 def main():

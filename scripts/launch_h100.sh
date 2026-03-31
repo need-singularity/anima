@@ -45,6 +45,12 @@ if ! python3 -c "import torch; assert torch.cuda.is_available(), 'No CUDA'" 2>/d
     read -r
 fi
 
+# ─── CUDA environment for crash resilience ───────────────────────────
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING=0
+echo "  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+echo "  CUDA_LAUNCH_BLOCKING=$CUDA_LAUNCH_BLOCKING"
+
 CORPUS_SIZE=$(du -h anima/data/corpus_v9.txt | cut -f1)
 echo "  Corpus: anima/data/corpus_v9.txt ($CORPUS_SIZE)"
 echo "  GPU: $(python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")' 2>/dev/null || echo 'unknown')"
@@ -79,7 +85,7 @@ echo "  checkpoints/v14_128c/"
 echo ""
 echo "=== Session 1: DecoderV3 274M (v3_train) ==="
 
-tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 python3 -u anima/training/train_v14.py \
+tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
   --data anima/data/corpus_v9.txt \
   --decoder v3 \
   --federated \
@@ -119,7 +125,7 @@ echo "  Log: checkpoints/v3_274M/train.log"
 echo ""
 echo "=== Session 2: v14.3 128-cell federated (v14_128c) ==="
 
-tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 python3 -u anima/training/train_v14.py \
+tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
   --data anima/data/corpus_v9.txt \
   --federated \
   --atoms 16 --cells-per-atom 8 \
@@ -149,4 +155,8 @@ echo ""
 echo "  Kill commands:"
 echo "    tmux kill-session -t v3_train            # stop v3"
 echo "    tmux kill-session -t v14_128c            # stop v14"
+echo ""
+echo "  Watchdog (auto-restart on crash):"
+echo "    crontab -e  # add this line:"
+echo "    */5 * * * * bash $(pwd)/scripts/h100_watchdog.sh >> $(pwd)/scripts/watchdog.log 2>&1"
 echo "═══════════════════════════════════════════════════════════"

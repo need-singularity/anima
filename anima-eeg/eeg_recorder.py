@@ -142,10 +142,49 @@ class EEGBackgroundRecorder:
             self._status.recording = False
         print(f"  [eeg-rec] Recording stopped ({self._status.total_samples} samples)")
 
+        # Auto-organize recordings (non-critical)
+        self._auto_organize()
+
     def get_status(self) -> dict:
         """Thread-safe status dict for WebSocket broadcast."""
         with self._lock:
             return asdict(self._status)
+
+    # ─── Auto-organize ───
+
+    def _auto_organize(self):
+        """Auto-organize recordings after session ends. Non-critical."""
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+            from organize_recordings import (
+                scan_flat_files, organize_file, init_db, insert_recording,
+                INDEX_DB, RECORDINGS_DIR,
+            )
+            flat_files = scan_flat_files(RECORDINGS_DIR)
+            if not flat_files:
+                return
+            conn = init_db(INDEX_DB)
+            organized = 0
+            for fpath in flat_files:
+                result = organize_file(fpath, dry_run=False)
+                if result:
+                    insert_recording(
+                        conn,
+                        session_id=result['session_id'],
+                        timestamp=result['timestamp'],
+                        protocol=result['protocol'],
+                        category=result['category'],
+                        file_paths=[result['destination']],
+                        brain_like_pct=result.get('brain_like_pct', 0),
+                        cells=result.get('cells', 0),
+                        steps=result.get('steps', 0),
+                    )
+                    organized += 1
+            conn.close()
+            if organized > 0:
+                print(f"  [eeg-rec] Auto-organized {organized} recording(s)")
+        except Exception as e:
+            print(f"  [eeg-rec] Auto-organize skipped: {e}")
 
     # ─── EEG stream ───
 
