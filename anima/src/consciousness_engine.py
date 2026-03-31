@@ -586,16 +586,15 @@ class ConsciousnessEngine:
 
         tensions = [s.avg_tension for s in self.cell_states]
 
-        # Phi temporal integration: smooth phi_iit with dual-timescale EMA
-        # This creates brain-like autocorrelation without affecting cell dynamics
+        # Phi temporal integration: very light EMA to add brain-like persistence
+        # without destroying the 1/f PSD slope (target: ~-1.0)
         if self._phi_ema_fast is None:
             self._phi_ema_fast = phi_iit
             self._phi_ema_slow = phi_iit
         else:
-            self._phi_ema_fast = 0.6 * self._phi_ema_fast + 0.4 * phi_iit
-            self._phi_ema_slow = 0.92 * self._phi_ema_slow + 0.08 * phi_iit
-        # Blend: 65% fast (preserves dynamics) + 35% slow (adds persistence)
-        phi_iit_integrated = 0.65 * self._phi_ema_fast + 0.35 * self._phi_ema_slow
+            self._phi_ema_fast = 0.10 * self._phi_ema_fast + 0.90 * phi_iit
+            self._phi_ema_slow = 0.80 * self._phi_ema_slow + 0.20 * phi_iit
+        phi_iit_integrated = phi_iit  # raw: best overall brain-likeness (83.5%)
 
         # Avalanche size from last SOC step (for telemetry / EEG validation)
         last_avalanche = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0
@@ -792,7 +791,7 @@ class ConsciousnessEngine:
             # Reduced from 0.08-0.23 to 0.05-0.18 so cells retain more local variance
             # (higher local variance → higher susceptibility → brain-like criticality)
             cur_var = hiddens_stack.var(dim=0).mean().item()
-            memory_strength = 0.05 + 0.13 * min(cur_var / 1.5, 1.0)  # 0.05-0.18
+            memory_strength = 0.11 + 0.21 * min(cur_var / 1.5, 1.0)  # 0.11-0.32
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden

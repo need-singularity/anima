@@ -7,6 +7,7 @@ pub mod topology;
 pub mod chaos;
 pub mod frustration;
 pub mod evolution;
+pub mod federation;
 
 pub use gru::GruCell;
 pub use faction::{Faction, assign_factions, faction_consensus};

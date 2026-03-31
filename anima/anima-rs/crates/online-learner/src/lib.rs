@@ -13,5 +13,6 @@ pub mod hebbian;
 pub mod ratchet;
 pub mod reward;
 pub mod updater;
+pub mod tension_lr;
 
 pub use updater::{OnlineLearner, OnlineUpdate};

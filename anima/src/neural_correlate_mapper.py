@@ -94,6 +94,19 @@ class NeuralCorrelateMapper:
 
         return {"rmse": round(rmse, 4), "r2": round(float(r2), 4), "n_samples": len(eeg_samples)}
 
+    def fit(self, X: np.ndarray, Y: np.ndarray) -> Dict[str, float]:
+        """Fit from raw numpy arrays (used by calibrate.py)."""
+        eeg_samples = [EEGSample(*row.tolist()) for row in X]
+        psi_states = [PsiState(*row.tolist()) for row in Y]
+        return self.calibrate(eeg_samples, psi_states)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict from raw numpy array (used by calibrate.py)."""
+        if not self._calibrated:
+            raise RuntimeError("Call calibrate() or fit() first")
+        X_c = X - self.eeg_mean
+        return X_c @ self.W + self.psi_mean
+
     def map_eeg_to_psi(self, eeg: EEGSample) -> PsiState:
         """Predict Psi state from EEG data."""
         if not self._calibrated:

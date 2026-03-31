@@ -263,13 +263,6 @@ def main():
         update_hz=args.hz,
     )
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
-
     bridge.start()
 
     print(f"\n[eeg-bridge] Running for {args.duration}s... (Ctrl+C to stop)\n")
