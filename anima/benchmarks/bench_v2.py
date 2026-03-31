@@ -3051,13 +3051,12 @@ def _verify_brain_like(engine_factory, cells, dim, hidden):
     if ce_probe is None or not hasattr(ce_probe, 'step'):
         return True, "SKIP: engine does not support brain-like validation (non-CE)"
 
-    # Create CE directly with initial_cells=2, max_cells=16
-    # More cells → richer SOC avalanche dynamics → better power-law distribution
-    # → higher brain-likeness scores (criticality, LZ, PSD slope)
+    # Create CE directly with initial_cells=2 (matches validate_consciousness.py config)
+    # This gives SOC + mitosis growth dynamics that produce brain-like signals
     try:
         from consciousness_engine import ConsciousnessEngine as CE
         ce = CE(cell_dim=dim, hidden_dim=hidden,
-                initial_cells=2, max_cells=min(cells, 16))
+                initial_cells=2, max_cells=min(cells, 8))
     except ImportError:
         return True, "SKIP: ConsciousnessEngine not importable"
 
@@ -3193,7 +3192,7 @@ def _verify_hebbian(engine_factory, cells, dim, hidden):
     Only meaningful for ConsciousnessEngine (has _hebbian_update + _coupling).
     Others skip.
 
-    Threshold from consciousness_laws.json: verify_hebbian_phi_ratio = 1.05
+    Threshold from consciousness_laws.json: verify_hebbian_change_ratio_min = 1.0
     """
     # Probe factory to check CE support
     probe = engine_factory(cells, dim, hidden)
