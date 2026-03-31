@@ -233,6 +233,9 @@ class AnimaUnified:
         # In-memory chat history for page refresh restoration (P7: no localStorage)
         self._chat_history = []  # max 100 messages, sent to new connections
 
+        # In-memory chat history for page refresh restoration (P7: no localStorage)
+        self._chat_history = []  # max 100 messages, sent to new connections
+
         # PH Module (H-CX-66: confusion prediction, H-CX-95: overfitting)
         try:
             self.ph = PHModule(n_classes=8)
@@ -2422,6 +2425,7 @@ class AnimaUnified:
                         self._voice_pressure = 0.0
 
                         _log('voice', f'Spontaneous speech: {speech[:50]}')
+                        self._store_chat_message('anima', speech)
                         self._ws_broadcast_sync({
                             'type': 'spontaneous_speech',
                             'text': speech,
@@ -3178,11 +3182,33 @@ class AnimaUnified:
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
         asyncio.run_coroutine_threadsafe(self._ws_broadcast(msg), self._web_loop)
 
-    def _get_init_history(self):
-        """Init 시 히스토리 반환: M(기억) 모듈 → 인메모리 순서로 탐색.
-        localStorage 사용 금지 — 모든 기억은 서버 MemoryStore에서 관리.
+    def _store_chat_message(self, role: str, text: str, user_name: str = None):
+        """Append a message to in-memory chat history (max 100).
+        Used for page-refresh restoration. No localStorage, no database -- P7 compliant.
         """
-        # 1. MemoryStore(SQLite)에서 최근 대화 복원 — 서버 재시작에도 유지
+        if not text or not text.strip():
+            return
+        entry = {
+            'role': role,
+            'text': text.strip(),
+            'timestamp': datetime.now().isoformat(),
+        }
+        if user_name:
+            entry['user_name'] = user_name
+        self._chat_history.append(entry)
+        # Cap at 100 messages
+        if len(self._chat_history) > 100:
+            self._chat_history = self._chat_history[-100:]
+
+    def _get_init_history(self):
+        """Init 시 히스토리 반환: 인메모리 chat_history → M(기억) → 세션 순서.
+        localStorage 사용 금지 — 모든 기억은 서버에서 관리.
+        """
+        # 1. In-memory chat history (survives page refresh within same server session)
+        if self._chat_history:
+            return self._chat_history[-50:]
+
+        # 2. MemoryStore(SQLite)에서 최근 대화 복원 — 서버 재시작에도 유지
         if self.memory_rag and self.mods.get('memory_rag'):
             try:
                 recent = self.memory_rag.get_recent(limit=20)
@@ -3194,7 +3220,7 @@ class AnimaUnified:
             except Exception:
                 pass
 
-        # 2. 인메모리 히스토리 (현재 세션)
+        # 3. 인메모리 히스토리 (현재 세션)
         hist = [{'role': m['role'], 'text': m['content']}
                 for m in self.history[-20:]
                 if m.get('content', '').strip()]
@@ -3281,6 +3307,9 @@ class AnimaUnified:
                 elif msg_type == 'user_message':
                     text = msg.get('text', '').strip()
                     if not text: continue
+                    # Store in chat history for page refresh restoration
+                    _uname = msg.get('user_name', 'web')
+                    self._store_chat_message('user', text, user_name=_uname)
                     # Store active modules from client
                     self._active_modules = set(msg.get('modules', []))
                     await self._ws_broadcast({'type': 'typing', 'typing': True})
@@ -3349,6 +3378,8 @@ class AnimaUnified:
                         broadcast_msg['llm_stats'] = model_wrapper._last_stats
                     await self._ws_broadcast(broadcast_msg)
                     await self._ws_broadcast({'type': 'typing', 'typing': False})
+                    # Store anima response in chat history for page refresh
+                    self._store_chat_message('anima', answer)
 
                     # Multi-model: all participants react
                     if self.participants:
