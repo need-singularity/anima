@@ -40,6 +40,7 @@
   8. Rust 우선 — 새 파일 생성 시 Rust가 유리하면 Rust로 개발
      성능 병목(텐션 교환, Φ 계산, 실시간 처리)은 Rust 필수.
      Python은 실험/프로토타입 용도. 확정된 알고리즘은 Rust로 이식.
+     계산기 공통 규칙: ~/Dev/TECS-L/.shared/CALCULATOR_RULES.md
      기존 crate: phi-rs(Φ계산), anima-rs(텐션), vad-rs(VAD),
                  consciousness-loop-rs(무한루프), consciousness-ffi(FFI),
                  corpus-gen(다차원 코퍼스 생성), online-learner(실시간 학습)
@@ -73,8 +74,6 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
   ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
   ConsciousDecoderV2: RoPE+SwiGLU+GQA+CrossAttn (34.5M, causal attention)
-  AnimaLM:         Mistral 7B + Parallel PureField (Engine A↔G tension)
-  Golden MoE:      PsiRouter + 4 CA rules + 1/e zone routing (Φ +27x)
   anima-rs:        Rust crates (consciousness, consciousness-ffi, esp32, core, talk5,
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
