@@ -1,3 +1,35 @@
+# ============================================================================
+# CI — Anima 단일 CI 파이프라인
+# ============================================================================
+#
+# [트러블슈팅 — 재발 방지 기록]
+#
+# 2026-03-31 (commit 2733b09 ~ 1e8495a): python-tests 3.12/3.13 반복 실패
+#   증상: test_novelty.py 수집 시 "ModuleNotFoundError: No module named 'scipy'"
+#   원인1: test_novelty.py가 --ignore 목록에 누락됨
+#     → test_novelty.py는 standalone 검증 도구 (--checkpoint 필수)이지 pytest 아님
+#   원인2: scipy는 pyproject.toml optional dep [eeg]. pip install -e . 성공 시
+#     || fallback이 실행 안 되어 scipy 미설치.
+#   원인3: test_novelty.py에 try/except ImportError 있으나, pytest --import-mode=prepend
+#     (기본값)에서 conftest 없는 환경 + PYTHONPATH 불일치 시 수집 단계에서 실패.
+#   해결: --ignore=tests/test_novelty.py 추가 (commit 99efdaa)
+#
+# [ignore 목록 관리 규칙]
+#   - standalone 도구 (argparse/--checkpoint 필요): --ignore 필수
+#   - 외부 HW 의존 (EEG/camera/lidar): --ignore 필수
+#   - 새 test_*.py 추가 시 반드시 CI 호환 확인!
+#   - -k 필터: optional dep 기반 테스트는 키워드로 제외
+#
+# [의존성 규칙]
+#   - pip install -e . || fallback 패턴 주의: -e . 성공하면 fallback 안 됨
+#   - optional dep (scipy, websockets 등)이 테스트에 필요하면 명시 설치할 것
+#
+# [중복 워크플로우 통합 이력]
+#   2026-04-01: test.yml + verify.yml → ci.yml 통합
+#     이유: ignore 목록이 3개 파일에 분산 → 동기화 실패의 근본 원인
+#     verify.yml의 py_compile 검증 → verify-syntax job으로 이관
+# ============================================================================
+
 name: CI
 
 on:
@@ -7,7 +39,30 @@ on:
     branches: [main]
 
 jobs:
+  # py_compile 검증 (구 verify.yml 통합)
+  verify-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install torch numpy
+      - name: Compile-check all src/*.py
+        run: |
+          python -c "
+          import py_compile, os
+          broken = []
+          for f in sorted(os.listdir('anima/src')):
+              if f.endswith('.py') and not f.startswith('__'):
+                  try: py_compile.compile(f'anima/src/{f}', doraise=True)
+                  except: broken.append(f)
+          print(f'OK: {len(os.listdir(\"anima/src\"))-len(broken)}, Broken: {len(broken)}')
+          if broken: print(broken); exit(1)
+          "
+
   python-tests:
+    needs: verify-syntax
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -30,11 +85,13 @@ jobs:
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
             ${{ runner.os }}-pip-
 
+      # [중요] pip install -e . 가 성공해도 scipy/websockets는 optional이라
+      # 설치 안 됨. 테스트에 필요한 dep은 반드시 명시 설치. fallback(||) 의존 금지!
       - name: Install anima package
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
-          pip install -e . || pip install torch numpy scipy websockets
+          pip install pytest scipy websockets
+          pip install -e . || pip install torch numpy
 
       - name: Install anima-agent package
         run: |
@@ -52,6 +109,12 @@ jobs:
             --ignore=tests/test_chat_v9.py \
             --ignore=tests/test_novelty.py \
             -k "not eeg and not brainflow and not camera and not faiss"
+          # [ignore 사유]
+          #   test_vision_encoder.py     — transformers/SigLIP 필요 (CI 미설치)
+          #   test_senses_integration.py — OpenCV/camera HW 의존
+          #   test_lidar_sense.py        — lidar HW 의존
+          #   test_chat_v9.py            — 모델 체크포인트 필요
+          #   test_novelty.py            — standalone 도구 (--checkpoint 필수)
 
       - name: Run agent tests
         env:
@@ -85,7 +148,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e . || pip install torch numpy scipy
+          pip install scipy
+          pip install -e . || pip install torch numpy
 
       - name: Run bench verify
         env:
