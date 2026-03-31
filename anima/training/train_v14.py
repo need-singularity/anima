@@ -809,6 +809,16 @@ def train(args):
                     print(f"  {phase} step {step:6d} | Phi={phi:.4f} | atoms=[{atom_str}]")
                 else:
                     print(f"  {phase} step {step:6d} | Phi={phi:.4f} | cells={total_cells}")
+
+            # Watchdog heartbeat (P0/P1 phases too)
+            if step % 100 == 0:
+                try:
+                    hb_path = os.path.join(args.checkpoint, "heartbeat.txt")
+                    with open(hb_path, 'w') as hf:
+                        hf.write(f"step={step} time={time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                 f"phi={phi:.4f} phase={phase}\n")
+                except Exception:
+                    pass
             continue
 
         # ── P2/P3: CE learning ──
