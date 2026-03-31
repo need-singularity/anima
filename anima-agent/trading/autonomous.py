@@ -118,8 +118,12 @@ class AutonomousTrader:
     with full consciousness integration.
     """
 
-    def __init__(self, config: Optional[AutonomousConfig] = None):
-        self.config = config or AutonomousConfig()
+    def __init__(self, config: Optional[AutonomousConfig] = None, mode: Optional[str] = None):
+        if config is None:
+            config = AutonomousConfig()
+        if mode is not None:
+            config.paper_mode = (mode.lower() != "live")
+        self.config = config
 
         # Core components
         self.portfolio = Portfolio(self.config.initial_balance)
