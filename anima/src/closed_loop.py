@@ -44,7 +44,8 @@ except ImportError:
 
 
 try:
-    from consciousness_laws import PSI_BALANCE, PSI_ALPHA as PSI_COUPLING
+    from consciousness_laws import PSI_BALANCE, PSI_ALPHA
+    PSI_COUPLING = PSI_ALPHA
 except ImportError:
     PSI_BALANCE = 0.5
     PSI_COUPLING = 0.014
