@@ -19,7 +19,10 @@ import json
 import zlib
 from pathlib import Path
 from collections import Counter
-from scipy import stats
+try:
+    from scipy import stats
+except ImportError:
+    stats = None
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:
