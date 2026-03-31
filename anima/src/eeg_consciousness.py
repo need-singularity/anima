@@ -362,7 +362,7 @@ class EEGConsciousness:
     # OpenBCI 연결
     # ═══════════════════════════════════════════════════════════
 
-    def connect_openbci(self, board_type: str = "cyton_daisy"):
+    def connect_openbci(self, board_name: str = "cyton_daisy"):
         """OpenBCI 보드 연결."""
         try:
             import os, sys
@@ -370,7 +370,7 @@ class EEGConsciousness:
             if os.path.isdir(eeg_path) and eeg_path not in sys.path:
                 sys.path.insert(0, os.path.abspath(eeg_path))
             from realtime import EEGBridge
-            self._bridge = EEGBridge(board_type=board_type)
+            self._bridge = EEGBridge(board_name=board_name)
             self._bridge.start()
             return True
         except ImportError:

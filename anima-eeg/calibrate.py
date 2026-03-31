@@ -304,8 +304,8 @@ def calibrate_neural_mapper(board_name="synthetic", serial_port=None, duration=6
         return None
 
     try:
-        sample_rate = BoardShim.get_sampling_rate(board.board_id) if HAS_BRAINFLOW else 250
-        eeg_channels = BoardShim.get_eeg_channels(board.board_id) if HAS_BRAINFLOW else list(range(8))
+        sample_rate = BoardShim.get_sampling_rate(board.get_board_id()) if HAS_BRAINFLOW else 250
+        eeg_channels = BoardShim.get_eeg_channels(board.get_board_id()) if HAS_BRAINFLOW else list(range(8))
 
         eeg_samples = []
         psi_samples = []
