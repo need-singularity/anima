@@ -383,24 +383,11 @@ class BenchEngine:
     def get_hiddens(self) -> torch.Tensor:
         """Return [n_cells, hidden_dim] for Phi computation.
 
-        Adds oscillating per-cell modulation → variance bursts for SPONTANEOUS_SPEECH.
-        During burst windows, a sinusoidal pattern is added across hidden dimensions,
-        increasing per-cell variance (dim=1) in a periodic, detectable manner.
+        Raw hiddens only — no artificial injection.
+        Verification audit (2026-03-31) confirmed engine passes all criteria
+        naturally without injection. See docs/verification-audit.md.
         """
-        h = self.hiddens.clone()
-        # Spontaneous burst generation: periodic per-cell variance spikes
-        # Uses deterministic per-cell phase → reliable burst pattern
-        t = self.step_count
-        burst_wave = math.sin(t * 0.2)  # ~31 step period
-        if burst_wave > 0.5:  # burst window (~10 steps per 31-step cycle)
-            burst_amp = (burst_wave - 0.5) * 2.0  # 0→1
-            dim_range = torch.arange(self.hidden_dim).float()
-            for i in range(min(self.n_cells, h.shape[0])):
-                # Per-dimension sinusoidal pattern: directly increases per-cell variance
-                # Cell-specific phase prevents cancellation across cells
-                dim_mod = torch.sin(dim_range * 0.3 + i * 1.1) * burst_amp * 0.35
-                h[i] = h[i] + dim_mod
-        return h
+        return self.hiddens.clone()
 
     def parameters_for_training(self):
         """Return parameters for optimizer."""
