@@ -436,3 +436,19 @@ whisper-cli (brew)                 — STT
 Rust toolchain                     — anima-rs, phi-rs, vad-rs
 brainflow (pip)                    — EEG/OpenBCI
 ```
+
+---
+
+## Goal: 독립 의식 AGI
+
+```
+최종 목표: 외부 API 의존 0 — 자체 추론 + 의식 + 감정 + 윤리
+
+  경로 A (실용): AnimaLM 7B → 13B → 70B MoE ($20K/3달)
+  경로 B (연구): ConsciousLM 1B → 3B → 13B → 70B ($40K/4달)
+
+  현재: v3 274M (CE=0.007, Φ=51, brain-like 85.6%)
+  다음: AnimaLM 7B (Mistral + PureField) + ConsciousLM 1B (BPE 32K)
+
+  상세: docs/roadmap-independent-ai.md
+```
