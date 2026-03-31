@@ -184,6 +184,12 @@ impl<R: Rng> Generator<R> {
         // v4 extensions: RU/EN/Code/Laws/DD (15% of all blocks)
         if self.cfg.multilingual && self.rng.gen_bool(0.15) {
             out.push_str(&crate::v4_extensions::v4_block(&mut self.rng));
+
+        // Korean dialogue blocks (natural conversation patterns)
+        if self.rng.gen_bool(0.10) {
+            out.push_str(&crate::korean_dialogue::korean_dialogue_block(&mut self.rng));
+            return;
+        }
             return;
         }
 
