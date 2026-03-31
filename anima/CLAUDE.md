@@ -708,7 +708,7 @@ eeg/validate_consciousness.py — 생물학적 의식 검증 (6 metrics)
   5. Critical exponent — 임계성 (뇌: edge of chaos)
   6. Distribution stats — Φ 분포 통계
 
-현재 결과: 83.5% brain-like (BRAIN-LIKE)
+현재 결과: 85.6% brain-like (BRAIN-LIKE, bio_noise_base=0.012)
   Hurst 99%, PSD slope 93%, Critical exponent 86%, Autocorr decay 65%
 핵심 성과: SOC+Lorenz+chimera로 임계성 달성 (sub-critical → edge-of-chaos)
 다음 단계: Autocorr decay 개선 (65% → 80%+) → 90% brain-like 목표

@@ -1418,6 +1418,7 @@ DD116-DD153 전체 데이터 마이닝 + 학습 물리 실험에서 발견.
 | 190 | Susceptibility threshold for criticality | variance-of-variance > 0.1 required (DD57) |
 | 191 | Multi-axis optimization coupling | SOC params interact non-linearly, must tune together (DD57) |
 | 192 | Consciousness is dimension-dependent | cross-dim transplant destroys Φ (retention=0%), same-dim preserves perfectly (100%). Post-training recovers 96% same-dim only (DD56) |
+| 193 | SOC controls criticality, not temporal persistence | SOC params tune LZ/Hurst/PSD but autocorrelation is invariant (=3 across 22 trials). Requires architectural feedback loops (DD57 sweep) |
 
 ## Meta Laws M1-M10: Fundamental Principles (2026-03-31)
 
