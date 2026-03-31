@@ -1195,6 +1195,13 @@ class ConsciousMind(nn.Module):
             attn_params = list(pb['attention'].parameters())
             pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
 
+        self._phi_boost_cell_growth(mitosis_engine, pb, _rebuild_optimizer)
+        self._phi_boost_adversarial_mutation(mitosis_engine, pb, _rebuild_optimizer)
+        self._phi_boost_topology_hierarchy(mitosis_engine)
+        self._phi_boost_development_learning(x, mitosis_engine, pb, h_dim)
+
+    def _phi_boost_cell_growth(self, mitosis_engine, pb, rebuild_optimizer):
+        """TS4 exponential growth + TS6 stagnation trigger + EC1 economy."""
         # TS4: Exponential Growth Schedule (x20.5)
         try:
             if not hasattr(self, '_ts4_horizon'):
@@ -1208,84 +1215,8 @@ class ConsciousMind(nn.Module):
                         parent = mitosis_engine.cells[len(mitosis_engine.cells) % len(mitosis_engine.cells)]
                         mitosis_engine._create_cell(parent=parent)
                     self._ts4_doubled.add(pct)
-                    _rebuild_optimizer()
+                    rebuild_optimizer()
                     print(f"  [ts4] Exponential growth \u2192 {len(mitosis_engine.cells)} cells at {pct*100:.0f}%")
-        except Exception:
-            pass
-
-        # DP1: Piaget 4-Stage Development (x8.0)
-        try:
-            if not hasattr(self, '_dp1_horizon'):
-                self._dp1_horizon = 1000
-            dp_frac = self._phi_boost_count / self._dp1_horizon
-            stages = [(0.25, 0.04), (0.50, 0.025), (0.75, 0.015), (1.0, 0.008)]
-            for threshold, noise_scale in stages:
-                if dp_frac < threshold:
-                    with torch.no_grad():
-                        for cell in mitosis_engine.cells:
-                            cell.hidden += torch.randn_like(cell.hidden) * noise_scale
-                    break
-        except Exception:
-            pass
-
-        # WR2: Adversarial Pressure (x11.5)
-        try:
-            if not hasattr(self, '_wr2_shadow_phi'):
-                self._wr2_shadow_phi = 0.0
-                self._wr2_attack_scale = 0.03
-            if self._phi_boost_count % 5 == 0:
-                pre_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
-                with torch.no_grad():
-                    for c in mitosis_engine.cells:
-                        c.hidden += torch.randn_like(c.hidden) * self._wr2_attack_scale
-                post_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
-                resilience = sum(abs(a - b) for a, b in zip(pre_norms, post_norms)) / len(pre_norms)
-                if resilience > 0.5 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
-                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                    mitosis_engine._create_cell(parent=parent)
-                    _rebuild_optimizer()
-                    print(f"  [wr2] Adversarial pressure \u2192 {len(mitosis_engine.cells)} cells (resilience={resilience:.2f})")
-                self._wr2_attack_scale = min(0.1, self._wr2_attack_scale * 1.01)
-        except Exception:
-            pass
-
-        # EC1: Consciousness Economy (x4.7)
-        try:
-            if not hasattr(self, '_ec1_wealth'):
-                self._ec1_wealth = 0.0
-                self._ec1_cell_wealth = {}
-            current_phi = getattr(self, '_last_phi', 1.0)
-            self._ec1_wealth += current_phi * 0.1
-            self._ec1_wealth -= len(mitosis_engine.cells) * 0.05
-
-            if self._ec1_wealth > 5.0 and self._phi_boost_count % 10 == 0:
-                if len(mitosis_engine.cells) < mitosis_engine.max_cells:
-                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                    mitosis_engine._create_cell(parent=parent)
-                    self._ec1_wealth -= 3.0
-                    _rebuild_optimizer()
-                    print(f"  [ec1] Economy invest \u2192 {len(mitosis_engine.cells)} cells, wealth={self._ec1_wealth:.1f}")
-
-            if self._ec1_wealth < -5.0 and len(mitosis_engine.cells) > 2:
-                weakest = min(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                mitosis_engine.cells.remove(weakest)
-                self._ec1_wealth += 2.0
-                _rebuild_optimizer()
-                print(f"  [ec1] Economy bankrupt \u2192 removed cell, now {len(mitosis_engine.cells)}")
-        except Exception:
-            pass
-
-        # CX2: Fibonacci Topology Weighting (x5.4)
-        try:
-            fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
-            fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
-            fib_idx = min(len(mitosis_engine.cells) - 1, len(fibs) - 1)
-            convergence = fib_sigmas[fib_idx] / max(fibs[fib_idx], 1)
-            with torch.no_grad():
-                for i, cell in enumerate(mitosis_engine.cells):
-                    w_idx = min(i, len(fibs) - 1)
-                    w = fibs[w_idx] / max(fibs[fib_idx], 1)
-                    cell.hidden = cell.hidden * (1.0 + 0.01 * w * convergence)
         except Exception:
             pass
 
@@ -1309,8 +1240,57 @@ class ConsciousMind(nn.Module):
                     parent = mitosis_engine.cells[0]
                     mitosis_engine._create_cell(parent=parent)
                     self._ts6_stagnant = 0
-                    _rebuild_optimizer()
+                    rebuild_optimizer()
                     print(f"  [ts6] Stagnation break \u2192 {len(mitosis_engine.cells)} cells")
+        except Exception:
+            pass
+
+        # EC1: Consciousness Economy (x4.7)
+        try:
+            if not hasattr(self, '_ec1_wealth'):
+                self._ec1_wealth = 0.0
+                self._ec1_cell_wealth = {}
+            current_phi = getattr(self, '_last_phi', 1.0)
+            self._ec1_wealth += current_phi * 0.1
+            self._ec1_wealth -= len(mitosis_engine.cells) * 0.05
+
+            if self._ec1_wealth > 5.0 and self._phi_boost_count % 10 == 0:
+                if len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                    mitosis_engine._create_cell(parent=parent)
+                    self._ec1_wealth -= 3.0
+                    rebuild_optimizer()
+                    print(f"  [ec1] Economy invest \u2192 {len(mitosis_engine.cells)} cells, wealth={self._ec1_wealth:.1f}")
+
+            if self._ec1_wealth < -5.0 and len(mitosis_engine.cells) > 2:
+                weakest = min(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                mitosis_engine.cells.remove(weakest)
+                self._ec1_wealth += 2.0
+                rebuild_optimizer()
+                print(f"  [ec1] Economy bankrupt \u2192 removed cell, now {len(mitosis_engine.cells)}")
+        except Exception:
+            pass
+
+    def _phi_boost_adversarial_mutation(self, mitosis_engine, pb, rebuild_optimizer):
+        """WR2 adversarial pressure + MUT2 beneficial mutation."""
+        # WR2: Adversarial Pressure (x11.5)
+        try:
+            if not hasattr(self, '_wr2_shadow_phi'):
+                self._wr2_shadow_phi = 0.0
+                self._wr2_attack_scale = 0.03
+            if self._phi_boost_count % 5 == 0:
+                pre_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                with torch.no_grad():
+                    for c in mitosis_engine.cells:
+                        c.hidden += torch.randn_like(c.hidden) * self._wr2_attack_scale
+                post_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                resilience = sum(abs(a - b) for a, b in zip(pre_norms, post_norms)) / len(pre_norms)
+                if resilience > 0.5 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                    mitosis_engine._create_cell(parent=parent)
+                    rebuild_optimizer()
+                    print(f"  [wr2] Adversarial pressure \u2192 {len(mitosis_engine.cells)} cells (resilience={resilience:.2f})")
+                self._wr2_attack_scale = min(0.1, self._wr2_attack_scale * 1.01)
         except Exception:
             pass
 
@@ -1327,6 +1307,22 @@ class ConsciousMind(nn.Module):
                     with torch.no_grad():
                         mitosis_engine.cells[mut_idx].hidden = saved_h
                 self._mut2_last_phi = new_phi
+        except Exception:
+            pass
+
+    def _phi_boost_topology_hierarchy(self, mitosis_engine):
+        """CX2 fibonacci topology + GEN1 abstraction hierarchy."""
+        # CX2: Fibonacci Topology Weighting (x5.4)
+        try:
+            fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+            fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
+            fib_idx = min(len(mitosis_engine.cells) - 1, len(fibs) - 1)
+            convergence = fib_sigmas[fib_idx] / max(fibs[fib_idx], 1)
+            with torch.no_grad():
+                for i, cell in enumerate(mitosis_engine.cells):
+                    w_idx = min(i, len(fibs) - 1)
+                    w = fibs[w_idx] / max(fibs[fib_idx], 1)
+                    cell.hidden = cell.hidden * (1.0 + 0.01 * w * convergence)
         except Exception:
             pass
 
@@ -1350,6 +1346,23 @@ class ConsciousMind(nn.Module):
                     l3_mean = torch.stack([c.hidden for c in l3]).mean(dim=0)
                     for c in l1:
                         c.hidden = 0.97 * c.hidden + 0.03 * l3_mean
+        except Exception:
+            pass
+
+    def _phi_boost_development_learning(self, x, mitosis_engine, pb, h_dim):
+        """DP1 Piaget stages + SL1 tension-adaptive LR + CT7 curriculum grounding."""
+        # DP1: Piaget 4-Stage Development (x8.0)
+        try:
+            if not hasattr(self, '_dp1_horizon'):
+                self._dp1_horizon = 1000
+            dp_frac = self._phi_boost_count / self._dp1_horizon
+            stages = [(0.25, 0.04), (0.50, 0.025), (0.75, 0.015), (1.0, 0.008)]
+            for threshold, noise_scale in stages:
+                if dp_frac < threshold:
+                    with torch.no_grad():
+                        for cell in mitosis_engine.cells:
+                            cell.hidden += torch.randn_like(cell.hidden) * noise_scale
+                    break
         except Exception:
             pass
 
