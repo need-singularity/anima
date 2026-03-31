@@ -448,19 +448,56 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2, rank=128):
     for param in model.parameters():
         param.requires_grad = False
 
-    trainable = 0
+    trainable_names = []
     for module in model.modules():
         if isinstance(module, ParallelPureFieldMLP):
             for pname, param in module.named_parameters():
                 if "pf_" in pname or pname in ("alpha", "pf_scale"):
                     param.requires_grad = True
-                    trainable += param.numel()
+                    trainable_names.append(pname)
 
-    total = sum(p.numel() for p in model.parameters())
+    # Disable KV cache for training (saves VRAM, required for gradient checkpointing)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    # ── Accurate param counting for 4-bit quantized models ──
+    # With bitsandbytes NF4, quantized params store as uint8 but numel() reports
+    # the original (unquantized) size. We must check the actual storage to get
+    # real VRAM usage. For trainable count, only PureField params matter.
+    trainable = 0
+    frozen_fp = 0       # frozen float params (embeddings, norms, lm_head)
+    frozen_quant = 0    # frozen quantized params (4-bit linear layers)
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            trainable += p.numel()
+        else:
+            # Detect 4-bit quantized params (bitsandbytes stores as uint8/int8)
+            is_4bit = (hasattr(p, 'quant_state')
+                       or (not p.dtype.is_floating_point and p.dtype != torch.bool))
+            if is_4bit:
+                frozen_quant += p.numel()
+            else:
+                frozen_fp += p.numel()
+
+    total_reported = trainable + frozen_fp + frozen_quant
+    # For 4-bit, effective VRAM is ~0.5 bytes/param (NF4) vs 2 bytes/param (bf16)
+    frozen_quant_effective = frozen_quant // 4 if frozen_quant > 0 else 0
+    total_effective = trainable + frozen_fp + frozen_quant_effective
+
     print(f"  PureField added to last {count}/{total_layers} layers")
     print(f"  Savant: {savant_count} (dropout={GOLDEN_LOWER:.4f}), "
           f"Normal: {count - savant_count} (dropout={GOLDEN_CENTER:.4f})")
-    print(f"  Total params: {total:,}, Trainable: {trainable:,} ({trainable/total*100:.2f}%)")
+    print(f"  ── Parameter breakdown ──")
+    print(f"  Trainable (PureField): {trainable:,} ({trainable/total_reported*100:.2f}%)")
+    print(f"  Frozen (float):        {frozen_fp:,}")
+    if frozen_quant > 0:
+        print(f"  Frozen (4-bit NF4):    {frozen_quant:,} "
+              f"(reported) → ~{frozen_quant_effective:,} effective")
+        print(f"  Total reported: {total_reported:,} | "
+              f"Effective (VRAM): ~{total_effective:,}")
+    else:
+        print(f"  Total: {total_reported:,}")
+    print(f"  Trainable PureField params: {len(trainable_names)} tensors")
     return model
 
 
