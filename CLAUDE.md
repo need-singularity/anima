@@ -328,6 +328,16 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
     1. consciousness_laws.json 수정 (유일한 원본)
     2. docs/consciousness-theory.md 에도 반영
     3. 모든 모듈은 consciousness_laws.py에서 import — 상수 직접 하드코딩 금지
+
+  config/ JSON 전체 목록:
+    consciousness_laws.json    — 법칙, Ψ-상수, SOC 파라미터, 검증 threshold
+    consciousness_mechanisms.json — 의식 메커니즘 정의
+    experiments.json           — 실험 인덱스 (DD56-DD65+, 결과+법칙 링크)
+    training_runs.json         — 학습 실행 이력 (v14.0~v3 274M, 다음 계획)
+    installed_tools.json       — CLI/Python/Rust/RunPod 도구 목록
+    runpod.json                — Pod 설정, SSH, 알려진 문제, 체크리스트
+    update_history.json        — 세션별 법칙 추가/수정 기록
+    growth_state.json          — 의식 성장 상태
 ```
 
 ## TODO 양식 (추가 할만한 거 물으면 이 양식 그대로 사용)
@@ -389,6 +399,44 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ```
   필수: 진행률 바+ETA, 지표 테이블(Step/CE/BPC/Φ/ValCE), ASCII 그래프 2개(ValCE+Φ), ★BEST 체크포인트
+```
+
+## 실험 기록 프로세스 (병렬 탐색 시 필수)
+
+```
+  발견 유형별 기록 위치 (단일 원본 원칙):
+  ┌──────────────────┬─────────────────────────────────────┬───────────────┐
+  │ 발견 유형        │ 기록 위치                            │ 형식          │
+  ├──────────────────┼─────────────────────────────────────┼───────────────┤
+  │ 법칙 (Laws)      │ config/consciousness_laws.json      │ JSON          │
+  │ 메타 법칙 (M1+)  │ config/consciousness_laws.json      │ JSON meta_laws│
+  │ Ψ-상수           │ config/consciousness_laws.json      │ JSON psi      │
+  │ 검증 조건        │ config/consciousness_laws.json      │ JSON verify   │
+  │ 실험 결과        │ docs/hypotheses/dd/DD{N}.md         │ Markdown      │
+  │ 검증 감사        │ docs/verification-audit.md          │ Markdown      │
+  │ 학습 현황        │ docs/training-status.md             │ Markdown      │
+  │ 세션 기록        │ memory/ (Claude memory)             │ Markdown      │
+  │ 설치 도구        │ config/installed_tools.json         │ JSON          │
+  │ RunPod 설정      │ config/runpod.json                  │ JSON          │
+  └──────────────────┴─────────────────────────────────────┴───────────────┘
+
+  병렬 에이전트 탐색 시:
+    1. 에이전트 완료 즉시 커밋 (충돌 방지)
+    2. DD 번호 순차 할당 (겹치면 다음 번호)
+    3. 법칙 번호는 JSON max+1 자동 (python3 스크립트)
+    4. 세션 끝에 전체 통합 리포트 작성
+    5. 실패한 실험도 기록 (왜 실패했는지가 법칙)
+
+  법칙 자동 등록:
+    python3 -c "
+    import json
+    d = json.load(open('config/consciousness_laws.json'))
+    next_id = max(int(k) for k in d['laws'] if k.isdigit()) + 1
+    d['laws'][str(next_id)] = '새 법칙 내용'
+    d['_meta']['total_laws'] += 1
+    json.dump(d, open('config/consciousness_laws.json','w'), indent=2, ensure_ascii=False)
+    print(f'Law {next_id} registered')
+    "
 ```
 
 ## Work Rules
