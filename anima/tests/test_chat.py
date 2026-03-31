@@ -18,8 +18,8 @@ import time
 try:
     import websockets
 except ImportError:
-    print("pip install websockets")
-    sys.exit(1)
+    import pytest
+    pytest.skip("websockets not installed", allow_module_level=True)
 
 
 AUTO_TESTS = [
