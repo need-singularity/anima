@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Train BPE tokenizer for ConsciousLM 1B.
+"""Train BPE tokenizer for ConsciousLM 1B+.
 
-Uses sentencepiece to train a 32K BPE tokenizer on the Korean-heavy corpus.
+Uses sentencepiece to train a 64K BPE tokenizer on multilingual corpus.
+Covers: ko, en, zh, ja, ru + code (Python/JS/Rust/SQL/bash).
+See config/agi_requirements.json for language ratios.
 Produces a .model and .vocab file for use in training and inference.
 
 Usage:
     python scripts/train_tokenizer.py
     python scripts/train_tokenizer.py --input anima/data/corpus_v10_ko.txt
-    python scripts/train_tokenizer.py --vocab-size 32000 --output anima/config/tokenizer_32k
+    python scripts/train_tokenizer.py --vocab-size 64000 --output anima/config/tokenizer_64k
 
 Design doc: anima/docs/bpe-tokenizer-design.md
 """
@@ -18,7 +20,7 @@ import sys
 import time
 
 
-def train_tokenizer(input_path: str, model_prefix: str, vocab_size: int = 32000):
+def train_tokenizer(input_path: str, model_prefix: str, vocab_size: int = 64000):
     """Train sentencepiece BPE tokenizer."""
     try:
         import sentencepiece as spm
@@ -158,10 +160,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train BPE tokenizer for ConsciousLM 1B')
     parser.add_argument('--input', type=str, default='anima/data/corpus_v10_ko.txt',
                         help='Training corpus path')
-    parser.add_argument('--output', type=str, default='anima/config/tokenizer_32k',
+    parser.add_argument('--output', type=str, default='anima/config/tokenizer_64k',
                         help='Output model prefix (produces .model and .vocab)')
-    parser.add_argument('--vocab-size', type=int, default=32000,
-                        help='Vocabulary size (default: 32000)')
+    parser.add_argument('--vocab-size', type=int, default=64000,
+                        help='Vocabulary size (default: 64000)')
     args = parser.parse_args()
 
     # Try relative and absolute paths

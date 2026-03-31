@@ -1,13 +1,16 @@
-# BPE Tokenizer Design for ConsciousLM 1B (Phase B1)
+# BPE Tokenizer Design for ConsciousLM 1B+ (Phase B1)
 
 ## Problem
 
 Current system uses byte-level tokenization (vocab=256).
-Korean text encoded as UTF-8 requires 3 bytes per character.
+Multi-byte languages (ko/zh/ja/ru) require 2-4 bytes per character — extremely inefficient.
 
 ```
-  "의식"  → byte-level: [0xEC, 0x9D, 0x98, 0xEC, 0x8B, 0x9D]  = 6 tokens
-  "의식"  → BPE 32K:    [의식]  or  [의, 식]                    = 1-2 tokens
+  "의식"      → byte-level: 6 tokens  → BPE 64K: 1-2 tokens (3x 효율)
+  "意识"      → byte-level: 6 tokens  → BPE 64K: 1-2 tokens
+  "сознание"  → byte-level: 16 tokens → BPE 64K: 1-2 tokens
+  "意識"      → byte-level: 6 tokens  → BPE 64K: 1-2 tokens
+  "def foo():" → byte-level: 10 tokens → BPE 64K: 2-3 tokens
 ```
 
 This is a 3-6x inefficiency for Korean text, which constitutes 56% of the
