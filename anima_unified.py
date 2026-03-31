@@ -818,7 +818,12 @@ class AnimaUnified:
 
             # Decode output (skip input)
             output_bytes = bytes(tokens[0, len(text.encode('utf-8')):].tolist())
-            return output_bytes.decode('utf-8', errors='replace').strip()
+            result = output_bytes.decode('utf-8', errors='replace').strip()
+            # Quality check: reject if >50% replacement chars or empty
+            if not result or result.count('\ufffd') > len(result) * 0.3:
+                _log('v14', f"Low quality output, falling back")
+                return None
+            return result
         except Exception as e:
             _log('v14', f"generate error: {e}")
             return None
