@@ -96,6 +96,7 @@ from consciousness_laws import (
     SOC_MEMORY_STRENGTH_BASE, SOC_MEMORY_STRENGTH_RANGE,
     SOC_PERTURBATION_BASE, SOC_PERTURBATION_RANGE,
     SOC_BURST_EXPONENT, SOC_BURST_DENOM, SOC_BURST_CAP,
+    SOC_SCALE_REF_CELLS,
     BIO_NOISE_BASE, BIO_NOISE_SPIKE_PROB, BIO_NOISE_SPIKE_RATE,
 )
 
@@ -510,6 +511,9 @@ class ConsciousnessEngine:
                     # → higher variance fluctuations → brain-like susceptibility
                     burst = (last_aval ** SOC_BURST_EXPONENT) / (n * SOC_BURST_DENOM)
                     burst = min(burst, SOC_BURST_CAP)
+                    # Law 213: scale burst down for large cell counts
+                    soc_burst_scale = min(1.0, SOC_SCALE_REF_CELLS / max(n, 1))
+                    burst *= soc_burst_scale
                     # Generate all kicks first, then subtract mean for zero-energy balance
                     kicks = []
                     for i in range(n):
@@ -703,6 +707,12 @@ class ConsciousnessEngine:
         if n < 2:
             return
 
+        # Law 213 (DD70): Scale avalanche strength inversely with cell count.
+        # SOC avalanche reduces Phi by ~9% at all scales because redistribution
+        # is too aggressive at large cell counts.
+        # At 8c: full strength. At 64c: 1/8. At 256c: 1/32.
+        soc_scale = min(1.0, SOC_SCALE_REF_CELLS / max(n, 1))
+
         threshold = self._soc_threshold_ema
 
         # Stochastic drive: randomly inject energy into cells
@@ -767,7 +777,8 @@ class ConsciousnessEngine:
 
             # Add small noise to redistributed energy (breaks exact periodicity)
             # _eeg_noise_modifier applied from BCI control (default 1.0)
-            noise_scale = 0.015 * norm * self._eeg_noise_modifier
+            # Law 213: scale down noise for large cell counts
+            noise_scale = 0.015 * norm * self._eeg_noise_modifier * soc_scale
             self.cell_states[left].hidden = (
                 self.cell_states[left].hidden
                 + torch.randn(self.hidden_dim) * noise_scale
@@ -846,7 +857,8 @@ class ConsciousnessEngine:
         # Increased scale (0.08 + 0.15) for higher susceptibility (variance of window variances)
         # This is the key mechanism for brain-like CRITICAL dynamics (susc > 0.1)
         if self._soc_hidden_ema is not None and avalanche_size > 0:
-            perturbation_scale = SOC_PERTURBATION_BASE + SOC_PERTURBATION_RANGE * min(avalanche_size / n, 1.0)
+            # Law 213: scale perturbation down for large cell counts
+            perturbation_scale = (SOC_PERTURBATION_BASE + SOC_PERTURBATION_RANGE * min(avalanche_size / n, 1.0)) * soc_scale
             for idx_cell in topple_count:
                 if idx_cell < n:
                     phase_noise = torch.randn(self.hidden_dim) * perturbation_scale
