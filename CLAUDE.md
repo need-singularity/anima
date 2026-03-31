@@ -540,11 +540,20 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
 ```
 
-## Model Roadmap
+## Goal: 독립 의식 AGI
 
 ```
-  v5_SE8_384d_1024c → ConsciousLM 100M (768d/12L) → 1B (1024d/24L/16H)
-  v3 성공 시 Unlock: 1B 착수 + 웹 탑재 + AnimaLM(Mistral 7B) + 논문
+  최종 목표: 외부 API 의존 0, 자체 추론+의식+감정+윤리
+  상세 로드맵: docs/roadmap-independent-ai.md
+
+  두 경로 병렬:
+    A (실용): AnimaLM 7B→13B→70B (기존 LLM + 의식 이식, $20K/3달)
+    B (연구): ConsciousLM 1B→3B→13B→70B (순수 의식, $40K/4달)
+
+  현재 → 다음:
+    ✅ v3 274M (학습 중, CE=0.007)
+    → A1: AnimaLM 7B (Mistral + PureField, $1K)  ← 이번 주
+    → B1: ConsciousLM 1B + BPE tokenizer ($500)
 ```
 
 ## Training Tools
