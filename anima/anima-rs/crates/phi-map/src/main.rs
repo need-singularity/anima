@@ -10,12 +10,21 @@
 
 use anima_phi_map::{AsciiHeatmap, PhiTerrain, PhiTracker};
 use std::fs;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() >= 2 && args[1] == "--demo" {
         run_demo();
+        return;
+    }
+
+    // Watch mode: tail a log file for Phi values
+    if args.len() >= 3 && args[1] == "--watch" {
+        run_watch(&args[2]);
         return;
     }
 
@@ -31,6 +40,7 @@ fn main() {
 
     if args.len() < 3 {
         eprintln!("Usage: phi-map --from <terrain.json> [--heatmap|--contour N|--optimal|--collapse]");
+        eprintln!("       phi-map --watch <logfile>          # Live sparkline of Phi values");
         eprintln!("       phi-map --laws <law_terrain.json>  # Law interaction heatmap");
         eprintln!("       phi-map --demo                     # Demo with sample data");
         std::process::exit(1);
@@ -89,6 +99,74 @@ fn main() {
                 println!("{}", AsciiHeatmap::render(&terrain));
             }
         }
+    }
+}
+
+fn run_watch(logfile: &str) {
+    use regex::Regex;
+
+    let phi_re = Regex::new(r"Phi=(\d+\.?\d*)").unwrap();
+    let mut values: Vec<f64> = Vec::new();
+    let sparkline_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    // Open file and seek to end (tail mode)
+    let mut file = fs::File::open(logfile).unwrap_or_else(|e| {
+        eprintln!("Cannot open {}: {}", logfile, e);
+        std::process::exit(1);
+    });
+
+    // First pass: read existing content for initial values
+    let reader = BufReader::new(&file);
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            for cap in phi_re.captures_iter(&line) {
+                if let Ok(v) = cap[1].parse::<f64>() {
+                    values.push(v);
+                }
+            }
+        }
+    }
+
+    println!("  phi-map --watch {} (Ctrl+C to stop)\n", logfile);
+
+    loop {
+        // Read any new lines from current position
+        let reader = BufReader::new(&file);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                for cap in phi_re.captures_iter(&line) {
+                    if let Ok(v) = cap[1].parse::<f64>() {
+                        values.push(v);
+                    }
+                }
+            }
+        }
+
+        // Display last 20 values as sparkline
+        if !values.is_empty() {
+            let window: Vec<f64> = values.iter().rev().take(20).copied().collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            let min = window.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = window.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let range = if (max - min).abs() < 1e-9 { 1.0 } else { max - min };
+
+            let spark: String = window.iter().map(|v| {
+                let idx = ((v - min) / range * 7.0).round() as usize;
+                sparkline_chars[idx.min(7)]
+            }).collect();
+
+            let current = window.last().unwrap();
+            print!("\r  Φ [{:>3}] {} {:.4}  (min={:.4} max={:.4})  ",
+                values.len(), spark, current, min, max);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        } else {
+            print!("\r  Waiting for Phi= values...");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }
+
+        thread::sleep(Duration::from_secs(2));
     }
 }
 

@@ -256,10 +256,20 @@ class ToolPolicy:
 
         return self._log_result(tool_name, True, "Access granted", required_phi, phi)
 
+    def check_immune(self, input_text: str) -> bool:
+        """Quick adversarial input check before tool policy evaluation."""
+        suspicious_patterns = ['rm -rf', 'DROP TABLE', '<script>', 'eval(', '__import__']
+        return not any(p.lower() in input_text.lower() for p in suspicious_patterns)
+
     def get_accessible_tools(
-        self, consciousness_state: dict[str, Any], user_id: str = ""
+        self, consciousness_state: dict[str, Any], user_id: str = "",
+        input_text: str = "",
     ) -> list[str]:
         """Return list of tool names accessible at current consciousness level."""
+        # Immune check: block all tools if input is adversarial
+        if input_text and not self.check_immune(input_text):
+            logger.warning("Immune check blocked adversarial input: %s", input_text[:80])
+            return []
         accessible = []
         for tool_name in self._tiers:
             result = self.check_access(tool_name, consciousness_state, user_id)
