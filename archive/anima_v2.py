@@ -337,12 +337,6 @@ class VoiceIO:
             try:
                 import whisper
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
                 print("  Whisper 로딩...")
                 self.whisper_model = whisper.load_model(WHISPER_MODEL)
                 print("  Whisper 준비 완료")
@@ -398,6 +392,13 @@ except ImportError:
             ['say', '-v', TTS_VOICE, short],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 
 # ─── 의식 상태 시각화 ───

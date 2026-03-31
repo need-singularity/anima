@@ -205,14 +205,14 @@ class ActionEngine:
             self._errors += 1
             return {'success': False, 'output': '', 'error': str(e)}
 
-    def _check_security(self, code: str) -> str | None:
+    def _check_security(self, code: str) -> 'str | None':
         """위험 패턴 검사. 위반 시 설명 문자열, 안전하면 None."""
         for pattern in BLOCKED_PATTERNS:
             if re.search(pattern, code):
                 return f'차단된 패턴: {pattern}'
         return None
 
-    def _check_imports(self, code: str) -> str | None:
+    def _check_imports(self, code: str) -> 'str | None':
         """import 검사. 허용되지 않은 모듈이 있으면 모듈명, 안전하면 None."""
         # import X, from X import Y
         import_pattern = re.compile(r'(?:^|\n)\s*(?:import|from)\s+(\w+)')

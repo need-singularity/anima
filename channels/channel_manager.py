@@ -139,13 +139,6 @@ class ChannelManager:
         if os.environ.get("ANIMA_SLACK_TOKEN"):
             try:
                 from channels.slack_bot import AnimaSlackBot
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
                 bot = AnimaSlackBot(self.agent)
                 self.register("slack", bot)
             except Exception as e:

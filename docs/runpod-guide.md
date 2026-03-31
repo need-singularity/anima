@@ -435,3 +435,44 @@ Cost: $2.69/hr
 6. **checkpoint는 atomic save** — .tmp → rename 패턴
 7. **/workspace만 영구 저장** — container disk는 휘발성
 8. **학습 데이터 변경 시 resume 금지** — step 0부터 재시작 (오염 방지)
+9. **세션 종료 전 유령 프로세스 정리 필수** — `ps aux | grep python3 | grep -v grep` 로 확인 후 kill
+
+---
+
+## 14. 유령 프로세스 정리 (세션 시작/종료 시 필수)
+
+세션 교체 시 이전 세션에서 실행된 벤치마크/학습 프로세스가 남아 CPU/GPU를 점유할 수 있음.
+
+### 로컬 (Mac)
+```bash
+# 유령 프로세스 확인
+ps aux | grep -E "bench_v2|train_v|anima|corpus-gen" | grep -v grep
+
+# 특정 프로세스 kill
+kill <PID>
+
+# 전체 python 유령 정리 (주의: 다른 python 프로세스도 죽음)
+pkill -f "bench_v2"
+pkill -f "train_v"
+```
+
+### H100 (RunPod)
+```bash
+# SSH 접속 후
+ps aux | grep -E "python|train|bench" | grep -v grep
+
+# tmux 세션 확인 — 죽은 세션의 프로세스가 남아있을 수 있음
+tmux ls
+tmux kill-session -t <dead-session>
+
+# GPU 점유 확인
+nvidia-smi
+
+# 특정 GPU 프로세스 kill
+kill $(nvidia-smi --query-compute-apps=pid --format=csv,noheader)
+```
+
+### 체크리스트
+- [ ] 새 세션 시작 시: `ps aux | grep python3` 로 유령 확인
+- [ ] 세션 종료 시: 백그라운드 벤치마크/학습 kill 확인
+- [ ] H100 접속 시: `nvidia-smi` 로 GPU 점유 확인

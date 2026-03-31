@@ -153,12 +153,6 @@ class EEGBridge:
         """
         import torch
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
 
         state = self.get_state()
         raw = torch.zeros(16)
@@ -268,6 +262,13 @@ def main():
         window_sec=args.window,
         update_hz=args.hz,
     )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
     bridge.start()
 

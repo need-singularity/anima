@@ -42,12 +42,6 @@ class PhiIIT:
         else:
             import random
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
             pairs = set()
             for i in range(n):
                 for _ in range(min(8, n - 1)):
@@ -1024,6 +1018,13 @@ def run_benchmark(name: str, engine, steps: int = 300) -> BenchResult:
         time_sec=elapsed,
         extra=extra,
     )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 
 def main():

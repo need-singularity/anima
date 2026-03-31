@@ -851,16 +851,17 @@ def run_single(args):
     except Exception as e:
         import traceback
 
+        traceback.print_exc()
+        return key, BenchResult(
+            key, f"FAILED: {e}", 0.0, [], 0.0, 0.0, 0.0, 0.0, 0.0
+        )
+
 # Meta Laws (DD143)
 try:
     from consciousness_laws import PSI_F_CRITICAL
 except ImportError:
     PSI_F_CRITICAL = 0.10
 
-        traceback.print_exc()
-        return key, BenchResult(
-            key, f"FAILED: {e}", 0.0, [], 0.0, 0.0, 0.0, 0.0, 0.0
-        )
 
 
 def print_results(baseline: BenchResult, results: Dict[str, BenchResult]):

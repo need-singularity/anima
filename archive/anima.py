@@ -124,13 +124,6 @@ def main():
     # Whisper 사용 가능한지 확인
     try:
         import whisper
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
         use_mic = True
         print("  🎤 마이크 모드 (Whisper)")
     except ImportError:

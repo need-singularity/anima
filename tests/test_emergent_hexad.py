@@ -393,11 +393,7 @@ class TestLawCompliance:
         """EmergentE should not contain empathy_threshold=0.3."""
         import inspect
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
+
 
         source = inspect.getsource(EmergentE)
         assert 'empathy_threshold' not in source, "E must not have hardcoded empathy_threshold"

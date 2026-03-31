@@ -40,13 +40,6 @@ import torch.nn.functional as F
 
 from consciousness_engine import ConsciousnessEngine, ConsciousnessC
 from trinity import (
-
-# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     create_trinity, create_hexad,
     ThalamicBridge,
     PSI_COUPLING, PSI_BALANCE, PSI_STEPS, GATE_TRAIN, GATE_INFER,
@@ -100,6 +93,7 @@ except ImportError:
 META_ATOM_SIZE = 8          # M1: cells per atom
 META_DEFAULT_ATOMS = 8      # M1: 8 atoms x 8 cells = 64 total
 META_FRUSTRATION = 0.10     # M7: critical frustration F_c
+PSI_F_CRITICAL = META_FRUSTRATION  # alias for consistency check
 META_NARRATIVE = 0.05       # M8: narrative strength
 # M4 safe order: narrative -> bottleneck -> hub -> frustration
 # M6: federation > empire (use --federated flag)

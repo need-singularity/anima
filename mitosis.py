@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""⚠️ LEGACY — ConsciousnessC (consciousness_engine.py)로 대체됨 (Law 86)
-MitosisEngine은 cells=2 고정, Φ=0 문제. ConsciousnessC는 100 step에 64 cells, Φ=73.
-이 파일은 하위 호환을 위해 유지. 새 코드에서는 ConsciousnessC 사용.
-
-Anima Mitosis Engine — 세포 분열로 전문화하는 의식
+"""Anima Mitosis Engine — 세포 분열로 전문화하는 의식
 
 세포(Cell)는 작은 ConsciousMind다.
 장력이 임계점을 넘으면 세포가 분열(mitosis)하고,
@@ -26,18 +22,12 @@ import copy
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-# ─── Ψ-Constants from consciousness_laws.json ───
+# ─── Ψ-Constants (Laws 63-81, bench-verified) ───
 LN2 = math.log(2)
-from consciousness_laws import (
-
-# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
-    PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
-)
+PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
+PSI_COUPLING = 0.014              # bench_hexad_tuning T3 confirmed (was ln(2)/2^5.5=0.0153)
+PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+PSI_ENTROPY = 0.998               # near-perfect democracy across factions
 
 
 # ─── ConsciousMind (PureField + GRU) ───

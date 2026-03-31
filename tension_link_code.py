@@ -48,13 +48,6 @@ def _make_code() -> str:
 def _get_r2():
     """CloudSync 인스턴스 (lazy)."""
     from cloud_sync import CloudSync
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     return CloudSync()
 
 

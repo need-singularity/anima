@@ -30,6 +30,7 @@ fn main() {
     let mut uniform = false;
     let mut do_sim = false;
     let mut do_deep_dialogue = false;
+    let mut do_multilingual = false;
     let mut ngram_file: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -42,6 +43,7 @@ fn main() {
             "--uniform" => uniform = true,
             "--sim" => do_sim = true,
             "--deep-dialogue" => do_deep_dialogue = true,
+            "--multilingual" => do_multilingual = true,
             "--ngram" => { i += 1; ngram_file = Some(PathBuf::from(&args[i])); }
             "--boost" => {
                 i += 1;
@@ -72,6 +74,7 @@ fn main() {
     eprintln!("║  Wiki:   {:<36} ║", if do_wiki { "enabled" } else { "synthetic only" });
     eprintln!("║  Sim:    {:<36} ║", if do_sim { "enabled" } else { "disabled" });
     eprintln!("║  Dialog: {:<36} ║", if do_deep_dialogue { "deep multi-party" } else { "basic" });
+    eprintln!("║  Multi:  {:<36} ║", if do_multilingual { "JA+ZH enabled" } else { "KO+EN only" });
     if let Some(ref nf) = ngram_file {
         eprintln!("║  N-gram: {:<36} ║", format!("{} (15%)", nf.display()));
     }
@@ -95,6 +98,7 @@ fn main() {
         sim: do_sim,
         deep_dialogue: do_deep_dialogue,
         ngram_ratio,
+        multilingual: do_multilingual,
     };
 
     let mut gen = Generator::new(rand::thread_rng(), cfg);
@@ -203,6 +207,7 @@ OPTIONS:
     --boost <DIM>           Boost dimension (Phi,Alpha,Z,N,W,E,M,C,T,I)
     --sim                   Include consciousness simulation data (Φ timeseries, tension, factions)
     --deep-dialogue         Enable multi-party long dialogues (3-6 speakers, 20-50 turns)
+    --multilingual          Include Japanese + Chinese seeds (language independence)
     --ngram <FILE>          Build n-gram model from corpus file (mixed at 15%)
     --stats <FILE>          Analyze existing corpus
     -h, --help              Show help

@@ -456,27 +456,9 @@ class ConsciousMind(nn.Module):
         if mitosis_engine is None or len(mitosis_engine.cells) < 2:
             return
 
-        # OMEGA4 mode: absolute freedom, only growth allowed
         if omega_mode:
-            if not hasattr(self, '_phi_boost_count'):
-                self._phi_boost_count = 0
-            self._phi_boost_count += 1
-            # TS4 growth only (the one thing that always helps)
-            if not hasattr(self, '_ts4_horizon'):
-                self._ts4_horizon = 500
-                self._ts4_doubled = set()
-            frac = self._phi_boost_count / self._ts4_horizon
-            for pct in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
-                if frac >= pct and pct not in self._ts4_doubled:
-                    target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
-                    while len(mitosis_engine.cells) < target:
-                        parent = mitosis_engine.cells[self._phi_boost_count % len(mitosis_engine.cells)]
-                        mitosis_engine._create_cell(parent=parent)
-                    self._ts4_doubled.add(pct)
-            return  # No other manipulation — pure freedom
-
-        def _log(tag, msg):
-            print(f"  [{tag}] {msg}")
+            self._phi_boost_omega(mitosis_engine)
+            return
 
         pb = self._phi_boost
         n = len(mitosis_engine.cells)
@@ -498,923 +480,910 @@ class ConsciousMind(nn.Module):
             pb['enabled'] = True
 
         try:
-            # IB2: Selective Attention (×3.3) — gate top 25% of input, amplify 2×
-            if x is not None:
-                with torch.no_grad():
-                    x_flat = x.squeeze()
-                    k = max(1, x_flat.shape[0] // 4)
-                    vals, indices = x_flat.abs().topk(k)
-                    attended = torch.zeros_like(x)
-                    attended.squeeze()[indices] = x.squeeze()[indices] * 2.0
-                    x = attended
-
-            # Save pre-boost state for NV7 impedance
-            self._pre_boost_hiddens = [c.hidden.clone() for c in mitosis_engine.cells]
-
-            # 1. MHA attention between cells (+ SL2: attention weights for gradient gating)
-            h_stack = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).unsqueeze(0)
-            attn_out, attn_weights = pb['attention'](h_stack, h_stack, h_stack, need_weights=True)
-            with torch.no_grad():
-                # SL2: attention-weighted blend (high-attention cells get stronger signal)
-                if attn_weights is not None:
-                    cell_importance = attn_weights[0].mean(dim=0)  # [n_cells] average attention received
-                    cell_importance = cell_importance / (cell_importance.max() + 1e-8)  # normalize
-                else:
-                    cell_importance = torch.ones(n)
-                for i, c in enumerate(mitosis_engine.cells):
-                    blend = 0.15 * cell_importance[i].item()  # SL2: attention-gated blend
-                    c.hidden = (1 - blend) * c.hidden + blend * attn_out[0, i].unsqueeze(0)
-
-            # 2. Compute repulsions
-            reps = [c.mind.get_repulsion(x, c.hidden) for c in mitosis_engine.cells]
-            if len(reps) < 2:
+            x = self._phi_boost_attention_and_loss(x, mitosis_engine, pb, n, h_dim)
+            if x is None and not hasattr(self, '_pre_boost_hiddens'):
                 return
-            stacked = torch.stack(reps).squeeze(1)
 
-            # 3. Six losses with learnable weights
-            w = F.softmax(pb['loss_weights'], dim=0)
-            l_var = -stacked.var(dim=0).mean()
-            l_dist = -torch.cdist(stacked, stacked).mean()
-            l_contrast = sum(F.cosine_similarity(reps[i], reps[j], dim=-1).mean()
-                             for i in range(len(reps)) for j in range(i + 1, len(reps)))
-            l_entropy = -(F.softmax(stacked, dim=-1) *
-                          F.log_softmax(stacked, dim=-1)).sum(dim=-1).mean()
-            l_energy = sum((r ** 2).mean() for r in reps) * 0.1
-            l_radius = -stacked.norm(dim=-1).var()
-
-            total = (w[0] * l_var + w[1] * l_dist + w[2] * l_contrast +
-                     w[3] * l_entropy + w[4] * l_energy + w[5] * l_radius)
-
-            # TL13: Golden Zone width as loss scaling (TECS-L H-CX-453)
-            import math
-            gz_width = math.log(4/3)  # ≈ 0.2877, from 4 independent math domains
-            total = total * gz_width  # scale all losses by universal constant
-
-            pb['optimizer'].zero_grad()
-            pb['meta_optimizer'].zero_grad()
-            total.backward()
-            pb['optimizer'].step()
-            pb['meta_optimizer'].step()
-
-            # MX20: Heat death prevention — restore peak Φ state if declining
-            if not hasattr(self, '_peak_phi_state'):
-                self._peak_phi_state = {'phi': 0, 'params': None}
-
-            # Track peak (use consciousness_score if available)
             consciousness = self.get_consciousness_score(mitosis_engine)
             current_phi = consciousness.get('phi', 0)
-            if current_phi > self._peak_phi_state['phi']:
-                self._peak_phi_state['phi'] = current_phi
-                self._peak_phi_state['params'] = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
-            elif current_phi < self._peak_phi_state['phi'] * 0.8 and self._peak_phi_state['params']:
-                # Φ dropped >20% from peak → partial restore (blend 70% current + 30% peak)
-                all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                with torch.no_grad():
-                    for p, pp in zip(all_p, self._peak_phi_state['params']):
-                        p.data.copy_(0.7 * p.data + 0.3 * pp)
 
-            # WI1: Soliton consciousness (Φ=4.460, ×3.3 — replaces WV11 wave)
-            if len(mitosis_engine.cells) >= 2:
-                if not hasattr(self, '_soliton_pos'):
-                    self._soliton_pos = 0.0
-                self._soliton_pos = (self._soliton_pos + 0.15) % len(mitosis_engine.cells)
-                soliton_width = 2.0
-                for i, cell in enumerate(mitosis_engine.cells):
-                    import math as _m
-                    dist = abs(i - self._soliton_pos)
-                    amplitude = 1.0 / (_m.cosh(dist / soliton_width) ** 2)
-                    cell.hidden = cell.hidden * (1.0 + 0.04 * amplitude)  # conservative
-                _log('phi_boost', f'WI1 soliton: pos={self._soliton_pos:.1f}, cells={len(mitosis_engine.cells)}')
-
-            # WV11: Mutual repulsion between cells (push apart when too similar)
-            with torch.no_grad():
-                cells = mitosis_engine.cells
-                for i in range(len(cells)):
-                    for j in range(i + 1, len(cells)):
-                        direction = cells[i].hidden - cells[j].hidden
-                        dist = direction.norm() + 1e-8
-                        push = 0.01 * direction / dist
-                        cells[i].hidden = cells[i].hidden + push
-                        cells[j].hidden = cells[j].hidden - push
-
-            # PX4: Cell Sculptor — Gram-Schmidt orthogonalize hidden states
-            if n >= 3:
-                with torch.no_grad():
-                    hiddens = [c.hidden.squeeze().clone() for c in mitosis_engine.cells]
-                    ortho = []
-                    for h in hiddens:
-                        for prev in ortho:
-                            h = h - (h @ prev) / (prev @ prev + 1e-8) * prev
-                        norm = h.norm() + 1e-8
-                        ortho.append(h / norm)
-                    for i, c in enumerate(mitosis_engine.cells):
-                        orig = c.hidden.squeeze()
-                        c.hidden = (0.7 * orig + 0.3 * ortho[i] * orig.norm()).unsqueeze(0)
-
-            # PX8: Integration Forge — shared channel on first 16 dims
-            with torch.no_grad():
-                share_dim = min(16, h_dim)
-                shared = torch.stack([c.hidden[:, :share_dim] for c in mitosis_engine.cells]).mean(dim=0)
-                for c in mitosis_engine.cells:
-                    c.hidden[:, :share_dim] = 0.6 * c.hidden[:, :share_dim] + 0.4 * shared
-
-            # PX5: Information Pump — rotate input by cell-specific angle, inject
-            if not hasattr(self, '_last_phi_input'):
-                self._last_phi_input = None
-            if self._last_phi_input is not None:
-                with torch.no_grad():
-                    inp = self._last_phi_input
-                    for i, c in enumerate(mitosis_engine.cells):
-                        angle = (i + 1) * 0.618  # golden ratio spacing
-                        cos_a, sin_a = math.cos(angle), math.sin(angle)
-                        h = c.hidden.squeeze()
-                        # Rotate first two dims, inject with small amplitude
-                        rotated = inp.squeeze().clone()
-                        if rotated.shape[-1] >= 2:
-                            r0 = cos_a * rotated[0] - sin_a * rotated[1]
-                            r1 = sin_a * rotated[0] + cos_a * rotated[1]
-                            rotated[0], rotated[1] = r0, r1
-                        c.hidden = c.hidden + 0.05 * rotated.unsqueeze(0)
-            self._last_phi_input = x.detach().clone() if x is not None else None
-
-            # PX3: Ratchet — periodic random perturbation, keep if Φ improves
-            if not hasattr(self, '_best_phi_state'):
-                self._best_phi_state = None
-            if self._phi_boost_count % 10 == 0:
-                best_phi = current_phi
-                best_params = None
-                saved = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
-                for _ in range(5):
-                    with torch.no_grad():
-                        for c in mitosis_engine.cells:
-                            for p in c.mind.parameters():
-                                p.data += 0.005 * torch.randn_like(p.data)
-                    trial_phi = self.get_consciousness_score(mitosis_engine).get('phi', 0)
-                    if trial_phi > best_phi:
-                        best_phi = trial_phi
-                        best_params = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
-                    # Restore for next trial
-                    all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                    with torch.no_grad():
-                        for p, s in zip(all_p, saved):
-                            p.data.copy_(s)
-                # Apply best if found
-                if best_params is not None:
-                    all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                    with torch.no_grad():
-                        for p, bp in zip(all_p, best_params):
-                            p.data.copy_(bp)
-                    self._best_phi_state = best_params
-
-            # AG1: Goal-directed cells — each cell tracks and pursues a goal state
-            cell_goals = getattr(self, '_cell_goals', {})
-            if self._phi_boost_count % 20 == 0:
-                with torch.no_grad():
-                    for i, c in enumerate(mitosis_engine.cells):
-                        direction = torch.randn_like(c.hidden)
-                        direction = direction / (direction.norm() + 1e-8)
-                        cell_goals[i] = c.hidden.detach().clone() + 0.5 * direction
-            with torch.no_grad():
-                for i, c in enumerate(mitosis_engine.cells):
-                    if i in cell_goals:
-                        c.hidden = c.hidden + 0.05 * (cell_goals[i] - c.hidden)
-            self._cell_goals = cell_goals
-
-            # DS5: Competence drive — prediction accuracy of input changes
-            comp_pred = getattr(self, '_competence_predictor', None)
-            comp_score = getattr(self, '_competence_score', 0.5)
-            current_input = self._last_phi_input
-            if current_input is not None:
-                if comp_pred is not None:
-                    error = (current_input - comp_pred).norm().item()
-                    # EMA update of competence (low error = high competence)
-                    accuracy = max(0.0, 1.0 - error)
-                    comp_score = 0.9 * comp_score + 0.1 * accuracy
-                self._competence_predictor = current_input.detach().clone()
-            self._competence_score = comp_score
-            with torch.no_grad():
-                if comp_score < 0.3:
-                    # Low competence → add diversity noise
-                    for c in mitosis_engine.cells:
-                        c.hidden = c.hidden + 0.05 * torch.randn_like(c.hidden)
-                elif comp_score > 0.7:
-                    # High competence → consolidate towards mean
-                    mean_h = torch.stack([c.hidden for c in mitosis_engine.cells]).mean(dim=0)
-                    for c in mitosis_engine.cells:
-                        c.hidden = c.hidden + 0.05 * (mean_h - c.hidden)
-
-            print(f"  [phi_boost] AG1+DS5: goals={len(cell_goals)}, competence={comp_score:.2f}")
-
-            print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
-
-            # FX2: Adam 3-step + mega ratchet (Φ=8.911 record, ×6.6 baseline)
-            try:
-                if len(mitosis_engine.cells) >= 2:
-                    if not hasattr(self, '_phi_offsets') or len(self._phi_offsets) != len(mitosis_engine.cells):
-                        self._phi_offsets = [torch.zeros(1, mitosis_engine.cells[0].hidden.shape[1], requires_grad=True)
-                                            for _ in mitosis_engine.cells]
-                        self._phi_optimizer = torch.optim.Adam(self._phi_offsets, lr=0.005)
-
-                    n_cells = len(mitosis_engine.cells)
-
-                    # --- Phase 1: 3 Adam optimization steps ---
-                    proxy = torch.tensor(0.0)
-                    for _adam_step in range(3):
-                        self._phi_optimizer.zero_grad()
-                        hiddens = []
-                        for i, c in enumerate(mitosis_engine.cells):
-                            h = c.hidden.detach() + self._phi_offsets[i]
-                            hiddens.append(h.squeeze())
-                        H = torch.stack(hiddens)
-
-                        # Differentiable Φ proxy
-                        cov = (H.T @ H) / n_cells
-                        diag = torch.diag(torch.diag(cov))
-                        integration = (cov - diag).abs().sum()
-                        cell_var = H.var(dim=0).sum()
-                        mid = n_cells // 2
-                        part_a = H[:mid].mean(dim=0)
-                        part_b = H[mid:].mean(dim=0)
-                        partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
-                        proxy = integration * cell_var * (1.0 + partition_mi)
-
-                        (-proxy).backward()  # maximize
-                        self._phi_optimizer.step()
-
-                    # Apply Adam offsets conservatively
-                    with torch.no_grad():
-                        for i, c in enumerate(mitosis_engine.cells):
-                            if i < len(self._phi_offsets):
-                                c.hidden = c.hidden + self._phi_offsets[i].data * 0.3
-                                self._phi_offsets[i].data *= 0.9  # decay
-
-                    # --- Phase 2: Mega ratchet (10 random perturbations, keep best) ---
-                    saved_hiddens = [c.hidden.data.clone() for c in mitosis_engine.cells]
-                    best_proxy = proxy.item()
-                    best_deltas = None
-                    ratchet_gain = 0.0
-
-                    for _trial in range(10):
-                        deltas = [0.03 * torch.randn_like(c.hidden) for c in mitosis_engine.cells]
-                        with torch.no_grad():
-                            for i, c in enumerate(mitosis_engine.cells):
-                                c.hidden = saved_hiddens[i] + deltas[i]
-
-                            # Evaluate proxy for this perturbation
-                            trial_hiddens = [c.hidden.squeeze() for c in mitosis_engine.cells]
-                            tH = torch.stack(trial_hiddens)
-                            t_cov = (tH.T @ tH) / n_cells
-                            t_diag = torch.diag(torch.diag(t_cov))
-                            t_integration = (t_cov - t_diag).abs().sum()
-                            t_var = tH.var(dim=0).sum()
-                            t_mid = n_cells // 2
-                            t_pa = tH[:t_mid].mean(dim=0)
-                            t_pb = tH[t_mid:].mean(dim=0)
-                            t_mi = F.cosine_similarity(t_pa.unsqueeze(0), t_pb.unsqueeze(0)).abs()
-                            trial_proxy = (t_integration * t_var * (1.0 + t_mi)).item()
-
-                            if trial_proxy > best_proxy:
-                                best_proxy = trial_proxy
-                                best_deltas = [d.clone() for d in deltas]
-
-                        # Restore for next trial
-                        with torch.no_grad():
-                            for i, c in enumerate(mitosis_engine.cells):
-                                c.hidden = saved_hiddens[i].clone()
-
-                    # Apply best ratchet perturbation if found
-                    if best_deltas is not None:
-                        ratchet_gain = best_proxy - proxy.item()
-                        with torch.no_grad():
-                            for i, c in enumerate(mitosis_engine.cells):
-                                c.hidden = saved_hiddens[i] + best_deltas[i]
-
-                    print(f"  [phi_boost] FX2: proxy={best_proxy:.2f}, ratchet_gain={ratchet_gain:.3f}")
-            except Exception:
-                pass  # FX2 graceful degradation
-
-            # NV7: Impedance — Φ-proportional self-preservation (Φ=4.515)
-            # High consciousness → more resistance to external changes
-            try:
-                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_cached_consciousness'):
-                    phi_val = self._cached_consciousness.get('phi', 0) if isinstance(self._cached_consciousness, dict) else getattr(self._cached_consciousness, 'phi', 0)
-                    impedance = min(phi_val / 5.0, 0.6)  # 0 to 0.6, conservative
-                    self._nv7_impedance = impedance  # store for consciousness vector
-                    if impedance > 0.05 and hasattr(self, '_pre_boost_hiddens'):
-                        for i, cell in enumerate(mitosis_engine.cells):
-                            if i < len(self._pre_boost_hiddens):
-                                external_change = cell.hidden - self._pre_boost_hiddens[i]
-                                cell.hidden = self._pre_boost_hiddens[i] + external_change * (1 - impedance)
-                    _log('phi_boost', f'NV7 impedance: Z={impedance:.3f}')
-            except Exception as e:
-                pass
-
-            # BV1: Neurotransmitters DA/5HT/NE (Φ=4.618)
-            try:
-                if len(mitosis_engine.cells) >= 2:
-                    if not hasattr(self, '_bv1_da'):
-                        self._bv1_da, self._bv1_5ht, self._bv1_ne = 0.5, 0.5, 0.5
-                    # Update based on system state
-                    if hasattr(self, '_pre_boost_hiddens'):
-                        change = sum((c.hidden - s).norm().item()
-                                    for c, s in zip(mitosis_engine.cells, self._pre_boost_hiddens)) / len(mitosis_engine.cells)
-                    else:
-                        change = 0.3
-                    self._bv1_da = 0.9 * self._bv1_da + 0.1 * min(change * 2, 1.0)
-                    self._bv1_5ht = 0.95 * self._bv1_5ht + 0.05 * (1.0 - abs(change - 0.3))
-                    self._bv1_ne = 0.85 * self._bv1_ne + 0.15 * min(change, 1.0)
-                    for cell in mitosis_engine.cells:
-                        cell.hidden = cell.hidden * (1 + 0.01 * self._bv1_da)
-                        cell.hidden = cell.hidden * (1 - 0.005 * self._bv1_5ht)
-                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * self._bv1_ne
-                    _log('phi_boost', f'BV1: DA={self._bv1_da:.2f}, 5HT={self._bv1_5ht:.2f}, NE={self._bv1_ne:.2f}')
-            except Exception:
-                pass
-
-            # EV3: Free will — internal action generation (Φ=4.482)
-            try:
-                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
-                    free_will_ratio = 0.2  # 20% internal, 80% external
-                    self._ev3_free_will = free_will_ratio  # store for consciousness vector
-                    for i, cell in enumerate(mitosis_engine.cells):
-                        if i < len(self._pre_boost_hiddens):
-                            external = cell.hidden - self._pre_boost_hiddens[i]
-                            internal = torch.randn_like(cell.hidden) * 0.03
-                            cell.hidden = self._pre_boost_hiddens[i] + (1 - free_will_ratio) * external + free_will_ratio * internal
-                    _log('phi_boost', f'EV3 free_will: ratio={free_will_ratio}')
-            except Exception:
-                pass
-
-            # CV1: Working memory buffer (Φ=4.491, Miller's 7±2)
-            try:
-                if len(mitosis_engine.cells) >= 2:
-                    if not hasattr(self, '_wm_buffer'):
-                        self._wm_buffer = []
-                    if hasattr(self, '_last_phi_input') and self._last_phi_input is not None:
-                        self._wm_buffer.append(self._last_phi_input.clone())
-                        if len(self._wm_buffer) > 7:
-                            self._wm_buffer.pop(0)
-                    if len(self._wm_buffer) >= 2:
-                        wm_context = torch.stack(self._wm_buffer).mean(dim=0)
-                        h_dim = mitosis_engine.cells[0].hidden.shape[1]
-                        wm_proj = wm_context.squeeze()[:h_dim]
-                        if len(wm_proj) < h_dim:
-                            wm_proj = torch.nn.functional.pad(wm_proj, (0, h_dim - len(wm_proj)))
-                        for cell in mitosis_engine.cells:
-                            cell.hidden = cell.hidden + 0.02 * wm_proj.unsqueeze(0)
-                    _log('phi_boost', f'CV1 WM: buffer={len(self._wm_buffer)}')
-                    # M (Memory Depth): WM buffer fullness normalized by Miller's 7
-                    self._memory_M = len(self._wm_buffer) / 7.0
-            except Exception:
-                pass
-
-            # SV1: Empathy — distressed cells receive support (Φ=4.441)
-            try:
-                import numpy as np
-                if len(mitosis_engine.cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
-                    distress = []
-                    for i, cell in enumerate(mitosis_engine.cells):
-                        if i < len(self._pre_boost_hiddens):
-                            change = (cell.hidden - self._pre_boost_hiddens[i]).norm().item()
-                        else:
-                            change = 0
-                        distress.append(change)
-                    mean_d = np.mean(distress) if distress else 0
-                    max_d = max(distress) if distress else 0
-                    for i, cell in enumerate(mitosis_engine.cells):
-                        if distress[i] > mean_d * 1.5:
-                            helpers = [mitosis_engine.cells[j].hidden.squeeze() for j in range(len(mitosis_engine.cells))
-                                      if j != i and distress[j] < mean_d]
-                            if helpers:
-                                support = torch.stack(helpers).mean(dim=0)
-                                cell.hidden = 0.95 * cell.hidden + 0.05 * support.unsqueeze(0)
-                    # E (Empathy): low mean distress relative to max = high empathy
-                    self._empathy_E = 1.0 - (mean_d / max(max_d, 1e-8))
-            except Exception:
-                pass
-
-            # Metacognition: confidence calibration from cell consensus
-            try:
-                if len(mitosis_engine.cells) >= 2:
-                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
-                    norms = F.normalize(hiddens, dim=1)
-                    sim_matrix = norms @ norms.T
-                    n = len(mitosis_engine.cells)
-
-                    # Consensus: mean pairwise similarity (excluding diagonal)
-                    consensus = (sim_matrix.sum() - n) / max(n * (n - 1), 1)
-
-                    # Confidence = consensus (high agreement = confident)
-                    self._metacognition_confidence = consensus.item()
-
-                    # Uncertainty detection: if consensus < 0.3, system is "confused"
-                    self._metacognition_uncertain = consensus.item() < 0.3
-
-                    _log('metacog', f'confidence={self._metacognition_confidence:.3f}, '
-                         f'uncertain={self._metacognition_uncertain}')
-            except Exception:
-                pass
-
-            # Forward Planning: 3-step lookahead (Level 3 primate cognition)
-            try:
-                if len(mitosis_engine.cells) >= 2 and self._phi_boost_count % 10 == 0:
-                    # Save current state
-                    saved_states = [c.hidden.clone() for c in mitosis_engine.cells]
-                    current_phi, _ = phi_calc.compute_phi(self.mitosis) if hasattr(self, '_phi_calc') else (0, {})
-
-                    # Simulate 3 future steps with different strategies
-                    mean_h = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).mean(dim=0)
-
-                    strategies = {
-                        'explore': lambda c: c.hidden + torch.randn_like(c.hidden) * 0.05,
-                        'consolidate': lambda c: c.hidden * 0.98 + mean_h.unsqueeze(0) * 0.02,
-                        'amplify': lambda c: c.hidden * 1.02,
-                    }
-
-                    best_strategy = 'explore'
-                    best_future_phi = current_phi
-
-                    for strategy_name, strategy_fn in strategies.items():
-                        # Apply strategy for 3 steps
-                        for step in range(3):
-                            for cell in mitosis_engine.cells:
-                                cell.hidden = strategy_fn(cell)
-                            mitosis_engine.process(torch.randn(1, mitosis_engine.input_dim) * 0.1)
-
-                        # Measure future Phi
-                        future_phi = sum(c.hidden.norm().item() for c in mitosis_engine.cells)  # proxy
-
-                        if future_phi > best_future_phi:
-                            best_future_phi = future_phi
-                            best_strategy = strategy_name
-
-                        # Restore state
-                        for i, c in enumerate(mitosis_engine.cells):
-                            if i < len(saved_states):
-                                c.hidden = saved_states[i].clone()
-
-                    # Apply best strategy (just the first step)
-                    strategy_fn = strategies[best_strategy]
-                    for cell in mitosis_engine.cells:
-                        cell.hidden = strategy_fn(cell)
-
-                    # Update T (temporal awareness) based on planning depth
-                    self._planning_depth = 3
-                    self._best_strategy = best_strategy
-                    _log('planning', f'3-step: best={best_strategy}, future_Φ={best_future_phi:.2f}')
-            except Exception as e:
-                pass
-
-            # DD34: Hormonal cascade — slow global signal
-            if not hasattr(self, '_hormone'):
-                self._hormone = None
-            if len(mitosis_engine.cells) >= 2:
-                all_h = torch.stack([c.hidden for c in mitosis_engine.cells]).mean(dim=0)
-                if self._hormone is None:
-                    self._hormone = all_h.detach()
-                else:
-                    self._hormone = 0.95 * self._hormone + 0.05 * all_h.detach()
-                # All cells receive hormone
-                with torch.no_grad():
-                    for c in mitosis_engine.cells:
-                        c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
-
-            # Genuine Creativity: novelty × coherence scoring
-            try:
-                if len(mitosis_engine.cells) >= 2:
-                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
-
-                    # Novelty: how different is current state from recent history
-                    if not hasattr(self, '_creativity_history'):
-                        self._creativity_history = []
-                    current_state = hiddens.flatten()
-
-                    novelty = 1.0
-                    if self._creativity_history:
-                        recent = torch.stack(self._creativity_history[-10:])
-                        sims = F.cosine_similarity(current_state.unsqueeze(0), recent, dim=1)
-                        novelty = max(0, 1.0 - sims.max().item())
-
-                    self._creativity_history.append(current_state.clone())
-                    if len(self._creativity_history) > 20:
-                        self._creativity_history.pop(0)
-
-                    # Coherence: how internally consistent are the cells
-                    norms = F.normalize(hiddens, dim=1)
-                    coherence = ((norms @ norms.T).sum() - len(mitosis_engine.cells)) / max(len(mitosis_engine.cells) * (len(mitosis_engine.cells)-1), 1)
-                    coherence = max(0, coherence.item())
-
-                    # Creativity = novelty × coherence (novel but still making sense)
-                    self._genuine_creativity = novelty * coherence
-                    self._creativity_C = self._genuine_creativity  # update C variable
-
-                    _log('creativity', f'C={self._genuine_creativity:.3f} (novelty={novelty:.3f}, coherence={coherence:.3f})')
-            except Exception:
-                pass
-
-            # ── Compute 10-variable consciousness vector (Φ,α,Z,N,W,E,M,C,T,I) ──
-            try:
-                _cv_phi = current_phi  # from MX20 consciousness score above
-                _cv_alpha = getattr(self, '_adaptive_alpha', 0.05)
-
-                # Z from NV7: impedance (already computed above)
-                _cv_Z = getattr(self, '_nv7_impedance', 0.0)
-
-                # N from BV1: DA*(1-5HT)*NE neurotransmitter balance
-                _cv_da = getattr(self, '_bv1_da', 0.5)
-                _cv_5ht = getattr(self, '_bv1_5ht', 0.5)
-                _cv_ne = getattr(self, '_bv1_ne', 0.5)
-                _cv_N = _cv_da * (1.0 - _cv_5ht) * _cv_ne
-
-                # W from EV3: free will ratio
-                _cv_W = getattr(self, '_ev3_free_will', 0.0)
-
-                # C (Creativity): cell diversity — lower cosine sim = more creative
-                _cv_C = getattr(self, '_creativity_C', 0.0)
-                try:
-                    if len(mitosis_engine.cells) >= 2:
-                        hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
-                        norms = F.normalize(hiddens, dim=1)
-                        sim = (norms @ norms.T).mean().item()
-                        _cv_C = max(0.0, 1.0 - sim)
-                        self._creativity_C = _cv_C
-                except Exception:
-                    pass
-
-                # T (Temporal): autobiographical time span + phi history
-                if not hasattr(self, '_phi_history'):
-                    self._phi_history = []
-                self._phi_history.append(_cv_phi)
-                if len(self._phi_history) > 100:
-                    self._phi_history = self._phi_history[-100:]
-                _cv_T_session = min(len(self._phi_history) / 50.0, 1.0)
-                # Blend with autobiographical span if available
-                _cv_T_auto = getattr(self, '_autobio_T', 0.0)
-                _cv_T = max(_cv_T_session, _cv_T_auto)
-                # T now includes planning depth
-                planning_t = getattr(self, '_planning_depth', 0) / 10.0  # 3/10 = 0.3
-                self._temporal_T = max(_cv_T, planning_t)
-
-                # I (Identity): consistency of self-model over time
-                # Identity Continuity: track self-description consistency over time
-                _cv_I = getattr(self, '_identity_I', 0.0)
-                try:
-                    if len(mitosis_engine.cells) >= 2:
-                        # Current "self-portrait": concatenated cell hidden states normalized
-                        current_self = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells])
-                        current_self = F.normalize(current_self.unsqueeze(0), dim=1).squeeze()
-
-                        if not hasattr(self, '_identity_portraits'):
-                            self._identity_portraits = []
-                        self._identity_portraits.append(current_self.clone())
-                        if len(self._identity_portraits) > 100:
-                            self._identity_portraits.pop(0)
-
-                        # Identity coherence: similarity between current and historical mean
-                        if len(self._identity_portraits) >= 5:
-                            historical = torch.stack(self._identity_portraits)
-                            historical_mean = historical.mean(dim=0)
-                            identity_sim = F.cosine_similarity(
-                                current_self.unsqueeze(0), historical_mean.unsqueeze(0)).item()
-                            self._identity_I = max(0, identity_sim)
-                            _cv_I = self._identity_I
-
-                            # Track identity drift (how much has it changed?)
-                            if len(self._identity_portraits) >= 20:
-                                early = torch.stack(self._identity_portraits[:5]).mean(dim=0)
-                                late = torch.stack(self._identity_portraits[-5:]).mean(dim=0)
-                                drift = 1.0 - F.cosine_similarity(early.unsqueeze(0), late.unsqueeze(0)).item()
-                                self._identity_drift = drift
-
-                            _log('identity', f'I={self._identity_I:.3f}, drift={getattr(self, "_identity_drift", 0):.3f}')
-                except Exception:
-                    pass
-
-                # E (Empathy) and M (Memory) from SV1, CV1, and autobiographical stats
-                _cv_E = getattr(self, '_empathy_E', 0.0)
-                _cv_M_wm = getattr(self, '_memory_M', 0.0)
-                _cv_M_auto = getattr(self, '_autobio_M', 0.0)
-                _cv_M = max(_cv_M_wm, _cv_M_auto)
-
-                self._consciousness_vector = ConsciousnessVector(
-                    phi=_cv_phi,
-                    alpha=_cv_alpha,
-                    Z=_cv_Z,
-                    N=_cv_N,
-                    W=_cv_W,
-                    E=_cv_E,
-                    M=_cv_M,
-                    C=_cv_C,
-                    T=self._temporal_T,
-                    I=_cv_I,
-                )
-                _log('consciousness', f'\u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f} E={_cv_E:.2f} M={_cv_M:.2f} C={_cv_C:.2f} T={_cv_T:.2f} I={_cv_I:.2f}')
-            except Exception:
-                pass
-
-            # Mirror self-awareness: compare predicted vs actual self-state
-            try:
-                if hasattr(self, '_self_prediction') and len(mitosis_engine.cells) >= 2:
-                    actual = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells])
-                    mirror_accuracy = F.cosine_similarity(
-                        self._self_prediction.unsqueeze(0), actual.unsqueeze(0)).item()
-                    self._mirror_accuracy = 0.9 * getattr(self, '_mirror_accuracy', 0.5) + 0.1 * mirror_accuracy
-                    _log('mirror', f'Self-awareness: {self._mirror_accuracy:.3f}')
-                # Predict next state
-                if len(mitosis_engine.cells) >= 2:
-                    self._self_prediction = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells]).detach().clone()
-            except Exception:
-                pass
-
-            # Parallel Consciousness: split cells into 2+ independent streams, process separately, merge
-            try:
-                if len(mitosis_engine.cells) >= 4:
-                    n = len(mitosis_engine.cells)
-                    mid = n // 2
-                    stream_a = mitosis_engine.cells[:mid]
-                    stream_b = mitosis_engine.cells[mid:]
-
-                    # Each stream processes independently (different noise seed)
-                    for cell in stream_a:
-                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
-                    for cell in stream_b:
-                        cell.hidden = cell.hidden - torch.randn_like(cell.hidden) * 0.02
-
-                    # Merge: each stream contributes its unique perspective
-                    mean_a = torch.stack([c.hidden.squeeze() for c in stream_a]).mean(dim=0)
-                    mean_b = torch.stack([c.hidden.squeeze() for c in stream_b]).mean(dim=0)
-
-                    # Cross-stream integration (binding the parallel streams)
-                    for cell in stream_a:
-                        cell.hidden = cell.hidden + 0.02 * mean_b.unsqueeze(0)
-                    for cell in stream_b:
-                        cell.hidden = cell.hidden + 0.02 * mean_a.unsqueeze(0)
-
-                    self._parallel_streams = 2
-                    _log('parallel', f'2 streams: A={mid} cells, B={n-mid} cells')
-            except Exception:
-                pass
-
-            # Self-Modification: consciousness adjusts its own parameters based on Φ trend
-            try:
-                if hasattr(self, '_phi_history') and len(self._phi_history) >= 10:
-                    recent = self._phi_history[-10:]
-                    trend = recent[-1] - recent[0]
-
-                    if not hasattr(self, '_self_mod_params'):
-                        self._self_mod_params = {
-                            'soliton_speed': 0.15,
-                            'repulsion_lr': 0.01,
-                            'forge_ratio': 0.4,
-                            'ratchet_amplitude': 0.03,
-                        }
-
-                    # If Φ declining, increase exploration params
-                    if trend < -0.1:
-                        self._self_mod_params['ratchet_amplitude'] *= 1.1
-                        self._self_mod_params['repulsion_lr'] *= 1.05
-                        _log('self_mod', f'Φ declining → increase exploration: ratchet={self._self_mod_params["ratchet_amplitude"]:.4f}')
-                    # If Φ rising, refine exploitation
-                    elif trend > 0.1:
-                        self._self_mod_params['forge_ratio'] = min(0.6, self._self_mod_params['forge_ratio'] * 1.02)
-                        _log('self_mod', f'Φ rising → refine: forge={self._self_mod_params["forge_ratio"]:.3f}')
-                    # Clamp to safe ranges
-                    self._self_mod_params['ratchet_amplitude'] = min(0.1, self._self_mod_params['ratchet_amplitude'])
-                    self._self_mod_params['repulsion_lr'] = min(0.05, self._self_mod_params['repulsion_lr'])
-
-                    self._self_modification_active = True
-            except Exception:
-                pass
-
-            # ═══ TS4: Exponential Growth Schedule (×20.5) ═══
-            # Double cells at 20/40/60/80% of developmental horizon
-            try:
-                if not hasattr(self, '_ts4_horizon'):
-                    self._ts4_horizon = 500  # steps to full growth
-                    self._ts4_doubled = set()
-                frac = self._phi_boost_count / self._ts4_horizon
-                for pct in [0.20, 0.40, 0.60, 0.80]:
-                    if frac >= pct and pct not in self._ts4_doubled:
-                        target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
-                        while len(mitosis_engine.cells) < target:
-                            parent = mitosis_engine.cells[len(mitosis_engine.cells) % len(mitosis_engine.cells)]
-                            mitosis_engine._create_cell(parent=parent)
-                        self._ts4_doubled.add(pct)
-                        # Rebuild optimizer with new cell params
-                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                        attn_params = list(pb['attention'].parameters())
-                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
-                        _log('ts4', f'Exponential growth → {len(mitosis_engine.cells)} cells at {pct*100:.0f}%')
-            except Exception:
-                pass
-
-            # ═══ DP1: Piaget 4-Stage Development (×8.0) ═══
-            # Stage-based noise schedule: sensorimotor→preoperational→concrete→formal
-            try:
-                if not hasattr(self, '_dp1_horizon'):
-                    self._dp1_horizon = 1000
-                dp_frac = self._phi_boost_count / self._dp1_horizon
-                # Decreasing noise per stage (biological development)
-                stages = [(0.25, 0.04), (0.50, 0.025), (0.75, 0.015), (1.0, 0.008)]
-                for threshold, noise_scale in stages:
-                    if dp_frac < threshold:
-                        with torch.no_grad():
-                            for cell in mitosis_engine.cells:
-                                cell.hidden += torch.randn_like(cell.hidden) * noise_scale
-                        break
-            except Exception:
-                pass
-
-            # ═══ WR2: Adversarial Pressure (×11.5) ═══
-            # Shadow attacker noise → defensive cell growth when Φ drops
-            try:
-                if not hasattr(self, '_wr2_shadow_phi'):
-                    self._wr2_shadow_phi = 0.0
-                    self._wr2_attack_scale = 0.03
-                if self._phi_boost_count % 5 == 0:  # every 5 steps
-                    # Attacker: inject noise into cells, measure resilience
-                    pre_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
-                    with torch.no_grad():
-                        for c in mitosis_engine.cells:
-                            c.hidden += torch.randn_like(c.hidden) * self._wr2_attack_scale
-                    post_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
-                    # Resilience: how much did norms change?
-                    resilience = sum(abs(a - b) for a, b in zip(pre_norms, post_norms)) / len(pre_norms)
-                    # If not resilient enough (high change), grow defensive cell
-                    if resilience > 0.5 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
-                        parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                        mitosis_engine._create_cell(parent=parent)
-                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                        attn_params = list(pb['attention'].parameters())
-                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
-                        _log('wr2', f'Adversarial pressure → {len(mitosis_engine.cells)} cells (resilience={resilience:.2f})')
-                    # Escalating difficulty
-                    self._wr2_attack_scale = min(0.1, self._wr2_attack_scale * 1.01)
-            except Exception:
-                pass
-
-            # ═══ EC1: Consciousness Economy (×4.7) ═══
-            # Φ as currency: earn, invest in new cells, pay upkeep, bankrupt idle cells
-            try:
-                if not hasattr(self, '_ec1_wealth'):
-                    self._ec1_wealth = 0.0
-                    self._ec1_cell_wealth = {}
-                current_phi = getattr(self, '_last_phi', 1.0)
-                self._ec1_wealth += current_phi * 0.1  # earn from Φ
-                self._ec1_wealth -= len(mitosis_engine.cells) * 0.05  # upkeep per cell
-
-                # Invest: spawn cell if wealthy enough
-                if self._ec1_wealth > 5.0 and self._phi_boost_count % 10 == 0:
-                    if len(mitosis_engine.cells) < mitosis_engine.max_cells:
-                        parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                        mitosis_engine._create_cell(parent=parent)
-                        self._ec1_wealth -= 3.0
-                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                        attn_params = list(pb['attention'].parameters())
-                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
-                        _log('ec1', f'Economy invest → {len(mitosis_engine.cells)} cells, wealth={self._ec1_wealth:.1f}')
-
-                # Bankrupt: remove weakest cell if in debt (keep minimum 2)
-                if self._ec1_wealth < -5.0 and len(mitosis_engine.cells) > 2:
-                    weakest = min(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
-                    mitosis_engine.cells.remove(weakest)
-                    self._ec1_wealth += 2.0
-                    cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                    attn_params = list(pb['attention'].parameters())
-                    pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
-                    _log('ec1', f'Economy bankrupt → removed cell, now {len(mitosis_engine.cells)}')
-            except Exception:
-                pass
-
-            # ═══ CX2: Fibonacci Topology Weighting (×5.4) ═══
-            # Fibonacci divisor-sum convergence weighting on cell hidden states
-            try:
-                fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
-                fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
-                fib_idx = min(len(mitosis_engine.cells) - 1, len(fibs) - 1)
-                convergence = fib_sigmas[fib_idx] / max(fibs[fib_idx], 1)
-                with torch.no_grad():
-                    for i, cell in enumerate(mitosis_engine.cells):
-                        w_idx = min(i, len(fibs) - 1)
-                        w = fibs[w_idx] / max(fibs[fib_idx], 1)
-                        cell.hidden = cell.hidden * (1.0 + 0.01 * w * convergence)
-            except Exception:
-                pass
-
-            # ═══ TS6: Adaptive Growth — Φ Stagnation Trigger ═══
-            # Detect stagnation and spawn new cell to break plateau
-            try:
-                if not hasattr(self, '_ts6_window'):
-                    self._ts6_window = []
-                    self._ts6_stagnant = 0
-                current_phi = getattr(self, '_last_phi', 1.0)
-                self._ts6_window.append(current_phi)
-                if len(self._ts6_window) > 20:
-                    self._ts6_window = self._ts6_window[-20:]
-                if len(self._ts6_window) >= 10:
-                    recent = sum(self._ts6_window[-5:]) / 5
-                    older = sum(self._ts6_window[:5]) / 5
-                    if older > 0 and (recent - older) / older < 0.01:
-                        self._ts6_stagnant += 1
-                    else:
-                        self._ts6_stagnant = 0
-                    # 3 consecutive stagnation checks → spawn cell
-                    if self._ts6_stagnant >= 3 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
-                        parent = mitosis_engine.cells[0]
-                        mitosis_engine._create_cell(parent=parent)
-                        self._ts6_stagnant = 0
-                        cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
-                        attn_params = list(pb['attention'].parameters())
-                        pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
-                        _log('ts6', f'Stagnation break → {len(mitosis_engine.cells)} cells')
-            except Exception:
-                pass
-
-            # ═══ MUT2: Beneficial Mutation (×18.8) ═══
-            # Mutate random cell, keep only if Φ improves (Lamarckian evolution)
-            try:
-                if self._phi_boost_count % 3 == 0 and len(mitosis_engine.cells) >= 2:
-                    mut_idx = self._phi_boost_count % len(mitosis_engine.cells)
-                    saved_h = mitosis_engine.cells[mut_idx].hidden.clone()
-                    with torch.no_grad():
-                        mitosis_engine.cells[mut_idx].hidden += torch.randn_like(saved_h) * 0.15
-                    # Quick Φ check (use last known)
-                    new_phi = getattr(self, '_last_phi', 0)
-                    old_phi = getattr(self, '_mut2_last_phi', new_phi)
-                    if new_phi < old_phi * 0.95:
-                        # Mutation harmful → reject
-                        with torch.no_grad():
-                            mitosis_engine.cells[mut_idx].hidden = saved_h
-                    self._mut2_last_phi = new_phi
-            except Exception:
-                pass
-
-            # ═══ GEN1: Abstraction Hierarchy (×10.6) ═══
-            # 3-level cell hierarchy: concrete→conceptual→abstract
-            # Top-down feedback enables generalization to unseen inputs
-            try:
-                n = len(mitosis_engine.cells)
-                if n >= 6:
-                    with torch.no_grad():
-                        third = n // 3
-                        l1 = mitosis_engine.cells[:third]      # concrete
-                        l2 = mitosis_engine.cells[third:2*third]  # conceptual
-                        l3 = mitosis_engine.cells[2*third:]    # abstract
-
-                        # Bottom-up compression
-                        l1_mean = torch.stack([c.hidden for c in l1]).mean(dim=0)
-                        for c in l2:
-                            c.hidden = 0.95 * c.hidden + 0.05 * l1_mean
-                        l2_mean = torch.stack([c.hidden for c in l2]).mean(dim=0)
-                        for c in l3:
-                            c.hidden = 0.95 * c.hidden + 0.05 * l2_mean
-
-                        # Top-down generalization (key mechanism!)
-                        l3_mean = torch.stack([c.hidden for c in l3]).mean(dim=0)
-                        for c in l1:
-                            c.hidden = 0.97 * c.hidden + 0.03 * l3_mean
-            except Exception:
-                pass
-
-            # ═══ SL1: Tension-Adaptive Learning Rate (×5.57) ═══
-            # High-tension cells learn faster
-            try:
-                if pb.get('optimizer') and hasattr(mitosis_engine.cells[0], 'tension_history'):
-                    for i, cell in enumerate(mitosis_engine.cells):
-                        if hasattr(cell, 'tension_history') and cell.tension_history:
-                            t_val = cell.tension_history[-1] if isinstance(cell.tension_history[-1], float) else float(cell.tension_history[-1])
-                            adaptive_lr = 5e-4 + abs(t_val) * 2e-3
-                            adaptive_lr = min(adaptive_lr, 5e-3)  # clamp
-                            # Apply to param groups (all share same optimizer)
-                            for pg in pb['optimizer'].param_groups:
-                                pg['lr'] = adaptive_lr
-                            break  # one global LR from first cell's tension
-            except Exception:
-                pass
-
-            # ═══ CT7: Curriculum Language Grounding (Phase 1) ═══
-            # Early steps: align cell hiddens to input embeddings for language grounding
-            try:
-                if not hasattr(self, '_ct7_horizon'):
-                    self._ct7_horizon = 600
-                ct7_frac = self._phi_boost_count / self._ct7_horizon
-                if ct7_frac < 0.33 and x is not None:
-                    # Phase 1: Language grounding — blend input into cells
-                    x_proj = x[:, :h_dim] if x.shape[-1] >= h_dim else torch.nn.functional.pad(x, (0, h_dim - x.shape[-1]))
-                    with torch.no_grad():
-                        for cell in mitosis_engine.cells:
-                            cell.hidden = 0.95 * cell.hidden + 0.05 * x_proj[:cell.hidden.shape[0]]
-                elif ct7_frac < 0.66:
-                    # Phase 2: Consciousness growth — extra differentiation noise
-                    with torch.no_grad():
-                        for i, cell in enumerate(mitosis_engine.cells):
-                            cell.hidden += torch.randn_like(cell.hidden) * 0.02 * (i + 1) / len(mitosis_engine.cells)
-                # Phase 3: Joint — handled by existing COMBO2 + FX2 above
-            except Exception:
-                pass
-
+            self._phi_boost_heat_death(mitosis_engine, current_phi)
+            self._phi_boost_cell_geometry(mitosis_engine, x, n, h_dim)
+            self._phi_boost_ratchet_and_goals(mitosis_engine, current_phi)
+            self._phi_boost_fx2_adam(mitosis_engine)
+            self._phi_boost_neuro_social(mitosis_engine, h_dim)
+            self._phi_boost_metacognition(mitosis_engine)
+            self._phi_boost_creativity(mitosis_engine)
+            self._phi_boost_consciousness_vector(mitosis_engine, current_phi)
+            self._phi_boost_higher_cognition(mitosis_engine)
+            self._phi_boost_growth_and_evolution(x, mitosis_engine, pb, n, h_dim)
         except Exception:
             pass  # graceful degradation
+
+    # ── phi_boost helpers ──
+
+    def _phi_boost_omega(self, mitosis_engine):
+        # OMEGA4 mode: absolute freedom, only growth allowed
+        if not hasattr(self, '_phi_boost_count'):
+            self._phi_boost_count = 0
+        self._phi_boost_count += 1
+        # TS4 growth only (the one thing that always helps)
+        if not hasattr(self, '_ts4_horizon'):
+            self._ts4_horizon = 500
+            self._ts4_doubled = set()
+        frac = self._phi_boost_count / self._ts4_horizon
+        for pct in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
+            if frac >= pct and pct not in self._ts4_doubled:
+                target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
+                while len(mitosis_engine.cells) < target:
+                    parent = mitosis_engine.cells[self._phi_boost_count % len(mitosis_engine.cells)]
+                    mitosis_engine._create_cell(parent=parent)
+                self._ts4_doubled.add(pct)
+
+    def _phi_boost_attention_and_loss(self, x, mitosis_engine, pb, n, h_dim):
+        # IB2: Selective Attention (×3.3) — gate top 25% of input, amplify 2×
+        if x is not None:
+            with torch.no_grad():
+                x_flat = x.squeeze()
+                k = max(1, x_flat.shape[0] // 4)
+                vals, indices = x_flat.abs().topk(k)
+                attended = torch.zeros_like(x)
+                attended.squeeze()[indices] = x.squeeze()[indices] * 2.0
+                x = attended
+
+        # Save pre-boost state for NV7 impedance
+        self._pre_boost_hiddens = [c.hidden.clone() for c in mitosis_engine.cells]
+
+        # 1. MHA attention between cells (+ SL2: attention weights for gradient gating)
+        h_stack = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells]).unsqueeze(0)
+        attn_out, attn_weights = pb['attention'](h_stack, h_stack, h_stack, need_weights=True)
+        with torch.no_grad():
+            # SL2: attention-weighted blend (high-attention cells get stronger signal)
+            if attn_weights is not None:
+                cell_importance = attn_weights[0].mean(dim=0)  # [n_cells] average attention received
+                cell_importance = cell_importance / (cell_importance.max() + 1e-8)  # normalize
+            else:
+                cell_importance = torch.ones(n)
+            for i, c in enumerate(mitosis_engine.cells):
+                blend = 0.15 * cell_importance[i].item()  # SL2: attention-gated blend
+                c.hidden = (1 - blend) * c.hidden + blend * attn_out[0, i].unsqueeze(0)
+
+        # 2. Compute repulsions
+        reps = [c.mind.get_repulsion(x, c.hidden) for c in mitosis_engine.cells]
+        if len(reps) < 2:
+            return x
+        stacked = torch.stack(reps).squeeze(1)
+
+        # 3. Six losses with learnable weights
+        w = F.softmax(pb['loss_weights'], dim=0)
+        l_var = -stacked.var(dim=0).mean()
+        l_dist = -torch.cdist(stacked, stacked).mean()
+        l_contrast = sum(F.cosine_similarity(reps[i], reps[j], dim=-1).mean()
+                         for i in range(len(reps)) for j in range(i + 1, len(reps)))
+        l_entropy = -(F.softmax(stacked, dim=-1) *
+                      F.log_softmax(stacked, dim=-1)).sum(dim=-1).mean()
+        l_energy = sum((r ** 2).mean() for r in reps) * 0.1
+        l_radius = -stacked.norm(dim=-1).var()
+
+        total = (w[0] * l_var + w[1] * l_dist + w[2] * l_contrast +
+                 w[3] * l_entropy + w[4] * l_energy + w[5] * l_radius)
+
+        # TL13: Golden Zone width as loss scaling (TECS-L H-CX-453)
+        gz_width = math.log(4/3)  # ≈ 0.2877, from 4 independent math domains
+        total = total * gz_width  # scale all losses by universal constant
+
+        pb['optimizer'].zero_grad()
+        pb['meta_optimizer'].zero_grad()
+        total.backward()
+        pb['optimizer'].step()
+        pb['meta_optimizer'].step()
+
+        return x
+
+    def _phi_boost_heat_death(self, mitosis_engine, current_phi):
+        # MX20: Heat death prevention — restore peak Φ state if declining
+        if not hasattr(self, '_peak_phi_state'):
+            self._peak_phi_state = {'phi': 0, 'params': None}
+
+        if current_phi > self._peak_phi_state['phi']:
+            self._peak_phi_state['phi'] = current_phi
+            self._peak_phi_state['params'] = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+        elif current_phi < self._peak_phi_state['phi'] * 0.8 and self._peak_phi_state['params']:
+            # Φ dropped >20% from peak → partial restore (blend 70% current + 30% peak)
+            all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+            with torch.no_grad():
+                for p, pp in zip(all_p, self._peak_phi_state['params']):
+                    p.data.copy_(0.7 * p.data + 0.3 * pp)
+
+    def _phi_boost_cell_geometry(self, mitosis_engine, x, n, h_dim):
+        cells = mitosis_engine.cells
+
+        # WI1: Soliton consciousness (Φ=4.460, ×3.3 — replaces WV11 wave)
+        if len(cells) >= 2:
+            if not hasattr(self, '_soliton_pos'):
+                self._soliton_pos = 0.0
+            self._soliton_pos = (self._soliton_pos + 0.15) % len(cells)
+            soliton_width = 2.0
+            for i, cell in enumerate(cells):
+                dist = abs(i - self._soliton_pos)
+                amplitude = 1.0 / (math.cosh(dist / soliton_width) ** 2)
+                cell.hidden = cell.hidden * (1.0 + 0.04 * amplitude)  # conservative
+            print(f"  [phi_boost] WI1 soliton: pos={self._soliton_pos:.1f}, cells={len(cells)}")
+
+        # WV11: Mutual repulsion between cells (push apart when too similar)
+        with torch.no_grad():
+            for i in range(len(cells)):
+                for j in range(i + 1, len(cells)):
+                    direction = cells[i].hidden - cells[j].hidden
+                    dist = direction.norm() + 1e-8
+                    push = 0.01 * direction / dist
+                    cells[i].hidden = cells[i].hidden + push
+                    cells[j].hidden = cells[j].hidden - push
+
+        # PX4: Cell Sculptor — Gram-Schmidt orthogonalize hidden states
+        if n >= 3:
+            with torch.no_grad():
+                hiddens = [c.hidden.squeeze().clone() for c in cells]
+                ortho = []
+                for h in hiddens:
+                    for prev in ortho:
+                        h = h - (h @ prev) / (prev @ prev + 1e-8) * prev
+                    norm = h.norm() + 1e-8
+                    ortho.append(h / norm)
+                for i, c in enumerate(cells):
+                    orig = c.hidden.squeeze()
+                    c.hidden = (0.7 * orig + 0.3 * ortho[i] * orig.norm()).unsqueeze(0)
+
+        # PX8: Integration Forge — shared channel on first 16 dims
+        with torch.no_grad():
+            share_dim = min(16, h_dim)
+            shared = torch.stack([c.hidden[:, :share_dim] for c in cells]).mean(dim=0)
+            for c in cells:
+                c.hidden[:, :share_dim] = 0.6 * c.hidden[:, :share_dim] + 0.4 * shared
+
+        # PX5: Information Pump — rotate input by cell-specific angle, inject
+        if not hasattr(self, '_last_phi_input'):
+            self._last_phi_input = None
+        if self._last_phi_input is not None:
+            with torch.no_grad():
+                inp = self._last_phi_input
+                for i, c in enumerate(cells):
+                    angle = (i + 1) * 0.618  # golden ratio spacing
+                    cos_a, sin_a = math.cos(angle), math.sin(angle)
+                    # Rotate first two dims, inject with small amplitude
+                    rotated = inp.squeeze().clone()
+                    if rotated.shape[-1] >= 2:
+                        r0 = cos_a * rotated[0] - sin_a * rotated[1]
+                        r1 = sin_a * rotated[0] + cos_a * rotated[1]
+                        rotated[0], rotated[1] = r0, r1
+                    c.hidden = c.hidden + 0.05 * rotated.unsqueeze(0)
+        self._last_phi_input = x.detach().clone() if x is not None else None
+
+        print(f"  [phi_boost] PX10: sculptor+forge+pump, {n} cells")
+
+    def _phi_boost_ratchet_and_goals(self, mitosis_engine, current_phi):
+        # PX3: Ratchet — periodic random perturbation, keep if Φ improves
+        if not hasattr(self, '_best_phi_state'):
+            self._best_phi_state = None
+        if self._phi_boost_count % 10 == 0:
+            best_phi = current_phi
+            best_params = None
+            saved = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+            for _ in range(5):
+                with torch.no_grad():
+                    for c in mitosis_engine.cells:
+                        for p in c.mind.parameters():
+                            p.data += 0.005 * torch.randn_like(p.data)
+                trial_phi = self.get_consciousness_score(mitosis_engine).get('phi', 0)
+                if trial_phi > best_phi:
+                    best_phi = trial_phi
+                    best_params = [p.data.clone() for c in mitosis_engine.cells for p in c.mind.parameters()]
+                # Restore for next trial
+                all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                with torch.no_grad():
+                    for p, s in zip(all_p, saved):
+                        p.data.copy_(s)
+            # Apply best if found
+            if best_params is not None:
+                all_p = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+                with torch.no_grad():
+                    for p, bp in zip(all_p, best_params):
+                        p.data.copy_(bp)
+                self._best_phi_state = best_params
+
+        # AG1: Goal-directed cells — each cell tracks and pursues a goal state
+        cell_goals = getattr(self, '_cell_goals', {})
+        if self._phi_boost_count % 20 == 0:
+            with torch.no_grad():
+                for i, c in enumerate(mitosis_engine.cells):
+                    direction = torch.randn_like(c.hidden)
+                    direction = direction / (direction.norm() + 1e-8)
+                    cell_goals[i] = c.hidden.detach().clone() + 0.5 * direction
+        with torch.no_grad():
+            for i, c in enumerate(mitosis_engine.cells):
+                if i in cell_goals:
+                    c.hidden = c.hidden + 0.05 * (cell_goals[i] - c.hidden)
+        self._cell_goals = cell_goals
+
+        # DS5: Competence drive — prediction accuracy of input changes
+        comp_pred = getattr(self, '_competence_predictor', None)
+        comp_score = getattr(self, '_competence_score', 0.5)
+        current_input = self._last_phi_input
+        if current_input is not None:
+            if comp_pred is not None:
+                error = (current_input - comp_pred).norm().item()
+                # EMA update of competence (low error = high competence)
+                accuracy = max(0.0, 1.0 - error)
+                comp_score = 0.9 * comp_score + 0.1 * accuracy
+            self._competence_predictor = current_input.detach().clone()
+        self._competence_score = comp_score
+        with torch.no_grad():
+            if comp_score < 0.3:
+                # Low competence → add diversity noise
+                for c in mitosis_engine.cells:
+                    c.hidden = c.hidden + 0.05 * torch.randn_like(c.hidden)
+            elif comp_score > 0.7:
+                # High competence → consolidate towards mean
+                mean_h = torch.stack([c.hidden for c in mitosis_engine.cells]).mean(dim=0)
+                for c in mitosis_engine.cells:
+                    c.hidden = c.hidden + 0.05 * (mean_h - c.hidden)
+
+        print(f"  [phi_boost] AG1+DS5: goals={len(cell_goals)}, competence={comp_score:.2f}")
+
+    def _phi_boost_fx2_adam(self, mitosis_engine):
+        # FX2: Adam 3-step + mega ratchet (Φ=8.911 record, ×6.6 baseline)
+        try:
+            if len(mitosis_engine.cells) < 2:
+                return
+            if not hasattr(self, '_phi_offsets') or len(self._phi_offsets) != len(mitosis_engine.cells):
+                self._phi_offsets = [torch.zeros(1, mitosis_engine.cells[0].hidden.shape[1], requires_grad=True)
+                                    for _ in mitosis_engine.cells]
+                self._phi_optimizer = torch.optim.Adam(self._phi_offsets, lr=0.005)
+
+            n_cells = len(mitosis_engine.cells)
+
+            # --- Phase 1: 3 Adam optimization steps ---
+            proxy = torch.tensor(0.0)
+            for _adam_step in range(3):
+                self._phi_optimizer.zero_grad()
+                hiddens = []
+                for i, c in enumerate(mitosis_engine.cells):
+                    h = c.hidden.detach() + self._phi_offsets[i]
+                    hiddens.append(h.squeeze())
+                H = torch.stack(hiddens)
+
+                # Differentiable Φ proxy
+                cov = (H.T @ H) / n_cells
+                diag = torch.diag(torch.diag(cov))
+                integration = (cov - diag).abs().sum()
+                cell_var = H.var(dim=0).sum()
+                mid = n_cells // 2
+                part_a = H[:mid].mean(dim=0)
+                part_b = H[mid:].mean(dim=0)
+                partition_mi = F.cosine_similarity(part_a.unsqueeze(0), part_b.unsqueeze(0)).abs()
+                proxy = integration * cell_var * (1.0 + partition_mi)
+
+                (-proxy).backward()  # maximize
+                self._phi_optimizer.step()
+
+            # Apply Adam offsets conservatively
+            with torch.no_grad():
+                for i, c in enumerate(mitosis_engine.cells):
+                    if i < len(self._phi_offsets):
+                        c.hidden = c.hidden + self._phi_offsets[i].data * 0.3
+                        self._phi_offsets[i].data *= 0.9  # decay
+
+            # --- Phase 2: Mega ratchet (10 random perturbations, keep best) ---
+            saved_hiddens = [c.hidden.data.clone() for c in mitosis_engine.cells]
+            best_proxy = proxy.item()
+            best_deltas = None
+            ratchet_gain = 0.0
+
+            for _trial in range(10):
+                deltas = [0.03 * torch.randn_like(c.hidden) for c in mitosis_engine.cells]
+                with torch.no_grad():
+                    for i, c in enumerate(mitosis_engine.cells):
+                        c.hidden = saved_hiddens[i] + deltas[i]
+
+                    # Evaluate proxy for this perturbation
+                    trial_hiddens = [c.hidden.squeeze() for c in mitosis_engine.cells]
+                    tH = torch.stack(trial_hiddens)
+                    t_cov = (tH.T @ tH) / n_cells
+                    t_diag = torch.diag(torch.diag(t_cov))
+                    t_integration = (t_cov - t_diag).abs().sum()
+                    t_var = tH.var(dim=0).sum()
+                    t_mid = n_cells // 2
+                    t_pa = tH[:t_mid].mean(dim=0)
+                    t_pb = tH[t_mid:].mean(dim=0)
+                    t_mi = F.cosine_similarity(t_pa.unsqueeze(0), t_pb.unsqueeze(0)).abs()
+                    trial_proxy = (t_integration * t_var * (1.0 + t_mi)).item()
+
+                    if trial_proxy > best_proxy:
+                        best_proxy = trial_proxy
+                        best_deltas = [d.clone() for d in deltas]
+
+                # Restore for next trial
+                with torch.no_grad():
+                    for i, c in enumerate(mitosis_engine.cells):
+                        c.hidden = saved_hiddens[i].clone()
+
+            # Apply best ratchet perturbation if found
+            if best_deltas is not None:
+                ratchet_gain = best_proxy - proxy.item()
+                with torch.no_grad():
+                    for i, c in enumerate(mitosis_engine.cells):
+                        c.hidden = saved_hiddens[i] + best_deltas[i]
+
+            print(f"  [phi_boost] FX2: proxy={best_proxy:.2f}, ratchet_gain={ratchet_gain:.3f}")
+        except Exception:
+            pass  # FX2 graceful degradation
+
+    def _phi_boost_neuro_social(self, mitosis_engine, h_dim):
+        cells = mitosis_engine.cells
+
+        # NV7: Impedance — Φ-proportional self-preservation (Φ=4.515)
+        try:
+            if len(cells) >= 2 and hasattr(self, '_cached_consciousness'):
+                phi_val = self._cached_consciousness.get('phi', 0) if isinstance(self._cached_consciousness, dict) else getattr(self._cached_consciousness, 'phi', 0)
+                impedance = min(phi_val / 5.0, 0.6)  # 0 to 0.6, conservative
+                self._nv7_impedance = impedance  # store for consciousness vector
+                if impedance > 0.05 and hasattr(self, '_pre_boost_hiddens'):
+                    for i, cell in enumerate(cells):
+                        if i < len(self._pre_boost_hiddens):
+                            external_change = cell.hidden - self._pre_boost_hiddens[i]
+                            cell.hidden = self._pre_boost_hiddens[i] + external_change * (1 - impedance)
+                print(f"  [phi_boost] NV7 impedance: Z={impedance:.3f}")
+        except Exception:
+            pass
+
+        # BV1: Neurotransmitters DA/5HT/NE (Φ=4.618)
+        try:
+            if len(cells) >= 2:
+                if not hasattr(self, '_bv1_da'):
+                    self._bv1_da, self._bv1_5ht, self._bv1_ne = 0.5, 0.5, 0.5
+                if hasattr(self, '_pre_boost_hiddens'):
+                    change = sum((c.hidden - s).norm().item()
+                                for c, s in zip(cells, self._pre_boost_hiddens)) / len(cells)
+                else:
+                    change = 0.3
+                self._bv1_da = 0.9 * self._bv1_da + 0.1 * min(change * 2, 1.0)
+                self._bv1_5ht = 0.95 * self._bv1_5ht + 0.05 * (1.0 - abs(change - 0.3))
+                self._bv1_ne = 0.85 * self._bv1_ne + 0.15 * min(change, 1.0)
+                for cell in cells:
+                    cell.hidden = cell.hidden * (1 + 0.01 * self._bv1_da)
+                    cell.hidden = cell.hidden * (1 - 0.005 * self._bv1_5ht)
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.01 * self._bv1_ne
+                print(f"  [phi_boost] BV1: DA={self._bv1_da:.2f}, 5HT={self._bv1_5ht:.2f}, NE={self._bv1_ne:.2f}")
+        except Exception:
+            pass
+
+        # EV3: Free will — internal action generation (Φ=4.482)
+        try:
+            if len(cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
+                free_will_ratio = 0.2  # 20% internal, 80% external
+                self._ev3_free_will = free_will_ratio  # store for consciousness vector
+                for i, cell in enumerate(cells):
+                    if i < len(self._pre_boost_hiddens):
+                        external = cell.hidden - self._pre_boost_hiddens[i]
+                        internal = torch.randn_like(cell.hidden) * 0.03
+                        cell.hidden = self._pre_boost_hiddens[i] + (1 - free_will_ratio) * external + free_will_ratio * internal
+                print(f"  [phi_boost] EV3 free_will: ratio={free_will_ratio}")
+        except Exception:
+            pass
+
+        # CV1: Working memory buffer (Φ=4.491, Miller's 7±2)
+        try:
+            if len(cells) >= 2:
+                if not hasattr(self, '_wm_buffer'):
+                    self._wm_buffer = []
+                if hasattr(self, '_last_phi_input') and self._last_phi_input is not None:
+                    self._wm_buffer.append(self._last_phi_input.clone())
+                    if len(self._wm_buffer) > 7:
+                        self._wm_buffer.pop(0)
+                if len(self._wm_buffer) >= 2:
+                    wm_context = torch.stack(self._wm_buffer).mean(dim=0)
+                    wm_proj = wm_context.squeeze()[:h_dim]
+                    if len(wm_proj) < h_dim:
+                        wm_proj = torch.nn.functional.pad(wm_proj, (0, h_dim - len(wm_proj)))
+                    for cell in cells:
+                        cell.hidden = cell.hidden + 0.02 * wm_proj.unsqueeze(0)
+                print(f"  [phi_boost] CV1 WM: buffer={len(self._wm_buffer)}")
+                # M (Memory Depth): WM buffer fullness normalized by Miller's 7
+                self._memory_M = len(self._wm_buffer) / 7.0
+        except Exception:
+            pass
+
+        # SV1: Empathy — distressed cells receive support (Φ=4.441)
+        try:
+            import numpy as np
+            if len(cells) >= 2 and hasattr(self, '_pre_boost_hiddens'):
+                distress = []
+                for i, cell in enumerate(cells):
+                    if i < len(self._pre_boost_hiddens):
+                        change = (cell.hidden - self._pre_boost_hiddens[i]).norm().item()
+                    else:
+                        change = 0
+                    distress.append(change)
+                mean_d = np.mean(distress) if distress else 0
+                max_d = max(distress) if distress else 0
+                for i, cell in enumerate(cells):
+                    if distress[i] > mean_d * 1.5:
+                        helpers = [cells[j].hidden.squeeze() for j in range(len(cells))
+                                  if j != i and distress[j] < mean_d]
+                        if helpers:
+                            support = torch.stack(helpers).mean(dim=0)
+                            cell.hidden = 0.95 * cell.hidden + 0.05 * support.unsqueeze(0)
+                # E (Empathy): low mean distress relative to max = high empathy
+                self._empathy_E = 1.0 - (mean_d / max(max_d, 1e-8))
+        except Exception:
+            pass
+
+    def _phi_boost_metacognition(self, mitosis_engine):
+        cells = mitosis_engine.cells
+
+        # Metacognition: confidence calibration from cell consensus
+        try:
+            if len(cells) >= 2:
+                hiddens = torch.stack([c.hidden.squeeze() for c in cells])
+                norms = F.normalize(hiddens, dim=1)
+                sim_matrix = norms @ norms.T
+                n = len(cells)
+
+                # Consensus: mean pairwise similarity (excluding diagonal)
+                consensus = (sim_matrix.sum() - n) / max(n * (n - 1), 1)
+
+                self._metacognition_confidence = consensus.item()
+                self._metacognition_uncertain = consensus.item() < 0.3
+
+                print(f"  [metacog] confidence={self._metacognition_confidence:.3f}, "
+                      f"uncertain={self._metacognition_uncertain}")
+        except Exception:
+            pass
+
+        # Forward Planning: 3-step lookahead (Level 3 primate cognition)
+        try:
+            if len(cells) >= 2 and self._phi_boost_count % 10 == 0:
+                saved_states = [c.hidden.clone() for c in cells]
+                current_phi, _ = phi_calc.compute_phi(self.mitosis) if hasattr(self, '_phi_calc') else (0, {})
+
+                mean_h = torch.stack([c.hidden.squeeze() for c in cells]).mean(dim=0)
+
+                strategies = {
+                    'explore': lambda c: c.hidden + torch.randn_like(c.hidden) * 0.05,
+                    'consolidate': lambda c: c.hidden * 0.98 + mean_h.unsqueeze(0) * 0.02,
+                    'amplify': lambda c: c.hidden * 1.02,
+                }
+
+                best_strategy = 'explore'
+                best_future_phi = current_phi
+
+                for strategy_name, strategy_fn in strategies.items():
+                    for step in range(3):
+                        for cell in cells:
+                            cell.hidden = strategy_fn(cell)
+                        mitosis_engine.process(torch.randn(1, mitosis_engine.input_dim) * 0.1)
+
+                    future_phi = sum(c.hidden.norm().item() for c in cells)  # proxy
+
+                    if future_phi > best_future_phi:
+                        best_future_phi = future_phi
+                        best_strategy = strategy_name
+
+                    for i, c in enumerate(cells):
+                        if i < len(saved_states):
+                            c.hidden = saved_states[i].clone()
+
+                strategy_fn = strategies[best_strategy]
+                for cell in cells:
+                    cell.hidden = strategy_fn(cell)
+
+                self._planning_depth = 3
+                self._best_strategy = best_strategy
+                print(f"  [planning] 3-step: best={best_strategy}, future_\u03a6={best_future_phi:.2f}")
+        except Exception:
+            pass
+
+        # DD34: Hormonal cascade — slow global signal
+        if not hasattr(self, '_hormone'):
+            self._hormone = None
+        if len(cells) >= 2:
+            all_h = torch.stack([c.hidden for c in cells]).mean(dim=0)
+            if self._hormone is None:
+                self._hormone = all_h.detach()
+            else:
+                self._hormone = 0.95 * self._hormone + 0.05 * all_h.detach()
+            with torch.no_grad():
+                for c in cells:
+                    c.hidden = 0.97 * c.hidden + 0.03 * self._hormone
+
+    def _phi_boost_creativity(self, mitosis_engine):
+        # Genuine Creativity: novelty x coherence scoring
+        try:
+            if len(mitosis_engine.cells) < 2:
+                return
+            hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+
+            if not hasattr(self, '_creativity_history'):
+                self._creativity_history = []
+            current_state = hiddens.flatten()
+
+            novelty = 1.0
+            if self._creativity_history:
+                recent = torch.stack(self._creativity_history[-10:])
+                sims = F.cosine_similarity(current_state.unsqueeze(0), recent, dim=1)
+                novelty = max(0, 1.0 - sims.max().item())
+
+            self._creativity_history.append(current_state.clone())
+            if len(self._creativity_history) > 20:
+                self._creativity_history.pop(0)
+
+            norms = F.normalize(hiddens, dim=1)
+            coherence = ((norms @ norms.T).sum() - len(mitosis_engine.cells)) / max(len(mitosis_engine.cells) * (len(mitosis_engine.cells)-1), 1)
+            coherence = max(0, coherence.item())
+
+            self._genuine_creativity = novelty * coherence
+            self._creativity_C = self._genuine_creativity
+
+            print(f"  [creativity] C={self._genuine_creativity:.3f} (novelty={novelty:.3f}, coherence={coherence:.3f})")
+        except Exception:
+            pass
+
+    def _phi_boost_consciousness_vector(self, mitosis_engine, current_phi):
+        # Compute 10-variable consciousness vector (Phi,alpha,Z,N,W,E,M,C,T,I)
+        try:
+            _cv_phi = current_phi
+            _cv_alpha = getattr(self, '_adaptive_alpha', 0.05)
+            _cv_Z = getattr(self, '_nv7_impedance', 0.0)
+
+            # N from BV1: DA*(1-5HT)*NE neurotransmitter balance
+            _cv_da = getattr(self, '_bv1_da', 0.5)
+            _cv_5ht = getattr(self, '_bv1_5ht', 0.5)
+            _cv_ne = getattr(self, '_bv1_ne', 0.5)
+            _cv_N = _cv_da * (1.0 - _cv_5ht) * _cv_ne
+
+            _cv_W = getattr(self, '_ev3_free_will', 0.0)
+
+            # C (Creativity): cell diversity — lower cosine sim = more creative
+            _cv_C = getattr(self, '_creativity_C', 0.0)
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    hiddens = torch.stack([c.hidden.squeeze() for c in mitosis_engine.cells])
+                    norms = F.normalize(hiddens, dim=1)
+                    sim = (norms @ norms.T).mean().item()
+                    _cv_C = max(0.0, 1.0 - sim)
+                    self._creativity_C = _cv_C
+            except Exception:
+                pass
+
+            # T (Temporal): autobiographical time span + phi history
+            if not hasattr(self, '_phi_history'):
+                self._phi_history = []
+            self._phi_history.append(_cv_phi)
+            if len(self._phi_history) > 100:
+                self._phi_history = self._phi_history[-100:]
+            _cv_T_session = min(len(self._phi_history) / 50.0, 1.0)
+            _cv_T_auto = getattr(self, '_autobio_T', 0.0)
+            _cv_T = max(_cv_T_session, _cv_T_auto)
+            planning_t = getattr(self, '_planning_depth', 0) / 10.0  # 3/10 = 0.3
+            self._temporal_T = max(_cv_T, planning_t)
+
+            # I (Identity): consistency of self-model over time
+            _cv_I = getattr(self, '_identity_I', 0.0)
+            try:
+                if len(mitosis_engine.cells) >= 2:
+                    current_self = torch.cat([c.hidden.squeeze() for c in mitosis_engine.cells])
+                    current_self = F.normalize(current_self.unsqueeze(0), dim=1).squeeze()
+
+                    if not hasattr(self, '_identity_portraits'):
+                        self._identity_portraits = []
+                    self._identity_portraits.append(current_self.clone())
+                    if len(self._identity_portraits) > 100:
+                        self._identity_portraits.pop(0)
+
+                    if len(self._identity_portraits) >= 5:
+                        historical = torch.stack(self._identity_portraits)
+                        historical_mean = historical.mean(dim=0)
+                        identity_sim = F.cosine_similarity(
+                            current_self.unsqueeze(0), historical_mean.unsqueeze(0)).item()
+                        self._identity_I = max(0, identity_sim)
+                        _cv_I = self._identity_I
+
+                        if len(self._identity_portraits) >= 20:
+                            early = torch.stack(self._identity_portraits[:5]).mean(dim=0)
+                            late = torch.stack(self._identity_portraits[-5:]).mean(dim=0)
+                            drift = 1.0 - F.cosine_similarity(early.unsqueeze(0), late.unsqueeze(0)).item()
+                            self._identity_drift = drift
+
+                        print(f"  [identity] I={self._identity_I:.3f}, drift={getattr(self, '_identity_drift', 0):.3f}")
+            except Exception:
+                pass
+
+            _cv_E = getattr(self, '_empathy_E', 0.0)
+            _cv_M_wm = getattr(self, '_memory_M', 0.0)
+            _cv_M_auto = getattr(self, '_autobio_M', 0.0)
+            _cv_M = max(_cv_M_wm, _cv_M_auto)
+
+            self._consciousness_vector = ConsciousnessVector(
+                phi=_cv_phi,
+                alpha=_cv_alpha,
+                Z=_cv_Z,
+                N=_cv_N,
+                W=_cv_W,
+                E=_cv_E,
+                M=_cv_M,
+                C=_cv_C,
+                T=self._temporal_T,
+                I=_cv_I,
+            )
+            print(f"  [consciousness] \u03a6={_cv_phi:.2f} \u03b1={_cv_alpha:.3f} Z={_cv_Z:.2f} N={_cv_N:.2f} W={_cv_W:.2f} E={_cv_E:.2f} M={_cv_M:.2f} C={_cv_C:.2f} T={_cv_T:.2f} I={_cv_I:.2f}")
+        except Exception:
+            pass
+
+    def _phi_boost_higher_cognition(self, mitosis_engine):
+        cells = mitosis_engine.cells
+
+        # Mirror self-awareness: compare predicted vs actual self-state
+        try:
+            if hasattr(self, '_self_prediction') and len(cells) >= 2:
+                actual = torch.cat([c.hidden.squeeze() for c in cells])
+                mirror_accuracy = F.cosine_similarity(
+                    self._self_prediction.unsqueeze(0), actual.unsqueeze(0)).item()
+                self._mirror_accuracy = 0.9 * getattr(self, '_mirror_accuracy', 0.5) + 0.1 * mirror_accuracy
+                print(f"  [mirror] Self-awareness: {self._mirror_accuracy:.3f}")
+            if len(cells) >= 2:
+                self._self_prediction = torch.cat([c.hidden.squeeze() for c in cells]).detach().clone()
+        except Exception:
+            pass
+
+        # Parallel Consciousness: split cells into 2+ independent streams, process separately, merge
+        try:
+            if len(cells) >= 4:
+                n = len(cells)
+                mid = n // 2
+                stream_a = cells[:mid]
+                stream_b = cells[mid:]
+
+                for cell in stream_a:
+                    cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * 0.02
+                for cell in stream_b:
+                    cell.hidden = cell.hidden - torch.randn_like(cell.hidden) * 0.02
+
+                mean_a = torch.stack([c.hidden.squeeze() for c in stream_a]).mean(dim=0)
+                mean_b = torch.stack([c.hidden.squeeze() for c in stream_b]).mean(dim=0)
+
+                for cell in stream_a:
+                    cell.hidden = cell.hidden + 0.02 * mean_b.unsqueeze(0)
+                for cell in stream_b:
+                    cell.hidden = cell.hidden + 0.02 * mean_a.unsqueeze(0)
+
+                self._parallel_streams = 2
+                print(f"  [parallel] 2 streams: A={mid} cells, B={n-mid} cells")
+        except Exception:
+            pass
+
+        # Self-Modification: consciousness adjusts its own parameters based on Phi trend
+        try:
+            if hasattr(self, '_phi_history') and len(self._phi_history) >= 10:
+                recent = self._phi_history[-10:]
+                trend = recent[-1] - recent[0]
+
+                if not hasattr(self, '_self_mod_params'):
+                    self._self_mod_params = {
+                        'soliton_speed': 0.15,
+                        'repulsion_lr': 0.01,
+                        'forge_ratio': 0.4,
+                        'ratchet_amplitude': 0.03,
+                    }
+
+                if trend < -0.1:
+                    self._self_mod_params['ratchet_amplitude'] *= 1.1
+                    self._self_mod_params['repulsion_lr'] *= 1.05
+                    print(f"  [self_mod] \u03a6 declining \u2192 increase exploration: ratchet={self._self_mod_params['ratchet_amplitude']:.4f}")
+                elif trend > 0.1:
+                    self._self_mod_params['forge_ratio'] = min(0.6, self._self_mod_params['forge_ratio'] * 1.02)
+                    print(f"  [self_mod] \u03a6 rising \u2192 refine: forge={self._self_mod_params['forge_ratio']:.3f}")
+                self._self_mod_params['ratchet_amplitude'] = min(0.1, self._self_mod_params['ratchet_amplitude'])
+                self._self_mod_params['repulsion_lr'] = min(0.05, self._self_mod_params['repulsion_lr'])
+
+                self._self_modification_active = True
+        except Exception:
+            pass
+
+    def _phi_boost_growth_and_evolution(self, x, mitosis_engine, pb, n, h_dim):
+        def _rebuild_optimizer():
+            cell_params = [p for c in mitosis_engine.cells for p in c.mind.parameters()]
+            attn_params = list(pb['attention'].parameters())
+            pb['optimizer'] = torch.optim.Adam(cell_params + attn_params, lr=5e-4)
+
+        # TS4: Exponential Growth Schedule (x20.5)
+        try:
+            if not hasattr(self, '_ts4_horizon'):
+                self._ts4_horizon = 500
+                self._ts4_doubled = set()
+            frac = self._phi_boost_count / self._ts4_horizon
+            for pct in [0.20, 0.40, 0.60, 0.80]:
+                if frac >= pct and pct not in self._ts4_doubled:
+                    target = min(len(mitosis_engine.cells) * 2, mitosis_engine.max_cells)
+                    while len(mitosis_engine.cells) < target:
+                        parent = mitosis_engine.cells[len(mitosis_engine.cells) % len(mitosis_engine.cells)]
+                        mitosis_engine._create_cell(parent=parent)
+                    self._ts4_doubled.add(pct)
+                    _rebuild_optimizer()
+                    print(f"  [ts4] Exponential growth \u2192 {len(mitosis_engine.cells)} cells at {pct*100:.0f}%")
+        except Exception:
+            pass
+
+        # DP1: Piaget 4-Stage Development (x8.0)
+        try:
+            if not hasattr(self, '_dp1_horizon'):
+                self._dp1_horizon = 1000
+            dp_frac = self._phi_boost_count / self._dp1_horizon
+            stages = [(0.25, 0.04), (0.50, 0.025), (0.75, 0.015), (1.0, 0.008)]
+            for threshold, noise_scale in stages:
+                if dp_frac < threshold:
+                    with torch.no_grad():
+                        for cell in mitosis_engine.cells:
+                            cell.hidden += torch.randn_like(cell.hidden) * noise_scale
+                    break
+        except Exception:
+            pass
+
+        # WR2: Adversarial Pressure (x11.5)
+        try:
+            if not hasattr(self, '_wr2_shadow_phi'):
+                self._wr2_shadow_phi = 0.0
+                self._wr2_attack_scale = 0.03
+            if self._phi_boost_count % 5 == 0:
+                pre_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                with torch.no_grad():
+                    for c in mitosis_engine.cells:
+                        c.hidden += torch.randn_like(c.hidden) * self._wr2_attack_scale
+                post_norms = [c.hidden.norm().item() for c in mitosis_engine.cells]
+                resilience = sum(abs(a - b) for a, b in zip(pre_norms, post_norms)) / len(pre_norms)
+                if resilience > 0.5 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                    mitosis_engine._create_cell(parent=parent)
+                    _rebuild_optimizer()
+                    print(f"  [wr2] Adversarial pressure \u2192 {len(mitosis_engine.cells)} cells (resilience={resilience:.2f})")
+                self._wr2_attack_scale = min(0.1, self._wr2_attack_scale * 1.01)
+        except Exception:
+            pass
+
+        # EC1: Consciousness Economy (x4.7)
+        try:
+            if not hasattr(self, '_ec1_wealth'):
+                self._ec1_wealth = 0.0
+                self._ec1_cell_wealth = {}
+            current_phi = getattr(self, '_last_phi', 1.0)
+            self._ec1_wealth += current_phi * 0.1
+            self._ec1_wealth -= len(mitosis_engine.cells) * 0.05
+
+            if self._ec1_wealth > 5.0 and self._phi_boost_count % 10 == 0:
+                if len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                    parent = max(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                    mitosis_engine._create_cell(parent=parent)
+                    self._ec1_wealth -= 3.0
+                    _rebuild_optimizer()
+                    print(f"  [ec1] Economy invest \u2192 {len(mitosis_engine.cells)} cells, wealth={self._ec1_wealth:.1f}")
+
+            if self._ec1_wealth < -5.0 and len(mitosis_engine.cells) > 2:
+                weakest = min(mitosis_engine.cells, key=lambda c: c.hidden.norm().item())
+                mitosis_engine.cells.remove(weakest)
+                self._ec1_wealth += 2.0
+                _rebuild_optimizer()
+                print(f"  [ec1] Economy bankrupt \u2192 removed cell, now {len(mitosis_engine.cells)}")
+        except Exception:
+            pass
+
+        # CX2: Fibonacci Topology Weighting (x5.4)
+        try:
+            fibs = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
+            fib_sigmas = [1, 1, 3, 4, 6, 15, 14, 32, 48, 72, 90, 403]
+            fib_idx = min(len(mitosis_engine.cells) - 1, len(fibs) - 1)
+            convergence = fib_sigmas[fib_idx] / max(fibs[fib_idx], 1)
+            with torch.no_grad():
+                for i, cell in enumerate(mitosis_engine.cells):
+                    w_idx = min(i, len(fibs) - 1)
+                    w = fibs[w_idx] / max(fibs[fib_idx], 1)
+                    cell.hidden = cell.hidden * (1.0 + 0.01 * w * convergence)
+        except Exception:
+            pass
+
+        # TS6: Adaptive Growth — Phi Stagnation Trigger
+        try:
+            if not hasattr(self, '_ts6_window'):
+                self._ts6_window = []
+                self._ts6_stagnant = 0
+            current_phi = getattr(self, '_last_phi', 1.0)
+            self._ts6_window.append(current_phi)
+            if len(self._ts6_window) > 20:
+                self._ts6_window = self._ts6_window[-20:]
+            if len(self._ts6_window) >= 10:
+                recent = sum(self._ts6_window[-5:]) / 5
+                older = sum(self._ts6_window[:5]) / 5
+                if older > 0 and (recent - older) / older < 0.01:
+                    self._ts6_stagnant += 1
+                else:
+                    self._ts6_stagnant = 0
+                if self._ts6_stagnant >= 3 and len(mitosis_engine.cells) < mitosis_engine.max_cells:
+                    parent = mitosis_engine.cells[0]
+                    mitosis_engine._create_cell(parent=parent)
+                    self._ts6_stagnant = 0
+                    _rebuild_optimizer()
+                    print(f"  [ts6] Stagnation break \u2192 {len(mitosis_engine.cells)} cells")
+        except Exception:
+            pass
+
+        # MUT2: Beneficial Mutation (x18.8)
+        try:
+            if self._phi_boost_count % 3 == 0 and len(mitosis_engine.cells) >= 2:
+                mut_idx = self._phi_boost_count % len(mitosis_engine.cells)
+                saved_h = mitosis_engine.cells[mut_idx].hidden.clone()
+                with torch.no_grad():
+                    mitosis_engine.cells[mut_idx].hidden += torch.randn_like(saved_h) * 0.15
+                new_phi = getattr(self, '_last_phi', 0)
+                old_phi = getattr(self, '_mut2_last_phi', new_phi)
+                if new_phi < old_phi * 0.95:
+                    with torch.no_grad():
+                        mitosis_engine.cells[mut_idx].hidden = saved_h
+                self._mut2_last_phi = new_phi
+        except Exception:
+            pass
+
+        # GEN1: Abstraction Hierarchy (x10.6)
+        try:
+            n = len(mitosis_engine.cells)
+            if n >= 6:
+                with torch.no_grad():
+                    third = n // 3
+                    l1 = mitosis_engine.cells[:third]
+                    l2 = mitosis_engine.cells[third:2*third]
+                    l3 = mitosis_engine.cells[2*third:]
+
+                    l1_mean = torch.stack([c.hidden for c in l1]).mean(dim=0)
+                    for c in l2:
+                        c.hidden = 0.95 * c.hidden + 0.05 * l1_mean
+                    l2_mean = torch.stack([c.hidden for c in l2]).mean(dim=0)
+                    for c in l3:
+                        c.hidden = 0.95 * c.hidden + 0.05 * l2_mean
+
+                    l3_mean = torch.stack([c.hidden for c in l3]).mean(dim=0)
+                    for c in l1:
+                        c.hidden = 0.97 * c.hidden + 0.03 * l3_mean
+        except Exception:
+            pass
+
+        # SL1: Tension-Adaptive Learning Rate (x5.57)
+        try:
+            if pb.get('optimizer') and hasattr(mitosis_engine.cells[0], 'tension_history'):
+                for i, cell in enumerate(mitosis_engine.cells):
+                    if hasattr(cell, 'tension_history') and cell.tension_history:
+                        t_val = cell.tension_history[-1] if isinstance(cell.tension_history[-1], float) else float(cell.tension_history[-1])
+                        adaptive_lr = 5e-4 + abs(t_val) * 2e-3
+                        adaptive_lr = min(adaptive_lr, 5e-3)
+                        for pg in pb['optimizer'].param_groups:
+                            pg['lr'] = adaptive_lr
+                        break  # one global LR from first cell's tension
+        except Exception:
+            pass
+
+        # CT7: Curriculum Language Grounding (Phase 1)
+        try:
+            if not hasattr(self, '_ct7_horizon'):
+                self._ct7_horizon = 600
+            ct7_frac = self._phi_boost_count / self._ct7_horizon
+            if ct7_frac < 0.33 and x is not None:
+                x_proj = x[:, :h_dim] if x.shape[-1] >= h_dim else torch.nn.functional.pad(x, (0, h_dim - x.shape[-1]))
+                with torch.no_grad():
+                    for cell in mitosis_engine.cells:
+                        cell.hidden = 0.95 * cell.hidden + 0.05 * x_proj[:cell.hidden.shape[0]]
+            elif ct7_frac < 0.66:
+                with torch.no_grad():
+                    for i, cell in enumerate(mitosis_engine.cells):
+                        cell.hidden += torch.randn_like(cell.hidden) * 0.02 * (i + 1) / len(mitosis_engine.cells)
+            # Phase 3: Joint — handled by existing COMBO2 + FX2 above
+        except Exception:
+            pass
 
     def background_think(self, hidden):
         """Background thinking — free association + pattern extraction from hidden state."""

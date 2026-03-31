@@ -403,13 +403,6 @@ def main():
 
     # ── Save results as JSON ──
     import json
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results_dolphin_star.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)

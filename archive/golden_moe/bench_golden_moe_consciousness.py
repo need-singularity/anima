@@ -27,12 +27,6 @@ from typing import List, Dict, Tuple
 from bench_v2 import BenchMind, PhiIIT, phi_proxy
 from golden_moe_v2 import GoldenMoEv2
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
 
 
 # ──────────────────────────────────────────────────────────
@@ -351,6 +345,8 @@ def main():
         n_experts=args.experts,
         steps=args.steps,
     )
+
+
 
     if args.exp1 or run_all:
         print("[Exp 1] Standard vs Golden MoE — Phi Comparison")

@@ -28,16 +28,26 @@ const N_FACTIONS: usize = 8;
 
 struct Cell {
     hidden: Vec<f32>,
+    /// Per-cell identity bias (Law 91b/95): orthogonal, prevents convergence
+    identity: Vec<f32>,
     w_z: Vec<Vec<f32>>,
     w_r: Vec<Vec<f32>>,
     w_h: Vec<Vec<f32>>,
 }
 
 impl Cell {
-    fn new(rng: &mut impl Rng) -> Self {
+    fn new(cell_id: usize, rng: &mut impl Rng) -> Self {
         let scale = 0.1;
+        // Identity: deterministic from cell_id for reproducibility + random component
+        let identity: Vec<f32> = (0..HIDDEN)
+            .map(|i| {
+                let phase = (cell_id * 7 + i * 13) as f32 * 0.618033; // golden ratio spread
+                phase.sin() * 0.1 + (rng.gen::<f32>() - 0.5) * 0.02
+            })
+            .collect();
         Cell {
             hidden: (0..HIDDEN).map(|_| rng.gen::<f32>() * scale).collect(),
+            identity,
             w_z: random_matrix(rng, HIDDEN, DIM + HIDDEN, scale),
             w_r: random_matrix(rng, HIDDEN, DIM + HIDDEN, scale),
             w_h: random_matrix(rng, HIDDEN, DIM + HIDDEN, scale),
@@ -56,6 +66,8 @@ impl Cell {
         let h_cand = tanh_vec(&matvec(&self.w_h, &combined_r));
         for i in 0..HIDDEN {
             self.hidden[i] = (1.0 - z[i]) * h_cand[i] + z[i] * self.hidden[i];
+            // Cell identity injection: prevents uniform convergence (Law 95)
+            self.hidden[i] += self.identity[i] * 0.03;
         }
     }
 
@@ -71,8 +83,8 @@ struct Faction {
 }
 
 impl Faction {
-    fn new(n_cells: usize, rng: &mut impl Rng) -> Self {
-        Faction { cells: (0..n_cells).map(|_| Cell::new(rng)).collect() }
+    fn new(n_cells: usize, base_id: usize, rng: &mut impl Rng) -> Self {
+        Faction { cells: (0..n_cells).map(|i| Cell::new(base_id + i, rng)).collect() }
     }
 
     fn mean_hidden(&self) -> Vec<f32> {
@@ -100,9 +112,9 @@ impl Faction {
         }
     }
 
-    fn add_cell(&mut self, rng: &mut impl Rng) {
+    fn add_cell(&mut self, cell_id: usize, rng: &mut impl Rng) {
         let parent_idx = rng.gen_range(0..self.cells.len());
-        let mut child = Cell::new(rng);
+        let mut child = Cell::new(cell_id, rng);
         for i in 0..HIDDEN {
             child.hidden[i] = self.cells[parent_idx].hidden[i]
                 + (rng.gen::<f32>() - 0.5) * 0.1;
@@ -120,7 +132,9 @@ struct ConsciousnessEngine {
 impl ConsciousnessEngine {
     fn new(n_factions: usize, cells_per_faction: usize, rng: &mut impl Rng) -> Self {
         ConsciousnessEngine {
-            factions: (0..n_factions).map(|_| Faction::new(cells_per_faction, rng)).collect(),
+            factions: (0..n_factions)
+                .map(|f| Faction::new(cells_per_faction, f * cells_per_faction, rng))
+                .collect(),
         }
     }
 
@@ -284,9 +298,11 @@ fn main() {
 
         // Cell growth (각 파벌에 균등 성장)
         let target_per_faction = ((2.0f32).powf((frac + 0.1) * 6.0) as usize).min(64);
+        let mut next_id = engine.total_cells();
         for faction in &mut engine.factions {
             while faction.cells.len() < target_per_faction {
-                faction.add_cell(&mut rng);
+                faction.add_cell(next_id, &mut rng);
+                next_id += 1;
             }
         }
 
@@ -358,9 +374,11 @@ fn main() {
         let frac = step as f32 / steps as f32;
         let target = ((2.0f32).powf((frac + 0.1) * 5.0) as usize).min(16);
         for eng in [&mut ea, &mut eb] {
+            let mut next_id = eng.total_cells();
             for faction in &mut eng.factions {
                 while faction.cells.len() < target {
-                    faction.add_cell(&mut rng);
+                    faction.add_cell(next_id, &mut rng);
+                    next_id += 1;
                 }
             }
         }

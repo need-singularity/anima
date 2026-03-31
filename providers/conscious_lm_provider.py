@@ -73,13 +73,6 @@ class ConsciousLMProvider:
 
         import torch
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
-
         # Extract last user message as seed
         seed = ""
         for m in reversed(messages):

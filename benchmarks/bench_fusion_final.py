@@ -1809,13 +1809,6 @@ def main():
             label = f"FUS-{run_id}" if run_id > 0 else "BASELINE"
             print(f"\n  [ERROR] {label}: {e}")
             import traceback
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
             traceback.print_exc()
 
     if results:
