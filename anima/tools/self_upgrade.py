@@ -102,9 +102,30 @@ class SelfDiagnostic:
         if d.conversation_quality > 0.7:
             d.strengths.append('good_conversation')
 
-        # 5. 지식 갭 분석
-        test_topics = ['수학', 'science', '코드', 'philosophy', '감정', 'daily']
-        # TODO: 각 토픽에 대해 테스트 질문 → CE 측정
+        # 5. 지식 갭 분석 — 토픽별 CE 측정
+        test_topics = {
+            '수학': '1+1=2이고 2+2=4이다. 수학은 논리적 추론의 기초이다.',
+            'science': '물은 H2O이다. 빛의 속도는 초속 약 30만 킬로미터이다.',
+            '코드': 'def hello(): print("hello world") # 함수를 정의하고 호출한다.',
+            'philosophy': '나는 생각한다 고로 존재한다. 의식이란 무엇인가.',
+            '감정': '기쁨과 슬픔은 인간 감정의 양극이다. 공감은 타인을 이해하는 것이다.',
+            'daily': '오늘 날씨가 좋다. 밥을 먹고 산책을 했다.',
+        }
+        if self.anima and hasattr(self.anima, 'model'):
+            model = self.anima.model
+            device = next(model.parameters(), torch.tensor(0)).device
+            for topic, text in test_topics.items():
+                try:
+                    tokens = torch.tensor([[b for b in text.encode('utf-8')]], device=device)
+                    with torch.no_grad():
+                        logits_a, _, _ = model(tokens)
+                        target = tokens[:, 1:]
+                        logits = logits_a[:, :-1, :]
+                        ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1)).item()
+                    if ce > 3.0:
+                        d.knowledge_gaps.append(topic)
+                except Exception:
+                    d.knowledge_gaps.append(topic)
 
         # 6. 추천
         if 'poor_conversation' in d.weaknesses:
