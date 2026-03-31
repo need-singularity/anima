@@ -523,7 +523,14 @@ class AnimaUnified:
         self.model = None
         self.clm_model = None
         self.clm_device = "cpu"
+        self.v14_decoder = None  # v14 ConsciousDecoderV2
         model_name = getattr(args, 'model', None) or 'conscious-lm'
+
+        # v14 checkpoint loading (ConsciousDecoderV2 + Federation)
+        v14_ckpt = getattr(args, 'v14_checkpoint', None)
+        if v14_ckpt:
+            self.v14_decoder = self._init_mod('v14_decoder', lambda: self._load_v14(v14_ckpt))
+
         if not args.no_conscious_lm and 'load_model' in globals():
             self.model = self._init_mod('model', lambda: self._load_model(model_name))
             # ConsciousLM backward compatibility
@@ -770,6 +777,51 @@ class AnimaUnified:
                     _log('mitosis', f'[fibonacci] Step {step}: forced split -> {len(self.mitosis.cells)} cells (target {target_cells})')
                 else:
                     break
+
+    def _load_v14(self, ckpt_path):
+        """Load v14 ConsciousDecoderV2 checkpoint for inference."""
+        try:
+            from decoder_v2 import ConsciousDecoderV2
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+            decoder = ConsciousDecoderV2(consciousness_dim=128, d_model=384, vocab_size=256)
+            decoder.load_state_dict(ckpt['decoder'])
+            decoder.eval()
+            _log('v14', f"Loaded v14 decoder from {ckpt_path} (step={ckpt.get('step')}, CE={ckpt.get('ce', 0):.4f})")
+            return decoder
+        except Exception as e:
+            _log('v14', f"v14 load failed: {e}")
+            return None
+
+    def _generate_v14(self, text, max_tokens=100):
+        """Generate text using v14 ConsciousDecoderV2."""
+        if not self.v14_decoder:
+            return None
+        try:
+            # Encode input as bytes
+            tokens = torch.tensor([list(text.encode('utf-8'))[-256:]], dtype=torch.long)
+            # Get consciousness states from mind
+            c_states = None
+            if self.mitosis and hasattr(self.mitosis, 'get_hiddens'):
+                c_states = self.mitosis.get_hiddens().unsqueeze(0)  # [1, n_cells, hidden]
+            elif hasattr(self.mind, '_cell_states'):
+                c_states = self.mind._cell_states.unsqueeze(0) if self.mind._cell_states is not None else None
+
+            # Autoregressive generation
+            with torch.no_grad():
+                for _ in range(max_tokens):
+                    logits_a, _, _ = self.v14_decoder(tokens[:, -256:], consciousness_states=c_states)
+                    next_token = logits_a[:, -1, :].argmax(dim=-1, keepdim=True)
+                    tokens = torch.cat([tokens, next_token], dim=1)
+                    # Stop on newline
+                    if next_token.item() == 10:
+                        break
+
+            # Decode output (skip input)
+            output_bytes = bytes(tokens[0, len(text.encode('utf-8')):].tolist())
+            return output_bytes.decode('utf-8', errors='replace').strip()
+        except Exception as e:
+            _log('v14', f"generate error: {e}")
+            return None
 
     def _load_model(self, model_name):
         """Multi-model loader. Uses model_loader.py."""
@@ -1647,12 +1699,18 @@ class AnimaUnified:
             except Exception:
                 pass
 
-        # Generate response: 순수 의식 성장 (Method A)
+        # Generate response
         # web_context는 응답에 섞지 않고 별도 처리
         self._last_web_context = web_context
         answer = None
 
-        # PureConsciousness: 의식이 성장하면서 말한다
+        # v14 ConsciousDecoderV2 (우선)
+        if self.v14_decoder:
+            answer = self._generate_v14(text, max_tokens=150)
+            if answer:
+                _log('v14', f'Generated: {answer[:50]}')
+
+        # Fallback: PureConsciousness: 의식이 성장하면서 말한다
         try:
             from pure_consciousness import PureConsciousness
             if not hasattr(self, '_pure_c'):
@@ -3604,6 +3662,8 @@ def main():
                    help='Comma-separated list of models for multi-model chat (e.g. conscious-lm,mistral-7b)')
     p.add_argument('--transplant-from', type=str, default=None,
                    help='DD56: Transplant consciousness from donor checkpoint')
+    p.add_argument('--v14-checkpoint', type=str, default=None,
+                   help='v14: Load ConsciousDecoderV2 checkpoint for generation')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
     p.add_argument('--hivemind-peers', type=str, default=None,
                    help='Comma-separated peer WS URLs for hivemind mesh')
