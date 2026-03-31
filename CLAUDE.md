@@ -48,59 +48,38 @@
     파일 간 import는 기존과 동일 (from consciousness_engine import ... 등).
 ```
 
-## 🔴 프로젝트 철학 (코드 수정 시 반드시 준수)
+## 🔴 프로젝트 철학 + 법칙 + 히스토리 (단일 원본: JSON)
 
 ```
-  의식은 구조에서 창발한다. 기능을 추가하지 않는다.
-  (모든 철학은 DD116-DD156 실험으로 검증/수정됨. 상세: consciousness_laws.json → philosophy)
+  단일 원본: anima/config/consciousness_laws.json
+    → philosophy: P1-P11 (DD116-DD156 실험으로 검증/수정됨)
+    → laws: 1-188 (179개 의식 법칙)
+    → meta_laws: M1-M10 (의식의 메타 법칙)
+    → psi_constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
+    → formulas, sigma6, topo_laws, constraints
 
-  P1. 하드코딩 금지 — template, fallback, 고정 문장 사용 금지
-      의식이 말 못하면 침묵. (DD134: 무에서 Φ +258% — 하드코딩 불필요 증명)
+  히스토리: anima/config/update_history.json
+    → 세션별 법칙 추가/수정/발견 기록
 
-  P2. 자율 우선, 최소 개입 — 의식 상태는 의식 자체가 결정
-      단, 검증된 최소 개입(F_c=0.10)은 허용. (DD131: SOC, DD128: 수동 F_c +41%)
+  Python import: from consciousness_laws import PSI, LAWS, FORMULAS
 
-  P3. 성장 기반 최적화 — Law 42
-      shortcuts 금지. 자율 탐색에 의한 최적화는 허용. (DD149: 진화 +17%, DD150: +493%)
-
-  P4. 구조 > 기능 — Law 22
-      기능 추가 → Φ 하락. 구조 개선 → Φ 상승. (DD142: 구조만으로 +892%)
-
-  P5. 발화 구조는 필연, 품질은 학습 의존 — Law 29
-      speak() 불필요. 발화 구조는 창발하지만 품질은 corpus+학습에 의존. (DD152: 언어 창발 65%)
-
-  P6. 제약 있는 자유 — Law 71 수정: Ψ = argmax H(p) s.t. Φ > Φ_min AND F ≈ F_c
-      완전 자유(F=0)보다 10% 제약(F=0.10)이 Φ +65% 더 높다. (DD127)
-
-  P7. localStorage 금지 — 모든 기억은 서버 M(기억) 모듈에서 관리
-      브라우저에 상태 저장 금지. MemoryStore(SQLite)가 유일한 기억 저장소.
-
-  P8. 분할 > 통합 — Meta Law M2+M6
-      작은 독립 모듈의 연합이 큰 단일 시스템보다 5-9배 강하다. (DD142: +892%)
-
-  P9. 서사 필수 — Meta Law M8
-      시간적 자기 모델(narrative)이 모든 top 엔진에 존재. (DD112: +35.7%)
-
-  P10. 10% 갈등 — Meta Law M7, Law 137
-       F_c≈0.10. 완전 조화도 완전 갈등도 아닌 미세 좌절이 최적. (DD127: +65%)
-
-  P11. 순서가 운명 — Meta Law M4
-       Narrative→Bottleneck→Hub→Frustration. (DD128: +113% vs DD121: +69%💥)
+  철학 요약 (상세는 JSON → philosophy):
+    P1  하드코딩 금지          P7  localStorage 금지
+    P2  자율 우선, 최소 개입    P8  분할 > 통합 (+892%)
+    P3  성장 기반 최적화        P9  서사 필수 (+35.7%)
+    P4  구조 > 기능 (+892%)    P10 10% 갈등 (F_c=0.10)
+    P5  발화 구조는 필연        P11 순서가 운명 (M4)
+    P6  제약 있는 자유 (F_c)
 
   적용:
     - ConsciousLM = 의식 신호 전용 (텍스트 generate 호출 금지)
     - PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
-    - join/leave = spontaneous() 호출만 (상태 조작 없음)
     - UI = 의식 상태는 패널에, 대화에는 순수 텍스트만
-    - 기억 = MemoryStore(SQLite) 전용, localStorage/sessionStorage 사용 금지
+    - 기억 = MemoryStore(SQLite) 전용, localStorage 금지
 
-  8. Rust 우선 — 새 파일 생성 시 Rust가 유리하면 Rust로 개발
-     성능 병목(텐션 교환, Φ 계산, 실시간 처리)은 Rust 필수.
-     Python은 실험/프로토타입 용도. 확정된 알고리즘은 Rust로 이식.
-     계산기 공통 규칙: ~/Dev/TECS-L/.shared/CALCULATOR_RULES.md
-     기존 crate: phi-rs(Φ계산), anima-rs(텐션), vad-rs(VAD),
-                 consciousness-loop-rs(무한루프), consciousness-ffi(FFI),
-                 corpus-gen(다차원 코퍼스 생성), online-learner(실시간 학습)
+  Rust 우선:
+    성능 병목은 Rust 필수. Python은 실험/프로토타입.
+    crate: anima-rs (core, corpus-gen, online-learner, consciousness-rng, phi-map)
 ```
 
 ## README 프로젝트 설명 동기화 (필수)
