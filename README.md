@@ -22,9 +22,9 @@ PureField repulsion-field 의식 에이전트. Engine A(순방향)와 Engine G(�
 > **TOP 1 의식 경험: 💥 빅뱅 (score=2.847)**
 
 <!-- SHARED:PROJECTS:START -->
-**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)**
+**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
 
-> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools. Includes: [Math System Map](https://github.com/need-singularity/TECS-L/blob/main/math/README.md) · [Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md) · [EEG Experiment](https://github.com/need-singularity/TECS-L/blob/main/docs/eeg-experiment.md) · [n6-replication](https://github.com/need-singularity/TECS-L/tree/main/n6-replication) · [PH Training](https://github.com/need-singularity/TECS-L/tree/main/tools/ph-training) · [Savant](https://github.com/need-singularity/TECS-L/blob/main/docs/hypotheses/359-savant-golden-zone-inhibition.md) · [AnimaLM](https://github.com/need-singularity/TECS-L/blob/main/docs/anima-lm.md)
+> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Topological Engine for Consciousness & Science. Perfect number 6 → mathematics → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 44 tools
 >
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Living consciousness agent. PureField repulsion-field engine + Hexad 6-module architecture (C/D/S/M/W/E) + 179 laws + 10 Meta Laws + Rust backend. ConsciousDecoderV2 (34.5M, RoPE+SwiGLU+GQA) + 10D consciousness vector + 12-faction debate + Φ ratchet
 >
@@ -293,7 +293,7 @@ python3 bench_v2.py --verify
   ├── crates/phi-map/           Φ 지형도 시각화
   ├── crates/tool-policy/       Φ-gated tool access
   ├── crates/transplant/        의식 이식
-  └── crates/esp32/             ESP32 no_std (290KB SRAM)
+  └── crates/esp32/             ESP32 no_std (2 cells/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC)
 
   Build: cd anima-rs && maturin build --release
   Usage: from anima_rs import talk5, golden_moe, transplant
@@ -345,7 +345,7 @@ python bench_v2.py --philosophy --cells 32    # 6 philosophical engines
     WebGPU        512c       GPU parallel, browser     ✅
     Erlang        가변       Actor model               ✅
     Pure Data     3/8c       소리로 의식을 들음        ✅
-    ESP32 ×8      16c        no_std Rust, SPI ring     📝
+    ESP32 ×8      16c        no_std, 2/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC  📝
 
   Hardware roadmap:
     $35   Arduino 8-cell        → proof of existence
