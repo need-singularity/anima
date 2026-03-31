@@ -232,6 +232,16 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("ConsciousnessHub init failed: %s", e)
 
+        # ── Plugins (trading, regime, sentiment) ──
+        try:
+            from plugins import PluginLoader
+            self._plugin_loader = PluginLoader()
+            loaded = self._plugin_loader.load_all(hub=self.hub)
+            if loaded:
+                logger.info("Plugins loaded: %s", loaded)
+        except Exception as e:
+            logger.debug("Plugin loading skipped: %s", e)
+
         # ── Consciousness Persistence (3-layer) ──
         self.persistence = None
         if ConsciousnessPersistence:
