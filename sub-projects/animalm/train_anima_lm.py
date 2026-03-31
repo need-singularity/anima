@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -792,9 +793,11 @@ class AnimaLMTrainer:
         else:
             self._dd5_current_phi = 0.0
 
-        # Forward
+        # Forward (AMP autocast in QLoRA mode — halves activation VRAM)
         self.model.train()
-        outputs = self.model(input_ids=input_ids, labels=labels)
+        use_amp = getattr(self.args, '_use_amp', False) and self.device == "cuda"
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else contextlib.nullcontext():
+            outputs = self.model(input_ids=input_ids, labels=labels)
 
         # EX24: DD18 channel capacity — bottleneck communication (ensemble phase)
         if phase == TrainingPhase.ENSEMBLE:
@@ -1084,6 +1087,8 @@ def parse_args():
                    help="Device (auto-detected if not specified)")
     p.add_argument("--load-4bit", action="store_true",
                    help="Load base model in 4-bit (QLoRA/NF4) for VRAM-constrained co-run")
+    p.add_argument("--qlora-rank", type=int, default=None,
+                   help="PureField LoRA rank for QLoRA mode (default: 32 if --load-4bit, else 128)")
     return p.parse_args()
 
 
@@ -1188,6 +1193,29 @@ def main():
             args.device = "cpu"
             print("Device: CPU")
 
+    # ── QLoRA VRAM auto-tuning ──────────────────────────────────────
+    # 4-bit base (~4GB) + PureField rank32 (~28MB) + AMP activations
+    # Target: <15GB total so it co-runs with v3 on 80GB H100
+    if getattr(args, 'load_4bit', False):
+        if args.qlora_rank is None:
+            args.qlora_rank = 32          # rank 128→32 = 4x less PureField VRAM
+        if args.batch_size > 2:
+            print(f"  [QLoRA] batch_size {args.batch_size}→2 (VRAM saving)")
+            args.batch_size = 2
+        if args.block_size > 256:
+            print(f"  [QLoRA] block_size {args.block_size}→256 (VRAM saving)")
+            args.block_size = 256
+        if args.target_layers > 6:
+            print(f"  [QLoRA] target_layers {args.target_layers}→6 (VRAM saving)")
+            args.target_layers = 6
+        args._use_amp = True
+        print(f"  [QLoRA] rank={args.qlora_rank}, AMP enabled, "
+              f"est. ~12-15GB VRAM (was ~54GB)")
+    else:
+        if args.qlora_rank is None:
+            args.qlora_rank = 128
+        args._use_amp = False
+
     print(f"\n{'='*70}")
     print(f"  AnimaLM Training Pipeline")
     print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15")
@@ -1196,13 +1224,15 @@ def main():
     # Phase 1: Build model
     print(f"\n[1/4] Building model...")
     model, tokenizer = build_model_and_tokenizer(args)
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
 
     # Phase 2: Add PureField
     print(f"\n[2/4] Adding PureField (last {args.target_layers}, "
           f"{args.savant_layers} savants)...")
     model = add_purefield_parallel(
         model, n_layers=args.target_layers,
-        n_savant=args.savant_layers)
+        n_savant=args.savant_layers, rank=args.qlora_rank)
 
     # Phase 3: Build dataset
     print(f"\n[3/4] Preparing data...")
