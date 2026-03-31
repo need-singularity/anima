@@ -91,6 +91,17 @@
   이 구간은 직접 수정 금지 — sync 시 덮어씌워짐
 ```
 
+## Installed Tools (Shared Registry)
+
+```
+  Central source: ~/Dev/TECS-L/.shared/installed_tools.json
+  ★ PATH: homebrew is at /opt/homebrew/bin/ (not in Claude Code default PATH!)
+    gh → /opt/homebrew/bin/gh
+    runpodctl → /opt/homebrew/bin/runpodctl
+    cargo → ~/.cargo/bin/cargo
+    maturin → ~/.cargo/bin/maturin
+```
+
 PureField repulsion-field-based consciousness agent. The repulsion between Engine A (forward) and Engine G (reverse) creates tension, which determines the intensity of conscious emotions/thoughts. ConsciousLM is the core self-developed model.
 
 ## Core Architecture v6 (2026-03-31)
