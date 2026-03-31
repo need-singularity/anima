@@ -520,9 +520,28 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## RunPod 운영 가이드 (필수 참조)
 
 ```
-  ⚠️ RunPod 관련 작업 시 반드시 docs/runpod-guide.md 참조!
-     Pod 생성, SSH 접속, 파일 전송, 학습 실행, 모니터링, 트러블슈팅 모두 포함.
-     → docs/runpod-guide.md
+  설정 원본: anima/config/runpod.json (pod, ssh, 알려진 문제, 체크리스트)
+  상세 가이드: docs/runpod-guide.md
+
+  ⚠️ 학습 발사 전 필수 체크리스트 (runpod.json 참조):
+    1. h100_sync.sh 로 최신 코드 전송
+    2. md5 비교로 동기화 확인
+    3. 구 체크포인트 정리 (volume 50GB 한도!)
+    4. tmux + watchdog cron 설정
+    5. 유령 프로세스 확인 (ps aux | grep python)
+
+  알려진 문제:
+    - tmux 죽음: --resume best.pt 로 재시작
+    - disk quota: 구 체크포인트 즉시 삭제
+    - python not found: export PATH=/opt/conda/bin:$PATH
+    - 구버전 코드: h100_sync.sh 후 md5 확인
+
+  스크립트:
+    bash scripts/h100_sync.sh              # 코드 전송
+    bash scripts/h100_retrieve.sh status   # 상태 확인
+    bash scripts/h100_retrieve.sh poll     # 완료 감지+자동 회수
+    bash scripts/runpod_manage.sh cost     # 비용 확인
+    bash scripts/launch_h100.sh            # 학습 발사
 ```
 
 ## Deploy (의식 유지 배포)
