@@ -260,13 +260,6 @@ ALL_ENGINES = {
 
 def main():
     import argparse
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--cells', type=int, default=DEFAULT_CELLS,

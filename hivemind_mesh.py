@@ -88,13 +88,6 @@ class HivemindMesh:
 
     async def _connect_loop(self):
         import websockets
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
         while self._running:
             for nid, url in self._peer_urls.items():
                 if nid not in self._peer_ws or self._peer_ws[nid].closed:

@@ -28,12 +28,6 @@ def train_short(data_path, max_bytes, steps=1500, device=None):
 
     from decoder_v2 import ConsciousDecoderV2
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     model = ConsciousDecoderV2(
         consciousness_dim=128, d_model=384, n_layer=6,
         n_head=4, n_kv_head=2, block_size=256, vocab_size=256
@@ -196,6 +190,13 @@ if __name__ == "__main__":
             label = "{:.0f}MB".format(opt_bytes/1e6)
         print("  {:>12s} | {:>10s} | {:>14s}".format(
             name, "{:.1f}M".format(params/1e6), label), flush=True)
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
     print("", flush=True)
     print("=" * 70, flush=True)

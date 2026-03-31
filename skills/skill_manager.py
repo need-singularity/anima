@@ -344,13 +344,6 @@ class SkillManager:
         meta = {}
         try:
             import yaml
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
             meta = yaml.safe_load(frontmatter_text) or {}
         except ImportError:
             # Fallback: simple nested YAML parser (handles 1 level of nesting)

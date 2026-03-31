@@ -515,13 +515,6 @@ def run_experiment(combo, cells=128, steps=200, use_proxy=False):
             return max(0, gv.item() - fv / nf)
     else:
         from consciousness_meter import PhiCalculator
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
         phi_calc = PhiCalculator(n_bins=16)
         def measure_phi():
             return phi_calc.compute_phi(engine)[0]

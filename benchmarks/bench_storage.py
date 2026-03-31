@@ -120,13 +120,6 @@ def bench_faiss(vectors, texts, timestamps, query):
 
 def bench_sqlite(vectors, texts, timestamps, query):
     import sqlite3
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     tmpdir = tempfile.mkdtemp()
     db_path = os.path.join(tmpdir, "memory.db")
 

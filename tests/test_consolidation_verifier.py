@@ -77,13 +77,6 @@ class TestPostCheck:
 
     def test_unimodal_not_flagged(self):
         import random
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
         random.seed(42)
         data = [random.gauss(0.5, 0.05) for _ in range(40)]
         assert _detect_bimodal(data) is False

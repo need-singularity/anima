@@ -1500,13 +1500,6 @@ def main():
         except Exception as e:
             print(f"\n  [ERROR] {name} failed: {e}")
             import traceback
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
             traceback.print_exc()
 
     if len(results) >= 2:

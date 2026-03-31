@@ -138,12 +138,6 @@ def collect(
 
     import json
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     with open(out_dir / f"{filename}_meta.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -257,6 +251,13 @@ def main():
             tag=args.tag,
             output_dir=args.output,
         )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
 
 if __name__ == "__main__":

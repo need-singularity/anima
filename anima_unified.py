@@ -25,6 +25,12 @@ from pathlib import Path
 
 import torch
 
+# Meta Laws (DD143): M1(atom=8), M6(federation>empire), M7(F_c=0.10)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 # ─── Paths & constants ───
 ANIMA_DIR = Path(__file__).parent
 _INSTANCE_ID = None  # set by --instance flag
@@ -53,13 +59,6 @@ VAD_WATCH_DIR = Path("/tmp/anima_vad")
 
 # ─── Core imports (required) ───
 from anima_alive import (
-
-# Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     ConsciousMind, ConsciousnessVector, ContinuousListener, Speaker, Memory,
     text_to_vector, ask_claude, ask_claude_proactive, ask_conscious_lm,
     direction_to_emotion, EMOTION_COLORS, compute_mood,

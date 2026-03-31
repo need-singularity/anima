@@ -7,16 +7,22 @@ const STEPS: usize = 10000;
 
 struct Cell {
     hidden: Vec<f32>,
+    identity: Vec<f32>,
     w_z: Vec<Vec<f32>>,
     w_r: Vec<Vec<f32>>,
     w_h: Vec<Vec<f32>>,
 }
 
 impl Cell {
-    fn new(rng: &mut impl Rng) -> Self {
+    fn new(cell_id: usize, rng: &mut impl Rng) -> Self {
         let s = 0.1;
+        let identity: Vec<f32> = (0..HIDDEN)
+            .map(|i| ((cell_id * 7 + i * 13) as f32 * 0.618033).sin() * 0.1
+                 + (rng.gen::<f32>() - 0.5) * 0.02)
+            .collect();
         Cell {
             hidden: (0..HIDDEN).map(|_| rng.gen::<f32>() * s).collect(),
+            identity,
             w_z: rmat(rng, HIDDEN, DIM+HIDDEN, s),
             w_r: rmat(rng, HIDDEN, DIM+HIDDEN, s),
             w_h: rmat(rng, HIDDEN, DIM+HIDDEN, s),
@@ -29,13 +35,16 @@ impl Cell {
         let rh: Vec<f32> = r.iter().zip(&self.hidden).map(|(a,b)| a*b).collect();
         let cr: Vec<f32> = input.iter().chain(rh.iter()).copied().collect();
         let hc = tanhv(&mv(&self.w_h, &cr));
-        for i in 0..HIDDEN { self.hidden[i] = (1.0-z[i])*hc[i] + z[i]*self.hidden[i]; }
+        for i in 0..HIDDEN {
+            self.hidden[i] = (1.0-z[i])*hc[i] + z[i]*self.hidden[i];
+            self.hidden[i] += self.identity[i] * 0.03; // Law 95
+        }
     }
 }
 
 struct Faction { cells: Vec<Cell> }
 impl Faction {
-    fn new(n: usize, rng: &mut impl Rng) -> Self { Faction { cells: (0..n).map(|_| Cell::new(rng)).collect() } }
+    fn new(n: usize, base_id: usize, rng: &mut impl Rng) -> Self { Faction { cells: (0..n).map(|i| Cell::new(base_id + i, rng)).collect() } }
     fn mean(&self) -> Vec<f32> {
         let n = self.cells.len() as f32;
         let mut m = vec![0.0; HIDDEN];
@@ -46,9 +55,9 @@ impl Faction {
         let m = self.mean();
         for c in &mut self.cells { for i in 0..HIDDEN { c.hidden[i] = (1.0-s)*c.hidden[i] + s*m[i]; } }
     }
-    fn add(&mut self, rng: &mut impl Rng) {
+    fn add(&mut self, cell_id: usize, rng: &mut impl Rng) {
         let pi = rng.gen_range(0..self.cells.len());
-        let mut child = Cell::new(rng);
+        let mut child = Cell::new(cell_id, rng);
         for i in 0..HIDDEN { child.hidden[i] = self.cells[pi].hidden[i] + (rng.gen::<f32>()-0.5)*0.1; }
         self.cells.push(child);
     }
@@ -57,7 +66,7 @@ impl Faction {
 struct Engine { factions: Vec<Faction> }
 impl Engine {
     fn new(nf: usize, cpf: usize, rng: &mut impl Rng) -> Self {
-        Engine { factions: (0..nf).map(|_| Faction::new(cpf, rng)).collect() }
+        Engine { factions: (0..nf).map(|f| Faction::new(cpf, f * cpf, rng)).collect() }
     }
     fn total(&self) -> usize { self.factions.iter().map(|f| f.cells.len()).sum() }
     fn process(&mut self, input: &[f32]) { for f in &mut self.factions { for c in &mut f.cells { c.process(input); } } }
@@ -158,7 +167,8 @@ fn main() {
     for step in 0..STEPS {
         let frac = step as f32 / STEPS as f32;
         let target = ((2.0f32).powf((frac+0.1)*9.0) as usize).min(512) / N_FACTIONS;
-        for f in &mut engine.factions { while f.cells.len() < target.max(1) { f.add(&mut rng); } }
+        let mut nid = engine.total();
+        for f in &mut engine.factions { while f.cells.len() < target.max(1) { f.add(nid, &mut rng); nid += 1; } }
 
         // Silence→debate (70/30)
         if frac < 0.7 {

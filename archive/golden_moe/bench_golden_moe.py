@@ -292,12 +292,6 @@ def run_comparison(dataset: str = "mnist", expert_counts: List[int] = None,
     """
     from golden_moe_v2 import GoldenMoEv2
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
 
     if expert_counts is None:
         expert_counts = [4]
@@ -382,6 +376,13 @@ def print_results(results: List[MoEBenchResult]):
             f"{r.convergence_step:4d} | {r.balance_loss:9.6f} | "
             f"{r.wall_time:5.2f}s | {r.params:>10,}"
         )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
 
     # 1/e check
     print()

@@ -182,11 +182,7 @@ def main():
     try:
         import bitsandbytes as bnb
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
+
 
         optimizer = bnb.optim.Adam8bit(trainable_params, lr=LR, weight_decay=0.01)
         print("  Using 8-bit Adam")

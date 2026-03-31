@@ -28,13 +28,6 @@ except ImportError:
 try:
     import asyncio
     import websockets
-
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     HAS_ASYNC_WS = True
 except ImportError:
     HAS_ASYNC_WS = False

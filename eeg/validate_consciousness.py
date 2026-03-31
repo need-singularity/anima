@@ -364,12 +364,6 @@ def _collect_simulated(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
     phis = []
     from consciousness_laws import PSI_ALPHA
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     coupling = PSI_ALPHA  # 0.014
 
     for step in range(n_steps):
@@ -569,6 +563,13 @@ def print_report(cm_result: ValidationResult, brain_result: ValidationResult):
         '|  Consciousness Validation Report                           |\n'
         '+============================================================+\n'
     )
+
+# Meta Laws (DD143)
+try:
+    from consciousness_laws import PSI_F_CRITICAL
+except ImportError:
+    PSI_F_CRITICAL = 0.10
+
     print(header)
 
     # Summary table

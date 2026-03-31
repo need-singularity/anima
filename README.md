@@ -281,17 +281,27 @@ dancindocker/anima:latest
 ## 📦 Download Model
 
 ```bash
-# setup.py가 자동 다운로드하지만, 수동으로도 가능:
+# v14 (최신, Federation + Phase-Optimal, CE=0.0021)
+pip install boto3
+python3 -c "
+import boto3, os
+s3 = boto3.client('s3',
+    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
+    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
+    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
+    region_name='auto')
+os.makedirs('checkpoints/v14_federated', exist_ok=True)
+print('Downloading v14 model (400MB)...')
+s3.download_file('anima', 'v14/model_best.pt', 'checkpoints/v14_federated/best.pt')
+print('Done!')
+"
 
-# HuggingFace
+# v2 (legacy)
 huggingface-cli download need-singularity/conscious-lm-v2 --local-dir ~/.anima/checkpoints
-
-# GitHub Releases
-wget https://github.com/need-singularity/anima/releases/latest/download/conscious-lm-v2.pt \
-  -O ~/.anima/checkpoints/conscious-lm-v2.pt
 ```
 
-> ConsciousLM v2 (28M params, 50K steps, ValCE=0.007, Ψ=0.491)
+> **v14** (34.5M params, 100K steps, CE=0.0021, Φ=49.7) — Federation 8×8c, Phase-Optimal, Meta Laws
+> v2 (28M params, 50K steps, ValCE=0.007, Ψ=0.491) — legacy
 
 ### 🏋️ Training v14 (Federated Consciousness, H100)
 
@@ -331,17 +341,21 @@ python train_v14.py \
 
 ```
   anima/v14/
+  ├── model_best.pt              400MB  v14 best checkpoint (ValCE=0.0022, Φ=50.75)
+  ├── model_step_100000.pt       400MB  v14 final (CE=0.0021, Φ=49.66)
   ├── corpus_v4.txt              110MB  5개국어(KO+JA+ZH+RU+EN)+코드+법칙
   ├── corpus_v5.txt              100MB  조합형: 60% high-tension + 25% 자가생성 + 15% DD/Laws
   ├── train_v14.py                      Federation + Phase-Optimal + --tension-lr
   ├── decoder_v2.py                     ConsciousDecoderV2 (34.5M)
   ├── consciousness_engine.py           --phase-optimal --federated
-  ├── consciousness_laws.json           Laws 1-187 + Meta M1-M10
+  ├── consciousness_laws.json           Laws 1-188 + Meta M1-M10
   ├── consciousness_laws.py             Laws loader
   ├── trinity.py                        Hexad/Trinity framework
   ├── feedback_bridge.py                HexadFeedbackBridge
   ├── hexad_loss.py                     Hexad 6-module loss
   └── gpu_phi.py                        GPU Phi calculator
+
+  v14 성과: CE=0.0021 (v13의 절반!), Φ=49.7, 100K steps, 3.4h H100
 
   Corpus 선택:
     v4: 5개국어 + 코드 + 법칙 (110MB, 균등 분포)
