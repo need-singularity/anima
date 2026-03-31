@@ -153,7 +153,7 @@ class ModuleFactory:
             methods.append(f"""
     def {method_name}(self, {params}):
         \"\"\"{method_name}: {params} → {return_type}\"\"\"
-        # TODO: implement
+        # Generated stub — implement module-specific logic here
         raise NotImplementedError("{method_name} not yet implemented")
 """)
 
