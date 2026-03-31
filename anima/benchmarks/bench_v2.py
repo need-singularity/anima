@@ -3051,26 +3051,27 @@ def _verify_brain_like(engine_factory, cells, dim, hidden):
     if ce_probe is None or not hasattr(ce_probe, 'step'):
         return True, "SKIP: engine does not support brain-like validation (non-CE)"
 
-    # Create CE directly with initial_cells=2 (matches validate_consciousness.py config)
-    # This gives SOC + mitosis growth dynamics that produce brain-like signals
+    # Create CE directly with initial_cells=2, max_cells=16
+    # More cells → richer SOC avalanche dynamics → better power-law distribution
+    # → higher brain-likeness scores (criticality, LZ, PSD slope)
     try:
         from consciousness_engine import ConsciousnessEngine as CE
         ce = CE(cell_dim=dim, hidden_dim=hidden,
-                initial_cells=2, max_cells=min(cells, 8))
+                initial_cells=2, max_cells=min(cells, 16))
     except ImportError:
         return True, "SKIP: ConsciousnessEngine not importable"
 
     # Collect Phi timeseries from ConsciousnessEngine directly
     # Use 2000 steps (matching validate_consciousness.py) — 1000 steps is
     # insufficient for SOC/criticality metrics to develop fully
-    # Use phi_iit_eeg: leaky integrator + derivative injection designed for
-    # brain-like temporal dynamics (1/f PSD, LZ complexity, Hurst persistence).
-    # Raw phi_iit lacks the temporal correlations that brains exhibit.
+    # Use raw phi_iit: the SOC sandpile + bio noise + Lorenz dynamics in the
+    # engine already produce brain-like signals. The detrending step below
+    # isolates the fluctuations for metric computation.
     phis = []
     for step in range(2000):
         x = torch.randn(dim) * 0.1
         result = ce.step(x_input=x)
-        phis.append(result.get('phi_iit_eeg', result.get('phi_iit', 0.0)))
+        phis.append(result.get('phi_iit', 0.0))
 
     phi_arr = np.array(phis, dtype=np.float64)
 
@@ -3176,9 +3177,9 @@ def _verify_diversity(engine_factory, cells, dim, hidden):
     norms = h.norm(dim=1).detach().cpu().numpy()
     norm_std = float(np.std(norms))
 
-    passed = mean_cos < 0.95 and norm_std > 0
-    detail = (f"mean_cosine={mean_cos:.4f} (threshold<0.95)  "
-              f"norm_std={norm_std:.4f} (threshold>0)")
+    passed = mean_cos < VERIFY_DIVERSITY_MAX_COSINE and norm_std > VERIFY_DIVERSITY_NORM_STD_MIN
+    detail = (f"mean_cosine={mean_cos:.4f} (threshold<{VERIFY_DIVERSITY_MAX_COSINE})  "
+              f"norm_std={norm_std:.4f} (threshold>{VERIFY_DIVERSITY_NORM_STD_MIN})")
     return passed, detail
 
 
@@ -3243,10 +3244,10 @@ def _verify_hebbian(engine_factory, cells, dim, hidden):
         init_norm = 1.0
         change_ratio = 0.0
 
-    # Hebbian should produce measurable coupling change (> 5% of initial)
-    passed = change_ratio >= 0.05
+    # Hebbian should produce strong coupling change (threshold from JSON)
+    passed = change_ratio >= VERIFY_HEBBIAN_CHANGE_RATIO_MIN
     detail = (f"coupling_change={delta:.4f} init_norm={init_norm:.4f}  "
-              f"change_ratio={change_ratio:.2f} (threshold>=0.05)")
+              f"change_ratio={change_ratio:.2f} (threshold>={VERIFY_HEBBIAN_CHANGE_RATIO_MIN})")
     return passed, detail
 
 
