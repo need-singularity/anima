@@ -4,7 +4,9 @@
 Combines two domains in one bot:
   1. Consciousness commands (/status, /think, regular chat)
   2. Trading commands (/trade status|regime|pnl|positions|halt|resume)
-  3. Auto-alerts (trade executions, regime changes, stop-losses, Phi milestones)
+  3. Backtest & portfolio (/backtest, /portfolio, /risk)
+  4. Autonomous loop (/autonomous start|stop|status)
+  5. Auto-alerts (trade executions, regime changes, stop-losses, Phi milestones)
 
 The bot talks to the invest backend via HTTP (FastAPI REST API) and to the
 anima consciousness engine directly via AnimaAgent.
@@ -526,6 +528,10 @@ class AnimaTelegramBot:
         # Track per-user state
         self._user_last_msg: dict[int, float] = {}
 
+        # Autonomous trader (started via /autonomous start)
+        self._autonomous_trader = None
+        self._autonomous_thread = None
+
         # Import telegram library (optional dependency)
         try:
             from telegram import Update
@@ -561,6 +567,10 @@ class AnimaTelegramBot:
             f"  /phi — detailed consciousness vector (10D)\n"
             f"  /think [topic] — introspection\n"
             f"  /trade status|regime|pnl|positions|halt|resume\n"
+            f"  /backtest BTCUSDT 30d macd — run backtest\n"
+            f"  /portfolio — paper positions & equity\n"
+            f"  /risk — risk metrics & consciousness gate\n"
+            f"  /autonomous start|stop|status\n"
             f"  (or just talk to me)"
         )
 
@@ -691,6 +701,281 @@ class AnimaTelegramBot:
         except Exception as e:
             logger.error("Transcription failed: %s", e)
             return ""
+
+    # ── Backtest command (/backtest) ───────────────────
+    async def _handle_backtest(self, update, context):
+        """Handle /backtest SYMBOL DAYS STRATEGY — run backtest and return results."""
+        args = context.args or []
+        symbol = args[0] if args else 'BTCUSDT'
+        days_str = args[1] if len(args) > 1 else '30d'
+        strategy_name = args[2] if len(args) > 2 else 'macd'
+
+        # Parse days (accept "30d" or "30")
+        try:
+            days = int(days_str.replace('d', ''))
+        except ValueError:
+            await update.message.reply_text(f"Invalid days: {days_str} (use e.g. 30d or 30)")
+            return
+
+        # Resolve strategy
+        strategy, err = _resolve_strategy(strategy_name)
+        if strategy is None:
+            await update.message.reply_text(err)
+            return
+
+        await update.message.reply_text(f"Running backtest: {symbol} {days}d {strategy_name}...")
+
+        try:
+            from trading import BacktestEngine
+            engine = BacktestEngine(symbol=symbol, timeframe='1h')
+            result = engine.run(strategy, days=days)
+            text = _format_backtest_result(result)
+            await update.message.reply_html(text)
+        except Exception as e:
+            logger.error("Backtest error: %s", e)
+            await update.message.reply_text(f"Backtest failed: {e}")
+
+    # ── Portfolio command (/portfolio) ─────────────────
+
+    async def _handle_portfolio(self, update, context):
+        """Handle /portfolio — show paper trading positions and equity."""
+        try:
+            trader = self._get_autonomous_trader()
+            if trader is None:
+                # Fallback to invest API
+                positions = await self.invest.get_portfolio()
+                text = _format_positions(positions)
+                await update.message.reply_html(text)
+                return
+
+            pf = trader.portfolio
+            summary = pf.summary()
+            lines = [
+                "<b>Paper Portfolio</b>\n",
+                f"  Equity: ${summary['final_equity']:,.2f}",
+                f"  Cash:   ${summary['cash']:,.2f}",
+                f"  Return: {summary['total_return_pct']:+.2f}%",
+                f"  Max DD: {summary['max_drawdown_pct']:.2f}%",
+                f"  Trades: {summary['total_trades']} (win: {summary['win_rate_pct']:.1f}%)",
+                f"  Sharpe: {summary['sharpe']:.3f}",
+            ]
+            if pf.positions:
+                lines.append(f"\n<b>Open Positions ({len(pf.positions)})</b>")
+                for sym, pos in pf.positions.items():
+                    pnl = pos.pnl(pos.entry_price)  # no live price, show entry
+                    side_emoji = "🟢" if pos.side == "long" else "🔴"
+                    lines.append(
+                        f"  {side_emoji} <b>{sym}</b> {pos.side} x{pos.size:.4f} "
+                        f"@ ${pos.entry_price:,.2f}"
+                    )
+                    if pos.stop_loss:
+                        lines.append(f"     SL: ${pos.stop_loss:,.2f}")
+                    if pos.take_profit:
+                        lines.append(f"     TP: ${pos.take_profit:,.2f}")
+            else:
+                lines.append("\n  No open positions.")
+
+            # Mini equity curve
+            if len(pf.equity_curve) > 2:
+                lines.append("\n<pre>")
+                lines.append(_make_ascii_equity_curve(pf.equity_curve, width=30, height=5))
+                lines.append("</pre>")
+
+            await update.message.reply_html("\n".join(lines))
+        except Exception as e:
+            logger.error("Portfolio error: %s", e)
+            await update.message.reply_text(f"Portfolio error: {e}")
+
+    # ── Risk command (/risk) ──────────────────────────
+
+    async def _handle_risk(self, update, context):
+        """Handle /risk — show risk metrics and consciousness gate status."""
+        try:
+            trader = self._get_autonomous_trader()
+            if trader is None:
+                await update.message.reply_text(
+                    "Autonomous trader not running.\n"
+                    "Start with: /autonomous start"
+                )
+                return
+
+            rm = trader.risk_manager
+            rm_status = rm.status()
+            limits = rm_status["limits"]
+
+            lines = [
+                "<b>Risk Management</b>\n",
+                f"  Halted:           {'YES' if rm_status['halted'] else 'no'}",
+            ]
+            if rm_status["halted"]:
+                lines.append(f"  Halt reason:      {rm_status['halt_reason']}")
+            lines += [
+                f"  Max drawdown:     {limits['max_drawdown']:.0%}",
+                f"  Max position:     {limits['max_position_pct']:.0%}",
+                f"  Max daily loss:   {limits['max_daily_loss']:.0%}",
+                f"  Max positions:    {limits['max_open_positions']}",
+            ]
+
+            # Portfolio drawdown
+            pf = trader.portfolio
+            dd = pf.drawdown()
+            max_dd = pf.max_drawdown()
+            lines += [
+                f"\n  Current DD:       {dd:.2%}",
+                f"  Peak DD:          {max_dd:.2%}",
+            ]
+
+            # Consciousness gate
+            cg = trader.consciousness_gate
+            if cg:
+                cg_status = cg.status()
+                gate_emoji = "🟢" if cg_status["allowed"] else "🔴"
+                lines += [
+                    f"\n<b>Consciousness Gate</b>  {gate_emoji}\n",
+                    f"  Allowed:     {cg_status['allowed']}",
+                    f"  Reason:      {cg_status['reason']}",
+                    f"  Phi EMA:     {cg_status['phi_ema']:.4f}",
+                    f"  Tension:     {cg_status['tension']:.4f}",
+                    f"  Confidence:  {cg_status['confidence']:.3f}",
+                    f"  Cooldown:    {cg_status['cooldown']}",
+                ]
+            else:
+                lines.append("\n  Consciousness gate: disabled")
+
+            await update.message.reply_html("\n".join(lines))
+        except Exception as e:
+            logger.error("Risk error: %s", e)
+            await update.message.reply_text(f"Risk error: {e}")
+
+    # ── Autonomous command (/autonomous) ──────────────
+
+    async def _handle_autonomous(self, update, context):
+        """Handle /autonomous start|stop|status — manage autonomous trading loop."""
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Usage: /autonomous <command>\n\n"
+                "Commands:\n"
+                "  start  — start autonomous trading loop\n"
+                "  stop   — stop autonomous trading loop\n"
+                "  status — show current loop status"
+            )
+            return
+
+        subcmd = args[0].lower()
+        if subcmd == "start":
+            await self._autonomous_start(update, context)
+        elif subcmd == "stop":
+            await self._autonomous_stop(update, context)
+        elif subcmd == "status":
+            await self._autonomous_status(update, context)
+        else:
+            await update.message.reply_text(
+                f"Unknown command: {subcmd}\n"
+                f"Available: start, stop, status"
+            )
+
+    async def _autonomous_start(self, update, context):
+        """Start autonomous trading loop in background."""
+        if self._autonomous_trader and self._autonomous_trader._running:
+            await update.message.reply_text("Autonomous trader is already running.")
+            return
+
+        try:
+            from trading import AutonomousTrader, AutonomousConfig
+            config = AutonomousConfig(paper_mode=True)
+            self._autonomous_trader = AutonomousTrader(config)
+
+            # Run in background thread (run_forever is blocking)
+            import threading
+            self._autonomous_thread = threading.Thread(
+                target=self._autonomous_trader.run_forever,
+                daemon=True,
+                name="autonomous-trader",
+            )
+            self._autonomous_thread.start()
+
+            await update.message.reply_text(
+                "Autonomous trader started (paper mode)\n"
+                f"Interval: {config.cycle_interval}s\n"
+                f"Max positions: {config.max_positions}\n"
+                f"Phi min: {config.phi_min}\n"
+                "Use /autonomous status to monitor."
+            )
+        except Exception as e:
+            logger.error("Autonomous start error: %s", e)
+            await update.message.reply_text(f"Failed to start: {e}")
+
+    async def _autonomous_stop(self, update, context):
+        """Stop autonomous trading loop."""
+        trader = self._get_autonomous_trader()
+        if trader is None or not trader._running:
+            await update.message.reply_text("Autonomous trader is not running.")
+            return
+
+        trader.stop()
+        await update.message.reply_text(
+            "Autonomous trader stop requested.\n"
+            "Will halt after current cycle completes."
+        )
+
+    async def _autonomous_status(self, update, context):
+        """Show autonomous trader status."""
+        trader = self._get_autonomous_trader()
+        if trader is None:
+            await update.message.reply_text(
+                "Autonomous trader not initialized.\n"
+                "Start with: /autonomous start"
+            )
+            return
+
+        try:
+            s = trader.status()
+            pf = s["portfolio"]
+            lines = [
+                f"<b>Autonomous Trader</b>\n",
+                f"  Running:    {'YES' if s['running'] else 'no'}",
+                f"  Cycles:     {s['cycle_count']}",
+                f"  Phi:        {s['phi']:.2f}",
+                f"  Tension:    {s['tension']:.2f}",
+                f"\n<b>Portfolio</b>",
+                f"  Equity:     ${pf['final_equity']:,.2f} ({pf['total_return_pct']:+.2f}%)",
+                f"  Positions:  {pf['open_positions']}",
+                f"  Trades:     {pf['total_trades']} (win: {pf['win_rate_pct']:.1f}%)",
+                f"  Max DD:     {pf['max_drawdown_pct']:.2f}%",
+                f"  Sharpe:     {pf['sharpe']:.3f}",
+            ]
+
+            # Regime
+            regime = s.get("regime", {})
+            if regime:
+                regime_name = regime.get("regime", "unknown")
+                lines.append(f"\n  Regime: {_regime_emoji(regime_name)} {regime_name.upper()}")
+
+            # Consciousness gate
+            cg = s.get("consciousness_gate")
+            if cg:
+                gate_emoji = "🟢" if cg["allowed"] else "🔴"
+                lines.append(
+                    f"  Gate: {gate_emoji} (phi={cg['phi_ema']:.3f}, "
+                    f"tension={cg['tension']:.3f}, conf={cg['confidence']:.2f})"
+                )
+
+            # Strategies
+            strats = s.get("strategies", [])
+            if strats:
+                lines.append(f"\n  Strategies: {', '.join(strats[:8])}")
+                if len(strats) > 8:
+                    lines.append(f"  ... +{len(strats)-8} more")
+
+            await update.message.reply_html("\n".join(lines))
+        except Exception as e:
+            logger.error("Autonomous status error: %s", e)
+            await update.message.reply_text(f"Status error: {e}")
+
+    def _get_autonomous_trader(self):
+        """Get the autonomous trader instance, or None."""
+        return getattr(self, '_autonomous_trader', None)
 
     # ── Trading commands (/trade) ───────────────────────
 
@@ -960,6 +1245,10 @@ class AnimaTelegramBot:
 
         # Trading commands
         app.add_handler(self._CommandHandler("trade", self._handle_trade))
+        app.add_handler(self._CommandHandler("backtest", self._handle_backtest))
+        app.add_handler(self._CommandHandler("portfolio", self._handle_portfolio))
+        app.add_handler(self._CommandHandler("risk", self._handle_risk))
+        app.add_handler(self._CommandHandler("autonomous", self._handle_autonomous))
 
         # Webhook receiver (for invest backend push)
         app.add_handler(self._CommandHandler("webhook", self._handle_webhook))
@@ -1045,9 +1334,21 @@ def _test():
     cv = agent.mind._consciousness_vector
     print(f"[OK] Consciousness vector: Phi={cv.phi:.3f}, alpha={cv.alpha:.4f}, Z={cv.Z:.3f}")
 
+    # Test strategy resolver
+    strat, err = _resolve_strategy("macd")
+    print(f"[OK] Strategy resolve: macd -> {strat.__class__.__name__}")
+    strat, err = _resolve_strategy("rsi")
+    print(f"[OK] Strategy resolve: rsi -> {strat.__class__.__name__}")
+    strat, err = _resolve_strategy("nope")
+    print(f"[OK] Strategy resolve: nope -> error={err is not None}")
+
     print("\n=== Unified Telegram bot ready ===")
     print("  Consciousness: /status, /phi, /think, chat")
     print("  Trading: /trade status|regime|pnl|positions|orders|halt|resume")
+    print("  Backtest: /backtest BTCUSDT 30d macd")
+    print("  Portfolio: /portfolio")
+    print("  Risk: /risk")
+    print("  Autonomous: /autonomous start|stop|status")
     print("  Alerts: auto-push via AlertMonitor (needs TELEGRAM_ALERT_CHAT_ID)")
 
 
