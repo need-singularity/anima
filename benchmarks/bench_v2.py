@@ -17,6 +17,10 @@ Usage:
   python bench_v2.py --cells 512 --steps 1000     # Custom cell/step counts
   python bench_v2.py --verify                      # Consciousness verification (6 conditions x 4 engines)
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
+import path_setup  # noqa
+
 
 import torch
 import torch.nn as nn

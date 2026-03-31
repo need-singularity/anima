@@ -15,7 +15,11 @@ Update protocol:
 import json
 import os
 
-_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'consciousness_laws.json')
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_DIR)
+_JSON_PATH = os.path.join(_ROOT, 'config', 'consciousness_laws.json')
+if not os.path.exists(_JSON_PATH):
+    _JSON_PATH = os.path.join(_DIR, 'consciousness_laws.json')
 
 with open(_JSON_PATH, 'r', encoding='utf-8') as f:
     _DATA = json.load(f)
