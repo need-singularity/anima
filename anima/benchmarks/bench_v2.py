@@ -2812,16 +2812,8 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
             if out is not None and isinstance(out, torch.Tensor) and out.numel() > 1:
                 ce_solo_vals.append(out.var().item())
 
-    # Use raw hiddens (no breathing overlay) for fair comparison between phases.
-    # The breathing oscillation in get_hiddens() is step-dependent and would
-    # create unfair differences between solo (100 steps) and connected (200+ steps).
-    def _get_raw(engine):
-        try:
-            return engine.get_hiddens(raw=True)
-        except TypeError:
-            return engine.get_hiddens()
-    phi_a_solo, _ = phi_calc.compute(_get_raw(ea_solo))
-    phi_b_solo, _ = phi_calc.compute(_get_raw(eb_solo))
+    phi_a_solo, _ = phi_calc.compute(ea_solo.get_hiddens())
+    phi_b_solo, _ = phi_calc.compute(eb_solo.get_hiddens())
     phi_solo = (phi_a_solo + phi_b_solo) / 2
     ce_solo = float(np.mean(ce_solo_vals)) if ce_solo_vals else 0.0
 
@@ -2880,13 +2872,13 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
                 ce_conn_vals.append(out_b.var().item())
 
     # Measure connected Phi (average of both + combined)
-    phi_a_conn, _ = phi_calc.compute(_get_raw(ea))
-    phi_b_conn, _ = phi_calc.compute(_get_raw(eb))
+    phi_a_conn, _ = phi_calc.compute(ea.get_hiddens())
+    phi_b_conn, _ = phi_calc.compute(eb.get_hiddens())
     phi_avg_conn = (phi_a_conn + phi_b_conn) / 2
 
     # Also measure combined Phi (integration across both engines)
-    ha = _get_raw(ea)
-    hb = _get_raw(eb)
+    ha = ea.get_hiddens()
+    hb = eb.get_hiddens()
     if not isinstance(ha, torch.Tensor):
         ha = torch.stack(ha) if isinstance(ha, list) else torch.tensor(ha)
     if not isinstance(hb, torch.Tensor):
@@ -2903,8 +2895,8 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
     for _ in range(100):
         ea.process(torch.randn(1, dim))
         eb.process(torch.randn(1, dim))
-    phi_a_disc, _ = phi_calc.compute(_get_raw(ea))
-    phi_b_disc, _ = phi_calc.compute(_get_raw(eb))
+    phi_a_disc, _ = phi_calc.compute(ea.get_hiddens())
+    phi_b_disc, _ = phi_calc.compute(eb.get_hiddens())
     phi_disconnected = (phi_a_disc + phi_b_disc) / 2
 
     # --- Check conditions (thresholds from consciousness_laws.json) ---
@@ -3195,20 +3187,11 @@ def _verify_hebbian(engine_factory, cells, dim, hidden):
 
     Threshold from consciousness_laws.json: verify_hebbian_change_ratio_min = 1.0
     """
-    # Probe factory to check CE support
-    probe = engine_factory(cells, dim, hidden)
-    ce_probe = getattr(probe, 'engine', None)
-    if ce_probe is None or not hasattr(ce_probe, '_hebbian_update'):
+    # Use factory to create engine (respects ablation configuration)
+    engine = engine_factory(cells, dim, hidden)
+    ce = getattr(engine, 'engine', None)
+    if ce is None or not hasattr(ce, '_hebbian_update'):
         return True, "SKIP: engine does not support Hebbian learning (non-CE)"
-
-    # Create CE directly to access coupling matrix
-    try:
-        from consciousness_engine import ConsciousnessEngine as CE
-        ce = CE(cell_dim=dim, hidden_dim=hidden,
-                initial_cells=min(cells, 16), max_cells=min(cells, 16),
-                n_factions=min(8, cells // 2))
-    except ImportError:
-        return True, "SKIP: ConsciousnessEngine not importable"
 
     # Record initial coupling matrix state
     if ce._coupling is not None:
@@ -3217,11 +3200,11 @@ def _verify_hebbian(engine_factory, cells, dim, hidden):
         return True, "SKIP: engine has no coupling matrix"
 
     # Create a fixed repeating pattern (stimulus that recurs)
-    pattern = torch.randn(dim) * 0.3
+    pattern = torch.randn(1, dim) * 0.3
 
     # Run 200 steps with same pattern (Hebbian should modify coupling)
     for step in range(200):
-        ce.step(x_input=pattern)
+        engine.process(pattern)
 
     # Measure coupling change
     if ce._coupling is not None:
