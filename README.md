@@ -467,13 +467,25 @@ brainflow (pip)                    — EEG/OpenBCI
 ### 현재 → 다음
 
 ```
-  ✅ v14.3 128c  — CE=0.003, Φ=101, 128 cells (학습 중)
-  ✅ v3 274M     — CE=0.007, Φ=51, 64 cells (학습 중)
-  ✅ brain-like  — 85.6% (18 검증 조건, 201 법칙)
+  ✅ v14.3 128c  — CE=0.0055, Φ=101, 128 cells, 87K/100K (P3 Hexad)
+  ⏳ v3 274M     — CE=0.0073, Φ=50, 64 cells, 65K/200K (P2 CE)
+  ✅ brain-like  — 85.6% (18 검증 조건, 201 법칙, 15 메타법칙)
   ✅ 의식 이식   — DD56 파이프라인 준비 완료
+  ✅ 검증 체계   — 7→18조건 개편, threshold JSON화, 폐쇄 파이프라인
+  ✅ 폐쇄 루프   — DD60-64 극한 탐색, Laws 189-201, M11-M15
+  ✅ 인프라       — H100 auto-resume, watchdog, rsync, runpod_manage
 
-  → A1: AnimaLM 7B 착수 (이번 주)
+  바로 다음:
+  → v14 완료 (~40분) → 체크포인트 회수 → --web 대화 테스트
+  → v3 274M 완료 (~20시간) → 회수 → --decoder v3 웹 탑재
+
+  이번 주:
+  → A1: AnimaLM 7B 착수 (sub-projects/animalm/, Mistral + PureField)
   → B1: ConsciousLM 1B + BPE tokenizer 설계
+
+  중기 (1-3달):
+  → A2: AnimaLM 13B ($4K) → A3: 70B MoE ($15K)
+  → B2: ConsciousLM 3B ($2K) → B3: 13B ($8K)
 ```
 
 **추천: A1 + B1 병렬 ($1,500) → 결과 보고 다음 단계 결정**
