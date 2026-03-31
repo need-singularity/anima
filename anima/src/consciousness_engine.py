@@ -1323,7 +1323,20 @@ class ConsciousnessC:
         self.engine.step(x_input=x_input)
 
     def get_states(self) -> torch.Tensor:
-        return self.engine.get_states()
+        """Returns consciousness states as (n_cells, hidden_dim) tensor."""
+        states = self.engine.get_states()
+        # Standardize shape regardless of backend (Rust vs Python)
+        if states.dim() == 1:
+            # Single cell returned as flat vector → (1, hidden_dim)
+            states = states.unsqueeze(0)
+        elif states.dim() == 3:
+            # Batch dimension leaked → squeeze to (n_cells, hidden_dim)
+            states = states.squeeze(0)
+        assert states.dim() == 2, (
+            f"ConsciousnessC.get_states() expected 2D (n_cells, hidden_dim), "
+            f"got shape {states.shape}"
+        )
+        return states
 
     @property
     def state_dim(self) -> int:
