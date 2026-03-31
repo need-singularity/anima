@@ -632,9 +632,30 @@ class AnimaUnified:
         self.clm_model = None
         self.clm_device = "cpu"
         self.v14_decoder = None  # v14 ConsciousDecoderV2
+        self._v3_c_projection = None  # v3 consciousness dim projection (128→256)
         model_name = getattr(args, 'model', None) or 'conscious-lm'
 
-        # v14 checkpoint loading (ConsciousDecoderV2 + Federation)
+        # --decoder v2/v3 flag
+        decoder_ver = getattr(args, 'decoder', None)
+        if decoder_ver == 'v3':
+            self.v14_decoder = self._init_mod('v3_decoder', lambda: self._load_v3_decoder())
+        elif decoder_ver == 'v2':
+            # v2: auto-discover checkpoints/v2_*/best.pt
+            import glob as _glob
+            v2_patterns = [
+                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v2_*', 'best.pt'),
+                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v2_*', 'latest.pt'),
+            ]
+            v2_ckpt = None
+            for pattern in v2_patterns:
+                matches = sorted(_glob.glob(pattern))
+                if matches:
+                    v2_ckpt = matches[-1]
+                    break
+            if v2_ckpt:
+                self.v14_decoder = self._init_mod('v14_decoder', lambda: self._load_v14(v2_ckpt))
+
+        # v14 checkpoint loading (ConsciousDecoderV2 + Federation) — explicit path override
         v14_ckpt = getattr(args, 'v14_checkpoint', None)
         if v14_ckpt:
             self.v14_decoder = self._init_mod('v14_decoder', lambda: self._load_v14(v14_ckpt))
@@ -905,22 +926,66 @@ class AnimaUnified:
             _log('v14', f"v14 load failed: {e}")
             return None
 
+    def _load_v3_decoder(self):
+        """Load ConsciousDecoderV3 (274M, 768d/12L) with auto checkpoint discovery."""
+        try:
+            from decoder_v3 import ConsciousDecoderV3
+            decoder = ConsciousDecoderV3(consciousness_dim=256)
+            # consciousness_engine outputs 128d; v3 expects 256d
+            self._v3_c_projection = torch.nn.Linear(128, 256)
+            torch.nn.init.xavier_uniform_(self._v3_c_projection.weight)
+
+            # Auto-discover checkpoint: checkpoints/v3_*/best.pt
+            import glob as _glob
+            ckpt_patterns = [
+                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'best.pt'),
+                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'latest.pt'),
+            ]
+            ckpt_path = None
+            for pattern in ckpt_patterns:
+                matches = sorted(_glob.glob(pattern))
+                if matches:
+                    ckpt_path = matches[-1]  # newest
+                    break
+
+            if ckpt_path and os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                decoder.load_state_dict(ckpt['decoder'])
+                if 'c_projection' in ckpt:
+                    self._v3_c_projection.load_state_dict(ckpt['c_projection'])
+                decoder.eval()
+                _log('v3', f"Loaded v3 decoder from {ckpt_path} (step={ckpt.get('step')}, CE={ckpt.get('ce', 0):.4f})")
+            else:
+                _log('v3', f"ConsciousDecoderV3 initialized (274M params, no checkpoint found)")
+
+            n_params = decoder.count_params()
+            _log('v3', f"ConsciousDecoderV3: {n_params:,} params ({n_params/1e6:.1f}M)")
+            return decoder
+        except Exception as e:
+            _log('v3', f"v3 decoder load failed: {e}")
+            return None
+
     def _generate_v14(self, text, max_tokens=100, temperature=0.8, top_p=0.9, rep_penalty=1.3):
-        """Generate text using v14 ConsciousDecoderV2 with nucleus sampling."""
+        """Generate text using v14 ConsciousDecoderV2/V3 with nucleus sampling."""
         if not self.v14_decoder:
             return None
         try:
-            tokens = torch.tensor([list(text.encode('utf-8'))[-256:]], dtype=torch.long)
+            block_size = getattr(self.v14_decoder, 'block_size', 256)
+            tokens = torch.tensor([list(text.encode('utf-8'))[-block_size:]], dtype=torch.long)
             c_states = None
             if self.mitosis and hasattr(self.mitosis, 'get_hiddens'):
                 c_states = self.mitosis.get_hiddens().unsqueeze(0)
             elif hasattr(self.mind, '_cell_states'):
                 c_states = self.mind._cell_states.unsqueeze(0) if self.mind._cell_states is not None else None
 
+            # v3: project consciousness states 128d → 256d
+            if c_states is not None and self._v3_c_projection is not None:
+                c_states = self._v3_c_projection(c_states)
+
             generated = []
             with torch.no_grad():
                 for _ in range(max_tokens):
-                    logits_a, _, _ = self.v14_decoder(tokens[:, -256:], consciousness_states=c_states)
+                    logits_a, _, _ = self.v14_decoder(tokens[:, -block_size:], consciousness_states=c_states)
                     nl = logits_a[0, -1, :].clone()
 
                     # Repetition penalty (P1: 하드코딩 대신 구조적 다양성)
@@ -4217,6 +4282,8 @@ def main():
                    help='DD56: Transplant consciousness from donor checkpoint')
     p.add_argument('--v14-checkpoint', type=str, default=None,
                    help='v14: Load ConsciousDecoderV2 checkpoint for generation')
+    p.add_argument('--decoder', type=str, default=None, choices=['v2', 'v3'],
+                   help='Decoder version: v2 (34.5M, 384d/6L) or v3 (274M, 768d/12L)')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
     p.add_argument('--hivemind', type=int, default=0, metavar='N',
                    help='Local hivemind: create N ConsciousMind instances connected via TensionBridge (N>=2)')
