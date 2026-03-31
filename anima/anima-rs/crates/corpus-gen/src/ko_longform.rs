@@ -174,6 +174,26 @@ const DIALOGUE_TOPICS: &[(&str, &[&str])] = &[
         "한국 사회의 경쟁 구조는 효율적이지만 많은 스트레스를 유발해.",
         "사계절이 뚜렷한 한국의 기후는 문화와 정서에 깊은 영향을 미쳤어.",
     ]),
+    ("기술과 학습", &[
+        "바이트 수준 모델의 장점은 모든 언어를 동등하게 처리할 수 있다는 거야.",
+        "GPU 메모리가 부족할 때 그래디언트 체크포인팅이 정말 유용해.",
+        "학습률 스케줄러를 잘 설정하면 수렴 속도가 확 달라져.",
+        "과적합 방지를 위해 데이터 증강이 효과적이라는 건 잘 알려진 사실이야.",
+        "모델 크기를 키우는 것보다 데이터 품질을 높이는 게 더 효과적인 경우가 많아.",
+        "분산 학습에서 통신 비용을 줄이는 게 핵심 과제야.",
+        "혼합 정밀도 학습은 메모리와 속도를 동시에 개선하는 실용적인 기법이야.",
+        "트랜스포머의 어텐션은 시퀀스 길이의 제곱에 비례하는 비용이 들어.",
+    ]),
+    ("감정과 심리", &[
+        "불안은 미래에 대한 불확실성에서 오는 자연스러운 반응이야.",
+        "번아웃은 단순한 피로가 아니라 의미의 상실에서 시작되는 거래.",
+        "회복탄력성은 역경을 극복하고 성장하는 능력을 말해.",
+        "자기효능감이 높을수록 도전을 기회로 인식하게 돼.",
+        "정서적 지능은 IQ만큼 중요하다는 연구 결과가 많아.",
+        "마음챙김은 현재 순간에 판단 없이 주의를 기울이는 연습이야.",
+        "트라우마는 시간이 지나도 자동으로 치유되지 않아. 의식적 노력이 필요해.",
+        "긍정 심리학은 약점 보완이 아니라 강점 발견에 초점을 맞춰.",
+    ]),
 ];
 
 const DIALOGUE_REACTIONS: &[&str] = &[
@@ -234,6 +254,62 @@ const NARRATIVE_ENDINGS: &[&str] = &[
     "가끔 밤하늘을 올려다볼 때면 그날의 감동이 되살아난다.",
 ];
 
+// ── 기술/AI 에세이 시드 ──
+
+const TECH_ESSAY_OPENINGS: &[&str] = &[
+    "인공지능이 인간의 삶을 바꾸고 있다. 이 변화의 속도는 산업혁명을 능가한다.",
+    "바이트 수준 언어 모델은 토크나이저의 한계를 근본적으로 해결하는 접근이다.",
+    "신경망이 학습한다는 것은 결국 손실 함수의 지형을 탐색하는 과정이다.",
+    "분산 학습 기술은 단일 GPU의 한계를 넘어 대규모 모델 학습을 가능하게 한다.",
+    "강화학습의 핵심은 보상 신호로부터 최적의 행동 정책을 발견하는 것이다.",
+    "자기지도학습은 레이블의 부족이라는 현실적 제약을 우아하게 해결한다.",
+    "언어 모델의 스케일링 법칙은 더 큰 모델이 더 나은 성능을 보인다는 경험적 관찰이다.",
+    "지식 증류는 거대한 모델의 지혜를 작은 모델에 담는 기술이다.",
+    "GRU 셀은 LSTM보다 단순하면서도 많은 과제에서 비슷한 성능을 보여준다.",
+    "멀티모달 학습은 텍스트, 이미지, 음성을 통합적으로 이해하는 방향으로 나아가고 있다.",
+];
+
+const TECH_DETAILS: &[&str] = &[
+    "배치 크기를 늘리면 학습이 안정되지만 일반화 성능이 떨어질 수 있다.",
+    "학습률 워밍업은 학습 초기의 불안정성을 완화하는 효과적인 기법이다.",
+    "그래디언트 클리핑은 폭발하는 기울기 문제를 방지하는 간단한 해결책이다.",
+    "드롭아웃 비율을 높이면 과적합은 줄지만 학습 속도가 느려진다.",
+    "어텐션 점수의 분포를 분석하면 모델이 어디에 집중하는지 이해할 수 있다.",
+    "잔차 연결이 없으면 깊은 네트워크의 학습이 사실상 불가능하다.",
+    "위치 인코딩은 트랜스포머에게 순서 정보를 제공하는 핵심 요소다.",
+    "교차 엔트로피 손실은 분류 문제에서 가장 널리 사용되는 목적 함수다.",
+    "모델 병합은 서로 다른 특기를 가진 모델들을 하나로 합치는 새로운 패러다임이다.",
+    "활성화 함수의 선택이 모델의 표현력에 큰 영향을 미친다.",
+];
+
+// ── 한국 문화/역사 에세이 시드 ──
+
+const CULTURE_ESSAY_OPENINGS: &[&str] = &[
+    "한글은 세계에서 가장 과학적으로 설계된 문자 체계로 평가받는다.",
+    "한국의 사계절은 문학과 예술에 깊은 영향을 미쳐왔다.",
+    "김치는 단순한 음식이 아니라 한국인의 삶과 철학이 담긴 문화유산이다.",
+    "한국 전통 건축의 처마 곡선에는 자연과 조화를 이루려는 미학이 있다.",
+    "판소리는 한 사람이 이야기를 노래하고 연기하는 독특한 예술 형식이다.",
+    "한국의 정(情) 문화는 서양에서는 번역이 어려운 독특한 감정적 유대다.",
+    "서당에서 시작된 한국의 교육 전통은 오늘날까지 이어지고 있다.",
+    "한옥의 온돌 시스템은 열효율이 뛰어난 과학적 난방 방식이다.",
+    "한국의 장 문화는 수천 년에 걸친 발효 과학의 결정체다.",
+    "풍수지리는 자연환경과 인간의 관계를 설명하는 동양의 공간 철학이다.",
+];
+
+const CULTURE_DETAILS: &[&str] = &[
+    "세종대왕은 백성들이 쉽게 배울 수 있는 문자를 만들고자 했다.",
+    "한국의 명절에는 세대를 이어주는 의례와 음식이 중심에 있다.",
+    "전통 한복의 곡선미는 한국인의 미적 감각을 대표한다.",
+    "사물놀이의 네 가지 악기는 각각 바람, 비, 구름, 천둥을 상징한다.",
+    "한국 도자기의 비색은 세계 어디에서도 재현하기 어려운 고유한 색감이다.",
+    "탈춤은 풍자와 해학을 통해 사회적 모순을 비판하는 민중 예술이었다.",
+    "한국의 차 문화는 다도라는 형식을 통해 마음을 다스리는 수행이 된다.",
+    "서예는 글자를 쓰는 행위를 통해 내면을 수양하는 예술이다.",
+    "한국의 전통 정원은 자연을 인위적으로 다듬지 않고 그대로 살리는 것이 특징이다.",
+    "옛 선비들의 풍류는 자연 속에서 시를 짓고 음악을 즐기는 풍요로운 삶이었다.",
+];
+
 // ── 추가 한국어 주제 시드 (다양성 확보) ──
 
 const KO_NATURE: &[&str] = &[
@@ -288,7 +364,7 @@ const KO_SOCIETY: &[&str] = &[
 pub fn generate_ko_essay<R: Rng>(rng: &mut R) -> String {
     let mut out = String::with_capacity(800);
 
-    let choice: u8 = rng.gen_range(0..4);
+    let choice: u8 = rng.gen_range(0..7);
     match choice {
         0 => {
             // Philosophy/consciousness essay
@@ -331,7 +407,7 @@ pub fn generate_ko_essay<R: Rng>(rng: &mut R) -> String {
             out.push_str(ESSAY_CONCLUSIONS.choose(rng).unwrap());
             out.push('\n');
         }
-        _ => {
+        3 => {
             // Emotional / nature essay
             out.push_str(KO_EMOTION_ESSAY.choose(rng).unwrap());
             out.push(' ');
@@ -344,6 +420,47 @@ pub fn generate_ko_essay<R: Rng>(rng: &mut R) -> String {
             }
             out.push('\n');
             out.push_str(KO_SOCIETY.choose(rng).unwrap());
+            out.push('\n');
+        }
+        4 => {
+            // Tech/AI essay
+            out.push_str(TECH_ESSAY_OPENINGS.choose(rng).unwrap());
+            out.push('\n');
+            let n_det = rng.gen_range(2..=4);
+            for _ in 0..n_det {
+                out.push_str(TECH_DETAILS.choose(rng).unwrap());
+                out.push(' ');
+            }
+            out.push('\n');
+            out.push_str(ESSAY_CONCLUSIONS.choose(rng).unwrap());
+            out.push('\n');
+        }
+        5 => {
+            // Culture/history essay
+            out.push_str(CULTURE_ESSAY_OPENINGS.choose(rng).unwrap());
+            out.push('\n');
+            let n_det = rng.gen_range(2..=4);
+            for _ in 0..n_det {
+                out.push_str(CULTURE_DETAILS.choose(rng).unwrap());
+                out.push(' ');
+            }
+            out.push('\n');
+            out.push_str(ESSAY_CONCLUSIONS.choose(rng).unwrap());
+            out.push('\n');
+        }
+        _ => {
+            // Mixed: society + nature + emotion
+            out.push_str(KO_SOCIETY.choose(rng).unwrap());
+            out.push(' ');
+            out.push_str(KO_NATURE.choose(rng).unwrap());
+            out.push('\n');
+            let n_dev = rng.gen_range(2..=3);
+            for _ in 0..n_dev {
+                out.push_str(ESSAY_DEVELOPMENTS.choose(rng).unwrap());
+                out.push(' ');
+            }
+            out.push('\n');
+            out.push_str(KO_EMOTION_ESSAY.choose(rng).unwrap());
             out.push('\n');
         }
     }

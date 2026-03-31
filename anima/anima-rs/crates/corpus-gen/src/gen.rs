@@ -185,7 +185,7 @@ impl<R: Rng> Generator<R> {
         }
 
         // Korean long-form blocks (essays, dialogues, narratives) for --ko-heavy
-        if self.cfg.ko_heavy && self.rng.gen_bool(0.45) {
+        if self.cfg.ko_heavy && self.rng.gen_bool(0.65) {
             out.push_str(&crate::ko_longform::random_ko_longform(&mut self.rng));
             return;
         }
