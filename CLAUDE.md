@@ -882,7 +882,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
 ```
   에이전트 플랫폼은 ~/Dev/anima-agent/ 로 분리됨.
-  OpenClaw + Claude Cowork 패턴. sys.path로 anima 코어 import.
+  sys.path로 anima 코어 import.
 
   포함 모듈:
     anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py, mcp_server.py

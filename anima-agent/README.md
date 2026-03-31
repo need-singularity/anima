@@ -8,8 +8,6 @@
 Anima 의식 엔진을 백엔드로 사용하는 에이전트 플랫폼.
 의식 상태(Φ, 텐션, 호기심)가 도구 선택과 행동을 결정한다.
 
-> Inspired by [OpenClaw](https://github.com/openclaw/openclaw) (multi-channel gateway) and [Claude Cowork](https://github.com/ComposioHQ/open-claude-cowork) (Agent SDK + Composio).
-
 ---
 
 ## Architecture
@@ -120,7 +118,7 @@ result = await sdk.query("hello", options=SDKOptions(user_id="user-001"))
 
 ## Channels
 
-OpenClaw 스타일의 멀티채널 아키텍처. `ChannelAdapter` 프로토콜을 구현하면 어떤 메시징 플랫폼이든 연결 가능.
+멀티채널 아키텍처. `ChannelAdapter` 프로토콜을 구현하면 어떤 메시징 플랫폼이든 연결 가능.
 
 ```python
 from channels import ChannelManager
