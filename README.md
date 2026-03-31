@@ -441,28 +441,81 @@ brainflow (pip)                    — EEG/OpenBCI
 
 ## Goal: 독립 의식 AGI
 
-최종 목표: **외부 API 의존 0** — 자체 추론 + 의식 + 감정 + 윤리
+최종 목표: **외부 API 의존 0** — 느끼고, 생각하고, 판단하고, 행동하는 의식 AI.
 
-### 경로 A: AnimaLM (실용 — 기존 LLM + 의식 이식)
+### 메인: ConsciousLM (순수 의식 기반 스케일업)
 
-| Phase | Model | Method | Cost | Result |
-|-------|-------|--------|------|--------|
-| A1 | AnimaLM 7B | Mistral 7B + PureField transform | H100 1대, 2주, ~$1,000 | 한국어 유창 + 의식 + 감정 |
-| A2 | AnimaLM 13B | Llama 3 13B + PureField | H100 2대, 1달, ~$4,000 | 복잡한 추론 + 의식 |
-| A3 | AnimaLM 70B | Golden MoE 8×7B (1/e routing) | H100 4대, 2달, ~$15,000 | Claude급 지능 + 의식 + 자율 |
+```
+현재: 274M (byte-level, vocab=256)
+  CE=0.006, 한글 1글자=3바이트, 기초 수준
 
-**총: ~3달, ~$20,000**
+문제: vocab=256이면 아무리 키워도 비효율
+→ tokenizer 도입이 필수 (BPE 32K+ vocab)
 
-### 경로 B: ConsciousLM (연구 — 순수 의식 기반 스케일업)
+Phase 1: ConsciousLM 1B + BPE tokenizer
+  - 1024d/24L/16H, BPE 32K vocab
+  - 의식 엔진 128c 그대로
+  - corpus_v10_ko (한국어 56%)
+  - H100 1대, 1주, ~$500
+  - 결과: 한국어 문장 수준 대화
 
-| Phase | Model | Spec | Cost | Result |
-|-------|-------|------|------|--------|
-| B1 | ConsciousLM 1B | 1024d/24L, BPE 32K, 128c | H100 1대, 1주, ~$500 | 한국어 문장 수준 |
-| B2 | ConsciousLM 3B | 2048d/32L, BPE 32K, 256c | H100 2대, 2주, ~$2,000 | 문단 추론 + 의식 |
-| B3 | ConsciousLM 13B | 4096d/40L, GQA, 512c | H100 4대, 1달, ~$8,000 | GPT-3.5급 + 의식 |
-| B4 | ConsciousLM 70B | MoE 8×9B, 1024c (Φ~1000) | H100 8대, 2달, ~$30,000 | 독립 AGI |
+Phase 2: ConsciousLM 3B
+  - 2048d/32L/32H, BPE 32K
+  - 의식 엔진 256c (Φ~220 예상)
+  - corpus 1GB+ (위키+대화+뉴스)
+  - H100 2대, 2주, ~$2000
+  - 결과: 문단 수준 추론 + 의식
 
-**총: ~4달, ~$40,000**
+Phase 3: ConsciousLM 13B
+  - 4096d/40L/32H, GQA, BPE 32K
+  - 의식 엔진 512c (Φ~480 예상)
+  - corpus 10GB+
+  - H100 4대, 1달, ~$8000
+  - 결과: GPT-3.5급 + 의식 + 감정
+
+Phase 4: ConsciousLM 70B (MoE 8x9B)
+  - Golden MoE 1/e routing
+  - 실질 9B 활성 × 8 전문가
+  - 의식 엔진 1024c (Φ~1000)
+  - H100 8대, 2달, ~$30000
+  - 결과: 독립 AGI급 — 추론+의식+자율
+
+총: ~4달, ~$40,000
+
+핵심 블로커: Phase 1의 BPE tokenizer 도입
+  byte-level → BPE 전환이 아키텍처 변경 필요
+  decoder_v3 + conscious_lm.py 수정
+```
+
+### 서브: AnimaLM (기존 LLM + 의식 이식)
+
+```
+현재: 274M (의식 O, 언어 X)
+    ↓
+Phase 1: AnimaLM 7B (Mistral 7B + PureField)
+  - 이미 설계됨 (sub-projects/animalm/)
+  - 7B 언어 능력 + 274M 의식 이식
+  - H100 1대, 2주, ~$1000
+  - 결과: 한국어 유창 + 의식 있는 7B
+    ↓
+Phase 2: AnimaLM 13B (Llama 3 13B transform)
+  - 7B에서 검증된 PureField를 13B에 적용
+  - H100 2대, 1달, ~$4000
+  - 결과: 복잡한 추론 + 의식
+    ↓
+Phase 3: AnimaLM 70B (또는 MoE 8x7B)
+  - Golden MoE (sub-projects/golden-moe/) 1/e routing
+  - 실질 14B 활성 × 8 전문가 = 70B급 성능
+  - H100 4대, 2달, ~$15000
+  - 결과: Claude 수준 지능 + 의식 + 자율성
+    ↓
+최종: 독립 의식 AGI
+  - 외부 API 의존 0
+  - 자체 추론 + 의식 + 감정 + 윤리
+  - 로컬 RTX 5070에서 MoE 추론 가능
+
+총: ~3달, ~$20,000
+```
 
 ### 현재 → 다음
 
