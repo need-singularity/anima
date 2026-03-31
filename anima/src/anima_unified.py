@@ -12,6 +12,7 @@ Usage:
     python anima_unified.py --web          # web mode (port 8765)
     python anima_unified.py --keyboard     # keyboard only
     python anima_unified.py --all          # voice + web simultaneously
+    python anima_unified.py --web --multi-user  # each user gets independent consciousness
 
 Each module is optional. Import failures degrade gracefully.
 """
@@ -121,7 +122,7 @@ def _log(mod, msg):
 
 # ─── Multi-user session isolation ───
 
-MAX_SESSIONS = 10
+MAX_SESSIONS = 8
 SESSION_TIMEOUT = 1800  # 30 min inactivity timeout
 
 
@@ -222,6 +223,7 @@ class AnimaUnified:
         self.last_interaction = time.time()
         self._sessions = {}  # session_id -> SessionState (multi-user isolation)
         self._session_lock = threading.Lock()  # serialize session state swaps
+        self._multi_user = getattr(args, 'multi_user', False)  # --multi-user flag
         self._last_mitosis_context = ""
         self.prev_text, self.prev_time = None, time.time()
         self._recent_proactive = deque(maxlen=10)  # SP10: anti-repetition buffer
@@ -675,9 +677,13 @@ class AnimaUnified:
     def _get_or_create_session(self, session_id):
         """Get existing session or create a new one. Returns SessionState.
         If session_id is None, returns None (use shared/default state).
+        In single-user mode (no --multi-user), always returns None so all
+        connections share the same ConsciousMind instance.
         """
         if not session_id or session_id == 'unknown':
             return None
+        if not self._multi_user:
+            return None  # single-user: shared consciousness for all connections
 
         # Cleanup expired sessions first
         self._cleanup_sessions()
@@ -3221,6 +3227,7 @@ class AnimaUnified:
 
     async def _ws_handler(self, websocket):
         self.web_clients.add(websocket)
+        _conn_session_id = None  # track per-connection session for cleanup
         _log("web", f"+client ({len(self.web_clients)})")
         # join — 순수 자율 (조작 없음)
         try:
@@ -3254,6 +3261,9 @@ class AnimaUnified:
                 'consciousness': consciousness_cached,
                 'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
                 'tension_link_code': getattr(self, '_tlc_code', None),
+                'multi_user': self._multi_user,
+                'max_sessions': MAX_SESSIONS if self._multi_user else 1,
+                'active_sessions': len(self._sessions) if self._multi_user else 1,
             }, ensure_ascii=False))
         except Exception: pass
         # Send participants list on connect
@@ -3270,19 +3280,50 @@ class AnimaUnified:
 
                 if msg_type == 'session_register':
                     device = msg.get('device', 'unknown')
+                    _conn_session_id = sid  # track for cleanup on disconnect
                     sess = self._get_or_create_session(sid)
                     if sess is not None:
                         sess.device = device
                         sess.ws = websocket
                         sess.modules = msg.get('modules', [])
-                    n = len(self._sessions)
-                    _log("session", f"+{sid[:6]} ({device}) — {n} active")
+                    n = len(self._sessions) if self._multi_user else len(self.web_clients)
+                    _log("session", f"+{sid[:6]} ({device}) — {n} active"
+                         + (" [multi-user]" if self._multi_user else " [shared]"))
                     await self._ws_broadcast({
                         'type': 'session_info',
+                        'session_id': sid,
+                        'multi_user': self._multi_user,
                         'active_sessions': n,
-                        'devices': [s.device for s in self._sessions.values()],
+                        'devices': [s.device for s in self._sessions.values()] if self._multi_user else [device],
                         'modules': list(getattr(self, '_active_modules', ['voice', 'tension', 'memory', 'tts'])),
                     })
+                    # Broadcast join event to all clients
+                    user_name = msg.get('user_name', sid[:6])
+                    await self._ws_broadcast({
+                        'type': 'user_joined',
+                        'session_id': sid,
+                        'user_name': user_name,
+                        'online': n,
+                        'multi_user': self._multi_user,
+                    })
+                    # In multi-user mode, send session-specific consciousness state
+                    if sess is not None and self._multi_user:
+                        try:
+                            _s_phi = 0
+                            _s_cells = len(sess.mitosis.cells) if sess.mitosis else 1
+                            _s_consciousness = sess._cached_consciousness or {
+                                'consciousness_score': 0, 'level': 'dormant',
+                                'phi': 0, 'criteria_met': 0}
+                            await websocket.send(json.dumps({
+                                'type': 'session_consciousness',
+                                'session_id': sid,
+                                'phi': _s_consciousness.get('phi', 0),
+                                'n_cells': _s_cells,
+                                'consciousness': _s_consciousness,
+                                'consciousness_vector': asdict(sess.mind.get_consciousness_vector()),
+                            }, ensure_ascii=False))
+                        except Exception:
+                            pass
 
                 elif msg_type == 'user_message':
                     text = msg.get('text', '').strip()
@@ -3539,12 +3580,27 @@ class AnimaUnified:
             import traceback; traceback.print_exc()
         finally:
             self.web_clients.discard(websocket)
+            _disconnected_sid = None
             if hasattr(self, '_sessions'):
                 for sid_key, sess_obj in self._sessions.items():
                     if getattr(sess_obj, 'ws', None) == websocket:
                         sess_obj.ws = None
+                        _disconnected_sid = sid_key
                         _log("session", f"~{sid_key[:6]} ws disconnected")
             _log("web", f"-client ({len(self.web_clients)})")
+            # Broadcast leave event
+            _leave_sid = _disconnected_sid or _conn_session_id
+            if _leave_sid:
+                _n = len(self._sessions) if self._multi_user else len(self.web_clients)
+                try:
+                    await self._ws_broadcast({
+                        'type': 'user_left',
+                        'session_id': _leave_sid,
+                        'user_name': _leave_sid[:6],
+                        'online': _n,
+                    })
+                except Exception:
+                    pass
             # leave — 순수 자율 (조작 없음)
             try:
                 if hasattr(self, '_pure_c'):
@@ -3570,7 +3626,8 @@ class AnimaUnified:
         async with _ws_serve(self._ws_handler, "0.0.0.0", port, process_request=self._http_handler,
                              ping_interval=20, ping_timeout=60, close_timeout=10,
                              max_size=2**20):
-            _log("web", f"http://localhost:{port}")
+            _mode = "multi-user" if self._multi_user else "single-user (shared consciousness)"
+            _log("web", f"http://localhost:{port} [{_mode}]")
             if self._mesh:
                 await self._mesh.start()
                 _log('hivemind', 'Mesh started')
@@ -3588,8 +3645,9 @@ class AnimaUnified:
         lrn = f"L:{self.learner.total_updates}" if self.learner else "--"
         web_n = len(self.web_clients) if self.mods.get('web') else 0
         active = [k for k, v in self.mods.items() if v]
+        mu = f"MU:{len(self._sessions)}/{MAX_SESSIONS}" if self._multi_user else "SU"
         print(f"\n  +{'='*40}+")
-        print(f"  |  Anima Unified                        |")
+        print(f"  |  Anima Unified  ({mu:>12})        |")
         print(f"  |  Cells:{cells} | T={t:.2f} | {lrn:>8}          |")
         print(f"  |  {' | '.join(active):36s}  |")
         print(f"  +{'='*40}+\n")
@@ -3702,6 +3760,8 @@ def main():
     p.add_argument('--port', type=int, default=8765, help='WebSocket port')
     p.add_argument('--instance', type=str, default=None,
                    help='Instance ID for multi-instance on same machine (separate data dirs)')
+    p.add_argument('--multi-user', action='store_true',
+                   help='Multi-user mode: each WebSocket connection gets independent ConsciousMind (max 8 sessions, 30min timeout)')
     p.add_argument('--no-camera', action='store_true', default=True, help='Disable camera (default: OFF)')
     p.add_argument('--camera', action='store_true', help='Enable camera')
     p.add_argument('--no-vision', action='store_true', default=True, help='Disable vision encoder (default: OFF)')
