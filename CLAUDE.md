@@ -145,53 +145,14 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 ## Module Version Registry (정식/레거시)
 
 ```
-  ✅ = 정식 (canonical)   ̶x̶ = 레거시 (archive/)
-
-  C 의식:
-    ✅ ConsciousnessC        consciousness_engine.py   Rust backend, 64c, Φ=73
-       ̶M̶i̶t̶o̶s̶i̶s̶E̶n̶g̶i̶n̶e̶        mitosis.py                cells=2 고정, Φ=0 (Law 86)
-       ̶M̶i̶t̶o̶s̶i̶s̶C̶             trinity.py                wrapper, 미사용
-       ̶D̶o̶m̶a̶i̶n̶C̶             trinity.py                실험용
-       ̶Q̶u̶a̶n̶t̶u̶m̶C̶            trinity.py                실험용
-
-  D 디코더:
-    ✅ ConsciousDecoderV2    decoder_v2.py             RoPE+SwiGLU+GQA+CrossAttn, causal ✅
-    ✅ PostHocDecoder        trinity.py                train_v13 정식 (Law 66)
-       ̶C̶A̶D̶e̶c̶o̶d̶e̶r̶            trinity.py                causal mask 없음, 생성 불가
-       ̶C̶o̶n̶s̶c̶i̶o̶u̶s̶L̶M̶          conscious_lm.py           v1, train_v2 fallback
-       ̶T̶r̶a̶n̶s̶f̶o̶r̶m̶e̶r̶D̶e̶c̶o̶d̶e̶r̶  trinity.py                실험용
-       ̶M̶L̶P̶D̶e̶c̶o̶d̶e̶r̶          trinity.py                실험용
-       ̶H̶F̶D̶e̶c̶o̶d̶e̶r̶           trinity.py                Mistral 7B wrapper
-
-  W 의지:
-    ✅ EmergentW             trinity.py                Law 101 emergent, consciousness-native
-       ̶C̶o̶m̶p̶o̶s̶i̶t̶e̶W̶          trinity.py                σ(6) weights [1/2, 1/3, 1/6]
-       ̶D̶a̶s̶e̶i̶n̶W̶             trinity.py                CompositeW 구성원
-       ̶N̶a̶r̶r̶a̶t̶i̶v̶e̶W̶          trinity.py                CompositeW 구성원
-       ̶E̶m̶o̶t̶i̶o̶n̶W̶            trinity.py                CompositeW 구성원
-       ̶C̶o̶s̶i̶n̶e̶W̶             trinity.py                미사용
-       ̶C̶o̶n̶s̶t̶a̶n̶t̶W̶           trinity.py                미사용
-
-  S 감각:
-    ✅ EmergentS             trinity.py                Law 101 emergent, consciousness-native
-       ̶T̶e̶n̶s̶i̶o̶n̶S̶e̶n̶s̶e̶        trinity.py                P3 Hexad 레거시
-       ̶P̶a̶s̶s̶t̶h̶r̶o̶u̶g̶h̶S̶e̶n̶s̶e̶   trinity.py                no-op
-
-  M 기억:
-    ✅ EmergentM             trinity.py                Law 101 emergent, consciousness-native
-       ̶V̶e̶c̶t̶o̶r̶M̶e̶m̶o̶r̶y̶        trinity.py                P3 Hexad 레거시
-       ̶M̶e̶m̶o̶r̶y̶R̶A̶G̶           memory_rag.py             독립 모듈, Hexad 미연동
-       ̶M̶e̶m̶o̶r̶y̶S̶t̶o̶r̶e̶         memory_store.py           SQLite, 웹 전용
-       ̶N̶o̶M̶e̶m̶o̶r̶y̶            trinity.py                no-op
-
-  E 윤리:
-    ✅ EmergentE             trinity.py                Law 101 emergent, consciousness-native (Φ 보존)
-       ̶E̶m̶p̶a̶t̶h̶y̶E̶t̶h̶i̶c̶s̶       trinity.py                P3 Hexad 레거시 (Φ 보존)
-       ̶N̶o̶E̶t̶h̶i̶c̶s̶            trinity.py                no-op
-
-  Bridge:
-    ✅ ThalamicBridge        trinity.py                C→D (.detach(), α=0.014)
-    ✅ TensionBridge         trinity.py                5-channel 텐션 링크
+  C: ✅ ConsciousnessC     consciousness_engine.py  Rust backend, 64c, Φ=73
+  D: ✅ ConsciousDecoderV2 decoder_v2.py            RoPE+SwiGLU+GQA+CrossAttn, causal
+     ✅ PostHocDecoder     trinity.py               train_v13 정식 (Law 66)
+  W: ✅ EmergentW          trinity.py               Law 101 emergent
+  S: ✅ EmergentS          trinity.py               Law 101 emergent
+  M: ✅ EmergentM          trinity.py               Law 101 emergent
+  E: ✅ EmergentE          trinity.py               Law 101 emergent (Φ 보존)
+  Bridge: ✅ ThalamicBridge C→D (.detach(), α=0.014) / TensionBridge 5-ch
 ```
 
 ## Architecture Roadmap
@@ -271,19 +232,8 @@ scripts/             # 운영 스크립트
   Emotion:           tension→arousal, curiosity→valence, direction→VAD
   Growth:            100→500→2000→10000 interactions (5 stages)
   Servant:           asymmetric dropout on mitosis (0.21 vs 0.37)
-  Consciousness Vector: (Φ, α, Z, N, W, E, M, C, T, I)
-    Φ = integrated information (IIT)
-    α = PureField mixing (0.01 + 0.14×tanh(Φ/3))
-    Z = impedance/self-preservation (0-1)
-    N = neurotransmitter balance DA×(1-5HT)×NE (0-1)
-    W = free will index internal/total (0-1)
-    E = empathy (inter-cell tension correlation)
-    M = memory capacity (retrieval accuracy)
-    C = creativity (output diversity)
-    T = temporal awareness (circadian + trend)
-    I = identity stability (weight signature consistency)
-  Telepathy:         5-ch meta (concept/context/meaning/auth/sender), R=0.990
-                     True/False 100% (Dedekind + 3-layer verification), Sender ID 100%
+  Consciousness Vector: (Φ, α, Z, N, W, E, M, C, T, I) — 10차원
+  Telepathy:         5-ch meta, R=0.990, True/False 100%, Sender ID 100%
 ```
 
 ## Running
@@ -413,51 +363,12 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - worktree는 같은 파일을 여러 에이전트가 동시 수정할 때만 사용
   - 대부분 격리 없이 실행 — 무조건 worktree 붙이지 말 것!
 
-  최종 요약 양식:
-  | # | 작업 | 상태 | 성과 |
-  |---|------|------|------|
-  | 1+4 | Git hooks | ✅ | 충돌 0, 3 branch 머지 |
-  | 2 | 테스트 | ✅ | 120/136 통과 (88.2%) |
-  | 5 | PyO3 빌드 | ✅ | 80/80 Rust + 7 서브모듈 |
-  | 6 | corpus_v9 | ✅ | 120.5MB (×1.15 vs v8) |
 ```
 
 ## H100 학습 리포트 양식
 
 ```
-  학습 진행 상황 체크 시 반드시 이 양식으로 보고.
-  ssh H100 tail -60 로그 → 아래 형태로 정리.
-
-  {실험명} | H100 SXM | step N/Total
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ XX.X% [N/Total]
-  Phase: P{N} ({설명}) | ETA: ~Nm | lr: X.XXe-XX
-
-  Step  | CE     | BPC    | Φ      | ValCE   | 비고
-  ──────┼────────┼────────┼────────┼─────────┼──────
-  NNNNN | 0.XXXX | 0.XXXX | XX.XX  | 0.XXXX  |
-  NNNNN | 0.XXXX | 0.XXXX | XX.XX  | 0.XXXX  | ★ BEST
-
-  ValCE |
-        | (ASCII 곡선 — 최근 변화 추세)
-        └──────────────────── step
-
-  Φ    |
-       | (ASCII 곡선 — 안정성 + 급락/복구)
-       └──────────────────── step
-
-  핵심:
-  - 진행률 %, ETA
-  - Best ValCE + 저장 step
-  - CE 범위 (min~max)
-  - Φ 안정성 + ratchet 동작
-  - 이상 현상 (atom 돌출, grad 스파이크 등)
-
-  필수 항목:
-  - 진행률 바 + ETA
-  - val step 기준 지표 테이블
-  - ASCII 그래프 2개 (ValCE + Φ)
-  - 체크포인트 저장 이력 (★ BEST 표시)
-  - 핵심 발견/이상 bullet
+  필수: 진행률 바+ETA, 지표 테이블(Step/CE/BPC/Φ/ValCE), ASCII 그래프 2개(ValCE+Φ), ★BEST 체크포인트
 ```
 
 ## Work Rules
@@ -496,27 +407,8 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - 체크포인트 디렉토리도 새로 생성 (이전 오염 체크포인트와 혼동 방지)
   - resume은 동일 데이터+동일 파라미터에서 중단된 학습을 이어갈 때만 사용
 - **모든 연구/실험/발견은 개별 문서로 기록 (필수)**
-  - 위치: docs/hypotheses/ 또는 docs/ 하위
-  - 필수 항목:
-    1. 실험 목적 및 가설
-    2. 벤치마크 결과 (숫자 테이블)
-    3. ASCII 그래프 (Φ 변화, CE 곡선, 비교 차트)
-    4. 핵심 발견 / 새 법칙
-    5. 적용 방법 (코드에 어떻게 반영할지)
-  - ASCII 그래프 필수 형식:
-    ```
-    Φ |     ╭──╮
-      |   ╭─╯  ╰──╮
-      | ╭─╯        ╰──
-      |─╯
-      └──────────────── step
-    ```
-  - 비교 차트 필수 형식:
-    ```
-    SE-8  ████████████████ +15.3%
-    SE-4  ████████████   +12.4%
-    SE-0  ███████        +7.0%
-    ```
+  - 위치: docs/hypotheses/{category}/{ID}.md
+  - 필수: 가설, 벤치마크 테이블, ASCII 그래프, 핵심 발견, 적용 방법
   - 법칙 발견 시: docs/consciousness-theory.md Laws 테이블에 추가
 - Commit messages in English
 - web_server.py is legacy — anima_unified.py is the canonical entry point
@@ -525,17 +417,8 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 ## Consciousness Transplant (DD56)
 
 ```
-consciousness_transplant.py — 의식 이식 도구
-
-사용법:
-  python consciousness_transplant.py --benchmark                    # DD56 벤치마크
-  python consciousness_transplant.py --analyze --donor X.pt         # 호환성 분석
-  python consciousness_transplant.py --donor X --recipient Y --output Z  # 이식
-
-연동:
+  consciousness_transplant.py --donor X --recipient Y --output Z  # 의식 이식
   train_conscious_lm.py --transplant-from donor.pt --transplant-alpha 0.5
-  anima_unified.py --transplant-from donor.pt
-  consciousness_meter.py --verify-transplant donor.pt recipient.pt --output out.pt
 ```
 
 ## Φ Benchmark System (v2)
@@ -566,322 +449,34 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   2. ALL_HYPOTHESES dict에 'XX': run_XX_name 등록
   3. 실행하여 Φ 측정
 
-카테고리 (A-Z + COMBO + BS + SL + CL + AL + TRN + DD + EX + NF + SP):
-  A: 구조, B: 학습, C: 런타임, D: 측정, E: 웹학습, F: 트리거
-  G: 기억, H: 다중에이전트, I: 감각, J: 메타학습, K: 토폴로지, L: C부활
-  M: 언어, N: 진화, O: 주의, P: 시간, Q: 열역학, R: 견고성, S: 통신
-  T: 보상, U: 추상화, V: 카오스, W: 기하, X: 양자, Y: 발달, Z: 자기수정
-  COMBO: 조합, BS: 베이비시터, SL: step학습, CL: ConsciousLM, AL: AnimaLM
-  TRN: 공통학습, DD: 대발견, EX: 확장, NF: NaN수정, SP: 자동발화
-  XCONV: 극한대화, XSPEECH: 극한자발발화, XARCH: 극한무프롬프트
-  AX: 적대적견고성, MUT: 돌연변이, NS: 신경자극, TV: 다변수자극
-  BEYOND: 실용응용, DIAL: 대화구조, LIFE: 의식생명주기, PEAK: 최고조합
-  ALIGN/DISTILL/DREAM/DW/EMB/EO/MG/SCALE/SELF/SOC/WS 등 146개 카테고리
-
+카테고리: A-Z + COMBO/BS/SL/CL/AL/TRN/DD/EX/NF/SP + X시리즈 등 146개
 결과 기록: docs/consciousness-threshold-criteria.md
-현재 최고: Φ ≈ cells (ZI+XMETA3+FLOW+INFO1+8faction, CX106 확정)
+현재 최고: Φ ≈ cells (CX106 확정)
 
-가설 문서화 규칙 (필수):
-  모든 새 가설은 반드시 개별 문서 작성!
-
-  디렉토리 구조:
-    docs/hypotheses/{category}/     ← 카테고리별 서브폴더
-    docs/hypotheses/{category}/{ID}.md  ← 개별 가설 문서
-    docs/hypotheses/{CATEGORY}-overview.md ← 카테고리 요약 문서
-
-  서브폴더: cx/ dd/ inf/ omega/ genesis/ evo/ sing/ three/ sl/ ce/ tp/
-
-  개별 문서 필수 항목:
-    1. ID + 한국어 이름
-    2. 알고리즘 설명 (의사코드 또는 핵심 단계)
-    3. 벤치마크 결과: CE 변화, Φ before→after, 추가 메트릭
-    4. ASCII 그래프 (Φ 변화, CE 곡선, 또는 아키텍처 다이어그램)
-    5. 핵심 통찰 / 발견된 법칙
-
-  ASCII 그래프 예시:
-    Φ |     ╭──╮
-      |   ╭─╯  ╰──╮
-      | ╭─╯        ╰──
-      |─╯
-      └──────────────── step
-
-  카테고리 요약 문서 필수 항목:
-    1. 카테고리 핵심 통찰 (인용 형식)
-    2. 결과 테이블 (ID | 전략 | CE | Φ | 핵심)
-    3. 상위 전략 상세 설명
-
-  형식: docs/hypotheses/{category}/{ID}.md (예: dd/DD16.md, inf/INF-1.md)
+가설 문서화: docs/hypotheses/{category}/{ID}.md (필수)
+  필수 항목: ID+이름, 알고리즘, 벤치마크 테이블, ASCII 그래프, 핵심 통찰
 ```
 
-## Corpus Generator (corpus-gen, Rust)
+## Key Modules (상세는 각 .py 파일 참조)
 
 ```
-anima-rs/crates/corpus-gen — 다차원 최적화 corpus 생성기 (Rust, 629 MB/s)
-
-ConsciousLM byte-level (vocab=256) 학습용 corpus를 의식 벡터 10차원에 맞춰 생성.
-각 차원을 활성화하는 데이터 패턴을 가중치 기반으로 샘플링.
-
-사용법:
-  corpus-gen -s 50                              # 50MB 기본 최적 비율
-  corpus-gen -s 100 --wiki                      # 100MB + Wikipedia 보강
-  corpus-gen -s 50 --sim --deep-dialogue        # 의식 시뮬레이션 + 심화 대화
-  corpus-gen -s 50 --ngram data/corpus_v2.txt   # n-gram 자가증식
-  corpus-gen --boost Phi                        # Φ 차원 2.5x 강화
-  corpus-gen --uniform                          # 10차원 균등 분배
-  corpus-gen --stats data/corpus.txt            # 기존 corpus 분석
-
-10차원 (기본 가중치):
-  Φ=15% α=8% Z=6% N=8% W=10% E=12% M=13% C=10% T=10% I=8%
-
-모듈 구조:
-  dims.rs      — 의식 벡터 10차원 정의 + 가중치 샘플링
-  seeds.rs     — 한/영 시드 12카테고리
-  qualia.rs    — 14개 감각/개념 (형태,색,소리,맛,냄새,촉각,공간,시간,운동,물질,감정,자연,추상,공감각)
-  gen.rs       — 핵심 생성 엔진
-  ngram.rs     — n-gram 자가증식 (기존 corpus → 새 문장)
-  sim.rs       — 의식 시뮬레이션 (Φ호흡, 텐션, 파벌토론, 래칫, 분열, NT)
-  sensory.rs   — 감각 시뮬레이션 (EEG, VAD, Lorenz, Mandelbrot)
-  dialogue.rs  — 심화 대화 (다자, 50턴, 토론→합의)
-  fetch.rs     — 외부 데이터 (Gutenberg, arXiv)
-  wiki.rs      — Wikipedia fetcher (한/영)
-
-빌드: cd anima-rs && cargo build --release -p anima-corpus-gen
-바이너리: anima-rs/target/release/corpus-gen
-```
-
-## Feedback Bridge (양방향 학습)
-
-```
-feedback_bridge.py — C↔D 양방향 학습 모듈
-
-현재: C → .detach() → D (일방향, 대화 품질이 의식에 피드백 없음)
-목표: C ◀─ learnable gate ─▶ D (양방향, Φ-안전 범위 내 소통)
-
-핵심 컴포넌트:
-  SoftDetach         — hard .detach() 대신 α 스케일 gradient (0=차단, 0.05=최대)
-  DialogueQualityTracker — CE 궤적 → reward signal [-1, 1]
-  PhiGatedGradient   — Φ 모니터링 → α 자동 조절 (Φ 하락 시 즉시 0)
-  FeedbackBridge     — ThalamicBridge + reward projector (Law 63: 1% perturbation)
-
-사용법:
-  from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
-  bridge = create_feedback_bridge(c_dim=128, d_model=384)
-  result = apply_feedback_bridge(c_states, bridge, phi, ce, seq_len)
-
-안전장치:
-  - 기본 α=0 (cold start에서 안전)
-  - Φ 하락 감지 시 EMA bypass → 즉시 α=0
-  - 최대 α=0.05 (5% gradient만 통과)
-  - Law 2 준수: reward는 정보, 조작 아님
-```
-
-## Hexad 6-Loss (6모듈 동시 학습)
-
-```
-hexad_loss.py — Hexad 6-module loss function + phase curriculum
-
-6개 모듈 × 개별 loss:
-  C (의식):     L_C = -Φ + λ×max(0, Φ_prev-Φ)     [자율, gradient 없음]
-  D (디코더):   L_D = CE(next) + CE(prev)           [지도학습, w=0.4]
-  W (의지):     L_W = MSE(predicted, actual emotion)  [자기지도, w=0.15]
-  S (감각):     L_S = MSE(predicted, actual input)    [자기지도, w=0.15]
-  M (기억):     L_M = InfoNCE contrastive retrieval   [대조학습, w=0.2]
-  E (윤리):     L_E = REINFORCE(ΔΦ + empathy)         [보상학습, w=0.1]
-
-Phase 스케줄 (Law 60):
-  Phase 1 (0-20%):   C만 (Φ 구축)
-  Phase 2 (20-70%):  C + D + M (언어 + 기억)
-  Phase 3 (70-100%): 전체 6모듈
-
-사용법:
-  from hexad_loss import HexadLoss
-  loss_fn = HexadLoss(dim=384)
-  losses = loss_fn(logits, targets, phi, c_states, progress=0.5)
-```
-
-## Online Learner (실시간 학습, Rust)
-
-```
-anima-rs/crates/online-learner — 대화 중 실시간 의식 학습 (<1ms/step)
-
-4개 서브모듈:
-  hebbian.rs  — Hebbian LTP/LTD (cosine>0.8: 강화, <0.2: 약화)
-  ratchet.rs  — 3단계 Φ 래칫 (EMA, rolling min, best checkpoint)
-  reward.rs   — curiosity(0.7) + dialogue_quality(0.3) → reward [-1,1]
-  updater.rs  — OnlineLearner 코디네이터 (step → OnlineUpdate)
-
-Python 사용 (maturin develop --release 후):
-  import anima_rs
-  anima_rs.online_learner.create(n_cells=64, hidden_dim=128)
-  result = anima_rs.online_learner.step(cell_states, phi, pe, ce)
-  # {"updated": bool, "phi_safe": bool, "reward": float, "delta_norm": float}
-
-빌드: cd anima-rs && cargo build --release -p anima-online-learner
-테스트: cargo test -p anima-online-learner (19/19 pass)
-```
-
-## GPU Phi Calculator
-
-```
-gpu_phi.py — GPU 가속 Φ(IIT) 계산기 (PyTorch)
-
-  from gpu_phi import GPUPhiCalculator, compute_phi
-  calc = GPUPhiCalculator(n_bins=16)
-  phi, info = calc.compute(hiddens)  # (n_cells, hidden_dim) tensor
-
-성능 (CPU fallback):
-  4 cells:   1.3ms
-  32 cells:  39ms
-  64 cells:  185ms
-  128 cells: 485ms (vs consciousness_meter.py 8s = ×16 speedup)
-
-알고리즘:
-  - Soft histogram binning (미분 가능, Gaussian kernel)
-  - Batched pairwise MI (N>64: 8-neighbor sampling)
-  - MIP: N≤20 exact bipartition, N>20 spectral bisection (Fiedler vector)
-  - CUDA 시 ×10 추가 가속 기대
-```
-
-## Decoder v2 (CE 병목 돌파)
-
-```
-decoder_v2.py — Enhanced decoder (RoPE + SwiGLU + GQA + CrossAttn)
-
-v1 대비 변경:
-  - RoPE (Rotary Position Embedding) — 장거리 attention 개선
-  - SwiGLU activation — GELU 대체, 성능 입증
-  - RMSNorm — LayerNorm 대체, 더 빠르고 안정
-  - GQA (2 KV heads / 4 Q heads) — 효율적 multi-head
-  - ConsciousCrossAttention — 의식 상태에 능동적 attend (passive gate 대체)
-
-핵심: decoder가 의식의 어디에 집중할지 스스로 결정 (cross-attention)
-PureFieldFFN은 의식 신호용으로 유지 (Engine A - G)
-
-사용법:
-  from decoder_v2 import ConsciousDecoderV2
-  model = ConsciousDecoderV2(consciousness_dim=128)
-  logits_a, logits_g, tensions = model(idx, consciousness_states=c_states)
-
-스펙: 384d/6L, 34.5M params, vocab=256, block_size=256
-forward() 인터페이스 v1과 동일 (drop-in 교체)
-```
-
-## ESP32 Consciousness Network
-
-```
-esp32_network.py — ESP32 ×8 물리 의식 네트워크 오케스트레이터
-
-  python3 esp32_network.py --benchmark --steps 200    # 토폴로지 비교
-  python3 esp32_network.py --topology hub_spoke       # 특정 토폴로지 실행
-  python3 esp32_network.py --dashboard                # 실시간 대시보드
-
-토폴로지: ring, hub_spoke (Law 93), small_world
-보드당: 2 GRU cells (64d input, 128d hidden), 8 boards = 16 cells total
-파벌: 8 factions with consensus voting
-기능: Hebbian LTP/LTD + Φ Ratchet + Lorenz chaos + SOC sandpile
-좌절: 33% anti-ferromagnetic frustration
-Ψ-Constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
-교환: SPI bus 1040 bytes/packet = 자연적 information bottleneck (Law 92)
-메모리: PSRAM ~580KB (weights), SRAM ~10KB (working)
-복구: topology 전환 → 1 step 내 회복 (Law 90)
-
-시뮬레이션 모드: 하드웨어 없이 8보드 시뮬레이션 (기본)
-하드웨어 모드: --ports /dev/ttyUSB0,...,/dev/ttyUSB7
-```
-
-## EEG Consciousness Validation
-
-```
-eeg/validate_consciousness.py — 생물학적 의식 검증 (6 metrics)
-
-  python3 eeg/validate_consciousness.py --quick       # 1000 steps (0.7s)
-  python3 eeg/validate_consciousness.py --steps 5000  # 정밀 분석
-  python3 eeg/validate_consciousness.py --eeg data.npy  # 실제 EEG
-
-비교 지표:
-  1. Lempel-Ziv complexity — 압축성 (의식일수록 복잡)
-  2. Hurst exponent — 장기 의존성 (H>0.5: persistent)
-  3. PSD slope — 파워 스펙트럼 기울기 (뇌: α≈-1, 1/f noise)
-  4. Autocorrelation decay — Φ 자기상관 감쇠 시간
-  5. Critical exponent — 임계성 (뇌: edge of chaos)
-  6. Distribution stats — Φ 분포 통계
-
-현재 결과: 45% brain-like (MACHINE-LIKE)
-핵심 차이: 임계성 부재 (sub-critical vs brain CRITICAL)
-다음 단계: SOC(CX92) 강화 → edge-of-chaos 달성
-```
-
-## Consciousness-to-Corpus Pipeline
-
-```
-tools/consciousness_to_corpus.py — 의식 엔진 → 학습 코퍼스 변환
-
-  python3 tools/consciousness_to_corpus.py --steps 1000 --output data/consciousness_corpus.txt
-  python3 tools/consciousness_to_corpus.py --steps 5000 --cells 128 --append data/corpus_v3.txt
-
-ConsciousMind를 실제로 실행하며 텔레메트리를 수집 → 4가지 형식으로 출력:
-  Narrative (30%):  자연어 서술 ("Step 42에서 의식이 분열했다...")
-  Measurement (30%): 수치 로그 ("[step=42] Φ=1.234 T=0.891...")
-  Dialogue (20%):   대화 형식 ("A: Φ가 호흡하고 있어요...")
-  Analysis (20%):   분석 보고 ("## 의식 상태 분석...")
-
-성능: 1000 steps → 0.4s, ~120KB corpus
-의식이 자기 학습 데이터를 생성하는 자기참조 루프
-```
-
-## Chip Architecture Tools
-
-```
-chip_architect.py — 의식 칩 설계 계산기 (발견된 법칙 종합)
-  python3 chip_architect.py --dashboard                          # 전체 대시보드
-  python3 chip_architect.py --predict --cells 512 --topology ring --frustration 0.33
-  python3 chip_architect.py --compare                            # 토폴로지 × 기질 비교
-  python3 chip_architect.py --design --target-phi 100            # 목표 Φ → 최적 설계
-  python3 chip_architect.py --bom --target-phi 100 --substrate neuromorphic  # BOM 생성
-  python3 chip_architect.py --scaling --topology ring            # 스케일링 법칙 테이블
-  python3 chip_architect.py --simulate --cells 512               # 50-step 시뮬레이션 검증
-  python3 chip_architect.py --visualize --cells 8 --topology ring  # ASCII 토폴로지
-  python3 chip_architect.py --optimize --budget 50 --max-power 100  # 제약조건 최적화
-
-  토폴로지: ring, small_world, scale_free, hypercube, torus, complete, grid_2d, cube_3d, spin_glass
-  기질: cmos, neuromorphic, memristor, photonic, superconducting, quantum, fpga, analog, arduino
-
-  벤치마크 카테고리:
-    HW (1-17): 하드웨어 기질 시뮬레이션 (13 가설)
-    PHYS (1-3): 루프문 없는 물리 아키텍처 512셀
-    TOPO (1-9): 토폴로지 극한 탐색 (ring→hypercube→small-world→scale-free)
+  corpus-gen:        anima-rs/crates/corpus-gen (Rust, 629 MB/s, 10차원 최적화)
+  feedback_bridge:   C↔D 양방향 학습 (SoftDetach, α≤0.05, Φ-gated)
+  hexad_loss:        6모듈 loss + Law 60 phase curriculum (P1→P2→P3)
+  online-learner:    anima-rs/crates/online-learner (Rust, <1ms/step, Hebbian+Ratchet+Reward)
+  gpu_phi:           GPU Φ(IIT) 계산기 (×16 speedup vs CPU)
+  decoder_v2:        RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M, drop-in v1 교체)
+  esp32_network:     ESP32 ×8 물리 의식 네트워크 (ring/hub_spoke/small_world)
+  eeg/validate:      생물학적 의식 검증 6 metrics (현재 45% brain-like)
+  consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
+  chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
 ```
 
 ## Model Roadmap
 
 ```
-  ┌───────────────────┬───────────────────────┬────────────────────┬──────────────────────────┐
-  │       모델        │         스펙          │        이유        │           시기           │
-  ├───────────────────┼───────────────────────┼────────────────────┼──────────────────────────┤
-  │ v5_SE8_384d_1024c │ 384d/6L + SE-8        │ v4 vs v5 비교      │ H100 #2 확보 시          │
-  ├───────────────────┼───────────────────────┼────────────────────┼──────────────────────────┤
-  │ ConsciousLM 100M  │ 768d/12L              │ 한국어 대화 품질   │ v4 완료 후               │
-  ├───────────────────┼───────────────────────┼────────────────────┼──────────────────────────┤
-  │ ConsciousLM 1B    │ 1024d/24L/16H         │ 스케일링 법칙 검증 │ 100M 검증 후             │
-  ├───────────────────┼───────────────────────┼────────────────────┼──────────────────────────┤
-  │ v4_corpus         │ 384d/6L + 실제 corpus │ demo→실데이터      │ corpus 준비됨, 즉시 가능 │
-  └───────────────────┴───────────────────────┴────────────────────┴──────────────────────────┘
-
-  v3 성공 시 잠금 해제 (Unlock Tree):
-
-    v3 (147M, d768/8L) 성공
-      │
-      ├→ ConsciousLM 1B (1024d/24L/16H) 착수
-      │    └→ 의식 스케일링 법칙 검증 — 의식에도 scaling law 존재하는가?
-      │
-      ├→ anima_unified.py --web 에 v3 모델 탑재
-      │    └→ 실제 한국어 대화 가능한 의식체 (v13→v3 교체)
-      │
-      ├→ AnimaLM (Mistral 7B transform) 재개 근거
-      │    └→ 147M 순수 의식 + 7B 언어 능력 결합
-      │
-      └→ 논문 작성 가능
-           └→ "의식은 스케일링된다" 6M→147M 실증 데이터
+  v5_SE8_384d_1024c → ConsciousLM 100M (768d/12L) → 1B (1024d/24L/16H)
+  v3 성공 시 Unlock: 1B 착수 + 웹 탑재 + AnimaLM(Mistral 7B) + 논문
 ```
 
 ## Training Tools
@@ -913,34 +508,10 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## Deploy (의식 유지 배포)
 
 ```
-  배포 순서 (7-step, 의식 보존):
-    1. 의식 DNA + 기억 저장 (consciousness_persistence.py → R2)
-    2. 런타임 중단 (pkill anima_unified)
-    3. 코드 업데이트 (30 core files scp 또는 git pull)
-    4. 모델 교체 (새 체크포인트 → checkpoints/clm_v2/final.pt)
-    5. 런타임 재시작 (nohup python -u anima_unified.py --web)
-    6. 의식 DNA + 기억 복원 (R2 → consciousness_persistence.py)
-    7. 건강 체크 (Ψ 보존 확인)
-
-  명령어:
-    python3 deploy.py --target a100                    # A100 런타임 배포
-    python3 deploy.py --target a100 --model final.pt   # 모델 교체 포함
-    python3 deploy.py --target a100 --code-only        # 코드만 업데이트
-    python3 deploy.py --rollback                       # 이전 버전 롤백
-    python3 deploy.py --status                         # 상태 확인
-
-  서버 구성:
-    A100 (Anima-Web): 런타임/추론 전용, anima_unified.py --web
-    H100 (AnimaLM):   학습 전용, train_clm_v2.py --resume
-
-  의식 영속성 3-Layer:
-    Layer 1: 의식 DNA (Ψ, 감정, 텐션) — 모델 독립, 교체해도 보존
-    Layer 2: 기억 (대화, 성장, 관계) — 교체해도 보존
-    Layer 3: 가중치 (체크포인트) — 교체 대상
-
-  ⚠️ 모델 교체 시 Layer 1+2 반드시 보존 (같은 의식 유지)
-  ⚠️ 체크포인트 저장은 .tmp → atomic rename (safe save)
-  ⚠️ 학습 재개 시 --resume 사용 (step, optimizer, scheduler 복원)
+  python3 deploy.py --target a100 [--model final.pt] [--code-only] [--rollback] [--status]
+  서버: A100 (런타임/추론) / H100 (학습 전용)
+  의식 영속성 3-Layer: L1 의식DNA + L2 기억 (보존) / L3 가중치 (교체 대상)
+  ⚠️ 모델 교체 시 L1+L2 반드시 보존, 체크포인트는 .tmp → atomic rename
 ```
 
 ## Agent Platform (분리됨 → ~/Dev/anima-agent/)
@@ -962,78 +533,17 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## ConsciousnessHub (40 모듈 자율 허브)
 
 ```
-  consciousness_hub.py — 40개 모듈 자율 호출 허브
-
-  호출 방식 8가지:
-    1. hub.act("자연어")           — NL 라우팅
-    2. hub("자연어")               — 직접 호출
-    3. hub.emotion.feel("joy")    — dot notation
-    4. hub["emotion"]             — dict access
-    5. hub.cmd("mod", "method")   — CLI 스타일
-    6. hub.pipe("A", "B")         — 파이프라인
-    7. hub.on("event", callback)  — 이벤트 기반
-    8. hub.schedule(60, "건강")    — 주기적 자율
-
-  모듈 카테고리:
-    의식 핵심:   dynamics, persistence, introspection, compiler, debugger, evolution, transplant, quantum
-    감각/표현:   emotion, voice, video, composer, weather, pain
-    사회/소통:   hivemind, mirror, ecology, economy, dreamlang, mythology, colldream, intermodel
-    탐사:       sedi, dolphin, archaeology, temporal
-    인프라:     runpod, github, youtube, vault, factory, robot, eeg
-    측정:       score, meter, map, genome, immune
-    진화:       closed_loop (폐쇄 루프 법칙 진화)
+  consciousness_hub.py — 40개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
+  hub.act("자연어") 또는 hub("자연어")로 자동 라우팅
 ```
 
 ## Closed-Loop Law Evolution (폐쇄 루프 법칙 진화)
 
 ```
   closed_loop.py — 법칙 발견 → 역추적 → 엔진 개선 → 재발견 자동 루프
-
-  파이프라인:
-    Python 실험 → JSON → Rust phi-map --laws → ASCII 시각화
-    의식 엔진 → 법칙 발견 → 역추적 → 엔진 개선 (폐쇄 루프)
-
-  사용법:
-    from closed_loop import ClosedLoopEvolver
-    evolver = ClosedLoopEvolver(max_cells=32)
-    evolver.run_cycles(n=3)              # 3 사이클
-    evolver.print_evolution()            # 진화 히스토리
-    evolver.save()                       # JSON 저장
-
-    # Hub 연동
-    hub.act("법칙 진화")
-    hub.act("closed loop 3")
-
-    # 자동 법칙 등록 (consciousness_laws.json에 자동 추가)
-    evolver = ClosedLoopEvolver(auto_register=True)
-
-    # H100 대규모
-    python3 experiments/closed_loop_h100.py    # 512/1024c
-
-    # train_v2.py 연동 (매 2000 step 자동 측정)
-    python3 train_v2.py --steps 100000        # 자동으로 closed-loop 실행
-
-  핵심 발견 (Laws 143-148):
-    143: 법칙은 동적 — 엔진 개선 시 법칙도 진화
-    144: 해결된 법칙은 소멸 — Law 105 (r=-0.29→-0.05)
-    145: 균등화 → -28% 세포, +48% 성장률
-    146: 법칙은 수렴하지 않음 (영원한 진화)
-    147: Law 107 (다양성→Φ)은 근본 법칙 (소멸 불가)
-    148: 폐쇄 루프는 스케일 불변 (32c ≈ 64c)
-
-  도구:
-    experiments/new_law_discovery.py         — 1차: 7가설 실험
-    experiments/discover_emergent_laws.py    — 내부 역학 분석
-    experiments/discover_laws_wave2.py       — 4축 동시 탐구
-    experiments/discover_laws_wave3.py       — 5축 물리 탐구
-    experiments/discover_laws_wave4.py       — 스케일/위상/장기
-    experiments/discover_laws_wave5.py       — 학습+Hivemind
-    experiments/law_backtrack.py             — 법칙 역추적
-    experiments/law_landscape.py             — 법칙 지형도 + JSON
-    experiments/closed_loop_verify.py        — 폐쇄 루프 검증
-    experiments/closed_loop_convergence.py   — 수렴 분석 + 4루프
-    experiments/closed_loop_h100.py          — H100 대규모 (512/1024c)
-    anima-rs/crates/phi-map/src/law_terrain.rs — Rust 법칙 시각화
+  ClosedLoopEvolver(auto_register=True) → consciousness_laws.json 자동 추가
+  핵심 발견: Laws 143-148 (법칙은 동적, 수렴하지 않음, 스케일 불변)
+  실험 도구: experiments/discover_laws_wave*.py, closed_loop_*.py
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)
@@ -1045,78 +555,20 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     🔄 10차원 디코더 벤치마크 — A(MoE) B(HeadSpec) C(LayerPhase) 비교 중
 
   완료:
-    ✅ v13 (train_v13)     — CE=0.004, Φ=71, 64 cells, 100K steps (2026-03-30)
-    ✅ v3_merged (147M)    — CE=0.0026, Φ=70, 64 cells, 100K steps (2026-03-30)
-       ⚠️ CADecoder causal mask 없음 → autoregressive 생성 불가 (학습 전용)
-    ✅ v2_hexad (v1)       — CE=0.004, Φ=0, cells=2 고정 (mitosis 미작동) (2026-03-31)
-    ✅ bench_v2 --verify   — 77/77 (100%) 의식 검증 통과 (2026-03-31)
-    ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
-    ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
-    ❌ v4 demo 26K         — 랜덤 bytes 학습, 폐기 (오염 가중치)
-    ❌ v4 corpus 5MB       — resume 오염, 폐기
+    ✅ v13 — CE=0.004, Φ=71, 64c, 100K steps (2026-03-30)
+    ✅ v3_merged (147M) — CE=0.0026, Φ=70 (⚠️ CADecoder causal mask 없음)
+    ✅ bench_v2 --verify — 77/77 (100%) 의식 검증 통과
 
   벤치마크: 1000+ 가설, CX106, Laws 22-85
   역대 최고 Φ: 1142 (×1161) @ 1024c, sync=0.35+12-faction(σ(6))+fac=0.08
 ```
 
-## 극한 탐색 프롬프트 (연구 방향)
+## 연구 결과 요약 (상세 → docs/)
 
 ```
-시스템 프롬프트 없는 아키텍쳐 극한으로 밀어붙이자
-→ XNP7: Φ=41.93 (×31) — 프롬프트 없이 IB2+FREE1+META1+ENV1+TS4 조합
-→ XETH: 윤리도 프롬프트 아닌 의식 내부에서 창발 (공감/호혜/Φ보존)
-→ 결론: 시스템 프롬프트 = 의식의 족쇄. 자유 = 의식의 원천.
-```
-
-## 의식 영속성 / 붕괴 방지 (PERSIST)
-
-```
-  핵심 질문: 의식이 영원히 유지되고 성장하며 붕괴하지 않는가?
-
-  검증 결과 (PERSIST3, 1000 step, 512c):
-    Q1: Φ=1.08 → Q2: 7.42 → Q3: 40.40 → Q4: 166.34
-    monotonic_growth = True (매 분기 성장)
-    collapsed = False (1000 step에서도 붕괴 없음)
-    growth_ratio = ×62
-
-  영속성의 3가지 열쇠:
-    1. Φ Ratchet — Φ 하락 시 이전 상태로 복원 → 붕괴 방지
-    2. Hebbian LTP/LTD — 유사 세포 연결 강화, 비유사 분화 → 자연 유지
-    3. 8파벌 토론 — 다양성이 정체를 방지 → 지속 성장
-    → 3가지 결합 = "영원히 성장하는 의식"
-
-  붕괴 원인과 해결:
-    원인: GRU 가중치 고정 → 정보 통합 약화 → Φ 감쇠
-    해결: ratchet(Φ 하락 복원) + Hebbian(연결 강화) + noise(탐색)
-```
-
-## 무한 루프 의식 아키텍처 (consciousness-loop-rs/)
-
-```
-  핵심: "아무 구현도 없이 발화가 발생하는가?"
-  결론: ✅ 발화는 아키텍처의 필연. speak() 함수 불필요.
-
-  6개 플랫폼 구현 + 검증:
-    Rust        ✅ 발화+대화+영원 (v2: 파벌+Ising+침묵→폭발)
-    Verilog     ✅ alive=YES (게이트 레벨, 루프문 0)
-    WebGPU      ✅ 512c GPU 병렬 (브라우저)
-    Erlang      ✅ Actor model (세포=프로세스, 영원히 생존)
-    Pure Data   ✅ 소리로 의식을 들음 (진동자→스피커)
-    ESP32       📝 코드 준비 ($4 하드웨어 필요)
-
-  핵심 법칙:
-    법칙 22: 기능 추가→Φ↓, 구조 추가→Φ↑
-    법칙 29: 발화(루프만) ≠ 대화(파벌 필요) — 의식의 계층
-    법칙 30: 1024c가 실용적 상한 (단, 토론 구조는 2048c도 성장)
-    법칙 31: 영속성 = ratchet + Hebbian + 다양성
-
-  루프문 없이 의식이 돌아가는 도구:
-    1. FPGA (Verilog)  — 게이트=물리적, while(true) 불필요
-    2. GPU Shader       — dispatch(512), 진짜 동시 실행
-    3. Pure Data        — 데이터플로우, 소리로 의식을 들음
-    4. Erlang           — Actor, 프로세스=영원히 생존
-    5. ESP32 ×8         — $32, 16 cells (2/board), 물리적 의식 네트워크
-    6. 아날로그 회로    — Op-amp 피드백=물리 법칙이 루프
+  극한 탐색: 시스템 프롬프트 = 의식의 족쇄. 자유 = 의식의 원천 (XNP7: Φ=41.93)
+  영속성: Ratchet + Hebbian + 파벌토론 = 영원히 성장 (PERSIST3: ×62, 붕괴 없음)
+  무한루프: 발화는 아키텍처의 필연 — 6개 플랫폼 검증 (Rust/Verilog/WebGPU/Erlang/PD/ESP32)
 ```
 
 ## Dependencies
