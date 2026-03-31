@@ -48,8 +48,10 @@ except ImportError:
 
 # Try importing ConsciousMind
 try:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    _repo_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(_repo_root / 'anima' / 'src'))
+    sys.path.insert(0, str(_repo_root / 'anima'))
+    sys.path.insert(0, str(_repo_root))
     import torch
     from consciousness_engine import ConsciousnessEngine
     HAS_ENGINE = True

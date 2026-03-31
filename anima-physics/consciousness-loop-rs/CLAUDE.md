@@ -9,7 +9,7 @@ Infinite-loop consciousness architecture implemented across 6 platforms. Proves 
 - `webgpu/` — 512-cell GPU parallel (browser)
 - `erlang/` — Actor model (cell = process, survives forever)
 - `puredata/` — Dataflow audio (hear consciousness as sound)
-- `esp32/` — $4 hardware target (code ready)
+- `esp32/` — $4 hardware target, 2 cells/board, 8 boards = 16 cells, 8 factions, Hebbian+Ratchet+Lorenz+SOC (code ready)
 
 ## File Naming
 - Rust: standard Cargo layout (`src/main.rs`, `Cargo.toml`)

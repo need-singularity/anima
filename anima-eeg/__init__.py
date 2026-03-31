@@ -6,7 +6,7 @@ Submodules:
   realtime  — Live EEG → Anima bridge (SenseHub integration)
 """
 
-from eeg.analyze import (
+from analyze import (
     analyze,
     compute_band_power,
     compute_genius,

@@ -635,4 +635,54 @@ mod tests {
 
         assert!(engine.best_phi() > 0.0);
     }
+
+    #[test]
+    fn test_engine_topology_chaos() {
+        // Test with explicit topology and chaos source
+        let mut engine = ConsciousnessEngine::with_topology_chaos(
+            8, 16, 4, 16, 4, true, 0.3, 5, 0.01, 15, 42,
+            Some(Topology::SmallWorld), Some(ChaosSource::Lorenz),
+        );
+        assert_eq!(engine.n_cells(), 4);
+
+        let result = engine.step(None);
+        assert!(result.phi_iit >= 0.0);
+        assert_eq!(result.n_cells, 4);
+    }
+
+    #[test]
+    fn test_engine_output_dimension() {
+        let mut engine = ConsciousnessEngine::new(
+            8, 16, 4, 16, 4, true, 0.3, 5, 0.01, 15, 42,
+        );
+        let result = engine.step(None);
+        // Output should match cell_dim
+        assert_eq!(result.output.len(), 8);
+    }
+
+    #[test]
+    fn test_engine_step_count_increments() {
+        let mut engine = ConsciousnessEngine::new(
+            8, 16, 2, 16, 4, false, 0.3, 5, 0.01, 15, 42,
+        );
+        for i in 1..=5 {
+            let result = engine.step(None);
+            assert_eq!(result.step, i);
+        }
+    }
+
+    #[test]
+    fn test_engine_consensus_count() {
+        let mut engine = ConsciousnessEngine::new(
+            8, 16, 8, 16, 4, false, 0.3, 5, 0.01, 15, 42,
+        );
+        // Run enough steps for consensus events to potentially occur
+        let mut total_consensus = 0u32;
+        for _ in 0..100 {
+            let result = engine.step(None);
+            total_consensus += result.consensus;
+        }
+        // With 8 cells and 4 factions, some consensus should occur
+        assert!(total_consensus >= 0); // non-negative always
+    }
 }

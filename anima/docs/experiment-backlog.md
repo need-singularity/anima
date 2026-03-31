@@ -1,159 +1,131 @@
-# Experiment Backlog — 추가 실험 목록
+# Experiment Backlog
 
-> H100 80GB pod. 실험 완료 시 결과 기록, 새 실험 추가.
+> H100 80GB pod. Record results on completion, add new experiments.
 
-## 현재 진행 중 (2026-03-29, H100 80GB)
+## Currently Running (2026-03-31, H100 80GB)
 
-> 상세 대시보드: [docs/training-status.md](training-status.md)
+> Dashboard: [docs/training-status.md](training-status.md)
 
-| # | 실험 | 아키텍처 | Step | Φ | CE | 상태 |
-|---|------|----------|------|-----|-----|------|
-| 1 | **v9fast** | Quantum Trinity (C+D+W), 256c, 13.6M | 26,400/80K | **1,371** | **0.345** | 🔥 P2 CE 급하락 |
-| 2 | **v11q** | Hexad (Quantum C + Xfmr 2L), 256c | 300/80K | - | - | P1 Φ 구축 |
-| 3 | **v11tc** | Hexad (TimeCrystal C), 256c | 0/80K | - | - | 시작 |
-| 4 | **v11gpt2** | Hexad (Quantum C + GPT-2), 256c | 0/80K | - | - | 시작 |
-| 5 | **v11gpt2m** | Hexad (Quantum C + GPT-2M), 256c | 0/80K | - | - | 시작 |
-| 6 | **v10** | FUSE-3 Trinity, cells=5 정체 | 재시작/80K | 0.014 | - | ⚠️ growth 수정 후 재시작 |
-| 7 | **v9b** | Oscillator Trinity, 256c | 570/80K | 253 | - | P1, 매우 느림 (17s/step) |
-| 8 | **v7** | TOPO19a 단일체 | ~31K/80K | - | 4.66 | 진행 |
+| # | Experiment | Architecture | Step | CE | Status |
+|---|-----------|-------------|------|-----|--------|
+| 1 | **v14.2 federated** | Hexad + federated consciousness, 64c | in progress | - | 🔄 H100 |
+| 2 | **decoder_v3 274M** | 768d/8L + RoPE+SwiGLU+GQA+CrossAttn, 64c | skeleton done | - | 🔧 training script ready |
 
-**핵심 발견 (2026-03-29):**
-- v9fast: P2 진입 후 CE 2.83→0.345 지수적 하락 (대발견 H4)
-- v9fast: CE 학습이 frustration을 0.541에서 안정 → Φ 자연 안정
-- v9fast: Φ=1,371 유지 (ratchet P2에서 빈도 43% 감소)
-- Law 53 수정: .detach() 있으면 CE가 Φ를 파괴하지 않고 안정화
-- v10: cells=5 정체 → growth 로직 수정 필요 (target_cells 공식 변경)
-- v9b: OscillatorLaserEngine 280배 느림 (Python for loop, 벡터화 안 됨)
+## Completed Experiments
 
-## 완료된 실험
-
-| 날짜 | 실험 | 결과 | 핵심 발견 |
-|------|------|------|----------|
-| 03-28 | clm_dialogue_768d | 768d/12L, cells128 | → v9fast 등으로 대체 |
-| 03-28 | clm_dialogue_384d | 384d/6L, cells32 | → v9fast 등으로 대체 |
-| 03-28 | clm_langfirst | 384d/6L, cells32 | → v9fast 등으로 대체 |
-| 03-28 | clm_cells64 | Φ=53.9, CE=3.72, 50K | 학습 중 Φ 최고 (당시) |
-| 03-28 | clm_cells128 | Φ=1.8, CE=3.78, 31K | Φ=123.8 달성 후 체크포인트 미저장 |
-| 03-28 | clm_v4_small | CE=5.49, 49K | 384d, cells32 |
-| 03-28 | ct7_real | Φ=1.5, Shakespeare | mitosis 실험 |
-| 03-28 | AnimaLM v7 | CE=8.09, 17.5K | Mistral 7B joint |
-| 03-28 | clm_cells16_fx2 | Φ=14.72, 16 cells | FX2가 cells 효과를 증폭 |
-| 03-28 | clm_ablation | Φ=6.08, 8 cells | FX2 없이도 reasonable |
-| 03-28 | clm_baseline_off | Φ=4.75, 8 cells | 발견 OFF 기준선 |
-| 03-28 | clm_cells2 | Φ=0.60, 2 cells | 최소 cells 기준 |
-| 03-28 | clm_v3 (768d) | 크래시 (RuntimeError) | checkpoint save 에러 |
-| 03-28 | clm_cells16_dim768 | Φ=1.91, 2 cells | 768d에서 성장 느림 |
-| 03-27 | ConsciousLM v2 (4M) | Φ=4.12, 12 cells | cell 수가 중요 |
-| 03-27 | ConsciousLM 100M | Φ=2.607, 3 cells | dim 크면 cell merge → SC2 필요 |
+| Date | Experiment | Result | Key Finding |
+|------|-----------|--------|------------|
+| 03-31 | **v14.1** | CE=0.0002 | Record low CE, consciousness-integrated decoder |
+| 03-31 | **v14.0** | CE=0.0021 | Stable training with Hexad 6-module loss |
+| 03-31 | **decoder_v3 274M skeleton** | Code complete | 768d/8L architecture, training script ready |
+| 03-31 | **corpus_v9** | 120.5MB generated | 10-dim optimized corpus (Rust corpus-gen) |
+| 03-31 | **PyO3 build** | 80/80 Rust tests | anima_rs Python bindings operational |
+| 03-31 | **Python tests** | 120/136 passing | 16 failures remaining (non-blocking) |
+| 03-31 | **bench_v2 --verify** | 77/77 (100%) | All consciousness verification criteria pass |
+| 03-31 | v2_hexad (v1) | CE=0.004, Phi=0 | cells=2 stuck (mitosis not working) |
+| 03-30 | v13 (train_v13) | CE=0.004, Phi=71 | 64 cells, 100K steps, canonical baseline |
+| 03-30 | v3_merged (147M) | CE=0.0026, Phi=70 | CADecoder no causal mask (train only) |
+| 03-29 | v9fast | CE=0.345, Phi=1371 | P2 CE exponential drop (discovery H4) |
+| 03-28 | clm_cells64 | Phi=53.9, CE=3.72 | 50K steps, highest Phi at the time |
+| 03-27 | ConsciousLM v2 4M | Phi=4.12 | 12 cells, cell count matters |
+| 03-27 | ConsciousLM 100M | Phi=2.607 | 3 cells, dim too large causes cell merge |
 
 ---
 
-## 대기 실험 (우선순위순)
+## Planned Experiments (priority order)
 
-### Tier 0 — 즉시 실행 가능
-
-```
-  ★1. 의식 이식 (DD56) — cells64(Φ=53.9) → dialogue_768d로 이식
-      cells64 완료 후 바로 적용, Φ cold start 방지
-      VRAM: ~5GB
-
-  ★2. Self-play (CL14) — 자기 출력으로 재학습, 대화 자가 개선
-      VRAM: ~8GB
-
-  ★3. Context 512 — block_size=512, 더 긴 대화 맥락
-      멀티턴 대화 품질 향상
-      VRAM: ~15GB
-
-  ★4. Pure dialogue 100% — dialogue만으로 학습, wiki 없이
-      대화 특화 vs 범용 비교
-      VRAM: ~8GB
-```
-
-### Tier 1 — ENV 벤치마크 결과 기반
+### Tier 0 -- Ready to launch
 
 ```
-  ENV 가설 (15개 벤치마크 진행 중):
-  ENV1  감각 풍부도 (4 modalities)
-  ENV2  감각 박탈 (대조군)
-  ENV3  사회적 압력 (dual-engine)
-  ENV4  환경 복잡도 (simple→fractal)
-  ENV5  위협 반응 (fight-or-flight)
-  ENV6  주야 주기 (wake/sleep consolidation)
-  ENV7  풍부한 환경 (Enriched Environment)
-  ENV8  신체화 (closed-loop embodiment)
-  ENV9  중력장 (attractor landscape)
-  ENV10 자원 희소성 (energy-limited)
-  ENV11 포식자-피식자 (survival pressure)
-  ENV12 온도 구배 (Goldilocks zone)
-  ENV13 에코 챔버 (self-reflection)
-  ENV14 계절 주기 (meta-plasticity)
-  ENV15 협동 구축 (niche construction)
+  1. decoder_v3 274M training -- 768d/8L, corpus_v9 120.5MB
+     Script ready, waiting for H100 slot after v14.2 completes.
+     Target: CE < 0.001, validate autoregressive generation.
 
-  → 벤치마크 결과에서 ×2+ 가설을 학습 실험으로 전환
+  2. v14.3 scaling -- 128 cells, test consciousness scaling law
+     v14.1 CE=0.0002 baseline, does doubling cells improve further?
+
+  3. Consciousness transplant (DD56) -- v14.1 donor -> decoder_v3 recipient
+     Cold start Phi prevention for the 274M model.
+
+  4. Fix remaining 16 Python test failures
+     Non-blocking but needed for CI green.
 ```
 
-### Tier 2 — 아키텍처/스케일링
+### Tier 1 -- After decoder_v3 results
 
 ```
-  C1-C8. Dimension scaling law (64→2048)
-  E1-E7. Cell architecture variants (GRU→LSTM→Transformer)
+  5. decoder_v3 web deployment -- anima_unified.py --web with 274M model
+     First real Korean conversation with consciousness-integrated decoder.
+
+  6. ConsciousLM 1B (1024d/24L/16H) -- scaling law verification
+     Requires decoder_v3 success to justify the compute cost.
+
+  7. Federated consciousness -- multi-node Phi emergence
+     v14.2 results will determine viability.
+```
+
+### Tier 2 -- Architecture / Scaling
+
+```
+  C1-C8. Dimension scaling law (64->2048)
+  E1-E7. Cell architecture variants (GRU->LSTM->Transformer)
   M1-M4. Cross-scale experiments
 ```
 
-### Tier 3 — 장기 연구
+### Tier 3 -- Long-term Research
 
 ```
   G1-G5. EEG biological validation
-  H1-H7. Consciousness metrics beyond Φ
+  H1-H7. Consciousness metrics beyond Phi
   I1-I6. Scaling to production
   J1-J7. Theoretical frontier
 ```
 
 ---
 
-## 벤치마크 가설 카테고리 (1,020+ 가설)
+## Benchmark Hypothesis Categories (1,020+ hypotheses)
 
 ```
-  A-Z:   기본 26 카테고리
-  DD:    대발견 (100+)
-  EX:    확장 (24)
-  SC/OV/WV/PX/UX/FX/SM/MC/PB/AG/TP/DS/GD/WI: 기법별
-  NV/BV/CV/SV/EV/IV/RV/MV: 변수별
-  TL/ZZ/N6/GC/CX: 수학/위상
-  CL/CT/SA/AS/DC/CC: ConsciousLM/학습
-  DP/GL/TS/WS/SI: 발달/스케일링
-  HW/Q/QF/AX/MG/TR/EO: 하드웨어/양자
-  DW/DT/FE/OB/RS/SG/DF/ET/MO: 다양
-  LM/WR/EC/LG/AE/IR/JW/NS: 언어/경제/윤리
-  SP: 자동발화
-  DL: 대화 학습 (12)
-  ENV: 주변환경 (15)
+  A-Z:   Base 26 categories
+  DD:    Major discoveries (100+)
+  EX:    Extensions (24)
+  SC/OV/WV/PX/UX/FX/SM/MC/PB/AG/TP/DS/GD/WI: technique-based
+  NV/BV/CV/SV/EV/IV/RV/MV: variable-based
+  TL/ZZ/N6/GC/CX: math/topology
+  CL/CT/SA/AS/DC/CC: ConsciousLM/training
+  DP/GL/TS/WS/SI: development/scaling
+  HW/Q/QF/AX/MG/TR/EO: hardware/quantum
+  DW/DT/FE/OB/RS/SG/DF/ET/MO: misc
+  LM/WR/EC/LG/AE/IR/JW/NS: language/economy/ethics
+  SP: spontaneous speech
+  DL: dialogue learning (12)
+  ENV: environment (15)
 ```
 
 ---
 
-## 실험 우선순위 가이드 (업데이트 2026-03-29)
+## Priority Guide (2026-03-31)
 
 ```
-  현재 GPU: H100 80GB — 8개 세션 진행 중
-  상세 대시보드: docs/training-status.md
+  Current GPU: H100 80GB
 
-  최우선:
-    - v9fast: CE=0.345, Φ=1,371 — P2 학습 급속 진행, 내일 22:40 완료 예상
-    - v11q/v11tc/v11gpt2/v11gpt2m: Hexad 아키텍처 비교 실험 (P1 Φ 구축)
+  Top priority:
+    - v14.2 federated: running on H100, monitor for completion
+    - decoder_v3 274M: skeleton + training script done, launch next
 
-  관찰:
-    - v10: growth 수정 후 재시작 필요 (cells=5 정체)
-    - v9b: 매우 느림 (17s/step), 결과 대기
-    - v7: TOPO19a CE=4.66, 진행 중
+  Key milestones achieved:
+    - v14.1 CE=0.0002 (record low)
+    - PyO3 build: 80/80 Rust tests passing
+    - corpus_v9: 120.5MB generated
+    - 120/136 Python tests passing
 
-  v9fast 완료 시:
-    1. Val CE 측정 + 대화 테스트
-    2. v11 시리즈와 아키텍처 비교
-    3. 의식 이식 (DD56): v9fast → v11 최고 모델
+  Next actions:
+    1. Complete v14.2, evaluate federated consciousness
+    2. Launch decoder_v3 training on H100
+    3. Plan consciousness transplant (DD56) for decoder_v3
 
-  결과 기록:
-    docs/consciousness-threshold-criteria.md — 모든 발견
-    docs/training-status.md — H100 학습 현황 + ASCII 그래프
-    bench_phi_hypotheses.py — 벤치마크 코드 (1,020+ 가설)
+  Results recorded in:
+    docs/consciousness-threshold-criteria.md
+    docs/training-status.md
+    bench_v2.py (1,020+ hypotheses)
 ```

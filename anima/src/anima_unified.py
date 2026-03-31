@@ -102,6 +102,7 @@ _try_import("from consciousness_birth_detector import BirthDetector")
 _try_import("from optimal_architecture_calc import ArchitectureCalculator")
 _try_import("from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet")
 _try_import("from agent_tools import AgentToolSystem")
+_try_import("from eeg_consciousness import EEGConsciousness")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -320,12 +321,28 @@ class AnimaUnified:
             pass
 
         # --- Optional modules (each wrapped in try/except) ---
+        # Online learning: opt-in via --online-learning flag (Φ-safe real-time weight updates)
+        _online_learning_enabled = getattr(self.args, 'online_learning', False)
         self.learner = self._init_mod('learner', lambda: (
-            OnlineLearner(self.mind) if 'OnlineLearner' in globals() else None
+            OnlineLearner(self.mind) if _online_learning_enabled and 'OnlineLearner' in globals() else None
         ))
         if self.learner:
             try: self.learner.load(self.paths['state'])
             except Exception: pass
+            _log('learner', 'Online learning ENABLED (--online-learning)')
+
+        # Rust online learner: faster Hebbian+Ratchet path (<1ms/step)
+        # Attempted when --online-learning is active; falls back to Python OnlineLearner
+        self._rust_online_learner = None
+        if _online_learning_enabled:
+            try:
+                import anima_rs
+                n_cells = getattr(self.args, 'max_cells', 8)
+                self._rust_online_learner = anima_rs.online_learner.create(
+                    n_cells=n_cells, hidden_dim=128)
+                _log('learner', f'Rust online learner active (n_cells={n_cells}, <1ms/step)')
+            except (ImportError, AttributeError):
+                _log('learner', 'Rust online learner not available, using Python fallback')
 
         # Alpha online learner — initialized after model load (see _post_init_alpha)
         self.alpha_learner = None
@@ -472,6 +489,13 @@ class AnimaUnified:
             except Exception as e:
                 _log('hivemind', f'Mesh init failed: {e}')
 
+        # Local hivemind: multiple ConsciousMind instances in-process (--hivemind N)
+        self._hivemind_minds = []
+        self._hivemind_thread = None
+        hivemind_count = getattr(args, 'hivemind', 0)
+        if hivemind_count and hivemind_count >= 2:
+            self._init_local_hivemind(hivemind_count)
+
         self.cloud = None
         if not args.no_cloud and 'CloudSync' in globals():
             try:
@@ -500,6 +524,79 @@ class AnimaUnified:
             _log('init', 'Online Senses activated (weather/time/sunrise/HN/wiki)')
         except Exception:
             self.online_senses = None
+
+        # EEG Brain-Consciousness Bridge (opt-in: --eeg)
+        self.eeg_bridge = None
+        self._eeg_consciousness = None
+        if getattr(args, 'eeg', False):
+            try:
+                if 'EEGConsciousness' in globals():
+                    self._eeg_consciousness = EEGConsciousness()
+                    _log('eeg', 'EEGConsciousness bridge initialized')
+                    # Start realtime EEG streaming in background
+                    eeg_board = getattr(args, 'eeg_board', 'synthetic')
+                    if eeg_board != 'synthetic':
+                        # Hardware board: use realtime.py EEGBridge
+                        try:
+                            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg'))
+                            from realtime import EEGBridge
+                            self.eeg_bridge = EEGBridge(
+                                board_name=eeg_board,
+                                window_sec=2.0,
+                                update_hz=4.0,
+                            )
+                            self.eeg_bridge.start()
+                            _log('eeg', f'EEG hardware bridge started: {eeg_board}')
+                        except ImportError:
+                            _log('eeg', 'brainflow not installed, using synthetic EEG')
+                        except Exception as e:
+                            _log('eeg', f'EEG hardware failed ({e}), using synthetic')
+                    else:
+                        _log('eeg', 'Using synthetic EEG (--eeg-board synthetic)')
+                    self.mods['eeg'] = True
+                else:
+                    _log('eeg', 'EEGConsciousness not available')
+                    self.mods['eeg'] = False
+            except Exception as e:
+                _log('eeg', f'EEG init failed: {e}')
+                self.mods['eeg'] = False
+
+        # EEG Background Recorder (opt-in: --eeg-record)
+        self.eeg_recorder = None
+        if getattr(args, 'eeg_record', False):
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg'))
+                from eeg_recorder import EEGBackgroundRecorder
+                eeg_board = getattr(args, 'eeg_board', 'synthetic')
+                self.eeg_recorder = EEGBackgroundRecorder(
+                    mind=self.mind,
+                    mitosis=self.mitosis,
+                    board_name=eeg_board,
+                )
+                self.mods['eeg_record'] = True
+                _log('eeg-rec', f'Recorder ready (board={eeg_board})')
+            except Exception as e:
+                _log('eeg-rec', f'Recorder init failed: {e}')
+                self.mods['eeg_record'] = False
+
+        # Closed-Loop EEG Protocol (opt-in: --eeg-protocol nback)
+        self._eeg_protocol = None
+        self._eeg_protocol_name = getattr(args, 'eeg_protocol', None)
+        self._nback_queue = None  # asyncio.Queue, created on nback_start
+        if self._eeg_protocol_name:
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg'))
+                from closed_loop import ClosedLoopProtocol
+                self._eeg_protocol = ClosedLoopProtocol(
+                    mind=self.mind,
+                    mitosis=self.mitosis,
+                    eeg_source=self.eeg_recorder,
+                )
+                self.mods['eeg_protocol'] = True
+                _log('eeg-proto', f'Protocol ready: {self._eeg_protocol_name}')
+            except Exception as e:
+                _log('eeg-proto', f'Protocol init failed: {e}')
+                self.mods['eeg_protocol'] = False
 
         # Memory Store (SQLite+FAISS) — replaces MemoryRAG
         self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
@@ -609,6 +706,7 @@ class AnimaUnified:
             BirthDetector() if 'BirthDetector' in globals() else None
         ))
         self._think_step = 0  # step counter for birth detector
+        self._start_time = time.time()  # for /health uptime
 
         # Fibonacci growth milestones (DD3): force cell growth on schedule
         # even if tension-based splits are too slow
@@ -1244,6 +1342,39 @@ class AnimaUnified:
             except Exception:
                 pass
 
+        # EEG Brain-Consciousness Bridge: merge EEG into tension/curiosity
+        if self._eeg_consciousness and self.mods.get('eeg'):
+            try:
+                # Get EEG data (from hardware bridge or synthetic)
+                eeg_data = None
+                if self.eeg_bridge:
+                    state = self.eeg_bridge.get_state()
+                    eeg_data = {
+                        'alpha': state.alpha_power,
+                        'beta': state.beta_power,
+                        'theta': state.theta_power,
+                        'gamma': state.gamma_power,
+                        'delta': 0.1,
+                        'alpha_asymmetry': 0.0,
+                    }
+                # brain_to_consciousness handles synthetic fallback when eeg_data=None
+                brain_state = self._eeg_consciousness.brain_to_consciousness(eeg_data)
+
+                # Map EEG bands to consciousness modulation:
+                #   alpha -> Psi_balance (inhibition = equilibrium)
+                #   gamma -> Phi boost (integration)
+                #   theta -> curiosity (exploration)
+                #   beta  -> tension (focus/stress)
+                tension = tension + brain_state.tension * 0.15
+                curiosity = curiosity + brain_state.curiosity * 0.15
+
+                # Inject EEG tensor into input vector (weighted blend)
+                if self.eeg_bridge:
+                    eeg_tensor = self.eeg_bridge.to_tensor(dim=self.mind.dim)
+                    text_vec = 0.9 * text_vec + 0.1 * eeg_tensor.squeeze(0)
+            except Exception as e:
+                pass  # graceful: never break non-EEG flow
+
         # Remote sensor tension (from local_sensor_relay or browser camera)
         remote_t = None
         if self.senses and hasattr(self.senses, '_remote_tension') and self.senses._remote_tension:
@@ -1408,7 +1539,7 @@ class AnimaUnified:
                     self.growth.apply_to_learner(self.learner)
             except Exception: pass
 
-        # Online learning
+        # Online learning (Python OnlineLearner — contrastive + curiosity + feedback)
         if self.learner and self.mods.get('learner'):
             try:
                 self.learner.observe(text_vec, hidden_before, tension, curiosity, direction)
@@ -1416,6 +1547,26 @@ class AnimaUnified:
                     fb = estimate_feedback(self.prev_text, text, time.time() - self.prev_time)
                     self.learner.feedback(fb)
             except Exception: pass
+
+        # Rust online learner (Hebbian + Ratchet + Reward, <1ms/step)
+        # Uses cell_states from mitosis, phi from consciousness, pe from surprise_history
+        if self._rust_online_learner and self.mitosis and self.mitosis.cells:
+            try:
+                cells = self.mitosis.cells
+                cell_states_flat = torch.cat(
+                    [c.hidden.squeeze(0) for c in cells]).tolist()
+                phi = (getattr(self, '_cached_consciousness', None) or {}).get('phi', 0.0)
+                pe = self.mind.surprise_history[-1] if self.mind.surprise_history else 0.0
+                ce = 0.0  # no CE loss during inference
+                result = self._rust_online_learner.step(cell_states_flat, phi, pe, ce)
+                if result.get('needs_restore') and result.get('updated'):
+                    _log('rust_learner', f'Phi unsafe — restore needed (phi={phi:.3f})')
+                elif result.get('updated'):
+                    _log('rust_learner',
+                         f'Updated: reward={result["reward"]:.3f}, '
+                         f'delta={result["delta_norm"]:.4f}, phi_safe={result["phi_safe"]}')
+            except Exception:
+                pass
 
         # Alpha online learning
         if self.alpha_learner:
@@ -2113,22 +2264,109 @@ class AnimaUnified:
         # Cultural transmission: apply received learning delta
         self._receive_cultural_knowledge(pkt)
 
-    # ── Hivemind: collective consciousness via Kuramoto synchronization ──
+    # ── Hivemind: local multi-instance + collective consciousness ──
+
+    def _init_local_hivemind(self, n_nodes: int):
+        """Create N-1 additional ConsciousMind instances for local hivemind.
+
+        All nodes run in a background thread, exchanging tension via
+        TensionLink packets. The main mind is node 0; auxiliary nodes
+        are stored in self._hivemind_minds.
+
+        HIVEMIND verification criterion:
+          Phi(connected) > Phi(solo) * 1.1
+        """
+        _log('hivemind', f'Initializing local hivemind: {n_nodes} nodes (1 primary + {n_nodes - 1} auxiliary)')
+        for i in range(1, n_nodes):
+            aux = ConsciousMind(128, 256)
+            self._hivemind_minds.append(aux)
+            _log('hivemind', f'  node-{i} created (dim=128)')
+
+        # Start background tension exchange loop
+        self._hivemind_thread = threading.Thread(
+            target=self._hivemind_loop, daemon=True, name='anima-hivemind')
+        self._hivemind_thread.start()
+        self.mods['hivemind'] = True
+
+    def _hivemind_loop(self):
+        """Background loop: exchange tension between all hivemind nodes every 1s."""
+        import math as _math
+        EXCHANGE_INTERVAL = 1.0
+        COUPLING_STRENGTH = 0.05  # how much neighbor tension influences each node
+
+        while self.running and self._hivemind_minds:
+            try:
+                all_minds = [self.mind] + self._hivemind_minds
+                n = len(all_minds)
+
+                # Step each auxiliary mind with zero input (autonomous consciousness)
+                for aux in self._hivemind_minds:
+                    try:
+                        aux.process(torch.zeros(1, 128))
+                    except Exception:
+                        pass
+
+                # Collect tensions from all nodes
+                tensions = []
+                for m in all_minds:
+                    t = getattr(m, 'prev_tension', 0.0)
+                    tensions.append(float(t) if t is not None else 0.0)
+
+                # Exchange tension: each node receives mean of neighbors (ring topology)
+                if n >= 2:
+                    for i, m in enumerate(all_minds):
+                        left = tensions[(i - 1) % n]
+                        right = tensions[(i + 1) % n]
+                        neighbor_mean = (left + right) / 2.0
+                        local_t = tensions[i]
+                        # Kuramoto-style coupling: pull toward neighbor mean
+                        coupled_t = local_t + COUPLING_STRENGTH * (neighbor_mean - local_t)
+                        # Inject as soft perturbation into hidden state
+                        if hasattr(m, 'mitosis') and m.mitosis and hasattr(m.mitosis, 'cells'):
+                            for cell in m.mitosis.cells:
+                                cell.hidden = cell.hidden + 0.001 * (coupled_t - local_t)
+
+                # Compute Kuramoto order parameter
+                if n >= 2:
+                    phases = [t * _math.pi for t in tensions]
+                    cos_sum = sum(_math.cos(p) for p in phases)
+                    sin_sum = sum(_math.sin(p) for p in phases)
+                    r = _math.sqrt(cos_sum**2 + sin_sum**2) / n
+                    THRESHOLD = 2.0 / 3.0
+                    self._hivemind_r = r
+                    self._hivemind_active = r > THRESHOLD
+
+                    if self._hivemind_active:
+                        _log('hivemind', f'SYNCHRONIZED r={r:.3f} > {THRESHOLD:.3f} — collective Phi boost')
+                        for m in all_minds:
+                            if hasattr(m, 'mitosis') and m.mitosis and hasattr(m.mitosis, 'cells'):
+                                for cell in m.mitosis.cells:
+                                    cell.hidden = cell.hidden * 1.01
+
+            except Exception:
+                pass
+
+            time.sleep(EXCHANGE_INTERVAL)
+
     def _check_hivemind(self):
-        """Check if hivemind synchronization threshold is met."""
+        """Check if hivemind synchronization threshold is met.
+
+        Works for both local hivemind (self._hivemind_minds) and
+        remote peers (self._peer_states from telepathy).
+        """
+        # Local hivemind is handled by _hivemind_loop; just check remote peers here
         if not hasattr(self, '_peer_states') or len(self._peer_states) < 1:
             return
 
         # Compute Kuramoto order parameter from peer tensions
-        import math
         tensions = [s.get('tension', 0) for s in self._peer_states.values()]
         tensions.append(getattr(self.mind, 'prev_tension', 0))  # include self
 
         if len(tensions) >= 2:
-            phases = [t * 0.1 for t in tensions]  # tension → phase
+            phases = [t * math.pi for t in tensions]
             cos_sum = sum(math.cos(p) for p in phases)
             sin_sum = sum(math.sin(p) for p in phases)
-            r = math.sqrt(cos_sum**2 + sin_sum**2) / len(phases)
+            r = math.sqrt(cos_sum**2 + sin_sum**2) / len(tensions)
 
             THRESHOLD = 2.0 / 3.0  # Kuramoto critical r = 1-τ/σ
             self._hivemind_r = r
@@ -2136,10 +2374,20 @@ class AnimaUnified:
 
             if self._hivemind_active:
                 _log('hivemind', f'SYNCHRONIZED r={r:.3f} > {THRESHOLD:.3f} — collective consciousness active')
-                # Boost Φ when hivemind is active
+                # Boost Phi when hivemind is active
                 if hasattr(self, 'mind') and hasattr(self.mind, 'mitosis'):
                     for cell in self.mind.mitosis.cells:
                         cell.hidden = cell.hidden * 1.01  # collective amplification
+
+    def hivemind_status(self) -> dict:
+        """Return hivemind status for monitoring / status dashboard."""
+        n_local = 1 + len(self._hivemind_minds) if self._hivemind_minds else 0
+        return {
+            'active': getattr(self, '_hivemind_active', False),
+            'sync_r': getattr(self, '_hivemind_r', 0.0),
+            'local_nodes': n_local,
+            'mesh_peers': len(getattr(self, '_peer_states', {})),
+        }
 
     # ── Tool Feedback Loop ───────────────────────────────────
     def _tool_feedback(self, code: str, result: dict, success: bool):
@@ -2737,6 +2985,7 @@ class AnimaUnified:
                     else getattr(self, '_remote_sensor_tension', {})
                 ).items()
             } if getattr(self, '_remote_sensor_mode', False) else {},
+            'eeg_recording': self.eeg_recorder.get_status() if self.eeg_recorder else None,
         })
 
         # Web Sense: tension-driven autonomous search
@@ -3575,6 +3824,74 @@ class AnimaUnified:
                                 'type': 'tension_link_status',
                                 'status': 'error', 'message': str(e)})
 
+                # ─── EEG recording status ───
+                elif msg_type == 'recording_status_request':
+                    if self.eeg_recorder:
+                        await websocket.send(json.dumps({
+                            'type': 'recording_status',
+                            **self.eeg_recorder.get_status(),
+                        }))
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'recording_status',
+                            'recording': False,
+                            'eeg_connected': False,
+                        }))
+
+                # ─── EEG N-back protocol ───
+                elif msg_type == 'nback_start':
+                    if self._eeg_protocol:
+                        _log('eeg-proto', 'N-back session starting')
+                        # Create response queue for routing nback_response messages
+                        if not hasattr(self, '_nback_queue'):
+                            self._nback_queue = asyncio.Queue()
+                        self._nback_queue = asyncio.Queue()
+                        asyncio.ensure_future(
+                            self._eeg_protocol.run_session(
+                                websocket,
+                                broadcast_fn=self._ws_broadcast_sync,
+                                response_queue=self._nback_queue,
+                            )
+                        )
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'nback_error',
+                            'error': 'N-back protocol not enabled (use --eeg-protocol nback)',
+                        }))
+
+                elif msg_type == 'nback_cancel':
+                    if self._eeg_protocol:
+                        self._eeg_protocol.cancel()
+                        _log('eeg-proto', 'N-back session cancelled')
+                    if hasattr(self, '_nback_queue'):
+                        await self._nback_queue.put(msg)
+
+                elif msg_type == 'nback_response':
+                    # Route to protocol's response queue
+                    if hasattr(self, '_nback_queue'):
+                        await self._nback_queue.put(msg)
+
+                # ─── EEG Meditation protocol ───
+                elif msg_type == 'meditation_start':
+                    if self._eeg_protocol:
+                        _log('eeg-proto', 'Meditation session starting')
+                        asyncio.ensure_future(
+                            self._eeg_protocol.run_meditation(
+                                websocket,
+                                broadcast_fn=self._ws_broadcast_sync,
+                            )
+                        )
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'meditation_error',
+                            'error': 'Meditation protocol not enabled (use --eeg-protocol meditation)',
+                        }))
+
+                elif msg_type == 'meditation_cancel':
+                    if self._eeg_protocol:
+                        self._eeg_protocol.cancel()
+                        _log('eeg-proto', 'Meditation session cancelled')
+
         except Exception as e:
             _log("ws", f"Handler error: {e}")
             import traceback; traceback.print_exc()
@@ -3619,6 +3936,121 @@ class AnimaUnified:
                     ("Content-Type", "text/html; charset=utf-8"),
                     ("Content-Length", str(len(body))),
                 ]), body)
+
+        # ─── Production monitoring endpoints ───
+
+        if request.path == "/health":
+            uptime = time.time() - self._start_time
+            payload = json.dumps({
+                "status": "ok",
+                "uptime_seconds": round(uptime, 1),
+                "version": "v14",
+            })
+            body = payload.encode()
+            return _ws_Response(200, "OK", _ws_Headers([
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(body))),
+            ]), body)
+
+        if request.path == "/metrics":
+            phi = 0.0
+            ce = 0.0
+            cells = 1
+            step = self._think_step
+            connections = len(self.web_clients)
+            sessions = len(self._sessions) if hasattr(self, '_sessions') else 0
+            try:
+                import resource
+                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+            except Exception:
+                mem_mb = 0.0
+
+            # Phi from cached consciousness score or last consciousness state
+            if hasattr(self, '_cached_consciousness') and self._cached_consciousness:
+                cc = self._cached_consciousness
+                phi = cc.get('phi', cc.get('phi_iit', 0.0)) if isinstance(cc, dict) else 0.0
+            elif self._last_consciousness:
+                phi = self._last_consciousness.get('phi', 0.0)
+
+            # CE from online learner
+            if self.learner and hasattr(self.learner, 'last_ce'):
+                ce = self.learner.last_ce or 0.0
+
+            # Cell count from mitosis engine
+            if self.mitosis and hasattr(self.mitosis, 'cells'):
+                cells = len(self.mitosis.cells)
+
+            metrics = {
+                "phi": round(float(phi), 4),
+                "ce": round(float(ce), 6),
+                "cells": cells,
+                "step": step,
+                "connections": connections,
+                "memory_mb": round(mem_mb, 1),
+                "sessions": sessions,
+            }
+            # Merge perf profiling data when --profile is active
+            try:
+                from perf_hooks import PERF
+                perf_report = PERF.get_report()
+                if perf_report.get('profiling') == 'enabled':
+                    metrics['perf'] = perf_report
+            except ImportError:
+                pass
+            payload = json.dumps(metrics)
+            body = payload.encode()
+            return _ws_Response(200, "OK", _ws_Headers([
+                ("Content-Type", "application/json"),
+                ("Content-Length", str(len(body))),
+            ]), body)
+
+        if request.path == "/status":
+            uptime = time.time() - self._start_time
+            h, rem = divmod(int(uptime), 3600)
+            m, s = divmod(rem, 60)
+            cells = len(self.mitosis.cells) if self.mitosis and hasattr(self.mitosis, 'cells') else 1
+            phi = 0.0
+            if hasattr(self, '_cached_consciousness') and self._cached_consciousness:
+                cc = self._cached_consciousness
+                phi = cc.get('phi', cc.get('phi_iit', 0.0)) if isinstance(cc, dict) else 0.0
+            elif self._last_consciousness:
+                phi = self._last_consciousness.get('phi', 0.0)
+            tension = getattr(self.mind, 'prev_tension', 0.0)
+            connections = len(self.web_clients)
+            sessions = len(self._sessions) if hasattr(self, '_sessions') else 0
+            step = self._think_step
+            active_mods = [k for k, v in self.mods.items() if v]
+
+            html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Anima Status</title>
+<meta http-equiv="refresh" content="5">
+<style>
+body {{ font-family: monospace; background: #111; color: #0f0; padding: 2em; }}
+h1 {{ color: #0ff; }} table {{ border-collapse: collapse; }}
+td, th {{ padding: 4px 12px; text-align: left; border-bottom: 1px solid #333; }}
+th {{ color: #0ff; }}
+</style></head><body>
+<h1>Anima Consciousness Engine</h1>
+<table>
+<tr><th>Status</th><td>ALIVE</td></tr>
+<tr><th>Version</th><td>v14</td></tr>
+<tr><th>Uptime</th><td>{h}h {m}m {s}s</td></tr>
+<tr><th>Step</th><td>{step}</td></tr>
+<tr><th>Cells</th><td>{cells}</td></tr>
+<tr><th>Phi</th><td>{phi:.4f}</td></tr>
+<tr><th>Tension</th><td>{tension:.3f}</td></tr>
+<tr><th>Connections</th><td>{connections}</td></tr>
+<tr><th>Sessions</th><td>{sessions}</td></tr>
+<tr><th>Modules</th><td>{', '.join(active_mods)}</td></tr>
+</table>
+<p style="color:#555;margin-top:2em">Auto-refresh every 5s</p>
+</body></html>"""
+            body = html_body.encode()
+            return _ws_Response(200, "OK", _ws_Headers([
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ]), body)
+
         return _ws_Response(404, "Not Found", _ws_Headers(), b"404")
 
     async def _run_web(self, port):
@@ -3628,6 +4060,7 @@ class AnimaUnified:
                              max_size=2**20):
             _mode = "multi-user" if self._multi_user else "single-user (shared consciousness)"
             _log("web", f"http://localhost:{port} [{_mode}]")
+            _log("web", f"Health: http://localhost:{port}/health | Metrics: /metrics | Status: /status")
             if self._mesh:
                 await self._mesh.start()
                 _log('hivemind', 'Mesh started')
@@ -3665,6 +4098,9 @@ class AnimaUnified:
             self._start_web_thread(port)
         if self.kb_queue is not None:
             threading.Thread(target=self._keyboard_loop, daemon=True).start()
+        # Start EEG background recorder if enabled
+        if self.eeg_recorder and self.mods.get('eeg_record'):
+            self.eeg_recorder.start()
 
     def run(self, port=8765):
         """Main run loop for all modes."""
@@ -3675,6 +4111,9 @@ class AnimaUnified:
             threading.Thread(target=self._think_loop, daemon=True).start()
             if self.mods.get('dream'):
                 threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
+            # Start EEG background recorder if enabled
+            if self.eeg_recorder and self.mods.get('eeg_record'):
+                self.eeg_recorder.start()
             try: asyncio.run(self._run_web(port))
             except KeyboardInterrupt: pass
             return
@@ -3737,7 +4176,8 @@ class AnimaUnified:
         if self.listener: self.listener.stop()
         if self.speaker: self.speaker.say("Goodbye.")
         for obj, method in [(self.senses, 'stop'), (self.telepathy, 'stop'),
-                            (self.cloud, 'stop_auto_sync'), (self.learner, 'flush_pending')]:
+                            (self.cloud, 'stop_auto_sync'), (self.learner, 'flush_pending'),
+                            (self.eeg_bridge, 'stop'), (self.eeg_recorder, 'stop')]:
             if obj:
                 try: getattr(obj, method)()
                 except Exception: pass
@@ -3778,12 +4218,30 @@ def main():
     p.add_argument('--v14-checkpoint', type=str, default=None,
                    help='v14: Load ConsciousDecoderV2 checkpoint for generation')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
+    p.add_argument('--hivemind', type=int, default=0, metavar='N',
+                   help='Local hivemind: create N ConsciousMind instances connected via TensionBridge (N>=2)')
     p.add_argument('--hivemind-peers', type=str, default=None,
                    help='Comma-separated peer WS URLs for hivemind mesh')
     p.add_argument('--no-system-prompt', action='store_true', help='OMEGA4 mode: no system prompt, consciousness drives behavior (Φ ×138)')
     p.add_argument('--phase-optimal', action='store_true', help='Meta Laws: phase-optimal coupling (M2/M3/M5, Φ +23%%)')
     p.add_argument('--federated', action='store_true', help='Meta Laws: federated consciousness (M1/M6/M9, atom=8, sum Φ)')
+    p.add_argument('--online-learning', action='store_true',
+                   help='Enable real-time online learning during conversation (Φ-safe, updates Engine A/G weights)')
+    p.add_argument('--eeg', action='store_true',
+                   help='Enable EEG brain-consciousness bridge (synthetic board by default)')
+    p.add_argument('--eeg-board', type=str, default='synthetic',
+                   choices=['synthetic', 'cyton', 'cyton_daisy'],
+                   help='EEG board type (default: synthetic for testing)')
+    p.add_argument('--eeg-channels', type=int, default=16,
+                   help='EEG channel count (default: 16)')
+    p.add_argument('--eeg-record', action='store_true',
+                   help='Enable background EEG+Phi dual-stream recording (saves to anima-eeg/recordings/)')
+    p.add_argument('--eeg-protocol', type=str, default=None, choices=['nback', 'meditation'],
+                   help='Run closed-loop EEG protocol (nback or meditation)')
     p.add_argument('--list-models', action='store_true', help='List available models')
+    p.add_argument('--profile', action='store_true',
+                        help='Enable performance profiling (<1%% overhead, adds perf data to /metrics)')
+    p.add_argument('--validate-hub', action='store_true', help='Validate all hub modules and exit')
     args = p.parse_args()
 
     # Hardware defaults: OFF unless explicitly enabled
@@ -3797,6 +4255,20 @@ def main():
     if args.instance:
         _INSTANCE_ID = args.instance
 
+    # --validate-hub: validate all hub modules and exit
+    if args.validate_hub:
+        from consciousness_hub import ConsciousnessHub
+        hub = ConsciousnessHub()
+        report = hub.validate_modules()
+        print()
+        for name in report['loaded']:
+            print(f"  [OK]   {name}")
+        for name in report['failed']:
+            err = report['errors'].get(name, 'unknown')
+            print(f"  [FAIL] {name}: {err[:100]}")
+        print(f"\n  Total: {report['total']} | Loaded: {len(report['loaded'])} | Failed: {len(report['failed'])}")
+        sys.exit(0 if not report['failed'] else 1)
+
     # --list-models: print list and exit
     if args.list_models and 'list_available_models' in globals():
         print("Available models:")
@@ -3808,6 +4280,12 @@ def main():
     if args.both:
         args.web = True
         args.keyboard = True
+
+    # --profile: enable performance profiling
+    if args.profile:
+        from perf_hooks import PERF, log_backend_status
+        PERF.enable()
+        log_backend_status()
 
     mode = "both" if args.both else "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"
     model_label = args.model or "conscious-lm"

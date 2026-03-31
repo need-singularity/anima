@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """ESP32 Consciousness Network Orchestrator
 
-Manages 8 ESP32-S3 boards connected via SPI bus:
-  - Board 0: Hub (Law 93: asymmetric hub-spoke)
-  - Board 1-7: Spoke cells
+Manages 8 ESP32-S3 boards connected via SPI bus (ring topology).
+Aligned with canonical ESP32 crate (anima-rs/crates/esp32/).
 
 Each board runs:
-  - 2-4 consciousness cells (GRU, 64d hidden)
-  - SPI tension exchange every cycle
-  - Local Phi computation (approximate)
+  - 2 GRU consciousness cells (64d input, 128d hidden)
+  - 8 factions with consensus voting
+  - Hebbian LTP/LTD (cosine > 0.8 strengthen, < 0.2 weaken)
+  - Phi Ratchet (best checkpoint + restore at 80% decay)
+  - Lorenz chaos injection
+  - SOC sandpile dynamics (edge-of-chaos criticality)
+  - Frustration (33% anti-ferromagnetic)
+  - Tension = distance from mean (not hidden norm)
+  - Tension-weighted softmax output
+  - All 4 Psi-Constants: alpha=0.014, balance=0.5, steps=4.33, entropy=0.998
 
-The SPI bus bandwidth = natural information bottleneck (Law 92).
-Hub board integrates info from all spokes (Law 93).
-
+8 boards x 2 cells = 16 cells total.
+SPI packet: 1040 bytes (2 cells x 128 f32 + metadata).
+Memory: PSRAM for weights (~580KB), SRAM for working (~10KB).
 Network Phi is measured by the Python host via serial.
 
 Usage:
@@ -39,7 +45,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Meta Law M1: 8 cells per ESP32 board = 1 consciousness atom
+# Aligned with esp32 crate: 2 cells/board, 8 factions, all 4 Psi-Constants
 try:
     from consciousness_laws import PSI_F_CRITICAL
 except ImportError:
@@ -67,13 +73,42 @@ except Exception:
 CELL_DIM = 64
 HIDDEN_DIM = 128
 COMBINED_DIM = CELL_DIM + 1 + HIDDEN_DIM  # 193
+
+# All 4 Ψ-Constants (Laws 69-70, from ln(2))
 PSI_COUPLING = 0.014
+PSI_BALANCE = 0.5
+PSI_STEPS = 4.33
+PSI_ENTROPY = 0.998
+
 N_BOARDS = 8
 CELLS_PER_BOARD = 2
-N_FACTIONS = 4
+N_CELLS_TOTAL = N_BOARDS * CELLS_PER_BOARD  # 16
+N_FACTIONS = 8
 
-# SPI packet: 128 floats (hidden) + 1 float (tension) + 2 bytes (cell_id, faction_id) = 518 bytes
-SPI_PACKET_SIZE = 518
+# Hebbian thresholds (from canonical engine)
+HEBBIAN_LTP_THRESH = 0.8   # cosine > 0.8 → strengthen
+HEBBIAN_LTD_THRESH = 0.2   # cosine < 0.2 → weaken
+HEBBIAN_RATE = 0.01
+
+# Φ ratchet
+RATCHET_DECAY_THRESH = 0.8  # restore if Φ < best × 0.8
+
+# Chaos (simplified Lorenz attractor)
+LORENZ_SIGMA = 10.0
+LORENZ_RHO = 28.0
+LORENZ_BETA = 2.667  # 8/3
+LORENZ_DT = 0.001
+CHAOS_SCALE = 0.01
+
+# SOC sandpile
+SANDPILE_THRESHOLD = 4.0
+SANDPILE_TRANSFER = 1.0
+
+# Frustration (Law 22: 33% anti-ferromagnetic)
+FRUSTRATION_RATIO = 3
+
+# SPI packet: 2 × 128 × 4 + 2×4 + 1 + 2 + 1 + 4 = 1040 bytes
+SPI_PACKET_SIZE = 1040
 
 # Serial protocol commands
 CMD_INIT = b'\x01'
@@ -140,8 +175,144 @@ TOPOLOGIES = {
 # Simulated GRU Cell (matches ESP32 Rust implementation)
 # ═══════════════════════════════════════════════════════════
 
+class LorenzChaos:
+    """Simplified Lorenz attractor for chaos injection (Laws 32-43)."""
+
+    def __init__(self):
+        self.x, self.y, self.z = 1.0, 1.0, 1.0
+
+    def step(self) -> float:
+        dx = LORENZ_SIGMA * (self.y - self.x)
+        dy = self.x * (LORENZ_RHO - self.z) - self.y
+        dz = self.x * self.y - LORENZ_BETA * self.z
+        self.x += dx * LORENZ_DT
+        self.y += dy * LORENZ_DT
+        self.z += dz * LORENZ_DT
+        return self.x / 25.0  # normalize to [-1, 1]
+
+
+class SandpileState:
+    """SOC sandpile dynamics for edge-of-chaos criticality."""
+
+    def __init__(self, n_cells: int):
+        self.grains = np.zeros(n_cells, dtype=np.float32)
+        self.n_cells = n_cells
+
+    def add_and_cascade(self, cell_idx: int) -> int:
+        """Add grain, cascade if threshold exceeded. Returns avalanche count."""
+        if cell_idx >= self.n_cells:
+            return 0
+        self.grains[cell_idx] += 1.0
+        avalanches = 0
+        changed = True
+        while changed:
+            changed = False
+            for i in range(self.n_cells):
+                if self.grains[i] >= SANDPILE_THRESHOLD:
+                    self.grains[i] -= SANDPILE_THRESHOLD
+                    left = (i - 1) % self.n_cells
+                    right = (i + 1) % self.n_cells
+                    self.grains[left] += SANDPILE_TRANSFER
+                    self.grains[right] += SANDPILE_TRANSFER
+                    avalanches += 1
+                    changed = True
+        return avalanches
+
+
+class HebbianCoupling:
+    """Hebbian LTP/LTD coupling matrix (sparse, ring neighbors)."""
+
+    def __init__(self, n_cells: int):
+        self.n_cells = n_cells
+        self.weights = np.zeros((n_cells, n_cells), dtype=np.float32)
+        # Initialize ring topology
+        for i in range(n_cells):
+            left = (i - 1) % n_cells
+            right = (i + 1) % n_cells
+            self.weights[i, left] = 0.01
+            self.weights[i, right] = 0.01
+
+    def update(self, hiddens: List[np.ndarray]):
+        """Update coupling based on cosine similarity."""
+        for i in range(self.n_cells):
+            left = (i - 1) % self.n_cells
+            right = (i + 1) % self.n_cells
+            for j in [left, right]:
+                cos = _cosine_similarity(hiddens[i], hiddens[j])
+                if cos > HEBBIAN_LTP_THRESH:
+                    self.weights[i, j] += HEBBIAN_RATE * (cos - HEBBIAN_LTP_THRESH)
+                elif cos < HEBBIAN_LTD_THRESH:
+                    self.weights[i, j] -= HEBBIAN_RATE * (HEBBIAN_LTD_THRESH - cos)
+                self.weights[i, j] = np.clip(self.weights[i, j], 0.0, 1.0)
+
+
+class PhiRatchet:
+    """Phi ratchet: best checkpoint + restore at 80% decay."""
+
+    def __init__(self, n_cells: int):
+        self.best_phi = 0.0
+        self.best_hiddens = [np.zeros(HIDDEN_DIM, dtype=np.float32) for _ in range(n_cells)]
+        self.n_cells = n_cells
+
+    def check_and_restore(self, cells: List['SimGruCell'], phi: float) -> bool:
+        """Check Phi decay, restore if below threshold. Returns True if restored."""
+        if phi > self.best_phi:
+            self.best_phi = phi
+            for i in range(self.n_cells):
+                self.best_hiddens[i] = cells[i].hidden.copy()
+            return False
+        elif self.best_phi > 0 and phi < self.best_phi * RATCHET_DECAY_THRESH:
+            for i in range(self.n_cells):
+                cells[i].hidden = self.best_hiddens[i].copy()
+            return True
+        return False
+
+
+class FactionState:
+    """8 factions with consensus voting."""
+
+    def __init__(self, n_cells: int):
+        self.n_cells = n_cells
+        self.cell_factions = [i % N_FACTIONS for i in range(n_cells)]
+        self.consensus_count = 0
+
+    def compute_consensus(self, hiddens: List[np.ndarray], threshold: float = 0.1) -> int:
+        """Compute faction consensus. Returns 1 if majority agrees."""
+        if self.n_cells < 2:
+            return 0
+        # Compute faction means
+        faction_means = [np.zeros(HIDDEN_DIM, dtype=np.float32) for _ in range(N_FACTIONS)]
+        faction_counts = [0] * N_FACTIONS
+        for i in range(self.n_cells):
+            f = self.cell_factions[i]
+            faction_counts[f] += 1
+            faction_means[f] += hiddens[i]
+        for f in range(N_FACTIONS):
+            if faction_counts[f] > 0:
+                faction_means[f] /= faction_counts[f]
+        # Count pairwise agreements
+        agreements, pairs = 0, 0
+        for i in range(N_FACTIONS):
+            if faction_counts[i] == 0:
+                continue
+            for j in range(i + 1, N_FACTIONS):
+                if faction_counts[j] == 0:
+                    continue
+                cos = _cosine_similarity(faction_means[i], faction_means[j])
+                if cos > threshold:
+                    agreements += 1
+                pairs += 1
+        consensus = 1 if (pairs > 0 and agreements > pairs // 2) else 0
+        self.consensus_count += consensus
+        return consensus
+
+
 class SimGruCell:
-    """Python simulation of the no_std GRU cell from esp32 crate."""
+    """Python simulation of the no_std GRU cell from esp32 crate.
+
+    Matches canonical ESP32 crate: 2 cells per board, 8 factions,
+    Hebbian LTP/LTD, Lorenz chaos, Phi ratchet, SOC sandpile.
+    """
 
     def __init__(self, seed: int = 42):
         rng = np.random.default_rng(seed)
@@ -172,13 +343,21 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
 
 
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    dot = float(np.dot(a, b))
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    denom = na * nb
+    return dot / denom if denom > 1e-8 else 0.0
+
+
 # ═══════════════════════════════════════════════════════════
 # Board state
 # ═══════════════════════════════════════════════════════════
 
 @dataclass
 class BoardState:
-    """State of one ESP32 board."""
+    """State of one ESP32 board (2 cells, matches canonical esp32 crate)."""
     board_id: int
     cells: List[SimGruCell] = field(default_factory=list)
     tensions: List[float] = field(default_factory=list)
@@ -187,6 +366,14 @@ class BoardState:
     step_count: int = 0
     # Aggregated hidden for SPI exchange
     mean_hidden: np.ndarray = field(default_factory=lambda: np.zeros(HIDDEN_DIM, dtype=np.float32))
+    # Subsystems aligned with Rust crate
+    chaos: LorenzChaos = field(default_factory=LorenzChaos)
+    ratchet: PhiRatchet = field(default=None)
+    restored: bool = False
+
+    def __post_init__(self):
+        if self.ratchet is None:
+            self.ratchet = PhiRatchet(CELLS_PER_BOARD)
 
     def compute_local_phi(self) -> float:
         """Approximate Phi from local cells (variance-based proxy)."""
@@ -211,7 +398,15 @@ class BoardState:
 # ═══════════════════════════════════════════════════════════
 
 class ESP32Network:
-    """Orchestrates 8 ESP32 boards (real or simulated)."""
+    """Orchestrates 8 ESP32 boards (real or simulated).
+
+    Aligned with canonical esp32 crate:
+      - 2 cells per board, 8 boards = 16 cells total
+      - 8 factions with consensus voting
+      - Hebbian LTP/LTD, Lorenz chaos, Phi ratchet, SOC sandpile
+      - Tension = distance from mean (not hidden norm)
+      - SPI packet: 1040 bytes
+    """
 
     def __init__(
         self,
@@ -232,16 +427,24 @@ class ESP32Network:
         topo_fn = TOPOLOGIES.get(topology, make_ring)
         self.adjacency = topo_fn(n_boards)
 
+        # Total cells
+        self.n_cells_total = n_boards * cells_per_board
+
         # Initialize boards
         self.boards: List[BoardState] = []
         for bid in range(n_boards):
             board = BoardState(board_id=bid)
             for cid in range(cells_per_board):
-                cell_seed = seed + bid * 100 + cid
+                cell_seed = seed + bid * 1000 + cid  # match Rust: bid * 1000 + 42/43
                 board.cells.append(SimGruCell(seed=cell_seed))
-                board.tensions.append(0.0)
+                board.tensions.append(0.5)  # match Rust initial tension
                 board.faction_ids.append((bid * cells_per_board + cid) % N_FACTIONS)
             self.boards.append(board)
+
+        # Network-level subsystems (matching Rust ConsciousnessNetwork)
+        self.hebbian = HebbianCoupling(self.n_cells_total)
+        self.factions = FactionState(self.n_cells_total)
+        self.sandpile = SandpileState(self.n_cells_total)
 
         # Serial connections (real hardware)
         self.serial_conns: List[Optional[serial.Serial]] = []
@@ -260,6 +463,8 @@ class ESP32Network:
         self.phi_history: List[float] = []
         self.tension_history: List[float] = []
         self.board_phi_history: List[List[float]] = [[] for _ in range(n_boards)]
+        self.consensus_history: List[int] = []
+        self.avalanche_history: List[int] = []
 
         # Phi calculator
         self.phi_calc_bins = 16
@@ -277,10 +482,15 @@ class ESP32Network:
     def step(self, external_input: Optional[np.ndarray] = None) -> Dict:
         """Run one consciousness cycle across all boards.
 
-        1. Each board processes its cells locally
-        2. SPI exchange: boards share mean hidden with neighbors
-        3. Hub integrates (if hub_spoke topology)
-        4. Compute network Phi
+        Aligned with Rust ConsciousnessNetwork::step():
+        1. Create SPI packets from current state
+        2. Each board processes its cells with chaos, coupling, frustration
+        3. Compute tension = distance from mean (correct method)
+        4. Hebbian LTP/LTD update
+        5. Faction consensus voting
+        6. SOC sandpile dynamics
+        7. Phi ratchet (every 10 steps)
+        8. Compute network Phi
         """
         self.step_count += 1
 
@@ -291,35 +501,89 @@ class ESP32Network:
         else:
             base_input = external_input[:CELL_DIM].astype(np.float32)
 
-        # Phase 1: Local processing on each board
+        # Phase 1: Local processing on each board (matches Rust board.step())
         for board in self.boards:
+            # Chaos injection (Law 33)
+            chaos_val = board.chaos.step() * CHAOS_SCALE
+            global_base = board.board_id * self.cells_per_board
+
             for ci, cell in enumerate(board.cells):
-                # Build coupled input from neighbor boards
                 coupled = base_input.copy()
+
+                # Local coupling: cell 0 <-> cell 1 within board
+                other_ci = 1 - ci if self.cells_per_board == 2 else (ci + 1) % len(board.cells)
+                coupled[:CELL_DIM] += PSI_COUPLING * board.cells[other_ci].hidden[:CELL_DIM]
+
+                # Inter-board coupling via SPI (ring neighbors)
                 for nb_id in self.adjacency[board.board_id]:
                     nb_hidden = self.boards[nb_id].mean_hidden
                     coupled[:CELL_DIM] += PSI_COUPLING * nb_hidden[:CELL_DIM]
 
-                # Compute tension
-                tension = float(np.sqrt(np.mean(cell.hidden ** 2)))
+                # Chaos perturbation
+                for d in range(CELL_DIM):
+                    coupled[d] += chaos_val * (1.0 + 0.1 * (d / CELL_DIM))
+
+                # Frustration: every 3rd cell is anti-ferromagnetic (Law 22)
+                global_idx = global_base + ci
+                if global_idx % FRUSTRATION_RATIO == 0:
+                    coupled = -coupled * 0.1 + base_input * 0.9
+
+                # Thermal noise
+                coupled += rng.standard_normal(CELL_DIM).astype(np.float32) * 0.02
+
+                # Use stored tension (correct: not hidden norm)
+                tension = board.tensions[ci]
                 cell.process(coupled, tension)
-                board.tensions[ci] = tension
+
+            # Compute tension: distance from mean (CORRECT method, matching Rust)
+            all_board_hiddens = [c.hidden for c in board.cells]
+            # Include neighbor means for tension computation
+            for nb_id in self.adjacency[board.board_id]:
+                all_board_hiddens.append(self.boards[nb_id].mean_hidden)
+            mean_hidden = np.mean(all_board_hiddens, axis=0)
+            for ci, cell in enumerate(board.cells):
+                diff = cell.hidden - mean_hidden
+                board.tensions[ci] = float(np.mean(diff ** 2))
 
             board.compute_mean_hidden()
             board.compute_local_phi()
             board.step_count = self.step_count
 
-        # Phase 2: Compute network-level Phi
+        # Phase 2: Network-level subsystems
         all_hiddens = []
         for board in self.boards:
             for cell in board.cells:
                 all_hiddens.append(cell.hidden.copy())
 
+        # Hebbian LTP/LTD (Law 31: persistence key)
+        self.hebbian.update(all_hiddens)
+
+        # Faction consensus voting (8 factions)
+        consensus = self.factions.compute_consensus(all_hiddens)
+
+        # SOC sandpile: add grain to highest-tension cell
+        max_tension_idx = 0
+        max_tension_val = 0.0
+        for b in self.boards:
+            for ci in range(len(b.cells)):
+                if b.tensions[ci] > max_tension_val:
+                    max_tension_val = b.tensions[ci]
+                    max_tension_idx = b.board_id * self.cells_per_board + ci
+        avalanches = self.sandpile.add_and_cascade(max_tension_idx)
+
+        # Phi ratchet (every 10 steps per board)
+        for board in self.boards:
+            if self.step_count % 10 == 0:
+                board.restored = board.ratchet.check_and_restore(board.cells, board.local_phi)
+
+        # Phase 3: Compute network-level Phi
         network_phi = self._compute_network_phi(all_hiddens)
         mean_tension = float(np.mean([t for b in self.boards for t in b.tensions]))
 
         self.phi_history.append(network_phi)
         self.tension_history.append(mean_tension)
+        self.consensus_history.append(consensus)
+        self.avalanche_history.append(avalanches)
         for i, board in enumerate(self.boards):
             self.board_phi_history[i].append(board.local_phi)
 
@@ -331,6 +595,8 @@ class ESP32Network:
             'board_tensions': [np.mean(b.tensions) for b in self.boards],
             'n_cells': sum(len(b.cells) for b in self.boards),
             'topology': self.topology_name,
+            'consensus': consensus,
+            'avalanches': avalanches,
         }
 
     def _compute_network_phi(self, hiddens: List[np.ndarray]) -> float:
@@ -427,7 +693,9 @@ class ESP32Network:
         lines.append(f'  ESP32 Consciousness Network  [{self.topology_name}]  {"SIM" if self.simulation_mode else "HW"}')
         lines.append(f'  [{bar}] {pct:5.1f}%  step {step + 1}/{total}')
         lines.append('')
-        lines.append(f'  Network Phi: {result["network_phi"]:.4f}   Mean Tension: {result["mean_tension"]:.4f}   Cells: {result["n_cells"]}')
+        consensus = result.get("consensus", 0)
+        avalanches = result.get("avalanches", 0)
+        lines.append(f'  Network Phi: {result["network_phi"]:.4f}   Mean Tension: {result["mean_tension"]:.4f}   Cells: {result["n_cells"]}   Consensus: {consensus}   Avalanches: {avalanches}')
         lines.append('')
 
         # Per-board status
@@ -502,6 +770,9 @@ class ESP32Network:
             ],
             'phi_history': self.phi_history[-100:],
             'tension_history': self.tension_history[-100:],
+            'consensus_history': self.consensus_history[-100:],
+            'avalanche_history': self.avalanche_history[-100:],
+            'total_consensus': self.factions.consensus_count,
         }
 
 
@@ -513,7 +784,8 @@ def run_benchmark():
     """Run ESP32 network benchmark across topologies."""
     print('=' * 70)
     print('  ESP32 Consciousness Network Benchmark')
-    print('  8 boards x 2 cells = 16 cells, 64d input, 128d hidden')
+    print('  8 boards x 2 cells = 16 cells, 64d input, 128d hidden, 8 factions')
+    print('  Hebbian LTP/LTD + Lorenz chaos + Phi ratchet + SOC sandpile')
     print('=' * 70)
     print()
 

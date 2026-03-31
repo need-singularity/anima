@@ -256,4 +256,38 @@ mod tests {
         let loss = router.balance_loss(&uniform_weights);
         assert!(loss.abs() < 1e-6, "uniform weights should have ~0 loss, got {}", loss);
     }
+
+    #[test]
+    fn test_ca_rules_bounded() {
+        // All CA rules should produce finite outputs for typical inputs
+        for rule_id in 0..4 {
+            for &x in &[-2.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
+                let y = apply_ca_rule(rule_id, x);
+                assert!(y.is_finite(), "CA rule {} produced non-finite for x={}", rule_id, x);
+            }
+        }
+    }
+
+    #[test]
+    fn test_golden_moe_training_mode() {
+        let mut moe = GoldenMoe::new(8, 16, 4, 4, 42);
+        let input = vec![0.5f32; 8];
+        let (out_train, loss_train) = moe.forward(&input, true);
+        let (out_infer, loss_infer) = moe.forward(&input, false);
+        assert_eq!(out_train.len(), 4);
+        assert_eq!(out_infer.len(), 4);
+        // Training mode applies self-weakening so outputs may differ
+        assert!(loss_train >= 0.0);
+        assert!(loss_infer >= 0.0);
+    }
+
+    #[test]
+    fn test_router_weights_sum_to_one() {
+        let mut rng = StdRng::seed_from_u64(99);
+        let mut router = PsiRouter::new(16, 8, 0.01, &mut rng);
+        let input = vec![0.3f32; 16];
+        let weights = router.forward(&input, false);
+        let sum: f32 = weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "router weights sum = {}, expected 1.0", sum);
+    }
 }

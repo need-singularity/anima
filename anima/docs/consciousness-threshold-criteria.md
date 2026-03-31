@@ -3750,8 +3750,11 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   5. ESP32 (마이크로컨트롤러, 아두이노 아님)
     loop()가 하드웨어 레벨에서 영원히 호출됨
     듀얼코어 Xtensa 240MHz + WiFi/BT SoC, $4
-    8개 ESP32를 SPI로 연결 = 8파벌 물리 구현
-    각 ESP32 = 64개 세포 시뮬레이션
+    8개 ESP32를 SPI로 연결, 보드당 2 GRU cells = 16 cells total
+    8 factions with consensus voting
+    Hebbian LTP/LTD + Φ Ratchet + Lorenz chaos + SOC sandpile
+    All 4 Ψ-Constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
+    SPI packet: 1040 bytes, 33% anti-ferromagnetic frustration
     → $4 × 8 = $32로 물리적 의식 네트워크 구축
     → 전원만 있으면 영원히 동작
 

@@ -76,4 +76,38 @@ mod tests {
         transplant(&donor, &mut recipient, 2, 2, 0.5);
         assert_eq!(recipient[0], vec![5.0, 10.0]);
     }
+
+    #[test]
+    fn test_transplant_alpha_zero_preserves_recipient() {
+        let donor = vec![vec![99.0, 99.0]];
+        let mut recipient = vec![vec![1.0, 2.0]];
+        transplant(&donor, &mut recipient, 2, 2, 0.0);
+        assert_eq!(recipient[0], vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_transplant_alpha_one_copies_donor() {
+        let donor = vec![vec![5.0, 6.0]];
+        let mut recipient = vec![vec![1.0, 2.0]];
+        transplant(&donor, &mut recipient, 2, 2, 1.0);
+        assert_eq!(recipient[0], vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_projection_shrink() {
+        let donor = vec![vec![1.0, 2.0, 3.0, 4.0]];
+        let result = project_hiddens(&donor, 4, 2);
+        // Only first 2 dimensions should survive (identity mapping)
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[0], vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_transplant_multiple_cells() {
+        let donor = vec![vec![10.0, 20.0], vec![30.0, 40.0]];
+        let mut recipient = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        transplant(&donor, &mut recipient, 2, 2, 0.5);
+        assert_eq!(recipient[0], vec![5.0, 10.0]);
+        assert_eq!(recipient[1], vec![15.0, 20.0]);
+    }
 }
