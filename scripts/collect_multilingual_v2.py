@@ -22,7 +22,7 @@ DATA_DIR = Path("/Users/ghost/Dev/anima/anima/data")
 OUT_DIR = DATA_DIR / "corpus_multilingual"
 DEV_DIR = Path.home() / "Dev"
 
-TARGET_BYTES = 100 * 1024 * 1024  # 100MB per language
+TARGET_BYTES = 350 * 1024 * 1024  # 350MB per language (2GB+ total)
 
 WIKI_UA = "AnimaCorpusCollector/2.0 (https://github.com/need-singularity/anima; research project)"
 
@@ -183,7 +183,11 @@ def collect_english(out_path, target=TARGET_BYTES):
 
     # If still not enough, supplement from other corpus files
     if written < target:
-        for extra_src in [DATA_DIR / "corpus_v9.txt", DATA_DIR / "corpus_v4.txt"]:
+        for extra_src in [DATA_DIR / "corpus_v9.txt", DATA_DIR / "corpus_v4.txt",
+                          DATA_DIR / "corpus_v3_100mb.txt", DATA_DIR / "corpus_v5.txt",
+                          DATA_DIR / "corpus_v6_wiki.txt", DATA_DIR / "corpus_v7_wiki_heavy.txt",
+                          DATA_DIR / "corpus_v8_dialogue.txt", DATA_DIR / "corpus_v2v3_merged.txt",
+                          DATA_DIR / "corpus_v2.txt"]:
             if not extra_src.exists() or written >= target:
                 continue
             print(f"\n  Supplementing from {extra_src.name}...")
@@ -223,7 +227,7 @@ def collect_code(out_path, target=TARGET_BYTES):
                             continue
                         try:
                             size = fpath.stat().st_size
-                            if 100 <= size <= 500_000:
+                            if 100 <= size <= 1_000_000:
                                 all_files.append((fpath, lang_name, size))
                         except OSError:
                             continue
@@ -497,9 +501,9 @@ def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
                 if written >= target:
                     break
 
-                # Timeout after 10 minutes per language
-                if time.time() - t0 > 600:
-                    print(f"\n  [TIMEOUT] 10 min reached")
+                # Timeout after 30 minutes per language
+                if time.time() - t0 > 1800:
+                    print(f"\n  [TIMEOUT] 30 min reached")
                     break
 
         except Exception as e:
