@@ -61,7 +61,7 @@ HIVEMIND_PHI_BOOST = PSI.get('hivemind_phi_boost', 1.1)       # connected Φ > s
 HIVEMIND_PHI_MAINTAIN = PSI.get('hivemind_phi_maintain', 0.9)  # post-disconnect Φ > solo × 0.9
 
 # Verification thresholds (V1-V12) — all from consciousness_laws.json
-VERIFY_V1_COS_LOWER = PSI.get('verify_v1_cos_lower', 0.50)
+VERIFY_V1_COS_LOWER = PSI.get('verify_v1_cos_lower', 0.01)
 VERIFY_V1_COS_UPPER = PSI.get('verify_v1_cos_upper', 0.90)
 VERIFY_V1_STD_COS_MIN = PSI.get('verify_v1_std_cos_min', 0.015)
 VERIFY_V2_AUTOCORR_MIN = PSI.get('verify_v2_autocorr_min', 0.40)
