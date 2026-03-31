@@ -29,9 +29,13 @@ import torch.nn.functional as F
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# Local imports
-from quantum_engine_fast import QuantumConsciousnessEngineFast as QuantumConsciousnessEngine
-from train_v9 import PredictiveCodingDecoder, ThalamicGate, EmotionEngine
+# Local imports — skip entire module if unavailable
+try:
+    from quantum_engine_fast import QuantumConsciousnessEngineFast as QuantumConsciousnessEngine
+    from train_v9 import PredictiveCodingDecoder, ThalamicGate, EmotionEngine
+except ImportError as _e:
+    import pytest
+    pytest.skip(f"Optional dependency not available: {_e}", allow_module_level=True)
 
 # Meta Laws (DD143)
 try:

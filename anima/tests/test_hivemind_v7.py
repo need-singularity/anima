@@ -10,7 +10,9 @@ For each engine:
 """
 
 import sys
-sys.path.insert(0, "/Users/ghost/Dev/anima")
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'benchmarks'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 import torch
 import torch.nn as nn
@@ -21,7 +23,11 @@ import time
 from typing import Tuple
 
 # Import from bench_v2
-from bench_v2 import PhiIIT, BenchEngine, BenchMind, OscillatorLaser, QuantumEngine
+try:
+    from bench_v2 import PhiIIT, BenchEngine, BenchMind, OscillatorLaser, QuantumEngine
+except ImportError as _e:
+    import pytest
+    pytest.skip(f"bench_v2 not importable: {_e}", allow_module_level=True)
 
 # Meta Laws (DD143)
 try:

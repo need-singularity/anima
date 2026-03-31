@@ -3,6 +3,8 @@ import pytest
 import torch
 import numpy as np
 
+cv2 = pytest.importorskip("cv2", reason="OpenCV (cv2) not installed")
+
 
 def test_vision_encoder_init():
     """VisionEncoder가 target_dim으로 초기화된다."""

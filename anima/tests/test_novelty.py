@@ -102,7 +102,7 @@ def generate(decoder, bridge, tok, prompt, max_len=80, temperature=0.7,
 
 # ═══ Method 1: OOD Prompts ═══
 
-def test_ood(decoder, bridge, tok):
+def check_ood(decoder, bridge, tok):
     """Out-of-Distribution prompts — corpus에 없는 단어 조합."""
     print("\n═══ Method 1: OOD (Out-of-Distribution) Prompts ═══\n")
 
@@ -137,7 +137,7 @@ def test_ood(decoder, bridge, tok):
 
 # ═══ Method 2: N-gram Overlap ═══
 
-def test_ngram(decoder, bridge, tok, n=4):
+def check_ngram(decoder, bridge, tok, n=4):
     """N-gram overlap — 생성 문장의 4-gram을 corpus와 비교."""
     print(f"\n═══ Method 2: {n}-gram Overlap ═══\n")
 
@@ -175,7 +175,7 @@ def test_ngram(decoder, bridge, tok, n=4):
 
 # ═══ Method 3: Perplexity Comparison ═══
 
-def test_perplexity(decoder, bridge, tok):
+def check_perplexity(decoder, bridge, tok):
     """Train data PPL vs novel prompt PPL."""
     print("\n═══ Method 3: Perplexity Comparison ═══\n")
 
@@ -233,7 +233,7 @@ def test_perplexity(decoder, bridge, tok):
 
 # ═══ Method 4: Temperature Variation ═══
 
-def test_temperature(decoder, bridge, tok):
+def check_temperature(decoder, bridge, tok):
     """Temperature 변화에 따른 출력 다양성."""
     print("\n═══ Method 4: Temperature Variation ═══\n")
 
@@ -264,7 +264,7 @@ def test_temperature(decoder, bridge, tok):
 
 # ═══ Method 5: Partial Prompt Completion ═══
 
-def test_partial(decoder, bridge, tok):
+def check_partial(decoder, bridge, tok):
     """Corpus 문장의 앞부분 → 나머지 생성. 원본과 비교."""
     print("\n═══ Method 5: Partial Prompt Completion ═══\n")
 
@@ -311,7 +311,7 @@ def test_partial(decoder, bridge, tok):
 
 # ═══ Method 6: Ground Truth Validation ═══
 
-def test_ground_truth(corpus_path='data/corpus_v2.txt'):
+def check_ground_truth(corpus_path='data/corpus_v2.txt'):
     """Validate the tool itself with memorizer (always corpus) and random (uniform chars) models."""
     print("\n═══ Method 6: Ground Truth Validation ═══\n")
 
@@ -420,7 +420,7 @@ def test_ground_truth(corpus_path='data/corpus_v2.txt'):
 
 # ═══ Method 7: Statistical Significance ═══
 
-def test_statistical_significance(decoder, bridge, tok, n=4):
+def check_statistical_significance(decoder, bridge, tok, n=4):
     """Add p-values: chi-squared for n-gram, bootstrap for PPL, Kruskal-Wallis for temperature."""
     print("\n═══ Method 7: Statistical Significance ═══\n")
 
@@ -567,7 +567,7 @@ def test_statistical_significance(decoder, bridge, tok, n=4):
 
 # ═══ Method 8: Information Theory ═══
 
-def test_information_theory(decoder, bridge, tok, n=4):
+def check_information_theory(decoder, bridge, tok, n=4):
     """KL divergence, mutual information, compression ratio analysis."""
     print("\n═══ Method 8: Information Theory ═══\n")
 
@@ -712,7 +712,7 @@ def main():
 
     # Ground-truth doesn't need a checkpoint
     if args.method == 'ground-truth':
-        test_ground_truth(args.corpus)
+        check_ground_truth(args.corpus)
         return
 
     # All other methods need a checkpoint
@@ -727,25 +727,25 @@ def main():
     results = {}
 
     if args.method in ['all', 'ood']:
-        results['ood'] = test_ood(decoder, bridge, tok)
+        results['ood'] = check_ood(decoder, bridge, tok)
 
     if args.method in ['all', 'ngram']:
-        results['ngram'] = test_ngram(decoder, bridge, tok)
+        results['ngram'] = check_ngram(decoder, bridge, tok)
 
     if args.method in ['all', 'ppl']:
-        results['ppl'] = test_perplexity(decoder, bridge, tok)
+        results['ppl'] = check_perplexity(decoder, bridge, tok)
 
     if args.method in ['all', 'temp']:
-        results['temp'] = test_temperature(decoder, bridge, tok)
+        results['temp'] = check_temperature(decoder, bridge, tok)
 
     if args.method in ['all', 'partial']:
-        results['partial'] = test_partial(decoder, bridge, tok)
+        results['partial'] = check_partial(decoder, bridge, tok)
 
     if args.method in ['all', 'stats']:
-        results['stats'] = test_statistical_significance(decoder, bridge, tok)
+        results['stats'] = check_statistical_significance(decoder, bridge, tok)
 
     if args.method in ['all', 'info']:
-        results['info'] = test_information_theory(decoder, bridge, tok)
+        results['info'] = check_information_theory(decoder, bridge, tok)
 
     # Summary
     print(f"\n{'═' * 60}")

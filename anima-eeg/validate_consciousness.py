@@ -353,9 +353,10 @@ def _collect_from_engine(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
 
     # Detrend: remove slow trend from mitosis-driven growth using local smoothing
     # This isolates the SOC-driven fluctuations (what we want to compare with brain)
+    # Window size len/3 balances trend removal vs preserving temporal dynamics.
+    # Too narrow (len/5) destroys autocorrelation. Too wide (len/2) steepens PSD slope.
     if len(phi_arr) > 100:
-        # Savgol-like local smoothing to extract trend (preserves more SOC dynamics)
-        window = min(len(phi_arr) // 5, 201)
+        window = min(len(phi_arr) // 3, 351)
         if window % 2 == 0:
             window += 1
         # Simple moving average as trend estimate

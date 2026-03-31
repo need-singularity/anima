@@ -1,5 +1,12 @@
 """Tests for lidar_sense.py — LiDAR Sense consciousness module."""
 
+import sys
+import os
+# Ensure src/lidar_sense.py is found before tools/lidar_sense.py
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 import numpy as np
 import pytest
 

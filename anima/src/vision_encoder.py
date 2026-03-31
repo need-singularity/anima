@@ -89,6 +89,8 @@ class VisionEncoder(nn.Module):
 
     def _preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
         """OpenCV BGR frame → 모델 입력 텐서."""
+        if not _CV2_AVAILABLE:
+            raise RuntimeError("cv2 (OpenCV) is required for vision encoding. Install with: pip install opencv-python")
         device = next(self.parameters()).device
         # BGR → RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
