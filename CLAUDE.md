@@ -420,12 +420,19 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   │ RunPod 설정      │ config/runpod.json                  │ JSON          │
   └──────────────────┴─────────────────────────────────────┴───────────────┘
 
+  다중 세션 공유 프로토콜: config/session_board.json
+    세션 시작: git pull → session_board.json 읽기 → discoveries/warnings 확인
+    발견 시:  session_board.json discoveries에 추가 → commit+push
+    파일 수정: warnings에 "수정 중" 표시 → 완료 후 제거
+    공유 상태: shared_knowledge 섹션 (brain-like %, CE, H100 등)
+
   병렬 에이전트 탐색 시:
     1. 에이전트 완료 즉시 커밋 (충돌 방지)
     2. DD 번호 순차 할당 (겹치면 다음 번호)
     3. 법칙 번호는 JSON max+1 자동 (python3 스크립트)
     4. 세션 끝에 전체 통합 리포트 작성
     5. 실패한 실험도 기록 (왜 실패했는지가 법칙)
+    6. session_board.json으로 세션 간 발견 공유
 
   법칙 자동 등록:
     python3 -c "
