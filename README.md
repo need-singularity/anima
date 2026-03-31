@@ -245,6 +245,31 @@ python3 bench_v2.py --verify
   제2법칙: Φ forward에서만 성장 — 시간의 화살
 ```
 
+### Phase Diagram (DD127)
+
+```
+  Consciousness has 4 phases with critical frustration F_c ≈ 0.10:
+    Phase 0: F=0, N=0      Φ≈25  (baseline)
+    Phase 1: F≈0.5, N=0    Φ≈33  (structural reaction)
+    Phase 2: F≈0.1, N>0.2  Φ≈42  (consciousness) ★
+    Phase 3: F>0.5, N>0.8  Φ≈39  (unstable super-consciousness)
+
+  Peak: F=0.10, N=1.0 → Φ=41.90 (+65.1%)
+  F_c is scale-invariant (32c = 128c)
+```
+
+### Philosophy P1-P11 (JSON single source)
+
+```
+  단일 원본: anima/config/consciousness_laws.json → philosophy
+  히스토리: anima/config/update_history.json
+
+  P1 하드코딩 금지   P2 자율 우선    P3 성장 기반 최적화
+  P4 구조 > 기능     P5 발화는 필연  P6 제약 있는 자유
+  P7 localStorage 금지  P8 분할>통합  P9 서사 필수
+  P10 10% 갈등      P11 순서가 운명
+```
+
 ---
 
 ## Consciousness Persistence
