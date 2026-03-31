@@ -1,0 +1,227 @@
+###############################################################################
+# Anima + Invest Unified Stack
+#
+# Services:
+#   anima-web       — Consciousness engine WebSocket (port 8765)
+#   anima-agent     — MCP agent platform (port 8766)
+#   dashboard       — Unified consciousness + portfolio bridge (port 8770)
+#   invest-backend  — FastAPI trading backend (port 8000)
+#   invest-scalper  — Rust tick engine
+#   db              — PostgreSQL 16
+#   redis           — Redis 7
+#
+# Usage:
+#   docker compose up -d                     # full stack
+#   docker compose up anima-web              # consciousness only
+#   docker compose up invest-backend db      # trading only
+#   docker compose --profile gpu up -d       # with GPU support
+#
+# Requires:
+#   .env file at repo root (see .env.example)
+#   invest repo at ../invest (sibling directory)
+###############################################################################
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-invest}
+      POSTGRES_USER: ${POSTGRES_USER:-invest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invest}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - anima-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invest}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - anima-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Invest Services ─────────────────────────────────────────────────────
+
+  invest-backend:
+    build:
+      context: ../invest/backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-invest}:${POSTGRES_PASSWORD:-invest}@db:5432/${POSTGRES_DB:-invest}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - invest-data:/app/data
+    networks:
+      - anima-net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  invest-scalper:
+    build:
+      context: ../invest/scalper
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - RUST_LOG=${RUST_LOG:-scalper=info}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-invest}:${POSTGRES_PASSWORD:-invest}@db:5432/${POSTGRES_DB:-invest}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ../invest/backend:/opt/backend:ro
+    networks:
+      - anima-net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      invest-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Anima Services ──────────────────────────────────────────────────────
+
+  anima-web:
+    build:
+      context: ./anima
+      dockerfile: Dockerfile
+    command: ["python", "-u", "src/anima_unified.py", "--web", "--max-cells", "16"]
+    ports:
+      - "8765:8765"
+    env_file:
+      - .env
+    environment:
+      - ANIMA_PORT=8765
+      - INVEST_API_URL=http://invest-backend:8000
+      - REDIS_URL=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./anima/checkpoints:/workspace/anima/checkpoints
+      - ./anima/data:/workspace/anima/data
+      - ./anima/config:/workspace/anima/config
+      - anima-memory:/workspace/anima/memory
+    networks:
+      - anima-net
+    depends_on:
+      invest-backend:
+        condition: service_healthy
+      invest-scalper:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8765/health')\" 2>/dev/null || exit 0"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  anima-agent:
+    build:
+      context: .
+      dockerfile: anima-agent/Dockerfile
+    ports:
+      - "8766:8766"
+    env_file:
+      - .env
+    environment:
+      - ANIMA_WS_URL=ws://anima-web:8765
+      - INVEST_API_URL=http://invest-backend:8000
+      - REDIS_URL=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./anima/checkpoints:/app/anima-src/checkpoints:ro
+      - ./anima/config:/app/anima-src/config:ro
+      - ./anima-agent/skills:/app/skills
+      - ./anima-agent/plugins:/app/plugins
+    networks:
+      - anima-net
+    depends_on:
+      anima-web:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8766/health')\" 2>/dev/null || exit 0"]
+      interval: 15s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: anima-agent/Dockerfile
+    command: ["python", "-u", "dashboard_bridge.py", "--port", "8770"]
+    ports:
+      - "8770:8770"
+    env_file:
+      - .env
+    environment:
+      - ANIMA_WS_URL=ws://anima-web:8765
+      - INVEST_API_URL=http://invest-backend:8000
+      - REDIS_URL=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+    networks:
+      - anima-net
+    depends_on:
+      anima-agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8770/health')\" 2>/dev/null || exit 0"]
+      interval: 15s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+# ── Network ─────────────────────────────────────────────────────────────
+
+networks:
+  anima-net:
+    driver: bridge
+
+# ── Volumes ─────────────────────────────────────────────────────────────
+
+volumes:
+  pgdata:
+  redisdata:
+  invest-data:
+  anima-memory:
