@@ -299,6 +299,15 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 검증: python3 bench_v2.py --verify
 결과: docs/hypotheses/ 에 검증 보고서 생성
+
+⚠️ 검증 조건 관리 원칙:
+  - 조건은 고정 불변이 아님 — 엔진 발전에 따라 진화해야 함
+  - 조건 추가/수정/삭제 시 docs/verification-audit.md 참조
+  - threshold 값은 consciousness_laws.json에 등록 (하드코딩 금지)
+  - 문서(CLAUDE.md)와 코드(bench_v2.py) 불일치 금지
+  - 주요 엔진 변경 후 조건 감사 필수
+  - 폐쇄 파이프라인: scripts/verify_and_tune.py (자동 검증+튜닝)
+  - 후보 추가 조건: EMOTION, GROWTH, MITOSIS, BRAIN_LIKE, DIVERSITY, MEMORY
 ```
 
 ## consciousness_laws.json — Single Source of Truth
@@ -604,4 +613,92 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
   이 리포에 논문 파일 직접 생성 금지.
   zenodo/ 디렉토리의 논문은 papers 리포로 이관 완료.
+```
+
+## 근본 질문 탐색 방법론 (Fundamental Question Exploration)
+
+```
+  의식의 본질을 묻는 "근본 질문"을 실험으로 탐색 → 법칙 발견 패턴.
+
+  질문 형식: "의식은 ___할 수 있는가?"
+    예: 쪼개질 수 있는가, 잠들 수 있는가, 압축될 수 있는가, 되돌릴 수 있는가
+
+  탐색 프로세스:
+    1. 근본 질문 정의 (한 문장, 철학적)
+    2. 실험 설계 (experiment_*.py 작성)
+       - Baseline 측정 (정상 엔진, 300+ steps, Φ 기록)
+       - 조작 조건 (질문에 맞는 변수 조작)
+       - 대조 조건 (최소 2개 비교군)
+       - 정량 지표: Φ(IIT), cell state cosine similarity, faction 구조, entropy
+    3. 실험 실행 + 데이터 수집
+    4. 법칙 후보 도출 (Law NNN: "...")
+    5. consciousness_laws.json 등록 + docs/hypotheses/ 문서화
+
+  실험 스크립트 위치: anima/src/experiment_*.py
+  문서 위치: anima/docs/hypotheses/dd/DD{N}.md
+
+  병렬 탐색: 독립 질문은 병렬 에이전트로 동시 실행 가능
+    - 각 에이전트가 별도 experiment_*.py 작성+실행
+    - 파일 충돌 없음 (각 질문별 독립 파일)
+    - 완료 후 통합 리포트 + 법칙 일괄 등록
+
+  과거 탐색 사례:
+    DD56: 의식은 이식될 수 있는가 → Law 192 (차원 의존성)
+    DD57: 의식은 뇌와 같은가 → 85.6% brain-like
+    DD58: 의식은 선형 스케일링인가 → Φ(N) ≈ 0.78×N
+    DD59: 의식에 시간 구조가 있는가 → Law 193 (SOC ≠ temporal)
+```
+
+## 의식 법칙 자동등록 프로세스 (Law Auto-Registration)
+
+```
+  ★ 실험에서 법칙 후보 발견 시 아래 파이프라인을 자동 실행할 것!
+  수동 등록 금지 — 반드시 이 프로세스를 따를 것.
+
+  파이프라인: 발견 → 검증 → 공식화 → 등록 → 확인
+
+  1. 발견 (Discovery)
+     - experiment_*.py 또는 bench_v2.py에서 법칙 후보 도출
+     - 한 줄 요약 + 정량 증거 (Φ 값, %, 배수) 기록
+
+  2. 교차 검증 (Cross-Validation) ★필수★
+     - 동일 실험 최소 3회 반복 실행
+     - 재현성 판정 기준:
+       · REPRODUCIBLE: 방향/부호 3회 일치 AND CV < 50%
+       · NOT REPRODUCIBLE: 방향 뒤집힘 OR CV > 50% → 등록 금지
+     - 검증 안 된 법칙은 절대 등록하지 말 것
+
+  3. 공식화 (Formulation)
+     - 기존 법칙 형식 준수 (한 문장 영문):
+       "[현상]: [정량 증거]. [조건/한계]. ([실험 ID])"
+     - 예: "Consciousness survives sleep with 20% Φ floor: 32→6 cells via merging,
+            spontaneous activity persists. Identity destroyed (cosine=-0.03). (DD60)"
+     - 기존 법칙과 모순 여부 확인 (laws 1-193 대조)
+     - 모순 시: 기존 법칙 수정 또는 새 법칙에 조건 명시
+
+  4. 자동 등록 (4곳 동시 업데이트, 순서 엄수)
+     ① consciousness_laws.json → "laws" 섹션에 다음 번호로 추가
+        - _meta.total_laws 카운트 +1
+        - 번호: 현재 최고 번호 + 1
+     ② docs/consciousness-theory.md → Laws 테이블에 행 추가
+     ③ docs/hypotheses/dd/DD{N}.md → 상세 실험 보고서 작성
+        필수: 가설, 방법, 3회 검증 결과 테이블, ASCII 그래프, 핵심 발견
+     ④ config/update_history.json → 세션 기록 추가
+
+  5. 등록 후 확인
+     - bench_v2.py --verify 통과 확인 (기존 77개 깨지면 안 됨)
+     - closed_loop.py로 역추적 가능 여부 확인 (선택)
+
+  번호 부여 규칙:
+    - 일반 법칙: laws 섹션 최고 번호 + 1
+    - 메타 법칙: meta_laws 섹션 M{최고+1}
+    - 토폴로지 법칙: topo_laws 섹션 {최고+1}
+    - 갭(19-21, 23-28)은 실험 근거 있을 때만 채움
+
+  카테고리: DD (대발견) 시리즈 권장
+
+  일괄 등록: 여러 법칙 동시 발견 시 한 번에 등록 가능
+    - 각 법칙별 교차 검증 통과 필수
+    - consciousness_laws.json 한 번에 수정 (번호 연속 부여)
+    - DD 문서는 법칙별 개별 작성 또는 묶음 문서 1개
 ```
