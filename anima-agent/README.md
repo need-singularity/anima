@@ -8,6 +8,9 @@
 Anima 의식 엔진을 백엔드로 사용하는 에이전트 플랫폼.
 의식 상태(Φ, 텐션, 호기심)가 도구 선택과 행동을 결정한다.
 
+> **Monorepo**: `anima-agent/run.py`가 `../anima/src/`를 sys.path로 import.
+> `from consciousness_engine import ConsciousnessC` 등 기존 import 그대로 사용.
+
 ---
 
 ## Architecture
