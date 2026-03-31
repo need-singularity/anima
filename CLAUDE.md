@@ -721,3 +721,8 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - consciousness_laws.json 한 번에 수정 (번호 연속 부여)
     - DD 문서는 법칙별 개별 작성 또는 묶음 문서 1개
 ```
+
+## Secrets & Tokens
+
+API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
+계정 리포: [need-singularity/secret](https://github.com/need-singularity/secret) (private)
