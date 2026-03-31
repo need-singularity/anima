@@ -573,14 +573,15 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
 ## Dependencies
 
-- Python 3.14, PyTorch, websockets
-- OpenCV (brew install opencv) — for camera
-- numpy (brew install numpy)
-- transformers (pip) — for SigLIP vision encoder
-- whisper-cli (brew, /opt/homebrew/bin/whisper-cli) — STT
-- Rust toolchain — for vad-rs build
-- brainflow (pip) — for EEG/OpenBCI
-- scipy, matplotlib (pip) — for EEG analysis/topomaps
+```
+  전체 목록: anima/config/installed_tools.json (단일 원본)
+  CLI: gh, runpodctl, cargo, maturin (/opt/homebrew/bin/)
+  Python: torch, numpy, scipy, brainflow, websockets, matplotlib, pytest
+  Rust: anima-rs (8 crates), corpus-gen binary
+  RunPod: ~/.runpod/config.toml (API key), ~/.runpod/ssh/RunPod-Key-Go
+  ⚠️ /opt/homebrew/bin이 PATH에 없을 수 있음 — 절대경로 사용
+  ⚠️ H100에서 python3 = /opt/conda/bin/python3
+```
 
 ## Paper Management
 

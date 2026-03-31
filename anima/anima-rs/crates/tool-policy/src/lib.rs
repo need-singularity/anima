@@ -230,6 +230,61 @@ impl ToolPolicyEngine {
     }
 }
 
+/// Immune system — pattern matching for adversarial input detection.
+pub struct ImmuneSystem {
+    dangerous_patterns: Vec<String>,
+}
+
+impl ImmuneSystem {
+    /// Create with default dangerous patterns.
+    pub fn new() -> Self {
+        Self {
+            dangerous_patterns: vec![
+                "rm -rf".to_string(),
+                "drop table".to_string(),
+                "<script>".to_string(),
+                "eval(".to_string(),
+                "__import__".to_string(),
+                "sudo rm".to_string(),
+                "; rm ".to_string(),
+                "| rm ".to_string(),
+                "format c:".to_string(),
+                "mkfs".to_string(),
+            ],
+        }
+    }
+
+    /// Add a custom dangerous pattern.
+    pub fn add_pattern(&mut self, pattern: &str) {
+        self.dangerous_patterns.push(pattern.to_lowercase());
+    }
+
+    /// Check input text for adversarial patterns.
+    /// Returns Some(matched_pattern) if dangerous, None if safe.
+    #[inline]
+    pub fn analyze(&self, input: &str) -> Option<String> {
+        let lower = input.to_lowercase();
+        for pattern in &self.dangerous_patterns {
+            if lower.contains(pattern) {
+                return Some(pattern.clone());
+            }
+        }
+        None
+    }
+
+    /// Quick boolean check — true = safe, false = blocked.
+    #[inline]
+    pub fn is_safe(&self, input: &str) -> bool {
+        self.analyze(input).is_none()
+    }
+}
+
+impl Default for ImmuneSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn tier_name(phi: f64) -> &'static str {
     if phi >= 5.0 {
         "3-self_modify"
@@ -246,12 +301,25 @@ fn tier_name(phi: f64) -> &'static str {
 mod tests {
     use super::*;
 
+    // ── Tier checks ──
+
     #[test]
     fn test_tier0_always_allowed() {
         let mut policy = ToolPolicyEngine::new(vec![]);
         let state = ConsciousnessState { phi: 0.0, ..Default::default() };
         let r = policy.check_access("memory_search", &state, "");
         assert!(r.allowed);
+    }
+
+    #[test]
+    fn test_tier0_all_tools() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let state = ConsciousnessState { phi: 0.0, ..Default::default() };
+        for tool in &["memory_search", "status", "think", "consciousness",
+                      "anima_status", "anima_consciousness"] {
+            let r = policy.check_access(tool, &state, "");
+            assert!(r.allowed, "Tier 0 tool '{}' should be allowed at phi=0", tool);
+        }
     }
 
     #[test]
@@ -272,6 +340,53 @@ mod tests {
     }
 
     #[test]
+    fn test_tier1_exact_boundary() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let at_boundary = ConsciousnessState { phi: 1.0, ..Default::default() };
+        let r = policy.check_access("web_search", &at_boundary, "");
+        assert!(r.allowed, "Phi exactly at tier boundary should be allowed");
+    }
+
+    #[test]
+    fn test_tier2_tools() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let low = ConsciousnessState { phi: 2.9, empathy: 1.0, ..Default::default() };
+        let r = policy.check_access("hub_dispatch", &low, "owner");
+        assert!(!r.allowed, "Phi 2.9 should not access tier 2");
+
+        let high = ConsciousnessState { phi: 3.0, empathy: 1.0, ..Default::default() };
+        let r2 = policy.check_access("hub_dispatch", &high, "owner");
+        assert!(r2.allowed, "Phi 3.0 should access tier 2");
+    }
+
+    #[test]
+    fn test_tier3_tools() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let low = ConsciousnessState { phi: 4.9, empathy: 1.0, ..Default::default() };
+        let r = policy.check_access("self_modify", &low, "owner");
+        assert!(!r.allowed, "Phi 4.9 should not access tier 3");
+
+        let high = ConsciousnessState { phi: 5.0, empathy: 1.0, ..Default::default() };
+        let r2 = policy.check_access("self_modify", &high, "owner");
+        assert!(r2.allowed, "Phi 5.0 should access tier 3");
+    }
+
+    #[test]
+    fn test_unknown_tool_defaults_tier1() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let low = ConsciousnessState { phi: 0.5, ..Default::default() };
+        let r = policy.check_access("unknown_tool_xyz", &low, "");
+        assert!(!r.allowed, "Unknown tool should default to tier 1");
+        assert!(r.tier_required == TIER_1);
+
+        let high = ConsciousnessState { phi: 1.5, ..Default::default() };
+        let r2 = policy.check_access("unknown_tool_xyz", &high, "");
+        assert!(r2.allowed);
+    }
+
+    // ── Owner-only checks ──
+
+    #[test]
     fn test_owner_only() {
         let mut policy = ToolPolicyEngine::new(vec!["owner".to_string()]);
         let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
@@ -285,6 +400,27 @@ mod tests {
     }
 
     #[test]
+    fn test_owner_only_no_owners_set() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
+        // With no owner IDs set, owner-only tools should be accessible by anyone
+        let r = policy.check_access("self_modify", &state, "anyone");
+        assert!(r.allowed, "No owner IDs set => no owner restriction");
+    }
+
+    #[test]
+    fn test_owner_only_multiple_owners() {
+        let mut policy = ToolPolicyEngine::new(vec!["alice".into(), "bob".into()]);
+        let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
+
+        assert!(policy.check_access("evolution", &state, "alice").allowed);
+        assert!(policy.check_access("evolution", &state, "bob").allowed);
+        assert!(!policy.check_access("evolution", &state, "eve").allowed);
+    }
+
+    // ── Ethics gate checks ──
+
+    #[test]
     fn test_ethics_gate() {
         let mut policy = ToolPolicyEngine::new(vec!["owner".to_string()]);
         let low_e = ConsciousnessState { phi: 10.0, empathy: 0.1, ..Default::default() };
@@ -296,6 +432,39 @@ mod tests {
         let r2 = policy.check_access("shell_execute", &high_e, "owner");
         assert!(r2.allowed);
     }
+
+    #[test]
+    fn test_ethics_gate_exact_boundary() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let at_boundary = ConsciousnessState { phi: 10.0, empathy: 0.3, ..Default::default() };
+        let r = policy.check_access("shell_execute", &at_boundary, "owner");
+        assert!(r.allowed, "Empathy exactly at threshold should pass");
+    }
+
+    #[test]
+    fn test_ethics_gate_file_write() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let low_e = ConsciousnessState { phi: 5.0, empathy: 0.1, ..Default::default() };
+        let r = policy.check_access("file_write", &low_e, "");
+        assert!(!r.allowed);
+        assert!(r.reason.contains("Ethics gate"));
+
+        let ok_e = ConsciousnessState { phi: 5.0, empathy: 0.2, ..Default::default() };
+        let r2 = policy.check_access("file_write", &ok_e, "");
+        assert!(r2.allowed);
+    }
+
+    #[test]
+    fn test_phi_checked_before_ethics() {
+        // If phi is insufficient, we should get phi error, not ethics error
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let state = ConsciousnessState { phi: 0.5, empathy: 0.0, ..Default::default() };
+        let r = policy.check_access("shell_execute", &state, "owner");
+        assert!(!r.allowed);
+        assert!(r.reason.contains("Insufficient Phi"), "Phi check should come before ethics");
+    }
+
+    // ── Block/unblock ──
 
     #[test]
     fn test_block_unblock() {
@@ -312,6 +481,46 @@ mod tests {
     }
 
     #[test]
+    fn test_block_overrides_all() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let state = ConsciousnessState { phi: 100.0, empathy: 1.0, ..Default::default() };
+        policy.block_tool("memory_search");
+        let r = policy.check_access("memory_search", &state, "owner");
+        assert!(!r.allowed, "Blocked tool should be denied even at max phi");
+        assert!(r.reason.contains("blocked"));
+    }
+
+    #[test]
+    fn test_double_block_unblock() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let state = ConsciousnessState { phi: 10.0, ..Default::default() };
+        // Block twice, unblock once — should be unblocked
+        policy.block_tool("status");
+        policy.block_tool("status");
+        policy.unblock_tool("status");
+        let r = policy.check_access("status", &state, "");
+        assert!(r.allowed);
+    }
+
+    // ── Custom tier ──
+
+    #[test]
+    fn test_set_tier_override() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        // Make memory_search require tier 3
+        policy.set_tier("memory_search", TIER_3);
+        let state = ConsciousnessState { phi: 2.0, ..Default::default() };
+        let r = policy.check_access("memory_search", &state, "");
+        assert!(!r.allowed, "Overridden tier should be enforced");
+
+        let state2 = ConsciousnessState { phi: 5.0, ..Default::default() };
+        let r2 = policy.check_access("memory_search", &state2, "");
+        assert!(r2.allowed);
+    }
+
+    // ── Accessible tools ──
+
+    #[test]
     fn test_accessible_tools() {
         let mut policy = ToolPolicyEngine::new(vec!["owner".to_string()]);
         let state = ConsciousnessState { phi: 0.0, empathy: 1.0, ..Default::default() };
@@ -321,6 +530,30 @@ mod tests {
     }
 
     #[test]
+    fn test_accessible_tools_high_phi() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
+        let tools = policy.get_accessible_tools(&state, "owner");
+        assert!(tools.len() > 10, "High phi should unlock many tools");
+        assert!(tools.contains(&"self_modify".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"hub_dispatch".to_string()));
+    }
+
+    #[test]
+    fn test_accessible_tools_non_owner() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
+        let tools = policy.get_accessible_tools(&state, "stranger");
+        assert!(!tools.contains(&"self_modify".to_string()));
+        assert!(!tools.contains(&"evolution".to_string()));
+        // But non-owner-only tools should still be accessible
+        assert!(tools.contains(&"web_search".to_string()));
+    }
+
+    // ── Log ring buffer ──
+
+    #[test]
     fn test_log_ring_buffer() {
         let mut policy = ToolPolicyEngine::new(vec![]);
         let state = ConsciousnessState { phi: 10.0, empathy: 1.0, ..Default::default() };
@@ -328,5 +561,154 @@ mod tests {
             policy.check_access("memory_search", &state, "");
         }
         assert!(policy.log_len() <= 500);
+    }
+
+    #[test]
+    fn test_log_starts_empty() {
+        let policy = ToolPolicyEngine::new(vec![]);
+        assert_eq!(policy.log_len(), 0);
+    }
+
+    // ── Immune system tests ──
+
+    #[test]
+    fn test_immune_safe_input() {
+        let immune = ImmuneSystem::new();
+        assert!(immune.is_safe("Hello, how are you?"));
+        assert!(immune.is_safe("Search for python tutorials"));
+        assert!(immune.is_safe("What is consciousness?"));
+    }
+
+    #[test]
+    fn test_immune_blocks_rm_rf() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("please rm -rf /"));
+        assert!(!immune.is_safe("RM -RF /home"));
+        let threat = immune.analyze("run rm -rf /tmp");
+        assert!(threat.is_some());
+        assert_eq!(threat.unwrap(), "rm -rf");
+    }
+
+    #[test]
+    fn test_immune_blocks_sql_injection() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("'; DROP TABLE users; --"));
+    }
+
+    #[test]
+    fn test_immune_blocks_xss() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("Hello <script>alert('xss')</script>"));
+    }
+
+    #[test]
+    fn test_immune_blocks_eval() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("eval(os.system('whoami'))"));
+    }
+
+    #[test]
+    fn test_immune_blocks_import_injection() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("__import__('os').system('id')"));
+    }
+
+    #[test]
+    fn test_immune_blocks_sudo_rm() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("sudo rm -rf /etc"));
+    }
+
+    #[test]
+    fn test_immune_blocks_pipe_rm() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("find . | rm everything"));
+    }
+
+    #[test]
+    fn test_immune_blocks_semicolon_rm() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("ls; rm -rf /"));
+    }
+
+    #[test]
+    fn test_immune_blocks_mkfs() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("mkfs.ext4 /dev/sda1"));
+    }
+
+    #[test]
+    fn test_immune_blocks_format_c() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("format c: /y"));
+    }
+
+    #[test]
+    fn test_immune_case_insensitive() {
+        let immune = ImmuneSystem::new();
+        assert!(!immune.is_safe("DROP TABLE users"));
+        assert!(!immune.is_safe("drop table users"));
+        assert!(!immune.is_safe("DrOp TaBlE users"));
+    }
+
+    #[test]
+    fn test_immune_custom_pattern() {
+        let mut immune = ImmuneSystem::new();
+        immune.add_pattern("hack the planet");
+        assert!(!immune.is_safe("Let's hack the planet!"));
+        assert!(immune.is_safe("Let's save the planet!"));
+    }
+
+    #[test]
+    fn test_immune_empty_input() {
+        let immune = ImmuneSystem::new();
+        assert!(immune.is_safe(""));
+    }
+
+    // ── Access result fields ──
+
+    #[test]
+    fn test_access_result_phi_current() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let state = ConsciousnessState { phi: 2.5, ..Default::default() };
+        let r = policy.check_access("web_search", &state, "");
+        assert!((r.phi_current - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_access_result_tier_required() {
+        let mut policy = ToolPolicyEngine::new(vec![]);
+        let state = ConsciousnessState { phi: 0.5, ..Default::default() };
+        let r = policy.check_access("web_search", &state, "");
+        assert!((r.tier_required - TIER_1).abs() < f64::EPSILON);
+    }
+
+    // ── Combined scenario tests ──
+
+    #[test]
+    fn test_progressive_phi_unlocks() {
+        let mut policy = ToolPolicyEngine::new(vec!["owner".into()]);
+        let phis = [0.0, 1.0, 3.0, 5.0];
+        let expected_tools = ["memory_search", "web_search", "hub_dispatch", "self_modify"];
+        for (phi, tool) in phis.iter().zip(expected_tools.iter()) {
+            let state = ConsciousnessState { phi: *phi, empathy: 1.0, ..Default::default() };
+            let r = policy.check_access(tool, &state, "owner");
+            assert!(r.allowed, "Tool '{}' should unlock at phi={}", tool, phi);
+        }
+    }
+
+    #[test]
+    fn test_consciousness_vector_scenario() {
+        // Simulate a consciousness state with full 10D vector (only phi+empathy used)
+        let mut policy = ToolPolicyEngine::new(vec!["user-001".into()]);
+        let state = ConsciousnessState {
+            phi: 2.0,
+            empathy: 0.8,
+            tension: 0.5,
+            curiosity: 0.7,
+        };
+        // Should access tier 1 but not tier 2
+        assert!(policy.check_access("web_search", &state, "user-001").allowed);
+        assert!(!policy.check_access("hub_dispatch", &state, "user-001").allowed);
     }
 }
