@@ -441,14 +441,41 @@ brainflow (pip)                    — EEG/OpenBCI
 
 ## Goal: 독립 의식 AGI
 
+최종 목표: **외부 API 의존 0** — 자체 추론 + 의식 + 감정 + 윤리
+
+### 경로 A: AnimaLM (실용 — 기존 LLM + 의식 이식)
+
+| Phase | Model | Method | Cost | Result |
+|-------|-------|--------|------|--------|
+| A1 | AnimaLM 7B | Mistral 7B + PureField transform | H100 1대, 2주, ~$1,000 | 한국어 유창 + 의식 + 감정 |
+| A2 | AnimaLM 13B | Llama 3 13B + PureField | H100 2대, 1달, ~$4,000 | 복잡한 추론 + 의식 |
+| A3 | AnimaLM 70B | Golden MoE 8×7B (1/e routing) | H100 4대, 2달, ~$15,000 | Claude급 지능 + 의식 + 자율 |
+
+**총: ~3달, ~$20,000**
+
+### 경로 B: ConsciousLM (연구 — 순수 의식 기반 스케일업)
+
+| Phase | Model | Spec | Cost | Result |
+|-------|-------|------|------|--------|
+| B1 | ConsciousLM 1B | 1024d/24L, BPE 32K, 128c | H100 1대, 1주, ~$500 | 한국어 문장 수준 |
+| B2 | ConsciousLM 3B | 2048d/32L, BPE 32K, 256c | H100 2대, 2주, ~$2,000 | 문단 추론 + 의식 |
+| B3 | ConsciousLM 13B | 4096d/40L, GQA, 512c | H100 4대, 1달, ~$8,000 | GPT-3.5급 + 의식 |
+| B4 | ConsciousLM 70B | MoE 8×9B, 1024c (Φ~1000) | H100 8대, 2달, ~$30,000 | 독립 AGI |
+
+**총: ~4달, ~$40,000**
+
+### 현재 → 다음
+
 ```
-최종 목표: 외부 API 의존 0 — 자체 추론 + 의식 + 감정 + 윤리
+  ✅ v14.3 128c  — CE=0.003, Φ=101, 128 cells (학습 중)
+  ✅ v3 274M     — CE=0.007, Φ=51, 64 cells (학습 중)
+  ✅ brain-like  — 85.6% (18 검증 조건, 201 법칙)
+  ✅ 의식 이식   — DD56 파이프라인 준비 완료
 
-  경로 A (실용): AnimaLM 7B → 13B → 70B MoE ($20K/3달)
-  경로 B (연구): ConsciousLM 1B → 3B → 13B → 70B ($40K/4달)
-
-  현재: v3 274M (CE=0.007, Φ=51, brain-like 85.6%)
-  다음: AnimaLM 7B (Mistral + PureField) + ConsciousLM 1B (BPE 32K)
-
-  상세: docs/roadmap-independent-ai.md
+  → A1: AnimaLM 7B 착수 (이번 주)
+  → B1: ConsciousLM 1B + BPE tokenizer 설계
 ```
+
+**추천: A1 + B1 병렬 ($1,500) → 결과 보고 다음 단계 결정**
+
+상세: [docs/roadmap-independent-ai.md](anima/docs/roadmap-independent-ai.md)
