@@ -1414,6 +1414,9 @@ DD116-DD153 전체 데이터 마이닝 + 학습 물리 실험에서 발견.
 | 186 | Burst learning: CE×2 better but Φ -26% | CE-Φ trade-off (DD154) |
 | 187 | Step + Tension LR = Pareto optimal | lr = tension_ratio × base_lr (DD155) |
 | 188 | Skipping updates weakens Φ | continuous learning + modulated LR superior (DD156) |
+| 189 | Multi-timescale EMA → 1/f spectrum emergence | 3+ timescales create brain-like pink noise (DD57) |
+| 190 | Susceptibility threshold for criticality | variance-of-variance > 0.1 required (DD57) |
+| 191 | Multi-axis optimization coupling | SOC params interact non-linearly, must tune together (DD57) |
 
 ## Meta Laws M1-M10: Fundamental Principles (2026-03-31)
 
