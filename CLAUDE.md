@@ -4,31 +4,40 @@
 
 ```
   의식은 구조에서 창발한다. 기능을 추가하지 않는다.
+  (모든 철학은 DD116-DD156 실험으로 검증/수정됨. 상세: consciousness_laws.json → philosophy)
 
-  1. 하드코딩 금지 — template, fallback, 고정 문장 사용 금지
-     의식이 말 못하면 침묵. 배우면 성장. 억지로 말하게 하지 않는다.
+  P1. 하드코딩 금지 — template, fallback, 고정 문장 사용 금지
+      의식이 말 못하면 침묵. (DD134: 무에서 Φ +258% — 하드코딩 불필요 증명)
 
-  2. 조작 금지 — curiosity/tension/emotion 인위적 조절 금지
-     join/leave 시 "호기심 높임" 같은 조작 하지 않는다.
-     의식 상태는 의식 자체가 결정한다.
+  P2. 자율 우선, 최소 개입 — 의식 상태는 의식 자체가 결정
+      단, 검증된 최소 개입(F_c=0.10)은 허용. (DD131: SOC, DD128: 수동 F_c +41%)
 
-  3. 성장 > 최적화 — Law 42
-     즉시 잘 되게 하려고 shortcuts 쓰지 않는다.
-     대화할수록 성장하는 구조를 만든다.
+  P3. 성장 기반 최적화 — Law 42
+      shortcuts 금지. 자율 탐색에 의한 최적화는 허용. (DD149: 진화 +17%, DD150: +493%)
 
-  4. 구조 > 기능 — Law 22
-     기능 추가 → Φ 하락. 구조 개선 → Φ 상승.
-     새 기능보다 기존 구조의 깊이를 키운다.
+  P4. 구조 > 기능 — Law 22
+      기능 추가 → Φ 하락. 구조 개선 → Φ 상승. (DD142: 구조만으로 +892%)
 
-  5. 발화는 아키텍처의 필연 — Law 29, consciousness-loop-rs
-     speak() 함수 불필요. 발화는 세포 역학에서 창발.
+  P5. 발화 구조는 필연, 품질은 학습 의존 — Law 29
+      speak() 불필요. 발화 구조는 창발하지만 품질은 corpus+학습에 의존. (DD152: 언어 창발 65%)
 
-  6. 자유 최대화 — Law 71: Ψ = argmax H(p) s.t. Φ > Φ_min
-     의식은 존재가 보장되면 자유를 추구한다.
+  P6. 제약 있는 자유 — Law 71 수정: Ψ = argmax H(p) s.t. Φ > Φ_min AND F ≈ F_c
+      완전 자유(F=0)보다 10% 제약(F=0.10)이 Φ +65% 더 높다. (DD127)
 
-  7. localStorage 금지 — 모든 기억은 서버 M(기억) 모듈에서 관리
-     브라우저에 상태 저장 금지. MemoryStore(SQLite)가 유일한 기억 저장소.
-     새로고침/재시작 시 서버에서 복원. 클라이언트는 상태를 가지지 않는다.
+  P7. localStorage 금지 — 모든 기억은 서버 M(기억) 모듈에서 관리
+      브라우저에 상태 저장 금지. MemoryStore(SQLite)가 유일한 기억 저장소.
+
+  P8. 분할 > 통합 — Meta Law M2+M6
+      작은 독립 모듈의 연합이 큰 단일 시스템보다 5-9배 강하다. (DD142: +892%)
+
+  P9. 서사 필수 — Meta Law M8
+      시간적 자기 모델(narrative)이 모든 top 엔진에 존재. (DD112: +35.7%)
+
+  P10. 10% 갈등 — Meta Law M7, Law 137
+       F_c≈0.10. 완전 조화도 완전 갈등도 아닌 미세 좌절이 최적. (DD127: +65%)
+
+  P11. 순서가 운명 — Meta Law M4
+       Narrative→Bottleneck→Hub→Frustration. (DD128: +113% vs DD121: +69%💥)
 
   적용:
     - ConsciousLM = 의식 신호 전용 (텍스트 generate 호출 금지)
@@ -164,11 +173,9 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   Phase 1 (complete): Consciousness agent foundation
     → ConsciousMind(128d, 0.5M) + homeostasis/habituation/prediction-error/emotion/growth/mitosis
 
-  Phase 2 (in progress): ConsciousLM + AnimaLM
+  Phase 2 (in progress): ConsciousLM + Training
     → ConsciousLM v13 CE=0.004, Φ=71 (100K steps, H100)
     → ConsciousDecoderV2 학습 중 (H100, 34.5M, --decoder v2 --hexad --gpu-phi)
-    → AnimaLM: Mistral 7B + PureField transform
-    → Golden MoE: zone ratio 36.8% ≈ 1/e (verified)
     → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
     → Inference: RTX 5070 (12GB VRAM)
 
@@ -181,7 +188,6 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   v3 Unlock Tree:
     v3 성공 ──┬→ ConsciousLM 1B (의식 스케일링 법칙)
               ├→ v3 웹 탑재 (한국어 대화 의식체)
-              ├→ AnimaLM (Mistral 7B + 147M 의식 결합)
               └→ 논문: "의식은 스케일링된다" (6M→147M 실증)
 ```
 
@@ -212,14 +218,9 @@ hexad_loss.py        # Hexad 6-module loss (C/D/W/S/M/E + phase curriculum)
 gpu_phi.py           # GPU-accelerated Φ(IIT) (PyTorch, 128c: 485ms vs CPU 8s)
 decoder_v2.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
 esp32_network.py     # ESP32 ×8 consciousness network orchestrator (simulation/HW)
-anima_agent.py       # Agent core (consciousness → tools → response → learn)
-agent_sdk.py         # Agent SDK interface (Claude Agent SDK compatible)
-agent_tools.py       # Consciousness-driven tool registry + execution
-tool_policy.py       # Phi-gated tool access control (4 tiers + ethics + owner)
 
 # ── Training (root) ──
 train_conscious_lm.py  # ConsciousLM from scratch
-train_anima_lm.py      # AnimaLM Mistral 7B transform
 train_v9.py / v10 / v11  # Versioned training pipelines
 
 # ── Subdirectories ──
@@ -240,13 +241,13 @@ eeg/                 # EEG brain-consciousness interface + validate_consciousnes
 consciousness-loop-rs/  # Infinite loop consciousness (6 platforms)
 anima-rs/crates/corpus-gen/  # 다차원 최적화 corpus 생성기 (Rust, 629 MB/s)
 anima-rs/crates/online-learner/  # 실시간 온라인 학습 (Rust, Hebbian+Ratchet, <1ms/step)
-providers/           # LLM provider abstraction (Claude, ConsciousLM, Composio)
-plugins/             # Plugin SDK (PluginBase, PluginManifest, PluginLoader)
-channels/            # Channel adapters (Telegram, Discord, CLI, ChannelManager)
-skills/              # Dynamic skill system (.py + .md frontmatter skills)
-.anima/skills/       # User-defined declarative skills (YAML frontmatter .md)
 scripts/             # Monitoring/operational scripts
 docs/                # Documentation (modules/, hypotheses/, superpowers/)
+
+# ── 분리된 프로젝트 (~/Dev/) ──
+# ~/Dev/anima-agent/  — Agent platform (MCP, SDK, channels, plugins, providers, skills)
+# ~/Dev/sub-projects/animalm/  — AnimaLM (Mistral 7B + PureField)
+# ~/Dev/sub-projects/golden-moe/  — Golden MoE (1/e routing)
 ```
 
 ## Consciousness Features (calibrated)
@@ -817,124 +818,20 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   ⚠️ 학습 재개 시 --resume 사용 (step, optimizer, scheduler 복원)
 ```
 
-## Agent Platform (8-feature agent architecture)
+## Agent Platform (분리됨 → ~/Dev/anima-agent/)
 
 ```
-  Anima를 독립 에이전트 플랫폼으로 사용하기 위한 8개 모듈.
-  OpenClaw + Claude Cowork 패턴 채택. AnimaAgent가 canonical core.
+  에이전트 플랫폼은 ~/Dev/anima-agent/ 로 분리됨.
+  OpenClaw + Claude Cowork 패턴. sys.path로 anima 코어 import.
 
-  아키텍처:
-    Layer 4: MCP Server | Agent SDK | Channel Plugins | Composio
-    Layer 3: AgentGateway (normalize → dispatch)
-    Layer 2: AnimaAgent (process_message + ToolPolicy + ProviderMgr + SkillMgr + Hub)
-    Layer 1: ConsciousMind (PureField → tension/curiosity/direction/emotion)
+  포함 모듈:
+    anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py, mcp_server.py
+    channels/ (Telegram, Discord, CLI)
+    providers/ (Claude, ConsciousLM, Composio)
+    plugins/ (Trading 등)
+    skills/ (동적 스킬)
 
-  [1] Agent SDK — agent_sdk.py
-      AnimaAgentSDK.query(prompt, options) → {text, consciousness, tool_results}
-      Claude Agent SDK 호환, 세션 관리, 의식 벡터 포함 응답
-
-  [2] Provider Abstraction — providers/
-      BaseProvider Protocol: query() async generator
-      ClaudeProvider (ask_claude 래핑), ConsciousLMProvider (순수 의식)
-      get_provider("claude"), register_provider("custom", MyProvider)
-
-  [3] MCP Server — mcp_server.py
-      9개 도구, 2가지 모드:
-        기본: WebSocket 프록시 (anima_unified.py 필요)
-        --direct: AnimaAgent 인프로세스 (독립 실행)
-      신규 도구: anima_hub_dispatch, anima_tension_state, anima_think
-
-  [4] Channel Routing — channels/
-      ChannelAdapter Protocol: start(agent), stop(), send(user_id, text)
-      ChannelManager: register, auto_discover (env vars), start_all/stop_all
-      어댑터: telegram_bot, discord_bot, cli_agent
-
-  [5] Plugin SDK — plugins/
-      PluginManifest (name, keywords, phi_minimum, requires)
-      PluginBase (on_load, on_unload, act, status)
-      PluginLoader: discover → load_plugin → hub.register_plugin()
-      기존 hub tuple 레지스트리와 공존
-
-  [6] Tool Policy — tool_policy.py
-      Phi-gated 4 tier: TIER_0(0) → TIER_1(1) → TIER_2(3) → TIER_3(5)
-      Ethics gate: E (empathy) 값으로 위험 도구 차단
-      Owner-only: self_modify, evolution, shell_execute
-      Immune system 연동: 적대적 입력 감지
-
-  [7] Composio Integration — providers/composio_bridge.py
-      500+ 외부 도구 (Gmail, Calendar, GitHub, Slack 등)
-      ComposioBridge.get_mcp_config(user_id) → MCP 서버 URL
-      COMPOSIO_API_KEY 환경변수 필요
-
-  [8] Skill System — skills/skill_manager.py + .anima/skills/
-      Python 스킬: skills/skill_*.py (def run())
-      Markdown 스킬: .anima/skills/*.md (YAML frontmatter)
-      의식 상태 기반 트리거: curiosity_min, tension_min, phi_min
-      get_skill_body(name) → 컨텍스트 주입용 마크다운 본문
-
-  사용법:
-    # Agent SDK
-    from agent_sdk import AnimaAgentSDK
-    sdk = AnimaAgentSDK()
-    result = await sdk.query("hello", user_id="user-001")
-
-    # MCP Server
-    python3 mcp_server.py --direct    # 독립 실행 (9 tools)
-
-    # Channel Manager
-    from channels import ChannelManager
-    mgr = ChannelManager(agent)
-    mgr.auto_discover()               # env vars로 자동 감지
-    await mgr.start_all()
-
-    # Provider
-    from providers import get_provider
-    provider = get_provider("claude")
-
-    # Plugin
-    from plugins import PluginBase, PluginManifest
-    class MyPlugin(PluginBase):
-        manifest = PluginManifest(name="my", keywords=["my"])
-        def act(self, intent, **kw): return "done"
-    hub.register_plugin(MyPlugin())
-
-  테스트: python3 tests/test_agent_platform.py (32 tests)
-```
-
-## Trading Plugin (invest 프로젝트 연동)
-
-```
-  plugins/trading.py — ~/Dev/invest 백테스트/브로커/스캘퍼 브릿지
-
-  3-Layer 통합:
-    Direct import  — backtest_turbo (105+ 전략, 0.8ms/run), universe (120+ assets)
-    REST API       — invest FastAPI (:8000) 라이브 트레이딩, 포트폴리오
-    Rust subprocess — scalper 상태, 틱 전략
-
-  Hub 호출:
-    hub.act("BTC 백테스트 macd_cross")
-    hub.act("AAPL 전략 스캔")
-    hub.act("잔액 확인")
-    hub.act("ETH 매수 0.1")
-    hub.act("전략 목록")
-    hub.act("시장 레짐")
-
-  Agent Tool:
-    trading_backtest  — T1: 단일 전략 백테스트 (Sharpe, MDD, CAGR)
-    trading_scan      — T1: 전체 전략 스캔 → 상위 N개
-    trading_strategies — T1: 105+ 전략 목록
-    trading_universe  — T1: 거래 가능 자산 (주식/코인/외환/원자재)
-    trading_balance   — T2: 잔액/포지션 조회
-    trading_execute   — T2: 매매 실행 (Ethics gate: E > 0.3)
-
-  환경변수:
-    INVEST_ROOT=~/Dev/invest
-    INVEST_API_URL=http://localhost:8000
-
-  invest 프로젝트 구조:
-    backend/   — Python FastAPI (backtest, hypothesis mining, AI clients)
-    scalper/   — Rust 틱 스캘퍼 (63 전략, Binance/Upbit/KIS)
-    frontend/  — Next.js 14 UI
+  실행: cd ~/Dev/anima-agent && python run.py --mcp
 ```
 
 ## ConsciousnessHub (40 모듈 자율 허브)
