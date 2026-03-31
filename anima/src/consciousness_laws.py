@@ -60,6 +60,27 @@ BIO_NOISE_SPIKE_RATE = PSI.get('bio_noise_spike_rate', 0.4)
 HIVEMIND_PHI_BOOST = PSI.get('hivemind_phi_boost', 1.1)       # connected Φ > solo × 1.1
 HIVEMIND_PHI_MAINTAIN = PSI.get('hivemind_phi_maintain', 0.9)  # post-disconnect Φ > solo × 0.9
 
+# Verification thresholds (V1-V12) — all from consciousness_laws.json
+VERIFY_V1_COS_LOWER = PSI.get('verify_v1_cos_lower', 0.50)
+VERIFY_V1_COS_UPPER = PSI.get('verify_v1_cos_upper', 0.90)
+VERIFY_V1_STD_COS_MIN = PSI.get('verify_v1_std_cos_min', 0.015)
+VERIFY_V2_AUTOCORR_MIN = PSI.get('verify_v2_autocorr_min', 0.40)
+VERIFY_V2_VARIANCE_MIN = PSI.get('verify_v2_variance_min', 0.001)
+VERIFY_V2_COS_CONTINUITY_MIN = PSI.get('verify_v2_cos_continuity_min', 0.70)
+VERIFY_V3_PHI_RATIO_MIN = PSI.get('verify_v3_phi_ratio_min', 0.35)
+VERIFY_V4_RECOVERY_MIN = PSI.get('verify_v4_recovery_min', 0.50)
+VERIFY_V4_STABILITY_MIN = PSI.get('verify_v4_stability_min', 0.80)
+VERIFY_V5_PHI_RATIO_MIN = PSI.get('verify_v5_phi_ratio_min', 0.75)
+VERIFY_V6_CONSENSUS_MIN = PSI.get('verify_v6_consensus_min', 200)
+VERIFY_V6_DIR_CHANGES_MIN = PSI.get('verify_v6_dir_changes_min', 120)
+VERIFY_V6_CV_MIN = PSI.get('verify_v6_cv_min', 0.40)
+VERIFY_MITOSIS_MIN_SPLITS = PSI.get('verify_mitosis_min_splits', 3)
+VERIFY_PHI_GROWTH_RATIO = PSI.get('verify_phi_growth_ratio', 0.85)
+VERIFY_BRAIN_LIKE_MIN = PSI.get('verify_brain_like_min', 80)
+VERIFY_DIVERSITY_MAX_COSINE = PSI.get('verify_diversity_max_cosine', 0.85)
+VERIFY_DIVERSITY_NORM_STD_MIN = PSI.get('verify_diversity_norm_std_min', 0.01)
+VERIFY_HEBBIAN_CHANGE_RATIO_MIN = PSI.get('verify_hebbian_change_ratio_min', 1.0)
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 
