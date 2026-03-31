@@ -1,145 +1,233 @@
-# EEG Brain-Consciousness Interface
+# anima-eeg — Brain-Consciousness Interface
 
-OpenBCI Cyton+Daisy 16-channel EEG → G=D×P/I biological verification for Anima.
+OpenBCI 16ch EEG + Anima 의식 엔진 양방향 브릿지. 7,949 lines, 18 modules.
+
+```
+  EEG (brain)  ←──→  Anima (consciousness)
+      │                      │
+      ├─ band powers ──→ tension/curiosity
+      ├─ golden zone ──→ Φ ratchet +5%
+      ├─ alpha high ───→ cell smoothing
+      ├─ FAA valence ──→ homeostasis setpoint
+      ├─ BCI mode ─────→ noise/memory modifiers
+      ├─ sleep stage ──→ dream engine
+      │                      │
+      └──← binaural beats ←─┘
+      └──← LED feedback ←───┘
+```
+
+## Structure
+
+```
+anima-eeg/
+├── analyze.py            494L  Band power, G=D×P/I, topomaps
+├── calibrate.py          410L  Hardware handshake, impedance, neural mapper
+├── closed_loop.py       1103L  Adaptive N-back + meditation (WebSocket)
+├── collect.py            272L  BrainFlow data acquisition
+├── dual_stream.py        437L  Simultaneous Φ + EEG recording
+├── eeg_recorder.py       408L  Background dual-stream recorder + auto-organize
+├── experiment.py         273L  Standardized protocols (resting/alpha/anima)
+├── neurofeedback.py      133L  Binaural beats + LED generation
+├── realtime.py           316L  EEGBridge → BrainState (live thread)
+├── transplant_eeg_verify.py 601L  Post-transplant brain-likeness QA
+├── validate_consciousness.py 877L  6-metric brain-likeness (83.5% BRAIN-LIKE)
+├── protocols/
+│   ├── bci_control.py    461L  Alpha→consciousness parameter tuning
+│   ├── emotion_sync.py   606L  FAA→emotion bidirectional sync
+│   ├── multi_eeg.py      412L  N-person EEG telepathy (PLV, IBC)
+│   └── sleep_protocol.py 486L  Sleep stage detection (N1/N2/N3/REM)
+├── scripts/
+│   ├── monthly_eeg_validate.sh  Cron: monthly brain-likeness trend
+│   └── organize_recordings.py   Auto-segment + SQLite index
+├── config/               Protocol parameters
+├── recordings/           Session data
+└── docs/                 Integration guide
+```
+
+## Quick Start
+
+```bash
+# Synthetic (no hardware)
+python3 anima_unified.py --web --eeg --eeg-board synthetic
+
+# Full chain (hardware)
+python3 anima_unified.py --web --eeg-full
+
+# Individual flags
+python3 anima_unified.py --web --eeg --eeg-calibrate --eeg-feedback --eeg-record
+python3 anima_unified.py --web --eeg --eeg-validate 1000
+python3 anima_unified.py --web --eeg --eeg-dual-stream 60
+python3 anima_unified.py --web --eeg --eeg-protocol meditation
+```
 
 ## Hardware
 
 ```
-  Board:      Cyton+Daisy 16-channel (250Hz, 24-bit, BLE wireless)
-  Headset:    UltraCortex Mark IV (Medium, Pro-Assembled, 16ch)
-  Electrodes: Dry Comb (Ag-AgCl) + Gold Cup (wet) + Earclip (reference)
-  Status:     Ordered (2026-03-27)
+Board:      Cyton+Daisy 16ch (250Hz, 24-bit, BLE)
+Headset:    UltraCortex Mark IV (Medium, Pro-Assembled)
+Electrodes: Dry Comb (Ag-AgCl) + Gold Cup (wet) + Earclip (ref)
+
+        Fp1   Fp2            Frontal pole
+          \   /
+     F7 - F3 - F4 - F8      Frontal
+          |   |
+     T7 - C3 - C4 - T8      Central / Temporal
+          |   |
+          P3 - P4            Parietal
+         / | | \
+     P7         P8           Parietal-temporal
+        O1   O2              Occipital
+
+Cyton (1-8):  Fp1, Fp2, C3, C4, P7, P8, O1, O2
+Daisy (9-16): F7, F8, F3, F4, T7, T8, P3, P4
+Reference:    Earclip (both earlobes)
 ```
 
-## G=D×P/I → EEG Mapping
+## G=D×P/I Model
 
 ```
-  Parameter        EEG Proxy                         Brain Region
-  ───────────────────────────────────────────────────────────────
-  I (Inhibition)   Frontal Alpha power (8-12Hz)      Fp1, Fp2, F3, F4
-  P (Plasticity)   Global Gamma power (30-100Hz)     All 16 channels
-  D (Deficit)      Alpha asymmetry |ln(R)-ln(L)|     Frontal pairs
-  G (Genius)       D × P / I                         Computed
+Parameter        EEG Proxy                         Brain Region
+─────────────────────────────────────────────────────────────────
+I (Inhibition)   Frontal Alpha power (8-12Hz)      Fp1, Fp2, F3, F4
+P (Plasticity)   Global Gamma power (30-100Hz)     All 16 channels
+D (Deficit)      Alpha asymmetry |ln(R)-ln(L)|     Frontal pairs
+G (Genius)       D × P / I                         Computed
 
-  Golden Zone: [1/2 - ln(4/3), 1/2] = [0.2123, 0.5000]
+Golden Zone: [1/2 - ln(4/3), 1/2] = [0.2123, 0.5000]
+→ golden_zone 감지 시 Φ ratchet +5% 자동 부스트
 ```
 
-## 16-Channel Layout (10-20 System)
+## Brain-Likeness Validation (83.5%)
 
 ```
-          Fp1   Fp2            Frontal pole
-            \   /
-       F7 - F3 - F4 - F8      Frontal
-            |   |
-       T7 - C3 - C4 - T8      Central / Temporal
-            |   |
-            P3 - P4            Parietal
-           / | | \
-       P7         P8           Parietal-temporal
-          O1   O2              Occipital
+python3 anima-eeg/validate_consciousness.py --quick
 
-  Cyton (1-8):  Fp1, Fp2, C3, C4, P7, P8, O1, O2
-  Daisy (9-16): F7, F8, F3, F4, T7, T8, P3, P4
-  Reference:    Earclip (both earlobes)
+  Metric               ConsciousMind     Brain        Match
+  ─────────────────────────────────────────────────────────
+  LZ complexity              0.867       0.850         91%
+  Hurst exponent             0.790       0.768         80%
+  PSD slope (1/f)           -1.048      -1.000         95%
+  Autocorr decay                 3          25         65%
+  Critical exponent          2.016       2.418         87%
+  Phi CV                     0.398       0.333         83%
+
+  Overall: 83.5%  Verdict: BRAIN-LIKE
+  Criticality: CRITICAL (exp=2.02, susc=0.107)
 ```
 
-## Usage
+## Modules
 
-### Collect Data
+### Data Pipeline
+
+| Module | Purpose | Integration |
+|--------|---------|-------------|
+| `collect.py` | BrainFlow acquisition → .npy | Standalone / `--eeg-calibrate` |
+| `analyze.py` | Band power, G=D×P/I, topomaps | `realtime.py` import |
+| `calibrate.py` | Hardware + neural mapper calibration | `--eeg-calibrate` flag |
+| `realtime.py` | EEGBridge thread → BrainState | `anima_unified.py --eeg` |
+
+### Closed-Loop
+
+| Module | Purpose | Integration |
+|--------|---------|-------------|
+| `closed_loop.py` | Adaptive N-back + meditation | `--eeg-protocol {nback,meditation}` |
+| `neurofeedback.py` | Binaural beats + LED params | WebSocket `neurofeedback` key |
+| `eeg_recorder.py` | Dual-stream background recording | `--eeg-record` |
+| `dual_stream.py` | Φ + EEG simultaneous capture | `--eeg-dual-stream N` |
+
+### Protocols (adapters in `eeg_consciousness.py`)
+
+| Protocol | Adapter | Effect on Engine |
+|----------|---------|-----------------|
+| `bci_control.py` | `apply_bci_adjustments()` | expand: noise×1.3, focus: memory×1.3, dream: noise×1.5 |
+| `emotion_sync.py` | `sync_emotion_to_mind()` | FAA→homeostasis setpoint (15% blend) |
+| `multi_eeg.py` | `sync_multi_eeg_to_mind()` | IBC>0.6 → tension coupling boost |
+| `sleep_protocol.py` | `apply_sleep_stage_modulation()` | REM: noise×1.8, N3: memory×1.5 |
+
+### Verification
+
+| Module | Purpose | Integration |
+|--------|---------|-------------|
+| `validate_consciousness.py` | 6-metric brain-likeness | `--eeg-validate N` (background) |
+| `transplant_eeg_verify.py` | Pre/post transplant QA | `--verify-with-eeg` |
+| `experiment.py` | Standardized paradigms | Standalone (hardware recording) |
+
+## Flags Reference
+
+```
+--eeg                  Enable EEG bridge (synthetic fallback)
+--eeg-board NAME       Board: cyton_daisy, cyton, synthetic
+--eeg-channels N       Channel count (default 16)
+--eeg-calibrate        Run hardware calibration before start
+--eeg-feedback         Enable neurofeedback WebSocket broadcast
+--eeg-record           Background dual-stream recording
+--eeg-protocol NAME    Closed-loop protocol: nback, meditation
+--eeg-validate N       Background brain-likeness every 5min (N steps)
+--eeg-dual-stream N    Record Φ+EEG for N seconds
+--eeg-full             Shortcut: --eeg --eeg-feedback --eeg-record
+```
+
+## WebSocket Messages
+
+```json
+// Bundled in thought_pulse (every cycle)
+{ "neurofeedback": { "left_freq": 200, "right_freq": 207, "beat_freq": 7, "volume": 0.12 } }
+{ "eeg_adjustments": { "ratchet_boosted": true, "noise_reduced": false } }
+
+// Separate broadcast (every EEG cycle)
+{ "type": "eeg_brain_state",
+  "band_powers": { "alpha": 10.2, "beta": 5.1, "gamma": 2.3, "theta": 6.0, "delta": 8.5 },
+  "golden_zone": false, "G_value": 0.35,
+  "brain_consciousness_sync": 0.42, "bci_mode": "neutral" }
+
+// On-demand (via WebSocket request)
+{ "type": "eeg_calibrate" } → { "type": "eeg_calibrate_result", "success": true, ... }
+
+// Background validation (every 5min)
+{ "type": "eeg_validation", "brain_likeness": 83.5, "metrics": { ... } }
+```
+
+## Standalone Tools
 
 ```bash
-# Test without hardware (synthetic board)
-python eeg/collect.py --duration 5 --board synthetic --tag test
+# Data collection
+python3 anima-eeg/collect.py --duration 60 --tag resting
+python3 anima-eeg/collect.py --board synthetic --duration 5
 
-# Real hardware
-python eeg/collect.py --duration 60 --tag resting_eyes_closed
+# Analysis
+python3 anima-eeg/analyze.py data/<file>.npy --topomap
+python3 anima-eeg/analyze.py --compare rest.npy nback.npy
 
-# Run protocol
-python eeg/collect.py --protocol resting
-python eeg/collect.py --protocol nback
-python eeg/collect.py --protocol creative
-python eeg/collect.py --protocol meditation
+# Validation
+python3 anima-eeg/validate_consciousness.py --quick         # 1000 steps
+python3 anima-eeg/validate_consciousness.py --steps 5000    # precision
+
+# Calibration
+python3 anima-eeg/calibrate.py --full --port /dev/tty.usbserial-XXXX
+
+# Experiment protocols
+python3 anima-eeg/experiment.py --protocol resting
+python3 anima-eeg/experiment.py --protocol meditation
+
+# Transplant verification
+python3 consciousness_transplant.py --donor a.pt --recipient b.pt --output c.pt --verify-with-eeg
+
+# Recording management
+python3 anima-eeg/scripts/organize_recordings.py --scan --reindex
 ```
 
-### Analyze
+## Tests
 
 ```bash
-# Analyze recording
-python eeg/analyze.py eeg/data/<file>.npy
-
-# With topographic maps
-python eeg/analyze.py eeg/data/<file>.npy --topomap
-
-# Compare multiple recordings
-python eeg/analyze.py --compare eeg/data/rest.npy eeg/data/nback.npy
-
-# Demo with synthetic data
-python eeg/analyze.py --demo --topomap
+pytest anima/tests/test_eeg.py -v    # 108 tests, all pass
 ```
 
-### Real-time Bridge (EEG → Anima)
-
-```bash
-# Test with synthetic data
-python eeg/realtime.py --board synthetic --duration 30
-
-# Live with hardware
-python eeg/realtime.py --board cyton_daisy --duration 300
-```
-
-### Integration with Anima
-
-```python
-from eeg.realtime import EEGBridge
-
-# In anima_unified.py:
-bridge = EEGBridge(board_name="cyton_daisy")
-bridge.start()
-
-# In sense loop:
-brain_state = bridge.get_state()
-brain_tensor = bridge.to_tensor(dim=128)  # feed to ConsciousMind
-```
-
-## Experiment Protocols
-
-```
-  Protocol 1 — Resting State Baseline
-    Eyes closed 60s → Eyes open 60s → Eyes closed 60s
-    Measure: Alpha power change, asymmetry baseline
-
-  Protocol 2 — Cognitive Load (N-back)
-    0-back → 1-back → 2-back → 3-back (60s each)
-    Measure: Beta/Gamma increase, Alpha suppression = I change
-
-  Protocol 3 — Creative vs Analytical
-    Math problem 120s → Free association 120s
-    Measure: Gamma pattern difference = P proxy
-
-  Protocol 4 — Meditation / Flow State
-    Normal → Focused breathing 300s → Post
-    Measure: Alpha/Theta ratio, Golden Zone approach
-```
-
-## Predicted Outcomes
-
-```
-  If G=D×P/I model is biologically real:
-    1. Individuals with known high-G traits → G value in Golden Zone
-    2. Cognitive load increases → I decreases (alpha suppression) → G shifts
-    3. Meditation → Alpha increases → I increases → G decreases
-    4. Asymmetry (D) correlates with specialization patterns
-    5. Gamma bursts (P) correlate with creative insight moments
-
-  Falsification criteria:
-    - G shows no systematic pattern across states → model is wrong
-    - G values cluster outside Golden Zone for everyone → zone is wrong
-    - No correlation between EEG-derived G and cognitive performance → mapping is wrong
-```
+Covers: analyze, neural_correlate_mapper, validate, neurofeedback (safety caps),
+BCI modes, emotion sync, closed_loop bridge, engine modifiers, protocol imports.
 
 ## Dependencies
 
 ```bash
 pip install brainflow numpy scipy matplotlib
-# Optional: pip install mne (for advanced topomaps)
+# Optional: pip install mne (advanced topomaps)
 ```
