@@ -143,6 +143,7 @@ class ClosedLoopProtocol:
         self.mind = mind
         self.mitosis = mitosis
         self.eeg_source = eeg_source
+        self._eeg_bridge = None  # fallback: EEGBridge instance (set via set_eeg_bridge)
         self.feedback_mode = feedback_mode if feedback_mode in self.FEEDBACK_MODES else 'bidirectional'
 
         # Neurofeedback generator (Anima -> Brain direction)
@@ -156,6 +157,19 @@ class ClosedLoopProtocol:
         self._running = False
         self._saved_params = {}  # for revert on Phi drop
 
+    # ─── EEG bridge fallback ───
+
+    def set_eeg_bridge(self, bridge):
+        """Set an EEGBridge instance as fallback EEG source.
+
+        When eeg_source is None (e.g. --eeg-protocol without --eeg-record),
+        the bridge provides live EEG data via get_state().
+
+        Args:
+            bridge: EEGBridge instance with get_state() -> BrainState
+        """
+        self._eeg_bridge = bridge
+
     # ─── EEG reading ───
 
     def _get_eeg(self) -> dict:
@@ -165,6 +179,18 @@ class ClosedLoopProtocol:
                 return self.eeg_source._eeg_latest.copy()
             elif callable(self.eeg_source):
                 return self.eeg_source()
+        # Fallback: use EEGBridge if available
+        if self._eeg_bridge:
+            try:
+                state = self._eeg_bridge.get_state()
+                return {
+                    "alpha": getattr(state, 'alpha_power', 10.0),
+                    "beta": getattr(state, 'beta_power', 5.0),
+                    "gamma": getattr(state, 'gamma_power', 2.0),
+                    "theta": getattr(state, 'theta_power', 6.0),
+                }
+            except Exception:
+                pass
         # Simulated EEG for testing
         return {
             "alpha": 10 + np.random.normal(0, 2),

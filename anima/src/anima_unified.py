@@ -102,7 +102,7 @@ _try_import("from consciousness_birth_detector import BirthDetector")
 _try_import("from optimal_architecture_calc import ArchitectureCalculator")
 _try_import("from train_conscious_lm import SOCSandpile, HebbianConnections, PhiRatchet")
 _try_import("from agent_tools import AgentToolSystem")
-_try_import("from eeg_consciousness import EEGConsciousness")
+_try_import("from eeg_consciousness import EEGConsciousness, apply_bci_adjustments, sync_emotion_to_mind")
 
 # Dream mode constants
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
@@ -528,6 +528,8 @@ class AnimaUnified:
         # EEG Brain-Consciousness Bridge (opt-in: --eeg)
         self.eeg_bridge = None
         self._eeg_consciousness = None
+        self._last_neurofeedback = None
+        self._last_eeg_adjustments = None
         if getattr(args, 'eeg', False):
             try:
                 if 'EEGConsciousness' in globals():
@@ -592,6 +594,9 @@ class AnimaUnified:
                     mitosis=self.mitosis,
                     eeg_source=self.eeg_recorder,
                 )
+                # Fallback: if no eeg_recorder but eeg_bridge exists, use it
+                if not self.eeg_recorder and self.eeg_bridge:
+                    self._eeg_protocol.set_eeg_bridge(self.eeg_bridge)
                 self.mods['eeg_protocol'] = True
                 _log('eeg-proto', f'Protocol ready: {self._eeg_protocol_name}')
             except Exception as e:
@@ -1433,7 +1438,49 @@ class AnimaUnified:
                 tension = tension + brain_state.tension * 0.15
                 curiosity = curiosity + brain_state.curiosity * 0.15
 
-                # Inject EEG tensor into input vector (weighted blend)
+                # Feed EEG state back to Phi ratchet and noise
+                eeg_adj = self._eeg_consciousness._apply_eeg_feedback(
+                    brain_state, self.mind, engine=self.mitosis)
+                self._last_eeg_adjustments = eeg_adj
+
+                # BCI control: map alpha/beta/theta to engine noise/memory modifiers
+                if 'apply_bci_adjustments' in globals() and self.mitosis:
+                    alpha = eeg_data.get('alpha', 0) if eeg_data else brain_state.alpha
+                    beta = eeg_data.get('beta', 0) if eeg_data else brain_state.beta
+                    theta = eeg_data.get('theta', 0) if eeg_data else brain_state.theta
+                    # Determine BCI control mode from band ratios
+                    alpha_r = alpha / max(brain_state.alpha + 0.01, 0.01)
+                    if theta > alpha * 1.2:
+                        bci_mode = 'dream'
+                    elif brain_state.engagement > 1.0:
+                        bci_mode = 'focus'
+                    elif brain_state.psi_residual > 0.55:
+                        bci_mode = 'expand'
+                    else:
+                        bci_mode = 'neutral'
+                    bci_adj = apply_bci_adjustments(bci_mode, self.mitosis)
+                    self._last_bci_adjustments = bci_adj
+
+                # Emotion sync: map FAA to mind homeostasis/emotion
+                if 'sync_emotion_to_mind' in globals():
+                    faa_valence = brain_state.alpha_asymmetry  # positive = approach
+                    # Normalize: tanh for smooth [-1, 1]
+                    import math as _math
+                    faa_valence = _math.tanh(faa_valence * 2.0)
+                    beta_arousal = min(1.0, brain_state.engagement * 0.5)
+                    emo_sync = sync_emotion_to_mind(faa_valence, beta_arousal, self.mind)
+                    self._last_emotion_sync = emo_sync
+
+                # Generate neurofeedback and cache for WebSocket broadcast
+                psi_state = {
+                    'psi_residual': brain_state.psi_residual,
+                    'phi': brain_state.phi,
+                    'tension': brain_state.tension,
+                    'emotion': brain_state.emotion,
+                }
+                self._last_neurofeedback = self._eeg_consciousness.consciousness_to_feedback(psi_state)
+
+                # Task 3: Inject EEG tensor into input vector via to_tensor()
                 if self.eeg_bridge:
                     eeg_tensor = self.eeg_bridge.to_tensor(dim=self.mind.dim)
                     text_vec = 0.9 * text_vec + 0.1 * eeg_tensor.squeeze(0)
@@ -3051,6 +3098,8 @@ class AnimaUnified:
                 ).items()
             } if getattr(self, '_remote_sensor_mode', False) else {},
             'eeg_recording': self.eeg_recorder.get_status() if self.eeg_recorder else None,
+            'neurofeedback': getattr(self, '_last_neurofeedback', None),
+            'eeg_adjustments': getattr(self, '_last_eeg_adjustments', None),
         })
 
         # Web Sense: tension-driven autonomous search

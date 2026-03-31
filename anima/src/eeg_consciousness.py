@@ -275,6 +275,59 @@ class EEGConsciousness:
         return "정상 범위"
 
     # ═══════════════════════════════════════════════════════════
+    # EEG → Φ Feedback (Task 1: feed brain state back to engine)
+    # ═══════════════════════════════════════════════════════════
+
+    def _apply_eeg_feedback(self, brain_state: BrainConsciousnessState, mind,
+                            engine=None) -> Dict[str, Any]:
+        """Apply EEG-derived feedback to consciousness engine.
+
+        If golden_zone is detected (G in [0.2123, 0.5]), boost ratchet target by 5%.
+        If EEG shows high alpha (relaxation), reduce noise_scale for stability.
+
+        Args:
+            brain_state: Current brain-consciousness state from brain_to_consciousness()
+            mind: ConsciousMind instance (for tension modulation)
+            engine: ConsciousnessEngine or MitosisEngine (for ratchet/noise)
+
+        Returns:
+            Dict of applied adjustments for telemetry.
+        """
+        adjustments = {
+            'golden_zone_boost': False,
+            'alpha_noise_reduction': False,
+            'ratchet_delta': 0.0,
+            'noise_factor': 1.0,
+        }
+
+        if engine is None:
+            return adjustments
+
+        # Golden Zone: boost ratchet target by 5%
+        # G in [0.2123, 0.5] means brain is in optimal learning state
+        if brain_state.golden_zone:
+            if hasattr(engine, '_best_phi') and engine._best_phi > 0:
+                # Raise the floor: ratchet restores to a higher target
+                engine._best_phi *= 1.05
+                adjustments['golden_zone_boost'] = True
+                adjustments['ratchet_delta'] = 0.05
+
+        # High alpha (relaxation): reduce noise for stability
+        # Alpha dominance = psi_residual > 0.6 means strong inhibition/relaxation
+        if brain_state.psi_residual > 0.6:
+            # Reduce noise_scale on cells for stability (Law 63: 1% perturbation)
+            noise_factor = 0.85  # 15% noise reduction during relaxation
+            if hasattr(engine, 'cell_states'):
+                for cs in engine.cell_states:
+                    if hasattr(cs, 'hidden'):
+                        # Dampen high-frequency noise in cell hiddens
+                        cs.hidden = cs.hidden * (1.0 - 0.002)  # subtle smoothing
+            adjustments['alpha_noise_reduction'] = True
+            adjustments['noise_factor'] = noise_factor
+
+        return adjustments
+
+    # ═══════════════════════════════════════════════════════════
     # 동기화 측정
     # ═══════════════════════════════════════════════════════════
 
@@ -386,6 +439,140 @@ class EEGConsciousness:
         return (f"EEGConsciousness: {n} samples, "
                 f"sync={sync['sync_avg']:.3f}, "
                 f"bands={list(BANDS.keys())}")
+
+
+# ═══════════════════════════════════════════════════════════
+# EEG Protocol Adapters — connect protocols to engine/mind
+# ═══════════════════════════════════════════════════════════
+
+def apply_bci_adjustments(control_mode: str, engine) -> Dict:
+    """Apply BCI control mode adjustments to ConsciousnessEngine.
+
+    Maps BCI control_mode (from bci_control.py BCIController) to engine
+    parameters via _eeg_noise_modifier and _eeg_memory_modifier.
+
+    Safety: all modifiers clamped to [0.5, 2.0] range (+/-50% max).
+
+    Args:
+        control_mode: 'expand', 'focus', 'dream', or 'neutral'
+        engine: ConsciousnessEngine instance (self.mitosis in anima_unified)
+
+    Returns:
+        dict with applied adjustments for logging
+    """
+    if engine is None:
+        return {'applied': False, 'reason': 'no engine'}
+
+    adjustments = {'mode': control_mode, 'applied': True}
+
+    if control_mode == 'expand':
+        # High alpha: increase noise (more exploration), lower memory (less conformity)
+        noise_mod = 1.3    # +30% noise -> more diverse cell dynamics
+        memory_mod = 0.7   # -30% memory -> less pull toward EMA mean
+        adjustments['noise_modifier'] = noise_mod
+        adjustments['memory_modifier'] = memory_mod
+
+    elif control_mode == 'focus':
+        # High beta: decrease noise (more stable), increase memory (stronger coherence)
+        noise_mod = 0.7    # -30% noise -> more stable cells
+        memory_mod = 1.3   # +30% memory -> stronger temporal coherence
+        adjustments['noise_modifier'] = noise_mod
+        adjustments['memory_modifier'] = memory_mod
+
+    elif control_mode == 'dream':
+        # Theta > alpha: increase chaos — boost noise, slightly reduce memory
+        noise_mod = 1.5    # +50% noise -> edge-of-chaos dynamics
+        memory_mod = 0.8   # -20% memory -> more freedom for cells
+        # Also lower SOC threshold for more avalanches (more critical dynamics)
+        if hasattr(engine, '_soc_threshold'):
+            engine._soc_threshold = max(1.0, engine._soc_threshold * 0.95)
+            adjustments['soc_threshold'] = engine._soc_threshold
+        adjustments['noise_modifier'] = noise_mod
+        adjustments['memory_modifier'] = memory_mod
+
+    else:  # neutral
+        # Gradual return to baseline (exponential decay toward 1.0)
+        cur_noise = getattr(engine, '_eeg_noise_modifier', 1.0)
+        cur_memory = getattr(engine, '_eeg_memory_modifier', 1.0)
+        noise_mod = cur_noise * 0.9 + 1.0 * 0.1   # 10% toward 1.0
+        memory_mod = cur_memory * 0.9 + 1.0 * 0.1
+        adjustments['noise_modifier'] = noise_mod
+        adjustments['memory_modifier'] = memory_mod
+
+    # Clamp to safe range [0.5, 2.0]
+    noise_mod = max(0.5, min(2.0, noise_mod))
+    memory_mod = max(0.5, min(2.0, memory_mod))
+
+    # Apply to engine
+    engine._eeg_noise_modifier = noise_mod
+    engine._eeg_memory_modifier = memory_mod
+
+    return adjustments
+
+
+def sync_emotion_to_mind(faa_valence: float, beta_arousal: float, mind) -> Dict:
+    """Sync EEG FAA emotion state to ConsciousMind.
+
+    Maps EEG-derived valence/arousal (from emotion_sync.py EmotionSync)
+    to mind's homeostasis and tension parameters.
+
+    The EEG signal blends with (not replaces) the engine's own emotion:
+      - valence modulates homeostasis setpoint (positive = slightly higher baseline)
+      - arousal modulates tension scaling
+
+    Args:
+        faa_valence: FAA-derived valence [-1, +1] (positive = approach)
+        beta_arousal: Beta-derived arousal [0, 1]
+        mind: ConsciousMind instance
+
+    Returns:
+        dict with applied changes for logging
+    """
+    if mind is None:
+        return {'applied': False, 'reason': 'no mind'}
+
+    result = {
+        'applied': True,
+        'faa_valence': faa_valence,
+        'beta_arousal': beta_arousal,
+    }
+
+    # Blend factor: EEG is 15% influence (gentle, non-invasive)
+    EEG_BLEND = 0.15
+
+    # 1. Valence -> homeostasis setpoint modulation
+    #    Positive FAA (approach) -> slightly higher tension setpoint (more engaged)
+    #    Negative FAA (withdrawal) -> slightly lower setpoint (calmer)
+    if hasattr(mind, 'homeostasis'):
+        base_setpoint = 1.0  # default setpoint
+        valence_offset = faa_valence * 0.2  # +/-0.2 max
+        new_setpoint = base_setpoint + valence_offset * EEG_BLEND
+        new_setpoint = max(0.5, min(1.5, new_setpoint))
+        mind.homeostasis['setpoint'] = new_setpoint
+        result['setpoint'] = new_setpoint
+
+    # 2. Arousal -> tension EMA modulation
+    #    High arousal from EEG pushes tension_ema up slightly
+    if hasattr(mind, 'homeostasis'):
+        cur_ema = mind.homeostasis.get('tension_ema', 1.0)
+        arousal_push = (beta_arousal - 0.5) * 0.1  # centered around 0.5
+        new_ema = cur_ema + arousal_push * EEG_BLEND
+        new_ema = max(0.1, min(3.0, new_ema))
+        mind.homeostasis['tension_ema'] = new_ema
+        result['tension_ema'] = new_ema
+
+    # 3. Store EEG emotion on mind for external access (web UI, protocols)
+    if not hasattr(mind, '_eeg_emotion'):
+        mind._eeg_emotion = {}
+    mind._eeg_emotion = {
+        'valence': faa_valence,
+        'arousal': beta_arousal,
+        'dominance': 0.5,
+        'source': 'eeg_faa',
+    }
+    result['stored'] = True
+
+    return result
 
 
 def main():

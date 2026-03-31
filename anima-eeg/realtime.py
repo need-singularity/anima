@@ -25,7 +25,10 @@ try:
 except ImportError:
     HAS_BRAINFLOW = False
 
-from eeg.analyze import compute_band_power, compute_genius, GeniusMetrics, CHANNEL_NAMES_16
+try:
+    from analyze import compute_band_power, compute_genius, GeniusMetrics, CHANNEL_NAMES_16
+except ImportError:
+    from eeg.analyze import compute_band_power, compute_genius, GeniusMetrics, CHANNEL_NAMES_16
 
 
 @dataclass
@@ -86,7 +89,10 @@ class EEGBridge:
         if not HAS_BRAINFLOW:
             raise ImportError("brainflow not installed: pip install brainflow")
 
-        from eeg.collect import BOARD_MAP
+        try:
+            from collect import BOARD_MAP
+        except ImportError:
+            from eeg.collect import BOARD_MAP
         params = BrainFlowInputParams()
         board_id = BOARD_MAP.get(self.board_name)
         if board_id is None:
