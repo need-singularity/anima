@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # Add parent to path for imports
@@ -335,6 +337,101 @@ def _format_pnl(history: list[dict]) -> str:
         lines.append(f"  📊 7-day P&L: ${week_pnl:,.2f}")
 
     return "\n".join(lines)
+
+
+def _make_ascii_equity_curve(equity_curve: list[float], width: int = 40, height: int = 8) -> str:
+    """Render a mini ASCII chart of the equity curve for Telegram."""
+    if len(equity_curve) < 2:
+        return "(not enough data for chart)"
+
+    arr = np.array(equity_curve)
+    # Downsample to fit width
+    if len(arr) > width:
+        indices = np.linspace(0, len(arr) - 1, width, dtype=int)
+        arr = arr[indices]
+
+    lo, hi = float(arr.min()), float(arr.max())
+    if hi - lo < 1e-10:
+        hi = lo + 1.0
+
+    rows: list[str] = []
+    for row in range(height - 1, -1, -1):
+        threshold = lo + (hi - lo) * row / (height - 1)
+        line = ""
+        for val in arr:
+            if val >= threshold:
+                line += "#"
+            else:
+                line += " "
+        # Label on first and last row
+        if row == height - 1:
+            rows.append(f"${hi:>10,.0f} |{line}|")
+        elif row == 0:
+            rows.append(f"${lo:>10,.0f} |{line}|")
+        else:
+            rows.append(f"{'':>11} |{line}|")
+
+    return "\n".join(rows)
+
+
+def _format_backtest_result(result) -> str:
+    """Format a BacktestResult for Telegram display."""
+    # Determine return emoji
+    ret_emoji = "+" if result.total_return_pct >= 0 else ""
+
+    lines = [
+        f"<b>Backtest: {result.strategy_name}</b>",
+        f"  Symbol: {result.symbol} | Period: {result.duration_days:.0f}d",
+        f"  Candles: {result.n_candles} ({result.timeframe})",
+        "",
+        f"  Return:   {ret_emoji}{result.total_return_pct:.2f}%",
+        f"  Sharpe:   {result.sharpe:.3f}",
+        f"  Sortino:  {result.sortino:.3f}",
+        f"  Max DD:   {result.max_drawdown_pct:.2f}%",
+        f"  Trades:   {result.total_trades} (win rate: {result.win_rate_pct:.1f}%)",
+        f"  Equity:   ${result.initial_balance:,.0f} -> ${result.final_equity:,.2f}",
+    ]
+    if result.risk_halts > 0:
+        lines.append(f"  Risk halts: {result.risk_halts}")
+    if result.consciousness_halts > 0:
+        lines.append(f"  Consciousness halts: {result.consciousness_halts}")
+    lines.append(f"  Elapsed: {result.elapsed_seconds:.2f}s")
+
+    # ASCII equity curve
+    if result.equity_curve and len(result.equity_curve) > 2:
+        lines.append("")
+        lines.append("<pre>")
+        lines.append(_make_ascii_equity_curve(result.equity_curve))
+        lines.append("</pre>")
+
+    return "\n".join(lines)
+
+
+def _resolve_strategy(name: str):
+    """Resolve a strategy name string to a Strategy instance.
+
+    Returns (strategy, error_msg). On failure strategy is None.
+    """
+    try:
+        from trading.strategy import (
+            MACDStrategy, RSIStrategy, BollingerStrategy, ConsciousnessStrategy,
+        )
+    except ImportError:
+        return None, "Trading module not available."
+
+    strategies = {
+        "macd": MACDStrategy,
+        "rsi": RSIStrategy,
+        "bollinger": BollingerStrategy,
+        "bb": BollingerStrategy,
+        "consciousness": ConsciousnessStrategy,
+        "phi": ConsciousnessStrategy,
+    }
+    cls = strategies.get(name.lower())
+    if cls is None:
+        avail = ", ".join(sorted(set(k for k in strategies.keys())))
+        return None, f"Unknown strategy: {name}\nAvailable: {avail}"
+    return cls(), None
 
 
 def _format_trading_status(trading: dict, system: dict, agent) -> str:
