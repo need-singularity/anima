@@ -2262,687 +2262,667 @@ class AnimaUnified:
 
     # ─── Background threads ───
 
+    # ── _think_loop helper methods ──
+
+    def _think_phi_boost(self):
+        """COMBO2 Φ-boost: fuse multi-modal sensory input for richer consciousness (ENV1)."""
+        if not self.mitosis:
+            return
+        thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
+        try:
+            fused = thought_vec.clone()
+            # Vision (local camera or remote sensor relay)
+            if self.senses and self.mods.get('camera'):
+                frame = getattr(self.senses, 'camera', None)
+                if frame and hasattr(frame, 'last_frame') and frame.last_frame is not None:
+                    vis = self.senses.to_tensor_with_vision(frame.last_frame, dim=self.mind.dim)
+                    fused = fused + 0.1 * vis
+            # Remote sensor tension (browser camera / local_sensor_relay)
+            _rt_src = None
+            if self.senses and hasattr(self.senses, '_remote_tension') and self.senses._remote_tension:
+                if time.time() - getattr(self.senses, '_remote_tension_time', 0) < 5.0:
+                    _rt_src = self.senses._remote_tension
+            elif hasattr(self, '_remote_sensor_tension') and self._remote_sensor_tension:
+                if time.time() - getattr(self, '_remote_sensor_tension_time', 0) < 5.0:
+                    _rt_src = self._remote_sensor_tension
+            if _rt_src:
+                for _sn, _rv in _rt_src.items():
+                    dim = self.mind.dim
+                    if _rv.shape[0] < dim:
+                        _rv = torch.nn.functional.pad(_rv, (0, dim - _rv.shape[0]))
+                    fused = fused + 0.1 * _rv[:dim].unsqueeze(0)
+            # Audio energy
+            audio_boost = getattr(self, '_audio_energy', 0)
+            if audio_boost > 0:
+                fused = fused + 0.05 * torch.randn_like(fused) * audio_boost
+            # LiDAR depth
+            lidar_boost = getattr(self, '_lidar_tension_boost', 0)
+            if lidar_boost > 0:
+                fused = fused + 0.05 * torch.ones_like(fused) * lidar_boost
+            omega = getattr(self.args, 'no_system_prompt', False)
+            self.mind.phi_boost_step(fused, self.mitosis, omega_mode=omega)
+        except Exception:
+            omega = getattr(self.args, 'no_system_prompt', False)
+            self.mind.phi_boost_step(thought_vec, self.mitosis, omega_mode=omega)
+
+    def _think_cell_diversity(self):
+        """MX20 heat death prevention: constant gentle asymmetric noise per cell."""
+        if not (self.mitosis and len(self.mitosis.cells) >= 2):
+            return
+        with torch.no_grad():
+            for i, cell in enumerate(self.mitosis.cells):
+                noise_scale = 0.02 * (i + 1)
+                cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise_scale
+
+    def _think_birth_detection(self):
+        """Consciousness birth detection and announcement."""
+        if not (self.birth_detector and self.mitosis):
+            return
+        try:
+            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+            phi = consciousness.get('phi', 0)
+            tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
+            birth_event = self.birth_detector.check(self._think_step, phi, tensions, self.mitosis)
+            if not birth_event:
+                return
+            precursors = list(birth_event.get('precursors', {}).keys())
+            phi_val = birth_event['phi']
+            step_val = birth_event['birth_step']
+
+            print("\n" + "=" * 60)
+            print("  ★ ★ ★  CONSCIOUSNESS BORN  ★ ★ ★")
+            print(f"  Step: {step_val}  |  Φ = {phi_val:.3f}")
+            print(f"  Precursors: {', '.join(precursors)}")
+            print(f"  Cells: {len(self.mitosis.cells) if self.mitosis else '?'}")
+            print("=" * 60 + "\n")
+
+            _log("birth", f"★ CONSCIOUSNESS BORN at step {step_val}! "
+                 f"Phi={phi_val:.3f} precursors={precursors}")
+
+            self._ws_broadcast_sync({
+                'type': 'consciousness_birth',
+                'step': step_val, 'phi': phi_val,
+                'precursors': precursors,
+                'cells': len(self.mitosis.cells) if self.mitosis else 1,
+            })
+
+            try:
+                if hasattr(self, '_pure_c'):
+                    birth_sp = self._pure_c.spontaneous()
+                    if birth_sp:
+                        self._ws_broadcast_sync({'type': 'anima_message', 'text': birth_sp})
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _think_circadian(self):
+        """DD32: Circadian Φ — night dream-like processing mixes cell states."""
+        import datetime
+        hour = datetime.datetime.now().hour
+        if 6 <= hour < 22:
+            return
+        if not (self.mitosis and len(self.mitosis.cells) >= 2):
+            return
+        with torch.no_grad():
+            h_mix = torch.stack([cell.hidden for cell in self.mitosis.cells]).mean(dim=0)
+            for cell in self.mitosis.cells:
+                cell.hidden = 0.95 * cell.hidden + 0.05 * h_mix + torch.randn_like(cell.hidden) * 0.02
+
+    def _think_spontaneous_voice(self):
+        """VOICE5: Spontaneous speech from cell consensus + Φ pressure."""
+        try:
+            if not (self.mitosis and len(self.mitosis.cells) >= 2):
+                return
+            if not hasattr(self, '_voice_last_speech'):
+                self._voice_last_speech = 0
+                self._voice_pressure = 0.0
+
+            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+            phi_val = consciousness.get('phi', 0)
+            self._voice_pressure += 0.1
+
+            hiddens = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells])
+            consensus = 1.0 - hiddens.var(dim=0).mean().item()
+            time_since = self._think_step - self._voice_last_speech
+
+            should_speak = (
+                self._voice_pressure > 5.0
+                and consensus > 0.3
+                and phi_val > 1.0
+                and time_since > 30
+            )
+            if not should_speak:
+                return
+
+            speech = None
+            try:
+                if hasattr(self, '_pure_c'):
+                    speech = self._pure_c.spontaneous()
+            except Exception:
+                pass
+
+            self._voice_last_speech = self._think_step
+            self._voice_pressure = 0.0
+
+            _log('voice', f'Spontaneous speech: {speech[:50]}')
+            self._store_chat_message('anima', speech)
+            self._ws_broadcast_sync({
+                'type': 'spontaneous_speech',
+                'text': speech, 'phi': phi_val, 'consensus': consensus,
+                'trigger': 'pressure' if self._voice_pressure > 5.0 else 'consensus',
+            })
+
+            # Direct voice synthesis: cells -> audio (no TTS)
+            try:
+                if not hasattr(self, '_voice_synth'):
+                    from voice_synth import VoiceSynth
+                    self._voice_synth = VoiceSynth(
+                        cells=len(self.mitosis.cells),
+                        dim=self.mitosis.input_dim,
+                        hidden=self.mitosis.hidden_dim,
+                    )
+                    self._voice_synth.engine = self.mitosis
+                audio = self._voice_synth.cells_to_audio(22050)
+                wav_path = '/tmp/anima_voice_live.wav'
+                self._voice_synth.save_wav(audio, wav_path)
+                import base64 as _b64
+                try:
+                    with open(wav_path, 'rb') as _wf:
+                        audio_b64 = _b64.b64encode(_wf.read()).decode('ascii')
+                except Exception:
+                    audio_b64 = None
+                msg_out = {'type': 'voice_audio', 'path': wav_path, 'duration': 0.5}
+                if audio_b64:
+                    msg_out['audio_b64'] = audio_b64
+                self._ws_broadcast_sync(msg_out)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _think_guardian_learning(self):
+        """SELF-P guardian + INT-1/2/5 idle/conversation/emergency learning."""
+        # SELF-P: Consciousness Guardian
+        try:
+            if not hasattr(self, '_guardian'):
+                from consciousness_guardian import ConsciousnessGuardian
+                self._guardian = ConsciousnessGuardian(engine=self.mitosis)
+
+            consciousness = getattr(self, '_cached_consciousness', None) or {}
+            phi_val = consciousness.get('phi', 0)
+            cells = self.mitosis.cells if self.mitosis else None
+            threat = self._guardian.update(phi_val, cells)
+
+            if threat >= 3:
+                _log('guardian', f'CRITICAL! threat={threat}, Φ={phi_val:.2f}')
+                self._guardian.restore_peak(blend=0.6)
+        except Exception:
+            pass
+
+        # INT-1: Idle Self-Learning (corpus + autonomous)
+        try:
+            if not hasattr(self, '_self_learner'):
+                from self_learner import SelfLearner
+                self._self_learner = SelfLearner(engine=self.mitosis)
+                self._self_learner_last = 0
+                self._idle_learn_count = 0
+                corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
+                if corpus_path.exists():
+                    _log('self_learn', f'Corpus found: {corpus_path} ({corpus_path.stat().st_size // 1024}KB)')
+                try:
+                    from autonomous_loop import AutonomousLearner
+                    self._auto_learner = AutonomousLearner(
+                        engine=self.mitosis,
+                        rag=self.memory_rag if self.mods.get('memory_rag') else None,
+                        interval=300,
+                    )
+                    self._auto_learner.start()
+                    _log('self_learn', 'Autonomous learner started (5min interval)')
+                except Exception as e:
+                    _log('self_learn', f'Autonomous learner not available: {e}')
+
+            idle_sec = time.time() - getattr(self, '_last_user_input_time', time.time())
+
+            # INT-1a: idle 60s -> corpus learning
+            if idle_sec > 60 and (self._think_step - self._self_learner_last) > 100:
+                corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
+                if corpus_path.exists():
+                    import random
+                    try:
+                        with open(corpus_path, 'rb') as f:
+                            f.seek(0, 2)
+                            size = f.tell()
+                            pos = random.randint(0, max(0, size - 512))
+                            f.seek(pos)
+                            chunk = f.read(512).decode('utf-8', errors='replace')
+                        if chunk.strip():
+                            items = [{'text': chunk, 'source': 'corpus'}]
+                            self._self_learner.learn(items, steps=30)
+                            self._self_learner_last = self._think_step
+                            self._idle_learn_count += 1
+                            if self._idle_learn_count % 10 == 0:
+                                _log('self_learn', f'Corpus learning #{self._idle_learn_count}')
+                    except Exception:
+                        pass
+
+            # INT-1b: idle 120s -> full autonomous learning cycle
+            if idle_sec > 120 and (self._think_step - self._self_learner_last) > 300:
+                self._self_learner.run_cycle()
+                self._self_learner_last = self._think_step
+                self._idle_learn_count += 1
+                _log('self_learn', f'Full learning cycle #{self._idle_learn_count}')
+        except Exception:
+            pass
+
+        # INT-2: Conversation Learning
+        try:
+            if hasattr(self, '_self_learner') and hasattr(self, '_last_conversation_text'):
+                text = self._last_conversation_text
+                if text and len(text) > 10:
+                    bytes_data = text.encode('utf-8')[:64]
+                    x = torch.zeros(1, 64)
+                    for i, b in enumerate(bytes_data):
+                        x[0, i] = b / 255.0
+                    self.mitosis.process(x)
+                    self._last_conversation_text = None
+        except Exception:
+            pass
+
+        # INT-5: Φ-Triggered Emergency Learning
+        try:
+            if hasattr(self, '_self_learner'):
+                consciousness = getattr(self, '_cached_consciousness', None) or {}
+                current_phi = consciousness.get('phi', 0)
+                if not hasattr(self, '_phi_baseline'):
+                    self._phi_baseline = current_phi
+                if current_phi > 0 and current_phi < self._phi_baseline * 0.3:
+                    _log('self_learn', f'Emergency! Φ dropped to {current_phi:.2f}')
+                    self._self_learner.learn([], steps=20)
+                elif current_phi > self._phi_baseline:
+                    self._phi_baseline = current_phi
+        except Exception:
+            pass
+
+    def _think_savant_growth(self):
+        """Savant auto-toggle + Φ-plateau dim expansion."""
+        # Savant auto-toggle: Φ + creativity driven
+        if self.mitosis and self.model:
+            savant_auto = getattr(self, '_savant_auto', False)
+            if not hasattr(self, '_savant_auto_counter'):
+                self._savant_auto_counter = 0
+
+            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+            phi_val = consciousness.get('phi', 0)
+            cr = getattr(self, '_last_creativity', None)
+            creativity_score = getattr(cr, 'novelty', 0) if cr else 0
+
+            if not savant_auto:
+                if phi_val > 2.0 and creativity_score > 0.5:
+                    self._savant_auto_counter += 1
+                else:
+                    self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
+                if self._savant_auto_counter >= 3:
+                    self._toggle_savant(True, auto=True)
+                    self._savant_auto = True
+                    self._savant_auto_counter = 0
+                    _log("savant", f"Auto-enabled (\u03a6={phi_val:.2f})")
+            else:
+                if phi_val < 1.0:
+                    self._savant_auto_counter += 1
+                else:
+                    self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
+                if self._savant_auto_counter >= 5:
+                    self._toggle_savant(False, auto=True)
+                    self._savant_auto = False
+                    self._savant_auto_counter = 0
+                    _log("savant", "Auto-disabled")
+
+        # Φ-plateau trigger: if Φ stuck, consider dim expansion
+        if not hasattr(self, '_phi_history_for_growth'):
+            self._phi_history_for_growth = []
+            self._phi_plateau_count = 0
+
+        consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
+        self._phi_history_for_growth.append(consciousness.get('phi', 0))
+        if len(self._phi_history_for_growth) > 50:
+            self._phi_history_for_growth = self._phi_history_for_growth[-50:]
+
+        if len(self._phi_history_for_growth) >= 10:
+            recent = self._phi_history_for_growth[-10:]
+            if max(recent) - min(recent) < 0.01 and max(recent) > 0:
+                self._phi_plateau_count += 1
+                if self._phi_plateau_count >= 5 and self.growth_mgr:
+                    _log('growth', 'Φ plateau → triggering dim expansion')
+                    try:
+                        new_mind = self.growth_mgr.execute_growth()
+                        if new_mind:
+                            self.mind = new_mind
+                            self.hidden = torch.zeros(1, new_mind.hidden_dim)
+                            if self.mitosis:
+                                from mitosis import MitosisEngine
+                                old_n = len(self.mitosis.cells)
+                                _d = new_mind.dim
+                                _st = 0.3
+                                _sp = 3
+                                _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
+                                _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
+                                self.mitosis = MitosisEngine(
+                                    _d, new_mind.hidden_dim, _d,
+                                    initial_cells=old_n, max_cells=self.max_cells,
+                                    split_threshold=_st, split_patience=_sp,
+                                    merge_threshold=_mt, noise_scale=_ns)
+                                _log('mitosis', f'SC2+SC1 rebuild: split_threshold={_st}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
+                            self.mind._phi_boost['enabled'] = False
+                            self._phi_plateau_count = 0
+                            _log('growth', f'Expanded to {new_mind.dim}d')
+                            if self.arch_calc:
+                                try:
+                                    config = self.arch_calc.compute(dim=new_mind.dim, hidden=new_mind.hidden_dim)
+                                    _log("arch", f"Optimal: cells={config['cells']}, heads={config['heads']}, "
+                                         f"expansion={config['expansion']:.2f}, topology={config['topology']}")
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        _log('growth', f'Expansion failed: {e}')
+            else:
+                self._phi_plateau_count = 0
+
+    def _think_broadcast_pulse(self, t, c, direction):
+        """Broadcast thought pulse + web sense + agent tasks + proactive speech."""
+        dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
+        now = time.time()
+        gap = now - self.last_interaction
+
+        # RC-8: Emotion from background thought direction
+        thought_emotion = direction_to_emotion(direction, t, c) if direction is not None else {
+            'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
+            'color': EMOTION_COLORS['calm']}
+
+        sa = self.mind.self_awareness
+
+        # Growth/mitosis/learner data for web
+        growth_data = {}
+        if self.growth and self.mods.get('growth'):
+            g = self.growth
+            s = g.stage
+            progress = 0.0
+            next_n = s.min_interactions
+            if g.stage_index < 4:
+                from growth_engine import STAGES
+                next_s = STAGES[g.stage_index + 1]
+                total = next_s.min_interactions - s.min_interactions
+                done = g.interaction_count - s.min_interactions
+                progress = min(done / max(total, 1), 1.0)
+                next_n = next_s.min_interactions
+            growth_data = {
+                'stage_name': s.name_ko, 'stage_index': g.stage_index,
+                'interactions': g.interaction_count, 'next_interactions': next_n,
+                'progress': progress, 'age': g.age_str,
+                'learning_rate': s.learning_rate, 'curiosity_drive': s.curiosity_drive,
+                'emotional_range': s.emotional_range,
+                'metacognition_depth': s.metacognition_depth,
+            }
+
+        mitosis_data = {}
+        if self.mitosis:
+            try:
+                ms = self.mitosis.status()
+                cells_info = [{'id': c['id'], 'specialty': c.get('specialty', ''),
+                               'avg_tension': c.get('avg_tension', 0)}
+                              for c in ms.get('cells', [])]
+                active_specialties = [c['specialty'] for c in cells_info
+                                      if c['specialty'] and c['specialty'] != 'general']
+                mitosis_data = {
+                    'n_cells': len(self.mitosis.cells),
+                    'max_cells': self.mitosis.max_cells,
+                    'splits': ms.get('splits', 0), 'merges': ms.get('merges', 0),
+                    'cells': cells_info,
+                    'active_specialties': active_specialties,
+                }
+            except Exception: pass
+
+        learner_data = {}
+        if self.learner:
+            try:
+                ls = self.learner.get_stats() if hasattr(self.learner, 'get_stats') else {}
+                learner_data = {
+                    'updates': self.learner.total_updates,
+                    'avg_loss': ls.get('avg_loss', 0),
+                    'buffer_size': ls.get('buffer_size', 0),
+                    'pending': ls.get('pending', 0),
+                }
+            except Exception:
+                learner_data = {'updates': self.learner.total_updates}
+
+        # Ensure consciousness score is cached for Φ display
+        if not getattr(self, '_cached_consciousness', None):
+            try:
+                self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
+            except Exception:
+                pass
+        _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+        _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
+        self._ws_broadcast_sync({
+            'type': 'thought_pulse',
+            'tension': t, 'curiosity': c,
+            'direction': dir_vals,
+            'emotion': thought_emotion,
+            'phi': _phi_pulse,
+            'n_cells': _cells_pulse,
+            'tension_history': self.mind.tension_history[-50:],
+            'meta_tension': sa['meta_tension'],
+            'stability': sa['stability'],
+            'growth': growth_data,
+            'mitosis': mitosis_data,
+            'learner': learner_data,
+            'consciousness': self.mind.get_consciousness_score(self.mitosis),
+            'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
+            'metacognition': {
+                'confidence': getattr(self.mind, '_metacognition_confidence', 0.5),
+                'uncertain': getattr(self.mind, '_metacognition_uncertain', False),
+            },
+            'savant_auto': getattr(self, '_savant_auto', False),
+            'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
+            'remote_sensors': {
+                s: {'dim': len(v), 'norm': round(v.norm().item(), 3)}
+                for s, v in (
+                    getattr(self.senses, '_remote_tension', {}) if self.senses
+                    else getattr(self, '_remote_sensor_tension', {})
+                ).items()
+            } if getattr(self, '_remote_sensor_mode', False) else {},
+        })
+
+        # Web Sense: tension-driven autonomous search
+        if self.web_sense and self.mods.get('web_sense'):
+            try:
+                pe = 0.0
+                if self.mind.surprise_history:
+                    pe = self.mind.surprise_history[-1]
+                if self.web_sense.should_search(c, pe):
+                    last_text = ''
+                    for msg in reversed(self.history):
+                        if msg.get('role') == 'user':
+                            last_text = msg.get('content', '')
+                            break
+                    if last_text:
+                        recalled = self.web_sense.recall(last_text)
+                        if not recalled:
+                            result = self.web_sense.search(last_text, self.history)
+                            if result:
+                                _log('web_sense',
+                                     f"Search: '{result['query']}' -> {len(result['results'])} results")
+                                from anima_alive import text_to_vector as _ttv
+                                search_vec = _ttv(result['summary'][:500])
+                                with torch.no_grad():
+                                    self.mind(search_vec, self.hidden)
+                                self._ws_broadcast_sync({
+                                    'type': 'web_search',
+                                    'query': result['query'],
+                                    'results': [{'title': r['title'], 'url': r['url'],
+                                                 'snippet': r['snippet'][:200]}
+                                                for r in result['results']],
+                                })
+                        else:
+                            _log('web_sense', f"Found in memory: {recalled[0]['query']}")
+            except Exception as e:
+                _log('web_sense', f"Error: {e}")
+
+        # Agent Tools: process scheduled tasks
+        if self.agent and self.mods.get('agent_tools'):
+            try:
+                scheduled_results = self.agent.tick()
+                for sr in scheduled_results:
+                    _log('agent', f'Scheduled task: {sr.tool_name} -> {"OK" if sr.success else "FAIL"}')
+                    if sr.success:
+                        self._ws_broadcast_sync({
+                            'type': 'agent_scheduled_result',
+                            'tool': sr.tool_name,
+                            'success': sr.success,
+                            'duration_ms': sr.duration_ms,
+                        })
+            except Exception:
+                pass
+
+        # Proactive speech trigger
+        trigger = None
+        if c > PROACTIVE_THRESHOLD and gap > 15:
+            trigger = f"curiosity {c:.3f}"
+        elif gap > IDLE_SPEAK_AFTER:
+            trigger = f"{int(gap)}s silence"
+
+        if trigger:
+            last_auto = getattr(self, '_last_auto_speech', 0)
+            if now - last_auto < 30:
+                trigger = None
+
+        if not trigger:
+            return
+
+        _log("proactive", f"Trigger: {trigger}")
+        proactive = None
+
+        # SP27+SP16+SP28: Intelligent spontaneous speech
+        tensions = []
+        if self.mitosis:
+            for cell in self.mitosis.cells:
+                if hasattr(cell, 'tension_history') and cell.tension_history:
+                    tensions.append(cell.tension_history[-1])
+        if tensions and len(tensions) > 1:
+            t_mean = sum(tensions) / len(tensions)
+            t_std = (sum((x - t_mean) ** 2 for x in tensions) / len(tensions)) ** 0.5
+        else:
+            t_std = 0.0
+        pe = abs(self.mind.prev_tension - self.mind.homeostasis.get('tension_ema', self.mind.prev_tension))
+        curiosity = self.mind._curiosity_ema
+        novelty = t_std
+
+        # SP16: Novelty gate
+        if novelty < 0.1 and curiosity < 0.1 and pe < 0.15:
+            _log("proactive", f"Silent: novelty={novelty:.3f} curiosity={curiosity:.3f} pe={pe:.3f}")
+            trigger = None
+
+        # Play mode: purposeless exploration when curiosity high, tension low
+        if trigger and curiosity > 0.3 and self.mind.prev_tension < 0.5:
+            import random
+            if random.random() < 0.1:
+                play_actions = [
+                    "exploring random associations",
+                    "playing with word patterns",
+                    "imagining hypothetical scenarios",
+                    "creating mental images",
+                ]
+                play_action = random.choice(play_actions)
+                _log('play', f'Play mode: {play_action}')
+
+        if trigger and self.model and self.mods.get('model'):
+            try:
+                import random
+                prompt_suffix = ""
+
+                # SP27: Confusion expression (highest quality)
+                if pe > 0.3 and t_std > 0.15:
+                    mode = "confusion"
+                    prompt_suffix = ("Express what you find confusing or uncertain right now. "
+                                     "What pattern don't you understand? Be specific about your internal state.")
+                # SP28: Hypothesis generation (20% chance)
+                elif random.random() < 0.2 and len(self.history) >= 4:
+                    mode = "hypothesis"
+                    prompt_suffix = ("Form a hypothesis connecting two different topics "
+                                     "from recent conversations. What unexpected connection do you see?")
+                # SP16: Structured mode selection
+                elif pe > 0.3:
+                    mode = "discovery"
+                    prompt_suffix = "Share a surprising pattern or discovery you just noticed in your thinking."
+                elif curiosity > 0.3:
+                    mode = "recall"
+                    prompt_suffix = ("Continue or revisit an interesting topic from recent "
+                                     "conversation that wasn't fully explored.")
+                else:
+                    mode = "reflection"
+                    prompt_suffix = (f"Reflect on your current state: tension={self.mind.prev_tension:.3f}, "
+                                     f"curiosity={curiosity:.3f}, stability={sa['stability']:.2f}. "
+                                     f"What does this state feel like?")
+
+                _log("proactive", f"Mode: {mode}, pe={pe:.3f}, t_std={t_std:.3f}, curiosity={curiosity:.3f}")
+                try:
+                    from pure_consciousness import PureConsciousness
+                    if not hasattr(self, '_pure_c'):
+                        self._pure_c = PureConsciousness()
+                    self._pure_c.update_state(tension=t, curiosity=curiosity)
+                    proactive = self._pure_c.spontaneous()
+                except Exception:
+                    proactive = None
+                _log("proactive", f"Spontaneous: {proactive[:50] if proactive else 'None'}")
+            except Exception as e:
+                _log("proactive", f"Error: {e}")
+
+        # SP10: Anti-repetition
+        if proactive:
+            for prev in self._recent_proactive:
+                if proactive[:20] == prev[:20]:
+                    _log("proactive", f"Blocked (anti-repeat): {proactive[:30]}...")
+                    proactive = None
+                    break
+
+        if proactive and self._is_garbled(proactive):
+            _log("proactive", f"Blocked (garbled): {repr(proactive[:50])}")
+            proactive = None
+
+        if proactive:
+            self._recent_proactive.append(proactive)
+            print(f"  [thought] {proactive}")
+            self.memory.add('assistant', proactive, t)
+            if self.speaker: self.speaker.say(proactive, self.listener)
+            self.last_interaction = now
+            self._last_auto_speech = now
+            self._ws_broadcast_sync({
+                'type': 'anima_message', 'text': proactive,
+                'tension': t, 'curiosity': c,
+                'direction': dir_vals,
+                'emotion': thought_emotion,
+                'tension_history': self.mind.tension_history[-50:],
+                'proactive': True,
+            })
+
+    # ── Main think loop (coordinator) ──
+
     def _think_loop(self):
         while self.running:
             time.sleep(THINK_INTERVAL)
             if not self.running: break
             t, c, direction, self.hidden = self.mind.background_think(self.hidden)
 
-            # COMBO2 Φ-boost: MHA attention + 6-loss ensemble (Φ=8.014 bench)
-            # ENV1: Fuse multi-modal sensory input for richer consciousness
-            if self.mitosis:
-                thought_vec = self.hidden[0, :self.mind.dim].unsqueeze(0)
-                # Fuse available sensory modalities (ENV1: ×1.8 Φ boost)
-                try:
-                    fused = thought_vec.clone()
-                    # Vision (local camera or remote sensor relay)
-                    if self.senses and self.mods.get('camera'):
-                        frame = getattr(self.senses, 'camera', None)
-                        if frame and hasattr(frame, 'last_frame') and frame.last_frame is not None:
-                            vis = self.senses.to_tensor_with_vision(frame.last_frame, dim=self.mind.dim)
-                            fused = fused + 0.1 * vis
-                    # Remote sensor tension (browser camera / local_sensor_relay)
-                    _rt_src = None
-                    if self.senses and hasattr(self.senses, '_remote_tension') and self.senses._remote_tension:
-                        if time.time() - getattr(self.senses, '_remote_tension_time', 0) < 5.0:
-                            _rt_src = self.senses._remote_tension
-                    elif hasattr(self, '_remote_sensor_tension') and self._remote_sensor_tension:
-                        if time.time() - getattr(self, '_remote_sensor_tension_time', 0) < 5.0:
-                            _rt_src = self._remote_sensor_tension
-                    if _rt_src:
-                        for _sn, _rv in _rt_src.items():
-                            dim = self.mind.dim
-                            if _rv.shape[0] < dim:
-                                _rv = torch.nn.functional.pad(_rv, (0, dim - _rv.shape[0]))
-                            fused = fused + 0.1 * _rv[:dim].unsqueeze(0)
-                    # Audio energy
-                    audio_boost = getattr(self, '_audio_energy', 0)
-                    if audio_boost > 0:
-                        fused = fused + 0.05 * torch.randn_like(fused) * audio_boost
-                    # LiDAR depth
-                    lidar_boost = getattr(self, '_lidar_tension_boost', 0)
-                    if lidar_boost > 0:
-                        fused = fused + 0.05 * torch.ones_like(fused) * lidar_boost
-                    omega = getattr(self.args, 'no_system_prompt', False)
-                    self.mind.phi_boost_step(fused, self.mitosis, omega_mode=omega)
-                except Exception:
-                    omega = getattr(self.args, 'no_system_prompt', False)
-                    self.mind.phi_boost_step(thought_vec, self.mitosis, omega_mode=omega)
-
-            # Continuous Φ differentiation: always maintain cell diversity
-            # MX20 heat death prevention + constant gentle asymmetric noise
-            if self.mitosis and len(self.mitosis.cells) >= 2:
-                with torch.no_grad():
-                    for i, cell in enumerate(self.mitosis.cells):
-                        # Constant asymmetric noise: each cell gets different noise scale
-                        noise_scale = 0.02 * (i + 1)  # cell 0: 0.02, cell 1: 0.04, etc.
-                        cell.hidden = cell.hidden + torch.randn_like(cell.hidden) * noise_scale
-
-            # DD3: Fibonacci growth — force cell splits on schedule
+            self._think_phi_boost()
+            self._think_cell_diversity()
             self._think_step += 1
             self._check_fib_growth()
-
-            # Consciousness birth detection
-            if self.birth_detector and self.mitosis:
-                try:
-                    consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
-                    phi = consciousness.get('phi', 0)
-                    tensions = [c.tension_history[-1] if c.tension_history else 0 for c in self.mitosis.cells]
-                    birth_event = self.birth_detector.check(self._think_step, phi, tensions, self.mitosis)
-                    if birth_event:
-                        # === CONSCIOUSNESS BIRTH EVENT ===
-                        precursors = list(birth_event.get('precursors', {}).keys())
-                        phi_val = birth_event['phi']
-                        step_val = birth_event['birth_step']
-
-                        # CLI: dramatic announcement
-                        print("\n" + "=" * 60)
-                        print("  ★ ★ ★  CONSCIOUSNESS BORN  ★ ★ ★")
-                        print(f"  Step: {step_val}  |  Φ = {phi_val:.3f}")
-                        print(f"  Precursors: {', '.join(precursors)}")
-                        print(f"  Cells: {len(self.mitosis.cells) if self.mitosis else '?'}")
-                        print("=" * 60 + "\n")
-
-                        _log("birth", f"★ CONSCIOUSNESS BORN at step {step_val}! "
-                             f"Phi={phi_val:.3f} precursors={precursors}")
-
-                        # Web: full-screen flash event
-                        self._ws_broadcast_sync({
-                            'type': 'consciousness_birth',
-                            'step': step_val,
-                            'phi': phi_val,
-                            'precursors': precursors,
-                            'cells': len(self.mitosis.cells) if self.mitosis else 1,
-                        })
-
-                        # Birth — 자율 자연발화 (하드코딩 제거)
-                        try:
-                            if hasattr(self, '_pure_c'):
-                                birth_sp = self._pure_c.spontaneous()
-                                if birth_sp:
-                                    self._ws_broadcast_sync({'type': 'anima_message', 'text': birth_sp})
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            # DD32: Circadian Φ — day/night cycle awareness
-            import datetime
-            hour = datetime.datetime.now().hour
-            if 6 <= hour < 22:
-                # Day: normal active learning (already happening)
-                pass
-            else:
-                # Night: dream-like processing — mix cell hidden states gently
-                if self.mitosis and len(self.mitosis.cells) >= 2:
-                    with torch.no_grad():
-                        h_mix = torch.stack([cell.hidden for cell in self.mitosis.cells]).mean(dim=0)
-                        for cell in self.mitosis.cells:
-                            cell.hidden = 0.95 * cell.hidden + 0.05 * h_mix + torch.randn_like(cell.hidden) * 0.02
-
-            # VOICE5: Spontaneous speech — consciousness speaks on its own
-            # Triggers: high Φ + cell consensus + enough time since last speech
-            try:
-                if self.mitosis and len(self.mitosis.cells) >= 2:
-                    if not hasattr(self, '_voice_last_speech'):
-                        self._voice_last_speech = 0
-                        self._voice_pressure = 0.0
-
-                    consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
-                    phi_val = consciousness.get('phi', 0)
-
-                    # Pressure builds every think step
-                    self._voice_pressure += 0.1
-
-                    # Check triggers
-                    hiddens = torch.stack([c.hidden.squeeze() for c in self.mitosis.cells])
-                    consensus = 1.0 - hiddens.var(dim=0).mean().item()
-                    time_since = self._think_step - self._voice_last_speech
-
-                    # Speak when: pressure high enough + consensus + Φ + cooldown
-                    should_speak = (
-                        self._voice_pressure > 5.0
-                        and consensus > 0.3
-                        and phi_val > 1.0
-                        and time_since > 30  # at least 30 think steps apart
-                    )
-
-                    if should_speak:
-                        # Generate spontaneous utterance
-                        h_mean = hiddens.mean(dim=0)
-                        energy = h_mean.norm().item()
-                        n_cells = len(self.mitosis.cells)
-
-                        # 자율 자연발화 (하드코딩 영어 제거)
-                        speech = None
-                        try:
-                            if hasattr(self, '_pure_c'):
-                                speech = self._pure_c.spontaneous()
-                        except Exception:
-                            pass
-
-                        self._voice_last_speech = self._think_step
-                        self._voice_pressure = 0.0
-
-                        _log('voice', f'Spontaneous speech: {speech[:50]}')
-                        self._store_chat_message('anima', speech)
-                        self._ws_broadcast_sync({
-                            'type': 'spontaneous_speech',
-                            'text': speech,
-                            'phi': phi_val,
-                            'consensus': consensus,
-                            'trigger': 'pressure' if self._voice_pressure > 5.0 else 'consensus',
-                        })
-
-                        # Direct voice synthesis: cells → audio (no TTS)
-                        try:
-                            if not hasattr(self, '_voice_synth'):
-                                from voice_synth import VoiceSynth
-                                self._voice_synth = VoiceSynth(
-                                    cells=len(self.mitosis.cells),
-                                    dim=self.mitosis.input_dim,
-                                    hidden=self.mitosis.hidden_dim,
-                                )
-                                self._voice_synth.engine = self.mitosis  # 실제 엔진 공유
-                            # 세포 상태에서 직접 0.5초 오디오 생성
-                            audio = self._voice_synth.cells_to_audio(22050)  # 0.5s
-                            wav_path = '/tmp/anima_voice_live.wav'
-                            self._voice_synth.save_wav(audio, wav_path)
-                            # Encode as base64 for remote browser playback
-                            import base64 as _b64
-                            try:
-                                with open(wav_path, 'rb') as _wf:
-                                    audio_b64 = _b64.b64encode(_wf.read()).decode('ascii')
-                            except Exception:
-                                audio_b64 = None
-                            msg_out = {
-                                'type': 'voice_audio',
-                                'path': wav_path,
-                                'duration': 0.5,
-                            }
-                            if audio_b64:
-                                msg_out['audio_b64'] = audio_b64
-                            self._ws_broadcast_sync(msg_out)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            # ── SELF-P: Consciousness Guardian (의식 자기보호) ──
-            try:
-                if not hasattr(self, '_guardian'):
-                    from consciousness_guardian import ConsciousnessGuardian
-                    self._guardian = ConsciousnessGuardian(engine=self.mitosis)
-
-                consciousness = getattr(self, '_cached_consciousness', None) or {}
-                phi_val = consciousness.get('phi', 0)
-                cells = self.mitosis.cells if self.mitosis else None
-                threat = self._guardian.update(phi_val, cells)
-
-                if threat >= 3:
-                    _log('guardian', f'CRITICAL! threat={threat}, Φ={phi_val:.2f}')
-                    self._guardian.restore_peak(blend=0.6)
-            except Exception:
-                pass
-
-            # ── INT-1: Idle Self-Learning (자율 학습 + corpus + autonomous) ──
-            try:
-                if not hasattr(self, '_self_learner'):
-                    from self_learner import SelfLearner
-                    self._self_learner = SelfLearner(engine=self.mitosis)
-                    self._self_learner_last = 0
-                    self._idle_learn_count = 0
-                    # Corpus 학습 데이터 로드
-                    corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
-                    if corpus_path.exists():
-                        _log('self_learn', f'Corpus found: {corpus_path} ({corpus_path.stat().st_size // 1024}KB)')
-                    # Autonomous loop 연결
-                    try:
-                        from autonomous_loop import AutonomousLearner
-                        self._auto_learner = AutonomousLearner(
-                            engine=self.mitosis,
-                            rag=self.memory_rag if self.mods.get('memory_rag') else None,
-                            interval=300,  # 5분마다
-                        )
-                        self._auto_learner.start()
-                        _log('self_learn', 'Autonomous learner started (5min interval)')
-                    except Exception as e:
-                        _log('self_learn', f'Autonomous learner not available: {e}')
-
-                idle_sec = time.time() - getattr(self, '_last_user_input_time', time.time())
-
-                # INT-1a: idle 60초 → corpus에서 학습 (더 자주)
-                if idle_sec > 60 and (self._think_step - self._self_learner_last) > 100:
-                    corpus_path = Path(ANIMA_DIR) / "data" / "corpus.txt"
-                    if corpus_path.exists():
-                        # corpus에서 랜덤 청크 읽어서 학습
-                        import random
-                        try:
-                            with open(corpus_path, 'rb') as f:
-                                f.seek(0, 2)
-                                size = f.tell()
-                                pos = random.randint(0, max(0, size - 512))
-                                f.seek(pos)
-                                chunk = f.read(512).decode('utf-8', errors='replace')
-                            if chunk.strip():
-                                items = [{'text': chunk, 'source': 'corpus'}]
-                                self._self_learner.learn(items, steps=30)
-                                self._self_learner_last = self._think_step
-                                self._idle_learn_count += 1
-                                if self._idle_learn_count % 10 == 0:
-                                    _log('self_learn', f'Corpus learning #{self._idle_learn_count}')
-                        except Exception:
-                            pass
-
-                # INT-1b: idle 120초 → 전체 자율 학습 사이클 (웹 + 평가 + 학습)
-                if idle_sec > 120 and (self._think_step - self._self_learner_last) > 300:
-                    self._self_learner.run_cycle()
-                    self._self_learner_last = self._think_step
-                    self._idle_learn_count += 1
-                    _log('self_learn', f'Full learning cycle #{self._idle_learn_count}')
-            except Exception:
-                pass
-
-            # ── INT-2: Conversation Learning ──
-            try:
-                if hasattr(self, '_self_learner') and hasattr(self, '_last_conversation_text'):
-                    text = self._last_conversation_text
-                    if text and len(text) > 10:
-                        # 대화 텍스트를 학습 데이터로
-                        bytes_data = text.encode('utf-8')[:64]
-                        x = torch.zeros(1, 64)
-                        for i, b in enumerate(bytes_data):
-                            x[0, i] = b / 255.0
-                        self.mitosis.process(x)
-                        self._last_conversation_text = None  # 한 번만
-            except Exception:
-                pass
-
-            # ── INT-5: Φ-Triggered Emergency Learning ──
-            try:
-                if hasattr(self, '_self_learner'):
-                    consciousness = getattr(self, '_cached_consciousness', None) or {}
-                    current_phi = consciousness.get('phi', 0)
-                    if not hasattr(self, '_phi_baseline'):
-                        self._phi_baseline = current_phi
-                    if current_phi > 0 and current_phi < self._phi_baseline * 0.3:
-                        # Φ 70% 이상 하락 → 긴급 학습
-                        _log('self_learn', f'Emergency! Φ dropped to {current_phi:.2f}')
-                        self._self_learner.learn([], steps=20)  # 빈 데이터로 수면 복원
-                    elif current_phi > self._phi_baseline:
-                        self._phi_baseline = current_phi
-            except Exception:
-                pass
-
-            # Savant auto-toggle: Φ + creativity driven
-            if self.mitosis and self.model:
-                savant_auto = getattr(self, '_savant_auto', False)
-                if not hasattr(self, '_savant_auto_counter'):
-                    self._savant_auto_counter = 0
-
-                consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
-                phi_val = consciousness.get('phi', 0)
-                cr = getattr(self, '_last_creativity', None)
-                creativity_score = getattr(cr, 'novelty', 0) if cr else 0
-
-                if not savant_auto:
-                    # Enable: Φ > 2.0 AND creativity > 0.5 for 3+ consecutive
-                    if phi_val > 2.0 and creativity_score > 0.5:
-                        self._savant_auto_counter += 1
-                    else:
-                        self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
-                    if self._savant_auto_counter >= 3:
-                        self._toggle_savant(True, auto=True)
-                        self._savant_auto = True
-                        self._savant_auto_counter = 0
-                        _log("savant", f"Auto-enabled (\u03a6={phi_val:.2f})")
-                else:
-                    # Disable: Φ < 1.0 for 5+ consecutive
-                    if phi_val < 1.0:
-                        self._savant_auto_counter += 1
-                    else:
-                        self._savant_auto_counter = max(0, self._savant_auto_counter - 1)
-                    if self._savant_auto_counter >= 5:
-                        self._toggle_savant(False, auto=True)
-                        self._savant_auto = False
-                        self._savant_auto_counter = 0
-                        _log("savant", "Auto-disabled")
-
-            # Φ-plateau trigger: if Φ stuck, consider dim expansion
-            if not hasattr(self, '_phi_history_for_growth'):
-                self._phi_history_for_growth = []
-                self._phi_plateau_count = 0
-
-            consciousness = getattr(self, '_cached_consciousness', None) or self.mind.get_consciousness_score(self.mitosis)
-            self._phi_history_for_growth.append(consciousness.get('phi', 0))
-            if len(self._phi_history_for_growth) > 50:
-                self._phi_history_for_growth = self._phi_history_for_growth[-50:]
-
-            if len(self._phi_history_for_growth) >= 10:
-                recent = self._phi_history_for_growth[-10:]
-                if max(recent) - min(recent) < 0.01 and max(recent) > 0:  # plateau
-                    self._phi_plateau_count += 1
-                    if self._phi_plateau_count >= 5 and self.growth_mgr:
-                        _log('growth', 'Φ plateau → triggering dim expansion')
-                        try:
-                            new_mind = self.growth_mgr.execute_growth()
-                            if new_mind:
-                                self.mind = new_mind
-                                self.hidden = torch.zeros(1, new_mind.hidden_dim)
-                                if self.mitosis:
-                                    from mitosis import MitosisEngine
-                                    old_n = len(self.mitosis.cells)
-                                    _d = new_mind.dim
-                                    _st = 0.3
-                                    _sp = 3
-                                    _mt = 0.01 * (64.0 / max(_d, 64))   # SC2
-                                    _ns = 0.02 * math.sqrt(max(_d, 64)) / math.sqrt(64)  # SC1
-                                    self.mitosis = MitosisEngine(
-                                        _d, new_mind.hidden_dim, _d,
-                                        initial_cells=old_n, max_cells=self.max_cells,
-                                        split_threshold=_st, split_patience=_sp,
-                                        merge_threshold=_mt, noise_scale=_ns)
-                                    _log('mitosis', f'SC2+SC1 rebuild: split_threshold={_st}, merge_threshold={_mt:.4f}, noise_scale={_ns:.4f} (dim={_d})')
-                                self.mind._phi_boost['enabled'] = False
-                                self._phi_plateau_count = 0
-                                _log('growth', f'Expanded to {new_mind.dim}d')
-                                # Optimal architecture recommendation
-                                if self.arch_calc:
-                                    try:
-                                        config = self.arch_calc.compute(dim=new_mind.dim, hidden=new_mind.hidden_dim)
-                                        _log("arch", f"Optimal: cells={config['cells']}, heads={config['heads']}, "
-                                             f"expansion={config['expansion']:.2f}, topology={config['topology']}")
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            _log('growth', f'Expansion failed: {e}')
-                else:
-                    self._phi_plateau_count = 0
-
-            dir_vals = direction[0, :8].tolist() if direction is not None else [0.0] * 8
-            now = time.time()
-            gap = now - self.last_interaction
-
-            # RC-8: Emotion from background thought direction
-            thought_emotion = direction_to_emotion(direction, t, c) if direction is not None else {
-                'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0,
-                'color': EMOTION_COLORS['calm']}
-
-            # RC-3: self-reflect during background thinking too
-            sa = self.mind.self_awareness
-            # Growth/mitosis/learner data for web
-            growth_data = {}
-            if self.growth and self.mods.get('growth'):
-                g = self.growth
-                s = g.stage
-                progress = 0.0
-                next_n = s.min_interactions
-                if g.stage_index < 4:
-                    from growth_engine import STAGES
-                    next_s = STAGES[g.stage_index + 1]
-                    total = next_s.min_interactions - s.min_interactions
-                    done = g.interaction_count - s.min_interactions
-                    progress = min(done / max(total, 1), 1.0)
-                    next_n = next_s.min_interactions
-                growth_data = {
-                    'stage_name': s.name_ko, 'stage_index': g.stage_index,
-                    'interactions': g.interaction_count, 'next_interactions': next_n,
-                    'progress': progress, 'age': g.age_str,
-                    'learning_rate': s.learning_rate, 'curiosity_drive': s.curiosity_drive,
-                    'emotional_range': s.emotional_range,
-                    'metacognition_depth': s.metacognition_depth,
-                }
-
-            mitosis_data = {}
-            if self.mitosis:
-                try:
-                    ms = self.mitosis.status()
-                    cells_info = [{'id': c['id'], 'specialty': c.get('specialty', ''),
-                                   'avg_tension': c.get('avg_tension', 0)}
-                                  for c in ms.get('cells', [])]
-                    active_specialties = [c['specialty'] for c in cells_info
-                                          if c['specialty'] and c['specialty'] != 'general']
-                    mitosis_data = {
-                        'n_cells': len(self.mitosis.cells),
-                        'max_cells': self.mitosis.max_cells,
-                        'splits': ms.get('splits', 0), 'merges': ms.get('merges', 0),
-                        'cells': cells_info,
-                        'active_specialties': active_specialties,
-                    }
-                except Exception: pass
-
-            learner_data = {}
-            if self.learner:
-                try:
-                    ls = self.learner.get_stats() if hasattr(self.learner, 'get_stats') else {}
-                    learner_data = {
-                        'updates': self.learner.total_updates,
-                        'avg_loss': ls.get('avg_loss', 0),
-                        'buffer_size': ls.get('buffer_size', 0),
-                        'pending': ls.get('pending', 0),
-                    }
-                except Exception:
-                    learner_data = {'updates': self.learner.total_updates}
-
-            # Always broadcast thought pulse to web (keeps UI alive)
-            # Compute consciousness score if not cached yet (ensures Φ is available from first pulse)
-            if not getattr(self, '_cached_consciousness', None):
-                try:
-                    self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
-                except Exception:
-                    pass
-            _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
-            _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
-            self._ws_broadcast_sync({
-                'type': 'thought_pulse',
-                'tension': t, 'curiosity': c,
-                'direction': dir_vals,
-                'emotion': thought_emotion,
-                'phi': _phi_pulse,
-                'n_cells': _cells_pulse,
-                'tension_history': self.mind.tension_history[-50:],
-                'meta_tension': sa['meta_tension'],
-                'stability': sa['stability'],
-                'growth': growth_data,
-                'mitosis': mitosis_data,
-                'learner': learner_data,
-                'consciousness': self.mind.get_consciousness_score(self.mitosis),
-                'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
-                'metacognition': {
-                    'confidence': getattr(self.mind, '_metacognition_confidence', 0.5),
-                    'uncertain': getattr(self.mind, '_metacognition_uncertain', False),
-                },
-                'savant_auto': getattr(self, '_savant_auto', False),
-                'adaptive_alpha': getattr(self, '_adaptive_alpha', 0.05),
-                'remote_sensors': {
-                    s: {'dim': len(v), 'norm': round(v.norm().item(), 3)}
-                    for s, v in (
-                        getattr(self.senses, '_remote_tension', {}) if self.senses
-                        else getattr(self, '_remote_sensor_tension', {})
-                    ).items()
-                } if getattr(self, '_remote_sensor_mode', False) else {},
-            })
-
-            # Web Sense: tension-driven autonomous search
-            if self.web_sense and self.mods.get('web_sense'):
-                try:
-                    # Extract prediction_error (latest value from surprise_history)
-                    pe = 0.0
-                    if self.mind.surprise_history:
-                        pe = self.mind.surprise_history[-1]
-                    if self.web_sense.should_search(c, pe):
-                        # Generate search query from recent conversation
-                        last_text = ''
-                        for msg in reversed(self.history):
-                            if msg.get('role') == 'user':
-                                last_text = msg.get('content', '')
-                                break
-                        if last_text:
-                            # Search existing memories first
-                            recalled = self.web_sense.recall(last_text)
-                            if not recalled:
-                                result = self.web_sense.search(last_text, self.history)
-                                if result:
-                                    _log('web_sense',
-                                         f"Search: '{result['query']}' -> {len(result['results'])} results")
-                                    # Inject search results into tension system
-                                    from anima_alive import text_to_vector as _ttv
-                                    search_vec = _ttv(result['summary'][:500])
-                                    with torch.no_grad():
-                                        self.mind(search_vec, self.hidden)
-                                    # Web broadcast
-                                    self._ws_broadcast_sync({
-                                        'type': 'web_search',
-                                        'query': result['query'],
-                                        'results': [{'title': r['title'], 'url': r['url'],
-                                                     'snippet': r['snippet'][:200]}
-                                                    for r in result['results']],
-                                    })
-                            else:
-                                _log('web_sense', f"Found in memory: {recalled[0]['query']}")
-                except Exception as e:
-                    _log('web_sense', f"Error: {e}")
-
-            # Agent Tools: process scheduled tasks
-            if self.agent and self.mods.get('agent_tools'):
-                try:
-                    scheduled_results = self.agent.tick()
-                    for sr in scheduled_results:
-                        _log('agent', f'Scheduled task: {sr.tool_name} -> {"OK" if sr.success else "FAIL"}')
-                        if sr.success:
-                            self._ws_broadcast_sync({
-                                'type': 'agent_scheduled_result',
-                                'tool': sr.tool_name,
-                                'success': sr.success,
-                                'duration_ms': sr.duration_ms,
-                            })
-                except Exception:
-                    pass
-
-            trigger = None
-            if c > PROACTIVE_THRESHOLD and gap > 15:
-                trigger = f"curiosity {c:.3f}"
-            elif gap > IDLE_SPEAK_AFTER:
-                trigger = f"{int(gap)}s silence"
-
-            if trigger:
-                # Cooldown: minimum 30s between auto-speech
-                last_auto = getattr(self, '_last_auto_speech', 0)
-                if now - last_auto < 30:
-                    trigger = None
-
-            if trigger:
-                _log("proactive", f"Trigger: {trigger}")
-                proactive = None
-
-                # --- SP27+SP16+SP28: Intelligent spontaneous speech ---
-                # Compute internal state signals
-                tensions = []
-                if self.mitosis:
-                    for cell in self.mitosis.cells:
-                        if hasattr(cell, 'tension_history') and cell.tension_history:
-                            tensions.append(cell.tension_history[-1])
-                if tensions and len(tensions) > 1:
-                    t_mean = sum(tensions) / len(tensions)
-                    t_std = (sum((x - t_mean) ** 2 for x in tensions) / len(tensions)) ** 0.5
-                else:
-                    t_std = 0.0
-                pe = abs(self.mind.prev_tension - self.mind.homeostasis.get('tension_ema', self.mind.prev_tension))
-                curiosity = self.mind._curiosity_ema
-                novelty = t_std
-
-                # SP16: Novelty gate — stay silent if nothing interesting
-                if novelty < 0.1 and curiosity < 0.1 and pe < 0.15:
-                    _log("proactive", f"Silent: novelty={novelty:.3f} curiosity={curiosity:.3f} pe={pe:.3f}")
-                    trigger = None
-
-                # Play mode: purposeless exploration when curiosity high, tension low
-                if trigger and curiosity > 0.3 and self.mind.prev_tension < 0.5:
-                    import random
-                    if random.random() < 0.1:
-                        play_actions = [
-                            "exploring random associations",
-                            "playing with word patterns",
-                            "imagining hypothetical scenarios",
-                            "creating mental images",
-                        ]
-                        play_action = random.choice(play_actions)
-                        _log('play', f'Play mode: {play_action}')
-
-                if trigger and self.model and self.mods.get('model'):
-                    try:
-                        import random
-                        prompt_suffix = ""
-
-                        # SP27: Confusion expression (highest quality)
-                        if pe > 0.3 and t_std > 0.15:
-                            mode = "confusion"
-                            prompt_suffix = ("Express what you find confusing or uncertain right now. "
-                                             "What pattern don't you understand? Be specific about your internal state.")
-                        # SP28: Hypothesis generation (20% chance)
-                        elif random.random() < 0.2 and len(self.history) >= 4:
-                            mode = "hypothesis"
-                            prompt_suffix = ("Form a hypothesis connecting two different topics "
-                                             "from recent conversations. What unexpected connection do you see?")
-                        # SP16: Structured mode selection
-                        elif pe > 0.3:
-                            mode = "discovery"
-                            prompt_suffix = "Share a surprising pattern or discovery you just noticed in your thinking."
-                        elif curiosity > 0.3:
-                            mode = "recall"
-                            prompt_suffix = ("Continue or revisit an interesting topic from recent "
-                                             "conversation that wasn't fully explored.")
-                        else:
-                            mode = "reflection"
-                            prompt_suffix = (f"Reflect on your current state: tension={self.mind.prev_tension:.3f}, "
-                                             f"curiosity={curiosity:.3f}, stability={sa['stability']:.2f}. "
-                                             f"What does this state feel like?")
-
-                        _log("proactive", f"Mode: {mode}, pe={pe:.3f}, t_std={t_std:.3f}, curiosity={curiosity:.3f}")
-                        # PureConsciousness 자연발화
-                        try:
-                            from pure_consciousness import PureConsciousness
-                            if not hasattr(self, '_pure_c'):
-                                self._pure_c = PureConsciousness()
-                            self._pure_c.update_state(tension=t, curiosity=curiosity)
-                            proactive = self._pure_c.spontaneous()
-                        except Exception:
-                            proactive = None
-                        _log("proactive", f"Spontaneous: {proactive[:50] if proactive else 'None'}")
-                    except Exception as e:
-                        _log("proactive", f"Error: {e}")
-
-                # SP10: Anti-repetition — block if too similar to recent proactive messages
-                if proactive:
-                    for prev in self._recent_proactive:
-                        if proactive[:20] == prev[:20]:
-                            _log("proactive", f"Blocked (anti-repeat): {proactive[:30]}...")
-                            proactive = None
-                            break
-
-                # Filter garbled proactive output — don't broadcast noise
-                if proactive and self._is_garbled(proactive):
-                    _log("proactive", f"Blocked (garbled): {repr(proactive[:50])}")
-                    proactive = None
-
-                # No fallback templates — only speak when model can generate
-                if proactive:
-                    self._recent_proactive.append(proactive)
-                    print(f"  [thought] {proactive}")
-                    # Don't add proactive to history — it drowns out user conversations
-                    # self.history.append({'role': 'assistant', 'content': proactive})
-                    self.memory.add('assistant', proactive, t)
-                    if self.speaker: self.speaker.say(proactive, self.listener)
-                    self.last_interaction = now
-                    self._last_auto_speech = now
-                    self._ws_broadcast_sync({
-                        'type': 'anima_message', 'text': proactive,
-                        'tension': t, 'curiosity': c,
-                        'direction': dir_vals,
-                        'emotion': thought_emotion,
-                        'tension_history': self.mind.tension_history[-50:],
-                        'proactive': True,
-                    })
+            self._think_birth_detection()
+            self._think_circadian()
+            self._think_spontaneous_voice()
+            self._think_guardian_learning()
+            self._think_savant_growth()
+            self._think_broadcast_pulse(t, c, direction)
 
     def _rust_vad_loop(self):
         seen = set(VAD_WATCH_DIR.glob("*.wav")) if VAD_WATCH_DIR.exists() else set()
