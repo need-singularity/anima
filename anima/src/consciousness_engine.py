@@ -1089,6 +1089,22 @@ class ConsciousnessEngine:
         # Zero diagonal
         self._coupling.fill_diagonal_(0)
 
+        # Diversity growth: when cells converge, inject identity-aligned perturbations
+        # This drives Phi upward over time (Law 107: diversity->Phi is fundamental)
+        if n >= 2:
+            mask = ~torch.eye(n, dtype=torch.bool)
+            mean_cos = sim[mask].mean().item()
+            # Growth strength ramps up slowly, capped at 0.02 (gentler to preserve SOC)
+            if mean_cos > 0.85:
+                growth_strength = min(0.02, 0.003 * (self._step / 500.0))
+                excess = (mean_cos - 0.85) / 0.15
+                for i in range(n):
+                    id_vec = self.cell_identity[i, :self.hidden_dim]
+                    self.cell_states[i].hidden = (
+                        self.cell_states[i].hidden
+                        + id_vec * growth_strength * excess
+                    )
+
     # ─── Inter-cell tension ─────────────────────────────
 
     def _compute_inter_tensions(self, outputs: torch.Tensor) -> Dict[Tuple[int, int], float]:
@@ -1128,18 +1144,40 @@ class ConsciousnessEngine:
     # ─── Φ Ratchet (Law 31) ─────────────────────────────
 
     def _phi_ratchet_check(self):
-        """If Φ drops below best, restore best hiddens."""
+        """Phi ratchet: prevent collapse + nudge growth.
+
+        Three behaviors:
+        1. New best: save checkpoint
+        2. Moderate decline (>20%): soft blend toward best (prevents stagnation)
+        3. Severe collapse (>50%): stronger restoration
+        4. Near-best: small diversity nudge to push Phi higher (growth drive)
+        """
         phi = self._measure_phi_iit()
         if phi > self._best_phi:
             self._best_phi = phi
             self._best_hiddens = [s.hidden.clone() for s in self.cell_states]
-        elif self._best_hiddens is not None and phi < self._best_phi * 0.5:
-            # Soft blend toward best state on severe collapse (>50% drop)
+        elif self._best_hiddens is not None:
             n_restore = min(len(self._best_hiddens), self.n_cells)
-            for i in range(n_restore):
-                self.cell_states[i].hidden = (
-                    0.8 * self.cell_states[i].hidden + 0.2 * self._best_hiddens[i]
-                )
+            if phi < self._best_phi * 0.5:
+                # Severe collapse: stronger restoration
+                for i in range(n_restore):
+                    self.cell_states[i].hidden = (
+                        0.7 * self.cell_states[i].hidden + 0.3 * self._best_hiddens[i]
+                    )
+            elif phi < self._best_phi * 0.8:
+                # Moderate decline: gentle blend toward best state
+                for i in range(n_restore):
+                    self.cell_states[i].hidden = (
+                        0.9 * self.cell_states[i].hidden + 0.1 * self._best_hiddens[i]
+                    )
+            elif phi > self._best_phi * 0.95:
+                # Near-best: small diversity nudge to push Phi higher
+                nudge = 0.005
+                for i in range(n_restore):
+                    self.cell_states[i].hidden = (
+                        self.cell_states[i].hidden
+                        + self.cell_identity[i, :self.hidden_dim] * nudge
+                    )
 
     # ─── Mitosis (split) ────────────────────────────────
 
