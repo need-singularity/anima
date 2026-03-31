@@ -92,6 +92,11 @@ from consciousness_laws import (
     PSI_BALANCE, PSI_ALPHA as PSI_COUPLING, PSI_STEPS, PSI_ENTROPY,
     GATE_TRAIN as PSI_GATE_TRAIN, GATE_INFER as PSI_GATE_INFER,
     PSI_F_CRITICAL, PSI_BOTTLENECK_RATIO,
+    SOC_EMA_FAST, SOC_EMA_SLOW, SOC_EMA_GLACIAL, SOC_MEMORY_BLEND,
+    SOC_MEMORY_STRENGTH_BASE, SOC_MEMORY_STRENGTH_RANGE,
+    SOC_PERTURBATION_BASE, SOC_PERTURBATION_RANGE,
+    SOC_BURST_EXPONENT, SOC_BURST_DENOM, SOC_BURST_CAP,
+    BIO_NOISE_BASE, BIO_NOISE_SPIKE_PROB, BIO_NOISE_SPIKE_RATE,
 )
 
 # Meta Law constants (M1, M6, M9)
@@ -499,8 +504,8 @@ class ConsciousnessEngine:
                     # Burst scales as power of avalanche size (creates heavy tail)
                     # Increased from n*10 to n*7 denominator for stronger bursts
                     # → higher variance fluctuations → brain-like susceptibility
-                    burst = (last_aval ** 1.15) / (n * 7.0)
-                    burst = min(burst, 0.30)
+                    burst = (last_aval ** SOC_BURST_EXPONENT) / (n * SOC_BURST_DENOM)
+                    burst = min(burst, SOC_BURST_CAP)
                     # Generate all kicks first, then subtract mean for zero-energy balance
                     kicks = []
                     for i in range(n):
@@ -564,12 +569,10 @@ class ConsciousnessEngine:
         n_now = self.n_cells
         if n_now >= 2:
             # Base noise: small continuous thermal noise
-            base_noise = 0.015
+            base_noise = BIO_NOISE_BASE
             # Sporadic spike: exponentially distributed amplitude (heavy-tailed)
-            # 20% chance creates intermittency similar to brain neural avalanches
-            # Heavier tail (Exponential(0.4)) for more extreme events → power-law distribution
-            if torch.rand(1).item() < 0.20:
-                spike_amp = base_noise * (1.0 + torch.distributions.Exponential(0.4).sample().item())
+            if torch.rand(1).item() < BIO_NOISE_SPIKE_PROB:
+                spike_amp = base_noise * (1.0 + torch.distributions.Exponential(BIO_NOISE_SPIKE_RATE).sample().item())
             else:
                 spike_amp = base_noise
             for i in range(n_now):
@@ -779,9 +782,9 @@ class ConsciousnessEngine:
         if not hasattr(self, '_soc_hidden_ema_glacial'):
             self._soc_hidden_ema_glacial = None
 
-        ema_fast = 0.05    # fast EMA: ~20-step half-life
-        ema_slow = 0.008   # slow EMA: ~87-step half-life
-        ema_glacial = 0.002 # glacial EMA: ~350-step half-life (long-range correlations)
+        ema_fast = SOC_EMA_FAST
+        ema_slow = SOC_EMA_SLOW
+        ema_glacial = SOC_EMA_GLACIAL
         if self._soc_hidden_ema is None:
             self._soc_hidden_ema = global_hidden.clone()
             self._soc_hidden_ema_slow = global_hidden.clone()
@@ -792,12 +795,14 @@ class ConsciousnessEngine:
             self._soc_hidden_ema_glacial = (1 - ema_glacial) * self._soc_hidden_ema_glacial + ema_glacial * global_hidden
             # Blend fast + slow + glacial memory for multi-scale temporal correlations
             # Glacial component creates the long-range persistence brain EEG shows
-            memory_target = 0.4 * self._soc_hidden_ema + 0.35 * self._soc_hidden_ema_slow + 0.25 * self._soc_hidden_ema_glacial
+            memory_target = (SOC_MEMORY_BLEND[0] * self._soc_hidden_ema
+                             + SOC_MEMORY_BLEND[1] * self._soc_hidden_ema_slow
+                             + SOC_MEMORY_BLEND[2] * self._soc_hidden_ema_glacial)
             # Adaptive memory strength: increases when variance is high (homeostasis)
             # This prevents unbounded Phi growth while preserving SOC dynamics
             cur_var = hiddens_stack.var(dim=0).mean().item()
             # _eeg_memory_modifier applied from BCI control (default 1.0)
-            memory_strength = (0.11 + 0.21 * min(cur_var / 1.5, 1.0)) * self._eeg_memory_modifier  # base: 0.11-0.32
+            memory_strength = (SOC_MEMORY_STRENGTH_BASE + SOC_MEMORY_STRENGTH_RANGE * min(cur_var / 1.5, 1.0)) * self._eeg_memory_modifier
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden
@@ -821,7 +826,7 @@ class ConsciousnessEngine:
         # Increased scale (0.08 + 0.15) for higher susceptibility (variance of window variances)
         # This is the key mechanism for brain-like CRITICAL dynamics (susc > 0.1)
         if self._soc_hidden_ema is not None and avalanche_size > 0:
-            perturbation_scale = 0.08 + 0.15 * min(avalanche_size / n, 1.0)
+            perturbation_scale = SOC_PERTURBATION_BASE + SOC_PERTURBATION_RANGE * min(avalanche_size / n, 1.0)
             for idx_cell in topple_count:
                 if idx_cell < n:
                     phase_noise = torch.randn(self.hidden_dim) * perturbation_scale

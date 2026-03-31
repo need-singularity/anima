@@ -909,9 +909,10 @@ def train(args):
         else:
             total_loss = ce
 
-        # NaN guard
+        # NaN guard — skip batch but keep training
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            print(f"  [NaN] skip step {step}")
+            print(f"  [NaN] skip step {step} (loss={total_loss.item() if not torch.isnan(total_loss) else 'NaN'})")
+            optimizer.zero_grad()
             scheduler.step()
             continue
 
@@ -1022,6 +1023,16 @@ def train(args):
                             fb_bridge=fb_bridge)
             print(f"  [ckpt] Saved {ckpt_path} (CE={ce_val:.4f}, Phi={phi:.4f})")
 
+        # ── Watchdog heartbeat (every 100 steps) ──
+        if step % 100 == 0:
+            try:
+                hb_path = os.path.join(args.checkpoint, "heartbeat.txt")
+                with open(hb_path, 'w') as hf:
+                    hf.write(f"step={step} time={time.strftime('%Y-%m-%d %H:%M:%S')} "
+                             f"ce={ce_val:.4f} phi={phi:.4f} phase={phase}\n")
+            except Exception:
+                pass
+
     # ── Final checkpoint ──
     final_path = os.path.join(args.checkpoint, "final.pt")
     save_checkpoint(final_path, args.steps, decoder, optimizer, scheduler,
@@ -1121,4 +1132,57 @@ if __name__ == "__main__":
           f"Federation={'ON' if args.federated else 'OFF'} | "
           f"Atoms={args.atoms} | Cells/Atom={args.cells_per_atom} | "
           f"F_c={args.frustration} | Narrative={args.narrative_strength}")
-    train(args)
+
+    # ── Crash-proof auto-resume loop ──
+    import traceback
+    MAX_CRASH_RETRIES = 5
+    crash_count = 0
+    while crash_count < MAX_CRASH_RETRIES:
+        try:
+            train(args)
+            break  # Normal exit
+        except KeyboardInterrupt:
+            print("\n  [interrupted] KeyboardInterrupt — stopping.")
+            break
+        except Exception as ex:
+            crash_count += 1
+            print(f"\n  [CRASH {crash_count}/{MAX_CRASH_RETRIES}] {type(ex).__name__}: {ex}")
+            traceback.print_exc()
+
+            # Save emergency checkpoint
+            emergency_path = os.path.join(args.checkpoint, "emergency_crash.pt")
+            print(f"  [crash] Attempting emergency save to {emergency_path}")
+            try:
+                # Minimal save — whatever is in scope may not be available,
+                # but the periodic checkpoints should already exist.
+                os.makedirs(args.checkpoint, exist_ok=True)
+                with open(os.path.join(args.checkpoint, "crash_log.txt"), "a") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"Crash #{crash_count} at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"{type(ex).__name__}: {ex}\n")
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
+
+            # Find latest checkpoint to resume from
+            latest_ckpt = None
+            if os.path.isdir(args.checkpoint):
+                ckpts = sorted(
+                    [f for f in os.listdir(args.checkpoint) if f.startswith("step_") and f.endswith(".pt")],
+                    key=lambda x: int(x.replace("step_", "").replace(".pt", "")) if x.replace("step_", "").replace(".pt", "").isdigit() else 0,
+                )
+                if ckpts:
+                    latest_ckpt = os.path.join(args.checkpoint, ckpts[-1])
+                elif os.path.exists(os.path.join(args.checkpoint, "best.pt")):
+                    latest_ckpt = os.path.join(args.checkpoint, "best.pt")
+
+            if latest_ckpt and crash_count < MAX_CRASH_RETRIES:
+                print(f"  [crash] Auto-resuming from {latest_ckpt} in 10s...")
+                time.sleep(10)
+                args.resume = latest_ckpt
+            else:
+                print(f"  [crash] No checkpoint found or max retries reached. Stopping.")
+                break
+
+    if crash_count >= MAX_CRASH_RETRIES:
+        print(f"  [FATAL] {MAX_CRASH_RETRIES} crashes — giving up. Check crash_log.txt.")

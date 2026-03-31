@@ -28,6 +28,8 @@ pub struct Config {
     pub ngram_ratio: f32,
     /// Enable multilingual seeds (Japanese + Chinese)
     pub multilingual: bool,
+    /// Korean-heavy mode: boost Korean long-form content to ~60%
+    pub ko_heavy: bool,
 }
 
 impl Default for Config {
@@ -41,6 +43,7 @@ impl Default for Config {
             deep_dialogue: false,
             ngram_ratio: 0.0,
             multilingual: false,
+            ko_heavy: false,
         }
     }
 }
@@ -179,6 +182,12 @@ impl<R: Rng> Generator<R> {
                 }
                 _ => {}
             }
+        }
+
+        // Korean long-form blocks (essays, dialogues, narratives) for --ko-heavy
+        if self.cfg.ko_heavy && self.rng.gen_bool(0.45) {
+            out.push_str(&crate::ko_longform::random_ko_longform(&mut self.rng));
+            return;
         }
 
         // v4 extensions: RU/EN/Code/Laws/DD (15% of all blocks)

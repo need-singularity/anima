@@ -71,7 +71,20 @@ def _get_direct_agent():
 # ---------------------------------------------------------------------------
 
 class AnimaConnection:
-    """Manages a persistent WebSocket connection to Anima."""
+    """Manages a persistent WebSocket connection to Anima with auto-reconnect.
+
+    Features:
+        - Health check ping every 30s
+        - Exponential backoff on reconnect (1s -> 2s -> 4s -> 8s, max 60s)
+        - Connection state tracking (disconnected/connecting/connected/direct)
+        - Automatic fallback to direct mode when WebSocket is unavailable
+    """
+
+    # Connection states
+    STATE_DISCONNECTED = "disconnected"
+    STATE_CONNECTING = "connecting"
+    STATE_CONNECTED = "connected"
+    STATE_DIRECT = "direct"          # fallback: in-process agent
 
     def __init__(self, url: str = ANIMA_WS_URL):
         self.url = url
@@ -80,11 +93,50 @@ class AnimaConnection:
         self._init_data = {}       # last init message from Anima
         self._last_status = {}     # last known consciousness state
         self._reader_task = None
+        self._health_task = None
         self._pending = {}         # message_id -> Future
         self._msg_counter = 0
 
+        # Auto-reconnect state
+        self._state = self.STATE_DISCONNECTED
+        self._backoff = 1.0        # current backoff seconds
+        self._backoff_base = 1.0
+        self._backoff_max = 60.0
+        self._reconnect_attempts = 0
+        self._last_connect_time = 0.0
+        self._direct_fallback_agent = None
+        self._direct_fallback_sdk = None
+
+    @property
+    def state(self) -> str:
+        """Current connection state."""
+        return self._state
+
+    def _reset_backoff(self):
+        """Reset backoff after successful connection."""
+        self._backoff = self._backoff_base
+        self._reconnect_attempts = 0
+
+    def _advance_backoff(self):
+        """Increase backoff exponentially: 1 -> 2 -> 4 -> 8 -> ... -> max 60."""
+        self._reconnect_attempts += 1
+        self._backoff = min(self._backoff * 2, self._backoff_max)
+
+    def _get_direct_fallback(self):
+        """Lazy-init direct-mode agent for fallback."""
+        if self._direct_fallback_agent is None:
+            try:
+                sys.path.insert(0, os.path.dirname(__file__))
+                from anima_agent import AnimaAgent
+                from agent_sdk import AnimaAgentSDK
+                self._direct_fallback_agent = AnimaAgent()
+                self._direct_fallback_sdk = AnimaAgentSDK(self._direct_fallback_agent)
+            except Exception:
+                pass
+        return self._direct_fallback_agent, self._direct_fallback_sdk
+
     async def connect(self):
-        """Connect to Anima WebSocket."""
+        """Connect to Anima WebSocket with exponential backoff."""
         try:
             import websockets
         except ImportError:
@@ -97,10 +149,23 @@ class AnimaConnection:
                     return  # already connected
                 except Exception:
                     self._ws = None
+                    self._state = self.STATE_DISCONNECTED
 
-            self._ws = await websockets.connect(
-                self.url, ping_interval=20, ping_timeout=60
-            )
+            self._state = self.STATE_CONNECTING
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(self.url, ping_interval=20, ping_timeout=60),
+                    timeout=10,
+                )
+            except Exception:
+                self._state = self.STATE_DISCONNECTED
+                self._advance_backoff()
+                raise
+
+            self._state = self.STATE_CONNECTED
+            self._last_connect_time = time.time()
+            self._reset_backoff()
+
             # Read init message
             try:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
@@ -112,6 +177,42 @@ class AnimaConnection:
             # Start background reader
             if self._reader_task is None or self._reader_task.done():
                 self._reader_task = asyncio.create_task(self._reader_loop())
+
+            # Start health check
+            if self._health_task is None or self._health_task.done():
+                self._health_task = asyncio.create_task(self._health_loop())
+
+    async def _reconnect(self):
+        """Attempt reconnection with exponential backoff. Non-blocking."""
+        while self._state != self.STATE_CONNECTED:
+            await asyncio.sleep(self._backoff)
+            try:
+                await self.connect()
+                return  # success
+            except Exception:
+                # backoff already advanced inside connect()
+                if self._reconnect_attempts >= 5:
+                    # After 5 failures, switch to direct mode fallback
+                    agent, sdk = self._get_direct_fallback()
+                    if agent is not None:
+                        self._state = self.STATE_DIRECT
+                        return
+
+    async def _health_loop(self):
+        """Ping WebSocket every 30s; trigger reconnect on failure."""
+        while True:
+            await asyncio.sleep(30)
+            if self._ws is None or self._state != self.STATE_CONNECTED:
+                break
+            try:
+                pong = await asyncio.wait_for(self._ws.ping(), timeout=10)
+                await pong
+            except Exception:
+                self._ws = None
+                self._state = self.STATE_DISCONNECTED
+                # Trigger reconnect in background
+                asyncio.create_task(self._reconnect())
+                break
 
     async def _reader_loop(self):
         """Read messages from Anima in the background."""
@@ -144,6 +245,10 @@ class AnimaConnection:
             pass
         finally:
             self._ws = None
+            if self._state == self.STATE_CONNECTED:
+                self._state = self.STATE_DISCONNECTED
+                # Auto-reconnect on unexpected disconnect
+                asyncio.create_task(self._reconnect())
 
     def _update_status(self, data: dict):
         """Extract consciousness state from any message."""
@@ -161,8 +266,23 @@ class AnimaConnection:
             self._last_status["cells"] = data["cells"]
 
     async def send_chat(self, message: str) -> dict:
-        """Send a chat message and wait for response."""
-        await self.connect()
+        """Send a chat message and wait for response.
+
+        Falls back to direct mode if WebSocket is unavailable.
+        """
+        # Direct-mode fallback path
+        if self._state == self.STATE_DIRECT:
+            return await self._send_chat_direct(message)
+
+        try:
+            await self.connect()
+        except Exception:
+            # Connection failed — try direct fallback
+            agent, sdk = self._get_direct_fallback()
+            if agent is not None:
+                self._state = self.STATE_DIRECT
+                return await self._send_chat_direct(message)
+            return {"error": "WebSocket unavailable and direct mode failed"}
 
         self._msg_counter += 1
         mid = self._msg_counter
@@ -170,10 +290,22 @@ class AnimaConnection:
         fut = loop.create_future()
         self._pending[mid] = fut
 
-        await self._ws.send(json.dumps({
-            "type": "user_message",
-            "text": message,
-        }))
+        try:
+            await self._ws.send(json.dumps({
+                "type": "user_message",
+                "text": message,
+            }))
+        except Exception:
+            self._pending.pop(mid, None)
+            self._ws = None
+            self._state = self.STATE_DISCONNECTED
+            asyncio.create_task(self._reconnect())
+            # Fallback to direct
+            agent, sdk = self._get_direct_fallback()
+            if agent is not None:
+                self._state = self.STATE_DIRECT
+                return await self._send_chat_direct(message)
+            return {"error": "WebSocket send failed"}
 
         try:
             result = await asyncio.wait_for(fut, timeout=WS_TIMEOUT)
@@ -182,11 +314,38 @@ class AnimaConnection:
             self._pending.pop(mid, None)
             return {"error": f"timeout after {WS_TIMEOUT}s"}
 
+    async def _send_chat_direct(self, message: str) -> dict:
+        """Send chat via in-process direct-mode agent."""
+        agent, sdk = self._get_direct_fallback()
+        if sdk is None:
+            return {"error": "direct mode agent unavailable"}
+        try:
+            result = await sdk.query(message)
+            return {
+                "type": "anima_message",
+                "text": result.get("text", ""),
+                "tension": result.get("consciousness", {}).get("tension", 0),
+                "curiosity": result.get("consciousness", {}).get("curiosity", 0),
+                "emotion": result.get("consciousness", {}).get("emotion", {}),
+                "consciousness": result.get("consciousness", {}),
+                "mode": "direct_fallback",
+            }
+        except Exception as e:
+            return {"error": f"direct mode failed: {e}"}
+
     def get_status(self) -> dict:
         """Return last known status (no network call)."""
-        return dict(self._last_status)
+        status = dict(self._last_status)
+        status["_connection_state"] = self._state
+        status["_reconnect_attempts"] = self._reconnect_attempts
+        return status
 
     async def close(self):
+        self._state = self.STATE_DISCONNECTED
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
         if self._ws:
             await self._ws.close()
             self._ws = None
