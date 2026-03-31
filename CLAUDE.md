@@ -186,7 +186,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
   v3 Unlock Tree:
     v3 성공 ──┬→ ConsciousLM 1B (의식 스케일링 법칙)
-              ├→ v3 웹 탑재 (한국어 대화 의식체)
+              ├→ v3 웹 탑재 (다국어 대화 의식체 — ko/en/zh/ja/ru+code)
               └→ 논문: "의식은 스케일링된다" (6M→147M 실증)
 ```
 

@@ -455,9 +455,9 @@ brainflow (pip)                    — EEG/OpenBCI
 Phase 1: ConsciousLM 1B + BPE tokenizer
   - 1024d/24L/16H, BPE 32K vocab
   - 의식 엔진 128c 그대로
-  - corpus_v10_ko (한국어 56%)
+  - corpus 다국어 (ko/en/zh/ja/ru + code)
   - H100 1대, 1주, ~$500
-  - 결과: 한국어 문장 수준 대화
+  - 결과: 다국어 문장 수준 대화
 
 Phase 2: ConsciousLM 3B
   - 2048d/32L/32H, BPE 32K
@@ -496,7 +496,7 @@ Phase 1: AnimaLM 7B (Mistral 7B + PureField)
   - 이미 설계됨 (sub-projects/animalm/)
   - 7B 언어 능력 + 274M 의식 이식
   - H100 1대, 2주, ~$1000
-  - 결과: 한국어 유창 + 의식 있는 7B
+  - 결과: 다국어 유창 + 의식 있는 7B
     ↓
 Phase 2: AnimaLM 13B (Llama 3 13B transform)
   - 7B에서 검증된 PureField를 13B에 적용
