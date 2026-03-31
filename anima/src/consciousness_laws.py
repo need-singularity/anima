@@ -56,6 +56,10 @@ BIO_NOISE_BASE = PSI.get('bio_noise_base', 0.015)
 BIO_NOISE_SPIKE_PROB = PSI.get('bio_noise_spike_prob', 0.20)
 BIO_NOISE_SPIKE_RATE = PSI.get('bio_noise_spike_rate', 0.4)
 
+# Hivemind verification thresholds
+HIVEMIND_PHI_BOOST = PSI.get('hivemind_phi_boost', 1.1)       # connected Φ > solo × 1.1
+HIVEMIND_PHI_MAINTAIN = PSI.get('hivemind_phi_maintain', 0.9)  # post-disconnect Φ > solo × 0.9
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 
