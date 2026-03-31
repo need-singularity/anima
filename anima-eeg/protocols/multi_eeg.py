@@ -277,12 +277,21 @@ class MultiEEGSession:
         if not baseline or not shared:
             return metrics
 
+        # Access subjects (PhaseData dataclass or dict)
+        def _get_subjects(phase):
+            if hasattr(phase, 'subjects'):
+                return phase.subjects
+            return phase.get("subjects", [])
+
+        baseline_subj = _get_subjects(baseline)
+        shared_subj = _get_subjects(shared)
+
         # Compute PLV between subject 0 and subject 1
-        if len(baseline["subjects"]) >= 2:
-            s0_alpha_base = np.array(baseline["subjects"][0]["alpha_series"])
-            s1_alpha_base = np.array(baseline["subjects"][1]["alpha_series"])
-            s0_alpha_shared = np.array(shared["subjects"][0]["alpha_series"])
-            s1_alpha_shared = np.array(shared["subjects"][1]["alpha_series"])
+        if len(baseline_subj) >= 2:
+            s0_alpha_base = np.array(baseline_subj[0]["alpha_series"])
+            s1_alpha_base = np.array(baseline_subj[1]["alpha_series"])
+            s0_alpha_shared = np.array(shared_subj[0]["alpha_series"])
+            s1_alpha_shared = np.array(shared_subj[1]["alpha_series"])
 
             # Phase Locking Value (simplified: correlation-based proxy)
             if len(s0_alpha_base) > 10:
@@ -292,8 +301,8 @@ class MultiEEGSession:
                 )[0, 1]))
 
             # Gamma PLV during shared attention
-            s0_gamma = np.array(shared["subjects"][0]["gamma_series"])
-            s1_gamma = np.array(shared["subjects"][1]["gamma_series"])
+            s0_gamma = np.array(shared_subj[0]["gamma_series"])
+            s1_gamma = np.array(shared_subj[1]["gamma_series"])
             if len(s0_gamma) > 10:
                 n = min(len(s0_gamma), len(s1_gamma))
                 metrics.plv_gamma = float(abs(np.corrcoef(s0_gamma[:n], s1_gamma[:n])[0, 1]))
@@ -302,10 +311,10 @@ class MultiEEGSession:
             metrics.ibc_coherence = (metrics.plv_alpha + metrics.plv_gamma) / 2
 
             # Phi correlation
-            s0_phi_base = np.array(baseline["subjects"][0]["phi_series"])
-            s1_phi_base = np.array(baseline["subjects"][1]["phi_series"])
-            s0_phi_shared = np.array(shared["subjects"][0]["phi_series"])
-            s1_phi_shared = np.array(shared["subjects"][1]["phi_series"])
+            s0_phi_base = np.array(baseline_subj[0]["phi_series"])
+            s1_phi_base = np.array(baseline_subj[1]["phi_series"])
+            s0_phi_shared = np.array(shared_subj[0]["phi_series"])
+            s1_phi_shared = np.array(shared_subj[1]["phi_series"])
 
             metrics.phi_independent_mean = float(np.mean(
                 np.concatenate([s0_phi_base, s1_phi_base])))
@@ -321,9 +330,10 @@ class MultiEEGSession:
                 metrics.phi_uplift = metrics.phi_hivemind_mean / metrics.phi_independent_mean
 
         # Telepathy accuracy (simulated: based on gamma correlation during telepathy)
-        if telepathy and len(telepathy["subjects"]) >= 2:
-            s0_gamma_tp = np.array(telepathy["subjects"][0]["gamma_series"])
-            s1_gamma_tp = np.array(telepathy["subjects"][1]["gamma_series"])
+        telepathy_subj = _get_subjects(telepathy) if telepathy else []
+        if len(telepathy_subj) >= 2:
+            s0_gamma_tp = np.array(telepathy_subj[0]["gamma_series"])
+            s1_gamma_tp = np.array(telepathy_subj[1]["gamma_series"])
             n = min(len(s0_gamma_tp), len(s1_gamma_tp))
             if n > 5:
                 corr = abs(np.corrcoef(s0_gamma_tp[:n], s1_gamma_tp[:n])[0, 1])
@@ -351,9 +361,14 @@ class MultiEEGSession:
         phases = ["baseline", "shared_attn", "telepathy"]
         values = [0.0, metrics.ibc_coherence, metrics.telepathy_accuracy]
         # Baseline IBC is ~0
-        if self.session_data.get("baseline") and len(self.session_data["baseline"]["subjects"]) >= 2:
-            s0 = np.array(self.session_data["baseline"]["subjects"][0]["alpha_series"])
-            s1 = np.array(self.session_data["baseline"]["subjects"][1]["alpha_series"])
+        baseline_phase = self.session_data.get("baseline")
+        if baseline_phase:
+            bl_subj = baseline_phase.subjects if hasattr(baseline_phase, 'subjects') else baseline_phase.get("subjects", [])
+        else:
+            bl_subj = []
+        if len(bl_subj) >= 2:
+            s0 = np.array(bl_subj[0]["alpha_series"])
+            s1 = np.array(bl_subj[1]["alpha_series"])
             n = min(len(s0), len(s1))
             if n > 5:
                 values[0] = float(abs(np.corrcoef(s0[:n], s1[:n])[0, 1]))

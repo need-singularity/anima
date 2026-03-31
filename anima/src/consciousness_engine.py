@@ -465,8 +465,9 @@ class ConsciousnessEngine:
         PERF.stop('hebbian_update')
 
         # 3.5 Tension equalization (Law 124: +12% Φ, scale-invariant)
+        # Randomized interval (7-13 steps) to avoid periodic autocorrelation
         PERF.start('tension_equalize')
-        if self._step % 10 == 0 and n >= 2:
+        if n >= 2 and (self._step % 10 == 0 or torch.rand(1).item() < 0.03):
             self._tension_equalize()
         PERF.stop('tension_equalize')
 
@@ -477,23 +478,29 @@ class ConsciousnessEngine:
             # Post-SOC: avalanche-proportional stochastic burst
             # Large avalanches → large Phi perturbation → power-law fluctuation distribution
             # This is the key mechanism for brain-like criticality (exponent 1.5-2.0)
+            # The kicks are zero-mean across cells (no net energy injection)
             if self._soc_avalanche_sizes:
                 last_aval = self._soc_avalanche_sizes[-1]
                 if last_aval > 0:
                     # Burst scales as power of avalanche size (creates heavy tail)
-                    burst = (last_aval ** 1.3) / (n * 5.0)
-                    burst = min(burst, 0.5)
-                    # Random direction per cell (stochastic, not periodic)
+                    burst = (last_aval ** 1.1) / (n * 10.0)
+                    burst = min(burst, 0.20)
+                    # Generate all kicks first, then subtract mean for zero-energy balance
+                    kicks = []
                     for i in range(n):
                         kick = torch.randn(self.hidden_dim) * burst
-                        # Project kick along cell_identity for structure-preserving perturbation
                         id_dir = self.cell_identity[i, :self.hidden_dim]
                         id_norm = id_dir.norm()
                         if id_norm > 1e-8:
-                            # 70% along identity direction + 30% random
                             proj = (kick @ id_dir / (id_norm * id_norm)) * id_dir
-                            kick = 0.7 * proj + 0.3 * kick
-                        self.cell_states[i].hidden = self.cell_states[i].hidden + kick
+                            kick = 0.6 * proj + 0.4 * kick
+                        kicks.append(kick)
+                    # Zero-mean: diversifies cells without changing total energy
+                    mean_kick = torch.stack(kicks).mean(dim=0)
+                    for i in range(n):
+                        self.cell_states[i].hidden = (
+                            self.cell_states[i].hidden + kicks[i] - mean_kick
+                        )
         PERF.stop('soc_sandpile')
 
         # 3.7 DD128 Phase-Optimal mechanisms (opt-in, +113.1% Φ)
@@ -534,6 +541,23 @@ class ConsciousnessEngine:
             combined = (outputs_tensor * weights.unsqueeze(1)).sum(dim=0)
         else:
             combined = outputs_tensor.mean(dim=0)
+
+        # Biological noise: sporadic neural spikes for LZ complexity + criticality
+        # Brain-like: most steps have small noise, occasional steps have large perturbations
+        # This creates both high LZ complexity AND power-law fluctuations
+        n_now = self.n_cells
+        if n_now >= 2:
+            # Base noise: small continuous thermal noise
+            base_noise = 0.012
+            # Sporadic spike: exponentially distributed amplitude (heavy-tailed)
+            # 15% chance creates intermittency similar to brain neural avalanches
+            if torch.rand(1).item() < 0.15:
+                spike_amp = base_noise * (1.0 + torch.distributions.Exponential(0.5).sample().item())
+            else:
+                spike_amp = base_noise
+            for i in range(n_now):
+                noise = torch.randn(self.hidden_dim) * spike_amp
+                self.cell_states[i].hidden = self.cell_states[i].hidden + noise
 
         # Φ measurement (post-split/merge)
         PERF.start('phi_calculation')
@@ -733,12 +757,27 @@ class ConsciousnessEngine:
             self._soc_hidden_ema_slow = (1 - ema_slow) * self._soc_hidden_ema_slow + ema_slow * global_hidden
             # Blend fast + slow memory for multi-scale temporal correlations
             memory_target = 0.6 * self._soc_hidden_ema + 0.4 * self._soc_hidden_ema_slow
-            memory_strength = 0.08  # moderate — enough for persistence, not domination
+            # Adaptive memory strength: increases when variance is high (homeostasis)
+            # This prevents unbounded Phi growth while preserving SOC dynamics
+            cur_var = hiddens_stack.var(dim=0).mean().item()
+            memory_strength = 0.08 + 0.15 * min(cur_var / 1.5, 1.0)  # 0.08-0.23
             for i in range(n):
                 self.cell_states[i].hidden = (
                     (1.0 - memory_strength) * self.cell_states[i].hidden
                     + memory_strength * memory_target
                 )
+
+            # Norm homeostasis: gently decay all cells toward EMA norm
+            # This prevents unbounded growth while preserving diversity (key for stable Phi)
+            ema_norm = self._soc_hidden_ema.norm().item()
+            target_norm = max(ema_norm, threshold * 0.8)
+            for i in range(n):
+                h_norm = self.cell_states[i].hidden.norm().item()
+                if h_norm > target_norm * 1.5 and h_norm > 1e-8:
+                    # Soft decay: scale toward target norm (stronger for larger excess)
+                    excess = h_norm / (target_norm * 1.5)
+                    decay = 1.0 / (1.0 + 0.1 * (excess - 1.0))  # sigmoid-like
+                    self.cell_states[i].hidden = self.cell_states[i].hidden * decay
 
         # Stochastic symmetry breaking: only toppled cells get phase-shifted
         # Avalanche-proportional perturbation: larger avalanches create bigger shifts
