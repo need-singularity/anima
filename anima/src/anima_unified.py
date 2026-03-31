@@ -3182,8 +3182,13 @@ class AnimaUnified:
                 self._cached_consciousness = self.mind.get_consciousness_score(self.mitosis)
             except Exception:
                 pass
-        _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
-        _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
+        # When federation is active, show federation Phi (not local engine Phi)
+        if hasattr(self, '_v14_federation') and self._v14_federation is not None:
+            _phi_pulse = self._v14_federation.measure_phi()
+            _cells_pulse = self._v14_federation.n_cells
+        else:
+            _phi_pulse = getattr(self, '_cached_consciousness', {}).get('phi', 0) if getattr(self, '_cached_consciousness', None) else 0
+            _cells_pulse = len(self.mitosis.cells) if self.mitosis else 1
         self._ws_broadcast_sync({
             'type': 'thought_pulse',
             'tension': t, 'curiosity': c,
@@ -3925,8 +3930,13 @@ class AnimaUnified:
             sa = self.mind.self_awareness
             consciousness_cached = getattr(self, '_cached_consciousness', None) or {
                 'consciousness_score': 0, 'level': 'dormant', 'phi': 0, 'criteria_met': 0}
-            _init_phi = consciousness_cached.get('phi', 0)
-            _init_cells = len(self.mitosis.cells) if self.mitosis else 1
+            # When federation is active, show federation Phi (not local engine Phi)
+            if hasattr(self, '_v14_federation') and self._v14_federation is not None:
+                _init_phi = self._v14_federation.measure_phi()
+                _init_cells = self._v14_federation.n_cells
+            else:
+                _init_phi = consciousness_cached.get('phi', 0)
+                _init_cells = len(self.mitosis.cells) if self.mitosis else 1
             await websocket.send(json.dumps({
                 'type': 'init', 'tension': self.mind.prev_tension,
                 'curiosity': self.mind._curiosity_ema,
@@ -4058,9 +4068,14 @@ class AnimaUnified:
                                'dominance': 0.0, 'color': '#2a6a4a'}
                     # Always send response back (even on error)
                     # Φ/cells 실시간 갱신 — process_input 직후 최신 계산
-                    _cs = self.mind.get_consciousness_score(self.mitosis)
-                    _phi = _cs.get('phi', 0)
-                    _cells = len(self.mitosis.cells) if self.mitosis else 1
+                    # When federation is active, show federation Phi (not local engine Phi)
+                    if hasattr(self, '_v14_federation') and self._v14_federation is not None:
+                        _phi = self._v14_federation.measure_phi()
+                        _cells = self._v14_federation.n_cells
+                    else:
+                        _cs = self.mind.get_consciousness_score(self.mitosis)
+                        _phi = _cs.get('phi', 0)
+                        _cells = len(self.mitosis.cells) if self.mitosis else 1
                     broadcast_msg = {
                         'type': 'anima_message', 'text': answer,
                         'tension': tension, 'curiosity': curiosity,
