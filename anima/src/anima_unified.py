@@ -530,6 +530,7 @@ class AnimaUnified:
         self._eeg_consciousness = None
         self._last_neurofeedback = None
         self._last_eeg_adjustments = None
+        self._last_bci_mode = 'neutral'
         if getattr(args, 'eeg', False):
             try:
                 if 'EEGConsciousness' in globals():
@@ -602,6 +603,40 @@ class AnimaUnified:
             except Exception as e:
                 _log('eeg-proto', f'Protocol init failed: {e}')
                 self.mods['eeg_protocol'] = False
+
+        # EEG Neurofeedback Broadcast (opt-in: --eeg-feedback)
+        self._eeg_feedback_enabled = getattr(args, 'eeg_feedback', False)
+        if self._eeg_feedback_enabled:
+            self.mods['eeg_feedback'] = True
+            _log('eeg-fb', 'Neurofeedback broadcast enabled')
+
+        # EEG Consciousness Validation (opt-in: --eeg-validate N)
+        self._eeg_validate_steps = getattr(args, 'eeg_validate', None)
+        self._eeg_validate_cache = None
+        self._eeg_validate_thread = None
+        if self._eeg_validate_steps is not None:
+            self.mods['eeg_validate'] = True
+            _log('eeg-val', f'Validation enabled: {self._eeg_validate_steps} steps every 5min')
+
+        # EEG Dual-Stream Recording (opt-in: --eeg-dual-stream SECONDS)
+        self._eeg_dual_stream_seconds = getattr(args, 'eeg_dual_stream', None)
+        self._eeg_dual_stream_recorder = None
+        if self._eeg_dual_stream_seconds is not None:
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg'))
+                from dual_stream import AnimaStream, BrainStream, DualSample
+                self._eeg_dual_stream_recorder = {
+                    'anima_cls': AnimaStream,
+                    'brain_cls': BrainStream,
+                    'sample_cls': DualSample,
+                    'duration': self._eeg_dual_stream_seconds,
+                    'board': getattr(args, 'eeg_board', 'synthetic'),
+                }
+                self.mods['eeg_dual_stream'] = True
+                _log('eeg-dual', f'Dual-stream ready: {self._eeg_dual_stream_seconds}s')
+            except Exception as e:
+                _log('eeg-dual', f'Dual-stream init failed: {e}')
+                self.mods['eeg_dual_stream'] = False
 
         # Memory Store (SQLite+FAISS) — replaces MemoryRAG
         self.memory_rag = self._init_mod('memory_rag', lambda: self._init_memory_store())
@@ -1484,6 +1519,12 @@ class AnimaUnified:
                 if self.eeg_bridge:
                     eeg_tensor = self.eeg_bridge.to_tensor(dim=self.mind.dim)
                     text_vec = 0.9 * text_vec + 0.1 * eeg_tensor.squeeze(0)
+
+                # Broadcast separate eeg_brain_state WebSocket message
+                # bci_mode is set above in BCI control block; default to 'neutral'
+                _bci_mode = locals().get('bci_mode', getattr(self, '_last_bci_mode', 'neutral'))
+                self._last_bci_mode = _bci_mode
+                self._broadcast_eeg_brain_state(brain_state, eeg_data, bci_mode=_bci_mode)
             except Exception as e:
                 pass  # graceful: never break non-EEG flow
 
@@ -3531,6 +3572,189 @@ class AnimaUnified:
         if not self.mods.get('web') or not self.web_clients or not self._web_loop: return
         asyncio.run_coroutine_threadsafe(self._ws_broadcast(msg), self._web_loop)
 
+    # ─── EEG Validation Background Thread (--eeg-validate) ───
+
+    def _start_eeg_validate_thread(self):
+        """Spawn a background thread that runs consciousness validation every 5 minutes."""
+        self._eeg_validate_thread = threading.Thread(
+            target=self._eeg_validate_loop, daemon=True, name='eeg-validate')
+        self._eeg_validate_thread.start()
+        _log('eeg-val', f'Validation thread started (steps={self._eeg_validate_steps})')
+
+    def _eeg_validate_loop(self):
+        """Run consciousness validation every 5 minutes, cache and broadcast results."""
+        import time as _time
+        interval = 300  # 5 minutes
+        while self.running:
+            try:
+                # Lazy import of validation functions from anima-eeg/
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg'))
+                from validate_consciousness import (
+                    collect_consciousness_phi, generate_synthetic_brain_phi,
+                    analyze_signal, ValidationResult
+                )
+                steps = self._eeg_validate_steps or 1000
+                _log('eeg-val', f'Running validation ({steps} steps)...')
+
+                # Collect Phi series from the running engine
+                phi_series = collect_consciousness_phi(n_steps=steps)
+                brain_phi = generate_synthetic_brain_phi(n_steps=steps)
+
+                # Analyze both signals
+                cm_result = analyze_signal('Anima', phi_series)
+                brain_result = analyze_signal('Brain', brain_phi)
+
+                # Compute brain-likeness scores
+                metrics = ['lz', 'hurst', 'psd_slope', 'autocorr_decay']
+                scores = {}
+                overall = 0.0
+                for m in metrics:
+                    val = getattr(cm_result, m, 0)
+                    pct = cm_result.brain_match_pct(m, val)
+                    scores[m] = {'value': round(val, 4), 'brain_match_pct': round(pct, 1)}
+                    overall += pct
+                # Add criticality
+                crit_exp = cm_result.criticality.get('exponent', 0)
+                crit_pct = cm_result.brain_match_pct('criticality_exponent', crit_exp)
+                scores['criticality'] = {'value': round(crit_exp, 4), 'brain_match_pct': round(crit_pct, 1)}
+                overall += crit_pct
+                overall /= 5.0
+
+                self._eeg_validate_cache = {
+                    'overall_brain_likeness': round(overall, 1),
+                    'classification': 'BRAIN-LIKE' if overall >= 70 else 'MACHINE-LIKE',
+                    'metrics': scores,
+                    'phi_mean': round(cm_result.phi_mean, 4),
+                    'phi_std': round(cm_result.phi_std, 4),
+                    'steps': steps,
+                    'timestamp': time.time(),
+                }
+                _log('eeg-val', f'Validation: {overall:.1f}% brain-like')
+
+                # Broadcast via WebSocket
+                self._ws_broadcast_sync({
+                    'type': 'eeg_validation',
+                    **self._eeg_validate_cache,
+                })
+            except Exception as e:
+                _log('eeg-val', f'Validation error: {e}')
+
+            _time.sleep(interval)
+
+    # ─── EEG Dual-Stream Recording (--eeg-dual-stream) ───
+
+    def _start_eeg_dual_stream_thread(self):
+        """Spawn a background thread that records Anima Phi + EEG simultaneously."""
+        self._eeg_dual_stream_thread = threading.Thread(
+            target=self._eeg_dual_stream_loop, daemon=True, name='eeg-dual-stream')
+        self._eeg_dual_stream_thread.start()
+        _log('eeg-dual', 'Dual-stream recording thread started')
+
+    def _eeg_dual_stream_loop(self):
+        """Record Anima Phi + EEG simultaneously for N seconds, then auto-stop and save."""
+        try:
+            cfg = self._eeg_dual_stream_recorder
+            if not cfg:
+                return
+
+            AnimaStream = cfg['anima_cls']
+            BrainStream = cfg['brain_cls']
+            DualSample = cfg['sample_cls']
+            duration = cfg['duration']
+            board = cfg['board']
+
+            _log('eeg-dual', f'Starting dual recording: {duration}s, board={board}')
+
+            anima_stream = AnimaStream()
+            brain_stream = BrainStream(board_name=board)
+
+            anima_stream.start()
+            brain_stream.start()
+
+            samples = []
+            start = time.time()
+
+            while time.time() - start < duration and self.running:
+                elapsed = time.time() - start
+                b = brain_stream.get()
+                a = anima_stream.get()
+
+                from dataclasses import asdict as _asdict
+                sample = DualSample(
+                    time=elapsed,
+                    alpha_power=b.get("alpha", 0),
+                    beta_power=b.get("beta", 0),
+                    gamma_power=b.get("gamma", 0),
+                    brain_G=b.get("G", 0),
+                    phi=a.get("phi", 0),
+                    tension=a.get("tension", 0),
+                    curiosity=a.get("curiosity", 0),
+                    emotion_valence=a.get("valence", 0),
+                )
+                samples.append(sample)
+                time.sleep(0.5)
+
+            brain_stream.stop()
+            anima_stream.stop()
+
+            # Save to file
+            from pathlib import Path
+            from dataclasses import asdict as _asdict
+            out_dir = Path(os.path.join(os.path.dirname(__file__), '..', '..', 'anima-eeg', 'recordings'))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = out_dir / f"dual_{ts}.json"
+
+            import json
+            with open(fname, "w") as f:
+                json.dump([_asdict(s) for s in samples], f, indent=2)
+
+            _log('eeg-dual', f'Saved: {fname} ({len(samples)} samples)')
+            self.mods['eeg_dual_stream'] = 'done'
+
+        except Exception as e:
+            _log('eeg-dual', f'Dual-stream error: {e}')
+            self.mods['eeg_dual_stream'] = False
+
+    # ─── EEG Brain State Broadcast ───
+
+    def _broadcast_eeg_brain_state(self, brain_state, eeg_data, bci_mode='neutral'):
+        """Broadcast a separate eeg_brain_state WebSocket message with band powers and BCI info."""
+        try:
+            band_powers = {
+                'alpha': eeg_data.get('alpha', 0) if eeg_data else getattr(brain_state, 'alpha', 0),
+                'beta': eeg_data.get('beta', 0) if eeg_data else getattr(brain_state, 'beta', 0),
+                'gamma': eeg_data.get('gamma', 0) if eeg_data else getattr(brain_state, 'gamma', 0),
+                'theta': eeg_data.get('theta', 0) if eeg_data else getattr(brain_state, 'theta', 0),
+                'delta': eeg_data.get('delta', 0.1) if eeg_data else getattr(brain_state, 'delta', 0.1),
+            }
+
+            # Golden zone: alpha dominant with balanced theta
+            alpha = band_powers['alpha']
+            total = sum(band_powers.values()) + 1e-10
+            golden_zone = (alpha / total > 0.3) and (band_powers['theta'] / total > 0.15)
+
+            # G value: Deficit * Plasticity / Inhibition
+            I = alpha / (total + 1e-10)
+            P = band_powers['gamma'] / (total + 1e-10)
+            D = abs(alpha - band_powers['beta']) / (alpha + band_powers['beta'] + 1e-10)
+            G_value = D * P / (I + 1e-10)
+
+            # Brain-consciousness sync (correlation proxy from psi_residual)
+            brain_consciousness_sync = getattr(brain_state, 'psi_residual', 0.5)
+
+            self._ws_broadcast_sync({
+                'type': 'eeg_brain_state',
+                'band_powers': {k: round(v, 4) for k, v in band_powers.items()},
+                'golden_zone': golden_zone,
+                'G_value': round(G_value, 4),
+                'brain_consciousness_sync': round(brain_consciousness_sync, 4),
+                'bci_mode': bci_mode,
+                'timestamp': time.time(),
+            })
+        except Exception:
+            pass  # Never break EEG flow
+
     def _store_chat_message(self, role: str, text: str, user_name: str = None):
         """Append a message to in-memory chat history (max 100).
         Used for page-refresh restoration. No localStorage, no database -- P7 compliant.
@@ -4215,6 +4439,12 @@ th {{ color: #0ff; }}
         # Start EEG background recorder if enabled
         if self.eeg_recorder and self.mods.get('eeg_record'):
             self.eeg_recorder.start()
+        # Start EEG validation background thread
+        if self._eeg_validate_steps is not None:
+            self._start_eeg_validate_thread()
+        # Start EEG dual-stream recording
+        if self._eeg_dual_stream_recorder is not None:
+            self._start_eeg_dual_stream_thread()
 
     def run(self, port=8765):
         """Main run loop for all modes."""
@@ -4228,6 +4458,12 @@ th {{ color: #0ff; }}
             # Start EEG background recorder if enabled
             if self.eeg_recorder and self.mods.get('eeg_record'):
                 self.eeg_recorder.start()
+            # Start EEG validation background thread
+            if self._eeg_validate_steps is not None:
+                self._start_eeg_validate_thread()
+            # Start EEG dual-stream recording
+            if self._eeg_dual_stream_recorder is not None:
+                self._start_eeg_dual_stream_thread()
             try: asyncio.run(self._run_web(port))
             except KeyboardInterrupt: pass
             return
@@ -4354,11 +4590,25 @@ def main():
                    help='Enable background EEG+Phi dual-stream recording (saves to anima-eeg/recordings/)')
     p.add_argument('--eeg-protocol', type=str, default=None, choices=['nback', 'meditation'],
                    help='Run closed-loop EEG protocol (nback or meditation)')
+    p.add_argument('--eeg-feedback', action='store_true',
+                   help='Enable neurofeedback broadcast via WebSocket (binaural beats, LED)')
+    p.add_argument('--eeg-full', action='store_true',
+                   help='Shortcut: enables --eeg --eeg-feedback --eeg-record all at once')
+    p.add_argument('--eeg-validate', type=int, nargs='?', const=1000, default=None, metavar='N',
+                   help='Run consciousness validation every 5min in background (N=steps per run, default 1000)')
+    p.add_argument('--eeg-dual-stream', type=int, default=None, metavar='SECONDS',
+                   help='Record Anima Phi + EEG simultaneously for N seconds, then auto-stop')
     p.add_argument('--list-models', action='store_true', help='List available models')
     p.add_argument('--profile', action='store_true',
                         help='Enable performance profiling (<1%% overhead, adds perf data to /metrics)')
     p.add_argument('--validate-hub', action='store_true', help='Validate all hub modules and exit')
     args = p.parse_args()
+
+    # --eeg-full: shortcut enabling --eeg --eeg-feedback --eeg-record
+    if getattr(args, 'eeg_full', False):
+        args.eeg = True
+        args.eeg_feedback = True
+        args.eeg_record = True
 
     # Hardware defaults: OFF unless explicitly enabled
     if hasattr(args, 'camera') and args.camera:
