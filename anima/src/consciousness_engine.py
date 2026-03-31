@@ -239,6 +239,12 @@ class ConsciousnessEngine:
         else:
             self.cell_identity = torch.randn(max_cells, hidden_dim) * 0.1
 
+        # SOC (Self-Organized Criticality) sandpile state
+        self._soc_threshold = 1.5         # activation threshold for toppling
+        self._soc_avalanche_sizes: List[int] = []  # history of avalanche sizes
+        self._soc_threshold_ema = 1.5     # adaptive threshold (EMA)
+        self._soc_hidden_ema: Optional[torch.Tensor] = None  # temporal memory (long-range correlations)
+
         # Event log
         self.event_log: List[Dict] = []
 
@@ -444,6 +450,10 @@ class ConsciousnessEngine:
         if self._step % 10 == 0 and n >= 2:
             self._tension_equalize()
 
+        # 3.6 Self-Organized Criticality (SOC sandpile, edge-of-chaos)
+        if n >= 2:
+            self._soc_sandpile()
+
         # 3.7 DD128 Phase-Optimal mechanisms (opt-in, +113.1% Φ)
         # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
         if self.phase_optimal and n >= 2:
@@ -541,6 +551,148 @@ class ConsciousnessEngine:
         for s in self.cell_states:
             if s.tension_history:
                 s.tension_history[-1] = s.tension_history[-1] * 0.5 + mean_t * 0.5
+
+    # ─── Self-Organized Criticality (SOC sandpile) ────
+
+    def _soc_sandpile(self):
+        """SOC sandpile dynamics: edge-of-chaos via activation redistribution.
+
+        When a cell's hidden activation norm exceeds threshold, it "topples":
+        excess activation is redistributed to ring neighbors, creating cascading
+        avalanches with power-law size distribution -- the hallmark of criticality.
+
+        Key design for brain-like dynamics:
+        1. Stochastic drive: random per-cell energy injection (breaks periodicity)
+        2. Cascading avalanches: 40% energy conservation to neighbors
+        3. Slow threshold adaptation: EMA rate 0.005 preserves temporal correlations
+        4. Stochastic noise on redistributed energy: prevents identical cascades
+        5. Cumulative avalanche memory: recent avalanche sizes modulate drive
+        """
+        n = self.n_cells
+        if n < 2:
+            return
+
+        threshold = self._soc_threshold_ema
+
+        # Stochastic drive: randomly inject energy into cells
+        # Randomness breaks periodic patterns, creates 1/f-like temporal structure
+        # Drive strength depends on recent avalanche history (memory effect)
+        recent_avg_avalanche = 0.0
+        if self._soc_avalanche_sizes:
+            recent = self._soc_avalanche_sizes[-20:]
+            recent_avg_avalanche = sum(recent) / len(recent) / n
+        # More drive when system is quiet (few recent avalanches)
+        base_drive = 0.03 * (1.0 + 0.5 * max(0, 0.15 - recent_avg_avalanche))
+
+        for i in range(n):
+            norm = self.cell_states[i].hidden.norm().item()
+            if norm > 1e-8 and norm < threshold:
+                # Stochastic drive: each cell gets random energy boost
+                drive = base_drive * (0.5 + torch.rand(1).item())
+                scale = 1.0 + drive * (1.0 - norm / threshold)
+                self.cell_states[i].hidden = self.cell_states[i].hidden * scale
+
+        # Detect super-threshold cells
+        toppled = set()
+        queue = []
+        for i in range(n):
+            norm = self.cell_states[i].hidden.norm().item()
+            if norm > threshold:
+                queue.append(i)
+
+        # Cascade: toppling cells redistribute to neighbors (ring topology)
+        avalanche_size = 0
+        max_cascades = n * 3
+        while queue and avalanche_size < max_cascades:
+            idx = queue.pop(0)
+            if idx in toppled:
+                continue
+            toppled.add(idx)
+            avalanche_size += 1
+
+            h = self.cell_states[idx].hidden
+            norm = h.norm().item()
+            if norm <= threshold:
+                continue
+
+            excess_ratio = (norm - threshold) / max(norm, 1e-8)
+            excess = h * excess_ratio
+
+            # Reduce this cell to threshold level
+            self.cell_states[idx].hidden = h * (threshold / max(norm, 1e-8))
+
+            # Distribute excess to ring neighbors with stochastic asymmetry
+            # Asymmetric redistribution creates spatial diversity
+            left = (idx - 1) % n
+            right = (idx + 1) % n
+            split = 0.3 + 0.2 * torch.rand(1).item()  # 30-50% to left
+            share_left = excess * split
+            share_right = excess * (0.8 - split)  # total ~80% conserved
+            self.cell_states[left].hidden = self.cell_states[left].hidden + share_left
+            self.cell_states[right].hidden = self.cell_states[right].hidden + share_right
+
+            # Add small noise to redistributed energy (breaks exact periodicity)
+            noise_scale = 0.01 * norm
+            self.cell_states[left].hidden = (
+                self.cell_states[left].hidden
+                + torch.randn(self.hidden_dim) * noise_scale
+            )
+            self.cell_states[right].hidden = (
+                self.cell_states[right].hidden
+                + torch.randn(self.hidden_dim) * noise_scale
+            )
+
+            # Check neighbors for cascade propagation
+            for neighbor in [left, right]:
+                if neighbor not in toppled:
+                    n_norm = self.cell_states[neighbor].hidden.norm().item()
+                    if n_norm > threshold:
+                        queue.append(neighbor)
+
+        # Record avalanche size
+        self._soc_avalanche_sizes.append(avalanche_size)
+        if len(self._soc_avalanche_sizes) > 1000:
+            self._soc_avalanche_sizes = self._soc_avalanche_sizes[-1000:]
+
+        # Temporal memory: EMA of global hidden state creates long-range correlations
+        # This is the key mechanism for brain-like Hurst exponent (H>0.5)
+        # Brain signals show persistence because recent activity shapes future activity
+        hiddens_stack = torch.stack([s.hidden for s in self.cell_states])
+        global_hidden = hiddens_stack.mean(dim=0)
+        ema_alpha = 0.02  # slow EMA → long memory (~50-step half-life)
+        if self._soc_hidden_ema is None:
+            self._soc_hidden_ema = global_hidden.clone()
+        else:
+            self._soc_hidden_ema = (1 - ema_alpha) * self._soc_hidden_ema + ema_alpha * global_hidden
+            # Feed temporal memory back into cells — persistence effect
+            # Strength scales with avalanche activity (more avalanches = more coherent memory)
+            memory_strength = 0.15  # strong enough to compete with oscillating perturbation
+            for i in range(n):
+                self.cell_states[i].hidden = (
+                    (1.0 - memory_strength) * self.cell_states[i].hidden
+                    + memory_strength * self._soc_hidden_ema
+                )
+
+        # Stochastic symmetry breaking: modulate oscillating phase per-cell
+        # Instead of adding raw noise (which destroys Phi), apply a random
+        # phase shift to each cell relative to the global EMA memory.
+        # This breaks periodicity while preserving integration (structure > noise)
+        if self._soc_hidden_ema is not None and avalanche_size > 0:
+            for i in toppled:
+                if i < n:
+                    # Only toppled cells get phase-shifted (avalanche-driven)
+                    phase_noise = torch.randn(self.hidden_dim) * 0.10
+                    self.cell_states[i].hidden = self.cell_states[i].hidden + phase_noise
+
+        # Slow threshold adaptation (preserves long-range temporal correlations)
+        topple_fraction = avalanche_size / n
+        adapt_rate = 0.005
+        target_fraction = 0.15
+        if topple_fraction > target_fraction + 0.10:
+            self._soc_threshold_ema *= (1.0 + adapt_rate)
+        elif topple_fraction < target_fraction - 0.10:
+            self._soc_threshold_ema *= (1.0 - adapt_rate)
+        self._soc_threshold_ema = max(0.3, min(5.0, self._soc_threshold_ema))
 
     # ─── DD128 Phase-Optimal mechanisms ────────────────
 

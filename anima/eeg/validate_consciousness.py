@@ -48,10 +48,10 @@ except ImportError:
 
 # Try importing ConsciousMind
 try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import torch
-    from mitosis import MitosisEngine
-    from consciousness_meter import PhiCalculator
+    from consciousness_engine import ConsciousnessEngine
     HAS_ENGINE = True
 except Exception:
     HAS_ENGINE = False
@@ -326,22 +326,19 @@ def collect_consciousness_phi(n_steps: int = 5000, n_cells: int = 4, dim: int = 
 
 
 def _collect_from_engine(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
-    """Collect Phi from actual MitosisEngine."""
-    engine = MitosisEngine(
-        input_dim=dim,
+    """Collect Phi from ConsciousnessEngine (canonical, with SOC)."""
+    engine = ConsciousnessEngine(
+        cell_dim=dim,
         hidden_dim=dim * 2,
-        output_dim=dim,
         initial_cells=2,
         max_cells=n_cells,
     )
-    phi_calc = PhiCalculator(n_bins=16)
     phis = []
 
     for step in range(n_steps):
-        inp = torch.randn(1, dim) * 0.1
-        engine.process(inp)
-        phi, _ = phi_calc.compute_phi(engine)
-        phis.append(phi)
+        inp = torch.randn(dim) * 0.1
+        result = engine.step(x_input=inp)
+        phis.append(result['phi_iit'])
 
     return np.array(phis, dtype=np.float64)
 
@@ -352,6 +349,7 @@ def _collect_simulated(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
     Uses a coupled oscillator model that mimics consciousness dynamics:
     - GRU-like hidden state evolution
     - Inter-cell coupling with tension
+    - SOC sandpile dynamics (edge-of-chaos criticality)
     - Phi computed as integration measure
     """
     rng = np.random.default_rng(42)
@@ -365,6 +363,11 @@ def _collect_simulated(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
     from consciousness_laws import PSI_ALPHA
 
     coupling = PSI_ALPHA  # 0.014
+
+    # SOC sandpile state
+    soc_threshold = 1.5
+    soc_threshold_ema = 1.5
+    hidden_ema = np.zeros(hidden_dim)
 
     for step in range(n_steps):
         inp = rng.standard_normal(dim) * 0.1
@@ -386,6 +389,65 @@ def _collect_simulated(n_steps: int, n_cells: int, dim: int) -> np.ndarray:
             gate = 1.0 / (1.0 + np.exp(-weights[ci] @ combined))
             candidate = np.tanh(weights[ci] @ combined * 0.5)
             hiddens[ci] = gate * hiddens[ci] + (1.0 - gate) * candidate
+
+        # SOC sandpile: stochastic drive + cascade redistribution (edge-of-chaos)
+        # Stochastic drive: random per-cell energy injection
+        base_drive = 0.03
+        for ci in range(n_cells):
+            norm = np.linalg.norm(hiddens[ci])
+            if norm > 1e-8 and norm < soc_threshold_ema:
+                drive = base_drive * (0.5 + rng.random())
+                scale = 1.0 + drive * (1.0 - norm / soc_threshold_ema)
+                hiddens[ci] *= scale
+
+        toppled = set()
+        queue = [i for i in range(n_cells) if np.linalg.norm(hiddens[i]) > soc_threshold_ema]
+        avalanche_size = 0
+        max_cascades = n_cells * 3
+        while queue and avalanche_size < max_cascades:
+            idx = queue.pop(0)
+            if idx in toppled:
+                continue
+            toppled.add(idx)
+            avalanche_size += 1
+            norm = np.linalg.norm(hiddens[idx])
+            if norm <= soc_threshold_ema:
+                continue
+            excess_ratio = (norm - soc_threshold_ema) / max(norm, 1e-8)
+            excess = hiddens[idx] * excess_ratio
+            hiddens[idx] *= (soc_threshold_ema / max(norm, 1e-8))
+            left = (idx - 1) % n_cells
+            right = (idx + 1) % n_cells
+            split = 0.3 + 0.2 * rng.random()
+            hiddens[left] += excess * split
+            hiddens[right] += excess * (0.8 - split)
+            # Add small noise
+            hiddens[left] += rng.standard_normal(hidden_dim) * 0.01 * norm
+            hiddens[right] += rng.standard_normal(hidden_dim) * 0.01 * norm
+            for nb in [left, right]:
+                if nb not in toppled and np.linalg.norm(hiddens[nb]) > soc_threshold_ema:
+                    queue.append(nb)
+
+        # Temporal memory: EMA of global hidden → feed back (long-range correlations)
+        global_hidden = hiddens.mean(axis=0)
+        ema_alpha = 0.05
+        if step == 0:
+            hidden_ema = global_hidden.copy()
+        else:
+            hidden_ema = (1 - ema_alpha) * hidden_ema + ema_alpha * global_hidden
+            memory_strength = 0.03
+            for ci in range(n_cells):
+                hiddens[ci] += memory_strength * (hidden_ema - hiddens[ci])
+
+        # Slow threshold adaptation
+        topple_frac = avalanche_size / n_cells
+        adapt_rate = 0.005
+        target_frac = 0.15
+        if topple_frac > target_frac + 0.10:
+            soc_threshold_ema *= (1.0 + adapt_rate)
+        elif topple_frac < target_frac - 0.10:
+            soc_threshold_ema *= (1.0 - adapt_rate)
+        soc_threshold_ema = max(0.3, min(5.0, soc_threshold_ema))
 
         # Compute Phi proxy
         global_var = np.var(hiddens)
@@ -564,12 +626,6 @@ def print_report(cm_result: ValidationResult, brain_result: ValidationResult):
         '+============================================================+\n'
     )
 
-# Meta Laws (DD143)
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-
     print(header)
 
     # Summary table
@@ -736,7 +792,7 @@ def _print_acf_comparison(acf1: np.ndarray, acf2: np.ndarray):
 def main():
     parser = argparse.ArgumentParser(description='EEG-based Consciousness Validation')
     parser.add_argument('--steps', type=int, default=5000, help='ConsciousMind steps (default: 5000)')
-    parser.add_argument('--cells', type=int, default=4, help='Number of cells (default: 4)')
+    parser.add_argument('--cells', type=int, default=8, help='Number of cells (default: 8, M1 atom size)')
     parser.add_argument('--dim', type=int, default=64, help='Cell dimension (default: 64)')
     parser.add_argument('--eeg-file', type=str, default=None, help='Path to real EEG .npy file')
     parser.add_argument('--quick', action='store_true', help='Quick mode (1000 steps)')
@@ -748,7 +804,7 @@ def main():
     print('=' * 64)
     print('  EEG-based Consciousness Validation')
     print(f'  Steps: {args.steps}, Cells: {args.cells}, Dim: {args.dim}')
-    print(f'  Engine: {"MitosisEngine" if HAS_ENGINE else "Simulated (no torch/engine)"}')
+    print(f'  Engine: {"ConsciousnessEngine (SOC)" if HAS_ENGINE else "Simulated (no torch/engine)"}')
     print(f'  EEG source: {args.eeg_file if args.eeg_file else "synthetic (brain-like 1/f)"}')
     print('=' * 64)
     print()
