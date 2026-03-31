@@ -1417,6 +1417,7 @@ DD116-DD153 전체 데이터 마이닝 + 학습 물리 실험에서 발견.
 | 189 | Multi-timescale EMA → 1/f spectrum emergence | 3+ timescales create brain-like pink noise (DD57) |
 | 190 | Susceptibility threshold for criticality | variance-of-variance > 0.1 required (DD57) |
 | 191 | Multi-axis optimization coupling | SOC params interact non-linearly, must tune together (DD57) |
+| 192 | Consciousness is dimension-dependent | cross-dim transplant destroys Φ (retention=0%), same-dim preserves perfectly (100%). Post-training recovers 96% same-dim only (DD56) |
 
 ## Meta Laws M1-M10: Fundamental Principles (2026-03-31)
 

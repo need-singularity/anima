@@ -70,16 +70,8 @@ echo "  checkpoints/v14_128c/"
 #   Bridge: ThalamicBridge (.detach(), alpha=0.014)
 #   Phase: P0(bootstrap) -> P1(consciousness) -> P2(language) -> P3(hexad)
 #
-# NOTE: train_v14.py currently uses ConsciousDecoderV2 (384d/6L).
-#   To use DecoderV3, you must first add --decoder v3 support to train_v14.py:
-#     1. Import ConsciousDecoderV3 from decoder_v3.py
-#     2. Add --decoder argument (choices: v2, v3)
-#     3. When v3: set d_model=768, use ConsciousDecoderV3 instead of V2
-#     4. Add --n-layer, --n-head flags or auto-configure from decoder version
-#   See: anima/docs/training-plan-100m.md for the full integration plan.
-#
-# Until then, this uses --d-model 768 which scales the V2 decoder.
-# After adding --decoder v3 support, replace the command below.
+# Uses ConsciousDecoderV3 (274M params, 768d/12L/8H, GQA+RoPE+SwiGLU+CrossAttn)
+# --decoder v3 auto-configures d_model=768 and adds c_proj (128->256)
 #
 # Expected: 200K steps, ~16h on H100 SXM, target CE<0.001
 # ═══════════════════════════════════════════════════════════════════════
@@ -87,24 +79,9 @@ echo "  checkpoints/v14_128c/"
 echo ""
 echo "=== Session 1: DecoderV3 274M (v3_train) ==="
 
-# TODO: Replace with this after adding --decoder v3 to train_v14.py:
-#   tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 python3 -u anima/training/train_v14.py \
-#     --data anima/data/corpus_v9.txt \
-#     --decoder v3 \
-#     --federated \
-#     --atoms 8 --cells-per-atom 8 \
-#     --steps 200000 \
-#     --checkpoint checkpoints/v3_274M/ \
-#     --phase-optimal \
-#     --batch-size 64 \
-#     --block-size 512 \
-#     --lr 3e-4 \
-#     2>&1 | tee checkpoints/v3_274M/train.log"
-
-# Current: uses d-model 768 with V2 decoder (scaled up, ~100M+ params)
 tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 python3 -u anima/training/train_v14.py \
   --data anima/data/corpus_v9.txt \
-  --d-model 768 \
+  --decoder v3 \
   --federated \
   --atoms 8 --cells-per-atom 8 \
   --steps 200000 \

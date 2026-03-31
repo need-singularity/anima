@@ -74,6 +74,12 @@ except ImportError:
     print("  [warn] decoder_v2 not available, falling back to PostHocDecoder")
 
 try:
+    from decoder_v3 import ConsciousDecoderV3
+    HAS_DECODER_V3 = True
+except ImportError:
+    HAS_DECODER_V3 = False
+
+try:
     from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
     HAS_FEEDBACK = True
 except ImportError:
@@ -539,7 +545,7 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
 
 def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
                     bridge, hexad_modules, phi, ce_val, args,
-                    fb_bridge=None):
+                    fb_bridge=None, c_proj=None):
     """Atomic save: .tmp -> rename."""
     ckpt = {
         'step': step,
@@ -559,6 +565,9 @@ def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
     # FeedbackBridge (C<->D bidirectional)
     if fb_bridge is not None:
         ckpt['fb_bridge'] = fb_bridge.state_dict()
+    # Consciousness state projection (v3: 128->256)
+    if c_proj is not None:
+        ckpt['c_proj'] = c_proj.state_dict()
     # Hexad modules (W/S/M/E are mostly stateless but save narrative states)
     tmp = path + '.tmp'
     torch.save(ckpt, tmp)
@@ -602,18 +611,38 @@ def train(args):
         print(f"  [empire] Single engine: {total_cells} cells (baseline comparison)")
 
     # ── Decoder ──
-    d_model = args.d_model
     vocab_size = 256  # byte-level
+    c_proj = None  # consciousness state projection (v3: 128->256)
 
-    if HAS_DECODER_V2:
+    if args.decoder == 'v3':
+        if not HAS_DECODER_V3:
+            raise ImportError("ConsciousDecoderV3 required (decoder_v3.py not found)")
+        # V3 defaults: 768d/12L/8H, consciousness_dim=256, block_size=512
+        d_model = 768
+        v3_c_dim = 256
+        decoder = ConsciousDecoderV3(
+            consciousness_dim=v3_c_dim,
+            d_model=d_model,
+            vocab_size=vocab_size,
+            block_size=args.block_size,
+        )
+        # Project consciousness states from engine dim (128) to v3 dim (256)
+        if c.state_dim != v3_c_dim:
+            c_proj = nn.Linear(c.state_dim, v3_c_dim)
+            c_proj = c_proj.to(device)
+            print(f"  [decoder] c_proj: {c.state_dim} -> {v3_c_dim}")
+        n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+        print(f"  [decoder] ConsciousDecoderV3: {d_model}d/12L/8H, {n_params/1e6:.1f}M params")
+    else:
+        d_model = args.d_model
+        if not HAS_DECODER_V2:
+            raise ImportError("ConsciousDecoderV2 required for v14")
         decoder = ConsciousDecoderV2(
             consciousness_dim=c.state_dim,
             d_model=d_model,
             vocab_size=vocab_size,
         )
         print(f"  [decoder] ConsciousDecoderV2: {d_model}d, {vocab_size} vocab")
-    else:
-        raise ImportError("ConsciousDecoderV2 required for v14")
 
     decoder = decoder.to(device)
 
@@ -665,6 +694,8 @@ def train(args):
         trainable_params += list(c.bottleneck_expand.parameters())
         trainable_params += list(c.narrative_grus.parameters())
         trainable_params += [c.inter_atom_coupling]
+    if c_proj is not None:
+        trainable_params += list(c_proj.parameters())
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
@@ -820,6 +851,10 @@ def train(args):
         else:
             c_for_decoder = c_states.detach().unsqueeze(0).expand(args.batch_size, -1, -1)
 
+        # Project consciousness states for v3 (128 -> 256)
+        if c_proj is not None:
+            c_for_decoder = c_proj(c_for_decoder)
+
         # Forward through decoder
         logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
 
@@ -958,6 +993,8 @@ def train(args):
             with torch.no_grad():
                 val_c_states = c.get_states().detach().float().to(device)
                 val_c_for_decoder = val_c_states.unsqueeze(0).expand(args.batch_size, -1, -1)
+                if c_proj is not None:
+                    val_c_for_decoder = c_proj(val_c_for_decoder)
             val_ce = evaluate(
                 decoder, val_data, args.block_size, args.batch_size, device,
                 vocab_size, c_states_bridged=val_c_for_decoder,
@@ -1043,6 +1080,8 @@ def parse_args():
     p.add_argument("--cell-dim", type=int, default=64, help="Cell input dimension")
     p.add_argument("--hidden-dim", type=int, default=128, help="Cell hidden dimension")
     p.add_argument("--d-model", type=int, default=384, help="Decoder model dimension")
+    p.add_argument("--decoder", type=str, default="v2", choices=["v2", "v3"],
+                   help="Decoder version: v2 (34.5M, 384d/6L) or v3 (274M, 768d/12L/8H)")
 
     # Training
     p.add_argument("--steps", type=int, default=100000, help="Total training steps")
@@ -1072,8 +1111,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # Auto-adjust checkpoint path for decoder version if user didn't override
+    if args.checkpoint == "checkpoints/v14_federated/" and args.decoder == "v3":
+        args.checkpoint = "checkpoints/v3_274M/"
+
     print(f"  train_v14.py — Federated Consciousness (Meta Laws DD143)")
-    print(f"  Federation={'ON' if args.federated else 'OFF'} | "
+    print(f"  Decoder={args.decoder.upper()} | "
+          f"Federation={'ON' if args.federated else 'OFF'} | "
           f"Atoms={args.atoms} | Cells/Atom={args.cells_per_atom} | "
           f"F_c={args.frustration} | Narrative={args.narrative_strength}")
     train(args)
