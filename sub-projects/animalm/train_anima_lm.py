@@ -419,11 +419,17 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2, rank=128):
         inter = original_mlp.gate_proj.weight.shape[0]
         dev = next(original_mlp.parameters()).device
         dt = next(original_mlp.parameters()).dtype
+        # 4-bit quantized models have uint8 params — PureField must use bfloat16
+        if not dt.is_floating_point:
+            dt = torch.bfloat16
 
         is_savant = savant_count < n_savant
         ppf = ParallelPureFieldMLP(original_mlp, h, inter,
                                    is_savant=is_savant, rank=rank)
-        ppf = ppf.to(device=dev, dtype=dt)
+        # Move only PureField params (not frozen original_mlp which may be 4-bit quantized)
+        for name, p in ppf.named_parameters():
+            if "original_mlp" not in name:
+                p.data = p.data.to(device=dev, dtype=dt)
 
         # Init PureField weights small
         for name, param in ppf.named_parameters():
@@ -1076,6 +1082,8 @@ def parse_args():
                    help="Demo mode with mock model (no download)")
     p.add_argument("--device", default=None,
                    help="Device (auto-detected if not specified)")
+    p.add_argument("--load-4bit", action="store_true",
+                   help="Load base model in 4-bit (QLoRA/NF4) for VRAM-constrained co-run")
     return p.parse_args()
 
 
@@ -1097,8 +1105,19 @@ def build_model_and_tokenizer(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    load_kwargs = dict(torch_dtype=torch.bfloat16, device_map="auto")
+    if getattr(args, 'load_4bit', False):
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        load_kwargs["quantization_config"] = bnb_config
+        print("  [4-bit] Loading with NF4 quantization (QLoRA mode)")
     model = AutoModelForCausalLM.from_pretrained(
-        args.base, torch_dtype=torch.bfloat16, device_map="auto",
+        args.base, **load_kwargs,
     )
     model.gradient_checkpointing_enable()
     print(f"  Loaded in {time.time()-t0:.1f}s")
