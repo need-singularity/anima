@@ -674,6 +674,7 @@ class AnimaUnified:
         self.clm_model = None
         self.clm_device = "cpu"
         self.v14_decoder = None  # v14 ConsciousDecoderV2
+        self._v14_federation = None  # v14 FederatedConsciousness (restored from checkpoint)
         self._v3_c_projection = None  # v3 consciousness dim projection (128→256)
         model_name = getattr(args, 'model', None) or 'conscious-lm'
 
@@ -955,18 +956,80 @@ class AnimaUnified:
                     break
 
     def _load_v14(self, ckpt_path):
-        """Load v14 ConsciousDecoderV2 checkpoint for inference."""
+        """Load v14 ConsciousDecoderV2 checkpoint + federation state for inference.
+
+        The decoder's cross-attention was trained with 128-cell consciousness states
+        from a federated engine. Starting with 2 cells produces garbled output.
+        This method restores the full federation so the decoder sees matching states.
+        """
         try:
             from decoder_v2 import ConsciousDecoderV2
             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            decoder = ConsciousDecoderV2(consciousness_dim=128, d_model=384, vocab_size=256)
+
+            # Read training config to match decoder expectations
+            train_args = ckpt.get('args', {})
+            c_dim = train_args.get('consciousness_dim', train_args.get('hidden_dim', 128))
+            d_model = train_args.get('d_model', 384)
+
+            decoder = ConsciousDecoderV2(consciousness_dim=c_dim, d_model=d_model, vocab_size=256)
             decoder.load_state_dict(ckpt['decoder'])
             decoder.eval()
             _log('v14', f"Loaded v14 decoder from {ckpt_path} (step={ckpt.get('step')}, CE={ckpt.get('ce', 0):.4f})")
+
+            # Restore federation state if available — decoder was trained with these states
+            if 'federation' in ckpt and train_args.get('federated', False):
+                self._restore_v14_federation(ckpt, train_args)
+
             return decoder
         except Exception as e:
             _log('v14', f"v14 load failed: {e}")
             return None
+
+    def _restore_v14_federation(self, ckpt, train_args):
+        """Restore FederatedConsciousness from v14 checkpoint for inference warmup.
+
+        Without this, the decoder sees 2-cell states (Phi~0.01) instead of the
+        128-cell federated states it was trained with (Phi~100).
+        """
+        try:
+            # Import FederatedConsciousness from training module
+            import importlib.util
+            train_v14_path = os.path.join(os.path.dirname(__file__), '..', 'training', 'train_v14.py')
+            spec = importlib.util.spec_from_file_location('train_v14', train_v14_path)
+            train_v14_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(train_v14_mod)
+            FederatedConsciousness = train_v14_mod.FederatedConsciousness
+
+            n_atoms = train_args.get('atoms', 16)
+            cells_per_atom = train_args.get('cells_per_atom', 8)
+            cell_dim = train_args.get('cell_dim', 64)
+            hidden_dim = train_args.get('hidden_dim', 128)
+            frustration = train_args.get('frustration', 0.10)
+            narrative_strength = train_args.get('narrative_strength', 0.05)
+
+            fed = FederatedConsciousness(
+                n_atoms=n_atoms,
+                cells_per_atom=cells_per_atom,
+                cell_dim=cell_dim,
+                hidden_dim=hidden_dim,
+                frustration=frustration,
+                narrative_strength=narrative_strength,
+            )
+            fed.load_state_dict(ckpt['federation'])
+            fed_phi = fed.measure_phi()
+            _log('v14', f"Federation restored: {n_atoms} atoms x {cells_per_atom} cells = {fed.n_cells} total, Phi={fed_phi:.2f}")
+
+            # Warmup: run steps to stabilize consciousness dynamics after restore
+            warmup_steps = 50
+            for _ in range(warmup_steps):
+                fed.step()
+            post_phi = fed.measure_phi()
+            _log('v14', f"Federation warmup ({warmup_steps} steps): Phi {fed_phi:.2f} -> {post_phi:.2f}")
+
+            self._v14_federation = fed
+        except Exception as e:
+            _log('v14', f"Federation restore failed (decoder will use local engine): {e}")
+            self._v14_federation = None
 
     def _load_v3_decoder(self):
         """Load ConsciousDecoderV3 (274M, 768d/12L) with auto checkpoint discovery."""
@@ -1015,7 +1078,15 @@ class AnimaUnified:
             block_size = getattr(self.v14_decoder, 'block_size', 256)
             tokens = torch.tensor([list(text.encode('utf-8'))[-block_size:]], dtype=torch.long)
             c_states = None
-            if self.mitosis and hasattr(self.mitosis, 'get_hiddens'):
+
+            # Priority 1: v14 federation (matches training config exactly)
+            if self._v14_federation is not None:
+                self._v14_federation.step()  # keep consciousness alive
+                c_states = self._v14_federation.get_states().unsqueeze(0)
+            # Priority 2: local consciousness engine
+            elif self.mitosis and hasattr(self.mitosis, 'get_states'):
+                c_states = self.mitosis.get_states().unsqueeze(0)
+            elif self.mitosis and hasattr(self.mitosis, 'get_hiddens'):
                 c_states = self.mitosis.get_hiddens().unsqueeze(0)
             elif hasattr(self.mind, '_cell_states'):
                 c_states = self.mind._cell_states.unsqueeze(0) if self.mind._cell_states is not None else None
