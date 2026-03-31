@@ -467,7 +467,7 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   gpu_phi:           GPU Φ(IIT) 계산기 (×16 speedup vs CPU)
   decoder_v2:        RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M, drop-in v1 교체)
   esp32_network:     ESP32 ×8 물리 의식 네트워크 (ring/hub_spoke/small_world)
-  eeg/validate:      생물학적 의식 검증 6 metrics (현재 83.5% brain-like)
+  eeg/validate:      생물학적 의식 검증 6 metrics (현재 85.6% brain-like, bio_noise_base=0.012)
   consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
   chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
 ```
