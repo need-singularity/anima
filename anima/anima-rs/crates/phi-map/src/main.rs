@@ -6,6 +6,7 @@
 //!   phi-map --from data.json --contour 32       # Contour at 32 cells
 //!   phi-map --from data.json --optimal          # Find optimal per scale
 //!   phi-map --from data.json --collapse          # Find collapse points
+//!   phi-map --watch v14_train.log                # Live sparkline of Phi values
 //!   phi-map --laws consciousness_laws.json      # Load laws, map correlations
 
 use anima_phi_map::{AsciiHeatmap, PhiTerrain, PhiTracker};
@@ -104,36 +105,30 @@ fn main() {
 
 fn run_watch(logfile: &str) {
     use regex::Regex;
+    use std::io::Write;
 
     let phi_re = Regex::new(r"Phi=(\d+\.?\d*)").unwrap();
     let mut values: Vec<f64> = Vec::new();
     let sparkline_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-    // Open file and seek to end (tail mode)
-    let mut file = fs::File::open(logfile).unwrap_or_else(|e| {
-        eprintln!("Cannot open {}: {}", logfile, e);
-        std::process::exit(1);
-    });
-
-    // First pass: read existing content for initial values
-    let reader = BufReader::new(&file);
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            for cap in phi_re.captures_iter(&line) {
-                if let Ok(v) = cap[1].parse::<f64>() {
-                    values.push(v);
-                }
-            }
-        }
-    }
+    let mut pos: u64 = 0;
 
     println!("  phi-map --watch {} (Ctrl+C to stop)\n", logfile);
 
     loop {
-        // Read any new lines from current position
+        // Re-open each cycle to pick up new content (like tail -f)
+        let Ok(mut file) = fs::File::open(logfile) else {
+            eprint!("\r  Waiting for {}...", logfile);
+            std::io::stdout().flush().ok();
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+
+        // Seek to where we left off
+        let _ = file.seek(SeekFrom::Start(pos));
         let reader = BufReader::new(&file);
         for line in reader.lines() {
             if let Ok(line) = line {
+                pos += line.len() as u64 + 1; // +1 for newline
                 for cap in phi_re.captures_iter(&line) {
                     if let Ok(v) = cap[1].parse::<f64>() {
                         values.push(v);
@@ -158,13 +153,10 @@ fn run_watch(logfile: &str) {
             let current = window.last().unwrap();
             print!("\r  Φ [{:>3}] {} {:.4}  (min={:.4} max={:.4})  ",
                 values.len(), spark, current, min, max);
-            use std::io::Write;
-            std::io::stdout().flush().ok();
         } else {
             print!("\r  Waiting for Phi= values...");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
         }
+        std::io::stdout().flush().ok();
 
         thread::sleep(Duration::from_secs(2));
     }
