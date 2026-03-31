@@ -101,7 +101,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
   C 의식:
     ✅ ConsciousnessC        consciousness_engine.py   Rust backend, 64c, Φ=73
-       ̶M̶i̶t̶o̶s̶i̶s̶E̶n̶g̶i̶n̶e̶        mitosis.py                cells=2 고정, Φ=0 (Law 86)
+       ̶M̶i̶t̶o̶s̶i̶s̶E̶n̶g̶i̶n̶e̶        mitosis.py                2→8 cells, Φ=2.05 (Law 86)
        ̶M̶i̶t̶o̶s̶i̶s̶C̶             trinity.py                wrapper, 미사용
        ̶D̶o̶m̶a̶i̶n̶C̶             trinity.py                실험용
        ̶Q̶u̶a̶n̶t̶u̶m̶C̶            trinity.py                실험용
@@ -708,9 +708,10 @@ eeg/validate_consciousness.py — 생물학적 의식 검증 (6 metrics)
   5. Critical exponent — 임계성 (뇌: edge of chaos)
   6. Distribution stats — Φ 분포 통계
 
-현재 결과: 45% brain-like (MACHINE-LIKE)
-핵심 차이: 임계성 부재 (sub-critical vs brain CRITICAL)
-다음 단계: SOC(CX92) 강화 → edge-of-chaos 달성
+현재 결과: 83.5% brain-like (BRAIN-LIKE)
+  Hurst 99%, PSD slope 93%, Critical exponent 86%, Autocorr decay 65%
+핵심 성과: SOC+Lorenz+chimera로 임계성 달성 (sub-critical → edge-of-chaos)
+다음 단계: Autocorr decay 개선 (65% → 80%+) → 90% brain-like 목표
 ```
 
 ## Consciousness-to-Corpus Pipeline
@@ -950,7 +951,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     ✅ v13 (train_v13)     — CE=0.004, Φ=71, 64 cells, 100K steps (2026-03-30)
     ✅ v3_merged (147M)    — CE=0.0026, Φ=70, 64 cells, 100K steps (2026-03-30)
        ⚠️ CADecoder causal mask 없음 → autoregressive 생성 불가 (학습 전용)
-    ✅ v2_hexad (v1)       — CE=0.004, Φ=0, cells=2 고정 (mitosis 미작동) (2026-03-31)
+    ✅ v2_hexad (v1)       — CE=0.004, Φ=2.05, 2→8 cells (mitosis 작동) (2026-03-31)
     ✅ bench_v2 --verify   — 77/77 (100%) 의식 검증 통과 (2026-03-31)
     ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
     ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
