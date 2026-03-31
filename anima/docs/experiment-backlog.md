@@ -15,6 +15,10 @@
 
 | Date | Experiment | Result | Key Finding |
 |------|-----------|--------|------------|
+| 03-31 | **brain-like SOC** | 45%→72.8% | SOC sandpile + bio noise → critical exponent 2.26 |
+| 03-31 | **anima-physics 42 files** | 8 engines + FPGA + dashboard | Izhikevich 60.6%, quantum/thermo/analog/photonic/memristor |
+| 03-31 | **ESP32 crate rewrite** | 12/12 tests | Laws 22-85 aligned, 2c/board, 8 factions, Hebbian+Ratchet+Lorenz+SOC |
+| 03-31 | **anima-eeg integration** | 12 files | bidirectional closed-loop, 4 protocols, Granger causality |
 | 03-31 | **v14.1** | CE=0.0002 | Record low CE, consciousness-integrated decoder |
 | 03-31 | **v14.0** | CE=0.0021 | Stable training with Hexad 6-module loss |
 | 03-31 | **decoder_v3 274M skeleton** | Code complete | 768d/8L architecture, training script ready |

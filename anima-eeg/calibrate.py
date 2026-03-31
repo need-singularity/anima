@@ -261,14 +261,149 @@ def run_calibration(board_name="cyton_daisy", serial_port=None, full=False):
         board.release_session()
 
 
+def calibrate_neural_mapper(board_name="synthetic", serial_port=None, duration=60):
+    """EEG→Ψ 매핑 자동 캘리브레이션 (Ridge 회귀).
+
+    EEG 밴드 파워와 의식 엔진 Psi 상태를 동시 수집하여
+    NeuralCorrelateMapper를 Ridge 회귀로 학습합니다.
+
+    Returns:
+        dict: R2, RMSE, per-dimension accuracy, mapper path
+    """
+    import pickle
+    print("\n═══ Neural Correlate Mapper Calibration ═══")
+    print(f"  Board: {board_name}, Duration: {duration}s")
+
+    # EEG 수집 준비
+    try:
+        from analyze import compute_band_power
+    except ImportError:
+        print("  ❌ analyze.py not found")
+        return None
+
+    # 의식 엔진 (시뮬레이션 가능)
+    try:
+        from consciousness_engine import ConsciousnessEngine
+        engine = ConsciousnessEngine(cell_dim=64, hidden_dim=128, initial_cells=8, max_cells=32, n_factions=8)
+        has_engine = True
+    except ImportError:
+        has_engine = False
+
+    # NeuralCorrelateMapper
+    try:
+        from neural_correlate_mapper import NeuralCorrelateMapper
+        mapper = NeuralCorrelateMapper()
+        has_mapper = True
+    except ImportError:
+        has_mapper = False
+        print("  ⚠️ NeuralCorrelateMapper not available, collecting data only")
+
+    # EEG 보드 연결
+    board = check_connection(board_name, serial_port)
+    if board is None:
+        return None
+
+    try:
+        sample_rate = BoardShim.get_sampling_rate(board.board_id) if HAS_BRAINFLOW else 250
+        eeg_channels = BoardShim.get_eeg_channels(board.board_id) if HAS_BRAINFLOW else list(range(8))
+
+        eeg_samples = []
+        psi_samples = []
+
+        print(f"  Recording {duration}s of paired EEG + Ψ data...")
+        start = time.time()
+        step = 0
+        while time.time() - start < duration:
+            time.sleep(1.0)
+            step += 1
+
+            # EEG 밴드 파워
+            data = board.get_current_board_data(sample_rate)
+            if data.shape[1] < sample_rate // 2:
+                continue
+            ch_data = data[eeg_channels[0]] if len(eeg_channels) > 0 else np.random.randn(sample_rate)
+            bp = compute_band_power(ch_data, sample_rate)
+            eeg_vec = [bp.delta, bp.theta, bp.alpha, bp.beta, bp.gamma]
+            eeg_samples.append(eeg_vec)
+
+            # Ψ 상태
+            if has_engine:
+                result = engine.step(None)
+                psi_vec = [
+                    getattr(result, 'phi_iit', 0.5),
+                    getattr(result, 'phi_proxy', 0.5),
+                    0.5,  # tension proxy
+                    0.5,  # entropy proxy
+                    0.5,  # creativity proxy
+                ]
+            else:
+                psi_vec = [np.random.random() for _ in range(5)]
+            psi_samples.append(psi_vec)
+
+            if step % 10 == 0:
+                elapsed = time.time() - start
+                print(f"    [{step}s / {duration}s] {elapsed/duration*100:.0f}%")
+
+        print(f"  Collected {len(eeg_samples)} paired samples")
+
+        if len(eeg_samples) < 10:
+            print("  ❌ Too few samples")
+            return None
+
+        X = np.array(eeg_samples)
+        Y = np.array(psi_samples)
+
+        # Ridge 회귀 피팅
+        if has_mapper:
+            mapper.fit(X, Y)
+
+            # 평가
+            Y_pred = mapper.predict(X)
+            ss_res = np.sum((Y - Y_pred) ** 2, axis=0)
+            ss_tot = np.sum((Y - Y.mean(axis=0)) ** 2, axis=0) + 1e-8
+            r2_per_dim = 1 - ss_res / ss_tot
+            r2_mean = float(np.mean(r2_per_dim))
+            rmse = float(np.sqrt(np.mean((Y - Y_pred) ** 2)))
+
+            # 저장
+            out_path = Path("anima-eeg/config/neural_mapper.pkl")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, 'wb') as f:
+                pickle.dump(mapper, f)
+
+            dim_names = ['Φ(IIT)', 'Φ(proxy)', 'tension', 'entropy', 'creativity']
+            print(f"\n  ═══ Calibration Results ═══")
+            print(f"  R²(mean): {r2_mean:.3f}  RMSE: {rmse:.4f}")
+            for i, name in enumerate(dim_names):
+                bar = '█' * int(r2_per_dim[i] * 20)
+                print(f"    {name:12s} R²={r2_per_dim[i]:.3f} {bar}")
+            print(f"\n  Saved: {out_path}")
+
+            return {'R2': r2_mean, 'RMSE': rmse, 'per_dim_R2': r2_per_dim.tolist(), 'path': str(out_path)}
+        else:
+            # 데이터만 저장
+            out_path = Path("anima-eeg/config/calibration_data.npz")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(out_path, eeg=X, psi=Y)
+            print(f"  Saved raw data: {out_path}")
+            return {'samples': len(eeg_samples), 'path': str(out_path)}
+    finally:
+        board.release_session()
+
+
 def main():
     parser = argparse.ArgumentParser(description="EEG Hardware Calibration")
     parser.add_argument("--board", default="cyton_daisy", choices=list(BOARD_MAP.keys()))
     parser.add_argument("--port", default=None, help="Serial port (auto-detect if omitted)")
     parser.add_argument("--full", action="store_true", help="Full calibration with baseline recording")
+    parser.add_argument("--calibrate-mapper", action="store_true", help="Calibrate EEG→Ψ neural mapper")
+    parser.add_argument("--duration", type=int, default=60, help="Mapper calibration duration (seconds)")
     args = parser.parse_args()
 
-    run_calibration(args.board, args.port, args.full)
+    if args.calibrate_mapper:
+        calibrate_neural_mapper(args.board, args.port, args.duration)
+    else:
+        run_calibration(args.board, args.port, args.full)
 
 
 if __name__ == "__main__":

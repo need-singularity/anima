@@ -269,15 +269,168 @@ def dual_record(duration=60, board_name="cyton_daisy", serial_port=None, plot=Fa
     return samples
 
 
+def analyze_dual_stream(samples, max_granger_lag=5, max_xcorr_lag_ms=500):
+    """다차원 상관 + Granger 인과성 + 교차 상관 분석.
+
+    Args:
+        samples: DualSample 리스트 (dual_record() 반환값 또는 JSON 로드)
+        max_granger_lag: Granger 인과성 최대 지연 (1..p)
+        max_xcorr_lag_ms: 교차 상관 최대 지연 (ms)
+    """
+    if len(samples) < 20:
+        print("  ❌ Need at least 20 samples for analysis")
+        return None
+
+    # 데이터 추출
+    c_names = ['phi', 'tension', 'curiosity']
+    e_names = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+
+    c_data = np.array([[getattr(s, n, 0) for n in c_names] for s in samples])
+    e_data = np.array([[getattr(s, f'{n}_power', 0) for n in e_names] for s in samples])
+
+    # ═══ 1. 상관 행렬 (3×5) ═══
+    print("\n  ═══ Correlation Matrix (Consciousness × EEG) ═══\n")
+    print(f"  {'':12s}", end="")
+    for en in e_names:
+        print(f"  {en:>7s}", end="")
+    print()
+
+    corr_matrix = np.zeros((len(c_names), len(e_names)))
+    for i, cn in enumerate(c_names):
+        print(f"  {cn:12s}", end="")
+        for j, en in enumerate(e_names):
+            x, y = c_data[:, i], e_data[:, j]
+            if np.std(x) > 1e-8 and np.std(y) > 1e-8:
+                r = np.corrcoef(x, y)[0, 1]
+            else:
+                r = 0.0
+            corr_matrix[i, j] = r
+            marker = "*" if abs(r) > 0.3 else " "
+            print(f"  {r:+.3f}{marker}", end="")
+        print()
+
+    print(f"\n  * = |r| > 0.3 (potentially significant)")
+
+    # ═══ 2. Granger 인과성 (VAR 모델, numpy only) ═══
+    print(f"\n  ═══ Granger Causality (lag 1..{max_granger_lag}) ═══\n")
+
+    def _var_residuals(Y, X_lag, p):
+        """Simple VAR residuals using least squares."""
+        n = len(Y)
+        if n < p + 10:
+            return None, float('inf')
+        # Build lagged matrix
+        X_rows = []
+        for t in range(p, n):
+            row = []
+            for lag in range(1, p + 1):
+                row.extend(X_lag[t - lag])
+            X_rows.append(row)
+        X_mat = np.array(X_rows)
+        Y_vec = Y[p:]
+        if X_mat.shape[0] < X_mat.shape[1] + 1:
+            return None, float('inf')
+        # OLS
+        try:
+            beta, res, _, _ = np.linalg.lstsq(X_mat, Y_vec, rcond=None)
+            pred = X_mat @ beta
+            resid = Y_vec - pred
+            rss = float(np.sum(resid ** 2))
+            return resid, rss
+        except np.linalg.LinAlgError:
+            return None, float('inf')
+
+    # Select best lag by BIC
+    best_p = 1
+    best_bic = float('inf')
+    all_data = np.hstack([c_data[:, :1], e_data[:, 2:3]])  # phi + alpha for quick BIC
+    for p in range(1, max_granger_lag + 1):
+        _, rss = _var_residuals(all_data[:, 0], all_data, p)
+        n = len(all_data) - p
+        k = p * all_data.shape[1]
+        if rss > 0 and n > k:
+            bic = n * np.log(rss / n + 1e-30) + k * np.log(n)
+            if bic < best_bic:
+                best_bic = bic
+                best_p = p
+
+    print(f"  Selected lag: p={best_p} (by BIC)\n")
+    print(f"  {'Direction':30s} {'F-stat':>8s} {'Causal?':>8s}")
+    print(f"  {'─' * 50}")
+
+    for en_idx, en in enumerate(e_names):
+        # EEG → Phi
+        restricted = c_data[:, :1]
+        unrestricted = np.hstack([c_data[:, :1], e_data[:, en_idx:en_idx + 1]])
+        _, rss_r = _var_residuals(c_data[:, 0], restricted, best_p)
+        _, rss_u = _var_residuals(c_data[:, 0], unrestricted, best_p)
+        n = len(c_data) - best_p
+        if rss_u > 0 and rss_r > rss_u:
+            f_stat = ((rss_r - rss_u) / best_p) / (rss_u / max(1, n - 2 * best_p))
+            causal = "YES" if f_stat > 3.0 else "no"
+        else:
+            f_stat = 0.0
+            causal = "no"
+        print(f"  {en:>7s} → Phi              {f_stat:8.2f} {causal:>8s}")
+
+    # ═══ 3. 교차 상관 (lag) ═══
+    print(f"\n  ═══ Cross-Correlation (±{max_xcorr_lag_ms}ms) ═══\n")
+    print(f"  {'EEG Band':10s} {'Peak r':>8s} {'Lag(ms)':>8s} {'Direction':>12s}")
+    print(f"  {'─' * 42}")
+
+    sample_interval_ms = 500  # dual_stream samples at ~2Hz
+    max_lag_samples = max(1, max_xcorr_lag_ms // sample_interval_ms)
+    phi = c_data[:, 0]
+
+    for j, en in enumerate(e_names):
+        eeg_band = e_data[:, j]
+        best_r = 0.0
+        best_lag = 0
+        for lag in range(-max_lag_samples, max_lag_samples + 1):
+            if lag >= 0:
+                x = phi[lag:]
+                y = eeg_band[:len(x)]
+            else:
+                y = eeg_band[-lag:]
+                x = phi[:len(y)]
+            if len(x) < 10:
+                continue
+            if np.std(x) > 1e-8 and np.std(y) > 1e-8:
+                r = np.corrcoef(x, y)[0, 1]
+                if abs(r) > abs(best_r):
+                    best_r = r
+                    best_lag = lag
+
+        lag_ms = best_lag * sample_interval_ms
+        direction = "EEG→Phi" if best_lag > 0 else "Phi→EEG" if best_lag < 0 else "sync"
+        print(f"  {en:10s} {best_r:+8.3f} {lag_ms:+8d} {direction:>12s}")
+
+    return {
+        'correlation_matrix': corr_matrix.tolist(),
+        'c_names': c_names,
+        'e_names': e_names,
+        'granger_lag': best_p,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Dual Stream: Brain + Anima")
     parser.add_argument("--duration", type=int, default=60)
     parser.add_argument("--board", default="cyton_daisy")
     parser.add_argument("--port", default=None)
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--analyze", default=None, help="Analyze existing dual_*.json file")
     args = parser.parse_args()
 
-    dual_record(args.duration, args.board, args.port, args.plot)
+    if args.analyze:
+        with open(args.analyze) as f:
+            raw = json.load(f)
+        samples = [DualSample(**d) for d in raw]
+        analyze_dual_stream(samples)
+    else:
+        samples = dual_record(args.duration, args.board, args.port, args.plot)
+        if samples and len(samples) > 20:
+            analyze_dual_stream(samples)
 
 
 if __name__ == "__main__":
