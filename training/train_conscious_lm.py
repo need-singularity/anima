@@ -15,6 +15,10 @@ Usage:
   python train_conscious_lm.py --data data/corpus.txt --dim 384 --layers 6
   python train_conscious_lm.py --resume checkpoints/step_10000.pt
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
+import path_setup  # noqa
+
 
 import argparse
 import json

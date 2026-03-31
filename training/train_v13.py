@@ -18,6 +18,10 @@ Usage:
   python train_v13.py --data data/corpus.txt --topology hypercube --chaos wave
   python train_v13.py --data data/corpus.txt --cells 64 --dim 384 --layers 6
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
+import path_setup  # noqa
+
 
 import argparse
 import math

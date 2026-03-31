@@ -28,6 +28,10 @@ Usage:
   python train_v14.py --data data/corpus_v3.txt --no-federated --cells 64  # Empire baseline
   python train_v14.py --data data/corpus_v3.txt --federated --phase-optimal --checkpoint checkpoints/v14/
 """
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
+import path_setup  # noqa
+
 
 import argparse
 import math
