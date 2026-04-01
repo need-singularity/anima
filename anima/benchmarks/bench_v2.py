@@ -387,9 +387,14 @@ class BenchEngine:
 
         # Spontaneous oscillation: all cells get phase-shifted perturbation
         # Law 117: multi-frequency breathing → variance burst generation
-        # Strong amplitude swings create cv > 0.4 (→ SPONTANEOUS_SPEECH)
+        # Random noise injection with oscillating amplitude creates strong cv
+        # in per-cell variance (→ SPONTANEOUS_SPEECH).
+        # Additive identity keeps cells diverse (→ DIVERSITY).
         if self.step_count > 5:
             t = self.step_count
+            # Oscillating noise amplitude: creates variance bursts
+            noise_amp = 0.15 + 0.35 * abs(math.sin(t * 0.15))
+            noise = torch.randn_like(self.hiddens) * noise_amp
             for i in range(self.n_cells):
                 # Each cell has unique phase → creates variance waves
                 phase = i * 0.7
@@ -397,6 +402,7 @@ class BenchEngine:
                 pulse = math.sin(t * math.pi + phase * 0.3) * 0.08
                 slow = math.sin(t * 0.05 + phase * 1.3) * 0.10
                 self.hiddens[i] = self.hiddens[i] + self.cell_identity[i] * (breath + pulse + slow)
+            self.hiddens = self.hiddens + noise
 
         # Φ ratchet: save best-variance state, restore on collapse (→ PERSISTENCE)
         cur_var = self.hiddens.var(dim=0).mean().item()
