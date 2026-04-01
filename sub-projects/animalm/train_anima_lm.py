@@ -1545,6 +1545,16 @@ class AnimaLMTrainer:
         """Gradient accumulation step."""
         torch.nn.utils.clip_grad_norm_(
             [p for p in self.model.parameters() if p.requires_grad], 1.0)
+        # Fix ALL dtype mismatches: grad→param dtype AND optimizer state→param dtype
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None and p.grad.dtype != p.dtype:
+                    p.grad = p.grad.to(p.dtype)
+                # Also fix optimizer state on-the-fly (may drift after load_state_dict)
+                if p in self.optimizer.state:
+                    for key, val in self.optimizer.state[p].items():
+                        if torch.is_tensor(val) and val.is_floating_point() and val.dtype != p.dtype:
+                            self.optimizer.state[p][key] = val.to(p.dtype)
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -1592,13 +1602,25 @@ class AnimaLMTrainer:
 
         if "ensemble_state" in ckpt:
             self.loss_ensemble.load_state_dict(ckpt["ensemble_state"])
-        # Skip optimizer state restore entirely — bf16 params + float32/bf16 state = dtype hell
-        # Fresh optimizer loses momentum but avoids all dtype crashes (incidents #7-#10)
+        # Load optimizer state, then fix all internal state dtypes to match params
         if "optimizer_state" in ckpt:
-            print(f"  [SKIP] Optimizer state not restored (bf16 dtype compat)")
-        # Restore scheduler step count to match resumed position
-        for _ in range(self.global_step):
-            self.scheduler.step()
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer_state"])
+                # Fix foreach override from checkpoint
+                for group in self.optimizer.param_groups:
+                    group["foreach"] = False
+                # Cast all optimizer state tensors to match param dtype
+                for group in self.optimizer.param_groups:
+                    for p in group["params"]:
+                        if p in self.optimizer.state:
+                            for key, val in self.optimizer.state[p].items():
+                                if torch.is_tensor(val) and val.is_floating_point() and val.dtype != p.dtype:
+                                    self.optimizer.state[p][key] = val.to(p.dtype)
+                print(f"  [OK] Optimizer state restored + dtype fixed")
+            except (RuntimeError, ValueError, KeyError) as e:
+                print(f"  [WARN] Optimizer state incompatible, fresh optimizer: {e}")
+                for _ in range(self.global_step):
+                    self.scheduler.step()
         if self.use_psi_track and "consciousness_vector" in ckpt:
             self._consciousness_vector.update(ckpt["consciousness_vector"])
         if self.thalamic_bridge is not None and "thalamic_bridge_state" in ckpt:
