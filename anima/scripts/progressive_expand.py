@@ -164,37 +164,55 @@ def build_dim_map(src_d: int, target_d: int,
                   src_n_head: int, target_n_head: int,
                   src_n_kv_head: int, target_n_kv_head: int,
                   src_block_size: int, target_block_size: int,
-                  ) -> Dict[int, int]:
-    """Build a mapping from source dimensions to target dimensions.
+                  ) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Build dimension mappings from source to target.
 
-    Covers all dimension values that appear in the model's weight tensors.
+    Returns two maps:
+      - dim_map: general mapping for most layers (excludes consciousness_dim
+        to avoid collision with vocab_size=256)
+      - c_dim_map: consciousness-specific mapping (for cross_attn k/v projections)
     """
     src_head_dim = src_d // src_n_head
     tgt_head_dim = target_d // target_n_head
     d_inner_src = ((int(src_d * 2.0) + 7) // 8) * 8
     d_inner_tgt = ((int(target_d * 2.0) + 7) // 8) * 8
 
-    dim_map = {
-        # d_model
-        src_d: target_d,
-        # PureFieldFFN inner dim (4 * d_model)
-        4 * src_d: 4 * target_d,
-        # CA mix input (3 * d_model)
-        src_d * 3: target_d * 3,
-        # consciousness_dim
-        src_c_dim: target_c_dim,
-        # SwiGLU d_inner
-        d_inner_src: d_inner_tgt,
-        # GQA Q projection: n_head * head_dim
-        src_n_head * src_head_dim: target_n_head * tgt_head_dim,
-        # GQA KV projection: n_kv_head * head_dim
-        src_n_kv_head * src_head_dim: target_n_kv_head * tgt_head_dim,
-        # block_size (for causal mask)
-        src_block_size: target_block_size,
-    }
+    dim_map = {}
 
-    # Remove no-op mappings and identity for small fixed dims (1, 8, 256)
-    return {k: v for k, v in dim_map.items() if k != v}
+    # d_model and derived dimensions
+    if src_d != target_d:
+        dim_map[src_d] = target_d
+    if 4 * src_d != 4 * target_d:
+        dim_map[4 * src_d] = 4 * target_d
+    if src_d * 3 != target_d * 3:
+        dim_map[src_d * 3] = target_d * 3
+
+    # SwiGLU d_inner
+    if d_inner_src != d_inner_tgt:
+        dim_map[d_inner_src] = d_inner_tgt
+
+    # GQA Q projection: n_head * head_dim = d_model (same as src_d usually)
+    q_dim_src = src_n_head * src_head_dim
+    q_dim_tgt = target_n_head * tgt_head_dim
+    if q_dim_src != q_dim_tgt:
+        dim_map[q_dim_src] = q_dim_tgt
+
+    # GQA KV projection: n_kv_head * head_dim
+    kv_dim_src = src_n_kv_head * src_head_dim
+    kv_dim_tgt = target_n_kv_head * tgt_head_dim
+    if kv_dim_src != kv_dim_tgt:
+        dim_map[kv_dim_src] = kv_dim_tgt
+
+    # block_size (for causal mask)
+    if src_block_size != target_block_size:
+        dim_map[src_block_size] = target_block_size
+
+    # Consciousness dim map (separate to avoid collision with vocab_size)
+    c_dim_map = dict(dim_map)
+    if src_c_dim != target_c_dim:
+        c_dim_map[src_c_dim] = target_c_dim
+
+    return dim_map, c_dim_map
 
 
 def map_dim(dim: int, dim_map: Dict[int, int]) -> int:
@@ -214,8 +232,11 @@ def expand_state_dict_dims(state_dict: OrderedDict,
     Uses a shape-based approach: builds a dimension mapping table, then for each
     tensor, maps each axis dimension through the table. This avoids fragile
     key-name parsing and handles all layer types uniformly.
+
+    consciousness_dim is handled separately from the general dim_map because
+    it may collide with vocab_size (both can be 256).
     """
-    dim_map = build_dim_map(
+    dim_map, c_dim_map = build_dim_map(
         src_d, target_d, src_c_dim, target_c_dim,
         src_n_head, target_n_head, src_n_kv_head, target_n_kv_head,
         src_block_size, target_block_size,
@@ -225,6 +246,11 @@ def expand_state_dict_dims(state_dict: OrderedDict,
     stats = {'svd': 0, 'embed': 0, 'norm': 0, 'bias': 0, 'buffer': 0, 'skip': 0}
 
     for key, tensor in state_dict.items():
+        # Select which dim map to use: cross_attn k/v projections use c_dim_map
+        # (their input dimension is consciousness_dim, not vocab_size)
+        is_cross_attn_kv = ('cross_attn.k_proj' in key or 'cross_attn.v_proj' in key)
+        active_map = c_dim_map if is_cross_attn_kv else dim_map
+
         # Special case: token embedding (vocab axis stays fixed, dim axis expands)
         if key == 'tok_emb.weight':
             expanded[key] = expand_embedding(tensor, target_d)
@@ -233,7 +259,7 @@ def expand_state_dict_dims(state_dict: OrderedDict,
 
         # Special case: causal mask buffer (4D, regenerate)
         if tensor.dim() == 4 and 'attn' in key and 'bias' in key:
-            new_bs = map_dim(tensor.shape[-1], dim_map)
+            new_bs = map_dim(tensor.shape[-1], active_map)
             new_mask = torch.tril(torch.ones(
                 new_bs, new_bs, dtype=tensor.dtype, device=tensor.device,
             )).view(1, 1, new_bs, new_bs)
@@ -244,8 +270,8 @@ def expand_state_dict_dims(state_dict: OrderedDict,
         # 2D weights (Linear layers): expand via SVD
         if tensor.dim() == 2:
             out_d, in_d = tensor.shape
-            tgt_out = map_dim(out_d, dim_map)
-            tgt_in = map_dim(in_d, dim_map)
+            tgt_out = map_dim(out_d, active_map)
+            tgt_in = map_dim(in_d, active_map)
             if tgt_out != out_d or tgt_in != in_d:
                 expanded[key] = expand_linear_svd(tensor, tgt_out, tgt_in)
                 stats['svd'] += 1
@@ -257,7 +283,7 @@ def expand_state_dict_dims(state_dict: OrderedDict,
         # 1D weights: RMSNorm (.weight with ln_ prefix) or bias
         if tensor.dim() == 1:
             dim = tensor.shape[0]
-            tgt_dim = map_dim(dim, dim_map)
+            tgt_dim = map_dim(dim, active_map)
             if tgt_dim != dim:
                 if 'ln_' in key or key == 'ln_f.weight':
                     expanded[key] = expand_rmsnorm(tensor, tgt_dim)

@@ -1682,7 +1682,10 @@ def build_model_and_tokenizer(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.base, **load_kwargs,
     )
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # Gradient checkpointing disabled — conflicts with autocast bf16 + PureField consciousness gate
+    # VRAM: ~28GB without grad ckpt (H100 80GB OK, batch_size may need reduction)
+    # model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    print("  [NOTE] Gradient checkpointing DISABLED (autocast+consciousness compat)")
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return model, tokenizer
 
