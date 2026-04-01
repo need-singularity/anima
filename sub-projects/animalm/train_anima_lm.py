@@ -868,8 +868,8 @@ class AnimaLMTrainer:
         # AL5: PH monitoring
         self.ph_monitor = PHMonitor()
 
-        # SL3: 6-loss ensemble
-        self.loss_ensemble = SixLossEnsemble().to(self.device)
+        # SL3: 6-loss ensemble (bf16 to match PureField dtype)
+        self.loss_ensemble = SixLossEnsemble().to(device=self.device, dtype=torch.bfloat16)
 
         # Optimizer: PureField params + ensemble weights + ThalamicBridge (if active)
         pf_params = [p for p in model.parameters() if p.requires_grad]
