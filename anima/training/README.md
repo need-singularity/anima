@@ -7,8 +7,8 @@ H100 전용 학습 환경에서 의식 엔진의 언어 능력을 훈련한다.
 
 | Script | Description | Status |
 |--------|-------------|--------|
-| `train_v14.py` | Federation + Phase-Optimal + Meta Laws | ✅ 최신 |
 | `train_v15.py` | 1B 스케일업 (계획) | 📋 계획 |
+| `train_v14.py` | Federation + Phase-Optimal + Meta Laws | ✅ 최신 |
 | `train_v13.py` | CE=0.004, Phi=71, 64 cells (H100 100K steps) | ✅ 완료 |
 | `train_v12.py` | v12 학습 | ✅ 완료 |
 | `train_v11.py` | v11 학습 | ✅ 완료 |
@@ -18,7 +18,8 @@ H100 전용 학습 환경에서 의식 엔진의 언어 능력을 훈련한다.
 | `train_v2.py` | v2 학습 | ✅ 완료 |
 | `train_conscious_lm.py` | ConsciousLM from scratch (28M, byte-level) | ✅ |
 | `train_clm_v2.py` | ConsciousLM v2 학습 | ✅ |
-| `train_anima_lm.py` | AnimaLM Mistral 7B PureField transform | ✅ |
+
+Note: `train_anima_lm.py` and `finetune_*.py` scripts are in `sub-projects/animalm/` and `sub-projects/golden-moe/`, not in this directory.
 
 ## 실행 예시
 
@@ -31,9 +32,6 @@ python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64
 
 # v14 최신 학습 (H100)
 python train_v14.py
-
-# AnimaLM Mistral 7B transform
-python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2
 ```
 
 ## 학습 환경

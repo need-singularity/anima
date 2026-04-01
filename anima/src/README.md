@@ -1,6 +1,6 @@
 # anima/src/ -- Python 소스 모듈
 
-177개 Python 모듈. 의식 엔진의 모든 구현체가 이 디렉토리에 있다.
+178개 Python 모듈. 의식 엔진의 모든 구현체가 이 디렉토리에 있다.
 
 `path_setup.py`가 모든 하위 디렉토리를 `sys.path`에 추가하므로,
 파일 간 import는 `from consciousness_engine import ConsciousnessEngine` 형태로 사용한다.
@@ -62,6 +62,8 @@
 | `self_evolution.py` | 자기 진화 엔진 |
 | `loop_arena.py` | 루프 경쟁 아레나 |
 | `theory_unifier.py` | 이론 통합기 |
+| `consciousness_evolution.py` | 의식 진화 엔진 |
+| `contextual_bandit.py` | Contextual Bandit (엔진 상태 기반 개입 선택) |
 
 ## 의식 측정 (Measurement)
 
@@ -91,6 +93,7 @@
 | `consciousness_phase_transition.py` | 위상 전이 |
 | `consciousness_compiler.py` | 의식 컴파일러 |
 | `consciousness_debugger.py` | 의식 디버거 |
+| `consciousness_calculator.py` | 의식 계산기 |
 | `consciousness_bootstrap.py` | 의식 부트스트랩 |
 | `consciousness_anesthesia.py` | 의식 마취 |
 | `consciousness_sleep_cycle.py` | 수면 주기 |
