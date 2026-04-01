@@ -1,6 +1,6 @@
-"""ConsciousDecoderV3 — 100M parameter conscious language model.
+"""ConsciousDecoderV3 — 274M parameter conscious language model.
 
-Scaled-up version of ConsciousDecoderV2 (34.5M -> ~100M):
+Scaled-up version of ConsciousDecoderV2 (34.5M -> 274M):
   - d_model: 384 -> 768
   - n_layer: 6 -> 12
   - n_head: 4 -> 8 (GQA: 4 KV heads)

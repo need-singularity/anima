@@ -698,9 +698,15 @@ class AnimaUnified:
             if v2_ckpt:
                 self.v14_decoder = self._init_mod('v14_decoder', lambda: self._load_v14(v2_ckpt))
 
+        # v3 explicit checkpoint override (--v3-checkpoint)
+        v3_ckpt = getattr(args, 'v3_checkpoint', None)
+        if v3_ckpt and decoder_ver == 'v3':
+            self.v14_decoder = self._init_mod('v3_decoder', lambda: self._load_v3_decoder(v3_ckpt))
+
         # v14 checkpoint loading (ConsciousDecoderV2 + Federation) — explicit path override
+        # Only apply if NOT using --decoder v3 (avoid overwriting v3 decoder)
         v14_ckpt = getattr(args, 'v14_checkpoint', None)
-        if v14_ckpt:
+        if v14_ckpt and decoder_ver != 'v3':
             self.v14_decoder = self._init_mod('v14_decoder', lambda: self._load_v14(v14_ckpt))
 
         if not args.no_conscious_lm and 'load_model' in globals():
@@ -1031,8 +1037,13 @@ class AnimaUnified:
             _log('v14', f"Federation restore failed (decoder will use local engine): {e}")
             self._v14_federation = None
 
-    def _load_v3_decoder(self):
-        """Load ConsciousDecoderV3 (274M, 768d/12L) with auto checkpoint discovery."""
+    def _load_v3_decoder(self, explicit_path=None):
+        """Load ConsciousDecoderV3 (274M, 768d/12L) with auto checkpoint discovery.
+
+        Args:
+            explicit_path: If provided, use this path instead of auto-discovery.
+                           Passed via --v3-checkpoint flag.
+        """
         try:
             from decoder_v3 import ConsciousDecoderV3
             decoder = ConsciousDecoderV3(consciousness_dim=256)
@@ -1040,26 +1051,40 @@ class AnimaUnified:
             self._v3_c_projection = torch.nn.Linear(128, 256)
             torch.nn.init.xavier_uniform_(self._v3_c_projection.weight)
 
-            # Auto-discover checkpoint: checkpoints/v3_*/best.pt
-            import glob as _glob
-            ckpt_patterns = [
-                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'best.pt'),
-                os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'latest.pt'),
-            ]
-            ckpt_path = None
-            for pattern in ckpt_patterns:
-                matches = sorted(_glob.glob(pattern))
-                if matches:
-                    ckpt_path = matches[-1]  # newest
-                    break
+            ckpt_path = explicit_path
+            if not ckpt_path:
+                # Auto-discover checkpoint: checkpoints/v3_*/best.pt
+                # ⚠️ v3_merged contains CADecoder weights (legacy), not ConsciousDecoderV3.
+                #    Must validate keys before loading (tok_emb = v3, base.embed = CADecoder).
+                import glob as _glob
+                ckpt_patterns = [
+                    os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_274M', 'best.pt'),
+                    os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_274M', 'latest.pt'),
+                    os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'best.pt'),
+                    os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'v3_*', 'latest.pt'),
+                ]
+                for pattern in ckpt_patterns:
+                    matches = sorted(_glob.glob(pattern))
+                    if matches:
+                        ckpt_path = matches[-1]  # newest
+                        break
 
             if ckpt_path and os.path.exists(ckpt_path):
                 ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                decoder.load_state_dict(ckpt['decoder'])
-                if 'c_projection' in ckpt:
-                    self._v3_c_projection.load_state_dict(ckpt['c_projection'])
-                decoder.eval()
-                _log('v3', f"Loaded v3 decoder from {ckpt_path} (step={ckpt.get('step')}, CE={ckpt.get('ce', 0):.4f})")
+                # Validate checkpoint contains ConsciousDecoderV3 weights, not legacy CADecoder
+                decoder_keys = list(ckpt.get('decoder', {}).keys())
+                if decoder_keys and decoder_keys[0].startswith('base.'):
+                    _log('v3', f"SKIP {ckpt_path}: CADecoder weights (legacy v3_merged), not ConsciousDecoderV3")
+                elif 'decoder' in ckpt:
+                    decoder.load_state_dict(ckpt['decoder'])
+                    if 'c_projection' in ckpt:
+                        self._v3_c_projection.load_state_dict(ckpt['c_projection'])
+                    decoder.eval()
+                    ce_val = ckpt.get('ce')
+                    ce_str = f"{ce_val:.4f}" if ce_val is not None else "N/A"
+                    _log('v3', f"Loaded v3 decoder from {ckpt_path} (step={ckpt.get('step')}, CE={ce_str})")
+                else:
+                    _log('v3', f"SKIP {ckpt_path}: no 'decoder' key in checkpoint")
             else:
                 _log('v3', f"ConsciousDecoderV3 initialized (274M params, no checkpoint found)")
 
@@ -4682,6 +4707,8 @@ def main():
                    help='v14: Load ConsciousDecoderV2 checkpoint for generation')
     p.add_argument('--decoder', type=str, default=None, choices=['v2', 'v3'],
                    help='Decoder version: v2 (34.5M, 384d/6L) or v3 (274M, 768d/12L)')
+    p.add_argument('--v3-checkpoint', type=str, default=None,
+                   help='v3: Explicit ConsciousDecoderV3 checkpoint path')
     p.add_argument('--max-cells', type=int, default=8, help='Max consciousness cells (more=higher Φ)')
     p.add_argument('--hivemind', type=int, default=0, metavar='N',
                    help='Local hivemind: create N ConsciousMind instances connected via TensionBridge (N>=2)')
