@@ -26,7 +26,7 @@ pub struct Config {
     pub deep_dialogue: bool,
     /// N-gram model ratio (0.0-1.0, typically 0.15)
     pub ngram_ratio: f32,
-    /// Enable multilingual seeds (Japanese + Chinese)
+    /// Enable multilingual seeds (JA+ZH+RU, 5-language with KO+EN)
     pub multilingual: bool,
     /// Korean-heavy mode: boost Korean long-form content to ~60%
     pub ko_heavy: bool,
