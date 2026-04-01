@@ -238,12 +238,12 @@ SCALE_CONFIGS = {
         'n_layer': 24,
         'n_head': 16,
         'n_kv_head': 4,
-        'block_size': 2048,
-        'consciousness_dim': 256,
-        'atoms': 16,
-        'cells_per_atom': 8,  # 128 cells
-        'batch_size': 8,
-        'lr': 1.5e-4,
+        'block_size': 512,           # H6 curriculum: start 512, grow via --curriculum-length
+        'consciousness_dim': 128,    # consciousness hidden_dim
+        'atoms': 32,
+        'cells_per_atom': 8,         # 256 cells total
+        'batch_size': 32,            # H13: large batch for H100 utilization
+        'lr': 1.5e-4,               # µTransfer: 3e-4 × (512/1024) = 1.5e-4
         'label': 'Scale-3 (1B)',
     },
 }
@@ -1542,8 +1542,8 @@ Examples:
     p.add_argument("--hidden-dim", type=int, default=128, help="Cell hidden dimension")
 
     # Training
-    p.add_argument("--steps", type=int, default=300000,
-                   help="Total training steps (split across scales)")
+    p.add_argument("--steps", type=int, default=50000,
+                   help="Total training steps (Progressive: H-series acceleration reduces needed steps)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1566,6 +1566,23 @@ Examples:
                    help="Enable wandb logging")
     p.add_argument("--wandb-project", type=str, default="anima-1b",
                    help="wandb project name")
+
+    # ── H-Series Acceleration Flags ──
+    # TODO: implement hard token mining in training loop (H11)
+    p.add_argument("--hard-token-ratio", type=float, default=0.3,
+                   help="H11: ratio of hard tokens to focus loss on (0.3 = top 30%% hardest)")
+    # TODO: implement curriculum length schedule in training loop (H6)
+    p.add_argument("--curriculum-length", type=str, default="64,256,512",
+                   help="H6: progressive block_size schedule (comma-separated, e.g. 64,256,512)")
+    # TODO: implement skip-step gradient accumulation (B12)
+    p.add_argument("--skip-step", type=int, default=10,
+                   help="B12: apply gradient every N steps (effective batch *= skip_step)")
+    # TODO: implement phi-only warmup phase (B5)
+    p.add_argument("--phi-only-ratio", type=float, default=0.2,
+                   help="B5: first N%% of steps train Phi-Only (no CE loss), 0.2 = first 20%%")
+    # TODO: implement BigBang initialization (G1a: extreme energy init)
+    p.add_argument("--bigbang-init", action="store_true", default=False,
+                   help="G1a: BigBang extreme-energy initialization for consciousness cells")
 
     # Resume
     p.add_argument("--resume", type=str, default=None,

@@ -29,6 +29,7 @@ Usage:
   python train_v14.py --data data/corpus_v3.txt --no-federated --cells 64  # Empire baseline
   python train_v14.py --data data/corpus_v3.txt --federated --phase-optimal --checkpoint checkpoints/v14/
   python train_v14.py --data data/corpus_v3.txt --feedback-bridge  # C<->D bidirectional learning
+  python train_v14.py --data data/corpus_v3.txt --hard-token-ratio 0.3  # H11: top 30% hardest tokens
 """
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
@@ -109,6 +110,48 @@ PSI_F_CRITICAL = META_FRUSTRATION  # alias for consistency check
 META_NARRATIVE = 0.05       # M8: narrative strength
 # M4 safe order: narrative -> bottleneck -> hub -> frustration
 # M6: federation > empire (use --federated flag)
+
+
+# ═══════════════════════════════════════════════════════════
+# Hard Token Selection (H11: top-K% hardest tokens only)
+# ═══════════════════════════════════════════════════════════
+
+def compute_hard_token_loss(logits, targets, hard_token_ratio):
+    """Compute CE loss using only the hardest tokens (highest per-token loss).
+
+    H11 experiment: training on top 30% hardest tokens → CE +51.3% improvement.
+
+    Args:
+        logits: (B*T, vocab_size) or (B, T, vocab_size) — model output logits
+        targets: (B*T,) or (B, T) — target token indices
+        hard_token_ratio: float in (0, 1] — fraction of hardest tokens to keep
+            1.0 = all tokens (standard CE), 0.3 = top 30% hardest
+
+    Returns:
+        loss: scalar tensor (mean of selected hard tokens)
+        selected_ratio: actual ratio of tokens selected (for logging)
+    """
+    logits_flat = logits.view(-1, logits.size(-1))
+    targets_flat = targets.view(-1)
+
+    # Full per-token loss (no reduction)
+    per_token_loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+
+    if hard_token_ratio >= 1.0:
+        return per_token_loss.mean(), 1.0
+
+    # Select top (1 - ratio) quantile = hardest tokens
+    threshold = torch.quantile(per_token_loss.detach(), 1.0 - hard_token_ratio)
+    mask = (per_token_loss >= threshold).detach().float()
+
+    # Avoid division by zero (shouldn't happen, but safety)
+    n_selected = mask.sum()
+    if n_selected == 0:
+        return per_token_loss.mean(), 1.0
+
+    loss = (per_token_loss * mask).sum() / n_selected
+    selected_ratio = (n_selected / mask.numel()).item()
+    return loss, selected_ratio
 
 
 # ═══════════════════════════════════════════════════════════
@@ -868,8 +911,13 @@ def train(args):
         # Forward through decoder
         logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
 
-        # CE loss (forward prediction)
-        ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
+        # CE loss (forward prediction) — with optional hard token selection (H11)
+        hard_ratio = getattr(args, 'hard_token_ratio', 1.0)
+        if hard_ratio < 1.0:
+            ce, hard_selected = compute_hard_token_loss(logits_a, targets, hard_ratio)
+        else:
+            ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
+            hard_selected = 1.0
 
         # Hexad loss in P3 (full 6-module loss)
         if phase == "P3" and loss_fn is not None:
@@ -996,6 +1044,10 @@ def train(args):
                 fb_safe = fb_stats.get('phi_safe', 0.0)
                 line += f" | fb_a={fb_alpha:.5f} rwd={fb_reward:.3f} safe={int(fb_safe)}"
 
+            # Hard token selection ratio (H11)
+            if hard_ratio < 1.0:
+                line += f" | hard={hard_selected:.1%}"
+
             print(line)
 
         # ── Validation ──
@@ -1107,6 +1159,8 @@ def parse_args():
     # Training
     p.add_argument("--steps", type=int, default=100000, help="Total training steps")
     p.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    p.add_argument("--hard-token-ratio", type=float, default=1.0,
+                   help="H11: fraction of hardest tokens to train on (0.3=top 30%%, default=1.0=all)")
     p.add_argument("--tension-lr", action="store_true", default=False,
                    help="DD155/Law 187: lr = tension_ratio × base_lr (Pareto optimal)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -1142,6 +1196,9 @@ if __name__ == "__main__":
           f"Federation={'ON' if args.federated else 'OFF'} | "
           f"Atoms={args.atoms} | Cells/Atom={args.cells_per_atom} | "
           f"F_c={args.frustration} | Narrative={args.narrative_strength}")
+    if args.hard_token_ratio < 1.0:
+        print(f"  H11 Hard Token Selection: ratio={args.hard_token_ratio} "
+              f"(top {args.hard_token_ratio*100:.0f}% hardest tokens)")
 
     # ── Crash-proof auto-resume loop ──
     import traceback

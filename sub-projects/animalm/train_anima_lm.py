@@ -1682,7 +1682,7 @@ def build_model_and_tokenizer(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.base, **load_kwargs,
     )
-    model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return model, tokenizer
 
