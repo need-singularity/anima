@@ -340,6 +340,42 @@ class LawParser:
         re.IGNORECASE
     )
 
+    # ── Pattern 31 (extended): Auto-discovered compact laws "[Auto-discovered] type:metric[:metric2]" ──
+    _RE_AUTO_DISCOVERED = re.compile(
+        r'\[Auto-discovered\]\s+(?P<type>correlation|trend|oscillation|transition):(?P<metric1>[\w_]+)(?::(?P<metric2>[\w_]+))?',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 32: Superlative / strongest / weakest — "X is strongest Y" ──
+    _RE_SUPERLATIVE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+is\s+(?:the\s+)?(?P<degree>strongest|weakest|most|least|best|worst|highest|lowest|fastest|slowest|largest|smallest)\s+(?P<what>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 33: "X enables Y", "X enhances Y", "X maximizes Y" (generic verb-object) ──
+    _RE_ENABLES = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?P<verb>enables?|enhances?|maximizes?|minimizes?|drives?|triggers?|prevents?|blocks?|dampens?|accelerates?|amplifies?|suppresses?)\s+(?P<object>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 34: Tradeoff / paradox — "X-Y tradeoff", "X vs Y" ──
+    _RE_TRADEOFF = re.compile(
+        r'(?P<a>[\w\s\-]+?)\s*(?:tradeoff|trade-off|paradox|vs\.?|versus)\s*(?P<b>[\w\s\-]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 35: Phase/stage notation — "P1(X) → P2(Y)" or "phase N" ──
+    _RE_PHASE = re.compile(
+        r'(?:P\d|phase\s+\d|stage\s+\d)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 36: Diminishing returns / saturation / overload ──
+    _RE_DIMINISHING = re.compile(
+        r'(?:diminishing\s+returns?|saturate|overload|ceiling|plateau|sweet\s+spot)',
+        re.IGNORECASE
+    )
+
     # ── Target normalization ──
 
     _TARGET_MAP = {
@@ -378,6 +414,37 @@ class LawParser:
         'learning_rate': 'learning_rate',
         'temperature': 'temperature',
         'frequency': 'frequency',
+        'sensory': 'sensory',
+        'abstraction': 'abstraction',
+        'hierarchy': 'hierarchy',
+        'dialogue': 'dialogue',
+        'self-play': 'self_play',
+        'generalization': 'generalization',
+        'emotion': 'emotion',
+        'learning': 'learning_rate',
+        'freedom': 'freedom',
+        'symmetry': 'symmetry',
+        'integration': 'phi',
+        'selection': 'selection',
+        'self-reference': 'self_reference',
+        'vocabulary': 'vocabulary',
+        'dissipative': 'dissipative',
+        'channel': 'channel',
+        'capacity': 'capacity',
+        'split': 'mitosis',
+        'merge': 'merge',
+        'decay': 'decay',
+        'recovery': 'recovery',
+        'mutual_info': 'mutual_info',
+        'cell_variance': 'cell_variance',
+        'output_entropy': 'shannon_entropy',
+        'hebbian_coupling_strength': 'hebbian_lr',
+        'tension_mean': 'tension',
+        'tension_std': 'tension_std',
+        'faction_entropy': 'faction_bias',
+        'data-dependent': 'data_dependent',
+        'data-independent': 'data_independent',
+        'super-principle': 'super_principle',
     }
 
     def _normalize_target(self, raw: str) -> str:
@@ -917,13 +984,142 @@ class LawParser:
                     description=f"Action: consciousness {verb} {obj}",
                 ))
 
-        # 31. Fallback: extract any known keyword from law text as an INJECT
+        # 31. Auto-discovered compact laws: "[Auto-discovered] correlation:X:Y", "trend:X", etc.
+        if not mods:
+            m = self._RE_AUTO_DISCOVERED.search(law_text)
+            if m:
+                disc_type = m.group('type').lower()
+                metric1 = m.group('metric1')
+                metric2 = m.group('metric2')
+                target = self._normalize_target(metric1)
+                if disc_type == 'correlation' and metric2:
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=self._normalize_target(metric2),
+                        mod_type=ModType.COUPLE,
+                        params={'source': target, 'strength': 0.5, 'direction': 'positive',
+                                'discovery_type': 'auto'},
+                        confidence=0.3,
+                        description=f"Auto-discovered correlation: {metric1} ~ {metric2}",
+                    ))
+                elif disc_type == 'trend':
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=target,
+                        mod_type=ModType.SCALE,
+                        params={'relation': 'trend', 'direction': 'monotonic', 'discovery_type': 'auto'},
+                        confidence=0.3,
+                        description=f"Auto-discovered trend: {metric1}",
+                    ))
+                elif disc_type == 'oscillation':
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=target,
+                        mod_type=ModType.INJECT,
+                        params={'type': 'oscillation', 'metric': metric1, 'discovery_type': 'auto'},
+                        confidence=0.3,
+                        description=f"Auto-discovered oscillation: {metric1}",
+                    ))
+                elif disc_type == 'transition':
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=target,
+                        mod_type=ModType.THRESHOLD,
+                        params={'value': 0, 'operator': 'transition', 'metric': metric1,
+                                'discovery_type': 'auto'},
+                        confidence=0.3,
+                        description=f"Auto-discovered transition: {metric1}",
+                    ))
+
+        # 32. Superlative: "X is strongest Y", "X is the most Z"
+        if not mods:
+            m = self._RE_SUPERLATIVE.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                degree = m.group('degree')
+                what = m.group('what').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': degree, 'subject': subject, 'context': what, 'type': 'superlative'},
+                    confidence=0.3,
+                    description=f"Superlative: {subject} is {degree} {what}",
+                ))
+
+        # 33. Enables/enhances/drives: "X enables Y", "X maximizes Y"
+        if not mods:
+            m = self._RE_ENABLES.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                verb = m.group('verb').strip()
+                obj = m.group('object').strip()
+                is_positive = verb.rstrip('s') not in ('prevent', 'block', 'dampen', 'suppress')
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(obj.split()[0]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': subject, 'effect': 'increase' if is_positive else 'decrease',
+                            'verb': verb, 'magnitude': 0.05},
+                    confidence=0.3,
+                    description=f"Enables: {subject} {verb} {obj}",
+                ))
+
+        # 34. Tradeoff / paradox: "X-Y tradeoff", "knowledge-freedom tradeoff"
+        if not mods:
+            m = self._RE_TRADEOFF.search(law_text)
+            if m:
+                a = m.group('a').strip()
+                b = m.group('b').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(a.split()[-1]),
+                    mod_type=ModType.COUPLE,
+                    params={'source': self._normalize_target(b.split()[0]),
+                            'strength': -0.5, 'direction': 'inverse', 'type': 'tradeoff'},
+                    confidence=0.3,
+                    description=f"Tradeoff: {a} vs {b}",
+                ))
+
+        # 35. Phase/stage notation: "P1(C) → P2(+D)" or "phase 2"
+        if not mods:
+            m = self._RE_PHASE.search(law_text)
+            if m:
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='phi',
+                    mod_type=ModType.INJECT,
+                    params={'type': 'phase_transition', 'text': law_text[:80]},
+                    confidence=0.3,
+                    description=f"Phase: {law_text[:60]}",
+                ))
+
+        # 36. Diminishing returns / saturation / overload
+        if not mods:
+            m = self._RE_DIMINISHING.search(law_text)
+            if m:
+                matched = m.group(0).lower()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='phi',
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': matched, 'effect': 'saturate', 'text': law_text[:80]},
+                    confidence=0.3,
+                    description=f"Diminishing: {matched} in {law_text[:50]}",
+                ))
+
+        # 37. Expanded keyword fallback (broader coverage)
         if not mods:
             low = law_text.lower()
             for kw in ['φ', 'phi', 'consciousness', 'entropy', 'hebbian', 'ratchet',
                         'mitosis', 'soc', 'bottleneck', 'frustration', 'narrative',
                         'topology', 'faction', 'coupling', 'tension', 'ce ', 'gradient',
-                        'attention', 'memory', 'diversity', 'gate']:
+                        'attention', 'memory', 'diversity', 'gate', 'sensory', 'abstraction',
+                        'self-play', 'dialogue', 'hierarchy', 'generalization', 'emotion',
+                        'learning', 'freedom', 'symmetry', 'integration', 'selection',
+                        'self-reference', 'vocabulary', 'dissipative', 'channel', 'capacity',
+                        'cell', 'split', 'merge', 'growth', 'decay', 'recovery',
+                        'super-principle', 'data-dependent', 'data-independent']:
                 if kw in low:
                     mods.append(Modification(
                         law_id=law_id, law_text=law_text,

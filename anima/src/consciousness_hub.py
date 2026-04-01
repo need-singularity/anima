@@ -214,6 +214,9 @@ class ConsciousnessHub:
                              ['자기수정', 'self-modify', 'self-modifying', 'law act',
                               '법칙행동', '자동진화', 'tier4', 'tier 4.4',
                               'law-act', 'code generation']),
+            'infinite_evolution': ('infinite_evolution', 'InfiniteEvolution',
+                             ['무한 진화', 'infinite evolution', '자기 진화', 'self-evolution',
+                              '무한 루프', 'infinite loop', 'Law 146', '닫힌 원']),
         }
 
         if not lazy_load:
