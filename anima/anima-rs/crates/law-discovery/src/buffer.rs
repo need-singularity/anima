@@ -210,7 +210,9 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.get(0, 0), None);
-        assert_eq!(buf.series(0), vec![]);
+        // NOTE: explicit type needed — pyo3 adds multiple PartialEq impls for f32,
+        // making bare vec![] ambiguous (E0282/E0283). Always annotate empty vecs.
+        assert_eq!(buf.series(0), Vec::<f32>::new());
     }
 
     #[test]
