@@ -53,6 +53,9 @@ class TestMitosisLaw86:
         Combined with Lorenz perturbation, this guarantees splits occur.
         Seed fixed for CI determinism.
         """
+        # FIX(2026-04-01): seed 미고정 + 100 step → CI flaky 실패.
+        # adaptive threshold(mean+1.5*std) 3연속 초과 확률이 낮아
+        # 시드 고정 + 200 step으로 결정적 동작 보장.
         torch.manual_seed(42)
         engine = MitosisEngine(**SMALL_CFG)
         assert len(engine.cells) == 2, "Should start with 2 cells"
