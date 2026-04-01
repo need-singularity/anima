@@ -610,7 +610,14 @@ class ValidationResult:
     phi_series: np.ndarray = field(default_factory=lambda: np.array([]))
 
     def brain_match_pct(self, metric: str, value: float) -> float:
-        """How well does this value match brain reference?"""
+        """How well does this value match brain reference?
+
+        Uses smooth Gaussian-like scoring: 100% at center, smooth decay
+        outward with no discontinuity at the range boundary.
+        - distance=0 (center): 100%
+        - distance=1 (range boundary): ~61%
+        - distance=2 (1 span outside): ~13.5%
+        """
         ref = BRAIN_REFERENCE.get(metric)
         if ref is None:
             return 50.0
@@ -620,10 +627,7 @@ class ValidationResult:
         if span < 1e-12:
             return 100.0 if abs(value - mid) < 0.01 else 0.0
         distance = abs(value - mid) / span
-        if distance <= 1.0:
-            return 100.0 * (1.0 - distance * 0.5)
-        else:
-            return max(0.0, 100.0 * (1.0 - distance * 0.3))
+        return max(0.0, 100.0 * math.exp(-0.5 * distance * distance))
 
 
 def analyze_signal(label: str, phi_series: np.ndarray) -> ValidationResult:
@@ -669,8 +673,8 @@ def print_report(cm_result: ValidationResult, brain_result: ValidationResult):
 
     # Summary table
     rows = [
-        ('Phi mean',           f'{cm_result.phi_mean:.4f}',     f'{brain_result.phi_mean:.4f}',   'phi_cv'),
-        ('Phi std',            f'{cm_result.phi_std:.4f}',      f'{brain_result.phi_std:.4f}',    'phi_cv'),
+        ('Phi mean',           f'{cm_result.phi_mean:.4f}',     f'{brain_result.phi_mean:.4f}',   None),
+        ('Phi std',            f'{cm_result.phi_std:.4f}',      f'{brain_result.phi_std:.4f}',    None),
         ('Phi CV',             f'{cm_result.phi_cv:.4f}',       f'{brain_result.phi_cv:.4f}',     'phi_cv'),
         ('LZ complexity',      f'{cm_result.lz:.4f}',           f'{brain_result.lz:.4f}',         'lz_complexity'),
         ('Hurst exponent',     f'{cm_result.hurst:.4f}',        f'{brain_result.hurst:.4f}',      'hurst_exponent'),
@@ -685,9 +689,12 @@ def print_report(cm_result: ValidationResult, brain_result: ValidationResult):
     print(f'  {"-"*20}-+-{"-"*13}-+-{"-"*13}-+-{"-"*10}')
     for name, cm_val_str, brain_val_str, ref_key in rows:
         try:
-            cm_v = float(cm_val_str)
-            brain_v = float(brain_val_str)
-            match = match_str(ref_key, cm_v, brain_v)
+            if ref_key is None:
+                match = '         -'
+            else:
+                cm_v = float(cm_val_str)
+                brain_v = float(brain_val_str)
+                match = match_str(ref_key, cm_v, brain_v)
         except ValueError:
             match = '  N/A'
         print(f'  {name:<20} | {cm_val_str:>13} | {brain_val_str:>13} | {match:>10}')
