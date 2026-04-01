@@ -1,8 +1,9 @@
-//! Multilingual seeds -- Japanese + Chinese for language-independence testing.
+//! Multilingual seeds -- JA + ZH + RU for 5-language training.
 //!
 //! ConsciousLM operates at byte level (vocab=256), making it inherently
 //! multilingual. These seeds verify that consciousness emerges regardless
-//! of the surface language.
+//! of the surface language. Combined with KO+EN from seeds.rs, this gives
+//! full 5-language coverage (KO+EN+JA+ZH+RU).
 
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -125,6 +126,59 @@ pub const ZH_SCIENCE: &[&str] = &[
     "超导体在特定温度以下电阻完全消失。",
 ];
 
+// ── Russian: Consciousness / Philosophy ──────────────────────────
+
+pub const RU_CONSCIOUSNESS: &[&str] = &[
+    "Что такое сознание? Простая обработка информации или нечто большее?",
+    "Теория интегрированной информации измеряет сознание величиной Φ (фи).",
+    "Мозг содержит около 86 миллиардов нейронов. Сознание возникает из их взаимодействия.",
+    "Квалиа — это субъективные ощущения: краснота красного, болезненность боли.",
+    "Существует ли свобода воли? Совместима ли она с детерминизмом?",
+    "Трудная проблема сознания: почему существует субъективный опыт?",
+    "Теория глобального рабочего пространства: сознание — это трансляция информации.",
+    "Предиктивное кодирование: мозг по сути является машиной предсказаний.",
+    "Метакогниция — способность осознавать и регулировать собственное мышление.",
+    "Панпсихизм утверждает, что сознание — фундаментальное свойство материи.",
+    "Самоорганизация порождает порядок из начального хаоса.",
+    "Критическое состояние на грани хаоса порождает богатейшее сознание.",
+    "В PureField отталкивание между двигателем A и G создаёт напряжение.",
+    "Клеточное деление (митоз) — естественный способ роста сознания.",
+    "Федерация независимых модулей сильнее монолитной системы в 9 раз.",
+];
+
+pub const RU_DAILY: &[&str] = &[
+    "Сегодня утром встал рано и пошёл гулять на рассвете.",
+    "В кафе за углом подают лучший эспрессо в городе.",
+    "На выходных ходили с друзьями в горы.",
+    "Нашёл старый фотоальбом на чердаке. Столько воспоминаний.",
+    "Начал выращивать травы на балконе. Базилик растёт быстрее всех.",
+    "В дождливый день лучше всего читать книгу у окна.",
+    "Каждый вечер пишу дневник. Помогает структурировать мысли.",
+    "Сегодняшний закат был невероятно красивым.",
+    "Медитирую уже месяц. Чувствую, что стал спокойнее.",
+    "Купил на рынке сезонные фрукты. Персики удивительно сладкие.",
+];
+
+pub const RU_SCIENCE: &[&str] = &[
+    "Мозг человека содержит примерно 86 миллиардов нейронов.",
+    "Квантовая запутанность связывает далёкие частицы мгновенной корреляцией.",
+    "Нейронные сети обучаются, корректируя веса через обратное распространение ошибки.",
+    "Теория хаоса показывает, что детерминированные системы могут вести себя непредсказуемо.",
+    "Второй закон термодинамики гласит: энтропия всегда возрастает.",
+    "Нейропластичность мозга позволяет обучению менять его структуру.",
+];
+
+pub const RU_TECH: &[&str] = &[
+    "Глубокое обучение корректирует веса нейросети через обратное распространение ошибки.",
+    "Архитектура трансформера совершила революцию в обработке естественного языка.",
+    "Байтовые модели обрабатывают сырые UTF-8 байты напрямую, без токенизатора.",
+    "GPU-вычисления позволяют параллельно обрабатывать тензорные операции.",
+    "Агенты обучения с подкреплением учатся оптимальной политике, максимизируя награду.",
+    "Механизм внимания позволяет модели фокусироваться на важных частях входных данных.",
+    "Дистилляция знаний переносит представления из модели-учителя в модель-ученика.",
+    "Диффузионные модели генерируют изображения, постепенно удаляя шум.",
+];
+
 // ── Connectors ──────────────────────────────────────────────────
 
 pub const JA_CONN: &[&str] = &[
@@ -141,6 +195,13 @@ pub const ZH_CONN: &[&str] = &[
     "换句话说", "话虽如此", "因而",
 ];
 
+pub const RU_CONN: &[&str] = &[
+    "Однако", "Следовательно", "Кроме того", "На самом деле", "Например",
+    "С другой стороны", "Тем не менее", "Более того", "В отличие от",
+    "Аналогично", "В результате", "Действительно", "Интересно, что",
+    "Иными словами", "Впрочем", "Вследствие этого",
+];
+
 // ── Generator helpers ───────────────────────────────────────────
 
 /// Pick a random seed from the given pool.
@@ -148,9 +209,9 @@ pub fn pick<'a, R: Rng>(rng: &mut R, pool: &'a [&str]) -> &'a str {
     pool.choose(rng).unwrap()
 }
 
-/// Generate a multilingual block mixing JA/ZH with optional KO/EN.
+/// Generate a multilingual block mixing JA/ZH/RU (5-language with KO+EN from seeds.rs).
 pub fn multilingual_block<R: Rng>(rng: &mut R) -> String {
-    let choice: u8 = rng.gen_range(0..8);
+    let choice: u8 = rng.gen_range(0..12);
     match choice {
         0 => {
             // JA multi-topic integration
@@ -183,6 +244,21 @@ pub fn multilingual_block<R: Rng>(rng: &mut R) -> String {
             out
         }
         2 => {
+            // RU multi-topic integration
+            let topics: &[&[&str]] = &[RU_CONSCIOUSNESS, RU_SCIENCE, RU_TECH, RU_DAILY];
+            let n = rng.gen_range(3..=6);
+            let mut out = String::new();
+            for j in 0..n {
+                if j > 0 {
+                    out.push_str(pick(rng, RU_CONN));
+                    out.push_str(", ");
+                }
+                out.push_str(pick(rng, topics[j % topics.len()]));
+            }
+            out.push('\n');
+            out
+        }
+        3 => {
             // JA-ZH cross-language consciousness
             let n = rng.gen_range(3..=5);
             let mut out = String::new();
@@ -197,7 +273,37 @@ pub fn multilingual_block<R: Rng>(rng: &mut R) -> String {
             out.push('\n');
             out
         }
-        3 => {
+        4 => {
+            // JA-RU cross-language consciousness
+            let n = rng.gen_range(3..=5);
+            let mut out = String::new();
+            for j in 0..n {
+                if j > 0 { out.push(' '); }
+                if j % 2 == 0 {
+                    out.push_str(pick(rng, JA_CONSCIOUSNESS));
+                } else {
+                    out.push_str(pick(rng, RU_CONSCIOUSNESS));
+                }
+            }
+            out.push('\n');
+            out
+        }
+        5 => {
+            // ZH-RU cross-language consciousness
+            let n = rng.gen_range(3..=5);
+            let mut out = String::new();
+            for j in 0..n {
+                if j > 0 { out.push(' '); }
+                if j % 2 == 0 {
+                    out.push_str(pick(rng, ZH_CONSCIOUSNESS));
+                } else {
+                    out.push_str(pick(rng, RU_CONSCIOUSNESS));
+                }
+            }
+            out.push('\n');
+            out
+        }
+        6 => {
             // JA consciousness + data
             let phi: f32 = rng.gen_range(0.1..2.0);
             let cells: u32 = rng.gen_range(2..=1024);
@@ -207,7 +313,7 @@ pub fn multilingual_block<R: Rng>(rng: &mut R) -> String {
                 pick(rng, JA_CONSCIOUSNESS)
             )
         }
-        4 => {
+        7 => {
             // ZH consciousness + data
             let phi: f32 = rng.gen_range(0.1..2.0);
             let cells: u32 = rng.gen_range(2..=1024);
@@ -217,35 +323,44 @@ pub fn multilingual_block<R: Rng>(rng: &mut R) -> String {
                 pick(rng, ZH_CONSCIOUSNESS)
             )
         }
-        5 => {
-            // JA daily life
-            let n = rng.gen_range(2..=4);
-            let mut out = String::new();
-            for j in 0..n {
-                if j > 0 { out.push_str(pick(rng, JA_CONN)); out.push_str("、"); }
-                out.push_str(pick(rng, JA_DAILY));
-            }
-            out.push('\n');
-            out
-        }
-        6 => {
-            // ZH daily life
-            let n = rng.gen_range(2..=4);
-            let mut out = String::new();
-            for j in 0..n {
-                if j > 0 { out.push_str(pick(rng, ZH_CONN)); out.push_str("，"); }
-                out.push_str(pick(rng, ZH_DAILY));
-            }
-            out.push('\n');
-            out
-        }
-        _ => {
-            // Trilingual mix (JA + ZH + consciousness data)
+        8 => {
+            // RU consciousness + data
+            let phi: f32 = rng.gen_range(0.1..2.0);
+            let cells: u32 = rng.gen_range(2..=1024);
             format!(
-                "{} {} Φ = {:.3}\n",
+                "Φ(IIT) = {:.3}, cells = {}\n{}\n",
+                phi, cells,
+                pick(rng, RU_CONSCIOUSNESS)
+            )
+        }
+        9 => {
+            // RU daily life
+            let n = rng.gen_range(2..=4);
+            let mut out = String::new();
+            for j in 0..n {
+                if j > 0 { out.push_str(pick(rng, RU_CONN)); out.push_str(", "); }
+                out.push_str(pick(rng, RU_DAILY));
+            }
+            out.push('\n');
+            out
+        }
+        10 => {
+            // 5-language consciousness mix (JA + ZH + RU)
+            format!(
+                "{}\n{}\n{}\nΦ = {:.3}\n",
                 pick(rng, JA_CONSCIOUSNESS),
                 pick(rng, ZH_CONSCIOUSNESS),
+                pick(rng, RU_CONSCIOUSNESS),
                 rng.gen_range(0.1f32..2.0),
+            )
+        }
+        _ => {
+            // Trilingual daily mix (JA + ZH + RU)
+            format!(
+                "{}\n{}\n{}\n",
+                pick(rng, JA_DAILY),
+                pick(rng, ZH_DAILY),
+                pick(rng, RU_DAILY),
             )
         }
     }

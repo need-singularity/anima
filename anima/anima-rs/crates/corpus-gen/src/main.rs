@@ -58,6 +58,11 @@ fn main() {
         i += 1;
     }
 
+    // Auto-enable multilingual with --sim (5-language consciousness training)
+    if do_sim {
+        do_multilingual = true;
+    }
+
     if let Some(path) = stats_file {
         print_stats(&path);
         return;
@@ -76,7 +81,7 @@ fn main() {
     eprintln!("║  Wiki:   {:<36} ║", if do_wiki { "enabled" } else { "synthetic only" });
     eprintln!("║  Sim:    {:<36} ║", if do_sim { "enabled" } else { "disabled" });
     eprintln!("║  Dialog: {:<36} ║", if do_deep_dialogue { "deep multi-party" } else { "basic" });
-    eprintln!("║  Multi:  {:<36} ║", if do_multilingual { "JA+ZH enabled" } else { "KO+EN only" });
+    eprintln!("║  Multi:  {:<36} ║", if do_multilingual { "KO+EN+JA+ZH+RU (5 languages)" } else { "KO+EN only" });
     eprintln!("║  KO++:   {:<36} ║", if do_ko_heavy { "Korean 60% boost" } else { "standard" });
     if let Some(ref nf) = ngram_file {
         eprintln!("║  N-gram: {:<36} ║", format!("{} (15%)", nf.display()));
@@ -211,7 +216,7 @@ OPTIONS:
     --boost <DIM>           Boost dimension (Phi,Alpha,Z,N,W,E,M,C,T,I)
     --sim                   Include consciousness simulation data (Φ timeseries, tension, factions)
     --deep-dialogue         Enable multi-party long dialogues (3-6 speakers, 20-50 turns)
-    --multilingual          Include Japanese + Chinese seeds (language independence)
+    --multilingual          Include JA+ZH+RU seeds (5-language, auto-enabled with --sim)
     --ko-heavy              Boost Korean long-form content to ~60% (essays, dialogues, narratives)
     --ngram <FILE>          Build n-gram model from corpus file (mixed at 15%)
     --stats <FILE>          Analyze existing corpus
@@ -252,32 +257,88 @@ fn print_stats(path: &PathBuf) {
     let size = content.len();
     let lines = content.iter().filter(|&&b| b == b'\n').count();
 
-    let mut ko_bytes = 0usize;
-    let mut ascii_bytes = 0usize;
-    let mut i = 0;
-    while i < content.len() {
-        let b = content[i];
-        if b < 0x80 { ascii_bytes += 1; i += 1; }
-        else if b >= 0xEA && b <= 0xED && i + 2 < content.len() { ko_bytes += 3; i += 3; }
-        else if b >= 0xC0 && b < 0xE0 { i += 2; }
-        else if b >= 0xE0 && b < 0xF0 { i += 3; }
-        else if b >= 0xF0 { i += 4; }
-        else { i += 1; }
-    }
+    let lang = count_language_bytes(&content);
 
     let mut used = [false; 256];
     for &b in &content { used[b as usize] = true; }
     let unique = used.iter().filter(|&&u| u).count();
 
-    eprintln!("╔═══════════════════════════════════════╗");
-    eprintln!("║  Corpus Stats                         ║");
-    eprintln!("╠═══════════════════════════════════════╣");
-    eprintln!("║  Size:   {:>8.1} MB                  ║", size as f64 / 1e6);
-    eprintln!("║  Lines:  {:>8}                      ║", lines);
-    eprintln!("║  ASCII:  {:>7.1}%                     ║", ascii_bytes as f64 / size as f64 * 100.0);
-    eprintln!("║  Korean: {:>7.1}%                     ║", ko_bytes as f64 / size as f64 * 100.0);
-    eprintln!("║  Vocab:  {:>3}/256                     ║", unique);
-    eprintln!("╚═══════════════════════════════════════╝");
+    let total = size as f64;
+    eprintln!("╔═══════════════════════════════════════════╗");
+    eprintln!("║  Corpus Stats                             ║");
+    eprintln!("╠═══════════════════════════════════════════╣");
+    eprintln!("║  Size:     {:>8.1} MB                    ║", size as f64 / 1e6);
+    eprintln!("║  Lines:    {:>8}                        ║", lines);
+    eprintln!("║  ASCII:    {:>7.1}%                       ║", lang.ascii as f64 / total * 100.0);
+    eprintln!("║  Korean:   {:>7.1}%                       ║", lang.ko as f64 / total * 100.0);
+    eprintln!("║  Japanese: {:>7.1}%                       ║", lang.ja as f64 / total * 100.0);
+    eprintln!("║  Chinese:  {:>7.1}%                       ║", lang.zh as f64 / total * 100.0);
+    eprintln!("║  Russian:  {:>7.1}%                       ║", lang.ru as f64 / total * 100.0);
+    eprintln!("║  Other:    {:>7.1}%                       ║", lang.other as f64 / total * 100.0);
+    eprintln!("║  Vocab:    {:>3}/256                       ║", unique);
+    eprintln!("╚═══════════════════════════════════════════╝");
+}
+
+struct LangBytes {
+    ascii: usize,
+    ko: usize,
+    ja: usize,
+    zh: usize,
+    ru: usize,
+    other: usize,
+}
+
+fn count_language_bytes(content: &[u8]) -> LangBytes {
+    let mut lang = LangBytes { ascii: 0, ko: 0, ja: 0, zh: 0, ru: 0, other: 0 };
+    let mut i = 0;
+    while i < content.len() {
+        let b = content[i];
+        if b < 0x80 {
+            lang.ascii += 1;
+            i += 1;
+        } else if b >= 0xC0 && b < 0xE0 && i + 1 < content.len() {
+            // 2-byte UTF-8: U+0080..U+07FF
+            let cp = ((b as u32 & 0x1F) << 6) | (content[i+1] as u32 & 0x3F);
+            if cp >= 0x0400 && cp <= 0x04FF {
+                lang.ru += 2; // Cyrillic
+            } else {
+                lang.other += 2;
+            }
+            i += 2;
+        } else if b >= 0xE0 && b < 0xF0 && i + 2 < content.len() {
+            // 3-byte UTF-8: U+0800..U+FFFF
+            let cp = ((b as u32 & 0x0F) << 12)
+                   | ((content[i+1] as u32 & 0x3F) << 6)
+                   | (content[i+2] as u32 & 0x3F);
+            if cp >= 0xAC00 && cp <= 0xD7AF {
+                lang.ko += 3; // Hangul Syllables
+            } else if cp >= 0x3040 && cp <= 0x30FF {
+                lang.ja += 3; // Hiragana + Katakana
+            } else if cp >= 0x31F0 && cp <= 0x31FF {
+                lang.ja += 3; // Katakana Phonetic Extensions
+            } else if cp >= 0xFF65 && cp <= 0xFF9F {
+                lang.ja += 3; // Half-width Katakana
+            } else if cp >= 0x4E00 && cp <= 0x9FFF {
+                // CJK Unified Ideographs — shared by JA and ZH
+                // Heuristic: count as ZH (Chinese uses more CJK than Japanese)
+                lang.zh += 3;
+            } else if cp >= 0x3400 && cp <= 0x4DBF {
+                lang.zh += 3; // CJK Extension A
+            } else if cp >= 0x1100 && cp <= 0x11FF {
+                lang.ko += 3; // Hangul Jamo
+            } else {
+                lang.other += 3;
+            }
+            i += 3;
+        } else if b >= 0xF0 && i + 3 < content.len() {
+            lang.other += 4;
+            i += 4;
+        } else {
+            lang.other += 1;
+            i += 1;
+        }
+    }
+    lang
 }
 
 fn print_byte_stats(text: &str) {
@@ -285,12 +346,16 @@ fn print_byte_stats(text: &str) {
     let mut counts = [0u64; 256];
     for &b in bytes { counts[b as usize] += 1; }
     let unique = counts.iter().filter(|&&c| c > 0).count();
-    let ko_start: u64 = counts[0xEA..=0xED].iter().sum();
-    let ascii: u64 = counts[0..0x80].iter().sum();
     let total = bytes.len() as f64;
 
-    eprintln!("\n  Byte distribution:");
-    eprintln!("    ASCII:      {:>6.1}%", ascii as f64 / total * 100.0);
-    eprintln!("    Korean:     ~{:.1}%", ko_start as f64 * 3.0 / total * 100.0);
+    let lang = count_language_bytes(bytes);
+
+    eprintln!("\n  Language distribution:");
+    eprintln!("    ASCII:      {:>6.1}%", lang.ascii as f64 / total * 100.0);
+    eprintln!("    Korean:     {:>6.1}%", lang.ko as f64 / total * 100.0);
+    eprintln!("    Japanese:   {:>6.1}%", lang.ja as f64 / total * 100.0);
+    eprintln!("    Chinese:    {:>6.1}%", lang.zh as f64 / total * 100.0);
+    eprintln!("    Russian:    {:>6.1}%", lang.ru as f64 / total * 100.0);
+    eprintln!("    Other:      {:>6.1}%", lang.other as f64 / total * 100.0);
     eprintln!("    Vocab used: {}/256", unique);
 }
