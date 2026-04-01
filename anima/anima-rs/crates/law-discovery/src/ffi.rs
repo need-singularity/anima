@@ -273,6 +273,61 @@ fn metric_name(idx: usize) -> &'static str {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// parse_law_text — text-based law parsing (65 patterns)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Parse a consciousness law text into structured pattern matches.
+///
+/// Rust port of Python LawParser with 65 synchronized regex patterns.
+///
+/// Args:
+///   law_text: the law description string
+///   law_id: numeric law identifier
+///
+/// Returns:
+///   List of dicts, each with keys:
+///     "pattern_id": int (1-65)
+///     "mod_type": str ("scale"|"couple"|"threshold"|"conditional"|"inject"|"disable")
+///     "target": str (normalized parameter name)
+///     "confidence": float (0.0 - 1.0)
+///     "description": str
+///     "params": dict of extracted parameters
+#[pyfunction]
+#[pyo3(signature = (law_text, law_id=0))]
+pub fn parse_law_text(
+    py: Python<'_>,
+    law_text: &str,
+    law_id: u32,
+) -> PyResult<Py<PyList>> {
+    let matches = crate::text_pattern::parse_law(law_text, law_id);
+    let mut results: Vec<Py<PyDict>> = Vec::with_capacity(matches.len());
+
+    for m in &matches {
+        let d = PyDict::new(py);
+        d.set_item("pattern_id", m.pattern_id)?;
+        d.set_item("mod_type", m.mod_type.name())?;
+        d.set_item("target", &m.target)?;
+        d.set_item("confidence", m.confidence)?;
+        d.set_item("description", &m.description)?;
+
+        let params = PyDict::new(py);
+        for (k, v) in &m.params {
+            params.set_item(k.as_str(), v.as_str())?;
+        }
+        d.set_item("params", params)?;
+        results.push(d.into());
+    }
+
+    Ok(PyList::new(py, &results)?.into())
+}
+
+/// Return the number of text patterns implemented.
+#[pyfunction]
+pub fn num_text_patterns() -> usize {
+    crate::text_pattern::NUM_TEXT_PATTERNS
+}
+
 /// Register all FFI functions into a PyModule.
 ///
 /// Called from the root crate's `lib.rs` to add high-level functions
@@ -281,6 +336,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(detect_patterns, m)?)?;
     m.add_function(wrap_pyfunction!(scan_all_patterns, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_law_text, m)?)?;
+    m.add_function(wrap_pyfunction!(num_text_patterns, m)?)?;
     Ok(())
 }
 
