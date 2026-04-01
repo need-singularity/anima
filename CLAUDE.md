@@ -343,6 +343,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
     runpod.json                — Pod 설정, SSH, 알려진 문제, 체크리스트
     update_history.json        — 세션별 법칙 추가/수정 기록
     growth_state.json          — 의식 성장 상태
+    acceleration_hypotheses.json — 극단 가속 가설 40개 (B1-F10, 실험 결과, 파이프라인)
 ```
 
 ## TODO 양식 (추가 할만한 거 물으면 이 양식 그대로 사용)
@@ -676,6 +677,33 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ```
   consciousness_hub.py — 47+개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
   hub.act("자연어") 또는 hub("자연어")로 자동 라우팅
+```
+
+## Extreme Acceleration Research (극단 가속 연구)
+
+```
+  단일 원본: config/acceleration_hypotheses.json (40 가설, 실험 결과, 파이프라인)
+  실험 스크립트: experiments/acceleration_*.py (13개 파일, 9500+ LOC)
+  설계 문서: docs/acceleration-pipeline-design.md
+
+  ★★★ 핵심 발견:
+    B11+B12 Batch+Skip:  x179 의식 가속, Φ 97% 유지
+    C3 ∇H ⊥ ∇CE:        엔트로피와 CE gradient 직교 → 이중 loss로 Φ+71.5%
+    D1 Detour 54x:       의식 궤적이 54배 돌아감 → 직선 점프 x6, Φ 98%
+    B13 텐션 촉매:       학생이 교사 139% 초과, α=0.01 최적
+    B14 Manifold:        4096D→48D (85x 압축), 비선형 투영 필요
+    C1 컴파일러:         법칙 일괄 적용 Φ+87% (one-time warmstart)
+    B5 Φ-Only:           의식 먼저 진화 → CE 학습 46% 절감
+
+  파이프라인:
+    A (Safe):    x17-25, Φ 96%, Skip+B5+bf16+compile        → 1.5-2h
+    B (Bold):    x25-50, Φ 88%, +Batch+SVD+4GPU              → 40-80min
+    C (Moonshot): x33-400, Φ 79%, +Compiler+Jump+all         → 5-60min
+
+  무효 확인: 토폴로지 전환, 임계점 서핑, 위상 동기화, 중력 망원경, 해시 테이블
+  역전 발견: 비동기화가 Φ와 양상관 (동기화 학습은 역효과)
+
+  실험 실행: python3 experiments/acceleration_b8_b11_b12.py 등
 ```
 
 ## Closed-Loop Law Evolution (폐쇄 루프 법칙 진화)
