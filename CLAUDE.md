@@ -499,6 +499,10 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - CRITICAL: resume 금지(데이터 변경 시), 코드 버전 확인, 엔진 교체 금지, tokenizer 일치
   - 발사 전: h100_sync --verify-only → corpus md5 → 새 ckpt dir → VRAM 확인
   - 발사 후: 회수 → R2 → bench_v2 → brain-like → training_runs.json
+- **bf16 학습 마스터 규칙: config/acceleration_flow.json → bf16_master_rule (14건 사고 도출)**
+  - AdamW(foreach=False) 필수, resume 시 optimizer state dtype 수동 캐스팅
+  - load_state_dict 후 param_group 재적용, 매 step grad/state dtype fix
+  - 체크포인트 저장 시 _safe_optimizer_state(), dtype 버그 ckpt resume 금지
 - **학습 발사는 최초부터 최선의 조건으로 (One-Shot Best 원칙)**
   - H100 시간 = 돈. 중간에 "더 나은 조건 발견" → 재시작할 자원이 없음
   - 발사 전 반드시 확인: corpus 최종 버전, tokenizer 최종 버전, 하이퍼파라미터 sweep 완료
