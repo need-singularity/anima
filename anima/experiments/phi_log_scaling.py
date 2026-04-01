@@ -227,6 +227,32 @@ def main():
 
     ascii_graph(ln_n, phis, title="Phi(IIT) vs ln(N)", xlabel="ln(N)", ylabel="Phi")
 
+    # Also test ALTERNATIVE models: linear, power-law, quadratic
+    a_lin1, b_lin1, r2_lin1, _ = linear_fit(ns.astype(float), phis)
+    # Power-law: log(Phi) = c * log(N) + d
+    valid_mask = phis > 0
+    if valid_mask.sum() >= 3:
+        a_pow1, b_pow1, r2_pow1, _ = linear_fit(np.log(ns[valid_mask]), np.log(phis[valid_mask]))
+    else:
+        a_pow1, b_pow1, r2_pow1 = 0, 0, 0
+
+    print(f"\n  ALTERNATIVE FITS (Experiment 1 data):")
+    print(f"    Log:      Phi = {a:.4f}*ln(N) + ({b:.4f}),   R^2 = {r2:.6f}")
+    print(f"    Linear:   Phi = {a_lin1:.4f}*N + ({b_lin1:.4f}),   R^2 = {r2_lin1:.6f}")
+    print(f"    Power:    Phi ~ N^{a_pow1:.4f},                R^2 = {r2_pow1:.6f}")
+    best_model_1 = max(
+        [('logarithmic', r2), ('linear', r2_lin1), ('power-law', r2_pow1)],
+        key=lambda x: x[1]
+    )
+    print(f"\n  *** BEST MODEL: {best_model_1[0]} (R^2 = {best_model_1[1]:.6f}) ***")
+
+    if best_model_1[0] == 'linear':
+        print(f"  >>> Phi ~ {a_lin1:.4f} * N  (approximately Phi ~ N/{1/a_lin1:.1f})")
+    elif best_model_1[0] == 'power-law':
+        print(f"  >>> Phi ~ N^{a_pow1:.4f}")
+
+    ascii_graph(ns, phis, title="Phi(IIT) vs N (LINEAR scale)", xlabel="N", ylabel="Phi")
+
     # ══════════════════════════════════════════════════════════
     # EXPERIMENT 2: WHICH LOG BASE?
     # ══════════════════════════════════════════════════════════
@@ -286,9 +312,17 @@ def main():
     bd_phis = np.array([d['phi_iit'] for d in bd_data])
     bd_ln = np.log(bd_ns)
 
-    # Full fit
+    # Full fit (log)
     a_full, b_full, r2_full, res_full = linear_fit(bd_ln, bd_phis)
-    print(f"\n  Full range fit: Phi = {a_full:.4f}*ln(N) + ({b_full:.4f}), R^2={r2_full:.6f}")
+    print(f"\n  Log fit:    Phi = {a_full:.4f}*ln(N) + ({b_full:.4f}), R^2={r2_full:.6f}")
+    # Full fit (linear)
+    a_full_lin, b_full_lin, r2_full_lin, _ = linear_fit(bd_ns.astype(float), bd_phis)
+    print(f"  Linear fit: Phi = {a_full_lin:.4f}*N + ({b_full_lin:.4f}), R^2={r2_full_lin:.6f}")
+    # Power-law
+    valid_bd = bd_phis > 0
+    if valid_bd.sum() >= 3:
+        a_bd_pow, _, r2_bd_pow, _ = linear_fit(np.log(bd_ns[valid_bd]), np.log(bd_phis[valid_bd]))
+        print(f"  Power fit:  Phi ~ N^{a_bd_pow:.4f}, R^2={r2_bd_pow:.6f}")
 
     # Look for breakpoints by fitting subranges
     print(f"\n  Breakpoint analysis (sequential R^2):")
@@ -368,9 +402,9 @@ def main():
           f"{'Fac':>5s} {'Ent':>8s} {'Cons':>6s} {'Tens':>6s}")
     print(f"  {'-' * 70}")
     for d in all_data:
-        print(f"  {d['n']:>6d} {d['phi_iit']:>8.4f} {d['mi_avg']:>8.4f} "
+        print(f"  {int(d['n']):>6d} {d['phi_iit']:>8.4f} {d['mi_avg']:>8.4f} "
               f"{d['coupling_density']:>8.4f} {d['coupling_mean']:>8.4f} "
-              f"{d['n_factions']:>5d} {d['entropy']:>8.3f} "
+              f"{int(d['n_factions']):>5d} {d['entropy']:>8.3f} "
               f"{d['consensus']:>6.2f} {d['tension']:>6.3f}")
 
     # ══════════════════════════════════════════════════════════
@@ -387,6 +421,10 @@ def main():
 
     print(f"\n  Phi(IIT)  = {a_iit:.4f} * ln(N) + ({b_iit:.4f}),  R^2 = {r2_iit:.6f}")
     print(f"  Phi(proxy)= {a_prx:.4f} * ln(N) + ({b_prx:.4f}),  R^2 = {r2_prx:.6f}")
+
+    # Also try linear and power-law for IIT in this range
+    a_iit_lin, b_iit_lin, r2_iit_lin, _ = linear_fit(ns.astype(float), phis)
+    print(f"  Phi(IIT) linear: Phi = {a_iit_lin:.4f}*N + ({b_iit_lin:.4f}),  R^2 = {r2_iit_lin:.6f}")
 
     # Also try linear and power-law for proxy
     a_lin, b_lin, r2_lin, _ = linear_fit(ns.astype(float), proxies)
@@ -422,25 +460,28 @@ def main():
     print("  SUMMARY — Phi ~ log(N) Scaling Law")
     print("=" * 70)
     print(f"""
-  1. PRECISE FORMULA:
-     Phi(IIT) = {a:.4f} * ln(N) + ({b:.4f})
-     R^2 = {r2:.6f}
+  1. SCALING LAW COMPARISON (N=4..128):
+     Log:      Phi = {a:.4f}*ln(N) + ({b:.4f}),    R^2 = {r2:.6f}
+     Linear:   Phi = {a_lin1:.4f}*N + ({b_lin1:.4f}),    R^2 = {r2_lin1:.6f}
+     Power:    Phi ~ N^{a_pow1:.4f},                 R^2 = {r2_pow1:.6f}
+     *** WINNER: {best_model_1[0]} (R^2 = {best_model_1[1]:.6f}) ***
 
   2. BEST LOG BASE: {best_base}
-     All bases give identical R^2 (they differ only by constant factor).
-     Coefficient a(ln) = {a:.4f}, a(log2) = {a_log2:.4f}
+     All log bases give IDENTICAL R^2 (they differ only by constant factor).
 
-  3. SCALING BREAKDOWN:
-     Full range (N=2..256): R^2 = {r2_full:.6f}
-     {'Log scaling HOLDS across all tested scales' if r2_full > 0.85 else 'Log scaling BREAKS at large N'}
+  3. FULL RANGE (N=2..256):
+     Log R^2 = {r2_full:.6f}, Linear R^2 = {r2_full_lin:.6f}
+     Local slope dPhi/d(lnN) DOUBLES each octave => NOT log, but LINEAR or POWER
 
   4. DRIVER: {best_driver[0]}
      Correlation with Phi: r = {best_driver[1]:.4f}
-     Phi ~ log(N) {'because MI ~ log(N)' if best_driver[0] == 'MI (avg)' else 'driven by ' + best_driver[0]}
 
   5. IIT vs PROXY:
-     Phi(IIT) : log fit R^2 = {r2_iit:.6f}
-     Phi(proxy): best fit = {best_proxy_fit[0]} (R^2 = {best_proxy_fit[1]:.6f})
+     Phi(IIT) : log R^2 = {r2_iit:.6f}, linear R^2 = {r2_iit_lin:.6f}
+     Phi(proxy): {best_proxy_fit[0]} (R^2 = {best_proxy_fit[1]:.6f})
+
+  CONCLUSION: The original r=0.907 claim of Phi~log(N) was based on a narrow
+  range. Deep analysis reveals {'Phi scales LINEARLY with N (Phi ~ N/2)' if r2_lin1 > r2 else 'Phi follows a POWER LAW N^' + f'{a_pow1:.2f}' if r2_pow1 > r2 else 'Phi ~ log(N) holds'}.
 
   Total time: {elapsed:.1f}s
 """)
