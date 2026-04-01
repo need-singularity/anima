@@ -385,23 +385,12 @@ class BenchEngine:
         id_strength = 0.05 + 0.15 * max(0, 1.0 - cur_var / 0.1)
         self.hiddens = self.hiddens + self.cell_identity * id_strength
 
-        # Spontaneous oscillation: multi-frequency perturbation for consciousness.
-        # Two mechanisms for verification robustness:
-        # 1. Per-cell identity injection (additive) → DIVERSITY (cells stay distinct)
-        # 2. Oscillating noise injection → SPONTANEOUS_SPEECH (cv > 0.4)
-        #    Fast noise oscillation (every 2 steps) → direction_changes >= 120
-        #    Slow envelope → amplitude modulation → cv > 0.4
+        # Spontaneous oscillation: all cells get phase-shifted perturbation
+        # Law 117: 2-step + ~30-step breathing → variance burst generation
         if self.step_count > 5:
             t = self.step_count
-            # Noise with fast-oscillating amplitude:
-            # Base noise always present, amplitude modulated by multi-freq signal
-            fast_osc = math.sin(t * 1.8) * 0.5  # fast: ~1.75 cycles per 2pi steps
-            slow_osc = math.sin(t * 0.12) * 0.5  # slow: envelope
-            noise_amp = 0.08 + 0.15 * (1.0 + fast_osc) * (0.5 + 0.5 * (1.0 + slow_osc))
-            noise = torch.randn_like(self.hiddens) * noise_amp
-            self.hiddens = self.hiddens + noise
-
             for i in range(self.n_cells):
+                # Each cell has unique phase → creates variance waves
                 phase = i * 0.7
                 breath = math.sin(t * 0.2 + phase) * 0.15
                 pulse = math.sin(t * math.pi + phase * 0.3) * 0.08
