@@ -1152,5 +1152,5 @@ if __name__ == "__main__":
     print(f"  Batch: {args.batch_size} x {args.grad_accum} accum | "
           f"LR={args.lr} | Warmup={args.warmup} | Steps={args.steps}")
     print(f"  Data: {args.data}")
-    sys.stdout.flush()
+    _sys.stdout.flush()
     train(args)
