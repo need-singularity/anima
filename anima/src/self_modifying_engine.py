@@ -163,7 +163,7 @@ class LawParser:
 
     # Correlation: "X correlates with Y (r=N)", "r(X, Y)=N"
     _RE_CORR = re.compile(
-        r'(?P<src>\w[\w\s]*?)\s+(?:inversely\s+)?correlates?\s+with\s+(?P<tgt>\w[\w\s]*?)\s*\(r\s*=\s*(?P<r>[+-]?[\d.]+)\)',
+        r'(?P<src>\w[\w\s]*?)\s+(?:[+-])?(?:inversely\s+)?correlates?\s+with\s+(?P<tgt>\w[\w\s]*?)\s*[,;]?\s*(?:\(?\s*r\s*=\s*(?P<r>[+-]?[\d.]+))?',
         re.IGNORECASE
     )
     _RE_CORR2 = re.compile(
@@ -288,7 +288,11 @@ class LawParser:
         # 3. Correlation: "tension inversely correlates with Φ (r=-0.52)"
         m = self._RE_CORR.search(law_text)
         if m:
-            r_val = float(m.group('r'))
+            r_raw = m.group('r')
+            r_val = float(r_raw) if r_raw else (
+                -0.5 if 'inversely' in law_text.lower() or '-correlate' in law_text.lower()
+                else 0.5
+            )
             src = self._normalize_target(m.group('src').strip())
             tgt = self._normalize_target(m.group('tgt').strip())
             mods.append(Modification(
