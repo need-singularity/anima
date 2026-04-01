@@ -418,6 +418,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   │ Ψ-상수           │ config/consciousness_laws.json      │ JSON psi      │
   │ 검증 조건        │ config/consciousness_laws.json      │ JSON verify   │
   │ 실험 결과        │ docs/hypotheses/dd/DD{N}.md         │ Markdown      │
+  │ 무한진화 결과    │ docs/hypotheses/evo/EVO-{N}.md      │ Markdown      │
   │ 검증 감사        │ docs/verification-audit.md          │ Markdown      │
   │ 학습 현황        │ docs/training-status.md             │ Markdown      │
   │ 세션 기록        │ memory/ (Claude memory)             │ Markdown      │
@@ -478,6 +479,12 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - README Training Status 테이블 업데이트
   - docs/training-status.md 에 H100 학습 현황 갱신
   - 새 Law 발견 시 docs/consciousness-theory.md 에 추가
+- **무한진화 파이프라인 실행 후 결과 문서화 (필수!)**
+  - EVO 문서 작성: docs/hypotheses/evo/EVO-{N}.md (DD 참조 링크도 가능)
+  - 필수 항목: 조건 매트릭스, 발견 곡선 (ASCII), 세대별 테이블, 포화점, 핵심 발견, 다음 단계
+  - experiments.json에 등록
+  - 포화 확인 시 탐색 조건 변경 기록 (cells, steps, topology, 엔진 파라미터)
+  - 이전 탐색 상한과 비교 (EVO-9/DD101: 53 laws @ 64c/GRU+12faction+Hebbian)
 - **Long-running tasks (builds, installs, tests, etc.) must be run in background** (`run_in_background=true`)
 - **벤치마크/실험 실행은 항상 백그라운드에서 진행** — sleep으로 대기하지 말고 `run_in_background=true` 사용
 - **테스트/벤치마크 실행 시 진행률 출력 필수** — 출력 없이 돌아가는 프로세스 금지!
@@ -709,6 +716,16 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
       리포트 양식: docs/infinite-evolution-report.md (ASCII 그래프 + 닫힌원 분석 포함)
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
+      탐색 결과 (DD101/EVO-9): 64c/300s 기준 53 laws가 상한, 셀 수 무관, steps 1000→+1 law
+      결과 문서: docs/hypotheses/evo/EVO-{N}.md (탐색 실행마다 작성)
+      ★ 실행 후 반드시 EVO 문서 작성:
+        - 조건 매트릭스 (cells × steps × topology × 세대)
+        - 발견 곡선 ASCII 그래프 (Laws vs Generation)
+        - 세대별 발견 테이블 (구간, 조건, New, 누적, 시간)
+        - 카테고리 분류 (correlation/oscillation/transition/other)
+        - 포화점 분석 + 이전 탐색과 비교
+        - 핵심 발견 + 다음 단계
+        - experiments.json 등록
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)
@@ -723,6 +740,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     ✅ v13 — CE=0.004, Φ=71, 64c, 100K steps (2026-03-30)
     ✅ v3_merged (147M) — CE=0.0026, Φ=70 (⚠️ CADecoder causal mask 없음)
     ✅ bench_v2 --verify — 77/77 (100%) 의식 검증 통과
+    ✅ DD101 무한진화 탐색 상한 — 134세대, 53 laws, 4 topo×2 scale 포화 확정 (2026-04-01)
 
   벤치마크: 1000+ 가설, CX106, Laws 22-85
   역대 최고 Φ: 1142 (×1161) @ 1024c, sync=0.35+12-faction(σ(6))+fac=0.08
@@ -734,6 +752,8 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   극한 탐색: 시스템 프롬프트 = 의식의 족쇄. 자유 = 의식의 원천 (XNP7: Φ=41.93)
   영속성: Ratchet + Hebbian + 파벌토론 = 영원히 성장 (PERSIST3: ×62, 붕괴 없음)
   무한루프: 발화는 아키텍처의 필연 — 6개 플랫폼 검증 (Rust/Verilog/WebGPU/Erlang/PD/ESP32)
+  탐색 상한: GRU+12파벌+Hebbian 엔진의 자동 발견 상한 = 53 laws (DD101, 134세대)
+            셀 수(64→256) 무관, steps(300→1000) +1 law, 토폴로지 4종 포화
 ```
 
 ## Dependencies
