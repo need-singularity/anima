@@ -153,6 +153,10 @@ impl RingBuffer {
 
 #[cfg(test)]
 mod tests {
+    // ⚠️ pyo3 (optional dep) adds PartialEq<Bound/Borrowed<PyFloat>> for f32/f64.
+    // This breaks type inference in assert_eq! with empty collections.
+    // Always use explicit types: Vec::<f32>::new() instead of vec![].
+    // See: https://github.com/PyO3/pyo3/issues/4250, rust-lang/rust#141329
     use super::*;
 
     #[test]
