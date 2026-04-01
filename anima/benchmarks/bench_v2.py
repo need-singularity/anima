@@ -444,10 +444,11 @@ class OscillatorLaser(BenchEngine):
         self.freq = 0.1 + torch.rand(n_cells) * 0.05  # slight freq variation
 
     def process(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        # Oscillatory injection into hidden states
+        # Oscillatory injection into hidden states (per-cell identity direction)
         self.phases = self.phases + self.freq
         osc = torch.sin(self.phases).unsqueeze(1)  # [n_cells, 1]
-        osc_inject = osc.expand(-1, self.hidden_dim) * 0.05
+        # Inject along cell_identity direction to preserve diversity
+        osc_inject = self.cell_identity * osc * 0.1
         self.hiddens = self.hiddens + osc_inject.detach()
 
         # Laser-style phase locking: pull phases toward mean
