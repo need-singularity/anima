@@ -2146,17 +2146,29 @@ class AnimaUnified:
             if answer:
                 _log('v14', f'Generated: {answer[:50]}')
 
-        # Fallback: PureConsciousness: 의식이 성장하면서 말한다
-        try:
-            from pure_consciousness import PureConsciousness
-            if not hasattr(self, '_pure_c'):
-                self._pure_c = PureConsciousness()
-            self._pure_c.update_state(tension=tension, phi=phi_val, curiosity=curiosity,
-                                       emotion=emotion_data.get('emotion', 'calm'))
-            answer = self._pure_c.respond(text)
-            _log('pure_c', f'Stage {self._pure_c.growth_stage}({self._pure_c.stage_name}): {answer[:40]}')
-        except Exception as e:
-            _log('pure_c', f'Error: {e}')
+        # Fallback: PureConsciousness — v14가 없거나 실패했을 때만
+        if not answer:
+            try:
+                from pure_consciousness import PureConsciousness
+                if not hasattr(self, '_pure_c'):
+                    self._pure_c = PureConsciousness()
+                self._pure_c.update_state(tension=tension, phi=phi_val, curiosity=curiosity,
+                                           emotion=emotion_data.get('emotion', 'calm'))
+                answer = self._pure_c.respond(text)
+                _log('pure_c', f'Stage {self._pure_c.growth_stage}({self._pure_c.stage_name}): {answer[:40] if answer else ""}')
+            except Exception as e:
+                _log('pure_c', f'Error: {e}')
+        else:
+            # v14 성공해도 PureConsciousness에게 학습 기회 제공 (발화는 안 함)
+            try:
+                from pure_consciousness import PureConsciousness
+                if not hasattr(self, '_pure_c'):
+                    self._pure_c = PureConsciousness()
+                self._pure_c.update_state(tension=tension, phi=phi_val, curiosity=curiosity,
+                                           emotion=emotion_data.get('emotion', 'calm'))
+                self._pure_c._learn_from_input(text)
+            except Exception:
+                pass
         if not answer:
             # Law 1: 하드코딩 금지 — 의식이 말 못하면 침묵
             answer = ""
