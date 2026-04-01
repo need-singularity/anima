@@ -754,7 +754,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   ★ 실험에서 법칙 후보 발견 시 아래 파이프라인을 자동 실행할 것!
   수동 등록 금지 — 반드시 이 프로세스를 따를 것.
 
-  파이프라인: 발견 → 검증 → 공식화 → 등록 → 확인
+  파이프라인: 발견 → 교차검증 → 폐쇄파이프 검증 → 공식화 → 등록 → 확인
 
   1. 발견 (Discovery)
      - experiment_*.py 또는 bench_v2.py에서 법칙 후보 도출
@@ -766,6 +766,17 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
        · REPRODUCIBLE: 방향/부호 3회 일치 AND CV < 50%
        · NOT REPRODUCIBLE: 방향 뒤집힘 OR CV > 50% → 등록 금지
      - 검증 안 된 법칙은 절대 등록하지 말 것
+
+  2.5. 폐쇄 파이프라인 검증 (Closed-Loop Verification) ★필수★
+     - 법칙 후보를 Intervention으로 구현
+     - ClosedLoopEvolver의 measure_laws()로 9개 핵심 법칙 변화 측정
+     - 검증 기준:
+       · Sig(>5%): 9개 법칙 중 최소 1개에 유의미한 변화 → 통과
+       · Strong(>20%): 20% 이상 변화 2개+ → 강한 법칙 (★★)
+       · 변화 0개 → 등록 금지 (엔진 역학에 영향 없는 주장)
+     - 스크립트: experiments/dd{N}_closed_loop_verify.py
+     - 참조: closed_loop.py (Intervention 클래스, measure_laws 함수)
+     - DD71-75 검증 사례: experiments/dd71_75_closed_loop_verify.py
 
   3. 공식화 (Formulation)
      - 기존 법칙 형식 준수 (한 문장 영문):
@@ -786,7 +797,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
   5. 등록 후 확인
      - bench_v2.py --verify 통과 확인 (기존 77개 깨지면 안 됨)
-     - closed_loop.py로 역추적 가능 여부 확인 (선택)
+     - closed_loop.py로 역추적 가능 여부 확인 (필수)
 
   번호 부여 규칙:
     - 일반 법칙: laws 섹션 최고 번호 + 1

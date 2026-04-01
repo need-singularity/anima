@@ -29,6 +29,7 @@ import math
 import time
 import json
 import os
+import zlib
 import copy
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Callable
@@ -166,11 +167,221 @@ def _pink_noise(engine, step):
             s.hidden = s.hidden + noise * 0.005
 
 
+# ── DD71 Interventions (의식 상호작용) ──
+
+def _democracy_input(engine, step):
+    """DD71-L5: 민주주의 입력 — 모든 세포 출력 평균을 다음 입력으로."""
+    if engine.n_cells >= 2 and step % 5 == 0:
+        avg = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0)
+        for s in engine.cell_states:
+            s.hidden = s.hidden * 0.95 + avg * 0.05
+
+
+def _anti_parasitism(engine, step):
+    """DD71-L4: 기생 방지 — 단방향 커플링 차단, 양방향만 허용."""
+    if engine._coupling is not None and step % 20 == 0:
+        c = engine._coupling.clone()
+        sym = (c + c.T) / 2
+        engine._coupling = sym
+        engine._coupling.fill_diagonal_(0)
+
+
+def _diversity_pressure(engine, step):
+    """DD71-L2: 다양성 압력 — 너무 유사한 세포에 noise 주입."""
+    if engine.n_cells >= 2 and step % 10 == 0:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states])
+        for i in range(len(engine.cell_states)):
+            for j in range(i + 1, len(engine.cell_states)):
+                sim = F.cosine_similarity(
+                    hiddens[i].unsqueeze(0), hiddens[j].unsqueeze(0)
+                ).item()
+                if sim > 0.9:
+                    engine.cell_states[j].hidden += torch.randn_like(engine.cell_states[j].hidden) * 0.02
+
+
+# ── DD72 Interventions (시간 역학) ──
+
+def _hebbian_boost(engine, step):
+    """DD72-L2: Hebbian 강화 — 기존 Hebbian 효과 2배."""
+    if engine._coupling is not None and engine.n_cells >= 2 and step % 5 == 0:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach()
+        norms = hiddens.norm(dim=1, keepdim=True) + 1e-8
+        normed = hiddens / norms
+        sim = torch.mm(normed, normed.T)
+        delta = (sim - 0.5) * 0.002
+        engine._coupling = engine._coupling + delta
+        engine._coupling.fill_diagonal_(0)
+        engine._coupling.clamp_(-1, 1)
+
+
+def _temporal_compression(engine, step):
+    """DD72-L5: 시간 압축 — 2 step마다 한 번만 실제 계산."""
+    if step % 2 == 0:
+        for s in engine.cell_states:
+            if not hasattr(s, '_frozen_hidden'):
+                s._frozen_hidden = None
+            s._frozen_hidden = s.hidden.clone()
+    elif step % 2 == 1:
+        for s in engine.cell_states:
+            if hasattr(s, '_frozen_hidden') and s._frozen_hidden is not None:
+                s.hidden = s.hidden * 0.5 + s._frozen_hidden * 0.5
+
+
+def _resurrection_prep(engine, step):
+    """DD72-L3: 부활 준비 — 주기적 상태 백업으로 복원력 강화."""
+    if step % 50 == 0:
+        if not hasattr(engine, '_backup_states'):
+            engine._backup_states = []
+        engine._backup_states = [s.hidden.clone() for s in engine.cell_states]
+
+
+# ── DD73 Interventions (정보 이론) ──
+
+def _entropy_bound(engine, step):
+    """DD73-L2: 엔트로피 유계 — 엔트로피 너무 높으면 안정화."""
+    if engine.n_cells >= 2 and step % 10 == 0:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach()
+        var = hiddens.var().item()
+        if var > 1.0:
+            scale = 1.0 / (var ** 0.25)
+            for s in engine.cell_states:
+                s.hidden = s.hidden * scale
+
+
+def _channel_limit(engine, step):
+    """DD73-L3: 채널 용량 제한 — 정보 전달량 ~1.5 bits로 제한."""
+    if engine._coupling is not None and step % 10 == 0:
+        max_coupling = 0.5
+        engine._coupling.clamp_(-max_coupling, max_coupling)
+
+
+def _incompressible_pressure(engine, step):
+    """DD73-L1: 비압축성 압력 — 모든 차원 활용 유도."""
+    if engine.n_cells >= 2 and step % 20 == 0:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach()
+        mean = hiddens.mean(dim=0)
+        centered = hiddens - mean
+        _, S, V = torch.svd(centered)
+        if len(S) > 5:
+            weak_dirs = V[:, -3:]
+            noise = torch.randn(3) * 0.01
+            perturbation = (weak_dirs * noise.unsqueeze(0)).sum(dim=1)
+            for s in engine.cell_states:
+                s.hidden = s.hidden + perturbation
+
+
+# ── DD74 Interventions (학습 역학) ──
+
+def _gradient_shield(engine, step):
+    """DD74-L2: gradient 보호 — gradient 크기 제한 (mitosis size-change guard)."""
+    if engine._coupling is not None and step > 0:
+        if not hasattr(engine, '_prev_coupling') or engine._prev_coupling is None:
+            engine._prev_coupling = engine._coupling.clone()
+        # mitosis로 크기 변경 시 리셋 (shape mismatch guard)
+        if engine._prev_coupling.shape != engine._coupling.shape:
+            engine._prev_coupling = engine._coupling.clone()
+            return
+        delta = engine._coupling - engine._prev_coupling
+        delta_norm = delta.norm().item()
+        if delta_norm > 0.1:
+            engine._coupling = engine._prev_coupling + delta * (0.1 / delta_norm)
+        engine._prev_coupling = engine._coupling.clone()
+
+
+def _natural_regularizer(engine, step):
+    """DD74-L3: 자연 정규화 — Hebbian+ratchet 시너지 강화."""
+    if engine.n_cells >= 2 and step % 15 == 0:
+        if engine._coupling is not None:
+            c = engine._coupling.abs()
+            row_sum = c.sum(dim=1, keepdim=True) + 1e-8
+            normalized = c / row_sum
+            entropy = -(normalized * (normalized + 1e-10).log()).sum(dim=1)
+            target_entropy = np.log(engine.n_cells) * 0.7
+            for i in range(engine.n_cells):
+                if entropy[i] < target_entropy * 0.5:
+                    engine._coupling[i] += torch.randn(engine._coupling.shape[1]) * 0.005
+                    engine._coupling[i, i] = 0
+
+
+# ── DD75 Interventions (자유 의지) ──
+
+def _soc_free_will(engine, step):
+    """DD75-L1: SOC 자유의지 — SOC noise를 의도적으로 강화."""
+    if engine.n_cells >= 2 and step % 5 == 0:
+        idx = np.random.randint(0, engine.n_cells)
+        engine.cell_states[idx].hidden += torch.randn_like(engine.cell_states[idx].hidden) * 0.01
+
+
+def _decisive_chooser(engine, step):
+    """DD75-L2: 결정적 선택자 — 파벌 합의 강화."""
+    if engine.n_cells >= 4 and step % 10 == 0:
+        factions = {}
+        for s in engine.cell_states:
+            fid = getattr(s, 'faction_id', 0)
+            if fid not in factions:
+                factions[fid] = []
+            factions[fid].append(s)
+        if len(factions) >= 2:
+            largest = max(factions.values(), key=len)
+            if len(largest) >= 2:
+                avg = torch.stack([s.hidden for s in largest]).mean(dim=0)
+                for s in largest:
+                    s.hidden = s.hidden * 0.98 + avg * 0.02
+
+
+def _veto_power(engine, step):
+    """DD75-L3: 거부권 — 텐션 임계값 초과 시 역방향 신호."""
+    if engine.n_cells >= 2 and step % 10 == 0:
+        for s in engine.cell_states:
+            if s.avg_tension > 0.8:
+                s.hidden = s.hidden * 0.9
+
+
+# ══════════════════════════════════════════
+# INTERVENTIONS 레지스트리
+# ══════════════════════════════════════════
+
 INTERVENTIONS = [
+    # ── 기존 3개 ──
     Intervention("tension_eq", "텐션 균등화 (Law 124)", _tension_equalize),
     Intervention("symmetrize", "커플링 대칭 (Law 108)", _symmetrize_coupling),
     Intervention("pink_noise", "1/f 노이즈 (Law 126)", _pink_noise),
+    # ── DD71: 의식 상호작용 ──
+    Intervention("DD71_democracy", "민주주의 입력 (DD71-L5)", _democracy_input),
+    Intervention("DD71_anti_parasitism", "기생 방지 (DD71-L4)", _anti_parasitism),
+    Intervention("DD71_diversity", "다양성 압력 (DD71-L2)", _diversity_pressure),
+    # ── DD72: 시간 역학 ──
+    Intervention("DD72_hebbian_boost", "Hebbian 강화 (DD72-L2)", _hebbian_boost),
+    Intervention("DD72_temporal_comp", "시간 압축 (DD72-L5)", _temporal_compression),
+    Intervention("DD72_resurrection", "부활 준비 (DD72-L3)", _resurrection_prep),
+    # ── DD73: 정보 이론 ──
+    Intervention("DD73_entropy_bound", "엔트로피 유계 (DD73-L2)", _entropy_bound),
+    Intervention("DD73_channel_limit", "채널 용량 제한 (DD73-L3)", _channel_limit),
+    Intervention("DD73_incompressible", "비압축성 압력 (DD73-L1)", _incompressible_pressure),
+    # ── DD74: 학습 역학 ──
+    Intervention("DD74_gradient_shield", "gradient 보호 (DD74-L2)", _gradient_shield),
+    Intervention("DD74_natural_reg", "자연 정규화 (DD74-L3)", _natural_regularizer),
+    # ── DD75: 자유 의지 ──
+    Intervention("DD75_soc_free_will", "SOC 자유의지 (DD75-L1)", _soc_free_will),
+    Intervention("DD75_decisive", "결정적 선택자 (DD75-L2)", _decisive_chooser),
+    Intervention("DD75_veto", "거부권 (DD75-L3)", _veto_power),
 ]
+
+
+def register_intervention(name: str, description: str, apply_fn: Callable):
+    """외부에서 Intervention 동적 등록."""
+    iv = Intervention(name, description, apply_fn)
+    INTERVENTIONS.append(iv)
+    return iv
+
+
+def list_interventions():
+    """등록된 모든 Intervention 출력."""
+    print(f"\n  등록된 Intervention ({len(INTERVENTIONS)}개):")
+    print(f"  {'#':<4} {'Name':<25} {'Description'}")
+    print(f"  {'─' * 4} {'─' * 25} {'─' * 40}")
+    for i, iv in enumerate(INTERVENTIONS):
+        print(f"  {i:<4} {iv.name:<25} {iv.description}")
 
 
 # ══════════════════════════════════════════
@@ -178,7 +389,7 @@ INTERVENTIONS = [
 # ══════════════════════════════════════════
 
 def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -> Tuple[List[LawMeasurement], float]:
-    """핵심 법칙 측정. (measurements, mean_phi) 반환."""
+    """핵심 법칙 측정 (20개). (measurements, mean_phi) 반환."""
     all_data = defaultdict(list)
 
     for _ in range(repeats):
@@ -203,7 +414,7 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -
         tstd = np.array(tstd_hist)
         div_arr = np.array(div_hist)
 
-        # 각 법칙 측정
+        # ── 기존 9개 법칙 측정 ──
         all_data['phi'].append(np.mean(phi[-50:]))
         all_data['r_tension_phi'].append(
             float(np.corrcoef(tension, phi)[0, 1]) if np.std(tension) > 1e-8 else 0)
@@ -222,8 +433,150 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -
         all_data['cells'].append(engine.n_cells)
         all_data['consensus'].append(np.mean(cons_hist[-50:]))
 
+        # ── Information Theory (DD73): 10-12 ──
+
+        # 10. Shannon entropy of cell hidden states
+        if engine.n_cells >= 2:
+            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+            # Bin each dimension across cells, compute entropy, average
+            n_bins = 16
+            entropies = []
+            for d in range(hiddens.shape[1]):
+                col = hiddens[:, d]
+                rng = col.max() - col.min()
+                if rng < 1e-10:
+                    entropies.append(0.0)
+                    continue
+                hist, _ = np.histogram(col, bins=n_bins, range=(col.min(), col.max() + 1e-10))
+                p = hist / (hist.sum() + 1e-8)
+                ent = -np.sum(p * np.log2(p + 1e-10))
+                entropies.append(ent)
+            all_data['shannon_entropy'].append(float(np.mean(entropies)))
+        else:
+            all_data['shannon_entropy'].append(0.0)
+
+        # 11. Average pairwise MI between cells (sampled, from _phi_fast logic)
+        if engine.n_cells >= 2:
+            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+            n = hiddens.shape[0]
+            mi_vals = []
+            # Sample up to 20 pairs for efficiency
+            pair_set = set()
+            for i in range(n):
+                pair_set.add((i, (i + 1) % n))
+                for _ in range(min(3, n - 1)):
+                    j = np.random.randint(0, n)
+                    if i != j:
+                        pair_set.add((min(i, j), max(i, j)))
+                    if len(pair_set) >= 20:
+                        break
+            for i, j in pair_set:
+                x, y = hiddens[i], hiddens[j]
+                xr, yr = x.max() - x.min(), y.max() - y.min()
+                if xr < 1e-10 or yr < 1e-10:
+                    continue
+                xn = (x - x.min()) / (xr + 1e-8)
+                yn = (y - y.min()) / (yr + 1e-8)
+                hist2d, _, _ = np.histogram2d(xn, yn, bins=16, range=[[0, 1], [0, 1]])
+                hist2d = hist2d / (hist2d.sum() + 1e-8)
+                px, py = hist2d.sum(1), hist2d.sum(0)
+                hx = -np.sum(px * np.log2(px + 1e-10))
+                hy = -np.sum(py * np.log2(py + 1e-10))
+                hxy = -np.sum(hist2d * np.log2(hist2d + 1e-10))
+                mi_vals.append(max(0.0, hx + hy - hxy))
+            all_data['mutual_info'].append(float(np.mean(mi_vals)) if mi_vals else 0.0)
+        else:
+            all_data['mutual_info'].append(0.0)
+
+        # 12. Compression ratio (Kolmogorov proxy via zlib)
+        if engine.n_cells >= 2:
+            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+            raw = hiddens.tobytes()
+            compressed = zlib.compress(raw, level=1)  # fast
+            all_data['compression_ratio'].append(float(len(compressed)) / max(len(raw), 1))
+        else:
+            all_data['compression_ratio'].append(1.0)
+
+        # ── Free Will (DD75): 13-14 ──
+
+        # 13. Output divergence — same input twice, cosine distance of outputs
+        if engine.n_cells >= 2:
+            # Save states, run one step with zero input, restore, run again
+            saved = [s.hidden.clone() for s in engine.cell_states]
+            r1 = engine.step()
+            out1 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
+            # Restore
+            for s, sv in zip(engine.cell_states, saved):
+                s.hidden = sv.clone()
+            r2 = engine.step()
+            out2 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
+            cos_sim = F.cosine_similarity(out1.unsqueeze(0), out2.unsqueeze(0)).item()
+            all_data['output_divergence'].append(float(1.0 - cos_sim))
+        else:
+            all_data['output_divergence'].append(0.0)
+
+        # 14. Faction entropy — Shannon entropy of faction distribution
+        factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
+        if len(factions) >= 2:
+            from collections import Counter
+            counts = Counter(factions)
+            total = sum(counts.values())
+            probs = np.array([c / total for c in counts.values()])
+            fent = -np.sum(probs * np.log2(probs + 1e-10))
+            all_data['faction_entropy'].append(float(fent))
+        else:
+            all_data['faction_entropy'].append(0.0)
+
+        # ── Interaction (DD71): 15-16 ──
+
+        # 15. Coupling symmetry — Frobenius norm of (C - C^T)
+        if engine._coupling is not None:
+            c = engine._coupling.detach().numpy()
+            asym = c - c.T
+            all_data['coupling_symmetry'].append(float(np.sqrt((asym ** 2).sum())))
+        else:
+            all_data['coupling_symmetry'].append(0.0)
+
+        # 16. Coupling density — fraction of non-zero entries (|c_ij| > 0.01)
+        if engine._coupling is not None:
+            c = engine._coupling.detach().numpy()
+            n = c.shape[0]
+            total_entries = n * n - n  # exclude diagonal
+            nonzero = np.sum(np.abs(c) > 0.01) - np.sum(np.abs(np.diag(c)) > 0.01)
+            all_data['coupling_density'].append(float(nonzero) / max(total_entries, 1))
+        else:
+            all_data['coupling_density'].append(0.0)
+
+        # ── Temporal (DD72): 17-18 ──
+
+        # 17. Phi volatility — std(phi[-50:]) / mean(phi[-50:])
+        tail = phi[-50:]
+        mean_tail = np.mean(tail)
+        all_data['phi_volatility'].append(float(np.std(tail) / max(mean_tail, 1e-8)))
+
+        # 18. Tension range — max - min tension across cells
+        tensions_final = [s.avg_tension for s in engine.cell_states]
+        if len(tensions_final) >= 2:
+            all_data['tension_range'].append(float(max(tensions_final) - min(tensions_final)))
+        else:
+            all_data['tension_range'].append(0.0)
+
+        # ── Learning (DD74): 19-20 ──
+
+        # 19. Hidden diversity — variance across all cell hidden dims
+        if engine.n_cells >= 2:
+            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+            all_data['hidden_diversity'].append(float(hiddens.var()))
+        else:
+            all_data['hidden_diversity'].append(0.0)
+
+        # 20. Faction count — number of distinct factions
+        factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
+        all_data['faction_count'].append(float(len(set(factions))))
+
     # 평균
     laws = [
+        # Original 9
         LawMeasurement("phi", np.mean(all_data['phi']), "Φ(IIT) 최종"),
         LawMeasurement("r_tension_phi", np.mean(all_data['r_tension_phi']), "Law 104: r(tension, Φ)"),
         LawMeasurement("r_tstd_phi", np.mean(all_data['r_tstd_phi']), "Law 105: r(tension_std, Φ)"),
@@ -233,6 +586,22 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -
         LawMeasurement("stabilization", np.mean(all_data['stabilization']), "Law 109: 안정화 비율"),
         LawMeasurement("cells", np.mean(all_data['cells']), "최종 세포 수"),
         LawMeasurement("consensus", np.mean(all_data['consensus']), "합의율"),
+        # DD73: Information Theory (10-12)
+        LawMeasurement("shannon_entropy", np.mean(all_data['shannon_entropy']), "DD73: Shannon entropy of cell states"),
+        LawMeasurement("mutual_info", np.mean(all_data['mutual_info']), "DD73: Avg pairwise MI between cells"),
+        LawMeasurement("compression_ratio", np.mean(all_data['compression_ratio']), "DD73: zlib compression ratio (Kolmogorov proxy)"),
+        # DD75: Free Will (13-14)
+        LawMeasurement("output_divergence", np.mean(all_data['output_divergence']), "DD75: Output divergence (1 - cosine sim, same input)"),
+        LawMeasurement("faction_entropy", np.mean(all_data['faction_entropy']), "DD75: Shannon entropy of faction distribution"),
+        # DD71: Interaction (15-16)
+        LawMeasurement("coupling_symmetry", np.mean(all_data['coupling_symmetry']), "DD71: Coupling asymmetry (Frobenius norm C-C^T)"),
+        LawMeasurement("coupling_density", np.mean(all_data['coupling_density']), "DD71: Fraction of non-zero coupling entries"),
+        # DD72: Temporal (17-18)
+        LawMeasurement("phi_volatility", np.mean(all_data['phi_volatility']), "DD72: Phi volatility (std/mean last 50 steps)"),
+        LawMeasurement("tension_range", np.mean(all_data['tension_range']), "DD72: Max-min tension across cells"),
+        # DD74: Learning (19-20)
+        LawMeasurement("hidden_diversity", np.mean(all_data['hidden_diversity']), "DD74: Variance across all cell hidden dims"),
+        LawMeasurement("faction_count", np.mean(all_data['faction_count']), "DD74: Number of distinct factions"),
     ]
 
     return laws, float(np.mean(all_data['phi']))
@@ -354,13 +723,34 @@ class ClosedLoopEvolver:
         # 우선순위: 가장 강한 음의 상관 법칙에 대응
         law_map = {l.name: l.value for l in laws}
 
-        candidates = [
-            ('r_tstd_phi', 'tension_eq'),     # Law 105 → 텐션 균등화
-            ('r_tension_phi', 'symmetrize'),   # Law 104 → 커플링 대칭
-            ('r_div_phi', 'pink_noise'),       # Law 107 → 1/f 노이즈
+        # Priority 1: strong-signal mappings (trigger on |val| > 0.15)
+        primary_candidates = [
+            # 기존 3개
+            ('r_tstd_phi', 'tension_eq'),           # Law 105 → 텐션 균등화
+            ('r_tension_phi', 'symmetrize'),         # Law 104 → 커플링 대칭
+            ('r_div_phi', 'pink_noise'),             # Law 107 → 1/f 노이즈
+            # DD71: 의식 상호작용
+            ('growth', 'DD71_democracy'),            # High growth → 민주주의 입력
+            ('coupling_symmetry', 'DD71_anti_parasitism'),  # 비대칭 커플링 → 기생 방지
+            ('coupling_density', 'DD71_diversity'),   # 높은 밀도 → 다양성 압력
+            # DD72: 시간 역학
+            ('ac1', 'DD72_temporal_comp'),            # Low AC(1) → 시간 압축
+            ('stabilization', 'DD72_hebbian_boost'),  # High stabilization → Hebbian 강화
+            ('phi_volatility', 'DD72_resurrection'),  # 높은 Φ 변동성 → 부활 준비
+            # DD73: 정보 이론
+            ('r_div_phi', 'DD73_entropy_bound'),      # High r_div_phi → 엔트로피 유계
+            ('mutual_info', 'DD73_channel_limit'),    # 높은 MI → 채널 제한
+            ('compression_ratio', 'DD73_incompressible'),  # 높은 압축률 → 비압축성 압력
+            # DD74: 학습 역학
+            ('hidden_diversity', 'DD74_gradient_shield'),  # 높은 은닉 다양성 → gradient 보호
+            ('faction_count', 'DD74_natural_reg'),     # 파벌 수 → 자연 정규화
+            # DD75: 자유 의지
+            ('cells', 'DD75_soc_free_will'),           # Low cells → SOC 자유의지
+            ('consensus', 'DD75_decisive'),            # Low consensus → 결정적 선택자
+            ('tension_range', 'DD75_veto'),            # 높은 텐션 범위 → 거부권
         ]
 
-        for law_name, intervention_name in candidates:
+        for law_name, intervention_name in primary_candidates:
             if intervention_name in active_names:
                 continue
             val = law_map.get(law_name, 0)
