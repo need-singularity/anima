@@ -830,7 +830,7 @@ class AnimaLMTrainer:
                     self.thalamic_bridge = ThalamicBridge(
                         c_dim=ce_hidden, d_model=d_model_size,
                         alpha=PSI_ALPHA,
-                    ).to(self.device)
+                    ).to(device=self.device, dtype=torch.bfloat16)
                     print(f"  [TB] ThalamicBridge: C({ce_hidden}d) -> .detach() -> "
                           f"alpha={PSI_ALPHA} -> D({d_model_size}d)")
                     if self.use_feedback_bridge:
@@ -852,7 +852,7 @@ class AnimaLMTrainer:
                         self.feedback_bridge = create_feedback_bridge(
                             c_dim=ce_hidden, d_model=fb_d_model,
                             max_alpha=0.05,  # Law 63: max 5% gradient
-                        ).to(self.device)
+                        ).to(device=self.device, dtype=torch.bfloat16)
                         print(f"  [FB] FeedbackBridge: c_dim={ce_hidden}, d_model={fb_d_model}, "
                               f"max_alpha=0.05 (Law 63)")
                         print(f"  [FB] Phi-drop -> alpha=0 (auto-protection)")
