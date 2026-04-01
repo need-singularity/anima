@@ -1741,6 +1741,164 @@ class LawParser:
                     ))
                     break
 
+        # ── Post-processing: adjust confidence based on evidence quality ──
+        mods = self._adjust_confidence(mods, law_text)
+
+        return mods
+
+    # ── Confidence post-processing ──
+
+    # Regex for detecting specific numeric evidence in law text
+    _RE_SPECIFIC_NUMBER = re.compile(
+        r'(?:'
+        r'r\s*=\s*[+-]?[\d.]+'           # correlation r=0.78
+        r'|[+-][\d.]+%'                   # percentage +15.3%, -28%
+        r'|[×\*][\d.]+'                   # multiplier ×1.5
+        r'|[\d.]+[×x]\b'                  # multiplier 4.6×
+        r'|(?:Φ|CE|BPC|alpha|α)\s*[=≈:]\s*[\d.]+' # metric=value
+        r'|\b\d+\.\d{2,}\b'              # precise decimal 0.014, 0.608
+        r'|\(\s*[+-]?[\d.]+%\s*\)'       # parenthesized percent (+22%)
+        r')',
+        re.IGNORECASE
+    )
+
+    # Patterns that indicate high-specificity (actionable) laws
+    _RE_ACTIONABLE_MARKERS = re.compile(
+        r'(?:'
+        r'\^[\d.]+'                       # exponent N^1.07
+        r'|r\s*=\s*[+-]?0\.\d+'          # correlation coefficient
+        r'|[=≈]\s*[\d.]+\s*[×\*]\s*\w+\^' # full equation Φ = 0.6 × N^1
+        r'|\b(?:iff|if and only if)\b'    # logical precision
+        r')',
+        re.IGNORECASE
+    )
+
+    # Structural evidence patterns for qualitative laws
+    _RE_ARROW = re.compile(r'→|↑|↓|⊃|⊂|≠')
+    _RE_CAUSAL_STRUCTURE = re.compile(
+        r'(?:'
+        r'\b(?:because|therefore|thus|hence|since|so\s+that|leads?\s+to|results?\s+in)\b'
+        r'|→'
+        r')',
+        re.IGNORECASE
+    )
+
+    def _adjust_confidence(self, mods: List['Modification'], law_text: str) -> List['Modification']:
+        """Adjust confidence scores based on evidence quality signals.
+
+        Strategies:
+          1. Specific numbers (r=0.78, x1.5, +15%) -> boost confidence
+          2. Multi-match (multiple patterns matched) -> boost confidence
+          3. Keyword-only fallback (INJECT with keyword_extract) -> keep low
+          4. Law length + specificity + structural markers -> complexity bonus
+          5. High-confidence mod_types (SCALE, THRESHOLD with values) -> type bonus
+        """
+        if not mods:
+            return mods
+
+        # --- Signal 1: Count specific numeric evidence ---
+        num_matches = len(self._RE_SPECIFIC_NUMBER.findall(law_text))
+        actionable = bool(self._RE_ACTIONABLE_MARKERS.search(law_text))
+
+        # --- Signal 2: Count distinct mod_types (multi-match diversity) ---
+        distinct_types = len(set(m.mod_type for m in mods))
+        n_mods = len(mods)
+
+        # --- Signal 3: Law complexity & structural evidence ---
+        law_len = len(law_text)
+        has_parens = '(' in law_text and ')' in law_text
+        has_experiment_id = bool(re.search(r'\(DD\d+|DD\d+\)', law_text))
+        has_arrows = bool(self._RE_ARROW.search(law_text))
+        has_causal = bool(self._RE_CAUSAL_STRUCTURE.search(law_text))
+        # Count distinct "technical" words as a proxy for specificity
+        low = law_text.lower()
+        tech_words = sum(1 for w in [
+            'phi', 'φ', 'hebbian', 'ratchet', 'topology', 'entropy', 'mitosis',
+            'faction', 'soc', 'lorenz', 'chimera', 'coupling', 'gradient',
+            'gru', 'tensor', 'eigenvalue', 'attractor', 'bifurcation',
+            'dissipative', 'markov', 'lyapunov', 'hamiltonian', 'ergodic',
+            'mutual_info', 'tension', 'cell_variance', 'consciousness',
+            'homeostasis', 'bottleneck', 'frustration', 'sandpile',
+        ] if w in low)
+        is_auto_discovered = law_text.startswith('[Auto-discovered]')
+
+        # --- Apply adjustments ---
+        for mod in mods:
+            boost = 0.0
+
+            # Skip keyword-only fallback — these stay at base confidence (0.2)
+            if mod.params.get('type') == 'keyword_extract':
+                continue
+
+            # 1. Numeric evidence boost: each specific number adds confidence
+            #    Moderate boost — avoid leapfrogging past medium into high
+            if num_matches >= 3:
+                boost += 0.18  # rich quantitative evidence
+            elif num_matches >= 2:
+                boost += 0.13
+            elif num_matches >= 1:
+                boost += 0.08
+
+            # 2. Actionable marker boost (equations, correlations with values)
+            if actionable:
+                boost += 0.05
+
+            # 3. Multi-match boost: multiple patterns = well-structured law
+            if n_mods >= 4:
+                boost += 0.12
+            elif n_mods >= 3:
+                boost += 0.08
+            elif n_mods >= 2:
+                boost += 0.05
+
+            # 4. Structural evidence (qualitative but well-formed laws)
+            #    This is the key boost for non-numeric laws to reach medium
+            if has_arrows:
+                boost += 0.07  # arrows indicate causal/directional claims
+            if has_causal:
+                boost += 0.04  # explicit causal language
+            if tech_words >= 3:
+                boost += 0.12  # domain-specific terminology = expert claim
+            elif tech_words >= 2:
+                boost += 0.08
+            elif tech_words >= 1:
+                boost += 0.06
+
+            # 5. Complexity bonus: longer laws are more precise, but even
+            #    short laws with domain terms deserve some credit
+            if law_len > 150:
+                boost += 0.08
+            elif law_len > 100:
+                boost += 0.06
+            elif law_len > 60:
+                boost += 0.04
+            elif law_len > 30:
+                boost += 0.02  # short but non-trivial
+
+            # 6. Evidence provenance
+            if has_parens:
+                boost += 0.03  # parenthetical structure = organized claim
+            if has_experiment_id:
+                boost += 0.04  # linked to specific experiment
+
+            # 7. Mod-type reliability: SCALE/THRESHOLD with params are more
+            #    actionable than generic INJECT
+            if mod.mod_type in (ModType.SCALE, ModType.THRESHOLD):
+                if 'val' in mod.params or 'exponent' in mod.params or 'threshold' in mod.params:
+                    boost += 0.04  # has concrete parameter values
+
+            # 8. Auto-discovered laws: machine-generated with structured format
+            #    They have systematic verification backing even without numbers
+            if is_auto_discovered:
+                boost += 0.10
+
+            # 9. Penalty: very short + no numbers + no structure + no domain terms
+            if law_len < 30 and num_matches == 0 and not has_arrows and tech_words == 0:
+                boost -= 0.05
+
+            # Apply boost, clamp to [0.1, 0.95]
+            mod.confidence = max(0.1, min(0.95, mod.confidence + boost))
+
         return mods
 
     def parse_laws_batch(self, laws_dict: Dict[str, str], max_laws: int = 50) -> Dict[int, List[Modification]]:

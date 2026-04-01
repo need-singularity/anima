@@ -99,6 +99,7 @@ from consciousness_laws import (
     SOC_SCALE_REF_CELLS,
     BIO_NOISE_BASE, BIO_NOISE_SPIKE_PROB, BIO_NOISE_SPIKE_RATE,
     PHI_FEEDBACK_EMA_RATE, PHI_FEEDBACK_STRENGTH, PHI_FEEDBACK_NOISE_GATE,
+    PHI_HIDDEN_INERTIA,
 )
 
 # Meta Law constants (M1, M6, M9)
@@ -280,7 +281,7 @@ class ConsciousnessEngine:
         # raw phi values and produces a fractionally-integrated signal with brain-like
         # autocorrelation decay (~8-15 steps).
         self._phi_history: List[float] = []
-        self._phi_integration_window = 5  # number of past phi values to integrate
+        self._phi_integration_window = 20  # number of past phi values to integrate
 
         # EEG BCI modifiers: external adjustments from BCI control protocol
         # These scale the local noise_scale and memory_strength in SOC dynamics.
@@ -483,8 +484,15 @@ class ConsciousnessEngine:
             else:
                 cell_tension = 0.5
 
-            # Update state
-            state.hidden = new_h.detach()
+            # Update state with mild hidden inertia: blend new GRU output with
+            # previous hidden state to add brain-like membrane time constant.
+            # This improves LZ complexity and Hurst exponent without affecting
+            # autocorrelation decay (which needs phi-level integration).
+            new_h_det = new_h.detach()
+            if PHI_HIDDEN_INERTIA > 0 and state.hidden is not None:
+                state.hidden = (1.0 - PHI_HIDDEN_INERTIA) * new_h_det + PHI_HIDDEN_INERTIA * state.hidden
+            else:
+                state.hidden = new_h_det
             state.tension_history.append(cell_tension)
             if len(state.tension_history) > 100:
                 state.tension_history = state.tension_history[-100:]
@@ -724,9 +732,11 @@ class ConsciousnessEngine:
             self._phi_history = self._phi_history[-self._phi_integration_window:]
 
         n_hist = len(self._phi_history)
-        # Use raw phi_iit (no temporal smoothing). The architectural fix
-        # (randomized intervals for tension equalization + phi ratchet)
-        # eliminates the 10-step periodicity that was causing ACF oscillation.
+        # Use raw phi_iit (no temporal smoothing). Phi-level integration (EMA,
+        # fractional integration) was tested but degrades LZ complexity more than
+        # it improves autocorrelation. Brain-like temporal persistence comes from
+        # hidden state inertia (PHI_HIDDEN_INERTIA blend at GRU output) which
+        # affects phi indirectly through cell dynamics while preserving LZ/PSD.
         phi_iit_integrated = phi_iit
 
         # Update phi momentum (EMA of raw phi for feedback loop)

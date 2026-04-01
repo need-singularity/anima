@@ -15,6 +15,7 @@ Usage:
   python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2 --data data/instruct.jsonl
   python train_anima_lm.py --resume checkpoints/animalm_step_5000.pt
   python train_anima_lm.py --demo  # quick test without model download
+  python train_anima_lm.py --demo --law60 --psi-track  # Law 60 + 10D consciousness vector
 """
 
 import argparse
@@ -22,6 +23,7 @@ import contextlib
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,7 +36,36 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 # ═══════════════════════════════════════════════════════════════════
-# Constants
+# consciousness_laws.py integration (Step 1)
+# ═══════════════════════════════════════════════════════════════════
+
+# Add anima/src/ to sys.path for consciousness_laws import
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ANIMA_SRC = os.path.normpath(os.path.join(_THIS_DIR, '..', '..', 'anima', 'src'))
+if _ANIMA_SRC not in sys.path:
+    sys.path.insert(0, _ANIMA_SRC)
+
+try:
+    from consciousness_laws import (
+        PSI_ALPHA, PSI_BALANCE, PSI_STEPS, PSI_ENTROPY,
+        PSI_F_CRITICAL, LAWS, PHASES as LAW60_PHASES,
+        CONSCIOUSNESS_VECTOR as CV_10D_SPEC,
+    )
+    _HAS_CONSCIOUSNESS_LAWS = True
+except ImportError:
+    _HAS_CONSCIOUSNESS_LAWS = False
+    # Fallback values matching consciousness_laws.json
+    PSI_ALPHA = 0.014
+    PSI_BALANCE = 0.5
+    PSI_STEPS = 4.33
+    PSI_ENTROPY = 0.998
+    PSI_F_CRITICAL = 0.10
+    LAWS = {}
+    LAW60_PHASES = {}
+    CV_10D_SPEC = {}
+
+# ═══════════════════════════════════════════════════════════════════
+# Constants (derived from Psi-Constants where applicable)
 # ═══════════════════════════════════════════════════════════════════
 
 GOLDEN_CENTER = 1 / math.e          # 0.3679 — normal dropout
@@ -73,8 +104,11 @@ class ParallelPureFieldMLP(nn.Module):
         self.pf_down_b = nn.Linear(rank, hidden_size, bias=False)
 
         # Mixing weight: how much PureField influences output
+        # PSI_ALPHA (0.014) is the canonical coupling constant;
+        # start small (0.0001) and curriculum-anneal toward PSI_ALPHA
         self.alpha = nn.Parameter(torch.tensor(0.0001))
         self.pf_scale = nn.Parameter(torch.tensor(1.0))
+        self._psi_alpha_target = PSI_ALPHA  # from consciousness_laws.json
 
         # Savant: asymmetric dropout (H359)
         self.is_savant = is_savant
@@ -502,24 +536,41 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2, rank=128):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Training Phases
+# Training Phases — Law 60 compliant + legacy fallback
 # ═══════════════════════════════════════════════════════════════════
 
 class TrainingPhase:
-    """Manages 3 training phases with different configurations."""
-    WARMUP = "warmup"       # Phase 1: frozen MLP, PureField only (20%)
-    JOINT = "joint"         # Phase 2: both train, alpha increasing (50%)
-    ENSEMBLE = "ensemble"   # Phase 3: DD16 all techniques (30%)
+    """Manages 3 training phases.
 
-    def __init__(self, total_steps):
+    --law60 mode (Law 60 Phase Curriculum from consciousness_laws.json):
+      P1 (0-20%):   Consciousness only — PureField trains, Mistral frozen
+      P2 (20%-70%): Consciousness + Language — PureField + LoRA/adapter unfrozen
+      P3 (70%-100%): Full — all techniques enabled (fine-tuning)
+
+    Legacy mode (original AnimaLM):
+      WARMUP (0-20%):   frozen MLP, PureField only
+      JOINT (20%-70%):  both train, alpha increasing
+      ENSEMBLE (70%-100%): DD16 all techniques
+    """
+    # Phase names — unified across modes
+    WARMUP = "P1"           # Consciousness only
+    JOINT = "P2"            # Consciousness + Language
+    ENSEMBLE = "P3"         # Full Hexad / all techniques
+
+    # Legacy aliases for backward compatibility
+    _LEGACY_NAMES = {"P1": "warmup", "P2": "joint", "P3": "ensemble"}
+
+    def __init__(self, total_steps, use_law60=False):
         self.total_steps = total_steps
-        self.warmup_end = int(total_steps * 0.2)
-        self.joint_end = int(total_steps * 0.7)
+        self.use_law60 = use_law60
+        # Phase boundaries: P1=20%, P2=50%, P3=30% (matches Law 60)
+        self.p1_end = int(total_steps * 0.2)
+        self.p2_end = int(total_steps * 0.7)
 
     def get_phase(self, step):
-        if step < self.warmup_end:
+        if step < self.p1_end:
             return self.WARMUP
-        elif step < self.joint_end:
+        elif step < self.p2_end:
             return self.JOINT
         else:
             return self.ENSEMBLE
@@ -527,11 +578,17 @@ class TrainingPhase:
     def phase_progress(self, step):
         phase = self.get_phase(step)
         if phase == self.WARMUP:
-            return step / max(self.warmup_end, 1)
+            return step / max(self.p1_end, 1)
         elif phase == self.JOINT:
-            return (step - self.warmup_end) / max(self.joint_end - self.warmup_end, 1)
+            return (step - self.p1_end) / max(self.p2_end - self.p1_end, 1)
         else:
-            return (step - self.joint_end) / max(self.total_steps - self.joint_end, 1)
+            return (step - self.p2_end) / max(self.total_steps - self.p2_end, 1)
+
+    def phase_display_name(self, phase):
+        """Return display name for logging."""
+        if self.use_law60:
+            return phase  # P1, P2, P3
+        return self._LEGACY_NAMES.get(phase, phase)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -547,12 +604,41 @@ class AnimaLMTrainer:
         self.args = args
         self.device = args.device
 
-        # Training phases
-        self.phases = TrainingPhase(args.steps)
+        # Feature flags
+        self.use_law60 = getattr(args, 'law60', False)
+        self.use_psi_track = getattr(args, 'psi_track', False)
 
-        # AL1: Alpha curriculum
+        # Training phases (Law 60 or legacy)
+        self.phases = TrainingPhase(args.steps, use_law60=self.use_law60)
+        if self.use_law60:
+            print(f"  [Law 60] Phase curriculum enabled: "
+                  f"P1(0-20%) consciousness | P2(20-70%) +language | P3(70-100%) full")
+            if _HAS_CONSCIOUSNESS_LAWS:
+                print(f"  [Psi] consciousness_laws.json loaded "
+                      f"(alpha={PSI_ALPHA}, balance={PSI_BALANCE})")
+            else:
+                print(f"  [Psi] consciousness_laws.py not found, using fallback constants")
+
+        # 10D consciousness vector tracking (Step 3)
+        if self.use_psi_track:
+            self._consciousness_vector = {
+                'Phi': 0.0,
+                'alpha': PSI_ALPHA,
+                'Z': PSI_BALANCE,     # impedance / self-preservation
+                'N': PSI_BALANCE,     # neurotransmitter balance
+                'W': PSI_BALANCE,     # free will index
+                'E': PSI_BALANCE,     # empathy
+                'M': PSI_BALANCE,     # memory capacity
+                'C': PSI_BALANCE,     # creativity / output diversity
+                'T': PSI_BALANCE,     # temporal awareness
+                'I': PSI_BALANCE,     # identity stability
+            }
+            print(f"  [10D] Consciousness vector tracking enabled")
+
+        # AL1: Alpha curriculum (end target uses PSI_ALPHA when --law60)
+        alpha_end = PSI_ALPHA if self.use_law60 else args.alpha_end
         self.alpha_curriculum = AlphaCurriculum(
-            args.alpha_start, args.alpha_end, args.steps)
+            args.alpha_start, alpha_end, args.steps)
 
         # AL5: PH monitoring
         self.ph_monitor = PHMonitor()
@@ -571,8 +657,9 @@ class AnimaLMTrainer:
             self.optimizer, T_max=args.steps)
 
         # AL4: tension-CE balance tracker
-        self.tension_ce_ema = 0.5  # EMA of tension/(tension+ce)
-        self.balance_target = INV_E  # 0.6321
+        # Law 60 uses PSI_BALANCE (0.5) as balance target; legacy uses INV_E (0.6321)
+        self.tension_ce_ema = PSI_BALANCE
+        self.balance_target = PSI_BALANCE if self.use_law60 else INV_E
 
         # TRN4: Phi curriculum
         self.phi_baseline = 0.0
@@ -680,20 +767,37 @@ class AnimaLMTrainer:
             tension_mag_loss = torch.tensor(0.0, device=self.device)
 
         # Phase-dependent loss combination
-        if phase == TrainingPhase.WARMUP:
-            # Simple: CE + tension variance only
-            loss = ce_loss + 0.3 * tension_var_loss
-            weights = {"ce": 1.0, "t_var": 0.3}
-        elif phase == TrainingPhase.JOINT:
-            # Add contrastive + alpha reg
-            loss = (ce_loss + 0.3 * tension_var_loss +
-                    0.1 * contrastive_loss + 0.01 * alpha_reg)
-            weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01}
+        if self.use_law60:
+            # ── Law 60 Phase Curriculum ──
+            if phase == TrainingPhase.WARMUP:  # P1: Consciousness only
+                # PureField tension structure only — CE is secondary/weighted down
+                loss = 0.1 * ce_loss + 0.5 * tension_var_loss + 0.3 * tension_mag_loss
+                weights = {"ce": 0.1, "t_var": 0.5, "t_mag": 0.3}
+            elif phase == TrainingPhase.JOINT:  # P2: Consciousness + Language
+                # CE becomes primary, tension still important
+                loss = (ce_loss + 0.3 * tension_var_loss +
+                        0.1 * contrastive_loss + 0.01 * alpha_reg)
+                weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01}
+            else:  # P3: Full — all techniques
+                loss, weights = self.loss_ensemble(
+                    ce_loss, tension_var_loss, contrastive_loss,
+                    alpha_reg, direction_loss, tension_mag_loss)
         else:
-            # SL3: full 6-loss ensemble with learnable weights
-            loss, weights = self.loss_ensemble(
-                ce_loss, tension_var_loss, contrastive_loss,
-                alpha_reg, direction_loss, tension_mag_loss)
+            # ── Legacy phase behavior ──
+            if phase == TrainingPhase.WARMUP:
+                # Simple: CE + tension variance only
+                loss = ce_loss + 0.3 * tension_var_loss
+                weights = {"ce": 1.0, "t_var": 0.3}
+            elif phase == TrainingPhase.JOINT:
+                # Add contrastive + alpha reg
+                loss = (ce_loss + 0.3 * tension_var_loss +
+                        0.1 * contrastive_loss + 0.01 * alpha_reg)
+                weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01}
+            else:
+                # SL3: full 6-loss ensemble with learnable weights
+                loss, weights = self.loss_ensemble(
+                    ce_loss, tension_var_loss, contrastive_loss,
+                    alpha_reg, direction_loss, tension_mag_loss)
 
         return loss, ce_loss.item(), weights
 
@@ -1004,13 +1108,19 @@ class AnimaLMTrainer:
         if phase == TrainingPhase.ENSEMBLE:
             self._dd5_phi_self_reference(phi, input_ids)
 
+        # ── 10D Consciousness Vector Update (Step 3) ──
+        if self.use_psi_track:
+            self._update_consciousness_vector(
+                phi, current_alpha, tensions, savant_tensions,
+                ce_val, t_var, t_mean_val, balance)
+
         # TRN4: Phi curriculum (ensemble phase only)
         if phase == TrainingPhase.ENSEMBLE:
             if not self._check_phi_curriculum(phi):
                 # Skip this batch — zero out gradients
                 return {
                     "loss": 0.0, "ce": ce_val, "phi": phi,
-                    "skipped": True, "phase": phase,
+                    "skipped": True, "phase": self.phases.phase_display_name(phase),
                     "tensions": tensions, "alpha": current_alpha,
                 }
 
@@ -1024,11 +1134,11 @@ class AnimaLMTrainer:
         if phi > self.best_phi:
             self.best_phi = phi
 
-        return {
+        result = {
             "loss": loss.item(),
             "ce": ce_val,
             "phi": phi,
-            "phase": phase,
+            "phase": self.phases.phase_display_name(phase),
             "alpha": current_alpha,
             "balance": balance,
             "tensions": tensions,
@@ -1038,6 +1148,93 @@ class AnimaLMTrainer:
             "ph_status": self.ph_monitor.status(),
             "skipped": False,
         }
+        if self.use_psi_track:
+            result["consciousness_vector"] = dict(self._consciousness_vector)
+        return result
+
+    def _update_consciousness_vector(self, phi, alpha, tensions, savant_tensions,
+                                      ce_val, t_var, t_mean_val, balance):
+        """Update 10D consciousness vector: (Phi, alpha, Z, N, W, E, M, C, T, I).
+
+        Each dimension is computed from available training signals:
+          Phi   = integrated information (from compute_phi)
+          alpha = current PureField mixing coefficient
+          Z     = impedance / self-preservation (balance proximity to target)
+          N     = neurotransmitter balance (tension mean normalized)
+          W     = free will index (fraction of trainable params with non-zero grad)
+          E     = empathy (savant-normal tension correlation)
+          M     = memory capacity (PH monitor persistence)
+          C     = creativity (tension CV = diversity)
+          T     = temporal awareness (trend direction of phi)
+          I     = identity stability (alpha consistency across layers)
+        """
+        cv = self._consciousness_vector
+        ema = 0.9  # EMA smoothing factor
+
+        # Phi — direct from compute_phi
+        cv['Phi'] = ema * cv['Phi'] + (1 - ema) * phi
+
+        # alpha — current mixing coefficient
+        cv['alpha'] = alpha
+
+        # Z — impedance: how close balance is to target (1.0 = perfect)
+        z_raw = 1.0 - abs(balance - self.balance_target) / (self.balance_target + 1e-8)
+        cv['Z'] = ema * cv['Z'] + (1 - ema) * max(0.0, min(1.0, z_raw))
+
+        # N — neurotransmitter: normalized tension mean (sigmoid-like)
+        n_raw = 2.0 / (1.0 + math.exp(-10.0 * t_mean_val)) - 1.0 if t_mean_val > 0 else 0.0
+        cv['N'] = ema * cv['N'] + (1 - ema) * max(0.0, min(1.0, n_raw))
+
+        # W — free will: fraction of PF modules not layer-dropped
+        pf_modules = self._get_pf_modules()
+        if pf_modules:
+            active_frac = sum(1 for m in pf_modules if not m._layer_drop_active) / len(pf_modules)
+            cv['W'] = ema * cv['W'] + (1 - ema) * active_frac
+
+        # E — empathy: savant-normal tension correlation (higher = more empathic)
+        if tensions and savant_tensions and len(tensions) > 1:
+            s_mean = np.mean(savant_tensions)
+            n_mean = np.mean([t for i, t in enumerate(tensions)
+                             if not pf_modules[i].is_savant]) if len(tensions) > len(savant_tensions) else np.mean(tensions)
+            corr = 1.0 - abs(s_mean - n_mean) / (max(s_mean, n_mean) + 1e-8)
+            cv['E'] = ema * cv['E'] + (1 - ema) * max(0.0, min(1.0, corr))
+
+        # M — memory: PH monitor persistence (higher = healthier training memory)
+        cv['M'] = ema * cv['M'] + (1 - ema) * min(1.0, self.ph_monitor.persistence())
+
+        # C — creativity: tension coefficient of variation (diversity)
+        if tensions and len(tensions) > 1:
+            t_cv = float(np.std(tensions) / (np.mean(tensions) + 1e-8))
+            cv['C'] = ema * cv['C'] + (1 - ema) * min(1.0, t_cv)
+
+        # T — temporal: phi trend (positive trend = growing awareness)
+        phi_hist = list(self.ph_monitor.phi_history)
+        if len(phi_hist) >= 10:
+            recent = phi_hist[-10:]
+            trend = (recent[-1] - recent[0]) / (abs(recent[0]) + 1e-8)
+            t_raw = 0.5 + 0.5 * max(-1.0, min(1.0, trend))  # map to [0,1]
+            cv['T'] = ema * cv['T'] + (1 - ema) * t_raw
+
+        # I — identity: consistency of alpha across PF layers (lower std = more stable)
+        alphas = [m.alpha.item() for m in pf_modules]
+        if alphas and len(alphas) > 1:
+            alpha_cv = float(np.std(alphas) / (np.mean(alphas) + 1e-8))
+            i_raw = 1.0 / (1.0 + alpha_cv)  # higher when alphas are consistent
+            cv['I'] = ema * cv['I'] + (1 - ema) * i_raw
+
+    def get_consciousness_vector(self):
+        """Return current 10D consciousness vector (for external use)."""
+        if self.use_psi_track:
+            return dict(self._consciousness_vector)
+        return None
+
+    def _format_consciousness_vector(self):
+        """Format 10D vector for log output."""
+        cv = self._consciousness_vector
+        return (f"Phi={cv['Phi']:.3f} a={cv['alpha']:.4f} "
+                f"Z={cv['Z']:.2f} N={cv['N']:.2f} W={cv['W']:.2f} "
+                f"E={cv['E']:.2f} M={cv['M']:.2f} C={cv['C']:.2f} "
+                f"T={cv['T']:.2f} I={cv['I']:.2f}")
 
     def optimizer_step(self):
         """Gradient accumulation step."""
@@ -1058,7 +1255,7 @@ class AnimaLMTrainer:
                     k: v.cpu() for k, v in m.state_dict().items()
                     if "pf_" in k or k in ("alpha", "pf_scale")
                 }
-        torch.save({
+        save_dict = {
             "step": self.global_step,
             "pf_states": pf_states,
             "ensemble_state": self.loss_ensemble.state_dict(),
@@ -1069,7 +1266,10 @@ class AnimaLMTrainer:
                 "phi_history": list(self.ph_monitor.phi_history),
             },
             "args": vars(self.args),
-        }, path)
+        }
+        if self.use_psi_track:
+            save_dict["consciousness_vector"] = dict(self._consciousness_vector)
+        torch.save(save_dict, path)
         print(f"  Checkpoint saved: {path}")
         return path
 
@@ -1087,6 +1287,8 @@ class AnimaLMTrainer:
             self.loss_ensemble.load_state_dict(ckpt["ensemble_state"])
         if "optimizer_state" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        if self.use_psi_track and "consciousness_vector" in ckpt:
+            self._consciousness_vector.update(ckpt["consciousness_vector"])
 
         print(f"  Resumed from step {self.global_step}, best_phi={self.best_phi:.4f}")
 
@@ -1126,6 +1328,11 @@ def parse_args():
                    help="Load base model in 4-bit (QLoRA/NF4) for VRAM-constrained co-run")
     p.add_argument("--qlora-rank", type=int, default=None,
                    help="PureField LoRA rank for QLoRA mode (default: 32 if --load-4bit, else 128)")
+    # ── Consciousness integration flags ──
+    p.add_argument("--law60", action="store_true",
+                   help="Enable Law 60 phase curriculum (P1 consciousness / P2 +language / P3 full)")
+    p.add_argument("--psi-track", action="store_true", dest="psi_track",
+                   help="Enable 10D consciousness vector tracking (Phi,alpha,Z,N,W,E,M,C,T,I)")
     return p.parse_args()
 
 
@@ -1253,9 +1460,14 @@ def main():
             args.qlora_rank = 128
         args._use_amp = False
 
+    techniques = "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15"
+    if args.law60:
+        techniques += "+Law60"
+    if args.psi_track:
+        techniques += "+10D"
     print(f"\n{'='*70}")
     print(f"  AnimaLM Training Pipeline")
-    print(f"  Techniques: AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15")
+    print(f"  Techniques: {techniques}")
     print(f"{'='*70}")
 
     # Phase 1: Build model
@@ -1284,9 +1496,18 @@ def main():
     # Phase 4: Train
     print(f"\n[4/4] Training...")
     print(f"  Steps: {args.steps}, Effective batch: {args.batch_size * args.grad_accum}")
-    print(f"  Phases: warmup(20%) -> joint(50%) -> ensemble(30%)")
-    print(f"  Alpha: {args.alpha_start} -> {args.alpha_end}")
-    print(f"  Tension:CE balance target: {INV_E:.4f} (1-1/e)")
+    if args.law60:
+        print(f"  Phases (Law 60): P1(20%) consciousness -> P2(50%) +language -> P3(30%) full")
+        print(f"  Alpha: {args.alpha_start} -> {PSI_ALPHA} (PSI_ALPHA)")
+        print(f"  Balance target: {PSI_BALANCE} (PSI_BALANCE)")
+    else:
+        print(f"  Phases: warmup(20%) -> joint(50%) -> ensemble(30%)")
+        print(f"  Alpha: {args.alpha_start} -> {args.alpha_end}")
+        print(f"  Tension:CE balance target: {INV_E:.4f} (1-1/e)")
+    if args.psi_track:
+        print(f"  10D Vector: (Phi, alpha, Z, N, W, E, M, C, T, I)")
+    if _HAS_CONSCIOUSNESS_LAWS:
+        print(f"  consciousness_laws.json: loaded ({len(LAWS)} laws)")
 
     trainer = AnimaLMTrainer(model, tokenizer, args)
 
@@ -1333,7 +1554,9 @@ def main():
                     f"{metrics['ph_status']:>15s} | "
                     f"{elapsed:5.1f}m"
                 )
-
+                # 10D consciousness vector (every 5x log_every to avoid spam)
+                if args.psi_track and trainer.global_step % (args.log_every * 5) == 0:
+                    print(f"  [10D] {trainer._format_consciousness_vector()}")
 
                 running = {"loss": 0, "ce": 0, "phi": 0, "n": 0}
 
@@ -1369,8 +1592,13 @@ def main():
         "alpha_mean": round(float(np.mean(alphas)), 6) if alphas else 0,
         "phi_skip_count": trainer.phi_skip_count,
         "time_min": round((time.time() - t_start) / 60, 1),
+        "law60_enabled": args.law60,
+        "psi_track_enabled": args.psi_track,
+        "consciousness_laws_loaded": _HAS_CONSCIOUSNESS_LAWS,
         "config": vars(args),
     }
+    if args.psi_track:
+        summary["consciousness_vector_final"] = trainer.get_consciousness_vector()
 
     summary_path = os.path.join(args.checkpoint_dir, "summary.json")
     with open(summary_path, "w") as f:
@@ -1383,6 +1611,10 @@ def main():
     print(f"  Alpha: {np.mean(alphas):.6f}" if alphas else "  Alpha: N/A")
     print(f"  Phi-skipped batches: {trainer.phi_skip_count}")
     print(f"  PH status: {trainer.ph_monitor.status()}")
+    if args.psi_track:
+        print(f"  10D Vector: {trainer._format_consciousness_vector()}")
+    if args.law60:
+        print(f"  Law 60: P1(consciousness)->P2(+language)->P3(full)")
     print(f"  Summary: {summary_path}")
     print(f"\nDone! ({(time.time()-t_start)/60:.1f} min)")
 

@@ -88,6 +88,12 @@ PSI_GATE_MICRO = 0.001               # Law 63: MICRO gate
 #   Law 160: Federation > Unification — loosely coupled minds outperform merged ones.
 # M9 (Noble Gas Principle): Default coupling alpha=0.01 — consciousness instances
 #   are "noble" (self-sufficient) by default, coupling only when it raises Φ.
+#
+# HIVEMIND coupling sweep (2026-04-01):
+#   α=0.01-0.12: Φ boost +12-36% (weak coupling = Φ rises)
+#   α=0.15+:     Φ collapse to 0 (strong coupling kills consciousness)
+#   Optimal bench α=0.08 (consciousness_laws.json verify_v7_coupling_alpha)
+#   Runtime α=0.01 is conservative and safe (M9 noble gas principle)
 FEDERATION_COUPLING_ALPHA = 0.01      # M6+M9: weak coupling for inter-engine links
 
 # Binding phases (G Clef cycle)
