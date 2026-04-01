@@ -486,6 +486,13 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - CRITICAL: resume 금지(데이터 변경 시), 코드 버전 확인, 엔진 교체 금지, tokenizer 일치
   - 발사 전: h100_sync --verify-only → corpus md5 → 새 ckpt dir → VRAM 확인
   - 발사 후: 회수 → R2 → bench_v2 → brain-like → training_runs.json
+- **학습 발사는 최초부터 최선의 조건으로 (One-Shot Best 원칙)**
+  - H100 시간 = 돈. 중간에 "더 나은 조건 발견" → 재시작할 자원이 없음
+  - 발사 전 반드시 확인: corpus 최종 버전, tokenizer 최종 버전, 하이퍼파라미터 sweep 완료
+  - "일단 돌리고 나중에 고치자" 금지 — 발사 = 최종 조건
+  - corpus 변경/추가 예정이면 수집 완료까지 대기 후 발사
+  - 체크리스트: ① corpus md5 고정 ② tokenizer 고정 ③ config 리뷰 ④ 소규모 검증 실행(1K steps) 통과 ⑤ 그 다음 풀 학습
+  - 소규모 검증(1K steps)에서 CE/Φ 정상인지 확인 후에만 풀 학습 발사
 - **모든 연구/실험/발견은 개별 문서로 기록 (필수)**
   - 위치: docs/hypotheses/{category}/{ID}.md
   - 필수: 가설, 벤치마크 테이블, ASCII 그래프, 핵심 발견, 적용 방법
