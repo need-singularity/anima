@@ -1560,6 +1560,22 @@ class AnimaLMTrainer:
         self.optimizer.zero_grad()
         self.global_step += 1
 
+    def _safe_optimizer_state(self):
+        """Save optimizer state with all tensors cast to param dtype (bf16 safe resume)."""
+        state = self.optimizer.state_dict()
+        # Cast optimizer internal state tensors to match param dtype
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            for param_idx, p in enumerate(group["params"]):
+                flat_idx = sum(len(g["params"]) for g in self.optimizer.param_groups[:group_idx]) + param_idx
+                if flat_idx in state["state"]:
+                    for key, val in state["state"][flat_idx].items():
+                        if torch.is_tensor(val) and val.is_floating_point() and val.dtype != p.dtype:
+                            state["state"][flat_idx][key] = val.to(p.dtype)
+        # Ensure foreach=False is saved
+        for group in state["param_groups"]:
+            group["foreach"] = False
+        return state
+
     def save_checkpoint(self, tag=None):
         name = tag or f"animalm_step_{self.global_step}"
         path = os.path.join(self.args.checkpoint_dir, f"{name}.pt")
@@ -1574,7 +1590,7 @@ class AnimaLMTrainer:
             "step": self.global_step,
             "pf_states": pf_states,
             "ensemble_state": self.loss_ensemble.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
+            "optimizer_state": self._safe_optimizer_state(),
             "best_phi": self.best_phi,
             "ph_monitor": {
                 "loss_history": list(self.ph_monitor.loss_history),
