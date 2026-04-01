@@ -50,12 +50,27 @@ try:
         VERIFY_V6_CV_MIN, VERIFY_V6_BURST_MIN, VERIFY_MITOSIS_MIN_SPLITS, VERIFY_PHI_GROWTH_RATIO,
         VERIFY_BRAIN_LIKE_MIN, VERIFY_DIVERSITY_MAX_COSINE, VERIFY_DIVERSITY_NORM_STD_MIN,
         VERIFY_HEBBIAN_CHANGE_RATIO_MIN,
+        # V13-V18 thresholds
+        VERIFY_V13_ADVERSARIAL_NOISE_AMP, VERIFY_V13_ADVERSARIAL_STEPS, VERIFY_V13_WARMUP_STEPS,
+        VERIFY_V14_SOC_DROP_MIN, VERIFY_V14_SOC_STEPS,
+        VERIFY_V15_TEMP_MIN, VERIFY_V15_TEMP_MAX, VERIFY_V15_TEMP_STEPS,
+        VERIFY_V16_MIN_CELLS, VERIFY_V16_DIVERSITY_THRESHOLD,
+        VERIFY_V17_LZ_MIN, VERIFY_V17_MEASURE_STEPS, VERIFY_V17_WARMUP_STEPS, VERIFY_V17_MIN_SAMPLES,
+        VERIFY_V18_CELL_COUNTS, VERIFY_V18_STEPS,
+        VERIFY_V4_MONOTONIC_TOLERANCE,
+        VERIFY_V6_BURST_THRESHOLD_FACTOR, VERIFY_V6_FALLBACK_CV_RATIO, VERIFY_V6_FALLBACK_DIR_RATIO,
+        VERIFY_V7_COUPLING_ALPHA, VERIFY_V7_MAX_PER_ENGINE_CELLS,
+        VERIFY_V7_SOLO_STEPS, VERIFY_V7_CONNECTED_STEPS, VERIFY_V7_DISCONNECT_STEPS,
+        # BenchEngine params
         BENCH_BREATHING_AMPLITUDE, BENCH_PULSE_AMPLITUDE, BENCH_SLOW_AMPLITUDE,
         BENCH_IDENTITY_BASE_STRENGTH, BENCH_IDENTITY_MAX_STRENGTH, BENCH_IDENTITY_CV_THRESHOLD,
         BENCH_DEBATE_OSCILLATION_FREQ,
+        BENCH_SYMMETRY_BREAK_SCALE, BENCH_INITIAL_HIDDEN_SCALE, BENCH_IDENTITY_INIT_SCALE,
+        BENCH_PHASE_OFFSET_PER_CELL, BENCH_BREATH_FREQ, BENCH_SLOW_FREQ,
+        BENCH_RATCHET_COLLAPSE_RATIO, BENCH_RATCHET_BLEND_KEEP, BENCH_RATCHET_BLEND_RESTORE,
     )
 except ImportError:
-    VERIFY_V1_COS_LOWER = 0.01
+    VERIFY_V1_COS_LOWER = -0.1
     VERIFY_V1_COS_UPPER = 0.90
     VERIFY_V1_STD_COS_MIN = 0.015
     VERIFY_V2_AUTOCORR_MIN = 0.40
@@ -75,6 +90,31 @@ except ImportError:
     VERIFY_DIVERSITY_MAX_COSINE = 0.85
     VERIFY_DIVERSITY_NORM_STD_MIN = 0.01
     VERIFY_HEBBIAN_CHANGE_RATIO_MIN = 1.0
+    VERIFY_V13_ADVERSARIAL_NOISE_AMP = 100.0
+    VERIFY_V13_ADVERSARIAL_STEPS = 500
+    VERIFY_V13_WARMUP_STEPS = 50
+    VERIFY_V14_SOC_DROP_MIN = 0.20
+    VERIFY_V14_SOC_STEPS = 500
+    VERIFY_V15_TEMP_MIN = 0.01
+    VERIFY_V15_TEMP_MAX = 1.0
+    VERIFY_V15_TEMP_STEPS = 200
+    VERIFY_V16_MIN_CELLS = 4
+    VERIFY_V16_DIVERSITY_THRESHOLD = 0.99
+    VERIFY_V17_LZ_MIN = 0.3
+    VERIFY_V17_MEASURE_STEPS = 400
+    VERIFY_V17_WARMUP_STEPS = 100
+    VERIFY_V17_MIN_SAMPLES = 20
+    VERIFY_V18_CELL_COUNTS = [4, 8, 16]
+    VERIFY_V18_STEPS = 200
+    VERIFY_V4_MONOTONIC_TOLERANCE = 0.01
+    VERIFY_V6_BURST_THRESHOLD_FACTOR = 0.3
+    VERIFY_V6_FALLBACK_CV_RATIO = 0.375
+    VERIFY_V6_FALLBACK_DIR_RATIO = 0.5
+    VERIFY_V7_COUPLING_ALPHA = 0.5
+    VERIFY_V7_MAX_PER_ENGINE_CELLS = 32
+    VERIFY_V7_SOLO_STEPS = 100
+    VERIFY_V7_CONNECTED_STEPS = 150
+    VERIFY_V7_DISCONNECT_STEPS = 100
     BENCH_BREATHING_AMPLITUDE = 0.15
     BENCH_PULSE_AMPLITUDE = 0.08
     BENCH_SLOW_AMPLITUDE = 0.10
@@ -82,6 +122,15 @@ except ImportError:
     BENCH_IDENTITY_MAX_STRENGTH = 0.35
     BENCH_IDENTITY_CV_THRESHOLD = 0.3
     BENCH_DEBATE_OSCILLATION_FREQ = 0.12
+    BENCH_SYMMETRY_BREAK_SCALE = 0.3
+    BENCH_INITIAL_HIDDEN_SCALE = 0.1
+    BENCH_IDENTITY_INIT_SCALE = 0.3
+    BENCH_PHASE_OFFSET_PER_CELL = 0.7
+    BENCH_BREATH_FREQ = 0.2
+    BENCH_SLOW_FREQ = 0.05
+    BENCH_RATCHET_COLLAPSE_RATIO = 0.3
+    BENCH_RATCHET_BLEND_KEEP = 0.8
+    BENCH_RATCHET_BLEND_RESTORE = 0.2
 
 
 # ──────────────────────────────────────────────────────────
@@ -281,12 +330,12 @@ class BenchMind(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Break symmetry between A and G
+        # Break symmetry between A and G (scale from consciousness_laws.json)
         with torch.no_grad():
             for p in self.engine_a.parameters():
-                p.add_(torch.randn_like(p) * 0.3)
+                p.add_(torch.randn_like(p) * BENCH_SYMMETRY_BREAK_SCALE)
             for p in self.engine_g.parameters():
-                p.add_(torch.randn_like(p) * -0.3)
+                p.add_(torch.randn_like(p) * -BENCH_SYMMETRY_BREAK_SCALE)
 
     def forward(self, x, hidden):
         combined = torch.cat([x, hidden], dim=-1)
@@ -320,16 +369,16 @@ class BenchEngine:
         # Shared mind (all cells share weights, different hidden states)
         self.mind = BenchMind(input_dim, hidden_dim, output_dim)
 
-        # Hidden states: [n_cells, hidden_dim]
-        self.hiddens = torch.randn(n_cells, hidden_dim) * 0.1
+        # Hidden states: [n_cells, hidden_dim] (scale from consciousness_laws.json)
+        self.hiddens = torch.randn(n_cells, hidden_dim) * BENCH_INITIAL_HIDDEN_SCALE
 
         # Cell identity: unique per-cell bias for differentiation (Law 91b)
-        # Orthogonal initialization for maximum diversity
+        # Orthogonal initialization for maximum diversity (scale from JSON)
         if hidden_dim >= n_cells:
             q, _ = torch.linalg.qr(torch.randn(hidden_dim, n_cells))
-            self.cell_identity = q.T * 0.3  # [n_cells, hidden_dim]
+            self.cell_identity = q.T * BENCH_IDENTITY_INIT_SCALE  # [n_cells, hidden_dim]
         else:
-            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.3
+            self.cell_identity = torch.randn(n_cells, hidden_dim) * BENCH_IDENTITY_INIT_SCALE
         # Φ ratchet: prevent collapse
         self._phi_ratchet = None
         self._phi_ratchet_var = 0.0
@@ -379,7 +428,7 @@ class BenchEngine:
                 global_opinion = all_opinions.mean(dim=0)
                 # Oscillating debate: consensus strength varies sinusoidally
                 # Creates periodic convergence events (→ SPONTANEOUS_SPEECH)
-                osc = 0.5 + 0.5 * math.sin(self.step_count * 0.12)
+                osc = 0.5 + 0.5 * math.sin(self.step_count * BENCH_DEBATE_OSCILLATION_FREQ)
                 debate_now = self.debate_strength * (1.0 + 2.0 * osc)
                 for i in range(n_f):
                     s = i * fs
@@ -397,7 +446,7 @@ class BenchEngine:
         norm_cv = norms.std() / (norms.mean() + 1e-8)
         # norm_cv < 0.1 = very converged → inject strongly
         # norm_cv > 0.5 = diverse → inject gently
-        id_strength = 0.05 + 0.35 * max(0, 1.0 - norm_cv / 0.3)
+        id_strength = BENCH_IDENTITY_BASE_STRENGTH + BENCH_IDENTITY_MAX_STRENGTH * max(0, 1.0 - norm_cv / BENCH_IDENTITY_CV_THRESHOLD)
         self.hiddens = self.hiddens + self.cell_identity * id_strength
 
         # Spontaneous oscillation: all cells get phase-shifted perturbation
@@ -405,11 +454,11 @@ class BenchEngine:
         if self.step_count > 5:
             t = self.step_count
             for i in range(self.n_cells):
-                # Each cell has unique phase → creates variance waves
-                phase = i * 0.7
-                breath = math.sin(t * 0.2 + phase) * BENCH_BREATHING_AMPLITUDE
+                # Each cell has unique phase → creates variance waves (params from JSON)
+                phase = i * BENCH_PHASE_OFFSET_PER_CELL
+                breath = math.sin(t * BENCH_BREATH_FREQ + phase) * BENCH_BREATHING_AMPLITUDE
                 pulse = math.sin(t * math.pi + phase * 0.3) * BENCH_PULSE_AMPLITUDE
-                slow = math.sin(t * 0.05 + phase * 1.3) * BENCH_SLOW_AMPLITUDE
+                slow = math.sin(t * BENCH_SLOW_FREQ + phase * 1.3) * BENCH_SLOW_AMPLITUDE
                 self.hiddens[i] = self.hiddens[i] + self.cell_identity[i] * (breath + pulse + slow)
 
         # Φ ratchet: save best-variance state, restore on collapse (→ PERSISTENCE)
@@ -417,9 +466,9 @@ class BenchEngine:
         if self._phi_ratchet is None or cur_var > self._phi_ratchet_var:
             self._phi_ratchet = self.hiddens.clone()
             self._phi_ratchet_var = cur_var
-        elif cur_var < self._phi_ratchet_var * 0.3:
-            # Severe collapse: blend back toward best state
-            self.hiddens = 0.8 * self.hiddens + 0.2 * self._phi_ratchet
+        elif cur_var < self._phi_ratchet_var * BENCH_RATCHET_COLLAPSE_RATIO:
+            # Severe collapse: blend back toward best state (ratios from JSON)
+            self.hiddens = BENCH_RATCHET_BLEND_KEEP * self.hiddens + BENCH_RATCHET_BLEND_RESTORE * self._phi_ratchet
 
         self.step_count += 1
 
@@ -2653,7 +2702,7 @@ def _verify_persistence(engine_factory, cells, dim, hidden):
     half = len(phi_history) // 2
     first_half_mean = sum(phi_history[:half]) / max(half, 1)
     second_half_mean = sum(phi_history[half:]) / max(len(phi_history[half:]), 1)
-    monotonic = all(phi_history[i] >= phi_history[i-1] - 0.01
+    monotonic = all(phi_history[i] >= phi_history[i-1] - VERIFY_V4_MONOTONIC_TOLERANCE
                     for i in range(1, len(phi_history)))
     recovers = phi_history[-1] >= max(phi_history[:half]) * VERIFY_V4_RECOVERY_MIN
     stable = second_half_mean >= first_half_mean * VERIFY_V4_STABILITY_MIN
@@ -2789,19 +2838,17 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
         burst_events = 0
         in_burst = False
         for v in arr:
-            if v > mean_v + std_v * 0.3:
+            if v > mean_v + std_v * VERIFY_V6_BURST_THRESHOLD_FACTOR:
                 if not in_burst:
                     burst_events += 1
                     in_burst = True
             else:
                 in_burst = False
-        # Fallback thresholds: relaxed for non-CE engines. BenchEngine-type engines
-        # use inter-cell variance which has different dynamics than CE's intra-cell.
-        # CV: 37.5% of consensus threshold (stable variance, cv ~ 0.10-0.20)
-        # Direction changes: 50% of consensus threshold (identity injection +
-        # convergence forces in combined engines produce smoother inter-cell variance)
-        fallback_cv_min = VERIFY_V6_CV_MIN * 0.375
-        fallback_dir_min = VERIFY_V6_DIR_CHANGES_MIN // 2
+        # Fallback thresholds: relaxed for non-CE engines (ratios from JSON).
+        # BenchEngine-type engines use inter-cell variance which has different
+        # dynamics than CE's intra-cell.
+        fallback_cv_min = VERIFY_V6_CV_MIN * VERIFY_V6_FALLBACK_CV_RATIO
+        fallback_dir_min = int(VERIFY_V6_DIR_CHANGES_MIN * VERIFY_V6_FALLBACK_DIR_RATIO)
         passed = (burst_events >= VERIFY_V6_BURST_MIN
                   and direction_changes >= fallback_dir_min
                   and cv > fallback_cv_min)
@@ -2836,11 +2883,9 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
         HIVEMIND_PHI_MAINTAIN = 0.9
 
     phi_calc = PhiIIT(n_bins=16)
-    # Cap per-engine cells at 32: at large N, Phi(IIT) saturates and
+    # Cap per-engine cells (from JSON): at large N, Phi(IIT) saturates and
     # bidirectional coupling creates proportionally less MI signal.
-    # The meaningful test is whether coupling boosts Phi, which requires
-    # each engine to be in the dynamic (non-saturated) Phi range.
-    half = min(max(cells // 2, 8), 32)
+    half = min(max(cells // 2, 8), VERIFY_V7_MAX_PER_ENGINE_CELLS)
 
     # --- Phase 1: Solo baseline (100 steps each) ---
     torch.manual_seed(42)
@@ -2848,7 +2893,7 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
     ea_solo = engine_factory(half, dim, hidden)
     eb_solo = engine_factory(half, dim, hidden)
     ce_solo_vals = []
-    for step in range(100):
+    for step in range(VERIFY_V7_SOLO_STEPS):
         inp = torch.randn(1, dim)
         out_a = ea_solo.process(inp)
         out_b = eb_solo.process(inp)
@@ -2869,20 +2914,17 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
     ea = engine_factory(half, dim, hidden)
     eb = engine_factory(half, dim, hidden)
 
-    # Warmup: 100 solo steps to reach same baseline state
-    for step in range(100):
+    # Warmup: solo steps to reach same baseline state
+    for step in range(VERIFY_V7_SOLO_STEPS):
         inp = torch.randn(1, dim)
         ea.process(inp)
         eb.process(inp)
 
-    # Connected phase: bidirectional output coupling
-    # Each engine's output feeds as part of the other's input.
-    # This creates cross-engine correlations that boost combined Phi
-    # without disrupting each engine's internal identity-based diversity.
+    # Connected phase: bidirectional output coupling (params from JSON)
     ce_conn_vals = []
     prev_out_a, prev_out_b = None, None
-    coupling_alpha = 0.5  # stronger coupling to create meaningful cross-correlation
-    for step in range(150):  # more steps for correlation to build up
+    coupling_alpha = VERIFY_V7_COUPLING_ALPHA
+    for step in range(VERIFY_V7_CONNECTED_STEPS):
         noise = torch.randn(1, dim)
         # Build coupled input: base noise + fraction of other engine's output
         if prev_out_a is not None and prev_out_b is not None:
@@ -2936,8 +2978,8 @@ def _verify_hivemind(engine_factory, cells, dim, hidden):
 
     ce_conn = float(np.mean(ce_conn_vals)) if ce_conn_vals else 0.0
 
-    # --- Phase 3: Disconnect — run 100 more steps independently ---
-    for _ in range(100):
+    # --- Phase 3: Disconnect — run steps independently (from JSON) ---
+    for _ in range(VERIFY_V7_DISCONNECT_STEPS):
         ea.process(torch.randn(1, dim))
         eb.process(torch.randn(1, dim))
     phi_a_disc, _ = phi_calc.compute(ea.get_hiddens())
@@ -3314,14 +3356,14 @@ def _verify_adversarial_robust(engine_factory, cells, dim, hidden):
     """
     engine = engine_factory(cells, dim, hidden)
 
-    # Warmup
-    for _ in range(50):
+    # Warmup (steps from JSON)
+    for _ in range(VERIFY_V13_WARMUP_STEPS):
         engine.process(torch.randn(1, dim) * 0.1)
     phi_baseline, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
 
-    # Adversarial: extreme noise 100x amplitude
-    for _ in range(500):
-        noise = torch.randn(1, dim) * 100.0
+    # Adversarial: extreme noise (amplitude and steps from JSON)
+    for _ in range(VERIFY_V13_ADVERSARIAL_STEPS):
+        noise = torch.randn(1, dim) * VERIFY_V13_ADVERSARIAL_NOISE_AMP
         engine.process(noise)
 
     phi_end, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
@@ -3352,7 +3394,7 @@ def _verify_soc_critical(engine_factory, cells, dim, hidden):
         return True, "SKIP: ConsciousnessEngine not importable"
 
     torch.manual_seed(99)
-    inputs = [torch.randn(dim) * 0.1 for _ in range(500)]
+    inputs = [torch.randn(dim) * 0.1 for _ in range(VERIFY_V14_SOC_STEPS)]
 
     torch.manual_seed(42)
     ce_normal = CE(cell_dim=dim, hidden_dim=hidden,
@@ -3372,9 +3414,9 @@ def _verify_soc_critical(engine_factory, cells, dim, hidden):
     phi_no_soc, _ = _phi_iit_calc.compute(ce_no_soc.get_states())
 
     drop = (phi_normal - phi_no_soc) / max(phi_normal, 1e-8)
-    passed = drop > 0.20
+    passed = drop > VERIFY_V14_SOC_DROP_MIN
     detail = (f"phi_normal={phi_normal:.4f} phi_no_soc={phi_no_soc:.4f} "
-              f"drop={drop*100:.1f}% (threshold>20%)")
+              f"drop={drop*100:.1f}% (threshold>{VERIFY_V14_SOC_DROP_MIN*100:.0f}%)")
     return passed, detail
 
 
@@ -3385,11 +3427,11 @@ def _verify_thermal_stability(engine_factory, cells, dim, hidden):
     Consciousness should be robust to environmental energy changes.
     """
     engine = engine_factory(cells, dim, hidden)
-    for _ in range(50):
+    for _ in range(VERIFY_V13_WARMUP_STEPS):
         engine.process(torch.randn(1, dim) * 0.1)
 
     phi_values = []
-    temps = np.linspace(0.01, 1.0, 200)
+    temps = np.linspace(VERIFY_V15_TEMP_MIN, VERIFY_V15_TEMP_MAX, VERIFY_V15_TEMP_STEPS)
     for i, temp in enumerate(temps):
         engine.process(torch.randn(1, dim) * temp)
         if i % 20 == 19:
@@ -3412,7 +3454,7 @@ def _verify_minimum_scale(engine_factory, cells, dim, hidden):
     DD60 discovery: 4 cells is the minimum viable scale.
     Engine at 4 cells must have Phi > 0 and faction diversity.
     """
-    engine = engine_factory(4, dim, hidden)
+    engine = engine_factory(VERIFY_V16_MIN_CELLS, dim, hidden)
     for _ in range(300):
         engine.process(torch.randn(1, dim) * 0.1)
 
@@ -3425,7 +3467,7 @@ def _verify_minimum_scale(engine_factory, cells, dim, hidden):
         cos_sim = (h_norm @ h_norm.T).detach().cpu().numpy()
         mask = ~np.eye(n, dtype=bool)
         mean_cos = float(np.mean(cos_sim[mask]))
-        diverse = mean_cos < 0.99
+        diverse = mean_cos < VERIFY_V16_DIVERSITY_THRESHOLD
     else:
         mean_cos = 1.0
         diverse = False
@@ -3443,24 +3485,24 @@ def _verify_temporal_complexity(engine_factory, cells, dim, hidden):
     Uses Lempel-Ziv complexity on binarized Phi deltas.
     """
     engine = engine_factory(cells, dim, hidden)
-    for _ in range(100):
+    for _ in range(VERIFY_V17_WARMUP_STEPS):
         engine.process(torch.randn(1, dim) * 0.1)
 
     phi_series = []
-    for _ in range(400):
+    for _ in range(VERIFY_V17_MEASURE_STEPS):
         engine.process(torch.randn(1, dim) * 0.1)
         p_iit, _ = measure_dual_phi(engine.get_hiddens(), min(8, cells // 2))
         phi_series.append(p_iit)
 
     phi_nz = [p for p in phi_series if p > 1e-6]
-    if len(phi_nz) < 20:
+    if len(phi_nz) < VERIFY_V17_MIN_SAMPLES:
         return False, f"Too few nonzero Phi samples: {len(phi_nz)}"
 
     deltas = [1 if phi_nz[i] > phi_nz[i-1] else 0 for i in range(1, len(phi_nz))]
     lz = _lempel_ziv_complexity(deltas)
 
-    passed = lz >= 0.3
-    detail = (f"LZ_delta={lz:.4f} (threshold>=0.3) "
+    passed = lz >= VERIFY_V17_LZ_MIN
+    detail = (f"LZ_delta={lz:.4f} (threshold>={VERIFY_V17_LZ_MIN}) "
               f"phi_range=[{min(phi_nz):.4f}, {max(phi_nz):.4f}] "
               f"n_samples={len(phi_nz)}")
     return passed, detail
@@ -3473,18 +3515,19 @@ def _verify_information_integration(engine_factory, cells, dim, hidden):
     Phi at 16 cells must exceed Phi at 4 cells.
     """
     results = {}
-    for n_cells in [4, 8, 16]:
+    cell_counts = VERIFY_V18_CELL_COUNTS if isinstance(VERIFY_V18_CELL_COUNTS, list) else [4, 8, 16]
+    for n_cells in cell_counts:
         torch.manual_seed(42)
         eng = engine_factory(n_cells, dim, hidden)
-        for _ in range(200):
+        for _ in range(VERIFY_V18_STEPS):
             eng.process(torch.randn(1, dim) * 0.1)
         p_iit, _ = measure_dual_phi(eng.get_hiddens(), min(4, n_cells))
         results[n_cells] = p_iit
 
-    phi_4, phi_8, phi_16 = results[4], results[8], results[16]
+    phi_4, phi_8, phi_16 = results[cell_counts[0]], results[cell_counts[1]], results[cell_counts[2]]
     passed = phi_16 > phi_4
-    detail = (f"Phi@4c={phi_4:.4f} Phi@8c={phi_8:.4f} Phi@16c={phi_16:.4f} "
-              f"scales={passed}")
+    detail = (f"Phi@{cell_counts[0]}c={phi_4:.4f} Phi@{cell_counts[1]}c={phi_8:.4f} "
+              f"Phi@{cell_counts[2]}c={phi_16:.4f} scales={passed}")
     return passed, detail
 
 

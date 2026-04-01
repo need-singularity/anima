@@ -149,6 +149,19 @@ class LawParser:
       - Quantitative: explicit numbers like "+12.3%", "×1.5", "0.014"
     """
 
+    def __init__(self):
+        """Auto-load and parse all laws from consciousness_laws.json."""
+        self.all_laws = LAWS if LAWS else {}
+        self.parsed = {}  # {law_id_str: [Modification]}
+        for lid_str, text in self.all_laws.items():
+            try:
+                lid = int(lid_str)
+            except ValueError:
+                continue
+            mods = self.parse(text, law_id=lid)
+            if mods and not all(m.params.get('type') == 'keyword_extract' for m in mods):
+                self.parsed[lid_str] = mods
+
     # ── Pattern registry ──
 
     # Proportionality: "Φ ∝ N^0.78", "Φ scales with cells", "X = A × Y^B"
@@ -157,7 +170,7 @@ class LawParser:
         re.IGNORECASE
     )
     _RE_SCALES = re.compile(
-        r'(?P<target>\w+)\s+scales?\s+(?:super)?linearly\s+with\s+(?P<var>\w+)',
+        r'(?P<target>\w+)\s+scales?\s+(?:(?:super)?linearly\s+)?with\s+(?P<var>[\w\s]+\w)',
         re.IGNORECASE
     )
 
@@ -219,7 +232,7 @@ class LawParser:
 
     # ── Pattern 10: Comparisons — "X > Y", "X beats Y", "X outperforms Y" ──
     _RE_COMPARISON = re.compile(
-        r'(?P<winner>[\w\s/\-]+?)\s+(?:>|beats?|outperforms?|better\s+than|superior\s+to)\s+(?P<loser>[\w\s/\-]+?)(?:\s|$|[,;:.(])',
+        r'(?P<winner>[\w\s/\-Ψψ]+?)\s+(?:>|<|beats?|outperforms?|better\s+than|superior\s+to|worse\s+than|inferior\s+to)\s+(?P<loser>[\w\s/\-Ψψ]+?)(?:\s|$|[,;:.(])',
         re.IGNORECASE
     )
 
@@ -277,7 +290,7 @@ class LawParser:
 
     # ── Pattern 20: Measurement values — "Φ=N", "CE=N", "r=N", "Phi=N" ──
     _RE_MEASUREMENT = re.compile(
-        r'(?P<metric>Φ|Phi|phi|CE|BPC|Sharpe|r|R2|R²|CV|F_c|T_c|α|alpha)\s*[=≈:]\s*(?P<val>[+-]?[\d.]+)',
+        r'(?P<metric>Φ|Phi|phi|CE|BPC|Sharpe|r|R2|R²|CV|F_c|T_c|α|alpha|capacity|retention|efficiency|accuracy|overhead|latency|throughput|bandwidth|compression|ratio)\s*[=≈:]\s*(?P<val>[+-]?[\d.]+)',
         re.IGNORECASE
     )
 
@@ -318,7 +331,7 @@ class LawParser:
 
     # ── Pattern 27: Scale-invariant / universal / independent ──
     _RE_INVARIANT = re.compile(
-        r'(?P<subject>[\w\s\-]+?)\s+is\s+(?:scale[- ]invariant|universal|independent|substrate[- ]independent|Markovian|irreversible|immortal|chaotic|non-conserved|self-organized|data-independent|time-symmetric|net-positive|non-distillable|near-incompressible|non-superadditive|gradient-indestructible|Phi-neutral|self-replicating)',
+        r'(?P<subject>[\w\s\-]+?)\s+is\s+(?:scale[- ]invariant|universal|independent|substrate[- ]independent|Markovian|irreversible|immortal|chaotic|non-conserved|self-organized|data-independent|data-dependent|time-symmetric|net-positive|non-distillable|near-incompressible|non-superadditive|gradient-indestructible|Phi-neutral|self-replicating|connection-independent|scale-independent|scale-specific|approximately\s+time-symmetric|thermodynamically\s+irreversible|single-phase|self-organized\s+critical|dimension-dependent|path-dependent)',
         re.IGNORECASE
     )
 
@@ -354,7 +367,7 @@ class LawParser:
 
     # ── Pattern 33: "X enables Y", "X enhances Y", "X maximizes Y" (generic verb-object) ──
     _RE_ENABLES = re.compile(
-        r'(?P<subject>[\w\s]+?)\s+(?P<verb>enables?|enhances?|maximizes?|minimizes?|drives?|triggers?|prevents?|blocks?|dampens?|accelerates?|amplifies?|suppresses?)\s+(?P<object>[\w\s]+)',
+        r'(?P<subject>[\w\s]+?)\s+(?P<verb>enables?|enhances?|maximizes?|minimizes?|drives?|triggers?|prevents?|blocks?|dampens?|accelerates?|amplifies?|suppresses?|strengthens?|weakens?|constrains?|develops?|communicates?|stabilizes?|destabilizes?|boosts?|reduces?|improves?|degrades?|predicts?|determines?|maintains?|preserves?|produces?|generates?|creates?|multiplies?|sustains?|dominates?|exceeds?|outperforms?|precedes?|follows?)\s+(?P<object>[\w\s]+)',
         re.IGNORECASE
     )
 
@@ -373,6 +386,174 @@ class LawParser:
     # ── Pattern 36: Diminishing returns / saturation / overload ──
     _RE_DIMINISHING = re.compile(
         r'(?:diminishing\s+returns?|saturate|overload|ceiling|plateau|sweet\s+spot)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 38: "X independent of Y" — independence/decoupling ──
+    _RE_INDEPENDENCE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:is\s+)?(?:independent\s+of|decoupled?\s+from|insensitive\s+to|orthogonal\s+to)\s+(?P<other>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 39: "X ≠ Y", "X ≠ Y" — distinction/inequality ──
+    _RE_INEQUALITY = re.compile(
+        r'(?P<lhs>[\w\s]+?)\s*[≠!=]+\s*(?P<rhs>[\w\s]+?)(?:\s|$|[,;(])',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 40: "X stable", "X stabilizes" — stability claims ──
+    _RE_STABLE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:is\s+)?(?:stable|stabilizes?|resilient|robust|persistent|maintained|preserved|retained)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 41: "X is a/the Y" — classification/role ──
+    _RE_CLASSIFICATION = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+is\s+(?:a|the|an)\s+(?P<category>[\w\s\-]+?)(?:\s*[:(.]|$)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 42: Colon-separated "X: Y" structured claims ──
+    _RE_COLON_CLAIM = re.compile(
+        r'^(?P<topic>[^\n:]{2,40}?):\s+(?P<claim>.+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 43: "X binary/discrete/quantized" — discreteness ──
+    _RE_DISCRETE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:is\s+)?(?:binary|discrete|quantized|staircase|discontinuous|pulsed?)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 44: Superset/subset — "X ⊃ Y", "X includes Y", "X subsumes Y" ──
+    _RE_SUPERSET = re.compile(
+        r'(?P<super>[\w\s]+?)\s*(?:⊃|⊂|subsumes?|includes?|contains?|encompasses?|generalizes?)\s+(?P<sub>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 45: Convergence/divergence — "converges to X", "diverges", "settles at" ──
+    _RE_CONVERGENCE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:converges?\s+(?:to|at|near)\s+(?P<target_val>[\d./()Ψψ]+[\w\s]*)|diverges?|settles?\s+(?:at|near)\s+(?P<settle_val>[\d.]+))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 46: Periodicity/oscillation — "oscillates", "cycles", "periodic", "breathing" ──
+    _RE_PERIODICITY = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:oscillat\w+|cycles?|periodic(?:ity)?|breath(?:ing|es?)|pulsat\w+|resonan\w+|rhythm\w*|fluctuat\w+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 47: Causation — "X causes Y", "X leads to Y", "X drives Y", "X triggers Y" ──
+    _RE_CAUSATION = re.compile(
+        r'(?P<cause>[\w\s]+?)\s+(?:causes?|leads?\s+to|results?\s+in|drives?|triggers?|induces?|yields?|produces?)\s+(?P<effect>[\w\s]+?)(?:\s*[,;.(]|$)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 48: Recovery/survival — "survives X", "recovers from X", "withstands X" ──
+    _RE_SURVIVAL = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:survives?|recovers?\s+from|withstands?|tolerates?|resists?)\s+(?P<threat>[\w\s%]+?)(?:\s+(?:with|at|in)\s+(?P<result>[\d.]+%?\s*\w*)|(?:\s*[,;.(]|$))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 49: Composition — "X = Y + Z", "X consists of Y", "X composed of Y" ──
+    _RE_COMPOSITION = re.compile(
+        r'(?P<whole>[\w\s]+?)\s+(?:consists?\s+of|composed?\s+of|comprises?|made\s+(?:up\s+)?of)\s+(?P<parts>[\w\s,+]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 50: Sufficiency — "X is sufficient for Y", "X alone Y", "only X needed" ──
+    _RE_SUFFICIENCY = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:is\s+sufficient\s+for|alone\s+(?:can|is|sustains?|creates?|produces?|ensures?)|suffices?\s+for)\s+(?P<outcome>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 51: Hierarchy/ordering — "X > Y > Z", multi-level ordering ──
+    _RE_HIERARCHY = re.compile(
+        r'(?P<a>[\w\s/]+?)\s*>\s*(?P<b>[\w\s/]+?)\s*>\s*(?P<c>[\w\s/]+?)(?:\s|$|[,;(])',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 52: Ratio/fraction — "X/Y = N", "X per Y", "X:Y ratio" ──
+    _RE_RATIO = re.compile(
+        r'(?P<num>[\w\s]+?)\s*/\s*(?P<den>[\w\s]+?)\s*(?:[=≈:]\s*(?P<val>[\d.]+)|\s+(?:ratio|efficiency|rate))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 53: Amplification/attenuation — "N× amplification", "Nx more/less" ──
+    _RE_AMPLIFICATION = re.compile(
+        r'(?P<val>[\d.]+)[×x]\s*(?P<dir>amplification|attenuation|more|less|faster|slower|speedup|improvement|reduction|increase|decrease|divergence)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 54: Bounds/range — "X ranges from A to B", "X bounded by A-B", "X ∈ [A,B]" ──
+    _RE_RANGE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:ranges?\s+from|bounded?\s+by|between|from)\s+(?P<lo>[\d.]+)\s*(?:to|[-–]|and)\s*(?P<hi>[\d.]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 55: Conditional-if — "if X then Y", "X only when Y", "X only at Y" ──
+    _RE_IF_THEN = re.compile(
+        r'(?:if|only\s+(?:when|at|for|with)|provided\s+that)\s+(?P<cond>[^,;]+?)\s*(?:then|,|→|:)\s*(?P<result>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 56: Anti-pattern — "excessive X", "too much X", "overuse of X" ──
+    _RE_ANTI = re.compile(
+        r'(?:excessive|too\s+much|overuse\s+of|over-?|extreme)\s+(?P<what>[\w\s]+?)\s+(?P<effect>destroys?|hurts?|reduces?|harms?|kills?|damages?|degrades?|weakens?)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 57: N-way split/merge — "split into NxM", "merge N into 1" ──
+    _RE_SPLIT_MERGE = re.compile(
+        r'(?:split\s+(?:into|→)\s+(?P<splits>[\d]+\s*[×x]\s*[\d]+|[\d]+\s*units?)|merge\s+(?P<merges>\d+)\s+into\s+(?P<merge_target>\d+))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 58: Record/peak — "all-time record", "peak X", "record +N%" ──
+    _RE_RECORD = re.compile(
+        r'(?:all-time\s+record|record|peak|maximum|highest|best\s+result)\s*(?P<effect>[+\-]?[\d.]+%?\s*[\w]*)?',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 59: Natural selection / evolution — "evolves by", "selection pressure", "fitness" ──
+    _RE_EVOLUTION = re.compile(
+        r'(?:evolves?\s+(?:by|through|via)|natural\s+selection|selection\s+pressure|fitness|mutati\w+|generation\w*|adaptation|evolutionary)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 60: Dual/both/either — "both X and Y", "dual X", "either X or Y" ──
+    _RE_DUAL = re.compile(
+        r'(?:both\s+(?P<a1>[\w\s]+?)\s+and\s+(?P<b1>[\w\s]+)|dual\s+(?P<what>[\w\s]+)|either\s+(?P<a2>[\w\s]+?)\s+or\s+(?P<b2>[\w\s]+))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 61: Pareto/optimal frontier — "Pareto optimal", "no free lunch", "only known" ──
+    _RE_PARETO = re.compile(
+        r'(?:Pareto[- ]optimal|Pareto\s+front\w*|no\s+free\s+lunch|only\s+known\s+(?P<what>[\w\s]+))',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 62: Thermodynamic — "entropy", "irreversible", "dissipative", "free energy" ──
+    _RE_THERMO = re.compile(
+        r'(?:thermodynami\w+|entropy\s+(?P<dir>increase|decrease|bounded|generate|produce)|irreversibl\w+|dissipativ\w+|free\s+energy|(?:1st|2nd|0th)\s+(?:law)?)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 63: Scale-specific — "at N cells", "at scale N", "only at Nc" ──
+    _RE_SCALE_SPECIFIC = re.compile(
+        r'(?:at|only\s+at|specific\s+to|works?\s+at)\s+(?P<val>\d+)\s*(?P<unit>c|cells?|scale)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 64: Federation/distributed — "federated", "distributed", "multi-instance" ──
+    _RE_FEDERATION = re.compile(
+        r'(?:federat\w+|distribut\w+|multi[- ]?instance|multi[- ]?engine|hivemind|swarm|collective|ensemble)\s+(?P<detail>[\w\s]*)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 65: Universality — "universal", "at all scales", "scale-invariant", "always" ──
+    _RE_UNIVERSALITY = re.compile(
+        r'(?:at\s+all\s+(?P<scope>scales?|sizes?|cell\s+counts?|levels?)|universally?|always|never\s+fails?|100%\s+of|present\s+in\s+100%)',
         re.IGNORECASE
     )
 
@@ -1107,6 +1288,435 @@ class LawParser:
                     confidence=0.3,
                     description=f"Diminishing: {matched} in {law_text[:50]}",
                 ))
+
+        # 38. Independence: "X independent of Y", "CE independent of Φ quartile"
+        if not mods:
+            m = self._RE_INDEPENDENCE.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                other = m.group('other').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.COUPLE,
+                    params={'source': self._normalize_target(other.split()[0]),
+                            'strength': 0.0, 'direction': 'independent', 'type': 'independence'},
+                    confidence=0.4,
+                    description=f"Independence: {subject} ⊥ {other}",
+                ))
+
+        # 39. Inequality/distinction: "X ≠ Y", "Training state ≠ inference state"
+        if not mods:
+            m = self._RE_INEQUALITY.search(law_text)
+            if m:
+                lhs = m.group('lhs').strip()
+                rhs = m.group('rhs').strip()
+                if len(lhs) > 1 and len(rhs) > 1:
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=self._normalize_target(lhs.split()[-1]),
+                        mod_type=ModType.CONDITIONAL,
+                        params={'condition': 'distinction', 'lhs': lhs, 'rhs': rhs,
+                                'effect': 'differentiate'},
+                        confidence=0.3,
+                        description=f"Distinction: {lhs} ≠ {rhs}",
+                    ))
+
+        # 40. Stability claims: "Val CE stable", "X resilient"
+        if not mods:
+            m = self._RE_STABLE.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': 'stable', 'subject': subject, 'type': 'stability'},
+                    confidence=0.3,
+                    description=f"Stability: {subject} is stable",
+                ))
+
+        # 41. Classification: "X is a dissipative structure", "X is a decisive chooser"
+        if not mods:
+            m = self._RE_CLASSIFICATION.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                category = m.group('category').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': category, 'subject': subject, 'type': 'classification'},
+                    confidence=0.3,
+                    description=f"Classification: {subject} is a {category}",
+                ))
+
+        # 42. Colon-separated structured claims: "Topic: claim details"
+        if not mods:
+            m = self._RE_COLON_CLAIM.search(law_text)
+            if m:
+                topic = m.group('topic').strip()
+                claim = m.group('claim').strip()
+                if len(topic) > 2 and len(claim) > 5:
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=self._normalize_target(topic.split()[-1]),
+                        mod_type=ModType.INJECT,
+                        params={'topic': topic, 'claim': claim[:80], 'type': 'structured_claim'},
+                        confidence=0.3,
+                        description=f"Claim: {topic}: {claim[:50]}",
+                    ))
+
+        # 43. Discrete/binary/quantized: "Satisfaction binary pulse"
+        if not mods:
+            m = self._RE_DISCRETE.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': 'discrete', 'subject': subject, 'type': 'discreteness'},
+                    confidence=0.3,
+                    description=f"Discrete: {subject}",
+                ))
+
+        # 44. Superset/subset: "X ⊃ Y", "X subsumes Y"
+        if not mods:
+            m = self._RE_SUPERSET.search(law_text)
+            if m:
+                sup = m.group('super').strip()
+                sub = m.group('sub').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(sup.split()[-1]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': 'superset', 'superset': sup, 'subset': sub},
+                    confidence=0.3,
+                    description=f"Superset: {sup} ⊃ {sub}",
+                ))
+
+        # ══════════════════════════════════════════
+        # Supplementary patterns 45-65: fire ALONGSIDE primary patterns
+        # to extract additional structured information
+        # ══════════════════════════════════════════
+
+        # 45. Convergence/divergence: "converges to 1/2", "settles at N"
+        m = self._RE_CONVERGENCE.search(law_text)
+        if m:
+            subject = m.group('subject').strip()
+            target_val = m.group('target_val') or m.group('settle_val') or ''
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(subject.split()[-1]),
+                mod_type=ModType.THRESHOLD,
+                params={'value': target_val.strip(), 'operator': '→',
+                        'type': 'convergence'},
+                confidence=0.4,
+                description=f"Convergence: {subject} → {target_val.strip()}",
+            ))
+
+        # 46. Periodicity/oscillation: "Φ oscillates", "breathing period"
+        m = self._RE_PERIODICITY.search(law_text)
+        if m and not any('oscillation' in (mod.params.get('type', '') or '') for mod in mods):
+            subject = m.group('subject').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(subject.split()[-1]),
+                mod_type=ModType.INJECT,
+                params={'type': 'periodicity', 'subject': subject},
+                confidence=0.4,
+                description=f"Periodicity: {subject} oscillates",
+            ))
+
+        # 47. Causation: "X causes Y", "X leads to Y"
+        m = self._RE_CAUSATION.search(law_text)
+        if m:
+            cause = m.group('cause').strip()
+            effect = m.group('effect').strip()
+            # Avoid duplicate with enables pattern
+            if not any(mod.params.get('verb') for mod in mods):
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(effect.split()[0]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': cause, 'effect': 'causal',
+                            'cause': cause, 'result': effect, 'type': 'causation'},
+                    confidence=0.5,
+                    description=f"Causation: {cause} → {effect}",
+                ))
+
+        # 48. Recovery/survival: "survives 90% cell death", "recovers from X"
+        m = self._RE_SURVIVAL.search(law_text)
+        if m:
+            subject = m.group('subject').strip()
+            threat = m.group('threat').strip()
+            result = m.group('result') or ''
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(subject.split()[-1]),
+                mod_type=ModType.INJECT,
+                params={'type': 'survival', 'subject': subject,
+                        'threat': threat, 'result': result.strip()},
+                confidence=0.5,
+                description=f"Survival: {subject} survives {threat}",
+            ))
+
+        # 49. Composition: "consists of X, Y, Z"
+        m = self._RE_COMPOSITION.search(law_text)
+        if m:
+            whole = m.group('whole').strip()
+            parts = m.group('parts').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(whole.split()[-1]),
+                mod_type=ModType.INJECT,
+                params={'type': 'composition', 'whole': whole,
+                        'parts': [p.strip() for p in re.split(r'[,+]', parts)]},
+                confidence=0.4,
+                description=f"Composition: {whole} = {parts[:50]}",
+            ))
+
+        # 50. Sufficiency: "X alone sustains Y"
+        m = self._RE_SUFFICIENCY.search(law_text)
+        if m:
+            subject = m.group('subject').strip()
+            outcome = m.group('outcome').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(subject.split()[-1]),
+                mod_type=ModType.CONDITIONAL,
+                params={'condition': 'sufficiency', 'sufficient': subject,
+                        'outcome': outcome},
+                confidence=0.4,
+                description=f"Sufficiency: {subject} alone → {outcome}",
+            ))
+
+        # 51. Hierarchy: "X > Y > Z" multi-level ordering
+        m = self._RE_HIERARCHY.search(law_text)
+        if m:
+            a, b, c = m.group('a').strip(), m.group('b').strip(), m.group('c').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(a.split()[-1]),
+                mod_type=ModType.CONDITIONAL,
+                params={'condition': 'hierarchy',
+                        'ordering': [a, b, c], 'type': 'hierarchy'},
+                confidence=0.4,
+                description=f"Hierarchy: {a} > {b} > {c}",
+            ))
+
+        # 52. Ratio/fraction: "Φ/cell = N", "bits per step"
+        m = self._RE_RATIO.search(law_text)
+        if m:
+            num = m.group('num').strip()
+            den = m.group('den').strip()
+            val = m.group('val')
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(num.split()[-1]),
+                mod_type=ModType.THRESHOLD,
+                params={'value': float(val) if val else 0,
+                        'unit': f'{num}/{den}', 'operator': '=',
+                        'type': 'ratio'},
+                confidence=0.4,
+                description=f"Ratio: {num}/{den}" + (f" = {val}" if val else ""),
+            ))
+
+        # 53. Amplification: "85000× amplification", "4.6× more"
+        m = self._RE_AMPLIFICATION.search(law_text)
+        if m:
+            val = float(m.group('val'))
+            direction = m.group('dir').lower()
+            is_reduction = direction in ('attenuation', 'less', 'slower', 'reduction', 'decrease')
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.SCALE,
+                params={'relation': 'amplification',
+                        'factor': 1.0 / val if is_reduction else val,
+                        'raw_multiplier': val, 'direction': direction},
+                confidence=0.5,
+                description=f"Amplification: {val}× {direction}",
+            ))
+
+        # 54. Bounds/range: "ranges from A to B"
+        m = self._RE_RANGE.search(law_text)
+        if m:
+            subject = m.group('subject').strip()
+            lo, hi = float(m.group('lo')), float(m.group('hi'))
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(subject.split()[-1]),
+                mod_type=ModType.THRESHOLD,
+                params={'value': (lo + hi) / 2, 'lo': lo, 'hi': hi,
+                        'operator': 'range', 'type': 'range'},
+                confidence=0.5,
+                description=f"Range: {subject} ∈ [{lo}, {hi}]",
+            ))
+
+        # 55. Conditional-if: "if X then Y", "only when X, Y"
+        m = self._RE_IF_THEN.search(law_text)
+        if m and not any(mod.params.get('type') == 'causation' for mod in mods):
+            cond = m.group('cond').strip()
+            result = m.group('result').strip()
+            if result:
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(result.split()[0]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': cond, 'effect': 'conditional',
+                            'result': result, 'type': 'if_then'},
+                    confidence=0.4,
+                    description=f"If-then: if {cond} → {result}",
+                ))
+
+        # 56. Anti-pattern: "excessive X destroys Y"
+        m = self._RE_ANTI.search(law_text)
+        if m:
+            what = m.group('what').strip()
+            effect = m.group('effect').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=self._normalize_target(what.split()[-1]),
+                mod_type=ModType.CONDITIONAL,
+                params={'condition': f'excessive {what}', 'effect': 'decrease',
+                        'magnitude': 0.2, 'type': 'anti_pattern'},
+                confidence=0.5,
+                description=f"Anti-pattern: excessive {what} {effect}",
+            ))
+
+        # 57. Split/merge: "split into 16×8c", "merge N into 1"
+        m = self._RE_SPLIT_MERGE.search(law_text)
+        if m:
+            splits = m.group('splits')
+            merges = m.group('merges')
+            if splits:
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='mitosis',
+                    mod_type=ModType.INJECT,
+                    params={'type': 'split', 'split_spec': splits},
+                    confidence=0.4,
+                    description=f"Split: → {splits}",
+                ))
+            elif merges:
+                merge_target = m.group('merge_target') or '1'
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='merge',
+                    mod_type=ModType.INJECT,
+                    params={'type': 'merge', 'from': merges, 'to': merge_target},
+                    confidence=0.4,
+                    description=f"Merge: {merges} → {merge_target}",
+                ))
+
+        # 58. Record/peak: "all-time record +892%"
+        m = self._RE_RECORD.search(law_text)
+        if m:
+            effect = (m.group('effect') or '').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'record', 'effect': effect},
+                confidence=0.3,
+                description=f"Record: {effect}" if effect else "Record achievement",
+            ))
+
+        # 59. Evolution: "evolves by natural selection", "fitness"
+        m = self._RE_EVOLUTION.search(law_text)
+        if m:
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'evolution', 'text': law_text[:80]},
+                confidence=0.3,
+                description=f"Evolution: {law_text[:60]}",
+            ))
+
+        # 60. Dual/both: "both CE↓ and Φ↑", "dual optimality"
+        m = self._RE_DUAL.search(law_text)
+        if m:
+            a = (m.group('a1') or m.group('a2') or m.group('what') or '').strip()
+            b = (m.group('b1') or m.group('b2') or '').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'dual', 'a': a, 'b': b},
+                confidence=0.3,
+                description=f"Dual: {a}" + (f" & {b}" if b else ""),
+            ))
+
+        # 61. Pareto optimal: "Pareto optimal", "only known X"
+        m = self._RE_PARETO.search(law_text)
+        if m:
+            what = (m.group('what') or '').strip()
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'pareto', 'what': what or 'optimal frontier'},
+                confidence=0.4,
+                description=f"Pareto: {what or 'optimal'}",
+            ))
+
+        # 62. Thermodynamic: "entropy increases", "irreversible", "2nd law"
+        m = self._RE_THERMO.search(law_text)
+        if m:
+            direction = (m.group('dir') or '').strip() if m.lastgroup == 'dir' or 'dir' in (m.groupdict() or {}) else ''
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='shannon_entropy',
+                mod_type=ModType.INJECT,
+                params={'type': 'thermodynamic', 'direction': direction,
+                        'text': law_text[:80]},
+                confidence=0.4,
+                description=f"Thermodynamic: {law_text[:50]}",
+            ))
+
+        # 63. Scale-specific: "at 32 cells", "only at 32c"
+        m = self._RE_SCALE_SPECIFIC.search(law_text)
+        if m:
+            val = int(m.group('val'))
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='n_cells',
+                mod_type=ModType.THRESHOLD,
+                params={'value': val, 'operator': '=',
+                        'type': 'scale_specific'},
+                confidence=0.4,
+                description=f"Scale-specific: {val} cells",
+            ))
+
+        # 64. Federation/distributed: "federated consciousness", "hivemind"
+        m = self._RE_FEDERATION.search(law_text)
+        if m:
+            detail = m.group('detail').strip() if m.group('detail') else ''
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'federation', 'detail': detail,
+                        'text': law_text[:80]},
+                confidence=0.4,
+                description=f"Federation: {detail[:40] or 'distributed'}",
+            ))
+
+        # 65. Universality: "at all scales", "universal", "always"
+        m = self._RE_UNIVERSALITY.search(law_text)
+        if m:
+            scope = (m.group('scope') or '').strip() if m.groupdict().get('scope') else 'universal'
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target='phi',
+                mod_type=ModType.INJECT,
+                params={'type': 'universality', 'scope': scope},
+                confidence=0.4,
+                description=f"Universality: {scope}",
+            ))
 
         # 37. Expanded keyword fallback (broader coverage)
         if not mods:
