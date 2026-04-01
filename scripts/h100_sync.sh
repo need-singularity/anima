@@ -53,6 +53,15 @@ declare -a SYNC_GROUPS=(
   "$REPO_ROOT/anima/src/|$DEST/|*.py *.json|src/"
   "$REPO_ROOT/anima/config/|$DEST/config/|*|config/"
   "$REPO_ROOT/anima/training/train_v14.py|$DEST/train_v14.py|single|train_v14.py"
+  "$REPO_ROOT/anima/training/train_v15.py|$DEST/train_v15.py|single|train_v15.py"
+  "$REPO_ROOT/scripts/preflight_training.sh|$DEST/preflight_training.sh|single|preflight_training.sh"
+  "$REPO_ROOT/scripts/merge_corpus.sh|$DEST/merge_corpus.sh|single|merge_corpus.sh"
+)
+
+# ── Large file definitions (rsync with MD5 skip) ──
+declare -a LARGE_FILES=(
+  "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt|$DEST/data/corpus_v11_multilingual.txt|corpus_v11_multilingual.txt"
+  "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model|$DEST/data/tokenizer_64k_multilingual.model|tokenizer_64k_multilingual.model"
 )
 
 # ── Helper: collect files from a directory with includes ──
@@ -193,6 +202,85 @@ transfer() {
   return 1
 }
 
+# ── Large file transfer (rsync + MD5 skip) ──
+transfer_large_file() {
+  local src="$1" dst="$2" label="$3"
+
+  if [ ! -f "$src" ]; then
+    echo "  [SKIP] $label — local file not found: $src"
+    return 1
+  fi
+
+  local file_size
+  file_size=$(stat -f%z "$src" 2>/dev/null || stat -c%s "$src" 2>/dev/null || echo "unknown")
+  local file_size_mb="unknown"
+  if [ "$file_size" != "unknown" ]; then
+    file_size_mb=$(( file_size / 1048576 ))
+  fi
+  echo "  File size: ${file_size_mb}MB"
+
+  # Compute local MD5
+  local local_md5
+  echo "  Computing local MD5 (this may take a moment for large files)..."
+  local_md5=$(md5 -q "$src" 2>/dev/null || md5sum "$src" | awk '{print $1}')
+  echo "  Local  MD5: $local_md5"
+
+  # Check remote MD5 — skip transfer if match
+  local remote_md5
+  remote_md5=$(ssh $SSH_OPTS "$HOST" "md5sum '$dst' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "MISSING")
+  echo "  Remote MD5: $remote_md5"
+
+  if [ "$local_md5" = "$remote_md5" ]; then
+    echo "  [SKIP] $label — remote file already matches (MD5 identical), skipping ${file_size_mb}MB transfer"
+    return 0
+  fi
+
+  echo "  [TRANSFER] $label — MD5 mismatch or missing, transferring ${file_size_mb}MB..."
+
+  if $DRY_RUN; then
+    echo "  [dry-run] Would transfer: $src -> $HOST:$dst (${file_size_mb}MB)"
+    return 0
+  fi
+
+  # Ensure remote directory exists
+  local remote_dir
+  remote_dir=$(dirname "$dst")
+  ssh $SSH_OPTS "$HOST" "mkdir -p '$remote_dir'" 2>/dev/null || true
+
+  # Use rsync with progress + compression for large files
+  if rsync -avz --progress --partial \
+    -e "ssh $SSH_OPTS" \
+    "$src" "$HOST:$dst" 2>&1; then
+    # Verify after transfer
+    echo "  Verifying transfer..."
+    local verify_md5
+    verify_md5=$(ssh $SSH_OPTS "$HOST" "md5sum '$dst' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "FAILED")
+    if [ "$local_md5" = "$verify_md5" ]; then
+      echo "  [OK] $label — transfer verified (MD5 match)"
+      return 0
+    else
+      echo "  [ERROR] $label — MD5 mismatch after transfer! local=$local_md5 remote=$verify_md5"
+      return 1
+    fi
+  else
+    echo "  [ERROR] rsync failed for $label, trying scp..."
+    if scp $SSH_OPTS "$src" "$HOST:$dst" 2>&1; then
+      local verify_md5
+      verify_md5=$(ssh $SSH_OPTS "$HOST" "md5sum '$dst' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "FAILED")
+      if [ "$local_md5" = "$verify_md5" ]; then
+        echo "  [OK] $label — scp transfer verified (MD5 match)"
+        return 0
+      else
+        echo "  [ERROR] $label — MD5 mismatch after scp! local=$local_md5 remote=$verify_md5"
+        return 1
+      fi
+    else
+      echo "  [ERROR] All transfer methods failed for $label"
+      return 1
+    fi
+  fi
+}
+
 # ── MD5 verification ──
 verify_md5() {
   local src="$1" dst="$2" label="$3"
@@ -256,18 +344,42 @@ TOTAL_ERRORS=0
 
 if ! $VERIFY_ONLY; then
   # Transfer: src/
-  echo "[1/3] Syncing src/ to H100..."
+  echo "[1/6] Syncing src/ to H100..."
   transfer "$REPO_ROOT/anima/src/" "$DEST/" "src/" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
   # Transfer: config/
   echo ""
-  echo "[2/3] Syncing config/..."
+  echo "[2/6] Syncing config/..."
   transfer "$REPO_ROOT/anima/config/" "$DEST/config/" "config/" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
-  # Transfer: train_v14.py
+  # Transfer: training scripts
   echo ""
-  echo "[3/3] Syncing train_v14.py..."
+  echo "[3/6] Syncing training scripts..."
   transfer "$REPO_ROOT/anima/training/train_v14.py" "$DEST/train_v14.py" "train_v14.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/anima/training/train_v15.py" "$DEST/train_v15.py" "train_v15.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+
+  # Transfer: operational scripts
+  echo ""
+  echo "[4/6] Syncing operational scripts..."
+  transfer "$REPO_ROOT/scripts/preflight_training.sh" "$DEST/preflight_training.sh" "preflight_training.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/scripts/merge_corpus.sh" "$DEST/merge_corpus.sh" "merge_corpus.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+
+  # Transfer: tokenizer (small, normal transfer)
+  echo ""
+  echo "[5/6] Syncing tokenizer..."
+  ssh $SSH_OPTS "$HOST" "mkdir -p '$DEST/data'" 2>/dev/null || true
+  transfer_large_file \
+    "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model" \
+    "$DEST/data/tokenizer_64k_multilingual.model" \
+    "tokenizer_64k_multilingual.model" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+
+  # Transfer: corpus_v11 (10.5GB — MD5 skip if already present)
+  echo ""
+  echo "[6/6] Syncing corpus_v11_multilingual.txt (10.5GB — will skip if MD5 matches)..."
+  transfer_large_file \
+    "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt" \
+    "$DEST/data/corpus_v11_multilingual.txt" \
+    "corpus_v11_multilingual.txt" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 fi
 
 # MD5 verification (sample key files)
@@ -281,7 +393,12 @@ verify_md5 "$REPO_ROOT/anima/src/consciousness_engine.py" "$DEST/consciousness_e
 verify_md5 "$REPO_ROOT/anima/src/trinity.py" "$DEST/trinity.py" "trinity.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/src/decoder_v2.py" "$DEST/decoder_v2.py" "decoder_v2.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/training/train_v14.py" "$DEST/train_v14.py" "train_v14.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/training/train_v15.py" "$DEST/train_v15.py" "train_v15.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/config/consciousness_laws.json" "$DEST/config/consciousness_laws.json" "consciousness_laws.json" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model" "$DEST/data/tokenizer_64k_multilingual.model" "tokenizer_64k_multilingual.model" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt" "$DEST/data/corpus_v11_multilingual.txt" "corpus_v11_multilingual.txt" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/scripts/preflight_training.sh" "$DEST/preflight_training.sh" "preflight_training.sh" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/scripts/merge_corpus.sh" "$DEST/merge_corpus.sh" "merge_corpus.sh" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 
 echo ""
 echo "========================================"
