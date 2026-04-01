@@ -410,6 +410,10 @@ class ConsciousnessHub:
         elif name == 'eeg':
             return self._dispatch_eeg(module, intent, **kwargs)
 
+        # PluginBase instances have their own .act() method
+        if hasattr(module, 'manifest') and hasattr(module, 'act'):
+            return module.act(intent, **kwargs)
+
         return f"{name} module loaded"
 
     def _dispatch_eeg(self, module: Any, intent: str, **kwargs) -> Any:
