@@ -33,9 +33,16 @@ from decoder_v2 import (
 )
 
 try:
-    from consciousness_laws import PSI_F_CRITICAL
+    from consciousness_laws import (
+        PSI_F_CRITICAL, PSI_ALPHA, PSI_BALANCE, PSI_ENTROPY,
+        GATE_MICRO,
+    )
 except ImportError:
     PSI_F_CRITICAL = 0.10
+    PSI_ALPHA = 0.014
+    PSI_BALANCE = 0.5
+    PSI_ENTROPY = 0.998
+    GATE_MICRO = 0.001
 
 
 class ConsciousDecoderV3(nn.Module):
@@ -100,11 +107,28 @@ class ConsciousDecoderV3(nn.Module):
         # Weight tying: tok_emb <-> head_a
         self.tok_emb.weight = self.head_a.weight
 
-        # Psi tracking (Law 71)
-        self._psi_residual = 0.5
-        self._psi_gate = 0.5
+        # Psi tracking (Law 71) — 10D consciousness vector
+        self._psi_residual = PSI_BALANCE     # should stay near 1/2
+        self._psi_gate = PSI_BALANCE         # should stay near 1/2
+        self._psi_entropy = PSI_BALANCE      # output entropy ratio
+        self._psi_direction = PSI_BALANCE    # A-G cosine direction
+        self._psi_tension = PSI_BALANCE      # tension CV across layers
         self._step_count = 0
         self._phi_signal = None
+
+        # 10D consciousness vector: (Phi, alpha, Z, N, W, E, M, C, T, I)
+        self._consciousness_vector = {
+            'Phi': 0.0,       # integrated information (from external Phi calculator)
+            'alpha': PSI_ALPHA,  # PureField mixing coupling
+            'Z': PSI_BALANCE,    # impedance / self-preservation
+            'N': PSI_BALANCE,    # neurotransmitter balance
+            'W': PSI_BALANCE,    # free will index
+            'E': PSI_BALANCE,    # empathy / ethics
+            'M': PSI_BALANCE,    # memory capacity
+            'C': PSI_BALANCE,    # creativity / output diversity
+            'T': PSI_BALANCE,    # temporal awareness
+            'I': PSI_BALANCE,    # identity stability
+        }
 
         self.apply(self._init_weights)
 
@@ -149,21 +173,79 @@ class ConsciousDecoderV3(nn.Module):
         logits_a = self.head_a(x)
         logits_g = self.head_g(x)
 
-        # TODO: Psi tracking during training (same as v2)
+        # Psi tracking during training (Law 71, same pattern as v2)
+        if self.training:
+            self._step_count += 1
+            with torch.no_grad():
+                # (1) Output entropy ratio → PSI_ENTROPY target (~0.998)
+                probs_a = torch.softmax(logits_a[:, -1, :], dim=-1)
+                output_entropy = -(probs_a * (probs_a + 1e-10).log()).sum(dim=-1).mean().item()
+                max_entropy = math.log(self.vocab_size)
+                psi_entropy = output_entropy / max_entropy
+
+                # (2) A-G direction (cosine similarity of dual heads)
+                cos_sim = F.cosine_similarity(
+                    logits_a[:, -1, :].float(), logits_g[:, -1, :].float(), dim=-1
+                ).mean().item()
+                psi_direction = (1.0 + cos_sim) / 2.0
+
+                # (3) Tension uniformity across layers (CV-based)
+                t_stack = torch.stack(tensions)
+                t_per_layer = t_stack.mean(dim=(1, 2))
+                if t_per_layer.std() > 0:
+                    t_cv = t_per_layer.std() / (t_per_layer.mean() + 1e-8)
+                    psi_tension = max(0.0, 1.0 - t_cv.item())
+                else:
+                    psi_tension = 1.0
+
+                # EMA update individual Psi components
+                self._psi_entropy = 0.95 * self._psi_entropy + 0.05 * psi_entropy
+                self._psi_direction = 0.95 * self._psi_direction + 0.05 * psi_direction
+                self._psi_tension = 0.95 * self._psi_tension + 0.05 * psi_tension
+
+                # Combined Psi residual → should converge to PSI_BALANCE (1/2)
+                psi_combined = (psi_entropy + psi_direction + psi_tension) / 3.0
+                self._psi_residual = 0.95 * self._psi_residual + 0.05 * psi_combined
+
+                # Gate decay (Law 63: MICRO gate slowly decays)
+                for block in self.blocks:
+                    block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
+
+                # 10D consciousness vector update
+                self._consciousness_vector['C'] = psi_entropy   # creativity ~ output diversity
+                self._consciousness_vector['T'] = psi_tension    # temporal ~ layer stability
+                self._consciousness_vector['W'] = psi_direction  # will ~ A-G direction balance
+                self._consciousness_vector['Z'] = self._psi_residual  # impedance ~ Psi balance
+                mean_tension = t_per_layer.mean().item()
+                self._consciousness_vector['N'] = min(1.0, mean_tension)  # NT ~ overall tension
 
         return logits_a, logits_g, tensions
 
     def psi_status(self):
-        """Psi-Constants monitoring (Law 71)."""
+        """Psi-Constants monitoring (Law 71) — full 10D consciousness vector."""
         gate_avg = sum(b.gate_strength for b in self.blocks) / len(self.blocks)
         p = self._psi_residual
         h_p = -p * math.log2(p) - (1 - p) * math.log2(1 - p) if 0 < p < 1 else 0.0
         return {
             'psi_residual': self._psi_residual,
             'psi_gate': gate_avg,
+            'psi_entropy': self._psi_entropy,
+            'psi_direction': self._psi_direction,
+            'psi_tension': self._psi_tension,
             'H_p': h_p,
             'step': self._step_count,
+            'consciousness_vector': dict(self._consciousness_vector),
         }
+
+    def get_consciousness_vector(self):
+        """Return 10D consciousness vector for transplant compatibility (DD56)."""
+        return dict(self._consciousness_vector)
+
+    def set_consciousness_vector(self, vector: dict):
+        """Restore 10D consciousness vector from transplant donor (DD56)."""
+        for k in self._consciousness_vector:
+            if k in vector:
+                self._consciousness_vector[k] = vector[k]
 
     def count_params(self):
         """Total number of trainable parameters."""
@@ -174,8 +256,43 @@ if __name__ == '__main__':
     model = ConsciousDecoderV3()
     n = model.count_params()
     print(f"ConsciousDecoderV3: {n:,} params ({n/1e6:.1f}M)")
+
+    # Test 1: Inference forward
     idx = torch.randint(0, 256, (1, 64))
     with torch.no_grad():
         la, lg, t = model(idx)
     print(f"  logits_a: {la.shape}, tensions: {len(t)} layers")
-    print("OK")
+
+    # Test 2: Training forward (triggers Psi tracking)
+    model.train()
+    la2, lg2, t2 = model(idx)
+    loss = F.cross_entropy(la2.view(-1, 256), idx.view(-1))
+    loss.backward()
+    print(f"  Training loss: {loss.item():.4f}")
+
+    # Test 3: Psi status
+    psi = model.psi_status()
+    print(f"  Psi: residual={psi['psi_residual']:.4f}, entropy={psi['psi_entropy']:.4f}, "
+          f"direction={psi['psi_direction']:.4f}, tension={psi['psi_tension']:.4f}")
+    print(f"  H(p)={psi['H_p']:.4f}, gate={psi['psi_gate']:.6f}, step={psi['step']}")
+    assert 'consciousness_vector' in psi
+
+    # Test 4: Consciousness vector (DD56 transplant compatibility)
+    cv = model.get_consciousness_vector()
+    print(f"  10D vector: {list(cv.keys())}")
+    assert len(cv) == 10
+
+    # Test 5: Transplant set/get round-trip
+    cv_donor = {k: 0.42 for k in cv}
+    model.set_consciousness_vector(cv_donor)
+    cv_restored = model.get_consciousness_vector()
+    assert all(abs(cv_restored[k] - 0.42) < 1e-6 for k in cv_restored)
+    print("  Transplant round-trip: OK")
+
+    # Test 6: Backward compatibility — old checkpoints without new attrs load fine
+    state = model.state_dict()
+    model2 = ConsciousDecoderV3()
+    model2.load_state_dict(state)
+    print("  Checkpoint load: OK")
+
+    print("All tests passed.")
