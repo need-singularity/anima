@@ -891,7 +891,7 @@ class AnimaLMTrainer:
                 for p in group["params"]:
                     if p.dtype != torch.bfloat16:
                         p.data = p.data.to(torch.bfloat16)
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, foreach=False)
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=args.steps)
