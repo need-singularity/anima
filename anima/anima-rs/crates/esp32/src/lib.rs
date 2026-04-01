@@ -23,6 +23,10 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod law_measurement;
+pub mod law_evolution;
+pub mod spi_sync;
+
 // ═══════════════════════════════════════════════════════════
 // Ψ-Constants (Laws 69-70, ALL four from ln(2))
 // ═══════════════════════════════════════════════════════════

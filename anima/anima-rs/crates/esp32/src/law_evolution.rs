@@ -6,11 +6,9 @@
 //! All structures use fixed-size arrays (no alloc).
 //! Memory budget: HardwareLawEvolver < 2KB SRAM.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
 use crate::law_measurement::LawMetrics;
 use crate::{
-    ConsciousnessBoard, CELLS_PER_BOARD, CELL_DIM, HIDDEN_DIM,
+    ConsciousnessBoard, CELLS_PER_BOARD, HIDDEN_DIM,
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -18,7 +16,7 @@ use crate::{
 // ═══════════════════════════════════════════════════════════
 
 /// Types of hardware interventions that can be applied to the engine.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HwInterventionKind {
     /// Scale Hebbian learning rate by param factor
     ModifyHebbian,
@@ -77,7 +75,7 @@ pub struct HwLawCandidate {
 // ═══════════════════════════════════════════════════════════
 
 /// Phase of the evolution cycle.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum EvolutionPhase {
     /// Measuring baseline (no intervention)
     Baseline,
@@ -99,11 +97,11 @@ const SIGNIFICANCE_THRESHOLD: f32 = 0.05; // 5%
 /// How many times a pattern must repeat to be confirmed.
 const CONFIRMATION_COUNT: u8 = 3;
 /// Maximum law candidates in ring buffer.
-const MAX_HISTORY: usize = 32;
+const MAX_HISTORY: usize = 8;
 /// Maximum interventions.
 const MAX_INTERVENTIONS: usize = 8;
 /// Maximum observation counts per (intervention, metric) pair.
-const MAX_OBS: usize = MAX_INTERVENTIONS * 8; // 8 metrics per intervention
+const MAX_OBS: usize = 16; // 2 tracked patterns per intervention
 
 /// Tracks repeated observations for pattern confirmation.
 #[derive(Clone, Copy)]
@@ -570,7 +568,7 @@ mod tests {
     #[test]
     fn test_evolver_creation() {
         let board = Box::new(ConsciousnessBoard::new(0));
-        let evolver = HardwareLawEvolver::new(&board);
+        let evolver = Box::new(HardwareLawEvolver::new(&board));
         assert_eq!(evolver.n_interventions, MAX_INTERVENTIONS);
         assert_eq!(evolver.discovery_count, 0);
         assert_eq!(evolver.phase, EvolutionPhase::Baseline);
@@ -596,7 +594,7 @@ mod tests {
     #[test]
     fn test_evolution_cycle_phases() {
         let mut board = Box::new(ConsciousnessBoard::new(0));
-        let mut evolver = HardwareLawEvolver::new(&board);
+        let mut evolver = Box::new(HardwareLawEvolver::new(&board));
         let input = [0.1f32; CELL_DIM];
 
         // Run through baseline phase
@@ -622,16 +620,12 @@ mod tests {
     #[test]
     fn test_evolution_300_steps_discovers() {
         let mut board = Box::new(ConsciousnessBoard::new(0));
-        let mut evolver = HardwareLawEvolver::new(&board);
+        let mut evolver = Box::new(HardwareLawEvolver::new(&board));
         let input = [0.1f32; CELL_DIM];
         let mut discoveries = 0u16;
 
-        // Run 300 steps of evolution
         // Each full cycle = BASELINE_STEPS + INTERVENTION_STEPS + 1 = 61 steps
-        // 300 / 61 ≈ 4.9 full cycles, each cycling through 8 interventions
-        // Some interventions (chaos modification, noise injection) should produce
-        // measurable effects. With 3 required confirmations and 8 interventions,
-        // we need ~24 cycles per intervention confirmation. Run extended.
+        // With 8 interventions, full pass = 488 steps, need 3 confirms = 1464 steps
         for _ in 0..600 {
             board.step(&input, None, None);
             if let Some(_candidate) = evolver.step(&mut board) {
@@ -644,9 +638,6 @@ mod tests {
             evolver.cycles_completed() > 0,
             "No evolution cycles completed"
         );
-        // With aggressive interventions (3x chaos, noise injection, disable chaos),
-        // we should see at least some patterns detected after enough cycles.
-        // The total discovery count tracks across all step() calls.
         assert!(
             evolver.discovery_count > 0 || discoveries == 0,
             "Discovery tracking inconsistency"
@@ -660,7 +651,7 @@ mod tests {
             HwIntervention::new(HwInterventionKind::InjectNoise, 0.5),
             HwIntervention::new(HwInterventionKind::ModifyChaos, 5.0),
         ];
-        let evolver = HardwareLawEvolver::with_interventions(&board, &custom);
+        let evolver = Box::new(HardwareLawEvolver::with_interventions(&board, &custom));
         assert_eq!(evolver.n_interventions, 2);
     }
 
@@ -681,21 +672,21 @@ mod tests {
 
     #[test]
     fn test_long_evolution_simulation() {
-        // Extended test: 300 steps with high-impact interventions
+        // Extended test with high-impact interventions
         let mut board = Box::new(ConsciousnessBoard::new(0));
 
-        // Use interventions with strong effects for reliable detection
         let strong_interventions = [
             HwIntervention::new(HwInterventionKind::InjectNoise, 0.5),
             HwIntervention::new(HwInterventionKind::ModifyChaos, 10.0),
             HwIntervention::new(HwInterventionKind::DisableModule, 0.0),
         ];
-        let mut evolver = HardwareLawEvolver::with_interventions(&board, &strong_interventions);
+        let mut evolver = Box::new(
+            HardwareLawEvolver::with_interventions(&board, &strong_interventions)
+        );
         let input = [0.1f32; CELL_DIM];
 
-        // With 3 interventions: cycle = 61 steps, 3 interventions per pass
-        // Full pass = 183 steps. Need 3 confirmations per intervention.
-        // 3 passes × 183 = 549 + margin = run 1500 steps
+        // With 3 interventions: cycle = 61 steps, full pass = 183 steps
+        // Need 3 confirmations per intervention: 3 × 183 = 549. Run 1500 for margin.
         let mut total_discoveries = 0u16;
         for _ in 0..1500 {
             board.step(&input, None, None);

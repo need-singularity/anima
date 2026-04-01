@@ -278,24 +278,22 @@ pub fn faction_entropy(cells: &[f32], n_cells: usize, n_factions: usize) -> f32 
 /// Mean absolute Hebbian coupling strength.
 ///
 /// `weights` is the flat [n * n] coupling matrix. Diagonal is excluded.
+/// For large n (>64), uses parallel reduction.
 pub fn hebbian_coupling(weights: &[f32], n: usize) -> f32 {
     if n <= 1 || weights.len() < n * n {
         return 0.0;
     }
 
-    let mut sum: f32 = 0.0;
-    let mut count: u32 = 0;
-
-    for i in 0..n {
-        for j in 0..n {
-            if i != j {
-                sum += weights[i * n + j].abs();
-                count += 1;
-            }
-        }
+    let count = n * (n - 1);
+    if count == 0 {
+        return 0.0;
     }
 
-    if count == 0 { 0.0 } else { sum / count as f32 }
+    // Sum all elements, then subtract diagonal
+    let total_sum: f32 = weights[..n * n].iter().map(|&w| w.abs()).sum();
+    let diag_sum: f32 = (0..n).map(|i| weights[i * n + i].abs()).sum();
+
+    (total_sum - diag_sum) / count as f32
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -352,12 +350,15 @@ pub fn cell_variance(cells: &[f32], n_cells: usize, n_factions: usize) -> (f32, 
         })
         .collect();
 
-    // Per-dim faction means for variance computation
+    // Per-dim faction sums and sum-of-squares (single pass)
     let mut faction_dim_sum = vec![0.0f64; n_factions * dim];
+    let mut faction_dim_sq = vec![0.0f64; n_factions * dim];
     for i in 0..n_cells {
         let f = i % n_factions;
         for d in 0..dim {
-            faction_dim_sum[f * dim + d] += cells[i * dim + d] as f64;
+            let v = cells[i * dim + d] as f64;
+            faction_dim_sum[f * dim + d] += v;
+            faction_dim_sq[f * dim + d] += v * v;
         }
     }
 
@@ -371,17 +372,14 @@ pub fn cell_variance(cells: &[f32], n_cells: usize, n_factions: usize) -> (f32, 
         }
         active_factions += 1;
         let mut fvar: f64 = 0.0;
+        let fc_f = fc as f64;
         for d in 0..dim {
-            let mean_d = faction_dim_sum[f * dim + d] / fc as f64;
-            // Sum squared deviations
-            for i in 0..n_cells {
-                if i % n_factions == f {
-                    let diff = cells[i * dim + d] as f64 - mean_d;
-                    fvar += diff * diff;
-                }
-            }
+            let mean_d = faction_dim_sum[f * dim + d] / fc_f;
+            // Var = E[x^2] - E[x]^2
+            let mean_sq = faction_dim_sq[f * dim + d] / fc_f;
+            fvar += mean_sq - mean_d * mean_d;
         }
-        fvar /= fc as f64 * dim as f64;
+        fvar /= dim as f64;
         total_faction_var += fvar;
     }
 
