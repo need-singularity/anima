@@ -528,6 +528,169 @@ fn tool_policy_unblock(tool_name: &str) -> PyResult<()> {
     Ok(())
 }
 
+// ── Law Discovery submodule ───────────────────────────────────────
+
+static LAW_DISCOVERY_BUFFER: Mutex<Option<anima_law_discovery::RingBuffer>> = Mutex::new(None);
+
+#[pyfunction]
+#[pyo3(name = "create_buffer", signature = (capacity=1000, n_metrics=8))]
+fn law_discovery_create_buffer(capacity: usize, n_metrics: usize) -> PyResult<()> {
+    let buf = anima_law_discovery::RingBuffer::new(capacity, n_metrics);
+    let mut guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    *guard = Some(buf);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "measure_all", signature = (cells_flat, n_cells, coupling_flat, n_factions, n_bins=16))]
+fn law_discovery_measure_all(
+    py: Python<'_>,
+    cells_flat: Vec<f32>,
+    n_cells: usize,
+    coupling_flat: Vec<f32>,
+    n_factions: usize,
+    n_bins: u16,
+) -> PyResult<Py<PyDict>> {
+    let snap = anima_law_discovery::measure_all(
+        &cells_flat, n_cells, &coupling_flat, n_factions, n_bins,
+    );
+
+    // Auto-push to buffer if exists
+    if let Ok(mut guard) = LAW_DISCOVERY_BUFFER.lock() {
+        if let Some(buf) = guard.as_mut() {
+            buf.push_snapshot(&snap);
+        }
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("phi", snap.phi)?;
+    dict.set_item("faction_entropy", snap.faction_entropy)?;
+    dict.set_item("hebbian_coupling", snap.hebbian_coupling)?;
+    dict.set_item("global_variance", snap.global_variance)?;
+    dict.set_item("faction_variance", snap.faction_variance)?;
+    dict.set_item("phi_proxy", snap.phi_proxy)?;
+    dict.set_item("lyapunov", snap.lyapunov)?;
+    dict.set_item("n_cells", snap.n_cells)?;
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "phi_fast", signature = (cells_flat, n_cells, n_bins=16))]
+fn law_discovery_phi_fast(cells_flat: Vec<f32>, n_cells: usize, n_bins: u16) -> PyResult<f32> {
+    Ok(anima_law_discovery::phi_fast(&cells_flat, n_cells, n_bins))
+}
+
+#[pyfunction]
+#[pyo3(name = "faction_entropy")]
+fn law_discovery_faction_entropy(cells_flat: Vec<f32>, n_cells: usize, n_factions: usize) -> PyResult<f32> {
+    Ok(anima_law_discovery::faction_entropy(&cells_flat, n_cells, n_factions))
+}
+
+#[pyfunction]
+#[pyo3(name = "hebbian_coupling")]
+fn law_discovery_hebbian_coupling(weights_flat: Vec<f32>, n: usize) -> PyResult<f32> {
+    Ok(anima_law_discovery::hebbian_coupling(&weights_flat, n))
+}
+
+#[pyfunction]
+#[pyo3(name = "cell_variance")]
+fn law_discovery_cell_variance(cells_flat: Vec<f32>, n_cells: usize, n_factions: usize) -> PyResult<(f32, f32)> {
+    Ok(anima_law_discovery::cell_variance(&cells_flat, n_cells, n_factions))
+}
+
+#[pyfunction]
+#[pyo3(name = "lyapunov_exponent")]
+fn law_discovery_lyapunov(trajectory: Vec<f32>, dt: f32) -> PyResult<f32> {
+    Ok(anima_law_discovery::lyapunov_exponent(&trajectory, dt))
+}
+
+#[pyfunction]
+#[pyo3(name = "push_metrics")]
+fn law_discovery_push(values: Vec<f32>) -> PyResult<()> {
+    let mut guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    buf.push(&values);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "detect_correlation")]
+fn law_discovery_detect_correlation(metric_a: usize, metric_b: usize) -> PyResult<Option<(f32, f32)>> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(anima_law_discovery::detect_correlation(buf, metric_a, metric_b))
+}
+
+#[pyfunction]
+#[pyo3(name = "detect_phase_transition", signature = (metric, sigma_threshold=2.0))]
+fn law_discovery_detect_phase_transition(metric: usize, sigma_threshold: f32) -> PyResult<Option<usize>> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(anima_law_discovery::detect_phase_transition(buf, metric, sigma_threshold))
+}
+
+#[pyfunction]
+#[pyo3(name = "detect_periodicity")]
+fn law_discovery_detect_periodicity(metric: usize) -> PyResult<Option<f32>> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(anima_law_discovery::detect_periodicity(buf, metric))
+}
+
+#[pyfunction]
+#[pyo3(name = "detect_trend")]
+fn law_discovery_detect_trend(metric: usize) -> PyResult<(f32, f32)> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(anima_law_discovery::detect_trend(buf, metric))
+}
+
+#[pyfunction]
+#[pyo3(name = "buffer_len")]
+fn law_discovery_buffer_len() -> PyResult<usize> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(buf.len())
+}
+
+#[pyfunction]
+#[pyo3(name = "buffer_series")]
+fn law_discovery_buffer_series(metric: usize) -> PyResult<Vec<f32>> {
+    let guard = LAW_DISCOVERY_BUFFER.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let buf = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No buffer. Call law_discovery.create_buffer() first.")
+    })?;
+    Ok(buf.series(metric))
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -584,6 +747,24 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     tool_policy.add_function(wrap_pyfunction!(tool_policy_block, &tool_policy)?)?;
     tool_policy.add_function(wrap_pyfunction!(tool_policy_unblock, &tool_policy)?)?;
     m.add_submodule(&tool_policy)?;
+
+    // law_discovery submodule (Tier 4.2: real-time law measurement + pattern detection)
+    let law_discovery = PyModule::new(py, "law_discovery")?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_create_buffer, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_measure_all, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_phi_fast, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_faction_entropy, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_hebbian_coupling, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_cell_variance, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_lyapunov, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_push, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_detect_correlation, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_detect_phase_transition, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_detect_periodicity, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_detect_trend, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_buffer_len, &law_discovery)?)?;
+    law_discovery.add_function(wrap_pyfunction!(law_discovery_buffer_series, &law_discovery)?)?;
+    m.add_submodule(&law_discovery)?;
 
     Ok(())
 }

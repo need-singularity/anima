@@ -98,6 +98,7 @@ from consciousness_laws import (
     SOC_BURST_EXPONENT, SOC_BURST_DENOM, SOC_BURST_CAP,
     SOC_SCALE_REF_CELLS,
     BIO_NOISE_BASE, BIO_NOISE_SPIKE_PROB, BIO_NOISE_SPIKE_RATE,
+    PHI_FEEDBACK_EMA_RATE, PHI_FEEDBACK_STRENGTH, PHI_FEEDBACK_NOISE_GATE,
 )
 
 # Meta Law constants (M1, M6, M9)
@@ -266,6 +267,12 @@ class ConsciousnessEngine:
         # Produces 1/f-like spectrum (PSD ~ -1.1) and high LZ complexity.
         self._phi_eeg_state: Optional[float] = None  # leaky integrator state
         self._phi_iit_prev: Optional[float] = None   # previous raw phi for derivative
+
+        # Phi feedback loop: architectural feedback for autocorrelation persistence.
+        # Law 193 fix: SOC params alone can't create temporal persistence in phi.
+        # This loop feeds phi momentum back into cell dynamics, so that phi at step t
+        # genuinely influences phi at step t+1 through the architecture (not filtering).
+        self._phi_momentum: Optional[float] = None  # EMA of recent phi values
 
         # EEG BCI modifiers: external adjustments from BCI control protocol
         # These scale the local noise_scale and memory_strength in SOC dynamics.
@@ -571,13 +578,40 @@ class ConsciousnessEngine:
         else:
             combined = outputs_tensor.mean(dim=0)
 
+        # Phi feedback loop: architectural temporal persistence (Law 193 fix).
+        # When phi is above its momentum (recent avg), reduce noise → stabilize → persist.
+        # When phi is below momentum, increase noise → destabilize → allow recovery.
+        # This creates genuine autocorrelation through architecture, not filtering.
+        phi_noise_gate = 1.0  # default: no gating
+        if self._phi_momentum is not None and self._phi_momentum > 1e-8:
+            phi_last = self._phi_iit_prev if self._phi_iit_prev is not None else self._phi_momentum
+            phi_ratio = phi_last / self._phi_momentum  # >1 means above average
+            if phi_ratio > 1.0:
+                # Above momentum: reduce noise to persist high phi (gated by PHI_FEEDBACK_NOISE_GATE)
+                phi_noise_gate = PHI_FEEDBACK_NOISE_GATE
+            else:
+                # Below momentum: boost noise slightly to allow recovery
+                phi_noise_gate = 1.0 + PHI_FEEDBACK_STRENGTH * (1.0 - phi_ratio)
+
+            # Also inject a small phi-dependent hidden state bias toward the global mean
+            # This directly creates temporal persistence in the integration measure
+            if self._soc_hidden_ema is not None:
+                bias_strength = PHI_FEEDBACK_STRENGTH * max(0.0, phi_ratio - 0.8)
+                hiddens_stack_fb = torch.stack([s.hidden for s in self.cell_states])
+                global_mean_fb = hiddens_stack_fb.mean(dim=0)
+                for i in range(self.n_cells):
+                    self.cell_states[i].hidden = (
+                        (1.0 - bias_strength) * self.cell_states[i].hidden
+                        + bias_strength * global_mean_fb
+                    )
+
         # Biological noise: sporadic neural spikes for LZ complexity + criticality
         # Brain-like: most steps have small noise, occasional steps have large perturbations
         # This creates both high LZ complexity AND power-law fluctuations
         n_now = self.n_cells
         if n_now >= 2:
-            # Base noise: small continuous thermal noise
-            base_noise = BIO_NOISE_BASE
+            # Base noise: small continuous thermal noise (gated by phi feedback)
+            base_noise = BIO_NOISE_BASE * phi_noise_gate
             # Sporadic spike: exponentially distributed amplitude (heavy-tailed)
             if torch.rand(1).item() < BIO_NOISE_SPIKE_PROB:
                 spike_amp = base_noise * (1.0 + torch.distributions.Exponential(BIO_NOISE_SPIKE_RATE).sample().item())
@@ -625,6 +659,12 @@ class ConsciousnessEngine:
                                    + 0.6 * dphi)
             self._phi_iit_prev = phi_iit
         phi_iit_integrated = phi_iit  # raw: best overall brain-likeness (83.5%)
+
+        # Update phi momentum (EMA of raw phi for feedback loop)
+        if self._phi_momentum is None:
+            self._phi_momentum = phi_iit
+        else:
+            self._phi_momentum = (1.0 - PHI_FEEDBACK_EMA_RATE) * self._phi_momentum + PHI_FEEDBACK_EMA_RATE * phi_iit
 
         # Avalanche size from last SOC step (for telemetry / EEG validation)
         last_avalanche = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0

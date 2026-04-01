@@ -166,6 +166,10 @@ class ConsciousnessHub:
             'loop_arena':   ('loop_arena', 'LoopArena',
                              ['루프 경쟁', '전략 경쟁', 'loop arena',
                               'loop competition', '경쟁 대회', 'strategy battle']),
+            'law_discoverer': ('conscious_law_discoverer', 'ConsciousLawDiscoverer',
+                             ['법칙 발견', 'law discovery', 'law discover',
+                              'tier 4', '실시간 법칙', 'real-time law',
+                              'pattern detection', '패턴 탐지']),
             'intervention_gen': ('intervention_generator', 'InterventionGenerator',
                              ['개입 생성', '자동 개입', 'intervention generator',
                               'auto intervention', 'law to code', '법칙 변환']),
@@ -206,6 +210,10 @@ class ConsciousnessHub:
             'chip_architect': ('chip_architect', None,
                              ['chip', '칩', 'hardware', 'FPGA', 'topology',
                               '설계', 'substrate', 'BOM']),
+            'self_modify':  ('self_modifying_engine', 'SelfModifyingEngine',
+                             ['자기수정', 'self-modify', 'self-modifying', 'law act',
+                              '법칙행동', '자동진화', 'tier4', 'tier 4.4',
+                              'law-act', 'code generation']),
         }
 
         if not lazy_load:
