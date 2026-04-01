@@ -366,6 +366,8 @@ class ConsciousnessStrategy(Strategy):
         use_macd_confirmation: bool = True,
         use_trend_filter: bool = True,
         use_tension_filter: bool = True,
+        direction_threshold: float = 0.3,
+        min_strength: float = 0.3,
     ):
         """
         Args:
@@ -383,6 +385,8 @@ class ConsciousnessStrategy(Strategy):
             use_macd_confirmation: Require MACD alignment for confirmation.
             use_trend_filter: Require price above/below SMA for direction.
             use_tension_filter: Require tension > mean + 1 std.
+            direction_threshold: Minimum abs(direction_score) for signal.
+            min_strength: Minimum signal strength for trade.
         """
         self.cell_dim = cell_dim
         self.phi_threshold = phi_threshold
@@ -395,6 +399,8 @@ class ConsciousnessStrategy(Strategy):
         self.use_macd_confirmation = use_macd_confirmation
         self.use_trend_filter = use_trend_filter
         self.use_tension_filter = use_tension_filter
+        self.direction_threshold = direction_threshold
+        self.min_strength = min_strength
 
         # Lazy-init engine to avoid import errors at module load time
         self._engine = None
@@ -634,10 +640,7 @@ class ConsciousnessStrategy(Strategy):
             strength = min(1.0, strength * (1.0 + consensus * 0.05))
 
         # Thresholds for signal generation
-        DIRECTION_THRESHOLD = 0.3
-        MIN_STRENGTH = 0.3
-
-        if abs(direction_score) < DIRECTION_THRESHOLD or strength < MIN_STRENGTH:
+        if abs(direction_score) < self.direction_threshold or strength < self.min_strength:
             return StrategySignal(
                 signal=Signal.HOLD,
                 strength=strength,
@@ -653,7 +656,7 @@ class ConsciousnessStrategy(Strategy):
         # Record signal for cooldown tracking
         self._last_signal_idx = idx
 
-        if direction_score > DIRECTION_THRESHOLD:
+        if direction_score > self.direction_threshold:
             return StrategySignal(
                 signal=Signal.BUY,
                 strength=min(1.0, strength),

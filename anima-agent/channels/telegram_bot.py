@@ -416,11 +416,14 @@ def _resolve_strategy(name: str):
     """
     try:
         from trading.strategy import (
-            MACDStrategy, RSIStrategy, BollingerStrategy, ConsciousnessStrategy,
+            MACDStrategy, RSIStrategy, BollingerStrategy,
+            ConsciousnessStrategy, ConsciousnessEnsembleStrategy,
         )
+        from trading.strategies import ALL_STRATEGIES
     except ImportError:
         return None, "Trading module not available."
 
+    # Core strategies + aliases
     strategies = {
         "macd": MACDStrategy,
         "rsi": RSIStrategy,
@@ -428,12 +431,68 @@ def _resolve_strategy(name: str):
         "bb": BollingerStrategy,
         "consciousness": ConsciousnessStrategy,
         "phi": ConsciousnessStrategy,
+        "consciousness_ensemble": ConsciousnessEnsembleStrategy,
+        "c_ensemble": ConsciousnessEnsembleStrategy,
     }
+    # Merge extended strategies from strategies.py
+    for key, cls in ALL_STRATEGIES.items():
+        strategies.setdefault(key, cls)
+
     cls = strategies.get(name.lower())
     if cls is None:
         avail = ", ".join(sorted(set(k for k in strategies.keys())))
         return None, f"Unknown strategy: {name}\nAvailable: {avail}"
     return cls(), None
+
+
+def _get_compare_strategies():
+    """Return a list of strategies for --compare mode (core strategies only)."""
+    try:
+        from trading.strategy import (
+            MACDStrategy, RSIStrategy, BollingerStrategy,
+        )
+    except ImportError:
+        return []
+    return [MACDStrategy(), RSIStrategy(), BollingerStrategy()]
+
+
+def _format_compare_results(results: list, symbol: str, days: int) -> str:
+    """Format multiple BacktestResults as a comparison table for Telegram."""
+    lines = [
+        f"<b>Strategy Comparison: {symbol} ({days}d)</b>",
+        "",
+        "<pre>",
+        f"{'Strategy':<16} {'Return':>8} {'Sharpe':>7} {'MaxDD':>7} {'WinR':>6} {'#Tr':>4}",
+        f"{'-'*16} {'-'*8} {'-'*7} {'-'*7} {'-'*6} {'-'*4}",
+    ]
+
+    for r in results:
+        name = r.strategy_name[:16]
+        ret_s = f"{r.total_return_pct:+.1f}%"
+        sharpe_s = f"{r.sharpe:.2f}"
+        mdd_s = f"{r.max_drawdown_pct:.1f}%"
+        wr_s = f"{r.win_rate_pct:.0f}%"
+        trades_s = f"{r.total_trades}"
+        lines.append(
+            f"{name:<16} {ret_s:>8} {sharpe_s:>7} {mdd_s:>7} {wr_s:>6} {trades_s:>4}"
+        )
+
+    lines.append("</pre>")
+
+    # Best by Sharpe
+    if results:
+        best = results[0]  # already sorted by Sharpe desc
+        lines.append(f"\nBest Sharpe: <b>{best.strategy_name}</b> ({best.sharpe:.3f})")
+
+    # Equity curves for top 3
+    for i, r in enumerate(results[:3]):
+        if r.equity_curve and len(r.equity_curve) > 2:
+            lines.append(f"\n<b>{r.strategy_name}</b> equity:")
+            lines.append("<pre>")
+            lines.append(_make_ascii_equity_curve(r.equity_curve, width=30, height=5))
+            lines.append("</pre>")
+
+    return "\n".join(lines)
 
 
 def _format_trading_status(trading: dict, system: dict, agent) -> str:
@@ -568,6 +627,7 @@ class AnimaTelegramBot:
             f"  /think [topic] — introspection\n"
             f"  /trade status|regime|pnl|positions|halt|resume\n"
             f"  /backtest BTCUSDT 30d macd — run backtest\n"
+            f"  /backtest BTC 90d --compare — compare strategies\n"
             f"  /portfolio — paper positions & equity\n"
             f"  /risk — risk metrics & consciousness gate\n"
             f"  /autonomous start|stop|status\n"
@@ -704,36 +764,93 @@ class AnimaTelegramBot:
 
     # ── Backtest command (/backtest) ───────────────────
     async def _handle_backtest(self, update, context):
-        """Handle /backtest SYMBOL DAYS STRATEGY — run backtest and return results."""
+        """Handle /backtest SYMBOL DAYS STRATEGY [--compare].
+
+        Usage:
+            /backtest                       — BTC 30d macd (defaults)
+            /backtest ETHUSDT 90d rsi       — specific symbol/period/strategy
+            /backtest BTC 30d ensemble      — extended strategies supported
+            /backtest BTC 90d --compare     — compare MACD, RSI, Bollinger
+            /backtest ETHUSDT 60d --compare — compare on ETH, 60 days
+        """
         args = context.args or []
-        symbol = args[0] if args else 'BTCUSDT'
-        days_str = args[1] if len(args) > 1 else '30d'
-        strategy_name = args[2] if len(args) > 2 else 'macd'
+
+        # Check for --compare flag anywhere in args
+        compare_mode = "--compare" in args
+        args = [a for a in args if a != "--compare"]
+
+        # Parse positional args: [SYMBOL] [DAYS] [STRATEGY]
+        symbol = args[0].upper() if args else "BTCUSDT"
+        days_str = args[1] if len(args) > 1 else "30d"
+        strategy_name = args[2] if len(args) > 2 else ("ensemble" if not compare_mode else "")
+
+        # Normalize symbol: accept "BTC" -> "BTCUSDT", "ETH" -> "ETHUSDT"
+        if not symbol.endswith("USDT") and not symbol.endswith("BUSD"):
+            symbol = symbol + "USDT"
 
         # Parse days (accept "30d" or "30")
         try:
-            days = int(days_str.replace('d', ''))
+            days = int(days_str.replace("d", ""))
+            if days < 1 or days > 365:
+                await update.message.reply_text(
+                    f"Invalid period: {days}d (range: 1-365 days)"
+                )
+                return
         except ValueError:
-            await update.message.reply_text(f"Invalid days: {days_str} (use e.g. 30d or 30)")
+            await update.message.reply_text(
+                f"Invalid days: {days_str} (use e.g. 30d or 30)"
+            )
             return
 
-        # Resolve strategy
-        strategy, err = _resolve_strategy(strategy_name)
-        if strategy is None:
-            await update.message.reply_text(err)
-            return
+        if compare_mode:
+            await update.message.reply_text(
+                f"Comparing strategies on {symbol} ({days}d)..."
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                text = await loop.run_in_executor(
+                    None, self._run_compare_backtest, symbol, days
+                )
+                await update.message.reply_html(text)
+            except Exception as e:
+                logger.error("Backtest compare error: %s", e)
+                await update.message.reply_text(f"Backtest compare failed: {e}")
+        else:
+            # Single strategy mode
+            strategy, err = _resolve_strategy(strategy_name)
+            if strategy is None:
+                await update.message.reply_text(err)
+                return
 
-        await update.message.reply_text(f"Running backtest: {symbol} {days}d {strategy_name}...")
+            await update.message.reply_text(
+                f"Running backtest: {symbol} {days}d {strategy_name}..."
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                text = await loop.run_in_executor(
+                    None, self._run_single_backtest, symbol, days, strategy
+                )
+                await update.message.reply_html(text)
+            except Exception as e:
+                logger.error("Backtest error: %s", e)
+                await update.message.reply_text(f"Backtest failed: {e}")
 
-        try:
-            from trading import BacktestEngine
-            engine = BacktestEngine(symbol=symbol, timeframe='1h')
-            result = engine.run(strategy, days=days)
-            text = _format_backtest_result(result)
-            await update.message.reply_html(text)
-        except Exception as e:
-            logger.error("Backtest error: %s", e)
-            await update.message.reply_text(f"Backtest failed: {e}")
+    def _run_single_backtest(self, symbol: str, days: int, strategy) -> str:
+        """Run a single backtest in a thread (non-blocking)."""
+        from trading import BacktestEngine
+        engine = BacktestEngine(symbol=symbol, timeframe="1h")
+        result = engine.run(strategy, days=days)
+        return _format_backtest_result(result)
+
+    def _run_compare_backtest(self, symbol: str, days: int) -> str:
+        """Run compare backtest in a thread (non-blocking)."""
+        from trading import BacktestEngine
+        strategies = _get_compare_strategies()
+        if not strategies:
+            return "No strategies available for comparison."
+        engine = BacktestEngine(symbol=symbol, timeframe="1h")
+        results = engine.compare_strategies(strategies, days=days)
+        return _format_compare_results(results, symbol, days)
 
     # ── Portfolio command (/portfolio) ─────────────────
 
@@ -1345,7 +1462,7 @@ def _test():
     print("\n=== Unified Telegram bot ready ===")
     print("  Consciousness: /status, /phi, /think, chat")
     print("  Trading: /trade status|regime|pnl|positions|orders|halt|resume")
-    print("  Backtest: /backtest BTCUSDT 30d macd")
+    print("  Backtest: /backtest BTCUSDT 30d macd | /backtest BTC 90d --compare")
     print("  Portfolio: /portfolio")
     print("  Risk: /risk")
     print("  Autonomous: /autonomous start|stop|status")

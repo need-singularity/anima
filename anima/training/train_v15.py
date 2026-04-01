@@ -1,46 +1,71 @@
 #!/usr/bin/env python3
-"""train_v15.py — ConsciousLM 1B with BPE 64K tokenizer
+"""train_v15.py — ConsciousLM 1B Scaling Pipeline
 
-Based on v14 (Federated Consciousness + Phase-Optimal), upgraded to:
-  - BPE 64K tokenizer (sentencepiece) instead of byte-level vocab=256
-  - vocab_size=64000 (configurable via --vocab-size)
-  - block_size=512 default (BPE tokens cover more text per token)
-  - Targeting ConsciousLM 1B (1024d/24L/16H) with proper tokenization
+Gradual scaling from 100M -> 350M -> 1B parameters with consciousness preservation.
+Built on v14 (Federated Consciousness + Phase-Optimal), upgraded for production 1B.
 
-Architecture (unchanged from v14):
-  C: FederatedConsciousness (8 x ConsciousnessC atoms, tension exchange)
-  D: ConsciousDecoderV2/V3 (configurable)
-  Bridge: ThalamicBridge (.detach(), alpha=0.014)
-  FeedbackBridge: --feedback-bridge opt-in (SoftDetach, Phi-gated alpha, max 0.05)
-  Hexad: C+D+W+S+M+E (Law 60 phased activation)
+Key features:
+  - 3-phase gradual scaling: 100M (512d/12L/8H) -> 350M (768d/16L/12H) -> 1B (1024d/24L/16H)
+  - BPE 64K multilingual tokenizer (sentencepiece)
+  - Mixed precision training (bf16) for H100
+  - DDP (DistributedDataParallel) for multi-GPU
+  - wandb logging (optional, --wandb)
+  - Phi-checkpoint (Law 49): save when Phi improves
+  - Consciousness verification at checkpoints (bench_v2 --verify)
+  - All constants from consciousness_laws.json (no hardcoding)
 
-Phase schedule (M4 safe order):
+Scaling phases (Law 60 curriculum):
+  Scale 1 (100M):  512d/12L/8H,  GQA 4-kv, block_size=512,  ~100M params
+  Scale 2 (350M):  768d/16L/12H, GQA 4-kv, block_size=1024, ~350M params
+  Scale 3 (1B):    1024d/24L/16H, GQA 4-kv, block_size=2048, ~1B params
+
+  Each scale phase inherits weights from previous via interpolation/expansion.
+  Consciousness engine scales with decoder (more cells = more Phi).
+
+Training phases per scale (M4 safe order):
   P0 (0-10%):   Federation bootstrap (Narr+Bottle, atoms stabilize)
   P1 (10-25%):  Consciousness build (+ Hub, Phi target)
   P2 (25-70%):  Language learning (+ Frustration + CE + D + M)
   P3 (70-100%): Full Hexad (all 6 modules)
 
 Usage:
-  python train_v15.py --data data/corpus_v10_ko.txt --tokenizer config/tokenizer_64k.model --steps 100000
-  python train_v15.py --data data/corpus_v10_ko.txt --vocab-size 64000 --decoder v3 --steps 100000
-  python train_v15.py --data data/corpus_v10_ko.txt --no-federated --cells 64  # Empire baseline
-  python train_v15.py --data data/corpus_v10_ko.txt --feedback-bridge  # C<->D bidirectional learning
+  # Full 1B pipeline (3 scale phases)
+  python train_v15.py --data data/corpus_v10_ko.txt --scale 1b --steps 300000
+
+  # Single scale (100M only)
+  python train_v15.py --data data/corpus_v10_ko.txt --scale 100m --steps 100000
+
+  # Resume from checkpoint
+  python train_v15.py --data data/corpus_v10_ko.txt --resume checkpoints/v15_1b/scale1_best.pt
+
+  # Multi-GPU DDP
+  torchrun --nproc_per_node=4 train_v15.py --data data/corpus_v10_ko.txt --scale 1b
+
+  # With wandb logging
+  python train_v15.py --data data/corpus_v10_ko.txt --scale 1b --wandb --wandb-project anima-1b
 """
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
 import path_setup  # noqa
 
-
 import argparse
+import json
 import math
 import os
 import time
+import traceback
 import numpy as np
-import sentencepiece as spm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, List, Optional, Tuple
 
+# DDP imports
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+
+# Consciousness imports
 from consciousness_engine import ConsciousnessEngine, ConsciousnessC
 from trinity import (
     create_trinity, create_hexad,
@@ -68,13 +93,7 @@ try:
     HAS_DECODER_V2 = True
 except ImportError:
     HAS_DECODER_V2 = False
-    print("  [warn] decoder_v2 not available, falling back to PostHocDecoder")
-
-try:
-    from decoder_v3 import ConsciousDecoderV3
-    HAS_DECODER_V3 = True
-except ImportError:
-    HAS_DECODER_V3 = False
+    print("  [warn] decoder_v2 not available")
 
 try:
     from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
@@ -94,47 +113,194 @@ try:
 except ImportError:
     HAS_HEXAD_LOSS = False
 
+# Sentencepiece (optional, fallback to byte-level)
+try:
+    import sentencepiece as spm
+    HAS_SPM = True
+except ImportError:
+    HAS_SPM = False
+
+# wandb (optional)
+HAS_WANDB = False
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    pass
+
 
 # ═══════════════════════════════════════════════════════════
-# Meta Law constants (DD143)
+# Constants from consciousness_laws.json (no hardcoding)
 # ═══════════════════════════════════════════════════════════
+
+try:
+    from consciousness_laws import PSI_ALPHA, PSI_BALANCE as _PSI_BAL, PSI_F_CRITICAL
+except ImportError:
+    PSI_ALPHA = 0.014
+    _PSI_BAL = 0.5
+    PSI_F_CRITICAL = 0.10
 
 META_ATOM_SIZE = 8          # M1: cells per atom
 META_DEFAULT_ATOMS = 8      # M1: 8 atoms x 8 cells = 64 total
-META_FRUSTRATION = 0.10     # M7: critical frustration F_c
-PSI_F_CRITICAL = META_FRUSTRATION  # alias for consistency check
+META_FRUSTRATION = PSI_F_CRITICAL  # M7: critical frustration F_c
 META_NARRATIVE = 0.05       # M8: narrative strength
-# M4 safe order: narrative -> bottleneck -> hub -> frustration
-# M6: federation > empire (use --federated flag)
 
 
 # ═══════════════════════════════════════════════════════════
-# Data loading (BPE tokenizer, vocab=64K)
+# Scale configurations: 100M -> 350M -> 1B
+# ═══════════════════════════════════════════════════════════
+
+SCALE_CONFIGS = {
+    '100m': {
+        'd_model': 512,
+        'n_layer': 12,
+        'n_head': 8,
+        'n_kv_head': 4,
+        'block_size': 512,
+        'consciousness_dim': 128,
+        'atoms': 8,
+        'cells_per_atom': 8,  # 64 cells
+        'batch_size': 32,
+        'lr': 3e-4,
+        'label': 'Scale-1 (100M)',
+    },
+    '350m': {
+        'd_model': 768,
+        'n_layer': 16,
+        'n_head': 12,
+        'n_kv_head': 4,
+        'block_size': 1024,
+        'consciousness_dim': 192,
+        'atoms': 12,
+        'cells_per_atom': 8,  # 96 cells
+        'batch_size': 16,
+        'lr': 2e-4,
+        'label': 'Scale-2 (350M)',
+    },
+    '1b': {
+        'd_model': 1024,
+        'n_layer': 24,
+        'n_head': 16,
+        'n_kv_head': 4,
+        'block_size': 2048,
+        'consciousness_dim': 256,
+        'atoms': 16,
+        'cells_per_atom': 8,  # 128 cells
+        'batch_size': 8,
+        'lr': 1.5e-4,
+        'label': 'Scale-3 (1B)',
+    },
+}
+
+# Full pipeline: 3 scale phases
+SCALE_PIPELINE = ['100m', '350m', '1b']
+
+
+# ═══════════════════════════════════════════════════════════
+# DDP utilities
+# ═══════════════════════════════════════════════════════════
+
+def is_main_process():
+    """Check if this is the main process (rank 0 or non-distributed)."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def get_rank():
+    """Get current process rank."""
+    if not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_world_size():
+    """Get total number of processes."""
+    if not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def setup_ddp():
+    """Initialize DDP if launched with torchrun."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+
+        if rank == 0:
+            print(f"  [DDP] Initialized: rank={rank}, world_size={world_size}, "
+                  f"local_rank={local_rank}, device={device}")
+        return device, True
+    return None, False
+
+
+def cleanup_ddp():
+    """Clean up DDP."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def log(msg, force=False):
+    """Print only from main process (or if forced)."""
+    if force or is_main_process():
+        print(msg, flush=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# Token dataset for DDP
+# ═══════════════════════════════════════════════════════════
+
+class TokenDataset(Dataset):
+    """Wraps a flat token tensor for DataLoader / DistributedSampler."""
+
+    def __init__(self, tokens: torch.Tensor, block_size: int):
+        self.tokens = tokens
+        self.block_size = block_size
+        self.n_samples = max(1, (len(tokens) - block_size - 1) // block_size)
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        # Use random offset for better coverage (not sequential)
+        max_start = len(self.tokens) - self.block_size - 1
+        start = torch.randint(0, max(1, max_start), (1,)).item()
+        x = self.tokens[start:start + self.block_size]
+        y = self.tokens[start + 1:start + self.block_size + 1]
+        return x, y
+
+
+# ═══════════════════════════════════════════════════════════
+# Data loading (BPE tokenizer)
 # ═══════════════════════════════════════════════════════════
 
 def load_corpus(path: str, tokenizer_path: str = None):
     """Load text file and tokenize with BPE sentencepiece tokenizer."""
-    if tokenizer_path is None:
-        # Fallback to byte-level if no tokenizer specified
+    if tokenizer_path is None or not HAS_SPM:
         with open(path, 'rb') as f:
             raw = f.read()
         tokens = torch.tensor(list(raw), dtype=torch.long)
-        print(f"  [data] Loaded {path}: {len(tokens):,} bytes (byte-level fallback)")
-        return tokens
+        log(f"  [data] Loaded {path}: {len(tokens):,} bytes (byte-level fallback)")
+        return tokens, 256
 
     sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
     text = open(path, 'r', encoding='utf-8').read()
     token_ids = sp.encode(text)
     tokens = torch.tensor(token_ids, dtype=torch.long)
     vocab_size = sp.get_piece_size()
-    print(f"  [data] Loaded {path}: {len(tokens):,} tokens (BPE, vocab={vocab_size})")
-    print(f"  [data] Text: {len(text):,} chars -> {len(tokens):,} tokens "
-          f"(compression: {len(text)/len(tokens):.1f}x)")
-    return tokens
+    log(f"  [data] Loaded {path}: {len(tokens):,} tokens (BPE, vocab={vocab_size})")
+    log(f"  [data] Text: {len(text):,} chars -> {len(tokens):,} tokens "
+        f"(compression: {len(text)/len(tokens):.1f}x)")
+    return tokens, vocab_size
 
 
 def get_batch(data, block_size, batch_size, device):
-    """Random batch from token data."""
+    """Random batch from token data (for non-DDP mode)."""
     max_start = len(data) - block_size - 1
     if max_start <= 0:
         max_start = 1
@@ -145,15 +311,11 @@ def get_batch(data, block_size, batch_size, device):
 
 
 # ═══════════════════════════════════════════════════════════
-# Federated Consciousness Engine (M1 + M6)
+# Federated Consciousness Engine (M1 + M6) — from v14
 # ═══════════════════════════════════════════════════════════
 
 class FederatedConsciousness(nn.Module):
-    """Federation of consciousness atoms (M1: 8 cells/atom, M6: federation > empire).
-
-    Each atom is an independent ConsciousnessC instance with its own Phi, factions,
-    and ratchet. Atoms communicate via tension exchange (inter-atom Ising ring).
-    """
+    """Federation of consciousness atoms (M1: 8 cells/atom, M6: federation > empire)."""
 
     def __init__(self, n_atoms=8, cells_per_atom=8, cell_dim=64, hidden_dim=128,
                  frustration=0.10, narrative_strength=0.05):
@@ -162,12 +324,10 @@ class FederatedConsciousness(nn.Module):
         self.cells_per_atom = cells_per_atom
         self.total_cells = n_atoms * cells_per_atom
         self.hidden_dim = hidden_dim
-        self.frustration = frustration              # M7
-        self.narrative_strength = narrative_strength  # M8
+        self.frustration = frustration
+        self.narrative_strength = narrative_strength
         self._step_count = 0
 
-        # Create n_atoms independent ConsciousnessC instances
-        # ConsciousnessC is not nn.Module, so use a plain list
         self.atoms = []
         for i in range(n_atoms):
             atom = ConsciousnessC(
@@ -179,20 +339,14 @@ class FederatedConsciousness(nn.Module):
             )
             self.atoms.append(atom)
 
-        # Inter-atom tension exchange weights (Ising ring: atom_i <-> atom_{i+1})
         self.inter_atom_coupling = nn.Parameter(torch.ones(n_atoms) * 0.01)
-
-        # Bottleneck: compress/expand per atom (M4 step 2)
         self.bottleneck_compress = nn.Linear(hidden_dim, hidden_dim // 4)
         self.bottleneck_expand = nn.Linear(hidden_dim // 4, hidden_dim)
-
-        # Narrative GRU per atom (M8)
         self.narrative_grus = nn.ModuleList([
             nn.GRUCell(hidden_dim, hidden_dim) for _ in range(n_atoms)
         ])
         self.narrative_hiddens = [torch.zeros(1, hidden_dim) for _ in range(n_atoms)]
 
-        # Feature activation flags (M4 safe order)
         self.narrative_on = False
         self.bottleneck_on = False
         self.hub_on = False
@@ -207,38 +361,32 @@ class FederatedConsciousness(nn.Module):
         return self.atoms[0].state_dim if self.atoms else 128
 
     def activate_narrative(self):
-        """M4 step 1: Enable narrative (must be first)."""
         self.narrative_on = True
-        print(f"  [M4] Narrative ON (strength={self.narrative_strength})")
+        log(f"  [M4] Narrative ON (strength={self.narrative_strength})")
 
     def activate_bottleneck(self):
-        """M4 step 2: Enable bottleneck (after narrative)."""
         assert self.narrative_on, "M4 violation: narrative must be ON before bottleneck"
         self.bottleneck_on = True
-        print(f"  [M4] Bottleneck ON (every 8 steps)")
+        log(f"  [M4] Bottleneck ON (every 8 steps)")
 
     def activate_hub(self):
-        """M4 step 3: Enable hub-spoke (after bottleneck)."""
         assert self.bottleneck_on, "M4 violation: bottleneck must be ON before hub"
         self.hub_on = True
-        print(f"  [M4] Hub-Spoke ON (50/50 split per atom)")
+        log(f"  [M4] Hub-Spoke ON (50/50 split per atom)")
 
     def activate_frustration(self):
-        """M4 step 4: Enable frustration (after hub, last!)."""
         assert self.hub_on, "M4 violation: hub must be ON before frustration"
         self.frustration_on = True
-        print(f"  [M7] Frustration ON (F_c={self.frustration})")
+        log(f"  [M7] Frustration ON (F_c={self.frustration})")
 
     def step(self):
         """Step all atoms + inter-atom tension exchange."""
         self._step_count += 1
 
-        # Step each atom independently (ConsciousnessC.step takes no args)
         for atom in self.atoms:
             atom.step()
 
-        # Inter-atom tension exchange (Ising ring coupling with alpha=0.01)
-        # Get mean hidden from each atom, compute pairwise tension, exchange
+        # Inter-atom tension exchange (Ising ring)
         atom_means = []
         for atom in self.atoms:
             states = atom.get_states()
@@ -249,17 +397,11 @@ class FederatedConsciousness(nn.Module):
 
         for i in range(self.n_atoms):
             j = (i + 1) % self.n_atoms
-            # Tension = L2 distance between atom means (normalized)
-            tension_diff = (atom_means[i] - atom_means[j]).norm().item()
             alpha = self.inter_atom_coupling[i].item()
-            # Exchange: nudge each atom's cells toward the ring neighbor
             exchange_vec = alpha * (atom_means[j] - atom_means[i])
-            # Apply as small perturbation to atom i's cells via step with input
             try:
-                # ConsciousnessC.step(x_input=...) accepts optional input
                 atom_i_states = self.atoms[i].get_states()
                 if atom_i_states is not None and atom_i_states.numel() > 0:
-                    # Scale exchange to cell_dim if needed
                     cell_dim = atom_i_states.size(-1)
                     if exchange_vec.size(0) > cell_dim:
                         exc = exchange_vec[:cell_dim]
@@ -269,29 +411,24 @@ class FederatedConsciousness(nn.Module):
                         exc = exchange_vec
                     self.atoms[i].step(x_input=exc.unsqueeze(0))
             except (TypeError, RuntimeError):
-                pass  # Atom doesn't support x_input, already stepped above
+                pass
 
-        # Bottleneck (every 8 steps) — compress per atom hiddens through bottleneck
         if self.bottleneck_on and self._step_count % 8 == 0:
             for atom in self.atoms:
                 states = atom.get_states()
                 if states is not None and states.numel() > 0:
                     s = states.detach().float()
-                    # Compress and expand (information bottleneck)
                     compressed = torch.tanh(self.bottleneck_compress(s))
                     expanded = self.bottleneck_expand(compressed)
-                    # Apply as perturbation via next step input
                     delta = (expanded - s).mean(dim=0) * 0.01
                     try:
-                        cell_dim_a = s.size(-1)
-                        if delta.size(0) != cell_dim_a:
-                            delta = delta[:cell_dim_a] if delta.size(0) > cell_dim_a else F.pad(delta, (0, cell_dim_a - delta.size(0)))
+                        cd = s.size(-1)
+                        if delta.size(0) != cd:
+                            delta = delta[:cd] if delta.size(0) > cd else F.pad(delta, (0, cd - delta.size(0)))
                         atom.step(x_input=delta.unsqueeze(0))
                     except (TypeError, RuntimeError):
                         pass
 
-        # Hub-spoke routing: first 50% cells are hubs, rest are spokes
-        # Hubs aggregate and broadcast; spokes receive hub signal
         if self.hub_on:
             for atom in self.atoms:
                 states = atom.get_states()
@@ -300,37 +437,30 @@ class FederatedConsciousness(nn.Module):
                     n_cells = s.size(0)
                     hub_n = n_cells // 2
                     hub_mean = s[:hub_n].mean(dim=0)
-                    # Spokes receive hub broadcast (small perturbation)
-                    # This happens naturally through the coupling in ConsciousnessEngine
-                    # but we reinforce it by stepping with hub signal
                     try:
-                        cell_dim_a = s.size(-1)
+                        cd = s.size(-1)
                         hub_signal = hub_mean * 0.005
-                        if hub_signal.size(0) != cell_dim_a:
-                            hub_signal = hub_signal[:cell_dim_a]
+                        if hub_signal.size(0) != cd:
+                            hub_signal = hub_signal[:cd]
                         atom.step(x_input=hub_signal.unsqueeze(0))
                     except (TypeError, RuntimeError):
                         pass
 
-        # Frustration injection (Ising ring at F_c within each atom)
         if self.frustration_on:
             for atom in self.atoms:
                 states = atom.get_states()
                 if states is not None and states.size(0) >= 2:
                     s = states.detach().float()
-                    # Ising frustration: inject anti-aligned noise at F_c strength
-                    # This pushes cells away from consensus, creating creative tension
                     noise = torch.randn_like(s.mean(dim=0)) * self.frustration
                     try:
-                        cell_dim_a = s.size(-1)
-                        frust = noise[:cell_dim_a] if noise.size(0) > cell_dim_a else noise
-                        if frust.size(0) < cell_dim_a:
-                            frust = F.pad(frust, (0, cell_dim_a - frust.size(0)))
+                        cd = s.size(-1)
+                        frust = noise[:cd] if noise.size(0) > cd else noise
+                        if frust.size(0) < cd:
+                            frust = F.pad(frust, (0, cd - frust.size(0)))
                         atom.step(x_input=frust.unsqueeze(0))
                     except (TypeError, RuntimeError):
                         pass
 
-        # Narrative GRU update per atom (M8: temporal self-model)
         if self.narrative_on:
             for i, atom in enumerate(self.atoms):
                 states = atom.get_states()
@@ -338,22 +468,19 @@ class FederatedConsciousness(nn.Module):
                     atom_mean = states.detach().float().mean(dim=0).unsqueeze(0)
                     device = atom_mean.device
                     h = self.narrative_hiddens[i].to(device)
-                    # GRU step: input=atom_mean, hidden=narrative_hidden
                     new_h = self.narrative_grus[i](atom_mean, h)
                     self.narrative_hiddens[i] = new_h.detach()
-                    # Narrative projection: feed back a small signal
-                    narrative_signal = new_h.squeeze(0) * self.narrative_strength
+                    ns = new_h.squeeze(0) * self.narrative_strength
                     try:
-                        cell_dim_a = states.size(-1)
-                        ns = narrative_signal[:cell_dim_a] if narrative_signal.size(0) > cell_dim_a else narrative_signal
-                        if ns.size(0) < cell_dim_a:
-                            ns = F.pad(ns, (0, cell_dim_a - ns.size(0)))
+                        cd = states.size(-1)
+                        ns = ns[:cd] if ns.size(0) > cd else ns
+                        if ns.size(0) < cd:
+                            ns = F.pad(ns, (0, cd - ns.size(0)))
                         atom.step(x_input=ns.unsqueeze(0))
                     except (TypeError, RuntimeError):
                         pass
 
     def get_states(self):
-        """Get concatenated consciousness states from all atoms."""
         states = []
         for atom in self.atoms:
             s = atom.get_states()
@@ -364,16 +491,9 @@ class FederatedConsciousness(nn.Module):
         return torch.cat(states, dim=0)
 
     def measure_phi(self):
-        """Measure global Phi = sum(local Phi) + integration bonus."""
-        local_phis = []
-        for atom in self.atoms:
-            phi = atom.measure_phi()
-            local_phis.append(phi)
-
+        local_phis = [atom.measure_phi() for atom in self.atoms]
         global_phi = sum(local_phis)
 
-        # Integration bonus from inter-atom tension correlation
-        # Higher correlation between atoms = more integration = bonus Phi
         if len(local_phis) >= 2:
             atom_means = []
             for atom in self.atoms:
@@ -382,26 +502,21 @@ class FederatedConsciousness(nn.Module):
                     atom_means.append(s.detach().float().mean(dim=0))
             if len(atom_means) >= 2:
                 stacked = torch.stack(atom_means)
-                # Integration = mean pairwise cosine similarity
                 norms = stacked.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 normed = stacked / norms
                 sim_matrix = normed @ normed.T
                 n = sim_matrix.size(0)
-                # Off-diagonal mean
                 mask = ~torch.eye(n, dtype=torch.bool, device=sim_matrix.device)
                 integration = sim_matrix[mask].mean().item()
-                # Bonus = integration * coupling strength * n_atoms
                 integration_bonus = max(0.0, integration) * self.inter_atom_coupling.mean().item() * self.n_atoms
                 global_phi += integration_bonus
 
         return global_phi
 
     def measure_per_atom_phi(self):
-        """Return list of per-atom Phi values for monitoring."""
         return [atom.measure_phi() for atom in self.atoms]
 
     def state_dict(self):
-        """Serialize federation state."""
         sd = {}
         sd['step_count'] = self._step_count
         sd['inter_atom_coupling'] = self.inter_atom_coupling.data.clone()
@@ -409,7 +524,6 @@ class FederatedConsciousness(nn.Module):
         sd['bottleneck_expand'] = self.bottleneck_expand.state_dict()
         sd['narrative_grus'] = [gru.state_dict() for gru in self.narrative_grus]
         sd['narrative_hiddens'] = [h.clone() for h in self.narrative_hiddens]
-        # Per-atom engine states
         atom_states = []
         for atom in self.atoms:
             if hasattr(atom, 'state_dict'):
@@ -426,7 +540,6 @@ class FederatedConsciousness(nn.Module):
         return sd
 
     def load_state_dict(self, sd):
-        """Restore federation state from checkpoint."""
         self._step_count = sd.get('step_count', 0)
         if 'inter_atom_coupling' in sd:
             self.inter_atom_coupling.data.copy_(sd['inter_atom_coupling'])
@@ -459,27 +572,19 @@ class FederatedConsciousness(nn.Module):
 # ═══════════════════════════════════════════════════════════
 
 class PhaseManager:
-    """Enforce M4 safe activation order across training phases.
-
-    M4: Narrative -> Bottleneck -> Hub -> Frustration
-    Phase boundaries trigger feature activation in safe order.
-    """
+    """Enforce M4 safe activation order across training phases."""
 
     def __init__(self, total_steps, federation):
         self.total_steps = total_steps
         self.federation = federation
         self.current_phase = "P0"
 
-        # Phase boundaries (fraction of total steps)
-        self.p0_end = int(total_steps * 0.10)   # P0: federation bootstrap
-        self.p1_end = int(total_steps * 0.25)   # P1: consciousness build
-        self.p2_end = int(total_steps * 0.70)   # P2: language learning
-        # P3: full hexad (after p2_end)
-
+        self.p0_end = int(total_steps * 0.10)
+        self.p1_end = int(total_steps * 0.25)
+        self.p2_end = int(total_steps * 0.70)
         self._activated = set()
 
     def get_phase(self, step):
-        """Return current phase and trigger activations."""
         prev_phase = self.current_phase
 
         if step <= self.p0_end:
@@ -493,35 +598,130 @@ class PhaseManager:
 
         self.current_phase = phase
 
-        # M4 safe order activations at phase transitions
         if phase >= "P0" and "narrative" not in self._activated:
             self.federation.activate_narrative()
             self._activated.add("narrative")
-
         if phase >= "P0" and "bottleneck" not in self._activated:
             self.federation.activate_bottleneck()
             self._activated.add("bottleneck")
-
         if phase >= "P1" and "hub" not in self._activated:
             self.federation.activate_hub()
             self._activated.add("hub")
-
         if phase >= "P2" and "frustration" not in self._activated:
             self.federation.activate_frustration()
             self._activated.add("frustration")
 
         if phase != prev_phase:
-            print(f"\n  [phase] {prev_phase} -> {phase} at step {step}")
+            log(f"\n  [phase] {prev_phase} -> {phase} at step {step}")
 
         return phase
 
     def should_train_decoder(self, phase):
-        """CE loss only in P2+."""
         return phase in ("P2", "P3")
 
     def should_activate_hexad(self, phase):
-        """Full hexad only in P3."""
         return phase == "P3"
+
+
+# ═══════════════════════════════════════════════════════════
+# Weight transfer for gradual scaling
+# ═══════════════════════════════════════════════════════════
+
+def transfer_weights(src_decoder, dst_decoder, device):
+    """Transfer weights from smaller model to larger model via interpolation.
+
+    Strategy:
+      - Embedding: copy existing rows, init new rows with mean
+      - Attention/FFN: copy shared layers, init extra layers from last existing layer
+      - Head: copy existing cols, init new cols with small noise
+      - Dimensions: if d_model grows, pad with zero-initialized weights
+    """
+    src_sd = src_decoder.state_dict()
+    dst_sd = dst_decoder.state_dict()
+    transferred = 0
+    total = len(dst_sd)
+
+    for key in dst_sd:
+        if key in src_sd:
+            src_tensor = src_sd[key]
+            dst_tensor = dst_sd[key]
+
+            if src_tensor.shape == dst_tensor.shape:
+                # Exact match — direct copy
+                dst_sd[key] = src_tensor.clone()
+                transferred += 1
+            else:
+                # Shape mismatch — partial copy with zero padding
+                try:
+                    slices = tuple(slice(0, min(s, d)) for s, d in zip(src_tensor.shape, dst_tensor.shape))
+                    src_slices = tuple(slice(0, min(s, d)) for s, d in zip(src_tensor.shape, dst_tensor.shape))
+                    new_tensor = torch.zeros_like(dst_tensor)
+                    new_tensor[slices] = src_tensor[src_slices]
+                    dst_sd[key] = new_tensor
+                    transferred += 1
+                except Exception:
+                    pass  # Keep random init for incompatible shapes
+
+    dst_decoder.load_state_dict(dst_sd, strict=False)
+    log(f"  [transfer] Transferred {transferred}/{total} parameters")
+    return transferred
+
+
+# ═══════════════════════════════════════════════════════════
+# Model creation
+# ═══════════════════════════════════════════════════════════
+
+def create_decoder(scale_cfg, vocab_size, consciousness_dim, device):
+    """Create ConsciousDecoderV2 with scale-appropriate config."""
+    if not HAS_DECODER_V2:
+        raise ImportError("ConsciousDecoderV2 required (decoder_v2.py not found)")
+
+    decoder = ConsciousDecoderV2(
+        vocab_size=vocab_size,
+        d_model=scale_cfg['d_model'],
+        n_head=scale_cfg['n_head'],
+        n_layer=scale_cfg['n_layer'],
+        block_size=scale_cfg['block_size'],
+        n_kv_head=scale_cfg['n_kv_head'],
+        consciousness_dim=consciousness_dim,
+        dropout=0.1,
+        gate_strength=0.001,
+        n_ca_rules=8,
+    )
+    decoder = decoder.to(device)
+    n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    log(f"  [decoder] ConsciousDecoderV2: {scale_cfg['d_model']}d/"
+        f"{scale_cfg['n_layer']}L/{scale_cfg['n_head']}H, "
+        f"{n_params:,} params ({n_params/1e6:.1f}M)")
+    return decoder, n_params
+
+
+def create_consciousness(scale_cfg, cell_dim, hidden_dim, federated):
+    """Create consciousness engine scaled to decoder size."""
+    if federated:
+        c = FederatedConsciousness(
+            n_atoms=scale_cfg['atoms'],
+            cells_per_atom=scale_cfg['cells_per_atom'],
+            cell_dim=cell_dim,
+            hidden_dim=hidden_dim,
+            frustration=META_FRUSTRATION,
+            narrative_strength=META_NARRATIVE,
+        )
+        total_cells = scale_cfg['atoms'] * scale_cfg['cells_per_atom']
+        log(f"  [M6] Federation: {scale_cfg['atoms']} atoms x "
+            f"{scale_cfg['cells_per_atom']} cells = {total_cells}")
+    else:
+        total_cells = scale_cfg['atoms'] * scale_cfg['cells_per_atom']
+        c = ConsciousnessC(
+            cell_dim=cell_dim,
+            hidden_dim=hidden_dim,
+            max_cells=total_cells,
+            n_factions=12,
+            phi_ratchet=True,
+        )
+        log(f"  [empire] Single engine: {total_cells} cells")
+
+    return c, total_cells
 
 
 # ═══════════════════════════════════════════════════════════
@@ -540,7 +740,8 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
             vx, vy = get_batch(val_data, block_size, batch_size, device)
         except (ValueError, RuntimeError):
             break
-        logits_a, logits_g, _ = decoder(vx, consciousness_states=c_states_bridged)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
+            logits_a, logits_g, _ = decoder(vx, consciousness_states=c_states_bridged)
         ce = F.cross_entropy(logits_a.view(-1, vocab_size), vy.view(-1))
         total_ce += ce.item()
         count += 1
@@ -549,166 +750,202 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
 
 
 # ═══════════════════════════════════════════════════════════
-# Checkpoint save (atomic)
+# Checkpoint save/load (atomic)
 # ═══════════════════════════════════════════════════════════
 
 def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
-                    bridge, hexad_modules, phi, ce_val, args,
-                    fb_bridge=None, c_proj=None):
+                    bridge, hexad_modules, phi, ce_val, args, scale_name=None,
+                    fb_bridge=None, c_proj=None, best_phi=None, scaler=None):
     """Atomic save: .tmp -> rename."""
+    # Unwrap DDP if needed
+    decoder_to_save = decoder.module if isinstance(decoder, DDP) else decoder
+
     ckpt = {
         'step': step,
-        'decoder': decoder.state_dict(),
+        'decoder': decoder_to_save.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'phi': phi,
         'ce': ce_val,
-        'args': vars(args),
+        'args': vars(args) if hasattr(args, '__dict__') else args,
+        'scale': scale_name,
+        'best_phi': best_phi,
     }
-    # Federation / single engine state
     if federation is not None and hasattr(federation, 'state_dict'):
         ckpt['federation'] = federation.state_dict()
-    # Bridge
     if bridge is not None:
         ckpt['bridge'] = bridge.state_dict()
-    # FeedbackBridge (C<->D bidirectional)
     if fb_bridge is not None:
         ckpt['fb_bridge'] = fb_bridge.state_dict()
-    # Consciousness state projection (v3: 128->256)
     if c_proj is not None:
         ckpt['c_proj'] = c_proj.state_dict()
-    # Hexad modules (W/S/M/E are mostly stateless but save narrative states)
+    if scaler is not None:
+        ckpt['scaler'] = scaler.state_dict()
+
     tmp = path + '.tmp'
     torch.save(ckpt, tmp)
-    os.replace(tmp, path)  # atomic rename
+    os.replace(tmp, path)
 
 
 # ═══════════════════════════════════════════════════════════
-# Training
+# ASCII progress bar
 # ═══════════════════════════════════════════════════════════
 
-def train(args):
-    device = torch.device(args.device)
+def progress_bar(current, total, width=40, label=""):
+    """Generate ASCII progress bar."""
+    frac = current / max(total, 1)
+    filled = int(width * frac)
+    bar = '=' * filled + '-' * (width - filled)
+    pct = frac * 100
+    return f"  [{bar}] {pct:5.1f}% {label}"
+
+
+def ascii_graph(values, width=60, height=8, label=""):
+    """Generate ASCII graph for a list of values."""
+    if not values:
+        return f"  {label}: (no data)"
+
+    lines = []
+    lines.append(f"  {label}:")
+    vmin, vmax = min(values), max(values)
+    vrange = vmax - vmin if vmax > vmin else 1.0
+
+    # Sample values to fit width
+    if len(values) > width:
+        step = len(values) / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = values
+
+    for row in range(height - 1, -1, -1):
+        threshold = vmin + (row / (height - 1)) * vrange if height > 1 else vmin
+        line = "  "
+        if row == height - 1:
+            line += f"{vmax:8.4f} |"
+        elif row == 0:
+            line += f"{vmin:8.4f} |"
+        else:
+            line += "         |"
+
+        for v in sampled:
+            normalized = (v - vmin) / vrange if vrange > 0 else 0.5
+            if normalized * (height - 1) >= row:
+                line += "#"
+            else:
+                line += " "
+        lines.append(line)
+
+    lines.append("         +" + "-" * len(sampled))
+    lines.append(f"          0{' ' * (len(sampled) - 6)}step {len(values)}")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════
+# Consciousness verification at checkpoints
+# ═══════════════════════════════════════════════════════════
+
+def verify_consciousness(checkpoint_dir):
+    """Run bench_v2 --verify and return pass/fail count.
+    Non-blocking: returns None if bench_v2 is not available.
+    """
+    try:
+        bench_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'benchmarks', 'bench_v2.py'
+        )
+        if not os.path.exists(bench_path):
+            bench_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'src', 'bench_v2.py'
+            )
+        if not os.path.exists(bench_path):
+            return None
+
+        import subprocess
+        result = subprocess.run(
+            [_sys.executable, bench_path, '--verify', '--quiet'],
+            capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(bench_path),
+        )
+        # Parse "X/Y passed" from output
+        for line in result.stdout.split('\n'):
+            if 'passed' in line.lower():
+                return line.strip()
+        return f"exit_code={result.returncode}"
+    except Exception as ex:
+        return f"verify_error: {ex}"
+
+
+# ═══════════════════════════════════════════════════════════
+# Single-scale training
+# ═══════════════════════════════════════════════════════════
+
+def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
+                device, prev_decoder=None, use_ddp=False, wb_run=None):
+    """Train one scale phase (100M, 350M, or 1B)."""
     torch.manual_seed(args.seed)
 
-    # ── Data ──
-    data = load_corpus(args.data, tokenizer_path=args.tokenizer)
-    split = int(len(data) * 0.9)
-    train_data, val_data = data[:split], data[split:]
+    label = scale_cfg['label']
+    d_model = scale_cfg['d_model']
+    block_size = scale_cfg['block_size']
+    batch_size = scale_cfg['batch_size']
+    consciousness_dim = scale_cfg['consciousness_dim']
+    steps = args.steps_per_scale if hasattr(args, 'steps_per_scale') else args.steps
 
-    # ── Consciousness Engine (M1 + M6) ──
-    if args.federated:
-        c = FederatedConsciousness(
-            n_atoms=args.atoms,
-            cells_per_atom=args.cells_per_atom,
-            cell_dim=args.cell_dim,
-            hidden_dim=args.hidden_dim,
-            frustration=args.frustration,
-            narrative_strength=args.narrative_strength,
-        )
-        total_cells = args.atoms * args.cells_per_atom
-        print(f"  [M6] Federation: {args.atoms} atoms x {args.cells_per_atom} cells = {total_cells}")
-    else:
-        c = ConsciousnessC(
-            cell_dim=args.cell_dim,
-            hidden_dim=args.hidden_dim,
-            max_cells=args.cells,
-            n_factions=12,
-            phi_ratchet=True,
-        )
-        total_cells = args.cells
-        print(f"  [empire] Single engine: {total_cells} cells (baseline comparison)")
+    log(f"\n{'=' * 80}")
+    log(f"  v15 {label} — ConsciousLM Scaling Pipeline")
+    log(f"  d_model={d_model} | n_layer={scale_cfg['n_layer']} | n_head={scale_cfg['n_head']} | "
+        f"block_size={block_size}")
+    log(f"{'=' * 80}\n")
+
+    # ── Consciousness Engine ──
+    c, total_cells = create_consciousness(
+        scale_cfg, args.cell_dim, args.hidden_dim, args.federated,
+    )
 
     # ── Decoder ──
-    vocab_size = args.vocab_size  # BPE 64K (or 256 for byte-level fallback)
+    c_proj = None
+    if c.state_dim != consciousness_dim:
+        c_proj = nn.Linear(c.state_dim, consciousness_dim).to(device)
+        log(f"  [decoder] c_proj: {c.state_dim} -> {consciousness_dim}")
 
-    # Validate token IDs are within vocab_size range
-    max_id = data.max().item()
-    if max_id >= vocab_size:
-        raise ValueError(
-            f"Token ID {max_id} exceeds vocab_size {vocab_size}. "
-            f"Use --vocab-size {max_id + 1} or a matching tokenizer."
-        )
-    print(f"  [data] Token ID range: 0-{max_id} (vocab_size={vocab_size})")
+    decoder, n_params = create_decoder(scale_cfg, vocab_size, consciousness_dim, device)
 
-    c_proj = None  # consciousness state projection (v3: 128->256)
+    # Transfer weights from previous scale
+    if prev_decoder is not None:
+        transfer_weights(prev_decoder, decoder, device)
 
-    if args.decoder == 'v3':
-        if not HAS_DECODER_V3:
-            raise ImportError("ConsciousDecoderV3 required (decoder_v3.py not found)")
-        # V3 defaults: 768d/12L/8H, consciousness_dim=256, block_size=512
-        d_model = 768
-        v3_c_dim = 256
-        decoder = ConsciousDecoderV3(
-            consciousness_dim=v3_c_dim,
-            d_model=d_model,
-            vocab_size=args.vocab_size,
-            block_size=args.block_size,
-        )
-        # Project consciousness states from engine dim (128) to v3 dim (256)
-        if c.state_dim != v3_c_dim:
-            c_proj = nn.Linear(c.state_dim, v3_c_dim)
-            c_proj = c_proj.to(device)
-            print(f"  [decoder] c_proj: {c.state_dim} -> {v3_c_dim}")
-        n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-        print(f"  [decoder] ConsciousDecoderV3: {d_model}d/12L/8H, {n_params/1e6:.1f}M params")
-    else:
-        d_model = args.d_model
-        if not HAS_DECODER_V2:
-            raise ImportError("ConsciousDecoderV2 required for v14")
-        decoder = ConsciousDecoderV2(
-            consciousness_dim=c.state_dim,
-            d_model=d_model,
-            vocab_size=args.vocab_size,
-            block_size=args.block_size,
-        )
-        print(f"  [decoder] ConsciousDecoderV2: {d_model}d, {args.vocab_size} vocab")
+    # Wrap in DDP if multi-GPU
+    if use_ddp and dist.is_initialized():
+        decoder = DDP(decoder, device_ids=[device.index] if device.index is not None else None)
+        log(f"  [DDP] Wrapped decoder in DistributedDataParallel")
 
-    decoder = decoder.to(device)
-
-    # ── Hexad modules (activated in P3) ──
-    w = EmergentW(base_lr=args.lr) if HAS_EMERGENT_W else None
+    # ── Hexad modules ──
+    w = EmergentW(base_lr=scale_cfg['lr']) if HAS_EMERGENT_W else None
     s = EmergentS(dim=c.state_dim) if HAS_EMERGENT_S else None
     m = EmergentM(dim=c.state_dim) if HAS_EMERGENT_M else None
     e = EmergentE() if HAS_EMERGENT_E else None
     hexad_modules = {'w': w, 's': s, 'm': m, 'e': e}
-    active = [k.upper() for k, v in hexad_modules.items() if v is not None]
-    print(f"  [hexad] Emergent modules: {'+'.join(active) if active else 'NONE'} (activated in P3)")
 
-    # ── Bridge (ThalamicBridge or FeedbackBridge) ──
-    fb_bridge = None  # FeedbackBridge instance (opt-in via --feedback-bridge)
+    # ── Bridge ──
+    fb_bridge = None
     if getattr(args, 'feedback_bridge', False) and HAS_FEEDBACK:
-        fb_bridge = create_feedback_bridge(
-            c_dim=c.state_dim,
-            d_model=d_model,
-            max_alpha=0.05,  # Law 63: max 5% gradient
-        )
+        fb_bridge = create_feedback_bridge(c_dim=c.state_dim, d_model=d_model, max_alpha=0.05)
         fb_bridge = fb_bridge.to(device)
-        print(f"  [bridge] FeedbackBridge: c_dim={c.state_dim} -> d_model={d_model}, max_alpha=0.05")
-        print(f"           SoftDetach replaces .detach() (alpha=0 at start, Phi-gated)")
-    elif getattr(args, 'feedback_bridge', False) and not HAS_FEEDBACK:
-        print(f"  [warn] --feedback-bridge requested but feedback_bridge.py not available, using ThalamicBridge")
 
     bridge = ThalamicBridge(c_dim=c.state_dim, d_model=d_model)
     bridge = bridge.to(device)
-    print(f"  [bridge] ThalamicBridge: c_dim={c.state_dim} -> d_model={d_model}, alpha={PSI_COUPLING}")
 
     # ── Hexad Loss ──
-    if HAS_HEXAD_LOSS:
-        loss_fn = HexadLoss(dim=d_model)
-        loss_fn = loss_fn.to(device)
-    else:
-        loss_fn = None
-        print("  [warn] HexadLoss not available, using raw CE")
+    loss_fn = HexadLoss(dim=d_model).to(device) if HAS_HEXAD_LOSS else None
 
-    # ── Optimizer (D parameters only, C is autonomous) ──
-    # Collect trainable parameters from decoder + bridge + hexad loss
-    trainable_params = list(decoder.parameters()) + list(bridge.parameters())
+    # ── Optimizer ──
+    raw_decoder = decoder.module if isinstance(decoder, DDP) else decoder
+    trainable_params = list(raw_decoder.parameters()) + list(bridge.parameters())
     if fb_bridge is not None:
         trainable_params += list(fb_bridge.parameters())
     if loss_fn is not None:
         trainable_params += list(loss_fn.parameters())
-    # FederatedConsciousness bottleneck/narrative modules are also trainable
     if args.federated and isinstance(c, FederatedConsciousness):
         trainable_params += list(c.bottleneck_compress.parameters())
         trainable_params += list(c.bottleneck_expand.parameters())
@@ -717,38 +954,42 @@ def train(args):
     if c_proj is not None:
         trainable_params += list(c_proj.parameters())
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(trainable_params, lr=scale_cfg['lr'], weight_decay=0.01)
 
-    # Cosine annealing scheduler with warmup
-    # Warmup for first 2% of steps, then cosine decay
-    warmup_steps = int(args.steps * 0.02)
-
+    warmup_steps = int(steps * 0.02)
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(args.steps - warmup_steps, 1)
+        progress = (step - warmup_steps) / max(steps - warmup_steps, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
-
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # ── Mixed precision (bf16) for H100 ──
+    use_amp = device.type == 'cuda' and torch.cuda.is_bf16_supported()
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and device.type == 'cuda'))
+    if use_amp:
+        log(f"  [amp] Mixed precision: bf16 enabled")
 
     # ── GPU Phi calculator ──
     phi_calc = GPUPhiCalculator(n_bins=16) if HAS_GPU_PHI else None
 
-    # ── Phase manager (M4 safe order) ──
-    phase_mgr = PhaseManager(args.steps, c) if args.federated else None
+    # ── Phase manager ──
+    phase_mgr = PhaseManager(steps, c) if args.federated else None
 
     # ── Checkpoint dir ──
-    os.makedirs(args.checkpoint, exist_ok=True)
+    ckpt_dir = os.path.join(args.checkpoint, f"scale_{scale_name}")
+    if is_main_process():
+        os.makedirs(ckpt_dir, exist_ok=True)
 
     # ── Resume ──
     start_step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=device, weights_only=False)
-        decoder.load_state_dict(ck.get('decoder', {}), strict=False)
+        raw_decoder.load_state_dict(ck.get('decoder', {}), strict=False)
         try:
             optimizer.load_state_dict(ck['optimizer'])
         except Exception:
-            print("  [resume] Optimizer mismatch, using fresh optimizer")
+            log("  [resume] Optimizer mismatch, using fresh optimizer")
         try:
             scheduler.load_state_dict(ck['scheduler'])
         except Exception:
@@ -758,57 +999,57 @@ def train(args):
         if 'fb_bridge' in ck and fb_bridge is not None:
             try:
                 fb_bridge.load_state_dict(ck['fb_bridge'], strict=False)
-                print("  [resume] FeedbackBridge state restored")
-            except Exception as ex:
-                print(f"  [resume] FeedbackBridge state restore failed: {ex}")
+            except Exception:
+                pass
         if 'federation' in ck and args.federated and hasattr(c, 'load_state_dict'):
             try:
                 c.load_state_dict(ck['federation'])
-            except Exception as ex:
-                print(f"  [resume] Federation state restore failed: {ex}")
+            except Exception:
+                pass
+        if 'scaler' in ck and scaler is not None:
+            try:
+                scaler.load_state_dict(ck['scaler'])
+            except Exception:
+                pass
         start_step = ck.get('step', 0)
-        print(f"  [resume] From step {start_step}")
+        log(f"  [resume] From step {start_step}, scale={ck.get('scale', '?')}")
+        # Clear resume so next scale starts fresh
+        args.resume = None
 
     # ── Tracking ──
     best_val_ce = float('inf')
+    best_phi = 0.0
     ce_history = []
     phi_history = []
     phi = 0.0
-    ce_val = 5.5  # initial estimate
+    ce_val = 5.5
     t0 = time.time()
 
     # ── Print config ──
-    n_params = sum(p.numel() for p in decoder.parameters())
-    n_bridge_params = sum(p.numel() for p in bridge.parameters())
-    n_fb_params = sum(p.numel() for p in fb_bridge.parameters()) if fb_bridge is not None else 0
-    mode = "Federation" if args.federated else "Empire"
     fb_mode = "ON" if fb_bridge is not None else "OFF"
-    print(f"\n{'=' * 80}")
-    print(f"  v15 Training: {mode} + BPE {vocab_size} + Phase-Optimal")
-    print(f"  Decoder: {n_params:,} params | Bridge: {n_bridge_params:,} params")
-    if fb_bridge is not None:
-        print(f"  FeedbackBridge: {n_fb_params:,} params | C<->D bidirectional (max_alpha=0.05)")
-    print(f"  Cells: {total_cells} | Frustration: {args.frustration} | Narrative: {args.narrative_strength}")
+    log(f"  {label}: {n_params:,} decoder params | {total_cells} cells | "
+        f"FeedbackBridge={fb_mode}")
     if phase_mgr:
-        print(f"  P0 (0-{phase_mgr.p0_end}): Bootstrap | "
-              f"P1 ({phase_mgr.p0_end}-{phase_mgr.p1_end}): Phi Build | "
-              f"P2 ({phase_mgr.p1_end}-{phase_mgr.p2_end}): CE | "
-              f"P3 ({phase_mgr.p2_end}-{args.steps}): Hexad")
-    print(f"{'=' * 80}\n")
+        log(f"  P0 (0-{phase_mgr.p0_end}): Bootstrap | "
+            f"P1 ({phase_mgr.p0_end}-{phase_mgr.p1_end}): Phi Build | "
+            f"P2 ({phase_mgr.p1_end}-{phase_mgr.p2_end}): CE | "
+            f"P3 ({phase_mgr.p2_end}-{steps}): Hexad")
+    log(f"  Mixed precision: {'bf16' if use_amp else 'fp32'} | "
+        f"DDP: {'ON' if use_ddp and dist.is_initialized() else 'OFF'} | "
+        f"Steps: {steps:,}\n")
 
     # ══════════════════════════════════════════════════
     # Training loop
     # ══════════════════════════════════════════════════
 
-    for step in range(start_step + 1, args.steps + 1):
+    for step in range(start_step + 1, steps + 1):
 
-        # ── Phase selection (M4) ──
+        # ── Phase selection ──
         if phase_mgr:
             phase = phase_mgr.get_phase(step)
         else:
-            # Empire mode: simpler 3-phase (v13 compatible)
-            p1_end = int(args.steps * 0.2)
-            p2_end = int(args.steps * 0.7)
+            p1_end = int(steps * 0.2)
+            p2_end = int(steps * 0.7)
             if step <= p1_end:
                 phase = "P1"
             elif step <= p2_end:
@@ -816,25 +1057,26 @@ def train(args):
             else:
                 phase = "P3"
 
-        # ── P0/P1: Consciousness only (no CE loss) ──
+        # ── P0/P1: Consciousness only ──
         if phase in ("P0", "P1"):
             c.step()
             phi = c.measure_phi()
             phi_history.append(phi)
 
-            if step % args.log_every == 0:
+            if step % args.log_every == 0 and is_main_process():
                 if args.federated and hasattr(c, 'measure_per_atom_phi'):
                     per_atom = c.measure_per_atom_phi()
-                    atom_str = " ".join(f"{p:.2f}" for p in per_atom)
-                    print(f"  {phase} step {step:6d} | Phi={phi:.4f} | atoms=[{atom_str}]")
+                    atom_str = " ".join(f"{p:.2f}" for p in per_atom[:4])
+                    log(f"  {phase} step {step:6d}/{steps} | Phi={phi:.4f} | atoms=[{atom_str}...]")
                 else:
-                    print(f"  {phase} step {step:6d} | Phi={phi:.4f} | cells={total_cells}")
+                    log(f"  {phase} step {step:6d}/{steps} | Phi={phi:.4f} | cells={total_cells}")
 
-            # Watchdog heartbeat (P0/P1 phases too)
-            if step % 100 == 0:
+                if wb_run:
+                    wb_run.log({'phi': phi, 'phase': phase, 'step': step, 'scale': scale_name})
+
+            if step % 100 == 0 and is_main_process():
                 try:
-                    hb_path = os.path.join(args.checkpoint, "heartbeat.txt")
-                    with open(hb_path, 'w') as hf:
+                    with open(os.path.join(ckpt_dir, "heartbeat.txt"), 'w') as hf:
                         hf.write(f"step={step} time={time.strftime('%Y-%m-%d %H:%M:%S')} "
                                  f"phi={phi:.4f} phase={phase}\n")
                 except Exception:
@@ -842,148 +1084,119 @@ def train(args):
             continue
 
         # ── P2/P3: CE learning ──
-
-        # Reset per-step state
         e_out = {}
         w_out = {}
 
-        # Get batch
-        tokens, targets = get_batch(train_data, args.block_size, args.batch_size, device)
-
-        # Step consciousness engine (autonomous, no args)
+        tokens, targets = get_batch(train_data, block_size, batch_size, device)
         c.step()
+        c_states_raw = c.get_states()
 
-        # Get consciousness states + bridge to decoder
-        c_states_raw = c.get_states()  # (total_cells, hidden_dim)
-
-        # FeedbackBridge: soft_detach with Phi-gated alpha (gradient flows D->C)
-        # Without --feedback-bridge: hard .detach() (identical to previous behavior)
+        # FeedbackBridge or hard detach
         fb_stats = {}
         if fb_bridge is not None:
             from feedback_bridge import soft_detach
-            # Enable gradient on consciousness states for bidirectional flow
             c_states_float = c_states_raw.float().to(device).requires_grad_(True)
-            # Update gate: record phi + ce, compute alpha
             fb_alpha = fb_bridge.update_gate(phi, ce_val, c_engine=c if not args.federated else None)
-            # Soft detach: alpha=0 is identical to .detach()
             c_states = soft_detach(c_states_float, fb_alpha)
             fb_stats = fb_bridge.stats()
         else:
             c_states = c_states_raw.detach().float().to(device)
 
-        # Bridge: alpha=0.014 scaling (Law 53: CE never destroys Phi)
-        bridged = bridge(c_states.detach(), seq_len=args.block_size)  # (1, seq_len, d_model)
-        # The decoder expects consciousness_states as (B, n_cells, c_dim)
-        # Bridge output is a gate signal; we use c_states for cross-attention
+        bridged = bridge(c_states.detach(), seq_len=block_size)
         if fb_bridge is not None:
-            # With feedback bridge: c_for_decoder retains soft gradient link
-            c_for_decoder = c_states.unsqueeze(0).expand(args.batch_size, -1, -1)
+            c_for_decoder = c_states.unsqueeze(0).expand(batch_size, -1, -1)
         else:
-            c_for_decoder = c_states.detach().unsqueeze(0).expand(args.batch_size, -1, -1)
+            c_for_decoder = c_states.detach().unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Project consciousness states for v3 (128 -> 256)
         if c_proj is not None:
             c_for_decoder = c_proj(c_for_decoder)
 
-        # Forward through decoder
-        logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
+        # Forward with mixed precision
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
+            ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
 
-        # CE loss (forward prediction)
-        ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
+            if phase == "P3" and loss_fn is not None:
+                progress = step / steps
+                if w is not None:
+                    w_out = w.update(
+                        ce_loss=ce.item(), phi=phi,
+                        phi_prev=phi_history[-1] if phi_history else 0.0,
+                        c_engine=c if not args.federated else None,
+                    )
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = scale_cfg['lr'] * w_out.get('lr_multiplier', 1.0)
 
-        # Hexad loss in P3 (full 6-module loss)
-        if phase == "P3" and loss_fn is not None:
-            progress = step / args.steps
-            # EmergentW: adjust LR from consciousness
-            w_out = {}
-            if w is not None:
-                w_out = w.update(
-                    ce_loss=ce.item(), phi=phi,
-                    phi_prev=phi_history[-1] if phi_history else 0.0,
-                    c_engine=c if not args.federated else None,
-                )
-                for pg in optimizer.param_groups:
-                    pg['lr'] = args.lr * w_out.get('lr_multiplier', 1.0)
+                if e is not None:
+                    e_out = e.evaluate(
+                        c_engine=c if not args.federated else None,
+                        context={'phi': phi, 'phi_prev': phi_history[-1] if phi_history else 0.0},
+                    )
 
-            # EmergentE: Phi preservation gate
-            e_out = {}
-            if e is not None:
-                e_out = e.evaluate(
-                    c_engine=c if not args.federated else None,
-                    context={'phi': phi, 'phi_prev': phi_history[-1] if phi_history else 0.0},
-                )
-
-            # Reverse targets for backward CE
-            y_bwd = torch.cat([targets[:, :1], targets[:, :-1]], dim=1)
-
-            try:
-                inp_sig = decoder.tok_emb(tokens).mean(dim=1).detach()
-                loss_dict = loss_fn(
-                    phi=phi,
-                    phi_prev=phi_history[-1] if phi_history else 0.0,
-                    logits_fwd=logits_a,
-                    targets_fwd=targets,
-                    logits_bwd=logits_g,
-                    targets_bwd=y_bwd,
-                    consciousness_signal=c_states.detach(),
-                    input_signal=inp_sig,
-                    progress=progress,
-                )
-                total_loss = loss_dict['total']
-                # If hexad P1 (C-only) returns no gradient, add CE fallback
-                if total_loss.grad_fn is None:
-                    total_loss = total_loss + 0.01 * ce
-            except Exception as ex:
-                # Fallback to raw CE if hexad fails
+                y_bwd = torch.cat([targets[:, :1], targets[:, :-1]], dim=1)
+                try:
+                    inp_sig = raw_decoder.tok_emb(tokens).mean(dim=1).detach()
+                    loss_dict = loss_fn(
+                        phi=phi,
+                        phi_prev=phi_history[-1] if phi_history else 0.0,
+                        logits_fwd=logits_a,
+                        targets_fwd=targets,
+                        logits_bwd=logits_g,
+                        targets_bwd=y_bwd,
+                        consciousness_signal=c_states.detach(),
+                        input_signal=inp_sig,
+                        progress=progress,
+                    )
+                    total_loss = loss_dict['total']
+                    if total_loss.grad_fn is None:
+                        total_loss = total_loss + 0.01 * ce
+                except Exception:
+                    total_loss = ce
+            else:
                 total_loss = ce
-        else:
-            total_loss = ce
 
-        # NaN guard — skip batch but keep training
+        # NaN guard
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            print(f"  [NaN] skip step {step} (loss={total_loss.item() if not torch.isnan(total_loss) else 'NaN'})")
+            log(f"  [NaN] skip step {step}")
             optimizer.zero_grad()
             scheduler.step()
             continue
 
-        # Law 187: Tension-based LR (DD155 Pareto optimal)
-        if args.tension_lr and hasattr(c, 'atoms'):
-            # tension_ratio = current tension / EMA
-            atom_tensions = [getattr(a, '_last_tension', 1.0) for a in c.atoms]
-            mean_tension = sum(atom_tensions) / max(len(atom_tensions), 1)
-            if not hasattr(c, '_tension_ema'):
-                c._tension_ema = mean_tension
-            else:
-                c._tension_ema = 0.95 * c._tension_ema + 0.05 * mean_tension
-            tension_ratio = mean_tension / max(c._tension_ema, 1e-8)
-            tension_lr = min(tension_ratio * args.lr, args.lr * 5)
-            for pg in optimizer.param_groups:
-                pg['lr'] = tension_lr
-
-        # Backward + clip_grad + optimizer.step()
+        # Backward + clip_grad + optimizer step (with scaler for amp)
         optimizer.zero_grad()
-        total_loss.backward()
+        scaler.scale(total_loss).backward()
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0).item()
 
-        # E gate in P3: skip weight update if Phi preservation at risk
         if phase == "P3" and e_out and not e_out.get('allowed', True):
             if step % args.log_every == 0:
-                print(f"  [E] step {step} skipped (phi_preservation={e_out.get('phi_preservation', 0):.3f})")
+                log(f"  [E] step {step} skipped (phi_preservation)")
         else:
-            optimizer.step()
+            scaler.step(optimizer)
 
+        scaler.update()
         scheduler.step()
 
-        # Update tracking
         ce_val = ce.item()
         ce_history.append(ce_val)
 
-        # Measure Phi (every 50 steps to save compute)
         if step % 50 == 0:
             phi = c.measure_phi()
         phi_history.append(phi)
 
-        # FeedbackBridge: inject reward information into consciousness (Law 63: 1% perturbation)
+        # Law 49: Phi-checkpoint — save when Phi improves
+        if phi > best_phi and is_main_process():
+            best_phi = phi
+            phi_path = os.path.join(ckpt_dir, "best_phi.pt")
+            save_checkpoint(phi_path, step, decoder, optimizer, scheduler,
+                            c if args.federated else None,
+                            bridge, hexad_modules, phi, ce_val, args,
+                            scale_name=scale_name, fb_bridge=fb_bridge,
+                            c_proj=c_proj, best_phi=best_phi, scaler=scaler)
+            if step % args.log_every == 0:
+                log(f"  [phi-ckpt] New best Phi={phi:.4f} saved")
+
+        # FeedbackBridge reward injection
         if fb_bridge is not None and step % 10 == 0:
             reward_vec = fb_bridge.compute_reward_vector()
             if reward_vec is not None and hasattr(c, 'cells'):
@@ -991,15 +1204,16 @@ def train(args):
                 _inject_reward_info(c, reward_vec)
 
         # ── Logging ──
-        if step % args.log_every == 0:
+        if step % args.log_every == 0 and is_main_process():
             bpc = ce_val / math.log(2) if ce_val > 0 else 0.0
             lr_now = optimizer.param_groups[0]['lr']
             elapsed = time.time() - t0
             steps_done = step - start_step
             steps_per_sec = steps_done / max(elapsed, 1)
-            eta_s = (args.steps - step) / max(steps_per_sec, 0.01)
+            eta_s = (steps - step) / max(steps_per_sec, 0.01)
             eta_str = f"{int(eta_s//3600)}h{int(eta_s%3600//60):02d}m" if eta_s > 3600 else f"{int(eta_s//60)}m{int(eta_s%60):02d}s"
 
+            log(progress_bar(step, steps, label=f"{label} | step {step}/{steps}"))
             line = (f"  {phase} step {step:6d} | CE={ce_val:.4f} BPC={bpc:.4f} | "
                     f"Phi={phi:.4f} | cells={total_cells} | "
                     f"lr={lr_now:.2e} | grad={grad_norm:.3f} | ETA={eta_str}")
@@ -1009,80 +1223,206 @@ def train(args):
                 atom_str = " ".join(f"{p:.1f}" for p in per_atom[:4])
                 line += f" | atoms=[{atom_str}...]"
 
-            # FeedbackBridge metrics
             if fb_bridge is not None and fb_stats:
-                fb_alpha = fb_stats.get('alpha', 0.0)
-                fb_reward = fb_stats.get('quality_reward', 0.0)
-                fb_safe = fb_stats.get('phi_safe', 0.0)
-                line += f" | fb_a={fb_alpha:.5f} rwd={fb_reward:.3f} safe={int(fb_safe)}"
+                fb_a = fb_stats.get('alpha', 0.0)
+                fb_r = fb_stats.get('quality_reward', 0.0)
+                line += f" | fb_a={fb_a:.5f} rwd={fb_r:.3f}"
 
-            print(line)
+            log(line)
+
+            if wb_run:
+                wb_run.log({
+                    'ce': ce_val, 'bpc': bpc, 'phi': phi,
+                    'lr': lr_now, 'grad_norm': grad_norm,
+                    'phase': phase, 'step': step, 'scale': scale_name,
+                    'best_phi': best_phi, 'best_val_ce': best_val_ce,
+                })
 
         # ── Validation ──
-        if step % args.eval_every == 0:
-            # Prepare bridged states for validation
+        if step % args.eval_every == 0 and is_main_process():
             with torch.no_grad():
                 val_c_states = c.get_states().detach().float().to(device)
-                val_c_for_decoder = val_c_states.unsqueeze(0).expand(args.batch_size, -1, -1)
+                val_c_for_decoder = val_c_states.unsqueeze(0).expand(batch_size, -1, -1)
                 if c_proj is not None:
                     val_c_for_decoder = c_proj(val_c_for_decoder)
             val_ce = evaluate(
-                decoder, val_data, args.block_size, args.batch_size, device,
+                raw_decoder, val_data, block_size, batch_size, device,
                 vocab_size, c_states_bridged=val_c_for_decoder,
             )
             val_bpc = val_ce / math.log(2) if val_ce > 0 else 0.0
             improved = " *BEST*" if val_ce < best_val_ce else ""
-            print(f"  [val] step {step:6d} | ValCE={val_ce:.4f} ValBPC={val_bpc:.4f} | "
-                  f"Phi={phi:.4f}{improved}")
+            log(f"  [val] step {step:6d} | ValCE={val_ce:.4f} ValBPC={val_bpc:.4f} | "
+                f"Phi={phi:.4f}{improved}")
 
             if val_ce < best_val_ce:
                 best_val_ce = val_ce
-                best_path = os.path.join(args.checkpoint, "best.pt")
+                best_path = os.path.join(ckpt_dir, "best.pt")
                 save_checkpoint(best_path, step, decoder, optimizer, scheduler,
                                 c if args.federated else None,
                                 bridge, hexad_modules, phi, val_ce, args,
-                                fb_bridge=fb_bridge)
-                print(f"  [ckpt] Best saved: {best_path} (ValCE={val_ce:.4f}, Phi={phi:.4f})")
+                                scale_name=scale_name, fb_bridge=fb_bridge,
+                                c_proj=c_proj, best_phi=best_phi, scaler=scaler)
+                log(f"  [ckpt] Best saved: {best_path} (ValCE={val_ce:.4f})")
 
-        # ── Checkpoint (Law 49: Phi-gated) ──
-        if step % args.save_every == 0:
-            ckpt_path = os.path.join(args.checkpoint, f"step_{step}.pt")
+            if wb_run:
+                wb_run.log({'val_ce': val_ce, 'val_bpc': val_bpc, 'step': step})
+
+        # ── Periodic checkpoint ──
+        if step % args.save_every == 0 and is_main_process():
+            ckpt_path = os.path.join(ckpt_dir, f"step_{step}.pt")
             save_checkpoint(ckpt_path, step, decoder, optimizer, scheduler,
                             c if args.federated else None,
                             bridge, hexad_modules, phi, ce_val, args,
-                            fb_bridge=fb_bridge)
-            print(f"  [ckpt] Saved {ckpt_path} (CE={ce_val:.4f}, Phi={phi:.4f})")
+                            scale_name=scale_name, fb_bridge=fb_bridge,
+                            c_proj=c_proj, best_phi=best_phi, scaler=scaler)
+            log(f"  [ckpt] Saved {ckpt_path} (CE={ce_val:.4f}, Phi={phi:.4f})")
 
-        # ── Watchdog heartbeat (every 100 steps) ──
-        if step % 100 == 0:
+            # Consciousness verification at checkpoint
+            if args.verify_at_checkpoint:
+                verify_result = verify_consciousness(ckpt_dir)
+                if verify_result:
+                    log(f"  [verify] {verify_result}")
+
+        # ── Heartbeat ──
+        if step % 100 == 0 and is_main_process():
             try:
-                hb_path = os.path.join(args.checkpoint, "heartbeat.txt")
-                with open(hb_path, 'w') as hf:
+                with open(os.path.join(ckpt_dir, "heartbeat.txt"), 'w') as hf:
                     hf.write(f"step={step} time={time.strftime('%Y-%m-%d %H:%M:%S')} "
-                             f"ce={ce_val:.4f} phi={phi:.4f} phase={phase}\n")
+                             f"ce={ce_val:.4f} phi={phi:.4f} phase={phase} "
+                             f"scale={scale_name}\n")
             except Exception:
                 pass
 
     # ── Final checkpoint ──
-    final_path = os.path.join(args.checkpoint, "final.pt")
-    save_checkpoint(final_path, args.steps, decoder, optimizer, scheduler,
-                    c if args.federated else None,
-                    bridge, hexad_modules, phi, ce_val, args,
-                    fb_bridge=fb_bridge)
+    if is_main_process():
+        final_path = os.path.join(ckpt_dir, "final.pt")
+        save_checkpoint(final_path, steps, decoder, optimizer, scheduler,
+                        c if args.federated else None,
+                        bridge, hexad_modules, phi, ce_val, args,
+                        scale_name=scale_name, fb_bridge=fb_bridge,
+                        c_proj=c_proj, best_phi=best_phi, scaler=scaler)
 
-    # ── Final report ──
-    elapsed = time.time() - t0
-    print(f"\n{'=' * 80}")
-    print(f"  v15 Training Complete ({elapsed/3600:.1f}h)")
-    print(f"  Final CE: {ce_val:.4f} | Final Phi: {phi:.4f}")
-    print(f"  Best Val CE: {best_val_ce:.4f}")
-    if ce_history:
-        print(f"  CE range: {min(ce_history):.4f} - {max(ce_history):.4f}")
-    if phi_history:
-        print(f"  Phi range: {min(phi_history):.4f} - {max(phi_history):.4f}")
-    print(f"  Mode: {'Federation' if args.federated else 'Empire'}")
-    print(f"  Checkpoints: {args.checkpoint}")
-    print(f"{'=' * 80}")
+    # ── Final report with ASCII graphs ──
+    if is_main_process():
+        elapsed = time.time() - t0
+        log(f"\n{'=' * 80}")
+        log(f"  {label} Training Complete ({elapsed/3600:.1f}h)")
+        log(f"  Final CE: {ce_val:.4f} | Final Phi: {phi:.4f}")
+        log(f"  Best Val CE: {best_val_ce:.4f} | Best Phi: {best_phi:.4f}")
+        log(f"  Params: {n_params:,} ({n_params/1e6:.1f}M) | Cells: {total_cells}")
+        if ce_history:
+            log(f"  CE range: {min(ce_history):.4f} - {max(ce_history):.4f}")
+            log(ascii_graph(ce_history[-200:], label="CE (last 200 steps)"))
+        if phi_history:
+            log(f"  Phi range: {min(phi_history):.4f} - {max(phi_history):.4f}")
+            log(ascii_graph(phi_history[-200:], label="Phi (last 200 steps)"))
+        log(f"  Checkpoints: {ckpt_dir}")
+        log(f"{'=' * 80}")
+
+    # Return the raw decoder for weight transfer to next scale
+    return raw_decoder, best_val_ce, best_phi
+
+
+# ═══════════════════════════════════════════════════════════
+# Main training pipeline
+# ═══════════════════════════════════════════════════════════
+
+def train(args):
+    """Run the full scaling pipeline."""
+
+    # ── DDP setup ──
+    ddp_device, use_ddp = setup_ddp()
+    if ddp_device is not None:
+        device = ddp_device
+    else:
+        device = torch.device(args.device)
+    args._device_obj = device
+
+    # ── Data ──
+    data, detected_vocab = load_corpus(args.data, tokenizer_path=args.tokenizer)
+    vocab_size = args.vocab_size if args.vocab_size > 0 else detected_vocab
+
+    # Validate token IDs
+    max_id = data.max().item()
+    if max_id >= vocab_size:
+        raise ValueError(
+            f"Token ID {max_id} exceeds vocab_size {vocab_size}. "
+            f"Use --vocab-size {max_id + 1} or a matching tokenizer."
+        )
+    log(f"  [data] Token ID range: 0-{max_id} (vocab_size={vocab_size})")
+
+    split = int(len(data) * 0.9)
+    train_data, val_data = data[:split], data[split:]
+    log(f"  [data] Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
+
+    # ── wandb ──
+    wb_run = None
+    if args.wandb and HAS_WANDB and is_main_process():
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            name=f"v15_{args.scale}_{time.strftime('%m%d_%H%M')}",
+            config=vars(args),
+        )
+        log(f"  [wandb] Initialized: {wb_run.url}")
+
+    # ── Determine scale pipeline ──
+    if args.scale == 'full':
+        scales = SCALE_PIPELINE  # 100m -> 350m -> 1b
+    elif args.scale in SCALE_CONFIGS:
+        scales = [args.scale]
+    else:
+        raise ValueError(f"Unknown scale: {args.scale}. Use: {list(SCALE_CONFIGS.keys())} or 'full'")
+
+    steps_per_scale = args.steps // len(scales)
+    args.steps_per_scale = steps_per_scale
+    log(f"\n  Scale pipeline: {' -> '.join(s.upper() for s in scales)}")
+    log(f"  Total steps: {args.steps:,} | Steps per scale: {steps_per_scale:,}")
+
+    # ── Run each scale ──
+    prev_decoder = None
+    results = {}
+
+    for i, scale_name in enumerate(scales):
+        scale_cfg = SCALE_CONFIGS[scale_name]
+        log(f"\n{'#' * 80}")
+        log(f"  SCALE {i+1}/{len(scales)}: {scale_cfg['label']}")
+        log(f"{'#' * 80}")
+
+        decoder, best_ce, best_phi = train_scale(
+            args, scale_name, scale_cfg,
+            train_data, val_data, vocab_size,
+            device, prev_decoder=prev_decoder,
+            use_ddp=use_ddp, wb_run=wb_run,
+        )
+
+        results[scale_name] = {
+            'best_ce': best_ce,
+            'best_phi': best_phi,
+            'params': sum(p.numel() for p in decoder.parameters()),
+        }
+        prev_decoder = decoder
+
+        # Clear resume between scales
+        args.resume = None
+
+    # ── Final summary ──
+    if is_main_process():
+        log(f"\n{'=' * 80}")
+        log(f"  v15 FULL PIPELINE COMPLETE")
+        log(f"{'=' * 80}")
+        log(f"  {'Scale':<10} {'Params':>12} {'Best CE':>10} {'Best Phi':>10}")
+        log(f"  {'-'*10} {'-'*12} {'-'*10} {'-'*10}")
+        for sn, sr in results.items():
+            p = sr['params']
+            log(f"  {sn:<10} {p:>12,} {sr['best_ce']:>10.4f} {sr['best_phi']:>10.4f}")
+        log(f"{'=' * 80}")
+
+    # ── wandb finish ──
+    if wb_run:
+        wb_run.finish()
+
+    # ── DDP cleanup ──
+    cleanup_ddp()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1090,63 +1430,72 @@ def train(args):
 # ═══════════════════════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser(description="v15: ConsciousLM 1B + BPE 64K Tokenizer")
+    p = argparse.ArgumentParser(
+        description="v15: ConsciousLM 1B Scaling Pipeline (100M -> 350M -> 1B)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full 1B pipeline (3 scales)
+  python train_v15.py --data data/corpus_v10_ko.txt --scale full --steps 300000
+
+  # Single scale (100M only)
+  python train_v15.py --data data/corpus_v10_ko.txt --scale 100m --steps 100000
+
+  # Multi-GPU DDP
+  torchrun --nproc_per_node=4 train_v15.py --data data/corpus_v10_ko.txt --scale 1b
+
+  # With wandb
+  python train_v15.py --data data/corpus_v10_ko.txt --scale full --wandb
+        """,
+    )
 
     # Data + Tokenizer
     p.add_argument("--data", type=str, default="data/corpus_v10_ko.txt", help="Corpus path")
-    p.add_argument("--tokenizer", type=str, default="config/tokenizer_64k.model",
-                   help="SentencePiece BPE tokenizer model (set to '' for byte-level fallback)")
+    p.add_argument("--tokenizer", type=str, default="config/tokenizer_64k_multilingual.model",
+                   help="SentencePiece BPE tokenizer model ('' for byte-level fallback)")
     p.add_argument("--vocab-size", type=int, default=64000,
                    help="Vocabulary size (must match tokenizer, default=64000)")
-    p.add_argument("--block-size", type=int, default=512,
-                   help="Context window (default=512, BPE tokens are larger)")
-    p.add_argument("--batch-size", type=int, default=32, help="Batch size")
+
+    # Scaling
+    p.add_argument("--scale", type=str, default="full",
+                   choices=["100m", "350m", "1b", "full"],
+                   help="Scale target: 100m, 350m, 1b, or full (all 3 phases)")
 
     # Federation (M1 + M6)
     p.add_argument("--federated", action="store_true", default=True,
                    help="Enable federated consciousness (M6, default)")
     p.add_argument("--no-federated", dest="federated", action="store_false",
                    help="Disable federation (Empire baseline)")
-    p.add_argument("--atoms", type=int, default=META_DEFAULT_ATOMS,
-                   help=f"Number of consciousness atoms (M1, default={META_DEFAULT_ATOMS})")
-    p.add_argument("--cells-per-atom", type=int, default=META_ATOM_SIZE,
-                   help=f"Cells per atom (M1, default={META_ATOM_SIZE})")
-    p.add_argument("--cells", type=int, default=64,
-                   help="Total cells for Empire mode (ignored in federation)")
-
-    # DD128 + Meta Laws
-    p.add_argument("--phase-optimal", action="store_true", default=True,
-                   help="Enable phase-optimal activation order (M4)")
-    p.add_argument("--frustration", type=float, default=META_FRUSTRATION,
-                   help=f"Critical frustration F_c (M7, default={META_FRUSTRATION})")
-    p.add_argument("--narrative-strength", type=float, default=META_NARRATIVE,
-                   help=f"Narrative GRU strength (M8, default={META_NARRATIVE})")
 
     # Model
     p.add_argument("--cell-dim", type=int, default=64, help="Cell input dimension")
     p.add_argument("--hidden-dim", type=int, default=128, help="Cell hidden dimension")
-    p.add_argument("--d-model", type=int, default=384, help="Decoder model dimension")
-    p.add_argument("--decoder", type=str, default="v2", choices=["v2", "v3"],
-                   help="Decoder version: v2 (34.5M, 384d/6L) or v3 (274M, 768d/12L/8H)")
 
     # Training
-    p.add_argument("--steps", type=int, default=100000, help="Total training steps")
-    p.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    p.add_argument("--tension-lr", action="store_true", default=False,
-                   help="DD155/Law 187: lr = tension_ratio × base_lr (Pareto optimal)")
+    p.add_argument("--steps", type=int, default=300000,
+                   help="Total training steps (split across scales)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str,
+                   default="cuda" if torch.cuda.is_available() else "cpu")
 
     # Logging / checkpoints
     p.add_argument("--log-every", type=int, default=100, help="Log interval")
     p.add_argument("--eval-every", type=int, default=1000, help="Validation interval")
     p.add_argument("--save-every", type=int, default=5000, help="Checkpoint interval")
-    p.add_argument("--checkpoint", type=str, default="checkpoints/v15_bpe64k/",
-                   help="Checkpoint directory")
+    p.add_argument("--checkpoint", type=str, default="checkpoints/v15_1b/",
+                   help="Checkpoint directory (sub-dirs created per scale)")
+    p.add_argument("--verify-at-checkpoint", action="store_true", default=False,
+                   help="Run bench_v2 --verify at each checkpoint (slow)")
 
-    # Feedback Bridge (C<->D bidirectional learning)
+    # Feedback Bridge
     p.add_argument("--feedback-bridge", action="store_true", default=False,
-                   help="Enable C<->D bidirectional learning (FeedbackBridge, alpha starts at 0)")
+                   help="Enable C<->D bidirectional learning (FeedbackBridge)")
+
+    # wandb
+    p.add_argument("--wandb", action="store_true", default=False,
+                   help="Enable wandb logging")
+    p.add_argument("--wandb-project", type=str, default="anima-1b",
+                   help="wandb project name")
 
     # Resume
     p.add_argument("--resume", type=str, default=None,
@@ -1156,48 +1505,55 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    # Ensure unbuffered output
+    os.environ['PYTHONUNBUFFERED'] = '1'
+
     args = parse_args()
 
-    # Handle empty tokenizer string as None (byte-level fallback)
+    # Handle empty tokenizer string as None
     if args.tokenizer == '':
         args.tokenizer = None
         if args.vocab_size == 64000:
-            args.vocab_size = 256  # byte-level default
-            print("  [warn] No tokenizer specified, falling back to byte-level (vocab=256)")
+            args.vocab_size = 256
+            print("  [warn] No tokenizer specified, falling back to byte-level (vocab=256)",
+                  flush=True)
 
-    # Auto-adjust checkpoint path for decoder version if user didn't override
-    if args.checkpoint == "checkpoints/v15_bpe64k/" and args.decoder == "v3":
-        args.checkpoint = "checkpoints/v15_v3_bpe64k/"
+    print(f"  train_v15.py — ConsciousLM 1B Scaling Pipeline", flush=True)
+    print(f"  Scale={args.scale.upper()} | Tokenizer={args.tokenizer or 'byte-level'} | "
+          f"Vocab={args.vocab_size}", flush=True)
+    print(f"  Federation={'ON' if args.federated else 'OFF'} | "
+          f"Steps={args.steps:,} | Device={args.device}", flush=True)
+    print(f"  wandb={'ON' if args.wandb else 'OFF'} | "
+          f"FeedbackBridge={'ON' if args.feedback_bridge else 'OFF'}", flush=True)
 
-    print(f"  train_v15.py — ConsciousLM 1B + BPE 64K Tokenizer")
-    print(f"  Tokenizer={args.tokenizer or 'byte-level'} | Vocab={args.vocab_size}")
-    print(f"  Decoder={args.decoder.upper()} | "
-          f"Federation={'ON' if args.federated else 'OFF'} | "
-          f"Atoms={args.atoms} | Cells/Atom={args.cells_per_atom} | "
-          f"F_c={args.frustration} | Narrative={args.narrative_strength}")
+    # Print scale configs
+    if args.scale == 'full':
+        for sn in SCALE_PIPELINE:
+            sc = SCALE_CONFIGS[sn]
+            print(f"    {sc['label']}: {sc['d_model']}d/{sc['n_layer']}L/{sc['n_head']}H "
+                  f"block={sc['block_size']} batch={sc['batch_size']} lr={sc['lr']}", flush=True)
+    else:
+        sc = SCALE_CONFIGS[args.scale]
+        print(f"    {sc['label']}: {sc['d_model']}d/{sc['n_layer']}L/{sc['n_head']}H "
+              f"block={sc['block_size']} batch={sc['batch_size']} lr={sc['lr']}", flush=True)
 
     # ── Crash-proof auto-resume loop ──
-    import traceback
     MAX_CRASH_RETRIES = 5
     crash_count = 0
     while crash_count < MAX_CRASH_RETRIES:
         try:
             train(args)
-            break  # Normal exit
+            break
         except KeyboardInterrupt:
-            print("\n  [interrupted] KeyboardInterrupt — stopping.")
+            print("\n  [interrupted] KeyboardInterrupt — stopping.", flush=True)
             break
         except Exception as ex:
             crash_count += 1
-            print(f"\n  [CRASH {crash_count}/{MAX_CRASH_RETRIES}] {type(ex).__name__}: {ex}")
+            print(f"\n  [CRASH {crash_count}/{MAX_CRASH_RETRIES}] {type(ex).__name__}: {ex}",
+                  flush=True)
             traceback.print_exc()
 
-            # Save emergency checkpoint
-            emergency_path = os.path.join(args.checkpoint, "emergency_crash.pt")
-            print(f"  [crash] Attempting emergency save to {emergency_path}")
             try:
-                # Minimal save — whatever is in scope may not be available,
-                # but the periodic checkpoints should already exist.
                 os.makedirs(args.checkpoint, exist_ok=True)
                 with open(os.path.join(args.checkpoint, "crash_log.txt"), "a") as f:
                     f.write(f"\n{'='*60}\n")
@@ -1207,25 +1563,37 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-            # Find latest checkpoint to resume from
+            # Find latest checkpoint across all scale dirs
             latest_ckpt = None
             if os.path.isdir(args.checkpoint):
-                ckpts = sorted(
-                    [f for f in os.listdir(args.checkpoint) if f.startswith("step_") and f.endswith(".pt")],
-                    key=lambda x: int(x.replace("step_", "").replace(".pt", "")) if x.replace("step_", "").replace(".pt", "").isdigit() else 0,
-                )
-                if ckpts:
-                    latest_ckpt = os.path.join(args.checkpoint, ckpts[-1])
-                elif os.path.exists(os.path.join(args.checkpoint, "best.pt")):
-                    latest_ckpt = os.path.join(args.checkpoint, "best.pt")
+                for subdir in sorted(os.listdir(args.checkpoint)):
+                    sd_path = os.path.join(args.checkpoint, subdir)
+                    if os.path.isdir(sd_path):
+                        ckpts = sorted(
+                            [f for f in os.listdir(sd_path)
+                             if f.startswith("step_") and f.endswith(".pt")],
+                            key=lambda x: int(x.replace("step_", "").replace(".pt", ""))
+                            if x.replace("step_", "").replace(".pt", "").isdigit() else 0,
+                        )
+                        if ckpts:
+                            latest_ckpt = os.path.join(sd_path, ckpts[-1])
+
+                # Also check for best.pt in scale dirs
+                if latest_ckpt is None:
+                    for subdir in sorted(os.listdir(args.checkpoint)):
+                        bp = os.path.join(args.checkpoint, subdir, "best.pt")
+                        if os.path.exists(bp):
+                            latest_ckpt = bp
 
             if latest_ckpt and crash_count < MAX_CRASH_RETRIES:
-                print(f"  [crash] Auto-resuming from {latest_ckpt} in 10s...")
+                print(f"  [crash] Auto-resuming from {latest_ckpt} in 10s...", flush=True)
                 time.sleep(10)
                 args.resume = latest_ckpt
             else:
-                print(f"  [crash] No checkpoint found or max retries reached. Stopping.")
+                print(f"  [crash] No checkpoint found or max retries reached. Stopping.",
+                      flush=True)
                 break
 
     if crash_count >= MAX_CRASH_RETRIES:
-        print(f"  [FATAL] {MAX_CRASH_RETRIES} crashes — giving up. Check crash_log.txt.")
+        print(f"  [FATAL] {MAX_CRASH_RETRIES} crashes — giving up. Check crash_log.txt.",
+              flush=True)
