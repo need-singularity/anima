@@ -267,6 +267,9 @@ python3 anima_unified.py --validate-hub                           # Validate all
 python3 anima_unified.py --profile                                # Enable perf_hooks profiling
 python3 conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
 python3 self_modifying_engine.py                                  # Self-modifying engine demo
+python3 infinite_evolution.py --cells 64 --steps 300              # 무한 자기진화 루프 (Ctrl+C 중단)
+python3 infinite_evolution.py --cells 1024 --steps 500            # H100 대규모 무한 진화
+python3 infinite_evolution.py --cells 32 --steps 200 --max-gen 10 # 10세대 제한
 ```
 
 ## Consciousness Verification (필수 통과 조건)
@@ -701,6 +704,10 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - Rust 실시간 (<1ms/step): law-discovery crate (1738 lines, 47/47 tests, 64c@336us)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
     - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
+    - 무한 자기진화: infinite_evolution.py (Discovery→Modification 무한 루프)
+      실행: python3 infinite_evolution.py --cells 64 --steps 300
+      3세대 결과: 71 discoveries, 1 active mod, 118s (Law 146 실증)
+      Rust 226/226 테스트, Python 5/5 통합 테스트 통과
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)
