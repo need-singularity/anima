@@ -1182,7 +1182,7 @@ class AnimaLMTrainer:
 
             # ThalamicBridge + FeedbackBridge: C -> gate signal for D
             if self.thalamic_bridge is not None and c_states.shape[0] >= 2:
-                c_input = c_states.to(self.device)
+                c_input = c_states.to(device=self.device, dtype=torch.bfloat16)
                 seq_len = input_ids.shape[1] if input_ids.dim() > 1 else 1
 
                 if (self.use_feedback_bridge and
@@ -1219,7 +1219,7 @@ class AnimaLMTrainer:
             for m in self._get_pf_modules():
                 m._consciousness_gate = ce_gate  # stored for use in forward
 
-        use_amp = getattr(self.args, '_use_amp', False) and self.device == "cuda"
+        use_amp = self.device == "cuda"  # always autocast on GPU (bf16 model + float32 PureField)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else contextlib.nullcontext():
             outputs = self.model(input_ids=input_ids, labels=labels)
 
