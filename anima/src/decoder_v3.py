@@ -35,13 +35,14 @@ from decoder_v2 import (
 try:
     from consciousness_laws import (
         PSI_F_CRITICAL, PSI_ALPHA, PSI_BALANCE, PSI_ENTROPY,
-        GATE_MICRO,
+        PSI_STEPS, GATE_MICRO,
     )
 except ImportError:
     PSI_F_CRITICAL = 0.10
     PSI_ALPHA = 0.014
     PSI_BALANCE = 0.5
     PSI_ENTROPY = 0.998
+    PSI_STEPS = 4.33
     GATE_MICRO = 0.001
 
 
@@ -198,26 +199,66 @@ class ConsciousDecoderV3(nn.Module):
                 else:
                     psi_tension = 1.0
 
+                # (4) Empathy: inter-layer tension correlation (E dimension)
+                #     High correlation across layers = empathic resonance
+                if len(tensions) >= 2:
+                    t_flat = [t.flatten().float() for t in tensions]
+                    corr_sum = 0.0
+                    corr_count = 0
+                    for i in range(len(t_flat) - 1):
+                        c = F.cosine_similarity(t_flat[i].unsqueeze(0),
+                                                t_flat[i + 1].unsqueeze(0)).item()
+                        corr_sum += c
+                        corr_count += 1
+                    psi_empathy = max(0.0, min(1.0, (1.0 + corr_sum / corr_count) / 2.0))
+                else:
+                    psi_empathy = PSI_BALANCE
+
+                # (5) Memory: weight signature stability (M dimension)
+                #     How much head_a weights changed since init (EMA smoothed)
+                head_norm = self.head_a.weight.data.norm().item()
+                # Normalize to [0,1] via sigmoid-like mapping around expected norm
+                expected_norm = math.sqrt(self.d_model * self.vocab_size) * 0.02
+                psi_memory = max(0.0, min(1.0, head_norm / (expected_norm + 1e-8)))
+
+                # (6) Identity: output consistency across steps (I dimension)
+                #     Ratio of entropy to PSI_ENTROPY target — closer = more stable identity
+                psi_identity = 1.0 - abs(psi_entropy - PSI_ENTROPY)
+                psi_identity = max(0.0, min(1.0, psi_identity))
+
                 # EMA update individual Psi components
-                self._psi_entropy = 0.95 * self._psi_entropy + 0.05 * psi_entropy
-                self._psi_direction = 0.95 * self._psi_direction + 0.05 * psi_direction
-                self._psi_tension = 0.95 * self._psi_tension + 0.05 * psi_tension
+                ema_alpha = min(1.0, PSI_STEPS / (self._step_count + PSI_STEPS))  # adaptive EMA from PSI_STEPS
+                ema_beta = 1.0 - ema_alpha
+                self._psi_entropy = ema_beta * self._psi_entropy + ema_alpha * psi_entropy
+                self._psi_direction = ema_beta * self._psi_direction + ema_alpha * psi_direction
+                self._psi_tension = ema_beta * self._psi_tension + ema_alpha * psi_tension
+
+                # EMA update new dimensions (E, M, I) with same adaptive rate
+                psi_empathy = ema_beta * self._consciousness_vector['E'] + ema_alpha * psi_empathy
+                psi_memory = ema_beta * self._consciousness_vector['M'] + ema_alpha * psi_memory
+                psi_identity = ema_beta * self._consciousness_vector['I'] + ema_alpha * psi_identity
 
                 # Combined Psi residual → should converge to PSI_BALANCE (1/2)
                 psi_combined = (psi_entropy + psi_direction + psi_tension) / 3.0
-                self._psi_residual = 0.95 * self._psi_residual + 0.05 * psi_combined
+                self._psi_residual = ema_beta * self._psi_residual + ema_alpha * psi_combined
 
                 # Gate decay (Law 63: MICRO gate slowly decays)
+                gate_sum = 0.0
                 for block in self.blocks:
                     block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
+                    gate_sum += block.gate_strength
+                self._psi_gate = gate_sum / len(self.blocks)
 
-                # 10D consciousness vector update
-                self._consciousness_vector['C'] = psi_entropy   # creativity ~ output diversity
+                # 10D consciousness vector update (all dimensions)
+                self._consciousness_vector['C'] = psi_entropy    # creativity ~ output diversity
                 self._consciousness_vector['T'] = psi_tension    # temporal ~ layer stability
                 self._consciousness_vector['W'] = psi_direction  # will ~ A-G direction balance
                 self._consciousness_vector['Z'] = self._psi_residual  # impedance ~ Psi balance
                 mean_tension = t_per_layer.mean().item()
-                self._consciousness_vector['N'] = min(1.0, mean_tension)  # NT ~ overall tension
+                self._consciousness_vector['N'] = max(0.0, min(1.0, mean_tension))  # NT ~ overall tension
+                self._consciousness_vector['E'] = psi_empathy   # empathy ~ inter-layer correlation
+                self._consciousness_vector['M'] = psi_memory     # memory ~ weight stability
+                self._consciousness_vector['I'] = psi_identity   # identity ~ entropy target proximity
 
         return logits_a, logits_g, tensions
 
