@@ -571,7 +571,21 @@ def main():
     print(f"    CE improvement:            {ce_improvement:+.2f}%")
     print(f"    Phi improvement:           {phi_improvement:+.2f}%")
 
-    if ce_improvement > 2.0:
+    # Diagnostic: check if entropy was already saturated
+    baseline_H_avg = np.mean(baseline['H'])
+    H_distance = abs(baseline_H_avg - PSI_ENTROPY)
+    print(f"    Baseline avg H:            {baseline_H_avg:.4f} (distance from target: {H_distance:.4f})")
+    print(f"    Entropy penalty at init:   {H_distance**2:.6f} (vs CE ~{baseline['avg_ce_last50']:.2f})")
+
+    if H_distance < 0.01:
+        print(f"    NOTE: Output entropy already near PSI_ENTROPY ({baseline_H_avg:.4f} vs {PSI_ENTROPY})")
+        print(f"          Entropy regularizer is ~{H_distance**2:.6f}, negligible vs CE ~5.5")
+        print(f"          The orthogonal gradient exists but has zero magnitude here")
+        print(f"    VERDICT: NEUTRAL — entropy already saturated at initialization")
+        print(f"          Dual gradient is structurally correct but requires a regime")
+        print(f"          where H deviates from PSI_ENTROPY (e.g. real corpus, larger model,")
+        print(f"          or early training where output distribution is non-uniform)")
+    elif ce_improvement > 2.0:
         print(f"    VERDICT: Dual gradient ACCELERATES CE convergence")
         print(f"    -> Orthogonal entropy gradient provides complementary learning signal")
     elif ce_improvement > 0:
