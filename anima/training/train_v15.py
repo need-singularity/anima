@@ -52,6 +52,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import time
 import traceback
 import numpy as np
@@ -139,6 +140,61 @@ except ImportError:
     PSI_ALPHA = 0.014
     _PSI_BAL = 0.5
     PSI_F_CRITICAL = 0.10
+
+# ═══════════════════════════════════════════════════════════
+# Signal handler — emergency checkpoint on SIGTERM/SIGINT
+# ═══════════════════════════════════════════════════════════
+
+_EMERGENCY_STATE = {
+    'decoder': None,
+    'optimizer': None,
+    'scheduler': None,
+    'federation': None,
+    'bridge': None,
+    'hexad_modules': None,
+    'step': 0,
+    'phi': 0.0,
+    'ce': float('inf'),
+    'args': None,
+    'scale_name': None,
+    'ckpt_dir': None,
+    'fb_bridge': None,
+    'c_proj': None,
+    'scaler': None,
+}
+
+def _emergency_save(signum, frame):
+    """Save emergency checkpoint on SIGTERM/SIGINT, then exit."""
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print(f"\n  [SIGNAL] Received {sig_name} — saving emergency checkpoint...", flush=True)
+
+    st = _EMERGENCY_STATE
+    if st['decoder'] is None or st['ckpt_dir'] is None:
+        print(f"  [SIGNAL] No training state to save. Exiting.", flush=True)
+        _sys.exit(128 + signum)
+
+    try:
+        ckpt_path = os.path.join(st['ckpt_dir'], f"emergency_step_{st['step']}.pt")
+        os.makedirs(st['ckpt_dir'], exist_ok=True)
+        save_checkpoint(
+            ckpt_path, st['step'], st['decoder'], st['optimizer'], st['scheduler'],
+            st['federation'], st['bridge'], st['hexad_modules'],
+            st['phi'], st['ce'], st['args'], scale_name=st['scale_name'],
+            fb_bridge=st['fb_bridge'], c_proj=st['c_proj'], scaler=st['scaler'],
+        )
+        print(f"  [SIGNAL] Emergency checkpoint saved: {ckpt_path}", flush=True)
+    except Exception as ex:
+        print(f"  [SIGNAL] Failed to save emergency checkpoint: {ex}", flush=True)
+
+    _sys.exit(128 + signum)
+
+
+def register_emergency_state(**kwargs):
+    """Register current training state for emergency save on signal."""
+    for k, v in kwargs.items():
+        if k in _EMERGENCY_STATE:
+            _EMERGENCY_STATE[k] = v
+
 
 META_ATOM_SIZE = 8          # M1: cells per atom
 META_DEFAULT_ATOMS = 8      # M1: 8 atoms x 8 cells = 64 total
@@ -1042,6 +1098,15 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
     # Training loop
     # ══════════════════════════════════════════════════
 
+    # Register training state for emergency save on SIGTERM/SIGINT
+    register_emergency_state(
+        decoder=decoder, optimizer=optimizer, scheduler=scheduler,
+        federation=c, bridge=bridge, hexad_modules=hexad_modules,
+        step=start_step, phi=phi, ce=ce_val, args=args,
+        scale_name=scale_name, ckpt_dir=ckpt_dir,
+        fb_bridge=fb_bridge, c_proj=c_proj, scaler=scaler,
+    )
+
     for step in range(start_step + 1, steps + 1):
 
         # ── Phase selection ──
@@ -1183,6 +1248,11 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         if step % 50 == 0:
             phi = c.measure_phi()
         phi_history.append(phi)
+
+        # Update emergency state for signal handler
+        _EMERGENCY_STATE['step'] = step
+        _EMERGENCY_STATE['phi'] = phi
+        _EMERGENCY_STATE['ce'] = ce_val
 
         # Law 49: Phi-checkpoint — save when Phi improves
         if phi > best_phi and is_main_process():
@@ -1450,7 +1520,7 @@ Examples:
     )
 
     # Data + Tokenizer
-    p.add_argument("--data", type=str, default="data/corpus_v10_ko.txt", help="Corpus path")
+    p.add_argument("--data", type=str, default="data/corpus_v11_multilingual.txt", help="Corpus path")
     p.add_argument("--tokenizer", type=str, default="config/tokenizer_64k_multilingual.model",
                    help="SentencePiece BPE tokenizer model ('' for byte-level fallback)")
     p.add_argument("--vocab-size", type=int, default=64000,
@@ -1507,6 +1577,12 @@ Examples:
 if __name__ == "__main__":
     # Ensure unbuffered output
     os.environ['PYTHONUNBUFFERED'] = '1'
+
+    # Install signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _emergency_save)
+    signal.signal(signal.SIGINT, _emergency_save)
+    print("  [safety] Signal handlers installed (SIGTERM/SIGINT -> emergency checkpoint)",
+          flush=True)
 
     args = parse_args()
 

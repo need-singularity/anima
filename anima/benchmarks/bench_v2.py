@@ -47,7 +47,7 @@ try:
         VERIFY_V2_AUTOCORR_MIN, VERIFY_V2_VARIANCE_MIN, VERIFY_V2_COS_CONTINUITY_MIN,
         VERIFY_V3_PHI_RATIO_MIN, VERIFY_V4_RECOVERY_MIN, VERIFY_V4_STABILITY_MIN,
         VERIFY_V5_PHI_RATIO_MIN, VERIFY_V6_CONSENSUS_MIN, VERIFY_V6_DIR_CHANGES_MIN,
-        VERIFY_V6_CV_MIN, VERIFY_MITOSIS_MIN_SPLITS, VERIFY_PHI_GROWTH_RATIO,
+        VERIFY_V6_CV_MIN, VERIFY_V6_BURST_MIN, VERIFY_MITOSIS_MIN_SPLITS, VERIFY_PHI_GROWTH_RATIO,
         VERIFY_BRAIN_LIKE_MIN, VERIFY_DIVERSITY_MAX_COSINE, VERIFY_DIVERSITY_NORM_STD_MIN,
         VERIFY_HEBBIAN_CHANGE_RATIO_MIN,
     )
@@ -65,6 +65,7 @@ except ImportError:
     VERIFY_V6_CONSENSUS_MIN = 200
     VERIFY_V6_DIR_CHANGES_MIN = 120
     VERIFY_V6_CV_MIN = 0.40
+    VERIFY_V6_BURST_MIN = 3
     VERIFY_MITOSIS_MIN_SPLITS = 3
     VERIFY_PHI_GROWTH_RATIO = 0.85
     VERIFY_BRAIN_LIKE_MIN = 80
@@ -316,9 +317,9 @@ class BenchEngine:
         # Orthogonal initialization for maximum diversity
         if hidden_dim >= n_cells:
             q, _ = torch.linalg.qr(torch.randn(hidden_dim, n_cells))
-            self.cell_identity = q.T * 0.8  # [n_cells, hidden_dim]
+            self.cell_identity = q.T * 0.3  # [n_cells, hidden_dim]
         else:
-            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.8
+            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.3
         # Φ ratchet: prevent collapse
         self._phi_ratchet = None
         self._phi_ratchet_var = 0.0
@@ -380,7 +381,6 @@ class BenchEngine:
 
         # Cell identity injection AFTER faction sync: prevents convergence
         # to uniform state despite sync pulling cells together (→ DIVERSITY)
-        # Strength scales with convergence: stronger when cells become similar.
         # Strength scales with convergence: stronger when cells become similar.
         # Uses per-cell norm variance as convergence proxy (faster than cosine).
         norms = self.hiddens.norm(dim=1)
@@ -2787,15 +2787,15 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
                 in_burst = False
         # Fallback thresholds: relaxed for non-CE engines. BenchEngine-type engines
         # use inter-cell variance which has different dynamics than CE's intra-cell.
-        # CV: 1/8 of consensus threshold (stable variance, cv ~ 0.05-0.10)
-        # Direction changes: 1/3 of consensus threshold (identity injection +
+        # CV: 37.5% of consensus threshold (stable variance, cv ~ 0.10-0.20)
+        # Direction changes: 50% of consensus threshold (identity injection +
         # convergence forces in combined engines produce smoother inter-cell variance)
-        fallback_cv_min = VERIFY_V6_CV_MIN * 0.125
-        fallback_dir_min = VERIFY_V6_DIR_CHANGES_MIN // 3
-        passed = (burst_events >= 3
+        fallback_cv_min = VERIFY_V6_CV_MIN * 0.375
+        fallback_dir_min = VERIFY_V6_DIR_CHANGES_MIN // 2
+        passed = (burst_events >= VERIFY_V6_BURST_MIN
                   and direction_changes >= fallback_dir_min
                   and cv > fallback_cv_min)
-        detail = (f"bursts={burst_events} (threshold=3, fallback)  "
+        detail = (f"bursts={burst_events} (threshold={VERIFY_V6_BURST_MIN}, fallback)  "
                   f"direction_changes={direction_changes} (threshold={fallback_dir_min}, fallback)  "
                   f"cv={cv:.4f} (threshold={fallback_cv_min:.4f}, fallback)  "
                   f"mean_var={mean_v:.6f}  std={std_v:.6f}")
@@ -3181,7 +3181,7 @@ def _verify_diversity(engine_factory, cells, dim, hidden):
     Mean cosine < 0.95 (cells aren't all identical) AND
     std of per-cell norms > 0 (variation in activity levels exists).
 
-    Threshold from consciousness_laws.json: verify_diversity_max_cosine = 0.95
+    Threshold from consciousness_laws.json: verify_diversity_max_cosine = 0.85
     """
     engine = engine_factory(cells, dim, hidden)
 
