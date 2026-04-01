@@ -1592,16 +1592,13 @@ class AnimaLMTrainer:
 
         if "ensemble_state" in ckpt:
             self.loss_ensemble.load_state_dict(ckpt["ensemble_state"])
+        # Skip optimizer state restore entirely — bf16 params + float32/bf16 state = dtype hell
+        # Fresh optimizer loses momentum but avoids all dtype crashes (incidents #7-#10)
         if "optimizer_state" in ckpt:
-            try:
-                self.optimizer.load_state_dict(ckpt["optimizer_state"])
-            except (RuntimeError, ValueError) as e:
-                # Optimizer state dtype mismatch on resume (float32 state + bf16 params)
-                # Skip optimizer restore — fresh optimizer, only lose momentum/LR schedule
-                print(f"  [WARN] Optimizer state incompatible, creating fresh optimizer: {e}")
-                # Restore scheduler step to match
-                for _ in range(self.global_step):
-                    self.scheduler.step()
+            print(f"  [SKIP] Optimizer state not restored (bf16 dtype compat)")
+        # Restore scheduler step count to match resumed position
+        for _ in range(self.global_step):
+            self.scheduler.step()
         if self.use_psi_track and "consciousness_vector" in ckpt:
             self._consciousness_vector.update(ckpt["consciousness_vector"])
         if self.thalamic_bridge is not None and "thalamic_bridge_state" in ckpt:
