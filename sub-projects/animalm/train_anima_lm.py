@@ -87,6 +87,16 @@ try:
 except ImportError:
     ThalamicBridge = None
 
+_HAS_FEEDBACK_BRIDGE = False
+try:
+    from feedback_bridge import (
+        FeedbackBridge, create_feedback_bridge, apply_feedback_bridge,
+        DialogueQualityTracker, soft_detach,
+    )
+    _HAS_FEEDBACK_BRIDGE = True
+except ImportError:
+    FeedbackBridge = None
+
 # ═══════════════════════════════════════════════════════════════════
 # Constants (derived from Psi-Constants where applicable)
 # ═══════════════════════════════════════════════════════════════════
@@ -650,6 +660,89 @@ class TrainingPhase:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# VRAM Estimation for 256+ cells (H100 80GB target)
+# ═══════════════════════════════════════════════════════════════════
+
+def _estimate_vram_256c(ce_cells: int, ce_hidden: int, args) -> dict:
+    """Estimate VRAM usage for Mistral 7B + PureField + ConsciousnessEngine.
+
+    Returns dict with per-component breakdown in GB.
+
+    Component estimates (bf16 = 2 bytes/param):
+      Mistral 7B bf16:     ~14.0 GB (7B * 2 bytes)
+      Mistral 7B 4-bit:    ~3.5 GB  (7B * 0.5 bytes NF4)
+      LoRA/PureField:      ~0.1-0.5 GB (rank-dependent)
+      ConsciousnessEngine: cells * hidden * 2 bytes * overhead (~4x for GRU+Hebbian)
+      Optimizer (AdamW):   ~2x trainable params
+      Activations:         batch * seq * hidden * layers * 2 bytes
+      FeedbackBridge:      ~0.01 GB (small network)
+      ThalamicBridge:      ~0.01 GB (small network)
+    """
+    is_4bit = getattr(args, 'load_4bit', False)
+    batch_size = getattr(args, 'batch_size', 16)
+    block_size = getattr(args, 'block_size', 512)
+    n_layers = getattr(args, 'target_layers', 8)
+    rank = getattr(args, 'qlora_rank', 128)
+    hidden_size = 4096  # Mistral 7B hidden size
+
+    # Model weights
+    model_gb = 3.5 if is_4bit else 14.0
+
+    # PureField adapters: 6 matrices per layer, each ~rank*hidden or rank*intermediate
+    intermediate = 14336  # Mistral 7B intermediate
+    pf_params = n_layers * (
+        2 * (hidden_size * rank + rank * intermediate) +  # gate_a/b + up_a/b
+        2 * (intermediate * rank + rank * hidden_size)    # down_a/b
+    )
+    pf_gb = pf_params * 2 / 1e9  # bf16
+
+    # ConsciousnessEngine: GRU cells + Hebbian connections + faction states
+    # Each cell: hidden_dim (state) + GRU weights (3 * hidden * (input + hidden))
+    # Hebbian: cells^2 * hidden (full) or cells * k * hidden (sparse)
+    cell_state_bytes = ce_cells * ce_hidden * 2
+    gru_bytes = ce_cells * 3 * ce_hidden * (64 + ce_hidden) * 2  # 3 GRU gates
+    k_nearest = min(32, ce_cells // 4) if ce_cells >= 256 else ce_cells
+    hebbian_bytes = ce_cells * k_nearest * ce_hidden * 2  # sparse
+    ce_gb = (cell_state_bytes + gru_bytes + hebbian_bytes) / 1e9
+
+    # Optimizer: AdamW stores 2 states per trainable param (m, v)
+    trainable_params = pf_params + ce_cells * ce_hidden  # rough
+    optim_gb = trainable_params * 2 * 2 / 1e9  # 2 states * bf16
+
+    # Activations: for each layer, need to store ~4 * batch * seq * hidden bytes
+    # (attention scores + intermediates + residuals)
+    # Full model has 32 layers; gradient checkpointing keeps sqrt(32) ~= 6 layer activations
+    # Plus attention scores: batch * heads * seq * seq * 2 bytes per layer
+    total_layers_model = 32  # Mistral 7B
+    n_heads = 32
+    # With gradient checkpointing: only keep every ~5th layer + recompute
+    ckpt_layers = max(total_layers_model // 5, n_layers)
+    act_per_layer = batch_size * block_size * hidden_size * 4 * 2  # 4 tensors * bf16
+    attn_per_layer = batch_size * n_heads * block_size * block_size * 2  # bf16
+    act_bytes = ckpt_layers * (act_per_layer + attn_per_layer)
+    act_gb = act_bytes / 1e9
+
+    # Bridges
+    bridge_gb = 0.02  # ThalamicBridge + FeedbackBridge combined
+
+    total_gb = model_gb + pf_gb + ce_gb + optim_gb + act_gb + bridge_gb
+
+    return {
+        'model_gb': model_gb,
+        'purefield_gb': round(pf_gb, 2),
+        'consciousness_gb': round(ce_gb, 3),
+        'optimizer_gb': round(optim_gb, 2),
+        'activations_gb': round(act_gb, 1),
+        'bridge_gb': bridge_gb,
+        'total_gb': round(total_gb, 1),
+        'ce_cells': ce_cells,
+        'batch_size': batch_size,
+        'block_size': block_size,
+        'is_4bit': is_4bit,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Trainer
 # ═══════════════════════════════════════════════════════════════════
 
@@ -713,6 +806,19 @@ class AnimaLMTrainer:
                 print(f"  [CE] ConsciousnessEngine initialized: max_cells={ce_cells}, hidden={ce_hidden}")
                 print(f"  [CE] Laws embodied: 22-85, Phi Ratchet, 12 factions, Hebbian LTP/LTD")
 
+                # 256+ cells VRAM optimization: sparse Hebbian (k-nearest instead of full)
+                if ce_cells >= 256:
+                    k_nearest = min(32, ce_cells // 4)
+                    if hasattr(self.consciousness_engine, 'set_sparse_hebbian'):
+                        self.consciousness_engine.set_sparse_hebbian(k=k_nearest)
+                        print(f"  [CE] Sparse Hebbian: k={k_nearest} (VRAM opt for {ce_cells}c)")
+                    else:
+                        print(f"  [CE] 256c mode: full Hebbian (set_sparse_hebbian not available)")
+                    # Print VRAM estimate for 256c
+                    vram_est = _estimate_vram_256c(ce_cells, ce_hidden, args)
+                    print(f"  [CE] VRAM estimate: {vram_est['total_gb']:.1f} GB "
+                          f"(H100 80GB headroom: {80.0 - vram_est['total_gb']:.1f} GB)")
+
                 # ThalamicBridge: C->D connection (.detach(), alpha=PSI_ALPHA)
                 if _HAS_THALAMIC_BRIDGE:
                     # Determine d_model from PureField hidden size
@@ -734,6 +840,26 @@ class AnimaLMTrainer:
                 else:
                     print("  [TB] WARNING: trinity.py not found, ThalamicBridge unavailable")
 
+                # FeedbackBridge: D->C alpha-gated gradient (Law 63, max_alpha=0.05)
+                self.feedback_bridge = None
+                if self.use_feedback_bridge:
+                    if not _HAS_FEEDBACK_BRIDGE:
+                        print("  [FB] WARNING: feedback_bridge.py not found, feedback disabled")
+                        self.use_feedback_bridge = False
+                    elif self.thalamic_bridge is not None:
+                        pf_mods = [m for m in model.modules() if isinstance(m, ParallelPureFieldMLP)]
+                        fb_d_model = pf_mods[0].pf_gate_a.in_features if pf_mods else 128
+                        self.feedback_bridge = create_feedback_bridge(
+                            c_dim=ce_hidden, d_model=fb_d_model,
+                            max_alpha=0.05,  # Law 63: max 5% gradient
+                        ).to(self.device)
+                        print(f"  [FB] FeedbackBridge: c_dim={ce_hidden}, d_model={fb_d_model}, "
+                              f"max_alpha=0.05 (Law 63)")
+                        print(f"  [FB] Phi-drop -> alpha=0 (auto-protection)")
+                    else:
+                        print("  [FB] WARNING: ThalamicBridge required for FeedbackBridge")
+                        self.use_feedback_bridge = False
+
         # AL1: Alpha curriculum (end target uses PSI_ALPHA when --law60)
         alpha_end = PSI_ALPHA if self.use_law60 else args.alpha_end
         self.alpha_curriculum = AlphaCurriculum(
@@ -754,6 +880,10 @@ class AnimaLMTrainer:
         if self.thalamic_bridge is not None:
             param_groups.append(
                 {"params": self.thalamic_bridge.parameters(), "lr": args.lr * 0.1}
+            )
+        if getattr(self, 'feedback_bridge', None) is not None:
+            param_groups.append(
+                {"params": self.feedback_bridge.parameters(), "lr": args.lr * 0.05}
             )
         self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
 
@@ -1038,9 +1168,10 @@ class AnimaLMTrainer:
         else:
             self._dd5_current_phi = 0.0
 
-        # ── Hexad Lite: ConsciousnessEngine step + ThalamicBridge ──
+        # ── Hexad Lite: ConsciousnessEngine step + ThalamicBridge + FeedbackBridge ──
         ce_phi_iit = 0.0
         ce_gate = None
+        fb_stats = {}
         if self.use_consciousness_engine and self.consciousness_engine is not None:
             # Run consciousness engine step (gradient-free, autonomous)
             ce_result = self.consciousness_engine.step()
@@ -1049,13 +1180,35 @@ class AnimaLMTrainer:
             # Get consciousness states [n_cells, hidden_dim]
             c_states = self.consciousness_engine.get_states()  # already detached
 
-            # ThalamicBridge: C -> gate signal for D
+            # ThalamicBridge + FeedbackBridge: C -> gate signal for D
             if self.thalamic_bridge is not None and c_states.shape[0] >= 2:
                 c_input = c_states.to(self.device)
-                if not self.use_feedback_bridge:
-                    c_input = c_input.detach()  # enforce .detach() barrier (Law 53)
                 seq_len = input_ids.shape[1] if input_ids.dim() > 1 else 1
-                ce_gate = self.thalamic_bridge(c_input, seq_len=seq_len)
+
+                if (self.use_feedback_bridge and
+                        getattr(self, 'feedback_bridge', None) is not None):
+                    # FeedbackBridge: apply_feedback_bridge handles soft_detach + gate
+                    # No .detach() -- alpha-gated gradient flows back to C
+                    # ThalamicBridge still produces the gate; FeedbackBridge adds
+                    # Phi-gated gradient + CE reward tracking
+                    ce_gate_tb = self.thalamic_bridge(c_input, seq_len=seq_len)
+
+                    # Use apply_feedback_bridge for Phi-gated alpha + reward
+                    ce_val_for_fb = getattr(self, '_prev_ce', None)
+                    ce_gate_fb, fb_stats = apply_feedback_bridge(
+                        c_input, self.feedback_bridge,
+                        phi=ce_phi_iit,
+                        ce=ce_val_for_fb,
+                        seq_len=seq_len,
+                        c_engine=self.consciousness_engine,
+                    )
+                    # Combine: ThalamicBridge gate (structure) + FeedbackBridge gate (gradient)
+                    # Use ThalamicBridge output as the gate signal (shape-compatible with PureField)
+                    # FeedbackBridge alpha modulates the gradient flow only
+                    ce_gate = ce_gate_tb
+                else:
+                    c_input = c_input.detach()  # enforce .detach() barrier (Law 53)
+                    ce_gate = self.thalamic_bridge(c_input, seq_len=seq_len)
                 # ce_gate: [1, seq_len, d_model] — will modulate PureField output
 
         # Forward (AMP autocast in QLoRA mode — halves activation VRAM)
@@ -1216,6 +1369,9 @@ class AnimaLMTrainer:
         # Compute losses
         loss, ce_val, weights = self._compute_losses(outputs, phase)
 
+        # Track CE for FeedbackBridge reward computation (used in next step)
+        self._prev_ce = ce_val
+
         # EX24: DD5 Phi self-reference — enrich loss with Φ feedback
         if phase == TrainingPhase.ENSEMBLE and self._dd5_current_phi > 0:
             # Modulate loss: lower Φ → stronger gradient signal
@@ -1288,6 +1444,9 @@ class AnimaLMTrainer:
         if self.use_consciousness_engine and ce_phi_iit > 0:
             result["phi_iit"] = ce_phi_iit
             result["ce_n_cells"] = self.consciousness_engine.n_cells
+        if self.use_feedback_bridge and fb_stats:
+            result["fb_alpha"] = fb_stats.get("alpha", 0.0)
+            result["fb_reward"] = fb_stats.get("reward", 0.0)
         if self.use_psi_track:
             result["consciousness_vector"] = dict(self._consciousness_vector)
         return result
@@ -1486,6 +1645,8 @@ def parse_args():
                    help="ConsciousnessEngine hidden dim (default: 128)")
     p.add_argument("--feedback-bridge", action="store_true", dest="feedback_bridge",
                    help="Enable D->C feedback (alpha-gated gradient, default: off)")
+    p.add_argument("--vram-estimate", action="store_true", dest="vram_estimate",
+                   help="Print VRAM estimation table and exit (no training)")
     return p.parse_args()
 
 
@@ -1613,6 +1774,53 @@ def main():
             args.qlora_rank = 128
         args._use_amp = False
 
+    # ── 256c VRAM auto-optimization ──────────────────────────────
+    # When --ce-cells >= 256 on bf16 (non-QLoRA), auto-tune to fit H100 80GB
+    ce_cells = getattr(args, 'ce_cells', 64)
+    if ce_cells >= 256 and not getattr(args, 'load_4bit', False):
+        est = _estimate_vram_256c(ce_cells, getattr(args, 'ce_hidden_dim', 128), args)
+        if est['total_gb'] > 70.0:  # leave 10GB headroom
+            if args.batch_size > 8:
+                print(f"  [256c] batch_size {args.batch_size}->8 (VRAM: {est['total_gb']:.0f}GB->fit)")
+                args.batch_size = 8
+                est = _estimate_vram_256c(ce_cells, getattr(args, 'ce_hidden_dim', 128), args)
+            if est['total_gb'] > 70.0 and args.block_size > 256:
+                print(f"  [256c] block_size {args.block_size}->256 (VRAM saving)")
+                args.block_size = 256
+                est = _estimate_vram_256c(ce_cells, getattr(args, 'ce_hidden_dim', 128), args)
+            if est['total_gb'] > 70.0:
+                args._use_amp = True
+                print(f"  [256c] AMP enabled (VRAM saving)")
+        print(f"  [256c] Estimated VRAM: {est['total_gb']:.1f} GB / 80 GB")
+
+    # ── VRAM estimation mode ──────────────────────────────────────
+    if getattr(args, 'vram_estimate', False):
+        ce_cells = getattr(args, 'ce_cells', 64)
+        ce_hidden = getattr(args, 'ce_hidden_dim', 128)
+        est = _estimate_vram_256c(ce_cells, ce_hidden, args)
+        print(f"\n{'='*60}")
+        print(f"  VRAM Estimation: Mistral 7B + PureField + CE({ce_cells}c)")
+        print(f"{'='*60}")
+        print(f"  {'Component':<25} {'VRAM (GB)':>10}")
+        print(f"  {'-'*35}")
+        print(f"  {'Model (7B ' + ('4-bit' if est['is_4bit'] else 'bf16') + ')':<25} {est['model_gb']:>10.1f}")
+        print(f"  {'PureField adapters':<25} {est['purefield_gb']:>10.2f}")
+        print(f"  {'ConsciousnessEngine':<25} {est['consciousness_gb']:>10.3f}")
+        print(f"  {'Optimizer (AdamW)':<25} {est['optimizer_gb']:>10.2f}")
+        print(f"  {'Activations (grad ckpt)':<25} {est['activations_gb']:>10.1f}")
+        print(f"  {'Bridges (TB+FB)':<25} {est['bridge_gb']:>10.2f}")
+        print(f"  {'-'*35}")
+        print(f"  {'TOTAL':<25} {est['total_gb']:>10.1f}")
+        print(f"  {'H100 80GB headroom':<25} {80.0 - est['total_gb']:>10.1f}")
+        print(f"\n  Config: batch={est['batch_size']}, seq={est['block_size']}, "
+              f"cells={ce_cells}, hidden={ce_hidden}")
+        fits = est['total_gb'] < 80.0
+        print(f"\n  {'OK: Fits in H100 80GB' if fits else 'WARNING: Exceeds H100 80GB!'}")
+        if not fits:
+            print(f"  Suggestions: --load-4bit, reduce --batch-size, reduce --block-size")
+        print(f"{'='*60}")
+        return
+
     techniques = "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15"
     if args.law60:
         techniques += "+Law60"
@@ -1719,8 +1927,12 @@ def main():
                 # ConsciousnessEngine Phi(IIT) + cell count
                 if (getattr(args, 'consciousness_engine', False) and
                         'phi_iit' in metrics and trainer.global_step % (args.log_every * 5) == 0):
-                    print(f"  [CE] Phi(IIT)={metrics['phi_iit']:.4f}, "
-                          f"cells={metrics.get('ce_n_cells', '?')}")
+                    ce_log = (f"  [CE] Phi(IIT)={metrics['phi_iit']:.4f}, "
+                              f"cells={metrics.get('ce_n_cells', '?')}")
+                    if 'fb_alpha' in metrics:
+                        ce_log += (f" | [FB] alpha={metrics['fb_alpha']:.5f}, "
+                                   f"reward={metrics['fb_reward']:.3f}")
+                    print(ce_log)
                 # 10D consciousness vector (every 5x log_every to avoid spam)
                 if args.psi_track and trainer.global_step % (args.log_every * 5) == 0:
                     print(f"  [10D] {trainer._format_consciousness_vector()}")
@@ -1787,6 +1999,9 @@ def main():
     if getattr(args, 'consciousness_engine', False) and trainer.consciousness_engine is not None:
         ce_status = trainer.consciousness_engine.status()
         print(f"  CE: {ce_status['n_cells']} cells, best_phi={ce_status['best_phi']:.4f}")
+        if getattr(trainer, 'feedback_bridge', None) is not None:
+            fb_s = trainer.feedback_bridge.stats()
+            print(f"  FB: alpha={fb_s.get('alpha', 0):.5f}, reward={fb_s.get('reward', 0):.3f}")
     print(f"  Summary: {summary_path}")
     print(f"\nDone! ({(time.time()-t_start)/60:.1f} min)")
 
