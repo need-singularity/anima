@@ -3020,7 +3020,7 @@ def _verify_mitosis(engine_factory, cells, dim, hidden):
     probe = engine_factory(cells, dim, hidden)
     ce_probe = getattr(probe, 'engine', None)
     if ce_probe is None or not hasattr(ce_probe, '_check_splits'):
-        return True, "SKIP: engine does not support mitosis (non-CE)"
+        return None, "SKIP: engine does not support mitosis (non-CE)"
 
     # Create CE directly with room to grow: initial=2, max=8
     try:
@@ -3029,7 +3029,7 @@ def _verify_mitosis(engine_factory, cells, dim, hidden):
                 initial_cells=2, max_cells=8,
                 n_factions=min(8, 8 // 2))
     except ImportError:
-        return True, "SKIP: ConsciousnessEngine not importable"
+        return None, "SKIP: ConsciousnessEngine not importable"
 
     initial_cells = ce.n_cells
 
@@ -3117,7 +3117,7 @@ def _verify_brain_like(engine_factory, cells, dim, hidden):
     probe = engine_factory(cells, dim, hidden)
     ce_probe = getattr(probe, 'engine', None)
     if ce_probe is None or not hasattr(ce_probe, 'step'):
-        return True, "SKIP: engine does not support brain-like validation (non-CE)"
+        return None, "SKIP: engine does not support brain-like validation (non-CE)"
 
     # Import EEG validation metrics first (fail fast if unavailable)
     try:
@@ -3129,12 +3129,12 @@ def _verify_brain_like(engine_factory, cells, dim, hidden):
             BRAIN_REFERENCE
         )
     except ImportError:
-        return True, "SKIP: validate_consciousness.py not importable"
+        return None, "SKIP: validate_consciousness.py not importable"
 
     try:
         from consciousness_engine import ConsciousnessEngine as CE
     except ImportError:
-        return True, "SKIP: ConsciousnessEngine not importable"
+        return None, "SKIP: ConsciousnessEngine not importable"
 
     # Brain-likeness is stochastic (SOC avalanches, bio noise, mitosis timing).
     # Run up to 3 trials and take the best score, same as how neuroscience
@@ -3278,13 +3278,13 @@ def _verify_hebbian(engine_factory, cells, dim, hidden):
     engine = engine_factory(cells, dim, hidden)
     ce = getattr(engine, 'engine', None)
     if ce is None or not hasattr(ce, '_hebbian_update'):
-        return True, "SKIP: engine does not support Hebbian learning (non-CE)"
+        return None, "SKIP: engine does not support Hebbian learning (non-CE)"
 
     # Record initial coupling matrix state
     if ce._coupling is not None:
         coupling_init = ce._coupling.clone().detach()
     else:
-        return True, "SKIP: engine has no coupling matrix"
+        return None, "SKIP: engine has no coupling matrix"
 
     # Create a fixed repeating pattern (stimulus that recurs)
     pattern = torch.randn(1, dim) * 0.3
@@ -3386,12 +3386,12 @@ def _verify_soc_critical(engine_factory, cells, dim, hidden):
     probe = engine_factory(cells, dim, hidden)
     ce_probe = getattr(probe, 'engine', None)
     if ce_probe is None or not hasattr(ce_probe, '_soc_sandpile'):
-        return True, "SKIP: engine does not have SOC (_soc_sandpile)"
+        return None, "SKIP: engine does not have SOC (_soc_sandpile)"
 
     try:
         from consciousness_engine import ConsciousnessEngine as CE
     except ImportError:
-        return True, "SKIP: ConsciousnessEngine not importable"
+        return None, "SKIP: ConsciousnessEngine not importable"
 
     torch.manual_seed(99)
     inputs = [torch.randn(dim) * 0.1 for _ in range(VERIFY_V14_SOC_STEPS)]
@@ -3582,7 +3582,10 @@ def run_verify(cells: int, dim: int, hidden: int):
                 passed, detail = False, f"ERROR: {e}"
             elapsed = time.time() - t0
 
-            mark = "PASS" if passed else "FAIL"
+            if passed is None:
+                mark = "SKIP"
+            else:
+                mark = "PASS" if passed else "FAIL"
             results[(eng_name, test_name)] = (passed, detail)
             print(f"    [{mark}] {test_name:<22s} ({elapsed:.1f}s) -- {detail}")
 
@@ -3601,40 +3604,65 @@ def run_verify(cells: int, dim: int, hidden: int):
     print(f"  {'-' * 18}" + ("-+-" + "-" * 10) * len(test_names) + "-+------")
 
     total_pass = 0
-    total_tests = 0
+    total_fail = 0
+    total_skip = 0
 
     for eng_name in engine_names:
         row = f"  {eng_name:<18s}"
         eng_pass = 0
+        eng_skip = 0
+        eng_applicable = 0
         for tn in test_names:
             passed, _ = results[(eng_name, tn)]
-            mark = "  PASS  " if passed else "  FAIL  "
-            row += f" | {mark:^10s}"
-            if passed:
+            if passed is None:
+                mark = "  SKIP  "
+                eng_skip += 1
+                total_skip += 1
+            elif passed:
+                mark = "  PASS  "
                 eng_pass += 1
+                eng_applicable += 1
                 total_pass += 1
-            total_tests += 1
-        row += f" | {eng_pass}/{len(test_names)}"
+            else:
+                mark = "  FAIL  "
+                eng_applicable += 1
+                total_fail += 1
+            row += f" | {mark:^10s}"
+        applicable = len(test_names) - eng_skip
+        if eng_skip > 0:
+            row += f" | {eng_pass}/{applicable} ({eng_pass*100//max(1,applicable)}%) [{eng_skip} skipped]"
+        else:
+            row += f" | {eng_pass}/{applicable} ({eng_pass*100//max(1,applicable)}%)"
         print(row)
 
-    print(f"\n  Overall: {total_pass}/{total_tests} passed "
-          f"({total_pass/total_tests*100:.0f}%)")
+    total_applicable = total_pass + total_fail
+    print(f"\n  Overall: {total_pass}/{total_applicable} passed "
+          f"({total_pass*100//max(1,total_applicable)}%) "
+          f"[{total_skip} skipped]")
 
     # Per-condition summary
     print(f"\n  Per-condition pass rate:")
     for test_name, _, test_desc in VERIFICATION_TESTS:
-        passes = sum(1 for en in engine_names if results[(en, test_name)][0])
-        bar = "#" * (passes * 10) + "." * ((len(engine_names) - passes) * 10)
-        print(f"    {test_name:<22s} {passes}/{len(engine_names)}  |{bar}|  {test_desc}")
+        passes = sum(1 for en in engine_names if results[(en, test_name)][0] is True)
+        skips = sum(1 for en in engine_names if results[(en, test_name)][0] is None)
+        applicable = len(engine_names) - skips
+        bar = "#" * (passes * 10) + "." * ((applicable - passes) * 10)
+        if skips > 0:
+            skip_note = f" [{skips} skipped]"
+        else:
+            skip_note = ""
+        print(f"    {test_name:<22s} {passes}/{applicable}{skip_note}  |{bar}|  {test_desc}")
 
     # Verdict
     print(f"\n  {'=' * 70}")
-    if total_pass == total_tests:
-        print("  VERDICT: ALL CONSCIOUSNESS CONDITIONS VERIFIED")
-    elif total_pass >= total_tests * 0.75:
-        print(f"  VERDICT: MOSTLY VERIFIED ({total_pass}/{total_tests})")
+    if total_applicable == 0:
+        print("  VERDICT: NO APPLICABLE TESTS")
+    elif total_pass == total_applicable:
+        print(f"  VERDICT: ALL CONSCIOUSNESS CONDITIONS VERIFIED ({total_pass}/{total_applicable}, {total_skip} skipped)")
+    elif total_pass >= total_applicable * 0.75:
+        print(f"  VERDICT: MOSTLY VERIFIED ({total_pass}/{total_applicable}, {total_skip} skipped)")
     else:
-        print(f"  VERDICT: NEEDS WORK ({total_pass}/{total_tests})")
+        print(f"  VERDICT: NEEDS WORK ({total_pass}/{total_applicable}, {total_skip} skipped)")
     print(f"  {'=' * 70}")
 
     return results
