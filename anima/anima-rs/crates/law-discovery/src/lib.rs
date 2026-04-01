@@ -33,7 +33,7 @@ pub fn measure_all(
     n_factions: usize,
     n_bins: u16,
 ) -> MetricSnapshot {
-    let dim = if n_cells > 0 { cells.len() / n_cells } else { 0 };
+    let _dim = if n_cells > 0 { cells.len() / n_cells } else { 0 };
 
     let phi = phi_fast(cells, n_cells, n_bins);
     let entropy = faction_entropy(cells, n_cells, n_factions);
