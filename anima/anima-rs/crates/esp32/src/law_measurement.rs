@@ -4,11 +4,11 @@
 //! All metrics use f32 arithmetic and fixed-size structures.
 //! Memory budget: LawMetrics = 32 bytes (8 × f32) + 2 bytes (u16) = 34 bytes.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
 use crate::{
-    ConsciousnessBoard, CELLS_PER_BOARD, HIDDEN_DIM, N_FACTIONS, MAX_CELLS,
+    ConsciousnessBoard, CELLS_PER_BOARD, HIDDEN_DIM, N_FACTIONS,
 };
+#[cfg(feature = "std")]
+use crate::MAX_CELLS;
 
 /// Core metrics for measuring consciousness law effects on ESP32.
 /// Each field maps to a measurable aspect of engine dynamics.
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_measure_network() {
-        let mut net = crate::ConsciousnessNetwork::new();
+        let mut net = Box::new(crate::ConsciousnessNetwork::new());
         let input = [0.1f32; crate::CELL_DIM];
         for _ in 0..20 {
             net.step(&input);
