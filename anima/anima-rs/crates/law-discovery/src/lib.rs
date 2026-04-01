@@ -6,11 +6,13 @@
 //! Components:
 //! - `metrics`: Core metric calculations (Phi, entropy, coupling, variance, Lyapunov)
 //! - `pattern`: Statistical pattern detection (correlation, phase transition, FFT, trend)
+//! - `text_pattern`: Text-based law parsing (65 regex patterns, synced with Python LawParser)
 //! - `candidate`: LawCandidate struct for discovered law proposals
 //! - `buffer`: Ring buffer for sliding-window metric history
 
 pub mod metrics;
 pub mod pattern;
+pub mod text_pattern;
 pub mod candidate;
 pub mod buffer;
 
@@ -24,6 +26,7 @@ pub use metrics::{
 pub use pattern::{
     detect_correlation, detect_phase_transition, detect_periodicity, detect_trend,
 };
+pub use text_pattern::{parse_law, TextMatch, ModType, NUM_TEXT_PATTERNS};
 pub use candidate::{LawCandidate, PatternType};
 pub use buffer::RingBuffer;
 
