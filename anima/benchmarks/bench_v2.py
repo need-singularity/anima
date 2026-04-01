@@ -316,9 +316,9 @@ class BenchEngine:
         # Orthogonal initialization for maximum diversity
         if hidden_dim >= n_cells:
             q, _ = torch.linalg.qr(torch.randn(hidden_dim, n_cells))
-            self.cell_identity = q.T * 0.5  # [n_cells, hidden_dim]
+            self.cell_identity = q.T * 0.8  # [n_cells, hidden_dim]
         else:
-            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.5
+            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.8
         # Φ ratchet: prevent collapse
         self._phi_ratchet = None
         self._phi_ratchet_var = 0.0
