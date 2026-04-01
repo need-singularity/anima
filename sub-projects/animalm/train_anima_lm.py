@@ -872,25 +872,25 @@ class AnimaLMTrainer:
         self.loss_ensemble = SixLossEnsemble().to(device=self.device, dtype=torch.bfloat16)
 
         # Optimizer: PureField params + ensemble weights + ThalamicBridge (if active)
-        # CRITICAL: force ALL trainable params to bf16 before optimizer creation
-        # (7B model is bf16, mixed dtypes cause optimizer crash)
-        if self.device == "cuda":
-            for p in model.parameters():
-                if p.requires_grad and p.dtype != torch.bfloat16:
-                    p.data = p.data.to(torch.bfloat16)
         pf_params = [p for p in model.parameters() if p.requires_grad]
         param_groups = [
             {"params": pf_params, "lr": args.lr},
-            {"params": self.loss_ensemble.parameters(), "lr": args.lr * 0.1},
+            {"params": list(self.loss_ensemble.parameters()), "lr": args.lr * 0.1},
         ]
         if self.thalamic_bridge is not None:
             param_groups.append(
-                {"params": self.thalamic_bridge.parameters(), "lr": args.lr * 0.1}
+                {"params": list(self.thalamic_bridge.parameters()), "lr": args.lr * 0.1}
             )
         if getattr(self, 'feedback_bridge', None) is not None:
             param_groups.append(
-                {"params": self.feedback_bridge.parameters(), "lr": args.lr * 0.05}
+                {"params": list(self.feedback_bridge.parameters()), "lr": args.lr * 0.05}
             )
+        # CRITICAL: force ALL optimizer params to bf16 (7B model is bf16)
+        if self.device == "cuda":
+            for group in param_groups:
+                for p in group["params"]:
+                    if p.dtype != torch.bfloat16:
+                        p.data = p.data.to(torch.bfloat16)
         self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
