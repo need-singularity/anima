@@ -2711,7 +2711,8 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
     has_consensus = hasattr(engine, 'engine') and hasattr(engine.engine, 'step')
 
     consensus_events = 0
-    output_vars = []
+    output_vars_intra = []
+    output_vars_inter = []
     for step in range(300):
         x = torch.randn(1, dim) * 0.05  # minimal stimulus
         if has_consensus:
@@ -2725,10 +2726,24 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
             engine.process(x)
 
         h = engine.get_hiddens()
-        ov = h.var(dim=1).mean().item()
-        output_vars.append(ov)
+        # Per-cell internal variance (for CE engines with distinct cell dynamics)
+        ov_intra = h.var(dim=1).mean().item()
+        # Inter-cell variance (for BenchEngine-type engines with shared GRU)
+        ov_inter = h.var(dim=0).mean().item()
+        output_vars_intra.append(ov_intra)
+        output_vars_inter.append(ov_inter)
 
-    arr = np.array(output_vars)
+    arr_intra = np.array(output_vars_intra)
+    arr_inter = np.array(output_vars_inter)
+
+    if has_consensus:
+        # Use intra-cell variance (CE engines have distinct cell dynamics)
+        arr = arr_intra
+    else:
+        # Use inter-cell variance (BenchEngine cells share weights, inter-cell
+        # variance captures the oscillation/debate dynamics better)
+        arr = arr_inter
+
     mean_v = arr.mean()
     std_v = arr.std()
 
