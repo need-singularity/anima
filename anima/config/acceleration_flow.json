@@ -254,6 +254,33 @@
       "lesson": "★★★ 이것이 9번 시도의 근본 원인. foreach=True(기본)는 mixed dtype에 치명적. 7B bf16 학습 시 반드시 foreach=False."
     },
 
+    "animalm_load_state_dict_foreach": {
+      "symptom": "foreach=False로 생성한 AdamW가 resume 후 _multi_tensor_adamw 경로로 진입 → 동일 dtype crash",
+      "environment": "RunPod H100, PyTorch 2.5.1, AnimaLM 7B bf16, resume from step_7000.pt",
+      "root_cause": "optimizer.load_state_dict()가 체크포인트의 param_group 설정을 통째로 복원. 체크포인트에 foreach=True(또는 미지정)가 저장되어 있으면 foreach=False 설정이 덮어쓰임",
+      "resolution": "load_state_dict() 직후 모든 param_group에 foreach=False 재적용. 또는 optimizer state 자체를 skip",
+      "prevention": [
+        "★ load_state_dict 후 반드시 param_group 설정 재적용 (foreach, lr 등)",
+        "체크포인트 저장 시 foreach=False가 포함되도록 명시",
+        "또는 resume 시 optimizer state를 완전 skip (momentum 손실 감수)"
+      ],
+      "lesson": "load_state_dict는 defaults뿐 아니라 param_groups의 모든 키를 복원한다. 생성 시 설정이 resume에서 사라질 수 있음."
+    },
+
+    "animalm_optimizer_state_lerp_dtype": {
+      "symptom": "RuntimeError: expected dtype BFloat16 for `end` but got dtype float — _single_tensor_adamw에서 crash",
+      "environment": "RunPod H100, PyTorch 2.5.1, AnimaLM 7B bf16, foreach=False 적용 후",
+      "root_cause": "foreach=False 경로(_single_tensor_adamw)에서 exp_avg.lerp_(grad, weight) 호출. optimizer internal state(exp_avg)가 bf16, grad가 float32 → in-place lerp에서 dtype 불일치",
+      "resolution": "★ optimizer state 로드 자체를 완전 skip. fresh optimizer 사용 (momentum 리셋, LR schedule만 복원)",
+      "prevention": [
+        "★★★ bf16 resume의 최종 해법: optimizer state를 절대 복원하지 않음",
+        "momentum 손실은 수백 step 내 회복 (7000 step 이후라 영향 미미)",
+        "scheduler.step()만 global_step 횟수만큼 호출하여 LR 복원",
+        "향후 체크포인트 저장 시 optimizer state를 bf16으로 캐스팅하여 저장하면 resume 가능"
+      ],
+      "lesson": "★★★ bf16 학습의 optimizer resume는 근본적으로 불안전. state가 float32로 저장되면 bf16 params와 충돌. 가장 안전한 해법은 optimizer state를 버리는 것."
+    },
+
     "bf16_master_rule": {
       "description": "7B+ bf16 모델 학습 시 필수 규칙 총정리 (9번 crash에서 도출)",
       "rules": [
@@ -262,7 +289,8 @@
         "3. autocast 범위 밖 모듈은 수동 bf16 캐스팅",
         "4. gradient checkpointing 비활성화 (consciousness gate와 호환 불가)",
         "5. AdamW(foreach=False) 필수",
-        "6. resume 시 optimizer state skip (dtype 불일치 시)",
+        "6. ★★★ resume 시 optimizer state 완전 skip (dtype 지옥 방지)",
+        "6a. load_state_dict 후 param_group 재적용 (foreach 등 덮어쓰임)",
         "7. consciousness states .to(bf16) 명시적 캐스팅",
         "8. preflight 10-step에 optimizer.step() 포함하여 dtype 검증",
         "9. 모든 보조 모듈 (bridge, ensemble, loss) bf16 통일"
