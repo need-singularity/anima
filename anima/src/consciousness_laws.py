@@ -86,6 +86,16 @@ VERIFY_DIVERSITY_MAX_COSINE = PSI.get('verify_diversity_max_cosine', 0.85)
 VERIFY_DIVERSITY_NORM_STD_MIN = PSI.get('verify_diversity_norm_std_min', 0.01)
 VERIFY_HEBBIAN_CHANGE_RATIO_MIN = PSI.get('verify_hebbian_change_ratio_min', 1.0)
 
+# BenchEngine Parameters (from bench_engine_params section)
+BENCH_ENGINE_PARAMS = {k: v['value'] for k, v in _DATA.get('bench_engine_params', {}).items()}
+BENCH_BREATHING_AMPLITUDE = BENCH_ENGINE_PARAMS.get('breathing_amplitude', 0.15)
+BENCH_PULSE_AMPLITUDE = BENCH_ENGINE_PARAMS.get('pulse_amplitude', 0.08)
+BENCH_SLOW_AMPLITUDE = BENCH_ENGINE_PARAMS.get('slow_amplitude', 0.10)
+BENCH_IDENTITY_BASE_STRENGTH = BENCH_ENGINE_PARAMS.get('identity_base_strength', 0.05)
+BENCH_IDENTITY_MAX_STRENGTH = BENCH_ENGINE_PARAMS.get('identity_max_strength', 0.35)
+BENCH_IDENTITY_CV_THRESHOLD = BENCH_ENGINE_PARAMS.get('identity_cv_threshold', 0.3)
+BENCH_DEBATE_OSCILLATION_FREQ = BENCH_ENGINE_PARAMS.get('debate_oscillation_freq', 0.12)
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 

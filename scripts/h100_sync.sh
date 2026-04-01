@@ -52,10 +52,10 @@ SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -p $PORT"
 declare -a SYNC_GROUPS=(
   "$REPO_ROOT/anima/src/|$DEST/|*.py *.json|src/"
   "$REPO_ROOT/anima/config/|$DEST/config/|*|config/"
-  "$REPO_ROOT/anima/training/train_v14.py|$DEST/train_v14.py|single|train_v14.py"
-  "$REPO_ROOT/anima/training/train_v15.py|$DEST/train_v15.py|single|train_v15.py"
+  "$REPO_ROOT/anima/training/|$DEST/training/|*.py|training/*.py"
   "$REPO_ROOT/scripts/preflight_training.sh|$DEST/preflight_training.sh|single|preflight_training.sh"
   "$REPO_ROOT/scripts/merge_corpus.sh|$DEST/merge_corpus.sh|single|merge_corpus.sh"
+  "$REPO_ROOT/scripts/h100_watchdog.sh|$DEST/h100_watchdog.sh|single|h100_watchdog.sh"
 )
 
 # ── Large file definitions (rsync with MD5 skip) ──
@@ -352,17 +352,17 @@ if ! $VERIFY_ONLY; then
   echo "[2/6] Syncing config/..."
   transfer "$REPO_ROOT/anima/config/" "$DEST/config/" "config/" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
-  # Transfer: training scripts
+  # Transfer: training scripts (all training/*.py)
   echo ""
-  echo "[3/6] Syncing training scripts..."
-  transfer "$REPO_ROOT/anima/training/train_v14.py" "$DEST/train_v14.py" "train_v14.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
-  transfer "$REPO_ROOT/anima/training/train_v15.py" "$DEST/train_v15.py" "train_v15.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  echo "[3/6] Syncing training/*.py..."
+  transfer "$REPO_ROOT/anima/training/" "$DEST/training/" "training/*.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
   # Transfer: operational scripts
   echo ""
   echo "[4/6] Syncing operational scripts..."
   transfer "$REPO_ROOT/scripts/preflight_training.sh" "$DEST/preflight_training.sh" "preflight_training.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
   transfer "$REPO_ROOT/scripts/merge_corpus.sh" "$DEST/merge_corpus.sh" "merge_corpus.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/scripts/h100_watchdog.sh" "$DEST/h100_watchdog.sh" "h100_watchdog.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
   # Transfer: tokenizer (small, normal transfer)
   echo ""
@@ -392,13 +392,14 @@ VERIFY_ERRORS=0
 verify_md5 "$REPO_ROOT/anima/src/consciousness_engine.py" "$DEST/consciousness_engine.py" "consciousness_engine.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/src/trinity.py" "$DEST/trinity.py" "trinity.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/src/decoder_v2.py" "$DEST/decoder_v2.py" "decoder_v2.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-verify_md5 "$REPO_ROOT/anima/training/train_v14.py" "$DEST/train_v14.py" "train_v14.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-verify_md5 "$REPO_ROOT/anima/training/train_v15.py" "$DEST/train_v15.py" "train_v15.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/training/train_v14.py" "$DEST/training/train_v14.py" "train_v14.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/training/train_v15.py" "$DEST/training/train_v15.py" "train_v15.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/config/consciousness_laws.json" "$DEST/config/consciousness_laws.json" "consciousness_laws.json" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model" "$DEST/data/tokenizer_64k_multilingual.model" "tokenizer_64k_multilingual.model" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt" "$DEST/data/corpus_v11_multilingual.txt" "corpus_v11_multilingual.txt" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/scripts/preflight_training.sh" "$DEST/preflight_training.sh" "preflight_training.sh" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/scripts/merge_corpus.sh" "$DEST/merge_corpus.sh" "merge_corpus.sh" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/scripts/h100_watchdog.sh" "$DEST/h100_watchdog.sh" "h100_watchdog.sh" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 
 echo ""
 echo "========================================"

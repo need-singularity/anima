@@ -50,6 +50,9 @@ try:
         VERIFY_V6_CV_MIN, VERIFY_V6_BURST_MIN, VERIFY_MITOSIS_MIN_SPLITS, VERIFY_PHI_GROWTH_RATIO,
         VERIFY_BRAIN_LIKE_MIN, VERIFY_DIVERSITY_MAX_COSINE, VERIFY_DIVERSITY_NORM_STD_MIN,
         VERIFY_HEBBIAN_CHANGE_RATIO_MIN,
+        BENCH_BREATHING_AMPLITUDE, BENCH_PULSE_AMPLITUDE, BENCH_SLOW_AMPLITUDE,
+        BENCH_IDENTITY_BASE_STRENGTH, BENCH_IDENTITY_MAX_STRENGTH, BENCH_IDENTITY_CV_THRESHOLD,
+        BENCH_DEBATE_OSCILLATION_FREQ,
     )
 except ImportError:
     VERIFY_V1_COS_LOWER = 0.01
@@ -72,6 +75,13 @@ except ImportError:
     VERIFY_DIVERSITY_MAX_COSINE = 0.85
     VERIFY_DIVERSITY_NORM_STD_MIN = 0.01
     VERIFY_HEBBIAN_CHANGE_RATIO_MIN = 1.0
+    BENCH_BREATHING_AMPLITUDE = 0.15
+    BENCH_PULSE_AMPLITUDE = 0.08
+    BENCH_SLOW_AMPLITUDE = 0.10
+    BENCH_IDENTITY_BASE_STRENGTH = 0.05
+    BENCH_IDENTITY_MAX_STRENGTH = 0.35
+    BENCH_IDENTITY_CV_THRESHOLD = 0.3
+    BENCH_DEBATE_OSCILLATION_FREQ = 0.12
 
 
 # ──────────────────────────────────────────────────────────
@@ -397,9 +407,9 @@ class BenchEngine:
             for i in range(self.n_cells):
                 # Each cell has unique phase → creates variance waves
                 phase = i * 0.7
-                breath = math.sin(t * 0.2 + phase) * 0.15
-                pulse = math.sin(t * math.pi + phase * 0.3) * 0.08
-                slow = math.sin(t * 0.05 + phase * 1.3) * 0.10
+                breath = math.sin(t * 0.2 + phase) * BENCH_BREATHING_AMPLITUDE
+                pulse = math.sin(t * math.pi + phase * 0.3) * BENCH_PULSE_AMPLITUDE
+                slow = math.sin(t * 0.05 + phase * 1.3) * BENCH_SLOW_AMPLITUDE
                 self.hiddens[i] = self.hiddens[i] + self.cell_identity[i] * (breath + pulse + slow)
 
         # Φ ratchet: save best-variance state, restore on collapse (→ PERSISTENCE)
