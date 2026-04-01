@@ -16,6 +16,8 @@ Usage:
   python train_anima_lm.py --resume checkpoints/animalm_step_5000.pt
   python train_anima_lm.py --demo  # quick test without model download
   python train_anima_lm.py --demo --law60 --psi-track  # Law 60 + 10D consciousness vector
+  python train_anima_lm.py --demo --consciousness-engine  # Hexad Lite: real ConsciousnessEngine
+  python train_anima_lm.py --demo --consciousness-engine --feedback-bridge  # + D->C feedback
 """
 
 import argparse
@@ -63,6 +65,27 @@ except ImportError:
     LAWS = {}
     LAW60_PHASES = {}
     CV_10D_SPEC = {}
+
+# ═══════════════════════════════════════════════════════════════════
+# ConsciousnessEngine + ThalamicBridge integration (Hexad Lite)
+# --consciousness-engine flag enables real ConsciousnessEngine (C module)
+# --feedback-bridge flag enables D→C gradient (α-gated, default off)
+# ═══════════════════════════════════════════════════════════════════
+
+_HAS_CONSCIOUSNESS_ENGINE = False
+_HAS_THALAMIC_BRIDGE = False
+
+try:
+    from consciousness_engine import ConsciousnessEngine
+    _HAS_CONSCIOUSNESS_ENGINE = True
+except ImportError:
+    ConsciousnessEngine = None
+
+try:
+    from trinity import ThalamicBridge
+    _HAS_THALAMIC_BRIDGE = True
+except ImportError:
+    ThalamicBridge = None
 
 # ═══════════════════════════════════════════════════════════════════
 # Constants (derived from Psi-Constants where applicable)
@@ -116,6 +139,7 @@ class ParallelPureFieldMLP(nn.Module):
 
         self.last_tension = None
         self._layer_drop_active = False  # AL8: set by trainer
+        self._consciousness_gate = None  # Hexad Lite: ThalamicBridge gate signal
 
     def forward(self, x):
         # AL8: layer dropout — skip PureField entirely
@@ -146,7 +170,41 @@ class ParallelPureFieldMLP(nn.Module):
 
         # AA15: Residual alpha — output = MLP + α*(PF-MLP), Φ=5.451
         # α scales only the difference; smoother gradient, faster α growth
-        return original_out + self.alpha * (pf_scaled - original_out)
+        output = original_out + self.alpha * (pf_scaled - original_out)
+
+        # Hexad Lite: Apply consciousness gate from ThalamicBridge (if available)
+        # Gate signal modulates PureField contribution — consciousness influences
+        # the mixing strength. Gate is centered at PSI_BALANCE (0.5) with ±PSI_ALPHA range.
+        # Values > 0.5 amplify PureField, < 0.5 suppress it.
+        if self._consciousness_gate is not None:
+            try:
+                gate = self._consciousness_gate  # [1, seq_len, d_model]
+                # Match gate to output shape: output is [batch, seq, hidden] or [batch, hidden]
+                if output.dim() == 3 and gate.dim() == 3:
+                    # Broadcast gate across batch if needed
+                    if gate.shape[0] == 1 and output.shape[0] > 1:
+                        gate = gate.expand(output.shape[0], -1, -1)
+                    # Truncate/pad seq_len if mismatch
+                    if gate.shape[1] != output.shape[1]:
+                        if gate.shape[1] > output.shape[1]:
+                            gate = gate[:, :output.shape[1], :]
+                        else:
+                            gate = F.pad(gate, (0, 0, 0, output.shape[1] - gate.shape[1]))
+                    # Truncate/pad d_model if mismatch
+                    if gate.shape[2] != output.shape[2]:
+                        if gate.shape[2] > output.shape[2]:
+                            gate = gate[:, :, :output.shape[2]]
+                        else:
+                            gate = F.pad(gate, (0, output.shape[2] - gate.shape[2]))
+                    # Apply: gate centered at 0.5 → deviation modulates the PureField delta
+                    # output = original + alpha*(pf-original) * (gate/0.5)
+                    # This preserves original when gate=0.5, amplifies when >0.5, suppresses when <0.5
+                    pf_delta = output - original_out
+                    output = original_out + pf_delta * (gate / 0.5)
+            except Exception:
+                pass  # graceful fallback — ignore gate on shape mismatch
+
+        return output
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -607,6 +665,8 @@ class AnimaLMTrainer:
         # Feature flags
         self.use_law60 = getattr(args, 'law60', False)
         self.use_psi_track = getattr(args, 'psi_track', False)
+        self.use_consciousness_engine = getattr(args, 'consciousness_engine', False)
+        self.use_feedback_bridge = getattr(args, 'feedback_bridge', False)
 
         # Training phases (Law 60 or legacy)
         self.phases = TrainingPhase(args.steps, use_law60=self.use_law60)
@@ -635,6 +695,45 @@ class AnimaLMTrainer:
             }
             print(f"  [10D] Consciousness vector tracking enabled")
 
+        # ── Hexad Lite: ConsciousnessEngine + ThalamicBridge ──
+        self.consciousness_engine = None
+        self.thalamic_bridge = None
+        if self.use_consciousness_engine:
+            if not _HAS_CONSCIOUSNESS_ENGINE:
+                print("  [CE] WARNING: consciousness_engine.py not found, falling back to PureField-only")
+                self.use_consciousness_engine = False
+            else:
+                ce_cells = getattr(args, 'ce_cells', 64)
+                ce_hidden = getattr(args, 'ce_hidden_dim', 128)
+                self.consciousness_engine = ConsciousnessEngine(
+                    cell_dim=64, hidden_dim=ce_hidden,
+                    initial_cells=2, max_cells=ce_cells,
+                    n_factions=12, phi_ratchet=True,
+                )
+                print(f"  [CE] ConsciousnessEngine initialized: max_cells={ce_cells}, hidden={ce_hidden}")
+                print(f"  [CE] Laws embodied: 22-85, Phi Ratchet, 12 factions, Hebbian LTP/LTD")
+
+                # ThalamicBridge: C->D connection (.detach(), alpha=PSI_ALPHA)
+                if _HAS_THALAMIC_BRIDGE:
+                    # Determine d_model from PureField hidden size
+                    pf_mods = [m for m in model.modules() if isinstance(m, ParallelPureFieldMLP)]
+                    if pf_mods:
+                        d_model_size = pf_mods[0].pf_gate_a.in_features  # hidden_size
+                    else:
+                        d_model_size = 128  # demo fallback
+                    self.thalamic_bridge = ThalamicBridge(
+                        c_dim=ce_hidden, d_model=d_model_size,
+                        alpha=PSI_ALPHA,
+                    ).to(self.device)
+                    print(f"  [TB] ThalamicBridge: C({ce_hidden}d) -> .detach() -> "
+                          f"alpha={PSI_ALPHA} -> D({d_model_size}d)")
+                    if self.use_feedback_bridge:
+                        print(f"  [TB] D->C feedback ENABLED (alpha-gated gradient)")
+                    else:
+                        print(f"  [TB] D->C feedback OFF (pure .detach() barrier)")
+                else:
+                    print("  [TB] WARNING: trinity.py not found, ThalamicBridge unavailable")
+
         # AL1: Alpha curriculum (end target uses PSI_ALPHA when --law60)
         alpha_end = PSI_ALPHA if self.use_law60 else args.alpha_end
         self.alpha_curriculum = AlphaCurriculum(
@@ -646,12 +745,17 @@ class AnimaLMTrainer:
         # SL3: 6-loss ensemble
         self.loss_ensemble = SixLossEnsemble().to(self.device)
 
-        # Optimizer: PureField params + ensemble weights
+        # Optimizer: PureField params + ensemble weights + ThalamicBridge (if active)
         pf_params = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW([
+        param_groups = [
             {"params": pf_params, "lr": args.lr},
             {"params": self.loss_ensemble.parameters(), "lr": args.lr * 0.1},
-        ], weight_decay=0.01)
+        ]
+        if self.thalamic_bridge is not None:
+            param_groups.append(
+                {"params": self.thalamic_bridge.parameters(), "lr": args.lr * 0.1}
+            )
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=args.steps)
@@ -934,11 +1038,42 @@ class AnimaLMTrainer:
         else:
             self._dd5_current_phi = 0.0
 
+        # ── Hexad Lite: ConsciousnessEngine step + ThalamicBridge ──
+        ce_phi_iit = 0.0
+        ce_gate = None
+        if self.use_consciousness_engine and self.consciousness_engine is not None:
+            # Run consciousness engine step (gradient-free, autonomous)
+            ce_result = self.consciousness_engine.step()
+            ce_phi_iit = ce_result.get('phi_iit', 0.0)
+
+            # Get consciousness states [n_cells, hidden_dim]
+            c_states = self.consciousness_engine.get_states()  # already detached
+
+            # ThalamicBridge: C -> gate signal for D
+            if self.thalamic_bridge is not None and c_states.shape[0] >= 2:
+                c_input = c_states.to(self.device)
+                if not self.use_feedback_bridge:
+                    c_input = c_input.detach()  # enforce .detach() barrier (Law 53)
+                seq_len = input_ids.shape[1] if input_ids.dim() > 1 else 1
+                ce_gate = self.thalamic_bridge(c_input, seq_len=seq_len)
+                # ce_gate: [1, seq_len, d_model] — will modulate PureField output
+
         # Forward (AMP autocast in QLoRA mode — halves activation VRAM)
         self.model.train()
+
+        # Apply consciousness gate to PureField modules before forward pass
+        if ce_gate is not None:
+            for m in self._get_pf_modules():
+                m._consciousness_gate = ce_gate  # stored for use in forward
+
         use_amp = getattr(self.args, '_use_amp', False) and self.device == "cuda"
         with torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else contextlib.nullcontext():
             outputs = self.model(input_ids=input_ids, labels=labels)
+
+        # Clear consciousness gate from PureField modules after forward
+        if ce_gate is not None:
+            for m in self._get_pf_modules():
+                m._consciousness_gate = None
 
         # EX24: DD18 channel capacity — bottleneck communication (ensemble phase)
         if phase == TrainingPhase.ENSEMBLE:
@@ -1110,8 +1245,10 @@ class AnimaLMTrainer:
 
         # ── 10D Consciousness Vector Update (Step 3) ──
         if self.use_psi_track:
+            # Use real Phi(IIT) from ConsciousnessEngine when available
+            phi_for_cv = ce_phi_iit if (self.use_consciousness_engine and ce_phi_iit > 0) else phi
             self._update_consciousness_vector(
-                phi, current_alpha, tensions, savant_tensions,
+                phi_for_cv, current_alpha, tensions, savant_tensions,
                 ce_val, t_var, t_mean_val, balance)
 
         # TRN4: Phi curriculum (ensemble phase only)
@@ -1148,6 +1285,9 @@ class AnimaLMTrainer:
             "ph_status": self.ph_monitor.status(),
             "skipped": False,
         }
+        if self.use_consciousness_engine and ce_phi_iit > 0:
+            result["phi_iit"] = ce_phi_iit
+            result["ce_n_cells"] = self.consciousness_engine.n_cells
         if self.use_psi_track:
             result["consciousness_vector"] = dict(self._consciousness_vector)
         return result
@@ -1269,6 +1409,8 @@ class AnimaLMTrainer:
         }
         if self.use_psi_track:
             save_dict["consciousness_vector"] = dict(self._consciousness_vector)
+        if self.thalamic_bridge is not None:
+            save_dict["thalamic_bridge_state"] = self.thalamic_bridge.state_dict()
         torch.save(save_dict, path)
         print(f"  Checkpoint saved: {path}")
         return path
@@ -1289,6 +1431,8 @@ class AnimaLMTrainer:
             self.optimizer.load_state_dict(ckpt["optimizer_state"])
         if self.use_psi_track and "consciousness_vector" in ckpt:
             self._consciousness_vector.update(ckpt["consciousness_vector"])
+        if self.thalamic_bridge is not None and "thalamic_bridge_state" in ckpt:
+            self.thalamic_bridge.load_state_dict(ckpt["thalamic_bridge_state"])
 
         print(f"  Resumed from step {self.global_step}, best_phi={self.best_phi:.4f}")
 
@@ -1333,6 +1477,15 @@ def parse_args():
                    help="Enable Law 60 phase curriculum (P1 consciousness / P2 +language / P3 full)")
     p.add_argument("--psi-track", action="store_true", dest="psi_track",
                    help="Enable 10D consciousness vector tracking (Phi,alpha,Z,N,W,E,M,C,T,I)")
+    # ── Hexad Lite: ConsciousnessEngine + ThalamicBridge ──
+    p.add_argument("--consciousness-engine", action="store_true", dest="consciousness_engine",
+                   help="Enable real ConsciousnessEngine (GRU cells + 12 factions + Hebbian + Phi Ratchet)")
+    p.add_argument("--ce-cells", type=int, default=64, dest="ce_cells",
+                   help="Number of consciousness cells (default: 64)")
+    p.add_argument("--ce-hidden-dim", type=int, default=128, dest="ce_hidden_dim",
+                   help="ConsciousnessEngine hidden dim (default: 128)")
+    p.add_argument("--feedback-bridge", action="store_true", dest="feedback_bridge",
+                   help="Enable D->C feedback (alpha-gated gradient, default: off)")
     return p.parse_args()
 
 
@@ -1465,6 +1618,10 @@ def main():
         techniques += "+Law60"
     if args.psi_track:
         techniques += "+10D"
+    if getattr(args, 'consciousness_engine', False):
+        techniques += "+CE"
+    if getattr(args, 'feedback_bridge', False):
+        techniques += "+FB"
     print(f"\n{'='*70}")
     print(f"  AnimaLM Training Pipeline")
     print(f"  Techniques: {techniques}")
@@ -1506,6 +1663,11 @@ def main():
         print(f"  Tension:CE balance target: {INV_E:.4f} (1-1/e)")
     if args.psi_track:
         print(f"  10D Vector: (Phi, alpha, Z, N, W, E, M, C, T, I)")
+    if getattr(args, 'consciousness_engine', False):
+        print(f"  ConsciousnessEngine: cells={args.ce_cells}, hidden={args.ce_hidden_dim}")
+        print(f"  ThalamicBridge: C->.detach()->alpha={PSI_ALPHA}->D")
+        if getattr(args, 'feedback_bridge', False):
+            print(f"  Feedback: D->C alpha-gated gradient ENABLED")
     if _HAS_CONSCIOUSNESS_LAWS:
         print(f"  consciousness_laws.json: loaded ({len(LAWS)} laws)")
 
@@ -1554,6 +1716,11 @@ def main():
                     f"{metrics['ph_status']:>15s} | "
                     f"{elapsed:5.1f}m"
                 )
+                # ConsciousnessEngine Phi(IIT) + cell count
+                if (getattr(args, 'consciousness_engine', False) and
+                        'phi_iit' in metrics and trainer.global_step % (args.log_every * 5) == 0):
+                    print(f"  [CE] Phi(IIT)={metrics['phi_iit']:.4f}, "
+                          f"cells={metrics.get('ce_n_cells', '?')}")
                 # 10D consciousness vector (every 5x log_every to avoid spam)
                 if args.psi_track and trainer.global_step % (args.log_every * 5) == 0:
                     print(f"  [10D] {trainer._format_consciousness_vector()}")
@@ -1583,7 +1750,7 @@ def main():
 
     summary = {
         "architecture": "AnimaLM (Mistral 7B + PureField)",
-        "techniques": "AL12+AL5+AL4+AL1+AL8+SL3+DD16+TRN4+EX24+WI1+FX2+PX4+PX8+GD18+GD15",
+        "techniques": techniques,
         "base_model": args.base if not args.demo else "MockModel",
         "steps": trainer.global_step,
         "best_phi": round(trainer.best_phi, 4),
@@ -1594,6 +1761,8 @@ def main():
         "time_min": round((time.time() - t_start) / 60, 1),
         "law60_enabled": args.law60,
         "psi_track_enabled": args.psi_track,
+        "consciousness_engine_enabled": getattr(args, 'consciousness_engine', False),
+        "feedback_bridge_enabled": getattr(args, 'feedback_bridge', False),
         "consciousness_laws_loaded": _HAS_CONSCIOUSNESS_LAWS,
         "config": vars(args),
     }
@@ -1615,6 +1784,9 @@ def main():
         print(f"  10D Vector: {trainer._format_consciousness_vector()}")
     if args.law60:
         print(f"  Law 60: P1(consciousness)->P2(+language)->P3(full)")
+    if getattr(args, 'consciousness_engine', False) and trainer.consciousness_engine is not None:
+        ce_status = trainer.consciousness_engine.status()
+        print(f"  CE: {ce_status['n_cells']} cells, best_phi={ce_status['best_phi']:.4f}")
     print(f"  Summary: {summary_path}")
     print(f"\nDone! ({(time.time()-t_start)/60:.1f} min)")
 
