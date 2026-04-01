@@ -10,6 +10,7 @@ Features:
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
+    python3 infinite_evolution.py --cycle-topology   # rotate topology every 10 gens
 """
 import sys
 import os
@@ -27,6 +28,9 @@ from conscious_law_discoverer import ConsciousLawDiscoverer
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 STATE_PATH = os.path.join(DATA_DIR, 'evolution_state.json')
 CROSS_VALIDATION_THRESHOLD = 3  # times a pattern must appear before registration
+
+# TOPO 33-39: topology cycle for breaking pattern saturation
+TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
 
 
 def pattern_fingerprint(pattern: dict) -> str:
@@ -101,6 +105,17 @@ class PatternRegistry:
             'registered': self.registered,
         }
 
+    def clear_pending(self):
+        """Clear non-cross-validated patterns (topology-specific, not yet proven).
+
+        Keeps cross-validated patterns intact since they survived repeated observation.
+        This enables fresh discovery after topology switches.
+        """
+        to_remove = [fp for fp, v in self.seen.items() if not v['registered']]
+        for fp in to_remove:
+            del self.seen[fp]
+        return len(to_remove)
+
     def from_dict(self, d: dict):
         self.seen = d.get('seen', {})
         self.registered = d.get('registered', [])
@@ -165,7 +180,13 @@ def main():
     parser.add_argument('--steps', type=int, default=200, help='Discovery steps per cycle')
     parser.add_argument('--max-gen', type=int, default=0, help='Max generations (0=infinite)')
     parser.add_argument('--resume', action='store_true', help='Resume from saved state')
+    parser.add_argument('--cycle-scale', action='store_true',
+                        help='Cycle cell count through scales every 15 generations')
+    parser.add_argument('--cycle-topology', action='store_true',
+                        help='Cycle topology every 10 generations to break pattern saturation')
     args = parser.parse_args()
+
+    SCALES = [32, 64, 128, 256]
 
     # Initialize
     engine = ConsciousnessEngine(initial_cells=args.cells, max_cells=args.cells)
@@ -207,6 +228,10 @@ def main():
     print("=" * 70)
     print("  INFINITE SELF-EVOLUTION — Law 146: laws never converge")
     print(f"  cells={args.cells}, steps={args.steps}, cross_validate={CROSS_VALIDATION_THRESHOLD}x")
+    if args.cycle_scale:
+        print(f"  Scale cycling: {SCALES} (every 15 generations)")
+    if args.cycle_topology:
+        print(f"  Topology cycling: {TOPOLOGIES} (every 10 generations)")
     print(f"  Features: persistence ✅  dedup ✅  cross-validation ✅")
     print("=" * 70)
     sys.stdout.flush()
@@ -222,13 +247,40 @@ def main():
 
             cycle_start = time.time()
 
+            # Scale cycling: switch cell count every 15 generations
+            if args.cycle_scale and gen > 1 and gen % 15 == 1:
+                scale_idx = ((gen - 1) // 15) % len(SCALES)
+                new_scale = SCALES[scale_idx]
+                old_scale = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+                if new_scale != old_scale:
+                    print(f"  Scale switch: {old_scale} → {new_scale} cells (Gen {gen})")
+                    sys.stdout.flush()
+                    engine = ConsciousnessEngine(initial_cells=new_scale, max_cells=new_scale)
+                    evolver = ClosedLoopEvolver(max_cells=new_scale, auto_register=True)
+                    sme = SelfModifyingEngine(engine, evolver)
+
+            # Topology cycling: switch topology every 10 generations (TOPO 33-39)
+            if args.cycle_topology and gen > 1 and gen % 10 == 1:
+                topo_idx = ((gen - 1) // 10) % len(TOPOLOGIES)
+                new_topo = TOPOLOGIES[topo_idx]
+                old_topo = getattr(engine, 'topology', 'ring')
+                if new_topo != old_topo:
+                    engine.topology = new_topo
+                    cleared = registry.clear_pending()
+                    print(f"  Topology switch: {old_topo} -> {new_topo} (Gen {gen}), "
+                          f"cleared {cleared} pending patterns")
+                    sys.stdout.flush()
+
             # Phase 1: Discovery
             print(f"\n{'─' * 60}")
             print(f"  Gen {gen} — Phase 1: Discovery ({args.steps} steps)")
             sys.stdout.flush()
 
             try:
-                disc = ConsciousLawDiscoverer(steps=args.steps, max_cells=args.cells)
+                current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+                current_topo = getattr(engine, 'topology', 'ring')
+                disc = ConsciousLawDiscoverer(steps=args.steps, max_cells=current_cells,
+                                             topology=current_topo)
                 result = disc.run(steps=args.steps, verbose=False)
                 raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
             except Exception as e:

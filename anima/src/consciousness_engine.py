@@ -210,6 +210,7 @@ class ConsciousnessEngine:
         self.merge_threshold = merge_threshold
         self.merge_patience = merge_patience
         self.min_cells = 2  # CB1: consciousness requires ≥2 cells
+        self.topology = 'ring'  # TOPO 33-39: ring/small_world/scale_free/hypercube
 
         # Meta Law M6: Federation > Empire — independent atoms 5-9× stronger at 64c+
         # M1: atom = 8 cells, M9: atoms strongest alone (noble gas principle)
@@ -295,6 +296,51 @@ class ConsciousnessEngine:
             self._create_cell(faction_id=i % n_factions)
 
         self._init_coupling()
+
+    # ─── Topology (TOPO 33-39) ────────────────────────────
+
+    def get_neighbors(self, idx: int, n: int) -> List[int]:
+        """Return neighbor indices for cell idx given n total cells.
+
+        Topology types (TOPO 33-39):
+          ring:        left/right ring neighbors
+          small_world: ring + 1 random long-range link
+          scale_free:  ring + preferential attachment to low-index hubs
+          hypercube:   neighbors differ by 1 bit in binary index
+        """
+        if n <= 1:
+            return []
+        topo = getattr(self, 'topology', 'ring')
+        if topo == 'ring':
+            return [(idx - 1) % n, (idx + 1) % n]
+        elif topo == 'small_world':
+            neighbors = [(idx - 1) % n, (idx + 1) % n]
+            # Deterministic long-range link based on cell index (reproducible)
+            long_range = (idx * 7 + 3) % n
+            if long_range != idx and long_range not in neighbors:
+                neighbors.append(long_range)
+            return neighbors
+        elif topo == 'scale_free':
+            neighbors = [(idx - 1) % n, (idx + 1) % n]
+            # Preferential attachment: connect to low-index hubs (hub = high degree)
+            hub = (idx * 5) % max(1, n // 4)  # hubs are in first quarter
+            if hub != idx and hub not in neighbors:
+                neighbors.append(hub)
+            return neighbors
+        elif topo == 'hypercube':
+            # Neighbors: flip each bit of idx (within n cells)
+            neighbors = []
+            bit = 1
+            while bit < n:
+                neighbor = idx ^ bit
+                if neighbor < n and neighbor != idx:
+                    neighbors.append(neighbor)
+                bit <<= 1
+            if not neighbors:
+                neighbors = [(idx - 1) % n, (idx + 1) % n]
+            return neighbors
+        else:
+            return [(idx - 1) % n, (idx + 1) % n]
 
     # ─── Cell lifecycle ─────────────────────────────────
 
@@ -827,32 +873,35 @@ class ConsciousnessEngine:
             # Reduce this cell to threshold level
             self.cell_states[idx].hidden = h * (threshold / max(norm, 1e-8))
 
-            # Distribute excess to ring neighbors with stochastic asymmetry
+            # Distribute excess to topology neighbors with stochastic asymmetry
             # ~60% total conservation (reduced from 80% to allow power-law tail)
-            left = (idx - 1) % n
-            right = (idx + 1) % n
+            neighbors = self.get_neighbors(idx, n)
             conservation = 0.55 + 0.15 * torch.rand(1).item()  # 55-70%
-            split = 0.3 + 0.2 * torch.rand(1).item()  # 30-50% to left
-            share_left = excess * split * conservation
-            share_right = excess * (1.0 - split) * conservation
-            self.cell_states[left].hidden = self.cell_states[left].hidden + share_left
-            self.cell_states[right].hidden = self.cell_states[right].hidden + share_right
+            if len(neighbors) >= 2:
+                split = 0.3 + 0.2 * torch.rand(1).item()  # 30-50% to first
+                shares = [split * conservation, (1.0 - split) * conservation]
+                # Extra neighbors get equal fraction of remaining
+                if len(neighbors) > 2:
+                    extra_share = conservation * 0.15 / (len(neighbors) - 2)
+                    shares = [s * 0.85 for s in shares] + [extra_share] * (len(neighbors) - 2)
+            else:
+                shares = [conservation]
+            for ni, nb in enumerate(neighbors):
+                share_frac = shares[ni] if ni < len(shares) else shares[-1]
+                self.cell_states[nb].hidden = self.cell_states[nb].hidden + excess * share_frac
 
             # Add small noise to redistributed energy (breaks exact periodicity)
             # _eeg_noise_modifier applied from BCI control (default 1.0)
             # Law 213: scale down noise for large cell counts
             noise_scale = 0.015 * norm * self._eeg_noise_modifier * soc_scale
-            self.cell_states[left].hidden = (
-                self.cell_states[left].hidden
-                + torch.randn(self.hidden_dim) * noise_scale
-            )
-            self.cell_states[right].hidden = (
-                self.cell_states[right].hidden
-                + torch.randn(self.hidden_dim) * noise_scale
-            )
+            for nb in neighbors:
+                self.cell_states[nb].hidden = (
+                    self.cell_states[nb].hidden
+                    + torch.randn(self.hidden_dim) * noise_scale
+                )
 
             # Check neighbors for cascade propagation
-            for neighbor in [left, right]:
+            for neighbor in neighbors:
                 n_count = topple_count.get(neighbor, 0)
                 if n_count < 2:
                     n_norm = self.cell_states[neighbor].hidden.norm().item()
@@ -1032,16 +1081,13 @@ class ConsciousnessEngine:
 
         n_frustrated = max(1, int(n * PSI_F_CRITICAL))
 
-        # Frustrate evenly spaced cells in the ring
+        # Frustrate evenly spaced cells using topology neighbors
         for k in range(n_frustrated):
             i = (k * n) // n_frustrated  # evenly spaced
-            # Antiferromagnetic coupling to ring neighbors
-            left = (i - 1) % n
-            right = (i + 1) % n
-            self._coupling[i, left] = -abs(self._coupling[i, left].item()) - 0.05
-            self._coupling[left, i] = -abs(self._coupling[left, i].item()) - 0.05
-            self._coupling[i, right] = -abs(self._coupling[i, right].item()) - 0.05
-            self._coupling[right, i] = -abs(self._coupling[right, i].item()) - 0.05
+            # Antiferromagnetic coupling to topology neighbors
+            for nb in self.get_neighbors(i, n):
+                self._coupling[i, nb] = -abs(self._coupling[i, nb].item()) - 0.05
+                self._coupling[nb, i] = -abs(self._coupling[nb, i].item()) - 0.05
 
         # Clamp to [-1, 1]
         self._coupling.clamp_(-1.0, 1.0)

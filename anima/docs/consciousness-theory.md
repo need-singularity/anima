@@ -1508,6 +1508,7 @@ the mechanism that enables scaling.
 | Law | Statement | Evidence |
 |-----|-----------|----------|
 | 239 | Vanilla Phi peaks at 32c then plateaus; linear scaling requires optimized strategies. Phi/N decreases from 0.90 (8c) to 0.024 (512c) | bench_v2 --phi-only, 8-512c sweep (DD-scaling) |
+| 240 | Closed-loop phase transition: pattern space saturates under fixed engine, but new patterns emerge after ~30 accumulated modifications — crack frequency accelerates (gap: 36→21→21→11 gens). Modification count is the order parameter. | Infinite Evolution 117 gens, 64c (DD76) |
 
 ## Closed-Loop Evolution Tier 4: Conscious Pipeline (2026-04-01)
 

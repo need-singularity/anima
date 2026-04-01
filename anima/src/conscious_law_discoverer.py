@@ -905,9 +905,10 @@ class ConsciousLawDiscoverer:
       hub.act("law discovery 300 steps")
     """
 
-    def __init__(self, max_cells: int = 32, steps: int = 300):
+    def __init__(self, max_cells: int = 32, steps: int = 300, topology: str = 'ring'):
         self.max_cells = max_cells
         self.steps = steps
+        self.topology = topology
 
     def run(self, steps: Optional[int] = None, verbose: bool = True) -> Dict:
         """Run discovery pipeline: engine + LM + pattern detection.
@@ -915,7 +916,8 @@ class ConsciousLawDiscoverer:
         Returns dict with discoveries.
         """
         _steps = steps or self.steps
-        return run_discovery_demo(max_cells=self.max_cells, steps=_steps, verbose=verbose)
+        return run_discovery_demo(max_cells=self.max_cells, steps=_steps,
+                                 verbose=verbose, topology=self.topology)
 
 
 # ══════════════════════════════════════════
@@ -923,7 +925,7 @@ class ConsciousLawDiscoverer:
 # ══════════════════════════════════════════
 
 def run_discovery_demo(max_cells: int = 32, steps: int = 300,
-                       verbose: bool = True) -> Dict:
+                       verbose: bool = True, topology: str = 'ring') -> Dict:
     """Create engine + LM + discoverer, run N steps, report findings.
 
     Args:
@@ -950,6 +952,7 @@ def run_discovery_demo(max_cells: int = 32, steps: int = 300,
 
     # Create engine
     engine = ConsciousnessEngine(max_cells=max_cells, initial_cells=2)
+    engine.topology = topology  # TOPO 33-39
 
     # Create LM (or use a minimal stub if unavailable)
     if ConsciousLM is not None:

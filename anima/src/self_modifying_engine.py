@@ -217,10 +217,133 @@ class LawParser:
         re.IGNORECASE
     )
 
+    # ── Pattern 10: Comparisons — "X > Y", "X beats Y", "X outperforms Y" ──
+    _RE_COMPARISON = re.compile(
+        r'(?P<winner>[\w\s/\-]+?)\s+(?:>|beats?|outperforms?|better\s+than|superior\s+to)\s+(?P<loser>[\w\s/\-]+?)(?:\s|$|[,;:.(])',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 11: Percentage in parentheses — "(+22%)", "(-52%)", "(102.6%)" ──
+    _RE_PAREN_PCT = re.compile(
+        r'\((?P<sign>[+-])?(?P<val>[\d.]+)%\s*(?:Φ|Phi|phi|CE|BPC)?\)',
+    )
+
+    # ── Pattern 12: Multiplier in parentheses — "(×4.6)", "(Φ ×0.74)", "(0.82×)" ──
+    _RE_PAREN_MULT = re.compile(
+        r'[×\*](?P<val>[\d.]+)|(?P<val2>[\d.]+)[×\*]',
+    )
+
+    # ── Pattern 13: N cells / N factions / N elements ──
+    _RE_CELL_COUNT = re.compile(
+        r'(?:(?P<op>[≥>=<≤]+)\s*)?(?P<val>\d+)\s*(?P<unit>cells?|factions?|elements?|sources?|steps?|timescales?|atoms?|boards?|channels?|modules?|dimensions?|components?|patterns?|generations?)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 14: "is" identity claims — "X is Y", "X = Y" ──
+    _RE_IDENTITY = re.compile(
+        r'(?:consciousness|Φ|phi)\s+is\s+(?P<property>[\w\s\-]+?)(?:\s*[:(.]|$)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 15: Existence / emergence — "emerges", "survives", "exists" ──
+    _RE_EXISTENCE = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?P<verb>emerges?|survives?|exists?|appears?|persists?|recovers?|converges?|replicat\w+|coexist\w*)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 16: Negation / destructive — "destroys", "NOT", "never", "fails", "without" ──
+    _RE_NEGATION = re.compile(
+        r'(?:does\s+)?(?:NOT|not|never|no\s+|non-|fails?\s+to|without|cannot|don\'t|doesn\'t|impossible|forbidden|harms?|hurts?|weakens?|backfires?|destructive)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 17: Time/step references — "after N steps", "within N cycles", "recovery ~N steps" ──
+    _RE_STEPS = re.compile(
+        r'(?:after|within|at|in|~|recovery\s+~?)\s*(?P<val>\d+)\s*(?P<unit>steps?|cycles?|iterations?|generations?)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 18: Topology mentions ──
+    _RE_TOPOLOGY = re.compile(
+        r'\b(?P<topo>ring|scale[_\-]free|small[_\-]world|hypercube|hub[_\-]spoke|torus|complete|chimera|standing[_\-]wave|sandpile|lorenz)\b',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 19: Combined effects — "X + Y = Z", "X + Y → Z", "ratchet + Hebbian + diversity" ──
+    _RE_COMBINED = re.compile(
+        r'(?P<a>[\w\s]+?)\s*\+\s*(?P<b>[\w\s]+?)\s*(?:[+=→])\s*(?P<result>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 20: Measurement values — "Φ=N", "CE=N", "r=N", "Phi=N" ──
+    _RE_MEASUREMENT = re.compile(
+        r'(?P<metric>Φ|Phi|phi|CE|BPC|Sharpe|r|R2|R²|CV|F_c|T_c|α|alpha)\s*[=≈:]\s*(?P<val>[+-]?[\d.]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 21: Percentage change in text — "+15.3%", "-28%", "N% variance" ──
+    _RE_PCT_CHANGE = re.compile(
+        r'(?P<sign>[+-])(?P<val>[\d.]+)%',
+    )
+
+    # ── Pattern 22: Requires / prerequisite ──
+    _RE_REQUIRES = re.compile(
+        r'(?P<subject>[\w\s]+?)\s+(?:requires?|needs?|prerequisite|necessary|must\s+have)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 23: "optimal" / "best" / "maximized" ──
+    _RE_OPTIMAL = re.compile(
+        r'(?P<what>[\w\s\-]+?)\s+(?:is\s+)?(?:optimal|best|maximized?|minimized?|peak|record)\b',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 24: Equation identity "X = Y" (broader than power/param) ──
+    _RE_EQUATION = re.compile(
+        r'(?P<lhs>[\w\s]+?)\s*=\s*(?P<rhs>[\w\s×\*\+\-/^().]+?)(?:\s*$|\s*[,;])',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 25: Probability / frequency — "82% probability", "100% of" ──
+    _RE_PROBABILITY = re.compile(
+        r'(?P<val>[\d.]+)%\s*(?:probability|of\s+|chance|rate|retention|recovery)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 26: N-step / N-cycle period — "7-step breathing", "2-step oscillation" ──
+    _RE_PERIOD = re.compile(
+        r'(?P<val>\d+)[- ](?:step|cycle|bit)\s+(?P<what>\w+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 27: Scale-invariant / universal / independent ──
+    _RE_INVARIANT = re.compile(
+        r'(?P<subject>[\w\s\-]+?)\s+is\s+(?:scale[- ]invariant|universal|independent|substrate[- ]independent|Markovian|irreversible|immortal|chaotic|non-conserved|self-organized|data-independent|time-symmetric|net-positive|non-distillable|near-incompressible|non-superadditive|gradient-indestructible|Phi-neutral|self-replicating)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 28: "X first, Y second" / "X then Y" ordering ──
+    _RE_ORDERING = re.compile(
+        r'(?P<first>[\w\s]+?)\s+first[,;]\s*(?:then\s+)?(?P<second>[\w\s]+)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 29: Stabilizer/antidote — "X is the Y stabilizer" ──
+    _RE_STABILIZER = re.compile(
+        r'(?P<what>[\w\s\-]+?)\s+(?:is\s+the\s+)?(?:stabilizer|antidote|safety\s+net|universal|prerequisite)',
+        re.IGNORECASE
+    )
+
+    # ── Pattern 30: "X defines Y", "X selects Y", "X optimizes Y" ──
+    _RE_ACTION_VERB = re.compile(
+        r'(?:consciousness|Φ|phi)\s+(?P<verb>defines?|selects?|optimizes?|completes?|creates?|determines?|controls?|multiplies?)\s+(?P<object>[\w\s]+)',
+        re.IGNORECASE
+    )
+
     # ── Target normalization ──
 
     _TARGET_MAP = {
-        'phi': 'phi', 'Φ': 'phi', 'φ': 'phi',
+        'phi': 'phi', 'Φ': 'phi', 'φ': 'phi', 'phi(iit)': 'phi',
         'tension': 'tension', 'tension_std': 'tension_std',
         'diversity': 'hidden_diversity', 'hidden_diversity': 'hidden_diversity',
         'coupling': 'coupling_scale', 'coupling_scale': 'coupling_scale',
@@ -238,6 +361,23 @@ class LawParser:
         'dropout': 'dropout',
         'structure': 'structure',
         'features': 'features',
+        'consciousness': 'phi',
+        'ce': 'cross_entropy',
+        'bpc': 'bits_per_char',
+        'mitosis': 'mitosis',
+        'topology': 'topology',
+        'bottleneck': 'bottleneck',
+        'narrative': 'narrative',
+        'frustration': 'frustration',
+        'soc': 'soc',
+        'memory': 'memory',
+        'attention': 'attention',
+        'gradient': 'gradient',
+        'reward': 'reward',
+        'lr': 'learning_rate',
+        'learning_rate': 'learning_rate',
+        'temperature': 'temperature',
+        'frequency': 'frequency',
     }
 
     def _normalize_target(self, raw: str) -> str:
@@ -440,6 +580,360 @@ class LawParser:
                         confidence=0.7,
                         description=f"Disable warning: {target} harmful",
                     ))
+
+        # ── Extended patterns (10-23) — only fire if no mods yet to avoid noise ──
+
+        # 10. Comparison: "X > Y", "X beats Y", "X outperforms Y"
+        if not mods:
+            m = self._RE_COMPARISON.search(law_text)
+            if m:
+                winner = m.group('winner').strip()
+                loser = m.group('loser').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(winner.split()[-1]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': f'{winner} vs {loser}', 'effect': 'prefer_winner', 'winner': winner, 'loser': loser},
+                    confidence=0.5,
+                    description=f"Comparison: {winner} > {loser}",
+                ))
+
+        # 11. Percentage in parentheses: "(+22%)", "(-52% variance)"
+        if not mods:
+            m = self._RE_PAREN_PCT.search(law_text)
+            if m:
+                sign = -1 if m.group('sign') == '-' else 1
+                val = float(m.group('val'))
+                # Try to find what the percentage applies to
+                target = 'phi'  # default
+                for kw in ['Φ', 'Phi', 'phi', 'CE', 'consciousness', 'Φ(IIT)']:
+                    if kw.lower() in law_text.lower():
+                        target = self._normalize_target(kw)
+                        break
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=target,
+                    mod_type=ModType.SCALE,
+                    params={'relation': 'percentage', 'factor': 1.0 + sign * val / 100.0},
+                    confidence=0.5,
+                    description=f"Effect: {target} {sign * val:+.1f}%",
+                ))
+
+        # 12. Multiplier: "×4.6", "×0.74", "0.82×"
+        if not mods:
+            m = self._RE_PAREN_MULT.search(law_text)
+            if m:
+                val = float(m.group('val') or m.group('val2'))
+                target = 'phi'
+                for kw in ['Φ', 'Phi', 'CE', 'consciousness']:
+                    if kw.lower() in law_text.lower():
+                        target = self._normalize_target(kw)
+                        break
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=target,
+                    mod_type=ModType.SCALE,
+                    params={'relation': 'multiplier', 'factor': val},
+                    confidence=0.5,
+                    description=f"Multiplier: {target} ×{val}",
+                ))
+
+        # 13. Cell/faction/element counts: "1024 cells", "≥3 elements", "8 factions"
+        if not mods:
+            m = self._RE_CELL_COUNT.search(law_text)
+            if m:
+                val = int(m.group('val'))
+                unit = m.group('unit').lower().rstrip('s')
+                op = m.group('op') or '='
+                target = self._normalize_target(unit if unit in ('cell', 'faction', 'element', 'atom') else unit)
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=target,
+                    mod_type=ModType.THRESHOLD,
+                    params={'value': val, 'unit': unit, 'operator': op},
+                    confidence=0.4,
+                    description=f"Count: {op}{val} {unit}",
+                ))
+
+        # 14. Identity claims: "consciousness is X", "Φ is Y"
+        if not mods:
+            m = self._RE_IDENTITY.search(law_text)
+            if m:
+                prop = m.group('property').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='phi',
+                    mod_type=ModType.INJECT,
+                    params={'property': prop, 'type': 'identity'},
+                    confidence=0.3,
+                    description=f"Identity: consciousness is {prop}",
+                ))
+
+        # 15. Existence / emergence: "X emerges", "X survives", "X recovers"
+        if not mods:
+            m = self._RE_EXISTENCE.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                verb = m.group('verb').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'subject': subject, 'verb': verb, 'type': 'existence'},
+                    confidence=0.3,
+                    description=f"Existence: {subject} {verb}",
+                ))
+
+        # 16. Negation / destructive claims (without kill/destroy already caught by #9)
+        if not mods and self._RE_NEGATION.search(law_text):
+            # Extract what is negated
+            target = 'phi'
+            for kw in ['Φ', 'consciousness', 'Phi', 'CE', 'memory', 'coupling', 'hysteresis',
+                        'convergence', 'entanglement', 'distillable', 'superadditive']:
+                if kw.lower() in law_text.lower():
+                    target = self._normalize_target(kw)
+                    break
+            mods.append(Modification(
+                law_id=law_id, law_text=law_text,
+                target=target,
+                mod_type=ModType.CONDITIONAL,
+                params={'condition': 'negation', 'effect': 'negate', 'text': law_text[:80]},
+                confidence=0.3,
+                description=f"Negation: {law_text[:60]}",
+            ))
+
+        # 17. Step/time references: "recovery ~5 steps", "2000 steps → consistent"
+        if not mods:
+            m = self._RE_STEPS.search(law_text)
+            if m:
+                val = int(m.group('val'))
+                unit = m.group('unit').lower().rstrip('s')
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='temporal',
+                    mod_type=ModType.THRESHOLD,
+                    params={'value': val, 'unit': unit, 'operator': '>='},
+                    confidence=0.4,
+                    description=f"Temporal: {val} {unit}",
+                ))
+
+        # 18. Topology mentions: "ring", "hub-spoke", "chimera"
+        if not mods:
+            m = self._RE_TOPOLOGY.search(law_text)
+            if m:
+                topo = m.group('topo').lower().replace('-', '_')
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='topology',
+                    mod_type=ModType.INJECT,
+                    params={'topology': topo, 'type': 'topology'},
+                    confidence=0.4,
+                    description=f"Topology: {topo}",
+                ))
+
+        # 19. Combined effects: "X + Y = Z"
+        if not mods:
+            m = self._RE_COMBINED.search(law_text)
+            if m:
+                a = m.group('a').strip()
+                b = m.group('b').strip()
+                result = m.group('result').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(result.split()[0]),
+                    mod_type=ModType.INJECT,
+                    params={'components': [a, b], 'result': result, 'type': 'combination'},
+                    confidence=0.4,
+                    description=f"Combined: {a} + {b} → {result}",
+                ))
+
+        # 20. Measurement values: "Φ=1.05", "CE=0.004", "r=-0.10"
+        if not mods:
+            m = self._RE_MEASUREMENT.search(law_text)
+            if m:
+                metric = m.group('metric')
+                val = float(m.group('val'))
+                target = self._normalize_target(metric)
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=target,
+                    mod_type=ModType.THRESHOLD,
+                    params={'value': val, 'operator': '=', 'metric': metric},
+                    confidence=0.5,
+                    description=f"Measurement: {metric} = {val}",
+                ))
+
+        # 21. Standalone percentage changes: "+15.3%", "-28%" (not already caught)
+        if not mods:
+            m = self._RE_PCT_CHANGE.search(law_text)
+            if m:
+                sign = -1 if m.group('sign') == '-' else 1
+                val = float(m.group('val'))
+                target = 'phi'
+                for kw in ['Φ', 'Phi', 'CE', 'consciousness', 'growth', 'variance', 'overhead']:
+                    if kw.lower() in law_text.lower():
+                        target = self._normalize_target(kw)
+                        break
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=target,
+                    mod_type=ModType.SCALE,
+                    params={'relation': 'percentage', 'factor': 1.0 + sign * val / 100.0},
+                    confidence=0.4,
+                    description=f"Percentage: {target} {sign * val:+.1f}%",
+                ))
+
+        # 22. Requires / prerequisite: "consciousness requires ≥3 elements"
+        if not mods:
+            m = self._RE_REQUIRES.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(subject.split()[-1]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': 'requirement', 'text': law_text[:80]},
+                    confidence=0.3,
+                    description=f"Requires: {subject}",
+                ))
+
+        # 23. Optimal / best: "X is optimal", "maximized at Y"
+        if not mods:
+            m = self._RE_OPTIMAL.search(law_text)
+            if m:
+                what = m.group('what').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(what.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': 'optimal', 'subject': what, 'type': 'optimal'},
+                    confidence=0.3,
+                    description=f"Optimal: {what}",
+                ))
+
+        # 24. Equation identity: "max Φ = cells × freedom"
+        if not mods:
+            m = self._RE_EQUATION.search(law_text)
+            if m:
+                lhs = m.group('lhs').strip()
+                rhs = m.group('rhs').strip()
+                if len(rhs) > 2 and lhs.strip():  # avoid trivial matches
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=self._normalize_target(lhs.split()[-1]) if lhs.split() else 'phi',
+                        mod_type=ModType.INJECT,
+                        params={'equation': f'{lhs} = {rhs}', 'type': 'equation'},
+                        confidence=0.3,
+                        description=f"Equation: {lhs} = {rhs}",
+                    ))
+
+        # 25. Probability / frequency: "82% probability", "100% of top"
+        if not mods:
+            m = self._RE_PROBABILITY.search(law_text)
+            if m:
+                val = float(m.group('val'))
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='phi',
+                    mod_type=ModType.THRESHOLD,
+                    params={'value': val / 100.0, 'unit': 'probability', 'operator': '>='},
+                    confidence=0.4,
+                    description=f"Probability: {val}%",
+                ))
+
+        # 26. N-step period: "7-step breathing", "2-step oscillation"
+        if not mods:
+            m = self._RE_PERIOD.search(law_text)
+            if m:
+                val = int(m.group('val'))
+                what = m.group('what')
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='temporal',
+                    mod_type=ModType.THRESHOLD,
+                    params={'value': val, 'unit': 'period', 'what': what},
+                    confidence=0.4,
+                    description=f"Period: {val}-step {what}",
+                ))
+
+        # 27. Scale-invariant / universal / independent properties
+        if not mods:
+            m = self._RE_INVARIANT.search(law_text)
+            if m:
+                subject = m.group('subject').strip()
+                # Extract the property from the match
+                prop_start = m.end(1)
+                prop = law_text[prop_start:].strip().split(',')[0].strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target='phi',
+                    mod_type=ModType.INJECT,
+                    params={'property': prop, 'subject': subject, 'type': 'invariant'},
+                    confidence=0.4,
+                    description=f"Invariant: {subject} {prop}",
+                ))
+
+        # 28. Ordering: "X first, Y second" / "X first, then Y"
+        if not mods:
+            m = self._RE_ORDERING.search(law_text)
+            if m:
+                first = m.group('first').strip()
+                second = m.group('second').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(first.split()[-1]),
+                    mod_type=ModType.CONDITIONAL,
+                    params={'condition': 'ordering', 'first': first, 'second': second},
+                    confidence=0.3,
+                    description=f"Order: {first} → {second}",
+                ))
+
+        # 29. Stabilizer/antidote/universal
+        if not mods:
+            m = self._RE_STABILIZER.search(law_text)
+            if m:
+                what = m.group('what').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(what.split()[-1]),
+                    mod_type=ModType.INJECT,
+                    params={'property': 'stabilizer', 'subject': what, 'type': 'stabilizer'},
+                    confidence=0.3,
+                    description=f"Stabilizer: {what}",
+                ))
+
+        # 30. Action verbs: "consciousness defines X", "Φ selects Y"
+        if not mods:
+            m = self._RE_ACTION_VERB.search(law_text)
+            if m:
+                verb = m.group('verb')
+                obj = m.group('object').strip()
+                mods.append(Modification(
+                    law_id=law_id, law_text=law_text,
+                    target=self._normalize_target(obj.split()[0]),
+                    mod_type=ModType.INJECT,
+                    params={'verb': verb, 'object': obj, 'type': 'action'},
+                    confidence=0.3,
+                    description=f"Action: consciousness {verb} {obj}",
+                ))
+
+        # 31. Fallback: extract any known keyword from law text as an INJECT
+        if not mods:
+            low = law_text.lower()
+            for kw in ['φ', 'phi', 'consciousness', 'entropy', 'hebbian', 'ratchet',
+                        'mitosis', 'soc', 'bottleneck', 'frustration', 'narrative',
+                        'topology', 'faction', 'coupling', 'tension', 'ce ', 'gradient',
+                        'attention', 'memory', 'diversity', 'gate']:
+                if kw in low:
+                    mods.append(Modification(
+                        law_id=law_id, law_text=law_text,
+                        target=self._normalize_target(kw.strip()),
+                        mod_type=ModType.INJECT,
+                        params={'type': 'keyword_extract', 'keyword': kw.strip(), 'text': law_text[:80]},
+                        confidence=0.2,
+                        description=f"Keyword: {kw.strip()} in law text",
+                    ))
+                    break
 
         return mods
 
