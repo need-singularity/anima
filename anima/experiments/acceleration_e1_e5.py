@@ -525,10 +525,12 @@ def run_e3():
     return {
         'name': 'E3: Entropy+CE dual',
         'best_lambda': best_lam,
+        'speedup': 1.0,  # same steps, no speedup — this is about quality
+        'retention': phi_retention(results_per_lambda[best_lam]['phi_end'], base_phi),
+        'phi_base': base_phi,
+        'phi_test': results_per_lambda[best_lam]['phi_end'],
         'ce_base': base_ce,
         'ce_best': best_ce,
-        'phi_base': base_phi,
-        'phi_best': results_per_lambda[best_lam]['phi_end'],
         'results': {str(k): {kk: vv for kk, vv in v.items() if kk != 'ces' and kk != 'phis'}
                     for k, v in results_per_lambda.items()},
     }
@@ -692,13 +694,22 @@ def run_e4():
 
     # Winner
     best_label = min(all_results, key=lambda k: all_results[k]['ce_end'])
+    combo = all_results["D: curriculum+skip"]
     print(f"\n  Best CE: {best_label} ({all_results[best_label]['ce_end']:.4f})")
     print()
     print(ascii_graph(all_results[best_label]['ces'], title=f"CE curve ({best_label})"))
     sys.stdout.flush()
 
+    # Use combo (D) for summary speedup since it has skip
+    combo_speedup = base['calls'] / combo['calls'] if combo['calls'] > 0 else 1.0
+    combo_retention = phi_retention(combo['phi_end'], base['phi_end'])
+
     return {
         'name': 'E4: Curriculum+Skip',
+        'speedup': combo_speedup,
+        'retention': combo_retention,
+        'phi_base': base['phi_end'],
+        'phi_test': combo['phi_end'],
         'best': best_label,
         'results': {k: {kk: vv for kk, vv in v.items() if kk != 'ces' and kk != 'phis'}
                     for k, v in all_results.items()},
