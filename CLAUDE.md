@@ -704,9 +704,10 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - Rust 실시간 (<1ms/step): law-discovery crate (1738 lines, 47/47 tests, 64c@336us)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
     - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
-    - 무한 자기진화: infinite_evolution.py (Discovery→Modification 무한 루프)
-      실행: python3 infinite_evolution.py --cells 64 --steps 300
-      3세대 결과: 71 discoveries, 1 active mod, 118s (Law 146 실증)
+    - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
+      실행: python3 infinite_evolution.py --cells 64 --steps 300 [--resume] [--max-gen N]
+      3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
+      5세대 결과: 44 unique patterns, 35 cross-validated, Laws 240-274 자동 등록
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
 ```
 
