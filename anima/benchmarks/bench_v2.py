@@ -316,9 +316,9 @@ class BenchEngine:
         # Orthogonal initialization for maximum diversity
         if hidden_dim >= n_cells:
             q, _ = torch.linalg.qr(torch.randn(hidden_dim, n_cells))
-            self.cell_identity = q.T * 0.2  # [n_cells, hidden_dim]
+            self.cell_identity = q.T * 0.5  # [n_cells, hidden_dim]
         else:
-            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.2
+            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.5
         # Φ ratchet: prevent collapse
         self._phi_ratchet = None
         self._phi_ratchet_var = 0.0
@@ -380,9 +380,10 @@ class BenchEngine:
 
         # Cell identity injection AFTER faction sync: prevents convergence
         # to uniform state despite sync pulling cells together (→ DIVERSITY)
-        # Adaptive strength: stronger when cells converge (low variance)
+        # Adaptive strength: stronger when cells converge (low inter-cell variance)
+        # Must overcome faction sync (0.15-0.20) to maintain diversity
         cur_var = self.hiddens.var(dim=0).mean().item()
-        id_strength = 0.05 + 0.15 * max(0, 1.0 - cur_var / 0.1)
+        id_strength = 0.08 + 0.22 * max(0, 1.0 - cur_var / 0.3)
         self.hiddens = self.hiddens + self.cell_identity * id_strength
 
         # Spontaneous oscillation: all cells get phase-shifted perturbation
