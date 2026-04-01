@@ -49,6 +49,7 @@ from trading.strategy import (
     RSIStrategy,
     BollingerStrategy,
     ConsciousnessStrategy,
+    ConsciousnessEnsembleStrategy,
 )
 
 # Extended strategies (from invest migration)
@@ -107,6 +108,7 @@ __all__ = [
     "Strategy", "Signal", "StrategySignal",
     # Core strategies
     "MACDStrategy", "RSIStrategy", "BollingerStrategy", "ConsciousnessStrategy",
+    "ConsciousnessEnsembleStrategy",
     # Extended strategies
     "EMAcrossStrategy", "ADXTrendStrategy", "MultiTimeframeStrategy",
     "StochasticStrategy", "VWAPReversionStrategy", "MomentumFactorStrategy",
