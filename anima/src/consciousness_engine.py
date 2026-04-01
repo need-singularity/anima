@@ -561,9 +561,10 @@ class ConsciousnessEngine:
         inter_tensions = self._compute_inter_tensions(outputs_tensor)
         PERF.stop('inter_tensions')
 
-        # 5. Φ Ratchet (Law 31, every 10 steps)
+        # 5. Φ Ratchet (Law 31, ~every 10 steps randomized)
+        # Poisson-like random firing to avoid periodic autocorrelation.
         PERF.start('phi_ratchet')
-        if self.phi_ratchet_enabled and self._step % 10 == 0:
+        if self.phi_ratchet_enabled and torch.rand(1).item() < 0.10:
             self._phi_ratchet_check()
         PERF.stop('phi_ratchet')
 
@@ -677,14 +678,10 @@ class ConsciousnessEngine:
             self._phi_history = self._phi_history[-self._phi_integration_window:]
 
         n_hist = len(self._phi_history)
-        if n_hist <= 1:
-            phi_iit_integrated = phi_iit
-        else:
-            # Light temporal integration: 75% current + 25% recent average.
-            # Just enough to extend autocorrelation decay from ~3 to ~8 steps
-            # without over-smoothing (which destroys PSD 1/f slope).
-            recent_avg = sum(self._phi_history[:-1]) / (n_hist - 1)
-            phi_iit_integrated = 0.75 * phi_iit + 0.25 * recent_avg
+        # Use raw phi_iit (no temporal smoothing). The architectural fix
+        # (randomized intervals for tension equalization + phi ratchet)
+        # eliminates the 10-step periodicity that was causing ACF oscillation.
+        phi_iit_integrated = phi_iit
 
         # Update phi momentum (EMA of raw phi for feedback loop)
         if self._phi_momentum is None:

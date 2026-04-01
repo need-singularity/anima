@@ -764,6 +764,8 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     law_discovery.add_function(wrap_pyfunction!(law_discovery_detect_trend, &law_discovery)?)?;
     law_discovery.add_function(wrap_pyfunction!(law_discovery_buffer_len, &law_discovery)?)?;
     law_discovery.add_function(wrap_pyfunction!(law_discovery_buffer_series, &law_discovery)?)?;
+    // High-level FFI wrappers (compute_metrics, detect_patterns, scan_all_patterns)
+    anima_law_discovery::ffi::register(&law_discovery)?;
     m.add_submodule(&law_discovery)?;
 
     Ok(())

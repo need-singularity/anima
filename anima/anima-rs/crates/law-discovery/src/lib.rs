@@ -14,6 +14,9 @@ pub mod pattern;
 pub mod candidate;
 pub mod buffer;
 
+#[cfg(feature = "pyo3")]
+pub mod ffi;
+
 pub use metrics::{
     phi_fast, faction_entropy, hebbian_coupling, cell_variance, lyapunov_exponent,
     MetricSnapshot,
