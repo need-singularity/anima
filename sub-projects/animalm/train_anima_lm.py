@@ -872,6 +872,12 @@ class AnimaLMTrainer:
         self.loss_ensemble = SixLossEnsemble().to(device=self.device, dtype=torch.bfloat16)
 
         # Optimizer: PureField params + ensemble weights + ThalamicBridge (if active)
+        # CRITICAL: force ALL trainable params to bf16 before optimizer creation
+        # (7B model is bf16, mixed dtypes cause optimizer crash)
+        if self.device == "cuda":
+            for p in model.parameters():
+                if p.requires_grad and p.dtype != torch.bfloat16:
+                    p.data = p.data.to(torch.bfloat16)
         pf_params = [p for p in model.parameters() if p.requires_grad]
         param_groups = [
             {"params": pf_params, "lr": args.lr},
