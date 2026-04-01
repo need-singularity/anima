@@ -65,7 +65,7 @@ DEFAULT_TARGETS_GB = {
 
 SOURCES = {
     "ko": [
-        ("wikipedia", "20231101.ko", "train", "text",
+        ("wikimedia/wikipedia", "20231101.ko", "train", "text",
          "Korean Wikipedia — comprehensive encyclopedia articles"),
         ("beomi/KoAlpaca-v1.1a", None, "train", "instruction",
          "KoAlpaca — Korean instruction-following data"),
@@ -75,7 +75,7 @@ SOURCES = {
          "C4 Korean (allenai) — large web crawl, cleaned"),
     ],
     "en": [
-        ("wikipedia", "20231101.en", "train", "text",
+        ("wikimedia/wikipedia", "20231101.en", "train", "text",
          "English Wikipedia — comprehensive encyclopedia"),
         ("openwebtext", None, "train", "text",
          "OpenWebText — Reddit-filtered web content"),
@@ -83,19 +83,19 @@ SOURCES = {
          "C4 English (allenai) — large web crawl, cleaned"),
     ],
     "zh": [
-        ("wikipedia", "20231101.zh", "train", "text",
+        ("wikimedia/wikipedia", "20231101.zh", "train", "text",
          "Chinese Wikipedia — encyclopedia articles"),
         ("allenai/c4", "zh", "train", "text",
          "C4 Chinese (allenai) — large web crawl, cleaned"),
     ],
     "ja": [
-        ("wikipedia", "20231101.ja", "train", "text",
+        ("wikimedia/wikipedia", "20231101.ja", "train", "text",
          "Japanese Wikipedia — encyclopedia articles"),
         ("allenai/c4", "ja", "train", "text",
          "C4 Japanese (allenai) — large web crawl, cleaned"),
     ],
     "ru": [
-        ("wikipedia", "20231101.ru", "train", "text",
+        ("wikimedia/wikipedia", "20231101.ru", "train", "text",
          "Russian Wikipedia — encyclopedia articles"),
         ("allenai/c4", "ru", "train", "text",
          "C4 Russian (allenai) — large web crawl, cleaned"),
