@@ -385,6 +385,93 @@ def list_interventions():
 
 
 # ══════════════════════════════════════════
+# Synergy/Antagonism Map (DD-A experiment)
+# ══════════════════════════════════════════
+
+# Synergy map: (intervention_a, intervention_b) -> synergy_score
+# Positive = super-additive (good combo), Negative = sub-additive (avoid)
+SYNERGY_MAP = {
+    ('DD71_anti_parasitism', 'DD74_gradient_shield'): +0.0141,  # BEST synergy
+    ('symmetrize', 'DD72_hebbian_boost'): +0.0114,              # 2nd best
+    ('DD71_democracy', 'DD73_entropy_bound'): +0.0050,          # mild synergy
+    ('DD73_entropy_bound', 'DD75_decisive'): +0.0030,           # mild synergy
+    ('DD74_natural_reg', 'DD72_temporal_comp'): -0.0318,        # WORST antagonism
+    ('DD72_resurrection', 'DD73_incompressible'): -0.0251,      # antagonistic
+    ('DD72_hebbian_boost', 'DD74_gradient_shield'): -0.0235,    # antagonistic
+    ('pink_noise', 'DD75_veto'): -0.0100,                       # mild antagonism
+}
+
+# Threshold for hard-blocking an antagonistic combo
+_ANTAGONISM_BLOCK_THRESHOLD = -0.02
+
+
+def get_synergy_score(active_interventions, candidate_name: str) -> float:
+    """Calculate total synergy of adding candidate to active set.
+
+    Args:
+        active_interventions: list of Intervention objects currently active
+        candidate_name: name of the candidate intervention
+
+    Returns:
+        Total synergy score (positive = good combo, negative = bad combo)
+    """
+    total = 0.0
+    for active in active_interventions:
+        key1 = (active.name, candidate_name)
+        key2 = (candidate_name, active.name)
+        total += SYNERGY_MAP.get(key1, 0.0) + SYNERGY_MAP.get(key2, 0.0)
+    return total
+
+
+def _has_strong_antagonism(active_interventions, candidate_name: str) -> bool:
+    """Check if candidate has any pairwise antagonism below block threshold."""
+    for active in active_interventions:
+        key1 = (active.name, candidate_name)
+        key2 = (candidate_name, active.name)
+        score = SYNERGY_MAP.get(key1, 0.0) + SYNERGY_MAP.get(key2, 0.0)
+        if score < _ANTAGONISM_BLOCK_THRESHOLD:
+            return True
+    return False
+
+
+def list_synergies():
+    """Print the synergy map as a formatted table."""
+    print(f"\n  {'=' * 75}")
+    print(f"  Intervention Synergy/Antagonism Map ({len(SYNERGY_MAP)} pairs)")
+    print(f"  {'=' * 75}")
+    print(f"  {'#':<4} {'Pair':<55} {'Score':>8} {'Type':<12}")
+    print(f"  {'─' * 4} {'─' * 55} {'─' * 8} {'─' * 12}")
+
+    sorted_pairs = sorted(SYNERGY_MAP.items(), key=lambda x: x[1], reverse=True)
+    for i, ((a, b), score) in enumerate(sorted_pairs):
+        pair_str = f"{a} + {b}"
+        if score > 0.01:
+            syn_type = "SYNERGY"
+        elif score > 0:
+            syn_type = "mild syn."
+        elif score > -0.01:
+            syn_type = "mild antag."
+        elif score > _ANTAGONISM_BLOCK_THRESHOLD:
+            syn_type = "ANTAGONISM"
+        else:
+            syn_type = "BLOCKED"
+        print(f"  {i + 1:<4} {pair_str:<55} {score:+8.4f} {syn_type:<12}")
+
+    # ASCII bar chart
+    print(f"\n  {'─' * 75}")
+    max_abs = max(abs(v) for v in SYNERGY_MAP.values()) if SYNERGY_MAP else 1.0
+    for (a, b), score in sorted_pairs:
+        short = f"{a.split('_')[-1]}+{b.split('_')[-1]}"
+        bar_len = int(abs(score) / max_abs * 25)
+        if score > 0:
+            bar = " " * 25 + "|" + "+" * bar_len
+        else:
+            bar = " " * (25 - bar_len) + "-" * bar_len + "|"
+        print(f"  {short:>30} {bar} {score:+.4f}")
+    print()
+
+
+# ══════════════════════════════════════════
 # 법칙 측정
 # ══════════════════════════════════════════
 
@@ -628,13 +715,24 @@ class ClosedLoopEvolver:
     """
 
     def __init__(self, max_cells: int = 32, steps: int = 300, repeats: int = 3,
-                 auto_register: bool = False):
+                 auto_register: bool = False, selection_strategy: str = 'correlation'):
         self.max_cells = max_cells
         self.steps = steps
         self.repeats = repeats
         self.auto_register = auto_register
+        self.selection_strategy = selection_strategy  # 'correlation', 'thompson', 'epsilon_greedy'
         self.history = EvolutionHistory()
         self._active_interventions: List[Intervention] = []
+
+        # Thompson sampling state: Beta(alpha, beta) per intervention
+        self._intervention_alpha: Dict[str, float] = {iv.name: 1.0 for iv in INTERVENTIONS}
+        self._intervention_beta: Dict[str, float] = {iv.name: 1.0 for iv in INTERVENTIONS}
+
+        # Epsilon-greedy state: running average Phi improvement per intervention
+        self._intervention_scores: Dict[str, List[float]] = defaultdict(list)
+
+        # Shared: prevent consecutive repeats
+        self._last_intervention: Optional[str] = None
 
     def _engine_factory(self) -> ConsciousnessEngine:
         """현재 활성 개입이 내장된 엔진 생성."""
@@ -660,8 +758,13 @@ class ClosedLoopEvolver:
             self.steps, self.repeats
         )
 
-        # 2. 가장 강한 상관 법칙 찾기 → 개입 선택
-        best_intervention = self._select_intervention(current_laws)
+        # 2. 전략에 따라 개입 선택
+        if self.selection_strategy == 'thompson':
+            best_intervention = self._select_thompson(current_laws)
+        elif self.selection_strategy == 'epsilon_greedy':
+            best_intervention = self._select_epsilon_greedy(current_laws)
+        else:
+            best_intervention = self._select_correlation(current_laws)
 
         # 3. 개입 적용 → Φ 측정
         if best_intervention and best_intervention.name not in [i.name for i in self._active_interventions]:
@@ -686,19 +789,34 @@ class ClosedLoopEvolver:
                     'change_pct': change,
                 })
 
+        intervention_name = best_intervention.name if best_intervention else "none"
+
         report = CycleReport(
             cycle=cycle_n,
             laws=[asdict(l) for l in improved_laws],
             phi_baseline=phi_current,
             phi_improved=phi_improved,
             phi_delta_pct=phi_delta,
-            intervention_applied=best_intervention.name if best_intervention else "none",
+            intervention_applied=intervention_name,
             laws_changed=laws_changed,
             time_sec=time.time() - t0,
         )
 
         self.history.cycles.append(report)
         self.history.total_laws_discovered += len(laws_changed)
+
+        # 5. Update adaptive selection scores based on Phi improvement
+        if intervention_name and intervention_name != "none":
+            phi_delta_val = phi_improved - phi_current
+            self._intervention_scores[intervention_name].append(phi_delta_val)
+
+            # Thompson: update Beta distribution parameters
+            if phi_delta_val > 0:
+                self._intervention_alpha[intervention_name] = self._intervention_alpha.get(intervention_name, 1.0) + 1.0
+            else:
+                self._intervention_beta[intervention_name] = self._intervention_beta.get(intervention_name, 1.0) + 1.0
+
+            self._last_intervention = intervention_name
 
         # 자동 법칙 등록 (consciousness_laws.json)
         if laws_changed and self.auto_register:
@@ -717,7 +835,23 @@ class ClosedLoopEvolver:
         return reports
 
     def _select_intervention(self, laws: List[LawMeasurement]) -> Optional[Intervention]:
-        """현재 법칙에서 가장 효과적인 개입 선택."""
+        """현재 법칙에서 가장 효과적인 개입 선택 (backward compat wrapper)."""
+        return self._select_correlation(laws)
+
+    def _get_available_interventions(self) -> List[Intervention]:
+        """Get interventions not yet active and not the last one used."""
+        active_names = {i.name for i in self._active_interventions}
+        available = []
+        for iv in INTERVENTIONS:
+            if iv.name in active_names:
+                continue
+            if iv.name == self._last_intervention:
+                continue  # Never repeat same intervention consecutively
+            available.append(iv)
+        return available
+
+    def _select_correlation(self, laws: List[LawMeasurement]) -> Optional[Intervention]:
+        """Correlation-based selection (original strategy)."""
         active_names = {i.name for i in self._active_interventions}
 
         # 우선순위: 가장 강한 음의 상관 법칙에 대응
@@ -753,12 +887,78 @@ class ClosedLoopEvolver:
         for law_name, intervention_name in primary_candidates:
             if intervention_name in active_names:
                 continue
+            # Synergy check: skip if strongly antagonistic with active set
+            if _has_strong_antagonism(self._active_interventions, intervention_name):
+                continue
             val = law_map.get(law_name, 0)
-            if abs(val) > 0.15:  # 유의미한 상관
+            # Apply synergy bonus to the signal threshold
+            synergy = get_synergy_score(self._active_interventions, intervention_name)
+            adjusted_val = abs(val) * (1.0 + synergy)
+            if adjusted_val > 0.15:  # 유의미한 상관
                 for iv in INTERVENTIONS:
                     if iv.name == intervention_name:
                         return iv
         return None
+
+    def _select_thompson(self, laws: List[LawMeasurement]) -> Optional[Intervention]:
+        """Thompson sampling: sample from Beta(alpha, beta) per intervention, pick highest.
+        Synergy-aware: multiply score by (1 + synergy_bonus), skip strong antagonisms."""
+        available = self._get_available_interventions()
+        if not available:
+            return None
+
+        best_sample = -float('inf')
+        best_iv = available[0]
+        for iv in available:
+            # Skip if strongly antagonistic with any active intervention
+            if _has_strong_antagonism(self._active_interventions, iv.name):
+                continue
+            a = self._intervention_alpha.get(iv.name, 1.0)
+            b = self._intervention_beta.get(iv.name, 1.0)
+            sample = np.random.beta(a, b)
+            # Apply synergy bonus
+            synergy = get_synergy_score(self._active_interventions, iv.name)
+            sample *= (1.0 + synergy)
+            if sample > best_sample:
+                best_sample = sample
+                best_iv = iv
+
+        return best_iv
+
+    def _select_epsilon_greedy(self, laws: List[LawMeasurement]) -> Optional[Intervention]:
+        """Epsilon-greedy: 80% exploit best, 20% explore random unused.
+        Synergy-aware: adjust scores by (1 + synergy_bonus), skip strong antagonisms."""
+        available = self._get_available_interventions()
+        if not available:
+            return None
+
+        # Filter out strongly antagonistic candidates
+        available = [iv for iv in available
+                     if not _has_strong_antagonism(self._active_interventions, iv.name)]
+        if not available:
+            return None
+
+        epsilon = 0.2  # 20% exploration
+
+        # Separate tried vs untried
+        tried = [iv for iv in available
+                 if iv.name in self._intervention_scores and len(self._intervention_scores[iv.name]) > 0]
+        untried = [iv for iv in available
+                   if iv.name not in self._intervention_scores or len(self._intervention_scores[iv.name]) == 0]
+
+        if np.random.random() < epsilon or not tried:
+            # Explore: prefer untried, fallback to random available
+            pool = untried if untried else available
+            chosen = pool[np.random.randint(len(pool))]
+        else:
+            # Exploit: pick best average score, adjusted by synergy
+            def synergy_adjusted_score(iv):
+                base = np.mean(self._intervention_scores[iv.name])
+                synergy = get_synergy_score(self._active_interventions, iv.name)
+                return base * (1.0 + synergy)
+            chosen = max(tried, key=synergy_adjusted_score)
+
+        return chosen
 
     def _print_cycle(self, report: CycleReport):
         """사이클 결과 출력."""
