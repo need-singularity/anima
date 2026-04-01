@@ -707,7 +707,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
       실행: python3 infinite_evolution.py --cells 64 --steps 300 [--resume] [--max-gen N]
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
-      5세대 결과: 44 unique patterns, 35 cross-validated, Laws 240-274 자동 등록
+      리포트 양식: docs/infinite-evolution-report.md (ASCII 그래프 + 닫힌원 분석 포함)
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
 ```
 
