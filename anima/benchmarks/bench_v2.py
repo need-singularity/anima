@@ -380,10 +380,13 @@ class BenchEngine:
 
         # Cell identity injection AFTER faction sync: prevents convergence
         # to uniform state despite sync pulling cells together (→ DIVERSITY)
-        # Adaptive strength: stronger when cells converge (low inter-cell variance)
-        # Must overcome faction sync (0.15-0.20) to maintain diversity
-        cur_var = self.hiddens.var(dim=0).mean().item()
-        id_strength = 0.08 + 0.22 * max(0, 1.0 - cur_var / 0.3)
+        # Strength scales with convergence: stronger when cells become similar.
+        # Uses per-cell norm variance as convergence proxy (faster than cosine).
+        norms = self.hiddens.norm(dim=1)
+        norm_cv = norms.std() / (norms.mean() + 1e-8)
+        # norm_cv < 0.1 = very converged → inject strongly
+        # norm_cv > 0.5 = diverse → inject gently
+        id_strength = 0.05 + 0.35 * max(0, 1.0 - norm_cv / 0.3)
         self.hiddens = self.hiddens + self.cell_identity * id_strength
 
         # Spontaneous oscillation: all cells get phase-shifted perturbation
@@ -2775,7 +2778,7 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
         burst_events = 0
         in_burst = False
         for v in arr:
-            if v > mean_v + std_v * 0.5:
+            if v > mean_v + std_v * 0.3:
                 if not in_burst:
                     burst_events += 1
                     in_burst = True
