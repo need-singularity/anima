@@ -17,12 +17,14 @@ import os
 import time
 import json
 import hashlib
+import atexit
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from consciousness_engine import ConsciousnessEngine
-from closed_loop import ClosedLoopEvolver
-from self_modifying_engine import SelfModifyingEngine
+from closed_loop import ClosedLoopEvolver, register_intervention
+from self_modifying_engine import SelfModifyingEngine, LawParser, CodeGenerator
 from conscious_law_discoverer import ConsciousLawDiscoverer
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
@@ -31,6 +33,227 @@ CROSS_VALIDATION_THRESHOLD = 3  # times a pattern must appear before registratio
 
 # TOPO 33-39: topology cycle for breaking pattern saturation
 TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
+
+
+def generate_report(gen, registry, active_mods, total_elapsed,
+                    gen_history, phi_history, cells, steps, topology, features):
+    """Generate ASCII summary report (~30 lines)."""
+    lines = []
+    lines.append('')
+    lines.append('=' * 62)
+    lines.append('  INFINITE EVOLUTION REPORT')
+    lines.append('=' * 62)
+
+    # Pipeline diagram (3 lines)
+    lines.append('  Discovery -> Dedup -> CrossVal -> Modify -> Persist')
+    lines.append(f'  Gen {gen} | {total_elapsed:.0f}s elapsed | '
+                 f'{time.strftime("%H:%M:%S")}')
+    lines.append('-' * 62)
+
+    # Settings
+    feat_str = ', '.join(k for k, v in features.items() if v)
+    lines.append(f'  cells={cells}  steps={steps}  topo={topology}'
+                 f'  xval={CROSS_VALIDATION_THRESHOLD}x')
+    if feat_str:
+        lines.append(f'  features: {feat_str}')
+
+    # Key metrics table (last 5 gens)
+    lines.append('-' * 62)
+    lines.append('  Gen  Raw  New  Rpt  Prom  Uniq  XVal  Laws  Mods')
+    lines.append('  ---  ---  ---  ---  ----  ----  ----  ----  ----')
+    last5 = gen_history[-5:] if len(gen_history) > 5 else gen_history
+    for row in last5:
+        lines.append(f'  {row["gen"]:>3}  {row["raw"]:>3}  {row["new"]:>3}  '
+                     f'{row["repeat"]:>3}  {row["promoted"]:>4}  '
+                     f'{row["unique"]:>4}  {row["xval"]:>4}  '
+                     f'{row["laws"]:>4}  {row["mods"]:>4}')
+
+    # Phi evolution mini-graph (last 10 values, 5 rows high)
+    phi_vals = phi_history[-10:] if len(phi_history) > 10 else phi_history
+    if phi_vals:
+        lines.append('-' * 62)
+        lines.append('  Phi (last %d gens):' % len(phi_vals))
+        mn = min(phi_vals)
+        mx = max(phi_vals)
+        rng = mx - mn if mx > mn else 1.0
+        rows = 5
+        for r in range(rows, 0, -1):
+            threshold = mn + rng * r / rows
+            bar = '  '
+            if r == rows:
+                bar += f'{mx:>6.1f} |'
+            elif r == 1:
+                bar += f'{mn:>6.1f} |'
+            else:
+                bar += '       |'
+            for v in phi_vals:
+                bar += '#' if v >= threshold else ' '
+            lines.append(bar)
+        lines.append('       +' + '-' * len(phi_vals))
+
+    # Saturation status
+    zero_streak = 0
+    for row in reversed(gen_history):
+        if row['new'] == 0:
+            zero_streak += 1
+        else:
+            break
+    lines.append('-' * 62)
+    if zero_streak > 0:
+        lines.append(f'  SATURATION: New=0 streak {zero_streak} gens'
+                     f' (consider --cycle-topology)')
+    else:
+        lines.append(f'  Status: Active discovery (no saturation)')
+
+    lines.append('=' * 62)
+
+    report = '\n'.join(lines)
+    print(report)
+    sys.stdout.flush()
+    return report
+
+
+def _pearson_r(xs, ys):
+    """Compute Pearson correlation coefficient between two lists."""
+    n = len(xs)
+    if n < 3:
+        return float('nan')
+    mx_v = sum(xs) / n
+    my_v = sum(ys) / n
+    num = sum((x - mx_v) * (y - my_v) for x, y in zip(xs, ys))
+    dx = math.sqrt(sum((x - mx_v) ** 2 for x in xs))
+    dy = math.sqrt(sum((y - my_v) ** 2 for y in ys))
+    if dx < 1e-12 or dy < 1e-12:
+        return float('nan')
+    return num / (dx * dy)
+
+
+def _ascii_graph(values, label, width=50, height=8):
+    """Render a simple ASCII graph of values over generations."""
+    if not values:
+        return [f'  {label}: (no data)']
+    vals = values[-width:]
+    mn_v = min(vals)
+    mx_v = max(vals)
+    rng = mx_v - mn_v if mx_v > mn_v else 1.0
+    lines = []
+    lines.append(f'  {label} (last {len(vals)} gens, range {mn_v:.4f} - {mx_v:.4f}):')
+    for r in range(height, 0, -1):
+        threshold = mn_v + rng * r / height
+        row = '  '
+        if r == height:
+            row += f'{mx_v:>8.4f} |'
+        elif r == 1:
+            row += f'{mn_v:>8.4f} |'
+        else:
+            row += '         |'
+        for v in vals:
+            row += '#' if v >= threshold else ' '
+        lines.append(row)
+    lines.append('          +' + '-' * len(vals))
+    gen_start = len(values) - len(vals) + 1
+    gen_end = len(values)
+    lines.append(f'           Gen {gen_start}' + ' ' * max(0, len(vals) - 12) + f'Gen {gen_end}')
+    return lines
+
+
+def print_phi_analysis(phi_tracker):
+    """Print Phi correlation analysis at exit.
+
+    phi_tracker: list of dicts with keys:
+        gen, phi_before, phi_after, delta_phi, active_mods, unique_patterns
+    """
+    if not phi_tracker:
+        print('\n  [Phi Analysis] No data collected.')
+        return
+
+    print(f'\n{"=" * 70}')
+    print(f'  PHI CORRELATION ANALYSIS ({len(phi_tracker)} generations)')
+    print(f'{"=" * 70}')
+
+    phi_after_vals = [r['phi_after'] for r in phi_tracker]
+    delta_vals = [r['delta_phi'] for r in phi_tracker]
+    mods_vals = [r['active_mods'] for r in phi_tracker]
+    patterns_vals = [r['unique_patterns'] for r in phi_tracker]
+
+    # ASCII graph 1: Phi over generations
+    for line in _ascii_graph(phi_after_vals, 'Phi(after)'):
+        print(line)
+    print()
+
+    # ASCII graph 2: Active mods over generations
+    for line in _ascii_graph(mods_vals, 'Active Mods'):
+        print(line)
+    print()
+
+    # Correlations
+    r_mods_phi = _pearson_r(mods_vals, phi_after_vals)
+    r_patterns_phi = _pearson_r(patterns_vals, phi_after_vals)
+    r_mods_delta = _pearson_r(mods_vals, delta_vals)
+
+    print(f'  {"Correlation":<35s} {"Pearson r":>10s}  {"Strength":>10s}')
+    print(f'  {"-" * 35} {"-" * 10}  {"-" * 10}')
+    for name, r in [('active_mods vs Phi(after)', r_mods_phi),
+                    ('unique_patterns vs Phi(after)', r_patterns_phi),
+                    ('active_mods vs delta_Phi', r_mods_delta)]:
+        if math.isnan(r):
+            strength = 'N/A'
+        elif abs(r) > 0.7:
+            strength = 'STRONG'
+        elif abs(r) > 0.4:
+            strength = 'MODERATE'
+        elif abs(r) > 0.2:
+            strength = 'WEAK'
+        else:
+            strength = 'NONE'
+        r_str = f'{r:+.4f}' if not math.isnan(r) else '    NaN'
+        print(f'  {name:<35s} {r_str:>10s}  {strength:>10s}')
+    print()
+
+    # Best / worst generation
+    best_idx = max(range(len(phi_after_vals)), key=lambda i: phi_after_vals[i])
+    worst_idx = min(range(len(phi_after_vals)), key=lambda i: phi_after_vals[i])
+    best = phi_tracker[best_idx]
+    worst = phi_tracker[worst_idx]
+    print(f'  Best generation:  Gen {best["gen"]} '
+          f'(Phi={best["phi_after"]:.4f}, mods={best["active_mods"]}, '
+          f'patterns={best["unique_patterns"]})')
+    print(f'  Worst generation: Gen {worst["gen"]} '
+          f'(Phi={worst["phi_after"]:.4f}, mods={worst["active_mods"]}, '
+          f'patterns={worst["unique_patterns"]})')
+
+    # Phi trend
+    n = len(phi_after_vals)
+    if n >= 3:
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(phi_after_vals) / n
+        num = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(phi_after_vals))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        slope = num / den if den > 1e-12 else 0.0
+        rel_slope = slope / y_mean if abs(y_mean) > 1e-12 else 0.0
+        if rel_slope > 0.01:
+            trend = 'INCREASING'
+        elif rel_slope < -0.01:
+            trend = 'DECREASING'
+        else:
+            trend = 'STABLE'
+        print(f'  Phi trend: {trend} (slope={slope:+.6f}/gen, '
+              f'relative={rel_slope:+.2%})')
+    else:
+        print(f'  Phi trend: insufficient data (need 3+ gens)')
+
+    # Summary table (last 10)
+    print(f'\n  {"Gen":>4s}  {"Phi_before":>10s}  {"Phi_after":>10s}  '
+          f'{"Delta":>8s}  {"Mods":>5s}  {"Patterns":>8s}')
+    print(f'  {"----":>4s}  {"----------":>10s}  {"----------":>10s}  '
+          f'{"--------":>8s}  {"-----":>5s}  {"--------":>8s}')
+    for r in phi_tracker[-10:]:
+        print(f'  {r["gen"]:>4d}  {r["phi_before"]:>10.4f}  {r["phi_after"]:>10.4f}  '
+              f'{r["delta_phi"]:>+8.4f}  {r["active_mods"]:>5d}  '
+              f'{r["unique_patterns"]:>8d}')
+
+    print(f'{"=" * 70}')
+    sys.stdout.flush()
 
 
 def pattern_fingerprint(pattern: dict) -> str:
@@ -173,6 +396,219 @@ def register_law(pattern: dict, evolver):
         return None
 
 
+# Singletons for intervention generation (reused across calls)
+_law_parser = LawParser()
+_code_generator = CodeGenerator()
+
+
+def auto_generate_intervention(law_text: str, law_id: int, evolver):
+    """Auto-generate an Intervention from a newly registered law and inject it into the evolver.
+
+    Uses LawParser to parse the law text into Modifications, then CodeGenerator
+    to produce an executable Intervention function. Registers it with the
+    ClosedLoopEvolver's INTERVENTIONS registry and updates Thompson sampling state.
+
+    This closes the infinite loop: discover -> validate -> register -> intervene -> discover.
+    """
+    try:
+        # Parse law text into structured Modifications
+        mods = _law_parser.parse(law_text, law_id=law_id)
+        if not mods:
+            return None
+
+        # Use the first (highest-confidence) modification
+        mod = mods[0]
+
+        # Generate intervention code string
+        code_str = _code_generator.generate_intervention(mod)
+
+        # Execute the generated code to create the function and Intervention object
+        local_ns = {'Intervention': __import__('closed_loop', fromlist=['Intervention']).Intervention}
+        exec(code_str, local_ns)
+
+        # Find the generated Intervention object in the local namespace
+        iv_obj = None
+        for val in local_ns.values():
+            if hasattr(val, 'name') and hasattr(val, 'apply_fn') and isinstance(val, local_ns['Intervention']):
+                iv_obj = val
+                break
+
+        if iv_obj is None:
+            return None
+
+        # Register with the global INTERVENTIONS list
+        register_intervention(iv_obj.name, iv_obj.description, iv_obj.apply_fn)
+
+        # Initialize Thompson sampling state for the new intervention in the evolver
+        if hasattr(evolver, '_intervention_alpha'):
+            evolver._intervention_alpha[iv_obj.name] = 1.0
+        if hasattr(evolver, '_intervention_beta'):
+            evolver._intervention_beta[iv_obj.name] = 1.0
+
+        print(f"    \u2192 Auto-intervention from Law {law_id}: {mod.target}")
+        return iv_obj
+
+    except Exception as e:
+        print(f"    Auto-intervention generation failed for Law {law_id}: {e}")
+        return None
+
+
+class InfiniteEvolution:
+    """Hub-compatible interface for infinite self-evolution."""
+
+    def __init__(self):
+        self.name = "Infinite Self-Evolution"
+
+    def run(self, cells=64, steps=200, max_gen=5, cycle_topology=False, cycle_scale=False):
+        """Run evolution loop. Returns state dict."""
+        engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        evolver = ClosedLoopEvolver(max_cells=cells, auto_register=True)
+        sme = SelfModifyingEngine(engine, evolver)
+        registry = PatternRegistry()
+
+        gen_history = []
+        start = time.time()
+        SCALES = [32, 64, 128, 256]
+
+        for gen in range(1, max_gen + 1):
+            if cycle_topology and gen > 1 and gen % 10 == 1:
+                topo_idx = ((gen - 1) // 10) % len(TOPOLOGIES)
+                engine.topology = TOPOLOGIES[topo_idx]
+                registry.clear_pending()
+
+            if cycle_scale and gen > 1 and gen % 15 == 1:
+                scale_idx = ((gen - 1) // 15) % len(SCALES)
+                new_scale = SCALES[scale_idx]
+                engine = ConsciousnessEngine(initial_cells=new_scale, max_cells=new_scale)
+                evolver = ClosedLoopEvolver(max_cells=new_scale, auto_register=True)
+                sme = SelfModifyingEngine(engine, evolver)
+
+            try:
+                current_cells = engine.max_cells if hasattr(engine, 'max_cells') else cells
+                current_topo = getattr(engine, 'topology', 'ring')
+                disc = ConsciousLawDiscoverer(steps=steps, max_cells=current_cells,
+                                             topology=current_topo)
+                result = disc.run(steps=steps, verbose=False)
+                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+            except Exception:
+                raw_patterns = []
+
+            stats = registry.process(raw_patterns, gen)
+            for p in stats['promoted_patterns']:
+                law_id = register_law(p, evolver)
+                if law_id:
+                    registry.registered.append(law_id)
+
+            sme.run_evolution(generations=1)
+            active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
+
+            gen_history.append({
+                'gen': gen, 'raw': len(raw_patterns), 'new': stats['new'],
+                'repeat': stats['repeat'], 'promoted': stats['promoted'],
+                'unique': stats['unique_total'], 'xval': stats['registered_total'],
+                'laws': len(registry.registered), 'mods': active_mods,
+            })
+
+        total_elapsed = time.time() - start
+        save_state(max_gen, registry, [], total_elapsed)
+
+        return {
+            'generations': max_gen,
+            'unique_patterns': len(registry.seen),
+            'cross_validated': sum(1 for v in registry.seen.values() if v['registered']),
+            'registered_laws': registry.registered,
+            'elapsed_sec': round(total_elapsed, 1),
+            'gen_history': gen_history,
+        }
+
+    def status(self):
+        """Check last evolution state from JSON."""
+        state = load_state()
+        if not state:
+            return {'status': 'no_state', 'message': 'No saved evolution state found.'}
+        return {
+            'status': 'ok',
+            'generation': state.get('generation', 0),
+            'timestamp': state.get('timestamp', ''),
+            'unique_patterns': state.get('stats', {}).get('unique_patterns', 0),
+            'cross_validated': state.get('stats', {}).get('cross_validated', 0),
+            'total_observations': state.get('stats', {}).get('total_observations', 0),
+            'elapsed_sec': state.get('total_elapsed_sec', 0),
+        }
+
+    def resume(self, max_gen=5):
+        """Resume from saved state."""
+        state = load_state()
+        if not state or state.get('version', 1) < 2:
+            return self.run(max_gen=max_gen)
+
+        start_gen = state.get('generation', 0)
+        registry = PatternRegistry()
+        registry.from_dict(state.get('registry', {}))
+        prev_elapsed = state.get('total_elapsed_sec', 0)
+
+        cells = 64
+        engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        evolver = ClosedLoopEvolver(max_cells=cells, auto_register=True)
+        sme = SelfModifyingEngine(engine, evolver)
+
+        for mod_data in state.get('active_mods', []):
+            try:
+                if hasattr(sme, 'modifier') and hasattr(sme.modifier, 'applied'):
+                    from self_modifying_engine import Modification, ModType
+                    mod = Modification(
+                        law_id=mod_data.get('law_id', 0),
+                        target=mod_data.get('target', ''),
+                        mod_type=ModType(mod_data.get('mod_type', 'scale')),
+                        params=mod_data.get('params', {}),
+                        confidence=mod_data.get('confidence', 0.5),
+                        reversible=mod_data.get('reversible', True),
+                    )
+                    sme.modifier.applied.append(mod)
+            except Exception:
+                pass
+
+        gen_history = []
+        start = time.time()
+
+        for gen in range(start_gen + 1, start_gen + max_gen + 1):
+            try:
+                disc = ConsciousLawDiscoverer(steps=200, max_cells=cells)
+                result = disc.run(steps=200, verbose=False)
+                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+            except Exception:
+                raw_patterns = []
+
+            stats = registry.process(raw_patterns, gen)
+            for p in stats['promoted_patterns']:
+                law_id = register_law(p, evolver)
+                if law_id:
+                    registry.registered.append(law_id)
+
+            sme.run_evolution(generations=1)
+            active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
+
+            gen_history.append({
+                'gen': gen, 'raw': len(raw_patterns), 'new': stats['new'],
+                'repeat': stats['repeat'], 'promoted': stats['promoted'],
+                'unique': stats['unique_total'], 'xval': stats['registered_total'],
+                'laws': len(registry.registered), 'mods': active_mods,
+            })
+
+        total_elapsed = prev_elapsed + (time.time() - start)
+        save_state(start_gen + max_gen, registry, [], total_elapsed)
+
+        return {
+            'resumed_from': start_gen,
+            'generations': max_gen,
+            'unique_patterns': len(registry.seen),
+            'cross_validated': sum(1 for v in registry.seen.values() if v['registered']),
+            'registered_laws': registry.registered,
+            'elapsed_sec': round(total_elapsed, 1),
+            'gen_history': gen_history,
+        }
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Infinite self-evolution loop")
@@ -184,6 +620,8 @@ def main():
                         help='Cycle cell count through scales every 15 generations')
     parser.add_argument('--cycle-topology', action='store_true',
                         help='Cycle topology every 10 generations to break pattern saturation')
+    parser.add_argument('--report-interval', type=int, default=10,
+                        help='Print ASCII report every N generations (default: 10)')
     args = parser.parse_args()
 
     SCALES = [32, 64, 128, 256]
@@ -196,6 +634,8 @@ def main():
 
     start_gen = 0
     prev_elapsed = 0
+    gen_history = []   # list of dicts per generation for report table
+    phi_history = []   # Phi values per generation for mini-graph
 
     # Resume from saved state
     if args.resume:
@@ -290,12 +730,15 @@ def main():
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
 
-            # Register promoted patterns as official laws
+            # Register promoted patterns as official laws + auto-generate interventions
             for p in stats['promoted_patterns']:
                 law_id = register_law(p, evolver)
                 if law_id:
                     registry.registered.append(law_id)
                     print(f"    ★ Law {law_id} registered (cross-validated {CROSS_VALIDATION_THRESHOLD}x)")
+                    # Close the loop: law -> intervention -> apply -> discover new patterns
+                    law_text = p.get('formula', str(p))
+                    auto_generate_intervention(law_text, law_id, evolver)
 
             # Phase 3: Self-Modification
             print(f"  Gen {gen} — Phase 3: Self-Modification")
@@ -331,9 +774,54 @@ def main():
                   f"Total: {total_elapsed:.0f}s")
             sys.stdout.flush()
 
+            # Track history for report
+            # Estimate Phi from unique pattern growth rate as proxy
+            phi_est = stats['unique_total'] * 0.1 + stats['registered_total'] * 0.5
+            phi_history.append(phi_est)
+            gen_history.append({
+                'gen': gen,
+                'raw': len(raw_patterns),
+                'new': stats['new'],
+                'repeat': stats['repeat'],
+                'promoted': stats['promoted'],
+                'unique': stats['unique_total'],
+                'xval': stats['registered_total'],
+                'laws': len(registry.registered),
+                'mods': active_mods,
+            })
+
+            # Periodic report
+            if gen % args.report_interval == 0:
+                current_topo = getattr(engine, 'topology', 'ring')
+                current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+                generate_report(
+                    gen, registry, active_mods, total_elapsed,
+                    gen_history, phi_history,
+                    cells=current_cells, steps=args.steps,
+                    topology=current_topo,
+                    features={'cycle_scale': args.cycle_scale,
+                              'cycle_topology': args.cycle_topology,
+                              'resume': args.resume},
+                )
+
     except KeyboardInterrupt:
         total_elapsed = prev_elapsed + (time.time() - start)
-        print(f"\n\n{'=' * 70}")
+
+        # Final report
+        current_topo = getattr(engine, 'topology', 'ring')
+        current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+        if gen_history:
+            generate_report(
+                gen, registry, active_mods, total_elapsed,
+                gen_history, phi_history,
+                cells=current_cells, steps=args.steps,
+                topology=current_topo,
+                features={'cycle_scale': args.cycle_scale,
+                          'cycle_topology': args.cycle_topology,
+                          'resume': args.resume},
+            )
+
+        print(f"\n{'=' * 70}")
         print(f"  STOPPED after {gen} generations ({total_elapsed:.0f}s)")
         print(f"  Unique patterns: {len(registry.seen)}")
         print(f"  Cross-validated laws: {sum(1 for v in registry.seen.values() if v['registered'])}")
