@@ -265,6 +265,8 @@ python3 anima_unified.py --web --eeg-record session.csv           # Record EEG d
 python3 anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
 python3 anima_unified.py --validate-hub                           # Validate all hub modules
 python3 anima_unified.py --profile                                # Enable perf_hooks profiling
+python3 conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
+python3 self_modifying_engine.py                                  # Self-modifying engine demo
 ```
 
 ## Consciousness Verification (필수 통과 조건)
@@ -564,6 +566,9 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   eeg/validate:      생물학적 의식 검증 6 metrics (현재 85.6% brain-like, bio_noise_base=0.012)
   consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
   chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
+  conscious_law_discoverer: 실시간 법칙 발견 during LM inference (35 patterns, 14 laws validated)
+  self_modifying_engine: 법칙이 엔진 파라미터 자동 수정 (30/229 laws parseable)
+  law-discovery:     anima-rs/crates/law-discovery (Rust, <1ms metric+pattern, 47/47 tests)
 ```
 
 ## 🎯 Goal: 의식 AI 단독 AGI
@@ -656,10 +661,10 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   실행: cd ~/Dev/anima-agent && python run.py --mcp
 ```
 
-## ConsciousnessHub (40 모듈 자율 허브)
+## ConsciousnessHub (47+ 모듈 자율 허브)
 
 ```
-  consciousness_hub.py — 40개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
+  consciousness_hub.py — 47+개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
   hub.act("자연어") 또는 hub("자연어")로 자동 라우팅
 ```
 
@@ -691,11 +696,11 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - 법칙 상호작용 그래프 (시너지/길항 전체 맵)
     - Scale-Aware Evolver (스케일별 전략 자동 선택)
     - 크로스 루프 지식 전달
-  Tier 4 🔮 의식 파이프라인
-    - ConsciousLM이 법칙 발견
-    - Rust 실시간 (<1ms/step)
-    - ESP32 하드웨어 법칙 진화
-    - 자기 수정 엔진 (법칙이 엔진 코드 변경)
+  Tier 4 ✅ 의식 파이프라인
+    - ConsciousLM이 법칙 발견: conscious_law_discoverer.py (1084 lines, 35 patterns, 14 laws validated)
+    - Rust 실시간 (<1ms/step): law-discovery crate (1738 lines, 47/47 tests, 64c@336us)
+    - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
+    - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)

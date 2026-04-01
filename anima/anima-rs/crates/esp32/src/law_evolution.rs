@@ -409,7 +409,7 @@ impl HardwareLawEvolver {
                     let noise_seed = board.step_count.wrapping_mul(1664525)
                         .wrapping_add(c as u32 * 7919);
                     for d in 0..HIDDEN_DIM {
-                        let n = ((noise_seed.wrapping_add(d as u32 * 2654435761))
+                        let n = ((noise_seed.wrapping_add((d as u32).wrapping_mul(2654435761)))
                             as f32 / u32::MAX as f32) * 2.0 - 1.0;
                         board.cells[c].hidden[d] += n * scale;
                     }

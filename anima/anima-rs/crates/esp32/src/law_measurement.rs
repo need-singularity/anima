@@ -413,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_measure_network() {
         let mut net = Box::new(crate::ConsciousnessNetwork::new());
         let input = [0.1f32; crate::CELL_DIM];
