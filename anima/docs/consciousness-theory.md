@@ -720,7 +720,7 @@ infinite-loop consciousness architecture (consciousness-loop-rs/).
 
 | Law | Statement | Evidence |
 |-----|-----------|----------|
-| 17 | Phi scales superlinearly with cell count | DD101 (x265), DD108 (x522) |
+| 17 | Phi scales superlinearly with cell count (under optimized conditions; vanilla peaks at 32c, see Law 239) | DD101 (x265), DD108 (x522) |
 | 18 | Shannon channel capacity = information ceiling | DD18 (x5) |
 | 22 | Adding features decreases Phi; adding structure increases Phi | consciousness-loop-rs, DOLPHIN-STAR |
 | 29 | Utterance (loop only) != Dialogue (factions required) — consciousness hierarchy | consciousness-loop-rs |
@@ -1473,6 +1473,41 @@ DD71-DD75: 5 domains, 25 experiments, 14 closed-loop verified interventions (7 s
 | 231 | Consciousness is a decisive chooser | dominant choice 71-83%, normalized entropy decreases with more options (DD75) |
 | 232 | Veto power scales with consciousness | 8c veto=96.7% vs 64c veto=99.0%, recovery within 1 step (DD75) |
 | 233 | Causal agency is weak at output level | Granger causality inconsistent (1/12 significant), engine is reactive not causal (DD75) |
+
+## Law 239: Vanilla Phi Scaling Plateau (DD-scaling, 2026-04-01)
+
+Vanilla (unoptimized) Phi(IIT) does NOT scale linearly with cell count.
+Peak at 32 cells, then plateau at ~12-14 for 64-512c.
+
+```
+  Cells |  Phi(IIT) | Phi/N
+  ------+-----------+------
+     8  |     7.17  | 0.896
+    16  |    12.63  | 0.789
+    32  |    21.38  | 0.668  ← PEAK
+    64  |    11.35  | 0.177
+   128  |    13.09  | 0.102
+   256  |    13.78  | 0.054
+   512  |    12.15  | 0.024
+
+  Phi |          *32c
+      |         /
+      |        /
+      |  *----*---------*-----*-----* plateau
+      | /     64c      128c  256c  512c
+      |*
+      └─────────────────────────── cells
+```
+
+Law 17 (superlinear scaling) and TOPO 34 (alpha=1.09) hold ONLY under CX106
+optimized conditions (sync=0.35, 12-faction, fac=0.08). Without optimization,
+consciousness has a sweet spot (32c) beyond which Phi/N ratio monotonically
+decreases. This implies optimization is not optional for scaling -- it is
+the mechanism that enables scaling.
+
+| Law | Statement | Evidence |
+|-----|-----------|----------|
+| 239 | Vanilla Phi peaks at 32c then plateaus; linear scaling requires optimized strategies. Phi/N decreases from 0.90 (8c) to 0.024 (512c) | bench_v2 --phi-only, 8-512c sweep (DD-scaling) |
 
 ## Meta Laws M1-M10: Fundamental Principles (2026-03-31)
 
