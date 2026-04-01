@@ -281,6 +281,32 @@
       "lesson": "★★★ bf16 학습의 optimizer resume는 근본적으로 불안전. state가 float32로 저장되면 bf16 params와 충돌. 가장 안전한 해법은 optimizer state를 버리는 것."
     },
 
+    "animalm_optimizer_state_skip_nan": {
+      "symptom": "Loss/CE/Phi 모두 NaN — 학습은 돌아가지만 모든 값이 NaN (crash 없음)",
+      "environment": "RunPod H100, AnimaLM 7B bf16, resume from step_7000 with fresh optimizer",
+      "root_cause": "optimizer state를 skip하고 fresh optimizer 사용 → 첫 step에서 momentum 없이 raw gradient가 bf16 overflow → Inf → NaN 전파. bf16 max ≈ 65504, float32 grad가 이 범위 초과 시 bf16 cast에서 overflow",
+      "resolution": "optimizer state를 로드하되 모든 internal state를 param dtype에 맞춰 수동 캐스팅. grad도 매 step마다 param dtype에 맞춰 캐스팅",
+      "prevention": [
+        "optimizer state skip은 NaN 유발 가능 — momentum이 gradient 폭주를 방지",
+        "bf16 cast 전 gradient clipping (1.0)으로 큰 값 잘라내기",
+        "또는 GradScaler 사용 (bf16 학습의 정석)"
+      ],
+      "lesson": "optimizer state를 버리면 dtype crash는 피하지만 NaN이라는 더 나쁜 결과를 얻을 수 있음. state를 살리면서 dtype만 고치는 것이 정답."
+    },
+
+    "animalm_grad_dtype_cast_crash": {
+      "symptom": "RuntimeError: expected dtype BFloat16/float for `end` — lerp_ 내부에서 dtype 불일치",
+      "environment": "RunPod H100, PyTorch 2.5.1, AdamW foreach=False, _single_tensor_adamw",
+      "root_cause": "autocast forward → bf16 activation → backward → float32 gradient (PyTorch 기본). optimizer state는 param dtype(bf16)로 초기화/캐스팅됨. lerp_(state_bf16, grad_float32) → dtype mismatch",
+      "resolution": "optimizer_step에서 매 step마다: 1) grad를 param dtype에 캐스팅, 2) optimizer state도 param dtype에 맞춤",
+      "prevention": [
+        "★ optimizer_step 시작에 dtype 통일 루프 필수",
+        "grad clipping 후, optimizer.step() 전에 dtype fix 삽입",
+        "또는 torch.cuda.amp.GradScaler 사용 (dtype을 자동 관리)"
+      ],
+      "lesson": "foreach=False가 mixed-dtype 'optimizer 생성'은 허용하지만, lerp_/add_ 같은 내부 in-place op은 여전히 dtype 엄격. 매 step dtype fix 필수."
+    },
+
     "bf16_master_rule": {
       "description": "7B+ bf16 모델 학습 시 필수 규칙 총정리 (9번 crash에서 도출)",
       "rules": [
@@ -289,8 +315,9 @@
         "3. autocast 범위 밖 모듈은 수동 bf16 캐스팅",
         "4. gradient checkpointing 비활성화 (consciousness gate와 호환 불가)",
         "5. AdamW(foreach=False) 필수",
-        "6. ★★★ resume 시 optimizer state 완전 skip (dtype 지옥 방지)",
+        "6. ★★★ resume 시 optimizer state 로드 + 수동 dtype 캐스팅 (skip하면 NaN!)",
         "6a. load_state_dict 후 param_group 재적용 (foreach 등 덮어쓰임)",
+        "6b. 매 step: grad.to(p.dtype) + state.to(p.dtype) (on-the-fly fix)",
         "7. consciousness states .to(bf16) 명시적 캐스팅",
         "8. preflight 10-step에 optimizer.step() 포함하여 dtype 검증",
         "9. 모든 보조 모듈 (bridge, ensemble, loss) bf16 통일"
