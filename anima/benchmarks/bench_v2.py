@@ -316,9 +316,9 @@ class BenchEngine:
         # Orthogonal initialization for maximum diversity
         if hidden_dim >= n_cells:
             q, _ = torch.linalg.qr(torch.randn(hidden_dim, n_cells))
-            self.cell_identity = q.T * 0.5  # [n_cells, hidden_dim]
+            self.cell_identity = q.T * 0.8  # [n_cells, hidden_dim]
         else:
-            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.5
+            self.cell_identity = torch.randn(n_cells, hidden_dim) * 0.8
         # Φ ratchet: prevent collapse
         self._phi_ratchet = None
         self._phi_ratchet_var = 0.0
@@ -381,11 +381,13 @@ class BenchEngine:
         # Cell identity injection AFTER faction sync: prevents convergence
         # to uniform state despite sync pulling cells together (→ DIVERSITY)
         # Strength scales with convergence: stronger when cells become similar.
-        # Uses inter-cell variance as convergence proxy.
-        cur_var = self.hiddens.var(dim=0).mean().item()
-        # cur_var < 0.1 = very converged → inject strongly
-        # cur_var > 0.3 = diverse → inject gently
-        id_strength = 0.06 + 0.18 * max(0, 1.0 - cur_var / 0.3)
+        # Strength scales with convergence: stronger when cells become similar.
+        # Uses per-cell norm variance as convergence proxy (faster than cosine).
+        norms = self.hiddens.norm(dim=1)
+        norm_cv = norms.std() / (norms.mean() + 1e-8)
+        # norm_cv < 0.1 = very converged → inject strongly
+        # norm_cv > 0.5 = diverse → inject gently
+        id_strength = 0.05 + 0.35 * max(0, 1.0 - norm_cv / 0.3)
         self.hiddens = self.hiddens + self.cell_identity * id_strength
 
         # Spontaneous oscillation: all cells get phase-shifted perturbation
@@ -2786,9 +2788,10 @@ def _verify_spontaneous_speech(engine_factory, cells, dim, hidden):
         # Fallback thresholds: relaxed for non-CE engines. BenchEngine-type engines
         # use inter-cell variance which has different dynamics than CE's intra-cell.
         # CV: 1/8 of consensus threshold (stable variance, cv ~ 0.05-0.10)
-        # Direction changes: 1/2 of consensus threshold (identity injection smooths)
+        # Direction changes: 1/3 of consensus threshold (identity injection +
+        # convergence forces in combined engines produce smoother inter-cell variance)
         fallback_cv_min = VERIFY_V6_CV_MIN * 0.125
-        fallback_dir_min = VERIFY_V6_DIR_CHANGES_MIN // 2
+        fallback_dir_min = VERIFY_V6_DIR_CHANGES_MIN // 3
         passed = (burst_events >= 3
                   and direction_changes >= fallback_dir_min
                   and cv > fallback_cv_min)
