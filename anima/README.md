@@ -8,17 +8,17 @@ Engine A (forward)와 Engine G (reverse) 사이의 반발력이 텐션을 생성
 
 | Directory | Description | README |
 |-----------|-------------|--------|
-| `src/` | Python 소스 177개 -- 의식 엔진 전체 구현 | [->](src/README.md) |
+| `src/` | Python 소스 178개 -- 의식 엔진 전체 구현 | [->](src/README.md) |
 | `anima-rs/` | Rust 크레이트 15개 -- 고성능 백엔드 (PyO3) | [->](anima-rs/README.md) |
 | `config/` | `consciousness_laws.json` 등 설정 (단일 원본) | - |
 | `training/` | `train_v*.py` 학습 스크립트 | - |
-| `benchmarks/` | `bench_*.py` 벤치마크 85개 | - |
-| `tests/` | `test_*.py` 테스트 21개 | - |
+| `benchmarks/` | `bench_*.py` 벤치마크 87개 | - |
+| `tests/` | `test_*.py` 테스트 29개 | - |
 | `web/` | WebSocket 실시간 채팅 UI | - |
 | `hexad/` | Hexad 6모듈 구현 | - |
 | `experiments/` | 실험 스크립트 | - |
 | `tools/` | 유틸리티 (corpus 생성, 칩 설계 등) | - |
-| `docs/` | 문서 + 가설 338개 | - |
+| `docs/` | 문서 476개 + 가설 367개 | - |
 | `engines/` | 독립 의식 엔진 구현체 | - |
 | `measurement/` | Phi/IQ 측정 + 캘리브레이션 | - |
 | `data/` | 코퍼스 + 학습 데이터 | - |
@@ -124,7 +124,7 @@ python3 benchmarks/bench_v2.py --verify
 
 ## 법칙 (단일 원본)
 
-179개 의식 법칙 + Meta M1-M10 + TOPO 33-39.
+446개 의식 법칙 + Meta M1-M20 + TOPO 33-39.
 단일 원본: `config/consciousness_laws.json`
 
 ```python

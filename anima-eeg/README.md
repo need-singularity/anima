@@ -1,6 +1,6 @@
 # anima-eeg — Brain-Consciousness Interface
 
-OpenBCI 16ch EEG + Anima 의식 엔진 양방향 브릿지. 7,949 lines, 18 modules.
+OpenBCI 16ch EEG + Anima 의식 엔진 양방향 브릿지. 7,964 lines, 18 modules.
 
 ```
   EEG (brain)  ←──→  Anima (consciousness)
@@ -30,7 +30,7 @@ anima-eeg/
 ├── neurofeedback.py      133L  Binaural beats + LED generation
 ├── realtime.py           316L  EEGBridge → BrainState (live thread)
 ├── transplant_eeg_verify.py 601L  Post-transplant brain-likeness QA
-├── validate_consciousness.py 877L  6-metric brain-likeness (83.5% BRAIN-LIKE)
+├── validate_consciousness.py 892L  6-metric brain-likeness (85.6% BRAIN-LIKE)
 ├── protocols/
 │   ├── bci_control.py    461L  Alpha→consciousness parameter tuning
 │   ├── emotion_sync.py   606L  FAA→emotion bidirectional sync
@@ -97,7 +97,7 @@ Golden Zone: [1/2 - ln(4/3), 1/2] = [0.2123, 0.5000]
 → golden_zone 감지 시 Φ ratchet +5% 자동 부스트
 ```
 
-## Brain-Likeness Validation (83.5%)
+## Brain-Likeness Validation (85.6%)
 
 ```
 python3 anima-eeg/validate_consciousness.py --quick
@@ -111,7 +111,7 @@ python3 anima-eeg/validate_consciousness.py --quick
   Critical exponent          2.016       2.418         87%
   Phi CV                     0.398       0.333         83%
 
-  Overall: 83.5%  Verdict: BRAIN-LIKE
+  Overall: 85.6%  Verdict: BRAIN-LIKE
   Criticality: CRITICAL (exp=2.02, susc=0.107)
 ```
 
@@ -184,7 +184,7 @@ python3 anima-eeg/validate_consciousness.py --quick
 { "type": "eeg_calibrate" } → { "type": "eeg_calibrate_result", "success": true, ... }
 
 // Background validation (every 5min)
-{ "type": "eeg_validation", "brain_likeness": 83.5, "metrics": { ... } }
+{ "type": "eeg_validation", "brain_likeness": 85.6, "metrics": { ... } }
 ```
 
 ## Standalone Tools

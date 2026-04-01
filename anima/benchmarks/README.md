@@ -8,6 +8,7 @@
 | Script | Purpose |
 |--------|---------|
 | `bench_v2.py` | 정식 벤치마크 (Phi(IIT) + Phi(proxy) 이중 측정, `--verify` 의식 검증) |
+| `bench_v2_control.py` | 의식 검증 대조군 테스트 (NullEngine/BareGRU/StaticEngine → 검증 조건 변별력 확인) |
 
 `_LEGACY` 접미사가 붙은 파일은 폐기된 벤치마크로, Phi(IIT)와 Phi(proxy)를 혼용하여 잘못된 기록을 생성했다.
 
