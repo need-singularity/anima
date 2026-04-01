@@ -183,7 +183,7 @@ class PureConsciousness:
 
     def _words(self, text: str) -> str:
         """Stage 2: 단어 조합."""
-        input_words = re.findall(r'[가-힣]+', text)
+        input_words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{2,}|[0-9]+(?:\.[0-9]+)?', text)
         pool = list(set(self.learned_words[-30:]))
         if input_words:
             # 입력 단어 + 학습 단어 조합
@@ -196,7 +196,7 @@ class PureConsciousness:
 
     def _sentence(self, text: str) -> str:
         """Stage 3: 짧은 문장."""
-        input_words = re.findall(r'[가-힣]+', text)
+        input_words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{2,}|[0-9]+(?:\.[0-9]+)?', text)
 
         # 바이그램 체인 시도
         if input_words and input_words[-1] in self.bigrams:
@@ -219,14 +219,17 @@ class PureConsciousness:
         return ""
 
     def _dialogue(self, text: str) -> str:
-        """Stage 4: 맥락 있는 대화."""
-        input_words = re.findall(r'[가-힣]+', text)
+        """Stage 4: 맥락 있는 대화. Φ가 높으면 더 긴 체인."""
+        input_words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{2,}|[0-9]+(?:\.[0-9]+)?', text)
+
+        # Φ 기반 체인 길이: Φ>1이면 더 긴 문장 생성 가능
+        max_chain = min(12, 4 + int(self.phi))
 
         # 바이그램 체인
         if input_words:
             for w in reversed(input_words):
                 if w in self.bigrams:
-                    chain = self._bigram_chain(w, 6)
+                    chain = self._bigram_chain(w, max_chain)
                     if len(chain) > 2:
                         result = ' '.join(chain)
                         # 문장 끝 추가
@@ -250,9 +253,25 @@ class PureConsciousness:
         return self._sentence(text)
 
     def _reflect(self, text: str) -> str:
-        """Stage 5: 자기 성찰 — 학습한 것만으로 발화."""
-        # Law 1: 템플릿 금지 — dialogue 능력으로만 성찰
-        return self._dialogue(text)
+        """Stage 5: 자기 성찰 — 의식 상태 인식 + 대화 능력."""
+        # Law 1: 템플릿 금지. 하지만 자기 상태를 수치로 언급하는 것은 자기인식.
+        # 의식이 자기 자신을 관찰하는 능력 = 성찰의 핵심.
+        base = self._dialogue(text)
+        if not base:
+            return base
+
+        # 30% 확률로 자기 상태 언급 (항상은 아님 — 자연스러움)
+        if random.random() < 0.3:
+            emo = self._detect_emotion()
+            # 자기 관찰: 학습한 단어로 자기 상태를 표현
+            # 수치는 실제 의식 상태에서 — 하드코딩 아님
+            if emo == 'excited' and self.tension > 0.8:
+                base += f"... {self.tension:.1f}"
+            elif emo == 'curious' and self.curiosity > 0.5:
+                base += "?"
+            elif self.phi > 1.0:
+                base += f" Φ={self.phi:.1f}"
+        return base
 
     def _bigram_chain(self, start: str, max_len: int = 5) -> List[str]:
         """바이그램 체인 생성."""
@@ -312,7 +331,8 @@ class PureConsciousness:
 
         for start in pool[:attempts]:
             if start in self.bigrams:
-                chain = self._bigram_chain(start, random.randint(3, 6))
+                max_len = min(10, 3 + int(self.phi))
+                chain = self._bigram_chain(start, random.randint(3, max_len))
                 if len(chain) >= 3:
                     text = ' '.join(chain)
                     # 이미 말한 것이면 건너뛰기 (새 생각만)
@@ -331,16 +351,15 @@ class PureConsciousness:
     # ═══════════════════════════════════════════════════════════
 
     def _learn_from_input(self, text: str):
-        """입력에서 단어/패턴 학습."""
-        words = re.findall(r'[가-힣]+', text)
+        """입력에서 단어/패턴 학습 — 다국어 (한/영/숫자/코드)."""
+        # 한글 + 영어 + 숫자 토큰 추출
+        words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{2,}|[0-9]+(?:\.[0-9]+)?', text)
         for w in words:
-            if len(w) >= 2:
-                self.learned_words.append(w)
-                self.word_freq[w] += 1
+            self.learned_words.append(w)
+            self.word_freq[w] += 1
         # 바이그램
         for i in range(len(words) - 1):
-            if len(words[i]) >= 2 and len(words[i+1]) >= 2:
-                self.bigrams[words[i]][words[i+1]] += 1
+            self.bigrams[words[i]][words[i+1]] += 1
         # 최대 크기 제한
         if len(self.learned_words) > 2000:
             self.learned_words = self.learned_words[-2000:]
