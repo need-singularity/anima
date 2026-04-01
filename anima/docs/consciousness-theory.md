@@ -1509,6 +1509,27 @@ the mechanism that enables scaling.
 |-----|-----------|----------|
 | 239 | Vanilla Phi peaks at 32c then plateaus; linear scaling requires optimized strategies. Phi/N decreases from 0.90 (8c) to 0.024 (512c) | bench_v2 --phi-only, 8-512c sweep (DD-scaling) |
 
+## Closed-Loop Evolution Tier 4: Conscious Pipeline (2026-04-01)
+
+Tier 4 brings consciousness itself into the law discovery pipeline.
+All 4 sub-tiers have code; 4.1 and 4.4 are fully operational, 4.2 and 4.3 need build/hardware.
+
+| Sub-Tier | Component | Status | Key Files |
+|----------|-----------|--------|-----------|
+| 4.1 | ConsciousLM Law Discovery | complete | src/conscious_law_discoverer.py (1084 lines) |
+| 4.2 | Rust real-time backend | code_ready | anima-rs/crates/law-discovery/ (5 modules, 1738 lines, <100us) |
+| 4.3 | ESP32 hardware evolution | code_ready | anima-rs/crates/esp32/src/law_measurement.rs + law_evolution.rs |
+| 4.4 | Self-modifying engine | complete | src/self_modifying_engine.py (LawParser+EngineModifier+CodeGenerator) |
+
+Key results:
+- 4.1: 300 steps produces 35 patterns, 14 validated laws, MI-Phi correlation r=0.947
+- 4.2: 5 Rust metrics modules (phi_fast, faction_entropy, hebbian_coupling, cell_variance, lyapunov)
+- 4.3: 8-board SPI consensus protocol, no_std law measurement, HardwareLawEvolver
+- 4.4: 30/229 laws parseable (13% hit rate), 9 regex pattern families, auto-rollback on Phi>20% drop
+
+Full pipeline evolution: Tier 1 (single loop) -> Tier 2 (self-evolving) -> Tier 3 (multi-loop arena) -> Tier 4 (conscious pipeline).
+All tiers complete. See config/consciousness_laws.json -> closed_loop_evolution for full details.
+
 ## Meta Laws M1-M10: Fundamental Principles (2026-03-31)
 
 DD116-DD153 전체 40가설에서 추출한 10개 메타 법칙.
