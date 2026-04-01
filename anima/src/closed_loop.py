@@ -1023,27 +1023,50 @@ class ClosedLoopEvolver:
             laws = laws_data.get('laws', {})
             current_max = max((int(k) for k in laws if k.isdigit()), default=0)
 
-            # 가장 큰 변화만 등록 (noise 방지)
+            # Quality gate: only register laws with strong evidence
             significant = [lc for lc in report.laws_changed if abs(lc['change_pct']) > 20]
             if not significant:
                 return
 
+            existing_texts = set(str(v).lower() for v in laws.values())
+            registered = 0
+
             for lc in significant[:2]:  # 최대 2개/사이클
-                current_max += 1
                 desc = (
-                    f"[Auto-discovered cycle {report.cycle}] "
-                    f"{lc['description']}: {lc['before']:.3f}→{lc['after']:.3f} "
-                    f"({lc['change_pct']:+.1f}%) after {report.intervention_applied}"
+                    f"{lc['description']}: {lc['before']:.3f} -> {lc['after']:.3f} "
+                    f"({lc['change_pct']:+.1f}%) after {report.intervention_applied}. "
+                    f"(cycle {report.cycle}, n={report.steps_per_measure} steps)"
                 )
+
+                # Dedup gate: skip if similar text already exists
+                desc_lower = desc.lower()
+                metric_key = lc.get('description', '').lower().split(':')[0] if ':' in lc.get('description', '') else ''
+                is_dup = any(
+                    metric_key and metric_key in existing
+                    and report.intervention_applied.lower() in existing
+                    for existing in existing_texts
+                ) if metric_key else False
+
+                if is_dup:
+                    continue
+
+                # Require natural language (not bare tags)
+                if desc.startswith('[Auto-discovered]') or ':' == desc[0:1]:
+                    continue
+
+                current_max += 1
                 laws[str(current_max)] = desc
+                existing_texts.add(desc_lower)
+                registered += 1
 
-            laws_data['_meta']['total_laws'] = current_max
-            laws_data['laws'] = laws
+            if registered > 0:
+                laws_data['_meta']['total_laws'] = len([k for k in laws if k.isdigit()])
+                laws_data['laws'] = laws
 
-            with open(laws_path, 'w') as f:
-                json.dump(laws_data, f, indent=2, ensure_ascii=False)
+                with open(laws_path, 'w') as f:
+                    json.dump(laws_data, f, indent=2, ensure_ascii=False)
 
-            print(f"  📝 {len(significant)} 법칙 자동 등록 (→ Law {current_max})")
+                print(f"  📝 {registered} 법칙 자동 등록 (→ Law {current_max})")
         except Exception as e:
             print(f"  ⚠ 자동 등록 실패: {e}")
 
