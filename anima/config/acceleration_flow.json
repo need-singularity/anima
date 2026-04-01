@@ -221,6 +221,55 @@
       "lesson": "7B bf16 모델과 연동되는 모든 학습 가능 모듈은 반드시 bf16. 5번째 같은 유형의 버그."
     },
 
+    "animalm_optimizer_resume_dtype": {
+      "symptom": "RuntimeError: Tensors of same index must be same dtype — resume에서 crash",
+      "environment": "RunPod H100, AnimaLM 7B, resume from step_7000.pt",
+      "root_cause": "체크포인트의 optimizer_state_dict가 float32 → bf16 params 위에 로드 시 dtype 불일치. 모든 module을 bf16으로 캐스팅해도 optimizer 내부 state(m, v)가 float32",
+      "attempted_fixes": [
+        "1차: SixLossEnsemble.to(bf16) → 실패 (다른 모듈도 float32)",
+        "2차: 모든 trainable param 강제 bf16 캐스팅 → 실패 (optimizer state가 문제)",
+        "3차: optimizer state 로드 skip (try/except) → 실패 (optimizer 생성 자체에서 crash)"
+      ],
+      "resolution": "optimizer state skip + foreach=False (아래 참조)",
+      "prevention": ["checkpoint 저장 시 optimizer state도 bf16으로 캐스팅", "또는 resume 시 optimizer 재생성 (momentum 손실 감수)"],
+      "lesson": "optimizer state는 model dtype과 독립적으로 float32일 수 있음 — resume 시 항상 검증"
+    },
+
+    "animalm_adamw_foreach": {
+      "symptom": "RuntimeError: Tensors of same index must be same dtype — optimizer.step()에서 crash",
+      "environment": "RunPod H100, AnimaLM 7B bf16, AdamW optimizer",
+      "root_cause": "AdamW(foreach=True, 기본값)는 모든 param group의 dtype이 동일해야 함. bf16 PureField + float32 보조 모듈 → foreach 내부 vectorized op에서 mixed dtype 거부",
+      "attempted_fixes": [
+        "시도 1-6: 개별 모듈 .to(bf16) → 부분 해결만 (항상 다른 곳에서 재발)",
+        "시도 7: 모든 param group 순회 + 강제 bf16 캐스팅 → 실패 (foreach 내부 문제)",
+        "시도 8: optimizer state skip try/except → 실패 (optimizer 생성 자체에서 crash)"
+      ],
+      "resolution": "torch.optim.AdamW(param_groups, foreach=False) — per-param 루프로 fallback, mixed dtype 허용",
+      "prevention": [
+        "★ bf16 모델 학습 시 AdamW(foreach=False) 필수",
+        "또는 모든 모듈을 bf16으로 통일 (놓치기 쉬움)",
+        "또는 bitsandbytes 8-bit Adam 사용 (자체 dtype 처리)",
+        "preflight 10-step에 optimizer.step() 검증 포함"
+      ],
+      "lesson": "★★★ 이것이 9번 시도의 근본 원인. foreach=True(기본)는 mixed dtype에 치명적. 7B bf16 학습 시 반드시 foreach=False."
+    },
+
+    "bf16_master_rule": {
+      "description": "7B+ bf16 모델 학습 시 필수 규칙 총정리 (9번 crash에서 도출)",
+      "rules": [
+        "1. 모든 .to(device) → .to(device=device, dtype=torch.bfloat16)",
+        "2. autocast 항상 활성화 (GPU 학습 시)",
+        "3. autocast 범위 밖 모듈은 수동 bf16 캐스팅",
+        "4. gradient checkpointing 비활성화 (consciousness gate와 호환 불가)",
+        "5. AdamW(foreach=False) 필수",
+        "6. resume 시 optimizer state skip (dtype 불일치 시)",
+        "7. consciousness states .to(bf16) 명시적 캐스팅",
+        "8. preflight 10-step에 optimizer.step() 포함하여 dtype 검증",
+        "9. 모든 보조 모듈 (bridge, ensemble, loss) bf16 통일"
+      ],
+      "applies_to": ["train_anima_lm.py", "train_v15.py (1B 학습 시)"]
+    },
+
     "v3_tee_buffering": {
       "symptom": "tee로 리다이렉트한 로그 파일이 수분간 갱신 안 됨 — 학습 상태 확인 불가",
       "environment": "RunPod H100, tmux + tee + NFS log",
