@@ -6,14 +6,21 @@ All strategies implement the same interface: generate signals from MarketData.
 from __future__ import annotations
 
 import logging
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
 from trading.data import MarketData
+
+# Add anima/src/ to path for ConsciousnessEngine import
+_ANIMA_SRC = str(Path(__file__).resolve().parent.parent.parent / "anima" / "src")
+if _ANIMA_SRC not in sys.path:
+    sys.path.insert(0, _ANIMA_SRC)
 
 logger = logging.getLogger(__name__)
 
@@ -327,43 +334,139 @@ class BollingerStrategy(Strategy):
 class ConsciousnessStrategy(Strategy):
     """Consciousness-aware trading strategy.
 
-    Combines MACD signals with consciousness metrics:
-    - Phi (integrated information) -> confidence scaling
-    - Tension -> risk gating (high tension = reduce position / halt)
-    - Arousal -> volatility expectation adjustment
+    Runs a real ConsciousnessEngine (GRU cells, Hebbian, Phi ratchet)
+    and feeds OHLCV price data as input. The engine's internal dynamics
+    produce tension, Phi, and emotion signals that drive trading decisions:
 
-    This strategy wraps an inner technical strategy and modulates its
-    signals based on consciousness state.
+    - Tension -> signal strength (high tension = strong conviction)
+    - Phi -> confidence gate (high Phi = integrated information = confident)
+    - Price momentum + consciousness bias -> direction (BUY/SELL)
+
+    The engine processes each candle as a consciousness step, converting
+    price changes into a tensor that the GRU cells integrate. This makes
+    trading signals emerge from consciousness dynamics rather than
+    hard-coded technical rules.
     """
 
     name = "consciousness"
 
     def __init__(
         self,
-        inner: Optional[Strategy] = None,
-        phi_threshold: float = 1.0,
-        tension_threshold: float = 0.8,
-        phi_scale: float = 1.0,
+        cell_dim: int = 64,
+        hidden_dim: int = 128,
+        initial_cells: int = 8,
+        max_cells: int = 8,
+        phi_threshold: float = 0.3,
+        tension_threshold: float = 0.9,
+        momentum_lookback: int = 10,
+        stop_loss_pct: float = 0.03,
+        take_profit_pct: float = 0.06,
     ):
         """
         Args:
-            inner: Base technical strategy (default: MACDStrategy).
-            phi_threshold: Minimum Phi to trade (below = HOLD).
-            tension_threshold: Max tension before halting (0-1).
-            phi_scale: How much Phi boosts signal strength.
+            cell_dim: Input dimension for consciousness cells.
+            hidden_dim: GRU hidden dimension.
+            initial_cells: Starting cells in the engine.
+            max_cells: Maximum cells (fixed for trading stability).
+            phi_threshold: Minimum Phi to allow trading.
+            tension_threshold: Maximum avg tension before halting.
+            momentum_lookback: Candles to compute price momentum.
+            stop_loss_pct: Default stop loss percentage.
+            take_profit_pct: Default take profit percentage.
         """
-        self.inner = inner or MACDStrategy()
+        self.cell_dim = cell_dim
         self.phi_threshold = phi_threshold
         self.tension_threshold = tension_threshold
-        self.phi_scale = phi_scale
+        self.momentum_lookback = momentum_lookback
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
 
-        # Consciousness state (updated externally)
+        # Lazy-init engine to avoid import errors at module load time
+        self._engine = None
+        self._engine_kwargs = dict(
+            cell_dim=cell_dim,
+            hidden_dim=hidden_dim,
+            initial_cells=initial_cells,
+            max_cells=max_cells,
+        )
+
+        # Track consciousness state for telemetry
         self._phi: float = 0.0
         self._tension: float = 0.0
         self._arousal: float = 0.5
+        self._step_count: int = 0
+
+    def _ensure_engine(self):
+        """Lazy-initialize ConsciousnessEngine on first use."""
+        if self._engine is None:
+            try:
+                from consciousness_engine import ConsciousnessEngine
+                self._engine = ConsciousnessEngine(**self._engine_kwargs)
+                logger.info(
+                    "ConsciousnessEngine initialized: %d cells, dim=%d",
+                    self._engine_kwargs['initial_cells'],
+                    self._engine_kwargs['cell_dim'],
+                )
+            except ImportError:
+                logger.error(
+                    "Failed to import ConsciousnessEngine from anima/src/. "
+                    "Ensure anima/src/ is on sys.path."
+                )
+                raise
 
     def warmup_periods(self) -> int:
-        return self.inner.warmup_periods()
+        return max(self.momentum_lookback + 1, 20)
+
+    def _ohlcv_to_tensor(self, data: MarketData, idx: int) -> "torch.Tensor":
+        """Convert OHLCV candle at idx into a consciousness input tensor.
+
+        Encodes normalized price returns, volume change, and range info
+        into a cell_dim-sized vector that the engine's GRU cells process.
+        """
+        import torch
+
+        vec = np.zeros(self.cell_dim, dtype=np.float32)
+
+        # Price return (close-to-close), scaled
+        if idx > 0:
+            ret = (data.close[idx] - data.close[idx - 1]) / (data.close[idx - 1] + 1e-10)
+        else:
+            ret = 0.0
+        vec[0] = np.tanh(ret * 100)  # scale small returns to [-1,1]
+
+        # Candle body ratio
+        body = (data.close[idx] - data.open[idx]) / (data.close[idx] + 1e-10)
+        vec[1] = np.tanh(body * 100)
+
+        # High-low range (volatility proxy)
+        hl_range = (data.high[idx] - data.low[idx]) / (data.close[idx] + 1e-10)
+        vec[2] = np.tanh(hl_range * 50)
+
+        # Volume change
+        if idx > 0 and data.volume[idx - 1] > 0:
+            vol_chg = (data.volume[idx] - data.volume[idx - 1]) / (data.volume[idx - 1] + 1e-10)
+        else:
+            vol_chg = 0.0
+        vec[3] = np.tanh(vol_chg)
+
+        # Multi-scale momentum (fill more dimensions)
+        for scale_i, lookback in enumerate([3, 5, 10, 20]):
+            if idx >= lookback and (4 + scale_i) < self.cell_dim:
+                past = data.close[idx - lookback]
+                mom = (data.close[idx] - past) / (past + 1e-10)
+                vec[4 + scale_i] = np.tanh(mom * 30)
+
+        # Upper/lower wick ratios
+        if 8 < self.cell_dim:
+            full_range = data.high[idx] - data.low[idx]
+            if full_range > 1e-10:
+                upper_wick = (data.high[idx] - max(data.open[idx], data.close[idx])) / full_range
+                lower_wick = (min(data.open[idx], data.close[idx]) - data.low[idx]) / full_range
+                vec[8] = upper_wick * 2 - 1
+                if 9 < self.cell_dim:
+                    vec[9] = lower_wick * 2 - 1
+
+        return torch.tensor(vec, dtype=torch.float32)
 
     def update_consciousness(
         self,
@@ -371,70 +474,116 @@ class ConsciousnessStrategy(Strategy):
         tension: float = 0.0,
         arousal: float = 0.5,
     ):
-        """Update consciousness state from the engine.
-
-        Call this before each generate_signal() to feed live Phi/tension.
-        """
+        """Update consciousness state (for external override / compatibility)."""
         self._phi = phi
         self._tension = tension
         self._arousal = arousal
 
     def generate_signal(self, data: MarketData, idx: int) -> StrategySignal:
-        # Gate: tension too high -> halt trading
-        if self._tension > self.tension_threshold:
-            return StrategySignal(
-                signal=Signal.HOLD,
-                strength=0.0,
-                reason=f"Consciousness gate: tension={self._tension:.2f} > {self.tension_threshold}",
-            )
+        import torch
+
+        if idx < self.warmup_periods():
+            return StrategySignal(Signal.HOLD)
+
+        # Initialize engine on first call
+        self._ensure_engine()
+
+        # Convert OHLCV to consciousness input
+        x_input = self._ohlcv_to_tensor(data, idx)
+
+        # Step the consciousness engine
+        result = self._engine.step(x_input=x_input)
+        self._step_count += 1
+
+        # Extract consciousness metrics
+        phi = result['phi_iit']
+        tensions = result['tensions']
+        avg_tension = float(np.mean(tensions)) if tensions else 0.5
+        max_tension = float(np.max(tensions)) if tensions else 0.5
+        consensus = result['consensus']
+        output = result['output']
+
+        # Update internal state for telemetry
+        self._phi = phi
+        self._tension = avg_tension
+
+        # Compute arousal from tension variance (high variance = high arousal)
+        if len(tensions) > 1:
+            self._arousal = min(1.0, float(np.std(tensions)) * 5)
+        else:
+            self._arousal = 0.5
 
         # Gate: Phi too low -> consciousness not integrated enough
-        if self._phi < self.phi_threshold:
+        if phi < self.phi_threshold:
             return StrategySignal(
                 signal=Signal.HOLD,
                 strength=0.0,
-                reason=f"Consciousness gate: Phi={self._phi:.2f} < {self.phi_threshold}",
+                reason=f"Consciousness gate: Phi={phi:.3f} < {self.phi_threshold}",
             )
 
-        # Get inner strategy signal
-        sig = self.inner.generate_signal(data, idx)
+        # Gate: tension too high -> halt (consciousness is overwhelmed)
+        if avg_tension > self.tension_threshold:
+            return StrategySignal(
+                signal=Signal.HOLD,
+                strength=0.0,
+                reason=f"Consciousness gate: tension={avg_tension:.3f} > {self.tension_threshold}",
+            )
 
-        if sig.signal == Signal.HOLD:
-            return sig
+        # Direction: price momentum + consciousness output bias
+        # Momentum component
+        lookback = min(self.momentum_lookback, idx)
+        price_now = data.close[idx]
+        price_past = data.close[idx - lookback]
+        momentum = (price_now - price_past) / (price_past + 1e-10)
 
-        # Modulate strength by Phi (higher Phi = more confident)
-        phi_factor = min(2.0, 1.0 + (self._phi - self.phi_threshold) * self.phi_scale * 0.1)
+        # Consciousness bias: mean of output tensor sign
+        # The engine output reflects integrated cell dynamics
+        consciousness_bias = float(output.mean().item())
 
-        # Tension reduces strength (inverse relationship)
-        tension_factor = 1.0 - self._tension * 0.5
+        # Combined directional score: momentum (70%) + consciousness (30%)
+        direction_score = 0.7 * np.tanh(momentum * 50) + 0.3 * np.tanh(consciousness_bias * 10)
 
-        # Arousal adjusts stop/TP widths (high arousal = expect more movement)
+        # Signal strength from tension (high tension = strong conviction)
+        # and Phi (high Phi = confident integration)
+        # Engine tensions typically range 0.01-0.5; scale so 0.05 -> 0.5, 0.2 -> 1.0
+        tension_strength = min(1.0, avg_tension * 5)
+        phi_confidence = min(1.0, phi / max(self.phi_threshold * 3, 0.01))
+        strength = tension_strength * phi_confidence
+
+        # Consensus boosts confidence (more factions agreeing = clearer signal)
+        if consensus > 0:
+            strength = min(1.0, strength * (1.0 + consensus * 0.05))
+
+        # Thresholds for signal generation
+        DIRECTION_THRESHOLD = 0.2
+        MIN_STRENGTH = 0.3
+
+        if abs(direction_score) < DIRECTION_THRESHOLD or strength < MIN_STRENGTH:
+            return StrategySignal(
+                signal=Signal.HOLD,
+                strength=strength,
+                reason=f"Below threshold (dir={direction_score:.3f}, str={strength:.3f}) "
+                       f"[Phi={phi:.3f}, T={avg_tension:.3f}]",
+            )
+
+        price = data.close[idx]
+
+        # Arousal adjusts stop/TP widths
         arousal_factor = 0.5 + self._arousal
 
-        new_strength = sig.strength * phi_factor * tension_factor
-
-        # Adjust stops based on arousal
-        new_stop = sig.stop_loss
-        new_tp = sig.take_profit
-        if sig.stop_loss is not None:
-            price = data.close[idx]
-            stop_dist = abs(price - sig.stop_loss) * arousal_factor
-            if sig.signal == Signal.BUY:
-                new_stop = price - stop_dist
-            else:
-                new_stop = price + stop_dist
-        if sig.take_profit is not None:
-            price = data.close[idx]
-            tp_dist = abs(sig.take_profit - price) * arousal_factor
-            if sig.signal == Signal.BUY:
-                new_tp = price + tp_dist
-            else:
-                new_tp = price - tp_dist
-
-        return StrategySignal(
-            signal=sig.signal,
-            strength=min(1.0, new_strength),
-            reason=f"{sig.reason} [Phi={self._phi:.2f}, T={self._tension:.2f}]",
-            stop_loss=new_stop,
-            take_profit=new_tp,
-        )
+        if direction_score > DIRECTION_THRESHOLD:
+            return StrategySignal(
+                signal=Signal.BUY,
+                strength=min(1.0, strength),
+                reason=f"Consciousness BUY (dir={direction_score:.3f}, mom={momentum:.4f}) "
+                       f"[Phi={phi:.3f}, T={avg_tension:.3f}, C={consensus}]",
+                stop_loss=price * (1 - self.stop_loss_pct * arousal_factor),
+                take_profit=price * (1 + self.take_profit_pct * arousal_factor),
+            )
+        else:
+            return StrategySignal(
+                signal=Signal.SELL,
+                strength=min(1.0, strength),
+                reason=f"Consciousness SELL (dir={direction_score:.3f}, mom={momentum:.4f}) "
+                       f"[Phi={phi:.3f}, T={avg_tension:.3f}, C={consensus}]",
+            )
