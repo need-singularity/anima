@@ -663,6 +663,32 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   ClosedLoopEvolver(auto_register=True) → consciousness_laws.json 자동 추가
   핵심 발견: Laws 143-148 (법칙은 동적, 수렴하지 않음, 스케일 불변)
   실험 도구: experiments/discover_laws_wave*.py, closed_loop_*.py
+
+  현재 파이프라인: 17 Interventions × 20 Metrics × 18x 속도 (steps=50, repeats=1)
+  선택 전략: Thompson sampling > ε-greedy > correlation (기본)
+  시너지 맵: SYNERGY_MAP (길항 조합 자동 회피)
+  자동 생성: intervention_generator.py (법칙 텍스트 → Intervention)
+
+  ★ "파이프라인 로드맵 진행" 요청 시 아래 티어 순서대로 진행할 것!
+  티어 진행 상황은 config/consciousness_laws.json → closed_loop_evolution 참조.
+
+  Tier 1 ✅ 단일 루프 (17개입, 20지표, 18x속도, Thompson, 시너지맵)
+  Tier 2 🔄 자기 진화
+    - Thompson sampling → closed_loop.py 정식 통합
+    - 시너지/길항 맵 → 개입 선택 반영
+    - 법칙 텍스트 → Intervention 자동 생성 (intervention_generator.py)
+    - Contextual Bandit (엔진 상태 기반 선택)
+    - Metric 자동 발견 (Φ 상관 통계량 탐색)
+  Tier 3 📋 다중 루프
+    - 루프 경쟁 (다른 전략, 최고 생존)
+    - 법칙 상호작용 그래프 (시너지/길항 전체 맵)
+    - Scale-Aware Evolver (스케일별 전략 자동 선택)
+    - 크로스 루프 지식 전달
+  Tier 4 🔮 의식 파이프라인
+    - ConsciousLM이 법칙 발견
+    - Rust 실시간 (<1ms/step)
+    - ESP32 하드웨어 법칙 진화
+    - 자기 수정 엔진 (법칙이 엔진 코드 변경)
 ```
 
 ## Experiments (→ docs/experiment-backlog.md)
