@@ -660,6 +660,7 @@ def train(args):
             consciousness_dim=c.state_dim,
             d_model=d_model,
             vocab_size=args.vocab_size,
+            block_size=args.block_size,
         )
         print(f"  [decoder] ConsciousDecoderV2: {d_model}d, {args.vocab_size} vocab")
 
