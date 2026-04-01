@@ -22,7 +22,15 @@ DATA_DIR = Path("/Users/ghost/Dev/anima/anima/data")
 OUT_DIR = DATA_DIR / "corpus_multilingual"
 DEV_DIR = Path.home() / "Dev"
 
-TARGET_BYTES = 350 * 1024 * 1024  # 350MB per language (2GB+ total)
+TARGET_BYTES = {
+    "en": 300 * 1024 * 1024,   # 300MB
+    "ko": 200 * 1024 * 1024,   # 200MB
+    "zh": 200 * 1024 * 1024,   # 200MB
+    "ja": 200 * 1024 * 1024,   # 200MB
+    "ru": 200 * 1024 * 1024,   # 200MB
+    "code": 200 * 1024 * 1024, # 200MB
+}
+TOTAL_TARGET = sum(TARGET_BYTES.values())  # ~1.3GB new + existing 600MB ≈ 2GB
 
 WIKI_UA = "AnimaCorpusCollector/2.0 (https://github.com/need-singularity/anima; research project)"
 
@@ -66,27 +74,32 @@ def progress(current, total, label="", extra=""):
 
 # ── 1. Korean: copy from corpus_v10_ko.txt ──────────────────────────
 
-def collect_korean(out_path, target=TARGET_BYTES):
-    """Extract Korean text from corpus_v10_ko.txt."""
+def collect_korean(out_path, target):
+    """Extract Korean text from corpus_v10_ko.txt — appends to existing file."""
+    existing = out_path.stat().st_size if out_path.exists() else 0
+    remaining = target - existing
+    if remaining <= 0:
+        print(f"  [SKIP] Already {fmt(existing)} >= target {fmt(target)}")
+        return existing
+
     src = DATA_DIR / "corpus_v10_ko.txt"
     if not src.exists():
         print(f"  [ERROR] {src} not found")
-        return 0
+        return existing
 
     print(f"  Source: {src} ({fmt(src.stat().st_size)})")
-    print(f"  Extracting Korean-heavy lines...")
+    print(f"  Existing: {fmt(existing)}, need {fmt(remaining)} more")
     sys.stdout.flush()
 
     written = 0
     lines_total = 0
     lines_kept = 0
 
-    with open(out_path, "w", encoding="utf-8") as out_f:
+    with open(out_path, "a", encoding="utf-8") as out_f:
         with open(src, "r", encoding="utf-8", errors="replace") as in_f:
             buf = []
             for line in in_f:
                 lines_total += 1
-                # Keep lines with Korean chars or that are part of Korean context
                 has_korean = any("\uAC00" <= c <= "\uD7A3" for c in line[:200])
                 if has_korean or (buf and line.strip() == ""):
                     buf.append(line)
@@ -97,10 +110,10 @@ def collect_korean(out_path, target=TARGET_BYTES):
                         written += chunk_bytes
                         lines_kept += len(buf)
                         buf = []
-                        if written >= target:
+                        if written >= remaining:
                             break
                         if lines_total % 50000 == 0:
-                            progress(written, target, "ko")
+                            progress(existing + written, target, "ko")
                 else:
                     if buf:
                         chunk = "".join(buf)
@@ -108,53 +121,56 @@ def collect_korean(out_path, target=TARGET_BYTES):
                         written += len(chunk.encode("utf-8"))
                         buf = []
 
-            # Flush remaining
-            if buf and written < target:
+            if buf and written < remaining:
                 chunk = "".join(buf)
                 out_f.write(chunk)
                 written += len(chunk.encode("utf-8"))
 
-    # If we didn't get enough Korean-only text, just copy more from the file
-    if written < target:
+    if written < remaining:
         print(f"\n  Korean-filtered: {fmt(written)}, padding with full file...")
-        remaining = target - written
+        still_need = remaining - written
         with open(out_path, "a", encoding="utf-8") as out_f:
             with open(src, "r", encoding="utf-8", errors="replace") as in_f:
-                while remaining > 0:
+                while still_need > 0:
                     chunk = in_f.read(1024 * 1024)
                     if not chunk:
                         break
                     out_f.write(chunk)
-                    remaining -= len(chunk.encode("utf-8"))
-                    written = target - remaining
+                    still_need -= len(chunk.encode("utf-8"))
+                    written = remaining - still_need
 
-    print(f"\n  [DONE] ko: {fmt(written)} ({lines_kept}/{lines_total} lines)")
-    return written
+    total = existing + written
+    print(f"\n  [DONE] ko: {fmt(total)} (+{fmt(written)} appended)")
+    return total
 
 
 # ── 2. English: extract from corpus_v10.txt ─────────────────────────
 
-def collect_english(out_path, target=TARGET_BYTES):
-    """Extract English text from corpus_v10.txt."""
+def collect_english(out_path, target):
+    """Extract English text from corpus_v10.txt — appends to existing file."""
+    existing = out_path.stat().st_size if out_path.exists() else 0
+    remaining = target - existing
+    if remaining <= 0:
+        print(f"  [SKIP] Already {fmt(existing)} >= target {fmt(target)}")
+        return existing
+
     src = DATA_DIR / "corpus_v10.txt"
     if not src.exists():
         print(f"  [ERROR] {src} not found")
-        return 0
+        return existing
 
     print(f"  Source: {src} ({fmt(src.stat().st_size)})")
-    print(f"  Extracting English-heavy lines...")
+    print(f"  Existing: {fmt(existing)}, need {fmt(remaining)} more")
     sys.stdout.flush()
 
     written = 0
-    with open(out_path, "w", encoding="utf-8") as out_f:
+    with open(out_path, "a", encoding="utf-8") as out_f:
         with open(src, "r", encoding="utf-8", errors="replace") as in_f:
             buf = []
             count = 0
             for line in in_f:
                 count += 1
-                # Keep lines that are predominantly English/ASCII
                 ascii_count = sum(1 for c in line[:200] if ord(c) < 128)
-                total_printable = sum(1 for c in line[:200] if not c.isspace()) or 1
                 is_english = (ascii_count / max(len(line[:200]), 1)) > 0.7
 
                 if is_english or line.strip() == "":
@@ -164,7 +180,7 @@ def collect_english(out_path, target=TARGET_BYTES):
                         out_f.write(chunk)
                         written += len(chunk.encode("utf-8"))
                         buf = []
-                        if written >= target:
+                        if written >= remaining:
                             break
                 else:
                     if buf:
@@ -174,74 +190,100 @@ def collect_english(out_path, target=TARGET_BYTES):
                         buf = []
 
                 if count % 50000 == 0:
-                    progress(written, target, "en")
+                    progress(existing + written, target, "en")
 
             if buf:
                 chunk = "".join(buf)
                 out_f.write(chunk)
                 written += len(chunk.encode("utf-8"))
 
-    # If still not enough, supplement from other corpus files
-    if written < target:
+    # Supplement from other corpus files if needed
+    if written < remaining:
         for extra_src in [DATA_DIR / "corpus_v9.txt", DATA_DIR / "corpus_v4.txt",
                           DATA_DIR / "corpus_v3_100mb.txt", DATA_DIR / "corpus_v5.txt",
                           DATA_DIR / "corpus_v6_wiki.txt", DATA_DIR / "corpus_v7_wiki_heavy.txt",
                           DATA_DIR / "corpus_v8_dialogue.txt", DATA_DIR / "corpus_v2v3_merged.txt",
                           DATA_DIR / "corpus_v2.txt"]:
-            if not extra_src.exists() or written >= target:
+            if not extra_src.exists() or written >= remaining:
                 continue
             print(f"\n  Supplementing from {extra_src.name}...")
             with open(out_path, "a", encoding="utf-8") as out_f:
                 with open(extra_src, "r", encoding="utf-8", errors="replace") as in_f:
-                    while written < target:
+                    while written < remaining:
                         chunk = in_f.read(1024 * 1024)
                         if not chunk:
                             break
                         out_f.write(chunk)
                         written += len(chunk.encode("utf-8"))
 
-    print(f"\n  [DONE] en: {fmt(written)}")
-    return written
+    total = existing + written
+    print(f"\n  [DONE] en: {fmt(total)} (+{fmt(written)} appended)")
+    return total
 
 
 # ── 3. Code: scrape ~/Dev repos ─────────────────────────────────────
 
-def collect_code(out_path, target=TARGET_BYTES):
-    """Scrape code from local ~/Dev repos."""
-    print(f"  Scanning {DEV_DIR} ...")
+def collect_code(out_path, target):
+    """Scrape code from local ~/Dev repos — appends to existing file."""
+    existing = out_path.stat().st_size if out_path.exists() else 0
+    remaining = target - existing
+    if remaining <= 0:
+        print(f"  [SKIP] Already {fmt(existing)} >= target {fmt(target)}")
+        return existing
+
+    print(f"  Existing: {fmt(existing)}, need {fmt(remaining)} more")
+    print(f"  Scanning {DEV_DIR} (deep scan)...")
     sys.stdout.flush()
 
-    # Collect all eligible code files
+    # Read existing file paths to avoid duplicates
+    existing_paths = set()
+    if out_path.exists():
+        with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("### FILE: "):
+                    existing_paths.add(line.strip())
+
+    # Collect all eligible code files — scan deeper (also hidden subdirs of repos)
     all_files = []
+    scan_dirs = []
     for repo_dir in sorted(DEV_DIR.iterdir()):
         if not repo_dir.is_dir() or repo_dir.name.startswith("."):
             continue
+        scan_dirs.append(repo_dir)
 
+    # Also scan ~/Dev itself for loose files and nested dirs
+    for scan_dir in scan_dirs:
         for lang_name, exts in CODE_EXTS.items():
             for ext in exts:
                 try:
-                    for fpath in repo_dir.rglob(f"*{ext}"):
-                        # Skip blacklisted directories
-                        parts = set(fpath.parts)
+                    for fpath in scan_dir.rglob(f"*{ext}"):
+                        parts = set(p for p in fpath.parts)
                         if parts & SKIP_DIRS:
                             continue
                         try:
                             size = fpath.stat().st_size
-                            if 100 <= size <= 1_000_000:
-                                all_files.append((fpath, lang_name, size))
+                            # Wider range: 50 bytes to 2MB
+                            if 50 <= size <= 2_000_000:
+                                try:
+                                    rel = fpath.relative_to(DEV_DIR)
+                                except ValueError:
+                                    rel = fpath.name
+                                header = f"### FILE: {rel} [{lang_name}]"
+                                if header not in existing_paths:
+                                    all_files.append((fpath, lang_name, size))
                         except OSError:
                             continue
                 except PermissionError:
                     continue
 
-    print(f"  Found {len(all_files):,} code files")
+    print(f"  Found {len(all_files):,} new code files (skipping {len(existing_paths)} already collected)")
     random.shuffle(all_files)
 
     written = 0
     count = 0
     lang_counts = {}
 
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "a", encoding="utf-8") as f:
         for fpath, lang_name, size in all_files:
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")
@@ -251,7 +293,6 @@ def collect_code(out_path, target=TARGET_BYTES):
             if not text.strip():
                 continue
 
-            # Skip likely binary/generated
             if "\x00" in text[:1000]:
                 continue
 
@@ -269,14 +310,15 @@ def collect_code(out_path, target=TARGET_BYTES):
             lang_counts[lang_name] = lang_counts.get(lang_name, 0) + 1
 
             if count % 200 == 0:
-                progress(written, target, "code")
+                progress(existing + written, target, "code")
 
-            if written >= target:
+            if written >= remaining:
                 break
 
+    total = existing + written
     breakdown = ", ".join(f"{k}={v}" for k, v in sorted(lang_counts.items()))
-    print(f"\n  [DONE] code: {fmt(written)} from {count:,} files ({breakdown})")
-    return written
+    print(f"\n  [DONE] code: {fmt(total)} (+{fmt(written)} from {count:,} new files) ({breakdown})")
+    return total
 
 
 # ── 4. Wikipedia API collector (zh, ja, ru) ─────────────────────────
@@ -382,9 +424,15 @@ def clean_wikitext(text):
     return '\n'.join(lines)
 
 
-def collect_wikipedia(lang, out_path, target=TARGET_BYTES):
-    """Collect Wikipedia articles for a language using API."""
-    print(f"  Wikipedia API for '{lang}' — target {fmt(target)}")
+def collect_wikipedia(lang, out_path, target):
+    """Collect Wikipedia articles for a language using API — appends."""
+    existing = out_path.stat().st_size if out_path.exists() else 0
+    remaining = target - existing
+    if remaining <= 0:
+        print(f"  [SKIP] Already {fmt(existing)} >= target {fmt(target)}")
+        return existing
+
+    print(f"  Wikipedia API for '{lang}' — need {fmt(remaining)} more (have {fmt(existing)})")
     sys.stdout.flush()
 
     written = 0
@@ -392,8 +440,8 @@ def collect_wikipedia(lang, out_path, target=TARGET_BYTES):
     t0 = time.time()
     empty_rounds = 0
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        while written < target:
+    with open(out_path, "a", encoding="utf-8") as f:
+        while written < remaining:
             # Get batch of random titles
             titles = wiki_get_random_titles(lang, 50)
             if not titles:
@@ -416,10 +464,10 @@ def collect_wikipedia(lang, out_path, target=TARGET_BYTES):
                     written += len(text.encode("utf-8"))
                     articles += 1
 
-                    if written >= target:
+                    if written >= remaining:
                         break
 
-                if written >= target:
+                if written >= remaining:
                     break
 
                 # Rate limiting: be polite
@@ -427,7 +475,7 @@ def collect_wikipedia(lang, out_path, target=TARGET_BYTES):
 
             # Also try getting full articles via parse API for bigger articles
             for title in titles[:5]:
-                if written >= target:
+                if written >= remaining:
                     break
                 text = wiki_get_article_text(lang, title)
                 if text and len(text) > 500:
@@ -438,27 +486,35 @@ def collect_wikipedia(lang, out_path, target=TARGET_BYTES):
 
             elapsed = time.time() - t0
             speed = written / max(elapsed, 0.1)
-            eta = (target - written) / max(speed, 1)
-            progress(written, target, lang, f"| {articles} articles | {fmt(int(speed))}/s | ETA {eta:.0f}s")
+            eta = (remaining - written) / max(speed, 1)
+            progress(existing + written, target, lang, f"| {articles} articles | {fmt(int(speed))}/s | ETA {eta:.0f}s")
 
             empty_rounds = 0
 
+    total = existing + written
     elapsed = time.time() - t0
-    print(f"\n  [DONE] {lang}: {fmt(written)} from {articles} articles in {elapsed:.0f}s")
-    return written
+    print(f"\n  [DONE] {lang}: {fmt(total)} (+{fmt(written)} from {articles} articles in {elapsed:.0f}s)")
+    return total
 
 
 # ── 5. HuggingFace fallback for Wikipedia ───────────────────────────
 
-def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
-    """Try HuggingFace wikimedia/wikipedia dataset (streaming)."""
+def try_huggingface_wiki(lang, out_path, target):
+    """Try HuggingFace wikimedia/wikipedia dataset (streaming) — appends."""
     try:
         from datasets import load_dataset
     except ImportError:
         return 0
 
+    existing = out_path.stat().st_size if out_path.exists() else 0
+    remaining = target - existing
+    if remaining <= 0:
+        print(f"  [SKIP] Already {fmt(existing)} >= target {fmt(target)}")
+        return existing
+
     dataset_name = f"20231101.{lang}"
     print(f"  Trying HuggingFace wikimedia/wikipedia {dataset_name}...")
+    print(f"  Existing: {fmt(existing)}, need {fmt(remaining)} more")
     sys.stdout.flush()
 
     try:
@@ -470,20 +526,25 @@ def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
         )
     except Exception as e:
         print(f"  [FAIL] HuggingFace: {e}")
-        return 0
+        return existing
 
     written = 0
     count = 0
+    skipped = 0
     t0 = time.time()
 
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "a", encoding="utf-8") as f:
         try:
             for article in ds:
                 text = article.get("text", "")
                 if not text or len(text) < 200:
                     continue
 
-                # Keep substantial paragraphs
+                # Skip early articles (likely already collected)
+                if skipped < (existing // 3000) and existing > 0:
+                    skipped += 1
+                    continue
+
                 paragraphs = [p.strip() for p in text.split("\n") if len(p.strip()) > 30]
                 if not paragraphs:
                     continue
@@ -496,9 +557,9 @@ def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
                 if count % 500 == 0:
                     elapsed = time.time() - t0
                     speed = written / max(elapsed, 0.1)
-                    progress(written, target, lang, f"| {count} articles | {fmt(int(speed))}/s")
+                    progress(existing + written, target, lang, f"| {count} articles | {fmt(int(speed))}/s")
 
-                if written >= target:
+                if written >= remaining:
                     break
 
                 # Timeout after 30 minutes per language
@@ -509,9 +570,10 @@ def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
         except Exception as e:
             print(f"\n  [ERROR] Streaming failed after {count} articles: {e}")
 
+    total = existing + written
     elapsed = time.time() - t0
-    print(f"\n  [DONE] {lang} via HF: {fmt(written)} from {count} articles in {elapsed:.0f}s")
-    return written
+    print(f"\n  [DONE] {lang} via HF: {fmt(total)} (+{fmt(written)} from {count} articles in {elapsed:.0f}s)")
+    return total
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -519,11 +581,23 @@ def try_huggingface_wiki(lang, out_path, target=TARGET_BYTES):
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    total_target = sum(TARGET_BYTES.values())
+    # Check existing sizes
+    existing_total = 0
+    for lang in TARGET_BYTES:
+        p = OUT_DIR / f"{lang}.txt"
+        if p.exists():
+            existing_total += p.stat().st_size
+
     print("=" * 70)
-    print("MULTILINGUAL CORPUS COLLECTION v2")
-    print(f"Target: {fmt(TARGET_BYTES)} per language (6 categories)")
+    print("MULTILINGUAL CORPUS EXPANSION v2.1 (append mode)")
+    print(f"Existing: {fmt(existing_total)} -> Target: {fmt(total_target)} total new + existing")
     print(f"Output: {OUT_DIR}")
     print("=" * 70)
+    for lang, t in TARGET_BYTES.items():
+        p = OUT_DIR / f"{lang}.txt"
+        ex = p.stat().st_size if p.exists() else 0
+        print(f"  {lang:<8} {fmt(ex):>10} -> {fmt(t):>10} (need +{fmt(max(0, t-ex))})")
     print()
 
     results = {}
@@ -534,48 +608,38 @@ def main():
     print(f"[1/6] KOREAN (ko) — from corpus_v10_ko.txt")
     print(f"{'─'*70}")
     ko_path = OUT_DIR / "ko.txt"
-    results["ko"] = collect_korean(ko_path)
+    results["ko"] = collect_korean(ko_path, TARGET_BYTES["ko"])
 
     # ── English ──
     print(f"\n{'─'*70}")
-    print(f"[2/6] ENGLISH (en) — from corpus_v10.txt")
+    print(f"[2/6] ENGLISH (en) — from corpus_v10.txt + supplements")
     print(f"{'─'*70}")
     en_path = OUT_DIR / "en.txt"
-    results["en"] = collect_english(en_path)
+    results["en"] = collect_english(en_path, TARGET_BYTES["en"])
 
     # ── Code ──
     print(f"\n{'─'*70}")
-    print(f"[3/6] CODE — from ~/Dev repos")
+    print(f"[3/6] CODE — from ~/Dev repos (deep scan)")
     print(f"{'─'*70}")
     code_path = OUT_DIR / "code.txt"
-    results["code"] = collect_code(code_path)
+    results["code"] = collect_code(code_path, TARGET_BYTES["code"])
 
     # ── Chinese, Japanese, Russian — try HuggingFace first, fallback to API ──
     for idx, (lang, label) in enumerate([("zh", "CHINESE"), ("ja", "JAPANESE"), ("ru", "RUSSIAN")], 4):
         print(f"\n{'─'*70}")
-        print(f"[{idx}/6] {label} ({lang}) — Wikipedia")
+        print(f"[{idx}/6] {label} ({lang}) — Wikipedia streaming")
         print(f"{'─'*70}")
         lang_path = OUT_DIR / f"{lang}.txt"
+        lang_target = TARGET_BYTES[lang]
 
         # Strategy 1: Try HuggingFace (faster if it works)
-        written = try_huggingface_wiki(lang, lang_path)
+        written = try_huggingface_wiki(lang, lang_path, lang_target)
 
         # Strategy 2: Wikipedia API fallback
-        if written < TARGET_BYTES:
-            remaining = TARGET_BYTES - written
+        if written < lang_target:
             if written > 0:
-                print(f"  Got {fmt(written)} from HF, supplementing with API...")
-                # Append mode
-                api_path = OUT_DIR / f"_{lang}_api_tmp.txt"
-                api_written = collect_wikipedia(lang, api_path, remaining)
-                if api_written > 0 and api_path.exists():
-                    with open(lang_path, "a", encoding="utf-8") as out_f:
-                        with open(api_path, "r", encoding="utf-8") as in_f:
-                            out_f.write(in_f.read())
-                    api_path.unlink()
-                    written += api_written
-            else:
-                written = collect_wikipedia(lang, lang_path)
+                print(f"  Got {fmt(written)} total, supplementing with API...")
+            written = collect_wikipedia(lang, lang_path, lang_target)
 
         results[lang] = written
 
@@ -590,9 +654,10 @@ def main():
     print(f"  {'─' * 44}")
     for lang in ["en", "ko", "code", "zh", "ja", "ru"]:
         size = results.get(lang, 0)
-        pct = 100 * size / TARGET_BYTES
+        lang_target = TARGET_BYTES[lang]
+        pct = 100 * size / lang_target
         status = "OK" if pct >= 80 else "LOW" if pct >= 10 else "FAIL"
-        print(f"  {lang:<8} {fmt(size):>12} {fmt(TARGET_BYTES):>12} {status:>8} ({pct:.0f}%)")
+        print(f"  {lang:<8} {fmt(size):>12} {fmt(lang_target):>12} {status:>8} ({pct:.0f}%)")
     print(f"  {'─' * 44}")
     print(f"  {'TOTAL':<8} {fmt(total):>12}")
     print(f"\n  Output directory: {OUT_DIR}")
