@@ -45,6 +45,7 @@ pub struct ToolPolicyEngine {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // API struct: fields read via Debug trait for audit logging
 struct LogEntry {
     tool: String,
     allowed: bool,

@@ -4,7 +4,6 @@
 //! (300 steps × N cells × N cells coupling) with vectorized Rust + rayon.
 
 use crate::mi;
-use rayon::prelude::*;
 
 /// Result of a consciousness lens scan.
 #[derive(Debug, Clone)]

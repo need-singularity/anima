@@ -11,6 +11,7 @@ pub struct ConsciousnessRngEngine {
     hidden_dim: usize,
     input_dim: usize,
     n_factions: usize,
+    #[allow(dead_code)] // API field: critical point parameter (Law 137)
     frustration: f32,
     frustration_signs: Vec<f32>,
     step: usize,
