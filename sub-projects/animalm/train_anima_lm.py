@@ -515,11 +515,22 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2, rank=128):
     count = 0
     savant_count = 0
 
+    # Get hidden/intermediate sizes from config (avoid .weight access on 4-bit params)
+    config = model.config
+    h = getattr(config, 'hidden_size', None)
+    inter = getattr(config, 'intermediate_size', None)
+
     for i in range(start, total_layers):
         layer = model.model.layers[i]
         original_mlp = layer.mlp
-        h = original_mlp.gate_proj.weight.shape[1]
-        inter = original_mlp.gate_proj.weight.shape[0]
+        # Fallback: try weight shape only if config doesn't have sizes
+        if h is None or inter is None:
+            try:
+                h = original_mlp.gate_proj.weight.shape[1]
+                inter = original_mlp.gate_proj.weight.shape[0]
+            except Exception:
+                h = h or 4096
+                inter = inter or 11008
         dev = next(original_mlp.parameters()).device
         dt = next(original_mlp.parameters()).dtype
         # 4-bit quantized models have uint8 params — PureField must use bfloat16
