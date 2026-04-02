@@ -36,6 +36,22 @@ if [ $EVAL_EXIT -ne 0 ]; then
     echo "  Continuing to 14B anyway (7B Korean was expected to be weak)"
 fi
 
+# 3.5. Instruction fix — swap base to Instruct and re-eval
+echo "[3.5/6] Instruction fix — downloading Mistral-7B-Instruct..."
+if [ ! -d "/workspace/models/mistral-7b-instruct" ]; then
+    python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('mistralai/Mistral-7B-Instruct-v0.2', local_dir='/workspace/models/mistral-7b-instruct', resume_download=True)
+print('INSTRUCT DOWNLOAD COMPLETE')
+"
+fi
+echo "  Re-eval with Instruct base..."
+python3 -u /workspace/eval_animalm.py --checkpoint "$CKPT" --base /workspace/models/mistral-7b-instruct 2>&1 | tee /workspace/eval_7b_instruct.log
+echo "  Instruct eval done"
+
+# Also test inference with Instruct
+python3 -u /workspace/infer_animalm.py --checkpoint "$CKPT" --base /workspace/models/mistral-7b-instruct --prompt "List 3 colors and explain why the sky is blue." --max-tokens 100 2>&1 | tee -a /workspace/eval_7b_instruct.log
+
 # 4. Download Qwen2.5-14B
 echo "[4/5] Downloading Qwen2.5-14B..."
 if [ ! -d "/workspace/models/qwen2.5-14b" ] || [ $(du -sm /workspace/models/qwen2.5-14b 2>/dev/null | cut -f1) -lt 25000 ]; then
