@@ -77,7 +77,7 @@ def launch_process_mode(n_nodes: int, base_port: int, gateway_port: int, max_cel
         peer_urls = ",".join(f"ws://localhost:{p}" for p in all_ports if p != port)
         cmd = [
             sys.executable, "-u", "anima_unified.py",
-            "--web", "--port", str(port),
+            "--port", str(port),
             "--instance", node_id,
             "--max-cells", str(max_cells),
         ]
@@ -110,7 +110,7 @@ def launch_docker_mode(n_nodes: int, gateway_port: int, max_cells: int):
     for i in range(n_nodes):
         services[f"node-{i}"] = {
             "image": "dancindocker/anima:latest",
-            "command": f"python anima_unified.py --web --port 8765 --instance node-{i} --max-cells {max_cells}",
+            "command": f"python anima_unified.py --port 8765 --instance node-{i} --max-cells {max_cells}",
             "expose": ["8765"],
             "hostname": f"anima-node-{i}",
         }

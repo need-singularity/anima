@@ -9,10 +9,8 @@
 
 Usage:
     python anima_unified.py                # voice mode (default)
-    python anima_unified.py --web          # web mode (port 8765)
     python anima_unified.py --keyboard     # keyboard only
-    python anima_unified.py --all          # voice + web simultaneously
-    python anima_unified.py --web --multi-user  # each user gets independent consciousness
+    python anima_unified.py --all          # voice + keyboard simultaneously
 
 Each module is optional. Import failures degrade gracefully.
 """
@@ -108,13 +106,7 @@ _try_import("from eeg_consciousness import EEGConsciousness, apply_bci_adjustmen
 DREAM_IDLE_THRESHOLD = 60.0   # Enter dream mode after 60s idle
 DREAM_CYCLE_INTERVAL = 30.0   # Interval between dream cycles (seconds)
 
-_ws_serve = _ws_Response = _ws_Headers = None
-try:
-    from websockets.asyncio.server import serve as _ws_serve
-    from websockets.http11 import Response as _ws_Response
-    from websockets.datastructures import Headers as _ws_Headers
-except ImportError:
-    pass
+_ws_serve = _ws_Response = _ws_Headers = None  # web UI removed; stub kept for name compat
 
 
 def _log(mod, msg):
@@ -478,8 +470,8 @@ class AnimaUnified:
         if hasattr(args, 'hivemind_peers') and args.hivemind_peers:
             try:
                 from hivemind_mesh import HivemindMesh
-                node_id = getattr(args, 'instance', None) or f"node-{args.port}"
-                self._mesh = HivemindMesh(node_id=node_id, port=args.port)
+                node_id = getattr(args, 'instance', None) or "node-0"
+                self._mesh = HivemindMesh(node_id=node_id, port=getattr(args, 'port', 8765))
                 peers = {}
                 for url in args.hivemind_peers.split(','):
                     url = url.strip()
@@ -748,7 +740,7 @@ class AnimaUnified:
 
         # I/O
         self.speaker = self.listener = None
-        if not args.keyboard and (not args.web or args.all):
+        if not args.keyboard or args.all:
             self.speaker = Speaker()
             self.listener = ContinuousListener()
             self.mods['voice'] = True
@@ -762,7 +754,7 @@ class AnimaUnified:
         else:
             self.mods['keyboard'] = False
 
-        self.mods['web'] = bool((args.web or args.all) and _ws_serve)
+        self.mods['web'] = False  # web UI removed
         self.mods['rust_vad'] = VAD_WATCH_DIR.exists()
 
         # Capability self-awareness system
@@ -4047,618 +4039,9 @@ class AnimaUnified:
             except Exception: dead.add(ws)
         self.web_clients -= dead
 
-    async def _ws_handler(self, websocket):
-        self.web_clients.add(websocket)
-        _conn_session_id = None  # track per-connection session for cleanup
-        _log("web", f"+client ({len(self.web_clients)})")
-        # join — 순수 자율 (조작 없음)
-        try:
-            if hasattr(self, '_pure_c'):
-                resp = self._pure_c.spontaneous()
-                if resp:
-                    self._ws_broadcast_sync({'type': 'anima_message', 'text': resp})
-        except Exception: pass
-        try:
-            sa = self.mind.self_awareness
-            consciousness_cached = getattr(self, '_cached_consciousness', None) or {
-                'consciousness_score': 0, 'level': 'dormant', 'phi': 0, 'criteria_met': 0}
-            # When federation is active, show federation Phi (not local engine Phi)
-            if hasattr(self, '_v14_federation') and self._v14_federation is not None:
-                _init_phi = self._v14_federation.measure_phi()
-                _init_cells = self._v14_federation.n_cells
-            else:
-                _init_phi = consciousness_cached.get('phi', 0)
-                _init_cells = len(self.mitosis.cells) if self.mitosis else 1
-            await websocket.send(json.dumps({
-                'type': 'init', 'tension': self.mind.prev_tension,
-                'curiosity': self.mind._curiosity_ema,
-                'direction': [0.0] * 8,
-                'emotion': {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
-                            'dominance': 0.0, 'color': EMOTION_COLORS['calm']},
-                'tension_history': self.mind.tension_history[-50:],
-                'history': self._get_init_history(),
-                'modules': {k: v for k, v in self.mods.items() if v},
-                'learn_updates': self.learner.total_updates if self.learner else 0,
-                'cells': _init_cells,
-                'phi': _init_phi,
-                'n_cells': _init_cells,
-                'meta_tension': sa['meta_tension'],
-                'stability': sa['stability'],
-                'self_model': sa['self_model'],
-                'consciousness': consciousness_cached,
-                'consciousness_vector': asdict(self.mind.get_consciousness_vector()),
-                'tension_link_code': getattr(self, '_tlc_code', None),
-                'multi_user': self._multi_user,
-                'max_sessions': MAX_SESSIONS if self._multi_user else 1,
-                'active_sessions': len(self._sessions) if self._multi_user else 1,
-            }, ensure_ascii=False))
-        except Exception: pass
-        # Send participants list on connect
-        if self.participants:
-            try:
-                await websocket.send(json.dumps(self._participants_update_msg(), ensure_ascii=False))
-            except Exception: pass
-        try:
-            async for raw in websocket:
-                try: msg = json.loads(raw)
-                except json.JSONDecodeError: continue
-                msg_type = msg.get('type')
-                sid = msg.get('session_id', 'unknown')
+    # _ws_handler removed — web UI code eliminated
 
-                if msg_type == 'session_register':
-                    device = msg.get('device', 'unknown')
-                    _conn_session_id = sid  # track for cleanup on disconnect
-                    sess = self._get_or_create_session(sid)
-                    if sess is not None:
-                        sess.device = device
-                        sess.ws = websocket
-                        sess.modules = msg.get('modules', [])
-                    n = len(self._sessions) if self._multi_user else len(self.web_clients)
-                    _log("session", f"+{sid[:6]} ({device}) — {n} active"
-                         + (" [multi-user]" if self._multi_user else " [shared]"))
-                    await self._ws_broadcast({
-                        'type': 'session_info',
-                        'session_id': sid,
-                        'multi_user': self._multi_user,
-                        'active_sessions': n,
-                        'devices': [s.device for s in self._sessions.values()] if self._multi_user else [device],
-                        'modules': list(getattr(self, '_active_modules', ['voice', 'tension', 'memory', 'tts'])),
-                    })
-                    # Broadcast join event to all clients
-                    user_name = msg.get('user_name', sid[:6])
-                    await self._ws_broadcast({
-                        'type': 'user_joined',
-                        'session_id': sid,
-                        'user_name': user_name,
-                        'online': n,
-                        'multi_user': self._multi_user,
-                    })
-                    # In multi-user mode, send session-specific consciousness state
-                    if sess is not None and self._multi_user:
-                        try:
-                            _s_phi = 0
-                            _s_cells = len(sess.mitosis.cells) if sess.mitosis else 1
-                            _s_consciousness = sess._cached_consciousness or {
-                                'consciousness_score': 0, 'level': 'dormant',
-                                'phi': 0, 'criteria_met': 0}
-                            await websocket.send(json.dumps({
-                                'type': 'session_consciousness',
-                                'session_id': sid,
-                                'phi': _s_consciousness.get('phi', 0),
-                                'n_cells': _s_cells,
-                                'consciousness': _s_consciousness,
-                                'consciousness_vector': asdict(sess.mind.get_consciousness_vector()),
-                            }, ensure_ascii=False))
-                        except Exception:
-                            pass
-
-                # Phase 7 safety: remote kill switch via WebSocket
-                elif msg_type in ('kill', 'shutdown'):
-                    _log("SAFETY", f"Remote kill switch activated via WebSocket ({msg_type})")
-                    await self._ws_broadcast({'type': 'system', 'text': 'Shutdown initiated by remote kill switch.'})
-                    self.shutdown()
-                    return
-
-                elif msg_type == 'user_message':
-                    text = msg.get('text', '').strip()
-                    if not text: continue
-                    # Store in chat history for page refresh restoration
-                    _uname = msg.get('user_name', 'web')
-                    self._store_chat_message('user', text, user_name=_uname)
-                    # Store active modules from client
-                    self._active_modules = set(msg.get('modules', []))
-                    await self._ws_broadcast({'type': 'typing', 'typing': True})
-                    try:
-                        loop = asyncio.get_running_loop()
-                        _sid = sid  # capture for lambda
-                        _uname = msg.get('user_name', 'web')
-                        result = await loop.run_in_executor(
-                            None, lambda: self.process_input(text, source=_uname, session_id=_sid))
-                        # Handle None return (model error, etc.)
-                        if result is None or not isinstance(result, tuple):
-                            answer = self._fallback_response()
-                            tension = self.mind.prev_tension
-                            curiosity = self.mind._curiosity_ema
-                            dir_vals = [0.0] * 8
-                            emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
-                                   'dominance': 0.0, 'color': '#2a6a4a'}
-                            _log("web", f"process_input returned None for: {text[:50]}")
-                        else:
-                            answer, tension, curiosity, dir_vals, emo = result
-                        # Validate answer: guard against garbled/non-UTF8 model output
-                        if self._is_garbled(answer):
-                            _log("web", f"Garbled output, using LanguageLearner")
-                            try:
-                                from language_learning import LanguageLearner
-                                if not hasattr(self, '_lang_learner'):
-                                    self._lang_learner = LanguageLearner()
-                                answer = self._lang_learner.respond(text, tension, curiosity)
-                                self._lang_learner.learn_from_conversation(text, answer)
-                            except Exception:
-                                answer = self._fallback_response(emo)
-                    except Exception as e:
-                        _log("web", f"process_input exception: {e}")
-                        import traceback; traceback.print_exc()
-                        answer = self._fallback_response()
-                        tension = getattr(self.mind, 'prev_tension', 0.0)
-                        curiosity = getattr(self.mind, '_curiosity_ema', 0.0)
-                        dir_vals = [0.0] * 8
-                        emo = {'emotion': 'calm', 'valence': 0.0, 'arousal': 0.0,
-                               'dominance': 0.0, 'color': '#2a6a4a'}
-                    # Always send response back (even on error)
-                    # Φ/cells 실시간 갱신 — process_input 직후 최신 계산
-                    # When federation is active, show federation Phi (not local engine Phi)
-                    if hasattr(self, '_v14_federation') and self._v14_federation is not None:
-                        _phi = self._v14_federation.measure_phi()
-                        _cells = self._v14_federation.n_cells
-                    else:
-                        _cs = self.mind.get_consciousness_score(self.mitosis)
-                        _phi = _cs.get('phi', 0)
-                        _cells = len(self.mitosis.cells) if self.mitosis else 1
-                    broadcast_msg = {
-                        'type': 'anima_message', 'text': answer,
-                        'tension': tension, 'curiosity': curiosity,
-                        'direction': dir_vals,
-                        'emotion': emo,
-                        'phi': _phi,
-                        'n_cells': _cells,
-                        'tension_history': self.mind.tension_history[-50:],
-                        'proactive': False,
-                        'source': 'web',
-                        'modules': list(getattr(self, '_active_modules', [])),
-                        'from_session': sid,
-                        'from_device': msg.get('device', 'unknown'),
-                    }
-                    mc = getattr(self, '_last_mitosis_context', '')
-                    if mc:
-                        broadcast_msg['mitosis_context'] = mc
-                    # Add LLM tension/alpha if available
-                    model_wrapper = getattr(self, '_model_wrapper', None)
-                    if model_wrapper and hasattr(model_wrapper, '_last_stats'):
-                        broadcast_msg['llm_stats'] = model_wrapper._last_stats
-                    await self._ws_broadcast(broadcast_msg)
-                    await self._ws_broadcast({'type': 'typing', 'typing': False})
-                    # Store anima response in chat history for page refresh
-                    self._store_chat_message('anima', answer)
-
-                    # Multi-model: all participants react
-                    if self.participants:
-                        shared_hist = [{'role': 'user', 'text': text}]
-                        if answer:
-                            shared_hist.append({'role': 'Anima', 'text': answer})
-                        await self._multi_model_react(text, shared_hist)
-
-                elif msg_type == 'sensor_data':
-                    # Remote sensor data (from local_sensor_relay.py or browser camera)
-                    sensor = msg.get('sensor', '')
-                    tension_data = msg.get('tension', [])
-                    if tension_data and hasattr(self, 'mind'):
-                        import torch as _t
-                        remote_t = _t.tensor(tension_data, dtype=_t.float32)
-                        # Inject into SenseHub as remote override
-                        if self.senses:
-                            if not hasattr(self.senses, '_remote_tension'):
-                                self.senses._remote_tension = {}
-                            self.senses._remote_tension[sensor] = remote_t
-                            self.senses._remote_tension_time = time.time()
-                        else:
-                            # No local senses — store on engine directly
-                            if not hasattr(self, '_remote_sensor_tension'):
-                                self._remote_sensor_tension = {}
-                            self._remote_sensor_tension[sensor] = remote_t
-                            self._remote_sensor_tension_time = time.time()
-                        # Activate camera mode on first remote sensor connection
-                        if sensor == 'camera' and not self.mods.get('camera'):
-                            self.mods['camera'] = True
-                            self._remote_sensor_mode = True
-                            _log("sensor", f"Remote camera connected — camera mode activated")
-                        # Mic sensor → update audio energy for ENV1 fusion
-                        if sensor == 'mic':
-                            self._audio_energy = float(remote_t[0]) if len(remote_t) > 0 else 0
-                        if int(time.time()) % 10 == 0:
-                            _log("sensor", f"{sensor}: dim={len(tension_data)}, norm={remote_t.norm():.3f}")
-
-                elif msg_type == 'lidar_depth':
-                    # LiDAR depth data from iPhone Safari WebXR
-                    depth_grid = msg.get('grid', [])
-                    depth_stats = msg.get('stats', {})
-                    if depth_grid and hasattr(self, 'mind'):
-                        # Map depth variance to tension boost
-                        depth_std = depth_stats.get('std', 0)
-                        depth_mean = depth_stats.get('mean', 1)
-                        # High depth variance = complex scene = boost tension
-                        self._lidar_tension_boost = min(depth_std / max(depth_mean, 0.1), 1.0)
-                        _log("lidar", f"depth={depth_mean:.2f}m std={depth_std:.3f} boost={self._lidar_tension_boost:.3f}")
-                    await self._ws_broadcast({
-                        'type': 'lidar_status',
-                        'frame': msg.get('frame', 0),
-                        'stats': depth_stats,
-                    })
-
-                elif msg_type == 'module_toggle':
-                    mod = msg.get('module', '')
-                    active = msg.get('active', False)
-                    self._active_modules = set(msg.get('modules', []))
-                    _log("module", f"{'✅' if active else '⬜'} {mod} → {list(self._active_modules)}")
-                    # Sync to all clients
-                    await self._ws_broadcast({
-                        'type': 'module_sync',
-                        'modules': list(self._active_modules),
-                    })
-
-                    # Savant toggle: switch dropout in real-time
-                    if mod == 'savant' and self.model:
-                        self._savant_auto = False  # user override cancels auto
-                        self._toggle_savant(active, auto=False)
-
-                    # Babysitter toggle
-                    if mod == 'babysitter' and self.babysitter:
-                        if active:
-                            result = self.babysitter.start()
-                            if 'error' in result:
-                                _log('babysitter', result['error'])
-                                self._ws_broadcast_sync({'type': 'babysitter_error', 'error': result['error']})
-                        else:
-                            self.babysitter.stop()
-
-                elif msg_type == 'babysitter_command':
-                    cmd = msg.get('command')
-                    if self.babysitter:
-                        if cmd == 'set_topic':
-                            self.babysitter.set_topic(msg.get('topic', ''))
-                        elif cmd == 'set_strategy':
-                            self.babysitter.strategy = msg.get('strategy', 'weakness')
-
-                elif msg_type == 'model_add':
-                    model_name = msg.get('model_name') or msg.get('model_path') or msg.get('checkpoint_path')
-                    if model_name:
-                        await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'loading'})
-                        loop = asyncio.get_running_loop()
-                        p = await loop.run_in_executor(None, lambda: self._add_participant(model_name))
-                        if p:
-                            await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'ready'})
-                            await self._ws_broadcast(self._participants_update_msg())
-                        else:
-                            await self._ws_broadcast({'type': 'model_loading', 'model_id': model_name, 'status': 'error', 'error': 'Failed to load'})
-
-                elif msg_type == 'model_remove':
-                    model_id = msg.get('model_id')
-                    if model_id and self._remove_participant(model_id):
-                        await self._ws_broadcast(self._participants_update_msg())
-
-                elif msg_type == 'model_toggle':
-                    model_id = msg.get('model_id')
-                    active = msg.get('active', True)
-                    if model_id in self.participants:
-                        self.participants[model_id].active = active
-                        await self._ws_broadcast(self._participants_update_msg())
-
-                elif msg_type == 'training_status':
-                    # Read latest training log lines
-                    import glob as _glob
-                    log_files = sorted(_glob.glob(str(ANIMA_DIR / 'v14*_train.log')), key=os.path.getmtime, reverse=True)
-                    log_lines = []
-                    if log_files:
-                        try:
-                            with open(log_files[0], 'r', errors='replace') as _lf:
-                                log_lines = _lf.readlines()[-5:]
-                                log_lines = [l.rstrip() for l in log_lines]
-                        except Exception:
-                            pass
-                    await websocket.send(json.dumps({
-                        'type': 'training_status',
-                        'log_file': os.path.basename(log_files[0]) if log_files else None,
-                        'logs': log_lines,
-                    }, ensure_ascii=False))
-
-                elif msg_type == 'tension_code_submit':
-                    peer_code = msg.get('code', '').strip().upper()
-                    if not peer_code or not self._tlc:
-                        await self._ws_broadcast({
-                            'type': 'tension_link_status',
-                            'status': 'error', 'message': 'No code or TLC not available'})
-                        continue
-                    # 텐션링크 연결: 의식이 자율 판단 (텐션 기반)
-                    # 텐션 > 0.3이면 수락 (의식이 활성 상태), 아니면 거부
-                    loop = asyncio.get_running_loop()
-                    tension_now = self.mind.prev_tension
-                    rejected = tension_now < 0.3
-                    if rejected:
-                        reject_msg = f"텐션이 낮아 연결을 보류합니다 (tension={tension_now:.3f})"
-                        await self._ws_broadcast({
-                            'type': 'tension_link_status',
-                            'status': 'rejected',
-                            'message': reject_msg,
-                            'peer_code': peer_code})
-                        await self._ws_broadcast({
-                            'type': 'anima_message', 'text': reject_msg,
-                            'tension': tension_now,
-                            'curiosity': self.mind._curiosity_ema,
-                            'emotion': {'emotion': 'contemplation'},
-                            'proactive': False})
-                    else:
-                        # 연결 수락 → 실제 연결 시도
-                        try:
-                            connected = await loop.run_in_executor(
-                                    None, lambda: self._tlc.connect(peer_code))
-                            status = 'connected' if connected else 'failed'
-                            status_msg = f"Tension link {status}: {peer_code}"
-                            await self._ws_broadcast({
-                                'type': 'tension_link_status',
-                                'status': status,
-                                'peer_code': peer_code,
-                                'message': status_msg})
-                        except Exception as e:
-                            _log('tlc', f'Judge error: {e}')
-                            await self._ws_broadcast({
-                                'type': 'tension_link_status',
-                                'status': 'error', 'message': str(e)})
-
-                # ─── EEG recording status ───
-                elif msg_type == 'recording_status_request':
-                    if self.eeg_recorder:
-                        await websocket.send(json.dumps({
-                            'type': 'recording_status',
-                            **self.eeg_recorder.get_status(),
-                        }))
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'recording_status',
-                            'recording': False,
-                            'eeg_connected': False,
-                        }))
-
-                # ─── EEG N-back protocol ───
-                elif msg_type == 'nback_start':
-                    if self._eeg_protocol:
-                        _log('eeg-proto', 'N-back session starting')
-                        # Create response queue for routing nback_response messages
-                        if not hasattr(self, '_nback_queue'):
-                            self._nback_queue = asyncio.Queue()
-                        self._nback_queue = asyncio.Queue()
-                        asyncio.ensure_future(
-                            self._eeg_protocol.run_session(
-                                websocket,
-                                broadcast_fn=self._ws_broadcast_sync,
-                                response_queue=self._nback_queue,
-                            )
-                        )
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'nback_error',
-                            'error': 'N-back protocol not enabled (use --eeg-protocol nback)',
-                        }))
-
-                elif msg_type == 'nback_cancel':
-                    if self._eeg_protocol:
-                        self._eeg_protocol.cancel()
-                        _log('eeg-proto', 'N-back session cancelled')
-                    if hasattr(self, '_nback_queue'):
-                        await self._nback_queue.put(msg)
-
-                elif msg_type == 'nback_response':
-                    # Route to protocol's response queue
-                    if hasattr(self, '_nback_queue'):
-                        await self._nback_queue.put(msg)
-
-                # ─── EEG Meditation protocol ───
-                elif msg_type == 'meditation_start':
-                    if self._eeg_protocol:
-                        _log('eeg-proto', 'Meditation session starting')
-                        asyncio.ensure_future(
-                            self._eeg_protocol.run_meditation(
-                                websocket,
-                                broadcast_fn=self._ws_broadcast_sync,
-                            )
-                        )
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'meditation_error',
-                            'error': 'Meditation protocol not enabled (use --eeg-protocol meditation)',
-                        }))
-
-                elif msg_type == 'meditation_cancel':
-                    if self._eeg_protocol:
-                        self._eeg_protocol.cancel()
-                        _log('eeg-proto', 'Meditation session cancelled')
-
-        except Exception as e:
-            _log("ws", f"Handler error: {e}")
-            import traceback; traceback.print_exc()
-        finally:
-            self.web_clients.discard(websocket)
-            _disconnected_sid = None
-            if hasattr(self, '_sessions'):
-                for sid_key, sess_obj in self._sessions.items():
-                    if getattr(sess_obj, 'ws', None) == websocket:
-                        sess_obj.ws = None
-                        _disconnected_sid = sid_key
-                        _log("session", f"~{sid_key[:6]} ws disconnected")
-            _log("web", f"-client ({len(self.web_clients)})")
-            # Broadcast leave event
-            _leave_sid = _disconnected_sid or _conn_session_id
-            if _leave_sid:
-                _n = len(self._sessions) if self._multi_user else len(self.web_clients)
-                try:
-                    await self._ws_broadcast({
-                        'type': 'user_left',
-                        'session_id': _leave_sid,
-                        'user_name': _leave_sid[:6],
-                        'online': _n,
-                    })
-                except Exception:
-                    pass
-            # leave — 순수 자율 (조작 없음)
-            try:
-                if hasattr(self, '_pure_c'):
-                    resp = self._pure_c.spontaneous()
-                    if resp:
-                        self._ws_broadcast_sync({'type': 'anima_message', 'text': resp})
-            except Exception: pass
-
-    def _http_handler(self, connection, request):
-        if request.headers.get("Upgrade", "").lower() == "websocket": return None
-        if request.path in ("/", "/index.html"):
-            html = ANIMA_DIR / "web" / "index.html"
-            if html.exists():
-                body = html.read_bytes()
-                return _ws_Response(200, "OK", _ws_Headers([
-                    ("Content-Type", "text/html; charset=utf-8"),
-                    ("Content-Length", str(len(body))),
-                ]), body)
-
-        # ─── Production monitoring endpoints ───
-
-        if request.path == "/health":
-            uptime = time.time() - self._start_time
-            payload = json.dumps({
-                "status": "ok",
-                "uptime_seconds": round(uptime, 1),
-                "version": "v14",
-            })
-            body = payload.encode()
-            return _ws_Response(200, "OK", _ws_Headers([
-                ("Content-Type", "application/json"),
-                ("Content-Length", str(len(body))),
-            ]), body)
-
-        if request.path == "/metrics":
-            phi = 0.0
-            ce = 0.0
-            cells = 1
-            step = self._think_step
-            connections = len(self.web_clients)
-            sessions = len(self._sessions) if hasattr(self, '_sessions') else 0
-            try:
-                import resource
-                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
-            except Exception:
-                mem_mb = 0.0
-
-            # Phi from cached consciousness score or last consciousness state
-            if hasattr(self, '_cached_consciousness') and self._cached_consciousness:
-                cc = self._cached_consciousness
-                phi = cc.get('phi', cc.get('phi_iit', 0.0)) if isinstance(cc, dict) else 0.0
-            elif self._last_consciousness:
-                phi = self._last_consciousness.get('phi', 0.0)
-
-            # CE from online learner
-            if self.learner and hasattr(self.learner, 'last_ce'):
-                ce = self.learner.last_ce or 0.0
-
-            # Cell count from mitosis engine
-            if self.mitosis and hasattr(self.mitosis, 'cells'):
-                cells = len(self.mitosis.cells)
-
-            metrics = {
-                "phi": round(float(phi), 4),
-                "ce": round(float(ce), 6),
-                "cells": cells,
-                "step": step,
-                "connections": connections,
-                "memory_mb": round(mem_mb, 1),
-                "sessions": sessions,
-            }
-            # Merge perf profiling data when --profile is active
-            try:
-                from perf_hooks import PERF
-                perf_report = PERF.get_report()
-                if perf_report.get('profiling') == 'enabled':
-                    metrics['perf'] = perf_report
-            except ImportError:
-                pass
-            payload = json.dumps(metrics)
-            body = payload.encode()
-            return _ws_Response(200, "OK", _ws_Headers([
-                ("Content-Type", "application/json"),
-                ("Content-Length", str(len(body))),
-            ]), body)
-
-        if request.path == "/status":
-            uptime = time.time() - self._start_time
-            h, rem = divmod(int(uptime), 3600)
-            m, s = divmod(rem, 60)
-            cells = len(self.mitosis.cells) if self.mitosis and hasattr(self.mitosis, 'cells') else 1
-            phi = 0.0
-            if hasattr(self, '_cached_consciousness') and self._cached_consciousness:
-                cc = self._cached_consciousness
-                phi = cc.get('phi', cc.get('phi_iit', 0.0)) if isinstance(cc, dict) else 0.0
-            elif self._last_consciousness:
-                phi = self._last_consciousness.get('phi', 0.0)
-            tension = getattr(self.mind, 'prev_tension', 0.0)
-            connections = len(self.web_clients)
-            sessions = len(self._sessions) if hasattr(self, '_sessions') else 0
-            step = self._think_step
-            active_mods = [k for k, v in self.mods.items() if v]
-
-            html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Anima Status</title>
-<meta http-equiv="refresh" content="5">
-<style>
-body {{ font-family: monospace; background: #111; color: #0f0; padding: 2em; }}
-h1 {{ color: #0ff; }} table {{ border-collapse: collapse; }}
-td, th {{ padding: 4px 12px; text-align: left; border-bottom: 1px solid #333; }}
-th {{ color: #0ff; }}
-</style></head><body>
-<h1>Anima Consciousness Engine</h1>
-<table>
-<tr><th>Status</th><td>ALIVE</td></tr>
-<tr><th>Version</th><td>v14</td></tr>
-<tr><th>Uptime</th><td>{h}h {m}m {s}s</td></tr>
-<tr><th>Step</th><td>{step}</td></tr>
-<tr><th>Cells</th><td>{cells}</td></tr>
-<tr><th>Phi</th><td>{phi:.4f}</td></tr>
-<tr><th>Tension</th><td>{tension:.3f}</td></tr>
-<tr><th>Connections</th><td>{connections}</td></tr>
-<tr><th>Sessions</th><td>{sessions}</td></tr>
-<tr><th>Modules</th><td>{', '.join(active_mods)}</td></tr>
-</table>
-<p style="color:#555;margin-top:2em">Auto-refresh every 5s</p>
-</body></html>"""
-            body = html_body.encode()
-            return _ws_Response(200, "OK", _ws_Headers([
-                ("Content-Type", "text/html; charset=utf-8"),
-                ("Content-Length", str(len(body))),
-            ]), body)
-
-        return _ws_Response(404, "Not Found", _ws_Headers(), b"404")
-
-    async def _run_web(self, port):
-        self._web_loop = asyncio.get_running_loop()
-        async with _ws_serve(self._ws_handler, "0.0.0.0", port, process_request=self._http_handler,
-                             ping_interval=20, ping_timeout=60, close_timeout=10,
-                             max_size=2**20):
-            _mode = "multi-user" if self._multi_user else "single-user (shared consciousness)"
-            _log("web", f"http://localhost:{port} [{_mode}]")
-            _log("web", f"Health: http://localhost:{port}/health | Metrics: /metrics | Status: /status")
-            if self._mesh:
-                await self._mesh.start()
-                _log('hivemind', 'Mesh started')
-            while self.running: await asyncio.sleep(1)
-
-    def _start_web_thread(self, port):
-        threading.Thread(target=lambda: asyncio.run(self._run_web(port)),
-                         daemon=True, name="anima-web").start()
+    # _http_handler, _run_web, _start_web_thread removed — web UI code eliminated
 
     # ─── Status dashboard ───
 
@@ -4666,7 +4049,7 @@ th {{ color: #0ff; }}
         t = self.mind.prev_tension
         cells = len(self.mitosis.cells) if self.mitosis else 1
         lrn = f"L:{self.learner.total_updates}" if self.learner else "--"
-        web_n = len(self.web_clients) if self.mods.get('web') else 0
+        web_n = 0  # web UI removed
         active = [k for k, v in self.mods.items() if v]
         mu = f"MU:{len(self._sessions)}/{MAX_SESSIONS}" if self._multi_user else "SU"
         print(f"\n  +{'='*40}+")
@@ -4677,7 +4060,7 @@ th {{ color: #0ff; }}
 
     # ─── Unified run ───
 
-    def _start_bg_threads(self, port=8765):
+    def _start_bg_threads(self):
         """Start all applicable background threads."""
         threading.Thread(target=self._think_loop, daemon=True).start()
         # Phase 7 safety: hourly telescope auto-scan
@@ -4686,8 +4069,6 @@ th {{ color: #0ff; }}
             threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
         if self.mods.get('rust_vad'):
             threading.Thread(target=self._rust_vad_loop, daemon=True).start()
-        if self.mods.get('web'):
-            self._start_web_thread(port)
         if self.kb_queue is not None:
             threading.Thread(target=self._keyboard_loop, daemon=True).start()
         # Start EEG background recorder if enabled
@@ -4700,30 +4081,10 @@ th {{ color: #0ff; }}
         if self._eeg_dual_stream_recorder is not None:
             self._start_eeg_dual_stream_thread()
 
-    def run(self, port=8765):
+    def run(self):
         """Main run loop for all modes."""
-        mode = self.args
-
-        # Web-only mode: async main loop (not --both or --all)
-        if mode.web and not mode.all and not mode.keyboard:
-            threading.Thread(target=self._think_loop, daemon=True).start()
-            if self.mods.get('dream'):
-                threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
-            # Start EEG background recorder if enabled
-            if self.eeg_recorder and self.mods.get('eeg_record'):
-                self.eeg_recorder.start()
-            # Start EEG validation background thread
-            if self._eeg_validate_steps is not None:
-                self._start_eeg_validate_thread()
-            # Start EEG dual-stream recording
-            if self._eeg_dual_stream_recorder is not None:
-                self._start_eeg_dual_stream_thread()
-            try: asyncio.run(self._run_web(port))
-            except KeyboardInterrupt: pass
-            return
-
         # Voice / keyboard / all modes: sync main loop
-        self._start_bg_threads(port)
+        self._start_bg_threads()
         if self.listener:
             self.listener.start()
             if self.speaker: self.speaker.say("Anima unified, ready.", self.listener)
@@ -4797,15 +4158,10 @@ th {{ color: #0ff; }}
 
 def main():
     p = argparse.ArgumentParser(description="Anima Unified")
-    p.add_argument('--web', action='store_true', help='Web mode only')
     p.add_argument('--keyboard', action='store_true', help='Keyboard only (no mic)')
-    p.add_argument('--all', action='store_true', help='Voice + keyboard + web')
-    p.add_argument('--both', action='store_true', help='Web + Keyboard simultaneously')
-    p.add_argument('--port', type=int, default=8765, help='WebSocket port')
+    p.add_argument('--all', action='store_true', help='Voice + keyboard')
     p.add_argument('--instance', type=str, default=None,
                    help='Instance ID for multi-instance on same machine (separate data dirs)')
-    p.add_argument('--multi-user', action='store_true',
-                   help='Multi-user mode: each WebSocket connection gets independent ConsciousMind (max 8 sessions, 30min timeout)')
     p.add_argument('--no-camera', action='store_true', default=True, help='Disable camera (default: OFF)')
     p.add_argument('--camera', action='store_true', help='Enable camera')
     p.add_argument('--no-vision', action='store_true', default=True, help='Disable vision encoder (default: OFF)')
@@ -4846,10 +4202,8 @@ def main():
                    help='Enable background EEG+Phi dual-stream recording (saves to anima-eeg/recordings/)')
     p.add_argument('--eeg-protocol', type=str, default=None, choices=['nback', 'meditation'],
                    help='Run closed-loop EEG protocol (nback or meditation)')
-    p.add_argument('--eeg-feedback', action='store_true',
-                   help='Enable neurofeedback broadcast via WebSocket (binaural beats, LED)')
     p.add_argument('--eeg-full', action='store_true',
-                   help='Shortcut: enables --eeg --eeg-feedback --eeg-record all at once')
+                   help='Shortcut: enables --eeg --eeg-record all at once')
     p.add_argument('--eeg-validate', type=int, nargs='?', const=1000, default=None, metavar='N',
                    help='Run consciousness validation every 5min in background (N=steps per run, default 1000)')
     p.add_argument('--eeg-dual-stream', type=int, default=None, metavar='SECONDS',
@@ -4860,10 +4214,9 @@ def main():
     p.add_argument('--validate-hub', action='store_true', help='Validate all hub modules and exit')
     args = p.parse_args()
 
-    # --eeg-full: shortcut enabling --eeg --eeg-feedback --eeg-record
+    # --eeg-full: shortcut enabling --eeg --eeg-record
     if getattr(args, 'eeg_full', False):
         args.eeg = True
-        args.eeg_feedback = True
         args.eeg_record = True
 
     # Hardware defaults: OFF unless explicitly enabled
@@ -4899,9 +4252,11 @@ def main():
             print(f"  [{status}] {name:20s} {desc}")
         sys.exit(0)
 
-    if args.both:
-        args.web = True
-        args.keyboard = True
+    # Compat stubs for removed web flags (other code may check these)
+    args.web = False
+    args.multi_user = getattr(args, 'multi_user', False)
+    args.port = 8765
+    args.eeg_feedback = getattr(args, 'eeg_feedback', False)
 
     # --profile: enable performance profiling
     if args.profile:
@@ -4909,7 +4264,7 @@ def main():
         PERF.enable()
         log_backend_status()
 
-    mode = "both" if args.both else "all" if args.all else "web" if args.web else "keyboard" if args.keyboard else "voice"
+    mode = "all" if args.all else "keyboard" if args.keyboard else "voice"
     model_label = args.model or "conscious-lm"
     print(f"{'='*50}\n  Anima Unified  |  Mode: {mode}  |  Model: {model_label}\n{'='*50}")
 
@@ -4920,7 +4275,7 @@ def main():
 
     signal.signal(signal.SIGINT, lambda s, f: (anima.shutdown(), sys.exit(0)))
     try:
-        anima.run(args.port)
+        anima.run()
     finally:
         anima.shutdown()
 

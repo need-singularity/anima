@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Anima 런타임 대화 테스트 CLI
+"""DEPRECATED: Web UI has been removed. This file tested WebSocket chat endpoints
+which no longer exist. Kept for reference only — do not run.
 
-Usage:
+Previously:
   python3 test_chat.py                      # 대화형 모드
   python3 test_chat.py --auto               # 자동 테스트 (한국어+영어)
   python3 test_chat.py --remote             # RunPod Anima-Web 원격 테스트

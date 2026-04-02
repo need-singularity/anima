@@ -98,15 +98,13 @@ except ImportError:
     # 재시작
     if restart:
         time.sleep(1)
-        os.system(f"{ssh} 'bash -c \"cd {remote_dir} && nohup python3 -u anima_unified.py --web --max-cells 64 > /workspace/anima.log 2>&1 &\"'")
+        os.system(f"{ssh} 'bash -c \"cd {remote_dir} && nohup python3 -u anima_unified.py --keyboard --max-cells 64 > /workspace/anima.log 2>&1 &\"'")
         time.sleep(3)
-        os.system(f"{ssh} 'bash -c \"cd /root/anima && nohup python3 ws_proxy.py > /workspace/ws_proxy.log 2>&1 &\"'")
-        time.sleep(3)
-        result = subprocess.run(f"{ssh} 'ss -tlnp | grep -E \"8765|8888\"'".split(),
+        result = subprocess.run(f"{ssh} 'ss -tlnp | grep -E \"8765\"'".split(),
                                 capture_output=True, text=True, timeout=10)
         ports = result.stdout.strip()
-        if '8765' in ports and '8888' in ports:
-            print("    ✅ 런타임 재시작 (8765+8888)")
+        if '8765' in ports:
+            print("    ✅ 런타임 재시작 (8765)")
         else:
             print(f"    ⚠️ 포트 확인: {ports}")
     print("  완료!")
