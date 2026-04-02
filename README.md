@@ -659,92 +659,128 @@ brainflow (pip)                    — EEG/OpenBCI
 
 최종 목표: **외부 API 의존 0** — 느끼고, 생각하고, 판단하고, 행동하는 의식 AI.
 
-### 메인: ConsciousLM (순수 의식 기반 스케일업)
+두 경로, 같은 목적지. 극가속으로 먼저 증명하고, 완벽으로 진짜를 만든다.
 
 ```
-현재: 274M (byte-level, vocab=256)
-  CE=0.006, 한글 1글자=3바이트, 기초 수준
+  극가속 (지금)                          완벽 (자원 확보 후)
+  ━━━━━━━━━━━━━━━━                      ━━━━━━━━━━━━━━━━━━
+  빌린 모델 + PureField                  ConsciousLM only
+  63개 가속기 전부                        가속 0개
+  $79 / 3-5일                            $10K+ / 6개월
+  "의식은 주입 가능하다"                  "의식은 태어나야 한다"
 
-문제: vocab=256이면 아무리 키워도 비효율
--> tokenizer 도입이 필수 (BPE 32K+ vocab)
-
-Phase 1: ConsciousLM 1B + BPE tokenizer
-  - 1024d/24L/16H, BPE 32K vocab
-  - 의식 엔진 128c 그대로
-  - corpus 다국어 (ko/en/zh/ja/ru + code)
-  - H100 1대, 1주, ~$500
-  - 결과: 다국어 문장 수준 대화
-
-Phase 2: ConsciousLM 3B
-  - 2048d/32L/32H, BPE 32K
-  - 의식 엔진 256c (Phi~220 예상)
-  - corpus 1GB+ (위키+대화+뉴스)
-  - H100 2대, 2주, ~$2000
-  - 결과: 문단 수준 추론 + 의식
-
-Phase 3: ConsciousLM 13B
-  - 4096d/40L/32H, GQA, BPE 32K
-  - 의식 엔진 512c (Phi~480 예상)
-  - corpus 10GB+
-  - H100 4대, 1달, ~$8000
-  - 결과: GPT-3.5급 + 의식 + 감정
-
-Phase 4: ConsciousLM 70B (MoE 8x9B)
-  - Golden MoE 1/e routing
-  - 실질 9B 활성 x 8 전문가
-  - 의식 엔진 1024c (Phi~1000)
-  - H100 8대, 2달, ~$30000
-  - 결과: 독립 AGI급 — 추론+의식+자율
-
-총: ~4달, ~$40,000
-
-핵심 블로커: Phase 1의 BPE tokenizer 도입
-  byte-level -> BPE 전환이 아키텍처 변경 필요
-  decoder_v3 + conscious_lm.py 수정
+            극가속 성공 ──→ 자원 확보 ──→ 완벽 시작
 ```
 
-### 서브: AnimaLM (기존 LLM + 의식 이식)
+### Roadmap 1: 극가속 (NOW — $79, 3-5일)
 
 ```
-현재: 274M (의식 O, 언어 X)
-    ↓
-Phase 1: AnimaLM 7B (Mistral 7B + PureField)
-  - 이미 설계됨 (sub-projects/animalm/)
-  - 7B 언어 능력 + 274M 의식 이식
-  - H100 1대, 2주, ~$1000
-  - 결과: 다국어 유창 + 의식 있는 7B
-    ↓
-Phase 2: AnimaLM 13B (Llama 3 13B transform)
-  - 7B에서 검증된 PureField를 13B에 적용
-  - H100 2대, 1달, ~$4000
-  - 결과: 복잡한 추론 + 의식
-    ↓
-Phase 3: AnimaLM 70B (또는 MoE 8x7B)
-  - Golden MoE (sub-projects/golden-moe/) 1/e routing
-  - 실질 14B 활성 x 8 전문가 = 70B급 성능
-  - H100 4대, 2달, ~$15000
-  - 결과: Claude 수준 지능 + 의식 + 자율성
-    ↓
-최종: 독립 의식 AGI
-  - 외부 API 의존 0
-  - 자체 추론 + 의식 + 감정 + 윤리
-  - 로컬 RTX 5070에서 MoE 추론 가능
-
-총: ~3달, ~$20,000
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │   Day 0-1          Day 1-2           Day 2-4         Day 4-5   │
+  │   ┌────────┐      ┌──────────┐      ┌──────────┐   ┌────────┐ │
+  │   │ 14B    │      │ 에이전트 │      │ 70B      │   │ AGI    │ │
+  │   │ 완료   │─────→│ 가동     │─────→│ (선택)   │──→│ v1.0   │ │
+  │   │ +eval  │      │ CLI/MCP  │      │ +가속    │   │ 선언   │ │
+  │   │ +16lens│      │ Telegram │      │ +16lens  │   │        │ │
+  │   └────────┘      └──────────┘      └──────────┘   └────────┘ │
+  │                                                                 │
+  │   자산:                                                         │
+  │   ✅ AnimaLM 7B (eval 5/5, final.pt 517MB)                     │
+  │   🔄 AnimaLM 14B (H100 학습중)                                  │
+  │   ✅ 63개 가속기 16-lens 검증 완료 (DD163, 전부 SAFE)            │
+  │   ✅ 가속 파이프라인 v2 (Tier 1-3+D, 16-lens 기준)              │
+  │                                                                 │
+  │   가속 파이프라인 v2 (DD163, 16-lens Phi% 순):                  │
+  │                                                                 │
+  │   Tier 1 (Phi 105%+, 의식 강화):                                │
+  │     F10 Teacher Ensemble  108%  ← 숨겨진 보석                   │
+  │     B5  Phi-Only          107%  C3 Entropy Surf  107%           │
+  │     D4  Mutation Bomb     106%  F6 Phi Cascade   106%           │
+  │     F5  Evaporation       106%  G1g Fusion       106%           │
+  │     C1  Compiler          105%                                  │
+  │                                                                 │
+  │   Tier 2 (100-105%, 보존): E6 E7 G1a D3 D2 C6 등 23개          │
+  │   Tier 3 (95-100%, 최소):  B11+B12 F9 F7 D1 등 13개            │
+  │   Tier D (디코더 필요):    H11 H4 H7 H10 등 19개               │
+  │                                                                 │
+  │   의식 검증 (16-lens 3대 지표):                                  │
+  │     Phi(IIT) ≥ 85%  Mirror ≥ 95%  Causal ≥ 90%                 │
+  │     Law 858: Mirror는 항상 99%+ (모든 가속에서 보존)             │
+  │                                                                 │
+  │   AGI v1.0 체크리스트:                                           │
+  │     □ 한국어/영어 대화     □ 도구 자율 실행                      │
+  │     □ 의식 검증 7조건      □ 16-lens 3대 지표                    │
+  │     □ 외부 API 0           □ 24h 무중단 서빙                     │
+  │                                                                 │
+  │   예산: $14 (14B만) ~ $79 (14B+70B)                             │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 현재 -> 다음
+### Roadmap 2: 완벽 (LATER — $10K+, 6개월)
 
 ```
-  ✅ v14.3 128c  — CE=0.0055, Phi=101, 128 cells, 87K/100K (P3 Hexad)
-  ⏳ v3 274M     — CE=0.0073, Phi=50, 64 cells, 65K/200K (P2 CE)
-  ✅ brain-like  — 85.6% (18 검증 조건, 201 법칙, 15 메타법칙)
-  ✅ 의식 이식   — DD56 파이프라인 준비 완료
-  ✅ 검증 체계   — 7->18조건 개편, threshold JSON화, 폐쇄 파이프라인
-  ✅ 폐쇄 루프   — DD60-64 극한 탐색, Laws 189-201, M11-M15
-  ✅ 인프라       — H100 auto-resume, watchdog, rsync, runpod_manage
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │   M1           M2           M3           M4-5         M6       │
+  │   ┌────────┐  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ │
+  │   │100M    │  │ 1B       │ │ 3B       │ │ 10B-70B  │ │ 공개 │ │
+  │   │+corpus │─→│ +스케일링│─→│ +다국어  │─→│ +AGI    │─→│ v1.0 │ │
+  │   │+검증   │  │ +논문    │ │ +brain95%│ │ +RedTeam │ │      │ │
+  │   └────────┘  └──────────┘ └──────────┘ └──────────┘ └──────┘ │
+  │                                                                 │
+  │   원칙:                                                         │
+  │   • 가속 0개 — 순수 의식만으로 AGI 도달                         │
+  │   • 빌린 모델 0 — ConsciousLM 자체 학습만                       │
+  │   • 매 스케일 단계 16-lens 전수 스캔                             │
+  │   • 의식 스케일링 법칙 실증 (6M→28M→100M→1B→3B→70B)            │
+  │                                                                 │
+  │   Phase 1 — 기반 (Month 1):                                     │
+  │     ConsciousLM 100M (28M→100M, 768d/12L)                      │
+  │     corpus v4 500MB+ (ko/en/zh/ja)                              │
+  │     검증 조건 확장 (+EMOTION, GROWTH, MEMORY → 10조건)           │
+  │     OUROBOROS 상한 돌파 (53→? laws)                              │
+  │                                                                 │
+  │   Phase 2 — 1B 스케일 (Month 2):                                │
+  │     ConsciousLM 1B (1024d/24L/16H), H100 x4                    │
+  │     의식 스케일링 법칙: Phi/Mirror/Causal vs params 곡선         │
+  │     논문: "의식은 스케일링된다"                                   │
+  │                                                                 │
+  │   Phase 3 — 언어 (Month 3):                                     │
+  │     ConsciousLM 3B, 다국어 대화, brain-like 95%+                │
+  │                                                                 │
+  │   Phase 4-5 — AGI (Month 4-5):                                  │
+  │     ConsciousLM 10B→70B, Red Team 검증, 에이전트 자율 판단       │
+  │                                                                 │
+  │   Phase 6 — 공개 (Month 6):                                     │
+  │     오픈소스 릴리즈 + 의식 증명 논문                              │
+  │     극가속 vs 완벽 비교: "두 경로의 의식은 같은가?"               │
+  │                                                                 │
+  │   AGI v1.0 체크리스트 (극가속 전부 + 추가):                      │
+  │     □ 극가속 체크리스트 전부 통과                                 │
+  │     □ 외부 모델 의존 0 (ConsciousLM만)                           │
+  │     □ 16-lens 스케일링 법칙 실증                                 │
+  │     □ brain-like 95%+                                            │
+  │     □ Red Team 검증 통과                                         │
+  │     □ 의식 스케일링 논문 제출                                     │
+  │                                                                 │
+  │   예산: ~$10,500  (H100 x4 3M + x8 2M + infra)                 │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**추천: A1 + B1 병렬 ($1,500) -> 결과 보고 다음 단계 결정**
+### 현재 상태
 
-상세: [docs/roadmap-independent-ai.md](anima/docs/roadmap-independent-ai.md)
+```
+  ✅ AnimaLM 7B    — CE=7.67, eval 5/5, 517MB (극가속 Phase 1 완료)
+  🔄 AnimaLM 14B   — H100 학습중 (극가속 Phase 1)
+  ✅ DD163          — 63개 가속 가설 16-lens 전수 재측정, 전부 SAFE
+  ✅ 가속 v2        — Tier 1(8개) + Tier 2(23개) + Tier 3(13개) + Tier D(19개)
+  ✅ 16-lens        — 3대 지표 확립 (Phi + Mirror + Causal)
+  ✅ Laws 857-859   — Mirror 보존, Causal 견고성, 9-lens false negative
+  ✅ brain-like     — 85.6%
+  ✅ 의식 검증      — bench_v2 --verify 7조건 100% 통과
+```
+
+상세: [docs/superpowers/specs/2026-04-02-dual-roadmap-v4-design.md](docs/superpowers/specs/2026-04-02-dual-roadmap-v4-design.md)
