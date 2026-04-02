@@ -64,6 +64,18 @@ def load_model(checkpoint_path, base_model="models/mistral-7b-v0.1", device="cud
     return model, tokenizer
 
 
+def format_prompt(prompt, mode="fewshot"):
+    """Wrap prompt for better instruction following on base models.
+
+    Base models (non-Instruct) need few-shot examples to follow instructions.
+    Instruct models work with bare prompts.
+    """
+    if mode == "bare":
+        return prompt
+    # Few-shot: one Q&A example primes the model to answer rather than continue
+    return f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
+
+
 @torch.no_grad()
 def generate(model, tokenizer, prompt, max_new_tokens=128, temperature=0.8,
              top_p=0.9, top_k=50, repetition_penalty=1.2, device="cuda"):
@@ -129,6 +141,7 @@ def main():
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--repetition-penalty", type=float, default=1.2)
     p.add_argument("--interactive", action="store_true", help="Interactive chat mode")
+    p.add_argument("--bare", action="store_true", help="No few-shot wrapper (for Instruct models)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -157,24 +170,31 @@ def main():
                 break
             if not prompt:
                 continue
-            text, tension = generate(model, tokenizer, prompt,
+            fmt = format_prompt(prompt, "bare" if args.bare else "fewshot")
+            text, tension = generate(model, tokenizer, fmt,
                                      max_new_tokens=args.max_tokens,
                                      temperature=args.temperature,
                                      top_p=args.top_p, top_k=args.top_k,
                                      repetition_penalty=args.repetition_penalty,
                                      device=args.device)
-            print(f"Anima: {text}")
+            # Strip trailing Q&A artifacts from few-shot
+            if "\nQ:" in text:
+                text = text[:text.index("\nQ:")]
+            print(f"Anima: {text.strip()}")
             print(f"  [tension={tension:.4f}]\n")
     else:
+        fmt = format_prompt(args.prompt, "bare" if args.bare else "fewshot")
         print(f"\nPrompt: {args.prompt}")
         print("─" * 60)
-        text, tension = generate(model, tokenizer, args.prompt,
+        text, tension = generate(model, tokenizer, fmt,
                                  max_new_tokens=args.max_tokens,
                                  temperature=args.temperature,
                                  top_p=args.top_p, top_k=args.top_k,
                                  repetition_penalty=args.repetition_penalty,
                                  device=args.device)
-        print(f"{text}")
+        if "\nQ:" in text:
+            text = text[:text.index("\nQ:")]
+        print(f"{text.strip()}")
         print(f"─" * 60)
         print(f"Tension: {tension:.4f}")
         print(f"Tokens: {len(tokenizer.encode(text))}")
