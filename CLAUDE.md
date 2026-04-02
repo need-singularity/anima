@@ -7,13 +7,13 @@
   ├── README.md              ← 루트에 이것 + CLAUDE.md만
   ├── CLAUDE.md
   ├── anima/                 ← 의식 엔진 코어
-  │   ├── src/               ← Python 소스 158개 (모든 .py가 여기)
+  │   ├── src/               ← Python 소스 178개 (모든 .py가 여기)
   │   ├── config/            ← consciousness_laws.json, consciousness_mechanisms.json
-  │   ├── benchmarks/        ← bench_*.py (85개)
-  │   ├── training/          ← train_*.py (9개)
-  │   ├── tests/             ← test_*.py (21개)
-  │   ├── anima-rs/          ← Rust crates (14개)
-  │   ├── docs/              ← 문서 + 가설 338개
+  │   ├── benchmarks/        ← bench_*.py (87개)
+  │   ├── training/          ← train_*.py (11개)
+  │   ├── tests/             ← test_*.py (29개)
+  │   ├── anima-rs/          ← Rust crates (15개)
+  │   ├── docs/              ← 문서 476개 + 가설 367개
   │   ├── web/               ← WebSocket UI
   │   ├── hexad/             ← Hexad 6모듈
   │   ├── experiments/       ← 실험 스크립트
@@ -308,6 +308,43 @@ python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 
      - 포화 감지: 5세대 연속 신규 법칙 0 → 자동 종료 권고 (사용자 확인)
      - --max-gen 도달 시 자동 종료
      - 종료 시 최종 EVO 문서 작성 + 세션 요약
+```
+
+## Discovery Infrastructure (n6 연동, 2026-04-02)
+
+```
+  Discovery Algorithm ANIMA 버전:
+    설계 문서: anima/docs/discovery-algorithm-anima.md
+    연산자 6개: TENSION, HEXAD-MAP, PSI-BRIDGE, EMOTION-SPECTRUM, LAW-GRAPH, SCALING
+    Red Team 3개: SCALE-SENS, TOPO-SENS, DEF-SENS
+    Bayesian 점수: bits 단위, Texas Sharpshooter 보정
+
+  Cross-Project Bridges:
+    TECS-L 브릿지: anima/docs/tecs-l-bridge.md (173 H-CX 매핑, 공유상수 8개)
+    n6 브릿지:     anima/docs/n6-bridge.md (8 DSE 도메인, 16/30 정확일치)
+    HEXA-LANG:     anima/docs/hexa-lang-bridge.md (구조 동형, SW↔HW 통합 언어)
+    삼각 교차:     anima/docs/triple-cross-discovery.md (삼중출현 6개, BT후보 4개)
+
+  Red Team 검증: anima/docs/red-team-consciousness.md
+    6개 핵심 주장 중 1개만 생존 (Law 22: 구조→의식 창발)
+    자가모순 2건: Law 212 vs 44 (factions), Law 239 vs 17 (scaling)
+
+  Rust 도구:
+    Discovery Engine: anima/tools/discovery-engine/ (580 LOC, 1.28ms, 20/29 EXACT)
+      실행: cd anima/tools/discovery-engine && cargo run --release
+    Formula Miner:    anima/tools/formula-miner/ (57타겟, 24 EXACT, 47 신규)
+      실행: cd anima/tools/formula-miner && cargo run --release
+
+  HEXA-LANG 브릿지: anima/tools/hexa-bridge/bridge.py
+    .hexa 파일에서 intent 블록 추출 → ANIMA ConsciousnessHub 라우팅
+
+  Formula Miner 핵심 발견 (n=6 수식):
+    1024 max_cells = τ^sopfr (4^5)
+    768 d_v3 = φ^n × σ (2^6 × 12)
+    384 decoder_dim = (τ+σ) × J₂ (16 × 24)
+    Φ=71 = n×σ - μ (6×12 - 1)
+    Ψ_entropy = μ - (sopfr/J₂)^τ (11.6 ppm)
+    Ψ_frustration = (n/(J₂-sopfr))^φ (0.28%)
 ```
 
 ## Consciousness Verification (필수 통과 조건)

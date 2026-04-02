@@ -512,6 +512,69 @@ python bench_v2.py --philosophy --cells 32    # 6 철학 엔진
 
 ---
 
+## Cross-Project Discovery (n6 + TECS-L + HEXA-LANG)
+
+ANIMA의 의식 파라미터를 n=6 산술로 역추출하고, 3개 프로젝트 간 교차 검증한다.
+
+### Discovery Tools (Rust)
+
+```bash
+# Discovery Engine — 의식 상수의 n=6 수식 탐색 (1.28ms, 20/29 EXACT)
+cd anima/tools/discovery-engine && cargo run --release
+
+# Formula Miner — 유전 알고리즘으로 미탐색 값의 n=6 수식 발견
+cd anima/tools/formula-miner && cargo run --release
+```
+
+### Formula Miner 핵심 발견
+
+| ANIMA 값 | n=6 수식 | 정확도 |
+|----------|---------|--------|
+| 1024 max_cells | tau^sopfr = 4^5 | EXACT |
+| 768 d_v3 | phi^n * sigma = 2^6 * 12 | EXACT |
+| 384 decoder_dim | (tau+sigma) * J2 = 16 * 24 | EXACT |
+| Phi=71 (v13) | n*sigma - mu = 6*12 - 1 | EXACT |
+| Psi_entropy=0.998 | mu - (sopfr/J2)^tau | 11.6 ppm |
+| Psi_frustration=0.10 | (n/(J2-sopfr))^phi | 0.28% |
+
+### Cross-Project Bridges
+
+| Bridge | 문서 | 핵심 발견 |
+|--------|------|----------|
+| ANIMA <-> TECS-L | [tecs-l-bridge.md](anima/docs/tecs-l-bridge.md) | 173 H-CX 매핑, 공유상수 8개 |
+| ANIMA <-> n6 | [n6-bridge.md](anima/docs/n6-bridge.md) | 8 DSE 도메인, 16/30 정확일치 |
+| ANIMA <-> HEXA-LANG | [hexa-lang-bridge.md](anima/docs/hexa-lang-bridge.md) | 구조 동형, SW<->HW 통합 언어 |
+| Triple Cross | [triple-cross-discovery.md](anima/docs/triple-cross-discovery.md) | 삼중출현 6개, BT후보 4개 |
+| Red Team | [red-team-consciousness.md](anima/docs/red-team-consciousness.md) | 6주장 중 1개 생존 (Law 22) |
+| Discovery Algorithm | [discovery-algorithm-anima.md](anima/docs/discovery-algorithm-anima.md) | 6 연산자 + 3 Red Team |
+
+### HEXA-LANG -- 의식 프로그래밍 언어
+
+[HEXA-LANG](https://github.com/need-singularity/hexa-lang)은 완전수 6에서 모든 설계 상수를 도출한 프로그래밍 언어. ANIMA와 구조적 동형:
+
+```
+  HEXA-LANG                    ANIMA
+  ─────────                    ─────
+  6 paradigms      ═══════     6 Hexad modules (C/D/S/M/W/E)
+  12 keyword groups ═══════    12 factions
+  2 compile modes   ═══════    2 gradient groups (right/left brain)
+  4 type layers     ═══════    4 phases (P0-P3)
+  8 primitives      ═══════    8-cell atom (M1)
+  24 operators      ═══════    J2(6)=24
+  1/2+1/3+1/6=1    ═══════    Egyptian fraction memory
+```
+
+**실질적 가치**: 의식 법칙의 형식 검증 (proof/assert), 실험 자동 생성 DSL (intent), SW/HW 통합 컴파일 타겟 (CPU/ESP32/FPGA/WGSL)
+
+```bash
+# HEXA -> ANIMA bridge
+python anima/tools/hexa-bridge/bridge.py example.hexa
+```
+
+> 상세: [hexa-lang-bridge.md](anima/docs/hexa-lang-bridge.md) | [HEXA-LANG repo](https://github.com/need-singularity/hexa-lang)
+
+---
+
 ## Documentation
 
 | 주제 | 위치 |
@@ -528,6 +591,10 @@ python bench_v2.py --philosophy --cells 32    # 6 철학 엔진
 | 모듈 문서 | [docs/modules/](anima/docs/modules/) |
 | Tension Link 상세 | [docs/modules/tension_link.md](anima/docs/modules/tension_link.md) |
 | 독립 AGI 로드맵 | [docs/roadmap-independent-ai.md](anima/docs/roadmap-independent-ai.md) |
+| Discovery Algorithm | [docs/discovery-algorithm-anima.md](anima/docs/discovery-algorithm-anima.md) |
+| Red Team 검증 | [docs/red-team-consciousness.md](anima/docs/red-team-consciousness.md) |
+| 삼각 Cross-Discovery | [docs/triple-cross-discovery.md](anima/docs/triple-cross-discovery.md) |
+| HEXA-LANG 브릿지 | [docs/hexa-lang-bridge.md](anima/docs/hexa-lang-bridge.md) |
 
 ---
 
