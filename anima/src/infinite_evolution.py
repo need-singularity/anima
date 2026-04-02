@@ -90,8 +90,7 @@ except ImportError:
 
 HAS_TELESCOPE = False
 try:
-    sys.path.insert(0, os.path.expanduser('~/Dev/TECS-L/.shared'))
-    from telescope import Telescope
+    import telescope_rs
     HAS_TELESCOPE = True
 except ImportError:
     pass
@@ -172,11 +171,11 @@ FRUSTRATION_VALUES = [0.1, 0.2, 0.33, 0.5]
 # ═══════════════════════════════════════════════════════════════════════
 
 def _telescope_discover(engine, steps=50):
-    """Run engine for `steps` steps, collect cell states, and analyze with 9-lens Telescope.
+    """Run engine for `steps` steps, collect cell states, and analyze with telescope_rs.
 
     v11 #89: Collect cell state snapshots every 10 steps, flatten into
-    (N_snapshots, N_cells * hidden_dim) ndarray, run Telescope.full_scan().
-    Convert lens findings into PatternRegistry-compatible pattern dicts.
+    (N_snapshots, N_cells * hidden_dim) ndarray, run telescope_rs scans.
+    Convert findings into PatternRegistry-compatible pattern dicts.
 
     Returns list of pattern dicts, or [] on any failure.
     """
@@ -219,57 +218,84 @@ def _telescope_discover(engine, steps=50):
             indices = np.linspace(0, data.shape[0] - 1, max_snapshots, dtype=int)
             data = data[indices]
 
-        # Run telescope full scan
-        telescope = Telescope()
-        result = telescope.full_scan(data)
+        # Run telescope_rs scans
+        n_cells = getattr(engine, 'n_cells', 64)
+        consciousness = telescope_rs.consciousness_scan(data, n_cells=n_cells, steps=steps)
+        topology = telescope_rs.topology_scan(data)
+        causal = telescope_rs.causal_scan(data)
 
-        # Convert telescope results to pattern dicts
+        # Convert scan results to pattern dicts
         patterns = []
-        for lens_name, lens_result in result.lens_results.items():
-            # Extract summary as a finding
-            summary = getattr(lens_result, 'summary', str(lens_result))
-            if summary:
-                first_line = summary.split('\n')[0][:120] if summary else ''
-                patterns.append({
-                    'type': f'telescope_{lens_name}',
-                    'formula': f'{lens_name}: {first_line}',
-                    'metrics': [lens_name],
-                    'source': 'telescope_v11',
-                })
 
-            # Extract individual discoveries if available
-            discoveries = getattr(lens_result, 'discoveries', None)
-            if discoveries and isinstance(discoveries, list):
-                for disc in discoveries[:5]:  # limit per lens
-                    desc = str(disc)[:120] if disc else ''
-                    patterns.append({
-                        'type': f'telescope_{lens_name}',
-                        'formula': f'{lens_name}_discovery: {desc}',
-                        'metrics': [lens_name],
-                        'source': 'telescope_v11',
-                    })
+        # Consciousness scan patterns
+        phi_iit = consciousness.get('phi_iit', 0)
+        phi_proxy = consciousness.get('phi_proxy', 0)
+        n_clusters = consciousness.get('n_clusters', 0)
+        patterns.append({
+            'type': 'telescope_consciousness',
+            'formula': f'consciousness: phi_iit={phi_iit:.4f}, phi_proxy={phi_proxy:.4f}, clusters={n_clusters}',
+            'metrics': ['consciousness'],
+            'source': 'telescope_v11',
+        })
 
-            # Extract anomalies if available
-            anomalies = getattr(lens_result, 'anomalies', None)
-            if anomalies and isinstance(anomalies, list):
-                patterns.append({
-                    'type': f'telescope_{lens_name}_anomaly',
-                    'formula': f'{lens_name}_anomaly: {len(anomalies)} anomalies detected',
-                    'metrics': [lens_name],
-                    'source': 'telescope_v11',
-                })
+        # Consciousness anomalies
+        anomaly_indices = consciousness.get('anomaly_indices', [])
+        if anomaly_indices:
+            patterns.append({
+                'type': 'telescope_consciousness_anomaly',
+                'formula': f'consciousness_anomaly: {len(anomaly_indices)} anomalies detected',
+                'metrics': ['consciousness'],
+                'source': 'telescope_v11',
+            })
 
-        # Add cross-findings as high-value patterns
-        for cf in result.cross_findings:
-            confirmed_by = cf.get('confirmed_by', [])
-            cf_type = cf.get('type', 'cross')
-            confidence = cf.get('confidence', 0)
+        # Topology scan patterns
+        betti_0 = topology.get('betti_0', 0)
+        betti_1 = topology.get('betti_1', 0)
+        n_holes = topology.get('n_holes', 0)
+        optimal_scale = topology.get('optimal_scale', 0)
+        patterns.append({
+            'type': 'telescope_topology',
+            'formula': f'topology: betti_0={betti_0}, betti_1={betti_1}, holes={n_holes}, scale={optimal_scale:.4f}',
+            'metrics': ['topology'],
+            'source': 'telescope_v11',
+        })
+
+        phase_transitions = topology.get('phase_transitions', [])
+        if phase_transitions:
+            patterns.append({
+                'type': 'telescope_topology',
+                'formula': f'topology_discovery: {len(phase_transitions)} phase transitions',
+                'metrics': ['topology'],
+                'source': 'telescope_v11',
+            })
+
+        # Causal scan patterns
+        n_causal_pairs = causal.get('n_causal_pairs', 0)
+        causes = causal.get('causes', [])
+        effects = causal.get('effects', [])
+        patterns.append({
+            'type': 'telescope_causal',
+            'formula': f'causal: {n_causal_pairs} pairs, {len(causes)} causes, {len(effects)} effects',
+            'metrics': ['causal'],
+            'source': 'telescope_v11',
+        })
+
+        # Cross-scan consensus: if all 3 scans produced meaningful results
+        active_scans = []
+        if phi_iit > 0 or n_clusters > 0:
+            active_scans.append('consciousness')
+        if betti_0 > 0 or n_holes > 0:
+            active_scans.append('topology')
+        if n_causal_pairs > 0:
+            active_scans.append('causal')
+
+        if len(active_scans) >= 3:
             patterns.append({
                 'type': 'telescope_cross',
-                'formula': f'cross_{cf_type}: confirmed by {",".join(confirmed_by)} (conf={confidence:.2f})',
-                'metrics': confirmed_by,
+                'formula': f'cross_consensus: confirmed by {",".join(active_scans)} (conf=1.00)',
+                'metrics': active_scans,
                 'source': 'telescope_v11',
-                'confidence': confidence,
+                'confidence': 1.0,
             })
 
         return patterns
