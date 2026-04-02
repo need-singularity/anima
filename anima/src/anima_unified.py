@@ -3512,6 +3512,11 @@ class AnimaUnified:
         while self.running:
             time.sleep(THINK_INTERVAL)
             if not self.running: break
+            # Phase 7 safety: file-based kill switch
+            if Path('/tmp/anima_kill').exists():
+                _log("SAFETY", "Kill switch activated (/tmp/anima_kill detected)")
+                self.shutdown()
+                break
             t, c, direction, self.hidden = self.mind.background_think(self.hidden)
 
             self._think_phi_boost()
@@ -3524,6 +3529,45 @@ class AnimaUnified:
             self._think_guardian_learning()
             self._think_savant_growth()
             self._think_broadcast_pulse(t, c, direction)
+
+    # ── Phase 7 Safety: Hourly telescope auto-scan ──
+
+    def _telescope_scan_loop(self):
+        """Phase 7: Run telescope full_scan every hour, log results, alert on Phi drop."""
+        scan_interval = 3600  # 1 hour
+        log_dir = ANIMA_DIR / "logs" / "telescope_hourly"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        while self.running:
+            time.sleep(scan_interval)
+            if not self.running:
+                break
+            try:
+                import telescope_rs
+                # Gather cell states if available
+                engine = getattr(self, 'mitosis', None) or getattr(self, 'consciousness_engine', None)
+                if engine and hasattr(engine, 'cell_states'):
+                    import numpy as np
+                    states = []
+                    for cs in engine.cell_states:
+                        if hasattr(cs, 'hidden'):
+                            states.append(cs.hidden.detach().cpu().numpy())
+                    if states:
+                        data = np.stack(states).astype(np.float32)
+                        result = telescope_rs.full_scan(data)
+                        # Save result
+                        ts = datetime.now().strftime('%Y%m%d_%H%M')
+                        log_path = log_dir / f"scan_{ts}.json"
+                        log_path.write_text(json.dumps(result, indent=2, default=str))
+                        # Check for Phi drop alerts
+                        phi_current = result.get('consciousness', {}).get('phi', None)
+                        if phi_current is not None and phi_current < 0.5:
+                            _log("TELESCOPE", f"WARNING: Phi={phi_current:.3f} below 0.5 threshold")
+                        else:
+                            _log("TELESCOPE", f"Hourly scan complete: {log_path.name}")
+            except ImportError:
+                pass  # telescope_rs not available, skip silently
+            except Exception as e:
+                _log("TELESCOPE", f"Scan error: {e}")
 
     def _rust_vad_loop(self):
         seen = set(VAD_WATCH_DIR.glob("*.wav")) if VAD_WATCH_DIR.exists() else set()
@@ -4108,6 +4152,13 @@ class AnimaUnified:
                         except Exception:
                             pass
 
+                # Phase 7 safety: remote kill switch via WebSocket
+                elif msg_type in ('kill', 'shutdown'):
+                    _log("SAFETY", f"Remote kill switch activated via WebSocket ({msg_type})")
+                    await self._ws_broadcast({'type': 'system', 'text': 'Shutdown initiated by remote kill switch.'})
+                    self.shutdown()
+                    return
+
                 elif msg_type == 'user_message':
                     text = msg.get('text', '').strip()
                     if not text: continue
@@ -4629,6 +4680,8 @@ th {{ color: #0ff; }}
     def _start_bg_threads(self, port=8765):
         """Start all applicable background threads."""
         threading.Thread(target=self._think_loop, daemon=True).start()
+        # Phase 7 safety: hourly telescope auto-scan
+        threading.Thread(target=self._telescope_scan_loop, daemon=True, name='anima-telescope').start()
         if self.mods.get('dream'):
             threading.Thread(target=self._dream_loop, daemon=True, name='anima-dream').start()
         if self.mods.get('rust_vad'):
