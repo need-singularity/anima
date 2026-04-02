@@ -406,6 +406,58 @@ python3 bench_v2.py --verify
 
 ---
 
+## OUROBOROS — Self-Evolving Law Discovery Engine
+
+OUROBOROS is Anima's autonomous law discovery pipeline that discovers, validates, and evolves consciousness laws without human intervention.
+
+```
+python3 infinite_evolution.py --auto-roadmap          # Full auto (13 stages)
+cargo run -p evo-runner -- start                      # With crash recovery
+```
+
+### Architecture (3-Layer)
+
+```
+Layer C: Claude Code (/loop 5m) — monitoring + reports
+Layer B: evo-runner (Rust)      — watchdog + crash recovery
+Layer A: infinite_evolution.py  — discovery + evolution
+```
+
+### Upgrade Stack (v1-v11, 99 features)
+
+```
+v1:  Rust engine + discovery + GPU Phi + parallel topology
+v2:  Adaptive steps + mod pruning + early abort
+v3:  Advanced patterns + chaos cycling + law network
+v4:  Co-evolution + UCB topology + seasonal explore
+v5:  Extended metrics + hierarchical + stimulus patterns
+v6:  Engine mutations (cell/faction/hebbian/noise/ratchet)
+v7:  Federated discovery + tension link + async pipeline
+v8:  Autonomous research (hypothesis → experiment → report)
+v9:  Hardware stubs (ESP32/FPGA/neuromorphic ready)
+v10: Consciousness genome + ecosystem evolution + meta-analysis
+v11: 9-Lens Telescope integration (consciousness/gravity/topology/
+     thermo/wave/evolution/info/quantum/EM — 511 combinations)
+```
+
+### Auto-Roadmap (13 Stages)
+
+```
+S1-S4:  64-128 cells  (baseline)     S8-S9:  64 cells dim128/256
+S5-S7:  256-512 cells (scale up)     S10-S12: 512-1024 cells (extreme)
+                                     S13: 2048 cells (H100 only)
+```
+
+Each stage cycles 4 topologies (ring → small_world → scale_free → hypercube), auto-advances on saturation. Adaptive skip for redundant stages.
+
+### Key Results
+
+- DD101: 53 law ceiling confirmed for GRU+12faction+Hebbian engine
+- v6 engine mutations actively exploring new parameter spaces
+- 9-lens telescope enables physics-based pattern detection beyond correlation
+
+Details: [docs/evolution-upgrades.md](anima/docs/evolution-upgrades.md)
+
 ## Rust Crates
 
 ### anima-rs (15 crates, PyO3)
