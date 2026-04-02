@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     agent_group.add_argument("--enable-learning", action="store_true", default=False,
                              help="Enable online learning")
     agent_group.add_argument("--provider", type=str, default=None,
-                             help="LLM provider (claude, consciouslm, etc.)")
+                             help="LLM provider: animalm (default, no API), claude, conscious-lm")
 
     # Logging
     parser.add_argument("--verbose", "-v", action="store_true",

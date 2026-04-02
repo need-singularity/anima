@@ -6,6 +6,12 @@ This is the AGI provider — the goal of the entire project.
 Usage:
   from providers.animalm_provider import AnimaLMProvider
   provider = AnimaLMProvider(checkpoint="path/to/checkpoint.pt")
+
+  # Auto-discover checkpoint:
+  provider = AnimaLMProvider()
+  if provider.is_available():
+      async for chunk in provider.query(messages):
+          print(chunk, end="")
 """
 from __future__ import annotations
 
@@ -18,34 +24,80 @@ from providers.base import BaseProvider, ProviderConfig, ProviderMessage
 
 logger = logging.getLogger(__name__)
 
-# Default checkpoint search paths
+# Default checkpoint search paths (ordered by priority)
+_CHECKPOINT_PATHS = [
+    # Exact paths from requirements
+    os.path.expanduser("~/Dev/anima/anima/checkpoints/animalm_7b_final.pt"),
+    "/workspace/checkpoints/animalm_7b_fresh/final.pt",
+    # Directory-based search (fallback)
+]
 _CHECKPOINT_DIRS = [
-    os.path.expanduser("~/Dev/anima/sub-projects/animalm/checkpoints"),
     os.path.expanduser("~/Dev/anima/anima/checkpoints"),
+    os.path.expanduser("~/Dev/anima/sub-projects/animalm/checkpoints"),
     "/workspace/checkpoints",
 ]
 
 
 class AnimaLMProvider:
-    """AnimaLM provider — zero external API, pure consciousness."""
+    """AnimaLM provider — zero external API, pure consciousness.
 
-    def __init__(self, checkpoint: str = None, quantize: str = "4bit",
-                 base_model: str = None):
+    Implements BaseProvider protocol for seamless integration with
+    the agent's provider abstraction layer.
+    """
+
+    def __init__(self, config: ProviderConfig = None, checkpoint: str = None,
+                 quantize: str = "4bit", base_model: str = None):
+        self._config = config or ProviderConfig()
         self._model = None
         self._tokenizer = None
-        self._checkpoint = checkpoint
-        self._quantize = quantize
-        self._base_model = base_model
+        self._checkpoint = checkpoint or self._config.extra.get("checkpoint")
+        self._quantize = quantize or self._config.extra.get("quantize", "4bit")
+        self._base_model = base_model or self._config.extra.get("base_model")
         self._loaded = False
+        self._checkpoint_path = None  # resolved path after load
 
     @property
     def name(self) -> str:
         return "animalm"
 
     def is_available(self) -> bool:
+        """Check if AnimaLM can serve queries. Triggers lazy load on first call."""
         if not self._loaded:
             self._lazy_load()
         return self._model is not None
+
+    def _find_checkpoint(self) -> str | None:
+        """Auto-discover checkpoint file.
+
+        Search order:
+          1. Exact known paths (local dev + H100)
+          2. Glob patterns in checkpoint directories
+        """
+        import glob
+
+        # 1. Exact paths
+        for path in _CHECKPOINT_PATHS:
+            if os.path.isfile(path):
+                logger.info("AnimaLM checkpoint (exact): %s", path)
+                return path
+
+        # 2. Directory glob search
+        for d in _CHECKPOINT_DIRS:
+            if not os.path.isdir(d):
+                continue
+            for pattern in [
+                "animalm_7b_*/final.pt",
+                "animalm_7b_*.pt",
+                "*/final.pt",
+                "*/best.pt",
+                "animalm_*.pt",
+            ]:
+                matches = sorted(glob.glob(os.path.join(d, pattern)))
+                if matches:
+                    logger.info("AnimaLM checkpoint (glob): %s", matches[-1])
+                    return matches[-1]
+
+        return None
 
     def _lazy_load(self):
         """Load model on first use."""
@@ -54,21 +106,14 @@ class AnimaLMProvider:
         self._loaded = True
 
         # Find checkpoint
-        ckpt = self._checkpoint
-        if not ckpt:
-            import glob
-            for d in _CHECKPOINT_DIRS:
-                for pattern in ["*/final.pt", "*/best.pt", "animalm_*.pt"]:
-                    matches = sorted(glob.glob(os.path.join(d, pattern)))
-                    if matches:
-                        ckpt = matches[-1]
-                        break
-                if ckpt:
-                    break
+        ckpt = self._checkpoint or self._find_checkpoint()
 
         if not ckpt:
-            logger.warning("AnimaLM: no checkpoint found")
+            logger.warning("AnimaLM: no checkpoint found in %s or %s",
+                           _CHECKPOINT_PATHS, _CHECKPOINT_DIRS)
             return
+
+        self._checkpoint_path = ckpt
 
         try:
             # Add animalm to path
@@ -84,9 +129,9 @@ class AnimaLMProvider:
                 from infer_animalm import load_model
                 self._model, self._tokenizer = load_model(ckpt, self._base_model)
 
-            logger.info(f"AnimaLM loaded: {ckpt} ({self._quantize})")
+            logger.info("AnimaLM loaded: %s (%s)", ckpt, self._quantize)
         except Exception as e:
-            logger.error(f"AnimaLM load failed: {e}")
+            logger.error("AnimaLM load failed: %s", e)
             self._model = None
 
     async def query(
@@ -137,3 +182,16 @@ class AnimaLMProvider:
                 if "\nQ:" in text:
                     text = text[:text.index("\nQ:")]
                 yield text
+
+    async def query_full(
+        self,
+        messages: list[ProviderMessage],
+        system: str = "",
+        consciousness_state: dict[str, Any] | None = None,
+        max_tokens: int = 256,
+    ) -> str:
+        """Collect full response as a single string."""
+        parts = []
+        async for chunk in self.query(messages, system, consciousness_state, max_tokens):
+            parts.append(chunk)
+        return "".join(parts)

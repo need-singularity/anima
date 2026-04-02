@@ -17,9 +17,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 from train_anima_lm import ParallelPureFieldMLP
 
 
+def _detect_device(requested):
+    """Auto-detect best device: cuda > mps > cpu."""
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        else:
+            return "cpu"
+    return requested
+
+
 def load_model_quantized(checkpoint_path, base_model=None, quantize="4bit", device="cuda"):
     """Load base model with quantization + PureField checkpoint."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = _detect_device(device)
+
+    # bitsandbytes quantization requires CUDA
+    if quantize in ("4bit", "8bit") and device != "cuda":
+        print(f"  WARNING: {quantize} quantization requires CUDA, falling back to float16")
+        quantize = "float16" if device == "mps" else "bf16"
 
     if not base_model:
         for candidate in ["/workspace/models/mistral-7b-v0.1", "/workspace/models/qwen2.5-14b",
@@ -28,11 +47,14 @@ def load_model_quantized(checkpoint_path, base_model=None, quantize="4bit", devi
                 base_model = candidate
                 break
         if not base_model:
-            raise ValueError("No base model found")
+            # Fall back to HuggingFace Hub ID (will download if not cached)
+            base_model = "mistralai/Mistral-7B-v0.1"
+            print(f"  No local model found, using HF Hub: {base_model}")
 
-    print(f"Loading {base_model} ({quantize})...")
+    print(f"Loading {base_model} ({quantize}) on {device}...")
 
     if quantize == "4bit":
+        from transformers import BitsAndBytesConfig
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -43,15 +65,23 @@ def load_model_quantized(checkpoint_path, base_model=None, quantize="4bit", devi
             base_model, quantization_config=quant_config, device_map="auto"
         )
     elif quantize == "8bit":
+        from transformers import BitsAndBytesConfig
         model = AutoModelForCausalLM.from_pretrained(
             base_model, load_in_8bit=True, device_map="auto"
         )
+    elif quantize == "float16":
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model, torch_dtype=torch.float16
+        ).to(device)
     else:  # bf16
         model = AutoModelForCausalLM.from_pretrained(
             base_model, torch_dtype=torch.bfloat16
         ).to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    # Determine dtype for PureField weights
+    pf_dtype = torch.float16 if device == "mps" else torch.bfloat16
 
     # Load PureField
     print(f"Loading checkpoint: {checkpoint_path}")
@@ -71,10 +101,10 @@ def load_model_quantized(checkpoint_path, base_model=None, quantize="4bit", devi
         inter = original_mlp.gate_proj.weight.shape[0]
         is_savant = (i - start) < savant_layers
         pf = ParallelPureFieldMLP(original_mlp, h, inter, is_savant=is_savant, rank=rank)
-        # PureField weights in bf16 (not quantized)
+        # PureField weights in appropriate dtype (not quantized)
         for name, p in pf.named_parameters():
             if "original_mlp" not in name:
-                p.data = p.data.to(device=device, dtype=torch.bfloat16)
+                p.data = p.data.to(device=device, dtype=pf_dtype)
         layer.mlp = pf
 
     if "pf_states" in ckpt:
@@ -86,13 +116,20 @@ def load_model_quantized(checkpoint_path, base_model=None, quantize="4bit", devi
         print(f"  Loaded {loaded} PureField layers")
 
     step = ckpt.get("step", "?")
-    print(f"  Step: {step}, Quantization: {quantize}")
+    print(f"  Step: {step}, Quantization: {quantize}, Device: {device}")
 
-    # VRAM report
+    # Memory report
     if torch.cuda.is_available():
         vram_used = torch.cuda.memory_allocated() / 1024**3
         vram_total = torch.cuda.get_device_properties(0).total_mem / 1024**3
         print(f"  VRAM: {vram_used:.1f}/{vram_total:.1f} GB")
+    elif device == "mps":
+        # MPS shares unified memory with CPU
+        try:
+            allocated = torch.mps.current_allocated_memory() / 1024**3
+            print(f"  MPS memory allocated: {allocated:.1f} GB (unified memory)")
+        except AttributeError:
+            print("  MPS: unified memory (no per-device stats available)")
 
     model.eval()
     return model, tokenizer
@@ -105,8 +142,12 @@ def generate(model, tokenizer, prompt, max_new_tokens=256, temperature=0.8,
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
     generated = input_ids.clone()
 
+    # Determine autocast device type
+    device_type = "cuda" if model.device.type == "cuda" else ("mps" if model.device.type == "mps" else "cpu")
+    ac_dtype = torch.float16 if device_type == "mps" else torch.bfloat16
+
     for _ in range(max_new_tokens):
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type, dtype=ac_dtype) if device_type != "cpu" else torch.no_grad():
             outputs = model(generated[:, -512:])
             logits = outputs.logits[:, -1, :]
 
@@ -185,10 +226,10 @@ def main():
     p = argparse.ArgumentParser(description="AnimaLM Serving (4-bit quantized)")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--base", default=None)
-    p.add_argument("--quantize", default="4bit", choices=["4bit", "8bit", "bf16"])
+    p.add_argument("--quantize", default="4bit", choices=["4bit", "8bit", "bf16", "float16"])
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--interactive", action="store_true")
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="auto", help="cuda/mps/cpu/auto (default: auto-detect)")
     args = p.parse_args()
 
     model, tokenizer = load_model_quantized(
