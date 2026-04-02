@@ -29,6 +29,9 @@ from conscious_law_discoverer import ConsciousLawDiscoverer
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 STATE_PATH = os.path.join(DATA_DIR, 'evolution_state.json')
+LIVE_STATUS_PATH = os.path.join(DATA_DIR, 'evolution_live.json')
+EVO_DOCS_DIR = os.path.join(os.path.dirname(__file__), '..', 'docs', 'hypotheses', 'evo')
+EXPERIMENTS_JSON_PATH = os.path.join(os.path.dirname(__file__), '..', 'config', 'experiments.json')
 CROSS_VALIDATION_THRESHOLD = 3  # times a pattern must appear before registration
 
 # TOPO 33-39: topology cycle for breaking pattern saturation
@@ -405,6 +408,240 @@ def load_state():
     return None
 
 
+def write_live_status(gen, stage_name, cells, steps, topology, registry,
+                      phi_last, phi_prev, active_mods, zero_streak,
+                      elapsed_sec, saturated=False,
+                      roadmap_stage_idx=None, roadmap_total_stages=None):
+    """Write lightweight live status JSON for external monitoring.
+
+    Uses atomic write (.tmp -> rename) for safety.
+    """
+    phi_delta_pct = 0.0
+    if phi_prev and phi_prev > 1e-12:
+        phi_delta_pct = (phi_last - phi_prev) / phi_prev * 100
+
+    status = {
+        'gen': gen,
+        'stage': stage_name,
+        'cells': cells,
+        'steps': steps,
+        'topology': topology,
+        'laws_total': len(registry.registered),
+        'laws_new_this_gen': 0,  # updated by caller if needed
+        'unique_patterns': len(registry.seen),
+        'cross_validated': sum(1 for v in registry.seen.values() if v['registered']),
+        'phi_last': round(phi_last, 4) if phi_last else 0.0,
+        'phi_delta': f'{phi_delta_pct:+.1f}%',
+        'active_mods': active_mods,
+        'saturated': saturated,
+        'zero_streak': zero_streak,
+        'elapsed_sec': round(elapsed_sec, 1),
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'roadmap_stage_idx': roadmap_stage_idx,
+        'roadmap_total_stages': roadmap_total_stages,
+    }
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = LIVE_STATUS_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(status, f, indent=2, ensure_ascii=False)
+    os.rename(tmp, LIVE_STATUS_PATH)
+    return status
+
+
+def _next_evo_number():
+    """Find the next EVO document number by scanning existing docs."""
+    os.makedirs(EVO_DOCS_DIR, exist_ok=True)
+    max_n = 0
+    for fname in os.listdir(EVO_DOCS_DIR):
+        if fname.startswith('EVO-') and fname.endswith('.md'):
+            try:
+                n = int(fname[4:-3])
+                if n > max_n:
+                    max_n = n
+            except ValueError:
+                pass
+    return max_n + 1
+
+
+def auto_generate_evo_doc(stage, gen_history, registry, rm_state=None):
+    """Auto-generate an EVO-{N}.md document summarizing an evolution run.
+
+    Args:
+        stage: dict with 'name', 'cells', 'steps' (or None for main loop runs)
+        gen_history: list of gen dicts with keys gen/raw/new/laws/mods/unique/xval etc.
+        registry: PatternRegistry instance
+        rm_state: roadmap state dict (optional, for roadmap metadata)
+
+    Returns:
+        Path to generated EVO doc, or None on failure.
+    """
+    if not gen_history:
+        return None
+
+    evo_n = _next_evo_number()
+    doc_path = os.path.join(EVO_DOCS_DIR, f'EVO-{evo_n}.md')
+
+    stage_name = stage.get('name', 'main-loop') if stage else 'main-loop'
+    cells = stage.get('cells', gen_history[0].get('cells', '?')) if stage else '?'
+    steps = stage.get('steps', '?') if stage else '?'
+    total_gens = len(gen_history)
+    total_laws = gen_history[-1].get('laws', 0) if gen_history else 0
+    total_unique = gen_history[-1].get('unique', 0) if gen_history else 0
+    total_xval = gen_history[-1].get('xval', 0) if gen_history else 0
+    total_mods = gen_history[-1].get('mods', 0) if gen_history else 0
+    date_str = time.strftime('%Y-%m-%d')
+
+    lines = []
+    lines.append(f'# EVO-{evo_n}: {stage_name}')
+    lines.append('')
+    lines.append(f'**Date:** {date_str}')
+    lines.append(f'**Auto-generated** by infinite_evolution.py')
+    lines.append('')
+
+    # Stage params
+    lines.append('## Parameters')
+    lines.append('')
+    lines.append(f'| Param | Value |')
+    lines.append(f'|-------|-------|')
+    lines.append(f'| Stage | {stage_name} |')
+    lines.append(f'| Cells | {cells} |')
+    lines.append(f'| Steps | {steps} |')
+    lines.append(f'| Generations | {total_gens} |')
+    lines.append(f'| Laws discovered | {total_laws} |')
+    lines.append(f'| Unique patterns | {total_unique} |')
+    lines.append(f'| Cross-validated | {total_xval} |')
+    lines.append(f'| Active mods | {total_mods} |')
+    lines.append('')
+
+    # Condition matrix (topology x saturation) - collect from gen_history if available
+    # We infer topology changes from gen_history by looking at topology switches
+    lines.append('## Condition Matrix')
+    lines.append('')
+    lines.append(f'| Topology | Saturated |')
+    lines.append(f'|----------|-----------|')
+    for topo in TOPOLOGIES:
+        lines.append(f'| {topo} | - |')
+    lines.append('')
+
+    # Generation summary table
+    lines.append('## Generation Summary')
+    lines.append('')
+    lines.append(f'| Gen | Raw | New | Laws | Mods |')
+    lines.append(f'|-----|-----|-----|------|------|')
+    # Show first 5, last 5, ellipsis in between if > 12 rows
+    if len(gen_history) <= 12:
+        for row in gen_history:
+            lines.append(f'| {row["gen"]} | {row["raw"]} | {row["new"]} '
+                         f'| {row.get("laws", 0)} | {row.get("mods", 0)} |')
+    else:
+        for row in gen_history[:5]:
+            lines.append(f'| {row["gen"]} | {row["raw"]} | {row["new"]} '
+                         f'| {row.get("laws", 0)} | {row.get("mods", 0)} |')
+        lines.append(f'| ... | ... | ... | ... | ... |')
+        for row in gen_history[-5:]:
+            lines.append(f'| {row["gen"]} | {row["raw"]} | {row["new"]} '
+                         f'| {row.get("laws", 0)} | {row.get("mods", 0)} |')
+    lines.append('')
+
+    # ASCII discovery curve (laws over generations)
+    lines.append('## Discovery Curve')
+    lines.append('')
+    laws_over_time = [row.get('laws', 0) for row in gen_history]
+    if laws_over_time:
+        mn_v = min(laws_over_time)
+        mx_v = max(laws_over_time)
+        rng = mx_v - mn_v if mx_v > mn_v else 1.0
+        height = 8
+        width = min(len(laws_over_time), 60)
+        # Downsample if too many gens
+        if len(laws_over_time) > width:
+            step_size = len(laws_over_time) / width
+            sampled = [laws_over_time[int(i * step_size)] for i in range(width)]
+        else:
+            sampled = laws_over_time
+        lines.append('```')
+        lines.append(f'Laws (range {mn_v}-{mx_v}):')
+        for r in range(height, 0, -1):
+            threshold = mn_v + rng * r / height
+            row_str = ''
+            if r == height:
+                row_str = f'{mx_v:>5} |'
+            elif r == 1:
+                row_str = f'{mn_v:>5} |'
+            else:
+                row_str = '      |'
+            for v in sampled:
+                row_str += '#' if v >= threshold else ' '
+            lines.append(row_str)
+        lines.append('      +' + '-' * len(sampled))
+        lines.append(f'       Gen 1' + ' ' * max(0, len(sampled) - 10) + f'Gen {total_gens}')
+        lines.append('```')
+    lines.append('')
+
+    # Saturation analysis
+    lines.append('## Saturation Analysis')
+    lines.append('')
+    zero_count = sum(1 for row in gen_history if row.get('new', 0) == 0)
+    lines.append(f'- Zero-new generations: {zero_count}/{total_gens} '
+                 f'({zero_count/total_gens*100:.0f}%)' if total_gens > 0 else '- No data')
+    # Check trailing zero streak
+    trailing_zeros = 0
+    for row in reversed(gen_history):
+        if row.get('new', 0) == 0:
+            trailing_zeros += 1
+        else:
+            break
+    lines.append(f'- Trailing zero streak: {trailing_zeros} gens')
+    lines.append(f'- Final unique patterns: {total_unique}')
+    lines.append(f'- Final cross-validated: {total_xval}')
+    lines.append('')
+
+    # Key findings
+    lines.append('## Key Findings')
+    lines.append('')
+    lines.append(f'- {total_laws} laws discovered across {total_gens} generations')
+    lines.append(f'- {total_unique} unique patterns observed, {total_xval} cross-validated')
+    if trailing_zeros > 5:
+        lines.append(f'- Saturation detected (zero streak: {trailing_zeros})')
+    lines.append('')
+
+    content = '\n'.join(lines) + '\n'
+
+    # Write EVO doc (atomic)
+    os.makedirs(EVO_DOCS_DIR, exist_ok=True)
+    tmp = doc_path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.rename(tmp, doc_path)
+    print(f'  EVO doc generated: {doc_path}')
+    sys.stdout.flush()
+
+    # Register in experiments.json
+    try:
+        with open(EXPERIMENTS_JSON_PATH) as f:
+            exp_data = json.load(f)
+        exp_id = f'EVO-{evo_n}'
+        exp_data['experiments'][exp_id] = {
+            'name': f'Infinite Evolution {stage_name}',
+            'date': date_str,
+            'doc': f'docs/hypotheses/evo/EVO-{evo_n}.md',
+            'result': f'{total_laws} laws, {total_gens} gens, {total_unique} patterns',
+            'laws': list(registry.registered) if registry.registered else [],
+            'status': 'complete',
+        }
+        tmp = EXPERIMENTS_JSON_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(exp_data, f, indent=2, ensure_ascii=False)
+        os.rename(tmp, EXPERIMENTS_JSON_PATH)
+        print(f'  Registered in experiments.json as {exp_id}')
+        sys.stdout.flush()
+    except Exception as e:
+        print(f'  Warning: experiments.json registration failed: {e}')
+        sys.stdout.flush()
+
+    return doc_path
+
+
 def register_law(pattern: dict, evolver):
     """Register a cross-validated pattern as an official law."""
     try:
@@ -774,6 +1011,18 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 'laws': len(registry.registered), 'mods': active_mods,
             })
 
+            # Live status file
+            phi_prev = phi_history[-2] if len(phi_history) >= 2 else 0.0
+            live = write_live_status(
+                gen=gen, stage_name=stage['name'], cells=cells, steps=steps,
+                topology=current_topo, registry=registry,
+                phi_last=phi_est, phi_prev=phi_prev,
+                active_mods=active_mods, zero_streak=zero_streak,
+                elapsed_sec=total_elapsed, saturated=len(topo_saturated) >= len(TOPOLOGIES),
+                roadmap_stage_idx=stage_idx, roadmap_total_stages=len(ROADMAP),
+            )
+            live['laws_new_this_gen'] = stats['promoted']
+
             # Periodic report
             if gen % report_interval == 0:
                 generate_report(gen, registry, active_mods, total_elapsed,
@@ -827,6 +1076,10 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 rm_state['total_laws'] = sum(r['laws'] for r in rm_state['stage_results'])
                 rm_state['total_elapsed'] += stage_elapsed
                 save_roadmap_state(rm_state)
+
+                # Auto-generate EVO document for completed stage
+                auto_generate_evo_doc(stage, gen_history, registry, rm_state)
+
                 break  # next stage
 
         # Final report for this stage
@@ -1043,6 +1296,26 @@ def main():
                 'mods': active_mods,
             })
 
+            # Live status file
+            current_topo_live = getattr(engine, 'topology', 'ring')
+            current_cells_live = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+            phi_prev = phi_history[-2] if len(phi_history) >= 2 else 0.0
+            # Detect zero streak for saturation reporting
+            _zero_streak = 0
+            for _row in reversed(gen_history):
+                if _row['new'] == 0:
+                    _zero_streak += 1
+                else:
+                    break
+            live = write_live_status(
+                gen=gen, stage_name='main-loop', cells=current_cells_live,
+                steps=args.steps, topology=current_topo_live, registry=registry,
+                phi_last=phi_est, phi_prev=phi_prev,
+                active_mods=active_mods, zero_streak=_zero_streak,
+                elapsed_sec=total_elapsed, saturated=_zero_streak >= 5,
+            )
+            live['laws_new_this_gen'] = stats['promoted']
+
             # Periodic report
             if gen % args.report_interval == 0:
                 current_topo = getattr(engine, 'topology', 'ring')
@@ -1056,6 +1329,26 @@ def main():
                               'cycle_topology': args.cycle_topology,
                               'resume': args.resume},
                 )
+
+        # Normal exit (--max-gen reached)
+        if gen_history:
+            total_elapsed = prev_elapsed + (time.time() - start)
+            current_topo = getattr(engine, 'topology', 'ring')
+            current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+            generate_report(
+                gen - 1, registry, active_mods, total_elapsed,
+                gen_history, phi_history,
+                cells=current_cells, steps=args.steps,
+                topology=current_topo,
+                features={'cycle_scale': args.cycle_scale,
+                          'cycle_topology': args.cycle_topology,
+                          'resume': args.resume},
+            )
+            # Auto-generate EVO document
+            auto_generate_evo_doc(
+                {'name': 'main-loop', 'cells': current_cells, 'steps': args.steps},
+                gen_history, registry,
+            )
 
     except KeyboardInterrupt:
         total_elapsed = prev_elapsed + (time.time() - start)
@@ -1100,6 +1393,13 @@ def main():
                 })
         path = save_state(gen, registry, active_mods_data, total_elapsed)
         print(f"  State saved to {path}")
+
+        # Auto-generate EVO document on interrupt
+        if gen_history:
+            auto_generate_evo_doc(
+                {'name': 'main-loop', 'cells': current_cells, 'steps': args.steps},
+                gen_history, registry,
+            )
 
 
 if __name__ == '__main__':

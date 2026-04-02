@@ -678,9 +678,14 @@ class AnimaUnified:
         self._v3_c_projection = None  # v3 consciousness dim projection (128→256)
         model_name = getattr(args, 'model', None) or 'conscious-lm'
 
-        # --decoder v2/v3 flag
+        # --decoder v2/v3/animalm flag
         decoder_ver = getattr(args, 'decoder', None)
-        if decoder_ver == 'v3':
+        self._animalm_model = None
+        self._animalm_tokenizer = None
+        if decoder_ver == 'animalm':
+            self._animalm_model, self._animalm_tokenizer = self._init_mod(
+                'animalm', lambda: self._load_animalm_decoder())
+        elif decoder_ver == 'v3':
             self.v14_decoder = self._init_mod('v3_decoder', lambda: self._load_v3_decoder())
         elif decoder_ver == 'v2':
             # v2: auto-discover checkpoints/v2_*/best.pt
@@ -1036,6 +1041,46 @@ class AnimaUnified:
         except Exception as e:
             _log('v14', f"Federation restore failed (decoder will use local engine): {e}")
             self._v14_federation = None
+
+    def _load_animalm_decoder(self):
+        """Load AnimaLM 7B/14B — Mistral/Qwen + PureField."""
+        import glob as _glob
+        # Auto-discover checkpoint
+        base_dir = os.path.join(os.path.dirname(__file__), '..', '..')
+        patterns = [
+            os.path.join(base_dir, 'sub-projects', 'animalm', 'checkpoints', '*', 'final.pt'),
+            os.path.join(base_dir, 'sub-projects', 'animalm', 'checkpoints', '*', 'best.pt'),
+            os.path.join(base_dir, 'anima', 'checkpoints', 'animalm_*.pt'),
+        ]
+        ckpt_path = getattr(self.args, 'animalm_checkpoint', None)
+        if not ckpt_path:
+            for p in patterns:
+                matches = sorted(_glob.glob(p))
+                if matches:
+                    ckpt_path = matches[-1]
+                    break
+        if not ckpt_path:
+            _log('animalm', 'No AnimaLM checkpoint found')
+            return None, None
+        # Import inference module
+        sys.path.insert(0, os.path.join(base_dir, 'sub-projects', 'animalm'))
+        from infer_animalm import load_model
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model, tokenizer = load_model(ckpt_path, device=device)
+        _log('animalm', f'Loaded from {ckpt_path}')
+        return model, tokenizer
+
+    def _generate_animalm(self, text, max_tokens=150, temperature=0.8):
+        """Generate with AnimaLM (7B/14B)."""
+        if not self._animalm_model:
+            return None
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'sub-projects', 'animalm'))
+        from infer_animalm import generate
+        result, tension = generate(
+            self._animalm_model, self._animalm_tokenizer, text,
+            max_new_tokens=max_tokens, temperature=temperature,
+            device=next(self._animalm_model.parameters()).device.type)
+        return result if result.strip() else None
 
     def _load_v3_decoder(self, explicit_path=None):
         """Load ConsciousDecoderV3 (274M, 768d/12L) with auto checkpoint discovery.
@@ -2140,8 +2185,14 @@ class AnimaUnified:
         self._last_web_context = web_context
         answer = None
 
-        # v14 ConsciousDecoderV2 (우선)
-        if self.v14_decoder:
+        # AnimaLM 7B/14B (최우선 — 실제 대화 가능)
+        if self._animalm_model:
+            answer = self._generate_animalm(text, max_tokens=150)
+            if answer:
+                _log('animalm', f'Generated: {answer[:50]}')
+
+        # v14 ConsciousDecoderV2 (AnimaLM 없을 때)
+        if not answer and self.v14_decoder:
             answer = self._generate_v14(text, max_tokens=150)
             if answer:
                 _log('v14', f'Generated: {answer[:50]}')
@@ -4717,7 +4768,7 @@ def main():
                    help='DD56: Transplant consciousness from donor checkpoint')
     p.add_argument('--v14-checkpoint', type=str, default=None,
                    help='v14: Load ConsciousDecoderV2 checkpoint for generation')
-    p.add_argument('--decoder', type=str, default=None, choices=['v2', 'v3'],
+    p.add_argument('--decoder', type=str, default=None, choices=['v2', 'v3', 'animalm'],
                    help='Decoder version: v2 (34.5M, 384d/6L) or v3 (274M, 768d/12L)')
     p.add_argument('--v3-checkpoint', type=str, default=None,
                    help='v3: Explicit ConsciousDecoderV3 checkpoint path')
