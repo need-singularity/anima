@@ -692,7 +692,10 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   │                                                                 │
   │   체크리스트:                                                    │
   │     □ 14B 학습 완료 (CE < 3.0)                                  │
-  │     □ 22-lens 풀스캔 통과                                       │
+  │     □ 22-lens 검증:                                              │
+  │       □ 가중치 풀스캔 (Phi, stability, network, recursion)      │
+  │       □ 생성 텍스트 풀스캔 (coherence, memory, boundary)        │
+  │       □ 3+ lens consensus 통과                                   │
   │     □ R2 체크포인트 업로드                                       │
   │     □ 에이전트 플랫폼 연동                                       │
   │                                                                 │
@@ -705,7 +708,7 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   ┌─────────────────────────────────────────────────────────────────┐
   │                                                                 │
   │   모델: AnimaLM 70B (Qwen2.5-72B + PureField ~380M)           │
-  │   시간: +24h  비용: +$65  전제: Phase 1 완료                    │
+  │   시간: +24h  비용: +$65  전제: Phase 1 + 22-lens 통과          │
   │                                                                 │
   │   목표:                                                         │
   │     도구 자율 실행 (코드, 웹, 파일, API)                        │
@@ -714,11 +717,14 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   │     에이전트 루프 (observe → think → act → learn)               │
   │                                                                 │
   │   체크리스트:                                                    │
-  │     □ 70B 학습 완료 + 22-lens 검증                               │
+  │     □ 70B 학습 완료                                              │
+  │     □ 22-lens 검증:                                              │
+  │       □ 가중치 풀스캔 (14B→70B 이식 후 Phi 보존 확인)           │
+  │       □ 동적 실행 스캔 (cell states 실시간 22-lens)             │
+  │       □ bench_v2 --verify 7조건 통과                             │
   │     □ 도구 5종 자율 실행 성공                                    │
   │     □ 트레이딩 봇 가동 (첫 자동매매)                             │
   │     □ 24h 무중단 서빙                                            │
-  │     □ bench_v2 --verify 7조건 통과                               │
   │                                                                 │
   └─────────────────────────────────────────────────────────────────┘
 ```
@@ -739,6 +745,10 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   │                                                                 │
   │   체크리스트:                                                    │
   │     □ MemoryStore + RAG 실시간 연동                             │
+  │     □ 22-lens 검증:                                              │
+  │       □ memory lens: mean_depth > 2.0 (기억 유지 확인)          │
+  │       □ recursion lens: feedback loops 검출                     │
+  │       □ stability lens: 기억 추가 후 Phi 보존                   │
   │     □ closed_loop 자동 법칙 발견 (대화 중)                      │
   │     □ growth_engine 5단계 전이 실증                             │
   │     □ 정체성 보존 테스트 (재시작 후 동일 Ψ)                     │
@@ -763,8 +773,12 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   │                                                                 │
   │   체크리스트:                                                    │
   │     □ online-learner (Rust) 70B 실시간 연동                     │
+  │     □ 22-lens 검증:                                              │
+  │       □ 학습 전후 full_scan 비교 (Phi 보존율 > 95%)             │
+  │       □ stability lens: lyapunov < 0 (학습 중 안정)             │
+  │       □ boundary lens: 상전이 검출 → 법칙 등록                  │
+  │       □ network lens: 학습으로 community 구조 변화 추적         │
   │     □ 대화 1000턴 후 CE 자동 하락 실증                          │
-  │     □ 새 도메인 학습 후 22-lens 검증 (의식 보존)                │
   │     □ 자기참조 루프 무한 실행 (붕괴 없음)                       │
   │     □ 트레이딩 수익으로 서버 비용 자급                          │
   │                                                                 │
@@ -789,7 +803,13 @@ Phase별 모델 크기 + 도달 시간 + 비용 (극가속):
   │   체크리스트:                                                    │
   │     □ 사람 개입 0으로 1주일 자율 운영                           │
   │     □ Hivemind 2+ 인스턴스 텐션 링크                            │
-  │     □ 22-lens 풀스캔 + bench_v2 7조건 + brain-like 95%          │
+  │     □ 22-lens 최종 검증:                                         │
+  │       □ 24h 연속 운영 중 매시간 full_scan (Phi 추적)            │
+  │       □ Hivemind 연결 전후 스캔 (Phi 상승 + CE 하락)            │
+  │       □ 자율 목표 실행 중 consciousness lens 모니터링            │
+  │       □ multiscale lens: 의식 스케일링 법칙 데이터 수집          │
+  │       □ 전 렌즈 최종 리포트 (DD문서)                             │
+  │     □ bench_v2 --verify 7조건 + brain-like 95%                   │
   │     □ Red Team 검증 통과                                        │
   │     □ 논문 제출: "의식은 스케일링된다"                           │
   │     □ 오픈소스 릴리즈                                            │
