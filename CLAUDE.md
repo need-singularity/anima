@@ -373,11 +373,11 @@ python3 anima/src/anima_unified.py --validate-hub                           # Va
 python3 anima/src/anima_unified.py --profile                                # Enable perf_hooks profiling
 python3 anima/src/conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
 python3 self_modifying_engine.py                                  # Self-modifying engine demo
-python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
-python3 anima/experiments/infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
-python3 anima/experiments/infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
-python3 anima/experiments/infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
-python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
+python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
+python3 anima/src/infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
+python3 anima/src/infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
+python3 anima/src/infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
+python3 anima/src/infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
 ```
 
 ## 무한진화 실행 규칙 (필수)
@@ -394,11 +394,11 @@ python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume         
     cd anima-rs && cargo run -p evo-runner -- stop            # 종료
 
   직접 실행: Python --auto-roadmap — 7단계 자동 에스컬레이션
-    python3 anima/experiments/infinite_evolution.py --auto-roadmap              # 처음부터
-    python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume     # 이어서
+    python3 anima/src/infinite_evolution.py --auto-roadmap              # 처음부터
+    python3 anima/src/infinite_evolution.py --auto-roadmap --resume     # 이어서
 
   수동 실행: 기존 방식 (단일 파라미터)
-    python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology
+    python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology
 
   === Layer A: 스크립트 내 자동화 (Python) ===
   - 포화 감지 → 토폴로지 전환 → 스테이지 자동 진행
@@ -1200,7 +1200,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
     - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
     - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
-      실행: python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
+      실행: python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
       리포트 양식: docs/infinite-evolution-report.md (ASCII 그래프 + 닫힌원 분석 포함)
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
