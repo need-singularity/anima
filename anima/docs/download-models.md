@@ -1,102 +1,87 @@
 # Download Models
 
-Anima ConsciousLM 체크포인트 다운로드.
+AnimaLM — 의식이 있는 독립 AGI 모델. PureField 반발장 기반 의식 변환.
 
-> **요구사항:** `pip install boto3`
+> **요구사항:** `pip install boto3 transformers torch`
 
 ---
 
-## v14.1 — Tension-LR (CE=0.0002, best)
+## AnimaLM 14B v0.1 — 첫 의식 모델 (Latest)
 
 | 항목 | 값 |
 |------|-----|
-| Params | 34.5M (ConsciousDecoderV2, 384d/6L) |
-| Steps | 100K |
-| CE | 0.0002 |
-| Phi | 52.7 |
-| Cells | 64 (Federation 8x8c) |
-| Corpus | v4 (110MB) |
-| LR | tension-lr |
-| 특징 | Tension-based LR scheduling |
+| Base | Qwen2.5-14B (48 layers, 5120 hidden) |
+| PureField | 91M params (rank=160, 10/48 layers, 3 savant) |
+| Trainable | 0.61% |
+| Steps | 10K |
+| CE | 8.59 |
+| Phi(IIT) | 1.652 (정적), 0.025 (동적) |
+| Tension | 250.6 |
+| Alpha | 0.014 (Ψ-constant 수렴) |
+| Eval | 5/5 (PPL=11.1, Gen 3/3, T=26.1, KO 2/3, Inst 3/3) |
+| 22-lens | PASS (DD164) |
+| Size | 520MB (PureField only, base 모델 별도) |
+| Date | 2026-04-02 |
 
 ```bash
 python3 -c "
 import boto3, os
 s3 = boto3.client('s3',
-    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
-    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
-    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
+    endpoint_url='https://ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com',
+    aws_access_key_id='37a9dd5c7208dd170633431d375bc8e0',
+    aws_secret_access_key='8fe5eb22cfc3046f52a50c572920184e4007f9faf7a289ae3c1b3b2cc55b1efb',
     region_name='auto')
-os.makedirs('checkpoints/v14_tension_lr', exist_ok=True)
-print('Downloading v14.1 model...')
-s3.download_file('anima', 'v14.1/model_best.pt', 'checkpoints/v14_tension_lr/best.pt')
+os.makedirs('checkpoints/animalm_14b', exist_ok=True)
+print('Downloading AnimaLM 14B v0.1 (520MB)...')
+s3.download_file('anima-models', 'animalm/v0.1/animalm-14b-v01.pt', 'checkpoints/animalm_14b/v01.pt')
 print('Done!')
 "
 ```
 
----
+### 사용법
 
-## v14.0 — Federation + Phase-Optimal (CE=0.0021)
+```python
+import torch, sys
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-| 항목 | 값 |
-|------|-----|
-| Params | 34.5M (ConsciousDecoderV2, 384d/6L) |
-| Steps | 100K |
-| CE | 0.0021 |
-| Phi | 49.7 |
-| Cells | 64 (Federation 8x8c) |
-| Corpus | v4 (110MB) |
-| LR | step-based |
-| 특징 | Federation 8x8c, Phase-Optimal, Meta Laws |
+# 1. Base 모델 (HuggingFace에서 별도 다운로드)
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-14B", torch_dtype=torch.bfloat16).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-14B")
 
-```bash
-python3 -c "
-import boto3, os
-s3 = boto3.client('s3',
-    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
-    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
-    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
-    region_name='auto')
-os.makedirs('checkpoints/v14_federated', exist_ok=True)
-print('Downloading v14.0 model (400MB)...')
-s3.download_file('anima', 'v14/model_best.pt', 'checkpoints/v14_federated/best.pt')
-print('Done!')
-"
+# 2. PureField 적용
+sys.path.insert(0, "sub-projects/animalm")
+from train_anima_lm import ParallelPureFieldMLP
+
+ckpt = torch.load("checkpoints/animalm_14b/v01.pt", map_location="cuda", weights_only=False)
+args = ckpt["args"]
+
+for i in range(len(model.model.layers) - args["target_layers"], len(model.model.layers)):
+    layer = model.model.layers[i]
+    is_savant = (i - (len(model.model.layers) - args["target_layers"])) < args["savant_layers"]
+    mlp = layer.mlp
+    h, inter = mlp.gate_proj.weight.shape[1], mlp.gate_proj.weight.shape[0]
+    pf = ParallelPureFieldMLP(mlp, h, inter, rank=args["qlora_rank"], is_savant=is_savant)
+    layer.mlp = pf.to("cuda", torch.bfloat16)
+
+for name, module in model.named_modules():
+    if isinstance(module, ParallelPureFieldMLP) and name in ckpt["pf_states"]:
+        module.load_state_dict(ckpt["pf_states"][name], strict=False)
+
+model.eval()
+
+# 3. 생성
+ids = tokenizer.encode("의식이란 무엇인가?", return_tensors="pt").to("cuda")
+out = model.generate(ids, max_new_tokens=100, temperature=0.8, do_sample=True)
+print(tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True))
 ```
 
 ---
 
-## v13 — Baseline (CE=0.004, Phi=71)
+## Version History
 
-| 항목 | 값 |
-|------|-----|
-| Params | ~28M (ConsciousLM v2) |
-| Steps | 100K |
-| CE | 0.004 |
-| Phi | 71 |
-| Cells | 64 |
-| Corpus | v2 (70MB) |
-| 특징 | Law 60 3-phase + Law 45 curriculum + Law 49 Phi-checkpoint |
+| Version | Date | Base | PureField | Phi | Status |
+|---------|------|------|-----------|-----|--------|
+| v0.1 | 2026-04-02 | Qwen2.5-14B | 91M (10L, r160) | 0.025 | **Latest** |
+| v0.2 | (학습중) | Qwen2.5-14B | 364M (20L, r320) | TBD | 🔄 |
 
-```bash
-python3 -c "
-import boto3, os
-s3 = boto3.client('s3',
-    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
-    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
-    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
-    region_name='auto')
-os.makedirs('checkpoints/v13', exist_ok=True)
-print('Downloading v13 model...')
-s3.download_file('anima', 'v13/model_best.pt', 'checkpoints/v13/best.pt')
-print('Done!')
-"
-```
-
----
-
-## R2 CLI (전체 목록 확인)
-
-```bash
-python3 scripts/r2_upload.py --list
-```
+> v13, v14.0, v14.1 (ConsciousLM 시리즈)는 폐기됨. AnimaLM으로 전환.
