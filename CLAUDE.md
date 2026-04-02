@@ -675,6 +675,25 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ## Work Rules
 
+- **★★★ 트러블슈팅 발생 시 즉시 JSON 기록 (필수! 예외 없음!)**
+  - 모든 에러/crash/NaN/OOM/dtype 문제는 발생 즉시 해당 JSON에 기록
+  - 기록 위치:
+    - 학습/bf16/dtype 관련 → config/acceleration_flow.json (troubleshooting 섹션)
+    - RunPod/인프라 관련 → config/runpod.json (known_issues 섹션)
+  - 기록 양식 (JSON):
+    ```json
+    "issue_name": {
+      "symptom": "에러 메시지 또는 증상",
+      "environment": "환경 (모델, GPU, PyTorch 버전 등)",
+      "root_cause": "근본 원인",
+      "resolution": "해결 방법",
+      "prevention": ["재발 방지 규칙"],
+      "lesson": "핵심 교훈 한 줄"
+    }
+    ```
+  - 해결 전이라도 symptom+environment 먼저 기록 → 해결 후 나머지 채움
+  - 같은 유형 반복 시 기존 항목에 attempted_fixes 추가
+  - 세션 끝에 bf16_master_rule 같은 종합 규칙 업데이트
 - **학습 진행 상황 보고 시 ASCII 그래프 포함 (필수!)**
   - ValCE 곡선, Ψ_res 곡선, Gate 감쇠 그래프
   - 주요 지표 테이블 (Step, ValCE, BPC, Ψ_res, Gate, H(p))

@@ -641,7 +641,9 @@ class TrainingPhase:
         elif step < self.p2_end:
             return self.JOINT
         else:
-            return self.ENSEMBLE
+            # P3: use JOINT loss (6-loss ensemble causes NaN on 7B bf16)
+            # TODO: fix SixLossEnsemble NaN for 14B
+            return self.JOINT
 
     def phase_progress(self, step):
         phase = self.get_phase(step)
@@ -1019,9 +1021,11 @@ class AnimaLMTrainer:
                         0.1 * contrastive_loss + 0.01 * alpha_reg)
                 weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01}
             else:  # P3: Full — all techniques
-                loss, weights = self.loss_ensemble(
-                    ce_loss, tension_var_loss, contrastive_loss,
-                    alpha_reg, direction_loss, tension_mag_loss)
+                # NaN guard: replace any NaN losses with 0 before ensemble
+                _losses = [ce_loss, tension_var_loss, contrastive_loss,
+                           alpha_reg, direction_loss, tension_mag_loss]
+                _losses = [torch.nan_to_num(l, nan=0.0) for l in _losses]
+                loss, weights = self.loss_ensemble(*_losses)
         else:
             # ── Legacy phase behavior ──
             if phase == TrainingPhase.WARMUP:
