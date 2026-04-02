@@ -209,8 +209,17 @@ fn enumerate_depth2() -> Vec<Expr> {
         ("phi^sopfr", 32.0),                              // 2^5=32
         ("sigma/phi-mu", 5.0),                            // 6-1
         ("(sigma-phi)^phi-mu/phi-n", 93.5),               // 100-0.5-6
+        // Additional architecture targets
+        ("sigma*n+(sigma-phi)*phi+n/phi+mu/phi", 85.5),  // 72+20+3+0.5 ~ 85.6
+        ("J2*sigma*n/phi+mu/phi+phi/n", 85.833),         // close to 85.6
+        ("(sigma-phi)^phi*n+sigma*J2+tau", 892.0),       // 600+288+4=892 Hexad improvement
+        ("mu/(tau*(sigma-phi))", 0.025),                  // 1/40
+        ("mu/tau^phi", 0.0625),                           // 1/16
+        ("mu/(phi*(sigma-phi))", 0.05),                   // 1/20 = soc_ema_fast
         // Large model sizes via n=6
-        ("sigma*phi^(tau+mu)*sigma-sigma*sopfr*J2-sigma*n*phi^sopfr/phi", 34500000.0), // ~34.5M (rough)
+        ("sigma*phi^(tau+mu)*sigma-sigma*sopfr*J2-sigma*n*phi^sopfr/phi", 34500000.0), // ~34.5M
+        // 274M = hard to express exactly; closest: sigma^tau*sopfr^tau + ...
+        // 12^4 * 5^4 - ... but let the engine search depth-3
     ];
     for &(text, value) in specials {
         if value.is_finite() {
@@ -218,7 +227,8 @@ fn enumerate_depth2() -> Vec<Expr> {
         }
     }
 
-    // Depth-3: limited ternary combinations (a op b op c) for small base values
+    // Depth-3: limited ternary combinations (a op b op c)
+    // Only unique ordered triples to avoid redundant expressions
     for i in 0..n {
         for j in 0..n {
             for k in 0..n {
@@ -230,26 +240,23 @@ fn enumerate_depth2() -> Vec<Expr> {
                 let cn = BASE[k].name;
 
                 // a / (b^c) — important for small Psi constants
-                if b > 0.0 && c.abs() <= 6.0 {
+                if b > 0.0 && c > 0.0 && c <= 6.0 {
                     let v = a / b.powf(c);
-                    if v.is_finite() && v.abs() < 1e12 && v.abs() > 1e-12 {
+                    if v.is_finite() && v.abs() < 1e9 && v.abs() > 1e-9 {
                         exprs.push(Expr { text: format!("{}/{}^{}", an, bn, cn), value: v });
                     }
                 }
-                // a*b + c
-                let v = a * b + c;
-                if v.is_finite() && v.abs() < 1e12 {
-                    exprs.push(Expr { text: format!("{}*{}+{}", an, bn, cn), value: v });
-                }
-                // a*b - c (if positive)
-                let v = a * b - c;
-                if v.is_finite() && v > 0.0 && v.abs() < 1e12 {
-                    exprs.push(Expr { text: format!("{}*{}-{}", an, bn, cn), value: v });
-                }
-                // a*b*c
-                let v = a * b * c;
-                if v.is_finite() && v.abs() < 1e12 {
-                    exprs.push(Expr { text: format!("{}*{}*{}", an, bn, cn), value: v });
+                // a*b + c (skip if i==j==k to reduce dupes)
+                if !(i == j && j == k) {
+                    let v = a * b + c;
+                    if v.is_finite() && v.abs() < 1e9 {
+                        exprs.push(Expr { text: format!("{}*{}+{}", an, bn, cn), value: v });
+                    }
+                    // a*b - c (if positive)
+                    let v = a * b - c;
+                    if v.is_finite() && v > 0.0 && v < 1e9 {
+                        exprs.push(Expr { text: format!("{}*{}-{}", an, bn, cn), value: v });
+                    }
                 }
             }
         }
@@ -334,34 +341,63 @@ fn anima_targets() -> Vec<AnimaTarget> {
 
 // ── Hash-based Expression Index ─────────────────────────────────
 
+/// Dual-scale quantization: linear for small values, log for large
 fn quantize(v: f64) -> i64 {
-    (v * 10000.0).round() as i64
+    if v.abs() < 10000.0 {
+        (v * 10000.0).round() as i64
+    } else {
+        // Log-scale bucket for large values (prevents huge range scans)
+        let sign = if v >= 0.0 { 1i64 } else { -1 };
+        sign * (100_000_000 + (v.abs().ln() * 100000.0).round() as i64)
+    }
 }
 
 struct ExprIndex {
     map: HashMap<i64, Vec<usize>>,
+    #[allow(dead_code)]
+    expr_count: usize,
 }
 
 impl ExprIndex {
     fn build(exprs: &[Expr]) -> Self {
         let mut map: HashMap<i64, Vec<usize>> = HashMap::with_capacity(exprs.len());
+        let count = exprs.len();
         for (i, e) in exprs.iter().enumerate() {
             map.entry(quantize(e.value)).or_default().push(i);
         }
-        ExprIndex { map }
+        ExprIndex { map, expr_count: count }
     }
 
     fn find_matches(&self, target: f64, tolerance: f64, exprs: &[Expr]) -> Vec<(usize, f64)> {
         let mut results = Vec::new();
         if target.abs() < 1e-15 { return results; }
-        let center = quantize(target);
-        let spread = ((target.abs() * tolerance * 10000.0).ceil() as i64).max(1);
-        for key in (center - spread)..=(center + spread) {
-            if let Some(indices) = self.map.get(&key) {
-                for &i in indices {
-                    let err = ((exprs[i].value - target) / target).abs();
-                    if err < tolerance {
-                        results.push((i, err));
+
+        if target.abs() < 10000.0 {
+            // Linear-scale lookup with bounded spread
+            let center = quantize(target);
+            let spread = ((target.abs() * tolerance * 10000.0).ceil() as i64).min(500).max(1);
+            for key in (center - spread)..=(center + spread) {
+                if let Some(indices) = self.map.get(&key) {
+                    for &i in indices {
+                        let err = ((exprs[i].value - target) / target).abs();
+                        if err < tolerance {
+                            results.push((i, err));
+                        }
+                    }
+                }
+            }
+        } else {
+            // For large values, use log-scale buckets with small spread
+            let center = quantize(target);
+            let spread = (tolerance * 100000.0).ceil() as i64;
+            let spread = spread.min(200).max(1);
+            for key in (center - spread)..=(center + spread) {
+                if let Some(indices) = self.map.get(&key) {
+                    for &i in indices {
+                        let err = ((exprs[i].value - target) / target).abs();
+                        if err < tolerance {
+                            results.push((i, err));
+                        }
                     }
                 }
             }
