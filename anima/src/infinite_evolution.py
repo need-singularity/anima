@@ -3875,6 +3875,16 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
             except Exception:
                 pass
 
+        # v10 #83: Apply law-derived engine config at stage start
+        try:
+            if stage_idx > 0 and shared_registry.registered:
+                law_config = _laws_to_engine_config(
+                    shared_registry.registered, shared_registry)
+                if law_config:
+                    _apply_engine_state(engine, law_config)
+        except Exception:
+            pass
+
         evolver = ClosedLoopEvolver(max_cells=cells, auto_register=True)
         sme = SelfModifyingEngine(engine, evolver)
         # #8: Use shared registry, only clear pending patterns between stages
@@ -4080,6 +4090,40 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                 'laws': len(registry.registered), 'mods': active_mods,
             })
 
+            # v8 #69: Auto-generate hypotheses every 20 gens in roadmap
+            try:
+                if gen % 20 == 0 and len(registry.registered) > 0:
+                    _hypotheses = _auto_generate_hypothesis(registry, _law_network)
+                    if _hypotheses:
+                        _auto_design_experiment(_hypotheses[0])
+            except Exception:
+                pass
+
+            # v8 #72: Score law quality for newly promoted laws
+            try:
+                if stats.get('promoted', 0) > 0:
+                    for lid in registry.registered[-3:]:
+                        score = _score_law_quality(lid, registry, _law_network)
+                        if score.get('total', 0) > 0:
+                            print(f'    \U0001f4ca Law {lid} quality: {score["total"]:.2f}')
+            except Exception:
+                pass
+
+            # v10 #86: Ecosystem step every 10 gens in roadmap
+            try:
+                if gen % 10 == 0:
+                    _genomes = _get_genome_population()
+                    _ecosystem_step(_genomes, registry)
+            except Exception:
+                pass
+
+            # v10 #88: Meta-analyze pipeline every 50 gens in roadmap
+            try:
+                if gen % 50 == 0 and len(gen_history) >= 10:
+                    _meta_analyze_pipeline(gen_history, registry, _law_network)
+            except Exception:
+                pass
+
             # Live status file
             phi_prev = phi_history[-2] if len(phi_history) >= 2 else 0.0
             live = write_live_status(
@@ -4152,6 +4196,29 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
 
                 # Auto-generate EVO document for completed stage
                 auto_generate_evo_doc(stage, gen_history, registry, rm_state)
+
+                # v8 #71: Auto-generate enhanced report for stage
+                try:
+                    _auto_generate_report(
+                        rm_state.get('stage_results', []),
+                        registry, _law_network, stage['name'])
+                except Exception:
+                    pass
+
+                # v8 #76: Save session log at stage completion
+                try:
+                    _auto_save_session_log(
+                        rm_state.get('stage_results', []), registry)
+                except Exception:
+                    pass
+
+                # v10 #83: Apply law-derived engine config for next stage
+                try:
+                    if registry.registered:
+                        _law_config = _laws_to_engine_config(
+                            registry.registered, registry)
+                except Exception:
+                    pass
 
                 break  # next stage
 
@@ -4570,6 +4637,16 @@ def main():
                 _law_network.save()
             except Exception:
                 pass
+            # v8 #76: Save session log on normal exit
+            try:
+                _auto_save_session_log([], registry)
+            except Exception:
+                pass
+            # v8 #71: Auto-generate report on normal exit
+            try:
+                _auto_generate_report([], registry, _law_network, 'main-loop-complete')
+            except Exception:
+                pass
 
     except KeyboardInterrupt:
         total_elapsed = prev_elapsed + (time.time() - start)
@@ -4625,6 +4702,19 @@ def main():
         # v3 #33-36: Save law network on exit
         try:
             _law_network.save()
+        except Exception:
+            pass
+
+        # v8 #76: Save session log
+        try:
+            _auto_save_session_log([], registry)
+        except Exception:
+            pass
+
+        # v8 #71: Auto-generate report on exit
+        try:
+            if gen_history:
+                _auto_generate_report([], registry, _law_network, 'main-loop-exit')
         except Exception:
             pass
 
