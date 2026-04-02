@@ -1,11 +1,12 @@
 //! telescope-rs — High-performance telescope lenses for consciousness analysis
 //!
-//! Implements 16 lenses in Rust:
+//! Implements 22 lenses in Rust:
 //!   Core:     ConsciousnessLens, TopologyLens, CausalLens
 //!   Physics:  GravityLens, ThermoLens, WaveLens, EMLens
 //!   Bio:      EvolutionLens
 //!   Info:     InfoLens, QuantumLens, QuantumMicroscopeLens
 //!   Geometry: RulerLens, TriangleLens, CompassLens, MirrorLens, ScaleLens
+//!   New:      StabilityLens, NetworkLens, MemoryLens, RecursionLens, BoundaryLens, MultiscaleLens
 //!
 //! Python binding via PyO3: `import telescope_rs`
 
@@ -26,6 +27,12 @@ pub mod compass;
 pub mod mirror;
 pub mod scale;
 pub mod quantum_microscope;
+pub mod stability;
+pub mod network;
+pub mod memory_lens;
+pub mod recursion;
+pub mod boundary;
+pub mod multiscale;
 
 #[cfg(feature = "pyo3-ext")]
 mod python;

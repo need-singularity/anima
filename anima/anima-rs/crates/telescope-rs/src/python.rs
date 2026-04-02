@@ -24,7 +24,8 @@ use pyo3::types::PyDict;
 use numpy::{PyReadonlyArray2, PyArray1};
 
 use crate::{consciousness, topology, causal, mi, gravity, thermo, wave, evolution,
-            info, quantum, em, ruler, triangle, compass, mirror, scale, quantum_microscope};
+            info, quantum, em, ruler, triangle, compass, mirror, scale, quantum_microscope,
+            stability, network, memory_lens, recursion, boundary, multiscale};
 
 /// Helper: extract flat data + dims from PyReadonlyArray2.
 fn extract_data(data: &PyReadonlyArray2<'_, f64>) -> (Vec<f64>, usize, usize) {
@@ -401,6 +402,132 @@ fn quantum_microscope_scan<'py>(
     Ok(dict)
 }
 
+/// Stability lens scan (Lyapunov + perturbation resilience)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn stability_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = stability::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("lyapunov_exponent", result.lyapunov_exponent)?;
+    dict.set_item("resilience", result.resilience)?;
+    dict.set_item("mean_recovery_time", result.mean_recovery_time)?;
+    dict.set_item("basin_stability", PyArray1::from_vec(py, result.basin_stability))?;
+    dict.set_item("variance_ratio", result.variance_ratio)?;
+    Ok(dict)
+}
+
+/// Network lens scan (correlation graph analysis)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn network_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = network::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("n_edges", result.n_edges)?;
+    dict.set_item("degree_centrality", PyArray1::from_vec(py, result.degree_centrality))?;
+    dict.set_item("n_communities", result.n_communities)?;
+    dict.set_item("community_ids", result.community_ids)?;
+    dict.set_item("hub_indices", result.hub_indices)?;
+    dict.set_item("density", result.density)?;
+    dict.set_item("clustering_coefficient", result.clustering_coefficient)?;
+    dict.set_item("avg_path_length", result.avg_path_length)?;
+    Ok(dict)
+}
+
+/// Memory lens scan (autocorrelation + recurrence)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn memory_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = memory_lens::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("acf_decay_times", PyArray1::from_vec(py, result.acf_decay_times))?;
+    dict.set_item("mean_memory_depth", result.mean_memory_depth)?;
+    dict.set_item("delayed_mi", PyArray1::from_vec(py, result.delayed_mi))?;
+    dict.set_item("recurrence_rate", result.recurrence_rate)?;
+    dict.set_item("determinism", result.determinism)?;
+    dict.set_item("max_diagonal_length", result.max_diagonal_length)?;
+    Ok(dict)
+}
+
+/// Recursion lens scan (self-reference & feedback loops)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn recursion_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = recursion::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("self_similarity", result.self_similarity)?;
+    dict.set_item("mean_self_similarity", result.mean_self_similarity)?;
+    let fb_i: Vec<usize> = result.feedback_loops.iter().map(|f| f.0).collect();
+    let fb_j: Vec<usize> = result.feedback_loops.iter().map(|f| f.1).collect();
+    let fb_s: Vec<f64> = result.feedback_loops.iter().map(|f| f.2).collect();
+    dict.set_item("feedback_loop_i", fb_i)?;
+    dict.set_item("feedback_loop_j", fb_j)?;
+    dict.set_item("feedback_loop_strength", PyArray1::from_vec(py, fb_s))?;
+    dict.set_item("n_fixed_points", result.n_fixed_points)?;
+    dict.set_item("fixed_point_indices", result.fixed_point_indices)?;
+    dict.set_item("recurrence_depth", result.recurrence_depth)?;
+    Ok(dict)
+}
+
+/// Boundary lens scan (phase transitions & edge detection)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn boundary_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = boundary::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("n_boundary_points", result.n_boundary_points)?;
+    dict.set_item("boundary_indices", result.boundary_indices)?;
+    dict.set_item("boundary_strengths", PyArray1::from_vec(py, result.boundary_strengths))?;
+    dict.set_item("n_phase_transitions", result.n_phase_transitions)?;
+    dict.set_item("transition_indices", result.transition_indices)?;
+    dict.set_item("mean_sharpness", result.mean_sharpness)?;
+    Ok(dict)
+}
+
+/// Multiscale lens scan (wavelet + multifractal)
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn multiscale_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result = multiscale::scan(&flat, n_samples, n_features);
+
+    let dict = PyDict::new(py);
+    dict.set_item("wavelet_energy", PyArray1::from_vec(py, result.wavelet_energy))?;
+    dict.set_item("dominant_scale", result.dominant_scale)?;
+    dict.set_item("multifractal_dq", PyArray1::from_vec(py, result.multifractal_dq))?;
+    dict.set_item("multifractal_width", result.multifractal_width)?;
+    dict.set_item("scale_entropy", PyArray1::from_vec(py, result.scale_entropy))?;
+    dict.set_item("n_significant_scales", result.n_significant_scales)?;
+    Ok(dict)
+}
+
 /// Fast mutual information between two 1D arrays
 #[pyfunction]
 #[pyo3(signature = (a, b, n_bins=16))]
@@ -432,6 +559,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mirror_scan, m)?)?;
     m.add_function(wrap_pyfunction!(scale_scan, m)?)?;
     m.add_function(wrap_pyfunction!(quantum_microscope_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(stability_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(network_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(memory_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(recursion_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(boundary_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(multiscale_scan, m)?)?;
     m.add_function(wrap_pyfunction!(fast_mutual_info, m)?)?;
     Ok(())
 }

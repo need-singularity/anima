@@ -43,7 +43,8 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> GravityResult 
         };
     }
 
-    // Compute bandwidth (median distance)
+    // Compute bandwidth using 10th percentile distance (tighter than median)
+    // This ensures mean-shift can distinguish nearby clusters
     let n_pairs = n_samples.min(200);
     let mut dists: Vec<f64> = Vec::with_capacity(n_pairs * n_pairs / 2);
     let step = (n_samples as f64 / n_pairs as f64).max(1.0) as usize;
@@ -57,7 +58,9 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> GravityResult 
     let bandwidth = if dists.is_empty() {
         1.0
     } else {
-        dists[dists.len() / 2].max(1e-12)
+        // Use 10th percentile instead of median — much tighter kernel
+        let p10_idx = (dists.len() as f64 * 0.1) as usize;
+        dists[p10_idx.min(dists.len() - 1)].max(1e-12)
     };
 
     // Compute density (energy = -density) using Gaussian kernel
@@ -111,7 +114,8 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> GravityResult 
     }
 
     // Cluster converged positions to find attractors
-    let merge_threshold = bandwidth * 0.5;
+    // Use tighter merge threshold for better separation
+    let merge_threshold = bandwidth * 0.3;
     let merge_thresh_sq = merge_threshold * merge_threshold;
     let mut attractor_ids: Vec<i32> = vec![-1; n_samples];
     let mut attractors: Vec<Vec<f64>> = Vec::new();

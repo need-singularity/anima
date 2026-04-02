@@ -32,21 +32,28 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
         .collect();
 
     // 1. Entanglement = high MI pairs
+    // Scan more pairs and use adaptive threshold
     let n_bins = 16;
-    let mut entanglement_pairs = Vec::new();
-    let max_pairs = 300;
-    let mut count = 0;
-    for i in 0..n_features {
-        for j in (i + 1)..n_features {
-            if count >= max_pairs { break; }
+    let mut all_mi: Vec<(usize, usize, f64)> = Vec::new();
+    let max_features = n_features.min(64); // scan up to 64 features
+    for i in 0..max_features {
+        for j in (i + 1)..max_features {
             let m = mi::mutual_info(&columns[i], &columns[j], n_bins);
-            if m > 0.2 {
-                entanglement_pairs.push((i, j, m));
-            }
-            count += 1;
+            all_mi.push((i, j, m));
         }
-        if count >= max_pairs { break; }
     }
+    // Adaptive threshold: mean + 0.5 * std (or minimum 0.05)
+    let mi_mean = if all_mi.is_empty() { 0.0 } else {
+        all_mi.iter().map(|x| x.2).sum::<f64>() / all_mi.len() as f64
+    };
+    let mi_std = if all_mi.len() < 2 { 0.0 } else {
+        (all_mi.iter().map(|x| (x.2 - mi_mean).powi(2)).sum::<f64>() / all_mi.len() as f64).sqrt()
+    };
+    let mi_threshold = (mi_mean + 0.5 * mi_std).max(0.05);
+    let mut entanglement_pairs: Vec<(usize, usize, f64)> = all_mi
+        .into_iter()
+        .filter(|x| x.2 > mi_threshold)
+        .collect();
     entanglement_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     entanglement_pairs.truncate(50);
 
@@ -76,7 +83,8 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
             d_input = d_input.sqrt();
             d_output = d_output.sqrt();
             // Tunneling: far in input, close in output
-            if d_input > 1e-6 && d_output < d_input * 0.3 {
+            // Relaxed threshold: 0.5 instead of 0.3 for better sensitivity
+            if d_input > 1e-6 && d_output < d_input * 0.5 {
                 tunneling_paths.push((i, j, d_input, d_output));
             }
         }

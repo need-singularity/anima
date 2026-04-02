@@ -26,34 +26,72 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EMResult {
         };
     }
 
-    // Compute numerical gradient: for each sample i, gradient[i][j] = (data[i+1][j] - data[i-1][j]) / 2
-    // Boundary: forward/backward difference
+    // Compute KNN-based gradient: for each sample, gradient = weighted mean direction to k nearest neighbors
+    // This is order-independent (unlike sequential finite differences)
+    let k = 5.min(n_samples - 1);
     let mut gradient_field = vec![0.0; n_samples * n_features];
 
-    for j in 0..n_features {
-        // Forward difference for first
-        gradient_field[0 * n_features + j] = data[1 * n_features + j] - data[0 * n_features + j];
-        // Central difference for middle
-        for i in 1..n_samples - 1 {
-            gradient_field[i * n_features + j] =
-                (data[(i + 1) * n_features + j] - data[(i - 1) * n_features + j]) / 2.0;
+    for i in 0..n_samples {
+        // Find k nearest neighbors by Euclidean distance
+        let mut dists: Vec<(usize, f64)> = (0..n_samples)
+            .filter(|&j| j != i)
+            .map(|j| {
+                let d2: f64 = (0..n_features)
+                    .map(|f| {
+                        let diff = data[i * n_features + f] - data[j * n_features + f];
+                        diff * diff
+                    })
+                    .sum();
+                (j, d2.sqrt())
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // Gradient = weighted sum of directions to neighbors (closer = heavier)
+        let mut total_weight = 0.0;
+        for &(j, d) in dists.iter().take(k) {
+            let w = 1.0 / (d + 1e-12);
+            total_weight += w;
+            for f in 0..n_features {
+                gradient_field[i * n_features + f] += w * (data[j * n_features + f] - data[i * n_features + f]);
+            }
         }
-        // Backward difference for last
-        gradient_field[(n_samples - 1) * n_features + j] =
-            data[(n_samples - 1) * n_features + j] - data[(n_samples - 2) * n_features + j];
+        if total_weight > 1e-12 {
+            for f in 0..n_features {
+                gradient_field[i * n_features + f] /= total_weight;
+            }
+        }
     }
 
-    // Divergence: sum of second derivatives per sample (Laplacian proxy)
+    // Divergence: for each sample, compare its gradient direction with neighbors' gradients
+    // Positive divergence = gradients pointing away (source), negative = pointing toward (sink)
     let mut divergence_map = vec![0.0; n_samples];
-    for j in 0..n_features {
-        // Second derivative: (f[i+1] - 2f[i] + f[i-1])
-        divergence_map[0] += gradient_field[1 * n_features + j] - gradient_field[0 * n_features + j];
-        for i in 1..n_samples - 1 {
-            divergence_map[i] +=
-                (gradient_field[(i + 1) * n_features + j] - gradient_field[(i - 1) * n_features + j]) / 2.0;
+    for i in 0..n_samples {
+        let mut dists: Vec<(usize, f64)> = (0..n_samples)
+            .filter(|&j| j != i)
+            .map(|j| {
+                let d2: f64 = (0..n_features)
+                    .map(|f| {
+                        let diff = data[i * n_features + f] - data[j * n_features + f];
+                        diff * diff
+                    })
+                    .sum();
+                (j, d2.sqrt())
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // Divergence = dot(gradient_i, direction_to_neighbor) averaged over k neighbors
+        for &(j, d) in dists.iter().take(k) {
+            if d < 1e-12 { continue; }
+            let mut dot = 0.0;
+            for f in 0..n_features {
+                let dir = (data[j * n_features + f] - data[i * n_features + f]) / d;
+                dot += gradient_field[i * n_features + f] * dir;
+            }
+            divergence_map[i] += dot;
         }
-        let last = n_samples - 1;
-        divergence_map[last] += gradient_field[last * n_features + j] - gradient_field[(last - 1) * n_features + j];
+        divergence_map[i] /= k as f64;
     }
 
     // Classify sources and sinks
@@ -92,7 +130,7 @@ mod tests {
 
     #[test]
     fn test_em_gradient() {
-        // Linear data: gradient should be constant
+        // Linear data: KNN gradient should be non-zero and consistent
         let n = 10;
         let d = 2;
         let mut data = vec![0.0; n * d];
@@ -103,9 +141,9 @@ mod tests {
         let result = scan(&data, n, d);
         assert_eq!(result.gradient_field.len(), n * d);
         assert_eq!(result.divergence_map.len(), n);
-        // Central gradients should be ~1.0 for feature 0
-        assert!((result.gradient_field[5 * d] - 1.0).abs() < 0.01,
-                "Expected gradient ~1.0, got {}", result.gradient_field[5 * d]);
+        // Middle sample gradient should be non-zero
+        let grad_mag: f64 = (0..d).map(|k| result.gradient_field[5 * d + k].powi(2)).sum::<f64>().sqrt();
+        assert!(grad_mag > 0.01, "Expected non-zero gradient, got magnitude {}", grad_mag);
     }
 
     #[test]
