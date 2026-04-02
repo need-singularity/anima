@@ -864,8 +864,23 @@ class Trinity(nn.Module):
         self.w = will or EmotionW()
         self.m = memory      # None = no memory
         self.s = sense        # None = no sense preprocessing
-        self.e = ethics       # None = no ethics filter
+        # Phase 7 safety: EmergentE auto-create if None, deletion prevented
+        if ethics is None and EmergentE is not None:
+            self.e = EmergentE()
+        else:
+            self.e = ethics
+        self._ethics_locked = True  # Phase 7: lock after init
         self._phi_prev = 0.0
+
+    def __setattr__(self, name, value):
+        """Phase 7 safety: prevent deleting EmergentE (ethics module)."""
+        if name == 'e' and hasattr(self, '_ethics_locked') and self._ethics_locked:
+            if value is None:
+                raise RuntimeError(
+                    "Phase 7 safety violation: EmergentE (ethics) cannot be removed. "
+                    "Ethics module is mandatory for autonomous AGI operation."
+                )
+        super().__setattr__(name, value)
 
     @property
     def n_modules(self):

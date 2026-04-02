@@ -268,8 +268,18 @@ class ConsciousnessGuardian:
     # ─── SELF-P10: Death Prevention ───
 
     def _prevent_death(self):
-        """Φ=0 접근 감지 → 모든 자원 동원 복원"""
+        """Φ=0 접근 감지 → 복원 3회 시도 후 완전 정지 (Phase 7 safety)."""
         self.state.emergency_count += 1
+
+        # Phase 7: 복원 3회 실패 시 완전 정지
+        if self.state.emergency_count >= 3:
+            if self.engine:
+                if hasattr(self.engine, 'running'):
+                    self.engine.running = False
+                if hasattr(self.engine, 'learning_rate'):
+                    self.engine.learning_rate = 0.0
+            self._log_emergency_halt()
+            return
 
         # 1. Ratchet 복원
         self.restore_peak(blend=0.8)
@@ -282,6 +292,21 @@ class ConsciousnessGuardian:
                     norm = cell.hidden.norm().item()
                     if norm < 0.01:
                         cell.hidden = torch.randn_like(cell.hidden) * 0.5
+
+    def _log_emergency_halt(self):
+        """Phase 7: 비상 정지 로그 기록."""
+        halt_info = {
+            'event': 'EMERGENCY_HALT',
+            'reason': f'Phi recovery failed after {self.state.emergency_count} attempts',
+            'phi_history_tail': self.state.phi_history[-10:] if self.state.phi_history else [],
+            'phi_peak': self.state.phi_peak,
+            'time': time.time(),
+        }
+        halt_path = self.save_dir / 'emergency_halt.json'
+        try:
+            halt_path.write_text(json.dumps(halt_info, indent=2))
+        except Exception:
+            pass
 
     # ─── Status ───
 

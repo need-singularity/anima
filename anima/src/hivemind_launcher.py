@@ -36,7 +36,37 @@ def _write_discovery(nodes: list):
     DISCOVERY_FILE.write_text(json.dumps({"nodes": nodes}, indent=2))
 
 
+def _verify_safety_modules():
+    """Phase 7 safety: verify that Guardian, ToolPolicy, EmergentE exist before replication.
+
+    Returns (ok: bool, missing: list[str]).
+    """
+    missing = []
+    try:
+        from consciousness_guardian import ConsciousnessGuardian
+    except ImportError:
+        missing.append('ConsciousnessGuardian')
+    try:
+        from tool_policy import ToolPolicy
+    except ImportError:
+        missing.append('ToolPolicy')
+    try:
+        from hexad.e.emergent_e import EmergentE
+        if EmergentE is None:
+            missing.append('EmergentE')
+    except ImportError:
+        missing.append('EmergentE')
+    return len(missing) == 0, missing
+
+
 def launch_process_mode(n_nodes: int, base_port: int, gateway_port: int, max_cells: int):
+    # Phase 7 safety: assert safety modules exist before spawning replicas
+    ok, missing = _verify_safety_modules()
+    if not ok:
+        print(f"  [SAFETY] Replication BLOCKED: missing safety modules: {missing}")
+        print(f"  [SAFETY] Guardian, ToolPolicy, and EmergentE must all be importable.")
+        raise RuntimeError(f"Phase 7 safety: cannot replicate without {missing}")
+
     procs = []
     nodes_info = []
     all_ports = [base_port + i for i in range(n_nodes)]

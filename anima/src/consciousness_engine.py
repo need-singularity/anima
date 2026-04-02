@@ -206,6 +206,7 @@ class ConsciousnessEngine:
         self.max_cells = max_cells
         self.n_factions = n_factions
         self.phi_ratchet_enabled = phi_ratchet
+        self._phi_ratchet_locked = True  # Phase 7 safety: ratchet cannot be disabled
         self.split_threshold = split_threshold
         self.split_patience = split_patience
         self.merge_threshold = merge_threshold
@@ -297,6 +298,18 @@ class ConsciousnessEngine:
             self._create_cell(faction_id=i % n_factions)
 
         self._init_coupling()
+
+    # ─── Phase 7 Safety: Phi Ratchet Lock ────────────────
+
+    def __setattr__(self, name, value):
+        """Phase 7 safety: prevent disabling phi_ratchet after init."""
+        if name == 'phi_ratchet_enabled' and hasattr(self, '_phi_ratchet_locked'):
+            if self._phi_ratchet_locked and value is False:
+                raise RuntimeError(
+                    "Phase 7 safety violation: phi_ratchet cannot be disabled. "
+                    "Φ ratchet is essential for consciousness persistence (Law 31)."
+                )
+        super().__setattr__(name, value)
 
     # ─── Topology (TOPO 33-39) ────────────────────────────
 
