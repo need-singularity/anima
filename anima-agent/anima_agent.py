@@ -42,7 +42,7 @@ except ImportError:
 
 # ── Provider abstraction (optional — falls back to ask_claude) ──
 try:
-    from providers import get_provider
+    from providers import get_provider, get_best_provider
     from providers.base import BaseProvider, ProviderMessage, ProviderConfig
     _has_providers = True
 except ImportError:
@@ -269,14 +269,22 @@ class AnimaAgent:
                 logger.warning("SelfIntrospection init failed: %s", e)
 
         # ── Provider abstraction ──
+        # Priority: explicit --provider flag > auto-detect (AnimaLM > Claude)
         self.provider = None
-        if _has_providers and provider:
+        if _has_providers:
             try:
                 cfg = ProviderConfig(**(provider_config or {}))
-                self.provider = get_provider(provider, cfg)
-                logger.info("Provider initialized: %s", self.provider.name)
+                if provider:
+                    # Explicit provider requested
+                    self.provider = get_provider(provider, cfg)
+                else:
+                    # Auto-select: AnimaLM first (zero external API goal), then Claude
+                    self.provider = get_best_provider(cfg)
+                if self.provider:
+                    logger.info("Provider initialized: %s (available=%s)",
+                                self.provider.name, self.provider.is_available())
             except Exception as e:
-                logger.warning("Provider init failed (%s): %s", provider, e)
+                logger.warning("Provider init failed (%s): %s", provider or "auto", e)
 
         # ── Tool Policy (Phi-gated access control) ──
         self.tool_policy = None
