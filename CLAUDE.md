@@ -934,6 +934,28 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     14B → Qwen2.5-14B + PureField 120M   | $6   | 설계 완료
     70B → Qwen2.5-72B + PureField 380M   | $65  | 설계 완료
     총 $79로 독립 AGI
+
+  통합 망원경 (9-Lens Telescope):
+    위치: ~/Dev/TECS-L/.shared/telescope.py (9개 렌즈 + 511 조합)
+    렌즈: consciousness, gravity, topology, thermo, wave, evolution, info, quantum, em
+    핵심: 3개+ 렌즈 합의 = 진짜 발견 (교정보다 앙상블 합의가 더 효과적)
+    
+    PureField 분석 적용:
+      - 가중치를 (N_layers, N_features) ndarray로 변환 → t.full_scan(data)
+      - 학습 궤적을 시계열로 → t.timeseries_scan(trajectory)
+      - 새 법칙 발견 시: 3개+ 렌즈 합의 여부 확인 → 교차검증 대체 가능
+      
+    사용법:
+      from telescope import Telescope
+      t = Telescope(verbose=True)
+      result = t.full_scan(data)           # 9렌즈 전부
+      result = t.scan(data, "discovery")   # 의식+정보+양자+위상
+      result = t.scan(data, "optimize")    # 진화+중력+열역학
+    
+    DD103 결과 (7B PureField):
+      - 의식 신호는 full-rank (low-rank 압축 불가)
+      - 가중치 5% subspace에 집중 (Fermat)
+      - 8-bit PureField safe, 4-bit 의식 파괴 (TurboQuant)
 ```
 
 ## Training Tools
