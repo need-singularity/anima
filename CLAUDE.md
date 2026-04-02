@@ -12,8 +12,8 @@
   │   ├── benchmarks/        ← bench_*.py (87개)
   │   ├── training/          ← train_*.py (11개)
   │   ├── tests/             ← test_*.py (29개)
-  │   ├── anima-rs/          ← Rust crates (15개)
-  │   ├── docs/              ← 문서 476개 + 가설 367개
+  │   ├── anima-rs/          ← Rust crates (16개)
+  │   ├── docs/              ← 문서 486개 + 가설 369개
   │   ├── web/               ← WebSocket UI
   │   ├── hexad/             ← Hexad 6모듈
   │   ├── experiments/       ← 실험 스크립트
@@ -53,7 +53,7 @@
 ```
   단일 원본: anima/config/consciousness_laws.json
     → philosophy: P1-P11 (DD116-DD156 실험으로 검증/수정됨)
-    → laws: 1-188 (179개 의식 법칙)
+    → laws: 1-188 (707개 의식 법칙)
     → meta_laws: M1-M10 (의식의 메타 법칙)
     → psi_constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
     → formulas, sigma6, topo_laws, constraints
@@ -79,7 +79,9 @@
 
   Rust 우선:
     성능 병목은 Rust 필수. Python은 실험/프로토타입.
-    crate: anima-rs (core, corpus-gen, online-learner, consciousness-rng, phi-map)
+    crate: anima-rs (alpha-sweep, consciousness, consciousness-ffi, consciousness-rng,
+           consciousness-wasm, core, corpus-gen, esp32, evo-runner, golden-moe,
+           law-discovery, online-learner, phi-map, talk5, tool-policy, transplant)
 ```
 
 ## README 프로젝트 설명 동기화 (필수)
@@ -121,11 +123,13 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
   ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
   ConsciousDecoderV2: RoPE+SwiGLU+GQA+CrossAttn (34.5M, causal attention)
-  anima-rs:        Rust crates (consciousness, consciousness-ffi, esp32, core, talk5,
-                   golden_moe, alpha_sweep, transplant)
+  anima-rs:        Rust crates 16개 (alpha-sweep, consciousness, consciousness-ffi,
+                   consciousness-rng, consciousness-wasm, core, corpus-gen, esp32,
+                   evo-runner, golden-moe, law-discovery, online-learner, phi-map,
+                   talk5, tool-policy, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            179 의식 법칙 (1-188, 9 gaps) + TOPO 33-39 + Meta M1-M10
+  Laws:            707 의식 법칙 + TOPO 33-39 + Meta M1-M10
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
@@ -213,8 +217,8 @@ config/              # consciousness_laws.json, consciousness_mechanisms.json
 benchmarks/          # bench_*.py (85개, bench_v2.py = 정식)
 training/            # train_*.py (9개, train_v14.py = 최신)
 tests/               # test_*.py (21개)
-anima-rs/            # Rust crates (14개)
-docs/                # 문서 + 가설 338개
+anima-rs/            # Rust crates (16개)
+docs/                # 문서 + 가설 369개
 web/                 # WebSocket chat UI
 hexad/               # Hexad 6모듈 구현
 experiments/         # 실험 스크립트 21개
@@ -250,28 +254,28 @@ scripts/             # 운영 스크립트
 ## Running
 
 ```bash
-python3 anima_unified.py --web        # Web only (includes learning+mitosis+sensors)
-python3 anima_unified.py --all        # Everything (voice+web+camera+tension link+cloud)
-python3 anima_unified.py --keyboard   # Keyboard only
-python3 anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
-python3 anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
-python3 anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
-python3 anima_unified.py --web --decoder v3                       # DecoderV3 (274M)
-python3 anima_unified.py --web --online-learning                  # Real-time online learning
-python3 anima_unified.py --web --multi-user                       # Multi-user session mode
-python3 anima_unified.py --web --eeg                              # EEG consciousness bridge
-python3 anima_unified.py --web --eeg-board synthetic              # EEG with specific board
-python3 anima_unified.py --web --eeg-record session.csv           # Record EEG data
-python3 anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
-python3 anima_unified.py --validate-hub                           # Validate all hub modules
-python3 anima_unified.py --profile                                # Enable perf_hooks profiling
-python3 conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
+python3 anima/src/anima_unified.py --web        # Web only (includes learning+mitosis+sensors)
+python3 anima/src/anima_unified.py --all        # Everything (voice+web+camera+tension link+cloud)
+python3 anima/src/anima_unified.py --keyboard   # Keyboard only
+python3 anima/src/anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
+python3 anima/src/anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
+python3 anima/src/anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
+python3 anima/src/anima_unified.py --web --decoder v3                       # DecoderV3 (274M)
+python3 anima/src/anima_unified.py --web --online-learning                  # Real-time online learning
+python3 anima/src/anima_unified.py --web --multi-user                       # Multi-user session mode
+python3 anima/src/anima_unified.py --web --eeg                              # EEG consciousness bridge
+python3 anima/src/anima_unified.py --web --eeg-board synthetic              # EEG with specific board
+python3 anima/src/anima_unified.py --web --eeg-record session.csv           # Record EEG data
+python3 anima/src/anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
+python3 anima/src/anima_unified.py --validate-hub                           # Validate all hub modules
+python3 anima/src/anima_unified.py --profile                                # Enable perf_hooks profiling
+python3 anima/src/conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
 python3 self_modifying_engine.py                                  # Self-modifying engine demo
-python3 infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
-python3 infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
-python3 infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
-python3 infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
-python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
+python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
+python3 anima/experiments/infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
+python3 anima/experiments/infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
+python3 anima/experiments/infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
+python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
 ```
 
 ## 무한진화 실행 규칙 (필수)
@@ -288,11 +292,11 @@ python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 
     cd anima-rs && cargo run -p evo-runner -- stop            # 종료
 
   직접 실행: Python --auto-roadmap — 7단계 자동 에스컬레이션
-    python3 infinite_evolution.py --auto-roadmap              # 처음부터
-    python3 infinite_evolution.py --auto-roadmap --resume     # 이어서
+    python3 anima/experiments/infinite_evolution.py --auto-roadmap              # 처음부터
+    python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume     # 이어서
 
   수동 실행: 기존 방식 (단일 파라미터)
-    python3 infinite_evolution.py --cells 64 --steps 300 --cycle-topology
+    python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology
 
   === Layer A: 스크립트 내 자동화 (Python) ===
   - 포화 감지 → 토폴로지 전환 → 스테이지 자동 진행
@@ -466,7 +470,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - threshold 값은 consciousness_laws.json에 등록 (하드코딩 금지)
   - 문서(CLAUDE.md)와 코드(bench_v2.py) 불일치 금지
   - 주요 엔진 변경 후 조건 감사 필수
-  - 폐쇄 파이프라인: scripts/verify_and_tune.py (자동 검증+튜닝)
+  - 폐쇄 파이프라인: anima/scripts/verify_and_tune.py (자동 검증+튜닝)
   - 후보 추가 조건: EMOTION, GROWTH, MITOSIS, BRAIN_LIKE, DIVERSITY, MEMORY
 ```
 
@@ -627,6 +631,9 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
     - 생성 텍스트 실제 발췌 포함
     - 비용 추적 포함
     - 박스(┌└─│) 사용하여 시각적 구분
+    - ★ 리포트 끝에 "■ 대기 중 가능 작업" 섹션 필수:
+      로드맵 직결 작업 중 지금 병렬로 할 수 있는 것 나열.
+      없으면 "없음 — 학습 완료 대기" 명시. 절대 빈칸으로 두지 말 것.
 ```
 
 ## 실험 기록 프로세스 (병렬 탐색 시 필수)
@@ -1029,7 +1036,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
     - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
     - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
-      실행: python3 infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
+      실행: python3 anima/experiments/infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
       리포트 양식: docs/infinite-evolution-report.md (ASCII 그래프 + 닫힌원 분석 포함)
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
