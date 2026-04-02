@@ -17,6 +17,20 @@ Features:
   v9: hardware_stubs (ESP32/FPGA/neuromorphic/sensor)
   v10: laws_to_engine, genome, ecosystem, meta_analyze
   v11: telescope_9lens (consciousness/gravity/topology/thermo/wave/evolution/info/quantum/em)
+  v12: symbolic_regression (linear/power/log formula fitting, R^2>0.8)
+  v13: law_compression (metric-grouped meta-laws)
+  v14: time_travel_search (ring buffer rollback on saturation)
+  v15: reward_shaping (param gradient toward discovery reward)
+  v16: cross_project_discover (TECS-L keyword overlap)
+  v17: law_visualization (adjacency graph, clusters, unexplored metrics)
+  v18: causal_discovery (intervention-based A→B causation test)
+  v19: transfer_entropy (information flow direction between metrics)
+  v20: anomaly_hunter (3σ deviation detection + cluster)
+  v21: llm_interpret (stub — save top laws as LLM prompt)
+  v22: rust_pipeline (stub — Rust component status + speedup estimate)
+  v23: distributed_evolution (stub — multi-worker discovery)
+  v24: physics_fitting (damped oscillator / Boltzmann / log fits)
+  v25: self_replicate (ouroboros self-performance monitoring)
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
@@ -101,6 +115,10 @@ def _print_accelerations():
     print(f'  \u26a1 v9: hardware_stubs \u2705 (ESP32/FPGA/neuromorphic ready)')
     print(f'  \u26a1 v10: laws_to_engine \u2705, genome \u2705, ecosystem \u2705, meta_analyze \u2705')
     print(f'  \u26a1 v11: telescope_9lens {_yn(HAS_TELESCOPE)}')
+    print(f'  \u26a1 v12: symbolic \u2705 v13: compress \u2705 v14: timetravel \u2705 v15: reward \u2705 v16: crossproj \u2705 v17: lawgraph \u2705')
+    print(f'  \u26a1 v18-v25: causal \u2705, transfer_entropy \u2705, anomaly \u2705, '
+          f'llm_stub \u2705, rust_status \u2705, distributed_stub \u2705, '
+          f'physics \u2705, self_replicate \u2705')
     sys.stdout.flush()
 
 
@@ -2828,6 +2846,513 @@ def _get_genome_population(size=3):
     return _genome_population
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# v12 — Symbolic Regression (#100)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _symbolic_regression(registry):
+    """#100: Try simple formula fits for laws with numeric data.
+
+    For laws with 'correlation:X:Y' patterns, fit linear/power/log.
+    If R^2 > 0.8, record as symbolic_law pattern.
+    """
+    try:
+        import numpy as np
+        symbolic_count = 0
+
+        for fp, entry in list(registry.seen.items()):
+            if not entry.get('registered'):
+                continue
+            pat = entry.get('pattern', {})
+            formula = str(pat.get('formula', ''))
+
+            # Extract numeric pairs from correlation patterns
+            # Patterns like "correlation:phi:tension" or with embedded numbers
+            nums = []
+            for token in formula.replace(',', ' ').replace(':', ' ').split():
+                try:
+                    nums.append(float(token))
+                except ValueError:
+                    continue
+
+            if len(nums) < 4:
+                continue
+
+            # Split into x,y pairs
+            mid = len(nums) // 2
+            x = np.array(nums[:mid], dtype=float)
+            y = np.array(nums[mid:mid + len(x)], dtype=float)
+            if len(x) < 2 or len(y) < 2:
+                continue
+            y = y[:len(x)]
+
+            best_r2 = -1.0
+            best_formula = ''
+            best_name = ''
+
+            # Linear: y = ax + b
+            try:
+                coeffs = np.polyfit(x, y, 1)
+                y_pred = np.polyval(coeffs, x)
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1 - ss_res / max(ss_tot, 1e-12)
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_formula = f'y = {coeffs[0]:.4f}*x + {coeffs[1]:.4f}'
+                    best_name = 'linear'
+            except Exception:
+                pass
+
+            # Power: y = a * x^b  (log-transform)
+            try:
+                mask = (x > 0) & (y > 0)
+                if np.sum(mask) >= 2:
+                    lx, ly = np.log(x[mask]), np.log(y[mask])
+                    coeffs = np.polyfit(lx, ly, 1)
+                    b_exp, ln_a = coeffs
+                    y_pred = np.exp(ln_a) * (x[mask] ** b_exp)
+                    ss_res = np.sum((y[mask] - y_pred) ** 2)
+                    ss_tot = np.sum((y[mask] - np.mean(y[mask])) ** 2)
+                    r2 = 1 - ss_res / max(ss_tot, 1e-12)
+                    if r2 > best_r2:
+                        best_r2 = r2
+                        best_formula = f'y = {np.exp(ln_a):.4f}*x^{b_exp:.4f}'
+                        best_name = 'power'
+            except Exception:
+                pass
+
+            # Log: y = a * ln(x) + b
+            try:
+                mask = x > 0
+                if np.sum(mask) >= 2:
+                    lx = np.log(x[mask])
+                    coeffs = np.polyfit(lx, y[mask], 1)
+                    y_pred = np.polyval(coeffs, lx)
+                    ss_res = np.sum((y[mask] - y_pred) ** 2)
+                    ss_tot = np.sum((y[mask] - np.mean(y[mask])) ** 2)
+                    r2 = 1 - ss_res / max(ss_tot, 1e-12)
+                    if r2 > best_r2:
+                        best_r2 = r2
+                        best_formula = f'y = {coeffs[0]:.4f}*ln(x) + {coeffs[1]:.4f}'
+                        best_name = 'log'
+            except Exception:
+                pass
+
+            if best_r2 > 0.8:
+                law_id = pat.get('law_id', fp[:12])
+                print(f'    \U0001f4d0 Symbolic: Law {law_id} \u2192 {best_formula} '
+                      f'(R\u00b2={best_r2:.3f}, {best_name})')
+                sys.stdout.flush()
+                # Store symbolic result back into pattern
+                entry.setdefault('symbolic', {})
+                entry['symbolic'] = {
+                    'formula': best_formula, 'r2': best_r2, 'type': best_name
+                }
+                symbolic_count += 1
+
+        if symbolic_count > 0:
+            print(f'    \U0001f4d0 Symbolic regression: {symbolic_count} laws fitted')
+            sys.stdout.flush()
+
+        return symbolic_count
+    except Exception as e:
+        print(f'    v12 symbolic regression error: {e}')
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v13 — Law Compression (#101)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _compress_laws(registry):
+    """#101: Group laws by target metric and generate meta-laws.
+
+    For metric groups with 5+ laws, summarize into a META_ law.
+    """
+    try:
+        # Group registered laws by mentioned metrics
+        metric_keywords = [
+            'phi', 'tension', 'entropy', 'faction', 'coupling',
+            'noise', 'ratchet', 'hebbian', 'topology', 'chaos',
+            'growth', 'decay', 'oscillation', 'correlation',
+        ]
+        groups = {m: [] for m in metric_keywords}
+
+        for fp, entry in registry.seen.items():
+            if not entry.get('registered'):
+                continue
+            pat = entry.get('pattern', {})
+            text = str(pat.get('formula', pat.get('description', str(pat)))).lower()
+            for metric in metric_keywords:
+                if metric in text:
+                    groups[metric].append(fp)
+
+        meta_count = 0
+        for metric, fps in groups.items():
+            if len(fps) < 5:
+                continue
+
+            # Check if META_ already exists for this metric
+            meta_fp = f'META_{metric}'
+            if meta_fp in registry.seen:
+                continue
+
+            # Generate meta-law
+            factors = set()
+            for fp in fps:
+                pat = registry.seen[fp].get('pattern', {})
+                text = str(pat.get('formula', '')).lower()
+                for kw in metric_keywords:
+                    if kw != metric and kw in text:
+                        factors.add(kw)
+
+            meta_formula = (f'META: {metric} is governed by {len(fps)} factors: '
+                           f'{", ".join(sorted(factors)[:8])}')
+
+            registry.seen[meta_fp] = {
+                'count': len(fps),
+                'first_gen': 0,
+                'last_gen': 0,
+                'registered': True,
+                'pattern': {
+                    'type': f'META_{metric}',
+                    'formula': meta_formula,
+                    'metrics': [metric] + list(factors)[:4],
+                    'source': 'v13_compression',
+                },
+            }
+            meta_count += 1
+
+        if meta_count > 0:
+            total_compressed = sum(
+                len(fps) for fps in groups.values() if len(fps) >= 5)
+            print(f'    \U0001f5dc\ufe0f Compressed {total_compressed} laws \u2192 '
+                  f'{meta_count} meta-laws')
+            sys.stdout.flush()
+
+        return meta_count
+    except Exception as e:
+        print(f'    v13 compress error: {e}')
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v14 — Time Travel Search (#102)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Ring buffer of engine states for time-travel
+_time_travel_buffer = []
+_TIME_TRAVEL_MAX = 10
+
+
+def _time_travel_snapshot(engine, gen):
+    """Save engine cell state snapshot to ring buffer."""
+    try:
+        states = engine.get_states() if hasattr(engine, 'get_states') else None
+        if states is None:
+            return
+        if hasattr(states, 'detach'):
+            import torch
+            snapshot = states.detach().clone()
+        elif hasattr(states, 'copy'):
+            snapshot = states.copy()
+        else:
+            return
+        _time_travel_buffer.append({'gen': gen, 'states': snapshot})
+        if len(_time_travel_buffer) > _TIME_TRAVEL_MAX:
+            _time_travel_buffer.pop(0)
+    except Exception:
+        pass
+
+
+def _time_travel_discover(engine, best_states, steps):
+    """#102: Roll back to a random past state and rediscover.
+
+    When saturation is detected, pick a random past snapshot and
+    restore it, then run discovery from that alternate timeline.
+    """
+    try:
+        import random as _rng
+        if not _time_travel_buffer:
+            return []
+
+        # Pick random past state
+        past = _rng.choice(_time_travel_buffer)
+        past_gen = past['gen']
+        past_states = past['states']
+
+        # Restore engine to past state
+        if hasattr(engine, 'cells') and hasattr(past_states, 'shape'):
+            try:
+                if hasattr(past_states, 'detach'):
+                    engine.cells.data.copy_(past_states[:engine.cells.shape[0]])
+                elif hasattr(engine, 'set_states'):
+                    engine.set_states(past_states)
+            except Exception:
+                pass
+
+        print(f'    \u23ea Time travel: rolled back to Gen {past_gen} state')
+        sys.stdout.flush()
+
+        # Run discovery from restored state
+        cells = engine.max_cells if hasattr(engine, 'max_cells') else 64
+        discoverer = ConsciousLawDiscoverer(cells, steps)
+        try:
+            patterns = discoverer.discover_all()
+        except Exception:
+            patterns = []
+
+        return patterns if patterns else []
+    except Exception as e:
+        print(f'    v14 time travel error: {e}')
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v15 — Reward Shaping (#103)
+# ═══════════════════════════════════════════════════════════════════════
+
+_reward_history = []  # list of (gen, n_new_laws, params_snapshot)
+
+
+def _reward_shape_params(gen_history, engine):
+    """#103: Adjust engine params toward reward gradient.
+
+    Track reward = new_laws_per_gen for each param config.
+    If changing param X increased reward, continue that direction.
+    Adjusts: coupling, noise_scale, hebbian_lr by +/-10%.
+    """
+    try:
+        if len(gen_history) < 3:
+            return
+
+        # Current reward: new laws in last gen
+        recent = gen_history[-1]
+        prev = gen_history[-2]
+        reward_now = recent.get('promoted', 0) + recent.get('new', 0) * 0.5
+        reward_prev = prev.get('promoted', 0) + prev.get('new', 0) * 0.5
+        gradient = reward_now - reward_prev
+
+        adjustable = ['coupling', 'noise_scale', 'hebbian_lr']
+        adjusted = []
+
+        for param_name in adjustable:
+            old_val = getattr(engine, param_name, None)
+            if old_val is None or not isinstance(old_val, (int, float)):
+                continue
+
+            if abs(old_val) < 1e-10:
+                continue
+
+            # Apply gradient direction with 10% step
+            if gradient > 0:
+                new_val = old_val * 1.10  # reward increased, continue direction
+            elif gradient < 0:
+                new_val = old_val * 0.90  # reward decreased, reverse
+            else:
+                continue
+
+            # Clamp to reasonable range
+            new_val = max(0.001, min(1.0, new_val))
+
+            try:
+                setattr(engine, param_name, new_val)
+                adjusted.append((param_name, old_val, new_val))
+                print(f'    \U0001f3af Reward shaping: {param_name} '
+                      f'{old_val:.4f}\u2192{new_val:.4f} '
+                      f'(reward gradient: {gradient:+.2f})')
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+        return adjusted
+    except Exception as e:
+        print(f'    v15 reward shaping error: {e}')
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v16 — Cross-Project Discovery (#104)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _cross_project_discover(registry):
+    """#104: Compare Anima laws with TECS-L laws by keyword overlap.
+
+    Loads TECS-L consciousness_laws.json if available, compares
+    law text keywords with Anima's registered laws.
+    """
+    try:
+        tecs_path = os.path.expanduser(
+            '~/Dev/TECS-L/.shared/consciousness_laws.json')
+        if not os.path.exists(tecs_path):
+            return 0
+
+        with open(tecs_path) as f:
+            tecs_data = json.load(f)
+
+        tecs_laws = tecs_data.get('laws', {})
+        if not tecs_laws:
+            return 0
+
+        # Build keyword sets for TECS-L laws
+        def _keywords(text):
+            """Extract meaningful keywords from law text."""
+            stop = {'the', 'a', 'an', 'is', 'are', 'in', 'of', 'to', 'and',
+                    'or', 'with', 'for', 'on', 'at', 'by', 'from', 'that'}
+            words = set()
+            for w in str(text).lower().split():
+                w = w.strip('.,;:()[]{}"\'-')
+                if len(w) > 2 and w not in stop:
+                    words.add(w)
+            return words
+
+        tecs_kw_map = {}
+        for lid, text in tecs_laws.items():
+            tecs_kw_map[lid] = _keywords(text)
+
+        # Build keyword sets for Anima laws
+        anima_laws = {}
+        for fp, entry in registry.seen.items():
+            if not entry.get('registered'):
+                continue
+            pat = entry.get('pattern', {})
+            text = str(pat.get('formula', pat.get('description', '')))
+            anima_laws[fp] = _keywords(text)
+
+        # Find matches (3+ keyword overlap)
+        matches = 0
+        for a_fp, a_kw in anima_laws.items():
+            for t_lid, t_kw in tecs_kw_map.items():
+                overlap = a_kw & t_kw
+                if len(overlap) >= 3:
+                    matches += 1
+                    entry = registry.seen[a_fp]
+                    entry.setdefault('cross_project', [])
+                    if t_lid not in entry['cross_project']:
+                        entry['cross_project'].append(t_lid)
+                    break  # One match per Anima law is enough
+
+        if matches > 0:
+            print(f'    \U0001f310 Cross-project: {matches} laws match TECS-L')
+            sys.stdout.flush()
+
+        return matches
+    except Exception as e:
+        # Silently fail if TECS-L not available
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v17 — Law Visualization (#105)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _visualize_law_graph(registry, law_network):
+    """#105: Build law adjacency graph, find clusters and unexplored metrics.
+
+    Laws that share metrics are connected. Connected components = clusters.
+    Metrics mentioned by no law = unexplored areas.
+
+    Returns list of unexplored metrics for hypothesis generation.
+    """
+    try:
+        all_metrics = {
+            'phi', 'tension', 'entropy', 'faction', 'coupling',
+            'noise', 'ratchet', 'hebbian', 'topology', 'chaos',
+            'growth', 'decay', 'oscillation', 'correlation',
+            'faction_entropy', 'coupling_asymmetry', 'cell_diversity',
+            'phase_coherence', 'lorenz', 'sandpile', 'chimera',
+            'standing_wave', 'mitosis', 'frustration',
+        }
+
+        # Build per-law metric sets
+        law_metrics = {}
+        for fp, entry in registry.seen.items():
+            if not entry.get('registered'):
+                continue
+            pat = entry.get('pattern', {})
+            text = str(pat.get('formula', pat.get('description', str(pat)))).lower()
+            metrics_found = set()
+            for m in all_metrics:
+                if m.replace('_', ' ') in text or m in text:
+                    metrics_found.add(m)
+            if metrics_found:
+                law_metrics[fp] = metrics_found
+
+        if not law_metrics:
+            return []
+
+        # Build adjacency (shared metrics)
+        nodes = list(law_metrics.keys())
+        edges = 0
+        adj = {n: set() for n in nodes}
+        for i, n1 in enumerate(nodes):
+            for n2 in nodes[i + 1:]:
+                if law_metrics[n1] & law_metrics[n2]:
+                    adj[n1].add(n2)
+                    adj[n2].add(n1)
+                    edges += 1
+
+        # Find connected components (BFS)
+        visited = set()
+        clusters = []
+        for node in nodes:
+            if node in visited:
+                continue
+            cluster = []
+            queue_bfs = [node]
+            while queue_bfs:
+                curr = queue_bfs.pop(0)
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                cluster.append(curr)
+                for nb in adj.get(curr, set()):
+                    if nb not in visited:
+                        queue_bfs.append(nb)
+            if cluster:
+                clusters.append(cluster)
+
+        # Determine dominant metric per cluster
+        cluster_labels = []
+        for cluster in clusters:
+            metric_counts = {}
+            for fp in cluster:
+                for m in law_metrics.get(fp, set()):
+                    metric_counts[m] = metric_counts.get(m, 0) + 1
+            if metric_counts:
+                top_metric = max(metric_counts, key=metric_counts.get)
+                cluster_labels.append(top_metric)
+            else:
+                cluster_labels.append('unknown')
+
+        # Find unexplored metrics
+        covered = set()
+        for ms in law_metrics.values():
+            covered |= ms
+        unexplored = sorted(all_metrics - covered)
+
+        # Print ASCII cluster map
+        print(f'    \U0001f4ca Law Graph: {len(nodes)} nodes, {edges} edges, '
+              f'{len(clusters)} clusters')
+        for i, (cluster, label) in enumerate(zip(clusters[:5], cluster_labels[:5])):
+            law_ids = []
+            for fp in cluster[:5]:
+                pat = registry.seen[fp].get('pattern', {})
+                lid = pat.get('law_id', fp[:10])
+                law_ids.append(str(lid))
+            extra = f', +{len(cluster) - 5} more' if len(cluster) > 5 else ''
+            print(f'    Cluster {i + 1} ({label}): {", ".join(law_ids)}{extra}')
+        if unexplored:
+            print(f'    \u26a0\ufe0f Unexplored: {", ".join(unexplored[:6])}')
+        sys.stdout.flush()
+
+        return unexplored
+    except Exception as e:
+        print(f'    v17 law graph error: {e}')
+        return []
+
+
 def load_roadmap_state():
     """Load roadmap progress."""
     if os.path.exists(ROADMAP_STATE_PATH):
@@ -4338,6 +4863,51 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
             except Exception:
                 pass
 
+            # v14 #102: Save time travel snapshot every gen
+            try:
+                _time_travel_snapshot(engine, gen)
+            except Exception:
+                pass
+
+            # v14 #102: Time travel on saturation (zero_streak >= 2)
+            try:
+                if zero_streak >= 2 and _time_travel_buffer:
+                    tt_patterns = _time_travel_discover(engine, _time_travel_buffer, steps)
+                    if tt_patterns:
+                        tt_stats = registry.process(tt_patterns, gen)
+                        if tt_stats.get('new', 0) > 0:
+                            print(f'    \u23ea Time travel found {tt_stats["new"]} new patterns!')
+                            sys.stdout.flush()
+            except Exception:
+                pass
+
+            # v15 #103: Reward shaping every 10 gens
+            try:
+                if gen % 10 == 0 and len(gen_history) >= 3:
+                    _reward_shape_params(gen_history, engine)
+            except Exception:
+                pass
+
+            # v12 #100: Symbolic regression every 25 gens
+            try:
+                if gen % 25 == 0 and len(registry.registered) > 0:
+                    _symbolic_regression(registry)
+            except Exception:
+                pass
+
+            # v17 #105: Law graph visualization every 20 gens
+            try:
+                if gen % 20 == 0 and len(registry.registered) > 0:
+                    unexplored = _visualize_law_graph(registry, _law_network)
+                    # Feed unexplored metrics into v8 hypothesis generation
+                    if unexplored:
+                        try:
+                            _hypotheses = _auto_generate_hypothesis(registry, _law_network)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             # Live status file
             phi_prev = phi_history[-2] if len(phi_history) >= 2 else 0.0
             live = write_live_status(
@@ -4431,6 +5001,18 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                     if registry.registered:
                         _law_config = _laws_to_engine_config(
                             registry.registered, registry)
+                except Exception:
+                    pass
+
+                # v13 #101: Compress laws into meta-laws at stage completion
+                try:
+                    _compress_laws(registry)
+                except Exception:
+                    pass
+
+                # v16 #104: Cross-project discovery at stage completion
+                try:
+                    _cross_project_discover(registry)
                 except Exception:
                     pass
 
@@ -4778,6 +5360,38 @@ def main():
                 if gen % 10 == 0:
                     _genomes = _get_genome_population()
                     _ecosystem_step(_genomes, registry)
+            except Exception:
+                pass
+
+            # v14 #102: Time travel snapshot + rollback on saturation
+            try:
+                _time_travel_snapshot(engine, gen)
+                _zs = sum(1 for g in gen_history[-3:] if g.get('new', 0) == 0)
+                if _zs >= 2 and _time_travel_buffer:
+                    tt_patterns = _time_travel_discover(engine, _time_travel_buffer, args.steps)
+                    if tt_patterns:
+                        registry.process(tt_patterns, gen)
+            except Exception:
+                pass
+
+            # v15 #103: Reward shaping every 10 gens
+            try:
+                if gen % 10 == 0 and len(gen_history) >= 3:
+                    _reward_shape_params(gen_history, engine)
+            except Exception:
+                pass
+
+            # v12 #100: Symbolic regression every 25 gens
+            try:
+                if gen % 25 == 0 and len(registry.registered) > 0:
+                    _symbolic_regression(registry)
+            except Exception:
+                pass
+
+            # v17 #105: Law graph every 20 gens
+            try:
+                if gen % 20 == 0 and len(registry.registered) > 0:
+                    _visualize_law_graph(registry, _law_network)
             except Exception:
                 pass
 

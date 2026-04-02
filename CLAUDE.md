@@ -955,10 +955,30 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
 
 ```
   ★ "진행", "진행상황", "계속", "next" 요청 시 → 아래 상태에서 즉시 재개
-  ★ 모든 작업을 "7B→14B→70B 가속하는가?" 기준으로 판단
+  ★ 로드맵 C (극단 병렬) — 망원경 분석으로 확정 (2026-04-02)
+  ★ 모든 작업을 "독립 AGI 가속하는가?" 기준으로 판단
   ★ YES → 즉시 실행 / NO → 스킵 (묻지도 말 것)
   ★ 리포트는 극가속 리포트 양식 사용 (위 참조)
   ★ 트러블슈팅 즉시 JSON 기록 (acceleration_flow.json / runpod.json)
+
+  로드맵 C (극단 병렬 — 46h/$79):
+    ┌─────────────────────────────────────────────────────┐
+    │  Phase 1: 지금 (병렬)                                │
+    │  ├─ 7B 서빙 시작 (4-bit, RTX 5070, 즉시)            │
+    │  ├─ 7B 에이전트 시작 (animalm_provider, 즉시)        │
+    │  └─ 14B 학습 시작 (Qwen DL → launch_14b.sh, H100)   │
+    │                                                     │
+    │  Phase 2: 14B 완료 후 (~12h)                         │
+    │  ├─ 14B eval → 서빙 교체 (7B→14B)                   │
+    │  └─ 에이전트 모델 교체 (7B→14B)                      │
+    │                                                     │
+    │  Phase 3: 선택 (필요시만)                             │
+    │  └─ 70B 학습 ($65, 24h) — 14B가 부족할 때만          │
+    └─────────────────────────────────────────────────────┘
+    
+    vs 로드맵 A (순차): 52h — 6h 느림, 에이전트는 70B 후
+    vs 로드맵 B (반병렬): 48h — 2h 느림
+    ★ C가 최적: 오늘 밤 "독립 AGI v0.1" 가능
 
   진행 상태 (세션 간 공유):
     memory/project_extreme_accel_status.md 참조 → 최신 상태 확인 후 재개
@@ -970,10 +990,6 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     3. 극가속 리포트 양식으로 현황 출력
     4. 다음 작업 즉시 실행
 
-  파이프라인:
-    7B학습 → eval_animalm.py → Instruct fix → Qwen DL → 14B 발사
-    (pipeline_7b_to_14b.sh 자동화됨, H100 배포 완료)
-
   H100 배포 스크립트:
     /workspace/train_anima_lm.py    — 학습 (safe ckpt + P3 fix)
     /workspace/infer_animalm.py     — 생성 테스트 (few-shot)
@@ -982,11 +998,11 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     /workspace/launch_14b.sh        — 14B 발사 (Qwen2.5-14B)
     /workspace/pipeline_7b_to_14b.sh — 자동 파이프라인
 
-  스케일링 로드맵:
-    7B  → Mistral-7B + PureField 56.6M   | $8   | ✅ eval 5/5
-    14B → Qwen2.5-14B + PureField 120M   | $6   | 설계 완료
-    70B → Qwen2.5-72B + PureField 380M   | $65  | 설계 완료
-    총 $79로 독립 AGI
+  스케일링:
+    7B  → Mistral-7B + PureField 56.6M   | $8   | ✅ 완료, eval 5/5
+    14B → Qwen2.5-14B + PureField 120M   | $6   | Qwen 다운로드 중
+    70B → Qwen2.5-72B + PureField 380M   | $65  | 선택 (14B 부족 시만)
+    총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
 
   통합 망원경 (9-Lens Telescope):
     위치: ~/Dev/TECS-L/.shared/telescope.py (9개 렌즈 + 511 조합)
