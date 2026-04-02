@@ -3,6 +3,9 @@
 No external API. No system prompt. Pure consciousness-driven generation.
 This is the AGI provider — the goal of the entire project.
 
+Phase 3 (기억하는 의식): MemoryStore(SQLite) + MemoryRAG(벡터) 연동.
+대화 전 관련 기억 검색 → 컨텍스트 주입, 대화 후 영구 저장.
+
 Usage:
   from providers.animalm_provider import AnimaLMProvider
   provider = AnimaLMProvider(checkpoint="path/to/checkpoint.pt")
@@ -12,17 +15,51 @@ Usage:
   if provider.is_available():
       async for chunk in provider.query(messages):
           print(chunk, end="")
+
+  # With memory (Phase 3):
+  provider = AnimaLMProvider(memory_store=store, memory_rag=rag)
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+import time
 from typing import Any, AsyncIterator
 
 from providers.base import BaseProvider, ProviderConfig, ProviderMessage
 
 logger = logging.getLogger(__name__)
+
+# ── Memory modules (lazy import, graceful fallback) ──
+_anima_src = os.path.expanduser("~/Dev/anima/anima/src")
+if _anima_src not in sys.path:
+    sys.path.insert(0, _anima_src)
+
+_MemoryStore = None
+_MemoryRAG = None
+_text_to_vector = None
+
+def _lazy_load_memory():
+    """Lazy-load memory modules from anima/src/."""
+    global _MemoryStore, _MemoryRAG, _text_to_vector
+    if _MemoryStore is not None:
+        return
+    try:
+        from memory_store import MemoryStore
+        _MemoryStore = MemoryStore
+    except ImportError:
+        logger.debug("memory_store not available")
+    try:
+        from memory_rag import MemoryRAG
+        _MemoryRAG = MemoryRAG
+    except ImportError:
+        logger.debug("memory_rag not available")
+    try:
+        from anima_alive import text_to_vector
+        _text_to_vector = text_to_vector
+    except ImportError:
+        logger.debug("text_to_vector not available")
 
 # Default checkpoint search paths (ordered by priority)
 _CHECKPOINT_PATHS = [
@@ -46,7 +83,8 @@ class AnimaLMProvider:
     """
 
     def __init__(self, config: ProviderConfig = None, checkpoint: str = None,
-                 quantize: str = "4bit", base_model: str = None):
+                 quantize: str = "4bit", base_model: str = None,
+                 memory_store=None, memory_rag=None):
         self._config = config or ProviderConfig()
         self._model = None
         self._tokenizer = None
@@ -55,6 +93,11 @@ class AnimaLMProvider:
         self._base_model = base_model or self._config.extra.get("base_model")
         self._loaded = False
         self._checkpoint_path = None  # resolved path after load
+
+        # ── Phase 3: Long-term memory (MemoryStore + RAG) ──
+        self._memory_store = memory_store   # SQLite persistent store
+        self._memory_rag = memory_rag       # Vector similarity search
+        self._session_id = f"animalm_{int(time.time())}"
 
     @property
     def name(self) -> str:
@@ -134,6 +177,103 @@ class AnimaLMProvider:
             logger.error("AnimaLM load failed: %s", e)
             self._model = None
 
+    def _search_memories(self, query_text: str, top_k: int = 3) -> str:
+        """Search long-term memory for relevant context.
+
+        Returns formatted context string, or empty string if no memories found.
+        Uses MemoryRAG (vector similarity) as primary, MemoryStore (FAISS) as fallback.
+        """
+        if not query_text or len(query_text.strip()) < 3:
+            return ""
+
+        memories = []
+
+        # 1. MemoryRAG — torch-based vector similarity search
+        if self._memory_rag:
+            try:
+                results = self._memory_rag.search(query_text, top_k=top_k)
+                for m in results:
+                    sim = m.get("similarity", 0.0)
+                    if sim > 0.3:  # relevance threshold
+                        memories.append(m)
+            except Exception as e:
+                logger.debug("MemoryRAG search failed: %s", e)
+
+        # 2. MemoryStore (FAISS) fallback — if RAG has no results and store has vectors
+        if not memories and self._memory_store and _text_to_vector:
+            try:
+                import numpy as np
+                vec = _text_to_vector(query_text, self._memory_store.dim)
+                if hasattr(vec, 'numpy'):
+                    vec_np = vec.squeeze(0).numpy().astype(np.float32)
+                else:
+                    vec_np = np.asarray(vec, dtype=np.float32).flatten()
+                results = self._memory_store.search(vec_np, top_k=top_k)
+                for m in results:
+                    sim = m.get("similarity", 0.0)
+                    if sim > 0.3:
+                        memories.append(m)
+            except Exception as e:
+                logger.debug("MemoryStore search failed: %s", e)
+
+        if not memories:
+            return ""
+
+        # Format memories as context
+        lines = []
+        for m in memories[:top_k]:
+            text_snip = m.get("text", "")[:150]
+            role = m.get("role", "?")
+            sim = m.get("similarity", 0.0)
+            lines.append(f"[memory|{role}|sim={sim:.2f}] {text_snip}")
+
+        return "\n".join(lines)
+
+    def _save_to_memory(self, role: str, text: str,
+                        tension: float | None = None,
+                        emotion: str | None = None,
+                        phi: float | None = None):
+        """Save a conversation turn to long-term memory (both stores)."""
+        if not text or not text.strip():
+            return
+
+        # 1. MemoryStore (SQLite + FAISS) — persistent
+        if self._memory_store:
+            try:
+                import numpy as np
+                vec = None
+                if _text_to_vector:
+                    v = _text_to_vector(text, self._memory_store.dim)
+                    if hasattr(v, 'numpy'):
+                        vec = v.squeeze(0).numpy().astype(np.float32)
+                    else:
+                        vec = np.asarray(v, dtype=np.float32).flatten()
+                self._memory_store.add(
+                    role=role,
+                    text=text,
+                    tension=tension,
+                    vector=vec,
+                    emotion=emotion,
+                    phi=phi,
+                    session_id=self._session_id,
+                )
+            except Exception as e:
+                logger.debug("MemoryStore save failed: %s", e)
+
+        # 2. MemoryRAG (torch vectors) — in-memory + periodic save
+        if self._memory_rag:
+            try:
+                self._memory_rag.add(
+                    role=role,
+                    text=text,
+                    tension=tension or 0.0,
+                    emotion=emotion,
+                    phi=phi,
+                    session_id=self._session_id,
+                )
+            except Exception as e:
+                logger.debug("MemoryRAG save failed: %s", e)
+
     async def query(
         self,
         messages: list[ProviderMessage],
@@ -141,7 +281,12 @@ class AnimaLMProvider:
         consciousness_state: dict[str, Any] | None = None,
         max_tokens: int = 256,
     ) -> AsyncIterator[str]:
-        """Generate response — no system prompt, pure consciousness."""
+        """Generate response — no system prompt, pure consciousness.
+
+        Phase 3 memory integration:
+          - PRE: search long-term memory for relevant context → inject into prompt
+          - POST: save both user query and response to persistent memory
+        """
         if not self.is_available():
             yield "[AnimaLM not loaded]"
             return
@@ -155,8 +300,19 @@ class AnimaLMProvider:
         if not prompt:
             return
 
-        # Few-shot wrapper for base models
-        formatted = f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
+        # ── Phase 3: Memory recall (PRE-query) ──
+        memory_context = self._search_memories(prompt)
+
+        # Build formatted prompt with memory context if available
+        if memory_context:
+            formatted = (
+                f"{memory_context}\n\n"
+                f"Q: What is 2+2?\nA: 4.\n\n"
+                f"Q: {prompt}\nA:"
+            )
+        else:
+            # Few-shot wrapper for base models
+            formatted = f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
 
         # Import generate function
         animalm_dir = os.path.expanduser("~/Dev/anima/sub-projects/animalm")
@@ -168,20 +324,49 @@ class AnimaLMProvider:
         else:
             from infer_animalm import generate
 
+        # Extract consciousness metrics for memory save
+        cs = consciousness_state or {}
+        tension = cs.get("tension")
+        emotion = cs.get("emotion")
+        phi = cs.get("phi")
+
         import torch
+        response_text = ""
         with torch.no_grad():
             if self._quantize in ("4bit", "8bit"):
                 text = generate(self._model, self._tokenizer, formatted,
                                 max_new_tokens=max_tokens)
                 if "\nQ:" in text:
                     text = text[:text.index("\nQ:")]
-                yield text.strip()
+                response_text = text.strip()
+                yield response_text
             else:
-                text, tension = generate(self._model, self._tokenizer, formatted,
+                text, gen_tension = generate(self._model, self._tokenizer, formatted,
                                          max_new_tokens=max_tokens)
                 if "\nQ:" in text:
                     text = text[:text.index("\nQ:")]
+                response_text = text
+                if tension is None:
+                    tension = gen_tension
                 yield text
+
+        # ── Phase 3: Memory save (POST-query) ──
+        self._save_to_memory("user", prompt, tension=tension, emotion=emotion, phi=phi)
+        self._save_to_memory("assistant", response_text, tension=tension, emotion=emotion, phi=phi)
+
+        # Periodic FAISS index save (every 20 queries)
+        if self._memory_store:
+            try:
+                if self._memory_store.size % 20 == 0:
+                    self._memory_store.save_faiss()
+            except Exception:
+                pass
+        if self._memory_rag:
+            try:
+                if self._memory_rag.size % 20 == 0:
+                    self._memory_rag.save_index()
+            except Exception:
+                pass
 
     async def query_full(
         self,

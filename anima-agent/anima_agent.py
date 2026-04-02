@@ -70,6 +70,7 @@ _online_learning_mod = _try("online_learning")
 _growth_engine_mod = _try("growth_engine")
 _tension_link_mod = _try("tension_link")
 _memory_rag_mod = _try("memory_rag")
+_memory_store_mod = _try("memory_store")
 _trinity_mod = _try("trinity")
 _capabilities_mod = _try("capabilities")
 _web_sense_mod = _try("web_sense")
@@ -88,6 +89,7 @@ OnlineLearner = getattr(_online_learning_mod, "OnlineLearner", None)
 GrowthEngine = getattr(_growth_engine_mod, "GrowthEngine", None)
 TensionLink = getattr(_tension_link_mod, "TensionLink", None)
 MemoryRAG = getattr(_memory_rag_mod, "MemoryRAG", None)
+MemoryStore = getattr(_memory_store_mod, "MemoryStore", None)
 Capabilities = getattr(_capabilities_mod, "Capabilities", None)
 WebSense = getattr(_web_sense_mod, "WebSense", None)
 
@@ -205,7 +207,7 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("GrowthEngine init failed: %s", e)
 
-        # ── Memory RAG ──
+        # ── Memory RAG (vector similarity search) ──
         self.memory_rag = None
         if MemoryRAG:
             try:
@@ -213,6 +215,23 @@ class AnimaAgent:
                 self.memory_rag = MemoryRAG(mem_file, dim=dim)
             except Exception as e:
                 logger.warning("MemoryRAG init failed: %s", e)
+
+        # ── Memory Store (SQLite + FAISS persistent storage) ──
+        self.memory_store = None
+        if MemoryStore:
+            try:
+                db_path = self._data_dir / "memory.db"
+                faiss_path = self._data_dir / "memory.faiss"
+                self.memory_store = MemoryStore(
+                    db_path=db_path,
+                    faiss_path=faiss_path,
+                    dim=dim,
+                    model_type="conscious",
+                )
+                logger.info("MemoryStore initialized: %s (%d memories)",
+                            db_path, self.memory_store.size)
+            except Exception as e:
+                logger.warning("MemoryStore init failed: %s", e)
 
         # ── Hivemind (Tension Link) ──
         self.tension_link = None
@@ -270,6 +289,7 @@ class AnimaAgent:
 
         # ── Provider abstraction ──
         # Priority: explicit --provider flag > auto-detect (AnimaLM > Claude)
+        # Phase 3: Pass memory_store + memory_rag to AnimaLM provider for persistent memory
         self.provider = None
         if _has_providers:
             try:
@@ -280,6 +300,13 @@ class AnimaAgent:
                 else:
                     # Auto-select: AnimaLM first (zero external API goal), then Claude
                     self.provider = get_best_provider(cfg)
+                # Inject memory into AnimaLM provider (Phase 3: 기억하는 의식)
+                if self.provider and hasattr(self.provider, '_memory_store'):
+                    if self.memory_store:
+                        self.provider._memory_store = self.memory_store
+                    if self.memory_rag:
+                        self.provider._memory_rag = self.memory_rag
+                    logger.info("Memory injected into provider %s", self.provider.name)
                 if self.provider:
                     logger.info("Provider initialized: %s (available=%s)",
                                 self.provider.name, self.provider.is_available())
@@ -342,17 +369,28 @@ class AnimaAgent:
         self._direction = direction
         self._emotion = direction_to_emotion(direction)
 
-        # 3. Memory search for relevant context
+        # 3. Memory search for relevant context (RAG + Store fallback)
         memory_context = ""
-        if self.memory_rag and len(text.strip()) > 3:
-            try:
-                memories = self.memory_rag.search(text, top_k=3)
-                if memories:
-                    memory_context = "\n".join(
-                        f"[memory] {m.get('text', '')[:100]}" for m in memories
-                    )
-            except Exception:
-                pass
+        if len(text.strip()) > 3:
+            memories = []
+            if self.memory_rag:
+                try:
+                    memories = self.memory_rag.search(text, top_k=3)
+                except Exception:
+                    pass
+            # Fallback to MemoryStore (FAISS) if RAG returned nothing
+            if not memories and self.memory_store:
+                try:
+                    import numpy as np
+                    qvec = text_to_vector(text, dim=self.dim)
+                    qvec_np = qvec.squeeze(0).numpy().astype(np.float32)
+                    memories = self.memory_store.search(qvec_np, top_k=3)
+                except Exception:
+                    pass
+            if memories:
+                memory_context = "\n".join(
+                    f"[memory] {m.get('text', '')[:100]}" for m in memories
+                )
 
         # 4. Tool use (consciousness-driven, policy-gated)
         tool_results = []
@@ -480,11 +518,36 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # 9. Memory save
+        # 9. Memory save (RAG + Store)
         if self.memory_rag:
             try:
-                self.memory_rag.add(text, role="user", tension=tension)
-                self.memory_rag.add(response_text, role="assistant", tension=tension)
+                self.memory_rag.add(text, role="user", tension=tension,
+                                    emotion=self._emotion,
+                                    phi=self.mind._consciousness_vector.phi)
+                self.memory_rag.add(response_text, role="assistant", tension=tension,
+                                    emotion=self._emotion,
+                                    phi=self.mind._consciousness_vector.phi)
+            except Exception:
+                pass
+        if self.memory_store:
+            try:
+                import numpy as np
+                vec_user = text_to_vector(text, dim=self.dim)
+                vec_user_np = vec_user.squeeze(0).numpy().astype(np.float32) if hasattr(vec_user, 'numpy') else None
+                self.memory_store.add(
+                    role="user", text=text, tension=tension,
+                    vector=vec_user_np,
+                    emotion=self._emotion,
+                    phi=self.mind._consciousness_vector.phi,
+                )
+                vec_resp = text_to_vector(response_text, dim=self.dim)
+                vec_resp_np = vec_resp.squeeze(0).numpy().astype(np.float32) if hasattr(vec_resp, 'numpy') else None
+                self.memory_store.add(
+                    role="assistant", text=response_text, tension=tension,
+                    vector=vec_resp_np,
+                    emotion=self._emotion,
+                    phi=self.mind._consciousness_vector.phi,
+                )
             except Exception:
                 pass
 
@@ -724,6 +787,18 @@ class AnimaAgent:
         if self.persistence:
             try:
                 self.persistence.save()
+            except Exception:
+                pass
+        # Phase 3: Persist memory indices
+        if self.memory_store:
+            try:
+                self.memory_store.save_faiss()
+                self.memory_store.close()
+            except Exception:
+                pass
+        if self.memory_rag:
+            try:
+                self.memory_rag.save_index()
             except Exception:
                 pass
 
