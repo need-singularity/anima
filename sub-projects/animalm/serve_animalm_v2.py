@@ -150,8 +150,16 @@ def serve_http(model, tokenizer, port=8080):
             max_tokens = body.get("max_tokens", 256)
             temp = body.get("temperature", 0.8)
 
+            # Few-shot wrapper for base models (improves instruction following)
+            bare = body.get("bare", False)
+            if not bare:
+                prompt = f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
             response = generate(model, tokenizer, prompt,
                                 max_new_tokens=max_tokens, temperature=temp)
+            # Strip trailing Q&A artifacts
+            if "\nQ:" in response:
+                response = response[:response.index("\nQ:")]
+            response = response.strip()
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
