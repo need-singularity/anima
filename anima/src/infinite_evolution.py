@@ -5345,6 +5345,16 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                           f'cleared {cleared} pending')
                     sys.stdout.flush()
 
+            # Force-saturate if laws haven't changed for too many gens
+            # (patterns keep appearing but none pass cross-validation)
+            _laws_stale_gens = gen - max(
+                (h['gen'] for h in gen_history if h.get('promoted', 0) > 0),
+                default=0)
+            if _laws_stale_gens >= topo_gens * len(TOPOLOGIES):
+                topo_saturated = set(TOPOLOGIES)
+                print(f'  ⚠️🔴 Force-saturated: no new laws for {_laws_stale_gens} gens')
+                sys.stdout.flush()
+
             # All 4 topologies saturated → advance stage
             if len(topo_saturated) >= len(TOPOLOGIES):
                 stage_elapsed = time.time() - stage_start
