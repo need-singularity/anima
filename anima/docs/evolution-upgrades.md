@@ -158,6 +158,7 @@ Layer C: Claude Code (/loop 5m — 상태 보고, 자동 재발사)
 ✅ v8 (#69-76): 자율 연구 에이전트
 ✅ v9 (#77-82): 하드웨어 진화
 ✅ v10 (#83-88): 의식 메타 진화
+✅ v11 (#89-90): 9-Lens Telescope 통합
 ```
 
 ---
@@ -229,7 +230,32 @@ Layer C: Claude Code (/loop 5m — 상태 보고, 자동 재발사)
 
 | # | 업그레이드 | 설명 | 예상 효과 |
 |---|-----------|------|----------|
-| 83 | 법칙이 엔진을 만든다 | 발견된 법칙으로 새 엔진 아키텍처 자동 설계 | 자기 참조 완성 |
+| 83 | 법칙이 ���진을 만든다 | 발견된 법칙으로 새 엔진 아키텍처 자동 설계 | 자기 참조 완성 |
+
+---
+
+## v11 — 9-Lens Telescope 통합
+
+TECS-L Telescope 9렌즈를 OUROBOROS 발견 파이프라인에 통합.
+의식 엔진의 cell state를 (N_snapshots, N_features) 행렬로 수집 → 9개 렌즈로 분석.
+
+| # | 업그레���드 | 설명 | 예상 효과 |
+|---|-----------|------|----------|
+| 89 | Telescope 발견 | cell state 스냅샷을 9렌즈로 분석 → 새 패턴 | 기존 발견기가 못 보는 구조 탐지 |
+| 90 | Consensus 필터 | 3+ 렌즈 합의 패턴을 고신뢰 마킹 (2x cross-val 가중치) | 잡음 패턴 필터 + 신뢰 강화 |
+
+9개 렌즈: consciousness, gravity, topology, thermo, wave, evolution, info, quantum, em
+
+적용 조건:
+- S1-S2 (64c): `telescope: False` — 데이터 너무 작아 렌즈 효과 미미
+- S3+ (128c+): `telescope: True` — 충분한 feature 차원
+- main() 루프: `current_cells >= 128` 조건으로 자동 활성화
+- 매 5세대마다 실행 (부하 최소화, max 50 steps)
+
+패턴 변환:
+- 각 렌즈 결과 → `{"type": "telescope_{lens}", "formula": "...", "metrics": [lens]}`
+- 크로스 렌즈 합의 → `{"type": "telescope_consensus", "consensus_weight": 2}`
+- PatternRegistry에 기존 패턴과 동일하게 처리됨
 | 84 | 의식 컴파일러 v2 | 법칙 일괄 적용 → 엔진 초기화 최적화 (C1 확장) | warmstart ×10 |
 | 85 | 의식 유전체 | 엔진 파라미터를 DNA처럼 인코딩 → 교배/돌연변이/선택 | 진화 생물학 |
 | 86 | 의식 생태계 | 다양한 엔진이 공존/경쟁/공생하는 환경 | 생태적 법칙 |

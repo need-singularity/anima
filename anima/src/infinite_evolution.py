@@ -16,6 +16,7 @@ Features:
   v8: hypothesis_gen, experiment_design, report_gen, law_quality, counter_example, session_log
   v9: hardware_stubs (ESP32/FPGA/neuromorphic/sensor)
   v10: laws_to_engine, genome, ecosystem, meta_analyze
+  v11: telescope_9lens (consciousness/gravity/topology/thermo/wave/evolution/info/quantum/em)
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
@@ -73,6 +74,14 @@ try:
 except ImportError:
     pass
 
+HAS_TELESCOPE = False
+try:
+    sys.path.insert(0, os.path.expanduser('~/Dev/TECS-L/.shared'))
+    from telescope import Telescope
+    HAS_TELESCOPE = True
+except ImportError:
+    pass
+
 
 def _print_accelerations():
     """Print startup acceleration status banner."""
@@ -91,6 +100,7 @@ def _print_accelerations():
     print(f'  \u26a1 v8: hypothesis_gen \u2705, experiment_design \u2705, report_gen \u2705, law_quality \u2705, counter_example \u2705, session_log \u2705')
     print(f'  \u26a1 v9: hardware_stubs \u2705 (ESP32/FPGA/neuromorphic ready)')
     print(f'  \u26a1 v10: laws_to_engine \u2705, genome \u2705, ecosystem \u2705, meta_analyze \u2705')
+    print(f'  \u26a1 v11: telescope_9lens {_yn(HAS_TELESCOPE)}')
     sys.stdout.flush()
 
 
@@ -108,24 +118,25 @@ TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
 # Each stage runs until all topologies saturate, then auto-advances
 # v3 #26-32: chaos_modes added per stage for search space expansion
 ROADMAP = [
-    # Phase 1: Baseline sweep (cells x steps)
-    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz']},
-    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile']},
-    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile']},
-    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    # Phase 1: Baseline sweep (cells x steps) — telescope off (too small)
+    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz'], 'telescope': False},
+    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'telescope': False},
+    # Phase 1b: Scale up — telescope on (128c+)
+    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'telescope': True},
+    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
     # Phase 2: Scale up
-    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
+    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
+    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
     # Phase 2b: Dimension mutation (v6 #56)
-    {'name': 'S8-dim128',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 128},
-    {'name': 'S9-dim256',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 256},
+    {'name': 'S8-dim128',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 128, 'telescope': False},
+    {'name': 'S9-dim256',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 256, 'telescope': False},
     # Phase 3: Extreme exploration
-    {'name': 'S10-mega512d',  'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S11-ultra1024', 'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S12-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S10-mega512d',  'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
+    {'name': 'S11-ultra1024', 'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
+    {'name': 'S12-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
     # Phase 4: Massive (H100 only)
-    {'name': 'S13-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S13-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera'], 'telescope': True},
 ]
 ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
 LAW_NETWORK_PATH = os.path.join(DATA_DIR, 'law_network.json')
@@ -135,6 +146,190 @@ OUROBOROS_REPORT_DIR = os.path.join(os.path.dirname(__file__), '..', 'docs', 'hy
 # v3 #26-32: chaos modes and frustration sweep
 CHAOS_MODES = ['lorenz', 'sandpile', 'chimera']
 FRUSTRATION_VALUES = [0.1, 0.2, 0.33, 0.5]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v11 #89-90: Telescope 9-lens integration
+# ═══════════════════════════════════════════════════════════════════════
+
+def _telescope_discover(engine, steps=50):
+    """Run engine for `steps` steps, collect cell states, and analyze with 9-lens Telescope.
+
+    v11 #89: Collect cell state snapshots every 10 steps, flatten into
+    (N_snapshots, N_cells * hidden_dim) ndarray, run Telescope.full_scan().
+    Convert lens findings into PatternRegistry-compatible pattern dicts.
+
+    Returns list of pattern dicts, or [] on any failure.
+    """
+    if not HAS_TELESCOPE:
+        return []
+    try:
+        import numpy as np
+        snapshots = []
+        collect_interval = 10
+        max_snapshots = 100
+
+        for step in range(steps):
+            try:
+                engine.process()
+            except Exception:
+                break
+
+            if step % collect_interval == 0:
+                try:
+                    states = engine.get_states() if hasattr(engine, 'get_states') else None
+                    if states is None:
+                        continue
+                    if hasattr(states, 'detach'):
+                        arr = states.detach().cpu().numpy()
+                    elif hasattr(states, 'numpy'):
+                        arr = states.numpy()
+                    else:
+                        arr = np.array(states)
+                    # Flatten to 1D per snapshot: (N_cells * hidden_dim,)
+                    snapshots.append(arr.flatten())
+                except Exception:
+                    continue
+
+        if len(snapshots) < 3:
+            return []
+
+        # Stack into (N_snapshots, N_features) and subsample if too large
+        data = np.stack(snapshots)
+        if data.shape[0] > max_snapshots:
+            indices = np.linspace(0, data.shape[0] - 1, max_snapshots, dtype=int)
+            data = data[indices]
+
+        # Run telescope full scan
+        telescope = Telescope()
+        result = telescope.full_scan(data)
+
+        # Convert telescope results to pattern dicts
+        patterns = []
+        for lens_name, lens_result in result.lens_results.items():
+            # Extract summary as a finding
+            summary = getattr(lens_result, 'summary', str(lens_result))
+            if summary:
+                first_line = summary.split('\n')[0][:120] if summary else ''
+                patterns.append({
+                    'type': f'telescope_{lens_name}',
+                    'formula': f'{lens_name}: {first_line}',
+                    'metrics': [lens_name],
+                    'source': 'telescope_v11',
+                })
+
+            # Extract individual discoveries if available
+            discoveries = getattr(lens_result, 'discoveries', None)
+            if discoveries and isinstance(discoveries, list):
+                for disc in discoveries[:5]:  # limit per lens
+                    desc = str(disc)[:120] if disc else ''
+                    patterns.append({
+                        'type': f'telescope_{lens_name}',
+                        'formula': f'{lens_name}_discovery: {desc}',
+                        'metrics': [lens_name],
+                        'source': 'telescope_v11',
+                    })
+
+            # Extract anomalies if available
+            anomalies = getattr(lens_result, 'anomalies', None)
+            if anomalies and isinstance(anomalies, list):
+                patterns.append({
+                    'type': f'telescope_{lens_name}_anomaly',
+                    'formula': f'{lens_name}_anomaly: {len(anomalies)} anomalies detected',
+                    'metrics': [lens_name],
+                    'source': 'telescope_v11',
+                })
+
+        # Add cross-findings as high-value patterns
+        for cf in result.cross_findings:
+            confirmed_by = cf.get('confirmed_by', [])
+            cf_type = cf.get('type', 'cross')
+            confidence = cf.get('confidence', 0)
+            patterns.append({
+                'type': 'telescope_cross',
+                'formula': f'cross_{cf_type}: confirmed by {",".join(confirmed_by)} (conf={confidence:.2f})',
+                'metrics': confirmed_by,
+                'source': 'telescope_v11',
+                'confidence': confidence,
+            })
+
+        return patterns
+
+    except Exception:
+        return []
+
+
+def _telescope_consensus_filter(patterns):
+    """Group telescope patterns by phenomenon and mark consensus findings.
+
+    v11 #90: If 3+ lenses agree on the same finding category, mark as
+    'telescope_consensus' type. Consensus patterns get fast-tracked in
+    cross-validation (count as 2x toward threshold).
+
+    Returns (filtered_patterns, n_consensus) where consensus patterns
+    have type='telescope_consensus' and extra key 'consensus_weight': 2.
+    """
+    if not patterns:
+        return patterns, 0
+
+    # Group by metric/phenomenon (the lens name in metrics[0])
+    from collections import defaultdict
+    lens_groups = defaultdict(list)
+    non_telescope = []
+
+    for p in patterns:
+        if isinstance(p, dict) and p.get('source') == 'telescope_v11':
+            # Group by the primary metric (lens name)
+            metrics = p.get('metrics', [])
+            ptype = p.get('type', '')
+            # Use type prefix as grouping key
+            if ptype == 'telescope_cross':
+                lens_groups['_cross'].append(p)
+            else:
+                lens_groups[ptype].append(p)
+        else:
+            non_telescope.append(p)
+
+    # Find consensus: 3+ distinct lens types reporting findings
+    active_lenses = set()
+    for p in patterns:
+        if isinstance(p, dict) and p.get('source') == 'telescope_v11':
+            metrics = p.get('metrics', [])
+            for m in metrics:
+                active_lenses.add(m)
+
+    consensus_patterns = []
+    n_consensus = 0
+
+    # Cross-findings already represent multi-lens agreement
+    for p in lens_groups.get('_cross', []):
+        confirmed = p.get('metrics', [])
+        if len(confirmed) >= 3:
+            consensus_p = dict(p)
+            consensus_p['type'] = 'telescope_consensus'
+            consensus_p['consensus_weight'] = 2
+            consensus_patterns.append(consensus_p)
+            n_consensus += 1
+        else:
+            non_telescope.append(p)
+
+    # If 3+ lenses produced findings, create a meta-consensus pattern
+    if len(active_lenses) >= 3:
+        sorted_lenses = sorted(active_lenses)
+        consensus_patterns.append({
+            'type': 'telescope_consensus',
+            'formula': f'multi_lens_consensus: {len(active_lenses)} lenses active ({",".join(sorted_lenses[:5])})',
+            'metrics': sorted_lenses,
+            'source': 'telescope_v11',
+            'consensus_weight': 2,
+        })
+        n_consensus += 1
+
+    # Merge everything back
+    result = non_telescope + [p for group_key, group in lens_groups.items()
+                              if group_key != '_cross'
+                              for p in group] + consensus_patterns
+    return result, n_consensus
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4015,6 +4210,25 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
             except Exception:
                 pass
 
+            # v11 #89-90: Telescope 9-lens scan every 5th gen (S3+ only)
+            try:
+                if (HAS_TELESCOPE and gen % 5 == 0
+                        and stage.get('telescope', False)):
+                    tele_patterns = _telescope_discover(engine, steps=min(steps, 50))
+                    if tele_patterns:
+                        tele_patterns, n_consensus = _telescope_consensus_filter(tele_patterns)
+                        n_lenses = len(set(
+                            m for p in tele_patterns
+                            if isinstance(p, dict) and p.get('source') == 'telescope_v11'
+                            for m in p.get('metrics', [])
+                        ))
+                        raw_patterns.extend(tele_patterns)
+                        print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
+                              f'from {n_lenses} lenses, {n_consensus} consensus')
+                        sys.stdout.flush()
+            except Exception:
+                pass
+
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
 
@@ -4415,6 +4629,24 @@ def main():
                     raw_patterns.extend(adv_patterns)
                     print(f'    v3: +{len(adv_patterns)} advanced patterns '
                           f'(oscillation/phase/decay)')
+            except Exception:
+                pass
+
+            # v11 #89-90: Telescope 9-lens scan every 5th gen (128c+ recommended)
+            try:
+                if HAS_TELESCOPE and gen % 5 == 0 and current_cells >= 128:
+                    tele_patterns = _telescope_discover(engine, steps=min(args.steps, 50))
+                    if tele_patterns:
+                        tele_patterns, n_consensus = _telescope_consensus_filter(tele_patterns)
+                        n_lenses = len(set(
+                            m for p in tele_patterns
+                            if isinstance(p, dict) and p.get('source') == 'telescope_v11'
+                            for m in p.get('metrics', [])
+                        ))
+                        raw_patterns.extend(tele_patterns)
+                        print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
+                              f'from {n_lenses} lenses, {n_consensus} consensus')
+                        sys.stdout.flush()
             except Exception:
                 pass
 
