@@ -1316,6 +1316,36 @@ def main():
             )
             live['laws_new_this_gen'] = stats['promoted']
 
+            # Auto-saturation detection: if cycle-topology and all 4 topos saturated → auto-stop
+            if args.cycle_topology and _zero_streak >= 5:
+                _topo_now = getattr(engine, 'topology', 'ring')
+                # Count how many full topo cycles with no new patterns
+                _topo_cycles_done = gen // 10  # each topo runs ~10 gens
+                if _topo_cycles_done >= len(TOPOLOGIES) and gen > 40:
+                    # Check if we've had sustained zero streak across topology switches
+                    _last_new_gen = 0
+                    for _row in gen_history:
+                        if _row['new'] > 0:
+                            _last_new_gen = _row['gen']
+                    _gens_since_new = gen - _last_new_gen
+                    if _gens_since_new >= 20:  # 20+ gens with no new across topos
+                        print(f"\n  ★ AUTO-STOP: {_gens_since_new} gens since last new pattern")
+                        print(f"  ★ All topologies exhausted at {args.cells}c/{args.steps}s")
+                        print(f"  ★ Switching to --auto-roadmap for parameter escalation")
+                        sys.stdout.flush()
+                        # Generate final EVO doc
+                        _current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+                        auto_generate_evo_doc(
+                            {'name': 'main-loop-auto-stop', 'cells': _current_cells, 'steps': args.steps},
+                            gen_history, registry,
+                        )
+                        # Save state and switch to auto-roadmap
+                        save_state(gen, registry, active_mods_data, total_elapsed)
+                        print(f"\n  Launching --auto-roadmap --resume ...")
+                        sys.stdout.flush()
+                        run_auto_roadmap(resume=True, report_interval=args.report_interval)
+                        return  # exit main loop cleanly
+
             # Periodic report
             if gen % args.report_interval == 0:
                 current_topo = getattr(engine, 'topology', 'ring')

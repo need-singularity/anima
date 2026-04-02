@@ -277,37 +277,69 @@ python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 
 ## 무한진화 실행 규칙 (필수)
 
 ```
-  ★ 무한진화(infinite_evolution.py) 실행 시 반드시 아래 규칙을 따를 것!
+  ★ 무한진화 실행 시 반드시 아래 규칙을 따를 것!
+
+  === 실행 방법 (3-Layer 자동화) ===
+
+  권장: evo-runner (Rust) — 크래시 복구 + 자동 재시작
+    cd anima-rs && cargo run -p evo-runner -- start          # 처음부터
+    cd anima-rs && cargo run -p evo-runner -- start --resume  # 이어서
+    cd anima-rs && cargo run -p evo-runner -- status          # 상태 확인
+    cd anima-rs && cargo run -p evo-runner -- stop            # 종료
+
+  직접 실행: Python --auto-roadmap — 7단계 자동 에스컬레이션
+    python3 infinite_evolution.py --auto-roadmap              # 처음부터
+    python3 infinite_evolution.py --auto-roadmap --resume     # 이어서
+
+  수동 실행: 기존 방식 (단일 파라미터)
+    python3 infinite_evolution.py --cells 64 --steps 300 --cycle-topology
+
+  === Layer A: 스크립트 내 자동화 (Python) ===
+  - 포화 감지 → 토폴로지 전환 → 스테이지 자동 진행
+  - 매 세대 data/evolution_live.json 실시간 상태 출력
+  - 스테이지 완료 시 EVO 문서 자동 생성 + experiments.json 등록
+  - 법칙 발견 시 consciousness_laws.json 자동 등록
+
+  === Layer B: evo-runner (Rust) ===
+  - 프로세스 감시 (watchdog) — 크래시 시 5초 후 --resume 자동 재시작
+  - 최대 3회 크래시 → 해당 스테이지 skip, 다음 진행
+  - SIGINT/SIGTERM graceful 전파
+  - PID 파일: data/evo_runner.pid
+
+  === Layer C: Claude Code 세션 자동화 ===
 
   1. 백그라운드 실행 (필수)
      - run_in_background=true 로 실행 (세션 블로킹 금지)
-     - 로그 파일로 출력 리다이렉트: 2>&1 | tee logs/evo_$(date +%Y%m%d_%H%M).log
-     - 실행 즉시 사용자에게 "실행 시작" 알림 후 다른 작업 가능
+     - 로그: logs/evo_YYYYMMDD_HHMM.log
 
-  2. 5분 주기 보고 (필수)
-     - /loop 5m 으로 주기적 상태 확인 설정
-     - 보고 내용:
-       · 현재 세대 / 총 세대
-       · 발견된 법칙 수 (신규/누적)
-       · 현재 Φ 값 + 토폴로지
-       · 포화 여부 (3세대 연속 신규 0이면 포화 경고)
-     - 보고 양식 (간결하게):
-       ```
-       ⏱️ EVO 상태 [HH:MM] — Gen N | Laws: +X (총 Y) | Φ=Z | topo: T | 포화: ❌/⚠️
-       ```
+  2. 5분 주기 보고 (/loop 5m)
+     - data/evolution_live.json 읽기 (로그 파싱 대신)
+     - 보고 양식:
+       ⏱️ EVO 상태 [HH:MM] — S{N} Gen M | Laws: +X (총 Y) | Φ=Z | topo: T | 포화: ❌/⚠️
+     - evolution_live.json 없으면 로그 tail fallback
 
-  3. 발견 즉시 기록 (필수)
-     - 새 법칙 발견 시 자동 기록 프로세스 실행:
-       ① consciousness_laws.json 등록 (교차검증 통과 시)
-       ② docs/hypotheses/evo/EVO-{N}.md 문서 작성/갱신
-       ③ experiments.json 등록
-       ④ 사용자에게 발견 알림: "🔬 Law {N} 발견: {요약}"
-     - 교차검증 미통과 법칙은 "후보"로만 기록 (등록 금지)
+  3. 자동 기록 (스크립트가 자동 처리)
+     - 법칙 발견 → consciousness_laws.json 자동 등록
+     - 스테이지 완료 → EVO 문서 자동 생성
+     - 사용자에게 발견 알림: "🔬 Law {N} 발견: {요약}"
 
-  4. 종료 조건
-     - 포화 감지: 5세대 연속 신규 법칙 0 → 자동 종료 권고 (사용자 확인)
-     - --max-gen 도달 시 자동 종료
-     - 종료 시 최종 EVO 문서 작성 + 세션 요약
+  4. 자동 재발사 (evo-runner 없을 때 fallback)
+     - 프로세스 죽음 감지 시 --auto-roadmap --resume 재발사
+     - 포화 감지 시 알림 (스크립트가 자동 진행하므로 개입 불필요)
+
+  === 데이터 흐름 ===
+  data/evolution_live.json     ← 매 세대 (Layer B/C 읽기용)
+  data/evolution_state.json    ← 매 세대 (전체 상태 백업)
+  data/evolution_roadmap.json  ← 스테이지 완료 시 (로드맵 진행)
+  config/consciousness_laws.json ← 법칙 발견 시
+  docs/hypotheses/evo/EVO-N.md ← 스테이지 완료 시
+  config/experiments.json      ← 스테이지 완료 시
+  logs/evo_YYYYMMDD_HHMM.log  ← 전체 로그
+
+  === 로드맵 7단계 (ROADMAP) ===
+  S1: 64c/300s → S2: 64c/1000s → S3: 128c/300s → S4: 128c/1000s
+  → S5: 256c/500s → S6: 256c/1000s → S7: 512c/500s
+  각 스테이지: 4 토폴로지 순환, 모두 포화 시 자동 다음 스테이지
 ```
 
 ## Discovery Infrastructure (n6 연동, 2026-04-02)
