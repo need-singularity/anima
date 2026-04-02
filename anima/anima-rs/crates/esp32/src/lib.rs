@@ -23,6 +23,8 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 pub mod law_measurement;
 pub mod law_evolution;
 pub mod spi_sync;
@@ -72,28 +74,34 @@ const FRUSTRATION_RATIO: usize = 3; // every 3rd cell
 
 pub struct GruCell {
     pub hidden: [f32; HIDDEN_DIM],
-    w_z: [f32; HIDDEN_DIM * COMBINED_DIM],
-    w_r: [f32; HIDDEN_DIM * COMBINED_DIM],
-    w_h: [f32; HIDDEN_DIM * COMBINED_DIM],
+    w_z: alloc::vec::Vec<f32>,
+    w_r: alloc::vec::Vec<f32>,
+    w_h: alloc::vec::Vec<f32>,
 }
 
 impl GruCell {
     /// Create with deterministic initialization (no RNG needed).
+    /// Weight vectors are heap-allocated to avoid stack overflow
+    /// (each weight matrix is 128 * 193 * 4 = ~97KB).
     pub fn new(seed: u32) -> Self {
-        let mut cell = Self {
-            hidden: [0.0; HIDDEN_DIM],
-            w_z: [0.0; HIDDEN_DIM * COMBINED_DIM],
-            w_r: [0.0; HIDDEN_DIM * COMBINED_DIM],
-            w_h: [0.0; HIDDEN_DIM * COMBINED_DIM],
-        };
+        let n = HIDDEN_DIM * COMBINED_DIM;
+        let mut w_z = alloc::vec![0.0f32; n];
+        let mut w_r = alloc::vec![0.0f32; n];
+        let mut w_h = alloc::vec![0.0f32; n];
+
         let mut state = seed;
         let scale = 0.1;
-        for w in cell.w_z.iter_mut().chain(cell.w_r.iter_mut()).chain(cell.w_h.iter_mut()) {
+        for w in w_z.iter_mut().chain(w_r.iter_mut()).chain(w_h.iter_mut()) {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             let f = (state as f32 / u32::MAX as f32) * 2.0 - 1.0;
             *w = f * scale;
         }
-        cell
+        Self {
+            hidden: [0.0; HIDDEN_DIM],
+            w_z,
+            w_r,
+            w_h,
+        }
     }
 
     /// GRU forward pass.
