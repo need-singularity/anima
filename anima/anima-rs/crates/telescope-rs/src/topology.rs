@@ -73,42 +73,18 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize,
         };
     }
 
-    // Pairwise distances (parallel)
-    let n_pairs = n_samples * (n_samples - 1) / 2;
-    let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(n_pairs);
+    // Pairwise distances using common utility + flat matrix for O(1) lookup
+    let dist_matrix = crate::common::pairwise_dist_matrix(data, n_samples, n_features);
+    let n = n_samples;
 
-    // Compute distances — use parallel chunks for large N
-    if n_samples > 100 {
-        let pair_dists: Vec<(f64, usize, usize)> = (0..n_samples)
-            .into_par_iter()
-            .flat_map(|i| {
-                let mut local = Vec::new();
-                for j in (i + 1)..n_samples {
-                    let mut dist_sq = 0.0;
-                    for k in 0..n_features {
-                        let d = data[i * n_features + k] - data[j * n_features + k];
-                        dist_sq += d * d;
-                    }
-                    local.push((dist_sq.sqrt(), i, j));
-                }
-                local
-            })
-            .collect();
-        edges = pair_dists;
-    } else {
-        for i in 0..n_samples {
-            for j in (i + 1)..n_samples {
-                let mut dist_sq = 0.0;
-                for k in 0..n_features {
-                    let d = data[i * n_features + k] - data[j * n_features + k];
-                    dist_sq += d * d;
-                }
-                edges.push((dist_sq.sqrt(), i, j));
-            }
+    let n_pairs = n * (n - 1) / 2;
+    let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(n_pairs);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            edges.push((dist_matrix[i * n + j], i, j));
         }
     }
-
-    edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    edges.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     let max_dist = edges.last().map(|e| e.0).unwrap_or(1.0);
     let step_size = max_dist / n_filtration_steps as f64;
@@ -135,30 +111,22 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize,
     let mut mst_uf = UnionFind::new(n_samples);
     let mut non_mst: Vec<(f64, usize, usize)> = Vec::new();
 
-    // Build edge weight lookup (hash for fast triangle check)
-    let mut edge_weight = std::collections::HashMap::new();
+    // Use flat distance matrix for O(1) lookup (no HashMap)
     for &(d, i, j) in &edges {
-        edge_weight.insert((i.min(j), i.max(j)), d);
-    }
-
-    for &(d, i, j) in &edges {
-        if mst_uf.union(i, j) {
-            // MST edge
-        } else {
+        if !mst_uf.union(i, j) {
             non_mst.push((d, i, j));
         }
     }
 
     // For each non-MST edge (ci, cj), find min triangle fill time
+    // Uses dist_matrix[i*n+j] for O(1) lookup instead of HashMap
     let b1_persistence: Vec<(f64, f64, u8)> = non_mst.par_iter()
         .filter_map(|&(birth, ci, cj)| {
             let mut min_fill = f64::INFINITY;
             for k in 0..n_samples {
                 if k == ci || k == cj { continue; }
-                let e_ik = edge_weight.get(&(ci.min(k), ci.max(k)))
-                    .copied().unwrap_or(f64::INFINITY);
-                let e_jk = edge_weight.get(&(cj.min(k), cj.max(k)))
-                    .copied().unwrap_or(f64::INFINITY);
+                let e_ik = dist_matrix[ci * n + k];
+                let e_jk = dist_matrix[cj * n + k];
                 let fill = birth.max(e_ik).max(e_jk);
                 if fill < min_fill { min_fill = fill; }
             }

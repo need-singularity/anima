@@ -28,6 +28,8 @@ pub struct NetworkResult {
 }
 
 use crate::mi;
+use crate::common;
+use rayon::prelude::*;
 
 /// Scan data and build correlation network.
 pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> NetworkResult {
@@ -46,22 +48,21 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> NetworkResult 
 
     let nf = n_features.min(128); // cap for O(n^2) computation
 
-    // Extract columns
-    let columns: Vec<Vec<f64>> = (0..nf)
-        .map(|j| (0..n_samples).map(|i| data[i * n_features + j]).collect())
-        .collect();
+    // Extract columns using common utility
+    let columns = common::column_vectors(data, n_samples, nf);
 
-    // Build adjacency matrix from MI
+    // Build adjacency matrix from MI — parallel over pairs
     let n_bins = 16;
     let mut adj = vec![false; nf * nf];
-    let mut mi_vals = Vec::new();
 
-    for i in 0..nf {
-        for j in (i + 1)..nf {
-            let m = mi::mutual_info(&columns[i], &columns[j], n_bins);
-            mi_vals.push(m);
-        }
-    }
+    let pairs: Vec<(usize, usize)> = (0..nf)
+        .flat_map(|i| ((i + 1)..nf).map(move |j| (i, j)))
+        .collect();
+
+    let mi_vals: Vec<f64> = pairs
+        .par_iter()
+        .map(|&(i, j)| mi::mutual_info(&columns[i], &columns[j], n_bins))
+        .collect();
 
     // Adaptive threshold: top 20% of MI values
     if mi_vals.is_empty() {

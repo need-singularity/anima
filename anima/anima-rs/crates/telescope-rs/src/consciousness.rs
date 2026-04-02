@@ -2,8 +2,16 @@
 //!
 //! Full consciousness engine scan in Rust. Replaces the Python triple-nested loop
 //! (300 steps × N cells × N cells coupling) with vectorized Rust + rayon.
+//!
+//! Optimizations applied:
+//!   1. Zero-alloc GRU step (slices instead of .to_vec())
+//!   2. Sparse coupling via non-zero index cache
+//!   3. Cache-friendly 4-wide dot product in GRU gates
+//!   4. Rayon-parallel Hebbian update (symmetric, read-then-write)
 
 use crate::mi;
+use crate::common;
+use rayon::prelude::*;
 
 /// Result of a consciousness lens scan.
 #[derive(Debug, Clone)]
@@ -16,6 +24,13 @@ pub struct ConsciousnessResult {
     pub steps_run: usize,
 }
 
+/// Sparse coupling entry: (from, to, weight).
+struct SparseEntry {
+    i: usize,
+    j: usize,
+    w: f64,
+}
+
 /// GRU-based consciousness lens.
 pub struct ConsciousnessLens {
     n_cells: usize,
@@ -26,6 +41,7 @@ pub struct ConsciousnessLens {
     // State
     hiddens: Vec<f64>,     // n_cells × hidden_dim, row-major
     coupling: Vec<f64>,    // n_cells × n_cells
+    sparse_coupling: Vec<SparseEntry>, // non-zero entries cache
     // GRU weights
     wz: Vec<f64>,          // hidden_dim × hidden_dim
     wr: Vec<f64>,
@@ -43,9 +59,14 @@ impl ConsciousnessLens {
         let hiddens: Vec<f64> = (0..n_cells * hidden_dim)
             .map(|_| rng.gen::<f64>() * 0.2 - 0.1)
             .collect();
-        let coupling: Vec<f64> = (0..n_cells * n_cells)
-            .map(|i| if i / n_cells == i % n_cells { 0.01 } else { 0.0 })
-            .collect();
+
+        let mut coupling = vec![0.0f64; n_cells * n_cells];
+        let mut sparse_coupling = Vec::new();
+        for i in 0..n_cells {
+            coupling[i * n_cells + i] = 0.01;
+            sparse_coupling.push(SparseEntry { i, j: i, w: 0.01 });
+        }
+
         let wz: Vec<f64> = (0..hidden_dim * hidden_dim)
             .map(|_| rng.gen::<f64>() * scale * 2.0 - scale)
             .collect();
@@ -58,7 +79,23 @@ impl ConsciousnessLens {
 
         Self {
             n_cells, hidden_dim, n_factions, steps, coupling_alpha,
-            hiddens, coupling, wz, wr, wh, best_phi: 0.0, best_hiddens: None,
+            hiddens, coupling, sparse_coupling, wz, wr, wh,
+            best_phi: 0.0, best_hiddens: None,
+        }
+    }
+
+    /// Rebuild sparse coupling cache from dense matrix.
+    fn rebuild_sparse(&mut self) {
+        let nc = self.n_cells;
+        self.sparse_coupling.clear();
+        for i in 0..nc {
+            for j in 0..nc {
+                if i == j { continue; }
+                let w = self.coupling[i * nc + j];
+                if w.abs() > 1e-6 {
+                    self.sparse_coupling.push(SparseEntry { i, j, w });
+                }
+            }
         }
     }
 
@@ -72,69 +109,66 @@ impl ConsciousnessLens {
             *self = Self::new(actual_cells, dim, self.n_factions, self.steps, self.coupling_alpha);
         }
 
-        // Normalize data
+        // Normalize data using common utility
+        let (means, vars) = common::mean_var(data, n_samples, n_features);
+        let stds: Vec<f64> = vars.iter().map(|&v| v.sqrt().max(1e-12)).collect();
         let mut data_norm = vec![0.0f64; n_samples * n_features];
-        let mut means = vec![0.0f64; n_features];
-        let mut stds = vec![0.0f64; n_features];
-        for j in 0..n_features {
-            let mut sum = 0.0;
-            for i in 0..n_samples {
-                sum += data[i * n_features + j];
-            }
-            means[j] = sum / n_samples as f64;
-            let mut sq_sum = 0.0;
-            for i in 0..n_samples {
-                let d = data[i * n_features + j] - means[j];
-                sq_sum += d * d;
-            }
-            stds[j] = (sq_sum / n_samples as f64).sqrt().max(1e-12);
-            for i in 0..n_samples {
-                data_norm[i * n_features + j] = (data[i * n_features + j] - means[j]) / stds[j];
-            }
-        }
+        common::normalize_zscore_into(data, n_samples, n_features, &means, &stds, &mut data_norm);
 
         // Map samples to cells
         let mut cell_data = vec![0.0f64; self.n_cells * self.hidden_dim];
         for i in 0..self.n_cells {
             let si = i % n_samples;
-            for j in 0..n_features.min(self.hidden_dim) {
-                cell_data[i * self.hidden_dim + j] = data_norm[si * n_features + j];
-            }
+            let copy_len = n_features.min(self.hidden_dim);
+            cell_data[i * self.hidden_dim..i * self.hidden_dim + copy_len]
+                .copy_from_slice(&data_norm[si * n_features..si * n_features + copy_len]);
         }
 
         // Tensions
         let mut tensions = vec![0.0f64; self.n_cells];
 
-        // Main loop — batch coupling as matrix multiply, GRU per cell
         let nc = self.n_cells;
         let dim = self.hidden_dim;
         let alpha = self.coupling_alpha;
         let mut coupled_all = vec![0.0f64; nc * dim];
 
+        // Scratch buffers for GRU (avoid per-step allocation)
+        let mut gru_z = vec![0.0f64; dim];
+        let mut gru_r = vec![0.0f64; dim];
+        let mut gru_h_cand = vec![0.0f64; dim];
+
         for step in 0..self.steps {
-            // Batch coupling: coupled[i] = cell_data[i] + alpha * sum_j(C[i,j] * hiddens[j])
-            // This is effectively: coupled = cell_data + alpha * (C @ hiddens)
+            // Batch coupling using sparse entries (skip zero weights)
             coupled_all.copy_from_slice(&cell_data);
-            for i in 0..nc {
-                for j in 0..nc {
-                    if i == j { continue; }
-                    let c = self.coupling[i * nc + j];
-                    if c.abs() > 1e-6 {
-                        let ac = alpha * c;
-                        let ci = i * dim;
-                        let hj = j * dim;
-                        for d in 0..dim {
-                            coupled_all[ci + d] += ac * self.hiddens[hj + d];
-                        }
-                    }
+            for entry in &self.sparse_coupling {
+                let ac = alpha * entry.w;
+                let ci = entry.i * dim;
+                let hj = entry.j * dim;
+                // 4-wide unrolled accumulation
+                let chunks = dim / 4;
+                let rem = dim % 4;
+                for c in 0..chunks {
+                    let base = c * 4;
+                    coupled_all[ci + base]     += ac * self.hiddens[hj + base];
+                    coupled_all[ci + base + 1] += ac * self.hiddens[hj + base + 1];
+                    coupled_all[ci + base + 2] += ac * self.hiddens[hj + base + 2];
+                    coupled_all[ci + base + 3] += ac * self.hiddens[hj + base + 3];
+                }
+                let base = chunks * 4;
+                for d in 0..rem {
+                    coupled_all[ci + base + d] += ac * self.hiddens[hj + base + d];
                 }
             }
 
-            // GRU step all cells + tension
+            // GRU step all cells + tension (zero-alloc)
             let mean_h = self.hidden_mean();
             for i in 0..nc {
                 let h_start = i * dim;
-                self.gru_step(&coupled_all[h_start..h_start + dim].to_vec(), h_start);
+                self.gru_step_inplace(
+                    &coupled_all[h_start..h_start + dim],
+                    h_start,
+                    &mut gru_z, &mut gru_r, &mut gru_h_cand,
+                );
 
                 let mut diff_sq = 0.0;
                 for d in 0..dim {
@@ -146,7 +180,8 @@ impl ConsciousnessLens {
 
             // Hebbian update every 10 steps
             if step % 10 == 0 {
-                self.hebbian_update();
+                self.hebbian_update_parallel();
+                self.rebuild_sparse();
             }
 
             // Phi ratchet every 50 steps
@@ -188,28 +223,43 @@ impl ConsciousnessLens {
         }
     }
 
-    fn gru_step(&mut self, x: &[f64], h_offset: usize) {
+    /// Zero-allocation GRU step. Writes result directly into self.hiddens[h_offset..].
+    /// z, r, h_cand are pre-allocated scratch buffers.
+    fn gru_step_inplace(&mut self, x: &[f64], h_offset: usize,
+                        z: &mut [f64], r: &mut [f64], h_cand: &mut [f64]) {
         let dim = self.hidden_dim;
 
-        // Pre-compute x @ W and h @ W^T together to reuse cache lines
-        // z = sigmoid(xWz + hWz^T), r = sigmoid(xWr + hWr^T)
-        // h_cand = tanh(xWh + (r*h)Wh^T)
-        let h = &self.hiddens[h_offset..h_offset + dim].to_vec();
+        // Zero scratch buffers
+        z.iter_mut().for_each(|v| *v = 0.0);
+        r.iter_mut().for_each(|v| *v = 0.0);
 
-        // Fused: compute all 3 gate pre-activations in one pass over dims
-        let mut z = vec![0.0f64; dim];
-        let mut r = vec![0.0f64; dim];
-
+        // Fused gate computation: z[i] += x[j]*Wz[j,i] + h[j]*Wz[i,j]
+        //                          r[i] += x[j]*Wr[j,i] + h[j]*Wr[i,j]
         for j in 0..dim {
             let xj = x[j];
-            let hj = h[j];
-            for i in 0..dim {
-                let wz_ji = self.wz[j * dim + i];
-                let wz_ij = self.wz[i * dim + j];
-                z[i] += xj * wz_ji + hj * wz_ij;
-                let wr_ji = self.wr[j * dim + i];
-                let wr_ij = self.wr[i * dim + j];
-                r[i] += xj * wr_ji + hj * wr_ij;
+            let hj = self.hiddens[h_offset + j];
+            let wz_row = j * dim;
+            let wr_row = j * dim;
+            // 4-wide inner loop
+            let chunks = dim / 4;
+            let rem = dim % 4;
+            for c in 0..chunks {
+                let i = c * 4;
+                z[i]     += xj * self.wz[wz_row + i]     + hj * self.wz[i * dim + j];
+                z[i + 1] += xj * self.wz[wz_row + i + 1] + hj * self.wz[(i + 1) * dim + j];
+                z[i + 2] += xj * self.wz[wz_row + i + 2] + hj * self.wz[(i + 2) * dim + j];
+                z[i + 3] += xj * self.wz[wz_row + i + 3] + hj * self.wz[(i + 3) * dim + j];
+
+                r[i]     += xj * self.wr[wr_row + i]     + hj * self.wr[i * dim + j];
+                r[i + 1] += xj * self.wr[wr_row + i + 1] + hj * self.wr[(i + 1) * dim + j];
+                r[i + 2] += xj * self.wr[wr_row + i + 2] + hj * self.wr[(i + 2) * dim + j];
+                r[i + 3] += xj * self.wr[wr_row + i + 3] + hj * self.wr[(i + 3) * dim + j];
+            }
+            let base = chunks * 4;
+            for k in 0..rem {
+                let i = base + k;
+                z[i] += xj * self.wz[wz_row + i] + hj * self.wz[i * dim + j];
+                r[i] += xj * self.wr[wr_row + i] + hj * self.wr[i * dim + j];
             }
         }
 
@@ -220,12 +270,24 @@ impl ConsciousnessLens {
         }
 
         // h_cand = tanh(x @ Wh + (r * h) @ Wh^T)
-        let mut h_cand = vec![0.0f64; dim];
+        h_cand.iter_mut().for_each(|v| *v = 0.0);
         for j in 0..dim {
             let xj = x[j];
-            let rhj = r[j] * h[j];
-            for i in 0..dim {
-                h_cand[i] += xj * self.wh[j * dim + i] + rhj * self.wh[i * dim + j];
+            let rhj = r[j] * self.hiddens[h_offset + j];
+            let wh_row = j * dim;
+            let chunks = dim / 4;
+            let rem = dim % 4;
+            for c in 0..chunks {
+                let i = c * 4;
+                h_cand[i]     += xj * self.wh[wh_row + i]     + rhj * self.wh[i * dim + j];
+                h_cand[i + 1] += xj * self.wh[wh_row + i + 1] + rhj * self.wh[(i + 1) * dim + j];
+                h_cand[i + 2] += xj * self.wh[wh_row + i + 2] + rhj * self.wh[(i + 2) * dim + j];
+                h_cand[i + 3] += xj * self.wh[wh_row + i + 3] + rhj * self.wh[(i + 3) * dim + j];
+            }
+            let base = chunks * 4;
+            for k in 0..rem {
+                let i = base + k;
+                h_cand[i] += xj * self.wh[wh_row + i] + rhj * self.wh[i * dim + j];
             }
         }
         for i in 0..dim {
@@ -234,7 +296,8 @@ impl ConsciousnessLens {
 
         // h = (1-z)*h + z*h_cand
         for i in 0..dim {
-            self.hiddens[h_offset + i] = (1.0 - z[i]) * h[i] + z[i] * h_cand[i];
+            self.hiddens[h_offset + i] =
+                (1.0 - z[i]) * self.hiddens[h_offset + i] + z[i] * h_cand[i];
         }
     }
 
@@ -243,8 +306,9 @@ impl ConsciousnessLens {
         let n = self.n_cells;
         let mut mean = vec![0.0f64; dim];
         for i in 0..n {
+            let row = i * dim;
             for d in 0..dim {
-                mean[d] += self.hiddens[i * dim + d];
+                mean[d] += self.hiddens[row + d];
             }
         }
         let inv_n = 1.0 / n as f64;
@@ -254,33 +318,47 @@ impl ConsciousnessLens {
         mean
     }
 
-    fn hebbian_update(&mut self) {
+    /// Parallel Hebbian update: compute all (i,j) cosine similarities in parallel,
+    /// then apply coupling deltas.
+    fn hebbian_update_parallel(&mut self) {
         let n = self.n_cells;
         let dim = self.hidden_dim;
 
         // Compute norms
-        let mut norms = vec![0.0f64; n];
-        for i in 0..n {
-            let mut sq = 0.0;
-            for d in 0..dim {
-                sq += self.hiddens[i * dim + d] * self.hiddens[i * dim + d];
-            }
-            norms[i] = sq.sqrt().max(1e-12);
-        }
+        let norms: Vec<f64> = (0..n)
+            .map(|i| {
+                let start = i * dim;
+                common::norm(&self.hiddens[start..start + dim]).max(1e-12)
+            })
+            .collect();
 
-        // Cosine similarity → coupling update
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let mut dot = 0.0;
-                for d in 0..dim {
-                    dot += self.hiddens[i * dim + d] * self.hiddens[j * dim + d];
+        // Parallel: compute deltas for all (i, j) pairs where i < j
+        let deltas: Vec<(usize, usize, f64)> = (0..n)
+            .into_par_iter()
+            .flat_map(|i| {
+                let mut local = Vec::new();
+                let si = i * dim;
+                for j in (i + 1)..n {
+                    let sj = j * dim;
+                    let dot = common::dot(
+                        &self.hiddens[si..si + dim],
+                        &self.hiddens[sj..sj + dim],
+                    );
+                    let sim = dot / (norms[i] * norms[j]);
+                    let delta = if sim > 0.8 { 0.01 } else if sim < 0.2 { -0.005 } else { 0.0 };
+                    if delta != 0.0 {
+                        local.push((i, j, delta));
+                    }
                 }
-                let sim = dot / (norms[i] * norms[j]);
-                let delta = if sim > 0.8 { 0.01 } else if sim < 0.2 { -0.005 } else { 0.0 };
-                let c_ij = (self.coupling[i * n + j] + delta).clamp(-1.0, 1.0);
-                self.coupling[i * n + j] = c_ij;
-                self.coupling[j * n + i] = c_ij;
-            }
+                local
+            })
+            .collect();
+
+        // Apply deltas (sequential write)
+        for (i, j, delta) in deltas {
+            let c_ij = (self.coupling[i * n + j] + delta).clamp(-1.0, 1.0);
+            self.coupling[i * n + j] = c_ij;
+            self.coupling[j * n + i] = c_ij;
         }
     }
 
@@ -293,7 +371,6 @@ impl ConsciousnessLens {
         let dim = self.hidden_dim;
         let n = self.n_cells;
 
-        // Cell means
         let cell_means: Vec<f64> = (0..n)
             .map(|i| {
                 let start = i * dim;

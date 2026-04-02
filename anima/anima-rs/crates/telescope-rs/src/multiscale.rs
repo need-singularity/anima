@@ -118,6 +118,16 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> MultiscaleResu
     let qs = [-2.0, -1.0, 0.0, 1.0, 2.0];
     let mut multifractal_dq = Vec::with_capacity(qs.len());
 
+    // Precompute min/max per feature ONCE (was recomputed per box-size × per q × per sample)
+    let box_dims = nf.min(4);
+    let col_ranges: Vec<(f64, f64, f64)> = (0..box_dims)
+        .map(|j| {
+            let (lo, hi) = crate::common::col_min_max(data, n_samples, n_features, j);
+            let range = (hi - lo).max(1e-12);
+            (lo, hi, range)
+        })
+        .collect();
+
     for &q in &qs {
         let mut log_eps_vals = Vec::new();
         let mut log_partition_vals = Vec::new();
@@ -126,17 +136,13 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> MultiscaleResu
             let n_divs = 1 << n_divs_exp;
             let eps = 1.0 / n_divs as f64;
 
-            // Count points in each box
+            // Count points in each box (using precomputed ranges)
             let mut box_counts = std::collections::HashMap::new();
             for i in 0..n_samples {
-                let key: Vec<u32> = (0..nf.min(4)) // limit dims for speed
+                let key: Vec<u32> = (0..box_dims)
                     .map(|j| {
-                        let min_j = (0..n_samples).map(|k| data[k * n_features + j])
-                            .fold(f64::INFINITY, f64::min);
-                        let max_j = (0..n_samples).map(|k| data[k * n_features + j])
-                            .fold(f64::NEG_INFINITY, f64::max);
-                        let range = (max_j - min_j).max(1e-12);
-                        let bin = ((data[i * n_features + j] - min_j) / range * n_divs as f64) as u32;
+                        let (lo, _, range) = col_ranges[j];
+                        let bin = ((data[i * n_features + j] - lo) / range * n_divs as f64) as u32;
                         bin.min(n_divs - 1)
                     })
                     .collect();
