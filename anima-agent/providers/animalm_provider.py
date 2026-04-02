@@ -110,6 +110,9 @@ class AnimaLMProvider:
         if not prompt:
             return
 
+        # Few-shot wrapper for base models
+        formatted = f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
+
         # Import generate function
         animalm_dir = os.path.expanduser("~/Dev/anima/sub-projects/animalm")
         if animalm_dir not in sys.path:
@@ -123,10 +126,14 @@ class AnimaLMProvider:
         import torch
         with torch.no_grad():
             if self._quantize in ("4bit", "8bit"):
-                text = generate(self._model, self._tokenizer, prompt,
+                text = generate(self._model, self._tokenizer, formatted,
                                 max_new_tokens=max_tokens)
-                yield text
+                if "\nQ:" in text:
+                    text = text[:text.index("\nQ:")]
+                yield text.strip()
             else:
-                text, tension = generate(self._model, self._tokenizer, prompt,
+                text, tension = generate(self._model, self._tokenizer, formatted,
                                          max_new_tokens=max_tokens)
+                if "\nQ:" in text:
+                    text = text[:text.index("\nQ:")]
                 yield text
