@@ -1833,8 +1833,12 @@ def _apply_engine_state(engine, state):
     """Apply a state snapshot to an engine (best-effort)."""
     if not state:
         return
+    # Keys that must be int (range() crashes on float)
+    _INT_KEYS = {'n_factions', 'initial_cells', 'max_cells', 'min_cells'}
     for key, val in state.items():
         try:
+            if key in _INT_KEYS and val is not None:
+                val = int(val)
             setattr(engine, key, val)
         except Exception:
             pass
