@@ -269,26 +269,7 @@ hub.broadcast(packet)                     # sender 제외 전체 전달
 
 ---
 
-## Download Model
-
-```bash
-# v14 (latest, Federation + Phase-Optimal, CE=0.0021)
-pip install boto3
-python3 -c "
-import boto3, os
-s3 = boto3.client('s3',
-    endpoint_url='https://d4acc95862b4203c11948da5baf079bc.r2.cloudflarestorage.com',
-    aws_access_key_id='b28e778750d9aca1f29a6c3b7785e76e',
-    aws_secret_access_key='4938d5318c1a0ab122cdfb107ad5c935fd934c81db8bab3ffe11b58e5b57735a',
-    region_name='auto')
-os.makedirs('checkpoints/v14_federated', exist_ok=True)
-print('Downloading v14 model (400MB)...')
-s3.download_file('anima', 'v14/model_best.pt', 'checkpoints/v14_federated/best.pt')
-print('Done!')
-"
-```
-
-> **v14** (34.5M params, 100K steps, CE=0.0021, Phi=49.7) — Federation 8x8c, Phase-Optimal, Meta Laws
+## [Download Model](anima/docs/download-models.md)
 
 ---
 
