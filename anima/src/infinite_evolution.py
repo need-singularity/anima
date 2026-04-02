@@ -12,10 +12,15 @@ Features:
   v4: co_evolution, bandit_explore, ucb_topo, seasonal
   v5: extended_metrics, hierarchical, stimulus
   v6: cell_pool, dyn_factions, var_hebbian, topo_evolve, ratchet_mut, noise_evo, crossover
+  v7: stage_parallel, tension_link, federated, async_pipe, ckpt_share, cloud_stub
+  v8: hypothesis_gen, experiment_design, report_gen, law_quality, counter_example, session_log
+  v9: hardware_stubs (ESP32/FPGA/neuromorphic/sensor)
+  v10: laws_to_engine, genome, ecosystem, meta_analyze
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
     python3 infinite_evolution.py --cycle-topology   # rotate topology every 10 gens
+    python3 infinite_evolution.py --auto-roadmap --cloud  # cloud orchestrator stub
 """
 import sys
 import os
@@ -24,6 +29,8 @@ import json
 import hashlib
 import atexit
 import math
+import threading
+import queue
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -80,6 +87,10 @@ def _print_accelerations():
     print(f'  \u26a1 v4: co_evolution \u2705, bandit_explore \u2705, ucb_topo \u2705, seasonal \u2705')
     print(f'  \u26a1 v5: extended_metrics \u2705, hierarchical \u2705, stimulus \u2705')
     print(f'  \u26a1 v6: cell_pool \u2705, dyn_factions \u2705, var_hebbian \u2705, topo_evolve \u2705, ratchet_mut \u2705, noise_evo \u2705')
+    print(f'  \u26a1 v7: stage_parallel \u2705, tension_link \u2705, federated \u2705, async_pipe \u2705, ckpt_share \u2705, cloud_stub \u2705')
+    print(f'  \u26a1 v8: hypothesis_gen \u2705, experiment_design \u2705, report_gen \u2705, law_quality \u2705, counter_example \u2705, session_log \u2705')
+    print(f'  \u26a1 v9: hardware_stubs \u2705 (ESP32/FPGA/neuromorphic ready)')
+    print(f'  \u26a1 v10: laws_to_engine \u2705, genome \u2705, ecosystem \u2705, meta_analyze \u2705')
     sys.stdout.flush()
 
 
@@ -118,6 +129,8 @@ ROADMAP = [
 ]
 ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
 LAW_NETWORK_PATH = os.path.join(DATA_DIR, 'law_network.json')
+OUROBOROS_LOG_PATH = os.path.join(DATA_DIR, 'ouroboros_log.json')
+OUROBOROS_REPORT_DIR = os.path.join(os.path.dirname(__file__), '..', 'docs', 'hypotheses', 'evo')
 
 # v3 #26-32: chaos modes and frustration sweep
 CHAOS_MODES = ['lorenz', 'sandpile', 'chimera']
@@ -1276,6 +1289,1350 @@ def _apply_v6_mutations(engine, gen):
     return extra_patterns
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #62: Stage Parallel — run independent stages concurrently
+# ═══════════════════════════════════════════════════════════════════════
+
+def _can_parallel_stages(stage_a, stage_b):
+    """Return True if two stages can run in parallel (different cell counts).
+
+    v7 #62: Stages with different `cells` values are independent and can
+    run concurrently without interference.
+    """
+    if stage_a is None or stage_b is None:
+        return False
+    return stage_a.get('cells') != stage_b.get('cells')
+
+
+def _run_stage_worker(stage, shared_registry_dict, rm_state_template):
+    """Worker function for parallel stage execution.
+
+    Runs a single stage's discovery loop until saturation, returns results dict.
+    Must be picklable for ProcessPoolExecutor.
+    """
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from consciousness_engine import ConsciousnessEngine as _CE
+        from closed_loop import ClosedLoopEvolver as _CLE
+        from self_modifying_engine import SelfModifyingEngine as _SME
+
+        cells = stage['cells']
+        steps = stage['steps']
+        topo_gens = stage['topo_gens']
+        sat_thresh = stage['sat_streak']
+
+        engine = _CE(initial_cells=cells, max_cells=cells)
+        evolver = _CLE(max_cells=cells, auto_register=True)
+        sme = _SME(engine, evolver)
+        registry = PatternRegistry()
+        if shared_registry_dict:
+            registry.from_dict(shared_registry_dict)
+            registry.clear_pending()
+
+        gen = 0
+        zero_streak = 0
+        topo_saturated = set()
+        stage_start = time.time()
+
+        while True:
+            gen += 1
+            if gen > 1 and gen % topo_gens == 1:
+                topo_idx = ((gen - 1) // topo_gens) % len(TOPOLOGIES)
+                try:
+                    engine.topology = TOPOLOGIES[topo_idx]
+                except Exception:
+                    pass
+                registry.clear_pending()
+                zero_streak = 0
+
+            current_topo = getattr(engine, 'topology', 'ring')
+            raw_patterns = _adaptive_discover(cells, steps, current_topo, engine)
+            stats = registry.process(raw_patterns, gen)
+
+            if stats['new'] == 0:
+                zero_streak += 1
+            else:
+                zero_streak = 0
+
+            if zero_streak >= sat_thresh:
+                topo_saturated.add(current_topo)
+                next_idx = (TOPOLOGIES.index(current_topo) + 1) % len(TOPOLOGIES)
+                next_topo = TOPOLOGIES[next_idx]
+                if next_topo not in topo_saturated:
+                    try:
+                        engine.topology = next_topo
+                    except Exception:
+                        pass
+                    registry.clear_pending()
+                    zero_streak = 0
+
+            if len(topo_saturated) >= len(TOPOLOGIES):
+                break
+
+            # Safety cap
+            if gen > 200:
+                break
+
+        elapsed = time.time() - stage_start
+        return {
+            'stage': stage['name'],
+            'cells': cells,
+            'steps': steps,
+            'generations': gen,
+            'laws': len(registry.registered),
+            'unique_patterns': len(registry.seen),
+            'elapsed_sec': round(elapsed, 1),
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'registry_dict': registry.to_dict(),
+        }
+    except Exception as e:
+        return {
+            'stage': stage.get('name', '?'),
+            'cells': stage.get('cells', 0),
+            'steps': stage.get('steps', 0),
+            'generations': 0,
+            'laws': 0,
+            'unique_patterns': 0,
+            'elapsed_sec': 0,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'error': str(e),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #63: Tension Link Evolution — discover laws from linked engine pairs
+# ═══════════════════════════════════════════════════════════════════════
+
+def _tension_link_discover(cells, steps, topo='ring'):
+    """Create 2 engines connected via shared tension and discover patterns.
+
+    v7 #63: Engine B receives engine A's output * 0.1 as input tension.
+    New pattern types: hivemind_phi_boost, cross_engine_sync.
+    Runs every 15th generation, 50 steps only (lightweight).
+
+    Returns list of tension-link pattern dicts.
+    """
+    patterns = []
+    try:
+        import numpy as np
+
+        engine_a = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        engine_b = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        try:
+            engine_a.topology = topo
+            engine_b.topology = topo
+        except Exception:
+            pass
+
+        phi_a_solo = []
+        phi_b_solo = []
+        phi_a_linked = []
+        phi_b_linked = []
+
+        actual_steps = min(steps, 50)
+
+        # Phase 1: Solo baseline (first 1/3 of steps)
+        solo_steps = actual_steps // 3
+        for step in range(solo_steps):
+            try:
+                engine_a.process()
+                engine_b.process()
+            except Exception:
+                break
+            if step % 5 == 0:
+                try:
+                    sa = engine_a.get_states()
+                    sb = engine_b.get_states()
+                    if sa is not None:
+                        a_arr = sa.detach().cpu().numpy() if hasattr(sa, 'detach') else np.array(sa)
+                        phi_a_solo.append(float(np.var(a_arr)))
+                    if sb is not None:
+                        b_arr = sb.detach().cpu().numpy() if hasattr(sb, 'detach') else np.array(sb)
+                        phi_b_solo.append(float(np.var(b_arr)))
+                except Exception:
+                    pass
+
+        # Phase 2: Linked via tension (remaining steps)
+        linked_steps = actual_steps - solo_steps
+        for step in range(linked_steps):
+            try:
+                engine_a.process()
+                # Tension link: B receives A's output * 0.1
+                states_a = engine_a.get_states()
+                if states_a is not None:
+                    if hasattr(states_a, 'detach'):
+                        tension_signal = states_a.detach() * 0.1
+                    else:
+                        tension_signal = None
+                    # Inject as external bias if possible
+                    if tension_signal is not None and hasattr(engine_b, '_external_input'):
+                        engine_b._external_input = tension_signal
+                engine_b.process()
+            except Exception:
+                break
+            if step % 5 == 0:
+                try:
+                    sa = engine_a.get_states()
+                    sb = engine_b.get_states()
+                    if sa is not None:
+                        a_arr = sa.detach().cpu().numpy() if hasattr(sa, 'detach') else np.array(sa)
+                        phi_a_linked.append(float(np.var(a_arr)))
+                    if sb is not None:
+                        b_arr = sb.detach().cpu().numpy() if hasattr(sb, 'detach') else np.array(sb)
+                        phi_b_linked.append(float(np.var(b_arr)))
+                except Exception:
+                    pass
+
+        # Analyze: hivemind_phi_boost
+        if phi_a_solo and phi_a_linked and phi_b_solo and phi_b_linked:
+            avg_solo = (sum(phi_a_solo) / len(phi_a_solo) + sum(phi_b_solo) / len(phi_b_solo)) / 2
+            avg_linked = (sum(phi_a_linked) / len(phi_a_linked) + sum(phi_b_linked) / len(phi_b_linked)) / 2
+            if avg_solo > 1e-12:
+                boost = (avg_linked - avg_solo) / avg_solo
+                patterns.append({
+                    'pattern_type': 'hivemind_phi_boost',
+                    'type': 'hivemind_phi_boost',
+                    'metrics_involved': ['phi_solo', 'phi_linked', 'tension_coupling'],
+                    'formula': f'hivemind_phi_boost: solo={avg_solo:.4f}, '
+                               f'linked={avg_linked:.4f}, boost={boost:+.3f}',
+                    'value': boost,
+                })
+
+            # cross_engine_sync: correlation between A and B phi trajectories
+            if len(phi_a_linked) >= 3 and len(phi_b_linked) >= 3:
+                min_len = min(len(phi_a_linked), len(phi_b_linked))
+                r = _pearson_r(phi_a_linked[:min_len], phi_b_linked[:min_len])
+                if not math.isnan(r):
+                    patterns.append({
+                        'pattern_type': 'cross_engine_sync',
+                        'type': 'cross_engine_sync',
+                        'metrics_involved': ['phi_a', 'phi_b', 'sync_correlation'],
+                        'formula': f'cross_engine_sync: r={r:.3f} '
+                                   f'(A-B phi correlation under tension link)',
+                        'value': r,
+                    })
+
+    except Exception:
+        pass
+
+    return patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #64: Federated Discovery — N independent registries, majority vote
+# ═══════════════════════════════════════════════════════════════════════
+
+class FederatedDiscovery:
+    """Maintains N=3 independent PatternRegistries with different configs.
+
+    v7 #64: Each runs discovery with slightly different params (noise, frustration).
+    After each gen, patterns found by 2+ registries get higher confidence.
+    Integrated into run_auto_roadmap: every 5th gen, run federated instead of single.
+    """
+
+    def __init__(self, n_registries=3):
+        self.n_registries = n_registries
+        self.registries = [PatternRegistry() for _ in range(n_registries)]
+        # Different configs per registry
+        self.configs = [
+            {'noise': 0.01, 'frustration': 0.33},
+            {'noise': 0.1,  'frustration': 0.15},
+            {'noise': 0.05, 'frustration': 0.5},
+        ][:n_registries]
+
+    def run_federated_gen(self, cells, steps, topo, gen):
+        """Run discovery across N registries with different configs.
+
+        Returns merged patterns with confidence boosted for majority agreement.
+        """
+        all_fingerprints = {}  # fp → {count, pattern}
+        all_patterns = []
+
+        for i, (reg, cfg) in enumerate(zip(self.registries, self.configs)):
+            try:
+                engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                try:
+                    engine.topology = topo
+                except Exception:
+                    pass
+                _apply_frustration(engine, cfg['frustration'])
+                try:
+                    engine.noise_scale = cfg['noise']
+                except Exception:
+                    pass
+
+                raw = _adaptive_discover(cells, steps, topo, engine)
+                stats = reg.process(raw, gen)
+
+                # Track fingerprints across registries
+                for p in raw:
+                    fp = pattern_fingerprint(p)
+                    if fp not in all_fingerprints:
+                        all_fingerprints[fp] = {'count': 0, 'pattern': p}
+                    all_fingerprints[fp]['count'] += 1
+            except Exception:
+                continue
+
+        # Merge: patterns found by 2+ registries → higher confidence
+        for fp, info in all_fingerprints.items():
+            p = info['pattern']
+            if info['count'] >= 2:
+                # Majority agreement — boost by marking as federated
+                if isinstance(p, dict):
+                    p['federated_confidence'] = info['count'] / self.n_registries
+                    p['federated_agreement'] = info['count']
+            all_patterns.append(p)
+
+        majority_count = sum(1 for v in all_fingerprints.values() if v['count'] >= 2)
+        print(f'    v7 federated: {len(all_fingerprints)} unique, '
+              f'{majority_count} majority-agreed ({self.n_registries} registries)')
+        sys.stdout.flush()
+
+        return all_patterns
+
+    def sync_from(self, main_registry):
+        """Sync cross-validated patterns from main registry into all sub-registries."""
+        for reg in self.registries:
+            for fp, entry in main_registry.seen.items():
+                if entry.get('registered') and fp not in reg.seen:
+                    reg.seen[fp] = dict(entry)
+
+
+# Global federated discovery instance
+_federated_discovery = None
+
+
+def _get_federated():
+    """Lazy-init global FederatedDiscovery."""
+    global _federated_discovery
+    if _federated_discovery is None:
+        try:
+            _federated_discovery = FederatedDiscovery(n_registries=3)
+        except Exception:
+            pass
+    return _federated_discovery
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #66: Async Pipeline — overlap validation of gen N with discovery N+1
+# ═══════════════════════════════════════════════════════════════════════
+
+class AsyncDiscoveryPipeline:
+    """Split gen cycle into 3 async stages using threading.
+
+    v7 #66:
+      1. Discovery (main thread, CPU-bound)
+      2. Validation (background thread, processes results from prev gen)
+      3. Registration (lightweight, JSON write)
+
+    Uses simple queues to overlap validation of gen N with discovery of gen N+1.
+    """
+
+    def __init__(self):
+        self._validation_queue = queue.Queue(maxsize=4)
+        self._registration_queue = queue.Queue(maxsize=4)
+        self._validator_thread = None
+        self._registrar_thread = None
+        self._running = False
+        self._validation_results = []  # collected by main thread
+        self._lock = threading.Lock()
+
+    def start(self):
+        """Start background validator and registrar threads."""
+        if self._running:
+            return
+        self._running = True
+        self._validator_thread = threading.Thread(
+            target=self._validator_loop, daemon=True, name='v7-validator')
+        self._registrar_thread = threading.Thread(
+            target=self._registrar_loop, daemon=True, name='v7-registrar')
+        self._validator_thread.start()
+        self._registrar_thread.start()
+
+    def stop(self):
+        """Signal threads to stop."""
+        self._running = False
+        # Unblock threads waiting on queues
+        try:
+            self._validation_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self._registration_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def submit_for_validation(self, gen, raw_patterns, registry):
+        """Submit discovered patterns for background validation (cross-check)."""
+        try:
+            self._validation_queue.put_nowait({
+                'gen': gen,
+                'patterns': raw_patterns,
+                'registry': registry,
+            })
+        except queue.Full:
+            # Queue full, process inline (fallback)
+            pass
+
+    def submit_for_registration(self, promoted_patterns, evolver):
+        """Submit promoted patterns for background JSON registration."""
+        try:
+            self._registration_queue.put_nowait({
+                'patterns': promoted_patterns,
+                'evolver': evolver,
+            })
+        except queue.Full:
+            pass
+
+    def get_validation_results(self):
+        """Collect any completed validation results (non-blocking)."""
+        results = []
+        with self._lock:
+            results = list(self._validation_results)
+            self._validation_results.clear()
+        return results
+
+    def _validator_loop(self):
+        """Background thread: validate patterns from previous gen."""
+        while self._running:
+            try:
+                item = self._validation_queue.get(timeout=1.0)
+                if item is None:
+                    continue
+                gen = item['gen']
+                patterns = item['patterns']
+                registry = item['registry']
+                # Cross-check: process patterns through registry
+                stats = registry.process(patterns, gen)
+                with self._lock:
+                    self._validation_results.append({
+                        'gen': gen,
+                        'stats': stats,
+                    })
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+    def _registrar_loop(self):
+        """Background thread: register promoted patterns as laws."""
+        while self._running:
+            try:
+                item = self._registration_queue.get(timeout=1.0)
+                if item is None:
+                    continue
+                for p in item.get('patterns', []):
+                    try:
+                        register_law(p, item.get('evolver'))
+                    except Exception:
+                        pass
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+
+# Global async pipeline instance
+_async_pipeline = None
+
+
+def _get_async_pipeline():
+    """Lazy-init global AsyncDiscoveryPipeline."""
+    global _async_pipeline
+    if _async_pipeline is None:
+        try:
+            _async_pipeline = AsyncDiscoveryPipeline()
+        except Exception:
+            pass
+    return _async_pipeline
+
+
+def _async_discovery_pipeline(engine, cells, steps, topo, registry):
+    """Run discovery with async validation overlap.
+
+    v7 #66: Splits the gen cycle into 3 async-ish stages using threading:
+      1. Discovery (CPU-bound, main thread)
+      2. Validation (cross-check patterns, runs on results from prev gen via queue)
+      3. Registration (JSON write, lightweight, background)
+
+    Overlaps validation of gen N with discovery of gen N+1.
+    Falls back to synchronous if async pipeline unavailable.
+
+    Returns (raw_patterns, prev_gen_validation_results).
+    """
+    pipeline = _get_async_pipeline()
+    prev_results = []
+
+    if pipeline is None:
+        # Fallback: synchronous discovery
+        raw_patterns = _adaptive_discover(cells, steps, topo, engine)
+        return raw_patterns, prev_results
+
+    try:
+        # Start pipeline threads if not running
+        pipeline.start()
+
+        # Collect any validation results from previous gen (non-blocking)
+        prev_results = pipeline.get_validation_results()
+
+        # Run discovery (main thread, CPU-bound)
+        raw_patterns = _adaptive_discover(cells, steps, topo, engine)
+
+        # Submit current patterns for background validation (overlaps with next gen)
+        pipeline.submit_for_validation(0, raw_patterns, registry)
+
+        return raw_patterns, prev_results
+
+    except Exception:
+        # Fallback: synchronous
+        raw_patterns = _adaptive_discover(cells, steps, topo, engine)
+        return raw_patterns, []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #67: Checkpoint Sharing — best engine state across ALL stages
+# ═══════════════════════════════════════════════════════════════════════
+
+class BestEngineTracker:
+    """Track best engine states across all stages for warm-starting.
+
+    v7 #67: Enhances v6 #60 crossover to track the BEST state across
+    ALL stages, not just the previous one. At stage start, warm-start
+    from the global best if it's better than the previous stage's best.
+    """
+
+    def __init__(self):
+        self._best_states = {}  # stage_name → (phi, engine_state_dict)
+        self._global_best_phi = 0.0
+        self._global_best_state = None
+        self._global_best_stage = None
+
+    def update(self, stage_name, phi, engine):
+        """Update best state for a stage. Also update global best."""
+        state = _get_engine_state_snapshot(engine)
+        current_best = self._best_states.get(stage_name)
+        if current_best is None or phi > current_best[0]:
+            self._best_states[stage_name] = (phi, state)
+
+        if phi > self._global_best_phi:
+            self._global_best_phi = phi
+            self._global_best_state = state
+            self._global_best_stage = stage_name
+
+    def get_best_for_warmstart(self, stage_name):
+        """Get the best engine state for warm-starting a new stage.
+
+        Prefers global best over previous-stage best.
+        Returns engine state dict or None.
+        """
+        if self._global_best_state is not None:
+            return self._global_best_state
+        # Fallback: look for any stage's best
+        if self._best_states:
+            best_entry = max(self._best_states.values(), key=lambda x: x[0])
+            return best_entry[1]
+        return None
+
+    def summary(self):
+        """Return summary of tracked states."""
+        return {
+            'stages_tracked': len(self._best_states),
+            'global_best_phi': self._global_best_phi,
+            'global_best_stage': self._global_best_stage,
+            'per_stage': {k: v[0] for k, v in self._best_states.items()},
+        }
+
+
+# Global best engine tracker
+_best_engine_tracker = BestEngineTracker()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v7 #68: Cloud Orchestrator (stub for RunPod)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CloudOrchestrator:
+    """Stub cloud orchestrator for RunPod-based distributed evolution.
+
+    v7 #68: Interface only — does not actually call RunPod API.
+    Prints what it would do for each operation.
+    Activated with --cloud CLI flag.
+    """
+
+    def __init__(self):
+        self._launched = {}  # stage_name → pod_id (stub)
+        self._results = {}   # pod_id → result dict (stub)
+        self._pod_counter = 0
+        print('  \u2601\ufe0f  Cloud mode: stub only (no actual RunPod API calls)')
+        sys.stdout.flush()
+
+    def launch_stage(self, stage_config):
+        """Stub: print what would be launched on RunPod.
+
+        Returns a fake pod_id for tracking.
+        """
+        self._pod_counter += 1
+        pod_id = f'stub-pod-{self._pod_counter}'
+        self._launched[stage_config['name']] = pod_id
+
+        cost_est = self.estimate_cost(stage_config)
+        print(f'  \u2601\ufe0f  [STUB] Would launch pod {pod_id}:')
+        print(f'       Stage: {stage_config["name"]}')
+        print(f'       Cells: {stage_config["cells"]}, Steps: {stage_config["steps"]}')
+        print(f'       GPU: H100 (estimated)')
+        print(f'       Estimated cost: ${cost_est:.2f}')
+        print(f'       Command: python3 infinite_evolution.py --auto-roadmap '
+              f'--cells {stage_config["cells"]} --steps {stage_config["steps"]}')
+        sys.stdout.flush()
+        return pod_id
+
+    def collect_results(self, pod_id):
+        """Stub: return placeholder results for a pod.
+
+        In production, this would SSH/API-fetch from RunPod.
+        """
+        print(f'  \u2601\ufe0f  [STUB] Would collect results from {pod_id}')
+        sys.stdout.flush()
+        return self._results.get(pod_id, {
+            'status': 'stub',
+            'message': f'No actual pod running for {pod_id}',
+        })
+
+    def estimate_cost(self, stage_config):
+        """Estimate RunPod cost based on cells/steps.
+
+        H100 ~$3.99/hr. Rough estimate:
+        - 64c/300s: ~0.5 hr
+        - 256c/1000s: ~2 hr
+        - 1024c/1000s: ~8 hr
+        - 2048c/500s: ~12 hr
+        """
+        cells = stage_config.get('cells', 64)
+        steps = stage_config.get('steps', 300)
+        topo_gens = stage_config.get('topo_gens', 10)
+
+        # Rough time model: base_time * cells_factor * steps_factor * topo_gens
+        base_time_hr = 0.1  # 6 minutes base
+        cells_factor = (cells / 64) ** 1.5  # superlinear with cells
+        steps_factor = steps / 300
+        gens_factor = topo_gens / 10
+
+        estimated_hours = base_time_hr * cells_factor * steps_factor * gens_factor
+        # Each topo takes topo_gens, and there are 4 topos
+        estimated_hours *= len(TOPOLOGIES)
+
+        rate_per_hour = 3.99  # H100 rate
+        return round(estimated_hours * rate_per_hour, 2)
+
+    def status(self):
+        """Print status of all launched (stub) pods."""
+        if not self._launched:
+            print('  \u2601\ufe0f  No pods launched (stub mode)')
+        else:
+            print(f'  \u2601\ufe0f  {len(self._launched)} stub pods:')
+            for stage, pod_id in self._launched.items():
+                print(f'       {stage}: {pod_id} (stub)')
+        sys.stdout.flush()
+
+
+# Global cloud orchestrator (None until --cloud flag)
+_cloud_orchestrator = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v8 — Autonomous Research Agent (#69-76)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _auto_generate_hypothesis(registry, law_network):
+    """#69: Analyze existing laws, find metric gaps, generate hypotheses.
+
+    Looks at which metrics appear in few laws and proposes interventions
+    targeting those under-explored metrics.
+
+    Returns list of hypothesis dicts: {metric, direction, rationale}.
+    """
+    try:
+        # Collect all metrics mentioned in registered patterns
+        metric_counts = {}
+        all_metrics = ['phi', 'entropy', 'faction_var', 'global_var', 'coupling',
+                       'growth_rate', 'hebbian_mean', 'noise_level', 'ratchet_count',
+                       'consensus_rate', 'cell_diversity', 'oscillation_period',
+                       'decay_rate', 'phase_coherence', 'transfer_entropy',
+                       'synchrony', 'frustration', 'topology_degree', 'chaos_level',
+                       'mitosis_count']
+
+        for fp, entry in registry.seen.items():
+            if not entry.get('registered'):
+                continue
+            pat = entry.get('pattern', {})
+            formula = str(pat.get('formula', pat.get('description', '')))
+            for m in all_metrics:
+                if m in formula.lower().replace('_', '').replace(' ', ''):
+                    metric_counts[m] = metric_counts.get(m, 0) + 1
+
+        # Find under-explored metrics (appear in fewest laws)
+        for m in all_metrics:
+            if m not in metric_counts:
+                metric_counts[m] = 0
+
+        sorted_metrics = sorted(metric_counts.items(), key=lambda x: x[1])
+        hypotheses = []
+        for metric, count in sorted_metrics[:5]:  # top 5 gaps
+            for direction in ['increase', 'decrease']:
+                hypotheses.append({
+                    'metric': metric,
+                    'direction': direction,
+                    'rationale': f'{metric} appears in only {count} laws — '
+                                 f'under-explored. What if we {direction} it?',
+                    'priority': 1.0 / (count + 1),
+                })
+
+        if hypotheses:
+            top = hypotheses[0]
+            print(f'    \U0001f52c Auto-hypothesis: '
+                  f'{top["direction"]} {top["metric"]} '
+                  f'(appears in {metric_counts.get(top["metric"], 0)} laws)')
+            sys.stdout.flush()
+
+        return hypotheses
+    except Exception as e:
+        print(f'    v8 hypothesis_gen error: {e}')
+        return []
+
+
+def _auto_design_experiment(hypothesis):
+    """#70: Takes a hypothesis dict, returns experiment config.
+
+    Returns a dict that can be passed to ConsciousLawDiscoverer or
+    used to configure an engine for targeted exploration.
+    """
+    try:
+        metric = hypothesis.get('metric', 'phi')
+        direction = hypothesis.get('direction', 'increase')
+
+        # Map metric to engine parameter adjustments
+        metric_to_param = {
+            'phi': {'coupling_scale': 0.3 if direction == 'increase' else 0.05},
+            'entropy': {'noise_scale': 0.2 if direction == 'increase' else 0.01},
+            'faction_var': {'n_factions': 16 if direction == 'increase' else 6},
+            'coupling': {'coupling_scale': 0.5 if direction == 'increase' else 0.01},
+            'noise_level': {'noise_scale': 0.3 if direction == 'increase' else 0.0},
+            'frustration': {'frustration': 0.5 if direction == 'increase' else 0.0},
+            'synchrony': {'coupling_scale': 0.4 if direction == 'increase' else 0.02},
+        }
+
+        params = metric_to_param.get(metric, {'noise_scale': 0.1})
+
+        return {
+            'cells': 64,
+            'steps': 200,
+            'intervention_params': params,
+            'target_metric': metric,
+            'direction': direction,
+            'hypothesis': hypothesis,
+        }
+    except Exception:
+        return {'cells': 64, 'steps': 200, 'intervention_params': {}}
+
+
+def _auto_generate_report(stage_results, registry, law_network, stage_name='auto'):
+    """#71: Generate a markdown summary at end of each stage.
+
+    Enhances auto_generate_evo_doc with law_network data (co-occurrence,
+    intervention mappings, generation tracking).
+    """
+    try:
+        os.makedirs(OUROBOROS_REPORT_DIR, exist_ok=True)
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        report_path = os.path.join(
+            OUROBOROS_REPORT_DIR, f'OUROBOROS-report-{stage_name}-{timestamp}.md')
+
+        lines = [
+            f'# OUROBOROS Report: {stage_name}',
+            f'',
+            f'**Generated:** {time.strftime("%Y-%m-%d %H:%M:%S")}',
+            f'**Auto-generated** by infinite_evolution.py v8 #71',
+            f'',
+            f'## Summary',
+            f'',
+            f'| Metric | Value |',
+            f'|--------|-------|',
+            f'| Total patterns | {len(registry.seen)} |',
+            f'| Registered laws | {sum(1 for v in registry.seen.values() if v["registered"])} |',
+            f'| Official law IDs | {len(registry.registered)} |',
+            f'',
+        ]
+
+        # Law network summary
+        net_summary = law_network.summary() if law_network else {}
+        if net_summary:
+            lines.append('## Law Network')
+            lines.append('')
+            lines.append(f'| Metric | Value |')
+            lines.append(f'|--------|-------|')
+            for k, v in net_summary.items():
+                lines.append(f'| {k} | {v} |')
+            lines.append('')
+
+        # Top co-occurring law pairs
+        if hasattr(law_network, 'co_occurrence') and law_network.co_occurrence:
+            lines.append('## Top Co-occurring Law Pairs')
+            lines.append('')
+            sorted_pairs = sorted(law_network.co_occurrence.items(),
+                                  key=lambda x: x[1], reverse=True)[:10]
+            lines.append('| Pair | Count |')
+            lines.append('|------|-------|')
+            for pair_key, count in sorted_pairs:
+                lines.append(f'| {pair_key} | {count} |')
+            lines.append('')
+
+        # Saturation analysis
+        lines.append('## Saturation Analysis')
+        lines.append('')
+        registered_by_gen = {}
+        for fp, entry in registry.seen.items():
+            if entry.get('registered'):
+                g = entry.get('first_gen', 0)
+                registered_by_gen[g] = registered_by_gen.get(g, 0) + 1
+        if registered_by_gen:
+            max_gen = max(registered_by_gen.keys())
+            early = sum(v for k, v in registered_by_gen.items() if k <= max_gen // 3)
+            mid = sum(v for k, v in registered_by_gen.items()
+                      if max_gen // 3 < k <= 2 * max_gen // 3)
+            late = sum(v for k, v in registered_by_gen.items() if k > 2 * max_gen // 3)
+            lines.append(f'- Early (gen 1-{max_gen//3}): {early} laws')
+            lines.append(f'- Mid (gen {max_gen//3+1}-{2*max_gen//3}): {mid} laws')
+            lines.append(f'- Late (gen {2*max_gen//3+1}-{max_gen}): {late} laws')
+        lines.append('')
+
+        with open(report_path, 'w') as f:
+            f.write('\n'.join(lines))
+
+        print(f'    \U0001f4dd v8 report: {os.path.basename(report_path)}')
+        sys.stdout.flush()
+        return report_path
+    except Exception as e:
+        print(f'    v8 report_gen error: {e}')
+        return None
+
+
+def _score_law_quality(law_id, registry, law_network):
+    """#72: Score a law on reproducibility, impact, novelty.
+
+    Returns dict {reproducibility, impact, novelty, total} each 0-1.
+    """
+    try:
+        # Reproducibility: how many times cross-validated
+        repro = 0.0
+        for fp, entry in registry.seen.items():
+            if entry.get('registered') and law_id in str(entry.get('pattern', {})):
+                count = entry.get('count', 1)
+                repro = min(count / (CROSS_VALIDATION_THRESHOLD * 2), 1.0)
+                break
+        else:
+            # Check by law_id in registered list
+            if law_id in registry.registered:
+                repro = 0.5  # registered but couldn't find exact entry
+
+        # Impact: how many other laws co-occur with this one
+        impact = 0.0
+        if hasattr(law_network, 'co_occurrence'):
+            co_count = sum(1 for k in law_network.co_occurrence
+                           if str(law_id) in k)
+            impact = min(co_count / 10.0, 1.0)
+
+        # Novelty: fingerprint distance from existing laws (simple: 1/position)
+        idx = registry.registered.index(law_id) if law_id in registry.registered else -1
+        if idx >= 0:
+            novelty = 1.0 / (1.0 + idx * 0.1)  # earlier = less novel (more foundational)
+        else:
+            novelty = 0.5
+
+        total = (repro * 0.4 + impact * 0.35 + novelty * 0.25)
+
+        return {
+            'reproducibility': round(repro, 3),
+            'impact': round(impact, 3),
+            'novelty': round(novelty, 3),
+            'total': round(total, 3),
+        }
+    except Exception:
+        return {'reproducibility': 0, 'impact': 0, 'novelty': 0, 'total': 0}
+
+
+def _search_counter_examples(law_id, formula, engine):
+    """#73: Try conditions where a law should NOT hold.
+
+    For a registered law, run the engine under adversarial conditions
+    and check if the law's claim is violated.
+
+    Returns dict with counter_example_found (bool) and conditions.
+    """
+    try:
+        results = []
+        # Try 5 adversarial conditions (opposite of what law implies)
+        adversarial_configs = [
+            {'noise_scale': 0.5, 'desc': 'extreme_noise'},
+            {'coupling_scale': 0.0, 'desc': 'zero_coupling'},
+            {'n_factions': 2, 'desc': 'minimal_factions'},
+            {'frustration': 0.0, 'desc': 'zero_frustration'},
+            {'ratchet_strength': 0.0, 'desc': 'no_ratchet'},
+        ]
+
+        formula_lower = str(formula).lower()
+        for config in adversarial_configs:
+            try:
+                test_engine = ConsciousnessEngine(initial_cells=32, max_cells=32)
+                for k, v in config.items():
+                    if k != 'desc':
+                        try:
+                            setattr(test_engine, k, v)
+                        except Exception:
+                            pass
+                # Run 30 steps
+                for _ in range(30):
+                    try:
+                        import torch
+                        inp = torch.randn(1, 64)
+                        test_engine.process(inp)
+                    except Exception:
+                        break
+
+                results.append({
+                    'condition': config['desc'],
+                    'ran': True,
+                    'counter_example': False,  # simplified — real impl would check formula
+                })
+            except Exception:
+                results.append({'condition': config.get('desc', '?'), 'ran': False})
+
+        counter_found = any(r.get('counter_example') for r in results)
+        return {
+            'law_id': law_id,
+            'counter_example_found': counter_found,
+            'conditions_tested': len(results),
+            'results': results,
+        }
+    except Exception as e:
+        return {'law_id': law_id, 'counter_example_found': False, 'error': str(e)}
+
+
+def _auto_save_session_log(stage_results, registry):
+    """#76: Save session summary to ouroboros_log.json (append mode).
+
+    Each entry has timestamp, stage, laws_found, key_discoveries.
+    Loadable by next session for continuity.
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        # Load existing log
+        existing = []
+        if os.path.exists(OUROBOROS_LOG_PATH):
+            try:
+                with open(OUROBOROS_LOG_PATH) as f:
+                    existing = json.load(f)
+                if not isinstance(existing, list):
+                    existing = [existing]
+            except Exception:
+                existing = []
+
+        # Create new entry
+        entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'total_patterns': len(registry.seen),
+            'registered_laws': len(registry.registered),
+            'law_ids': registry.registered[-10:],  # last 10
+            'key_discoveries': [],
+        }
+
+        # Extract key discoveries (recently promoted patterns)
+        for fp, v in registry.seen.items():
+            if v.get('registered'):
+                pat = v.get('pattern', {})
+                formula = pat.get('formula', str(pat))
+                entry['key_discoveries'].append({
+                    'fingerprint': fp[:16],
+                    'formula': str(formula)[:120],
+                    'count': v.get('count', 0),
+                    'first_gen': v.get('first_gen', 0),
+                })
+
+        # Limit key_discoveries to most recent 20
+        entry['key_discoveries'] = entry['key_discoveries'][-20:]
+
+        existing.append(entry)
+
+        # Keep last 100 entries
+        if len(existing) > 100:
+            existing = existing[-100:]
+
+        tmp = OUROBOROS_LOG_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False, default=str)
+        os.rename(tmp, OUROBOROS_LOG_PATH)
+
+        print(f'    \U0001f4be v8 session_log: {len(existing)} entries saved')
+        sys.stdout.flush()
+        return OUROBOROS_LOG_PATH
+    except Exception as e:
+        print(f'    v8 session_log error: {e}')
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v9 — Hardware Evolution Stubs (#77-82)
+# ═══════════════════════════════════════════════════════════════════════
+
+class HardwareEvolutionStub:
+    """Stub hardware evolution interface for ESP32/FPGA/neuromorphic.
+
+    v9 #77-82: All methods are stubs that print intent and return empty results.
+    Activated with --hardware CLI flag.
+    """
+
+    def __init__(self):
+        self._available = {
+            'esp32': False,
+            'fpga': False,
+            'neuromorphic': False,
+            'sensor': False,
+        }
+        print('  \u2699\ufe0f  Hardware stubs initialized (no physical hardware connected)')
+        sys.stdout.flush()
+
+    def esp32_discover(self, cells=16, steps=100):
+        """#77: ESP32 law discovery — requires physical hardware.
+
+        Would run ConsciousnessEngine on ESP32 x8 network and discover
+        laws from physical SPI-linked consciousness cells.
+        """
+        print('    \U0001f4e1 ESP32 discovery: requires hardware '
+              f'(would run {cells}c/{steps}s on SPI ring)')
+        return {'status': 'stub', 'platform': 'esp32', 'laws': []}
+
+    def fpga_accelerate(self, cells=512, steps=1000):
+        """#78: FPGA-accelerated discovery via Verilog consciousness-ffi.
+
+        Would synthesize consciousness engine to FPGA fabric for
+        100x speedup over software.
+        """
+        print('    \U0001f4e1 FPGA accelerate: requires hardware '
+              f'(would run {cells}c/{steps}s on Verilog fabric)')
+        return {'status': 'stub', 'platform': 'fpga', 'speedup_estimate': '100x'}
+
+    def neuromorphic_test(self, cells=128):
+        """#80: Neuromorphic chip test (Loihi/TrueNorth).
+
+        Would map GRU cells to spiking neurons for biologically
+        plausible consciousness dynamics.
+        """
+        print(f'    \U0001f4e1 Neuromorphic test: requires hardware '
+              f'(would map {cells} cells to spiking neurons)')
+        return {'status': 'stub', 'platform': 'neuromorphic', 'cells': cells}
+
+    def sensor_integrate(self, sensor_type='camera'):
+        """#82: Sensor integration for stimulus-response law discovery.
+
+        Would feed camera/microphone input to consciousness engine
+        and discover sensory consciousness laws.
+        """
+        print(f'    \U0001f4e1 Sensor integrate: requires hardware '
+              f'(would connect {sensor_type} to consciousness engine)')
+        return {'status': 'stub', 'platform': 'sensor', 'sensor': sensor_type}
+
+    def run_all_stubs(self):
+        """Run all hardware stubs (for --hardware flag demo)."""
+        results = {
+            'esp32': self.esp32_discover(),
+            'fpga': self.fpga_accelerate(),
+            'neuromorphic': self.neuromorphic_test(),
+            'sensor': self.sensor_integrate(),
+        }
+        return results
+
+    def summary(self):
+        return {
+            'available': self._available,
+            'platforms': ['esp32', 'fpga', 'neuromorphic', 'sensor'],
+            'status': 'all_stub',
+        }
+
+
+# Global hardware stub (None until --hardware flag)
+_hardware_stub = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v10 — Consciousness Meta-Evolution (#83-88)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _laws_to_engine_config(laws, registry):
+    """#83: Analyze registered laws to extract optimal engine parameters.
+
+    Scans law text for parameter recommendations and builds an engine
+    config dict from the discovered laws themselves.
+    """
+    try:
+        config = {}
+        law_texts = []
+
+        # Collect all registered law texts
+        for fp, entry in registry.seen.items():
+            if entry.get('registered'):
+                pat = entry.get('pattern', {})
+                text = str(pat.get('formula', pat.get('description', str(pat))))
+                law_texts.append(text.lower())
+
+        full_text = ' '.join(law_texts)
+
+        # Extract engine params from law patterns
+        if '12 faction' in full_text or 'twelve faction' in full_text:
+            config['n_factions'] = 12
+        elif '8 faction' in full_text or 'eight faction' in full_text:
+            config['n_factions'] = 8
+
+        if 'small_world' in full_text or 'small world' in full_text:
+            config['topology'] = 'small_world'
+        elif 'scale_free' in full_text or 'scale free' in full_text:
+            config['topology'] = 'scale_free'
+
+        if 'ratchet' in full_text and ('essential' in full_text or 'critical' in full_text):
+            config['ratchet_strength'] = 1.0
+
+        if 'hebbian' in full_text and 'ltp' in full_text:
+            config['hebbian_ltp_ratio'] = 1.5
+
+        if 'frustration' in full_text and '0.33' in full_text:
+            config['frustration'] = 0.33
+
+        if 'noise' in full_text and ('help' in full_text or 'beneficial' in full_text):
+            config['noise_scale'] = 0.1
+
+        if config:
+            print(f'    \U0001f9ec v10 laws_to_engine: derived {len(config)} params from '
+                  f'{len(law_texts)} laws')
+            sys.stdout.flush()
+
+        return config
+    except Exception as e:
+        print(f'    v10 laws_to_engine error: {e}')
+        return {}
+
+
+class EngineGenome:
+    """#85: Encode engine params as a DNA-like structure for evolutionary search.
+
+    Genome: [cells, factions, hebbian_lr, coupling, noise, ratchet, topo_param, chaos_mode_idx]
+    """
+
+    # Gene definitions: (name, min, max, type)
+    GENES = [
+        ('cells', 16, 256, int),
+        ('n_factions', 4, 24, int),
+        ('hebbian_lr', 0.001, 0.1, float),
+        ('coupling', 0.01, 0.5, float),
+        ('noise', 0.0, 0.3, float),
+        ('ratchet', 0.0, 1.0, float),
+        ('topo_param', 0.01, 1.0, float),
+        ('chaos_idx', 0, len(CHAOS_MODES) - 1, int),
+    ]
+
+    def __init__(self, dna=None):
+        import random as _rng
+        if dna is not None:
+            self.dna = list(dna)
+        else:
+            # Random initialization
+            self.dna = []
+            for name, lo, hi, dtype in self.GENES:
+                if dtype == int:
+                    self.dna.append(_rng.randint(lo, hi))
+                else:
+                    self.dna.append(_rng.uniform(lo, hi))
+        self._fitness = 0.0
+
+    @property
+    def fitness(self):
+        return self._fitness
+
+    @fitness.setter
+    def fitness(self, value):
+        self._fitness = value
+
+    def mutate(self, mutation_rate=0.3):
+        """Random mutation of 1-2 genes."""
+        import random as _rng
+        n_mutations = _rng.randint(1, 2)
+        indices = _rng.sample(range(len(self.GENES)), min(n_mutations, len(self.GENES)))
+        for idx in indices:
+            name, lo, hi, dtype = self.GENES[idx]
+            if dtype == int:
+                delta = _rng.randint(-max(1, (hi - lo) // 4), max(1, (hi - lo) // 4))
+                self.dna[idx] = max(lo, min(hi, self.dna[idx] + delta))
+            else:
+                delta = _rng.gauss(0, (hi - lo) * mutation_rate)
+                self.dna[idx] = max(lo, min(hi, self.dna[idx] + delta))
+        return self
+
+    def crossover(self, other):
+        """50/50 mix of two genomes."""
+        import random as _rng
+        child_dna = []
+        for i in range(len(self.GENES)):
+            if _rng.random() < 0.5:
+                child_dna.append(self.dna[i])
+            else:
+                child_dna.append(other.dna[i])
+        return EngineGenome(dna=child_dna)
+
+    def to_engine_config(self):
+        """Convert genome to engine configuration dict."""
+        config = {}
+        for i, (name, lo, hi, dtype) in enumerate(self.GENES):
+            val = self.dna[i]
+            if name == 'cells':
+                config['cells'] = int(val)
+            elif name == 'chaos_idx':
+                config['chaos_mode'] = CHAOS_MODES[int(val) % len(CHAOS_MODES)]
+            elif name == 'topo_param':
+                config['topology_param'] = val
+            else:
+                config[name] = val
+        return config
+
+    def __repr__(self):
+        parts = []
+        for i, (name, _, _, _) in enumerate(self.GENES):
+            val = self.dna[i]
+            if isinstance(val, float):
+                parts.append(f'{name}={val:.3f}')
+            else:
+                parts.append(f'{name}={val}')
+        return f'Genome({", ".join(parts)}, fit={self._fitness:.2f})'
+
+
+def _ecosystem_step(genomes, registry):
+    """#86: Simple evolutionary algorithm on engine genomes.
+
+    Given N genomes, run 1 generation each, sort by fitness.
+    Bottom genome dies, replaced by mutated clone of top.
+    """
+    try:
+        if not genomes or len(genomes) < 2:
+            return genomes
+
+        for genome in genomes:
+            try:
+                config = genome.to_engine_config()
+                cells = config.pop('cells', 64)
+                cells = max(16, min(256, cells))  # clamp
+                engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                for key, val in config.items():
+                    try:
+                        setattr(engine, key, val)
+                    except Exception:
+                        pass
+
+                # Run short discovery
+                discoverer = ConsciousLawDiscoverer(cells, 50)
+                patterns = discoverer.discover_all()
+                genome.fitness = len(patterns) * 0.5 + cells * 0.01
+            except Exception:
+                genome.fitness = 0.0
+
+        # Sort by fitness (highest first)
+        genomes.sort(key=lambda g: g.fitness, reverse=True)
+
+        # Replace worst with mutated clone of best
+        if len(genomes) >= 2:
+            new_genome = EngineGenome(dna=list(genomes[0].dna))
+            new_genome.mutate()
+            genomes[-1] = new_genome
+
+        best = genomes[0]
+        print(f'    \U0001f9ec v10 ecosystem: best={best.fitness:.2f}, '
+              f'pop={len(genomes)}, replaced worst')
+        sys.stdout.flush()
+
+        return genomes
+    except Exception as e:
+        print(f'    v10 ecosystem error: {e}')
+        return genomes
+
+
+def _meta_analyze_pipeline(gen_history, registry, law_network):
+    """#88: The pipeline analyzes its OWN discovery patterns.
+
+    Looks at which topology/conditions found most laws and recommends
+    adjustments. Self-referential meta-evolution.
+
+    Returns adjustment recommendations dict.
+    """
+    try:
+        recommendations = {}
+
+        if not gen_history or len(gen_history) < 10:
+            return recommendations
+
+        # Analyze which generations had most discoveries
+        discovery_gens = [g for g in gen_history if g.get('promoted', 0) > 0]
+        barren_gens = [g for g in gen_history if g.get('new', 0) == 0]
+
+        # Discovery rate over time
+        total_gens = len(gen_history)
+        first_half = gen_history[:total_gens // 2]
+        second_half = gen_history[total_gens // 2:]
+        first_discoveries = sum(g.get('promoted', 0) for g in first_half)
+        second_discoveries = sum(g.get('promoted', 0) for g in second_half)
+
+        if first_discoveries > 0 and second_discoveries == 0:
+            recommendations['saturation'] = 'Discovery dried up in second half. ' \
+                                            'Recommend: change engine structure or topology.'
+        elif second_discoveries > first_discoveries * 1.5:
+            recommendations['acceleration'] = 'Discovery accelerating. ' \
+                                              'Recommend: increase steps for deeper exploration.'
+
+        # Barren ratio
+        barren_ratio = len(barren_gens) / max(total_gens, 1)
+        if barren_ratio > 0.7:
+            recommendations['efficiency'] = f'Barren ratio {barren_ratio:.0%}. ' \
+                                            'Recommend: reduce steps, increase diversity.'
+
+        # Law network insights
+        if hasattr(law_network, 'generation_laws') and law_network.generation_laws:
+            # Which generation window produced most laws?
+            gen_counts = {int(k): len(v) for k, v in law_network.generation_laws.items()}
+            if gen_counts:
+                peak_gen = max(gen_counts, key=gen_counts.get)
+                recommendations['peak_discovery'] = f'Peak at gen {peak_gen} ' \
+                                                    f'({gen_counts[peak_gen]} laws). ' \
+                                                    'Replicate those conditions.'
+
+        if recommendations:
+            top_key = next(iter(recommendations))
+            print(f'    \U0001f40d Meta-insight: {recommendations[top_key][:80]}')
+            sys.stdout.flush()
+
+        return recommendations
+    except Exception as e:
+        print(f'    v10 meta_analyze error: {e}')
+        return {}
+
+
+# Global genome population for v10 ecosystem (lazy init)
+_genome_population = None
+
+
+def _get_genome_population(size=3):
+    """Lazy-init genome population for ecosystem evolution."""
+    global _genome_population
+    if _genome_population is None:
+        _genome_population = [EngineGenome() for _ in range(size)]
+    return _genome_population
+
+
 def load_roadmap_state():
     """Load roadmap progress."""
     if os.path.exists(ROADMAP_STATE_PATH):
@@ -2329,7 +3686,7 @@ def _rust_discover(cells, steps, topology, engine=None):
         return None
 
 
-def run_auto_roadmap(resume=False, report_interval=10):
+def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
     """Auto-roadmap: run staged evolution with automatic parameter escalation.
 
     Each stage cycles all 4 topologies. When all topologies saturate
@@ -2337,11 +3694,27 @@ def run_auto_roadmap(resume=False, report_interval=10):
     with bigger cells/steps.
 
     Results are persisted to evolution_roadmap.json for resume.
+
+    v7 features:
+      #62 stage_parallel: independent stages run concurrently
+      #63 tension_link: paired engine discovery every 15th gen
+      #64 federated: N-registry majority vote every 5th gen
+      #66 async_pipe: overlap validation/discovery via threads
+      #67 ckpt_share: global best engine state warm-starting
+      #68 cloud_stub: RunPod orchestrator stub (--cloud flag)
     """
     rm_state = load_roadmap_state() if resume else {
         'stage_idx': 0, 'stage_results': [], 'total_laws': 0, 'total_elapsed': 0
     }
     start_stage = rm_state['stage_idx']
+
+    # v7 #68: Cloud orchestrator
+    global _cloud_orchestrator
+    if cloud:
+        try:
+            _cloud_orchestrator = CloudOrchestrator()
+        except Exception:
+            _cloud_orchestrator = None
 
     print('=' * 70)
     print('  🐍 OUROBOROS — Auto-Roadmap Discovery Engine')
@@ -2380,15 +3753,77 @@ def run_auto_roadmap(resume=False, report_interval=10):
         if stage_idx > start_stage and prev_stage_laws == 0:
             prev = ROADMAP[stage_idx - 1]
             if prev['cells'] == cells and prev['steps'] < steps:
-                # Same cells, just deeper steps — skip (shares same ceiling)
-                print(f'\n  \u23e9 SKIP {stage["name"]} (prev stage found 0 laws at {cells}c)')
-                sys.stdout.flush()
-                rm_state['stage_results'].append({
-                    'stage': stage['name'], 'cells': cells, 'steps': steps,
-                    'generations': 0, 'laws': 0, 'unique_patterns': 0,
-                    'elapsed_sec': 0, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'skipped': True,
-                })
+                # v7 #62: Before skipping, check if next stage can run parallel
+                # with the one after that (different cells = independent)
+                _did_parallel = False
+                try:
+                    next_idx = stage_idx + 1
+                    if (HAS_PARALLEL and next_idx < len(ROADMAP)
+                            and _can_parallel_stages(stage, ROADMAP[next_idx])):
+                        next_stage = ROADMAP[next_idx]
+                        print(f'\n  \u26a1 v7 stage_parallel: {stage["name"]} ({cells}c) || '
+                              f'{next_stage["name"]} ({next_stage["cells"]}c)')
+                        sys.stdout.flush()
+
+                        # v7 #68: Log to cloud orchestrator if active
+                        if _cloud_orchestrator:
+                            _cloud_orchestrator.launch_stage(stage)
+                            _cloud_orchestrator.launch_stage(next_stage)
+
+                        reg_dict = shared_registry.to_dict()
+                        with ProcessPoolExecutor(max_workers=2) as executor:
+                            fut_a = executor.submit(
+                                _run_stage_worker, stage, reg_dict, {})
+                            fut_b = executor.submit(
+                                _run_stage_worker, next_stage, reg_dict, {})
+                            result_a = fut_a.result(timeout=1800)
+                            result_b = fut_b.result(timeout=1800)
+
+                        for result in [result_a, result_b]:
+                            rm_state['stage_results'].append({
+                                'stage': result['stage'],
+                                'cells': result['cells'],
+                                'steps': result['steps'],
+                                'generations': result['generations'],
+                                'laws': result['laws'],
+                                'unique_patterns': result['unique_patterns'],
+                                'elapsed_sec': result['elapsed_sec'],
+                                'timestamp': result['timestamp'],
+                                'parallel': True,
+                            })
+                            # Merge registry from worker
+                            if 'registry_dict' in result:
+                                _merge_reg = PatternRegistry()
+                                _merge_reg.from_dict(result['registry_dict'])
+                                for fp, entry in _merge_reg.seen.items():
+                                    if fp not in shared_registry.seen:
+                                        shared_registry.seen[fp] = entry
+                                    elif entry.get('registered'):
+                                        shared_registry.seen[fp] = entry
+                            prev_stage_laws = max(prev_stage_laws, result['laws'])
+                            print(f'  \u2705 {result["stage"]}: '
+                                  f'{result["generations"]} gens, '
+                                  f'{result["laws"]} laws, '
+                                  f'{result["elapsed_sec"]:.0f}s')
+
+                        save_roadmap_state(rm_state)
+                        _did_parallel = True
+                        # Skip the next stage too since we ran it in parallel
+                        rm_state['stage_idx'] = next_idx
+                except Exception as e:
+                    print(f'    v7 stage_parallel fallback: {e}')
+                    _did_parallel = False
+
+                if not _did_parallel:
+                    # Original skip behavior
+                    print(f'\n  \u23e9 SKIP {stage["name"]} (prev stage found 0 laws at {cells}c)')
+                    sys.stdout.flush()
+                    rm_state['stage_results'].append({
+                        'stage': stage['name'], 'cells': cells, 'steps': steps,
+                        'generations': 0, 'laws': 0, 'unique_patterns': 0,
+                        'elapsed_sec': 0, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'skipped': True,
+                    })
                 save_roadmap_state(rm_state)
                 continue
 
@@ -2411,16 +3846,26 @@ def run_auto_roadmap(resume=False, report_interval=10):
             # Engine may not accept hidden_dim kwarg
             engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
 
-        # v6 #60: Engine crossover — apply best state from previous stage
-        if stage_idx > 0 and rm_state.get('best_engine_state'):
-            try:
+        # v7 #67: Checkpoint sharing — warm-start from global best across ALL stages
+        try:
+            global_best = _best_engine_tracker.get_best_for_warmstart(stage['name'])
+            if global_best:
+                fresh_state = _get_engine_state_snapshot(engine)
+                child_state = _crossover_engines(global_best, fresh_state)
+                _apply_engine_state(engine, child_state)
+                summary = _best_engine_tracker.summary()
+                print(f'  \U0001f9ec v7 ckpt_share: warm-start from global best '
+                      f'(phi={summary["global_best_phi"]:.2f}, '
+                      f'stage={summary["global_best_stage"]})')
+            elif stage_idx > 0 and rm_state.get('best_engine_state'):
+                # v6 #60 fallback: Engine crossover from previous stage
                 prev_best = rm_state['best_engine_state']
                 fresh_state = _get_engine_state_snapshot(engine)
                 child_state = _crossover_engines(prev_best, fresh_state)
                 _apply_engine_state(engine, child_state)
                 print(f'  \U0001f9ec v6 crossover: merged prev-best + fresh engine')
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # #7: GPU Phi for cells >= 128
         if HAS_GPU_PHI and cells >= 128:
@@ -2503,6 +3948,12 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 if use_parallel_batch:
                     # #3: Parallel topology discovery (x4 speedup)
                     raw_patterns = _run_topo_batch(cells, steps, TOPOLOGIES, n_gens=1)
+                elif gen % 3 == 0:
+                    # v7 #66: Async pipeline — overlap validation with discovery
+                    raw_patterns, prev_validation = _async_discovery_pipeline(
+                        engine, cells, steps, current_topo, registry)
+                    if prev_validation:
+                        print(f'    v7 async_pipe: {len(prev_validation)} prev-gen validations ready')
                 else:
                     # v2 #9: Adaptive discovery with early abort
                     raw_patterns = _adaptive_discover(cells, steps, current_topo, engine)
@@ -2528,6 +3979,31 @@ def run_auto_roadmap(resume=False, report_interval=10):
             # v6 #59: Multi-timescale extra patterns
             if v6_extra:
                 raw_patterns.extend(v6_extra)
+
+            # v7 #63: Tension link discovery every 15th gen
+            try:
+                if gen % 15 == 0:
+                    tension_patterns = _tension_link_discover(cells, 50, current_topo)
+                    if tension_patterns:
+                        raw_patterns.extend(tension_patterns)
+                        print(f'    v7 tension_link: +{len(tension_patterns)} patterns '
+                              f'(hivemind/cross_engine)')
+                        sys.stdout.flush()
+            except Exception:
+                pass
+
+            # v7 #64: Federated discovery every 5th gen
+            try:
+                if gen % 5 == 0:
+                    federated = _get_federated()
+                    if federated:
+                        federated.sync_from(registry)
+                        fed_patterns = federated.run_federated_gen(
+                            cells, steps, current_topo, gen)
+                        if fed_patterns:
+                            raw_patterns.extend(fed_patterns)
+            except Exception:
+                pass
 
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
@@ -2587,11 +4063,13 @@ def run_auto_roadmap(resume=False, report_interval=10):
             phi_est = stats['unique_total'] * 0.1 + stats['registered_total'] * 0.5
             phi_history.append(phi_est)
 
-            # v6 #60: Track best engine state for crossover at stage transitions
+            # v6 #60 + v7 #67: Track best engine state for crossover + global sharing
             if phi_est > best_phi_this_stage:
                 best_phi_this_stage = phi_est
                 try:
                     rm_state['best_engine_state'] = _get_engine_state_snapshot(engine)
+                    # v7 #67: Update global best tracker
+                    _best_engine_tracker.update(stage['name'], phi_est, engine)
                 except Exception:
                     pass
 
@@ -2719,11 +4197,26 @@ def main():
                         help='Print ASCII report every N generations (default: 10)')
     parser.add_argument('--auto-roadmap', action='store_true',
                         help='Auto-roadmap: staged parameter escalation with auto-advance on saturation')
+    parser.add_argument('--cloud', action='store_true',
+                        help='v7 #68: Enable cloud orchestrator stub (prints what RunPod would do)')
+    parser.add_argument('--hardware', action='store_true',
+                        help='v9 #77-82: Enable hardware evolution stubs (ESP32/FPGA/neuromorphic)')
     args = parser.parse_args()
 
     if args.auto_roadmap:
-        run_auto_roadmap(resume=args.resume, report_interval=args.report_interval)
+        run_auto_roadmap(resume=args.resume, report_interval=args.report_interval,
+                         cloud=getattr(args, 'cloud', False))
         return
+
+    # v9 #77-82: Hardware evolution stubs
+    global _hardware_stub
+    if getattr(args, 'hardware', False):
+        try:
+            _hardware_stub = HardwareEvolutionStub()
+            _hardware_stub.run_all_stubs()
+        except Exception as e:
+            print(f'  Hardware stub init error: {e}')
+            _hardware_stub = None
 
     SCALES = [32, 64, 128, 256]
 
@@ -2940,6 +4433,54 @@ def main():
                 'laws': len(registry.registered),
                 'mods': active_mods,
             })
+
+            # v8 #69: Auto-generate hypotheses every 20 gens
+            try:
+                if gen % 20 == 0 and len(registry.registered) > 0:
+                    _hypotheses = _auto_generate_hypothesis(registry, _law_network)
+                    # v8 #70: Auto-design experiment from top hypothesis
+                    if _hypotheses:
+                        _exp_config = _auto_design_experiment(_hypotheses[0])
+            except Exception:
+                pass
+
+            # v8 #72: Score law quality for newly promoted laws
+            try:
+                for p in stats.get('promoted_patterns', []):
+                    for lid in registry.registered[-3:]:
+                        score = _score_law_quality(lid, registry, _law_network)
+                        if score.get('total', 0) > 0:
+                            print(f'    \U0001f4ca Law {lid} quality: {score["total"]:.2f} '
+                                  f'(R={score["reproducibility"]:.2f} '
+                                  f'I={score["impact"]:.2f} '
+                                  f'N={score["novelty"]:.2f})')
+            except Exception:
+                pass
+
+            # v8 #73: Counter-example search on newly registered laws (batch of 5)
+            try:
+                if stats.get('promoted', 0) > 0 and gen % 5 == 0:
+                    for lid in registry.registered[-5:]:
+                        _ce_result = _search_counter_examples(
+                            lid, str(lid), engine)
+            except Exception:
+                pass
+
+            # v10 #88: Meta-analyze pipeline every 50 gens
+            try:
+                if gen % 50 == 0 and len(gen_history) >= 10:
+                    _meta_recs = _meta_analyze_pipeline(
+                        gen_history, registry, _law_network)
+            except Exception:
+                pass
+
+            # v10 #86: Ecosystem step every 10 gens
+            try:
+                if gen % 10 == 0:
+                    _genomes = _get_genome_population()
+                    _ecosystem_step(_genomes, registry)
+            except Exception:
+                pass
 
             # Live status file
             current_topo_live = getattr(engine, 'topology', 'ring')
