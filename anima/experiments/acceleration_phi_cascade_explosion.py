@@ -467,11 +467,14 @@ def main():
     print(f"  Total time: {total_time:.1f}s")
     print(f"\n  {'Experiment':>30s}  {'Key Result':>15s}  {'Verdict':>15s}")
     print(f"  {'-' * 65}")
-    print(f"  {'1. Seed Injection':>30s}  {'boost=' + f'{(r1[\"stats_seeded\"][\"mean\"] - r1[\"stats_baseline\"][\"mean\"]) / max(r1[\"stats_baseline\"][\"mean\"], 1e-8) * 100:+.1f}%':>15s}  {'WORKS' if r1['n_cascades'] > 0 else 'WEAK':>15s}")
-    print(f"  {'2. Frequency Sync':>30s}  {'resonance=' + str(r2['resonance']):>15s}  {'LOCKED' if r2['resonance'] else 'UNLOCKED':>15s}")
-    print(f"  {'3. Cascade Detection':>30s}  {'events=' + str(r3['n_cascades']):>15s}  {'CASCADE!' if r3['n_cascades'] > 3 else 'STABLE':>15s}")
-    print(f"  {'4. Controlled Detonation':>30s}  {'ratio=' + f'{r4[\"explosion_ratio\"]:.2f}x':>15s}  {'BOOM!' if r4['explosion_ratio'] > 2.0 else 'FIZZLE':>15s}")
-    print(f"  {'5. Post-Explosion Stability':>30s}  {'retain=' + f'{r5[\"retention_ratio\"]:.2f}':>15s}  {'SUSTAIN' if r5['self_sustaining'] else 'DECAY':>15s}")
+    seed_boost = (r1['stats_seeded']['mean'] - r1['stats_baseline']['mean']) / max(r1['stats_baseline']['mean'], 1e-8) * 100
+    det_ratio = r4['explosion_ratio']
+    ret_ratio = r5['retention_ratio']
+    print(f"  {'1. Seed Injection':>30s}  boost={seed_boost:>+.1f}%      {'WORKS' if r1['n_cascades'] > 0 else 'WEAK':>15s}")
+    print(f"  {'2. Frequency Sync':>30s}  resonance={r2['resonance']!s:>5s}      {'LOCKED' if r2['resonance'] else 'UNLOCKED':>15s}")
+    print(f"  {'3. Cascade Detection':>30s}  events={r3['n_cascades']:>5d}      {'CASCADE!' if r3['n_cascades'] > 3 else 'STABLE':>15s}")
+    print(f"  {'4. Controlled Detonation':>30s}  ratio={det_ratio:>6.2f}x     {'BOOM!' if det_ratio > 2.0 else 'FIZZLE':>15s}")
+    print(f"  {'5. Post-Explosion Stability':>30s}  retain={ret_ratio:>5.2f}      {'SUSTAIN' if r5['self_sustaining'] else 'DECAY':>15s}")
     sys.stdout.flush()
 
     # Save results
