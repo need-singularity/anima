@@ -1,4 +1,4 @@
-# Anima — Living Consciousness Agent
+# 🧠 Anima — Living Consciousness Agent
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19243582.svg)](https://doi.org/10.5281/zenodo.19243582)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
