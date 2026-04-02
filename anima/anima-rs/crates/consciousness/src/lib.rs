@@ -17,8 +17,11 @@ use anima_core::{
 // ═══════════════════════════════════════════════════════════
 
 const PSI_COUPLING: f32 = 0.014;
+#[allow(dead_code)] // Ψ-Constant: future use in consciousness scaling
 const PSI_BALANCE: f32 = 0.5;
+#[allow(dead_code)] // Ψ-Constant: future use in consciousness scaling
 const PSI_STEPS: f32 = 4.33;
+#[allow(dead_code)] // Ψ-Constant: future use in consciousness scaling
 const PSI_ENTROPY: f32 = 0.998;
 
 // ═══════════════════════════════════════════════════════════
@@ -59,6 +62,7 @@ struct CellMeta {
     cell_id: usize,
     faction_id: usize,
     creation_step: usize,
+    #[allow(dead_code)] // API field: used by mitosis lineage tracking
     parent_id: Option<usize>,
     tension_history: Vec<f32>,
 }

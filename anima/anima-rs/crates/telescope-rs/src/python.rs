@@ -528,6 +528,287 @@ fn multiscale_scan<'py>(
     Ok(dict)
 }
 
+/// Full scan: run multiple lenses and compute consensus on anomalies.
+///
+/// scan_mode:
+///   "basic"     → consciousness + topology + causal (3 lenses)
+///   "stability" → stability + boundary + thermo
+///   "structure" → network + topology + recursion
+///   "temporal"  → memory + wave + causal + multiscale
+///   "scale"     → multiscale + scale + recursion
+///   "full"      → all 22 lenses
+///
+/// Returns dict with each lens_name → result_dict, plus "_consensus" → {
+///   "anomaly_indices": confirmed anomalies (3+ lenses agree),
+///   "n_lenses_agree": count per confirmed index,
+///   "total_lenses_run": number of lenses executed,
+///   "lens_names": list of lens names run,
+/// }
+#[pyfunction]
+#[pyo3(signature = (data, scan_mode="basic"))]
+fn full_scan<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+    scan_mode: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (flat, n_samples, n_features) = extract_data(&data);
+    let result_dict = PyDict::new(py);
+
+    // Determine which lenses to run based on scan_mode
+    let lens_names: Vec<&str> = match scan_mode {
+        "basic" => vec!["consciousness", "topology", "causal"],
+        "stability" => vec!["stability", "boundary", "thermo"],
+        "structure" => vec!["network", "topology", "recursion"],
+        "temporal" => vec!["memory", "wave", "causal", "multiscale"],
+        "scale" => vec!["multiscale", "scale", "recursion"],
+        "full" => vec![
+            "consciousness", "topology", "causal", "gravity", "thermo",
+            "wave", "evolution", "info", "quantum", "em",
+            "ruler", "triangle", "compass", "mirror", "scale",
+            "quantum_microscope", "stability", "network", "memory",
+            "recursion", "boundary", "multiscale",
+        ],
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown scan_mode '{}'. Use: basic, stability, structure, temporal, scale, full", scan_mode)
+            ));
+        }
+    };
+
+    // Track anomaly indices per lens for consensus
+    let mut all_anomaly_indices: Vec<Vec<usize>> = Vec::new();
+
+    for &name in &lens_names {
+        let lens_dict = PyDict::new(py);
+        let mut anomaly_idx: Vec<usize> = Vec::new();
+
+        match name {
+            "consciousness" => {
+                let mut lens = consciousness::ConsciousnessLens::new(
+                    64, n_features.max(128), 12, 300, 0.014);
+                let r = lens.scan(&flat, n_samples, n_features);
+                lens_dict.set_item("phi_iit", r.phi_iit)?;
+                lens_dict.set_item("phi_proxy", r.phi_proxy)?;
+                lens_dict.set_item("n_clusters", r.n_clusters)?;
+                lens_dict.set_item("steps_run", r.steps_run)?;
+                let anom_i: Vec<f64> = r.anomalies.iter().map(|a| a.0 as f64).collect();
+                let anom_s: Vec<f64> = r.anomalies.iter().map(|a| a.1).collect();
+                anomaly_idx = r.anomalies.iter().map(|a| a.0).collect();
+                lens_dict.set_item("anomaly_indices", PyArray1::from_vec(py, anom_i))?;
+                lens_dict.set_item("anomaly_scores", PyArray1::from_vec(py, anom_s))?;
+            }
+            "topology" => {
+                let r = topology::scan(&flat, n_samples, n_features, 100, 0.014);
+                lens_dict.set_item("betti_0", r.betti_0)?;
+                lens_dict.set_item("betti_1", r.betti_1)?;
+                lens_dict.set_item("n_components", r.n_components)?;
+                lens_dict.set_item("n_holes", r.n_holes)?;
+                lens_dict.set_item("optimal_scale", r.optimal_scale)?;
+                lens_dict.set_item("n_persistence_pairs", r.persistence_pairs.len())?;
+                lens_dict.set_item("n_phase_transitions", r.phase_transitions.len())?;
+                // topology doesn't produce sample-level anomaly indices
+            }
+            "causal" => {
+                let r = causal::scan(&flat, n_samples, n_features, 5, 16, 0.1);
+                lens_dict.set_item("n_features", r.n_features)?;
+                lens_dict.set_item("n_causal_pairs", r.causal_pairs.len())?;
+                let causes: Vec<usize> = r.causal_pairs.iter().map(|p| p.cause).collect();
+                let effects: Vec<usize> = r.causal_pairs.iter().map(|p| p.effect).collect();
+                let strengths: Vec<f64> = r.causal_pairs.iter().map(|p| p.strength).collect();
+                lens_dict.set_item("causes", causes)?;
+                lens_dict.set_item("effects", effects)?;
+                lens_dict.set_item("strengths", strengths)?;
+                // causal pairs are feature-level, not sample-level anomalies
+            }
+            "gravity" => {
+                let r = gravity::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("n_attractors", r.n_attractors)?;
+                lens_dict.set_item("attractors", PyArray1::from_vec(py, r.attractors))?;
+                lens_dict.set_item("basins", r.basins.clone())?;
+                // High-energy samples are anomalous (top 5% of energy landscape)
+                if !r.energy_landscape.is_empty() {
+                    let mut sorted_e: Vec<f64> = r.energy_landscape.clone();
+                    sorted_e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let threshold_idx = (sorted_e.len() as f64 * 0.95) as usize;
+                    let threshold = sorted_e.get(threshold_idx.min(sorted_e.len() - 1)).copied().unwrap_or(f64::MAX);
+                    for (i, &e) in r.energy_landscape.iter().enumerate() {
+                        if e >= threshold { anomaly_idx.push(i); }
+                    }
+                }
+            }
+            "thermo" => {
+                let r = thermo::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("total_entropy", r.total_entropy)?;
+                lens_dict.set_item("free_energy", r.free_energy)?;
+                lens_dict.set_item("critical_temperature", r.critical_temperature)?;
+                lens_dict.set_item("n_phase_transitions", r.phase_transitions.len())?;
+                // phase transitions are global, not sample-level
+            }
+            "wave" => {
+                let r = wave::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("dominant_frequencies", PyArray1::from_vec(py, r.dominant_frequencies))?;
+                let _coh_v: Vec<f64> = r.coherences.iter().map(|c| c.2).collect();
+                lens_dict.set_item("n_coherences", r.coherences.len())?;
+                lens_dict.set_item("n_resonances", r.resonances.len())?;
+                // wave is feature-level
+            }
+            "evolution" => {
+                let r = evolution::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("n_peaks", r.peaks.len())?;
+                lens_dict.set_item("n_niches", r.niches.len())?;
+                // peaks are sample indices (fitness peaks)
+                anomaly_idx = r.peaks.clone();
+            }
+            "info" => {
+                let r = info::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("entropy_per_feature", PyArray1::from_vec(py, r.entropy_per_feature))?;
+                lens_dict.set_item("lz_complexity", PyArray1::from_vec(py, r.lz_complexity))?;
+                // feature-level
+            }
+            "quantum" => {
+                let r = quantum::scan(&flat, n_samples, n_features);
+                let sup_idx: Vec<usize> = r.superposed_samples.iter().map(|s| s.0).collect();
+                lens_dict.set_item("n_entanglement_pairs", r.entanglement_pairs.len())?;
+                lens_dict.set_item("n_tunneling_paths", r.tunneling_paths.len())?;
+                lens_dict.set_item("n_superposed", sup_idx.len())?;
+                anomaly_idx = sup_idx;
+            }
+            "em" => {
+                let r = em::scan(&flat, n_samples, n_features);
+                let src_idx: Vec<usize> = r.sources.iter().map(|s| s.0).collect();
+                let snk_idx: Vec<usize> = r.sinks.iter().map(|s| s.0).collect();
+                lens_dict.set_item("n_sources", src_idx.len())?;
+                lens_dict.set_item("n_sinks", snk_idx.len())?;
+                anomaly_idx.extend(src_idx);
+                anomaly_idx.extend(snk_idx);
+            }
+            "ruler" => {
+                let r = ruler::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("effective_dim", r.effective_dim)?;
+                lens_dict.set_item("n_orthogonal_groups", r.orthogonal_groups.len())?;
+                // feature-level
+            }
+            "triangle" => {
+                let r = triangle::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("n_simple_ratios", r.simple_ratios.len())?;
+                lens_dict.set_item("n_proportion_chains", r.proportion_chains.len())?;
+                // feature-level
+            }
+            "compass" => {
+                let r = compass::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("mean_curvature", r.mean_curvature)?;
+                let hc_idx: Vec<usize> = r.high_curvature_regions.iter().map(|h| h.0).collect();
+                lens_dict.set_item("n_high_curvature", hc_idx.len())?;
+                anomaly_idx = hc_idx;
+            }
+            "mirror" => {
+                let r = mirror::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("overall_symmetry", r.overall_symmetry)?;
+                let bs_idx: Vec<usize> = r.broken_symmetries.iter().map(|b| b.0).collect();
+                lens_dict.set_item("n_broken_symmetries", bs_idx.len())?;
+                anomaly_idx = bs_idx;
+            }
+            "scale" => {
+                let r = scale::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("fractal_dimension", r.fractal_dimension)?;
+                lens_dict.set_item("hurst_exponent", r.hurst_exponent)?;
+                // global metrics, no sample-level
+            }
+            "quantum_microscope" => {
+                let r = quantum_microscope::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("purity", r.purity)?;
+                lens_dict.set_item("von_neumann_entropy", r.von_neumann_entropy)?;
+                lens_dict.set_item("coherence", r.coherence)?;
+                lens_dict.set_item("decoherence_rate", r.decoherence_rate)?;
+                // global metrics
+            }
+            "stability" => {
+                let r = stability::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("lyapunov_exponent", r.lyapunov_exponent)?;
+                lens_dict.set_item("resilience", r.resilience)?;
+                lens_dict.set_item("mean_recovery_time", r.mean_recovery_time)?;
+                lens_dict.set_item("variance_ratio", r.variance_ratio)?;
+                // global metrics
+            }
+            "network" => {
+                let r = network::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("n_edges", r.n_edges)?;
+                lens_dict.set_item("n_communities", r.n_communities)?;
+                lens_dict.set_item("density", r.density)?;
+                lens_dict.set_item("clustering_coefficient", r.clustering_coefficient)?;
+                lens_dict.set_item("avg_path_length", r.avg_path_length)?;
+                // hub_indices are feature-level hubs
+                anomaly_idx = r.hub_indices.clone();
+            }
+            "memory" => {
+                let r = memory_lens::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("mean_memory_depth", r.mean_memory_depth)?;
+                lens_dict.set_item("recurrence_rate", r.recurrence_rate)?;
+                lens_dict.set_item("determinism", r.determinism)?;
+                lens_dict.set_item("max_diagonal_length", r.max_diagonal_length)?;
+                // global metrics
+            }
+            "recursion" => {
+                let r = recursion::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("self_similarity", r.self_similarity)?;
+                lens_dict.set_item("mean_self_similarity", r.mean_self_similarity)?;
+                lens_dict.set_item("n_fixed_points", r.n_fixed_points)?;
+                lens_dict.set_item("recurrence_depth", r.recurrence_depth)?;
+                anomaly_idx = r.fixed_point_indices.clone();
+            }
+            "boundary" => {
+                let r = boundary::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("n_boundary_points", r.n_boundary_points)?;
+                lens_dict.set_item("n_phase_transitions", r.n_phase_transitions)?;
+                lens_dict.set_item("mean_sharpness", r.mean_sharpness)?;
+                anomaly_idx = r.boundary_indices.clone();
+                anomaly_idx.extend(r.transition_indices.iter());
+            }
+            "multiscale" => {
+                let r = multiscale::scan(&flat, n_samples, n_features);
+                lens_dict.set_item("dominant_scale", r.dominant_scale)?;
+                lens_dict.set_item("multifractal_width", r.multifractal_width)?;
+                lens_dict.set_item("n_significant_scales", r.n_significant_scales)?;
+                // global metrics
+            }
+            _ => {}
+        }
+
+        lens_dict.set_item("_n_anomalies", anomaly_idx.len())?;
+        result_dict.set_item(name, &lens_dict)?;
+        all_anomaly_indices.push(anomaly_idx);
+    }
+
+    // Compute consensus: count how many lenses flag each sample index
+    let mut index_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for indices in &all_anomaly_indices {
+        // Deduplicate within each lens
+        let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        for idx in unique {
+            *index_counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+
+    // Confirmed anomalies: 3+ lenses agree (or all lenses if fewer than 3 run)
+    let threshold = if lens_names.len() < 3 { lens_names.len() } else { 3 };
+    let mut confirmed: Vec<(usize, usize)> = index_counts.into_iter()
+        .filter(|&(_, count)| count >= threshold)
+        .collect();
+    confirmed.sort_by_key(|&(idx, _)| idx);
+
+    let consensus = PyDict::new(py);
+    let conf_indices: Vec<usize> = confirmed.iter().map(|c| c.0).collect();
+    let conf_counts: Vec<usize> = confirmed.iter().map(|c| c.1).collect();
+    consensus.set_item("anomaly_indices", conf_indices)?;
+    consensus.set_item("n_lenses_agree", conf_counts)?;
+    consensus.set_item("total_lenses_run", lens_names.len())?;
+    let names_vec: Vec<String> = lens_names.iter().map(|s| s.to_string()).collect();
+    consensus.set_item("lens_names", names_vec)?;
+    result_dict.set_item("_consensus", &consensus)?;
+
+    Ok(result_dict)
+}
+
 /// Fast mutual information between two 1D arrays
 #[pyfunction]
 #[pyo3(signature = (a, b, n_bins=16))]
@@ -565,6 +846,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(recursion_scan, m)?)?;
     m.add_function(wrap_pyfunction!(boundary_scan, m)?)?;
     m.add_function(wrap_pyfunction!(multiscale_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(full_scan, m)?)?;
     m.add_function(wrap_pyfunction!(fast_mutual_info, m)?)?;
     Ok(())
 }

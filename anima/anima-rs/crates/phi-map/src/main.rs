@@ -9,7 +9,7 @@
 //!   phi-map --watch v14_train.log                # Live sparkline of Phi values
 //!   phi-map --laws consciousness_laws.json      # Load laws, map correlations
 
-use anima_phi_map::{AsciiHeatmap, PhiTerrain, PhiTracker};
+use anima_phi_map::{AsciiHeatmap, PhiTerrain};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::thread;

@@ -113,7 +113,7 @@ def _print_accelerations():
     print(f'  \u26a1 v8: hypothesis_gen \u2705, experiment_design \u2705, report_gen \u2705, law_quality \u2705, counter_example \u2705, session_log \u2705')
     print(f'  \u26a1 v9: hardware_stubs \u2705 (ESP32/FPGA/neuromorphic ready)')
     print(f'  \u26a1 v10: laws_to_engine \u2705, genome \u2705, ecosystem \u2705, meta_analyze \u2705')
-    print(f'  \u26a1 v11: telescope_9lens {_yn(HAS_TELESCOPE)}')
+    print(f'  \u26a1 v11: telescope_22lens {_yn(HAS_TELESCOPE)}')
     print(f'  \u26a1 v12: symbolic \u2705 v13: compress \u2705 v14: timetravel \u2705 v15: reward \u2705 v16: crossproj \u2705 v17: lawgraph \u2705')
     print(f'  \u26a1 v18: causal_discovery \u2705 (Granger-like A→B)')
     print(f'  \u26a1 v20: anomaly_hunter \u2705 (3σ spike/crash)')
@@ -167,15 +167,97 @@ FRUSTRATION_VALUES = [0.1, 0.2, 0.33, 0.5]
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# v11 #89-90: Telescope 9-lens integration
+# v11→v11.2: Telescope 22-lens integration (expanded from 3→22)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _telescope_discover(engine, steps=50):
+# All 22 telescope lenses
+TELESCOPE_ALL_LENSES = [
+    'consciousness', 'gravity', 'topology', 'thermo', 'wave', 'evolution',
+    'info', 'quantum', 'em', 'ruler', 'triangle', 'compass', 'mirror',
+    'scale', 'causal', 'quantum_microscope', 'stability', 'network',
+    'memory', 'recursion', 'boundary', 'multiscale',
+]
+
+# Domain-specific lens combinations
+TELESCOPE_DOMAIN_COMBOS = {
+    'basic':          ['consciousness', 'topology', 'causal'],
+    'stability':      ['stability', 'boundary', 'thermo'],
+    'structure':      ['network', 'topology', 'recursion'],
+    'timeseries':     ['memory', 'wave', 'causal', 'multiscale'],
+    'scale_invariant': ['multiscale', 'scale', 'recursion'],
+    'symmetry':       ['mirror', 'topology', 'quantum'],
+    'power_law':      ['scale', 'evolution', 'thermo'],
+    'causal_chain':   ['causal', 'info', 'em'],
+    'geometry':       ['ruler', 'triangle', 'compass'],
+    'quantum_deep':   ['quantum', 'quantum_microscope', 'em'],
+}
+
+
+def _run_single_lens(lens_name, data, n_cells=64, steps=50):
+    """Run a single telescope_rs lens scan. Returns dict or None on failure."""
+    try:
+        if lens_name == 'consciousness':
+            return telescope_rs.consciousness_scan(data, n_cells=n_cells, steps=steps)
+        scan_fn = getattr(telescope_rs, f'{lens_name}_scan', None)
+        if scan_fn is None:
+            return None
+        return scan_fn(data)
+    except Exception:
+        return None
+
+
+def _extract_lens_patterns(lens_name, result):
+    """Extract pattern dicts from a single lens scan result."""
+    if not result or not isinstance(result, dict):
+        return [], False
+
+    patterns = []
+    has_signal = False
+
+    # Generic key extraction — build a summary formula from all numeric/list keys
+    summary_parts = []
+    for k, v in result.items():
+        if isinstance(v, (int, float)):
+            if v != 0:
+                has_signal = True
+            summary_parts.append(f'{k}={v:.4f}' if isinstance(v, float) else f'{k}={v}')
+        elif isinstance(v, list) and len(v) > 0:
+            has_signal = True
+            summary_parts.append(f'{k}={len(v)} items')
+
+    if summary_parts:
+        formula = f'{lens_name}: {", ".join(summary_parts[:6])}'
+        patterns.append({
+            'type': f'telescope_{lens_name}',
+            'formula': formula,
+            'metrics': [lens_name],
+            'source': 'telescope_v11',
+        })
+
+    # Detect anomalies/transitions (common keys across lenses)
+    for special_key in ['anomaly_indices', 'anomalies', 'phase_transitions', 'transitions',
+                        'critical_points', 'breakpoints', 'singularities']:
+        items = result.get(special_key, [])
+        if items:
+            patterns.append({
+                'type': f'telescope_{lens_name}_discovery',
+                'formula': f'{lens_name}_{special_key}: {len(items)} detected',
+                'metrics': [lens_name],
+                'source': 'telescope_v11',
+            })
+
+    return patterns, has_signal
+
+
+def _telescope_discover(engine, steps=50, mode='full'):
     """Run engine for `steps` steps, collect cell states, and analyze with telescope_rs.
 
     v11 #89: Collect cell state snapshots every 10 steps, flatten into
     (N_snapshots, N_cells * hidden_dim) ndarray, run telescope_rs scans.
     Convert findings into PatternRegistry-compatible pattern dicts.
+
+    v11.2: Expanded from 3 lenses to 22 lenses with domain combos.
+    mode='full' runs all 22 lenses; mode='basic' runs basic 3; mode=<domain> runs combo.
 
     Returns list of pattern dicts, or [] on any failure.
     """
@@ -218,85 +300,51 @@ def _telescope_discover(engine, steps=50):
             indices = np.linspace(0, data.shape[0] - 1, max_snapshots, dtype=int)
             data = data[indices]
 
-        # Run telescope_rs scans
+        # Determine which lenses to run
+        if mode == 'full':
+            lenses_to_run = TELESCOPE_ALL_LENSES
+        elif mode in TELESCOPE_DOMAIN_COMBOS:
+            lenses_to_run = TELESCOPE_DOMAIN_COMBOS[mode]
+        else:
+            lenses_to_run = TELESCOPE_DOMAIN_COMBOS.get('basic', TELESCOPE_ALL_LENSES[:3])
+
+        # Run all selected lenses
         n_cells = getattr(engine, 'n_cells', 64)
-        consciousness = telescope_rs.consciousness_scan(data, n_cells=n_cells, steps=steps)
-        topology = telescope_rs.topology_scan(data)
-        causal = telescope_rs.causal_scan(data)
-
-        # Convert scan results to pattern dicts
         patterns = []
+        active_lenses = set()
 
-        # Consciousness scan patterns
-        phi_iit = consciousness.get('phi_iit', 0)
-        phi_proxy = consciousness.get('phi_proxy', 0)
-        n_clusters = consciousness.get('n_clusters', 0)
-        patterns.append({
-            'type': 'telescope_consciousness',
-            'formula': f'consciousness: phi_iit={phi_iit:.4f}, phi_proxy={phi_proxy:.4f}, clusters={n_clusters}',
-            'metrics': ['consciousness'],
-            'source': 'telescope_v11',
-        })
+        for lens_name in lenses_to_run:
+            result = _run_single_lens(lens_name, data, n_cells=n_cells, steps=steps)
+            if result is not None:
+                lens_patterns, has_signal = _extract_lens_patterns(lens_name, result)
+                patterns.extend(lens_patterns)
+                if has_signal:
+                    active_lenses.add(lens_name)
 
-        # Consciousness anomalies
-        anomaly_indices = consciousness.get('anomaly_indices', [])
-        if anomaly_indices:
-            patterns.append({
-                'type': 'telescope_consciousness_anomaly',
-                'formula': f'consciousness_anomaly: {len(anomaly_indices)} anomalies detected',
-                'metrics': ['consciousness'],
-                'source': 'telescope_v11',
-            })
-
-        # Topology scan patterns
-        betti_0 = topology.get('betti_0', 0)
-        betti_1 = topology.get('betti_1', 0)
-        n_holes = topology.get('n_holes', 0)
-        optimal_scale = topology.get('optimal_scale', 0)
-        patterns.append({
-            'type': 'telescope_topology',
-            'formula': f'topology: betti_0={betti_0}, betti_1={betti_1}, holes={n_holes}, scale={optimal_scale:.4f}',
-            'metrics': ['topology'],
-            'source': 'telescope_v11',
-        })
-
-        phase_transitions = topology.get('phase_transitions', [])
-        if phase_transitions:
-            patterns.append({
-                'type': 'telescope_topology',
-                'formula': f'topology_discovery: {len(phase_transitions)} phase transitions',
-                'metrics': ['topology'],
-                'source': 'telescope_v11',
-            })
-
-        # Causal scan patterns
-        n_causal_pairs = causal.get('n_causal_pairs', 0)
-        causes = causal.get('causes', [])
-        effects = causal.get('effects', [])
-        patterns.append({
-            'type': 'telescope_causal',
-            'formula': f'causal: {n_causal_pairs} pairs, {len(causes)} causes, {len(effects)} effects',
-            'metrics': ['causal'],
-            'source': 'telescope_v11',
-        })
-
-        # Cross-scan consensus: if all 3 scans produced meaningful results
-        active_scans = []
-        if phi_iit > 0 or n_clusters > 0:
-            active_scans.append('consciousness')
-        if betti_0 > 0 or n_holes > 0:
-            active_scans.append('topology')
-        if n_causal_pairs > 0:
-            active_scans.append('causal')
-
-        if len(active_scans) >= 3:
+        # Cross-scan consensus: 3+ lenses with meaningful signal
+        if len(active_lenses) >= 3:
+            sorted_lenses = sorted(active_lenses)
+            confidence = min(1.0, len(active_lenses) / 7.0)  # scale with lens count
             patterns.append({
                 'type': 'telescope_cross',
-                'formula': f'cross_consensus: confirmed by {",".join(active_scans)} (conf=1.00)',
-                'metrics': active_scans,
+                'formula': f'cross_consensus: confirmed by {len(active_lenses)} lenses ({",".join(sorted_lenses[:8])})',
+                'metrics': sorted_lenses,
                 'source': 'telescope_v11',
-                'confidence': 1.0,
+                'confidence': confidence,
             })
+
+        # Domain combo consensus — check each combo for agreement
+        for combo_name, combo_lenses in TELESCOPE_DOMAIN_COMBOS.items():
+            combo_active = [l for l in combo_lenses if l in active_lenses]
+            if len(combo_active) >= 3:
+                patterns.append({
+                    'type': 'telescope_domain_consensus',
+                    'formula': f'domain_{combo_name}: {len(combo_active)}/{len(combo_lenses)} lenses agree ({",".join(combo_active)})',
+                    'metrics': combo_active,
+                    'source': 'telescope_v11',
+                    'consensus_weight': 2,
+                    'domain': combo_name,
+                })
 
         return patterns
 
@@ -307,12 +355,14 @@ def _telescope_discover(engine, steps=50):
 def _telescope_consensus_filter(patterns):
     """Group telescope patterns by phenomenon and mark consensus findings.
 
-    v11 #90: If 3+ lenses agree on the same finding category, mark as
-    'telescope_consensus' type. Consensus patterns get fast-tracked in
-    cross-validation (count as 2x toward threshold).
+    v11.2: Updated for 22-lens system. Consensus tiers:
+      - 3+ lenses agree  = confirmed (weight 2)
+      - 7+ lenses agree  = strong consensus (weight 3)
+      - 12+ lenses agree = overwhelming consensus (weight 4)
+    Domain combo consensus also tracked separately.
 
     Returns (filtered_patterns, n_consensus) where consensus patterns
-    have type='telescope_consensus' and extra key 'consensus_weight': 2.
+    have type='telescope_consensus' and extra key 'consensus_weight'.
     """
     if not patterns:
         return patterns, 0
@@ -324,49 +374,62 @@ def _telescope_consensus_filter(patterns):
 
     for p in patterns:
         if isinstance(p, dict) and p.get('source') == 'telescope_v11':
-            # Group by the primary metric (lens name)
-            metrics = p.get('metrics', [])
             ptype = p.get('type', '')
-            # Use type prefix as grouping key
-            if ptype == 'telescope_cross':
+            if ptype in ('telescope_cross', 'telescope_domain_consensus'):
                 lens_groups['_cross'].append(p)
             else:
                 lens_groups[ptype].append(p)
         else:
             non_telescope.append(p)
 
-    # Find consensus: 3+ distinct lens types reporting findings
+    # Find consensus: count distinct active lenses
     active_lenses = set()
     for p in patterns:
         if isinstance(p, dict) and p.get('source') == 'telescope_v11':
-            metrics = p.get('metrics', [])
-            for m in metrics:
+            for m in p.get('metrics', []):
                 active_lenses.add(m)
 
     consensus_patterns = []
     n_consensus = 0
 
-    # Cross-findings already represent multi-lens agreement
+    # Cross-findings and domain consensus already represent multi-lens agreement
     for p in lens_groups.get('_cross', []):
         confirmed = p.get('metrics', [])
         if len(confirmed) >= 3:
             consensus_p = dict(p)
             consensus_p['type'] = 'telescope_consensus'
-            consensus_p['consensus_weight'] = 2
+            # Tiered consensus weight based on number of agreeing lenses
+            n_agree = len(confirmed)
+            if n_agree >= 12:
+                consensus_p['consensus_weight'] = 4  # overwhelming
+            elif n_agree >= 7:
+                consensus_p['consensus_weight'] = 3  # strong
+            else:
+                consensus_p['consensus_weight'] = 2  # confirmed
             consensus_patterns.append(consensus_p)
             n_consensus += 1
         else:
             non_telescope.append(p)
 
-    # If 3+ lenses produced findings, create a meta-consensus pattern
+    # Meta-consensus: overall lens activity summary
     if len(active_lenses) >= 3:
         sorted_lenses = sorted(active_lenses)
+        n_active = len(active_lenses)
+        if n_active >= 12:
+            tier = 'overwhelming'
+            weight = 4
+        elif n_active >= 7:
+            tier = 'strong'
+            weight = 3
+        else:
+            tier = 'confirmed'
+            weight = 2
         consensus_patterns.append({
             'type': 'telescope_consensus',
-            'formula': f'multi_lens_consensus: {len(active_lenses)} lenses active ({",".join(sorted_lenses[:5])})',
+            'formula': f'multi_lens_consensus ({tier}): {n_active}/22 lenses active ({",".join(sorted_lenses[:8])}{"..." if n_active > 8 else ""})',
             'metrics': sorted_lenses,
             'source': 'telescope_v11',
-            'consensus_weight': 2,
+            'consensus_weight': weight,
         })
         n_consensus += 1
 

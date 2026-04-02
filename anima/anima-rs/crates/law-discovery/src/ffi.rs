@@ -12,8 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::buffer::RingBuffer;
-use crate::candidate::LawCandidate;
-use crate::metrics::{self, MetricSnapshot, NUM_METRICS};
+use crate::metrics::NUM_METRICS;
 use crate::{detect_correlation, detect_phase_transition, detect_periodicity, detect_trend};
 
 // ═══════════════════════════════════════════════════════════════════════

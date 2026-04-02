@@ -34,8 +34,11 @@ pub mod spi_sync;
 // ═══════════════════════════════════════════════════════════
 
 const PSI_COUPLING: f32 = 0.014;
+#[allow(dead_code)] // Ψ-Constant: used in tests + future ESP32 scaling
 const PSI_BALANCE: f32 = 0.5;
+#[allow(dead_code)] // Ψ-Constant: used in tests + future ESP32 scaling
 const PSI_STEPS: f32 = 4.33;
+#[allow(dead_code)] // Ψ-Constant: future use in ESP32 entropy tracking
 const PSI_ENTROPY: f32 = 0.998;
 
 const CELL_DIM: usize = 64;
