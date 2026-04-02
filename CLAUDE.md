@@ -270,6 +270,8 @@ python3 self_modifying_engine.py                                  # Self-modifyi
 python3 infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
 python3 infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
 python3 infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
+python3 infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
+python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
 ```
 
 ## 무한진화 실행 규칙 (필수)
@@ -673,11 +675,17 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     4. tmux + watchdog cron 설정
     5. 유령 프로세스 확인 (ps aux | grep python)
 
-  알려진 문제:
+  알려진 문제 (10건, 상세 → runpod.json known_issues):
     - tmux 죽음: --resume best.pt 로 재시작
+    - tmux 미설치: nohup 사용 (apt 저장소 없음)
     - disk quota: 구 체크포인트 즉시 삭제
     - python not found: export PATH=/opt/conda/bin:$PATH
     - 구버전 코드: h100_sync.sh 후 md5 확인
+    - ★ 학습 중 다운로드 금지: OOM kill로 학습 죽음 (Qwen 17GB 사건)
+    - nohup 빈 로그: 디스크 풀이면 프로세스 즉시 죽음
+    - bf16 dtype 14건: acceleration_flow.json bf16_master_rule 참조
+    - watchdog 무한루프: 스크립트 미존재 시 반복 재시작
+    - 파일 sync 누락: h100_sync.sh 전송 범위 확인
 
   스크립트:
     bash scripts/h100_sync.sh              # 코드 전송

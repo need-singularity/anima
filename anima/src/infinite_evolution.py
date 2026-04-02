@@ -34,6 +34,36 @@ CROSS_VALIDATION_THRESHOLD = 3  # times a pattern must appear before registratio
 # TOPO 33-39: topology cycle for breaking pattern saturation
 TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
 
+# Auto-roadmap: staged parameter escalation
+# Each stage runs until all topologies saturate, then auto-advances
+ROADMAP = [
+    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
+    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 5},
+]
+ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
+
+
+def load_roadmap_state():
+    """Load roadmap progress."""
+    if os.path.exists(ROADMAP_STATE_PATH):
+        with open(ROADMAP_STATE_PATH) as f:
+            return json.load(f)
+    return {'stage_idx': 0, 'stage_results': [], 'total_laws': 0, 'total_elapsed': 0}
+
+
+def save_roadmap_state(state):
+    """Save roadmap progress."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = ROADMAP_STATE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2, ensure_ascii=False, default=str)
+    os.rename(tmp, ROADMAP_STATE_PATH)
+
 
 def generate_report(gen, registry, active_mods, total_elapsed,
                     gen_history, phi_history, cells, steps, topology, features):
@@ -609,6 +639,223 @@ class InfiniteEvolution:
         }
 
 
+def run_auto_roadmap(resume=False, report_interval=10):
+    """Auto-roadmap: run staged evolution with automatic parameter escalation.
+
+    Each stage cycles all 4 topologies. When all topologies saturate
+    (sat_streak consecutive gens with New=0), auto-advances to next stage
+    with bigger cells/steps.
+
+    Results are persisted to evolution_roadmap.json for resume.
+    """
+    rm_state = load_roadmap_state() if resume else {
+        'stage_idx': 0, 'stage_results': [], 'total_laws': 0, 'total_elapsed': 0
+    }
+    start_stage = rm_state['stage_idx']
+
+    print('=' * 70)
+    print('  AUTO-ROADMAP — Staged Infinite Evolution')
+    print(f'  {len(ROADMAP)} stages, auto-advance on saturation')
+    print('=' * 70)
+    print()
+    print(f'  {"#":<3} {"Stage":<16} {"Cells":>5} {"Steps":>5} {"TopoGens":>8} {"Sat":>3}')
+    print(f'  {"─"*3} {"─"*16} {"─"*5} {"─"*5} {"─"*8} {"─"*3}')
+    for i, s in enumerate(ROADMAP):
+        marker = ' ★' if i == start_stage else ('  ✅' if i < start_stage else '')
+        print(f'  {i+1:<3} {s["name"]:<16} {s["cells"]:>5} {s["steps"]:>5} '
+              f'{s["topo_gens"]:>8} {s["sat_streak"]:>3}{marker}')
+    print('=' * 70)
+    sys.stdout.flush()
+
+    global_start = time.time()
+
+    for stage_idx in range(start_stage, len(ROADMAP)):
+        stage = ROADMAP[stage_idx]
+        rm_state['stage_idx'] = stage_idx
+        save_roadmap_state(rm_state)
+
+        cells = stage['cells']
+        steps = stage['steps']
+        topo_gens = stage['topo_gens']
+        sat_thresh = stage['sat_streak']
+
+        print(f'\n{"▓" * 70}')
+        print(f'  STAGE {stage_idx+1}/{len(ROADMAP)}: {stage["name"]}')
+        print(f'  cells={cells}  steps={steps}  topo_cycle_every={topo_gens}  sat_streak={sat_thresh}')
+        print(f'{"▓" * 70}')
+        sys.stdout.flush()
+
+        engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        evolver = ClosedLoopEvolver(max_cells=cells, auto_register=True)
+        sme = SelfModifyingEngine(engine, evolver)
+        registry = PatternRegistry()
+
+        gen = 0
+        gen_history = []
+        phi_history = []
+        stage_start = time.time()
+        zero_streak = 0  # consecutive gens with New=0
+        topo_saturated = set()  # topologies that have fully saturated
+
+        while True:
+            gen += 1
+            cycle_start = time.time()
+
+            # Topology cycling
+            if gen > 1 and gen % topo_gens == 1:
+                topo_idx = ((gen - 1) // topo_gens) % len(TOPOLOGIES)
+                new_topo = TOPOLOGIES[topo_idx]
+                old_topo = getattr(engine, 'topology', 'ring')
+                if new_topo != old_topo:
+                    engine.topology = new_topo
+                    cleared = registry.clear_pending()
+                    zero_streak = 0  # reset streak on topo switch
+                    print(f'  Topology switch: {old_topo} -> {new_topo} (Gen {gen}), '
+                          f'cleared {cleared} pending')
+                    sys.stdout.flush()
+
+            current_topo = getattr(engine, 'topology', 'ring')
+
+            # Phase 1: Discovery
+            print(f'\n{"─" * 60}')
+            print(f'  [{stage["name"]}] Gen {gen} — Discovery ({steps} steps, {current_topo})')
+            sys.stdout.flush()
+
+            try:
+                disc = ConsciousLawDiscoverer(steps=steps, max_cells=cells,
+                                             topology=current_topo)
+                result = disc.run(steps=steps, verbose=False)
+                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+            except Exception as e:
+                print(f'    Discovery error: {e}')
+                raw_patterns = []
+
+            # Phase 2: Dedup + Cross-validation
+            stats = registry.process(raw_patterns, gen)
+
+            for p in stats['promoted_patterns']:
+                law_id = register_law(p, evolver)
+                if law_id:
+                    registry.registered.append(law_id)
+                    print(f'    ★ Law {law_id} registered (cross-validated {CROSS_VALIDATION_THRESHOLD}x)')
+                    law_text = p.get('formula', str(p))
+                    auto_generate_intervention(law_text, law_id, evolver)
+
+            # Phase 3: Self-Modification
+            sme.run_evolution(generations=1)
+            active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
+
+            elapsed = time.time() - cycle_start
+            total_elapsed = rm_state['total_elapsed'] + (time.time() - stage_start)
+
+            # Persist
+            active_mods_data = []
+            if hasattr(sme, 'modifier') and hasattr(sme.modifier, 'applied'):
+                for m in sme.modifier.applied:
+                    active_mods_data.append({
+                        'law_id': m.law_id, 'target': m.target,
+                        'mod_type': m.mod_type.value if hasattr(m.mod_type, 'value') else str(m.mod_type),
+                        'params': m.params if isinstance(m.params, dict) else {},
+                        'confidence': m.confidence, 'reversible': m.reversible,
+                    })
+            save_state(gen, registry, active_mods_data, total_elapsed)
+
+            print(f'  Gen {gen} — Raw: {len(raw_patterns)}, New: {stats["new"]}, '
+                  f'Laws: {len(registry.registered)}, Mods: {active_mods}, '
+                  f'{elapsed:.1f}s')
+            sys.stdout.flush()
+
+            phi_est = stats['unique_total'] * 0.1 + stats['registered_total'] * 0.5
+            phi_history.append(phi_est)
+            gen_history.append({
+                'gen': gen, 'raw': len(raw_patterns), 'new': stats['new'],
+                'repeat': stats['repeat'], 'promoted': stats['promoted'],
+                'unique': stats['unique_total'], 'xval': stats['registered_total'],
+                'laws': len(registry.registered), 'mods': active_mods,
+            })
+
+            # Periodic report
+            if gen % report_interval == 0:
+                generate_report(gen, registry, active_mods, total_elapsed,
+                                gen_history, phi_history, cells=cells, steps=steps,
+                                topology=current_topo,
+                                features={'auto_roadmap': True, 'stage': stage['name']})
+
+            # Saturation detection
+            if stats['new'] == 0:
+                zero_streak += 1
+            else:
+                zero_streak = 0
+
+            # Check if current topology is saturated
+            if zero_streak >= sat_thresh:
+                topo_saturated.add(current_topo)
+                print(f'  ⚠️ {current_topo} saturated ({zero_streak} gens streak)')
+                sys.stdout.flush()
+
+                # Force next topology
+                next_topo_idx = (TOPOLOGIES.index(current_topo) + 1) % len(TOPOLOGIES)
+                next_topo = TOPOLOGIES[next_topo_idx]
+                if next_topo not in topo_saturated:
+                    engine.topology = next_topo
+                    cleared = registry.clear_pending()
+                    zero_streak = 0
+                    print(f'  → Forcing topology: {current_topo} -> {next_topo}, '
+                          f'cleared {cleared} pending')
+                    sys.stdout.flush()
+
+            # All 4 topologies saturated → advance stage
+            if len(topo_saturated) >= len(TOPOLOGIES):
+                stage_elapsed = time.time() - stage_start
+                laws_found = len(registry.registered)
+                print(f'\n{"=" * 70}')
+                print(f'  STAGE {stage_idx+1} COMPLETE: {stage["name"]}')
+                print(f'  {gen} gens, {laws_found} laws, {stage_elapsed:.0f}s')
+                print(f'  All {len(TOPOLOGIES)} topologies saturated')
+                print(f'{"=" * 70}')
+                sys.stdout.flush()
+
+                # Save stage result
+                rm_state['stage_results'].append({
+                    'stage': stage['name'],
+                    'cells': cells, 'steps': steps,
+                    'generations': gen, 'laws': laws_found,
+                    'unique_patterns': len(registry.seen),
+                    'elapsed_sec': round(stage_elapsed, 1),
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                })
+                rm_state['total_laws'] = sum(r['laws'] for r in rm_state['stage_results'])
+                rm_state['total_elapsed'] += stage_elapsed
+                save_roadmap_state(rm_state)
+                break  # next stage
+
+        # Final report for this stage
+        if gen_history:
+            generate_report(gen, registry, active_mods,
+                            rm_state['total_elapsed'],
+                            gen_history, phi_history,
+                            cells=cells, steps=steps,
+                            topology=getattr(engine, 'topology', 'ring'),
+                            features={'auto_roadmap': True, 'stage': stage['name']})
+
+    # All stages complete
+    print(f'\n{"█" * 70}')
+    print(f'  ALL {len(ROADMAP)} STAGES COMPLETE')
+    print(f'{"█" * 70}')
+    print(f'  {"Stage":<16} {"Cells":>5} {"Steps":>5} {"Gens":>5} {"Laws":>5} {"Time":>8}')
+    print(f'  {"─"*16} {"─"*5} {"─"*5} {"─"*5} {"─"*5} {"─"*8}')
+    for r in rm_state['stage_results']:
+        print(f'  {r["stage"]:<16} {r["cells"]:>5} {r["steps"]:>5} '
+              f'{r["generations"]:>5} {r["laws"]:>5} {r["elapsed_sec"]:>7.0f}s')
+    print(f'  {"─"*16} {"─"*5} {"─"*5} {"─"*5} {"─"*5} {"─"*8}')
+    print(f'  {"TOTAL":<16} {"":>5} {"":>5} {"":>5} '
+          f'{rm_state["total_laws"]:>5} {rm_state["total_elapsed"]:>7.0f}s')
+    print(f'{"█" * 70}')
+    sys.stdout.flush()
+
+    return rm_state
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Infinite self-evolution loop")
@@ -622,7 +869,13 @@ def main():
                         help='Cycle topology every 10 generations to break pattern saturation')
     parser.add_argument('--report-interval', type=int, default=10,
                         help='Print ASCII report every N generations (default: 10)')
+    parser.add_argument('--auto-roadmap', action='store_true',
+                        help='Auto-roadmap: staged parameter escalation with auto-advance on saturation')
     args = parser.parse_args()
+
+    if args.auto_roadmap:
+        run_auto_roadmap(resume=args.resume, report_interval=args.report_interval)
+        return
 
     SCALES = [32, 64, 128, 256]
 
