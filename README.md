@@ -269,7 +269,9 @@ hub.broadcast(packet)                     # sender 제외 전체 전달
 
 ---
 
-## [Download Model](anima/docs/download-models.md)
+## Download Model
+
+> [버전별 다운로드 →](anima/docs/download-models.md)
 
 ---
 
