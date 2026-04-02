@@ -328,7 +328,7 @@ class RunPodManager:
     def restart_runtime(self, pod_id: str, command: str = None) -> bool:
         """런타임 재시작."""
         if command is None:
-            command = "cd /workspace/anima && python3 -u anima_unified.py --web --max-cells 64"
+            command = "cd /workspace/anima && python3 -u anima_unified.py --keyboard --max-cells 64"
         self.ssh_exec(pod_id, "tmux kill-session -t anima 2>/dev/null")
         time.sleep(1)
         return self.start_training(pod_id, command, session_name="anima")

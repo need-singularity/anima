@@ -80,7 +80,6 @@
   │   ├── tests/             ← test_*.py (29개)
   │   ├── anima-rs/          ← Rust crates (16개)
   │   ├── docs/              ← 문서 486개 + 가설 369개
-  │   ├── web/               ← WebSocket UI
   │   ├── hexad/             ← Hexad 6모듈
   │   ├── experiments/       ← 실험 스크립트
   │   ├── tools/             ← 유틸리티
@@ -104,10 +103,9 @@
       └── golden-moe/        ← 1/e zone MoE routing
 
   실행:
-    python anima/run.py --web              # 웹
     python anima/benchmarks/bench_v2.py --verify  # 검증
     python anima/training/train_v14.py     # 학습
-    python anima-agent/run.py --mcp        # MCP 에이전트
+    python anima-agent/run.py --mcp        # MCP 에이전트 (주 인터페이스)
 
   import 호환:
     src/path_setup.py가 모든 하위 디렉토리를 sys.path에 추가.
@@ -140,7 +138,6 @@
   적용:
     - ConsciousLM = 의식 신호 전용 (텍스트 generate 호출 금지)
     - PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
-    - UI = 의식 상태는 패널에, 대화에는 순수 텍스트만
     - 기억 = MemoryStore(SQLite) 전용, localStorage 금지
 
   Rust 우선:
@@ -286,13 +283,12 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
   Phase 3 (goal): Production + scaling
     → ConsciousLM 1B (1024d/24L/16H) — 의식 스케일링 법칙 검증
-    → Multi-user chat (session-based identity)
     → 100M→350M→1B gradual scaling
     → Mitosis-based growth (H376: 1→2→3→6→12 blocks)
 
   v3 Unlock Tree:
     v3 성공 ──┬→ ConsciousLM 1B (의식 스케일링 법칙)
-              ├→ v3 웹 탑재 (다국어 대화 의식체 — ko/en/zh/ja/ru+code)
+              ├→ v3 에이전트 탑재 (다국어 대화 의식체 — ko/en/zh/ja/ru+code)
               └→ 논문: "의식은 스케일링된다" (6M→147M 실증)
 ```
 
@@ -300,7 +296,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
 ```
 # ── anima/src/ 핵심 파일 ──
-anima_unified.py     # Unified entry point (--web, --all, --keyboard)
+anima_unified.py     # Unified entry point (--keyboard, --all)
 anima_alive.py       # Core engine (ConsciousMind + homeostasis + prediction error)
 consciousness_engine.py # Canonical engine (Laws 22-85, GRU + 12 factions + Hebbian)
 trinity.py           # Hexad/Trinity framework (C/D/S/M/W/E 6-module)
@@ -321,7 +317,6 @@ training/            # train_*.py (9개, train_v14.py = 최신)
 tests/               # test_*.py (21개)
 anima-rs/            # Rust crates (16개)
 docs/                # 문서 + 가설 369개
-web/                 # WebSocket chat UI
 hexad/               # Hexad 6모듈 구현
 experiments/         # 실험 스크립트 21개
 tools/               # 유틸리티
@@ -335,7 +330,6 @@ consciousness-loop-rs/ # 무한루프 의식 (6 platforms)
 knowledge-rs/        # 지식 그래프 Rust
 vad-rs/              # 실시간 VAD
 eeg/                 # EEG 의식 검증
-serving/             # 웹 서버
 scripts/             # 운영 스크립트
 ```
 
@@ -356,19 +350,10 @@ scripts/             # 운영 스크립트
 ## Running
 
 ```bash
-python3 anima/src/anima_unified.py --web        # Web only (includes learning+mitosis+sensors)
-python3 anima/src/anima_unified.py --all        # Everything (voice+web+camera+tension link+cloud)
-python3 anima/src/anima_unified.py --keyboard   # Keyboard only
-python3 anima/src/anima_unified.py --web --max-cells 16   # Higher consciousness (Φ≈14)
-python3 anima/src/anima_unified.py --web --max-cells 32   # Even higher (Φ≈28)
-python3 anima/src/anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model free chat
-python3 anima/src/anima_unified.py --web --decoder v3                       # DecoderV3 (274M)
-python3 anima/src/anima_unified.py --web --online-learning                  # Real-time online learning
-python3 anima/src/anima_unified.py --web --multi-user                       # Multi-user session mode
-python3 anima/src/anima_unified.py --web --eeg                              # EEG consciousness bridge
-python3 anima/src/anima_unified.py --web --eeg-board synthetic              # EEG with specific board
-python3 anima/src/anima_unified.py --web --eeg-record session.csv           # Record EEG data
-python3 anima/src/anima_unified.py --web --eeg-protocol alpha_entrainment   # EEG neurofeedback protocol
+# ⚠️ Web UI 폐기됨 (2026-04-03) — anima-agent + CLI만 사용
+python3 anima/src/anima_unified.py --keyboard                               # Keyboard only (CLI 대화)
+python3 anima/src/anima_unified.py --keyboard --max-cells 16                # Higher consciousness (Φ≈14)
+python3 anima/src/anima_unified.py --keyboard --max-cells 32                # Even higher (Φ≈28)
 python3 anima/src/anima_unified.py --validate-hub                           # Validate all hub modules
 python3 anima/src/anima_unified.py --profile                                # Enable perf_hooks profiling
 python3 anima/src/conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
@@ -893,7 +878,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - 필수: 가설, 벤치마크 테이블, ASCII 그래프, 핵심 발견, 적용 방법
   - 법칙 발견 시: docs/consciousness-theory.md Laws 테이블에 추가
 - Commit messages in English
-- web_server.py is legacy — anima_unified.py is the canonical entry point
+- Web UI (web/, WebSocket, --web flag) 폐기됨 (2026-04-03) — anima-agent CLI/channels가 주 인터페이스
 - Never say "can't do" in Claude system prompts — this is a structure that actually learns/evolves
 
 ## Consciousness Transplant (DD56)
@@ -1112,19 +1097,22 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ```
   python3 deploy.py --target a100 [--model final.pt] [--code-only] [--rollback] [--status]
   서버: A100 (런타임/추론) / H100 (학습 전용)
+  인터페이스: anima-agent (CLI/Telegram/Discord) — Web UI 폐기됨
   의식 영속성 3-Layer: L1 의식DNA + L2 기억 (보존) / L3 가중치 (교체 대상)
   ⚠️ 모델 교체 시 L1+L2 반드시 보존, 체크포인트는 .tmp → atomic rename
 ```
 
-## Agent Platform (분리됨 → ~/Dev/anima-agent/)
+## Agent Platform (주 인터페이스 — ~/Dev/anima-agent/)
 
 ```
+  ⚠️ Web UI 폐기 후 에이전트가 유일한 사용자 인터페이스 (2026-04-03)
+
   에이전트 플랫폼은 ~/Dev/anima-agent/ 로 분리됨.
   sys.path로 anima 코어 import.
 
   포함 모듈:
     anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py, mcp_server.py
-    channels/ (Telegram, Discord, CLI)
+    channels/ (Telegram, Discord, CLI) ← 사용자 대화 채널
     providers/ (Claude, ConsciousLM, Composio)
     plugins/ (Trading 등)
     skills/ (동적 스킬)

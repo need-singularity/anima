@@ -45,7 +45,7 @@ TARGETS = {
         'host': '209.170.80.132',
         'port': 15074,
         'remote_dir': '/workspace/anima',
-        'runtime_cmd': 'python3 -u anima_unified.py --web --max-cells 64',
+        'runtime_cmd': 'python3 -u anima_unified.py --keyboard --max-cells 64',
         'session': 'anima',
     },
     'h100': {
