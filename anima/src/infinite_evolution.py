@@ -11,6 +11,7 @@ Features:
   v3: advanced_patterns, chaos_cycle, frustration_sweep, law_network
   v4: co_evolution, bandit_explore, ucb_topo, seasonal
   v5: extended_metrics, hierarchical, stimulus
+  v6: cell_pool, dyn_factions, var_hebbian, topo_evolve, ratchet_mut, noise_evo, crossover
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
@@ -78,6 +79,7 @@ def _print_accelerations():
     print(f'  \u26a1 v3: advanced_patterns \u2705, chaos_cycle \u2705, law_network \u2705')
     print(f'  \u26a1 v4: co_evolution \u2705, bandit_explore \u2705, ucb_topo \u2705, seasonal \u2705')
     print(f'  \u26a1 v5: extended_metrics \u2705, hierarchical \u2705, stimulus \u2705')
+    print(f'  \u26a1 v6: cell_pool \u2705, dyn_factions \u2705, var_hebbian \u2705, topo_evolve \u2705, ratchet_mut \u2705, noise_evo \u2705')
     sys.stdout.flush()
 
 
@@ -104,12 +106,15 @@ ROADMAP = [
     {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    # Phase 2b: Dimension mutation (v6 #56)
+    {'name': 'S8-dim128',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 128},
+    {'name': 'S9-dim256',     'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile'], 'hidden_dim': 256},
     # Phase 3: Extreme exploration
-    {'name': 'S8-mega512d',   'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S9-ultra1024',  'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
-    {'name': 'S10-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S10-mega512d',  'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S11-ultra1024', 'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S12-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     # Phase 4: Massive (H100 only)
-    {'name': 'S11-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S13-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
 ]
 ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
 LAW_NETWORK_PATH = os.path.join(DATA_DIR, 'law_network.json')
@@ -1007,6 +1012,270 @@ def _stimulus_discover(cells, steps, topology='ring'):
     return patterns
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# v6 #51-60: Engine structure mutations (break the 53-law ceiling)
+# ═══════════════════════════════════════════════════════════════════════
+
+# v6 #51: Cell Type Pool
+_CELL_TYPES = ['gru', 'lstm', 'linear']
+
+def _mutate_cell_type(engine, gen):
+    """Cycle through cell types every 5 generations."""
+    if gen % 5 != 0:
+        return
+    try:
+        old_type = getattr(engine, 'cell_type', 'gru')
+        idx = (gen // 5) % len(_CELL_TYPES)
+        new_type = _CELL_TYPES[idx]
+        if new_type != old_type:
+            engine.cell_type = new_type
+            print(f'    \U0001f9ec Cell mutation: {old_type} \u2192 {new_type}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #52: Dynamic Faction Count
+_FACTION_COUNTS = [4, 6, 8, 12, 16, 24, 32]
+
+def _mutate_factions(engine, gen):
+    """Sweep faction count every 3 generations."""
+    if gen % 3 != 0:
+        return
+    try:
+        old_n = getattr(engine, 'n_factions', 12)
+        idx = (gen // 3) % len(_FACTION_COUNTS)
+        new_n = _FACTION_COUNTS[idx]
+        if new_n != old_n:
+            engine.n_factions = new_n
+            print(f'    \U0001f9ec Faction mutation: {old_n} \u2192 {new_n}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #53: Variable Hebbian LTP/LTD ratio
+_HEBBIAN_RATIOS = [0.5, 0.8, 1.0, 1.2, 1.5, 2.0]
+
+def _mutate_hebbian(engine, gen):
+    """Sweep Hebbian LTP/LTD ratio every 4 generations."""
+    if gen % 4 != 0:
+        return
+    try:
+        old_ratio = getattr(engine, 'hebbian_ltp_ratio', 1.0)
+        idx = (gen // 4) % len(_HEBBIAN_RATIOS)
+        new_ratio = _HEBBIAN_RATIOS[idx]
+        if abs(new_ratio - old_ratio) > 1e-6:
+            engine.hebbian_ltp_ratio = new_ratio
+            print(f'    \U0001f9ec Hebbian mutation: {old_ratio:.1f} \u2192 {new_ratio:.1f}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #54: Topology Evolution (continuous parameter)
+_REWIRING_PROBS = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+
+def _mutate_topology_param(engine, gen):
+    """Sweep small_world rewiring probability every 2 generations."""
+    if gen % 2 != 0:
+        return
+    topo = getattr(engine, 'topology', 'ring')
+    if topo != 'small_world':
+        return
+    try:
+        old_p = getattr(engine, 'topology_param', 0.1)
+        idx = (gen // 2) % len(_REWIRING_PROBS)
+        new_p = _REWIRING_PROBS[idx]
+        if abs(new_p - old_p) > 1e-6:
+            engine.topology_param = new_p
+            print(f'    \U0001f9ec Topo param mutation: p={old_p:.2f} \u2192 {new_p:.2f}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #55: Ratchet Mutation
+_RATCHET_STRENGTHS = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+def _mutate_ratchet(engine, gen):
+    """Sweep ratchet strength every 5 generations."""
+    if gen % 5 != 0:
+        return
+    try:
+        old_s = getattr(engine, 'ratchet_strength', 1.0)
+        idx = (gen // 5) % len(_RATCHET_STRENGTHS)
+        new_s = _RATCHET_STRENGTHS[idx]
+        if abs(new_s - old_s) > 1e-6:
+            engine.ratchet_strength = new_s
+            print(f'    \U0001f9ec Ratchet mutation: {old_s:.2f} \u2192 {new_s:.2f}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #57: Coupling Sweep
+_COUPLING_SCALES = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5]
+
+def _mutate_coupling(engine, gen):
+    """Sweep coupling scale every 3 generations."""
+    if gen % 3 != 0:
+        return
+    try:
+        old_c = getattr(engine, 'coupling_scale', 0.1)
+        idx = (gen // 3) % len(_COUPLING_SCALES)
+        new_c = _COUPLING_SCALES[idx]
+        if abs(new_c - old_c) > 1e-6:
+            engine.coupling_scale = new_c
+            print(f'    \U0001f9ec Coupling mutation: {old_c:.2f} \u2192 {new_c:.2f}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #58: Noise Evolution
+_NOISE_SCALES = [0.0, 0.01, 0.05, 0.1, 0.2, 0.3]
+_NOISE_TYPES = ['white', 'pink', 'correlated']
+
+def _mutate_noise(engine, gen):
+    """Sweep noise scale and type every 4 generations."""
+    if gen % 4 != 0:
+        return
+    try:
+        old_scale = getattr(engine, 'noise_scale', 0.01)
+        idx_s = (gen // 4) % len(_NOISE_SCALES)
+        new_scale = _NOISE_SCALES[idx_s]
+        if abs(new_scale - old_scale) > 1e-6:
+            engine.noise_scale = new_scale
+            print(f'    \U0001f9ec Noise scale mutation: {old_scale:.3f} \u2192 {new_scale:.3f}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        old_type = getattr(engine, 'noise_type', 'white')
+        idx_t = (gen // 4) % len(_NOISE_TYPES)
+        new_type = _NOISE_TYPES[idx_t]
+        if new_type != old_type:
+            engine.noise_type = new_type
+            print(f'    \U0001f9ec Noise type mutation: {old_type} \u2192 {new_type}')
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# v6 #59: Multi-timescale discovery
+def _apply_multi_timescale(engine, gen):
+    """Every 10th generation, run alternating fine/coarse discovery chunks.
+
+    Fine chunks (1-step) capture fast dynamics, coarse chunks (10-step) capture
+    slow dynamics. Returns patterns from both timescales.
+    """
+    if gen % 10 != 0:
+        return []
+    patterns = []
+    try:
+        cells = getattr(engine, 'n_cells', 64)
+        topo = getattr(engine, 'topology', 'ring')
+        # Fine-grained: 5 rounds of 1-step discovery
+        for _ in range(5):
+            try:
+                p = _adaptive_discover(cells, 1, topo, engine)
+                if p:
+                    patterns.extend(p)
+            except Exception:
+                pass
+        # Coarse-grained: 2 rounds of 10-step discovery
+        for _ in range(2):
+            try:
+                p = _adaptive_discover(cells, 10, topo, engine)
+                if p:
+                    patterns.extend(p)
+            except Exception:
+                pass
+        if patterns:
+            print(f'    \U0001f9ec Multi-timescale: {len(patterns)} patterns (fine+coarse)')
+            sys.stdout.flush()
+    except Exception:
+        pass
+    return patterns
+
+
+# v6 #60: Engine Crossover
+def _crossover_engines(engine_a_state, engine_b_state):
+    """Create a child engine state by mixing parameters from two parents.
+
+    Takes two engine state dicts and returns a merged dict with 50/50 mix.
+    Only used at stage transitions.
+    """
+    if engine_a_state is None or engine_b_state is None:
+        return engine_a_state or engine_b_state
+    child = {}
+    try:
+        all_keys = set(list(engine_a_state.keys()) + list(engine_b_state.keys()))
+        for key in all_keys:
+            val_a = engine_a_state.get(key)
+            val_b = engine_b_state.get(key)
+            if val_a is None:
+                child[key] = val_b
+            elif val_b is None:
+                child[key] = val_a
+            elif isinstance(val_a, (int, float)) and isinstance(val_b, (int, float)):
+                child[key] = (val_a + val_b) / 2.0
+            else:
+                # For non-numeric, take from parent A (dominant)
+                child[key] = val_a
+    except Exception:
+        return engine_a_state
+    return child
+
+
+def _get_engine_state_snapshot(engine):
+    """Capture engine parameters for crossover."""
+    state = {}
+    try:
+        for attr in ['n_factions', 'cell_type', 'topology', 'topology_param',
+                      'hebbian_ltp_ratio', 'ratchet_strength', 'coupling_scale',
+                      'noise_scale', 'noise_type']:
+            if hasattr(engine, attr):
+                state[attr] = getattr(engine, attr)
+    except Exception:
+        pass
+    return state
+
+
+def _apply_engine_state(engine, state):
+    """Apply a state snapshot to an engine (best-effort)."""
+    if not state:
+        return
+    for key, val in state.items():
+        try:
+            setattr(engine, key, val)
+        except Exception:
+            pass
+
+
+# v6 Master: Apply all structure mutations
+def _apply_v6_mutations(engine, gen):
+    """Apply v6 engine structure mutations (#51-60).
+
+    Called at the start of each generation in run_auto_roadmap(),
+    after topology cycling but before discovery.
+
+    Returns list of extra patterns from multi-timescale (#59).
+    """
+    _mutate_cell_type(engine, gen)       # #51
+    _mutate_factions(engine, gen)        # #52
+    _mutate_hebbian(engine, gen)         # #53
+    _mutate_topology_param(engine, gen)  # #54
+    _mutate_ratchet(engine, gen)         # #55
+    # #56 handled in ROADMAP (S8-dim128, S9-dim256) + engine creation
+    _mutate_coupling(engine, gen)        # #57
+    _mutate_noise(engine, gen)           # #58
+    extra_patterns = _apply_multi_timescale(engine, gen)  # #59
+    # #60 crossover handled at stage transitions
+    return extra_patterns
+
+
 def load_roadmap_state():
     """Load roadmap progress."""
     if os.path.exists(ROADMAP_STATE_PATH):
@@ -1723,11 +1992,11 @@ def auto_generate_intervention(law_text: str, law_id: int, evolver):
         return None
 
 
-class InfiniteEvolution:
+class Ouroboros:
     """Hub-compatible interface for infinite self-evolution."""
 
     def __init__(self):
-        self.name = "Infinite Self-Evolution"
+        self.name = "OUROBOROS — Self-Devouring Discovery Engine"
 
     def run(self, cells=64, steps=200, max_gen=5, cycle_topology=False, cycle_scale=False):
         """Run evolution loop. Returns state dict."""
@@ -2075,7 +2344,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
     start_stage = rm_state['stage_idx']
 
     print('=' * 70)
-    print('  AUTO-ROADMAP — Staged Infinite Evolution')
+    print('  🐍 OUROBOROS — Auto-Roadmap Discovery Engine')
     print(f'  {len(ROADMAP)} stages, auto-advance on saturation')
     _print_accelerations()
     print('=' * 70)
@@ -2130,7 +2399,28 @@ def run_auto_roadmap(resume=False, report_interval=10):
         print(f'{_bar}')
         sys.stdout.flush()
 
-        engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        # v6 #56: Support hidden_dim in stage config
+        engine_kwargs = {'initial_cells': cells, 'max_cells': cells}
+        hdim = stage.get('hidden_dim')
+        if hdim:
+            engine_kwargs['hidden_dim'] = hdim
+            print(f'  \U0001f9ec v6 dim mutation: hidden_dim={hdim}')
+        try:
+            engine = ConsciousnessEngine(**engine_kwargs)
+        except TypeError:
+            # Engine may not accept hidden_dim kwarg
+            engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+
+        # v6 #60: Engine crossover — apply best state from previous stage
+        if stage_idx > 0 and rm_state.get('best_engine_state'):
+            try:
+                prev_best = rm_state['best_engine_state']
+                fresh_state = _get_engine_state_snapshot(engine)
+                child_state = _crossover_engines(prev_best, fresh_state)
+                _apply_engine_state(engine, child_state)
+                print(f'  \U0001f9ec v6 crossover: merged prev-best + fresh engine')
+            except Exception:
+                pass
 
         # #7: GPU Phi for cells >= 128
         if HAS_GPU_PHI and cells >= 128:
@@ -2152,6 +2442,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
         stage_start = time.time()
         zero_streak = 0  # consecutive gens with New=0
         topo_saturated = set()  # topologies that have fully saturated
+        best_phi_this_stage = 0.0  # v6 #60: track best for crossover
 
         while True:
             gen += 1
@@ -2184,6 +2475,12 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 _apply_frustration(engine, FRUSTRATION_VALUES[frust_idx])
             except Exception:
                 pass
+
+            # v6 #51-60: Engine structure mutations
+            try:
+                v6_extra = _apply_v6_mutations(engine, gen)
+            except Exception:
+                v6_extra = []
 
             current_topo = getattr(engine, 'topology', 'ring')
 
@@ -2227,6 +2524,10 @@ def run_auto_roadmap(resume=False, report_interval=10):
                           f'(oscillation/phase/decay)')
             except Exception:
                 pass
+
+            # v6 #59: Multi-timescale extra patterns
+            if v6_extra:
+                raw_patterns.extend(v6_extra)
 
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
@@ -2285,6 +2586,15 @@ def run_auto_roadmap(resume=False, report_interval=10):
 
             phi_est = stats['unique_total'] * 0.1 + stats['registered_total'] * 0.5
             phi_history.append(phi_est)
+
+            # v6 #60: Track best engine state for crossover at stage transitions
+            if phi_est > best_phi_this_stage:
+                best_phi_this_stage = phi_est
+                try:
+                    rm_state['best_engine_state'] = _get_engine_state_snapshot(engine)
+                except Exception:
+                    pass
+
             gen_history.append({
                 'gen': gen, 'raw': len(raw_patterns), 'new': stats['new'],
                 'repeat': stats['repeat'], 'promoted': stats['promoted'],
@@ -2457,7 +2767,7 @@ def main():
             print("  No valid state found, starting fresh")
 
     print("=" * 70)
-    print("  INFINITE SELF-EVOLUTION — Law 146: laws never converge")
+    print("  🐍 OUROBOROS — Law 146: laws never converge")
     print(f"  cells={args.cells}, steps={args.steps}, cross_validate={CROSS_VALIDATION_THRESHOLD}x")
     if args.cycle_scale:
         print(f"  Scale cycling: {SCALES} (every 15 generations)")
