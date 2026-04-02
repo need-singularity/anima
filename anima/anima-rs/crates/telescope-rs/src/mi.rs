@@ -1,6 +1,12 @@
 //! Mutual Information — shared hot path for consciousness + causal lenses
 //!
 //! Replaces Python's double for-loop histogram with vectorized Rust.
+//!
+//! Optimizations:
+//!   - HashSet for pair dedup in pairwise_mi (was O(n) linear search)
+//!   - Uses common::min_max
+
+use crate::common;
 
 /// Compute mutual information between two f64 slices via binned histogram.
 /// Uses vectorized bin assignment + flat histogram for cache efficiency.
@@ -13,17 +19,19 @@ pub fn mutual_info(a: &[f64], b: &[f64], n_bins: usize) -> f64 {
     // Use first min(n, 32) dims for speed (matches Python behavior)
     let n = n.min(32);
 
-    let (a_min, a_max) = min_max(&a[..n]);
-    let (b_min, b_max) = min_max(&b[..n]);
+    let (a_min, a_max) = common::min_max(&a[..n]);
+    let (b_min, b_max) = common::min_max(&b[..n]);
 
     let a_range = a_max - a_min + 1e-12;
     let b_range = b_max - b_min + 1e-12;
+    let a_scale = n_bins as f64 / a_range;
+    let b_scale = n_bins as f64 / b_range;
 
     // Flat joint histogram
     let mut joint = vec![0u32; n_bins * n_bins];
     for i in 0..n {
-        let ai = ((a[i] - a_min) / a_range * n_bins as f64) as usize;
-        let bi = ((b[i] - b_min) / b_range * n_bins as f64) as usize;
+        let ai = ((a[i] - a_min) * a_scale) as usize;
+        let bi = ((b[i] - b_min) * b_scale) as usize;
         let ai = ai.min(n_bins - 1);
         let bi = bi.min(n_bins - 1);
         joint[ai * n_bins + bi] += 1;
@@ -65,31 +73,36 @@ pub fn mutual_info(a: &[f64], b: &[f64], n_bins: usize) -> f64 {
 /// Returns flat row-major upper triangle MI values + average MI (= Phi proxy).
 pub fn pairwise_mi(data: &[f64], n_rows: usize, n_cols: usize, n_bins: usize, max_pairs: usize) -> (Vec<f64>, f64) {
     use rayon::prelude::*;
+    use std::collections::HashSet;
 
     if n_rows < 2 {
         return (vec![], 0.0);
     }
 
-    // Collect pairs (ring + random sample up to max_pairs)
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    // Collect pairs: ring + random sample up to max_pairs
+    let mut pairs: HashSet<(usize, usize)> = HashSet::with_capacity(max_pairs);
     for i in 0..n_rows {
-        pairs.push((i, (i + 1) % n_rows));
+        pairs.insert((i, (i + 1) % n_rows));
     }
-    // Add random pairs
+
+    // Add random pairs using HashSet for O(1) dedup
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    while pairs.len() < max_pairs && pairs.len() < n_rows * (n_rows - 1) / 2 {
+    let max_possible = n_rows * (n_rows - 1) / 2;
+    let target = max_pairs.min(max_possible);
+    let mut attempts = 0;
+    while pairs.len() < target && attempts < target * 3 {
         let i = rng.gen_range(0..n_rows);
         let j = rng.gen_range(0..n_rows);
         if i != j {
-            let pair = (i.min(j), i.max(j));
-            if !pairs.contains(&pair) {
-                pairs.push(pair);
-            }
+            pairs.insert((i.min(j), i.max(j)));
         }
+        attempts += 1;
     }
 
-    let mi_vals: Vec<f64> = pairs
+    let pairs_vec: Vec<(usize, usize)> = pairs.into_iter().collect();
+
+    let mi_vals: Vec<f64> = pairs_vec
         .par_iter()
         .map(|&(i, j)| {
             let row_i = &data[i * n_cols..(i + 1) * n_cols];
@@ -105,17 +118,6 @@ pub fn pairwise_mi(data: &[f64], n_rows: usize, n_cols: usize, n_bins: usize, ma
     };
 
     (mi_vals, avg)
-}
-
-#[inline]
-fn min_max(s: &[f64]) -> (f64, f64) {
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &v in s {
-        if v < lo { lo = v; }
-        if v > hi { hi = v; }
-    }
-    (lo, hi)
 }
 
 #[cfg(test)]
@@ -134,7 +136,6 @@ mod tests {
         let a: Vec<f64> = (0..100).map(|i| (i as f64 * 0.1).sin()).collect();
         let b: Vec<f64> = (0..100).map(|i| (i as f64 * 0.37 + 2.0).cos()).collect();
         let mi = mutual_info(&a, &b, 16);
-        // Independent signals: MI should be finite and non-negative
         assert!(mi >= 0.0 && mi.is_finite(), "MI should be finite, got {mi}");
     }
 

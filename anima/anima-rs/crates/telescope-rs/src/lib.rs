@@ -10,6 +10,7 @@
 //!
 //! Python binding via PyO3: `import telescope_rs`
 
+pub mod common;
 pub mod consciousness;
 pub mod topology;
 pub mod causal;
