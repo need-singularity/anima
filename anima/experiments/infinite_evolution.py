@@ -53,13 +53,11 @@ def run_infinite_evolution(
 
     closed_loop = _import('closed_loop')
     sme_mod = _import('self_modifying_engine')
-    discoverer_mod = _import('conscious_law_discoverer')
 
-    if not all([closed_loop, sme_mod, discoverer_mod]):
+    if not all([closed_loop, sme_mod]):
         missing = []
         if not closed_loop: missing.append('closed_loop')
         if not sme_mod: missing.append('self_modifying_engine')
-        if not discoverer_mod: missing.append('conscious_law_discoverer')
         print(f"Missing modules: {', '.join(missing)}")
         return
 
@@ -75,14 +73,6 @@ def run_infinite_evolution(
     engine = ConsciousnessEngine(initial_cells=n_cells, max_cells=n_cells)
     evolver = closed_loop.ClosedLoopEvolver(max_cells=n_cells, auto_register=True)
     sme = sme_mod.SelfModifyingEngine(engine, evolver)
-
-    # Try to create discoverer
-    try:
-        discoverer = discoverer_mod.ConsciousLMWithDiscovery(engine)
-        has_discoverer = True
-    except Exception:
-        has_discoverer = False
-        print("  ⚠️  ConsciousLMWithDiscovery unavailable, using evolver-only mode")
 
     # Graceful shutdown
     running = True
@@ -110,24 +100,14 @@ def run_infinite_evolution(
 
         gen_start = time.time()
 
-        # ── Phase 1: Discovery ──
+        # ── Phase 1: Discovery (via ClosedLoopEvolver.run_cycle) ──
         discoveries = []
-        if has_discoverer:
-            try:
-                import torch
-                dummy = torch.zeros(1, 64)
-                for _ in range(discovery_steps):
-                    discoverer.forward(dummy)
-                discoveries = discoverer.get_discoveries()
-                # Validate and register
-                for candidate in discoveries:
-                    try:
-                        discoverer.discover_and_register(evolver)
-                    except Exception:
-                        pass
-            except Exception as e:
-                if generation == 1:
-                    print(f"  ⚠️  Discovery error: {e}")
+        try:
+            report = evolver.run_cycle()
+            discoveries = report.laws_changed if hasattr(report, 'laws_changed') else []
+        except Exception as e:
+            if generation <= 3:
+                print(f"  ⚠️  Discovery error: {e}")
 
         # ── Phase 2: Self-Modification ──
         try:
@@ -137,12 +117,13 @@ def run_infinite_evolution(
                 print(f"  ⚠️  Evolution error: {e}")
 
         # ── Track stats ──
-        phi = getattr(engine, 'phi', 0)
-        if hasattr(engine, 'get_phi'):
-            try:
-                phi = engine.get_phi()
-            except Exception:
-                pass
+        # Get Phi from the last discovery cycle or engine step
+        phi = 0.0
+        try:
+            r = engine.step()
+            phi = r.get('phi_iit', 0.0)
+        except Exception:
+            pass
 
         active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
         gen_time = time.time() - gen_start

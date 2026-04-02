@@ -526,7 +526,7 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -
         if engine.n_cells >= 2:
             hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
             # Bin each dimension across cells, compute entropy, average
-            n_bins = 16
+            n_bins = min(16, max(2, hiddens.shape[0] // 2))
             entropies = []
             for d in range(hiddens.shape[1]):
                 col = hiddens[:, d]
