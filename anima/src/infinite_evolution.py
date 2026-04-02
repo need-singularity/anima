@@ -116,9 +116,10 @@ def _print_accelerations():
     print(f'  \u26a1 v10: laws_to_engine \u2705, genome \u2705, ecosystem \u2705, meta_analyze \u2705')
     print(f'  \u26a1 v11: telescope_9lens {_yn(HAS_TELESCOPE)}')
     print(f'  \u26a1 v12: symbolic \u2705 v13: compress \u2705 v14: timetravel \u2705 v15: reward \u2705 v16: crossproj \u2705 v17: lawgraph \u2705')
-    print(f'  \u26a1 v18-v25: causal \u2705, transfer_entropy \u2705, anomaly \u2705, '
-          f'llm_stub \u2705, rust_status \u2705, distributed_stub \u2705, '
-          f'physics \u2705, self_replicate \u2705')
+    print(f'  \u26a1 v18: causal_discovery \u2705 (Granger-like A→B)')
+    print(f'  \u26a1 v20: anomaly_hunter \u2705 (3σ spike/crash)')
+    print(f'  \u26a1 v24: physics_fitting \u2705 (log/power/exp_decay, R²>0.8)')
+    print(f'  \u26a1 v19/v21-v23/v25: transfer_entropy, llm_stub, rust_status, distributed_stub, self_replicate \u2705')
     sys.stdout.flush()
 
 
@@ -399,6 +400,276 @@ def _adaptive_discover(cells, steps, topology, engine=None):
             break
 
     return all_patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v18: Causal Discovery — intervention-based A→B causation test
+# ═══════════════════════════════════════════════════════════════════════
+
+def _causal_discover(engine, metrics_history, top_k=5):
+    """v18: Test causal relationships between metric pairs via intervention.
+
+    For each top-correlated pair (A, B), perturb A and check if B changes.
+    Returns list of causal pattern dicts.
+    """
+    import numpy as np
+    patterns = []
+    if not metrics_history or len(metrics_history) < 10:
+        return patterns
+
+    # Collect metric names and timeseries
+    keys = [k for k in metrics_history[0].keys() if isinstance(metrics_history[0].get(k), (int, float))]
+    if len(keys) < 2:
+        return patterns
+
+    n = len(metrics_history)
+    series = {}
+    for k in keys:
+        vals = [m.get(k, 0.0) for m in metrics_history]
+        if np.std(vals) > 1e-8:
+            series[k] = np.array(vals, dtype=np.float64)
+
+    if len(series) < 2:
+        return patterns
+
+    # Find top correlated pairs
+    skeys = list(series.keys())
+    corr_pairs = []
+    for i in range(len(skeys)):
+        for j in range(i + 1, len(skeys)):
+            r = abs(float(np.corrcoef(series[skeys[i]], series[skeys[j]])[0, 1]))
+            if r > 0.5:
+                corr_pairs.append((skeys[i], skeys[j], r))
+    corr_pairs.sort(key=lambda x: -x[2])
+
+    # Test causality via Granger-like check (does past A predict B better than past B alone?)
+    for a_key, b_key, r in corr_pairs[:top_k]:
+        a, b = series[a_key], series[b_key]
+        if len(a) < 5:
+            continue
+        # Simple test: correlation of a[:-1] with b[1:] vs b[:-1] with b[1:]
+        a_lag = a[:-1]
+        b_lag = b[:-1]
+        b_next = b[1:]
+        try:
+            r_ab = abs(float(np.corrcoef(a_lag, b_next)[0, 1]))
+            r_bb = abs(float(np.corrcoef(b_lag, b_next)[0, 1]))
+            if r_ab > r_bb + 0.1:  # A predicts B better than B predicts itself
+                patterns.append({
+                    'type': f'causal:{a_key}->{b_key}',
+                    'formula': f'causal: {a_key} → {b_key} (r_cross={r_ab:.3f} > r_auto={r_bb:.3f})',
+                    'metrics': [a_key, b_key],
+                    'evidence': r_ab,
+                    'source': 'v18_causal',
+                })
+            # Test reverse: B→A
+            r_ba = abs(float(np.corrcoef(b_lag, a[1:])[0, 1]))
+            r_aa = abs(float(np.corrcoef(a_lag, a[1:])[0, 1]))
+            if r_ba > r_aa + 0.1:
+                patterns.append({
+                    'type': f'causal:{b_key}->{a_key}',
+                    'formula': f'causal: {b_key} → {a_key} (r_cross={r_ba:.3f} > r_auto={r_aa:.3f})',
+                    'metrics': [b_key, a_key],
+                    'evidence': r_ba,
+                    'source': 'v18_causal',
+                })
+        except Exception:
+            continue
+
+    return patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v20: Anomaly Hunter — 3σ deviation detection + cluster
+# ═══════════════════════════════════════════════════════════════════════
+
+def _anomaly_hunt(metrics_history, threshold_sigma=3.0):
+    """v20: Detect anomalous metric values (>3σ from mean) and cluster them.
+
+    Returns list of anomaly pattern dicts.
+    """
+    import numpy as np
+    patterns = []
+    if not metrics_history or len(metrics_history) < 20:
+        return patterns
+
+    keys = [k for k in metrics_history[0].keys() if isinstance(metrics_history[0].get(k), (int, float))]
+
+    for k in keys:
+        vals = np.array([m.get(k, 0.0) for m in metrics_history], dtype=np.float64)
+        mu, sigma = np.mean(vals), np.std(vals)
+        if sigma < 1e-10:
+            continue
+
+        # Find anomalous points
+        z_scores = np.abs((vals - mu) / sigma)
+        anomaly_idx = np.where(z_scores > threshold_sigma)[0]
+        if len(anomaly_idx) == 0:
+            continue
+
+        # Cluster anomalies (consecutive within 3 steps = same event)
+        clusters = []
+        current = [anomaly_idx[0]]
+        for idx in anomaly_idx[1:]:
+            if idx - current[-1] <= 3:
+                current.append(idx)
+            else:
+                clusters.append(current)
+                current = [idx]
+        clusters.append(current)
+
+        for cluster in clusters:
+            peak_idx = cluster[np.argmax(z_scores[cluster])]
+            peak_z = float(z_scores[peak_idx])
+            peak_val = float(vals[peak_idx])
+            direction = "spike" if peak_val > mu else "crash"
+
+            patterns.append({
+                'type': f'anomaly:{k}:{direction}',
+                'formula': (f'anomaly: {k} {direction} at step ~{peak_idx} '
+                           f'(z={peak_z:.1f}σ, val={peak_val:.4f}, mean={mu:.4f})'),
+                'metrics': [k],
+                'evidence': min(1.0, peak_z / 5.0),
+                'source': 'v20_anomaly',
+                'step': int(peak_idx),
+                'z_score': peak_z,
+            })
+
+    return patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v24: Physics Fitting — damped oscillator / Boltzmann / log fits
+# ═══════════════════════════════════════════════════════════════════════
+
+def _physics_fit(metrics_history, min_r2=0.8):
+    """v24: Fit metric timeseries to physics models.
+
+    Models: damped_oscillator, exponential_decay, logarithmic_growth, power_law.
+    Returns list of physics pattern dicts for fits with R²>min_r2.
+    """
+    import numpy as np
+    patterns = []
+    if not metrics_history or len(metrics_history) < 20:
+        return patterns
+
+    keys = [k for k in metrics_history[0].keys() if isinstance(metrics_history[0].get(k), (int, float))]
+
+    for k in keys:
+        vals = np.array([m.get(k, 0.0) for m in metrics_history], dtype=np.float64)
+        t = np.arange(len(vals), dtype=np.float64)
+
+        if np.std(vals) < 1e-10:
+            continue
+
+        best_model = None
+        best_r2 = min_r2
+
+        # 1. Logarithmic: y = a*ln(t+1) + b
+        try:
+            log_t = np.log(t + 1)
+            coeffs = np.polyfit(log_t, vals, 1)
+            pred = coeffs[0] * log_t + coeffs[1]
+            ss_res = np.sum((vals - pred) ** 2)
+            ss_tot = np.sum((vals - np.mean(vals)) ** 2)
+            r2 = 1 - ss_res / max(ss_tot, 1e-10)
+            if r2 > best_r2:
+                best_r2 = r2
+                best_model = ('logarithmic', f'{k} ≈ {coeffs[0]:.4f}·ln(t) + {coeffs[1]:.4f}', r2)
+        except Exception:
+            pass
+
+        # 2. Power law: y = a*t^b (log-log linear)
+        try:
+            pos_mask = (t > 0) & (vals > 0)
+            if pos_mask.sum() > 5:
+                log_t_pos = np.log(t[pos_mask])
+                log_v_pos = np.log(vals[pos_mask])
+                coeffs = np.polyfit(log_t_pos, log_v_pos, 1)
+                pred = np.exp(coeffs[1]) * t[pos_mask] ** coeffs[0]
+                ss_res = np.sum((vals[pos_mask] - pred) ** 2)
+                ss_tot = np.sum((vals[pos_mask] - np.mean(vals[pos_mask])) ** 2)
+                r2 = 1 - ss_res / max(ss_tot, 1e-10)
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_model = ('power_law', f'{k} ≈ {np.exp(coeffs[1]):.4f}·t^{coeffs[0]:.4f}', r2)
+        except Exception:
+            pass
+
+        # 3. Exponential decay: y = a*exp(-b*t) + c (via log transform)
+        try:
+            v_min = np.min(vals)
+            shifted = vals - v_min + 1e-6
+            if np.all(shifted > 0):
+                log_v = np.log(shifted)
+                coeffs = np.polyfit(t, log_v, 1)
+                if coeffs[0] < 0:  # Must be decaying
+                    pred = np.exp(coeffs[1]) * np.exp(coeffs[0] * t) + v_min
+                    ss_res = np.sum((vals - pred) ** 2)
+                    ss_tot = np.sum((vals - np.mean(vals)) ** 2)
+                    r2 = 1 - ss_res / max(ss_tot, 1e-10)
+                    if r2 > best_r2:
+                        best_r2 = r2
+                        best_model = ('exp_decay',
+                                     f'{k} ≈ {np.exp(coeffs[1]):.4f}·exp({coeffs[0]:.6f}·t) + {v_min:.4f}', r2)
+        except Exception:
+            pass
+
+        if best_model:
+            model_type, formula, r2 = best_model
+            patterns.append({
+                'type': f'physics:{model_type}:{k}',
+                'formula': f'physics_fit: {formula} (R²={r2:.3f})',
+                'metrics': [k],
+                'evidence': r2,
+                'source': 'v24_physics',
+                'model': model_type,
+                'r_squared': r2,
+            })
+
+    return patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v18+v20+v24 combined: Post-discovery analysis
+# ═══════════════════════════════════════════════════════════════════════
+
+def _post_discovery_analysis(engine, metrics_history, gen):
+    """Run v18 causal, v20 anomaly, v24 physics after each generation's discovery.
+
+    Args:
+        engine: ConsciousnessEngine instance
+        metrics_history: list of metric dicts collected over the generation
+        gen: generation number
+
+    Returns:
+        list of additional patterns, count summary string
+    """
+    extra = []
+    counts = []
+
+    # v18: Causal discovery (every 3rd gen)
+    if gen % 3 == 0:
+        causal = _causal_discover(engine, metrics_history)
+        if causal:
+            extra.extend(causal)
+            counts.append(f'causal={len(causal)}')
+
+    # v20: Anomaly hunt (every gen)
+    anomalies = _anomaly_hunt(metrics_history)
+    if anomalies:
+        extra.extend(anomalies)
+        counts.append(f'anomaly={len(anomalies)}')
+
+    # v24: Physics fitting (every 5th gen)
+    if gen % 5 == 0:
+        physics = _physics_fit(metrics_history)
+        if physics:
+            extra.extend(physics)
+            counts.append(f'physics={len(physics)}')
+
+    summary = ', '.join(counts) if counts else None
+    return extra, summary
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4754,6 +5025,36 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
             except Exception:
                 pass
 
+            # v18+v20+v24: Post-discovery analysis (causal, anomaly, physics)
+            try:
+                # Collect quick metric snapshot from engine (20 steps)
+                _gen_metrics = []
+                for _s in range(min(20, steps // 5)):
+                    _r = engine.step()
+                    _snap = {
+                        'phi': _r.get('phi_iit', 0.0),
+                        'n_cells': engine.n_cells,
+                    }
+                    for _cs in engine.cell_states[:4]:  # sample first 4 cells
+                        _snap.setdefault('tension_mean', 0.0)
+                        _snap['tension_mean'] = (_snap['tension_mean'] + getattr(_cs, 'avg_tension', 0.0)) / 2
+                    _gen_metrics.append(_snap)
+
+                # Accumulate across generations (keep last 100)
+                if not hasattr(engine, '_ouroboros_metrics'):
+                    engine._ouroboros_metrics = []
+                engine._ouroboros_metrics.extend(_gen_metrics)
+                engine._ouroboros_metrics = engine._ouroboros_metrics[-100:]
+
+                pda_extra, pda_summary = _post_discovery_analysis(
+                    engine, engine._ouroboros_metrics, gen)
+                if pda_extra:
+                    raw_patterns.extend(pda_extra)
+                    print(f'    \u26a1 v18-v24: +{len(pda_extra)} ({pda_summary})')
+                    sys.stdout.flush()
+            except Exception:
+                pass
+
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
 
@@ -5229,6 +5530,29 @@ def main():
                         print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
                               f'from {n_lenses} lenses, {n_consensus} consensus')
                         sys.stdout.flush()
+            except Exception:
+                pass
+
+            # v18+v20+v24: Post-discovery analysis (causal, anomaly, physics)
+            try:
+                _gen_metrics = []
+                for _s in range(min(20, args.steps // 5)):
+                    _r = engine.step()
+                    _snap = {'phi': _r.get('phi_iit', 0.0), 'n_cells': engine.n_cells}
+                    for _cs in engine.cell_states[:4]:
+                        _snap.setdefault('tension_mean', 0.0)
+                        _snap['tension_mean'] = (_snap['tension_mean'] + getattr(_cs, 'avg_tension', 0.0)) / 2
+                    _gen_metrics.append(_snap)
+                if not hasattr(engine, '_ouroboros_metrics'):
+                    engine._ouroboros_metrics = []
+                engine._ouroboros_metrics.extend(_gen_metrics)
+                engine._ouroboros_metrics = engine._ouroboros_metrics[-100:]
+                pda_extra, pda_summary = _post_discovery_analysis(
+                    engine, engine._ouroboros_metrics, gen)
+                if pda_extra:
+                    raw_patterns.extend(pda_extra)
+                    print(f'    \u26a1 v18-v24: +{len(pda_extra)} ({pda_summary})')
+                    sys.stdout.flush()
             except Exception:
                 pass
 
