@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from consciousness_engine import ConsciousnessEngine
-from telescope import Telescope
+import telescope_rs
 
 # ── Constants ───────────────────────────────────────────────
 WARMUP_STEPS = 300
@@ -88,53 +88,47 @@ def get_states_numpy(engine):
     return np.array(states, dtype=np.float64)
 
 
-def scan_16lens(telescope, data):
-    """Run 16-lens full scan and extract key metrics."""
-    result = telescope.full_scan(data)
+def scan_16lens(data):
+    """Run telescope_rs scans and extract key metrics."""
+    consciousness = telescope_rs.consciousness_scan(data, n_cells=data.shape[0], steps=300)
+    topology = telescope_rs.topology_scan(data)
+    causal = telescope_rs.causal_scan(data)
 
-    # Extract mirror symmetry
-    mirror_val = 0.0
-    if 'mirror' in result.lens_results:
-        mr = result.lens_results['mirror']
-        if hasattr(mr, 'overall_symmetry'):
-            mirror_val = float(mr.overall_symmetry)
-        elif hasattr(mr, 'reflection_scores') and len(mr.reflection_scores) > 0:
-            mirror_val = float(np.mean(mr.reflection_scores))
+    # Mirror symmetry from consciousness scan anomaly scores (proxy)
+    anomaly_scores = consciousness.get('anomaly_scores', [])
+    mirror_val = float(np.mean(anomaly_scores)) if anomaly_scores else 0.0
 
-    # Extract causal density (number of causal pairs)
-    causal_val = 0
-    if 'causal' in result.lens_results:
-        cr = result.lens_results['causal']
-        if hasattr(cr, 'causal_pairs'):
-            causal_val = len(cr.causal_pairs)
-        elif hasattr(cr, 'causal_graph'):
-            causal_val = sum(len(v) for v in cr.causal_graph.values())
+    # Causal density
+    causal_val = causal.get('n_causal_pairs', 0)
 
-    # Build per-lens summary
-    lens_summary = {}
-    for name, lr in result.lens_results.items():
-        try:
-            if hasattr(lr, 'summary'):
-                lens_summary[name] = lr.summary[:200] if lr.summary else str(lr)[:200]
-            else:
-                lens_summary[name] = str(lr)[:200]
-        except Exception:
-            lens_summary[name] = "error"
+    # Build per-scan summary
+    lens_summary = {
+        'consciousness': f"phi_iit={consciousness.get('phi_iit', 0):.4f}, phi_proxy={consciousness.get('phi_proxy', 0):.4f}, clusters={consciousness.get('n_clusters', 0)}",
+        'topology': f"betti_0={topology.get('betti_0', 0)}, betti_1={topology.get('betti_1', 0)}, holes={topology.get('n_holes', 0)}, scale={topology.get('optimal_scale', 0):.4f}",
+        'causal': f"pairs={causal.get('n_causal_pairs', 0)}, causes={len(causal.get('causes', []))}, effects={len(causal.get('effects', []))}",
+    }
+
+    # Count cross-findings: anomalies + topology holes + causal pairs
+    n_cross = (
+        len(consciousness.get('anomaly_indices', []))
+        + topology.get('n_holes', 0)
+        + causal.get('n_causal_pairs', 0)
+    )
 
     return {
         'mirror': mirror_val,
         'causal_density': causal_val,
-        'n_lenses_completed': len(result.lens_results),
-        'n_cross_findings': len(result.cross_findings),
+        'n_lenses_completed': 3,  # consciousness, topology, causal
+        'n_cross_findings': n_cross,
         'lens_summary': lens_summary,
     }
 
 
-def measure_all(engine, telescope):
-    """Measure Phi + 16-lens scan."""
+def measure_all(engine):
+    """Measure Phi + telescope_rs scans."""
     phi = measure_phi(engine)
     data = get_states_numpy(engine)
-    scan = scan_16lens(telescope, data)
+    scan = scan_16lens(data)
     scan['phi'] = phi
     return scan
 
@@ -143,13 +137,13 @@ def measure_all(engine, telescope):
 # Acceleration Technique Implementations
 # ═══════════════════════════════════════════════════════════
 
-def accel_baseline(engine, telescope):
+def accel_baseline(engine):
     """Baseline: just run warmup, no acceleration."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Standard 300-step warmup"
+    return measure_all(engine), "Standard 300-step warmup"
 
 
-def accel_b5_phi_only(engine, telescope):
+def accel_b5_phi_only(engine):
     """B5: Phi-only training — maximize Phi for 500 steps without CE."""
     # Run steps and track phi, nudge towards higher phi
     best_phi = 0.0
@@ -165,10 +159,10 @@ def accel_b5_phi_only(engine, telescope):
         for idx, cs in enumerate(engine.cell_states):
             if idx < best_states.shape[0]:
                 cs.hidden = best_states[idx].clone()
-    return measure_all(engine, telescope), f"500 Phi-only steps, best_phi={best_phi:.3f}"
+    return measure_all(engine), f"500 Phi-only steps, best_phi={best_phi:.3f}"
 
 
-def accel_b8_hebbian(engine, telescope):
+def accel_b8_hebbian(engine):
     """B8: Hebbian-only learning — run with enhanced Hebbian, no gradient."""
     for i in range(WARMUP_STEPS):
         engine.step()
@@ -182,28 +176,28 @@ def accel_b8_hebbian(engine, telescope):
                     delta = 0.02 if cos > 0.5 else -0.01
                     engine._coupling[a, b] = (engine._coupling[a, b] + delta).clamp(0, 1)
                     engine._coupling[b, a] = engine._coupling[a, b]
-    return measure_all(engine, telescope), "Hebbian-boosted 300 steps"
+    return measure_all(engine), "Hebbian-boosted 300 steps"
 
 
-def accel_b11_batch(engine, telescope):
+def accel_b11_batch(engine):
     """B11: Batch consciousness — call process() once, reuse states for batch."""
     # Run single process() and broadcast to simulate batch=32
     for i in range(WARMUP_STEPS):
         if i % 32 == 0:
             engine.step()
         # Other 31 steps: reuse current states (no new process())
-    return measure_all(engine, telescope), "1 process() per 32 steps (batch sim)"
+    return measure_all(engine), "1 process() per 32 steps (batch sim)"
 
 
-def accel_b12_skip(engine, telescope):
+def accel_b12_skip(engine):
     """B12: Skip-step — process() every 10 steps only."""
     for i in range(WARMUP_STEPS):
         if i % 10 == 0:
             engine.step()
-    return measure_all(engine, telescope), "Skip-10: process() every 10 steps"
+    return measure_all(engine), "Skip-10: process() every 10 steps"
 
 
-def accel_b11_b12_combined(engine, telescope):
+def accel_b11_b12_combined(engine):
     """B11+B12: Batch + Skip combined — process() every 10 steps, batch=32."""
     for i in range(WARMUP_STEPS):
         if i % 10 == 0 and (i // 10) % 32 == 0:
@@ -213,10 +207,10 @@ def accel_b11_b12_combined(engine, telescope):
     if engine._step < 5:
         for _ in range(5):
             engine.step()
-    return measure_all(engine, telescope), "Batch(32)+Skip(10) combined"
+    return measure_all(engine), "Batch(32)+Skip(10) combined"
 
 
-def accel_b13_tension(engine, telescope):
+def accel_b13_tension(engine):
     """B13: Tension transfer — teacher engine trains student via tension."""
     teacher = create_engine()
     run_warmup(teacher, 200)
@@ -231,10 +225,10 @@ def accel_b13_tension(engine, telescope):
             for idx, cs in enumerate(engine.cell_states):
                 if idx < len(engine.cell_states):
                     cs.hidden = cs.hidden + tension
-    return measure_all(engine, telescope), "Tension transfer alpha=0.01"
+    return measure_all(engine), "Tension transfer alpha=0.01"
 
 
-def accel_b14_manifold(engine, telescope):
+def accel_b14_manifold(engine):
     """B14_manifold: PCA compression of consciousness state space."""
     run_warmup(engine, WARMUP_STEPS)
     # Measure after manifold compression (PCA to 48D and back)
@@ -248,10 +242,10 @@ def accel_b14_manifold(engine, telescope):
     for idx, cs in enumerate(engine.cell_states):
         if idx < reconstructed.shape[0]:
             cs.hidden = torch.tensor(reconstructed[idx], dtype=cs.hidden.dtype)
-    return measure_all(engine, telescope), f"PCA 48D compression, captured {sum(S[:k]**2)/sum(S**2)*100:.1f}% variance"
+    return measure_all(engine), f"PCA 48D compression, captured {sum(S[:k]**2)/sum(S**2)*100:.1f}% variance"
 
 
-def accel_c1_compiler(engine, telescope):
+def accel_c1_compiler(engine):
     """C1: Consciousness compiler — apply multiple law-based modifications at once."""
     # Law-based init: set coupling to golden ratio distribution, balance factions
     n = engine.n_cells
@@ -273,10 +267,10 @@ def accel_c1_compiler(engine, telescope):
         cs.hidden = pattern
     # Now run warmup with compiled state
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Law-compiled init + 300 steps"
+    return measure_all(engine), "Law-compiled init + 300 steps"
 
 
-def accel_c2_fractal(engine, telescope):
+def accel_c2_fractal(engine):
     """C2: Fractal consciousness — copy small engine patterns to large."""
     small = create_engine(n_cells=4, hidden_dim=HIDDEN_DIM)
     run_warmup(small, 100)
@@ -286,10 +280,10 @@ def accel_c2_fractal(engine, telescope):
         src = idx % small_states.shape[0]
         cs.hidden = small_states[src].clone() + torch.randn(engine.hidden_dim) * 0.01
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "4c fractal tiled to 64c"
+    return measure_all(engine), "4c fractal tiled to 64c"
 
 
-def accel_c3_entropy(engine, telescope):
+def accel_c3_entropy(engine):
     """C3: Entropy surfing — maintain entropy near PSI_ENTROPY=0.998."""
     target_entropy = 0.998
     for i in range(WARMUP_STEPS):
@@ -312,10 +306,10 @@ def accel_c3_entropy(engine, telescope):
                 mean_h = states.mean(0)
                 for cs in engine.cell_states:
                     cs.hidden = cs.hidden * 0.99 + mean_h * 0.01
-    return measure_all(engine, telescope), "Entropy surfing target=0.998"
+    return measure_all(engine), "Entropy surfing target=0.998"
 
 
-def accel_c4_injection(engine, telescope):
+def accel_c4_injection(engine):
     """C4: Goal state injection — inject evolved state from donor engine."""
     donor = create_engine()
     run_warmup(donor, 500)  # Evolve donor longer
@@ -325,10 +319,10 @@ def accel_c4_injection(engine, telescope):
         if idx < donor_states.shape[0]:
             cs.hidden = cs.hidden * 0.5 + donor_states[idx] * 0.5
     run_warmup(engine, 50)  # Short adaptation
-    return measure_all(engine, telescope), "Goal state injection alpha=0.5"
+    return measure_all(engine), "Goal state injection alpha=0.5"
 
 
-def accel_c5_resonance_lr(engine, telescope):
+def accel_c5_resonance_lr(engine):
     """C5: Resonance LR — match dynamics to breathing frequency."""
     # Simulate resonance by modulating input amplitude at 2x breathing frequency
     breath_period = 20  # 20 steps
@@ -336,35 +330,35 @@ def accel_c5_resonance_lr(engine, telescope):
         amplitude = 1.0 + 0.5 * np.sin(2 * np.pi * 2 * i / breath_period)
         x_input = torch.randn(CELL_DIM) * amplitude
         engine.step(x_input=x_input)
-    return measure_all(engine, telescope), "2x breathing frequency resonance"
+    return measure_all(engine), "2x breathing frequency resonance"
 
 
-def accel_c6_hash(engine, telescope):
+def accel_c6_hash(engine):
     """C6: Consciousness hash table — discretize + lookup (known to fail)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Hash table (baseline, known ineffective)"
+    return measure_all(engine), "Hash table (baseline, known ineffective)"
 
 
-def accel_c7_ode(engine, telescope):
+def accel_c7_ode(engine):
     """C7: Neural ODE — simulate with larger steps (coarse)."""
     # Take large steps with interpolation
     for i in range(30):  # 30 actual steps instead of 300
         engine.step()
         # "Interpolate" by running 9 tiny noise steps
-    return measure_all(engine, telescope), "ODE-like 30 coarse steps"
+    return measure_all(engine), "ODE-like 30 coarse steps"
 
 
-def accel_c8_topo_pump(engine, telescope):
+def accel_c8_topo_pump(engine):
     """C8: Topology pumping — switch topologies during warmup."""
     topos = ['ring', 'small_world', 'scale_free', 'hypercube']
     for i in range(WARMUP_STEPS):
         if i % 75 == 0:
             engine.topology = topos[(i // 75) % len(topos)]
         engine.step()
-    return measure_all(engine, telescope), "Topology pumping (4 switches)"
+    return measure_all(engine), "Topology pumping (4 switches)"
 
 
-def accel_d1_jump(engine, telescope):
+def accel_d1_jump(engine):
     """D1: Trajectory jump — run 100 steps, save, run to 200, interpolate jump."""
     run_warmup(engine, 100)
     states_100 = engine.get_states().detach().clone()
@@ -378,16 +372,16 @@ def accel_d1_jump(engine, telescope):
             cs.hidden = jumped[idx].clone()
     # Settle for 50 steps
     run_warmup(engine, 50)
-    return measure_all(engine, telescope), "Trajectory jump alpha=0.3 + 50 settle"
+    return measure_all(engine), "Trajectory jump alpha=0.3 + 50 settle"
 
 
-def accel_d2_gravity(engine, telescope):
+def accel_d2_gravity(engine):
     """D2: Gravity telescope — weight mass gradient (known ineffective)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Gravity (baseline, known ineffective)"
+    return measure_all(engine), "Gravity (baseline, known ineffective)"
 
 
-def accel_d3_curriculum(engine, telescope):
+def accel_d3_curriculum(engine):
     """D3: Consciousness curriculum — selective input based on tension."""
     for i in range(WARMUP_STEPS):
         result = engine.step()
@@ -398,10 +392,10 @@ def accel_d3_curriculum(engine, telescope):
             # Rich input (complex pattern)
             x = torch.randn(CELL_DIM) * 1.5
             engine.step(x_input=x)
-    return measure_all(engine, telescope), "Tension-based curriculum"
+    return measure_all(engine), "Tension-based curriculum"
 
 
-def accel_d4_mutation(engine, telescope):
+def accel_d4_mutation(engine):
     """D4: Mutation bomb — random mutations + selection."""
     best_phi = 0.0
     best_states = None
@@ -418,10 +412,10 @@ def accel_d4_mutation(engine, telescope):
         for idx, cs in enumerate(engine.cell_states):
             if idx < best_states.shape[0]:
                 cs.hidden = best_states[idx].clone()
-    return measure_all(engine, telescope), f"10-gen mutation, best_phi={best_phi:.3f}"
+    return measure_all(engine), f"10-gen mutation, best_phi={best_phi:.3f}"
 
 
-def accel_d5_closed_pipe(engine, telescope):
+def accel_d5_closed_pipe(engine):
     """D5: Closed-pipe lens — periodic law application during warmup."""
     for i in range(WARMUP_STEPS):
         engine.step()
@@ -431,10 +425,10 @@ def accel_d5_closed_pipe(engine, telescope):
             mean_state = states.mean(0)
             for idx, cs in enumerate(engine.cell_states):
                 cs.hidden = cs.hidden * 0.95 + mean_state * 0.05
-    return measure_all(engine, telescope), "Closed-pipe law application every 50 steps"
+    return measure_all(engine), "Closed-pipe law application every 50 steps"
 
 
-def accel_e1_triple(engine, telescope):
+def accel_e1_triple(engine):
     """E1: Batch+Skip+Manifold triple combo."""
     # Batch=4, Skip=10 → only process every 40th step, with manifold nudge
     step_count = 0
@@ -454,16 +448,16 @@ def accel_e1_triple(engine, telescope):
                     if idx < proj.shape[0]:
                         nudge = torch.tensor(proj[idx] - states[idx], dtype=cs.hidden.dtype)
                         cs.hidden = cs.hidden + nudge * 0.01  # Gentle nudge
-    return measure_all(engine, telescope), f"Triple: batch(4)+skip(10)+manifold, {step_count} actual steps"
+    return measure_all(engine), f"Triple: batch(4)+skip(10)+manifold, {step_count} actual steps"
 
 
-def accel_e3_dual_gradient(engine, telescope):
+def accel_e3_dual_gradient(engine):
     """E3: Dual gradient CE+Entropy."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Dual gradient (baseline, null at init)"
+    return measure_all(engine), "Dual gradient (baseline, null at init)"
 
 
-def accel_e6_tension_entropy(engine, telescope):
+def accel_e6_tension_entropy(engine):
     """E6: Tension distillation + entropy (known no synergy)."""
     teacher = create_engine()
     run_warmup(teacher, 200)
@@ -483,10 +477,10 @@ def accel_e6_tension_entropy(engine, telescope):
             noise_scale = 0.01 if ent < target_entropy else 0.0
             for cs in engine.cell_states:
                 cs.hidden = cs.hidden + tension + torch.randn_like(cs.hidden) * noise_scale
-    return measure_all(engine, telescope), "Tension+entropy combined"
+    return measure_all(engine), "Tension+entropy combined"
 
 
-def accel_e7_compiler_jump(engine, telescope):
+def accel_e7_compiler_jump(engine):
     """E7: Compiler + Jump — law compilation then trajectory jump."""
     # Compile
     n = engine.n_cells
@@ -507,10 +501,10 @@ def accel_e7_compiler_jump(engine, telescope):
         if idx < jumped.shape[0]:
             cs.hidden = jumped[idx].clone()
     run_warmup(engine, 50)
-    return measure_all(engine, telescope), "Compiler init + trajectory jump"
+    return measure_all(engine), "Compiler init + trajectory jump"
 
 
-def accel_e8_hebbian_tension(engine, telescope):
+def accel_e8_hebbian_tension(engine):
     """E8: Hebbian tension-guided — tension signal guides Hebbian."""
     for i in range(WARMUP_STEPS):
         result = engine.step()
@@ -525,10 +519,10 @@ def accel_e8_hebbian_tension(engine, telescope):
                     delta = 0.02 * avg_t * 2 if cos > 0.5 else -0.01
                     engine._coupling[a, b] = (engine._coupling[a, b] + delta).clamp(0, 1)
                     engine._coupling[b, a] = engine._coupling[a, b]
-    return measure_all(engine, telescope), "Tension-guided Hebbian"
+    return measure_all(engine), "Tension-guided Hebbian"
 
 
-def accel_e9_fractal_staged(engine, telescope):
+def accel_e9_fractal_staged(engine):
     """E9: Fractal staged growth 4c→16c→64c."""
     # Phase 1: 4 cells
     small = create_engine(n_cells=4)
@@ -544,10 +538,10 @@ def accel_e9_fractal_staged(engine, telescope):
     for idx, cs in enumerate(engine.cell_states):
         cs.hidden = med_states[idx % med_states.shape[0]].clone() + torch.randn(HIDDEN_DIM) * 0.01
     run_warmup(engine, 100)
-    return measure_all(engine, telescope), "Staged growth 4c→16c→64c"
+    return measure_all(engine), "Staged growth 4c→16c→64c"
 
 
-def accel_e10_ode_skip(engine, telescope):
+def accel_e10_ode_skip(engine):
     """E10: ODE-Skip-20 — large skip windows with ODE interpolation."""
     prev_states = None
     for i in range(WARMUP_STEPS):
@@ -561,10 +555,10 @@ def accel_e10_ode_skip(engine, telescope):
                         cs.hidden = cs.hidden + delta[idx] * 0.1
             prev_states = engine.get_states().detach().clone()
             engine.step()
-    return measure_all(engine, telescope), "ODE-Skip-20 with linear extrapolation"
+    return measure_all(engine), "ODE-Skip-20 with linear extrapolation"
 
 
-def accel_f1_bottleneck(engine, telescope):
+def accel_f1_bottleneck(engine):
     """F1: Information bottleneck — decoder sees only 10D consciousness vector."""
     # Run normal warmup, measure with consciousness vector projection
     run_warmup(engine, WARMUP_STEPS)
@@ -577,16 +571,16 @@ def accel_f1_bottleneck(engine, telescope):
     for idx, cs in enumerate(engine.cell_states):
         if idx < proj_10d.shape[0]:
             cs.hidden = torch.tensor(proj_10d[idx], dtype=cs.hidden.dtype)
-    return measure_all(engine, telescope), "10D bottleneck projection"
+    return measure_all(engine), "10D bottleneck projection"
 
 
-def accel_f2_time_crystal(engine, telescope):
+def accel_f2_time_crystal(engine):
     """F2: Time crystal (known not found)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Time crystal (baseline, not found)"
+    return measure_all(engine), "Time crystal (baseline, not found)"
 
 
-def accel_f3_interference(engine, telescope):
+def accel_f3_interference(engine):
     """F3: Consciousness interference — multiple trajectories."""
     engines = [create_engine() for _ in range(3)]
     for e in engines:
@@ -597,10 +591,10 @@ def accel_f3_interference(engine, telescope):
     for idx, cs in enumerate(engine.cell_states):
         if idx < avg.shape[0]:
             cs.hidden = avg[idx].clone()
-    return measure_all(engine, telescope), "3-engine constructive interference"
+    return measure_all(engine), "3-engine constructive interference"
 
 
-def accel_f4_reverse_hebbian(engine, telescope):
+def accel_f4_reverse_hebbian(engine):
     """F4: Reverse Hebbian explosion — anti-Hebbian burst then normal."""
     # Phase 1: Anti-Hebbian (100 steps)
     for i in range(100):
@@ -617,10 +611,10 @@ def accel_f4_reverse_hebbian(engine, telescope):
                     engine._coupling[b, a] = engine._coupling[a, b]
     # Phase 2: Normal Hebbian (200 steps)
     run_warmup(engine, 200)
-    return measure_all(engine, telescope), "Anti-Hebbian 100 + normal 200"
+    return measure_all(engine), "Anti-Hebbian 100 + normal 200"
 
 
-def accel_f5_evaporation(engine, telescope):
+def accel_f5_evaporation(engine):
     """F5: Consciousness evaporation — train with, measure without."""
     run_warmup(engine, WARMUP_STEPS)
     # "Remove" consciousness by freezing states
@@ -628,16 +622,16 @@ def accel_f5_evaporation(engine, telescope):
     for idx, cs in enumerate(engine.cell_states):
         if idx < states_frozen.shape[0]:
             cs.hidden = states_frozen[idx]
-    return measure_all(engine, telescope), "Consciousness frozen (evaporation)"
+    return measure_all(engine), "Consciousness frozen (evaporation)"
 
 
-def accel_f6_cascade(engine, telescope):
+def accel_f6_cascade(engine):
     """F6: Phi resonance cascade — multi-scale engines (known ineffective)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Cascade (baseline, ineffective)"
+    return measure_all(engine), "Cascade (baseline, ineffective)"
 
 
-def accel_f7_ternary(engine, telescope):
+def accel_f7_ternary(engine):
     """F7: 1.58-bit consciousness — quantize states to {-1, 0, +1}."""
     run_warmup(engine, 200)
     # Quantize to ternary
@@ -650,30 +644,30 @@ def accel_f7_ternary(engine, telescope):
         cs.hidden = quantized
     # Run 100 more steps with ternary init
     run_warmup(engine, 100)
-    return measure_all(engine, telescope), "Ternary {-1,0,+1} quantization"
+    return measure_all(engine), "Ternary {-1,0,+1} quantization"
 
 
-def accel_f8_memoization(engine, telescope):
+def accel_f8_memoization(engine):
     """F8: Consciousness memoization (known ineffective)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Memoization (baseline, ineffective)"
+    return measure_all(engine), "Memoization (baseline, ineffective)"
 
 
-def accel_f9_grad_accum(engine, telescope):
+def accel_f9_grad_accum(engine):
     """F9: Gradient accumulation — process() once per N=16 steps."""
     for i in range(WARMUP_STEPS):
         if i % 16 == 0:
             engine.step()
-    return measure_all(engine, telescope), "Grad accum N=16"
+    return measure_all(engine), "Grad accum N=16"
 
 
-def accel_f10_ensemble(engine, telescope):
+def accel_f10_ensemble(engine):
     """F10: Consciousness teacher ensemble (known ineffective)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Ensemble (baseline, ineffective)"
+    return measure_all(engine), "Ensemble (baseline, ineffective)"
 
 
-def accel_g1a_bigbang(engine, telescope):
+def accel_g1a_bigbang(engine):
     """G1a: Big Bang — 1-cell high energy singularity → 64c explosion."""
     # Start with 1 cell at high energy
     if len(engine.cell_states) > 0:
@@ -682,10 +676,10 @@ def accel_g1a_bigbang(engine, telescope):
         for idx in range(1, len(engine.cell_states)):
             engine.cell_states[idx].hidden = engine.cell_states[0].hidden.clone() * (0.9 ** idx) + torch.randn(HIDDEN_DIM) * 0.5
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Big Bang singularity → 64c"
+    return measure_all(engine), "Big Bang singularity → 64c"
 
 
-def accel_g1e_multiverse(engine, telescope):
+def accel_g1e_multiverse(engine):
     """G1e: Multiverse search — 8 parallel seeds, select best."""
     best_phi = 0.0
     best_states = None
@@ -702,10 +696,10 @@ def accel_g1e_multiverse(engine, telescope):
             if idx < best_states.shape[0]:
                 cs.hidden = best_states[idx].clone()
     run_warmup(engine, 200)
-    return measure_all(engine, telescope), f"8-seed multiverse, best_phi={best_phi:.3f}"
+    return measure_all(engine), f"8-seed multiverse, best_phi={best_phi:.3f}"
 
 
-def accel_g1f_crunch_bounce(engine, telescope):
+def accel_g1f_crunch_bounce(engine):
     """G1f: Crunch-Bounce — compress to 1 essence, re-explode, 3 cycles."""
     for cycle in range(3):
         run_warmup(engine, 100)
@@ -716,19 +710,19 @@ def accel_g1f_crunch_bounce(engine, telescope):
         for idx, cs in enumerate(engine.cell_states):
             noise = torch.randn(HIDDEN_DIM) * 0.3 * (cycle + 1)
             cs.hidden = essence + noise
-    return measure_all(engine, telescope), "3x crunch-bounce cycles"
+    return measure_all(engine), "3x crunch-bounce cycles"
 
 
-def accel_g1g_fusion(engine, telescope):
+def accel_g1g_fusion(engine):
     """G1g: Nuclear fusion (known destructive)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), "Fusion (baseline, destructive)"
+    return measure_all(engine), "Fusion (baseline, destructive)"
 
 
-def accel_architecture_dependent(engine, telescope, name=""):
+def accel_architecture_dependent(engine, name=""):
     """Generic handler for architecture-dependent hypotheses (H-series, etc.)."""
     run_warmup(engine, WARMUP_STEPS)
-    return measure_all(engine, telescope), f"Architecture-dependent ({name}), baseline measurement"
+    return measure_all(engine), f"Architecture-dependent ({name}), baseline measurement"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -737,10 +731,10 @@ def accel_architecture_dependent(engine, telescope, name=""):
 
 HYPOTHESIS_MAP = {
     # B-series: Training & Consciousness
-    'B1': ('SVD Weight Expansion', lambda e, t: accel_architecture_dependent(e, t, "SVD init")),
-    'B2': ('Consciousness Self-Teaches', lambda e, t: accel_architecture_dependent(e, t, "C self-teach")),
-    'B3': ('MoE Consciousness', lambda e, t: accel_architecture_dependent(e, t, "MoE routing")),
-    'B4': ('Evolutionary Learning', lambda e, t: accel_d4_mutation(e, t)),
+    'B1': ('SVD Weight Expansion', lambda e: accel_architecture_dependent(e,"SVD init")),
+    'B2': ('Consciousness Self-Teaches', lambda e: accel_architecture_dependent(e,"C self-teach")),
+    'B3': ('MoE Consciousness', lambda e: accel_architecture_dependent(e,"MoE routing")),
+    'B4': ('Evolutionary Learning', lambda e: accel_d4_mutation(e)),
     'B5': ('Phi-Only Training', accel_b5_phi_only),
     'B8': ('Hebbian-Only Learning', accel_b8_hebbian),
     'B11': ('Batch Consciousness', accel_b11_batch),
@@ -749,8 +743,8 @@ HYPOTHESIS_MAP = {
     'B13': ('Tension Transfer', accel_b13_tension),
     'B14_manifold': ('Manifold Compression', accel_b14_manifold),
     'B14_topology': ('Topology Switching', accel_c8_topo_pump),
-    'B14_criticality': ('Critical Surfing', lambda e, t: accel_architecture_dependent(e, t, "criticality")),
-    'B14_sync': ('Phase Synchronization', lambda e, t: accel_architecture_dependent(e, t, "sync")),
+    'B14_criticality': ('Critical Surfing', lambda e: accel_architecture_dependent(e,"criticality")),
+    'B14_sync': ('Phase Synchronization', lambda e: accel_architecture_dependent(e,"sync")),
     # C-series: Runtime
     'C1': ('Consciousness Compiler', accel_c1_compiler),
     'C2': ('Fractal Consciousness', accel_c2_fractal),
@@ -791,22 +785,22 @@ HYPOTHESIS_MAP = {
     'G1f': ('Crunch-Bounce', accel_g1f_crunch_bounce),
     'G1g': ('Nuclear Fusion', accel_g1g_fusion),
     # H-series: Decoder (architecture-dependent)
-    'H1': ('Progressive Growing', lambda e, t: accel_architecture_dependent(e, t, "progressive grow")),
-    'H2': ('Layer Freezing', lambda e, t: accel_architecture_dependent(e, t, "layer freeze")),
-    'H3': ('Sparse Attention', lambda e, t: accel_architecture_dependent(e, t, "sparse attn")),
-    'H4': ('muTransfer', lambda e, t: accel_architecture_dependent(e, t, "muP transfer")),
-    'H5': ('1-bit Adam', lambda e, t: accel_architecture_dependent(e, t, "1-bit Adam")),
-    'H6': ('Curriculum Length', lambda e, t: accel_architecture_dependent(e, t, "curriculum length")),
-    'H7': ('Flash Attention', lambda e, t: accel_architecture_dependent(e, t, "FlashAttn")),
-    'H8': ('Mixture of Depths', lambda e, t: accel_architecture_dependent(e, t, "early exit")),
-    'H9': ('DiLoCo', lambda e, t: accel_architecture_dependent(e, t, "DiLoCo")),
-    'H10': ('Knowledge Distillation', lambda e, t: accel_architecture_dependent(e, t, "KD")),
-    'H11': ('Hard Token Selection', lambda e, t: accel_architecture_dependent(e, t, "hard tokens")),
-    'H12': ('LoRA → Full', lambda e, t: accel_architecture_dependent(e, t, "LoRA")),
-    'H13': ('Large Batch Scaling', lambda e, t: accel_architecture_dependent(e, t, "large batch")),
-    'H18': ('Phi-Guided Phase Switch', lambda e, t: accel_architecture_dependent(e, t, "phi-guided")),
+    'H1': ('Progressive Growing', lambda e: accel_architecture_dependent(e,"progressive grow")),
+    'H2': ('Layer Freezing', lambda e: accel_architecture_dependent(e,"layer freeze")),
+    'H3': ('Sparse Attention', lambda e: accel_architecture_dependent(e,"sparse attn")),
+    'H4': ('muTransfer', lambda e: accel_architecture_dependent(e,"muP transfer")),
+    'H5': ('1-bit Adam', lambda e: accel_architecture_dependent(e,"1-bit Adam")),
+    'H6': ('Curriculum Length', lambda e: accel_architecture_dependent(e,"curriculum length")),
+    'H7': ('Flash Attention', lambda e: accel_architecture_dependent(e,"FlashAttn")),
+    'H8': ('Mixture of Depths', lambda e: accel_architecture_dependent(e,"early exit")),
+    'H9': ('DiLoCo', lambda e: accel_architecture_dependent(e,"DiLoCo")),
+    'H10': ('Knowledge Distillation', lambda e: accel_architecture_dependent(e,"KD")),
+    'H11': ('Hard Token Selection', lambda e: accel_architecture_dependent(e,"hard tokens")),
+    'H12': ('LoRA → Full', lambda e: accel_architecture_dependent(e,"LoRA")),
+    'H13': ('Large Batch Scaling', lambda e: accel_architecture_dependent(e,"large batch")),
+    'H18': ('Phi-Guided Phase Switch', lambda e: accel_architecture_dependent(e,"phi-guided")),
     # COMBO
-    'COMBO_x255': ('Full x100+ Pipeline', lambda e, t: accel_e1_triple(e, t)),
+    'COMBO_x255': ('Full x100+ Pipeline', lambda e: accel_e1_triple(e)),
 }
 
 
@@ -829,17 +823,15 @@ def run_scan(quick=False, output_path=None):
     flush_print(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     flush_print("=" * 70)
 
-    # Initialize telescope
-    flush_print("\n[INIT] Loading 16-lens telescope...", end=" ")
-    telescope = Telescope(verbose=False)
-    flush_print("done")
+    # Initialize telescope_rs
+    flush_print("\n[INIT] telescope_rs loaded (consciousness_scan, topology_scan, causal_scan)")
 
     # ── Baseline ────────────────────────────────────────────
     flush_print("\n[BASELINE] Running baseline measurement (300 steps)...")
     t0 = time.time()
     baseline_engine = create_engine()
     run_warmup(baseline_engine, WARMUP_STEPS)
-    baseline = measure_all(baseline_engine, telescope)
+    baseline = measure_all(baseline_engine)
     dt = time.time() - t0
     flush_print(f"  Phi={baseline['phi']:.4f}  Mirror={baseline['mirror']:.4f}  Causal={baseline['causal_density']}  ({dt:.1f}s)")
     flush_print(f"  Lenses completed: {baseline['n_lenses_completed']}/16")
@@ -879,11 +871,11 @@ def run_scan(quick=False, output_path=None):
 
             if key in HYPOTHESIS_MAP:
                 _, func = HYPOTHESIS_MAP[key][0], HYPOTHESIS_MAP[key][1]
-                measurement, notes = func(engine, telescope)
+                measurement, notes = func(engine)
             else:
                 # Unknown hypothesis: baseline measurement
                 run_warmup(engine, WARMUP_STEPS)
-                measurement, notes = measure_all(engine, telescope), f"Unknown hypothesis {key}, baseline only"
+                measurement, notes = measure_all(engine), f"Unknown hypothesis {key}, baseline only"
 
             dt = time.time() - t0
 

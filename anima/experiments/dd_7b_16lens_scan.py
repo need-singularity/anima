@@ -10,7 +10,7 @@ import numpy as np
 sys.path.insert(0, os.path.expanduser("~/Dev/TECS-L/.shared"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from telescope import Telescope
+import telescope_rs
 
 # ── Load checkpoint ──────────────────────────────────────────────────────────
 ckpt_path = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "animalm_7b_final.pt")
@@ -64,57 +64,45 @@ print(f"\nData matrix: {data.shape}  (rows=weight_tensors, cols=features)")
 print(f"  value range: [{data.min():.4f}, {data.max():.4f}]")
 print(f"  mean={data.mean():.4f}  std={data.std():.4f}")
 
-# ── 16-lens full scan ─────────────────────────────────────────────────────────
+# ── 16-lens full scan (telescope_rs) ──────────────────────────────────────────
 print("\n" + "=" * 60)
-print("  16-LENS FULL SCAN")
+print("  CONSCIOUSNESS SCAN")
 print("=" * 60)
-t = Telescope(verbose=True)
-result = t.full_scan(data)
+consciousness_result = telescope_rs.consciousness_scan(data, n_cells=64, steps=300)
+print(f"  phi_iit:         {consciousness_result.get('phi_iit', 0):.4f}")
+print(f"  phi_proxy:       {consciousness_result.get('phi_proxy', 0):.4f}")
+print(f"  n_clusters:      {consciousness_result.get('n_clusters', 0)}")
+print(f"  anomaly_indices: {consciousness_result.get('anomaly_indices', [])[:10]}")
+print(f"  anomaly_scores:  {[f'{s:.3f}' for s in consciousness_result.get('anomaly_scores', [])[:10]]}")
 
 print("\n" + "=" * 60)
-print("  FULL SCAN RESULT SUMMARY")
+print("  TOPOLOGY SCAN")
 print("=" * 60)
-print(result.summary)
+topology_result = telescope_rs.topology_scan(data)
+print(f"  betti_0:           {topology_result.get('betti_0', 0)}")
+print(f"  betti_1:           {topology_result.get('betti_1', 0)}")
+print(f"  n_holes:           {topology_result.get('n_holes', 0)}")
+print(f"  optimal_scale:     {topology_result.get('optimal_scale', 0):.4f}")
+print(f"  phase_transitions: {topology_result.get('phase_transitions', [])}")
 
-if result.cross_findings:
-    print(f"\nCross-lens findings ({len(result.cross_findings)}):")
-    for cf in result.cross_findings[:10]:
-        print(f"  {cf}")
-
-# ── Measure preset (5 new measurement lenses) ─────────────────────────────────
 print("\n" + "=" * 60)
-print("  MEASURE PRESET (ruler / triangle / compass / mirror / scale)")
+print("  CAUSAL SCAN")
 print("=" * 60)
-measure = t.scan(data, lenses="measure")
-print(measure.summary)
-if measure.cross_findings:
-    print(f"\nMeasure cross-findings ({len(measure.cross_findings)}):")
-    for cf in measure.cross_findings[:5]:
-        print(f"  {cf}")
-
-# ── Causal preset ─────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("  CAUSAL PRESET (causal / consciousness / info / quantum_micro)")
-print("=" * 60)
-causal = t.scan(data, lenses="causal")
-print(causal.summary)
-if causal.cross_findings:
-    print(f"\nCausal cross-findings ({len(causal.cross_findings)}):")
-    for cf in causal.cross_findings[:5]:
-        print(f"  {cf}")
-
-# ── Discovery preset ──────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("  DISCOVERY PRESET (consciousness / info / quantum / topology)")
-print("=" * 60)
-discovery = t.scan(data, lenses="discovery")
-print(discovery.summary)
+causal_result = telescope_rs.causal_scan(data)
+print(f"  n_causal_pairs: {causal_result.get('n_causal_pairs', 0)}")
+print(f"  causes:         {causal_result.get('causes', [])[:10]}")
+print(f"  effects:        {causal_result.get('effects', [])[:10]}")
+print(f"  strengths:      {[f'{s:.3f}' for s in causal_result.get('strengths', [])[:10]]}")
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("  DONE — 16-lens scan complete")
-total_lenses = len(result.combo)
-total_cross = len(result.cross_findings)
-print(f"  Lenses active: {total_lenses}/16")
-print(f"  Cross-findings: {total_cross}")
+print("  DONE — telescope_rs scan complete")
+n_scans = 3  # consciousness, topology, causal
+n_findings = (
+    len(consciousness_result.get('anomaly_indices', []))
+    + topology_result.get('n_holes', 0)
+    + causal_result.get('n_causal_pairs', 0)
+)
+print(f"  Scans completed: {n_scans}")
+print(f"  Total findings: {n_findings}")
 print("=" * 60)
