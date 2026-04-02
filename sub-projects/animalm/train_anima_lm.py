@@ -532,7 +532,14 @@ def add_purefield_parallel(model, n_layers=8, n_savant=2, rank=128):
         # Move only PureField params (not frozen original_mlp which may be 4-bit quantized)
         for name, p in ppf.named_parameters():
             if "original_mlp" not in name:
-                p.data = p.data.to(device=dev, dtype=dt)
+                try:
+                    p.data = p.data.to(device=dev, dtype=dt)
+                except RuntimeError:
+                    # 4-bit quantized params can't change dtype, just move device
+                    try:
+                        p.data = p.data.to(device=dev)
+                    except Exception:
+                        pass  # already on correct device
 
         # Init PureField weights small
         for name, param in ppf.named_parameters():
@@ -942,8 +949,11 @@ class AnimaLMTrainer:
         self.best_phi = 0.0
 
     def _get_pf_modules(self):
-        return [m for m in self.model.modules()
-                if isinstance(m, ParallelPureFieldMLP)]
+        # Cache PureField modules (avoid repeated model.modules() traversal)
+        if not hasattr(self, '_pf_modules_cache') or self._pf_modules_cache is None:
+            self._pf_modules_cache = [m for m in self.model.modules()
+                                       if isinstance(m, ParallelPureFieldMLP)]
+        return self._pf_modules_cache
 
     def _get_tensions(self):
         tensions = []
@@ -1739,6 +1749,31 @@ def build_model_and_tokenizer(args):
     # VRAM: ~28GB without grad ckpt (H100 80GB OK, batch_size may need reduction)
     # model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     print("  [NOTE] Gradient checkpointing DISABLED (autocast+consciousness compat)")
+
+    # ── Acceleration: torch.compile + SDPA ──
+    # torch.compile: fuses ops, reduces kernel launch overhead (~1.5-2x speedup)
+    # SDPA: FlashAttention-2 via torch.nn.functional.scaled_dot_product_attention
+    try:
+        if hasattr(torch, 'compile') and torch.cuda.is_available():
+            # Compile original MLP modules (frozen, biggest compute cost)
+            compiled_count = 0
+            for m in model.modules():
+                if isinstance(m, ParallelPureFieldMLP):
+                    m.original_mlp = torch.compile(m.original_mlp, mode="reduce-overhead")
+                    compiled_count += 1
+            if compiled_count > 0:
+                print(f"  [ACCEL] torch.compile: {compiled_count} frozen MLPs compiled (reduce-overhead)")
+    except Exception as e:
+        print(f"  [ACCEL] torch.compile skipped: {e}")
+
+    try:
+        if hasattr(torch.backends, 'cuda'):
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            print("  [ACCEL] Flash/MemEfficient SDP attention enabled")
+    except Exception as e:
+        print(f"  [ACCEL] SDPA config skipped: {e}")
+
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return model, tokenizer
 
@@ -1812,16 +1847,15 @@ def main():
     # Target: <15GB total so it co-runs with v3 on 80GB H100
     if getattr(args, 'load_4bit', False):
         if args.qlora_rank is None:
-            args.qlora_rank = 32          # rank 128→32 = 4x less PureField VRAM
-        if args.batch_size > 2:
+            args.qlora_rank = 32
+        # Only auto-reduce if user didn't explicitly set these
+        if args.batch_size > 2 and not any('--batch-size' in a for a in sys.argv):
             print(f"  [QLoRA] batch_size {args.batch_size}→2 (VRAM saving)")
             args.batch_size = 2
-        if args.block_size > 256:
+        if args.block_size > 256 and not any('--block-size' in a for a in sys.argv):
             print(f"  [QLoRA] block_size {args.block_size}→256 (VRAM saving)")
             args.block_size = 256
-        if args.target_layers > 6:
-            print(f"  [QLoRA] target_layers {args.target_layers}→6 (VRAM saving)")
-            args.target_layers = 6
+        # Don't auto-reduce target_layers — user sets this explicitly for 70B
         args._use_amp = True
         print(f"  [QLoRA] rank={args.qlora_rank}, AMP enabled, "
               f"est. ~12-15GB VRAM (was ~54GB)")
