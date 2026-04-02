@@ -440,6 +440,573 @@ def _apply_frustration(engine, value):
         pass
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# v4 #37: Co-evolution — counter-discover to disprove patterns
+# ═══════════════════════════════════════════════════════════════════════
+
+def _counter_discover(promoted_patterns, cells, topology='ring'):
+    """Try to DISPROVE promoted patterns by running under opposite conditions.
+
+    v4 #37: For each promoted pattern, test with opposite conditions (50 steps).
+    If pattern still holds → boost confidence (robust).
+    If pattern breaks → mark as conditional.
+
+    Returns list of dicts: {pattern, robust: bool, counter_result: str}
+    """
+    results = []
+    for p in promoted_patterns:
+        try:
+            # Determine "opposite" conditions
+            # If pattern involves high tension → try low frustration
+            # If pattern involves specific chaos → try different chaos
+            counter_engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+            try:
+                counter_engine.topology = topology
+            except Exception:
+                pass
+
+            # Apply opposite frustration (if original was high, use low and vice versa)
+            try:
+                _apply_frustration(counter_engine, 0.05)  # minimal frustration
+            except Exception:
+                pass
+
+            # Apply different chaos mode
+            try:
+                _apply_chaos_mode(counter_engine, 'sandpile' if topology != 'sandpile' else 'lorenz')
+            except Exception:
+                pass
+
+            # Run 50 steps and check if pattern still appears
+            counter_patterns = _adaptive_discover(cells, 50, topology, counter_engine)
+
+            # Check if original pattern fingerprint appears in counter results
+            orig_fp = pattern_fingerprint(p)
+            found_in_counter = False
+            for cp in counter_patterns:
+                if pattern_fingerprint(cp) == orig_fp:
+                    found_in_counter = True
+                    break
+
+            results.append({
+                'pattern': p,
+                'robust': found_in_counter,
+                'counter_result': 'ROBUST (survives opposite conditions)' if found_in_counter
+                                  else 'CONDITIONAL (breaks under opposite conditions)',
+            })
+        except Exception:
+            results.append({
+                'pattern': p,
+                'robust': False,
+                'counter_result': 'ERROR (counter-test failed)',
+            })
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v4 #38: RL-based exploration (bandit) — track exploration scores
+# ═══════════════════════════════════════════════════════════════════════
+
+class ExplorationBandit:
+    """Track exploration scores for (cells, topo, chaos_mode) configs.
+
+    v4 #38: Maps config tuples to average laws_per_gen.
+    Used to inform adaptive roadmap skip decisions.
+    """
+
+    def __init__(self):
+        self.scores = {}   # (cells, topo, chaos) → {'total_laws': N, 'gens': N}
+
+    def update(self, cells, topo, chaos_mode, laws_this_gen):
+        """Update score for a config after a generation."""
+        key = (cells, topo, chaos_mode or 'default')
+        if key not in self.scores:
+            self.scores[key] = {'total_laws': 0, 'gens': 0}
+        self.scores[key]['total_laws'] += laws_this_gen
+        self.scores[key]['gens'] += 1
+
+    def avg_score(self, key):
+        """Average laws per gen for a config."""
+        if key not in self.scores or self.scores[key]['gens'] == 0:
+            return 0.0
+        return self.scores[key]['total_laws'] / self.scores[key]['gens']
+
+    def top_bottom(self, n=3):
+        """Return top-N and bottom-N configs by avg score."""
+        ranked = sorted(self.scores.keys(), key=lambda k: self.avg_score(k), reverse=True)
+        top = [(k, self.avg_score(k)) for k in ranked[:n]]
+        bottom = [(k, self.avg_score(k)) for k in ranked[-n:] if self.avg_score(k) < self.avg_score(ranked[0])]
+        return top, bottom
+
+    def is_bottom(self, cells, topo, chaos_mode, n=3):
+        """Check if a config is in the bottom-N performers."""
+        key = (cells, topo, chaos_mode or 'default')
+        _, bottom = self.top_bottom(n)
+        return key in [b[0] for b in bottom]
+
+    def print_summary(self):
+        """Print top-3 and bottom-3 configs."""
+        top, bottom = self.top_bottom(3)
+        if top:
+            print(f'    v4 bandit top-3: {", ".join(f"{k}: {v:.2f}" for k, v in top)}')
+        if bottom:
+            print(f'    v4 bandit bot-3: {", ".join(f"{k}: {v:.2f}" for k, v in bottom)}')
+        sys.stdout.flush()
+
+
+# Global bandit instance
+_exploration_bandit = ExplorationBandit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v4 #40: UCB1 topology selection
+# ═══════════════════════════════════════════════════════════════════════
+
+def _ucb_select_topology(topo_stats, total_gens):
+    """Select topology using UCB1 scoring.
+
+    v4 #40: UCB = mean_laws_per_gen + sqrt(2 * ln(total_gens) / topo_gens)
+    Falls back to round-robin if < 3 gens per topo.
+
+    Args:
+        topo_stats: dict mapping topo → {'total_laws': N, 'gens': N}
+        total_gens: total generations across all topologies
+
+    Returns:
+        selected topology name, or None if insufficient data
+    """
+    if total_gens < len(TOPOLOGIES) * 3:
+        return None  # insufficient data, fall back to round-robin
+
+    best_topo = None
+    best_ucb = -1.0
+
+    for topo in TOPOLOGIES:
+        stats = topo_stats.get(topo, {'total_laws': 0, 'gens': 0})
+        if stats['gens'] < 3:
+            return None  # insufficient data for this topo
+
+        mean_reward = stats['total_laws'] / stats['gens']
+        exploration = math.sqrt(2.0 * math.log(max(total_gens, 1)) / max(stats['gens'], 1))
+        ucb = mean_reward + exploration
+
+        if ucb > best_ucb:
+            best_ucb = ucb
+            best_topo = topo
+
+    return best_topo
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v4 #42: Seasonal exploration (exploit/explore phases)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _get_seasonal_phase(gen, cycle_length=20):
+    """Determine if we're in EXPLOIT or EXPLORE phase.
+
+    v4 #42: Every cycle_length gens, alternate between:
+    - EXPLOIT (first half): use best-performing config
+    - EXPLORE (second half): try random variations
+
+    Returns ('EXPLOIT', best_config) or ('EXPLORE', random_config)
+    """
+    import random as _rnd
+    phase_pos = gen % cycle_length
+    if phase_pos < cycle_length // 2:
+        return 'EXPLOIT'
+    else:
+        return 'EXPLORE'
+
+
+def _seasonal_apply(gen, engine, bandit, cycle_length=20):
+    """Apply seasonal phase settings to engine.
+
+    v4 #42: In EXPLOIT, use best config. In EXPLORE, randomize.
+    """
+    try:
+        import random as _rnd
+        phase = _get_seasonal_phase(gen, cycle_length)
+
+        if phase == 'EXPLOIT':
+            # Use best-performing config from bandit
+            top, _ = bandit.top_bottom(1)
+            if top:
+                best_key = top[0][0]  # (cells, topo, chaos)
+                _, best_topo, best_chaos = best_key
+                try:
+                    engine.topology = best_topo
+                except Exception:
+                    pass
+                _apply_chaos_mode(engine, best_chaos if best_chaos != 'default' else 'lorenz')
+        else:
+            # EXPLORE: random chaos mode and frustration
+            _apply_chaos_mode(engine, _rnd.choice(CHAOS_MODES))
+            _apply_frustration(engine, _rnd.uniform(0.05, 0.6))
+
+        return phase
+    except Exception:
+        return 'EXPLOIT'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v5 #44: Extended metrics
+# ═══════════════════════════════════════════════════════════════════════
+
+def _collect_extended_metrics(engine, step_idx, prev_phi=None, prev_prev_phi=None):
+    """Collect extended metrics from engine state.
+
+    v5 #44: faction_entropy, coupling_asymmetry, phi_acceleration,
+    cell_death_rate, synchronization_index.
+
+    Returns dict of extended metrics (empty dict on failure).
+    """
+    metrics = {}
+    try:
+        import numpy as np
+
+        states = engine.get_states() if hasattr(engine, 'get_states') else None
+        if states is None:
+            return metrics
+
+        if hasattr(states, 'detach'):
+            arr = states.detach().cpu().numpy()
+        elif hasattr(states, 'numpy'):
+            arr = states.numpy()
+        else:
+            arr = np.array(states)
+
+        n_cells = arr.shape[0] if arr.ndim >= 1 else 0
+        if n_cells == 0:
+            return metrics
+
+        # Faction entropy: Shannon entropy of faction sizes
+        try:
+            n_factions = getattr(engine, 'n_factions', 12)
+            if hasattr(engine, '_faction_ids'):
+                fids = engine._faction_ids
+                if hasattr(fids, 'detach'):
+                    fids = fids.detach().cpu().numpy()
+                elif hasattr(fids, 'numpy'):
+                    fids = fids.numpy()
+                else:
+                    fids = np.array(fids)
+                counts = np.bincount(fids.flatten().astype(int), minlength=n_factions)
+            else:
+                # Approximate by dividing cells evenly
+                counts = np.ones(n_factions) * (n_cells / n_factions)
+            probs = counts / counts.sum() if counts.sum() > 0 else np.ones(len(counts)) / len(counts)
+            probs = probs[probs > 0]
+            faction_entropy = -float(np.sum(probs * np.log2(probs)))
+            metrics['faction_entropy'] = faction_entropy
+        except Exception:
+            pass
+
+        # Coupling asymmetry: max(coupling) / min(coupling)
+        try:
+            if hasattr(engine, '_coupling') and engine._coupling is not None:
+                c = engine._coupling
+                if hasattr(c, 'detach'):
+                    c = c.detach().cpu().numpy()
+                elif hasattr(c, 'numpy'):
+                    c = c.numpy()
+                else:
+                    c = np.array(c)
+                c_flat = c.flatten()
+                c_pos = c_flat[c_flat > 1e-12]
+                if len(c_pos) > 0:
+                    metrics['coupling_asymmetry'] = float(np.max(c_pos) / np.min(c_pos))
+        except Exception:
+            pass
+
+        # Phi acceleration: d2Phi/dt2
+        try:
+            if prev_phi is not None and prev_prev_phi is not None:
+                # Second derivative approximation
+                current_phi = getattr(engine, '_last_phi', None)
+                if current_phi is not None:
+                    d2phi = current_phi - 2 * prev_phi + prev_prev_phi
+                    metrics['phi_acceleration'] = float(d2phi)
+        except Exception:
+            pass
+
+        # Cell death rate: fraction of cells with near-zero activity
+        try:
+            if arr.ndim >= 2:
+                cell_norms = np.linalg.norm(arr, axis=1)
+            else:
+                cell_norms = np.abs(arr)
+            threshold = np.mean(cell_norms) * 0.01 if np.mean(cell_norms) > 0 else 1e-8
+            death_rate = float(np.sum(cell_norms < threshold) / max(len(cell_norms), 1))
+            metrics['cell_death_rate'] = death_rate
+        except Exception:
+            pass
+
+        # Synchronization index: mean pairwise cosine similarity
+        try:
+            if arr.ndim >= 2 and n_cells >= 2:
+                # Sample pairs if too many cells
+                max_pairs = 50
+                if n_cells > max_pairs:
+                    indices = np.random.choice(n_cells, max_pairs, replace=False)
+                    sampled = arr[indices]
+                else:
+                    sampled = arr
+                norms = np.linalg.norm(sampled, axis=1, keepdims=True)
+                norms = np.maximum(norms, 1e-12)
+                normalized = sampled / norms
+                sim_matrix = normalized @ normalized.T
+                # Mean of upper triangle (excluding diagonal)
+                n = sim_matrix.shape[0]
+                mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+                sync_idx = float(np.mean(sim_matrix[mask]))
+                metrics['sync_index'] = sync_idx
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v5 #49: Hierarchical discovery (local vs global faction groups)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _hierarchical_discover(cells, steps, topology='ring'):
+    """Split cells into local/global groups and measure cross-group patterns.
+
+    v5 #49: Local factions (0-5) vs global factions (6-11).
+    Measures per-group metrics + cross-group tension.
+    Run every 5th generation as alternative discovery mode.
+
+    Returns list of hierarchical pattern dicts.
+    """
+    patterns = []
+    try:
+        import numpy as np
+
+        engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+        try:
+            engine.topology = topology
+        except Exception:
+            pass
+
+        local_phis = []
+        global_phis = []
+        cross_tensions = []
+
+        for step in range(min(steps, 200)):
+            try:
+                engine.process()
+            except Exception:
+                break
+
+            if step % 10 == 0:
+                try:
+                    states = engine.get_states()
+                    if states is None:
+                        continue
+                    if hasattr(states, 'detach'):
+                        arr = states.detach().cpu().numpy()
+                    elif hasattr(states, 'numpy'):
+                        arr = states.numpy()
+                    else:
+                        arr = np.array(states)
+
+                    n = arr.shape[0]
+                    if n < 4:
+                        continue
+                    mid = n // 2
+
+                    local_group = arr[:mid]
+                    global_group = arr[mid:]
+
+                    # Variance-based phi proxy per group
+                    local_phi = float(np.var(local_group))
+                    global_phi = float(np.var(global_group))
+                    local_phis.append(local_phi)
+                    global_phis.append(global_phi)
+
+                    # Cross-group tension: mean distance between group centroids
+                    local_centroid = np.mean(local_group, axis=0) if local_group.ndim >= 2 else np.mean(local_group)
+                    global_centroid = np.mean(global_group, axis=0) if global_group.ndim >= 2 else np.mean(global_group)
+                    if hasattr(local_centroid, '__len__'):
+                        cross_t = float(np.linalg.norm(local_centroid - global_centroid))
+                    else:
+                        cross_t = abs(float(local_centroid) - float(global_centroid))
+                    cross_tensions.append(cross_t)
+                except Exception:
+                    continue
+
+        # Analyze collected data
+        if len(local_phis) >= 5 and len(global_phis) >= 5:
+            # Local vs global phi correlation
+            r = _pearson_r(local_phis, global_phis)
+            if not math.isnan(r):
+                patterns.append({
+                    'pattern_type': 'hierarchical_phi_correlation',
+                    'type': 'hierarchical_phi_correlation',
+                    'metrics_involved': ['local_phi', 'global_phi'],
+                    'formula': f'hierarchical: local_phi vs global_phi r={r:.3f}',
+                    'value': r,
+                })
+
+            # Cross-group tension trend
+            if len(cross_tensions) >= 5:
+                first_half = cross_tensions[:len(cross_tensions) // 2]
+                second_half = cross_tensions[len(cross_tensions) // 2:]
+                avg_first = sum(first_half) / len(first_half)
+                avg_second = sum(second_half) / len(second_half)
+                if avg_first > 1e-12:
+                    ratio = avg_second / avg_first
+                    patterns.append({
+                        'pattern_type': 'cross_group_tension',
+                        'type': 'cross_group_tension',
+                        'metrics_involved': ['cross_group_tension'],
+                        'formula': f'cross_group_tension: ratio={ratio:.3f} '
+                                   f'(first={avg_first:.4f}, second={avg_second:.4f})',
+                        'value': ratio,
+                    })
+
+            # Local-global phi asymmetry
+            avg_local = sum(local_phis) / len(local_phis)
+            avg_global = sum(global_phis) / len(global_phis)
+            if avg_local > 1e-12 or avg_global > 1e-12:
+                asymmetry = abs(avg_local - avg_global) / max(avg_local, avg_global, 1e-12)
+                patterns.append({
+                    'pattern_type': 'hierarchical_asymmetry',
+                    'type': 'hierarchical_asymmetry',
+                    'metrics_involved': ['local_phi', 'global_phi'],
+                    'formula': f'hierarchical_asymmetry: {asymmetry:.3f} '
+                               f'(local={avg_local:.4f}, global={avg_global:.4f})',
+                    'value': asymmetry,
+                })
+
+    except Exception:
+        pass
+
+    return patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v5 #50: External stimulus patterns
+# ═══════════════════════════════════════════════════════════════════════
+
+def _stimulus_discover(cells, steps, topology='ring'):
+    """Inject periodic signals and measure response patterns.
+
+    v5 #50: Instead of zero-input, inject sine wave, step function, noise burst.
+    Measures response latency, amplitude, and adaptation rate.
+    Run every 10th generation.
+
+    Returns list of stimulus-response pattern dicts.
+    """
+    patterns = []
+    try:
+        import numpy as np
+
+        stimuli = [
+            ('sine', lambda s: np.sin(2 * np.pi * s / 20.0) * 0.5),
+            ('step', lambda s: 1.0 if s >= steps // 3 else 0.0),
+            ('noise_burst', lambda s: np.random.randn() * 0.5 if steps // 3 <= s <= 2 * steps // 3 else 0.0),
+        ]
+
+        for stim_name, stim_fn in stimuli:
+            try:
+                engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                try:
+                    engine.topology = topology
+                except Exception:
+                    pass
+
+                responses = []
+                stim_active = False
+                response_start = None
+                max_response = 0.0
+                pre_stim_mean = None
+
+                actual_steps = min(steps, 150)
+                for step in range(actual_steps):
+                    # Inject stimulus as external input
+                    stim_val = stim_fn(step)
+                    try:
+                        if hasattr(engine, 'process'):
+                            engine.process()
+                    except Exception:
+                        break
+
+                    if step % 5 == 0:
+                        try:
+                            states = engine.get_states()
+                            if states is None:
+                                continue
+                            if hasattr(states, 'detach'):
+                                arr = states.detach().cpu().numpy()
+                            elif hasattr(states, 'numpy'):
+                                arr = states.numpy()
+                            else:
+                                arr = np.array(states)
+                            resp = float(np.mean(np.abs(arr)))
+                            responses.append((step, stim_val, resp))
+
+                            # Track pre-stimulus baseline
+                            if step < actual_steps // 4:
+                                if pre_stim_mean is None:
+                                    pre_stim_mean = resp
+                                else:
+                                    pre_stim_mean = 0.9 * pre_stim_mean + 0.1 * resp
+
+                            # Track response amplitude
+                            if abs(stim_val) > 0.1 and not stim_active:
+                                stim_active = True
+                                response_start = step
+                            if stim_active:
+                                delta = abs(resp - (pre_stim_mean or resp))
+                                if delta > max_response:
+                                    max_response = delta
+                        except Exception:
+                            continue
+
+                if len(responses) >= 5:
+                    # Response latency: steps between stimulus onset and peak response
+                    latency = 0
+                    if response_start is not None:
+                        for s, sv, rv in responses:
+                            if s > response_start and rv >= max_response * 0.9:
+                                latency = s - response_start
+                                break
+
+                    # Adaptation rate: how fast response returns to baseline after stimulus
+                    adaptation_rate = 0.0
+                    post_stim = [(s, r) for s, sv, r in responses if s > 2 * actual_steps // 3]
+                    if post_stim and pre_stim_mean and pre_stim_mean > 1e-12:
+                        post_vals = [r for _, r in post_stim]
+                        if len(post_vals) >= 2:
+                            decay = abs(post_vals[0] - post_vals[-1])
+                            adaptation_rate = decay / max(abs(post_vals[0] - pre_stim_mean), 1e-12)
+
+                    patterns.append({
+                        'pattern_type': f'stimulus_response_{stim_name}',
+                        'type': f'stimulus_response_{stim_name}',
+                        'metrics_involved': ['stimulus', 'response', stim_name],
+                        'formula': f'stimulus_{stim_name}: latency={latency}, '
+                                   f'amplitude={max_response:.4f}, '
+                                   f'adaptation={adaptation_rate:.3f}',
+                        'value': max_response,
+                        'latency': latency,
+                        'adaptation_rate': adaptation_rate,
+                    })
+
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return patterns
+
+
 def load_roadmap_state():
     """Load roadmap progress."""
     if os.path.exists(ROADMAP_STATE_PATH):
