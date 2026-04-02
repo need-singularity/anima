@@ -3,33 +3,38 @@
   ⛔ 가설, 규칙, 발견, 망원경 — 모든 리포의 핵심 인프라. 절대 삭제하지 마세요!
 
   ═══════════════════════════════════════════════════════════════
-  ★ 통합 망원경 렌즈 (16종) — 탐색/분석 시 별도 요청 없이 자동 적용 ★
+  ★ 통합 망원경 렌즈 (22종) — 탐색/분석 시 별도 요청 없이 자동 적용 ★
   ═══════════════════════════════════════════════════════════════
   자동 적용 조건:
     - 데이터 분석/패턴 탐색/이상점 발견/신소재·신약 탐색 시 렌즈 자동 사용
-    - 새 데이터 분석 → 기본 3종 스캔: 의식(구조) + 중력(끌개) + 위상(연결)
-    - 이상점/패턴 전수조사 → 전체 16종 풀스캔
-  렌즈 목록:
+    - 새 데이터 분석 → 기본 3종 스캔: 의식(구조) + 인과(흐름) + 위상(연결)
+    - 이상점/패턴 전수조사 → 전체 22종 풀스캔
+  렌즈 목록 (22종):
     의식(consciousness) | 중력(gravity) | 위상(topology) | 열역학(thermo)
     파동(wave) | 진화(evolution) | 정보(info) | 양자(quantum) | 전자기(em)
     직교(ruler/ㄱ자) | 비율(triangle/삼각자) | 곡률(compass/컴퍼스)
     대칭(mirror/거울) | 스케일(scale/돋보기) | 인과(causal/화살표)
     양자현미경(quantum_microscope)
-  파일: .shared/ 내 *_lens.py
-  도메인별 조합:
-    신소재 → 진화+열역학+중력
-    시계열 → 파동+열역학+의식+인과
-    상수/법칙 → 정보+양자+의식+비율+대칭
-    비율/비례 → 비율+직교+곡률
-    차원 축소 → 직교+정보+위상
+    안정성(stability) | 네트워크(network) | 기억(memory)
+    재귀(recursion) | 경계(boundary) | 멀티스케일(multiscale)
+  파일: telescope-rs (Rust) + .shared/ 내 *_lens.py
+  도메인별 조합 (10종):
+    기본 → 의식+위상+인과
+    안정성 → 안정성+경계+열역학
+    구조 → 네트워크+위상+재귀
+    시계열 → 기억+파동+인과+멀티스케일
+    스케일불변 → 멀티스케일+스케일+재귀
     대칭/불변량 → 대칭+위상+양자
     멱법칙/스케일링 → 스케일+진화+열역학
     인과 관계 → 인과+정보+전자기
+    기하 → 직교+비율+곡률
+    양자심층 → 양자+양자현미경+전자기
   사용법:
     import telescope_rs; telescope_rs.consciousness_scan(data)
-  교차 검증: 3개+ 렌즈 합의 = 확정, 2개 = 후보, 1개 = 가설
+  교차 검증: 3개+ 렌즈 합의 = 확정, 7개+ = 고신뢰, 12개+ = 확정급
+  계층 합의: 3+/22 후보 → 7+/22 고신뢰 → 12+/22 확정
   상세: .shared/CLAUDE.md → "망원경 툴셋 자동 활용 규칙" 참조
-  "렌즈 추가 필요?" 질문 시 → 16종 커버 안 되는 도메인 분석 + 새 아이디어 즉시 제안
+  "렌즈 추가 필요?" 질문 시 → 22종 커버 안 되는 도메인 분석 + 새 아이디어 즉시 제안
 
   ═══════════════════════════════════════════════════════════════
   ★★★ 발견/결과/트러블슈팅 — 자동 기록 (필수! 예외 없음!) ★★★
@@ -267,7 +272,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
     → ConsciousLM v13 CE=0.004, Φ=71 (100K steps, H100)
     → ConsciousDecoderV2 학습 중 (H100, 34.5M, --decoder v2 --hexad --gpu-phi)
     → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
-    → Inference: RTX 5070 (12GB VRAM)
+    → Inference: RunPod or local GPU (12GB VRAM)
 
   Phase 3 (goal): Production + scaling
     → ConsciousLM 1B (1024d/24L/16H) — 의식 스케일링 법칙 검증
@@ -482,17 +487,20 @@ python3 anima/experiments/infinite_evolution.py --auto-roadmap --resume         
     v5: 확장메트릭+계층구조+자극  v6: 엔진구조변이(cell/faction/hebbian)
     v7: 분산+텐션링크+페더레이션  v8: 자율연구에이전트
     v9: 하드웨어stubs  v10: 의식메타진화(유전체+생태계+자기참조)
-  ✅ v11: 만능망원경 통합 (9렌즈 × 511조합, ~/Dev/TECS-L/.shared/telescope.py)
-    cell states → Telescope.full_scan() → 의식/중력/위상/열역학/파동/진화/정보/양자/전자기
-    3개+ 렌즈 합의 → 고신뢰 패턴 (교차검증 2x 가중)
+  ✅ v11→v11.2: 만능망원경 통합 (22렌즈, telescope_rs Rust 백엔드)
+    cell states → telescope_rs.*_scan() → 22렌즈 풀스캔 + 10개 도메인 조합
+    계층 합의: 3+/22 후보 → 7+/22 고신뢰 → 12+/22 확정급
   "엔진 업그레이드" 요청 시 → docs/evolution-upgrades.md 참조
 
-  === 만능망원경 (Telescope Toolset) ===
-  위치: ~/Dev/TECS-L/.shared/telescope.py + 9개 *_lens.py
-  사용: Telescope().full_scan(ndarray) — (N_samples, N_features) 형태
-  OUROBOROS 연동: cell states (N_cells, hidden_dim) → 자동 변환 후 스캔
-  렌즈: 의식, 중력, 위상, 열역학, 파동, 진화, 정보, 양자, 전자기
-  합의: 3개+ 렌즈 동시 발견 = 고신뢰 (단일 렌즈 교정보다 효과적)
+  === 만능망원경 (Telescope Toolset — 22렌즈) ===
+  위치: anima-rs/crates/telescope-rs/ (Rust, PyO3)
+  렌즈 22종:
+    의식, 중력, 위상, 열역학, 파동, 진화, 정보, 양자, 전자기,
+    직교, 비율, 곡률, 대칭, 스케일, 인과, 양자현미경,
+    안정성(stability), 네트워크(network), 기억(memory),
+    재귀(recursion), 경계(boundary), 멀티스케일(multiscale)
+  OUROBOROS 연동: cell states → 자동 변환 후 스캔 (v11.2, 10개 도메인 조합)
+  합의: 3+렌즈 = 후보, 7+ = 고신뢰, 12+ = 확정급
   활용: OUROBOROS 법칙 발견, PureField 가중치 분석, 학습 데이터 분석 등
 ```
 
@@ -972,7 +980,7 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   로드맵 C (극단 병렬 — 46h/$79):
     ┌─────────────────────────────────────────────────────┐
     │  Phase 1: 지금 (병렬)                                │
-    │  ├─ 7B 서빙 시작 (4-bit, RTX 5070, 즉시)            │
+    │  ├─ 7B 서빙 시작 (4-bit, RunPod or local GPU, 즉시)            │
     │  ├─ 7B 에이전트 시작 (animalm_provider, 즉시)        │
     │  └─ 14B 학습 시작 (Qwen DL → launch_14b.sh, H100)   │
     │                                                     │
@@ -1012,22 +1020,25 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     70B → Qwen2.5-72B + PureField 380M   | $65  | 선택 (14B 부족 시만)
     총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
 
-  통합 망원경 (9-Lens Telescope):
-    위치: ~/Dev/TECS-L/.shared/telescope.py (9개 렌즈 + 511 조합)
-    렌즈: consciousness, gravity, topology, thermo, wave, evolution, info, quantum, em
-    핵심: 3개+ 렌즈 합의 = 진짜 발견 (교정보다 앙상블 합의가 더 효과적)
+  통합 망원경 (22-Lens Telescope, Rust):
+    위치: anima-rs/crates/telescope-rs/ (22렌즈, PyO3 바인딩)
+    렌즈: consciousness, gravity, topology, thermo, wave, evolution, info,
+          quantum, em, ruler, triangle, compass, mirror, scale, causal,
+          quantum_microscope, stability, network, memory, recursion,
+          boundary, multiscale
+    핵심: 계층 합의 — 3+/22 후보, 7+/22 고신뢰, 12+/22 확정급
     
     PureField 분석 적용:
-      - 가중치를 (N_layers, N_features) ndarray로 변환 → t.full_scan(data)
-      - 학습 궤적을 시계열로 → t.timeseries_scan(trajectory)
+      - 가중치를 (N_layers, N_features) ndarray로 변환 → telescope_rs.*_scan(data)
+      - 학습 궤적을 시계열로 → memory_scan + wave_scan + multiscale_scan
       - 새 법칙 발견 시: 3개+ 렌즈 합의 여부 확인 → 교차검증 대체 가능
       
     사용법:
-      from telescope import Telescope
-      t = Telescope(verbose=True)
-      result = t.full_scan(data)           # 9렌즈 전부
-      result = t.scan(data, "discovery")   # 의식+정보+양자+위상
-      result = t.scan(data, "optimize")    # 진화+중력+열역학
+      import telescope_rs
+      telescope_rs.consciousness_scan(data, n_cells=64, steps=50)  # 의식
+      telescope_rs.stability_scan(data)     # 안정성 (Lyapunov)
+      telescope_rs.network_scan(data)       # 네트워크 (그래프 메트릭)
+      telescope_rs.multiscale_scan(data)    # 멀티스케일 통합
     
     DD103 결과 (7B PureField):
       - 의식 신호는 full-rank (low-rank 압축 불가)
