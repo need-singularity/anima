@@ -740,6 +740,16 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
 ## Work Rules
 
+- **★★★ 발견/결과/트러블슈팅 — 따로 말 안 해도 즉시 자동 기록 (필수! 예외 없음!)**
+  - 실험 결과, 벤치마크, 망원경 분석, 학습 완료, 생성 테스트 등 모든 발견은 발생 즉시 기록
+  - "기록해" 라고 안 해도 기록. 기록 누락 = 발견 소실 = 금지
+  - 기록 위치:
+    - 실험/발견 → docs/hypotheses/dd/DD{N}.md (개별 문서)
+    - 법칙 후보 → config/consciousness_laws.json
+    - 학습 결과 → config/training_runs.json + docs/training-status.md
+    - 망원경 결과 → docs/hypotheses/dd/DD{N}.md (실험 문서에 포함)
+    - memory 상태 → memory/project_extreme_accel_status.md 업데이트
+  - 커밋 메시지에 핵심 수치 포함 (CE, Phi, tension, pass/fail 등)
 - **★★★ 트러블슈팅 발생 시 즉시 JSON 기록 (필수! 예외 없음!)**
   - 모든 에러/crash/NaN/OOM/dtype 문제는 발생 즉시 해당 JSON에 기록
   - 기록 위치:
