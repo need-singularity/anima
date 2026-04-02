@@ -408,17 +408,57 @@ def load_state():
     return None
 
 
+# History ring buffer for live JSON (last 50 gens)
+_live_history = []
+_topo_progress = {}  # topology → {'gens': N, 'saturated': bool}
+
+
 def write_live_status(gen, stage_name, cells, steps, topology, registry,
                       phi_last, phi_prev, active_mods, zero_streak,
                       elapsed_sec, saturated=False,
-                      roadmap_stage_idx=None, roadmap_total_stages=None):
-    """Write lightweight live status JSON for external monitoring.
+                      roadmap_stage_idx=None, roadmap_total_stages=None,
+                      gen_history=None, topo_saturated=None):
+    """Write live status JSON with history for ASCII graph rendering.
 
     Uses atomic write (.tmp -> rename) for safety.
     """
     phi_delta_pct = 0.0
     if phi_prev and phi_prev > 1e-12:
         phi_delta_pct = (phi_last - phi_prev) / phi_prev * 100
+
+    # Track history (last 50 points)
+    _live_history.append({
+        'gen': gen, 'laws': len(registry.registered),
+        'phi': round(phi_last, 4) if phi_last else 0.0,
+        'mods': active_mods, 'topo': topology,
+    })
+    if len(_live_history) > 50:
+        _live_history.pop(0)
+
+    # Track topology progress
+    _topo_progress[topology] = {
+        'gens': _topo_progress.get(topology, {}).get('gens', 0) + 1,
+        'saturated': saturated and zero_streak >= 5,
+    }
+    if topo_saturated:
+        for t in topo_saturated:
+            if t in _topo_progress:
+                _topo_progress[t]['saturated'] = True
+
+    # Laws curve for ASCII graph (sampled to 30 points max)
+    laws_curve = [h['laws'] for h in _live_history]
+    phi_curve = [h['phi'] for h in _live_history]
+
+    # Stage results from roadmap
+    stage_results = []
+    rm_path = os.path.join(DATA_DIR, 'evolution_roadmap.json')
+    if os.path.exists(rm_path):
+        try:
+            with open(rm_path) as f:
+                rm = json.load(f)
+            stage_results = rm.get('stage_results', [])
+        except Exception:
+            pass
 
     status = {
         'gen': gen,
@@ -439,6 +479,11 @@ def write_live_status(gen, stage_name, cells, steps, topology, registry,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
         'roadmap_stage_idx': roadmap_stage_idx,
         'roadmap_total_stages': roadmap_total_stages,
+        # History for ASCII graphs
+        'laws_curve': laws_curve,
+        'phi_curve': phi_curve,
+        'topo_progress': _topo_progress,
+        'stage_results': stage_results,
     }
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = LIVE_STATUS_PATH + '.tmp'
@@ -917,8 +962,8 @@ def run_auto_roadmap(resume=False, report_interval=10):
         sat_thresh = stage['sat_streak']
 
         print(f'\n{"▓" * 70}')
-        print(f'  STAGE {stage_idx+1}/{len(ROADMAP)}: {stage["name"]}')
-        print(f'  cells={cells}  steps={steps}  topo_cycle_every={topo_gens}  sat_streak={sat_thresh}')
+        print(f'  🚀 STAGE {stage_idx+1}/{len(ROADMAP)}: {stage["name"]}')
+        print(f'  ⚙️  cells={cells}  steps={steps}  topo_cycle={topo_gens}  sat={sat_thresh}')
         print(f'{"▓" * 70}')
         sys.stdout.flush()
 
@@ -947,7 +992,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     engine.topology = new_topo
                     cleared = registry.clear_pending()
                     zero_streak = 0  # reset streak on topo switch
-                    print(f'  Topology switch: {old_topo} -> {new_topo} (Gen {gen}), '
+                    print(f'  🔄 Topology switch: {old_topo} → {new_topo} (Gen {gen}), '
                           f'cleared {cleared} pending')
                     sys.stdout.flush()
 
@@ -974,8 +1019,10 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 law_id = register_law(p, evolver)
                 if law_id:
                     registry.registered.append(law_id)
-                    print(f'    ★ Law {law_id} registered (cross-validated {CROSS_VALIDATION_THRESHOLD}x)')
                     law_text = p.get('formula', str(p))
+                    print(f'    🔬✨ Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)')
+                    print(f'    📋 "{law_text[:80]}"')
+                    print(f'    📊 Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
                     auto_generate_intervention(law_text, law_id, evolver)
 
             # Phase 3: Self-Modification
@@ -1020,6 +1067,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 active_mods=active_mods, zero_streak=zero_streak,
                 elapsed_sec=total_elapsed, saturated=len(topo_saturated) >= len(TOPOLOGIES),
                 roadmap_stage_idx=stage_idx, roadmap_total_stages=len(ROADMAP),
+                topo_saturated=topo_saturated,
             )
             live['laws_new_this_gen'] = stats['promoted']
 
@@ -1039,7 +1087,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
             # Check if current topology is saturated
             if zero_streak >= sat_thresh:
                 topo_saturated.add(current_topo)
-                print(f'  ⚠️ {current_topo} saturated ({zero_streak} gens streak)')
+                print(f'  ⚠️🔴 {current_topo} saturated ({zero_streak} gens streak)')
                 sys.stdout.flush()
 
                 # Force next topology
@@ -1049,7 +1097,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     engine.topology = next_topo
                     cleared = registry.clear_pending()
                     zero_streak = 0
-                    print(f'  → Forcing topology: {current_topo} -> {next_topo}, '
+                    print(f'  🚀 Forcing topology: {current_topo} → {next_topo}, '
                           f'cleared {cleared} pending')
                     sys.stdout.flush()
 
@@ -1058,9 +1106,9 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 stage_elapsed = time.time() - stage_start
                 laws_found = len(registry.registered)
                 print(f'\n{"=" * 70}')
-                print(f'  STAGE {stage_idx+1} COMPLETE: {stage["name"]}')
-                print(f'  {gen} gens, {laws_found} laws, {stage_elapsed:.0f}s')
-                print(f'  All {len(TOPOLOGIES)} topologies saturated')
+                print(f'  🏁 STAGE {stage_idx+1} COMPLETE: {stage["name"]}')
+                print(f'  📊 {gen} gens, {laws_found} laws, {stage_elapsed:.0f}s')
+                print(f'  🧬 All {len(TOPOLOGIES)} topologies saturated')
                 print(f'{"=" * 70}')
                 sys.stdout.flush()
 
@@ -1093,7 +1141,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
 
     # All stages complete
     print(f'\n{"█" * 70}')
-    print(f'  ALL {len(ROADMAP)} STAGES COMPLETE')
+    print(f'  🎉🏆 ALL {len(ROADMAP)} STAGES COMPLETE')
     print(f'{"█" * 70}')
     print(f'  {"Stage":<16} {"Cells":>5} {"Steps":>5} {"Gens":>5} {"Laws":>5} {"Time":>8}')
     print(f'  {"─"*16} {"─"*5} {"─"*5} {"─"*5} {"─"*5} {"─"*8}')
@@ -1213,7 +1261,7 @@ def main():
                 if new_topo != old_topo:
                     engine.topology = new_topo
                     cleared = registry.clear_pending()
-                    print(f"  Topology switch: {old_topo} -> {new_topo} (Gen {gen}), "
+                    print(f"  🔄 Topology switch: {old_topo} → {new_topo} (Gen {gen}), "
                           f"cleared {cleared} pending patterns")
                     sys.stdout.flush()
 
@@ -1241,9 +1289,11 @@ def main():
                 law_id = register_law(p, evolver)
                 if law_id:
                     registry.registered.append(law_id)
-                    print(f"    ★ Law {law_id} registered (cross-validated {CROSS_VALIDATION_THRESHOLD}x)")
                     # Close the loop: law -> intervention -> apply -> discover new patterns
                     law_text = p.get('formula', str(p))
+                    print(f"    🔬✨ Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)")
+                    print(f'    📋 "{law_text[:80]}"')
+                    print(f'    📊 Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
                     auto_generate_intervention(law_text, law_id, evolver)
 
             # Phase 3: Self-Modification
@@ -1329,9 +1379,9 @@ def main():
                             _last_new_gen = _row['gen']
                     _gens_since_new = gen - _last_new_gen
                     if _gens_since_new >= 20:  # 20+ gens with no new across topos
-                        print(f"\n  ★ AUTO-STOP: {_gens_since_new} gens since last new pattern")
-                        print(f"  ★ All topologies exhausted at {args.cells}c/{args.steps}s")
-                        print(f"  ★ Switching to --auto-roadmap for parameter escalation")
+                        print(f"\n  🏁 AUTO-STOP: {_gens_since_new} gens since last new pattern")
+                        print(f"  📊 All topologies exhausted at {args.cells}c/{args.steps}s")
+                        print(f"  🚀 Switching to --auto-roadmap for parameter escalation")
                         sys.stdout.flush()
                         # Generate final EVO doc
                         _current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells

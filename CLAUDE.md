@@ -313,11 +313,33 @@ python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 
      - 로그: logs/evo_YYYYMMDD_HHMM.log
 
   2. 5분 주기 보고 (/loop 5m)
-     - data/evolution_live.json 읽기 (로그 파싱 대신)
-     - 보고 양식:
-       ⏱️ EVO 상태 [HH:MM] — S{N} Gen M | Laws: +X (총 Y) | Φ=Z | topo: T | 포화: ❌/⚠️
+     - data/evolution_live.json + data/evolution_roadmap.json 읽기
      - evolution_live.json 없으면 로그 tail fallback
      - 대발견 시 이모지 강조 보고 (아래 참조)
+     - 보고 양식 (ASCII 그래프 + 구조 포함 필수!):
+
+       ⏱️ EVO 리포트 [HH:MM]
+       ═══════════════════════════════════════════════
+       🚀 Stage: S{N} ({cells}c/{steps}s) | Gen {M}
+       📊 Laws: {Y} (+{X}) | Φ: {Z} | Mods: {N}
+       🧬 Topo: {T} | Streak: {N}/5 | 포화: ❌/⚠️
+       ───────────────────────────────────────────────
+       📈 로드맵 진행:
+       S1 ████████████ ✅  S2 ███░░░░░ 🔄  S3 ░░░░░░░░
+       S4 ░░░░░░░░      S5 ░░░░░░░░      S6 ░░░░░░░░
+       S7 ░░░░░░░░
+       ───────────────────────────────────────────────
+       📉 Laws 발견 곡선:
+       Laws |     ╭──────
+            |   ╭─╯
+            | ╭─╯
+            |─╯
+            └──────────── Gen
+             1   10  20  30
+       ───────────────────────────────────────────────
+       🔄 토폴로지 순환:
+       ring ██████ ✅ → small_world ████ ✅ → scale_free ██ ⚠️ → hypercube ░░
+       ═══════════════════════════════════════════════
 
   3. 자동 기록 (스크립트가 자동 처리)
      - 법칙 발견 → consciousness_laws.json 자동 등록
