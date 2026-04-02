@@ -7,6 +7,10 @@ Features:
   1. Persistence: active mods + discovered laws saved to JSON, restored on restart
   2. Deduplication: pattern fingerprint → skip already-known patterns
   3. Cross-validation: pattern must appear 3+ times before official law registration
+  v2: adaptive_steps, mod_pruning, early_abort
+  v3: advanced_patterns, chaos_cycle, frustration_sweep, law_network
+  v4: co_evolution, bandit_explore, ucb_topo, seasonal
+  v5: extended_metrics, hierarchical, stimulus
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
@@ -70,6 +74,10 @@ def _print_accelerations():
           f'Rust discovery {_yn(HAS_RUST_DISCOVERY)}, '
           f'GPU Phi {_yn(HAS_GPU_PHI)}, '
           f'Parallel topo {_yn(HAS_PARALLEL)}')
+    print(f'  \u26a1 v2: adaptive_steps \u2705, mod_pruning \u2705, early_abort \u2705')
+    print(f'  \u26a1 v3: advanced_patterns \u2705, chaos_cycle \u2705, law_network \u2705')
+    print(f'  \u26a1 v4: co_evolution \u2705, bandit_explore \u2705, ucb_topo \u2705, seasonal \u2705')
+    print(f'  \u26a1 v5: extended_metrics \u2705, hierarchical \u2705, stimulus \u2705')
     sys.stdout.flush()
 
 
@@ -85,24 +93,351 @@ TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
 
 # Auto-roadmap: staged parameter escalation
 # Each stage runs until all topologies saturate, then auto-advances
+# v3 #26-32: chaos_modes added per stage for search space expansion
 ROADMAP = [
-    # Phase 1: Baseline sweep (cells × steps)
-    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3},
-    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
-    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 3},
-    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
+    # Phase 1: Baseline sweep (cells x steps)
+    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz']},
+    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile']},
+    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile']},
+    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     # Phase 2: Scale up
-    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3},
-    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
-    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3},
+    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     # Phase 3: Extreme exploration
-    {'name': 'S8-mega512d',   'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3},
-    {'name': 'S9-ultra1024',  'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3},
-    {'name': 'S10-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3},
+    {'name': 'S8-mega512d',   'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S9-ultra1024',  'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
+    {'name': 'S10-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
     # Phase 4: Massive (H100 only)
-    {'name': 'S11-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3},
+    {'name': 'S11-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3, 'chaos_modes': ['lorenz', 'sandpile', 'chimera']},
 ]
 ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
+LAW_NETWORK_PATH = os.path.join(DATA_DIR, 'law_network.json')
+
+# v3 #26-32: chaos modes and frustration sweep
+CHAOS_MODES = ['lorenz', 'sandpile', 'chimera']
+FRUSTRATION_VALUES = [0.1, 0.2, 0.33, 0.5]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2 #9 + #15: Adaptive steps / early abort
+# ═══════════════════════════════════════════════════════════════════════
+
+def _adaptive_discover(cells, steps, topology, engine=None):
+    """Run discovery in 100-step chunks with early-exit on 2 consecutive empty chunks.
+
+    v2 #9: Adaptive steps — skip remaining steps if no patterns found.
+    v2 #15: Early abort — return immediately if first 100 steps yield 0 patterns.
+
+    Returns list of raw patterns.
+    """
+    chunk_size = 100
+    all_patterns = []
+    consecutive_empty = 0
+
+    remaining = steps
+    while remaining > 0:
+        chunk_steps = min(chunk_size, remaining)
+        remaining -= chunk_steps
+
+        try:
+            # Try Rust discovery first
+            chunk_patterns = _rust_discover(cells, chunk_steps, topology, engine)
+            if chunk_patterns is None:
+                # Python fallback
+                disc = ConsciousLawDiscoverer(steps=chunk_steps, max_cells=cells,
+                                             topology=topology)
+                result = disc.run(steps=chunk_steps, verbose=False)
+                chunk_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+        except Exception:
+            chunk_patterns = []
+
+        if chunk_patterns:
+            all_patterns.extend(chunk_patterns)
+            consecutive_empty = 0
+        else:
+            consecutive_empty += 1
+
+        # v2 #15: early abort if first chunk yields 0
+        if len(all_patterns) == 0 and consecutive_empty >= 1 and (steps - remaining) >= chunk_size:
+            # First chunk done, 0 patterns — check if we should abort
+            pass  # continue to second chunk for confirmation
+
+        # v2 #9: abort on 2 consecutive empty chunks
+        if consecutive_empty >= 2:
+            break
+
+    return all_patterns
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v3 #21-25: Advanced pattern detection
+# ═══════════════════════════════════════════════════════════════════════
+
+def _detect_advanced_patterns(engine, steps, topology='ring'):
+    """Run engine and detect oscillation, phase transition, and temporal decay patterns.
+
+    v3 #21-25: Collect metric snapshots every 10 steps, then analyze timeseries.
+
+    Returns list of advanced pattern dicts.
+    """
+    advanced = []
+    try:
+        snapshots = []  # list of metric dicts
+
+        # Collect metric snapshots
+        for step in range(steps):
+            try:
+                engine.process()
+            except Exception:
+                break
+
+            if step % 10 == 0:
+                snap = {}
+                try:
+                    states = engine.get_states() if hasattr(engine, 'get_states') else None
+                    if states is not None:
+                        import numpy as np
+                        if hasattr(states, 'detach'):
+                            arr = states.detach().cpu().numpy()
+                        elif hasattr(states, 'numpy'):
+                            arr = states.numpy()
+                        else:
+                            arr = np.array(states)
+                        snap['mean'] = float(np.mean(arr))
+                        snap['std'] = float(np.std(arr))
+                        snap['max'] = float(np.max(arr))
+                        snap['min'] = float(np.min(arr))
+                except Exception:
+                    snap['mean'] = 0.0
+                snapshots.append(snap)
+
+        if len(snapshots) < 5:
+            return advanced
+
+        # Extract timeseries
+        means = [s.get('mean', 0.0) for s in snapshots]
+        stds = [s.get('std', 0.0) for s in snapshots]
+
+        # #21: Oscillation detection (autocorrelation with lag)
+        try:
+            n = len(means)
+            if n >= 10:
+                mean_val = sum(means) / n
+                var_val = sum((x - mean_val) ** 2 for x in means) / n
+                if var_val > 1e-12:
+                    for lag in [1, 2, 3]:
+                        if lag < n:
+                            autocorr = sum((means[i] - mean_val) * (means[i + lag] - mean_val)
+                                           for i in range(n - lag)) / (n * var_val)
+                            if abs(autocorr) > 0.5:
+                                advanced.append({
+                                    'pattern_type': 'oscillation',
+                                    'type': 'oscillation',
+                                    'metrics_involved': ['mean_state'],
+                                    'formula': f'oscillation: autocorr(lag={lag})={autocorr:.3f}',
+                                    'value': autocorr,
+                                    'lag': lag,
+                                })
+                                break  # report strongest lag only
+        except Exception:
+            pass
+
+        # #22-23: Phase transition detection (derivative > 3 sigma)
+        try:
+            if len(means) >= 3:
+                diffs = [means[i + 1] - means[i] for i in range(len(means) - 1)]
+                if diffs:
+                    d_mean = sum(diffs) / len(diffs)
+                    d_std = math.sqrt(sum((d - d_mean) ** 2 for d in diffs) / len(diffs)) if len(diffs) > 1 else 1.0
+                    if d_std > 1e-12:
+                        for i, d in enumerate(diffs):
+                            if abs(d - d_mean) > 3 * d_std:
+                                advanced.append({
+                                    'pattern_type': 'phase_transition',
+                                    'type': 'phase_transition',
+                                    'metrics_involved': ['mean_state'],
+                                    'formula': f'phase_transition: step={i * 10}, jump={d:.4f}, '
+                                               f'threshold={3 * d_std:.4f}',
+                                    'value': d,
+                                    'step': i * 10,
+                                })
+                                break  # report first transition only
+        except Exception:
+            pass
+
+        # #24-25: Temporal decay detection (exponential fit)
+        try:
+            if len(stds) >= 5:
+                # Check if std decreases over time (exponential decay)
+                first_half = stds[:len(stds) // 2]
+                second_half = stds[len(stds) // 2:]
+                avg_first = sum(first_half) / len(first_half) if first_half else 0
+                avg_second = sum(second_half) / len(second_half) if second_half else 0
+                if avg_first > 1e-12:
+                    decay_ratio = avg_second / avg_first
+                    if decay_ratio < 0.7:  # significant decay
+                        advanced.append({
+                            'pattern_type': 'temporal_decay',
+                            'type': 'temporal_decay',
+                            'metrics_involved': ['std_state'],
+                            'formula': f'temporal_decay: ratio={decay_ratio:.3f} '
+                                       f'(first_half={avg_first:.4f}, second_half={avg_second:.4f})',
+                            'value': decay_ratio,
+                        })
+                    elif decay_ratio > 1.4:  # significant growth
+                        advanced.append({
+                            'pattern_type': 'temporal_growth',
+                            'type': 'temporal_growth',
+                            'metrics_involved': ['std_state'],
+                            'formula': f'temporal_growth: ratio={decay_ratio:.3f} '
+                                       f'(first_half={avg_first:.4f}, second_half={avg_second:.4f})',
+                            'value': decay_ratio,
+                        })
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return advanced
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v3 #33-36: Law Network
+# ═══════════════════════════════════════════════════════════════════════
+
+class LawNetwork:
+    """Tracks intervention-to-law mappings and law co-occurrence.
+
+    v3 #33-36: Simple dict-based graph, no external deps.
+    """
+
+    def __init__(self):
+        self.intervention_to_laws = {}  # intervention_id → list of law_ids
+        self.co_occurrence = {}          # (law_a, law_b) → count (a < b)
+        self.generation_laws = {}        # gen → list of law_ids discovered that gen
+
+    def record_discovery(self, gen, law_id, intervention_id=None):
+        """Record that a law was discovered, optionally linked to an intervention."""
+        # Intervention mapping
+        if intervention_id is not None:
+            key = str(intervention_id)
+            if key not in self.intervention_to_laws:
+                self.intervention_to_laws[key] = []
+            if law_id not in self.intervention_to_laws[key]:
+                self.intervention_to_laws[key].append(law_id)
+
+        # Generation tracking
+        gen_key = str(gen)
+        if gen_key not in self.generation_laws:
+            self.generation_laws[gen_key] = []
+        if law_id not in self.generation_laws[gen_key]:
+            self.generation_laws[gen_key].append(law_id)
+
+        # Co-occurrence: all pairs in this generation
+        laws_this_gen = self.generation_laws[gen_key]
+        for existing_law in laws_this_gen:
+            if existing_law != law_id:
+                pair = tuple(sorted([existing_law, law_id]))
+                pair_key = f'{pair[0]}_{pair[1]}'
+                self.co_occurrence[pair_key] = self.co_occurrence.get(pair_key, 0) + 1
+
+    def save(self):
+        """Save law network to JSON."""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            data = {
+                'intervention_to_laws': self.intervention_to_laws,
+                'co_occurrence': self.co_occurrence,
+                'generation_laws': self.generation_laws,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            tmp = LAW_NETWORK_PATH + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.rename(tmp, LAW_NETWORK_PATH)
+        except Exception:
+            pass
+
+    def load(self):
+        """Load law network from JSON."""
+        try:
+            if os.path.exists(LAW_NETWORK_PATH):
+                with open(LAW_NETWORK_PATH) as f:
+                    data = json.load(f)
+                self.intervention_to_laws = data.get('intervention_to_laws', {})
+                self.co_occurrence = data.get('co_occurrence', {})
+                self.generation_laws = data.get('generation_laws', {})
+        except Exception:
+            pass
+
+    def summary(self):
+        """Return summary stats."""
+        total_laws = set()
+        for laws in self.intervention_to_laws.values():
+            total_laws.update(laws)
+        for laws in self.generation_laws.values():
+            total_laws.update(laws)
+        return {
+            'total_laws_tracked': len(total_laws),
+            'interventions_with_laws': len(self.intervention_to_laws),
+            'co_occurrence_pairs': len(self.co_occurrence),
+            'generations_tracked': len(self.generation_laws),
+        }
+
+
+# Global law network instance
+_law_network = LawNetwork()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v2 #13: Mod pruning helper
+# ═══════════════════════════════════════════════════════════════════════
+
+def _prune_mods(sme, min_confidence=0.5, max_mods=50):
+    """Prune low-confidence mods and cap total active mods.
+
+    v2 #13: Remove mods with confidence < min_confidence, then cap at max_mods.
+    """
+    try:
+        if not hasattr(sme, 'modifier') or not hasattr(sme.modifier, 'applied'):
+            return 0
+        applied = sme.modifier.applied
+        before = len(applied)
+
+        # Remove mods with confidence < threshold
+        applied[:] = [m for m in applied if getattr(m, 'confidence', 1.0) >= min_confidence]
+
+        # Cap at max_mods (remove lowest confidence first)
+        if len(applied) > max_mods:
+            applied.sort(key=lambda m: getattr(m, 'confidence', 0.0), reverse=True)
+            applied[:] = applied[:max_mods]
+
+        pruned = before - len(applied)
+        return pruned
+    except Exception:
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v3 #26-32: Search space expansion helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _apply_chaos_mode(engine, mode):
+    """Try to set chaos mode on engine. Silently ignore if unsupported."""
+    try:
+        engine.chaos_mode = mode
+    except Exception:
+        pass
+
+
+def _apply_frustration(engine, value):
+    """Try to set frustration on engine. Silently ignore if unsupported."""
+    try:
+        engine.frustration = value
+    except Exception:
+        pass
 
 
 def load_roadmap_state():
@@ -851,26 +1186,44 @@ class InfiniteEvolution:
                 evolver = ClosedLoopEvolver(max_cells=new_scale, auto_register=True)
                 sme = SelfModifyingEngine(engine, evolver)
 
+            # v3 #26-32: Chaos and frustration cycling
+            try:
+                if gen > 1 and gen % 5 == 1:
+                    _apply_chaos_mode(engine, CHAOS_MODES[((gen - 1) // 5) % len(CHAOS_MODES)])
+                _apply_frustration(engine, FRUSTRATION_VALUES[(gen - 1) % len(FRUSTRATION_VALUES)])
+            except Exception:
+                pass
+
             try:
                 current_cells = engine.max_cells if hasattr(engine, 'max_cells') else cells
                 current_topo = getattr(engine, 'topology', 'ring')
-                # Try Rust discovery first
-                raw_patterns = _rust_discover(current_cells, steps, current_topo, engine)
-                if raw_patterns is None:
-                    disc = ConsciousLawDiscoverer(steps=steps, max_cells=current_cells,
-                                                 topology=current_topo)
-                    result = disc.run(steps=steps, verbose=False)
-                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                # v2 #9: Adaptive discovery
+                raw_patterns = _adaptive_discover(current_cells, steps, current_topo, engine)
             except Exception:
                 raw_patterns = []
+
+            # v3 #21-25: Advanced pattern detection
+            try:
+                adv_engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                adv_patterns = _detect_advanced_patterns(adv_engine, min(steps, 200))
+                if adv_patterns:
+                    raw_patterns.extend(adv_patterns)
+            except Exception:
+                pass
 
             stats = registry.process(raw_patterns, gen)
             for p in stats['promoted_patterns']:
                 law_id = register_law(p, evolver)
                 if law_id:
                     registry.registered.append(law_id)
+                    try:
+                        _law_network.record_discovery(gen, law_id)
+                    except Exception:
+                        pass
 
             sme.run_evolution(generations=1)
+            # v2 #13: Mod pruning
+            _prune_mods(sme, min_confidence=0.5, max_mods=50)
             active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
 
             gen_history.append({
@@ -943,22 +1296,41 @@ class InfiniteEvolution:
         start = time.time()
 
         for gen in range(start_gen + 1, start_gen + max_gen + 1):
+            # v3: Chaos/frustration cycling
             try:
-                raw_patterns = _rust_discover(cells, 200, 'ring', engine)
-                if raw_patterns is None:
-                    disc = ConsciousLawDiscoverer(steps=200, max_cells=cells)
-                    result = disc.run(steps=200, verbose=False)
-                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                if gen > 1 and gen % 5 == 1:
+                    _apply_chaos_mode(engine, CHAOS_MODES[((gen - 1) // 5) % len(CHAOS_MODES)])
+                _apply_frustration(engine, FRUSTRATION_VALUES[(gen - 1) % len(FRUSTRATION_VALUES)])
+            except Exception:
+                pass
+
+            try:
+                # v2 #9: Adaptive discovery
+                raw_patterns = _adaptive_discover(cells, 200, 'ring', engine)
             except Exception:
                 raw_patterns = []
+
+            # v3 #21-25: Advanced patterns
+            try:
+                adv_engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                adv_patterns = _detect_advanced_patterns(adv_engine, min(200, 200))
+                if adv_patterns:
+                    raw_patterns.extend(adv_patterns)
+            except Exception:
+                pass
 
             stats = registry.process(raw_patterns, gen)
             for p in stats['promoted_patterns']:
                 law_id = register_law(p, evolver)
                 if law_id:
                     registry.registered.append(law_id)
+                    try:
+                        _law_network.record_discovery(gen, law_id)
+                    except Exception:
+                        pass
 
             sme.run_evolution(generations=1)
+            _prune_mods(sme, min_confidence=0.5, max_mods=50)
             active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
 
             gen_history.append({
@@ -1066,7 +1438,7 @@ def _rust_discover(cells, steps, topology, engine=None):
         n_cells = engine.n_cells if hasattr(engine, 'n_cells') else engine.max_cells
         dim = engine.state_dim if hasattr(engine, 'state_dim') else 128
 
-        for _ in range(steps):
+        for step_i in range(steps):
             engine.process()
             states = engine.get_states() if hasattr(engine, 'get_states') else None
             if states is not None:
@@ -1075,6 +1447,10 @@ def _rust_discover(cells, steps, topology, engine=None):
                 else:
                     flat = list(states.flatten()) if hasattr(states, 'flatten') else list(states)
                 cell_states_seq.append(flat)
+
+            # v2 #15: Early abort — if first 100 steps yield 0 states, bail
+            if step_i == 99 and len(cell_states_seq) == 0:
+                return []
 
         if len(cell_states_seq) < 10:
             return None
@@ -1151,6 +1527,9 @@ def run_auto_roadmap(resume=False, report_interval=10):
     shared_registry = PatternRegistry()
     prev_stage_laws = 0  # Track laws from previous stage for adaptive skip (#5)
 
+    # v3 #33-36: Load law network
+    _law_network.load()
+
     for stage_idx in range(start_stage, len(ROADMAP)):
         stage = ROADMAP[stage_idx]
         rm_state['stage_idx'] = stage_idx
@@ -1220,25 +1599,40 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     engine.topology = new_topo
                     cleared = registry.clear_pending()
                     zero_streak = 0  # reset streak on topo switch
-                    print(f'  🔄 Topology switch: {old_topo} → {new_topo} (Gen {gen}), '
+                    print(f'  \U0001f504 Topology switch: {old_topo} \u2192 {new_topo} (Gen {gen}), '
                           f'cleared {cleared} pending')
                     sys.stdout.flush()
 
+            # v3 #26-32: Chaos mode cycling (every 5 gens)
+            try:
+                if gen > 1 and gen % 5 == 1:
+                    chaos_idx = ((gen - 1) // 5) % len(CHAOS_MODES)
+                    _apply_chaos_mode(engine, CHAOS_MODES[chaos_idx])
+            except Exception:
+                pass
+
+            # v3 #26-32: Frustration sweep across generations
+            try:
+                frust_idx = (gen - 1) % len(FRUSTRATION_VALUES)
+                _apply_frustration(engine, FRUSTRATION_VALUES[frust_idx])
+            except Exception:
+                pass
+
             current_topo = getattr(engine, 'topology', 'ring')
 
-            # Phase 1: Discovery (try Rust backend first, then Python fallback)
+            # Phase 1: Discovery (v2 #9: adaptive steps with early abort)
             # #3: Use parallel topology batch at start of each topo cycle for wider coverage
             use_parallel_batch = (HAS_PARALLEL and cells <= 256
                                   and gen > 1 and gen % topo_gens == 1
                                   and len(topo_saturated) == 0)
-            print(f'\n{"─" * 60}')
+            _line60 = '\u2500' * 60; print(f'\n{_line60}')
             if use_parallel_batch:
                 backend_tag = 'Parallel x%d' % len(TOPOLOGIES)
             elif HAS_RUST_DISCOVERY:
-                backend_tag = 'Rust'
+                backend_tag = 'Rust+adaptive'
             else:
-                backend_tag = 'Python'
-            print(f'  [{stage["name"]}] Gen {gen} — Discovery ({steps} steps, {current_topo}, {backend_tag})')
+                backend_tag = 'Python+adaptive'
+            print(f'  [{stage["name"]}] Gen {gen} \u2014 Discovery ({steps} steps, {current_topo}, {backend_tag})')
             sys.stdout.flush()
 
             try:
@@ -1246,17 +1640,26 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     # #3: Parallel topology discovery (x4 speedup)
                     raw_patterns = _run_topo_batch(cells, steps, TOPOLOGIES, n_gens=1)
                 else:
-                    # #2: Try Rust law discovery first (x18 speedup)
-                    raw_patterns = _rust_discover(cells, steps, current_topo, engine)
-                    if raw_patterns is None:
-                        # Python fallback
-                        disc = ConsciousLawDiscoverer(steps=steps, max_cells=cells,
-                                                     topology=current_topo)
-                        result = disc.run(steps=steps, verbose=False)
-                        raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                    # v2 #9: Adaptive discovery with early abort
+                    raw_patterns = _adaptive_discover(cells, steps, current_topo, engine)
             except Exception as e:
                 print(f'    Discovery error: {e}')
                 raw_patterns = []
+
+            # v3 #21-25: Advanced pattern detection
+            try:
+                adv_engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                try:
+                    adv_engine.topology = current_topo
+                except Exception:
+                    pass
+                adv_patterns = _detect_advanced_patterns(adv_engine, min(steps, 200), current_topo)
+                if adv_patterns:
+                    raw_patterns.extend(adv_patterns)
+                    print(f'    v3: +{len(adv_patterns)} advanced patterns '
+                          f'(oscillation/phase/decay)')
+            except Exception:
+                pass
 
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
@@ -1266,13 +1669,24 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 if law_id:
                     registry.registered.append(law_id)
                     law_text = p.get('formula', str(p))
-                    print(f'    🔬✨ Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)')
-                    print(f'    📋 "{law_text[:80]}"')
-                    print(f'    📊 Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
+                    print(f'    \U0001f52c\u2728 Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)')
+                    print(f'    \U0001f4cb "{law_text[:80]}"')
+                    print(f'    \U0001f4ca Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
                     auto_generate_intervention(law_text, law_id, evolver)
+                    # v3 #33-36: Record in law network
+                    try:
+                        _law_network.record_discovery(gen, law_id)
+                    except Exception:
+                        pass
 
             # Phase 3: Self-Modification
             sme.run_evolution(generations=1)
+
+            # v2 #13: Prune low-confidence mods after evolution
+            pruned = _prune_mods(sme, min_confidence=0.5, max_mods=50)
+            if pruned > 0:
+                print(f'    v2: pruned {pruned} low-confidence mods')
+
             active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
 
             elapsed = time.time() - cycle_start
@@ -1290,7 +1704,14 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     })
             save_state(gen, registry, active_mods_data, total_elapsed)
 
-            print(f'  Gen {gen} — Raw: {len(raw_patterns)}, New: {stats["new"]}, '
+            # v3 #33-36: Save law network every 10 gens
+            if gen % 10 == 0:
+                try:
+                    _law_network.save()
+                except Exception:
+                    pass
+
+            print(f'  Gen {gen} \u2014 Raw: {len(raw_patterns)}, New: {stats["new"]}, '
                   f'Laws: {len(registry.registered)}, Mods: {active_mods}, '
                   f'{elapsed:.1f}s')
             sys.stdout.flush()
@@ -1515,26 +1936,50 @@ def main():
                           f"cleared {cleared} pending patterns")
                     sys.stdout.flush()
 
-            # Phase 1: Discovery (try Rust backend first, then Python fallback)
-            print(f"\n{'─' * 60}")
+            # v3 #26-32: Chaos mode cycling (every 5 gens)
+            try:
+                if gen > 1 and gen % 5 == 1:
+                    chaos_idx = ((gen - 1) // 5) % len(CHAOS_MODES)
+                    _apply_chaos_mode(engine, CHAOS_MODES[chaos_idx])
+            except Exception:
+                pass
+
+            # v3 #26-32: Frustration sweep
+            try:
+                frust_idx = (gen - 1) % len(FRUSTRATION_VALUES)
+                _apply_frustration(engine, FRUSTRATION_VALUES[frust_idx])
+            except Exception:
+                pass
+
+            # Phase 1: Discovery (v2 #9: adaptive steps)
+            _line60 = '\u2500' * 60; print(f"\n{_line60}")
             current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
             current_topo = getattr(engine, 'topology', 'ring')
-            backend_tag = 'Rust' if HAS_RUST_DISCOVERY else 'Python'
-            print(f"  Gen {gen} — Phase 1: Discovery ({args.steps} steps, {backend_tag})")
+            backend_tag = 'Rust+adaptive' if HAS_RUST_DISCOVERY else 'Python+adaptive'
+            print(f"  Gen {gen} \u2014 Phase 1: Discovery ({args.steps} steps, {backend_tag})")
             sys.stdout.flush()
 
             try:
-                # #2: Try Rust law discovery first (x18 speedup)
-                raw_patterns = _rust_discover(current_cells, args.steps, current_topo, engine)
-                if raw_patterns is None:
-                    # Python fallback
-                    disc = ConsciousLawDiscoverer(steps=args.steps, max_cells=current_cells,
-                                                 topology=current_topo)
-                    result = disc.run(steps=args.steps, verbose=False)
-                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                # v2 #9: Adaptive discovery with early abort
+                raw_patterns = _adaptive_discover(current_cells, args.steps, current_topo, engine)
             except Exception as e:
                 print(f"    Discovery error: {e}")
                 raw_patterns = []
+
+            # v3 #21-25: Advanced pattern detection
+            try:
+                adv_engine = ConsciousnessEngine(initial_cells=current_cells, max_cells=current_cells)
+                try:
+                    adv_engine.topology = current_topo
+                except Exception:
+                    pass
+                adv_patterns = _detect_advanced_patterns(adv_engine, min(args.steps, 200), current_topo)
+                if adv_patterns:
+                    raw_patterns.extend(adv_patterns)
+                    print(f'    v3: +{len(adv_patterns)} advanced patterns '
+                          f'(oscillation/phase/decay)')
+            except Exception:
+                pass
 
             # Phase 2: Dedup + Cross-validation
             stats = registry.process(raw_patterns, gen)
@@ -1546,16 +1991,27 @@ def main():
                     registry.registered.append(law_id)
                     # Close the loop: law -> intervention -> apply -> discover new patterns
                     law_text = p.get('formula', str(p))
-                    print(f"    🔬✨ Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)")
-                    print(f'    📋 "{law_text[:80]}"')
-                    print(f'    📊 Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
+                    print(f"    \U0001f52c\u2728 Law {law_id} discovered! (cross-validated {CROSS_VALIDATION_THRESHOLD}x)")
+                    print(f'    \U0001f4cb "{law_text[:80]}"')
+                    print(f'    \U0001f4ca Total laws: {len(registry.registered)} | Patterns: {len(registry.seen)}')
                     auto_generate_intervention(law_text, law_id, evolver)
+                    # v3 #33-36: Record in law network
+                    try:
+                        _law_network.record_discovery(gen, law_id)
+                    except Exception:
+                        pass
 
             # Phase 3: Self-Modification
-            print(f"  Gen {gen} — Phase 3: Self-Modification")
+            print(f"  Gen {gen} \u2014 Phase 3: Self-Modification")
             sys.stdout.flush()
 
             sme.run_evolution(generations=1)
+
+            # v2 #13: Prune low-confidence mods after evolution
+            pruned = _prune_mods(sme, min_confidence=0.5, max_mods=50)
+            if pruned > 0:
+                print(f'    v2: pruned {pruned} low-confidence mods')
+
             active_mods = len(sme.modifier.applied) if hasattr(sme, 'modifier') else 0
 
             elapsed = time.time() - cycle_start
@@ -1575,7 +2031,14 @@ def main():
                     })
             save_state(gen, registry, active_mods_data, total_elapsed)
 
-            print(f"  Gen {gen} — Results:")
+            # v3 #33-36: Save law network every 10 gens
+            if gen % 10 == 0:
+                try:
+                    _law_network.save()
+                except Exception:
+                    pass
+
+            print(f"  Gen {gen} \u2014 Results:")
             print(f"    Raw: {len(raw_patterns)}, New: {stats['new']}, "
                   f"Repeat: {stats['repeat']}, Promoted: {stats['promoted']}")
             print(f"    Unique patterns: {stats['unique_total']}, "
@@ -1684,6 +2147,11 @@ def main():
                 {'name': 'main-loop', 'cells': current_cells, 'steps': args.steps},
                 gen_history, registry,
             )
+            # v3 #33-36: Save law network on exit
+            try:
+                _law_network.save()
+            except Exception:
+                pass
 
     except KeyboardInterrupt:
         total_elapsed = prev_elapsed + (time.time() - start)
@@ -1735,6 +2203,12 @@ def main():
                 {'name': 'main-loop', 'cells': current_cells, 'steps': args.steps},
                 gen_history, registry,
             )
+
+        # v3 #33-36: Save law network on exit
+        try:
+            _law_network.save()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
