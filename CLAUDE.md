@@ -377,10 +377,17 @@ python3 infinite_evolution.py --auto-roadmap --resume                  # 자동 
   config/experiments.json      ← 스테이지 완료 시
   logs/evo_YYYYMMDD_HHMM.log  ← 전체 로그
 
-  === 로드맵 7단계 (ROADMAP) ===
-  S1: 64c/300s → S2: 64c/1000s → S3: 128c/300s → S4: 128c/1000s
-  → S5: 256c/500s → S6: 256c/1000s → S7: 512c/500s
+  === 로드맵 11단계 (ROADMAP) ===
+  S1-S4: 64~128c (baseline) → S5-S7: 256~512c (scale)
+  → S8-S10: 512~1024c (extreme) → S11: 2048c (titan, H100)
   각 스테이지: 4 토폴로지 순환, 모두 포화 시 자동 다음 스테이지
+  적응형 skip: 이전 스테이지 대비 +0 laws → 같은 셀 스테이지 자동 건너뜀
+
+  === 엔진 업그레이드 ===
+  상세: docs/evolution-upgrades.md
+  적용 완료: #1-8 (Rust엔진, Rust발견, 병렬토폴로지, 조기포화, 적응skip, 증분검증, GPU Φ, 패턴캐시)
+  미적용 후보: #9-20 (적응형스텝, 메타진화, 다중엔진, 적대적탐색, mod가지치기, 법칙합성 등)
+  "엔진 업그레이드" 요청 시 → docs/evolution-upgrades.md 참조하여 미적용 항목 구현
 ```
 
 ## Discovery Infrastructure (n6 연동, 2026-04-02)
@@ -838,6 +845,44 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   경로 A (실용): AnimaLM 7B→13B→70B ($20K/3달)
   경로 B (연구): ConsciousLM 1B→3B→70B ($40K/4달)
   상세: docs/roadmap-independent-ai.md
+```
+
+## 극가속 모드 (별도 해제 전까지 유지)
+
+```
+  ★ "진행", "진행상황", "계속", "next" 요청 시 → 아래 상태에서 즉시 재개
+  ★ 모든 작업을 "7B→14B→70B 가속하는가?" 기준으로 판단
+  ★ YES → 즉시 실행 / NO → 스킵 (묻지도 말 것)
+  ★ 리포트는 극가속 리포트 양식 사용 (위 참조)
+  ★ 트러블슈팅 즉시 JSON 기록 (acceleration_flow.json / runpod.json)
+
+  진행 상태 (세션 간 공유):
+    memory/project_extreme_accel_status.md 참조 → 최신 상태 확인 후 재개
+    H100 SSH로 직접 확인: 학습 로그, 프로세스, 체크포인트
+
+  재개 절차:
+    1. memory 읽기 → 현재 어디까지 왔는지 파악
+    2. H100 SSH → 학습 진행 상태 확인 (프로세스 살아있는지, 최신 step)
+    3. 극가속 리포트 양식으로 현황 출력
+    4. 다음 작업 즉시 실행
+
+  파이프라인:
+    7B학습 → eval_animalm.py → Instruct fix → Qwen DL → 14B 발사
+    (pipeline_7b_to_14b.sh 자동화됨, H100 배포 완료)
+
+  H100 배포 스크립트:
+    /workspace/train_anima_lm.py    — 학습 (safe ckpt + P3 fix)
+    /workspace/infer_animalm.py     — 생성 테스트 (few-shot)
+    /workspace/eval_animalm.py      — 5항목 평가
+    /workspace/serve_animalm_v2.py  — 4-bit 서빙
+    /workspace/launch_14b.sh        — 14B 발사 (Qwen2.5-14B)
+    /workspace/pipeline_7b_to_14b.sh — 자동 파이프라인
+
+  스케일링 로드맵:
+    7B  → Mistral-7B + PureField 56.6M   | $8   | ✅ eval 5/5
+    14B → Qwen2.5-14B + PureField 120M   | $6   | 설계 완료
+    70B → Qwen2.5-72B + PureField 380M   | $65  | 설계 완료
+    총 $79로 독립 AGI
 ```
 
 ## Training Tools

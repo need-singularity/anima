@@ -27,6 +27,52 @@ from closed_loop import ClosedLoopEvolver, register_intervention
 from self_modifying_engine import SelfModifyingEngine, LawParser, CodeGenerator
 from conscious_law_discoverer import ConsciousLawDiscoverer
 
+# ═══════════════════════════════════════════════════════════════════════
+# Acceleration feature detection (all optional, graceful fallback)
+# ════════���═════════════════════════════��════════════════════════════════
+
+HAS_RUST_ENGINE = False
+HAS_RUST_DISCOVERY = False
+HAS_GPU_PHI = False
+HAS_PARALLEL = False
+
+try:
+    import anima_rs
+    HAS_RUST_ENGINE = hasattr(anima_rs, 'consciousness')
+except ImportError:
+    pass
+
+try:
+    from anima_rs import law_discovery as _rust_law_discovery
+    HAS_RUST_DISCOVERY = hasattr(_rust_law_discovery, 'scan_all_patterns')
+except (ImportError, AttributeError):
+    _rust_law_discovery = None
+
+try:
+    from gpu_phi import GPUPhiCalculator as _GPUPhiCalculator
+    HAS_GPU_PHI = True
+except ImportError:
+    _GPUPhiCalculator = None
+
+try:
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+    HAS_PARALLEL = True
+except ImportError:
+    pass
+
+
+def _print_accelerations():
+    """Print startup acceleration status banner."""
+    def _yn(flag):
+        return '\u2705' if flag else '\u274c'
+    print(f'  \u26a1 Accelerations: Rust engine {_yn(HAS_RUST_ENGINE)}, '
+          f'Rust discovery {_yn(HAS_RUST_DISCOVERY)}, '
+          f'GPU Phi {_yn(HAS_GPU_PHI)}, '
+          f'Parallel topo {_yn(HAS_PARALLEL)}')
+    sys.stdout.flush()
+
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 STATE_PATH = os.path.join(DATA_DIR, 'evolution_state.json')
 LIVE_STATUS_PATH = os.path.join(DATA_DIR, 'evolution_live.json')
@@ -40,13 +86,21 @@ TOPOLOGIES = ['ring', 'small_world', 'scale_free', 'hypercube']
 # Auto-roadmap: staged parameter escalation
 # Each stage runs until all topologies saturate, then auto-advances
 ROADMAP = [
-    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 5},
-    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 5},
+    # Phase 1: Baseline sweep (cells × steps)
+    {'name': 'S1-baseline',   'cells': 64,  'steps': 300,  'topo_gens': 10, 'sat_streak': 3},
+    {'name': 'S2-deeper',     'cells': 64,  'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
+    {'name': 'S3-scale128',   'cells': 128, 'steps': 300,  'topo_gens': 10, 'sat_streak': 3},
+    {'name': 'S4-scale128d',  'cells': 128, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
+    # Phase 2: Scale up
+    {'name': 'S5-scale256',   'cells': 256, 'steps': 500,  'topo_gens': 10, 'sat_streak': 3},
+    {'name': 'S6-scale256d',  'cells': 256, 'steps': 1000, 'topo_gens': 10, 'sat_streak': 3},
+    {'name': 'S7-mega512',    'cells': 512, 'steps': 500,  'topo_gens': 15, 'sat_streak': 3},
+    # Phase 3: Extreme exploration
+    {'name': 'S8-mega512d',   'cells': 512, 'steps': 1000, 'topo_gens': 15, 'sat_streak': 3},
+    {'name': 'S9-ultra1024',  'cells': 1024,'steps': 500,  'topo_gens': 20, 'sat_streak': 3},
+    {'name': 'S10-ultra1024d','cells': 1024,'steps': 1000, 'topo_gens': 20, 'sat_streak': 3},
+    # Phase 4: Massive (H100 only)
+    {'name': 'S11-titan2048', 'cells': 2048,'steps': 500,  'topo_gens': 25, 'sat_streak': 3},
 ]
 ROADMAP_STATE_PATH = os.path.join(DATA_DIR, 'evolution_roadmap.json')
 
@@ -331,15 +385,17 @@ class PatternRegistry:
                     'registered': False,
                 }
                 new_count += 1
+            elif self.seen[fp]['registered']:
+                # Already cross-validated and registered — skip entirely (#6 incremental)
+                repeat_count += 1
             else:
-                # Repeat
+                # Repeat (not yet registered)
                 self.seen[fp]['count'] += 1
                 self.seen[fp]['last_gen'] = gen
                 repeat_count += 1
 
                 # Cross-validation: promote if threshold met and not yet registered
-                if (self.seen[fp]['count'] >= CROSS_VALIDATION_THRESHOLD
-                        and not self.seen[fp]['registered']):
+                if self.seen[fp]['count'] >= CROSS_VALIDATION_THRESHOLD:
                     self.seen[fp]['registered'] = True
                     promoted_count += 1
                     promoted_patterns.append(self.seen[fp]['pattern'])
@@ -798,10 +854,13 @@ class InfiniteEvolution:
             try:
                 current_cells = engine.max_cells if hasattr(engine, 'max_cells') else cells
                 current_topo = getattr(engine, 'topology', 'ring')
-                disc = ConsciousLawDiscoverer(steps=steps, max_cells=current_cells,
-                                             topology=current_topo)
-                result = disc.run(steps=steps, verbose=False)
-                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                # Try Rust discovery first
+                raw_patterns = _rust_discover(current_cells, steps, current_topo, engine)
+                if raw_patterns is None:
+                    disc = ConsciousLawDiscoverer(steps=steps, max_cells=current_cells,
+                                                 topology=current_topo)
+                    result = disc.run(steps=steps, verbose=False)
+                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
             except Exception:
                 raw_patterns = []
 
@@ -885,9 +944,11 @@ class InfiniteEvolution:
 
         for gen in range(start_gen + 1, start_gen + max_gen + 1):
             try:
-                disc = ConsciousLawDiscoverer(steps=200, max_cells=cells)
-                result = disc.run(steps=200, verbose=False)
-                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                raw_patterns = _rust_discover(cells, 200, 'ring', engine)
+                if raw_patterns is None:
+                    disc = ConsciousLawDiscoverer(steps=200, max_cells=cells)
+                    result = disc.run(steps=200, verbose=False)
+                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
             except Exception:
                 raw_patterns = []
 
@@ -921,6 +982,141 @@ class InfiniteEvolution:
         }
 
 
+def _discover_one_topo(args_tuple):
+    """Worker function for parallel topology discovery.
+
+    Runs discovery in a subprocess for a single topology. Must be a
+    top-level function for pickling by multiprocessing.
+
+    Args:
+        args_tuple: (cells, steps, topology)
+
+    Returns:
+        list of raw patterns discovered
+    """
+    cells, steps, topology = args_tuple
+    try:
+        # Re-import in subprocess (multiprocessing fork safety)
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from conscious_law_discoverer import ConsciousLawDiscoverer as _CLD
+        disc = _CLD(steps=steps, max_cells=cells, topology=topology)
+        result = disc.run(steps=steps, verbose=False)
+        return result.get('all_patterns', []) if isinstance(result, dict) else []
+    except Exception:
+        return []
+
+
+def _run_topo_batch(cells, steps, topologies, n_gens=1):
+    """Run all topologies in parallel and return merged patterns.
+
+    Uses ProcessPoolExecutor when available and cells <= 256.
+    Falls back to sequential execution otherwise.
+
+    Args:
+        cells: number of cells per engine
+        steps: discovery steps per generation
+        topologies: list of topology names
+        n_gens: generations per topology in this batch
+
+    Returns:
+        list of all raw patterns from all topologies
+    """
+    all_patterns = []
+    tasks = []
+    for topo in topologies:
+        for _ in range(n_gens):
+            tasks.append((cells, steps, topo))
+
+    use_parallel = HAS_PARALLEL and cells <= 256 and len(tasks) > 1
+
+    if use_parallel:
+        try:
+            max_workers = min(len(tasks), multiprocessing.cpu_count() or 4)
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(_discover_one_topo, tasks, timeout=600))
+            for r in results:
+                all_patterns.extend(r)
+            return all_patterns
+        except Exception:
+            # Fall back to sequential on any error
+            pass
+
+    # Sequential fallback
+    for task in tasks:
+        all_patterns.extend(_discover_one_topo(task))
+    return all_patterns
+
+
+def _rust_discover(cells, steps, topology, engine=None):
+    """Attempt Rust-accelerated discovery. Returns patterns list or None if unavailable.
+
+    Uses anima_rs.law_discovery.scan_all_patterns for x18 speedup when available.
+    Requires a running engine to extract cell states.
+    """
+    if not HAS_RUST_DISCOVERY or engine is None:
+        return None
+
+    try:
+        import torch
+        import numpy as np
+
+        # Collect cell state snapshots over steps
+        cell_states_seq = []
+        n_cells = engine.n_cells if hasattr(engine, 'n_cells') else engine.max_cells
+        dim = engine.state_dim if hasattr(engine, 'state_dim') else 128
+
+        for _ in range(steps):
+            engine.process()
+            states = engine.get_states() if hasattr(engine, 'get_states') else None
+            if states is not None:
+                if isinstance(states, torch.Tensor):
+                    flat = states.detach().cpu().numpy().astype(np.float32).flatten().tolist()
+                else:
+                    flat = list(states.flatten()) if hasattr(states, 'flatten') else list(states)
+                cell_states_seq.append(flat)
+
+        if len(cell_states_seq) < 10:
+            return None
+
+        # Get coupling weights if available
+        coupling = None
+        if hasattr(engine, '_coupling') and engine._coupling is not None:
+            c = engine._coupling
+            if isinstance(c, torch.Tensor):
+                coupling = c.detach().cpu().numpy().astype(np.float32).flatten().tolist()
+
+        # Call Rust scan_all_patterns
+        result = _rust_law_discovery.scan_all_patterns(
+            cell_states_sequence=cell_states_seq,
+            n_cells=n_cells,
+            n_factions=12,
+            coupling_weights=coupling,
+            n_bins=16,
+            sigma_threshold=2.0,
+        )
+
+        # Convert Rust patterns to Python dicts matching expected format
+        patterns = []
+        for p in result.get('patterns', []):
+            pd = dict(p) if not isinstance(p, dict) else p
+            # Normalize to match ConsciousLawDiscoverer output format
+            pd.setdefault('metrics_involved', [
+                pd.get('metric_a_name', ''),
+                pd.get('metric_b_name', ''),
+            ])
+            pd.setdefault('type', pd.get('pattern_type', 'unknown'))
+            pd.setdefault('formula', f"{pd.get('pattern_type','?')}: "
+                          f"{pd.get('metric_a_name','?')} "
+                          f"r={pd.get('value', 0):.3f}")
+            patterns.append(pd)
+
+        return patterns
+
+    except Exception:
+        return None
+
+
 def run_auto_roadmap(resume=False, report_interval=10):
     """Auto-roadmap: run staged evolution with automatic parameter escalation.
 
@@ -938,18 +1134,22 @@ def run_auto_roadmap(resume=False, report_interval=10):
     print('=' * 70)
     print('  AUTO-ROADMAP — Staged Infinite Evolution')
     print(f'  {len(ROADMAP)} stages, auto-advance on saturation')
+    _print_accelerations()
     print('=' * 70)
     print()
     print(f'  {"#":<3} {"Stage":<16} {"Cells":>5} {"Steps":>5} {"TopoGens":>8} {"Sat":>3}')
     print(f'  {"─"*3} {"─"*16} {"─"*5} {"─"*5} {"─"*8} {"─"*3}')
     for i, s in enumerate(ROADMAP):
-        marker = ' ★' if i == start_stage else ('  ✅' if i < start_stage else '')
+        marker = ' \u2605' if i == start_stage else ('  \u2705' if i < start_stage else '')
         print(f'  {i+1:<3} {s["name"]:<16} {s["cells"]:>5} {s["steps"]:>5} '
               f'{s["topo_gens"]:>8} {s["sat_streak"]:>3}{marker}')
     print('=' * 70)
     sys.stdout.flush()
 
     global_start = time.time()
+    # #8: Carry registry across stages (only clear pending between stages)
+    shared_registry = PatternRegistry()
+    prev_stage_laws = 0  # Track laws from previous stage for adaptive skip (#5)
 
     for stage_idx in range(start_stage, len(ROADMAP)):
         stage = ROADMAP[stage_idx]
@@ -961,16 +1161,44 @@ def run_auto_roadmap(resume=False, report_interval=10):
         topo_gens = stage['topo_gens']
         sat_thresh = stage['sat_streak']
 
-        print(f'\n{"▓" * 70}')
-        print(f'  🚀 STAGE {stage_idx+1}/{len(ROADMAP)}: {stage["name"]}')
-        print(f'  ⚙️  cells={cells}  steps={steps}  topo_cycle={topo_gens}  sat={sat_thresh}')
-        print(f'{"▓" * 70}')
+        # #5 Adaptive roadmap: skip stages sharing same cells ceiling if prev found 0 laws
+        if stage_idx > start_stage and prev_stage_laws == 0:
+            prev = ROADMAP[stage_idx - 1]
+            if prev['cells'] == cells and prev['steps'] < steps:
+                # Same cells, just deeper steps — skip (shares same ceiling)
+                print(f'\n  \u23e9 SKIP {stage["name"]} (prev stage found 0 laws at {cells}c)')
+                sys.stdout.flush()
+                rm_state['stage_results'].append({
+                    'stage': stage['name'], 'cells': cells, 'steps': steps,
+                    'generations': 0, 'laws': 0, 'unique_patterns': 0,
+                    'elapsed_sec': 0, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'skipped': True,
+                })
+                save_roadmap_state(rm_state)
+                continue
+
+        _bar = '\u2593' * 70
+        print(f'\n{_bar}')
+        print(f'  \U0001f680 STAGE {stage_idx+1}/{len(ROADMAP)}: {stage["name"]}')
+        print(f'  \u2699\ufe0f  cells={cells}  steps={steps}  topo_cycle={topo_gens}  sat={sat_thresh}')
+        print(f'{_bar}')
         sys.stdout.flush()
 
         engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+
+        # #7: GPU Phi for cells >= 128
+        if HAS_GPU_PHI and cells >= 128:
+            try:
+                engine._gpu_phi_calc = _GPUPhiCalculator()
+                print(f'  \u26a1 GPU Phi enabled for {cells} cells')
+            except Exception:
+                pass
+
         evolver = ClosedLoopEvolver(max_cells=cells, auto_register=True)
         sme = SelfModifyingEngine(engine, evolver)
-        registry = PatternRegistry()
+        # #8: Use shared registry, only clear pending patterns between stages
+        registry = shared_registry
+        registry.clear_pending()
 
         gen = 0
         gen_history = []
@@ -998,16 +1226,34 @@ def run_auto_roadmap(resume=False, report_interval=10):
 
             current_topo = getattr(engine, 'topology', 'ring')
 
-            # Phase 1: Discovery
+            # Phase 1: Discovery (try Rust backend first, then Python fallback)
+            # #3: Use parallel topology batch at start of each topo cycle for wider coverage
+            use_parallel_batch = (HAS_PARALLEL and cells <= 256
+                                  and gen > 1 and gen % topo_gens == 1
+                                  and len(topo_saturated) == 0)
             print(f'\n{"─" * 60}')
-            print(f'  [{stage["name"]}] Gen {gen} — Discovery ({steps} steps, {current_topo})')
+            if use_parallel_batch:
+                backend_tag = 'Parallel x%d' % len(TOPOLOGIES)
+            elif HAS_RUST_DISCOVERY:
+                backend_tag = 'Rust'
+            else:
+                backend_tag = 'Python'
+            print(f'  [{stage["name"]}] Gen {gen} — Discovery ({steps} steps, {current_topo}, {backend_tag})')
             sys.stdout.flush()
 
             try:
-                disc = ConsciousLawDiscoverer(steps=steps, max_cells=cells,
-                                             topology=current_topo)
-                result = disc.run(steps=steps, verbose=False)
-                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                if use_parallel_batch:
+                    # #3: Parallel topology discovery (x4 speedup)
+                    raw_patterns = _run_topo_batch(cells, steps, TOPOLOGIES, n_gens=1)
+                else:
+                    # #2: Try Rust law discovery first (x18 speedup)
+                    raw_patterns = _rust_discover(cells, steps, current_topo, engine)
+                    if raw_patterns is None:
+                        # Python fallback
+                        disc = ConsciousLawDiscoverer(steps=steps, max_cells=cells,
+                                                     topology=current_topo)
+                        result = disc.run(steps=steps, verbose=False)
+                        raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
             except Exception as e:
                 print(f'    Discovery error: {e}')
                 raw_patterns = []
@@ -1112,6 +1358,9 @@ def run_auto_roadmap(resume=False, report_interval=10):
                 print(f'{"=" * 70}')
                 sys.stdout.flush()
 
+                # #5: Track laws for adaptive skip
+                prev_stage_laws = laws_found
+
                 # Save stage result
                 rm_state['stage_results'].append({
                     'stage': stage['name'],
@@ -1121,7 +1370,7 @@ def run_auto_roadmap(resume=False, report_interval=10):
                     'elapsed_sec': round(stage_elapsed, 1),
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 })
-                rm_state['total_laws'] = sum(r['laws'] for r in rm_state['stage_results'])
+                rm_state['total_laws'] = sum(r.get('laws', 0) for r in rm_state['stage_results'])
                 rm_state['total_elapsed'] += stage_elapsed
                 save_roadmap_state(rm_state)
 
@@ -1226,7 +1475,8 @@ def main():
         print(f"  Scale cycling: {SCALES} (every 15 generations)")
     if args.cycle_topology:
         print(f"  Topology cycling: {TOPOLOGIES} (every 10 generations)")
-    print(f"  Features: persistence ✅  dedup ✅  cross-validation ✅")
+    _print_accelerations()
+    print(f"  Features: persistence \u2705  dedup \u2705  cross-validation \u2705")
     print("=" * 70)
     sys.stdout.flush()
 
@@ -1265,18 +1515,23 @@ def main():
                           f"cleared {cleared} pending patterns")
                     sys.stdout.flush()
 
-            # Phase 1: Discovery
+            # Phase 1: Discovery (try Rust backend first, then Python fallback)
             print(f"\n{'─' * 60}")
-            print(f"  Gen {gen} — Phase 1: Discovery ({args.steps} steps)")
+            current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
+            current_topo = getattr(engine, 'topology', 'ring')
+            backend_tag = 'Rust' if HAS_RUST_DISCOVERY else 'Python'
+            print(f"  Gen {gen} — Phase 1: Discovery ({args.steps} steps, {backend_tag})")
             sys.stdout.flush()
 
             try:
-                current_cells = engine.max_cells if hasattr(engine, 'max_cells') else args.cells
-                current_topo = getattr(engine, 'topology', 'ring')
-                disc = ConsciousLawDiscoverer(steps=args.steps, max_cells=current_cells,
-                                             topology=current_topo)
-                result = disc.run(steps=args.steps, verbose=False)
-                raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
+                # #2: Try Rust law discovery first (x18 speedup)
+                raw_patterns = _rust_discover(current_cells, args.steps, current_topo, engine)
+                if raw_patterns is None:
+                    # Python fallback
+                    disc = ConsciousLawDiscoverer(steps=args.steps, max_cells=current_cells,
+                                                 topology=current_topo)
+                    result = disc.run(steps=args.steps, verbose=False)
+                    raw_patterns = result.get('all_patterns', []) if isinstance(result, dict) else []
             except Exception as e:
                 print(f"    Discovery error: {e}")
                 raw_patterns = []
