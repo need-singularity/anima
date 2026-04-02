@@ -55,9 +55,28 @@ def load_model(checkpoint_path, base_model="models/mistral-7b-v0.1", device="cud
     print(f"[load] Checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Apply PureField to same layers as training (last 8, 2 savants)
-    target_layers = 8
-    savant_layers = 2
+    # Auto-detect target_layers and savant_layers from checkpoint
+    # Counts PureField weight keys to infer how many layers were trained
+    pf_weight_keys = [k for k in ckpt.get("pf_states", {}).keys()]
+    if pf_weight_keys:
+        # Each PureField layer has its own key in pf_states; derive counts from training args if present
+        n_pf_layers = len(pf_weight_keys)
+        # Heuristic: savant = last 25% of PureField layers (same as training default)
+        savant_layers = max(1, int(round(n_pf_layers * 0.25)))
+        target_layers = n_pf_layers
+        print(f"[load] Auto-detected: target_layers={target_layers}, savant_layers={savant_layers} (from checkpoint)")
+    else:
+        # Fallback: count PureField weight tensors directly in flat checkpoint
+        n_layers_detected = sum(1 for k in ckpt if "purefield" in k.lower() and "weight" in k.lower())
+        if n_layers_detected > 0:
+            savant_layers = max(1, int(round(n_layers_detected * 0.25)))
+            target_layers = n_layers_detected
+            print(f"[load] Auto-detected (flat keys): target_layers={target_layers}, savant_layers={savant_layers}")
+        else:
+            # Final fallback: use training CLI args stored in checkpoint, else 7B defaults
+            target_layers = ckpt.get("target_layers", 8)
+            savant_layers = ckpt.get("savant_layers", 2)
+            print(f"[load] Layer counts from ckpt metadata or defaults: target_layers={target_layers}, savant_layers={savant_layers}")
     total_layers = len(model.model.layers)
     start = total_layers - target_layers
 
