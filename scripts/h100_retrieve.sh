@@ -173,7 +173,7 @@ is_training_complete() {
 
     # Check if process is still running
     local RUNNING
-    RUNNING=$($SSH_CMD "pgrep -f 'train_v14\|train_v3' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    RUNNING=$($SSH_CMD "pgrep -f 'train\.py\|train_v3' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
     if [ "$RUNNING" = "0" ]; then
         # Process not running but didn't reach target - might have crashed
         echo "stopped"

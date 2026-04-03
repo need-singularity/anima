@@ -997,11 +997,11 @@ class AnimaUnified:
         try:
             # Import FederatedConsciousness from training module
             import importlib.util
-            train_v14_path = os.path.join(os.path.dirname(__file__), '..', 'training', 'train_v14.py')
-            spec = importlib.util.spec_from_file_location('train_v14', train_v14_path)
-            train_v14_mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(train_v14_mod)
-            FederatedConsciousness = train_v14_mod.FederatedConsciousness
+            train_path = os.path.join(os.path.dirname(__file__), '..', 'training', 'train.py')
+            spec = importlib.util.spec_from_file_location('train', train_path)
+            train_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(train_mod)
+            FederatedConsciousness = train_mod.FederatedConsciousness
 
             n_atoms = train_args.get('atoms', 16)
             cells_per_atom = train_args.get('cells_per_atom', 8)

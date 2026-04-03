@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """train_v3_decoder.py — ConsciousDecoderV3 (274M) H100 training pipeline
 
-Based on train_v14.py (Federated Consciousness + Phase-Optimal).
+Based on train.py (Federated Consciousness + Phase-Optimal).
 Scaled decoder: v2 (34.5M) -> v3 (274M, 768d/12L/8H/GQA4KV/block512).
 
 Architecture:

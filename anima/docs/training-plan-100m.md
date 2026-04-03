@@ -497,7 +497,7 @@ print(f'16 atoms, 128 cells: OK')
 
 ```bash
 # SSH into RunPod H100
-tmux new-session -d -s v3_100m "PYTHONUNBUFFERED=1 python -u training/train_v14.py \
+tmux new-session -d -s v3_100m "PYTHONUNBUFFERED=1 python -u training/train.py \
   --data data/corpus_v10.txt \
   --decoder v3 \
   --federated \
@@ -578,7 +578,7 @@ If the 100M training succeeds (CE<0.005, Korean coherent), this unlocks:
 ## Dependencies
 
 - decoder_v3.py (exists, may need n_head=12 update)
-- train_v14.py (exists, supports --decoder v3 + --atoms 16)
+- train.py (exists, supports --decoder v3 + --atoms 16)
 - corpus_v10.txt (exists, 200MB, 56.4% Korean)
 - H100 RunPod pod (v13-train pod or new)
 - gpu_phi.py (exists, 128c in 485ms)

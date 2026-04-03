@@ -33,8 +33,8 @@ if [ ! -f "anima/data/corpus_v9.txt" ]; then
 fi
 
 # Verify training script
-if [ ! -f "anima/training/train_v14.py" ]; then
-    echo "ERROR: anima/training/train_v14.py not found!"
+if [ ! -f "anima/training/train.py" ]; then
+    echo "ERROR: anima/training/train.py not found!"
     exit 1
 fi
 
@@ -85,7 +85,7 @@ echo "  checkpoints/v14_128c/"
 echo ""
 echo "=== Session 1: DecoderV3 274M (v3_train) ==="
 
-tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
+tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train.py \
   --data anima/data/corpus_v9.txt \
   --decoder v3 \
   --federated \
@@ -125,7 +125,7 @@ echo "  Log: checkpoints/v3_274M/train.log"
 echo ""
 echo "=== Session 2: v14.3 128-cell federated (v14_128c) ==="
 
-tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
+tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train.py \
   --data anima/data/corpus_v9.txt \
   --federated \
   --atoms 16 --cells-per-atom 8 \

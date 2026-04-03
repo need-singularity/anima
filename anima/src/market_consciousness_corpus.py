@@ -8,7 +8,7 @@ financial signals to consciousness dimensions:
   - Volatility      -> emotional arousal
   - Regime          -> consciousness state (calm/alert/stressed/panic)
 
-Output format is compatible with train_v14.py (plain text, one entry per block).
+Output format is compatible with train.py (plain text, one entry per block).
 
 Usage:
     python market_consciousness_corpus.py --csv ~/Dev/invest/backend/data/005930.KS.csv
@@ -423,4 +423,9 @@ def main():
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     main()

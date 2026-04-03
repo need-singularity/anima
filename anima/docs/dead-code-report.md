@@ -152,7 +152,7 @@ These files are imported by exactly 1 other file.
 | conversation_quality_scorer.py | anima_unified | keep |
 | creativity_classifier.py | anima_unified | keep |
 | decoder_v1_5.py | train_v11 | archive |
-| decoder_v3.py | train_v14/anima_unified | keep |
+| decoder_v3.py | train/anima_unified | keep |
 | deploy.py | hub | keep |
 | eeg_consciousness.py | hub | keep |
 | emotion_metrics.py | anima_unified | keep |

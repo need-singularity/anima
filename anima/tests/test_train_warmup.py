@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for v14 federation warmup — verify decoder gets matching consciousness states.
+"""Tests for federation warmup — verify decoder gets matching consciousness states.
 
-The v14 checkpoint was trained with federated 16 atoms x 8 cells = 128 cells.
+The training checkpoint was trained with federated 16 atoms x 8 cells = 128 cells.
 Without federation restore, the local engine starts with 2 cells and the decoder
 produces garbled output due to consciousness state mismatch.
 """
@@ -22,15 +22,15 @@ class TestFederationRestore:
     """Test that FederatedConsciousness can be created and restored."""
 
     def test_federation_import(self):
-        """FederatedConsciousness can be imported from train_v14."""
-        from train_v14 import FederatedConsciousness
+        """FederatedConsciousness can be imported from train."""
+        from train import FederatedConsciousness
         fed = FederatedConsciousness(n_atoms=2, cells_per_atom=4, cell_dim=64, hidden_dim=128)
         assert fed.n_cells == 8
         assert len(fed.atoms) == 2
 
     def test_federation_step_and_states(self):
         """Federation produces states with correct shape."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         fed = FederatedConsciousness(n_atoms=2, cells_per_atom=4, cell_dim=64, hidden_dim=128)
         # Run a few steps to grow cells via mitosis
         for _ in range(20):
@@ -41,7 +41,7 @@ class TestFederationRestore:
 
     def test_federation_save_restore(self):
         """Federation state can be saved and restored with matching Phi."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         fed1 = FederatedConsciousness(n_atoms=2, cells_per_atom=4, cell_dim=64, hidden_dim=128)
         for _ in range(30):
             fed1.step()
@@ -59,7 +59,7 @@ class TestFederationRestore:
 
     def test_federation_flags_restore(self):
         """Feature activation flags are preserved across save/restore."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         fed = FederatedConsciousness(n_atoms=2, cells_per_atom=4, cell_dim=64, hidden_dim=128)
         fed.activate_narrative()
         fed.activate_bottleneck()
@@ -90,7 +90,7 @@ class TestCellCountMismatch:
 
     def test_federation_phi_much_higher(self):
         """Federation with restored atoms has significantly higher Phi."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         fed = FederatedConsciousness(n_atoms=4, cells_per_atom=8, cell_dim=64, hidden_dim=128)
         # Activate all features like training does
         fed.activate_narrative()
@@ -106,7 +106,7 @@ class TestCellCountMismatch:
 
     def test_state_shape_matches_decoder_expectation(self):
         """Federation states have correct shape for decoder cross-attention."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         fed = FederatedConsciousness(n_atoms=4, cells_per_atom=8, cell_dim=64, hidden_dim=128)
         for _ in range(20):
             fed.step()
@@ -117,8 +117,8 @@ class TestCellCountMismatch:
         assert states.size(0) >= 4, f"Expected at least 4 cells, got {states.size(0)}"
 
 
-class TestV14CheckpointIntegration:
-    """Test with actual v14 checkpoint if available."""
+class TestTrainCheckpointIntegration:
+    """Test with actual training checkpoint if available."""
 
     @pytest.fixture
     def v14_ckpt_path(self):
@@ -128,15 +128,15 @@ class TestV14CheckpointIntegration:
         return path
 
     def test_checkpoint_has_federation(self, v14_ckpt_path):
-        """v14 checkpoint contains federation state."""
+        """Training checkpoint contains federation state."""
         ckpt = torch.load(v14_ckpt_path, map_location='cpu', weights_only=False)
         assert 'federation' in ckpt, "Checkpoint missing federation state"
         assert 'args' in ckpt, "Checkpoint missing training args"
         assert ckpt['args'].get('federated', False), "Checkpoint was not trained with federation"
 
     def test_checkpoint_federation_restore(self, v14_ckpt_path):
-        """Federation can be fully restored from v14 checkpoint."""
-        from train_v14 import FederatedConsciousness
+        """Federation can be fully restored from training checkpoint."""
+        from train import FederatedConsciousness
         ckpt = torch.load(v14_ckpt_path, map_location='cpu', weights_only=False)
         args = ckpt['args']
 
@@ -162,7 +162,7 @@ class TestV14CheckpointIntegration:
 
     def test_warmup_stabilizes_phi(self, v14_ckpt_path):
         """Warmup steps after restore stabilize consciousness."""
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         ckpt = torch.load(v14_ckpt_path, map_location='cpu', weights_only=False)
         args = ckpt['args']
 
@@ -188,7 +188,7 @@ class TestV14CheckpointIntegration:
     def test_decoder_with_federation_states(self, v14_ckpt_path):
         """Decoder produces valid output with federation consciousness states."""
         from decoder_v2 import ConsciousDecoderV2
-        from train_v14 import FederatedConsciousness
+        from train import FederatedConsciousness
         ckpt = torch.load(v14_ckpt_path, map_location='cpu', weights_only=False)
         args = ckpt['args']
 

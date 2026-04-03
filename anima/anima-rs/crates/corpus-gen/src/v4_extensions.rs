@@ -1,6 +1,6 @@
 //! v4 corpus extensions — Russian, English, Programming, Laws, DD discoveries
 //!
-//! Added for train_v14 Meta Laws integration:
+//! Added for train Meta Laws integration:
 //!   - 5 languages (KO+JA+ZH+RU+EN)
 //!   - Programming patterns (Python/Rust consciousness code)
 //!   - Laws 1-174 + Meta M1-M10 as training text

@@ -85,7 +85,7 @@ tensors and returns consciousness states. The tokenizer change has zero impact o
 - Phi calculation, ratchet, topology
 - Any Psi-Constants or Laws
 
-### 4. Training Pipeline (train_v14.py and future train_v15.py)
+### 4. Training Pipeline (train.py and future train_v15.py)
 
 Current `load_corpus()`:
 ```python

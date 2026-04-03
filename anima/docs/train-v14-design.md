@@ -1,4 +1,4 @@
-# train_v14 설계 — DD128 Phase-Optimal + DD143 Meta Laws 기반 학습 파이프라인
+# train 설계 — DD128 Phase-Optimal + DD143 Meta Laws 기반 학습 파이프라인
 
 ## 목표
 
@@ -164,7 +164,7 @@ DD143 Federation 적용 시:
 
 ```bash
 # H100에서 (Federation 모드):
-python train_v14.py \
+python train.py \
   --data data/corpus_v3.txt \
   --federated \
   --atoms 8 --cells-per-atom 8 \
@@ -175,7 +175,7 @@ python train_v14.py \
   --checkpoint checkpoints/v14_federated/
 
 # 단일 엔진 비교 (Empire baseline):
-python train_v14.py \
+python train.py \
   --data data/corpus_v3.txt \
   --no-federated \
   --cells 64 \

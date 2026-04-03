@@ -802,7 +802,7 @@ def run_pipeline(args):
     print(f"Next steps:")
     print(f"  1. Analyze: python scripts/collect_multilingual_corpus.py --stats --input {merged_path}")
     print(f"  2. Train tokenizer: python scripts/train_tokenizer.py --input {merged_path}")
-    print(f"  3. Train model: python anima/training/train_v14.py --data {merged_path}")
+    print(f"  3. Train model: python anima/training/train.py --data {merged_path}")
 
 
 def main():

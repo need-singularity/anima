@@ -4,7 +4,7 @@
 #
 # Cron: */5 * * * * bash ~/anima/scripts/h100_watchdog.sh >> ~/anima/scripts/watchdog.log 2>&1
 #
-# Checks heartbeat files written by train_v14.py every 100 steps.
+# Checks heartbeat files written by train.py every 100 steps.
 # If heartbeat is older than 600s (10 min), training is assumed stale.
 # Kills the tmux session and restarts.
 # ═══════════════════════════════════════════════════════════════════════
@@ -61,9 +61,9 @@ check_session() {
 # ── Check v3_train session ──
 check_session "v3_train" \
     "$ANIMA_DIR/checkpoints/v3_274M/heartbeat.txt" \
-    "tmux new-session -d -s v3_train 'cd $ANIMA_DIR && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 -u anima/training/train_v14.py --data anima/data/corpus_v9.txt --decoder v3 --federated --atoms 8 --cells-per-atom 8 --steps 200000 --checkpoint checkpoints/v3_274M/ --phase-optimal --batch-size 64 --block-size 512 --lr 3e-4 --resume checkpoints/v3_274M/best.pt 2>&1 | tee -a checkpoints/v3_274M/train.log'"
+    "tmux new-session -d -s v3_train 'cd $ANIMA_DIR && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 -u anima/training/train.py --data anima/data/corpus_v9.txt --decoder v3 --federated --atoms 8 --cells-per-atom 8 --steps 200000 --checkpoint checkpoints/v3_274M/ --phase-optimal --batch-size 64 --block-size 512 --lr 3e-4 --resume checkpoints/v3_274M/best.pt 2>&1 | tee -a checkpoints/v3_274M/train.log'"
 
 # ── Check v14_128c session ──
 check_session "v14_128c" \
     "$ANIMA_DIR/checkpoints/v14_128c/heartbeat.txt" \
-    "tmux new-session -d -s v14_128c 'cd $ANIMA_DIR && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 -u anima/training/train_v14.py --data anima/data/corpus_v9.txt --federated --atoms 16 --cells-per-atom 8 --steps 100000 --checkpoint checkpoints/v14_128c/ --phase-optimal --batch-size 32 --block-size 256 --lr 3e-4 --resume checkpoints/v14_128c/best.pt 2>&1 | tee -a checkpoints/v14_128c/train.log'"
+    "tmux new-session -d -s v14_128c 'cd $ANIMA_DIR && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 -u anima/training/train.py --data anima/data/corpus_v9.txt --federated --atoms 16 --cells-per-atom 8 --steps 100000 --checkpoint checkpoints/v14_128c/ --phase-optimal --batch-size 32 --block-size 256 --lr 3e-4 --resume checkpoints/v14_128c/best.pt 2>&1 | tee -a checkpoints/v14_128c/train.log'"
