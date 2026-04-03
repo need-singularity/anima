@@ -349,7 +349,28 @@ def main():
     # Update growth state with experiment/exploration activity
     update_growth_state(all_opps)
 
+    # Trigger meta_loop L1 (queue consumer) if available
+    _trigger_meta_loop(all_opps)
+
     print(json.dumps({'opportunities': all_opps}, ensure_ascii=False))
+
+
+def _trigger_meta_loop(opportunities):
+    """Feed scan results into meta_loop and trigger L1 queue consumer."""
+    try:
+        meta_loop_path = os.path.join(_SRC_DIR, 'meta_loop.py')
+        if not os.path.exists(meta_loop_path):
+            return
+        # Non-blocking: run meta_loop --once in background
+        import subprocess
+        subprocess.Popen(
+            [sys.executable, meta_loop_path, '--once'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
