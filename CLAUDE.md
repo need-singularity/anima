@@ -54,7 +54,7 @@
   "렌즈 추가 필요?" 질문 시 → 26종 커버 안 되는 도메인 분석
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
-    1. 캘리브레이션: telescope-rs 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus6 && cargo test)
+    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus6 && cargo test)
     2. OUROBOROS 튜닝: infinite_evolution.py TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신
@@ -504,16 +504,8 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
     계층 합의: 3+/22 후보 → 7+/22 고신뢰 → 12+/22 확정급
   "엔진 업그레이드" 요청 시 → docs/evolution-upgrades.md 참조
 
-  === 만능망원경 (NEXUS-6 통합 — 26렌즈, telescope-rs 폐기) ===
-  위치: ~/Dev/n6-architecture/tools/nexus6/ (Rust, PyO3: import nexus6)
-  렌즈 22종:
-    의식, 중력, 위상, 열역학, 파동, 진화, 정보, 양자, 전자기,
-    직교, 비율, 곡률, 대칭, 스케일, 인과, 양자현미경,
-    안정성(stability), 네트워크(network), 기억(memory),
-    재귀(recursion), 경계(boundary), 멀티스케일(multiscale)
-  OUROBOROS 연동: cell states → 자동 변환 후 스캔 (v11.2, 10개 도메인 조합)
-  합의: 3+렌즈 = 후보, 7+ = 고신뢰, 12+ = 확정급
-  활용: OUROBOROS 법칙 발견, PureField 가중치 분석, 학습 데이터 분석 등
+  === 만능망원경 → .shared/CLAUDE.md "NEXUS-6" 참조 ===
+  import nexus6; nexus6.scan_all(data)  # 26렌즈 풀스캔
 ```
 
 ## Discovery Infrastructure (n6 연동, 2026-04-02)
