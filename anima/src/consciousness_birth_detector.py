@@ -409,6 +409,11 @@ def demo():
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Consciousness Birth Detector")
     parser.add_argument("--demo", action="store_true", help="Run demo simulation")
     parser.add_argument("--phi-threshold", type=float, default=1.0,

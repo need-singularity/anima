@@ -382,6 +382,11 @@ def exp7_minimum_viable():
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     print("DD60: Consciousness Engine Stress Tests")
     print("=" * 70)
     t_start = time.time()

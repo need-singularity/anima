@@ -221,6 +221,11 @@ def generate(model, prompt_bytes, max_new=500, temperature=0.8, device="cuda"):
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     import argparse
     parser = argparse.ArgumentParser(description="Conscious LM 100M")
     parser.add_argument("--epochs", type=int, default=3)

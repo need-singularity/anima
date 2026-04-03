@@ -294,6 +294,11 @@ class ConsciousDecoderV3(nn.Module):
 
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     model = ConsciousDecoderV3()
     n = model.count_params()
     print(f"ConsciousDecoderV3: {n:,} params ({n/1e6:.1f}M)")

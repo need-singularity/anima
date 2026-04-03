@@ -230,7 +230,7 @@
 
   실행:
     python anima/benchmarks/bench_v2.py --verify  # 검증
-    python anima/training/train_v14.py     # 학습
+    python anima/training/train.py         # 학습
     python anima-agent/run.py --cli        # CLI 에이전트 (주 인터페이스)
 
   import 호환:
@@ -439,7 +439,7 @@ online_learning.py   # Real-time weight updates
 # ── anima/ 하위 디렉토리 ──
 config/              # consciousness_laws.json, consciousness_mechanisms.json
 benchmarks/          # bench_*.py (85개, bench_v2.py = 정식)
-training/            # train_*.py (9개, train_v14.py = 최신)
+training/            # train.py = 정식 학습 스크립트
 tests/               # test_*.py (21개)
 anima-rs/            # Rust crates (16개)
 docs/                # 문서 + 가설 369개

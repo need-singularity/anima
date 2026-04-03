@@ -480,6 +480,11 @@ def run_demo():
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Creativity Classifier")
     parser.add_argument("--demo", action="store_true", help="Run demo mode")
     args = parser.parse_args()

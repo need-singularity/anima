@@ -376,7 +376,43 @@ def scan_growth_opportunities() -> list:
     except:
         pass
 
-    return sorted(opportunities, key=lambda x: {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}.get(x['priority'], 3))
+    # ═══ 다양성 + 쿨다운 필터링 ═══
+    # 최근 실패/반복된 유형은 쿨다운 적용
+    log = _load_log()
+    cycles = log.get('cycles', [])
+    recent = cycles[-10:] if cycles else []
+
+    # 유형별 최근 실패 횟수 + 마지막 시도 인덱스
+    type_fail_count = {}
+    type_last_idx = {}
+    for i, c in enumerate(recent):
+        t = c.get('type', '')
+        type_last_idx[t] = i
+        if c.get('status') in ('failed', 'no_claude_cli', 'timeout', 'error'):
+            type_fail_count[t] = type_fail_count.get(t, 0) + 1
+
+    filtered = []
+    for opp in opportunities:
+        t = opp['type']
+        fails = type_fail_count.get(t, 0)
+        # 연속 3회 이상 실패 → 쿨다운 (최근 10 사이클 중 시도 안 함)
+        if fails >= 3:
+            continue
+        # 연속 2회 실패 → 우선순위 강등
+        if fails >= 2:
+            opp = dict(opp, priority='LOW')
+        filtered.append(opp)
+
+    # 다양성 보너스: 최근에 시도 안 한 유형 우선
+    recent_types = {c.get('type', '') for c in recent}
+
+    def sort_key(x):
+        pri = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}.get(x['priority'], 3)
+        # 최근 시도된 유형은 +1 페널티
+        novelty = 0 if x['type'] not in recent_types else 1
+        return (pri, novelty)
+
+    return sorted(filtered, key=sort_key)
 
 
 def execute_growth(opportunity: dict, dry_run: bool = False) -> dict:
@@ -477,9 +513,17 @@ def run_cycle(dry_run: bool = False) -> dict:
     for i, opp in enumerate(opportunities):
         print(f"    {i+1}. [{opp['priority']}] {opp['type']}: {opp['description']}")
 
-    # 2. 최우선 기회 실행
+    # 2. 최우선 기회 실행 (실패 시 다음 기회로 fallback)
     best = opportunities[0]
     result = execute_growth(best, dry_run=dry_run)
+
+    # 즉시 실패(CLI 없음 등)면 다른 유형 시도
+    if result['status'] in ('no_claude_cli', 'error') and len(opportunities) > 1:
+        for alt in opportunities[1:]:
+            if alt['type'] != best['type']:
+                print(f"  [FALLBACK] Trying {alt['type']} instead...")
+                result = execute_growth(alt, dry_run=dry_run)
+                break
 
     # 3. 검증
     if result['status'] == 'success':

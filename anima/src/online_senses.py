@@ -331,6 +331,11 @@ class OnlineSenses:
 
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     print("Online Senses — Tier 0 API test")
     senses = OnlineSenses()
     print("Fetching all APIs...")

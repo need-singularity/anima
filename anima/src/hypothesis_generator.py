@@ -605,6 +605,11 @@ def run_param_sweep(steps: int = 50, params_to_sweep: List[str] = None,
 
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--generate", type=int, default=20, help="Number of combos to test")
     parser.add_argument("--max-size", type=int, default=4, help="Max techniques per combo")

@@ -595,7 +595,14 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
 def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
                     bridge, hexad_modules, phi, ce_val, args,
                     fb_bridge=None, c_proj=None):
-    """Atomic save: .tmp -> rename."""
+    """Atomic save: local tmp -> rename -> async NFS copy if needed.
+
+    TSH-001 fix: NFS hang killed v3_274M at 170K. Save to /tmp first,
+    then move to target path to avoid NFS blocking the training loop.
+    """
+    import shutil
+    import threading
+
     ckpt = {
         'step': step,
         'decoder': decoder.state_dict(),
@@ -618,9 +625,34 @@ def save_checkpoint(path, step, decoder, optimizer, scheduler, federation,
     if c_proj is not None:
         ckpt['c_proj'] = c_proj.state_dict()
     # Hexad modules (W/S/M/E are mostly stateless but save narrative states)
-    tmp = path + '.tmp'
-    torch.save(ckpt, tmp)
-    os.replace(tmp, path)  # atomic rename
+
+    # Save to local /tmp first (fast), then copy to target (may be NFS)
+    local_tmp = f"/tmp/anima_ckpt_step{step}.pt.tmp"
+    torch.save(ckpt, local_tmp)
+
+    # If target is on NFS (e.g. /workspace/), copy async to avoid blocking
+    target_dir = os.path.dirname(os.path.abspath(path))
+    is_nfs = target_dir.startswith('/workspace') or target_dir.startswith('/nfs')
+
+    if is_nfs:
+        # Move to local final first (atomic)
+        local_final = f"/tmp/anima_ckpt_step{step}.pt"
+        os.replace(local_tmp, local_final)
+
+        # Async copy to NFS — training continues immediately
+        def _copy_to_nfs():
+            try:
+                nfs_tmp = path + '.tmp'
+                shutil.copy2(local_final, nfs_tmp)
+                os.replace(nfs_tmp, path)
+                os.remove(local_final)
+            except Exception as e:
+                print(f"  [warn] NFS copy failed for {path}: {e} (local copy at {local_final})")
+
+        threading.Thread(target=_copy_to_nfs, daemon=True).start()
+    else:
+        # Local disk — direct atomic rename
+        os.replace(local_tmp, path)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1230,7 +1262,7 @@ def parse_args():
     # Logging / checkpoints
     p.add_argument("--log-every", type=int, default=100, help="Log interval")
     p.add_argument("--eval-every", type=int, default=1000, help="Validation interval")
-    p.add_argument("--save-every", type=int, default=5000, help="Checkpoint interval")
+    p.add_argument("--save-every", type=int, default=10000, help="Checkpoint interval (R09: >=4000 for large models)")
     p.add_argument("--checkpoint", type=str, default="checkpoints/v14_federated/",
                    help="Checkpoint directory")
 

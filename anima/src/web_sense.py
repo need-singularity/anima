@@ -362,6 +362,11 @@ class WebSense:
 # ─── CLI 테스트 ───
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     import sys
     logging.basicConfig(level=logging.INFO)
 

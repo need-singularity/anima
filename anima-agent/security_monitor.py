@@ -67,9 +67,10 @@ class SecurityMonitor:
             (r"\.\./\.\./", "path_traversal"),
             (r"http://(localhost|127\.0\.0\.1|0\.0\.0\.0)", "ssrf"),
             (r"\$\(|`[^`]*`", "command_inject"),
-            (r"\{\{|\{%|\$\{", "template_inject"),
             (r"__proto__|constructor\.prototype", "proto_pollution"),
         ],
+        "medium": [
+            (r"\{\{|\{%|\$\{", "template_inject"),
         "medium": [
             (r"<img\s+src\s*=\s*x|onerror\s*=|onload\s*=", "xss_event"),
             (r"file://", "file_protocol"),

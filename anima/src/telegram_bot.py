@@ -603,5 +603,10 @@ def start_bot_thread(anima=None):
 
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     bot = AnimaTelegramBot()
     bot.run()

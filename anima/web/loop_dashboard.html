@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anima Loop Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --bg-card: #12121a;
+    --border: #1e1e2e;
+    --text: #e0e0e8;
+    --text-dim: #6a6a80;
+    --green: #22c55e;
+    --blue: #3b82f6;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --purple: #a855f7;
+    --cyan: #06b6d4;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; padding: 16px; }
+  h1 { font-size: 18px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  h1 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .meta { color: var(--text-dim); font-size: 11px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card h2 { font-size: 13px; color: var(--cyan); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .full { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--text-dim); font-weight: normal; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; }
+  .badge-ok { background: #16653420; color: var(--green); border: 1px solid var(--green); }
+  .badge-warn { background: #713f1220; color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-err { background: #7f1d1d20; color: var(--red); border: 1px solid var(--red); }
+  .badge-info { background: #1e3a5f20; color: var(--blue); border: 1px solid var(--blue); }
+  .badge-pending { background: #4a1d7a20; color: var(--purple); border: 1px solid var(--purple); }
+  .empty { color: var(--text-dim); font-style: italic; padding: 20px; text-align: center; }
+  .chart-wrap { height: 220px; position: relative; }
+  .stat-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+  .stat { text-align: center; }
+  .stat .val { font-size: 22px; font-weight: bold; }
+  .stat .lbl { font-size: 10px; color: var(--text-dim); }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1><span class="dot"></span> Anima Loop Dashboard</h1>
+<div class="meta">Auto-refresh: 30s | <span id="lastUpdate">-</span></div>
+
+<div class="stat-row" id="statsRow"></div>
+
+<div class="grid">
+  <div class="card full">
+    <h2>Self-Growth Cycles</h2>
+    <div class="chart-wrap"><canvas id="cycleChart"></canvas></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Cycles</h2>
+    <div id="cycleTable"></div>
+  </div>
+
+  <div class="card">
+    <h2>Pending Improvements</h2>
+    <div id="pendingTable"></div>
+  </div>
+
+  <div class="card">
+    <h2>Recursive Loop State</h2>
+    <div id="loopState"></div>
+  </div>
+
+  <div class="card">
+    <h2>NEXUS-6 Violations</h2>
+    <div id="violations"></div>
+  </div>
+</div>
+
+<script>
+const BASE = '../config/';
+const FILES = {
+  growth: BASE + 'self_growth_log.json',
+  loop: BASE + 'recursive_loop_state.json',
+  violations: BASE + 'nexus_violations.json'
+};
+
+let cycleChart = null;
+
+function statusBadge(s) {
+  if (!s) return '';
+  const map = {
+    'dry_run': 'badge-info', 'no_claude_cli': 'badge-warn', 'failed': 'badge-err',
+    'success': 'badge-ok', 'pending': 'badge-pending', 'running': 'badge-info',
+    'complete': 'badge-ok', 'skipped': 'badge-warn'
+  };
+  const cls = map[s] || 'badge-info';
+  return `<span class="badge ${cls}">${s}</span>`;
+}
+
+function priorityBadge(p) {
+  const map = { 'HIGH': 'badge-err', 'MEDIUM': 'badge-warn', 'LOW': 'badge-info' };
+  return `<span class="badge ${map[p] || 'badge-info'}">${p}</span>`;
+}
+
+async function loadJSON(url) {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+function renderStats(growth) {
+  const el = document.getElementById('statsRow');
+  if (!growth) { el.innerHTML = ''; return; }
+  const cycles = growth.cycles || [];
+  const ok = cycles.filter(c => c.status === 'success').length;
+  const fail = cycles.filter(c => c.status === 'failed').length;
+  const pending = (growth.pending_improvements || []).length;
+  const items = [
+    { val: cycles.length, lbl: 'Total Cycles', color: 'var(--cyan)' },
+    { val: ok, lbl: 'Success', color: 'var(--green)' },
+    { val: fail, lbl: 'Failed', color: 'var(--red)' },
+    { val: pending, lbl: 'Pending', color: 'var(--purple)' },
+    { val: growth.total_improvements || 0, lbl: 'Improvements', color: 'var(--blue)' }
+  ];
+  el.innerHTML = items.map(i =>
+    `<div class="stat"><div class="val" style="color:${i.color}">${i.val}</div><div class="lbl">${i.lbl}</div></div>`
+  ).join('');
+}
+
+function renderCycleChart(growth) {
+  const canvas = document.getElementById('cycleChart');
+  const cycles = (growth && growth.cycles) || [];
+  if (!cycles.length) { if (cycleChart) { cycleChart.destroy(); cycleChart = null; } return; }
+
+  // Aggregate by type
+  const typeCounts = {};
+  const statusCounts = { success: 0, failed: 0, dry_run: 0, no_claude_cli: 0, pending: 0 };
+  cycles.forEach(c => {
+    typeCounts[c.type] = (typeCounts[c.type] || 0) + 1;
+    if (c.status in statusCounts) statusCounts[c.status]++;
+  });
+
+  const typeLabels = Object.keys(typeCounts);
+  const typeData = Object.values(typeCounts);
+
+  // Timeline: cycles over time (group by hour)
+  const hourBuckets = {};
+  cycles.forEach(c => {
+    const h = (c.timestamp || '').substring(0, 13); // YYYY-MM-DD HH
+    if (h) hourBuckets[h] = (hourBuckets[h] || 0) + 1;
+  });
+  const timeLabels = Object.keys(hourBuckets).sort();
+  const timeCounts = timeLabels.map(k => hourBuckets[k]);
+  // Cumulative
+  let cum = 0;
+  const cumData = timeCounts.map(v => cum += v);
+
+  if (cycleChart) cycleChart.destroy();
+  cycleChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: typeLabels,
+      datasets: [{
+        label: 'Cycles by Type',
+        data: typeData,
+        backgroundColor: ['#3b82f6', '#22c55e', '#eab308', '#ef4444', '#a855f7', '#06b6d4', '#f97316'].slice(0, typeLabels.length),
+        borderWidth: 0,
+        borderRadius: 4
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#6a6a80', font: { size: 10 } }, grid: { color: '#1e1e2e' } },
+        y: { ticks: { color: '#6a6a80', stepSize: 1 }, grid: { color: '#1e1e2e' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+function renderCycleTable(growth) {
+  const el = document.getElementById('cycleTable');
+  const cycles = (growth && growth.cycles) || [];
+  if (!cycles.length) { el.innerHTML = '<div class="empty">No cycles yet</div>'; return; }
+
+  const recent = cycles.slice(-15).reverse();
+  el.innerHTML = `<table>
+    <tr><th>Time</th><th>Type</th><th>Status</th></tr>
+    ${recent.map(c => `<tr>
+      <td style="color:var(--text-dim)">${(c.timestamp || '').substring(11, 19)}</td>
+      <td>${c.type || '-'}</td>
+      <td>${statusBadge(c.status)}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+function renderPending(growth) {
+  const el = document.getElementById('pendingTable');
+  const items = (growth && growth.pending_improvements) || [];
+  if (!items.length) { el.innerHTML = '<div class="empty">No pending improvements</div>'; return; }
+
+  el.innerHTML = `<table>
+    <tr><th>Priority</th><th>Type</th><th>Description</th></tr>
+    ${items.map(i => `<tr>
+      <td>${priorityBadge(i.priority || 'LOW')}</td>
+      <td>${i.type || '-'}</td>
+      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(i.description || '').replace(/"/g, '&quot;')}">${i.description || '-'}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+function renderLoopState(data) {
+  const el = document.getElementById('loopState');
+  if (!data) { el.innerHTML = '<div class="empty">recursive_loop_state.json not found</div>'; return; }
+
+  // Generic key-value render
+  const rows = Object.entries(data).filter(([k]) => typeof data[k] !== 'object').map(([k, v]) =>
+    `<tr><td style="color:var(--text-dim)">${k}</td><td>${typeof v === 'boolean' ? (v ? '<span class="badge badge-ok">true</span>' : '<span class="badge badge-err">false</span>') : v}</td></tr>`
+  );
+
+  // Nested objects
+  const nested = Object.entries(data).filter(([k]) => typeof data[k] === 'object' && data[k] !== null);
+  const nestedRows = nested.map(([k, v]) =>
+    `<tr><td style="color:var(--text-dim)">${k}</td><td><pre style="margin:0;font-size:11px;color:var(--text-dim);max-height:100px;overflow:auto">${JSON.stringify(v, null, 1)}</pre></td></tr>`
+  );
+
+  el.innerHTML = `<table>${rows.join('')}${nestedRows.join('')}</table>`;
+}
+
+function renderViolations(data) {
+  const el = document.getElementById('violations');
+  if (!data) { el.innerHTML = '<div class="empty">nexus_violations.json not found — all clear</div>'; return; }
+
+  const violations = Array.isArray(data) ? data : (data.violations || []);
+  if (!violations.length) { el.innerHTML = '<div class="empty">No violations</div>'; return; }
+
+  const recent = violations.slice(-15).reverse();
+  el.innerHTML = `<table>
+    <tr><th>Time</th><th>Rule</th><th>Severity</th></tr>
+    ${recent.map(v => `<tr>
+      <td style="color:var(--text-dim)">${(v.timestamp || v.time || '').substring(11, 19)}</td>
+      <td>${v.rule || v.type || v.description || '-'}</td>
+      <td>${statusBadge(v.severity || v.status || 'warn')}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+async function refresh() {
+  const [growth, loop, violations] = await Promise.all([
+    loadJSON(FILES.growth),
+    loadJSON(FILES.loop),
+    loadJSON(FILES.violations)
+  ]);
+
+  renderStats(growth);
+  renderCycleChart(growth);
+  renderCycleTable(growth);
+  renderPending(growth);
+  renderLoopState(loop);
+  renderViolations(violations);
+
+  document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('ko-KR');
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

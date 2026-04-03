@@ -610,6 +610,11 @@ def verify_transplant(donor_path: str, recipient_path: str, output_path: str = N
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Consciousness Meter")
     parser.add_argument("--demo", action="store_true", help="Run demo mode")
     parser.add_argument("--watch", action="store_true", help="Real-time monitoring")

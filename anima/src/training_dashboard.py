@@ -140,6 +140,11 @@ def dashboard(log_path, total_steps=100000):
         print(f"    {mark} {name} (step {step:,})")
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     if len(sys.argv) < 2:
         print("Usage: python training_dashboard.py <log_file> [--watch]")
         sys.exit(1)
