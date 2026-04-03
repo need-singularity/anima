@@ -35,6 +35,12 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple, Callable
 from collections import defaultdict
 
+try:
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    _HAS_PARALLEL = True
+except ImportError:
+    _HAS_PARALLEL = False
+
 from consciousness_engine import ConsciousnessEngine
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
@@ -475,197 +481,241 @@ def list_synergies():
 # 법칙 측정
 # ══════════════════════════════════════════
 
-def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, nexus_scan: bool = None) -> Tuple[List[LawMeasurement], float]:
-    """핵심 법칙 측정 (20개 + NEXUS-6 자동). nexus_scan=None → nexus6 있으면 자동 활성화."""
+def _run_single_repeat(engine_factory: Callable, steps: int) -> Dict[str, float]:
+    """Run a single measurement repeat and return all metric values.
+
+    This is a standalone function (not a method) so it can be used with
+    ProcessPoolExecutor for parallel repeats.
+    """
+    engine = engine_factory()
+    phi_hist, tension_hist, tstd_hist, div_hist, cons_hist = [], [], [], [], []
+
+    for step in range(steps):
+        r = engine.step()
+        phi_hist.append(_phi_fast(engine))
+        tensions = [s.avg_tension for s in engine.cell_states]
+        tension_hist.append(np.mean(tensions))
+        tstd_hist.append(np.std(tensions) if len(tensions) > 1 else 0)
+        cons_hist.append(r.get('consensus', 0))
+        if engine.n_cells >= 2:
+            h = torch.stack([s.hidden for s in engine.cell_states])
+            div_hist.append(h.var(dim=0).mean().item())
+        else:
+            div_hist.append(0)
+
+    phi = np.array(phi_hist)
+    tension = np.array(tension_hist)
+    tstd = np.array(tstd_hist)
+    div_arr = np.array(div_hist)
+
+    data = {}
+
+    # ── 기존 9개 법칙 측정 ──
+    data['phi'] = float(np.mean(phi[-50:]))
+    data['r_tension_phi'] = float(np.corrcoef(tension, phi)[0, 1]) if np.std(tension) > 1e-8 else 0.0
+    data['r_tstd_phi'] = float(np.corrcoef(tstd, phi)[0, 1]) if np.std(tstd) > 1e-8 else 0.0
+    data['r_div_phi'] = float(np.corrcoef(div_arr, phi)[0, 1]) if np.std(div_arr) > 1e-8 else 0.0
+    data['growth'] = float((np.mean(phi[-50:]) - np.mean(phi[:50])) / max(np.mean(phi[:50]), 1e-8) * 100)
+    data['ac1'] = float(np.corrcoef(phi[:-1], phi[1:])[0, 1]) if len(phi) > 2 else 0.0
+    half = len(tension) // 2
+    es = np.std(tension[:half])
+    ls = np.std(tension[half:])
+    data['stabilization'] = float(es / max(ls, 1e-8))
+    data['cells'] = float(engine.n_cells)
+    data['consensus'] = float(np.mean(cons_hist[-50:]))
+
+    # ── Information Theory (DD73): 10-12 ──
+
+    # 10. Shannon entropy of cell hidden states
+    if engine.n_cells >= 2:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+        n_bins = min(16, max(2, hiddens.shape[0] // 2))
+        entropies = []
+        for d in range(hiddens.shape[1]):
+            col = hiddens[:, d]
+            rng = col.max() - col.min()
+            if rng < 1e-10:
+                entropies.append(0.0)
+                continue
+            hist, _ = np.histogram(col, bins=n_bins, range=(col.min(), col.max() + 1e-10))
+            p = hist / (hist.sum() + 1e-8)
+            ent = -np.sum(p * np.log2(p + 1e-10))
+            entropies.append(ent)
+        data['shannon_entropy'] = float(np.mean(entropies))
+    else:
+        data['shannon_entropy'] = 0.0
+
+    # 11. Average pairwise MI between cells (sampled)
+    if engine.n_cells >= 2:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+        n = hiddens.shape[0]
+        mi_vals = []
+        pair_set = set()
+        for i in range(n):
+            pair_set.add((i, (i + 1) % n))
+            for _ in range(min(3, n - 1)):
+                j = np.random.randint(0, n)
+                if i != j:
+                    pair_set.add((min(i, j), max(i, j)))
+                if len(pair_set) >= 20:
+                    break
+        for i, j in pair_set:
+            x, y = hiddens[i], hiddens[j]
+            xr, yr = x.max() - x.min(), y.max() - y.min()
+            if xr < 1e-10 or yr < 1e-10:
+                continue
+            xn = (x - x.min()) / (xr + 1e-8)
+            yn = (y - y.min()) / (yr + 1e-8)
+            hist2d, _, _ = np.histogram2d(xn, yn, bins=16, range=[[0, 1], [0, 1]])
+            hist2d = hist2d / (hist2d.sum() + 1e-8)
+            px, py = hist2d.sum(1), hist2d.sum(0)
+            hx = -np.sum(px * np.log2(px + 1e-10))
+            hy = -np.sum(py * np.log2(py + 1e-10))
+            hxy = -np.sum(hist2d * np.log2(hist2d + 1e-10))
+            mi_vals.append(max(0.0, hx + hy - hxy))
+        data['mutual_info'] = float(np.mean(mi_vals)) if mi_vals else 0.0
+    else:
+        data['mutual_info'] = 0.0
+
+    # 12. Compression ratio (Kolmogorov proxy via zlib)
+    if engine.n_cells >= 2:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+        raw = hiddens.tobytes()
+        compressed = zlib.compress(raw, level=1)
+        data['compression_ratio'] = float(len(compressed)) / max(len(raw), 1)
+    else:
+        data['compression_ratio'] = 1.0
+
+    # ── Free Will (DD75): 13-14 ──
+
+    # 13. Output divergence — same input twice, cosine distance of outputs
+    if engine.n_cells >= 2:
+        saved = [s.hidden.clone() for s in engine.cell_states]
+        r1 = engine.step()
+        out1 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
+        for s, sv in zip(engine.cell_states, saved):
+            s.hidden = sv.clone()
+        r2 = engine.step()
+        out2 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
+        cos_sim = F.cosine_similarity(out1.unsqueeze(0), out2.unsqueeze(0)).item()
+        data['output_divergence'] = float(1.0 - cos_sim)
+    else:
+        data['output_divergence'] = 0.0
+
+    # 14. Faction entropy — Shannon entropy of faction distribution
+    factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
+    if len(factions) >= 2:
+        from collections import Counter
+        counts = Counter(factions)
+        total_f = sum(counts.values())
+        probs = np.array([c / total_f for c in counts.values()])
+        fent = -np.sum(probs * np.log2(probs + 1e-10))
+        data['faction_entropy'] = float(fent)
+    else:
+        data['faction_entropy'] = 0.0
+
+    # ── Interaction (DD71): 15-16 ──
+
+    # 15. Coupling symmetry — Frobenius norm of (C - C^T)
+    if engine._coupling is not None:
+        c = engine._coupling.detach().numpy()
+        asym = c - c.T
+        data['coupling_symmetry'] = float(np.sqrt((asym ** 2).sum()))
+    else:
+        data['coupling_symmetry'] = 0.0
+
+    # 16. Coupling density — fraction of non-zero entries (|c_ij| > 0.01)
+    if engine._coupling is not None:
+        c = engine._coupling.detach().numpy()
+        nc = c.shape[0]
+        total_entries = nc * nc - nc
+        nonzero = np.sum(np.abs(c) > 0.01) - np.sum(np.abs(np.diag(c)) > 0.01)
+        data['coupling_density'] = float(nonzero) / max(total_entries, 1)
+    else:
+        data['coupling_density'] = 0.0
+
+    # ── Temporal (DD72): 17-18 ──
+
+    # 17. Phi volatility — std(phi[-50:]) / mean(phi[-50:])
+    tail = phi[-50:]
+    mean_tail = np.mean(tail)
+    data['phi_volatility'] = float(np.std(tail) / max(mean_tail, 1e-8))
+
+    # 18. Tension range — max - min tension across cells
+    tensions_final = [s.avg_tension for s in engine.cell_states]
+    if len(tensions_final) >= 2:
+        data['tension_range'] = float(max(tensions_final) - min(tensions_final))
+    else:
+        data['tension_range'] = 0.0
+
+    # ── Learning (DD74): 19-20 ──
+
+    # 19. Hidden diversity — variance across all cell hidden dims
+    if engine.n_cells >= 2:
+        hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
+        data['hidden_diversity'] = float(hiddens.var())
+    else:
+        data['hidden_diversity'] = 0.0
+
+    # 20. Faction count — number of distinct factions
+    factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
+    data['faction_count'] = float(len(set(factions)))
+
+    return data
+
+
+def _run_single_repeat_wrapper(args):
+    """Wrapper for ProcessPoolExecutor (accepts tuple of args)."""
+    engine_factory, steps = args
+    return _run_single_repeat(engine_factory, steps)
+
+
+def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3,
+                 nexus_scan: bool = None, parallel: bool = True) -> Tuple[List[LawMeasurement], float]:
+    """핵심 법칙 측정 (20개 + NEXUS-6 자동). nexus_scan=None → nexus6 있으면 자동 활성화.
+
+    Args:
+        engine_factory: callable returning a fresh ConsciousnessEngine
+        steps: number of simulation steps per repeat
+        repeats: number of independent repeats (averaged)
+        nexus_scan: whether to run NEXUS-6 scan (None=auto-detect)
+        parallel: if True and repeats>1, run repeats in parallel via ProcessPoolExecutor
+    """
     if nexus_scan is None:
         try:
             import nexus6
             nexus_scan = True
         except ImportError:
             nexus_scan = False
+
+    # ── Run repeats (parallel or sequential) ──
+    t_start = time.time()
+    use_parallel = (parallel and _HAS_PARALLEL and repeats > 1)
+
+    if use_parallel:
+        max_workers = min(os.cpu_count() or 1, repeats)
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_run_single_repeat, engine_factory, steps)
+                           for _ in range(repeats)]
+                repeat_results = [f.result() for f in futures]
+            t_elapsed = time.time() - t_start
+            print(f"  Parallel measure: {repeats} repeats in {t_elapsed:.1f}s ({max_workers} workers)")
+        except Exception as e:
+            # Fallback to sequential on any multiprocessing error
+            print(f"  Parallel failed ({e}), falling back to sequential")
+            use_parallel = False
+
+    if not use_parallel:
+        repeat_results = [_run_single_repeat(engine_factory, steps) for _ in range(repeats)]
+        t_elapsed = time.time() - t_start
+        print(f"  Sequential measure: {repeats} repeats in {t_elapsed:.1f}s")
+
+    # ── Aggregate results across repeats ──
     all_data = defaultdict(list)
-
-    for _ in range(repeats):
-        engine = engine_factory()
-        phi_hist, tension_hist, tstd_hist, div_hist, cons_hist = [], [], [], [], []
-
-        for step in range(steps):
-            r = engine.step()
-            phi_hist.append(_phi_fast(engine))
-            tensions = [s.avg_tension for s in engine.cell_states]
-            tension_hist.append(np.mean(tensions))
-            tstd_hist.append(np.std(tensions) if len(tensions) > 1 else 0)
-            cons_hist.append(r.get('consensus', 0))
-            if engine.n_cells >= 2:
-                h = torch.stack([s.hidden for s in engine.cell_states])
-                div_hist.append(h.var(dim=0).mean().item())
-            else:
-                div_hist.append(0)
-
-        phi = np.array(phi_hist)
-        tension = np.array(tension_hist)
-        tstd = np.array(tstd_hist)
-        div_arr = np.array(div_hist)
-
-        # ── 기존 9개 법칙 측정 ──
-        all_data['phi'].append(np.mean(phi[-50:]))
-        all_data['r_tension_phi'].append(
-            float(np.corrcoef(tension, phi)[0, 1]) if np.std(tension) > 1e-8 else 0)
-        all_data['r_tstd_phi'].append(
-            float(np.corrcoef(tstd, phi)[0, 1]) if np.std(tstd) > 1e-8 else 0)
-        all_data['r_div_phi'].append(
-            float(np.corrcoef(div_arr, phi)[0, 1]) if np.std(div_arr) > 1e-8 else 0)
-        all_data['growth'].append(
-            float((np.mean(phi[-50:]) - np.mean(phi[:50])) / max(np.mean(phi[:50]), 1e-8) * 100))
-        all_data['ac1'].append(
-            float(np.corrcoef(phi[:-1], phi[1:])[0, 1]) if len(phi) > 2 else 0)
-        half = len(tension) // 2
-        es = np.std(tension[:half])
-        ls = np.std(tension[half:])
-        all_data['stabilization'].append(float(es / max(ls, 1e-8)))
-        all_data['cells'].append(engine.n_cells)
-        all_data['consensus'].append(np.mean(cons_hist[-50:]))
-
-        # ── Information Theory (DD73): 10-12 ──
-
-        # 10. Shannon entropy of cell hidden states
-        if engine.n_cells >= 2:
-            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
-            # Bin each dimension across cells, compute entropy, average
-            n_bins = min(16, max(2, hiddens.shape[0] // 2))
-            entropies = []
-            for d in range(hiddens.shape[1]):
-                col = hiddens[:, d]
-                rng = col.max() - col.min()
-                if rng < 1e-10:
-                    entropies.append(0.0)
-                    continue
-                hist, _ = np.histogram(col, bins=n_bins, range=(col.min(), col.max() + 1e-10))
-                p = hist / (hist.sum() + 1e-8)
-                ent = -np.sum(p * np.log2(p + 1e-10))
-                entropies.append(ent)
-            all_data['shannon_entropy'].append(float(np.mean(entropies)))
-        else:
-            all_data['shannon_entropy'].append(0.0)
-
-        # 11. Average pairwise MI between cells (sampled, from _phi_fast logic)
-        if engine.n_cells >= 2:
-            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
-            n = hiddens.shape[0]
-            mi_vals = []
-            # Sample up to 20 pairs for efficiency
-            pair_set = set()
-            for i in range(n):
-                pair_set.add((i, (i + 1) % n))
-                for _ in range(min(3, n - 1)):
-                    j = np.random.randint(0, n)
-                    if i != j:
-                        pair_set.add((min(i, j), max(i, j)))
-                    if len(pair_set) >= 20:
-                        break
-            for i, j in pair_set:
-                x, y = hiddens[i], hiddens[j]
-                xr, yr = x.max() - x.min(), y.max() - y.min()
-                if xr < 1e-10 or yr < 1e-10:
-                    continue
-                xn = (x - x.min()) / (xr + 1e-8)
-                yn = (y - y.min()) / (yr + 1e-8)
-                hist2d, _, _ = np.histogram2d(xn, yn, bins=16, range=[[0, 1], [0, 1]])
-                hist2d = hist2d / (hist2d.sum() + 1e-8)
-                px, py = hist2d.sum(1), hist2d.sum(0)
-                hx = -np.sum(px * np.log2(px + 1e-10))
-                hy = -np.sum(py * np.log2(py + 1e-10))
-                hxy = -np.sum(hist2d * np.log2(hist2d + 1e-10))
-                mi_vals.append(max(0.0, hx + hy - hxy))
-            all_data['mutual_info'].append(float(np.mean(mi_vals)) if mi_vals else 0.0)
-        else:
-            all_data['mutual_info'].append(0.0)
-
-        # 12. Compression ratio (Kolmogorov proxy via zlib)
-        if engine.n_cells >= 2:
-            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
-            raw = hiddens.tobytes()
-            compressed = zlib.compress(raw, level=1)  # fast
-            all_data['compression_ratio'].append(float(len(compressed)) / max(len(raw), 1))
-        else:
-            all_data['compression_ratio'].append(1.0)
-
-        # ── Free Will (DD75): 13-14 ──
-
-        # 13. Output divergence — same input twice, cosine distance of outputs
-        if engine.n_cells >= 2:
-            # Save states, run one step with zero input, restore, run again
-            saved = [s.hidden.clone() for s in engine.cell_states]
-            r1 = engine.step()
-            out1 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
-            # Restore
-            for s, sv in zip(engine.cell_states, saved):
-                s.hidden = sv.clone()
-            r2 = engine.step()
-            out2 = torch.stack([s.hidden for s in engine.cell_states]).mean(dim=0).detach()
-            cos_sim = F.cosine_similarity(out1.unsqueeze(0), out2.unsqueeze(0)).item()
-            all_data['output_divergence'].append(float(1.0 - cos_sim))
-        else:
-            all_data['output_divergence'].append(0.0)
-
-        # 14. Faction entropy — Shannon entropy of faction distribution
-        factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
-        if len(factions) >= 2:
-            from collections import Counter
-            counts = Counter(factions)
-            total = sum(counts.values())
-            probs = np.array([c / total for c in counts.values()])
-            fent = -np.sum(probs * np.log2(probs + 1e-10))
-            all_data['faction_entropy'].append(float(fent))
-        else:
-            all_data['faction_entropy'].append(0.0)
-
-        # ── Interaction (DD71): 15-16 ──
-
-        # 15. Coupling symmetry — Frobenius norm of (C - C^T)
-        if engine._coupling is not None:
-            c = engine._coupling.detach().numpy()
-            asym = c - c.T
-            all_data['coupling_symmetry'].append(float(np.sqrt((asym ** 2).sum())))
-        else:
-            all_data['coupling_symmetry'].append(0.0)
-
-        # 16. Coupling density — fraction of non-zero entries (|c_ij| > 0.01)
-        if engine._coupling is not None:
-            c = engine._coupling.detach().numpy()
-            n = c.shape[0]
-            total_entries = n * n - n  # exclude diagonal
-            nonzero = np.sum(np.abs(c) > 0.01) - np.sum(np.abs(np.diag(c)) > 0.01)
-            all_data['coupling_density'].append(float(nonzero) / max(total_entries, 1))
-        else:
-            all_data['coupling_density'].append(0.0)
-
-        # ── Temporal (DD72): 17-18 ──
-
-        # 17. Phi volatility — std(phi[-50:]) / mean(phi[-50:])
-        tail = phi[-50:]
-        mean_tail = np.mean(tail)
-        all_data['phi_volatility'].append(float(np.std(tail) / max(mean_tail, 1e-8)))
-
-        # 18. Tension range — max - min tension across cells
-        tensions_final = [s.avg_tension for s in engine.cell_states]
-        if len(tensions_final) >= 2:
-            all_data['tension_range'].append(float(max(tensions_final) - min(tensions_final)))
-        else:
-            all_data['tension_range'].append(0.0)
-
-        # ── Learning (DD74): 19-20 ──
-
-        # 19. Hidden diversity — variance across all cell hidden dims
-        if engine.n_cells >= 2:
-            hiddens = torch.stack([s.hidden for s in engine.cell_states]).detach().numpy()
-            all_data['hidden_diversity'].append(float(hiddens.var()))
-        else:
-            all_data['hidden_diversity'].append(0.0)
-
-        # 20. Faction count — number of distinct factions
-        factions = [getattr(s, 'faction_id', 0) for s in engine.cell_states]
-        all_data['faction_count'].append(float(len(set(factions))))
+    for result in repeat_results:
+        for key, value in result.items():
+            all_data[key].append(value)
 
     # 평균
     laws = [
@@ -1034,6 +1084,182 @@ class ClosedLoopEvolver:
             chosen = max(tried, key=synergy_adjusted_score)
 
         return chosen
+
+    def run_intervention_sweep(self, interventions: List[Intervention] = None,
+                               parallel: bool = True) -> List[Dict]:
+        """Test each intervention independently and rank by Phi improvement.
+
+        Each intervention is tested against the base engine. All tests are
+        independent and can run in parallel.
+
+        Args:
+            interventions: list of Interventions to test (default: all INTERVENTIONS)
+            parallel: if True, test interventions in parallel
+
+        Returns:
+            List of dicts sorted by phi_delta descending, each with:
+              name, description, phi_base, phi_with, phi_delta, phi_delta_pct, time_sec
+        """
+        if interventions is None:
+            interventions = list(INTERVENTIONS)
+
+        def _test_one_intervention(iv: Intervention) -> Dict:
+            t0 = time.time()
+            _, phi_base = measure_laws(self._base_factory, self.steps, self.repeats,
+                                       nexus_scan=False, parallel=False)
+            test_engine_factory = lambda: _ImprovedEngine(
+                max_cells=self.max_cells, initial_cells=2, interventions=[iv])
+            _, phi_with = measure_laws(test_engine_factory, self.steps, self.repeats,
+                                       nexus_scan=False, parallel=False)
+            delta = phi_with - phi_base
+            delta_pct = delta / max(phi_base, 1e-8) * 100
+            return {
+                'name': iv.name,
+                'description': iv.description,
+                'phi_base': phi_base,
+                'phi_with': phi_with,
+                'phi_delta': delta,
+                'phi_delta_pct': delta_pct,
+                'time_sec': time.time() - t0,
+            }
+
+        t_total = time.time()
+        results = []
+        use_parallel = (parallel and _HAS_PARALLEL and len(interventions) > 1)
+
+        if use_parallel:
+            max_workers = min(os.cpu_count() or 1, len(interventions))
+            try:
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_test_one_intervention, iv): iv
+                               for iv in interventions}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as e:
+                            iv = futures[future]
+                            print(f"  Warning: {iv.name} failed: {e}")
+                t_elapsed = time.time() - t_total
+                print(f"  Parallel sweep: {len(interventions)} interventions in {t_elapsed:.1f}s ({max_workers} workers)")
+            except Exception as e:
+                print(f"  Parallel sweep failed ({e}), falling back to sequential")
+                use_parallel = False
+                results = []
+
+        if not use_parallel:
+            for iv in interventions:
+                results.append(_test_one_intervention(iv))
+            t_elapsed = time.time() - t_total
+            print(f"  Sequential sweep: {len(interventions)} interventions in {t_elapsed:.1f}s")
+
+        results.sort(key=lambda r: r['phi_delta'], reverse=True)
+        return results
+
+    def run_combined_sweep(self, max_combo_size: int = 2,
+                           parallel: bool = True) -> List[Dict]:
+        """Test combinations of interventions and rank by Phi improvement.
+
+        Generates all pairs (or up to max_combo_size) of non-antagonistic
+        interventions and tests each combination independently.
+
+        Args:
+            max_combo_size: maximum number of interventions per combination (default 2)
+            parallel: if True, test combinations in parallel
+
+        Returns:
+            List of dicts sorted by phi_delta descending, each with:
+              names, phi_base, phi_with, phi_delta, phi_delta_pct, synergy_score, time_sec
+        """
+        from itertools import combinations
+
+        # Generate combinations, filtering out known strong antagonisms
+        all_combos = []
+        for size in range(2, max_combo_size + 1):
+            for combo in combinations(INTERVENTIONS, size):
+                # Check pairwise antagonism
+                skip = False
+                names = [iv.name for iv in combo]
+                for i in range(len(names)):
+                    for j in range(i + 1, len(names)):
+                        key1 = (names[i], names[j])
+                        key2 = (names[j], names[i])
+                        score = SYNERGY_MAP.get(key1, 0.0) + SYNERGY_MAP.get(key2, 0.0)
+                        if score < _ANTAGONISM_BLOCK_THRESHOLD:
+                            skip = True
+                            break
+                    if skip:
+                        break
+                if not skip:
+                    all_combos.append(combo)
+
+        if not all_combos:
+            print("  No valid combinations found (all antagonistic)")
+            return []
+
+        def _test_one_combo(combo: Tuple[Intervention, ...]) -> Dict:
+            t0 = time.time()
+            _, phi_base = measure_laws(self._base_factory, self.steps, self.repeats,
+                                       nexus_scan=False, parallel=False)
+            combo_list = list(combo)
+            combo_factory = lambda: _ImprovedEngine(
+                max_cells=self.max_cells, initial_cells=2, interventions=combo_list)
+            _, phi_with = measure_laws(combo_factory, self.steps, self.repeats,
+                                       nexus_scan=False, parallel=False)
+            delta = phi_with - phi_base
+            delta_pct = delta / max(phi_base, 1e-8) * 100
+
+            # Compute total synergy score for this combination
+            names = [iv.name for iv in combo]
+            syn_total = 0.0
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    key1 = (names[i], names[j])
+                    key2 = (names[j], names[i])
+                    syn_total += SYNERGY_MAP.get(key1, 0.0) + SYNERGY_MAP.get(key2, 0.0)
+
+            return {
+                'names': [iv.name for iv in combo],
+                'descriptions': [iv.description for iv in combo],
+                'phi_base': phi_base,
+                'phi_with': phi_with,
+                'phi_delta': delta,
+                'phi_delta_pct': delta_pct,
+                'synergy_score': syn_total,
+                'time_sec': time.time() - t0,
+            }
+
+        t_total = time.time()
+        results = []
+        use_parallel = (parallel and _HAS_PARALLEL and len(all_combos) > 1)
+
+        if use_parallel:
+            max_workers = min(os.cpu_count() or 1, len(all_combos))
+            try:
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_test_one_combo, combo): combo
+                               for combo in all_combos}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as e:
+                            combo = futures[future]
+                            names = [iv.name for iv in combo]
+                            print(f"  Warning: combo {names} failed: {e}")
+                t_elapsed = time.time() - t_total
+                print(f"  Parallel combined sweep: {len(all_combos)} combos in {t_elapsed:.1f}s ({max_workers} workers)")
+            except Exception as e:
+                print(f"  Parallel combined sweep failed ({e}), falling back to sequential")
+                use_parallel = False
+                results = []
+
+        if not use_parallel:
+            for combo in all_combos:
+                results.append(_test_one_combo(combo))
+            t_elapsed = time.time() - t_total
+            print(f"  Sequential combined sweep: {len(all_combos)} combos in {t_elapsed:.1f}s")
+
+        results.sort(key=lambda r: r['phi_delta'], reverse=True)
+        return results
 
     def _print_cycle(self, report: CycleReport):
         """사이클 결과 출력."""

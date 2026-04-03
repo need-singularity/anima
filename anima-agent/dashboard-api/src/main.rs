@@ -309,8 +309,23 @@ async fn ws_connection(mut socket: WebSocket, state: Arc<AppState>) {
             Some(msg) = async { socket.recv().await } => {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        // Handle client messages (e.g., chat)
-                        tracing::debug!("WS recv: {}", text);
+                        // Handle chat messages from frontend
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if parsed.get("type").and_then(|v| v.as_str()) == Some("chat") {
+                                if let Some(user_text) = parsed.get("text").and_then(|v| v.as_str()) {
+                                    let cs = state.consciousness.read().await;
+                                    let response = serde_json::json!({
+                                        "type": "chat_response",
+                                        "text": format!("[agent response to: {}]", &user_text[..user_text.len().min(80)]),
+                                        "tension": cs.tension,
+                                        "emotion": cs.emotion,
+                                        "phi": cs.phi,
+                                    });
+                                    drop(cs);
+                                    let _ = socket.send(Message::Text(response.to_string().into())).await;
+                                }
+                            }
+                        }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}

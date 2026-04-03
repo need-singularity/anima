@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Anima Dashboard",
-  description: "Consciousness + Trading unified dashboard",
+  title: "Anima",
+  description: "Consciousness interface",
 };
 
 export default function RootLayout({
@@ -12,8 +12,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark">
-      <body className="min-h-screen bg-surface-0 antialiased">
+    <html lang="ko" className="dark">
+      <body className="h-screen overflow-hidden bg-surface-0 antialiased">
+        <div className="noise-overlay" />
         {children}
       </body>
     </html>

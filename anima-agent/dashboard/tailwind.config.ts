@@ -8,28 +8,25 @@ const config: Config = {
     extend: {
       colors: {
         surface: {
-          0: "#0a0a0f",
-          1: "#12121a",
-          2: "#1a1a26",
-          3: "#242434",
+          0: "#08080c",
+          1: "#0e0e14",
+          2: "#15151e",
+          3: "#1e1e2c",
+          4: "#2a2a3a",
+        },
+        glow: {
+          phi: "#4ade80",
+          tension: "#fb923c",
+          danger: "#f87171",
         },
         accent: {
-          phi: "#6ee7b7",
-          tension: "#f97316",
-          pnl: {
-            pos: "#22c55e",
-            neg: "#ef4444",
-          },
-          regime: {
-            bull: "#22c55e",
-            bear: "#ef4444",
-            range: "#eab308",
-            unknown: "#6b7280",
-          },
+          cyan: "#22d3ee",
+          amber: "#fbbf24",
         },
       },
       fontFamily: {
-        mono: ["'JetBrains Mono'", "Menlo", "monospace"],
+        sans: ["'DM Sans'", "-apple-system", "BlinkMacSystemFont", "sans-serif"],
+        mono: ["'Azeret Mono'", "Menlo", "monospace"],
       },
     },
   },

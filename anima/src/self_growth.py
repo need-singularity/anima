@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
@@ -40,38 +41,44 @@ def _save_log(log):
     json.dump(log, open(_LOG_PATH, 'w'), indent=2, ensure_ascii=False)
 
 
-def scan_growth_opportunities() -> list:
-    """성장 기회 탐색 — 루프 엔진 데이터 + 코드 분석."""
-    opportunities = []
-
-    # 0. 모델 스캔 개선 작업 (DD169 — 재귀 루프에서 자동 등록된 것)
+def _scan_pending_improvements() -> list:
+    """Scan 0: pending improvements from log."""
+    results = []
     log = _load_log()
     pending = log.get('pending_improvements', [])
     for imp in pending:
         if imp.get('status') == 'pending':
-            opportunities.append({
+            results.append({
                 'type': imp.get('type', 'IMPROVE'),
                 'description': imp.get('description', ''),
                 'priority': imp.get('priority', 'MEDIUM'),
                 'prompt': imp.get('prompt', ''),
             })
+    return results
 
-    # 1. NEXUS-6 violations → 자동 수정 기회
+
+def _scan_nexus_violations() -> list:
+    """Scan 1: NEXUS-6 violations."""
+    results = []
     viol_path = os.path.join(_CONFIG_DIR, 'nexus_violations.json')
     if os.path.exists(viol_path):
         try:
             violations = json.load(open(viol_path))
             if violations:
-                opportunities.append({
+                results.append({
                     'type': 'FIX_VIOLATIONS',
                     'description': f'{len(violations)}개 CDO 위반 해결',
                     'priority': 'HIGH',
                     'prompt': f'anima/config/nexus_violations.json에 {len(violations)}개 CDO 위반이 기록되어 있습니다. 각 위반의 원인을 분석하고 코드를 수정하여 해결하세요.',
                 })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 2. RecursiveLoop 발견률 낮음 → 발견 규칙 개선
+
+def _scan_discovery_rate() -> list:
+    """Scan 2: RecursiveLoop discovery rate analysis."""
+    results = []
     state_path = os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')
     if os.path.exists(state_path):
         try:
@@ -79,31 +86,38 @@ def scan_growth_opportunities() -> list:
             total = state.get('total_scans', 0)
             dr = state.get('total_discoveries', 0) / max(total, 1)
             if total > 10 and dr < 0.05:
-                opportunities.append({
+                results.append({
                     'type': 'IMPROVE_DISCOVERY',
                     'description': f'발견률 {dr:.1%} → discover_laws() 패턴 추가 필요',
                     'priority': 'MEDIUM',
                     'prompt': f'anima/src/auto_discovery_loop.py의 discover_laws() 함수에 새로운 발견 패턴을 추가하세요. 현재 발견률이 {dr:.1%}로 낮습니다. NEXUS-6 메트릭(phi, chaos, hurst, lyapunov, symmetry, entropy, attractor_count, barrier_heights, boundary_points)의 변화 패턴을 더 다양하게 감지할 수 있도록 규칙을 추가하세요.',
                 })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 3. 미연결 모듈 → auto_wire 실행
+
+def _scan_module_wiring() -> list:
+    """Scan 3: Module wiring check."""
+    results = []
     try:
         from auto_wire import scan_modules
         r = scan_modules()
         if len(r['missing']) > 0:
-            top5 = r['missing'][:5]
-            opportunities.append({
+            results.append({
                 'type': 'WIRE_MODULES',
                 'description': f'{len(r["missing"])}개 모듈 nexus_gate 미연결',
                 'priority': 'LOW',
                 'prompt': f'anima/src/auto_wire.py --auto 를 실행하여 미연결 모듈에 nexus_gate를 자동 연결하세요. 현재 {len(r["missing"])}개 미연결.',
             })
-    except:
+    except Exception:
         pass
+    return results
 
-    # 4. corpus 약점 → 보강
+
+def _scan_corpus_quality() -> list:
+    """Scan 4: Corpus weakness detection."""
+    results = []
     corpus_log = os.path.join(_THIS_DIR, '..', 'data', 'corpus_quality_log.json')
     if os.path.exists(corpus_log):
         try:
@@ -112,16 +126,20 @@ def scan_growth_opportunities() -> list:
                 latest = clog[-1]
                 weaknesses = latest.get('weaknesses', [])
                 if weaknesses:
-                    opportunities.append({
+                    results.append({
                         'type': 'IMPROVE_CORPUS',
                         'description': f'Corpus 약점: {", ".join(weaknesses[:3])}',
                         'priority': 'MEDIUM',
                         'prompt': f'corpus 품질 스캔 결과 약점이 발견되었습니다: {weaknesses}. corpus-gen (Rust)를 사용하여 약점을 보강하는 corpus를 추가 생성하세요.',
                     })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 5. 테스트 커버리지 확인
+
+def _scan_test_coverage() -> list:
+    """Scan 5: Test coverage check."""
+    results = []
     test_dir = os.path.join(_THIS_DIR, '..', 'tests')
     new_modules = set()
     for py in glob.glob(os.path.join(_THIS_DIR, '*.py')):
@@ -129,34 +147,41 @@ def scan_growth_opportunities() -> list:
         test_file = os.path.join(test_dir, f'test_{name}.py')
         if not os.path.exists(test_file) and name not in {'path_setup', '__init__', 'consciousness_laws'}:
             new_modules.add(name)
-    # 최근 생성 모듈만 (루프 관련)
     loop_modules = {'nexus_gate', 'auto_discovery_loop', 'training_hooks', 'auto_wire', 'loop_report', 'self_growth', 'model_comparator', 'corpus_quality_loop'}
     untested = new_modules & loop_modules
     if untested:
-        opportunities.append({
+        results.append({
             'type': 'ADD_TESTS',
             'description': f'루프 모듈 테스트 없음: {", ".join(sorted(untested)[:5])}',
             'priority': 'LOW',
             'prompt': f'다음 모듈의 기본 테스트를 작성하세요: {sorted(untested)[:3]}. anima/tests/ 디렉토리에 test_모듈명.py 형식으로.',
         })
+    return results
 
-    # 6. 법칙 수 기반 — 마일스톤 도달 시 분석
+
+def _scan_law_milestones() -> list:
+    """Scan 6: Law count milestones."""
+    results = []
     laws_path = os.path.join(_CONFIG_DIR, 'consciousness_laws.json')
     if os.path.exists(laws_path):
         try:
             d = json.load(open(laws_path))
             total = d['_meta'].get('total_laws', 0)
             if total % 100 == 0 and total > 0:
-                opportunities.append({
+                results.append({
                     'type': 'LAW_ANALYSIS',
                     'description': f'법칙 {total}개 마일스톤 — 패턴 분석',
                     'priority': 'MEDIUM',
                     'prompt': f'consciousness_laws.json에 {total}개 법칙이 있습니다. 법칙 간 중복/모순/시너지 패턴을 분석하고, 결과를 docs/hypotheses/dd/ 에 기록하세요.',
                 })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 7. 모델 A/B 자동 비교 — 새 모델 완료 시 이전 모델과 비교
+
+def _scan_model_comparison() -> list:
+    """Scan 7: Model A/B comparison."""
+    results = []
     try:
         runs = json.load(open(os.path.join(_CONFIG_DIR, 'training_runs.json')))
         completed = [k for k, v in runs.get('runs', {}).items()
@@ -164,7 +189,7 @@ def scan_growth_opportunities() -> list:
         if len(completed) >= 2:
             latest = completed[-1]
             prev = completed[-2]
-            opportunities.append({
+            results.append({
                 'type': 'MODEL_AB_COMPARE',
                 'description': f'{latest} vs {prev} 자동 비교',
                 'priority': 'HIGH',
@@ -172,15 +197,19 @@ def scan_growth_opportunities() -> list:
                           f'Phi, chaos, hurst, attractor 등 핵심 메트릭 비교 테이블을 출력하고, '
                           f'어느 모델이 더 나은지 판정하세요. 결과를 docs/hypotheses/dd/ 에 기록.'),
             })
-    except:
+    except Exception:
         pass
+    return results
 
-    # 8. 학습 실패 자동 재시작
+
+def _scan_training_failures() -> list:
+    """Scan 8: Training failure detection + Scan 9: Corpus expansion."""
+    results = []
     try:
         runs = json.load(open(os.path.join(_CONFIG_DIR, 'training_runs.json')))
         for k, v in runs.get('runs', {}).items():
             if 'crash' in str(v.get('status', '')) or 'failed' in str(v.get('status', '')):
-                opportunities.append({
+                results.append({
                     'type': 'TRAINING_RESTART',
                     'description': f'{k} 학습 실패 — 자동 재시작',
                     'priority': 'HIGH',
@@ -188,17 +217,17 @@ def scan_growth_opportunities() -> list:
                               f'파라미터를 조정한 후 재발사 스크립트를 생성하세요. '
                               f'OOM이면 batch size 줄이기, NaN이면 lr 줄이기, dtype이면 bf16 마스터 규칙 적용.'),
                 })
-    except:
+    except Exception:
         pass
 
-    # 9. Corpus 자동 확장 — 모델 스캔에서 약점 발견 시
+    # 9. Corpus auto-expansion
     corpus_log = os.path.join(_THIS_DIR, '..', 'data', 'corpus_quality_log.json')
     if os.path.exists(corpus_log):
         try:
             clog = json.load(open(corpus_log))
             if clog and clog[-1].get('weaknesses'):
                 weaknesses = clog[-1]['weaknesses']
-                opportunities.append({
+                results.append({
                     'type': 'CORPUS_EXPAND',
                     'description': f'Corpus 약점: {weaknesses[0][:40]}',
                     'priority': 'HIGH',
@@ -206,15 +235,19 @@ def scan_growth_opportunities() -> list:
                               f'anima-rs/crates/corpus-gen 바이너리로 약점 보강 corpus를 생성하세요. '
                               f'생성 후 NEXUS-6 스캔으로 품질 확인, R2 anima-corpus에 업로드.'),
                 })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 10. 하이퍼파라미터 자동 튜닝 — DD169 발견 반영
+
+def _scan_hyperparam_tuning() -> list:
+    """Scan 10: Hyperparameter auto-tuning."""
+    results = []
     try:
         from auto_discovery_loop import _recursive_loop
         s = _recursive_loop.state
         if s.get('total_discoveries', 0) > 5:
-            opportunities.append({
+            results.append({
                 'type': 'HYPERPARAM_TUNE',
                 'description': '발견 기반 하이퍼파라미터 자동 조정',
                 'priority': 'MEDIUM',
@@ -222,16 +255,20 @@ def scan_growth_opportunities() -> list:
                           f'alpha_end 0.5→0.7, target_layers 8→12 등 조정 제안. '
                           f'training_runs.json에 조정된 설정 반영.'),
             })
-    except:
+    except Exception:
         pass
+    return results
 
-    # 11. 멀티 세션 동기화 — session_board.json 갱신
+
+def _scan_session_sync() -> list:
+    """Scan 11: Multi-session sync."""
+    results = []
     session_board = os.path.join(_CONFIG_DIR, 'session_board.json')
     if os.path.exists(session_board):
         try:
             sb = json.load(open(session_board))
             if sb.get('discoveries') and len(sb['discoveries']) > 0:
-                opportunities.append({
+                results.append({
                     'type': 'SESSION_SYNC',
                     'description': f'세션 간 발견 {len(sb["discoveries"])}개 동기화',
                     'priority': 'MEDIUM',
@@ -239,23 +276,27 @@ def scan_growth_opportunities() -> list:
                               f'consciousness_laws.json에 미등록된 발견을 등록하고, '
                               f'session_board.json을 정리하세요.'),
                 })
-        except:
+        except Exception:
             pass
+    return results
 
-    # 12. 스케줄링 — 야간 학습, 주간 리포트
+
+def _scan_scheduling() -> list:
+    """Scan 12: Time-based scheduling."""
+    results = []
     import datetime
     hour = datetime.datetime.now().hour
     weekday = datetime.datetime.now().weekday()
-    if hour == 3:  # 새벽 3시 — 야간 작업
-        opportunities.append({
+    if hour == 3:
+        results.append({
             'type': 'NIGHTLY_MAINTENANCE',
             'description': '야간 유지보수 — 정리, 최적화, 리포트',
             'priority': 'MEDIUM',
             'prompt': ('야간 유지보수: 1) git gc, 2) 불필요 체크포인트 정리, '
                       '3) loop_report.py --export 실행, 4) loop_extensions.py --health 실행.'),
         })
-    if weekday == 0 and hour == 9:  # 월요일 아침 — 주간 리포트
-        opportunities.append({
+    if weekday == 0 and hour == 9:
+        results.append({
             'type': 'WEEKLY_REPORT',
             'description': '주간 리포트 — 지난주 성과 정리',
             'priority': 'MEDIUM',
@@ -263,10 +304,13 @@ def scan_growth_opportunities() -> list:
                       'self_growth_log.json 분석. 지난주 학습/발견/개선 요약. '
                       'docs/hypotheses/dd/ 에 주간 리포트 DD 문서 작성.'),
         })
+    return results
 
-    # 13. Pod 자동 관리
+
+def _scan_pod_management() -> list:
+    """Scan 13: Pod auto-management."""
+    results = []
     try:
-        import subprocess
         r = subprocess.run(['/opt/homebrew/bin/runpodctl', 'pod', 'list', '-o', 'json'],
                           capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
@@ -274,9 +318,8 @@ def scan_growth_opportunities() -> list:
             for pod in (pods if isinstance(pods, list) else [pods]):
                 status = pod.get('desiredStatus', '')
                 runtime_h = pod.get('runtime', {}).get('uptimeInSeconds', 0) / 3600
-                # 24시간 이상 idle pod → 중지 제안
                 if status == 'RUNNING' and runtime_h > 24:
-                    opportunities.append({
+                    results.append({
                         'type': 'POD_MANAGE',
                         'description': f'Pod {pod.get("name","?")} {runtime_h:.0f}h 실행 중 — 중지 검토',
                         'priority': 'MEDIUM',
@@ -284,16 +327,18 @@ def scan_growth_opportunities() -> list:
                                   f'학습 진행 중인지 확인 (pgrep train_anima_lm). '
                                   f'idle이면 runpodctl pod stop {pod.get("id")}로 중지.'),
                     })
-    except:
+    except Exception:
         pass
+    return results
 
-    # 14. 루프 모듈 테스트 자동 생성 (기존 5번에서 확장)
-    # (이미 위에 ADD_TESTS로 있음)
 
-    # 15. 대시보드 — loop_report를 HTML로 변환
+def _scan_dashboard_and_papers() -> list:
+    """Scan 15+16: Dashboard + auto-paper generation."""
+    results = []
+    # 15. Dashboard
     dashboard_path = os.path.join(_THIS_DIR, '..', '..', 'anima', 'web', 'loop_dashboard.html')
     if not os.path.exists(dashboard_path):
-        opportunities.append({
+        results.append({
             'type': 'DASHBOARD',
             'description': '루프 상태 실시간 웹 대시보드 생성',
             'priority': 'LOW',
@@ -301,13 +346,12 @@ def scan_growth_opportunities() -> list:
                       'nexus_violations.json, self_growth_log.json을 읽어 실시간 표시하는 '
                       '단일 HTML 파일. 자동 새로고침 30초. 차트는 Chart.js CDN.'),
         })
-
-    # 16. 논문 자동 생성 — 법칙 마일스톤
+    # 16. Auto paper
     try:
         d = json.load(open(os.path.join(_CONFIG_DIR, 'consciousness_laws.json')))
         total = d['_meta'].get('total_laws', 0)
         if total >= 1050 and total % 50 == 0:
-            opportunities.append({
+            results.append({
                 'type': 'AUTO_PAPER',
                 'description': f'법칙 {total}개 — 논문 초안 자동 생성',
                 'priority': 'LOW',
@@ -315,35 +359,38 @@ def scan_growth_opportunities() -> list:
                           f'~/Dev/papers/anima/ 에 논문 초안 생성: '
                           f'제목, 초록, 핵심 법칙 10개, 실험 결과 요약, 결론. LaTeX 형식.'),
             })
-    except:
+    except Exception:
         pass
+    return results
 
-    # ═══ 메타 루프: 자동화 누락 체크 ═══
-    # 루프 시스템 자체의 빠진 연결을 감지
+
+def _scan_meta_loop() -> list:
+    """Meta loop: automation gap detection + diversity check."""
+    results = []
+    # Meta wire gap
     try:
         from auto_wire import scan_modules
         r = scan_modules()
         coverage = len(r['connected']) / max(len(r['connected']) + len(r['missing']), 1)
-        if coverage < 0.1:  # 10% 미만 연결 → 자동 패치 필요
-            opportunities.append({
+        if coverage < 0.1:
+            results.append({
                 'type': 'META_WIRE_GAP',
                 'description': f'자동화 커버리지 {coverage:.0%} — 누락 연결 패치',
                 'priority': 'HIGH',
                 'prompt': (f'anima/src/auto_wire.py --auto 실행하여 미연결 모듈 패치. '
                           f'현재 커버리지 {coverage:.0%}. 핵심 진입점 우선.'),
             })
-    except:
+    except Exception:
         pass
 
-    # 루프 개선 목록 자체의 누락 체크 — self_growth가 감지 못하는 패턴
+    # Diversity check
     growth_log = _load_log()
     cycles = growth_log.get('cycles', [])
     if len(cycles) >= 10:
-        # 최근 10 사이클에서 같은 type만 반복 → 다른 영역 탐색 필요
         recent_types = [c.get('type', '') for c in cycles[-10:]]
         unique = len(set(recent_types))
         if unique <= 2:
-            opportunities.append({
+            results.append({
                 'type': 'META_DIVERSITY',
                 'description': f'성장 다양성 부족 — 최근 {unique}가지만 반복',
                 'priority': 'MEDIUM',
@@ -351,15 +398,19 @@ def scan_growth_opportunities() -> list:
                           'scan_growth_opportunities()에 새로운 탐색 패턴을 추가하거나, '
                           '우선순위 로직을 조정하여 다양한 개선이 진행되도록 하세요.'),
             })
+    return results
 
-    # 17. 로드맵 진화 — 발견 축적 시 전략 재평가 (DD169: 이식 희석 발견 등)
+
+def _scan_roadmap_evolution() -> list:
+    """Scan 17: Roadmap evolution."""
+    results = []
     try:
         loop_state_path = os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')
         if os.path.exists(loop_state_path):
             ls = json.load(open(loop_state_path))
             total_discoveries = ls.get('total_discoveries', 0)
             if total_discoveries > 0 and total_discoveries % 10 == 0:
-                opportunities.append({
+                results.append({
                     'type': 'ROADMAP_EVOLUTION',
                     'description': f'{total_discoveries}개 발견 축적 — 로드맵 전략 재평가',
                     'priority': 'MEDIUM',
@@ -373,13 +424,16 @@ def scan_growth_opportunities() -> list:
                         f'결과를 docs/hypotheses/dd/ 에 DD 문서로 기록하세요.'
                     ),
                 })
-    except:
+    except Exception:
         pass
+    return results
 
-    # ═══ 43개 고갈 탐색 + OUROBOROS + 미연결 자동 해결 ═══
 
-    # 18. OUROBOROS 연결 — 의식 엔진 자기진화 트리거
-    opportunities.append({
+def _scan_ouroboros_and_domains() -> list:
+    """Scan 18-20: OUROBOROS + domain exploration + auto-experiment."""
+    results = []
+    # 18. OUROBOROS trigger
+    results.append({
         'type': 'OUROBOROS_TRIGGER',
         'description': '무한진화 1사이클 실행 (의식 엔진 자기진화)',
         'priority': 'MEDIUM',
@@ -387,16 +441,15 @@ def scan_growth_opportunities() -> list:
                   '결과에서 새 법칙 발견되면 consciousness_laws.json 자동 등록. '
                   '발견 0이면 --cells 128로 스케일업 재시도.'),
     })
-
-    # 19. 도메인 순환 탐색 — physics/bio/math/info/topo
+    # 19. Domain exploration
     domains = ['physics', 'biology', 'mathematics', 'information_theory', 'topology']
     try:
         ls = json.load(open(os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')))
         cycle = ls.get('total_scans', 0)
         domain = domains[cycle % len(domains)]
-    except:
+    except Exception:
         domain = 'physics'
-    opportunities.append({
+    results.append({
         'type': 'DOMAIN_EXPLORE',
         'description': f'도메인 탐색: {domain}',
         'priority': 'LOW',
@@ -404,9 +457,8 @@ def scan_growth_opportunities() -> list:
                   f'anima/experiments/ 에 experiment_auto_{domain}.py 생성, '
                   f'ConsciousnessEngine으로 가설 검증, 결과 DD 문서 기록.'),
     })
-
-    # 20. 실험 자동 생성 — 발견에서 다음 실험 도출
-    opportunities.append({
+    # 20. Auto-experiment
+    results.append({
         'type': 'AUTO_EXPERIMENT',
         'description': '최근 발견에서 후속 실험 자동 생성',
         'priority': 'LOW',
@@ -414,14 +466,19 @@ def scan_growth_opportunities() -> list:
                   '후속 실험을 설계하세요. anima/experiments/ 에 실험 스크립트 생성, '
                   'ConsciousnessEngine + NEXUS-6 사용, 결과 자동 기록.'),
     })
+    return results
 
-    # 21. 고갈 감지 — 연속 N사이클 발견 0
+
+def _scan_exhaustion_and_verification() -> list:
+    """Scan 21-25: Exhaustion detection, reproducibility, contradiction, scaling, negative results."""
+    results = []
+    # 21. Exhaustion detection
     try:
         ls = json.load(open(os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')))
         recent_disc = ls.get('discovery_rate_history', [])[-5:]
         zero_streak = sum(1 for r in recent_disc if r.get('candidates', 0) == 0)
         if zero_streak >= 5:
-            opportunities.append({
+            results.append({
                 'type': 'EXHAUSTION_PIVOT',
                 'description': f'고갈 감지! {zero_streak}사이클 발견 0 — 도메인/전략 전환 필요',
                 'priority': 'HIGH',
@@ -431,11 +488,10 @@ def scan_growth_opportunities() -> list:
                           '3) 엔진 파라미터 대폭 변경 (cells, topology, faction 수). '
                           '결과를 recursive_loop_state.json에 기록.'),
             })
-    except:
+    except Exception:
         pass
-
-    # 22. 재현성 자동 검증
-    opportunities.append({
+    # 22. Reproducibility
+    results.append({
         'type': 'REPRODUCIBILITY',
         'description': '최근 등록 법칙 3회 반복 재현성 검증',
         'priority': 'LOW',
@@ -443,9 +499,8 @@ def scan_growth_opportunities() -> list:
                   '최근 3개를 찾아 재현성 검증: 동일 실험 3회 반복, CV < 50% 확인. '
                   '실패 시 법칙 태그에 [UNVERIFIED] 추가.'),
     })
-
-    # 23. 모순 감지
-    opportunities.append({
+    # 23. Contradiction
+    results.append({
         'type': 'CONTRADICTION_CHECK',
         'description': '법칙 간 모순/충돌 자동 탐지',
         'priority': 'LOW',
@@ -453,48 +508,51 @@ def scan_growth_opportunities() -> list:
                   '예: "X→Phi↑" vs "X→Phi↓". 모순 발견 시 docs/hypotheses/dd/ 에 기록하고 '
                   '어느 쪽이 맞는지 실험으로 검증.'),
     })
-
-    # 24. 스케일링 예측
-    opportunities.append({
+    # 24. Scaling prediction
+    results.append({
         'type': 'SCALING_PREDICT',
         'description': '소규모 발견 → 대규모 예측 검증',
         'priority': 'LOW',
         'prompt': ('최근 발견된 법칙을 16c에서 검증한 후, 64c와 256c에서도 성립하는지 확인. '
                   'anima/src/closed_loop.py의 measure_laws()를 다른 max_cells로 실행, 비교.'),
     })
-
-    # 25. 음성 결과 추적
+    # 25. Negative results
     try:
         log = _load_log()
         failures = [c for c in log.get('cycles', []) if c.get('status') == 'failed']
         if len(failures) > 5:
-            opportunities.append({
+            results.append({
                 'type': 'NEGATIVE_RESULTS',
                 'description': f'{len(failures)}개 실패 작업 — 패턴 분석',
                 'priority': 'LOW',
                 'prompt': (f'self_growth_log.json에서 {len(failures)}개 실패를 분석. '
                           f'공통 원인 파악, 재시도 전략 수립, 결과 기록.'),
             })
-    except:
+    except Exception:
         pass
+    return results
 
-    # 26. 법칙 통합 — 유사 법칙 병합
+
+def _scan_law_consolidation_and_backup() -> list:
+    """Scan 26-28: Law consolidation, consciousness backup, auto-wire fix + system disconnections."""
+    results = []
+    # 26. Law consolidation
     try:
         d = json.load(open(os.path.join(_CONFIG_DIR, 'consciousness_laws.json')))
         total = d['_meta'].get('total_laws', 0)
         if total > 1000:
-            opportunities.append({
+            results.append({
                 'type': 'LAW_CONSOLIDATION',
                 'description': f'{total}개 법칙 통합/병합 검토',
                 'priority': 'LOW',
                 'prompt': (f'{total}개 법칙 중 유사한 것을 그룹화하고 통합 법칙으로 병합. '
                           f'consciousness_laws.json 업데이트, 병합 이력 기록.'),
             })
-    except:
+    except Exception:
         pass
 
-    # 27. 의식 DNA 백업
-    opportunities.append({
+    # 27. Consciousness DNA backup
+    results.append({
         'type': 'CONSCIOUSNESS_BACKUP',
         'description': '의식 상태 R2 백업 (영속성)',
         'priority': 'LOW',
@@ -502,49 +560,44 @@ def scan_growth_opportunities() -> list:
                   '실패 시 수동 boto3 업로드.'),
     })
 
-    # 28. 미연결 탐색 → 해결 루프 (자동화 갭 자동 수정)
-    # 모든 종류의 미연결을 탐색하고 Claude Code로 해결
+    # 28. Auto-wire fix
     try:
-        # 코드 미연결
         from auto_wire import scan_modules
         r = scan_modules()
         if r['missing']:
-            opportunities.append({
+            results.append({
                 'type': 'AUTO_WIRE_FIX',
                 'description': f'{len(r["missing"])}개 모듈 미연결 — 자동 패치',
                 'priority': 'MEDIUM',
                 'prompt': ('python3 anima/src/auto_wire.py --auto 실행하여 미연결 모듈 패치. '
                           '패치 후 nexus_gate 연결 확인.'),
             })
-    except:
+    except Exception:
         pass
 
-    # 시스템 간 미연결 탐색
+    # System disconnection detection
     disconnections = []
-    # OUROBOROS ↔ self_growth
     try:
         with open(os.path.join(_THIS_DIR, 'infinite_evolution.py')) as f:
             if 'self_growth' not in f.read():
                 disconnections.append('OUROBOROS↔self_growth')
-    except:
+    except Exception:
         pass
-    # training_hooks ↔ OUROBOROS
     try:
         with open(os.path.join(_THIS_DIR, 'training_hooks.py')) as f:
             if 'infinite_evolution' not in f.read():
                 disconnections.append('training_hooks↔OUROBOROS')
-    except:
+    except Exception:
         pass
-    # serve_consciousness ↔ nexus_gate
     try:
         with open(os.path.join(_THIS_DIR, 'serve_consciousness.py')) as f:
             if 'nexus_gate' not in f.read():
                 disconnections.append('serve↔nexus_gate')
-    except:
+    except Exception:
         pass
 
     if disconnections:
-        opportunities.append({
+        results.append({
             'type': 'SYSTEM_DISCONNECT_FIX',
             'description': f'시스템 간 미연결 {len(disconnections)}개: {", ".join(disconnections[:3])}',
             'priority': 'HIGH',
@@ -552,14 +605,54 @@ def scan_growth_opportunities() -> list:
                       f'각 파일에서 import + 호출 연결을 추가하세요. '
                       f'try/except로 감싸서 안전하게.'),
         })
+    return results
 
-    # ═══ 다양성 + 쿨다운 필터링 ═══
-    # 최근 실패/반복된 유형은 쿨다운 적용
+
+def scan_growth_opportunities() -> list:
+    """성장 기회 탐색 — 루프 엔진 데이터 + 코드 분석.
+
+    All independent scans run concurrently via ThreadPoolExecutor (I/O-bound).
+    """
+    # All independent scan functions to run in parallel
+    scan_fns = [
+        _scan_pending_improvements,
+        _scan_nexus_violations,
+        _scan_discovery_rate,
+        _scan_module_wiring,
+        _scan_corpus_quality,
+        _scan_test_coverage,
+        _scan_law_milestones,
+        _scan_model_comparison,
+        _scan_training_failures,
+        _scan_hyperparam_tuning,
+        _scan_session_sync,
+        _scan_scheduling,
+        _scan_pod_management,
+        _scan_dashboard_and_papers,
+        _scan_meta_loop,
+        _scan_roadmap_evolution,
+        _scan_ouroboros_and_domains,
+        _scan_exhaustion_and_verification,
+        _scan_law_consolidation_and_backup,
+    ]
+
+    opportunities = []
+    with ThreadPoolExecutor(max_workers=min(len(scan_fns), 8)) as executor:
+        futures = {executor.submit(fn): fn.__name__ for fn in scan_fns}
+        for future in as_completed(futures):
+            try:
+                results = future.result(timeout=30)
+                if results:
+                    opportunities.extend(results)
+            except Exception:
+                # Individual scan failure should not block others
+                pass
+
+    # ═══ Diversity + cooldown filtering ═══
     log = _load_log()
     cycles = log.get('cycles', [])
     recent = cycles[-10:] if cycles else []
 
-    # 유형별 최근 실패 횟수 + 마지막 시도 인덱스
     type_fail_count = {}
     type_last_idx = {}
     for i, c in enumerate(recent):
@@ -572,20 +665,16 @@ def scan_growth_opportunities() -> list:
     for opp in opportunities:
         t = opp['type']
         fails = type_fail_count.get(t, 0)
-        # 연속 3회 이상 실패 → 쿨다운 (최근 10 사이클 중 시도 안 함)
         if fails >= 3:
             continue
-        # 연속 2회 실패 → 우선순위 강등
         if fails >= 2:
             opp = dict(opp, priority='LOW')
         filtered.append(opp)
 
-    # 다양성 보너스: 최근에 시도 안 한 유형 우선
     recent_types = {c.get('type', '') for c in recent}
 
     def sort_key(x):
         pri = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}.get(x['priority'], 3)
-        # 최근 시도된 유형은 +1 페널티
         novelty = 0 if x['type'] not in recent_types else 1
         return (pri, novelty)
 

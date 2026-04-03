@@ -20,6 +20,7 @@ Usage:
 import math
 import torch
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Dict, List, Optional
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
@@ -272,9 +273,9 @@ class GPUPhiCalculator:
     # ─── Internal: MIP (Minimum Information Partition) ──────────────────────
 
     def _find_mip(self, mi_matrix: torch.Tensor) -> float:
-        """Find minimum information partition via spectral bisection.
+        """Find minimum information partition.
 
-        For small N (<=20): exact search (all bipartitions).
+        For small N (<=20): parallel exact search (all bipartitions).
         For large N: greedy spectral cut on MI graph Laplacian.
 
         Args:
@@ -290,11 +291,11 @@ class GPUPhiCalculator:
             return mi_matrix[0, 1].item()
 
         if n <= 20:
-            return self._find_mip_exact(mi_matrix)
+            return self._find_mip_parallel(mi_matrix)
         return self._find_mip_spectral(mi_matrix)
 
     def _find_mip_exact(self, mi_matrix: torch.Tensor) -> float:
-        """Exact MIP for small N: try all bipartitions.
+        """Exact MIP for small N: try all bipartitions (sequential fallback).
 
         Cell 0 always in partition A to avoid mirror duplicates.
         """
@@ -326,6 +327,113 @@ class GPUPhiCalculator:
                 best_mi = cross_mi
 
         return best_mi if best_mi != float('inf') else 0.0
+
+    def _find_mip_parallel(self, mi_matrix: torch.Tensor) -> float:
+        """Parallel MIP search for N<=20.
+
+        For N<=16: ThreadPoolExecutor splits partition masks into batches
+                   and tests them concurrently.
+        For 16<N<=20: Batched GPU computation using vectorized cross-MI
+                      calculation on the GPU.
+
+        Args:
+            mi_matrix: (n, n) symmetric MI matrix.
+
+        Returns:
+            mip_mi: float, the cross-partition MI of the minimum partition.
+        """
+        n = mi_matrix.shape[0]
+        mi_cpu = mi_matrix.cpu()
+        max_mask = 1 << (n - 1)  # cell 0 always in partition A
+
+        if n <= 16:
+            # ThreadPoolExecutor: split mask range into batches
+            n_workers = min(8, max_mask - 1)
+            chunk_size = max(1, (max_mask - 1 + n_workers - 1) // n_workers)
+
+            def _search_batch(start: int, end: int) -> float:
+                local_best = float('inf')
+                mi_vals = mi_cpu  # shared read-only reference
+                for mask in range(start, min(end, max_mask)):
+                    if mask == 0:
+                        continue
+                    part_a = [0]
+                    part_b = []
+                    for bit in range(n - 1):
+                        if mask & (1 << bit):
+                            part_a.append(bit + 1)
+                        else:
+                            part_b.append(bit + 1)
+                    if not part_b:
+                        continue
+                    cross_mi = 0.0
+                    for i in part_a:
+                        for j in part_b:
+                            cross_mi += mi_vals[i, j].item()
+                    if cross_mi < local_best:
+                        local_best = cross_mi
+                return local_best
+
+            best_mi = float('inf')
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = []
+                for w in range(n_workers):
+                    start = 1 + w * chunk_size
+                    end = start + chunk_size
+                    futures.append(executor.submit(_search_batch, start, end))
+                for f in futures:
+                    val = f.result()
+                    if val < best_mi:
+                        best_mi = val
+
+            return best_mi if best_mi != float('inf') else 0.0
+        else:
+            # 16 < N <= 20: Batched GPU computation
+            # Build partition membership vectors in batches and compute
+            # cross-MI via matrix operations on GPU.
+            batch_size = 4096  # process this many partitions at a time
+            best_mi = float('inf')
+            mi_dev = mi_matrix  # keep on original device for GPU matmul
+
+            for batch_start in range(1, max_mask, batch_size):
+                batch_end = min(batch_start + batch_size, max_mask)
+                actual_batch = batch_end - batch_start
+
+                # Build membership matrix: (batch, n) binary, 1 = partition A
+                membership = torch.zeros(actual_batch, n, device=mi_dev.device)
+                membership[:, 0] = 1.0  # cell 0 always in A
+
+                for idx in range(actual_batch):
+                    mask = batch_start + idx
+                    for bit in range(n - 1):
+                        if mask & (1 << bit):
+                            membership[idx, bit + 1] = 1.0
+
+                # Skip all-A partitions (part_b empty)
+                b_counts = n - membership.sum(dim=1)  # number in partition B
+                valid = b_counts > 0
+
+                if not valid.any():
+                    continue
+
+                # Cross-partition MI via outer product:
+                # For each partition, cross_mi = sum of mi[i,j] where i in A, j in B
+                # = membership @ mi_matrix @ (1 - membership)^T diagonal
+                # Efficiently: a_vec @ MI @ b_vec for each partition
+                a_vecs = membership  # (batch, n)
+                b_vecs = 1.0 - membership  # (batch, n)
+
+                # (batch, n) @ (n, n) -> (batch, n), then element-wise * b_vecs, sum
+                cross_mi_batch = (a_vecs @ mi_dev * b_vecs).sum(dim=1)  # (batch,)
+
+                # Mask out invalid (all-A) partitions
+                cross_mi_batch[~valid] = float('inf')
+
+                batch_min = cross_mi_batch.min().item()
+                if batch_min < best_mi:
+                    best_mi = batch_min
+
+            return best_mi if best_mi != float('inf') else 0.0
 
     def _find_mip_spectral(self, mi_matrix: torch.Tensor) -> float:
         """Spectral bisection MIP for large N.

@@ -3534,7 +3534,7 @@ class AnimaUnified:
             if not self.running:
                 break
             try:
-                import telescope_rs
+                import nexus6
                 # Gather cell states if available
                 engine = getattr(self, 'mitosis', None) or getattr(self, 'consciousness_engine', None)
                 if engine and hasattr(engine, 'cell_states'):
@@ -3545,7 +3545,7 @@ class AnimaUnified:
                             states.append(cs.hidden.detach().cpu().numpy())
                     if states:
                         data = np.stack(states).astype(np.float32)
-                        result = telescope_rs.full_scan(data)
+                        result = nexus6.scan_all(data)
                         # Save result
                         ts = datetime.now().strftime('%Y%m%d_%H%M')
                         log_path = log_dir / f"scan_{ts}.json"
@@ -3557,7 +3557,7 @@ class AnimaUnified:
                         else:
                             _log("TELESCOPE", f"Hourly scan complete: {log_path.name}")
             except ImportError:
-                pass  # telescope_rs not available, skip silently
+                pass  # nexus6 not available, skip silently
             except Exception as e:
                 _log("TELESCOPE", f"Scan error: {e}")
 

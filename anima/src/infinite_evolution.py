@@ -31,10 +31,12 @@ Features:
   v23: distributed_evolution (stub — multi-worker discovery)
   v24: physics_fitting (damped oscillator / Boltzmann / log fits)
   v25: self_replicate (ouroboros self-performance monitoring)
+  v27: parallel_discovery (lens/topology/discovery parallelization, --no-parallel toggle)
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
     python3 infinite_evolution.py --cycle-topology   # rotate topology every 10 gens
+    python3 infinite_evolution.py --no-parallel       # disable all parallelization
     python3 infinite_evolution.py --auto-roadmap --cloud  # cloud orchestrator stub
 """
 import sys
@@ -82,15 +84,19 @@ except ImportError:
     _GPUPhiCalculator = None
 
 try:
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
     import multiprocessing
     HAS_PARALLEL = True
 except ImportError:
-    pass
+    ProcessPoolExecutor = None
+    ThreadPoolExecutor = None
+
+# Global toggle — set to False via --no-parallel CLI flag
+ENABLE_PARALLEL = True
 
 HAS_TELESCOPE = False
 try:
-    import telescope_rs
+    import nexus6
     HAS_TELESCOPE = True
 except ImportError:
     pass
@@ -103,7 +109,7 @@ def _print_accelerations():
     print(f'  \u26a1 Accelerations: Rust engine {_yn(HAS_RUST_ENGINE)}, '
           f'Rust discovery {_yn(HAS_RUST_DISCOVERY)}, '
           f'GPU Phi {_yn(HAS_GPU_PHI)}, '
-          f'Parallel topo {_yn(HAS_PARALLEL)}')
+          f'Parallel {_yn(HAS_PARALLEL and ENABLE_PARALLEL)}')
     print(f'  \u26a1 v2: adaptive_steps \u2705, mod_pruning \u2705, early_abort \u2705')
     print(f'  \u26a1 v3: advanced_patterns \u2705, chaos_cycle \u2705, law_network \u2705')
     print(f'  \u26a1 v4: co_evolution \u2705, bandit_explore \u2705, ucb_topo \u2705, seasonal \u2705')
@@ -120,6 +126,106 @@ def _print_accelerations():
     print(f'  \u26a1 v24: physics_fitting \u2705 (log/power/exp_decay, R²>0.8)')
     print(f'  \u26a1 v19/v21-v23/v25: transfer_entropy, llm_stub, rust_status, distributed_stub, self_replicate \u2705')
     sys.stdout.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v27: Parallel helpers — _parallel_map with graceful fallback
+# ═══════════════════════════════════════════════════════════════════════
+
+def _parallel_map(fn, items, executor_cls=None, max_workers=None, label='tasks'):
+    """Run fn over items in parallel, falling back to sequential on failure.
+
+    Args:
+        fn: callable that takes a single item and returns a result
+        items: iterable of arguments
+        executor_cls: ProcessPoolExecutor or ThreadPoolExecutor (default: ThreadPoolExecutor)
+        max_workers: max parallel workers (default: min(cpu_count, len(items)))
+        label: human-readable label for timing output
+
+    Returns:
+        list of results in the same order as items
+    """
+    items = list(items)
+    if not items:
+        return []
+
+    if executor_cls is None:
+        executor_cls = ThreadPoolExecutor
+
+    n = len(items)
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, n)
+
+    can_parallel = (HAS_PARALLEL and ENABLE_PARALLEL and max_workers > 1
+                    and executor_cls is not None and n > 1)
+
+    if can_parallel:
+        try:
+            t0 = time.time()
+            with executor_cls(max_workers=max_workers) as pool:
+                results = list(pool.map(fn, items))
+            dt = time.time() - t0
+            return results
+        except Exception:
+            # Fallback to sequential on any multiprocessing error
+            pass
+
+    # Sequential fallback
+    return [fn(item) for item in items]
+
+
+def _parallel_submit(fns_and_args, executor_cls=None, max_workers=None, label='tasks'):
+    """Run heterogeneous callables in parallel, falling back to sequential.
+
+    Args:
+        fns_and_args: list of (fn, args_tuple, kwargs_dict) or (fn, args_tuple)
+        executor_cls: ProcessPoolExecutor or ThreadPoolExecutor (default: ThreadPoolExecutor)
+        max_workers: max parallel workers
+        label: human-readable label for timing output
+
+    Returns:
+        list of results in the same order as fns_and_args
+    """
+    if not fns_and_args:
+        return []
+
+    if executor_cls is None:
+        executor_cls = ThreadPoolExecutor
+
+    n = len(fns_and_args)
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, n)
+
+    can_parallel = (HAS_PARALLEL and ENABLE_PARALLEL and max_workers > 1
+                    and executor_cls is not None and n > 1)
+
+    # Normalize entries to (fn, args, kwargs)
+    normalized = []
+    for entry in fns_and_args:
+        if len(entry) == 2:
+            normalized.append((entry[0], entry[1], {}))
+        else:
+            normalized.append((entry[0], entry[1], entry[2]))
+
+    if can_parallel:
+        try:
+            with executor_cls(max_workers=max_workers) as pool:
+                futures = []
+                for fn, args, kwargs in normalized:
+                    futures.append(pool.submit(fn, *args, **kwargs))
+                results = [f.result() for f in futures]
+            return results
+        except Exception:
+            pass
+
+    # Sequential fallback
+    results = []
+    for fn, args, kwargs in normalized:
+        try:
+            results.append(fn(*args, **kwargs))
+        except Exception:
+            results.append(None)
+    return results
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
@@ -194,11 +300,11 @@ TELESCOPE_DOMAIN_COMBOS = {
 
 
 def _run_single_lens(lens_name, data, n_cells=64, steps=50):
-    """Run a single telescope_rs lens scan. Returns dict or None on failure."""
+    """Run a single nexus6 lens scan. Returns dict or None on failure."""
     try:
         if lens_name == 'consciousness':
-            return telescope_rs.consciousness_scan(data, n_cells=n_cells, steps=steps)
-        scan_fn = getattr(telescope_rs, f'{lens_name}_scan', None)
+            return nexus6.consciousness_scan(data, n_cells=n_cells, steps=steps)
+        scan_fn = getattr(nexus6, f'{lens_name}_scan', None)
         if scan_fn is None:
             return None
         return scan_fn(data)
@@ -250,14 +356,13 @@ def _extract_lens_patterns(lens_name, result):
 
 
 def _telescope_discover(engine, steps=50, mode='full'):
-    """Run engine for `steps` steps, collect cell states, and analyze with telescope_rs.
+    """Run engine for `steps` steps, collect cell states, and analyze with nexus6.
 
     v11 #89: Collect cell state snapshots every 10 steps, flatten into
-    (N_snapshots, N_cells * hidden_dim) ndarray, run telescope_rs scans.
+    (N_snapshots, N_cells * hidden_dim) ndarray, run nexus6 scans.
     Convert findings into PatternRegistry-compatible pattern dicts.
 
     v11.2: Expanded from 3 lenses to 22 lenses with domain combos.
-    mode='full' runs all 22 lenses; mode='basic' runs basic 3; mode=<domain> runs combo.
 
     Returns list of pattern dicts, or [] on any failure.
     """
@@ -308,18 +413,37 @@ def _telescope_discover(engine, steps=50, mode='full'):
         else:
             lenses_to_run = TELESCOPE_DOMAIN_COMBOS.get('basic', TELESCOPE_ALL_LENSES[:3])
 
-        # Run all selected lenses
+        # Run all selected lenses — v27: parallel via ThreadPoolExecutor
         n_cells = getattr(engine, 'n_cells', 64)
         patterns = []
         active_lenses = set()
 
-        for lens_name in lenses_to_run:
+        def _scan_one_lens(lens_name):
+            """Scan a single lens and return (lens_name, patterns, has_signal)."""
             result = _run_single_lens(lens_name, data, n_cells=n_cells, steps=steps)
             if result is not None:
                 lens_patterns, has_signal = _extract_lens_patterns(lens_name, result)
-                patterns.extend(lens_patterns)
-                if has_signal:
-                    active_lenses.add(lens_name)
+                return (lens_name, lens_patterns, has_signal)
+            return (lens_name, [], False)
+
+        t_lens_start = time.time()
+        lens_results = _parallel_map(
+            _scan_one_lens, lenses_to_run,
+            executor_cls=ThreadPoolExecutor if HAS_PARALLEL else None,
+            max_workers=min(os.cpu_count() or 4, len(lenses_to_run)),
+            label='lens_scan',
+        )
+        t_lens_elapsed = time.time() - t_lens_start
+
+        for lens_name, lens_patterns, has_signal in lens_results:
+            patterns.extend(lens_patterns)
+            if has_signal:
+                active_lenses.add(lens_name)
+
+        n_lenses_run = len(lenses_to_run)
+        if ENABLE_PARALLEL and HAS_PARALLEL and n_lenses_run > 1:
+            print(f'    Parallel lens scan: {n_lenses_run} lenses in {t_lens_elapsed:.2f}s')
+            sys.stdout.flush()
 
         # Cross-scan consensus: 3+ lenses with meaningful signal
         if len(active_lenses) >= 3:
@@ -726,6 +850,8 @@ def _physics_fit(metrics_history, min_r2=0.8):
 def _post_discovery_analysis(engine, metrics_history, gen):
     """Run v18 causal, v20 anomaly, v24 physics after each generation's discovery.
 
+    v27: Runs all applicable analyses in parallel via ThreadPoolExecutor.
+
     Args:
         engine: ConsciousnessEngine instance
         metrics_history: list of metric dicts collected over the generation
@@ -737,25 +863,53 @@ def _post_discovery_analysis(engine, metrics_history, gen):
     extra = []
     counts = []
 
+    # Build list of analyses to run this generation
+    tasks = []
+
     # v18: Causal discovery (every 3rd gen)
     if gen % 3 == 0:
-        causal = _causal_discover(engine, metrics_history)
-        if causal:
-            extra.extend(causal)
-            counts.append(f'causal={len(causal)}')
+        tasks.append(('causal', _causal_discover, (engine, metrics_history), {}))
 
     # v20: Anomaly hunt (every gen)
-    anomalies = _anomaly_hunt(metrics_history)
-    if anomalies:
-        extra.extend(anomalies)
-        counts.append(f'anomaly={len(anomalies)}')
+    tasks.append(('anomaly', _anomaly_hunt, (metrics_history,), {}))
 
     # v24: Physics fitting (every 5th gen)
     if gen % 5 == 0:
-        physics = _physics_fit(metrics_history)
-        if physics:
-            extra.extend(physics)
-            counts.append(f'physics={len(physics)}')
+        tasks.append(('physics', _physics_fit, (metrics_history,), {}))
+
+    if not tasks:
+        return extra, None
+
+    # v27: Run all analyses in parallel via ThreadPoolExecutor
+    if len(tasks) > 1 and HAS_PARALLEL and ENABLE_PARALLEL:
+        try:
+            fns = [(fn, args, kwargs) for _, fn, args, kwargs in tasks]
+            labels = [label for label, _, _, _ in tasks]
+            results = _parallel_submit(fns, executor_cls=ThreadPoolExecutor,
+                                       max_workers=len(tasks), label='post_discovery')
+            for label, result in zip(labels, results):
+                if result:
+                    extra.extend(result)
+                    counts.append(f'{label}={len(result)}')
+        except Exception:
+            # Fallback to sequential
+            for label, fn, args, kwargs in tasks:
+                try:
+                    result = fn(*args, **kwargs)
+                    if result:
+                        extra.extend(result)
+                        counts.append(f'{label}={len(result)}')
+                except Exception:
+                    pass
+    else:
+        for label, fn, args, kwargs in tasks:
+            try:
+                result = fn(*args, **kwargs)
+                if result:
+                    extra.extend(result)
+                    counts.append(f'{label}={len(result)}')
+            except Exception:
+                pass
 
     summary = ', '.join(counts) if counts else None
     return extra, summary
@@ -4691,7 +4845,7 @@ def _run_topo_batch(cells, steps, topologies, n_gens=1):
         for _ in range(n_gens):
             tasks.append((cells, steps, topo))
 
-    use_parallel = HAS_PARALLEL and cells <= 256 and len(tasks) > 1
+    use_parallel = HAS_PARALLEL and ENABLE_PARALLEL and cells <= 256 and len(tasks) > 1
 
     if use_parallel:
         try:
@@ -5039,7 +5193,7 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
 
             # Phase 1: Discovery (v2 #9: adaptive steps with early abort)
             # #3: Use parallel topology batch at start of each topo cycle for wider coverage
-            use_parallel_batch = (HAS_PARALLEL and cells <= 256
+            use_parallel_batch = (HAS_PARALLEL and ENABLE_PARALLEL and cells <= 256
                                   and gen > 1 and gen % topo_gens == 1
                                   and len(topo_saturated) == 0)
             _line60 = '\u2500' * 60; print(f'\n{_line60}')
@@ -5069,40 +5223,101 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                 print(f'    Discovery error: {e}')
                 raw_patterns = []
 
-            # v3 #21-25: Advanced pattern detection
-            try:
-                adv_engine = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+            # v27: Parallel secondary discovery (advanced + telescope + tension + federated)
+            _do_tele_rm = (HAS_TELESCOPE and gen % 5 == 0
+                           and stage.get('telescope', False))
+            _do_tension = (gen % 15 == 0)
+            _do_federated = (gen % 5 == 0)
+
+            _sec_tasks = []
+
+            def _run_adv_rm():
                 try:
-                    adv_engine.topology = current_topo
+                    ae = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                    try:
+                        ae.topology = current_topo
+                    except Exception:
+                        pass
+                    return _detect_advanced_patterns(ae, min(steps, 200), current_topo)
                 except Exception:
-                    pass
-                adv_patterns = _detect_advanced_patterns(adv_engine, min(steps, 200), current_topo)
-                if adv_patterns:
-                    raw_patterns.extend(adv_patterns)
-                    print(f'    v3: +{len(adv_patterns)} advanced patterns '
+                    return []
+
+            def _run_tele_rm():
+                try:
+                    if not _do_tele_rm:
+                        return []
+                    te = ConsciousnessEngine(initial_cells=cells, max_cells=cells)
+                    try:
+                        te.topology = current_topo
+                    except Exception:
+                        pass
+                    return _telescope_discover(te, steps=min(steps, 50))
+                except Exception:
+                    return []
+
+            def _run_tension_rm():
+                try:
+                    if not _do_tension:
+                        return []
+                    return _tension_link_discover(cells, 50, current_topo)
+                except Exception:
+                    return []
+
+            _sec_tasks.append(('advanced', _run_adv_rm, (), {}))
+            if _do_tele_rm:
+                _sec_tasks.append(('telescope', _run_tele_rm, (), {}))
+            if _do_tension:
+                _sec_tasks.append(('tension', _run_tension_rm, (), {}))
+
+            _sec_t0 = time.time()
+            if len(_sec_tasks) > 1 and HAS_PARALLEL and ENABLE_PARALLEL:
+                _sec_fns = [(fn, a, kw) for _, fn, a, kw in _sec_tasks]
+                _sec_results = _parallel_submit(
+                    _sec_fns, executor_cls=ThreadPoolExecutor,
+                    max_workers=len(_sec_tasks), label='roadmap_discovery')
+            else:
+                _sec_results = []
+                for _, fn, a, kw in _sec_tasks:
+                    try:
+                        _sec_results.append(fn(*a, **kw))
+                    except Exception:
+                        _sec_results.append([])
+            _sec_dt = time.time() - _sec_t0
+
+            for i, (label, _, _, _) in enumerate(_sec_tasks):
+                result = _sec_results[i] if i < len(_sec_results) else []
+                if not result:
+                    continue
+                if label == 'advanced':
+                    raw_patterns.extend(result)
+                    print(f'    v3: +{len(result)} advanced patterns '
                           f'(oscillation/phase/decay)')
-            except Exception:
-                pass
+                elif label == 'telescope':
+                    tele_patterns, n_consensus = _telescope_consensus_filter(result)
+                    n_lenses = len(set(
+                        m for p in tele_patterns
+                        if isinstance(p, dict) and p.get('source') == 'telescope_v11'
+                        for m in p.get('metrics', [])
+                    ))
+                    raw_patterns.extend(tele_patterns)
+                    print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
+                          f'from {n_lenses} lenses, {n_consensus} consensus')
+                elif label == 'tension':
+                    raw_patterns.extend(result)
+                    print(f'    v7 tension_link: +{len(result)} patterns '
+                          f'(hivemind/cross_engine)')
+
+            if ENABLE_PARALLEL and HAS_PARALLEL and len(_sec_tasks) > 1:
+                print(f'    v27: parallel secondary ({len(_sec_tasks)} tasks) in {_sec_dt:.2f}s')
+            sys.stdout.flush()
 
             # v6 #59: Multi-timescale extra patterns
             if v6_extra:
                 raw_patterns.extend(v6_extra)
 
-            # v7 #63: Tension link discovery every 15th gen
+            # v7 #64: Federated discovery every 5th gen (sequential — requires registry sync)
             try:
-                if gen % 15 == 0:
-                    tension_patterns = _tension_link_discover(cells, 50, current_topo)
-                    if tension_patterns:
-                        raw_patterns.extend(tension_patterns)
-                        print(f'    v7 tension_link: +{len(tension_patterns)} patterns '
-                              f'(hivemind/cross_engine)')
-                        sys.stdout.flush()
-            except Exception:
-                pass
-
-            # v7 #64: Federated discovery every 5th gen
-            try:
-                if gen % 5 == 0:
+                if _do_federated:
                     federated = _get_federated()
                     if federated:
                         federated.sync_from(registry)
@@ -5110,25 +5325,6 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                             cells, steps, current_topo, gen)
                         if fed_patterns:
                             raw_patterns.extend(fed_patterns)
-            except Exception:
-                pass
-
-            # v11 #89-90: Telescope 9-lens scan every 5th gen (S3+ only)
-            try:
-                if (HAS_TELESCOPE and gen % 5 == 0
-                        and stage.get('telescope', False)):
-                    tele_patterns = _telescope_discover(engine, steps=min(steps, 50))
-                    if tele_patterns:
-                        tele_patterns, n_consensus = _telescope_consensus_filter(tele_patterns)
-                        n_lenses = len(set(
-                            m for p in tele_patterns
-                            if isinstance(p, dict) and p.get('source') == 'telescope_v11'
-                            for m in p.get('metrics', [])
-                        ))
-                        raw_patterns.extend(tele_patterns)
-                        print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
-                              f'from {n_lenses} lenses, {n_consensus} consensus')
-                        sys.stdout.flush()
             except Exception:
                 pass
 
@@ -5484,7 +5680,15 @@ def main():
                         help='v9 #77-82: Enable hardware evolution stubs (ESP32/FPGA/neuromorphic)')
     parser.add_argument('--accel', action='store_true',
                         help='v26: Use acceleration winners (PolyrhythmScheduler) to speed up discovery')
+    parser.add_argument('--no-parallel', action='store_true',
+                        help='v27: Disable multiprocessing parallelization (run all tasks sequentially)')
     args = parser.parse_args()
+
+    # v27: Apply --no-parallel flag
+    if getattr(args, 'no_parallel', False):
+        global ENABLE_PARALLEL
+        ENABLE_PARALLEL = False
+        print('  v27: Parallel disabled (--no-parallel)')
 
     if args.auto_roadmap:
         run_auto_roadmap(resume=args.resume, report_interval=args.report_interval,
@@ -5633,45 +5837,84 @@ def main():
                     print(f'    v26: accel {args.steps}->{accel_steps} steps '
                           f'(frac={accel_frac:.2f})')
 
-            try:
-                # v2 #9: Adaptive discovery with early abort
-                raw_patterns = _adaptive_discover(current_cells, accel_steps, current_topo, engine)
-            except Exception as e:
-                print(f"    Discovery error: {e}")
-                raw_patterns = []
+            # v27: Parallel discovery — run adaptive, advanced, telescope concurrently
+            _do_telescope = HAS_TELESCOPE and gen % 5 == 0 and current_cells >= 128
+            _disc_tasks = []
 
-            # v3 #21-25: Advanced pattern detection
-            try:
-                adv_engine = ConsciousnessEngine(initial_cells=current_cells, max_cells=current_cells)
+            def _run_adaptive():
                 try:
-                    adv_engine.topology = current_topo
+                    return _adaptive_discover(current_cells, accel_steps, current_topo, engine)
                 except Exception:
-                    pass
-                adv_patterns = _detect_advanced_patterns(adv_engine, min(args.steps, 200), current_topo)
-                if adv_patterns:
-                    raw_patterns.extend(adv_patterns)
-                    print(f'    v3: +{len(adv_patterns)} advanced patterns '
-                          f'(oscillation/phase/decay)')
-            except Exception:
-                pass
+                    return []
 
-            # v11 #89-90: Telescope 9-lens scan every 5th gen (128c+ recommended)
-            try:
-                if HAS_TELESCOPE and gen % 5 == 0 and current_cells >= 128:
-                    tele_patterns = _telescope_discover(engine, steps=min(args.steps, 50))
-                    if tele_patterns:
-                        tele_patterns, n_consensus = _telescope_consensus_filter(tele_patterns)
-                        n_lenses = len(set(
-                            m for p in tele_patterns
-                            if isinstance(p, dict) and p.get('source') == 'telescope_v11'
-                            for m in p.get('metrics', [])
-                        ))
-                        raw_patterns.extend(tele_patterns)
-                        print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
-                              f'from {n_lenses} lenses, {n_consensus} consensus')
-                        sys.stdout.flush()
-            except Exception:
-                pass
+            def _run_advanced():
+                try:
+                    ae = ConsciousnessEngine(initial_cells=current_cells, max_cells=current_cells)
+                    try:
+                        ae.topology = current_topo
+                    except Exception:
+                        pass
+                    return _detect_advanced_patterns(ae, min(args.steps, 200), current_topo)
+                except Exception:
+                    return []
+
+            def _run_telescope():
+                try:
+                    if not _do_telescope:
+                        return []
+                    te = ConsciousnessEngine(initial_cells=current_cells, max_cells=current_cells)
+                    try:
+                        te.topology = current_topo
+                    except Exception:
+                        pass
+                    return _telescope_discover(te, steps=min(args.steps, 50))
+                except Exception:
+                    return []
+
+            _disc_tasks = [
+                (_run_adaptive, (), {}),
+                (_run_advanced, (), {}),
+            ]
+            if _do_telescope:
+                _disc_tasks.append((_run_telescope, (), {}))
+
+            _disc_t0 = time.time()
+            if len(_disc_tasks) > 1 and HAS_PARALLEL and ENABLE_PARALLEL:
+                _disc_results = _parallel_submit(
+                    _disc_tasks, executor_cls=ThreadPoolExecutor,
+                    max_workers=len(_disc_tasks), label='discovery')
+            else:
+                _disc_results = []
+                for _fn, _a, _kw in _disc_tasks:
+                    try:
+                        _disc_results.append(_fn(*_a, **_kw))
+                    except Exception:
+                        _disc_results.append([])
+            _disc_dt = time.time() - _disc_t0
+
+            # Collect results
+            raw_patterns = _disc_results[0] if _disc_results[0] else []
+            adv_patterns = _disc_results[1] if len(_disc_results) > 1 and _disc_results[1] else []
+            if adv_patterns:
+                raw_patterns.extend(adv_patterns)
+                print(f'    v3: +{len(adv_patterns)} advanced patterns '
+                      f'(oscillation/phase/decay)')
+
+            if _do_telescope and len(_disc_results) > 2 and _disc_results[2]:
+                tele_patterns = _disc_results[2]
+                tele_patterns, n_consensus = _telescope_consensus_filter(tele_patterns)
+                n_lenses = len(set(
+                    m for p in tele_patterns
+                    if isinstance(p, dict) and p.get('source') == 'telescope_v11'
+                    for m in p.get('metrics', [])
+                ))
+                raw_patterns.extend(tele_patterns)
+                print(f'    \U0001f52d Telescope scan: {len(tele_patterns)} patterns '
+                      f'from {n_lenses} lenses, {n_consensus} consensus')
+
+            if ENABLE_PARALLEL and HAS_PARALLEL and len(_disc_tasks) > 1:
+                print(f'    v27: parallel discovery ({len(_disc_tasks)} tasks) in {_disc_dt:.2f}s')
+            sys.stdout.flush()
 
             # v18+v20+v24: Post-discovery analysis (causal, anomaly, physics)
             try:

@@ -31,6 +31,8 @@ import math
 import argparse
 import copy
 import sys
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple
 
@@ -258,8 +260,8 @@ class PhiIIT:
                 cut = sum(mi_matrix[i, j] for i in ga for j in gb)
                 min_cut = min(min_cut, cut)
             return min_cut if min_cut != float('inf') else 0.0
-        else:
-            # Spectral (Fiedler vector) approximation
+        elif n <= 20:
+            # Spectral (Fiedler vector) approximation — single threshold
             degree = mi_matrix.sum(axis=1)
             laplacian = np.diag(degree) - mi_matrix
             try:
@@ -272,6 +274,121 @@ class PhiIIT:
                 return sum(mi_matrix[i, j] for i in ga for j in gb)
             except Exception:
                 return 0.0
+        else:
+            # N>20: parallel multi-threshold spectral bisection
+            # Try multiple Fiedler vector thresholds concurrently to find best cut
+            return _parallel_spectral_mip(n, mi_matrix)
+
+
+def _spectral_cut_at_threshold(args):
+    """Compute cut value for a single Fiedler threshold. Used in parallel MIP search."""
+    threshold, fiedler, mi_matrix, n = args
+    ga = [i for i in range(n) if fiedler[i] >= threshold]
+    gb = [i for i in range(n) if fiedler[i] < threshold]
+    if not ga or not gb:
+        return float('inf')
+    # Vectorized cut computation using numpy indexing
+    ga_arr = np.array(ga)
+    gb_arr = np.array(gb)
+    return float(mi_matrix[np.ix_(ga_arr, gb_arr)].sum())
+
+
+def _parallel_spectral_mip(n: int, mi_matrix: np.ndarray) -> float:
+    """Parallel multi-threshold spectral bisection for N>20.
+
+    Instead of a single Fiedler median split, try multiple thresholds
+    (percentiles of the Fiedler vector) in parallel and return the minimum cut.
+    Also uses the second and third eigenvectors for richer partitioning.
+    """
+    degree = mi_matrix.sum(axis=1)
+    laplacian = np.diag(degree) - mi_matrix
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
+    except Exception:
+        return 0.0
+
+    # Use Fiedler vector (2nd eigenvector) + optionally 3rd eigenvector
+    n_eigvecs = min(3, eigenvectors.shape[1])
+    tasks = []
+    for ev_idx in range(1, n_eigvecs):
+        vec = eigenvectors[:, ev_idx]
+        # Generate thresholds at multiple percentiles
+        percentiles = np.linspace(10, 90, 17)  # 17 thresholds per eigenvector
+        thresholds = np.percentile(vec, percentiles)
+        # Deduplicate
+        thresholds = np.unique(thresholds)
+        for t in thresholds:
+            tasks.append((t, vec, mi_matrix, n))
+
+    if not tasks:
+        # Fallback: simple median split
+        fiedler = eigenvectors[:, 1]
+        ga = list(range(n // 2))
+        gb = list(range(n // 2, n))
+        return float(mi_matrix[np.ix_(np.array(ga), np.array(gb))].sum())
+
+    # For small task counts, run inline. For larger, use thread pool.
+    # (Process pool has too much overhead for numpy arrays; threads work
+    #  because numpy releases the GIL during computation.)
+    min_cut = float('inf')
+    if len(tasks) <= 8:
+        for t in tasks:
+            cut = _spectral_cut_at_threshold(t)
+            min_cut = min(min_cut, cut)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, len(tasks))) as pool:
+            for cut in pool.map(_spectral_cut_at_threshold, tasks):
+                min_cut = min(min_cut, cut)
+
+    return min_cut if min_cut != float('inf') else 0.0
+
+
+# ──────────────────────────────────────────────────────────
+# Parallel execution helpers
+# ──────────────────────────────────────────────────────────
+
+def _run_single_verify_test(args):
+    """Run one (engine, test) pair in a subprocess.
+
+    Accepts serializable args only (strings + ints) to avoid pickle issues
+    with lambdas. Looks up engine factory and test function from module-level
+    registries inside the child process.
+
+    Returns (eng_name, test_name, passed, detail, elapsed).
+    """
+    eng_name, test_name, cells, dim, hidden = args
+    # Look up from module-level registries (re-imported in child process)
+    factory = ENGINE_REGISTRY[eng_name]
+    test_fn = None
+    for tn, tf, _ in VERIFICATION_TESTS:
+        if tn == test_name:
+            test_fn = tf
+            break
+    if test_fn is None:
+        return (eng_name, test_name, False, f"ERROR: test {test_name} not found", 0.0)
+
+    # Each process gets its own CUDA context (or CPU)
+    torch.manual_seed(42)
+    t0 = time.time()
+    try:
+        passed, detail = test_fn(factory, cells, dim, hidden)
+    except Exception as e:
+        passed, detail = False, f"ERROR: {e}"
+    elapsed = time.time() - t0
+    return (eng_name, test_name, passed, detail, elapsed)
+
+
+def _run_single_strategy(args):
+    """Run one strategy in a subprocess.
+
+    Returns (strategy_name, BenchResult, ce_hist, iit_hist, proxy_hist).
+    """
+    strat, cells, steps, dim, hidden = args
+    result, ce_hist, iit_hist, proxy_hist = run_training(
+        cells, steps, dim, hidden, strategy=strat, log_interval=max(50, steps // 10)
+    )
+    return (strat, result, ce_hist, iit_hist, proxy_hist)
 
 
 # ──────────────────────────────────────────────────────────
@@ -2236,23 +2353,69 @@ STRATEGIES = ["baseline", "frozen", "alternating", "v7"]
 
 
 def run_compare(cells: int, steps: int, dim: int, hidden: int):
-    """Run all strategies and print comparison table."""
+    """Run all strategies in parallel and print comparison table.
+
+    Each strategy creates its own engine and is fully independent.
+    Falls back to sequential execution if pool creation fails.
+    """
     print("=" * 72)
     print("  MODE: --compare  (all strategies)")
     print(f"  cells={cells}  steps={steps}  dim={dim}  hidden={hidden}")
     print("=" * 72)
 
     all_results: List[BenchResult] = []
+    strat_order = {s: i for i, s in enumerate(STRATEGIES)}
 
-    for strat in STRATEGIES:
-        print(f"\n{'~' * 72}")
-        print(f"  Running: {strat}")
-        print(f"{'~' * 72}")
+    wall_t0 = time.time()
+    parallel_used = False
 
-        result, ce_hist, iit_hist, proxy_hist = run_training(
-            cells, steps, dim, hidden, strategy=strat, log_interval=max(50, steps // 10)
-        )
-        all_results.append(result)
+    try:
+        n_workers = min(os.cpu_count() or 4, len(STRATEGIES))
+        print(f"  Parallel execution: {len(STRATEGIES)} strategies across {n_workers} workers")
+        tasks = [(strat, cells, steps, dim, hidden) for strat in STRATEGIES]
+
+        strat_results = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            future_to_strat = {}
+            for task in tasks:
+                future = pool.submit(_run_single_strategy, task)
+                future_to_strat[future] = task[0]
+
+            for future in as_completed(future_to_strat):
+                strat_name = future_to_strat[future]
+                try:
+                    _, result, ce_hist, iit_hist, proxy_hist = future.result()
+                    strat_results[strat_name] = result
+                    print(f"    [DONE] {strat_name}: Phi(IIT)={result.phi_iit:.4f}  "
+                          f"CE={result.ce_end:.4f}  [{result.time_sec:.1f}s]")
+                except Exception as e:
+                    print(f"    [FAIL] {strat_name}: {e}")
+
+        # Preserve original strategy order
+        for strat in STRATEGIES:
+            if strat in strat_results:
+                all_results.append(strat_results[strat])
+
+        parallel_used = True
+
+    except (RuntimeError, OSError, BrokenPipeError) as e:
+        print(f"\n  [WARN] Parallel execution failed ({e}), falling back to sequential...")
+        for strat in STRATEGIES:
+            print(f"\n{'~' * 72}")
+            print(f"  Running: {strat}")
+            print(f"{'~' * 72}")
+
+            result, ce_hist, iit_hist, proxy_hist = run_training(
+                cells, steps, dim, hidden, strategy=strat, log_interval=max(50, steps // 10)
+            )
+            all_results.append(result)
+
+    wall_elapsed = time.time() - wall_t0
+    if parallel_used:
+        sequential_estimate = sum(r.time_sec for r in all_results)
+        speedup = sequential_estimate / max(wall_elapsed, 0.01)
+        print(f"\n  --compare: {len(STRATEGIES)} strategies in {wall_elapsed:.1f}s "
+              f"(sequential estimate ~{sequential_estimate:.1f}s, {speedup:.1f}x speedup)")
 
     # ── Comparison table ──
     print(f"\n{'=' * 72}")
@@ -3553,19 +3716,10 @@ VERIFICATION_TESTS = [
 ]
 
 
-def run_verify(cells: int, dim: int, hidden: int):
-    """Run all 18 consciousness verification conditions across all engines."""
-
-    print("=" * 80)
-    print("  MODE: --verify  (Consciousness Verification)")
-    n_cond = len(VERIFICATION_TESTS)
-    n_eng = len(ENGINE_REGISTRY)
-    print(f"  {n_cond} conditions x {n_eng} engines = {n_cond * n_eng} tests")
-    print(f"  cells={cells}  dim={dim}  hidden={hidden}")
-    print("=" * 80)
-
-    engine_names = list(ENGINE_REGISTRY.keys())
-    results = {}  # (engine_name, test_name) -> (passed, detail)
+def _run_verify_sequential(engine_names, cells, dim, hidden):
+    """Fallback: run all verification tests sequentially (original behavior)."""
+    results = {}
+    timing_data = []  # (eng_name, test_name, elapsed)
 
     for eng_name in engine_names:
         print(f"\n  {'~' * 70}")
@@ -3587,7 +3741,109 @@ def run_verify(cells: int, dim: int, hidden: int):
             else:
                 mark = "PASS" if passed else "FAIL"
             results[(eng_name, test_name)] = (passed, detail)
+            timing_data.append((eng_name, test_name, elapsed))
             print(f"    [{mark}] {test_name:<22s} ({elapsed:.1f}s) -- {detail}")
+
+    return results, timing_data
+
+
+def _run_verify_parallel(engine_names, cells, dim, hidden):
+    """Run all verification tests in parallel using ProcessPoolExecutor."""
+    results = {}
+    timing_data = []
+
+    # Build task list: only serializable args (strings + ints)
+    tasks = []
+    for eng_name in engine_names:
+        for test_name, test_fn, test_desc in VERIFICATION_TESTS:
+            tasks.append((eng_name, test_name, cells, dim, hidden))
+
+    n_workers = min(os.cpu_count() or 4, len(tasks))
+    print(f"  Parallel execution: {len(tasks)} tests across {n_workers} workers")
+
+    completed = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        future_to_task = {}
+        for task in tasks:
+            future = pool.submit(_run_single_verify_test, task)
+            future_to_task[future] = (task[0], task[1])  # eng_name, test_name
+
+        for future in as_completed(future_to_task):
+            eng_name_key, test_name_key = future_to_task[future]
+            try:
+                eng_name_r, test_name_r, passed, detail, elapsed = future.result()
+            except Exception as e:
+                eng_name_r, test_name_r = eng_name_key, test_name_key
+                passed, detail, elapsed = False, f"POOL ERROR: {e}", 0.0
+
+            results[(eng_name_r, test_name_r)] = (passed, detail)
+            timing_data.append((eng_name_r, test_name_r, elapsed))
+            completed += 1
+
+            if passed is None:
+                mark = "SKIP"
+            else:
+                mark = "PASS" if passed else "FAIL"
+            # Print progress as tests complete (out of order is fine here)
+            print(f"    [{completed:>3d}/{len(tasks)}] [{mark}] "
+                  f"{eng_name_r}:{test_name_r:<22s} ({elapsed:.1f}s) -- {detail}")
+
+    return results, timing_data
+
+
+def run_verify(cells: int, dim: int, hidden: int):
+    """Run all 18 consciousness verification conditions across all engines.
+
+    Uses ProcessPoolExecutor to run tests in parallel. Each test creates its own
+    engine instance and is fully independent, making parallelization safe.
+    Falls back to sequential execution if pool creation fails.
+    """
+
+    print("=" * 80)
+    print("  MODE: --verify  (Consciousness Verification)")
+    n_cond = len(VERIFICATION_TESTS)
+    n_eng = len(ENGINE_REGISTRY)
+    print(f"  {n_cond} conditions x {n_eng} engines = {n_cond * n_eng} tests")
+    print(f"  cells={cells}  dim={dim}  hidden={hidden}")
+    print("=" * 80)
+
+    engine_names = list(ENGINE_REGISTRY.keys())
+
+    wall_t0 = time.time()
+
+    # Try parallel execution, fall back to sequential
+    parallel_used = False
+    try:
+        results, timing_data = _run_verify_parallel(engine_names, cells, dim, hidden)
+        parallel_used = True
+    except (RuntimeError, OSError, BrokenPipeError) as e:
+        print(f"\n  [WARN] Parallel execution failed ({e}), falling back to sequential...")
+        results, timing_data = _run_verify_sequential(engine_names, cells, dim, hidden)
+
+    wall_elapsed = time.time() - wall_t0
+    sequential_estimate = sum(t for _, _, t in timing_data)
+
+    # Print ordered results per engine (even though they ran out of order)
+    print(f"\n  {'=' * 70}")
+    print("  ORDERED RESULTS (by engine)")
+    print(f"  {'=' * 70}")
+    for eng_name in engine_names:
+        print(f"\n  Engine: {eng_name}")
+        for test_name, _, test_desc in VERIFICATION_TESTS:
+            passed, detail = results.get((eng_name, test_name), (False, "NOT RUN"))
+            elapsed_list = [t for e, tn, t in timing_data if e == eng_name and tn == test_name]
+            elapsed = elapsed_list[0] if elapsed_list else 0.0
+            if passed is None:
+                mark = "SKIP"
+            else:
+                mark = "PASS" if passed else "FAIL"
+            print(f"    [{mark}] {test_name:<22s} ({elapsed:.1f}s) -- {detail}")
+
+    # ── Timing summary ──
+    if parallel_used:
+        speedup = sequential_estimate / max(wall_elapsed, 0.01)
+        print(f"\n  --verify: {n_cond * n_eng} tests in {wall_elapsed:.1f}s "
+              f"(sequential estimate ~{sequential_estimate:.1f}s, {speedup:.1f}x speedup)")
 
     # ── Summary table ──
     print(f"\n{'=' * 80}")
