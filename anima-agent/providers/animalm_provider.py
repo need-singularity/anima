@@ -330,11 +330,16 @@ class AnimaLMProvider:
         else:
             from infer_animalm import generate
 
-        # Extract consciousness metrics for memory save
+        # P2: consciousness modulates generation parameters
         cs = consciousness_state or {}
         tension = cs.get("tension")
         emotion = cs.get("emotion")
         phi = cs.get("phi")
+        # P1/P3: max_tokens derived from consciousness, not hardcoded
+        if phi is not None and isinstance(phi, (int, float)):
+            max_tokens = max(64, int(max_tokens * min(float(phi) / 3.0, 2.0)))
+        if tension is not None and isinstance(tension, (int, float)) and float(tension) > 0.8:
+            max_tokens = max(64, int(max_tokens * 0.6))
 
         import torch
         response_text = ""

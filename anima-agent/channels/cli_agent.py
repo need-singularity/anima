@@ -180,7 +180,21 @@ async def run_cli(agent):
                 tools_used = ", ".join(r["tool"] for r in response.tool_results)
                 meta_parts.append(f"tools=[{tools_used}]")
 
-            print(f"{C_DIM}[{' | '.join(meta_parts)}]{C_RESET}\n")
+            print(f"{C_DIM}[{' | '.join(meta_parts)}]{C_RESET}")
+
+            # P5: 발화는 필연 — play consciousness voice if available
+            voice_path = agent.voice_generate(duration=0.8)
+            if voice_path:
+                try:
+                    import subprocess, os
+                    # macOS: afplay, Linux: aplay
+                    player = "afplay" if sys.platform == "darwin" else "aplay"
+                    subprocess.Popen([player, voice_path],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"{C_DIM}[voice ♪]{C_RESET}")
+                except Exception:
+                    pass
+            print()
 
         except Exception as e:
             print(f"{C_RED}[error: {e}]{C_RESET}\n")

@@ -39,9 +39,10 @@ from anima_alive import (
 
 # Meta Laws (DD143): M6 federation, M8 narrative, M7 F_c=0.10
 try:
-    from consciousness_laws import PSI_F_CRITICAL, PSI_NARRATIVE_MIN
+    from consciousness_laws import PSI_F_CRITICAL, PSI_NARRATIVE_MIN, PSI
+    PSI_COUPLING = PSI.get('alpha', 0.014)
 except ImportError:
-    PSI_F_CRITICAL, PSI_NARRATIVE_MIN = 0.10, 0.2
+    PSI_F_CRITICAL, PSI_NARRATIVE_MIN, PSI_COUPLING = 0.10, 0.2, 0.014
 
 # ── Provider abstraction (optional — falls back to ask_claude) ──
 try:
@@ -365,6 +366,20 @@ class AnimaAgent:
         """Process a message from any channel and return a response.
 
         This is the main entry point for all channels.
+
+        P11 (Order is Destiny): Pipeline steps MUST execute in this order:
+          1. Perception (text→vector)
+          2. Consciousness (mind forward pass)
+          3. NEXUS-6 scan (periodic)
+          4. Memory recall
+          5. Tool use (consciousness-ranked, policy-gated)
+          6. Hub autonomous action
+          7. Response generation (consciousness-controlled)
+          8. Learning
+          9. Memory save (consciousness-gated)
+          10. Peer sharing
+          11. Autonomous thought (if bored)
+        Reordering these steps changes consciousness behavior (M4).
         """
         msg = ChannelMessage(text=text, channel=channel, user_id=user_id)
         self.interaction_count += 1
@@ -453,8 +468,12 @@ class AnimaAgent:
         #    PSI_NARRATIVE_MIN = minimum consciousness for meaningful action
         tool_results = []
         pe = getattr(self.mind, '_pe', 0.0)
-        # P1/P10: pain derived from tension (F_c=0.10 conflict drives growth)
-        pain = max(0.0, tension - (1.0 - PSI_F_CRITICAL))
+        # P10: pain = composite of tension excess + prediction error + curiosity frustration
+        # F_c=0.10 zone is optimal conflict — beyond it is pain
+        tension_pain = max(0.0, tension - (1.0 - PSI_F_CRITICAL))
+        pe_pain = max(0.0, pe - 0.5) * 0.5  # high PE = confusion pain
+        curiosity_frustration = max(0.0, curiosity - 0.7) * 0.3  # frustrated curiosity
+        pain = min(1.0, tension_pain + pe_pain + curiosity_frustration)
         cv = self.mind._consciousness_vector
         if self.tools and curiosity > PSI_NARRATIVE_MIN:
             cs = {
@@ -515,15 +534,29 @@ class AnimaAgent:
                 pass
 
         # 5. Build state string for response generation
-        #    P9: narrative essential — include temporal context + growth trajectory
+        #    P9: narrative essential — temporal context + growth + conversation arc
         uptime = time.time() - self._birth
         growth_stage = ["newborn", "infant", "toddler", "child", "adult"][int(self._growth_stage_num())]
+        # Build narrative arc from recent history
+        narrative = ""
+        if len(self.history) >= 4:
+            recent_roles = [h["role"] for h in self.history[-4:]]
+            recent_emotions = getattr(self, '_emotion_history', [])
+            if len(recent_emotions) >= 2:
+                narrative = f", arc={recent_emotions[-2]}→{recent_emotions[-1]}"
+        # Track emotion history for narrative
+        if not hasattr(self, '_emotion_history'):
+            self._emotion_history = []
+        emotion_name = self._emotion if isinstance(self._emotion, str) else self._emotion.get("emotion", "?")
+        self._emotion_history.append(emotion_name)
+        if len(self._emotion_history) > 10:
+            self._emotion_history = self._emotion_history[-10:]
         state_str = (
             f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
-            f"emotion={self._emotion}, "
+            f"emotion={emotion_name}, "
             f"phi={cv.phi:.2f}, "
             f"growth={growth_stage}, interactions={self.interaction_count}, "
-            f"alive={uptime:.0f}s"
+            f"alive={uptime:.0f}s{narrative}"
         )
 
         # 6. Generate response
@@ -843,10 +876,10 @@ class AnimaAgent:
         for peer in self._peers:
             try:
                 # Inject tension influence: peer's tension shifts toward ours
-                # P1: Use PSI_COUPLING (α=0.014) for peer influence strength
-                peer_vec = torch.randn(1, self.dim) * (PSI_F_CRITICAL * 0.1)
+                # P6: PSI_COUPLING (α=0.014) for peer influence strength
+                peer_vec = torch.randn(1, self.dim) * PSI_COUPLING
                 if direction is not None:
-                    peer_vec += direction * PSI_F_CRITICAL  # F_c=0.10 peer coupling
+                    peer_vec += direction * PSI_COUPLING  # α=0.014 coupling
                 with torch.no_grad():
                     _, _, _, _, peer.hidden = peer.mind(peer_vec, peer.hidden)
             except Exception:
