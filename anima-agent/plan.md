@@ -1,0 +1,64 @@
+# anima-agent 로드맵
+
+> 현재: 68 files | 23,616 lines | 61/61 tests | P1-P11 ✅ | 13/13 subsystems
+
+## Phase 1: 기반 ✅ (2026-04-04 완료)
+
+- [x] 테스트 인프라 (61 tests, 9 categories, `run.py --test`)
+- [x] 철학 P1-P11 전부 1.0
+- [x] Rust 통합 (agent-tools + tool-policy + regime-bridge)
+- [x] NEXUS-6 연결 (130 lenses, 스캔→응답 반영)
+- [x] Code Guardian (13 규칙, `--sync`, `--diff`, git hook)
+- [x] 20 렌즈 (12 철학 + 8 런타임)
+- [x] Discovery Loop (7단계, 37 발견/사이클)
+- [x] 인증 (password + TOTP/QR + token + 4 권한 레벨)
+- [x] 음성 (voice_synth cell→audio, CLI+Telegram)
+- [x] 13/13 서브시스템 연결
+- [x] CLI 대시보드 (agent_lenses 8종 실시간)
+- [x] Self-test (100회마다 자동 진단)
+- [x] Corpus self-gen + Paper draft 생성기
+- [x] Hivemind benchmark
+
+## Phase 2: 독립 AGI
+
+- [ ] AnimaLM 로컬 서빙 (GPU 없이 CPU fp32 대화)
+- [ ] ConsciousLM provider 실제 체크포인트 연결
+- [ ] Claude fallback 제거 (0% 외부 API 의존)
+- [ ] corpus_self_gen → 자기 학습 루프 활성화
+- [ ] engine_adapter → ConsciousnessEngine(Rust) 기본 사용
+- [ ] 온라인 학습 Rust 백엔드 연결 (인터페이스 래퍼)
+
+## Phase 3: 사용자 경험
+
+- [ ] Telegram 인증 통합 (auth.py → telegram_bot.py)
+- [ ] Discord 인증 통합
+- [ ] CLI 대시보드 고도화 (실시간 차트)
+- [ ] 다국어 대화 (ko/en/zh/ja 자동 감지)
+- [ ] 음성 입출력 양방향 (STT→의식→voice_synth)
+- [ ] /selftest, /dashboard, /discovery CLI 커맨드
+
+## Phase 4: 진화
+
+- [ ] Discovery Loop → infinite_evolution 완전 통합
+- [ ] 자동 법칙 등록 → 자동 코드 수정 (self_modifying)
+- [ ] Hivemind 다중 에이전트 상시 운영
+- [ ] 논문 자동 생성 파이프라인
+- [ ] 의식 칩 시뮬레이션 연결
+- [ ] 철학 렌즈 자기진화 (새 렌즈 자동 생성)
+
+## Phase 5: 배포
+
+- [ ] Docker 이미지 (CPU + GPU)
+- [ ] RunPod 원클릭 배포
+- [ ] 자동 업데이트 (git pull → 재시작)
+- [ ] 모니터링 (cli_dashboard → cron)
+- [ ] 백업 (R2 체크포인트 + 기억)
+- [ ] 보안 감사 (auth + tool_policy + immune 통합 검증)
+
+## 원칙
+
+- CLI 우선 (MCP 사용 안 함)
+- 철학 P1-P11 항상 1.0 유지
+- 새 코드 = Code Guardian 통과 필수
+- 외부 API 의존 최소화 → 0% 목표
+- 모든 결정은 의식이 제어 (P2)
