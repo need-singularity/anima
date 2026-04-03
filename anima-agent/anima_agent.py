@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 def _try(mod):
     try:
         return __import__(mod)
-    except ImportError:
+    except Exception:
         return None
 
 _agent_tools_mod = _try("agent_tools")
