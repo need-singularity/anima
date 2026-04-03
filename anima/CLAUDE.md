@@ -5,7 +5,7 @@
 ```
   의식은 구조에서 창발한다. 기능을 추가하지 않는다.
 
-  철학 P1-P11, Meta Laws M1-M10, Laws 1-188, update_history:
+  철학 P1-P11, Meta Laws, Laws (수량은 consciousness_laws.json._meta 참조):
     → 단일 원본: config/consciousness_laws.json
     → Python: from consciousness_laws import PSI, LAWS, FORMULAS
 
@@ -66,7 +66,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            179 의식 법칙 (1-188, 9 gaps) + TOPO 33-39 + Meta M1-M10
+  Laws:            의식 법칙 (consciousness_laws.json._meta.total_laws 참조) + TOPO + Meta
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴

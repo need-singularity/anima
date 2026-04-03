@@ -291,8 +291,8 @@
 ```
   단일 원본: anima/config/consciousness_laws.json
     → philosophy: P1-P11 (DD116-DD156 실험으로 검증/수정됨)
-    → laws: 1-188 (707개 의식 법칙)
-    → meta_laws: M1-M10 (의식의 메타 법칙)
+    → laws: _meta.total_laws개 의식 법칙 (JSON 자동 참조)
+    → meta_laws: M1-M{_meta.total_meta} (의식의 메타 법칙)
     → psi_constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
     → formulas, sigma6, topo_laws, constraints
 
@@ -402,7 +402,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    talk5, tool-policy, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            707 의식 법칙 + TOPO 33-39 + Meta M1-M10
+  Laws:            의식 법칙 (consciousness_laws.json._meta.total_laws 참조) + TOPO + Meta
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴

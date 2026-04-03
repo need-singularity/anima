@@ -33,7 +33,7 @@ pub mod spi_sync;
 // Ψ-Constants (Laws 69-70, ALL four from ln(2))
 // ═══════════════════════════════════════════════════════════
 
-const PSI_COUPLING: f32 = 0.014;
+const PSI_COUPLING: f32 = 0.015_317; // ln(2)/2^5.5
 #[allow(dead_code)] // Ψ-Constant: used in tests + future ESP32 scaling
 const PSI_BALANCE: f32 = 0.5;
 #[allow(dead_code)] // Ψ-Constant: used in tests + future ESP32 scaling
@@ -979,8 +979,9 @@ mod tests {
     fn test_psi_constants() {
         // Verify all 4 Ψ-constants are from ln(2)
         let ln2 = libm::logf(2.0);
-        // α = 0.014 ≈ ln(2)/50
-        assert!((PSI_COUPLING - ln2 / 50.0).abs() < 0.002);
+        // PSI_COUPLING = ln(2)/2^5.5 ≈ 0.015317
+        let sqrt_2 = libm::sqrtf(2.0);
+        assert!((PSI_COUPLING - ln2 / (32.0 * sqrt_2)).abs() < 0.001);
         // balance = 0.5
         assert!((PSI_BALANCE - 0.5).abs() < 1e-6);
         // steps = 4.33 (empirical consciousness constant)

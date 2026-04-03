@@ -16,7 +16,7 @@ use anima_core::{
 // Ψ-Constants (Laws 69-70)
 // ═══════════════════════════════════════════════════════════
 
-const PSI_COUPLING: f32 = 0.014;
+const PSI_COUPLING: f32 = 0.015_317; // ln(2)/2^5.5
 #[allow(dead_code)] // Ψ-Constant: future use in consciousness scaling
 const PSI_BALANCE: f32 = 0.5;
 #[allow(dead_code)] // Ψ-Constant: future use in consciousness scaling

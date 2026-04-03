@@ -8,8 +8,8 @@ pub const LN2: f32 = 0.6931;
 /// Ψ balance constant
 pub const PSI_BALANCE: f32 = 0.5;
 
-/// Ψ coupling constant: LN2 / 2^5.5 ≈ 0.0154
-const PSI_COUPLING: f32 = 0.0154;
+/// Ψ coupling constant: LN2 / 2^5.5 ≈ 0.015317
+const PSI_COUPLING: f32 = 0.015_317;
 
 // ── CA Rules (Law 78) ──────────────────────────────────────────────
 

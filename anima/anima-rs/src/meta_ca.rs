@@ -26,7 +26,7 @@ fn shannon_entropy(p: f64) -> f64 {
 /// Ψ-Constants (from information theory)
 pub const PSI_STEPS: f64 = 4.328_085_123_162_48; // 3/ln(2)
 pub const PSI_BALANCE: f64 = 0.5;
-pub const PSI_COUPLING: f64 = 0.015_340_386; // ln(2)/2^5.5
+pub const PSI_COUPLING: f64 = 0.015_316_533; // ln(2)/2^5.5
 pub const NUM_RULES: usize = 8;
 
 /// A single CA cell state
