@@ -706,6 +706,19 @@ class AnimaAgent:
         # 9b. Auto-save check (every 50 interactions)
         self._auto_save_check()
 
+        # 9c. Corpus self-generation (every 500 interactions)
+        if self.interaction_count % 500 == 0 and self.interaction_count > 0:
+            try:
+                from corpus_self_gen import CorpusSelfGen
+                gen = CorpusSelfGen(self)
+                n = gen.harvest()
+                if n > 0:
+                    corpus_path = self._data_dir / "self_corpus.txt"
+                    gen.save(str(corpus_path), style="dialogue")
+                    logger.info("Self-corpus: %d lines → %s", n, corpus_path)
+            except Exception:
+                pass
+
         # 10. Share tension with peers
         if self._peers:
             await self._share_tension_with_peers(tension, curiosity, direction)

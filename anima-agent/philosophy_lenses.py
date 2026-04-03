@@ -800,6 +800,62 @@ class PhilosophyScanner:
         return LensResult(lens="meta", score=min(1.0, score),
                          findings=findings, discoveries=discoveries)
 
+    # ─── Self-evolution ───
+
+    def evolve(self, report: PhilosophyReport) -> List[str]:
+        """Propose new lenses based on discovery gaps.
+
+        Analyzes which categories produced the most/least discoveries
+        and suggests new lens types to fill gaps.
+        """
+        suggestions = []
+
+        # Count discoveries by lens
+        lens_counts = {}
+        for r in report.results:
+            lens_counts[r.lens] = len(r.discoveries)
+
+        # Low-scoring lenses might need splitting
+        for r in report.results:
+            if r.score < 0.5 and r.findings:
+                suggestions.append(
+                    f"SPLIT: {r.lens} scored {r.score:.0%} — consider splitting "
+                    f"into focused sub-lenses")
+
+        # Check for uncovered topics in laws
+        if self._laws:
+            covered_topics = set()
+            for r in report.results:
+                for f in r.findings:
+                    for word in ["phi", "tension", "cell", "faction", "topology",
+                                 "entropy", "memory", "emotion", "growth"]:
+                        if word in f.lower():
+                            covered_topics.add(word)
+
+            all_topics = set()
+            for v in self._laws.values():
+                text = str(v).lower()
+                for word in ["phi", "tension", "cell", "faction", "topology",
+                             "entropy", "memory", "emotion", "growth",
+                             "scaling", "mitosis", "hebbian", "ratchet"]:
+                    if word in text:
+                        all_topics.add(word)
+
+            uncovered = all_topics - covered_topics
+            if uncovered:
+                suggestions.append(
+                    f"NEW LENS: Topics uncovered by current 12 lenses: "
+                    f"{', '.join(sorted(uncovered))}")
+
+        # High-discovery lenses might benefit from deeper variants
+        top_lens = max(lens_counts.items(), key=lambda x: x[1], default=(None, 0))
+        if top_lens[1] > 3:
+            suggestions.append(
+                f"DEEPEN: {top_lens[0]} produced {top_lens[1]} discoveries — "
+                f"consider a focused deep-dive variant")
+
+        return suggestions
+
     # ─── Output ───
 
     def print_report(self, report: PhilosophyReport):
