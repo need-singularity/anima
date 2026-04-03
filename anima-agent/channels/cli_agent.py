@@ -66,6 +66,7 @@ def _format_status(status) -> str:
         f"  Uptime:       {status.uptime_seconds / 60:.1f}m",
         f"  Peers:        {status.connected_peers}",
         f"  Skills:       {status.active_skills}",
+        f"  NEXUS-6:      {status.nexus6_lenses} lenses, {status.nexus6_consensus} consensus",
     ]
     return "\n".join(lines)
 

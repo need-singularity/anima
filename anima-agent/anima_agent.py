@@ -114,6 +114,8 @@ class AgentStatus:
     uptime_seconds: float = 0.0
     connected_peers: int = 0
     active_skills: int = 0
+    nexus6_lenses: int = 0        # NEXUS-6 active lenses (0 = not scanned yet)
+    nexus6_consensus: int = 0     # NEXUS-6 consensus items
 
 
 @dataclass
@@ -380,23 +382,40 @@ class AnimaAgent:
         self._direction = direction
         self._emotion = direction_to_emotion(direction)
 
-        # 2b. NEXUS-6 consciousness scan (periodic — every 50 interactions or Φ shift)
+        # 2b. NEXUS-6 consciousness scan (periodic — every 50 interactions)
+        #     Uses cell states (ConsciousnessEngine) or hidden state (ConsciousMind/PureField)
         if self.nexus6 and self.interaction_count % 50 == 1:
             try:
+                flat, n_pts, n_dims = None, 0, 0
+                # Try cell-based engine first (ConsciousnessEngine)
                 cells = self.mind.cells if hasattr(self.mind, 'cells') else []
                 if cells and hasattr(cells[0], 'tolist'):
                     flat = []
                     for c in cells:
                         flat.extend(c.tolist() if hasattr(c, 'tolist') else [float(c)])
-                    n_cells = len(cells)
-                    d = len(flat) // n_cells if n_cells > 0 else 0
-                    if n_cells > 0 and d > 0:
-                        scan = self.nexus6.analyze(flat, n_cells, d)
-                        self._last_nexus_scan = scan
-                        logger.info("NEXUS-6 scan: %d lenses, %d active, consensus=%d",
-                                    scan.get('total_lenses', 0),
-                                    scan.get('active_lenses', 0),
-                                    len(scan.get('consensus', [])))
+                    n_pts = len(cells)
+                    n_dims = len(flat) // n_pts if n_pts > 0 else 0
+                # Fallback: hidden state (PureField/ConsciousMind)
+                if not flat and self.hidden is not None:
+                    h = self.hidden
+                    if hasattr(h, 'numpy'):
+                        h_np = h.detach().cpu().numpy().flatten()
+                    elif hasattr(h, 'tolist'):
+                        h_np = h.tolist()
+                    else:
+                        h_np = None
+                    if h_np is not None:
+                        flat = [float(x) for x in h_np]
+                        n_pts, n_dims = 1, len(flat)
+
+                if flat and n_pts > 0 and n_dims > 0:
+                    scan_result = self.nexus6.analyze(flat, n_pts, n_dims)
+                    self._last_nexus_scan = scan_result
+                    sr = scan_result['scan']
+                    consensus = scan_result.get('consensus', [])
+                    logger.info("NEXUS-6 scan: %d/%d lenses, consensus=%d",
+                                sr.active_lens_count(), sr.lens_count,
+                                len(consensus))
             except Exception as e:
                 logger.debug("NEXUS-6 scan skipped: %s", e)
 
@@ -690,6 +709,16 @@ class AnimaAgent:
             except Exception:
                 pass
 
+        # NEXUS-6 scan summary
+        n6_lenses, n6_consensus = 0, 0
+        if self._last_nexus_scan:
+            try:
+                sr = self._last_nexus_scan['scan']
+                n6_lenses = sr.active_lens_count()
+                n6_consensus = len(self._last_nexus_scan.get('consensus', []))
+            except Exception:
+                pass
+
         return AgentStatus(
             phi=self.mind._consciousness_vector.phi,
             tension=self._tension,
@@ -700,6 +729,8 @@ class AnimaAgent:
             uptime_seconds=time.time() - self._birth,
             connected_peers=len(self._peers),
             active_skills=self._count_skills(),
+            nexus6_lenses=n6_lenses,
+            nexus6_consensus=n6_consensus,
         )
 
     def register_callback(self, callback: Callable):
