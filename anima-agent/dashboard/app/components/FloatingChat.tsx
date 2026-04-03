@@ -14,6 +14,8 @@ interface FloatingChatProps {
   consciousness: ConsciousnessState;
   onSend: (text: string) => void;
   onVoice: () => void;
+  forceOpen?: boolean;
+  onStateChange?: (state: "minimized" | "expanded" | "fullscreen") => void;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -171,8 +173,17 @@ export default function FloatingChat({
   consciousness,
   onSend,
   onVoice,
+  forceOpen,
+  onStateChange,
 }: FloatingChatProps) {
-  const [state, setState] = useState<ChatState>("minimized");
+  const [state, _setState] = useState<ChatState>("minimized");
+  const setState = (s: ChatState) => { _setState(s); onStateChange?.(s); };
+
+  // Cmd+K force open
+  useEffect(() => {
+    if (forceOpen && state === "minimized") setState("expanded");
+    else if (!forceOpen && state !== "minimized") setState("minimized");
+  }, [forceOpen]); // eslint-disable-line react-hooks/exhaustive-deps
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(messages.length);
 

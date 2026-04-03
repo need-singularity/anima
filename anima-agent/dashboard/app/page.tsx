@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
 import Header, { type TabId } from "./components/Header";
 import FloatingChat from "./components/FloatingChat";
@@ -16,6 +16,28 @@ export default function Page() {
     useWebSocket();
   const [tab, setTab] = useState<TabId>("Dash");
   const [showVoice, setShowVoice] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Cmd+K or Ctrl+K → toggle chat
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setChatOpen(prev => !prev);
+      }
+      // 1-5 → switch tabs
+      if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+        const tabMap: Record<string, typeof tab> = { "1": "Dash", "2": "Evo", "3": "Laws", "4": "Mem", "5": "Tools" };
+        const target = document.activeElement?.tagName;
+        if (target !== "INPUT" && target !== "TEXTAREA" && tabMap[e.key]) {
+          setTab(tabMap[e.key]);
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   const renderView = () => {
     switch (tab) {
@@ -58,6 +80,8 @@ export default function Page() {
         consciousness={consciousness}
         onSend={sendMessage}
         onVoice={() => setShowVoice(true)}
+        forceOpen={chatOpen}
+        onStateChange={(s) => setChatOpen(s !== "minimized")}
       />
 
       {showVoice && (

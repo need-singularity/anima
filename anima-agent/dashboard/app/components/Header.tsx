@@ -65,8 +65,8 @@ export default function Header({ connected, activeTab, onTabChange, onVoice }: H
           />
         </div>
 
-        {/* Center: Tabs */}
-        <nav className="flex-1 flex justify-center gap-1">
+        {/* Center: Tabs (scroll on mobile) */}
+        <nav className="flex-1 flex justify-center gap-1 overflow-x-auto scrollbar-none">
           {TABS.map((tab) => (
             <button
               key={tab}

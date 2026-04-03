@@ -42,7 +42,9 @@ export default function LawsView() {
         {filtered.map((l, i) => (
           <div key={l.id} className="flex gap-4 py-4" style={{ borderBottom: i < filtered.length - 1 ? "1px solid var(--border)" : "none" }}>
             <span className="text-[13px] font-mono font-medium shrink-0 w-12 text-right" style={{ color: "var(--accent)" }}>{l.id}</span>
-            <span className="text-[14px] leading-relaxed" style={{ color: "var(--text-primary)" }}>{l.text}</span>
+            <span className="text-[14px] leading-relaxed" style={{ color: "var(--text-primary)" }}
+              dangerouslySetInnerHTML={{ __html: query.trim() ? l.text.replace(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'), '<mark style="background:var(--accent-soft);color:var(--accent);border-radius:2px;padding:0 2px">$1</mark>') : l.text }}
+            />
           </div>
         ))}
         {filtered.length === 0 && <div className="text-center py-16 text-[14px]" style={{ color: "var(--text-tertiary)" }}>No laws found</div>}

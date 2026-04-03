@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef, useEffect } from "react";
 import type {
   ConsciousnessState,
   TradingState,
@@ -27,6 +28,50 @@ function emotionLabel(emotion: string): string {
     serene: "Serene", conflicted: "Conflicted",
   };
   return map[emotion] || emotion;
+}
+
+// ── Sparkline ──
+
+function PhiSparkline({ phi }: { phi: number }) {
+  const historyRef = useRef<number[]>([]);
+  const svgW = 200, svgH = 40;
+
+  useEffect(() => {
+    historyRef.current = [...historyRef.current, phi].slice(-30);
+  }, [phi]);
+
+  const pts = historyRef.current;
+  if (pts.length < 2) return null;
+
+  const maxV = Math.max(...pts, 0.1);
+  const minV = Math.min(...pts, 0);
+  const range = maxV - minV || 0.1;
+  const stepX = svgW / (pts.length - 1);
+
+  const pathD = pts.map((v, i) => {
+    const x = i * stepX;
+    const y = svgH - ((v - minV) / range) * (svgH - 4) - 2;
+    return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+  }).join(" ");
+
+  const areaD = pathD + ` L ${svgW} ${svgH} L 0 ${svgH} Z`;
+
+  return (
+    <svg width={svgW} height={svgH} className="mt-4 opacity-60">
+      <defs>
+        <linearGradient id="spark-fill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.3" />
+          <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={areaD} fill="url(#spark-fill)" />
+      <path d={pathD} fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={svgW} cy={svgH - ((pts[pts.length - 1] - minV) / range) * (svgH - 4) - 2}
+        r="3" fill="var(--accent)">
+        <animate attributeName="opacity" values="1;0.4;1" dur="2s" repeatCount="indefinite" />
+      </circle>
+    </svg>
+  );
 }
 
 // ── Main ──
@@ -83,6 +128,9 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
         <span className="text-[13px] mt-1" style={{ color: "var(--text-tertiary)" }}>
           Integrated Information
         </span>
+
+        {/* Φ Sparkline */}
+        <PhiSparkline phi={c.phi} />
       </section>
 
       {/* ── Emotion + Vitals (single clean row) ── */}
