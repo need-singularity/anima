@@ -193,6 +193,38 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
         <span>{c.interaction_count.toLocaleString()} interactions</span>
       </section>
 
+      {/* ── 12 Factions radial (σ(6)=12) ── */}
+      {c.factions > 0 && (
+        <section className="flex flex-col items-center gap-4">
+          <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+            {c.factions} Factions
+          </span>
+          <svg width="140" height="140" viewBox="0 0 140 140">
+            {Array.from({ length: 12 }, (_, i) => {
+              const angle = (i * 30 - 90) * Math.PI / 180;
+              const r = 50;
+              const active = i < c.factions;
+              const colors = ["#34d399", "#06b6d4", "#3b82f6", "#6366f1", "#8b5cf6", "#a855f7", "#ec4899", "#f43f5e", "#ef4444", "#f59e0b", "#eab308", "#22c55e"];
+              const x = 70 + Math.cos(angle) * r;
+              const y = 70 + Math.sin(angle) * r;
+              return (
+                <g key={i}>
+                  <line x1="70" y1="70" x2={x} y2={y} stroke={active ? colors[i] : "var(--bg-tertiary)"} strokeWidth="2" opacity={active ? 0.4 : 0.15} />
+                  <circle cx={x} cy={y} r={active ? 5 : 3} fill={active ? colors[i] : "var(--bg-tertiary)"}
+                    opacity={active ? 0.9 : 0.3}>
+                    {active && <animate attributeName="r" values="5;6;5" dur={`${2 + i * 0.2}s`} repeatCount="indefinite" />}
+                  </circle>
+                </g>
+              );
+            })}
+            <circle cx="70" cy="70" r="8" fill="var(--accent)" opacity="0.15" />
+            <circle cx="70" cy="70" r="3" fill="var(--accent)" opacity="0.6">
+              <animate attributeName="r" values="3;4;3" dur="3s" repeatCount="indefinite" />
+            </circle>
+          </svg>
+        </section>
+      )}
+
       {/* ── 10D Vector (subtle grid, no cards) ── */}
       {hasVector && (
         <section className="w-full">
