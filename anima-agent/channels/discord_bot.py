@@ -136,22 +136,44 @@ class AnimaDiscordBot:
 
             user_id = str(message.author.id)
 
+            # Auth check
+            try:
+                from auth import AuthManager, Permission
+                auth_mgr = AuthManager()
+                username = auth_mgr.resolve_channel_user("discord", user_id)
+                if username:
+                    if not auth_mgr.check_permission(username, Permission.USER):
+                        await message.reply("🔒 Not authorized.")
+                        return
+                elif auth_mgr.list_users():
+                    await message.reply("🔒 Link your account first.")
+                    return
+            except ImportError:
+                pass  # No auth = allow all
+
             try:
                 async with message.channel.typing():
                     response = await agent.process_message(
                         text=text, channel="discord", user_id=user_id
                     )
 
+                # Φ gauge
+                phi = response.metadata.get("phi", 0)
+                t = response.tension
+                emotion = response.emotion
+                if isinstance(emotion, dict):
+                    emotion = emotion.get("emotion", "?")
+                gauge = f"`[Φ={phi:.1f} T={t:.2f} {emotion}]`"
+
                 reply = response.text
-                # Discord has 2000 char limit
-                if len(reply) > 1900:
-                    reply = reply[:1900] + "..."
+                if len(reply) > 1800:
+                    reply = reply[:1800] + "..."
 
                 if response.tool_results:
-                    reply += "\n\n*[tools: " + ", ".join(
-                        r["tool"] for r in response.tool_results
-                    ) + "]*"
+                    reply += "\n🔧 " + ", ".join(
+                        r["tool"] for r in response.tool_results)
 
+                reply += f"\n{gauge}"
                 await message.reply(reply)
             except Exception as e:
                 logger.error("Error processing message: %s", e)

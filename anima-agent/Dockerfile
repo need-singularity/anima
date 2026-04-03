@@ -28,9 +28,17 @@ COPY anima-agent/ /app/
 ENV PYTHONPATH="/app:/app/anima-src"
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8766
+ENV KMP_DUPLICATE_LIB_OK=TRUE
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')" || exit 1
+# Health check via self-test (CLI principle — no web server)
+HEALTHCHECK --interval=60s --timeout=30s --start-period=30s --retries=3 \
+    CMD python -c "from self_test import AgentSelfTest; from anima_agent import AnimaAgent; a=AnimaAgent(enable_tools=False,enable_learning=False,enable_growth=False); r=AgentSelfTest(a).run(); exit(0 if r['passed'] else 1)"
 
-CMD ["python", "run.py", "--mcp", "--direct"]
+# Default: CLI mode (MCP excluded — CLI only rule)
+CMD ["python", "run.py", "--cli"]
+
+# Other modes:
+# docker run anima-agent python run.py --telegram
+# docker run anima-agent python run.py --test
+# docker run anima-agent python discovery_loop.py --continuous
+# docker run anima-agent python cli_dashboard.py

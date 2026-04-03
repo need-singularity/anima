@@ -384,6 +384,10 @@ class AnimaAgent:
         msg = ChannelMessage(text=text, channel=channel, user_id=user_id)
         self.interaction_count += 1
 
+        # 0. Language detection (multi-lingual consciousness)
+        detected_lang = self._detect_language(text)
+        msg.metadata["lang"] = detected_lang
+
         # 1. Text -> tensor
         vec = text_to_vector(text, dim=self.dim)
 
@@ -940,6 +944,31 @@ class AnimaAgent:
         if phi >= 1.0:
             return 1.0
         return 0.0
+
+    @staticmethod
+    def _detect_language(text: str) -> str:
+        """Detect language from text. Simple heuristic — no external deps."""
+        if not text:
+            return "en"
+        # Korean: Hangul range
+        ko_count = sum(1 for c in text if '\uac00' <= c <= '\ud7a3' or '\u3131' <= c <= '\u318e')
+        # Japanese: Hiragana + Katakana
+        ja_count = sum(1 for c in text if '\u3040' <= c <= '\u30ff')
+        # Chinese: CJK Unified
+        zh_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        # Russian: Cyrillic
+        ru_count = sum(1 for c in text if '\u0400' <= c <= '\u04ff')
+
+        total = len(text)
+        if ko_count > total * 0.2:
+            return "ko"
+        if ja_count > total * 0.2:
+            return "ja"
+        if zh_count > total * 0.2:
+            return "zh"
+        if ru_count > total * 0.2:
+            return "ru"
+        return "en"
 
     def _count_skills(self) -> int:
         """Count active skills."""

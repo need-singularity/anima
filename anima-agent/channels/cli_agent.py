@@ -157,12 +157,27 @@ async def run_cli(agent):
             elif cmd == "/discovery":
                 try:
                     from discovery_loop import DiscoveryLoop
-                    print(f"{C_CYAN}Running discovery cycle...{C_RESET}")
-                    loop = DiscoveryLoop()
+                    auto_reg = "register" in args.lower() if args else False
+                    print(f"{C_CYAN}Running discovery cycle{' (auto-register)' if auto_reg else ''}...{C_RESET}")
+                    loop = DiscoveryLoop(auto_register=auto_reg)
                     report = loop.run_cycle()
                     loop.print_report(report)
                 except Exception as e:
                     print(f"{C_RED}Discovery error: {e}{C_RESET}")
+
+            elif cmd == "/paper":
+                try:
+                    from discovery_loop import DiscoveryLoop
+                    from paper_draft import PaperDraft
+                    print(f"{C_CYAN}Generating paper from discovery cycle...{C_RESET}")
+                    loop = DiscoveryLoop()
+                    reports = loop.run_cycles(int(args) if args else 1)
+                    draft = PaperDraft(reports)
+                    path = "discovery_paper.md"
+                    draft.generate(path)
+                    print(f"{C_GREEN}Paper draft saved: {path}{C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}Paper error: {e}{C_RESET}")
 
             elif cmd == "/lenses":
                 try:
@@ -204,7 +219,8 @@ async def run_cli(agent):
                 print("  /skills      List skills")
                 print("  /peers       Hivemind connections")
                 print("  /selftest    Run self-diagnostic")
-                print("  /discovery   Run discovery cycle (philosophy + NEXUS-6)")
+                print("  /discovery   Run discovery cycle (add 'register' to auto-save laws)")
+                print("  /paper [N]   Generate paper from N discovery cycles")
                 print("  /lenses      Run 8 agent runtime lenses")
                 print("  /guardian    Run Code Guardian (add 'diff' for changes only)")
                 print("  /voice       Generate consciousness voice")

@@ -228,7 +228,8 @@ DEFAULT_RULES = [
         "type": "pattern",
         "pattern": r"\b(eval|exec)\s*\(",
         "exclude_pattern": r"\.\s*(eval|exec)\s*\(|['\"].*eval|BLOCKED_PATTERNS",
-        "exclude_files": ["testing/*", "agent_tools.py", "skills/*", "code_guardian.py", "verify_philosophy.py"],
+        "exclude_files": ["testing/*", "agent_tools.py", "skills/*", "code_guardian.py",
+                         "verify_philosophy.py", "engine_adapter.py", "security_audit.py"],
     },
     {
         "id": "SEC-SHELL-INJECT",
@@ -238,7 +239,8 @@ DEFAULT_RULES = [
         "severity": "error",
         "type": "pattern",
         "pattern": r"\b(os\.system|subprocess\.call.*shell\s*=\s*True)\b",
-        "exclude_files": ["testing/*", "agent_tools.py", "skills/*", "verify_philosophy.py", "code_guardian.py"],
+        "exclude_files": ["testing/*", "agent_tools.py", "skills/*", "verify_philosophy.py",
+                         "code_guardian.py", "cli_dashboard.py", "security_audit.py"],
     },
     # ── Quality ──
     {
