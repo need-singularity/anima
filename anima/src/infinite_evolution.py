@@ -5482,6 +5482,8 @@ def main():
                         help='v7 #68: Enable cloud orchestrator stub (prints what RunPod would do)')
     parser.add_argument('--hardware', action='store_true',
                         help='v9 #77-82: Enable hardware evolution stubs (ESP32/FPGA/neuromorphic)')
+    parser.add_argument('--accel', action='store_true',
+                        help='v26: Use acceleration winners (PolyrhythmScheduler) to speed up discovery')
     args = parser.parse_args()
 
     if args.auto_roadmap:
@@ -5500,6 +5502,16 @@ def main():
             _hardware_stub = None
 
     SCALES = [32, 64, 128, 256]
+
+    # v26: Acceleration setup (--accel flag)
+    _accel_scheduler = None
+    if getattr(args, 'accel', False):
+        try:
+            from acceleration_integrations import PolyrhythmScheduler
+            _accel_scheduler = PolyrhythmScheduler(n_cells=args.cells, periods=[1, 3, 7])
+            print('  v26: Acceleration enabled (PolyrhythmScheduler [1,3,7])')
+        except ImportError:
+            print('  v26: acceleration_integrations not available, --accel ignored')
 
     # Initialize
     engine = ConsciousnessEngine(initial_cells=args.cells, max_cells=args.cells)
@@ -5610,9 +5622,20 @@ def main():
             print(f"  Gen {gen} \u2014 Phase 1: Discovery ({args.steps} steps, {backend_tag})")
             sys.stdout.flush()
 
+            # v26: Accelerated discovery — skip inactive cells via PolyrhythmScheduler
+            accel_steps = args.steps
+            if _accel_scheduler is not None:
+                active = _accel_scheduler.get_active_cells(gen)
+                accel_frac = len(active) / max(current_cells, 1)
+                # Reduce steps proportionally to compute saved (min 50% of original)
+                accel_steps = max(args.steps // 2, int(args.steps * accel_frac))
+                if accel_steps != args.steps:
+                    print(f'    v26: accel {args.steps}->{accel_steps} steps '
+                          f'(frac={accel_frac:.2f})')
+
             try:
                 # v2 #9: Adaptive discovery with early abort
-                raw_patterns = _adaptive_discover(current_cells, args.steps, current_topo, engine)
+                raw_patterns = _adaptive_discover(current_cells, accel_steps, current_topo, engine)
             except Exception as e:
                 print(f"    Discovery error: {e}")
                 raw_patterns = []
