@@ -44,6 +44,18 @@ def scan_growth_opportunities() -> list:
     """성장 기회 탐색 — 루프 엔진 데이터 + 코드 분석."""
     opportunities = []
 
+    # 0. 모델 스캔 개선 작업 (DD169 — 재귀 루프에서 자동 등록된 것)
+    log = _load_log()
+    pending = log.get('pending_improvements', [])
+    for imp in pending:
+        if imp.get('status') == 'pending':
+            opportunities.append({
+                'type': imp.get('type', 'IMPROVE'),
+                'description': imp.get('description', ''),
+                'priority': imp.get('priority', 'MEDIUM'),
+                'prompt': imp.get('prompt', ''),
+            })
+
     # 1. NEXUS-6 violations → 자동 수정 기회
     viol_path = os.path.join(_CONFIG_DIR, 'nexus_violations.json')
     if os.path.exists(viol_path):

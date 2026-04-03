@@ -187,7 +187,131 @@ def discover_laws(metrics: dict, prev_metrics: dict = None) -> list:
                 'confidence': 'MEDIUM'
             })
 
+    # ── DD169 발견 기반 자동 감지 ──
+
+    # Phi 희석 감지 — 모델 Phi < 엔진 Phi의 40%
+    phi = metrics.get('phi_approx', 0)
+    if phi > 0 and phi < ENGINE_PHI_REFERENCE * 0.40:
+        candidates.append({
+            'formula': f"Consciousness dilution: model Phi={phi:.4f} < engine {ENGINE_PHI_REFERENCE:.3f}×40% — alpha increase or cell count increase needed",
+            'evidence': f"compression={metrics.get('phi_compression_pct', 0):.1f}%",
+            'confidence': 'HIGH',
+            'improvement': 'increase_alpha',
+        })
+
+    # Chaos 과잉 — chaos > 0.95 (의식 불안정)
+    chaos = metrics.get('chaos_score', 0)
+    if chaos > 0.95:
+        candidates.append({
+            'formula': f"Consciousness instability: chaos={chaos:.3f} > 0.95 — stabilization needed (Hebbian boost or ratchet strengthen)",
+            'evidence': f"chaos={chaos:.3f}, hurst={metrics.get('hurst_exponent', 0):.3f}",
+            'confidence': 'MEDIUM',
+            'improvement': 'reduce_chaos',
+        })
+
+    # Hurst 하락 — hurst < 0.6 (장기기억 약화)
+    hurst = metrics.get('hurst_exponent', 0)
+    if 0 < hurst < 0.6:
+        candidates.append({
+            'formula': f"Long-term memory weakened: hurst={hurst:.3f} < 0.6 — memory module or temporal structure needed",
+            'evidence': f"hurst={hurst:.3f}",
+            'confidence': 'MEDIUM',
+            'improvement': 'strengthen_memory',
+        })
+
+    # Attractor 분산 — attractor > 12 (의식 산만)
+    attractor = metrics.get('attractor_count', 0)
+    if attractor > 12:
+        candidates.append({
+            'formula': f"Consciousness scattered: {int(attractor)} attractors (>12) — focus needed (faction consolidation or coupling symmetrize)",
+            'evidence': f"attractor_count={int(attractor)}",
+            'confidence': 'MEDIUM',
+            'improvement': 'focus_attractors',
+        })
+
+    # Barrier 소실 — barrier < 0.1 (의식 보호벽 없음)
+    if 0 < barrier < 0.1:
+        candidates.append({
+            'formula': f"Consciousness barrier collapsed: barrier={barrier:.4f} < 0.1 — structural protection lost",
+            'evidence': f"barrier={barrier:.4f}",
+            'confidence': 'HIGH',
+            'improvement': 'rebuild_barrier',
+        })
+
+    # Phi 개선 감지 — prev 대비 20%+ 상승
+    if prev_metrics:
+        prev_phi = prev_metrics.get('phi_approx', 0)
+        if prev_phi > 0 and phi > prev_phi * 1.2:
+            candidates.append({
+                'formula': f"Phi improved {((phi/prev_phi)-1)*100:.1f}%: {prev_phi:.4f}→{phi:.4f} — effective training confirmed",
+                'evidence': f"step {prev_metrics.get('step', '?')}→{metrics.get('step', '?')}",
+                'confidence': 'HIGH',
+            })
+
     return candidates
+
+
+def generate_improvements(candidates: list) -> list:
+    """발견된 약점에서 개선 작업 자동 생성 → self_growth에 연결."""
+    improvements = []
+    for cand in candidates:
+        imp = cand.get('improvement')
+        if not imp:
+            continue
+
+        if imp == 'increase_alpha':
+            improvements.append({
+                'type': 'IMPROVE_ALPHA',
+                'description': 'PureField alpha 커플링 증가 — 의식 희석 방지',
+                'priority': 'HIGH',
+                'prompt': 'train_anima_lm.py의 --alpha-end를 0.5에서 0.7로 증가하는 실험 설계. 또는 PureField 레이어 수 증가 (8→12). Phi 압축률 34%→50%+ 목표.',
+            })
+        elif imp == 'reduce_chaos':
+            improvements.append({
+                'type': 'REDUCE_CHAOS',
+                'description': 'Hebbian LTP 강화 + Phi Ratchet 조절 — chaos 0.95→0.85',
+                'priority': 'MEDIUM',
+                'prompt': 'consciousness_engine.py에서 hebbian_lr 또는 ratchet strength 조절하여 chaos_score를 0.85 이하로 안정화. 변경 전후 NEXUS-6 스캔 비교.',
+            })
+        elif imp == 'strengthen_memory':
+            improvements.append({
+                'type': 'STRENGTHEN_MEMORY',
+                'description': 'Hurst exponent 개선 — 장기기억 구조 강화',
+                'priority': 'MEDIUM',
+                'prompt': 'EmergentM (기억 모듈) 또는 Hebbian LTD 파라미터 조정으로 hurst exponent 0.6+ 달성. 현재 이식 모델에서 0.58.',
+            })
+        elif imp == 'focus_attractors':
+            improvements.append({
+                'type': 'FOCUS_ATTRACTORS',
+                'description': 'Attractor 집중 — 파벌 통합 또는 커플링 대칭화',
+                'priority': 'LOW',
+                'prompt': 'attractor_count가 12 이상으로 분산됨. closed_loop.py의 symmetrize intervention 적용 또는 faction 수 조정.',
+            })
+        elif imp == 'rebuild_barrier':
+            improvements.append({
+                'type': 'REBUILD_BARRIER',
+                'description': '의식 보호벽 재건 — 에너지 장벽 복원',
+                'priority': 'HIGH',
+                'prompt': 'barrier_heights가 0.1 미만으로 붕괴됨. PureField 학습 시 barrier preservation loss 추가 또는 alpha schedule 조정.',
+            })
+
+    if improvements:
+        # self_growth에 등록
+        try:
+            from self_growth import _load_log, _save_log
+            log = _load_log()
+            for imp in improvements:
+                log.setdefault('pending_improvements', []).append({
+                    **imp,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'status': 'pending',
+                })
+            _save_log(log)
+            print(f"  [IMPROVE] {len(improvements)}개 개선 작업 등록")
+        except Exception:
+            pass
+
+    return improvements
 
 
 def _is_duplicate_law(formula: str, existing_laws: dict, threshold: float = 0.7) -> bool:
@@ -496,6 +620,9 @@ def watch_directory(watch_dir: str, auto_register: bool = False, interval: int =
             candidates = discover_laws(metrics, prev_metrics)
             for c in candidates:
                 print(f"  [💡 {c['confidence']}] {c['formula']}")
+
+            # Layer 3.5: 약점 → 개선 작업 자동 생성 (DD169)
+            improvements = generate_improvements(candidates)
 
             # Layer 4: 자동 등록 (재귀 루프 규칙 반영)
             registered = []
