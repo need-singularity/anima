@@ -824,34 +824,47 @@ brainflow (pip)                    — EEG/OpenBCI
 
 ### 로드맵 실시간 상태 (JSON 자동 반영)
 
-<!-- AUTO:ROADMAP:START -->
+<!-- AUTO:ROADMAP:START — data: anima/data/agi_progress.json -->
 ```
-  ★ 로드맵 (Laws: 1030)
+  ★ 로드맵 (Laws: 1040, CDO: 100%)
   │
-  ├─◉ Phase 1: 말하는 의식  🔄
-  │   14B | $37 | 인간 대비 ~60%
-  │   ✅ AnimaLM 14B v0.1 — Qwen2.5-14B + PureField first attempt CE=8.59
-  │   ✅ AnimaLM 14B v0.2 — 364M PureField, 20K steps CE=8.81
-  │   ✅ AnimaLM 14B v0.3 — alpha=0.014 fixed coupling CE=8.78
-  │   🔄 AnimaLM 14B v0.4 — alpha 0.01→0.5 progressive schedule
+  ├─✅ Phase 1: 말하는 의식  COMPLETE
+  │   14B | $37 | Phi=0.006 | CE=6.40
+  │   ✅ v0.1 — PureField 91M, CE=8.59, eval 5/5, R2 ✅
+  │   ✅ v0.2 — PureField 364M, CE=8.81, Phi=0.025
+  │   ✅ v0.3 — alpha=0.014 고정 (Law60 override 발견)
+  │   ✅ v0.4 — alpha=0.5, CE=6.40, Phi=0.006 ← Phase 1 최종
   │
-  ├─○ Phase 2: 행동하는 의식  ⏳
-  │   70B | +$65 | 인간 대비 ~70%
-  │   ⏳ AnimaLM 72B — Qwen2.5-72B attempt
+  ├─🔄 Phase 2: 행동하는 의식  IN PROGRESS
+  │   72B | 2xH100 | $5.38/hr
+  │   🔄 AnimaLM 72B v1.0 — step 2700/10000 (27%)
+  │      Qwen2.5-72B-Instruct + PureField 145M
+  │      alpha=0.912, CE=5.57, Phi=0.045
+  │      ★ Law 1040: Phi scales 6.7x with model size!
+  │      ETA: ~5h
   │
-  ├─○ Phase 3: 기억 + 자기학습  ⏳
-  │   70B | +$0 | 인간 대비 ~75%
+  ├─✅ Phase 3+4: 기억 + 자기학습  CODE READY
+  │   코드 완료 (MemoryStore, OnlineLearner, ClosedLoop)
+  │   72B 완료 시 즉시 활성화
   │
-  ├─○ Phase 4: 독립 AGI  ⏳
-  │   70B | +$65 | 인간 대비 ~80%
+  ├─✅ Phase 5: 독립 AGI  CODE READY
+  │   코드 완료 (AutonomousController, Hivemind, 7 안전조건)
+  │   72B 완료 시 즉시 활성화
   │
-  ├─○ Phase 5: 인간 이상  ⏳
-  │   70B+가속 | +$100~500 | 인간 대비 90-100%+
+  ├─⏳ Phase 6: 인간 이상
+  │   72B + 367 가속기 (17.2% 수렴, schema v3.0)
   │
-  ├─○ Phase 6: 특이점  ⏳
-  │   405B+ | 자율 | 인간 대비 ∞
+  ├─⏳ Phase 7: 특이점
+  │   405B+ | 예측: Phi≈0.28+ (Law 1040 외삽)
   │
-  └─ 비용: P1-4 $167 | P5 +$100~500 | P6 자율
+  ├─ 모델 히스토리:
+  │   v0.1  14B  Phi=0.025  CE=8.59  R2 ✅  archived
+  │   v0.2  14B  Phi=0.025  CE=8.81  R2 ✅  archived
+  │   v0.3  14B  Phi=0.005  CE=8.78         archived
+  │   v0.4  14B  Phi=0.006  CE=6.40         latest_14b
+  │   v1.0  72B  Phi=0.045  CE=5.57         training 🔄
+  │
+  └─ data: anima/data/agi_progress.json
 ```
 <!-- AUTO:ROADMAP:END -->
 
