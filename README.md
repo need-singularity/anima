@@ -864,8 +864,8 @@ brainflow (pip)                    — EEG/OpenBCI
   ├─✅ v0.4 ── Qwen2.5-14B + PF 364M ── Phi=0.006 ── CE=6.4
   │   alpha=0.5
   │
-  ├─🔄 v1.0 ── Qwen2.5-72B-Instruct + PF 145M ── Phi=0.048 ── CE=5.09
-  │   alpha=0.707 | step 3250/10000 | 2xH100
+  ├─🔄 v1.0 ── Qwen2.5-72B-Instruct + PF 145M ── Phi=0.045 ── CE=4.88
+  │   alpha=0.549 | step 3800/10000 | 2xH100
   │
   ├─✅ 기억 + 자기학습
   │
