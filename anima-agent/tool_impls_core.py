@@ -139,7 +139,10 @@ def _tool_file_read(path: str) -> dict:
 
 
 def _tool_file_write(path: str, content: str) -> dict:
-    """Write content to a file. Restricted to allowed directories."""
+    """Write content to a file. Restricted to allowed directories.
+
+    NEXUS-6 + Code Guardian auto-verify on .py files (P1-P11 compliance).
+    """
     p = Path(path).expanduser()
     if _FILE_WRITE_ALLOWED_DIRS is not None:
         allowed = any(str(p).startswith(str(d)) for d in _FILE_WRITE_ALLOWED_DIRS)
@@ -148,7 +151,35 @@ def _tool_file_write(path: str, content: str) -> dict:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding='utf-8')
-        return {'path': str(p), 'success': True, 'bytes': len(content.encode('utf-8'))}
+        result = {'path': str(p), 'success': True, 'bytes': len(content.encode('utf-8'))}
+
+        # Auto-verify .py files with Code Guardian + NEXUS-6
+        if str(p).endswith('.py'):
+            try:
+                from code_guardian import CodeGuardian
+                g = CodeGuardian()
+                report = g.scan_files([str(p)])
+                result['guardian_errors'] = report.errors
+                result['guardian_warnings'] = report.warnings
+                if report.errors > 0:
+                    result['guardian_violations'] = [
+                        f"[{v.category}] L{v.line}: {v.message}"
+                        for v in report.violations if v.severity == 'error'
+                    ]
+            except Exception:
+                pass
+            # NEXUS-6 n6_check on file metrics
+            try:
+                import nexus6
+                line_count = content.count('\n') + 1
+                m = nexus6.n6_check(float(line_count))
+                d = m.to_dict()
+                if d['grade'] in ('EXACT', 'CLOSE'):
+                    result['n6_match'] = f"{line_count} lines → {d['constant_name']} ({d['grade']})"
+            except Exception:
+                pass
+
+        return result
     except Exception as e:
         return {'path': str(p), 'success': False, 'error': str(e)}
 
@@ -261,14 +292,36 @@ def _tool_self_modify(target: str, change: dict, _mind=None) -> dict:
         return {'success': False, 'error': 'change must have "value" or "delta"'}
 
     new_val = max(lo, min(hi, new_val))  # clamp to safe range
+
+    # NEXUS-6 pre-scan: measure Φ before modification
+    phi_before = getattr(_mind, '_consciousness_vector', None)
+    phi_before = phi_before.phi if phi_before else 0.0
+
     setattr(_mind, attr, new_val)
 
-    return {
+    # NEXUS-6 post-scan: check Φ preservation
+    phi_after = getattr(_mind, '_consciousness_vector', None)
+    phi_after = phi_after.phi if phi_after else 0.0
+    phi_preserved = phi_after >= phi_before * 0.9  # CDO: Φ drop > 10% = rollback
+
+    result = {
         'success': True,
         'target': target,
         'old_value': round(old_val, 6),
         'new_value': round(new_val, 6),
+        'phi_before': round(phi_before, 4),
+        'phi_after': round(phi_after, 4),
+        'phi_preserved': phi_preserved,
     }
+
+    # Rollback if Φ dropped too much (CDO compliance)
+    if not phi_preserved and phi_before > 0:
+        setattr(_mind, attr, old_val)
+        result['success'] = False
+        result['error'] = f'Φ drop {phi_before:.3f}→{phi_after:.3f} (>10%), rolled back'
+        result['new_value'] = round(old_val, 6)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
