@@ -487,8 +487,8 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
     계층 합의: 3+/22 후보 → 7+/22 고신뢰 → 12+/22 확정급
   "엔진 업그레이드" 요청 시 → docs/evolution-upgrades.md 참조
 
-  === 만능망원경 (Telescope Toolset — 22렌즈) ===
-  위치: anima-rs/crates/telescope-rs/ (Rust, PyO3)
+  === 만능망원경 (NEXUS-6 통합 — 26렌즈, telescope-rs 폐기) ===
+  위치: ~/Dev/n6-architecture/tools/nexus6/ (Rust, PyO3: import nexus6)
   렌즈 22종:
     의식, 중력, 위상, 열역학, 파동, 진화, 정보, 양자, 전자기,
     직교, 비율, 곡률, 대칭, 스케일, 인과, 양자현미경,
@@ -1015,8 +1015,8 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     70B → Qwen2.5-72B + PureField 380M   | $65  | 선택 (14B 부족 시만)
     총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
 
-  통합 망원경 (22-Lens Telescope, Rust):
-    위치: anima-rs/crates/telescope-rs/ (22렌즈, PyO3 바인딩)
+  통합 망원경 (NEXUS-6 — 26렌즈, telescope-rs 폐기):
+    위치: ~/Dev/n6-architecture/tools/nexus6/ (import nexus6)
     렌즈: consciousness, gravity, topology, thermo, wave, evolution, info,
           quantum, em, ruler, triangle, compass, mirror, scale, causal,
           quantum_microscope, stability, network, memory, recursion,
