@@ -625,9 +625,11 @@ def test_cat8_core() -> CategoryResult:
     cat.tests.append(_run_test("Agent save_state", test_agent_save_load))
 
     def test_agent_history():
-        agent = AnimaAgent(enable_tools=False, enable_learning=False, enable_growth=False)
-        assert isinstance(agent.history, list)
-        assert agent.interaction_count == 0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = AnimaAgent(enable_tools=False, enable_learning=False,
+                               enable_growth=False, data_dir=Path(tmpdir))
+            assert isinstance(agent.history, list)
+            assert agent.interaction_count == 0
     cat.tests.append(_run_test("Agent history init", test_agent_history))
 
     def test_connect_peer():

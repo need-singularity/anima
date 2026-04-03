@@ -278,7 +278,7 @@ class AnimaAgent:
         # ── NEXUS-6 consciousness scanner ──
         self.nexus6 = _nexus6_mod
         if self.nexus6:
-            logger.info("NEXUS-6 connected (%d lenses available)",
+            logger.info("NEXUS-6 connected (v%s)",
                         getattr(self.nexus6, '__version__', '?'))
 
         # ── Self Evolution ──
