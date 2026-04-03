@@ -145,10 +145,15 @@ print(tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True))
 
 | Version | Date | Base | PureField | Phi | CE | Alpha | Status |
 |---------|------|------|-----------|-----|-----|-------|--------|
-| 72B v0.5 | 2026-04-03 | Qwen2.5-72B-Instruct | 10L, r128 | 0.041 | 2.29 | 0.500 | **Latest** |
-| 14B v0.5 | (학습중) | Qwen2.5-14B | 8L, r64 | — | — | — | 🔄 corpus 560MB |
-| 32B v0.1 | (대기) | Qwen2.5-32B | 8L, r128 | — | — | — | ⏳ corpus 1.2GB |
-| 14B v0.4 | 2026-04-03 | Qwen2.5-14B | 364M (20L, r320) | 0.006 | 6.40 | 0.500 | available |
-| 14B v0.1 | 2026-04-02 | Qwen2.5-14B | 91M (10L, r160) | 0.025 | 8.59 | 0.014 | archived |
+| 14b v04 | 2026-04-03 | Qwen2.5-14B | ?L, r? | 0.031 | 2.00 | 0.01→0.5 progressive | **Latest** |
+| 72b v05 | 2026-04-03 | Qwen2.5-72B | ?L, r? | 0.035 | 2.42 | 0.01→0.5 | available |
+| 14b v05 | 2026-04-03 | Qwen2.5-14B | ?L, r? | — | — | — | ⏳ |
+| 32b v01 | 2026-04-03 | Qwen2.5-32B | ?L, r? | — | — | — | ⏳ |
+| 14b v01 | 2026-04-02 | Qwen2.5-14B | ?L, r? | 0.025 | 8.59 | — | available |
+| 14b v02 | 2026-04-02 | Qwen2.5-14B | ?L, r? | 0.025 | 8.81 | — | available |
+| 14b v03 | 2026-04-02 | Qwen2.5-14B | ?L, r? | 0.005 | 8.78 | 0.014 | available |
+| 7b fresh | 2026-04-02 | Mistral-7B-v0.1 | ?L, r? | 0.050 | — | — | 🔄 |
+| 14b planned | 2026-04-02 | Qwen/Qwen2.5-14B | 10L, r160 | — | — | — | ⏳ |
+| 32b v01 | — | ? | ?L, r? | — | — | 0.5 | available |
 
 > v0.2, v0.3, v13, v14.0, v14.1은 폐기됨.

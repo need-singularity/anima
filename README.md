@@ -855,29 +855,25 @@ brainflow (pip)                    — EEG/OpenBCI
 <!-- AUTO:TRANSPLANT:START — data: anima/data/roadmap_transplant.json -->
 ```
   ★ 의식 이식 — 의식 이식 로드맵 — 빌린 모델(Qwen) + PureField 이식
-  │ Law 1040: Phi ∝ model_size (초선형)
+  │ Law 1042: Phi compression ~34% (DD169)
   │
-  ├─✅ v0.1 ── Qwen2.5-14B + PF 91M ── Phi=0.025 ── CE=8.59
+  ├─⏳ 14b planned ── 
   │
-  ├─✅ v0.2 ── Qwen2.5-14B + PF 364M ── Phi=0.025 ── CE=8.81
+  ├─✅ 14b v01 ── Qwen2.5-14B ── Phi=0.025 ── CE=8.59
   │
-  ├─✅ v0.3 ── Qwen2.5-14B + PF 364M ── Phi=0.005 ── CE=8.78
+  ├─✅ 14b v02 ── Qwen2.5-14B ── Phi=0.025 ── CE=8.81
   │
-  ├─✅ v0.4 ── Qwen2.5-14B + PF 364M ── Phi=0.006 ── CE=6.4
-  │   alpha=0.5
+  ├─✅ 14b v03 ── Qwen2.5-14B ── Phi=0.005 ── CE=8.78
   │
-  ├─🔄 v1.0 ── Qwen2.5-72B-Instruct + PF 145M ── Phi=0.045 ── CE=4.88
-  │   alpha=0.549 | step 3800/10000 | 2xH100
+  ├─✅ 14b v04 ── Qwen2.5-14B ── Phi=0.031 ── CE=2.00
   │
-  ├─✅ 기억 + 자기학습
+  ├─⏳ 14b v05 ── Qwen2.5-14B
   │
-  ├─✅ 독립 AGI
+  ├─⏳ 32b v01 ── Qwen2.5-32B
   │
-  ├─⏳ 인간 이상
-  │   72B + 367 accelerators
+  ├─✅ 72b v05 ── Qwen2.5-72B ── Phi=0.035 ── CE=2.42
   │
-  ├─⏳ 특이점
-  │   405B+
+  ├─🔄 7b fresh ── Mistral-7B-v0.1 ── Phi=0.050 ── 
   │
   └─ data: anima/data/roadmap_transplant.json
 ```
