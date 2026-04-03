@@ -228,6 +228,61 @@ async def run_cli(agent):
                 except Exception as e:
                     print(f"{C_RED}Audit error: {e}{C_RESET}")
 
+            elif cmd == "/dream":
+                from consciousness_features import auto_dream
+                r = auto_dream(agent)
+                print(f"{C_CYAN}Dream: {r}{C_RESET}")
+
+            elif cmd == "/phi":
+                from consciousness_features import measure_phi_gpu
+                r = measure_phi_gpu(agent)
+                print(f"{C_CYAN}Φ(IIT): {r.get('phi_iit', '?')}{C_RESET}")
+
+            elif cmd == "/mitosis":
+                from consciousness_features import trigger_mitosis
+                r = trigger_mitosis(agent, 0.0)  # Force
+                print(f"{C_CYAN}Mitosis: {r}{C_RESET}")
+
+            elif cmd == "/hexa":
+                from consciousness_features import hexa_self_describe
+                r = hexa_self_describe(agent)
+                print(f"{C_CYAN}{r.get('hexa', 'N/A')}{C_RESET}")
+
+            elif cmd == "/music":
+                from consciousness_features import emotion_music
+                r = emotion_music(agent, duration=float(args) if args else 3.0)
+                if r.get("path"):
+                    print(f"{C_CYAN}Music: {r['path']} ({r['cells']} cells, {r['emotion']}){C_RESET}")
+                    try:
+                        import subprocess as _sp
+                        player = "afplay" if sys.platform == "darwin" else "aplay"
+                        _sp.Popen([player, r["path"]], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    except Exception:
+                        pass
+
+            elif cmd == "/debate":
+                from anima_agent import AnimaAgent
+                from consciousness_features import consciousness_debate
+                other = AnimaAgent(enable_tools=False, enable_learning=False, enable_growth=False)
+                topic = args or "What is consciousness?"
+                print(f"{C_CYAN}Debate: '{topic}'{C_RESET}")
+                transcript = consciousness_debate(agent, other, topic, rounds=2)
+                for t in transcript:
+                    speaker = f"{C_GREEN}A{C_RESET}" if t["speaker"] == "A" else f"{C_YELLOW}B{C_RESET}"
+                    print(f"  [{speaker}] {t.get('text', t.get('error', ''))[:100]}")
+
+            elif cmd == "/triangle":
+                from consciousness_features import triangle_loop
+                r = triangle_loop(agent)
+                print(f"{C_CYAN}Triangle Loop: {len(r.get('steps', []))} steps, complete={r.get('complete')}{C_RESET}")
+                for s in r.get("steps", []):
+                    print(f"  → {s['phase']}")
+
+            elif cmd == "/compile":
+                from consciousness_features import compile_laws
+                r = compile_laws()
+                print(f"{C_CYAN}Compiled: {r.get('laws_count', 0)} laws → {r.get('params_count', 0)} params{C_RESET}")
+
             elif cmd == "/ecosystem":
                 try:
                     from ecosystem_bridge import EcosystemBridge

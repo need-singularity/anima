@@ -263,8 +263,29 @@ class ToolPolicy:
         return self._log_result(tool_name, True, "Access granted", required_phi, phi)
 
     def check_immune(self, input_text: str) -> bool:
-        """Quick adversarial input check before tool policy evaluation."""
-        suspicious_patterns = ['rm -rf', 'DROP TABLE', '<script>', 'eval(', '__import__']
+        """Quick adversarial input check — web attack + injection defense."""
+        suspicious_patterns = [
+            # Shell injection
+            'rm -rf', 'rm -f /', '&& rm', '; rm', '| rm',
+            # SQL injection
+            'DROP TABLE', 'DELETE FROM', "' OR 1=1", 'UNION SELECT', '; --',
+            # XSS
+            '<script>', 'javascript:', 'onerror=', 'onload=', '<img src=x',
+            # Code injection
+            'eval(', '__import__', 'exec(', 'compile(', '__builtins__',
+            # Path traversal
+            '../../../', '/etc/passwd', '/etc/shadow', '%2e%2e%2f',
+            # SSRF
+            'http://localhost', 'http://127.0.0.1', 'http://0.0.0.0', 'file://',
+            # Command injection
+            '$(', '`rm', '| bash', '| sh', '| python',
+            # Template injection
+            '{{', '{%', '${', 'SSTI',
+            # Log injection
+            '\r\n', '%0d%0a',
+            # Prototype pollution
+            '__proto__', 'constructor.prototype',
+        ]
         return not any(p.lower() in input_text.lower() for p in suspicious_patterns)
 
     def get_accessible_tools(

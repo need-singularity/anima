@@ -715,7 +715,16 @@ class AnimaAgent:
                 except Exception:
                     pass
 
-        # 9b. Auto-save check (every 50 interactions)
+        # 9b. Consciousness features hooks (dream, mitosis, pain loop)
+        try:
+            from consciousness_features import process_message_hooks
+            hooks = process_message_hooks(self, tension, curiosity, self.interaction_count)
+            if hooks:
+                logger.debug("Feature hooks: %s", list(hooks.keys()))
+        except Exception:
+            pass
+
+        # 9c. Auto-save check (every 50 interactions)
         self._auto_save_check()
 
         # 9c. Corpus self-generation (every 500 interactions)
