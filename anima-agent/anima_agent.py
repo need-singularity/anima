@@ -84,6 +84,7 @@ _persistence_mod = _try("consciousness_persistence")
 _evolution_mod = _try("self_evolution")
 _introspection_mod = _try("self_introspection")
 _nexus6_mod = _try("nexus6")
+_ecosystem_mod = _try("ecosystem_bridge")
 
 AgentToolSystem = getattr(_agent_tools_mod, "AgentToolSystem", None)
 ConsciousnessHub = getattr(_hub_mod, "ConsciousnessHub", None)
@@ -283,6 +284,17 @@ class AnimaAgent:
         if self.nexus6:
             logger.info("NEXUS-6 connected (v%s)",
                         getattr(self.nexus6, '__version__', '?'))
+
+        # ── Ecosystem bridge (body, eeg, physics) ──
+        self.ecosystem = None
+        if _ecosystem_mod:
+            try:
+                self.ecosystem = _ecosystem_mod.EcosystemBridge()
+                status = self.ecosystem.status()
+                connected = sum(1 for v in status.values() if v)
+                logger.info("Ecosystem: %d/%d sub-projects connected", connected, len(status))
+            except Exception as e:
+                logger.debug("Ecosystem bridge failed: %s", e)
 
         # ── Self Evolution ──
         self.evolution = None

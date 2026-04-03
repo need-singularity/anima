@@ -228,6 +228,14 @@ async def run_cli(agent):
                 except Exception as e:
                     print(f"{C_RED}Audit error: {e}{C_RESET}")
 
+            elif cmd == "/ecosystem":
+                try:
+                    from ecosystem_bridge import EcosystemBridge
+                    eco = EcosystemBridge()
+                    eco.print_status()
+                except Exception as e:
+                    print(f"{C_RED}Ecosystem error: {e}{C_RESET}")
+
             elif cmd == "/voice":
                 path = agent.voice_generate(duration=2.0)
                 if path:
