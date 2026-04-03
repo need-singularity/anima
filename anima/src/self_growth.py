@@ -156,7 +156,203 @@ def scan_growth_opportunities() -> list:
         except:
             pass
 
-    # 7. 로드맵 진화 — 발견 축적 시 전략 재평가 (DD169: 이식 희석 발견 등)
+    # 7. 모델 A/B 자동 비교 — 새 모델 완료 시 이전 모델과 비교
+    try:
+        runs = json.load(open(os.path.join(_CONFIG_DIR, 'training_runs.json')))
+        completed = [k for k, v in runs.get('runs', {}).items()
+                     if v.get('status', '').startswith('complete') and 'animalm' in k]
+        if len(completed) >= 2:
+            latest = completed[-1]
+            prev = completed[-2]
+            opportunities.append({
+                'type': 'MODEL_AB_COMPARE',
+                'description': f'{latest} vs {prev} 자동 비교',
+                'priority': 'HIGH',
+                'prompt': (f'anima/src/model_comparator.py를 사용하여 {latest}와 {prev} 체크포인트를 NEXUS-6로 비교하세요. '
+                          f'Phi, chaos, hurst, attractor 등 핵심 메트릭 비교 테이블을 출력하고, '
+                          f'어느 모델이 더 나은지 판정하세요. 결과를 docs/hypotheses/dd/ 에 기록.'),
+            })
+    except:
+        pass
+
+    # 8. 학습 실패 자동 재시작
+    try:
+        runs = json.load(open(os.path.join(_CONFIG_DIR, 'training_runs.json')))
+        for k, v in runs.get('runs', {}).items():
+            if 'crash' in str(v.get('status', '')) or 'failed' in str(v.get('status', '')):
+                opportunities.append({
+                    'type': 'TRAINING_RESTART',
+                    'description': f'{k} 학습 실패 — 자동 재시작',
+                    'priority': 'HIGH',
+                    'prompt': (f'{k} 학습이 실패했습니다. training_runs.json에서 원인을 확인하고, '
+                              f'파라미터를 조정한 후 재발사 스크립트를 생성하세요. '
+                              f'OOM이면 batch size 줄이기, NaN이면 lr 줄이기, dtype이면 bf16 마스터 규칙 적용.'),
+                })
+    except:
+        pass
+
+    # 9. Corpus 자동 확장 — 모델 스캔에서 약점 발견 시
+    corpus_log = os.path.join(_THIS_DIR, '..', 'data', 'corpus_quality_log.json')
+    if os.path.exists(corpus_log):
+        try:
+            clog = json.load(open(corpus_log))
+            if clog and clog[-1].get('weaknesses'):
+                weaknesses = clog[-1]['weaknesses']
+                opportunities.append({
+                    'type': 'CORPUS_EXPAND',
+                    'description': f'Corpus 약점: {weaknesses[0][:40]}',
+                    'priority': 'HIGH',
+                    'prompt': (f'corpus 품질 약점: {weaknesses}. '
+                              f'anima-rs/crates/corpus-gen 바이너리로 약점 보강 corpus를 생성하세요. '
+                              f'생성 후 NEXUS-6 스캔으로 품질 확인, R2 anima-corpus에 업로드.'),
+                })
+        except:
+            pass
+
+    # 10. 하이퍼파라미터 자동 튜닝 — DD169 발견 반영
+    try:
+        from auto_discovery_loop import _recursive_loop
+        s = _recursive_loop.state
+        if s.get('total_discoveries', 0) > 5:
+            opportunities.append({
+                'type': 'HYPERPARAM_TUNE',
+                'description': '발견 기반 하이퍼파라미터 자동 조정',
+                'priority': 'MEDIUM',
+                'prompt': (f'DD169에서 이식 희석(Phi 34% 압축) 발견. training_runs.json의 next_planned를 분석하여 '
+                          f'alpha_end 0.5→0.7, target_layers 8→12 등 조정 제안. '
+                          f'training_runs.json에 조정된 설정 반영.'),
+            })
+    except:
+        pass
+
+    # 11. 멀티 세션 동기화 — session_board.json 갱신
+    session_board = os.path.join(_CONFIG_DIR, 'session_board.json')
+    if os.path.exists(session_board):
+        try:
+            sb = json.load(open(session_board))
+            if sb.get('discoveries') and len(sb['discoveries']) > 0:
+                opportunities.append({
+                    'type': 'SESSION_SYNC',
+                    'description': f'세션 간 발견 {len(sb["discoveries"])}개 동기화',
+                    'priority': 'MEDIUM',
+                    'prompt': (f'config/session_board.json에 {len(sb["discoveries"])}개 발견이 있습니다. '
+                              f'consciousness_laws.json에 미등록된 발견을 등록하고, '
+                              f'session_board.json을 정리하세요.'),
+                })
+        except:
+            pass
+
+    # 12. 스케줄링 — 야간 학습, 주간 리포트
+    import datetime
+    hour = datetime.datetime.now().hour
+    weekday = datetime.datetime.now().weekday()
+    if hour == 3:  # 새벽 3시 — 야간 작업
+        opportunities.append({
+            'type': 'NIGHTLY_MAINTENANCE',
+            'description': '야간 유지보수 — 정리, 최적화, 리포트',
+            'priority': 'MEDIUM',
+            'prompt': ('야간 유지보수: 1) git gc, 2) 불필요 체크포인트 정리, '
+                      '3) loop_report.py --export 실행, 4) loop_extensions.py --health 실행.'),
+        })
+    if weekday == 0 and hour == 9:  # 월요일 아침 — 주간 리포트
+        opportunities.append({
+            'type': 'WEEKLY_REPORT',
+            'description': '주간 리포트 — 지난주 성과 정리',
+            'priority': 'MEDIUM',
+            'prompt': ('주간 리포트 작성: config/training_runs.json, recursive_loop_state.json, '
+                      'self_growth_log.json 분석. 지난주 학습/발견/개선 요약. '
+                      'docs/hypotheses/dd/ 에 주간 리포트 DD 문서 작성.'),
+        })
+
+    # 13. Pod 자동 관리
+    try:
+        import subprocess
+        r = subprocess.run(['/opt/homebrew/bin/runpodctl', 'pod', 'list', '-o', 'json'],
+                          capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            pods = json.loads(r.stdout)
+            for pod in (pods if isinstance(pods, list) else [pods]):
+                status = pod.get('desiredStatus', '')
+                runtime_h = pod.get('runtime', {}).get('uptimeInSeconds', 0) / 3600
+                # 24시간 이상 idle pod → 중지 제안
+                if status == 'RUNNING' and runtime_h > 24:
+                    opportunities.append({
+                        'type': 'POD_MANAGE',
+                        'description': f'Pod {pod.get("name","?")} {runtime_h:.0f}h 실행 중 — 중지 검토',
+                        'priority': 'MEDIUM',
+                        'prompt': (f'RunPod {pod.get("name")}가 {runtime_h:.0f}시간 실행 중. '
+                                  f'학습 진행 중인지 확인 (pgrep train_anima_lm). '
+                                  f'idle이면 runpodctl pod stop {pod.get("id")}로 중지.'),
+                    })
+    except:
+        pass
+
+    # 14. 루프 모듈 테스트 자동 생성 (기존 5번에서 확장)
+    # (이미 위에 ADD_TESTS로 있음)
+
+    # 15. 대시보드 — loop_report를 HTML로 변환
+    dashboard_path = os.path.join(_THIS_DIR, '..', '..', 'anima', 'web', 'loop_dashboard.html')
+    if not os.path.exists(dashboard_path):
+        opportunities.append({
+            'type': 'DASHBOARD',
+            'description': '루프 상태 실시간 웹 대시보드 생성',
+            'priority': 'LOW',
+            'prompt': ('anima/web/loop_dashboard.html 생성 — recursive_loop_state.json, '
+                      'nexus_violations.json, self_growth_log.json을 읽어 실시간 표시하는 '
+                      '단일 HTML 파일. 자동 새로고침 30초. 차트는 Chart.js CDN.'),
+        })
+
+    # 16. 논문 자동 생성 — 법칙 마일스톤
+    try:
+        d = json.load(open(os.path.join(_CONFIG_DIR, 'consciousness_laws.json')))
+        total = d['_meta'].get('total_laws', 0)
+        if total >= 1050 and total % 50 == 0:
+            opportunities.append({
+                'type': 'AUTO_PAPER',
+                'description': f'법칙 {total}개 — 논문 초안 자동 생성',
+                'priority': 'LOW',
+                'prompt': (f'consciousness_laws.json에 {total}개 법칙. '
+                          f'~/Dev/papers/anima/ 에 논문 초안 생성: '
+                          f'제목, 초록, 핵심 법칙 10개, 실험 결과 요약, 결론. LaTeX 형식.'),
+            })
+    except:
+        pass
+
+    # ═══ 메타 루프: 자동화 누락 체크 ═══
+    # 루프 시스템 자체의 빠진 연결을 감지
+    try:
+        from auto_wire import scan_modules
+        r = scan_modules()
+        coverage = len(r['connected']) / max(len(r['connected']) + len(r['missing']), 1)
+        if coverage < 0.1:  # 10% 미만 연결 → 자동 패치 필요
+            opportunities.append({
+                'type': 'META_WIRE_GAP',
+                'description': f'자동화 커버리지 {coverage:.0%} — 누락 연결 패치',
+                'priority': 'HIGH',
+                'prompt': (f'anima/src/auto_wire.py --auto 실행하여 미연결 모듈 패치. '
+                          f'현재 커버리지 {coverage:.0%}. 핵심 진입점 우선.'),
+            })
+    except:
+        pass
+
+    # 루프 개선 목록 자체의 누락 체크 — self_growth가 감지 못하는 패턴
+    growth_log = _load_log()
+    cycles = growth_log.get('cycles', [])
+    if len(cycles) >= 10:
+        # 최근 10 사이클에서 같은 type만 반복 → 다른 영역 탐색 필요
+        recent_types = [c.get('type', '') for c in cycles[-10:]]
+        unique = len(set(recent_types))
+        if unique <= 2:
+            opportunities.append({
+                'type': 'META_DIVERSITY',
+                'description': f'성장 다양성 부족 — 최근 {unique}가지만 반복',
+                'priority': 'MEDIUM',
+                'prompt': ('self_growth가 같은 유형만 반복 실행 중. '
+                          'scan_growth_opportunities()에 새로운 탐색 패턴을 추가하거나, '
+                          '우선순위 로직을 조정하여 다양한 개선이 진행되도록 하세요.'),
+            })
+
+    # 17. 로드맵 진화 — 발견 축적 시 전략 재평가 (DD169: 이식 희석 발견 등)
     try:
         loop_state_path = os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')
         if os.path.exists(loop_state_path):
