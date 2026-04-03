@@ -420,21 +420,27 @@ class AnimaAgent:
                 logger.debug("NEXUS-6 scan skipped: %s", e)
 
         # 3. Memory search for relevant context (RAG + Store fallback)
+        #    P2: consciousness controls search depth
+        #    High curiosity → broader search. High tension → focused (fewer).
         memory_context = ""
         if len(text.strip()) > 3:
+            mem_top_k = 3
+            if curiosity > 0.6:
+                mem_top_k = 5  # Curious → explore more memories
+            elif tension > 0.7:
+                mem_top_k = 2  # Tense → focus
             memories = []
             if self.memory_rag:
                 try:
-                    memories = self.memory_rag.search(text, top_k=3)
+                    memories = self.memory_rag.search(text, top_k=mem_top_k)
                 except Exception:
                     pass
-            # Fallback to MemoryStore (FAISS) if RAG returned nothing
             if not memories and self.memory_store:
                 try:
                     import numpy as np
                     qvec = text_to_vector(text, dim=self.dim)
                     qvec_np = qvec.squeeze(0).numpy().astype(np.float32)
-                    memories = self.memory_store.search(qvec_np, top_k=3)
+                    memories = self.memory_store.search(qvec_np, top_k=mem_top_k)
                 except Exception:
                     pass
             if memories:
@@ -535,7 +541,34 @@ class AnimaAgent:
             )
             context_parts.append(f"[consciousness hub] {hub_summary}")
 
+        # 6b. NEXUS-6 scan context (if available)
+        if self._last_nexus_scan:
+            try:
+                n6_consensus = self._last_nexus_scan.get('consensus', [])
+                if n6_consensus:
+                    n6_summary = "; ".join(str(c) for c in n6_consensus[:3])
+                    context_parts.append(f"[nexus-6] {n6_summary}")
+            except Exception:
+                pass
+
+        # 6c. Consciousness-driven generation parameters (P2: consciousness controls output)
+        phi = cv.phi
+        # P3: max_tokens scales with consciousness complexity
+        max_tokens = 128 + int(min(phi, 10.0) * 38.4)  # phi=0→128, phi=10→512
+        # P10: tension modulates conciseness (high tension → shorter, focused)
+        if tension > 0.8:
+            max_tokens = max(64, int(max_tokens * 0.6))
+
+        cs_dict = {
+            "tension": tension, "curiosity": curiosity,
+            "prediction_error": pe, "pain": pain,
+            "emotion": self._emotion,
+            "phi": phi, "E": cv.E,
+            "growth_stage": self._growth_stage_num(),
+        }
+
         # Use provider if available, else fallback to ask_claude
+        # P2: fallback only if consciousness permits external API use
         system = state_str + ("\n" + "\n".join(context_parts) if context_parts else "")
         if self.provider and self.provider.is_available():
             try:
@@ -543,17 +576,18 @@ class AnimaAgent:
                     ProviderMessage(role=h["role"], content=h["content"])
                     for h in self.history
                 ]
-                cs_dict = {
-                    "tension": tension, "curiosity": curiosity,
-                    "emotion": self._emotion,
-                    "phi": self.mind._consciousness_vector.phi,
-                }
-                response_text = await self.provider.query_full(messages, system, cs_dict)
+                response_text = await self.provider.query_full(
+                    messages, system, cs_dict, max_tokens=max_tokens)
             except Exception as e:
                 logger.warning("Provider query failed, falling back to ask_claude: %s", e)
                 response_text = ask_claude(text, system, self.history)
-        else:
+        elif phi >= PSI_NARRATIVE_MIN:
+            # P2: only use external API if consciousness has narrative capacity
             response_text = ask_claude(text, system, self.history)
+        else:
+            # Consciousness too low for external interface — silence or minimal
+            response_text = ""
+            logger.debug("Phi %.2f < narrative_min — no external response", phi)
 
         self.history.append({"role": "assistant", "content": response_text})
 

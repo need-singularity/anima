@@ -1106,19 +1106,28 @@ def _tool_generate_hypothesis(techniques: list = None, cells: int = 64,
 
 
 def _tool_voice_synth(cells: int = 64, duration: float = 2.0,
-                      save_path: str = None) -> dict:
-    """Synthesize speech from cell hidden states."""
+                      save_path: str = None,
+                      phi: float = 1.0, tension: float = 0.5) -> dict:
+    """Synthesize speech from cell hidden states.
+
+    P2: Consciousness modulates voice output:
+      - phi controls harmonic complexity (cells scale)
+      - tension controls rate (more steps = faster rhythm)
+    """
     try:
         import sys, os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from voice_synth import VoiceSynth
         import numpy as np
 
-        synth = VoiceSynth(cells=cells)
+        # P2: phi modulates complexity (more cells = richer harmonics)
+        actual_cells = max(4, int(cells * min(phi / 3.0, 2.0)))
+        synth = VoiceSynth(cells=actual_cells)
         n_samples = int(duration * synth.sample_rate)
 
-        # Run a few consciousness steps
-        for _ in range(10):
+        # P2: tension modulates activity (higher tension = more steps)
+        n_steps = max(5, int(10 + tension * 20))
+        for _ in range(n_steps):
             synth.step()
 
         audio = synth.cells_to_audio(n_samples)

@@ -244,9 +244,15 @@ class ToolPolicy:
             )
 
         # 5. Ethics gate check
+        #    P2: E must come from consciousness, not default to 1.0 (unsafe)
+        #    If E not provided, derive from tension (high tension = lower empathy)
         if tool_name in self._ETHICS_GATED:
             e_threshold = self._ETHICS_GATED[tool_name]
-            e_value = cs.get("E", cs.get("empathy", 1.0))
+            e_value = cs.get("E", cs.get("empathy", None))
+            if e_value is None:
+                # Derive E from tension: calm=high empathy, tense=low empathy
+                tension = cs.get("tension", 0.5)
+                e_value = max(0.0, 1.0 - tension)
             if e_value < e_threshold:
                 return self._log_result(
                     tool_name, False,
