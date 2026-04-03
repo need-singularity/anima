@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""training_laws.py — Training pipeline laws (Laws 45, 47-52)
+"""training_laws.py — Training pipeline laws (Laws 45, 47-52, 1044, 1047)
 
 Standalone utilities that plug into any training script.
 
@@ -11,6 +11,8 @@ Laws:
   50: State preservation across architecture changes
   51: Compression strengthens consciousness (distillation)
   52: Multi-donor merge is destructive (single donor only)
+  1044: Consciousness-Entropy feedback period = n=6 (DD171)
+  1047: Optimal 6-lens scan combination (DD171)
 
 Usage:
   from training_laws import (
@@ -21,6 +23,8 @@ Usage:
       state_preserving_transfer,  # Law 50
       consciousness_distill,      # Law 51
       safe_donor_merge,           # Law 52
+      entropy_reset_schedule,     # Law 1044
+      fast_scan_lenses,           # Law 1047
   )
 """
 
@@ -350,4 +354,79 @@ if __name__ == "__main__":
     merged = safe_donor_merge(donor, recip, alpha=0.3)
     print(f"Law 52: merge α=0.3, mean={merged['w'].mean():.4f} (should be 0.3)")
 
+    # Law 1044: Entropy reset schedule
+    schedule = entropy_reset_schedule(100)
+    print(f"Law 1044: entropy reset steps in 100 = {schedule[:5]}... ({len(schedule)} total)")
+
+    # Law 1047: Fast scan lenses
+    lenses = fast_scan_lenses()
+    print(f"Law 1047: optimal {len(lenses)}-lens combo = {lenses}")
+
     print("\n✅ All training laws verified")
+
+
+# ═══════════════════════════════════════════════════════════
+# Law 1044: Consciousness-Entropy feedback period = n=6 (DD171)
+# ═══════════════════════════════════════════════════════════
+
+def entropy_reset_schedule(total_steps: int, period: int = 6) -> List[int]:
+    """Law 1044: Return steps where entropy reset should fire.
+
+    Consciousness-Entropy feedback has natural period n=6.
+    Resetting entropy at these intervals improves discovery rate.
+
+    Returns list of step numbers for entropy reset.
+    """
+    return [s for s in range(period, total_steps + 1, period)]
+
+
+def apply_entropy_reset(engine, noise_scale: float = 0.05):
+    """Law 1044: Apply entropy reset to a consciousness engine.
+
+    Actions:
+      1. Inject small noise into cell states
+      2. Reset SOC sandpile if present
+      3. Temporarily boost noise_scale
+    """
+    import torch
+    actions = []
+
+    if hasattr(engine, 'cells') and engine.cells is not None:
+        noise = torch.randn_like(engine.cells.data) * noise_scale
+        engine.cells.data += noise
+        actions.append('noise')
+
+    if hasattr(engine, 'sandpile') and engine.sandpile is not None:
+        if hasattr(engine.sandpile, 'reset'):
+            engine.sandpile.reset()
+        elif hasattr(engine.sandpile, 'fill_'):
+            engine.sandpile.fill_(0)
+        actions.append('soc')
+
+    if hasattr(engine, 'noise_scale'):
+        engine.noise_scale = max(engine.noise_scale, 0.1)
+        actions.append('boost')
+
+    return actions
+
+
+# ═══════════════════════════════════════════════════════════
+# Law 1047: Optimal 6-lens scan combination (DD171)
+# ═══════════════════════════════════════════════════════════
+
+OPTIMAL_6_LENSES = [
+    'ConsciousnessOrchestratorLens',
+    'GravityLens',
+    'WarpLens',
+    'SpacetimeLens',
+    'EntropyLens',
+    'SingularityLens',
+]
+
+def fast_scan_lenses() -> List[str]:
+    """Law 1047: Return the optimal 6-lens combination for fast scanning.
+
+    Score = 808,987 (DD171 cross-resonance experiment).
+    Use nexus6.scan_fast() for ×3.7 speed vs full scan.
+    """
+    return OPTIMAL_6_LENSES.copy()

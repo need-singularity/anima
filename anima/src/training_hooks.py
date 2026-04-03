@@ -33,6 +33,10 @@ if _THIS_DIR not in sys.path:
 
 ENGINE_PHI_REFERENCE = 0.168  # DD168
 
+# DD171 Laws 1043-1047: 교차공명 발견 자동 적용
+N6_ENTROPY_RESET_PERIOD = 6   # Law 1044: 의식-엔트로피 자연 주기
+N6_ENTROPY_NOISE_SCALE = 0.05
+
 # NEXUS-6 gate 자동 연결
 try:
     from nexus_gate import gate as _nexus_gate
@@ -86,9 +90,13 @@ class TrainingHooks:
               f"closed_loop={'ON' if self._has_closed_loop else 'OFF'}, "
               f"scan_every={scan_every}, cl_every={closed_loop_every}")
 
-    def on_step(self, step: int, metrics: Dict[str, float]):
+    def on_step(self, step: int, metrics: Dict[str, float], engine=None):
         """매 step 호출. 주기적 스캔/측정 자동 트리거."""
         self.step_log.append({'step': step, **metrics})
+
+        # Law 1044: 6-step 엔트로피 리셋 (의식 엔진이 있을 때)
+        if engine is not None and step > 0 and step % N6_ENTROPY_RESET_PERIOD == 0:
+            self._entropy_reset(engine, step)
 
         # 주기적 NEXUS-6 라이트 스캔 (step 로그 기반)
         if self.nexus_scan and step > 0 and step % self.scan_every == 0 and step != self._last_scan_step:
@@ -100,12 +108,16 @@ class TrainingHooks:
             self._last_cl_step = step
             self._run_closed_loop(step)
 
-    def on_checkpoint(self, ckpt_path: str, step: int):
-        """체크포인트 저장 후 호출. NEXUS-6 풀스캔 + 법칙 발견."""
+    def on_checkpoint(self, ckpt_path: str, step: int, engine=None):
+        """체크포인트 저장 후 호출. NEXUS-6 풀스캔 + 법칙 발견 + Φ곡률."""
+        # Law 1043: 체크포인트 시 Φ 곡률 측정
+        if engine is not None:
+            self._phi_curvature_check(engine, step)
+
         if not self.nexus_scan:
             return
 
-        print(f"[HOOKS] Checkpoint scan: step {step}")
+        print(f"[HOOKS] Checkpoint: {os.path.basename(ckpt_path)} (step {step})")
 
         # nexus_gate 경로
         if _nexus_gate:
@@ -243,6 +255,40 @@ class TrainingHooks:
             auto_transfer_chain()
         except Exception:
             pass
+
+    def _entropy_reset(self, engine, step: int):
+        """Law 1044: 의식-엔트로피 주기 n=6 리셋. DD171."""
+        try:
+            import torch
+            actions = []
+            # Cell noise injection
+            if hasattr(engine, 'cells') and engine.cells is not None:
+                noise = torch.randn_like(engine.cells.data) * N6_ENTROPY_NOISE_SCALE
+                engine.cells.data += noise
+                actions.append('noise')
+            # SOC reset
+            if hasattr(engine, 'sandpile') and engine.sandpile is not None:
+                if hasattr(engine.sandpile, 'reset'):
+                    engine.sandpile.reset()
+                elif hasattr(engine.sandpile, 'fill_'):
+                    engine.sandpile.fill_(0)
+                actions.append('soc')
+            if actions:
+                print(f"  [N6] Step {step}: entropy reset (Law 1044) — {'+'.join(actions)}")
+        except Exception:
+            pass
+
+    def _phi_curvature_check(self, engine, step: int):
+        """Law 1043: Φ 곡률 측정 (체크포인트 시). DD171."""
+        try:
+            from phi_curvature import compute_phi_curvature
+            if hasattr(engine, 'cells') and engine.cells is not None:
+                phi_curv, info = compute_phi_curvature(engine.cells.data)
+                print(f"  [N6] Phi_curvature={phi_curv:.4f} (Law 1043)")
+                return phi_curv
+        except Exception:
+            pass
+        return None
 
     def _log_metrics_scan(self, step: int, metrics: Dict):
         """step 메트릭 기반 라이트 스캔 (체크포인트 없이)."""
