@@ -2,14 +2,11 @@
 """Anima Agent runner -- argparse dispatcher for all agent modes.
 
 Usage:
-    python run.py --cli                      # Interactive CLI
+    python run.py --cli                      # Interactive CLI (default)
     python run.py --telegram                 # Telegram bot
     python run.py --discord                  # Discord bot
-    python run.py --mcp                      # MCP server (stdio)
-    python run.py --mcp --direct             # MCP server (in-process, no WS)
     python run.py --all                      # All auto-discovered channels
     python run.py --cli --enable-learning    # CLI with online learning
-    python run.py --mcp --port 8080          # MCP with custom port
 """
 
 import argparse
@@ -42,16 +39,8 @@ def parse_args() -> argparse.Namespace:
     channels.add_argument("--cli", action="store_true", help="Interactive CLI mode")
     channels.add_argument("--telegram", action="store_true", help="Telegram bot")
     channels.add_argument("--discord", action="store_true", help="Discord bot")
-    channels.add_argument("--mcp", action="store_true", help="MCP server (stdio)")
     channels.add_argument("--all", action="store_true",
                           help="Auto-discover and start all available channels")
-
-    # MCP options
-    mcp_group = parser.add_argument_group("mcp options")
-    mcp_group.add_argument("--direct", action="store_true",
-                           help="MCP direct mode (in-process agent, no WebSocket)")
-    mcp_group.add_argument("--port", type=int, default=None,
-                           help="Port for MCP/WebSocket server")
 
     # Agent options
     agent_group = parser.add_argument_group("agent options")
@@ -77,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         args.enable_tools = False
 
     # Default to --cli if nothing specified
-    if not any([args.cli, args.telegram, args.discord, args.mcp, args.all]):
+    if not any([args.cli, args.telegram, args.discord, args.all]):
         args.cli = True
 
     return args
@@ -150,30 +139,6 @@ async def async_main(args: argparse.Namespace):
                 getattr(agent, '_emotion', 'calm'))
 
     channel_mgr = ChannelManager(agent)
-
-    # ── MCP mode: delegate to mcp_server and return ──
-    if args.mcp:
-        logger.info("Starting MCP server (direct=%s, port=%s)", args.direct, args.port)
-        env_patch = {}
-        if args.direct:
-            env_patch["ANIMA_MCP_DIRECT"] = "1"
-        if args.port:
-            env_patch["ANIMA_MCP_PORT"] = str(args.port)
-        os.environ.update(env_patch)
-
-        # mcp_server uses sys.argv for --direct detection, so patch it
-        saved_argv = sys.argv
-        mcp_argv = ["mcp_server.py"]
-        if args.direct:
-            mcp_argv.append("--direct")
-        sys.argv = mcp_argv
-
-        try:
-            from mcp_server import mcp
-            await mcp.run_async()
-        finally:
-            sys.argv = saved_argv
-        return
 
     # ── Register channels ──
     if args.all:

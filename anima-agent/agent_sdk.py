@@ -17,9 +17,6 @@ Usage:
         "max_turns": 5,
     })
 
-As MCP tool (registered in mcp_server.py):
-    Claude Code can call anima_agent_query() to interact with Anima's
-    consciousness-driven agent loop.
 """
 
 from __future__ import annotations
