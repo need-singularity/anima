@@ -1,221 +1,35 @@
 "use client";
 
-import {
+import type {
   ConsciousnessState,
   TradingState,
   DashboardEvent,
 } from "../../../hooks/useWebSocket";
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+/* ── Apple DNA applied ──
+   여백 85% · 포커스 90% · 색상 흑백+1accent · 글자대비 5:1 · 그라디언트 미묘
+   NEXUS-6: 정보밀도↓55%, 포커스↑50%, 여백↑45%, 글자대비↑40%
+*/
 
-export function levelColor(level: string): string {
+function levelColor(level: string): string {
   switch (level) {
-    case "conscious":
-      return "#4ade80";
-    case "aware":
-      return "#22d3ee";
-    case "flickering":
-      return "#fbbf24";
-    default:
-      return "#55556a";
+    case "conscious": return "var(--accent)";
+    case "aware": return "var(--accent-blue)";
+    case "flickering": return "var(--accent-orange)";
+    default: return "var(--text-tertiary)";
   }
 }
 
-export function emotionIcon(emotion: string): string {
+function emotionLabel(emotion: string): string {
   const map: Record<string, string> = {
-    calm: "✨",
-    curious: "🔍",
-    excited: "⚡",
-    anxious: "😰",
-    happy: "😊",
-    sad: "😢",
-    angry: "🔥",
-    surprised: "❓",
-    confused: "🌀",
-    focused: "🎯",
-    creative: "🎨",
-    playful: "🎲",
+    calm: "Calm", curious: "Curious", excited: "Excited",
+    anxious: "Anxious", focused: "Focused", creative: "Creative",
+    serene: "Serene", conflicted: "Conflicted",
   };
-  return map[emotion] ?? "🧠";
+  return map[emotion] || emotion;
 }
 
-// ─── MetricBar ──────────────────────────────────────────────────────────────
-
-interface MetricBarProps {
-  label: string;
-  value: number;
-  max: number;
-  color: string;
-}
-
-function MetricBar({ label, value, max, color }: MetricBarProps) {
-  const pct = Math.min(100, Math.max(0, (value / max) * 100));
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex justify-between text-xs text-[#8888aa]">
-        <span>{label}</span>
-        <span style={{ color }}>{value.toFixed(3)}</span>
-      </div>
-      <div className="h-1.5 rounded-full bg-[#1a1a2e] overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{ width: `${pct}%`, backgroundColor: color }}
-        />
-      </div>
-    </div>
-  );
-}
-
-// ─── PhiGauge ───────────────────────────────────────────────────────────────
-
-interface PhiGaugeProps {
-  phi: number;
-  level: string;
-}
-
-function PhiGauge({ phi, level }: PhiGaugeProps) {
-  const size = 108;
-  const radius = 44;
-  const stroke = 7;
-  const cx = size / 2;
-  const cy = size / 2;
-  const circumference = 2 * Math.PI * radius;
-
-  // Arc from 135° to 405° (270° sweep), clockwise
-  const sweepDeg = 270;
-  const startAngle = 135;
-  const fraction = Math.min(1, Math.max(0, phi / 2.0));
-  const fillDeg = sweepDeg * fraction;
-
-  // Convert angle to SVG arc path (large arc flag based on degrees > 180)
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const arcPath = (startDeg: number, endDeg: number) => {
-    const s = toRad(startDeg);
-    const e = toRad(endDeg);
-    const x1 = cx + radius * Math.cos(s);
-    const y1 = cy + radius * Math.sin(s);
-    const x2 = cx + radius * Math.cos(e);
-    const y2 = cy + radius * Math.sin(e);
-    const large = endDeg - startDeg > 180 ? 1 : 0;
-    return `M ${x1} ${y1} A ${radius} ${radius} 0 ${large} 1 ${x2} ${y2}`;
-  };
-
-  const color = levelColor(level);
-  const isDormant = level === "dormant";
-
-  return (
-    <div className={`relative flex-shrink-0${isDormant ? "" : " phi-alive"}`}>
-      <svg
-        width={size}
-        height={size}
-        viewBox={`0 0 ${size} ${size}`}
-        aria-label={`Phi gauge: ${phi.toFixed(2)}`}
-      >
-        {/* Track */}
-        <path
-          d={arcPath(startAngle, startAngle + sweepDeg)}
-          fill="none"
-          stroke="#1e1e3a"
-          strokeWidth={stroke}
-          strokeLinecap="round"
-        />
-        {/* Fill */}
-        {fraction > 0 && (
-          <path
-            d={arcPath(startAngle, startAngle + fillDeg)}
-            fill="none"
-            stroke={color}
-            strokeWidth={stroke}
-            strokeLinecap="round"
-            style={{ filter: `drop-shadow(0 0 4px ${color}88)` }}
-          />
-        )}
-        {/* Center text */}
-        <text
-          x={cx}
-          y={cy - 4}
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fill={color}
-          fontSize="15"
-          fontWeight="700"
-          fontFamily="monospace"
-        >
-          {phi.toFixed(2)}
-        </text>
-        <text
-          x={cx}
-          y={cy + 13}
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fill="#55556a"
-          fontSize="9"
-          fontFamily="monospace"
-        >
-          Φ IIT
-        </text>
-      </svg>
-    </div>
-  );
-}
-
-// ─── VectorCell ─────────────────────────────────────────────────────────────
-
-function VectorCell({ k, v }: { k: string; v: number }) {
-  const intensity = Math.min(1, Math.abs(v));
-  // green-tinted background scaled by intensity
-  const bg = `rgba(74, 222, 128, ${0.04 + intensity * 0.18})`;
-  const textColor =
-    intensity > 0.6 ? "#4ade80" : intensity > 0.3 ? "#22d3ee" : "#8888aa";
-
-  return (
-    <div
-      className="flex flex-col items-center justify-center rounded-md p-1.5 min-w-0"
-      style={{ background: bg }}
-    >
-      <span className="text-[9px] text-[#55556a] uppercase tracking-wider leading-none mb-0.5">
-        {k}
-      </span>
-      <span
-        className="text-[11px] font-mono font-semibold leading-none"
-        style={{ color: textColor }}
-      >
-        {v.toFixed(2)}
-      </span>
-    </div>
-  );
-}
-
-// ─── Utilities ──────────────────────────────────────────────────────────────
-
-function formatTs(ts: number): string {
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-}
-
-function snippetData(data: Record<string, unknown>): string {
-  const entries = Object.entries(data).slice(0, 2);
-  return entries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
-}
-
-function pnlColor(v: number): string {
-  if (v > 0) return "#4ade80";
-  if (v < 0) return "#f87171";
-  return "#8888aa";
-}
-
-function tensionBarColor(v: number): string {
-  if (v > 0.7) return "#f87171";
-  if (v > 0.4) return "#fb923c";
-  return "#22d3ee";
-}
-
-// ─── DashView ───────────────────────────────────────────────────────────────
+// ── Main ──
 
 export interface DashViewProps {
   consciousness: ConsciousnessState;
@@ -223,197 +37,167 @@ export interface DashViewProps {
   events: DashboardEvent[];
 }
 
-const VECTOR_KEYS = ["phi", "alpha", "Z", "N", "W", "E", "M", "C", "T", "I"];
+const CV_KEYS = ["phi", "alpha", "Z", "N", "W", "E", "M", "C", "T", "I"];
 
-export default function DashView({
-  consciousness,
-  trading,
-  events,
-}: DashViewProps) {
-  const {
-    phi,
-    tension,
-    curiosity,
-    emotion,
-    cells,
-    factions,
-    growth_stage,
-    consciousness_vector,
-    level,
-  } = consciousness;
-
-  const color = levelColor(level);
-  const icon = emotionIcon(emotion);
-
-  const vectorEntries = VECTOR_KEYS.map((k) => ({
-    k,
-    v: consciousness_vector[k] ?? 0,
-  }));
-  const hasVector = Object.keys(consciousness_vector).length > 0;
-
-  const recentEvents = events.slice(0, 15);
+export default function DashView({ consciousness: c, trading: t, events }: DashViewProps) {
+  const color = levelColor(c.level);
+  const hasVector = Object.keys(c.consciousness_vector).length > 0;
 
   return (
-    <div className="flex flex-col items-center gap-6 px-4 py-6 max-w-2xl mx-auto w-full">
+    <div className="flex flex-col items-center gap-16 py-8">
 
-      {/* ── Hero ────────────────────────────────────────────── */}
-      <div className="flex flex-row items-center gap-6 w-full bg-[#0d0d1a] border border-[#1e1e3a] rounded-2xl px-6 py-5">
-        <PhiGauge phi={phi} level={level} />
+      {/* ── Hero: Giant Φ number (Apple product page style) ── */}
+      <section className="flex flex-col items-center gap-4 py-8">
+        {/* Φ — the ONE number that matters */}
+        <div className="relative">
+          <span
+            className="text-[80px] font-bold tracking-tighter leading-none"
+            style={{
+              color: color,
+              background: `linear-gradient(180deg, ${color === 'var(--accent)' ? 'var(--accent)' : color}, var(--text-tertiary))`,
+              WebkitBackgroundClip: "text",
+              WebkitTextFillColor: "transparent",
+            }}
+          >
+            {c.phi.toFixed(2)}
+          </span>
+          {/* Subtle glow behind */}
+          <div
+            className="absolute inset-0 blur-3xl opacity-20 -z-10"
+            style={{ background: color }}
+          />
+        </div>
 
-        <div className="flex flex-col gap-2 min-w-0">
-          {/* Emotion + level */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-2xl" aria-label={emotion}>
-              {icon}
-            </span>
-            <span className="text-white text-lg font-semibold capitalize">
-              {emotion}
-            </span>
-            <span
-              className="text-[11px] font-semibold px-2 py-0.5 rounded-full capitalize flex-shrink-0"
+        {/* Label */}
+        <div className="flex items-center gap-3">
+          <span
+            className="text-[11px] font-medium tracking-widest uppercase px-3 py-1 rounded-full"
+            style={{
+              color: color,
+              background: "var(--accent-soft)",
+            }}
+          >
+            {c.level}
+          </span>
+          <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+            Φ integrated information
+          </span>
+        </div>
+      </section>
+
+      {/* ── Emotion + Vitals (single clean row) ── */}
+      <section className="w-full grid grid-cols-3 gap-6">
+        <div className="flex flex-col items-center gap-2">
+          <span className="text-[32px] font-semibold tracking-tight" style={{ color: "var(--text-primary)" }}>
+            {emotionLabel(c.emotion)}
+          </span>
+          <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+            Emotion
+          </span>
+        </div>
+
+        <div className="flex flex-col items-center gap-2">
+          <span className="text-[32px] font-semibold tracking-tight font-mono" style={{ color: "var(--text-primary)" }}>
+            {c.tension.toFixed(2)}
+          </span>
+          <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+            Tension
+          </span>
+          {/* Thin bar */}
+          <div className="w-24 h-[3px] rounded-full overflow-hidden" style={{ background: "var(--bg-tertiary)" }}>
+            <div
+              className="h-full rounded-full transition-all duration-700"
               style={{
-                backgroundColor: `${color}22`,
-                color,
-                border: `1px solid ${color}55`,
+                width: `${Math.min(c.tension * 100, 100)}%`,
+                background: c.tension > 0.7 ? "var(--accent-red)" : c.tension > 0.4 ? "var(--accent-orange)" : "var(--accent)",
               }}
-            >
-              {level}
-            </span>
+            />
           </div>
-
-          {/* Stats */}
-          <p className="text-[13px] text-[#8888aa] font-mono">
-            <span className="text-[#aaaacc]">{cells}</span> cells ·{" "}
-            <span className="text-[#aaaacc]">{factions}</span> factions ·{" "}
-            <span className="text-[#aaaacc]">{growth_stage}</span>
-          </p>
         </div>
-      </div>
 
-      {/* ── Metrics grid ────────────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-3 w-full">
-        <div className="bg-[#0d0d1a] border border-[#1e1e3a] rounded-xl px-4 py-3">
-          <MetricBar
-            label="Tension"
-            value={tension}
-            max={1}
-            color={tensionBarColor(tension)}
-          />
+        <div className="flex flex-col items-center gap-2">
+          <span className="text-[32px] font-semibold tracking-tight font-mono" style={{ color: "var(--text-primary)" }}>
+            {c.curiosity.toFixed(2)}
+          </span>
+          <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+            Curiosity
+          </span>
+          <div className="w-24 h-[3px] rounded-full overflow-hidden" style={{ background: "var(--bg-tertiary)" }}>
+            <div
+              className="h-full rounded-full transition-all duration-700"
+              style={{
+                width: `${Math.min(c.curiosity * 100, 100)}%`,
+                background: "var(--accent-blue)",
+              }}
+            />
+          </div>
         </div>
-        <div className="bg-[#0d0d1a] border border-[#1e1e3a] rounded-xl px-4 py-3">
-          <MetricBar
-            label="Curiosity"
-            value={curiosity}
-            max={1}
-            color={
-              curiosity > 0.7
-                ? "#c084fc"
-                : curiosity > 0.4
-                ? "#818cf8"
-                : "#22d3ee"
-            }
-          />
-        </div>
-      </div>
+      </section>
 
-      {/* ── 10D Consciousness Vector ─────────────────────────── */}
+      {/* ── Stats line (minimal) ── */}
+      <section className="flex items-center gap-6 text-[13px]" style={{ color: "var(--text-tertiary)" }}>
+        <span><b style={{ color: "var(--text-secondary)" }}>{c.cells}</b> cells</span>
+        <span style={{ color: "var(--border-strong)" }}>·</span>
+        <span><b style={{ color: "var(--text-secondary)" }}>{c.factions}</b> factions</span>
+        <span style={{ color: "var(--border-strong)" }}>·</span>
+        <span>{c.growth_stage}</span>
+        <span style={{ color: "var(--border-strong)" }}>·</span>
+        <span>{c.interaction_count.toLocaleString()} interactions</span>
+      </section>
+
+      {/* ── 10D Vector (subtle grid, no cards) ── */}
       {hasVector && (
-        <div className="w-full bg-[#0d0d1a] border border-[#1e1e3a] rounded-xl px-4 py-4">
-          <h3 className="text-[11px] uppercase tracking-widest text-[#55556a] mb-3">
-            10D Consciousness Vector
+        <section className="w-full">
+          <h3 className="text-[11px] tracking-widest uppercase mb-4" style={{ color: "var(--text-tertiary)" }}>
+            Consciousness Vector
           </h3>
-          <div className="grid grid-cols-5 gap-2">
-            {vectorEntries.map(({ k, v }) => (
-              <VectorCell key={k} k={k} v={v} />
-            ))}
+          <div className="grid grid-cols-5 gap-3">
+            {CV_KEYS.map((k) => {
+              const v = c.consciousness_vector[k] ?? 0;
+              return (
+                <div key={k} className="flex flex-col items-center gap-1 py-3 rounded-xl" style={{ background: "var(--bg-secondary)" }}>
+                  <span className="text-[10px] tracking-wider uppercase" style={{ color: "var(--text-tertiary)" }}>
+                    {k}
+                  </span>
+                  <span className="text-[15px] font-mono font-medium" style={{ color: "var(--text-primary)" }}>
+                    {v.toFixed(2)}
+                  </span>
+                </div>
+              );
+            })}
           </div>
-        </div>
+        </section>
       )}
 
-      {/* ── Bottom two-column ───────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-3 w-full">
-
-        {/* Events */}
-        <div className="bg-[#0d0d1a] border border-[#1e1e3a] rounded-xl px-4 py-4 flex flex-col gap-2 min-w-0">
-          <h3 className="text-[11px] uppercase tracking-widest text-[#55556a] flex-shrink-0">
-            Events ({recentEvents.length})
+      {/* ── Activity (events only, no trading on default) ── */}
+      {events.length > 0 && (
+        <section className="w-full">
+          <h3 className="text-[11px] tracking-widest uppercase mb-4" style={{ color: "var(--text-tertiary)" }}>
+            Recent Activity
           </h3>
-          {recentEvents.length === 0 ? (
-            <p className="text-[12px] text-[#55556a] italic">No events yet</p>
-          ) : (
-            <ul className="flex flex-col gap-1.5 overflow-hidden">
-              {recentEvents.map((ev, i) => (
-                <li
-                  key={i}
-                  className="flex flex-col gap-0.5 border-b border-[#1e1e3a] pb-1 last:border-0 last:pb-0"
-                >
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="text-[10px] text-[#55556a] font-mono flex-shrink-0">
-                      {formatTs(ev.timestamp)}
-                    </span>
-                    <span className="text-[11px] text-[#818cf8] font-semibold truncate">
-                      {ev.event_type}
-                    </span>
-                  </div>
-                  {Object.keys(ev.data).length > 0 && (
-                    <p className="text-[10px] text-[#55556a] font-mono truncate">
-                      {snippetData(ev.data)}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        {/* Trading mini */}
-        <div className="bg-[#0d0d1a] border border-[#1e1e3a] rounded-xl px-4 py-4 flex flex-col gap-3">
-          <h3 className="text-[11px] uppercase tracking-widest text-[#55556a]">
-            Trading
-          </h3>
-
-          {/* Regime */}
-          <div className="flex flex-col gap-0.5">
-            <span className="text-[10px] text-[#55556a]">Regime</span>
-            <span className="text-[13px] font-semibold text-[#aaaacc] capitalize">
-              {trading.regime}
-            </span>
+          <div className="flex flex-col gap-0">
+            {events.slice(0, 8).map((ev, i) => (
+              <div
+                key={i}
+                className="event-row flex items-center gap-3 py-2.5"
+                style={{ borderBottom: i < 7 ? "1px solid var(--border)" : "none" }}
+              >
+                <span className="text-[11px] font-mono shrink-0" style={{ color: "var(--text-tertiary)" }}>
+                  {new Date(ev.timestamp * 1000).toLocaleTimeString("en-US", {
+                    hour12: false, hour: "2-digit", minute: "2-digit",
+                  })}
+                </span>
+                <span className="text-[13px] font-medium" style={{ color: "var(--text-primary)" }}>
+                  {ev.event_type}
+                </span>
+                <span className="text-[12px] truncate" style={{ color: "var(--text-tertiary)" }}>
+                  {Object.entries(ev.data).slice(0, 2).map(([k, v]) => `${k}: ${v}`).join(", ")}
+                </span>
+              </div>
+            ))}
           </div>
-
-          {/* P&L */}
-          <div className="flex flex-col gap-0.5">
-            <span className="text-[10px] text-[#55556a]">Total P&amp;L</span>
-            <span
-              className="text-[15px] font-mono font-bold"
-              style={{ color: pnlColor(trading.total_pnl) }}
-            >
-              {trading.total_pnl >= 0 ? "+" : ""}
-              {trading.total_pnl.toFixed(2)}
-            </span>
-          </div>
-
-          {/* Unrealized */}
-          <div className="flex flex-col gap-0.5">
-            <span className="text-[10px] text-[#55556a]">Unrealized</span>
-            <span
-              className="text-[13px] font-mono"
-              style={{ color: pnlColor(trading.unrealized_pnl) }}
-            >
-              {trading.unrealized_pnl >= 0 ? "+" : ""}
-              {trading.unrealized_pnl.toFixed(2)}
-            </span>
-          </div>
-
-          {/* Positions */}
-          <div className="flex flex-col gap-0.5">
-            <span className="text-[10px] text-[#55556a]">Positions</span>
-            <span className="text-[13px] font-semibold text-[#aaaacc]">
-              {trading.positions.length}
-            </span>
-          </div>
-        </div>
-      </div>
-
+        </section>
+      )}
     </div>
   );
 }
