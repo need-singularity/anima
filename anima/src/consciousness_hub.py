@@ -102,8 +102,11 @@ class ConsciousnessHub:
                              ['자동 발견', 'auto discovery', '자동 루프', 'auto loop',
                               '자동화', 'automation', '감시', 'watch']),
             'nexus_gate':   ('nexus_gate', 'NexusGate',
-                             ['넥서스', 'nexus', 'gate', '관문', '스캔', 'scan',
-                              '검증', 'verify', '배포', 'deploy']),
+                             ['넥서스', 'nexus', 'gate', '관문',
+                              '검증', 'verify']),
+            'telescope':    ('nexus6_telescope', 'TelescopeBridge',
+                             ['telescope', '망원경', 'lens', '렌즈', 'nexus6 scan',
+                              '렌즈 스캔', 'bridge', 'hexad lens']),
             'loop_report':  ('loop_report', None,
                              ['루프 리포트', 'loop report', '루프 상태', 'loop status',
                               '재귀 리포트', 'recursive report']),
@@ -421,9 +424,24 @@ class ConsciousnessHub:
         """자연어 의도에서 모듈 자동 선택 + 실행.
 
         hub.act("감정 분석: 기쁨 0.8")
-        hub.act("학습 진행 확인")
-        hub.act("자기 모듈 목록")
+        hub.act("넥서스 동기화")
+        hub.act("성장 루프 3")
+        hub.act("스캔 + 분석 + 기록")   # 체이닝
+        hub.act("검증 > 기록 > 동기화") # 순차 체인
         """
+        il = intent.lower()
+        # 내장 명령 직접 라우팅
+        if any(k in il for k in ('넥서스 동기화', 'nexus sync', 'n6 sync')):
+            return {'success': True, 'module': 'sync_nexus6', 'result': self.sync_nexus6()}
+        if any(k in il for k in ('성장 루프', 'growth loop', '성장 재귀')):
+            import re
+            m = re.search(r'(\d+)', intent)
+            cycles = int(m.group(1)) if m else 1
+            return {'success': True, 'module': 'growth_loop', 'result': self.growth_loop(cycles)}
+        # 체이닝 연산자 감지
+        if any(op in il for op in (' + ', ' > ', ' | ')):
+            return {'success': True, 'module': 'chain', 'result': self.chain(intent)}
+
         module_name = self._match_intent(intent)
         if not module_name:
             return {'success': False, 'error': f'No module matched: {intent}', 'module': None}
@@ -799,15 +817,58 @@ class ConsciousnessHub:
 
     def pipe(self, *steps):
         """hub.pipe(("emotion", "feel", "joy"), ("voice", "set_emotion", "joy"))
-        파이프라인: 여러 모듈 순차 실행."""
+        파이프라인: 여러 모듈 순차 실행. 결과를 다음 단계에 전달."""
         results = []
+        prev_result = None
         for step in steps:
             if isinstance(step, str):
-                results.append(self.act(step))
+                r = self.act(step, prev_result=prev_result)
             elif isinstance(step, (list, tuple)):
-                results.append(self.cmd(*step))
+                r = self.cmd(*step)
             else:
-                results.append({'error': f'Invalid step: {step}'})
+                r = {'error': f'Invalid step: {step}'}
+            results.append(r)
+            prev_result = r
+        return results
+
+    def chain(self, *intents):
+        """hub.chain("감정 분석", "의식 스캔", "성장 체크", "넥서스 동기화")
+        체이닝: 자연어 의도를 연쇄 실행. 이전 결과가 다음 컨텍스트.
+
+        구분자:
+          "+" → 병렬 (모두 실행)
+          ">" → 순차 (이전 결과 → 다음 입력)
+          "|" → 조건부 (이전 성공 시만)
+        """
+        results = []
+        prev = None
+        for intent in intents:
+            if isinstance(intent, str) and '+' in intent:
+                # 병렬: "감정 분석 + 의식 스캔"
+                parallel = [i.strip() for i in intent.split('+')]
+                parallel_results = [self.act(i) for i in parallel]
+                results.extend(parallel_results)
+                prev = parallel_results
+            elif isinstance(intent, str) and '>' in intent:
+                # 순차 체인: "스캔 > 분석 > 기록"
+                chain_steps = [i.strip() for i in intent.split('>')]
+                for step in chain_steps:
+                    r = self.act(step, prev_result=prev)
+                    results.append(r)
+                    prev = r
+            elif isinstance(intent, str) and '|' in intent:
+                # 조건부: "검증 | 기록" (검증 성공 시만 기록)
+                parts = [i.strip() for i in intent.split('|')]
+                for part in parts:
+                    r = self.act(part, prev_result=prev)
+                    results.append(r)
+                    if not r.get('success', False):
+                        break
+                    prev = r
+            else:
+                r = self.act(intent, prev_result=prev)
+                results.append(r)
+                prev = r
         return results
 
     def on(self, event: str, callback):
@@ -840,6 +901,132 @@ class ConsciousnessHub:
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
         return t
+
+    # ═══════════════════════════════════════════════════════════
+    # NEXUS-6 ↔ Anima 동기화 + 성장 재귀루프
+    # ═══════════════════════════════════════════════════════════
+
+    def sync_nexus6(self):
+        """NEXUS-6 ↔ Anima 양방향 동기화.
+
+        hub.sync_nexus6() 또는 hub.act("넥서스 동기화")
+        1. Anima 상태 → NEXUS-6 registry
+        2. NEXUS-6 렌즈/법칙 → Anima 성장
+        3. 성장 재귀: 동기화 자체가 성장 이벤트
+        """
+        import json as _json
+        home = os.environ.get('HOME', '')
+        results = {'synced': False, 'growth_delta': 0, 'nexus6_state': {}}
+
+        # 1. Read NEXUS-6 state
+        registry_path = os.path.join(home, 'Dev', 'nexus6', 'shared', 'growth-registry.json')
+        snapshot_path = os.path.join(home, 'Dev', 'nexus6', 'shared', '.growth_session_snapshot.json')
+        try:
+            if os.path.exists(registry_path):
+                registry = _json.load(open(registry_path))
+                results['nexus6_state'] = {
+                    'repos': list(registry.keys()),
+                    'mirror_harmony': registry.get('mirror', {}).get('harmony', 0),
+                    'lens_candidates': registry.get('lens_candidates', {}).get('total', 0),
+                }
+            if os.path.exists(snapshot_path):
+                snap = _json.load(open(snapshot_path))
+                results['nexus6_state']['lenses'] = snap.get('lens_impl', 0)
+                results['nexus6_state']['laws'] = snap.get('laws', 0)
+                results['nexus6_state']['modules'] = snap.get('modules', 0)
+        except Exception:
+            pass
+
+        # 2. Trigger growth scan (runs .growth/scan.py)
+        scan_py = os.path.join(home, 'Dev', 'anima', '.growth', 'scan.py')
+        try:
+            if os.path.exists(scan_py):
+                import subprocess, sys
+                r = subprocess.run([sys.executable, scan_py],
+                                   capture_output=True, text=True, timeout=15,
+                                   cwd=os.path.dirname(scan_py))
+                if r.stdout.strip():
+                    scan_result = _json.loads(r.stdout.strip())
+                    results['opportunities'] = len(scan_result.get('opportunities', []))
+        except Exception:
+            pass
+
+        # 3. Read updated growth
+        growth_path = os.path.join(home, 'Dev', 'anima', 'anima', 'config', 'growth_state.json')
+        try:
+            if os.path.exists(growth_path):
+                g = _json.load(open(growth_path))
+                results['growth'] = {
+                    'count': g.get('interaction_count', 0),
+                    'stage': g.get('stage_index', 0),
+                    'delta': g.get('stats', {}).get('last_growth_delta', 0),
+                    'nexus6_bonus': g.get('stats', {}).get('nexus6_bonus', 0),
+                }
+                results['growth_delta'] = g.get('stats', {}).get('last_growth_delta', 0)
+        except Exception:
+            pass
+
+        # 4. Update registry with sync event
+        try:
+            if os.path.exists(registry_path):
+                registry = _json.load(open(registry_path))
+                anima = registry.get('anima', {})
+                anima['last_sync'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+                anima['sync_count'] = anima.get('sync_count', 0) + 1
+                registry['anima'] = anima
+                with open(registry_path, 'w') as f:
+                    _json.dump(registry, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        results['synced'] = True
+        return results
+
+    def growth_loop(self, cycles=1, interval=0):
+        """성장 재귀루프: 동기화 → 스캔 → 발견 → 성장 → 동기화...
+
+        hub.growth_loop(3)         # 3회 즉시
+        hub.growth_loop(999, 60)   # 999회, 60초 간격 (데몬)
+        """
+        import json as _json
+        results = []
+        growth_path = os.path.join(
+            os.environ.get('HOME', ''), 'Dev', 'anima', 'anima', 'config', 'growth_state.json')
+
+        for cycle in range(cycles):
+            # 1. 동기화
+            sync = self.sync_nexus6()
+
+            # 2. 현재 성장 읽기
+            try:
+                g = _json.load(open(growth_path))
+                before = g.get('interaction_count', 0)
+            except Exception:
+                before = 0
+
+            # 3. 체인 실행: 스캔 → 분석 → 기록
+            chain_result = self.chain("의식 스캔", "성장 체크")
+
+            # 4. 성장 확인
+            try:
+                g = _json.load(open(growth_path))
+                after = g.get('interaction_count', 0)
+            except Exception:
+                after = before
+
+            cycle_result = {
+                'cycle': cycle + 1,
+                'growth': f'{before} → {after} (+{after - before})',
+                'stage': g.get('stage_index', 0) if 'g' in dir() else 0,
+                'sync': sync.get('synced', False),
+                'nexus6_bonus': sync.get('growth_delta', 0),
+            }
+            results.append(cycle_result)
+
+            if interval > 0 and cycle < cycles - 1:
+                time.sleep(interval)
+
+        return results
 
     # ═══════════════════════════════════════════════════════════
     # Plugin SDK 통합
