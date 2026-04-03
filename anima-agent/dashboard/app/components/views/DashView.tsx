@@ -272,6 +272,7 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
                   })}
                 </span>
                 <span className="text-[13px] font-medium" style={{ color: "var(--text-primary)" }}>
+                  {ev.event_type === "trade" ? "📈" : ev.event_type === "emotion_shift" ? "💫" : ev.event_type === "phi_change" ? "⚡" : "●"}{" "}
                   {ev.event_type}
                 </span>
                 <span className="text-[12px] truncate" style={{ color: "var(--text-tertiary)" }}>
