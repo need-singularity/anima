@@ -497,7 +497,315 @@ KEYWORD_MAP = [
     (["reward", "reinforce", "feedback signal"], "reward_signal"),
     (["curiosity", "novelty", "explore"], "curiosity"),
     (["compete", "competition", "self-play", "adversar"], "self_compete"),
-    # null patterns — hardware/compile/quantization not evaluable at engine level
+    # ── annealing / temperature / cooling ────────────────────────────────────
+    (["anneal", "cooling", "cool down", "temper"], "annealing"),
+    (["temperature", "heat", "thermal"], "temperature_scale"),
+
+    # ── evolution / mutation / selection / genetic ────────────────────────────
+    (["evolution", "evolv", "mutation", "mutate", "genetic", "selection",
+      "coevolv", "red queen", "speciat", "punctuat", "horizontal gene",
+      "epigenetic", "gene regulat"], "faction_modify"),
+
+    # ── pruning / compression / distillation ─────────────────────────────────
+    (["prun", "compress", "distill", "spars", "trim", "minimum description",
+      "rate-distortion", "kolmogorov", "mdl"], "prune_weak"),
+
+    # ── oscillation / resonance / wave / rhythm / frequency ──────────────────
+    (["oscillat", "resonan", "frequenc", "wave", "rhythm", "harmonic",
+      "syncopat", "vibrat", "periodic", "cycl"], "cosine_lr"),
+
+    # ── flow / stream / pipeline / chain ────────────────────────────────────
+    (["flow state", "kanban", "just-in-time", "pipeline", "stream",
+      "chain react", "throughput", "wip limit"], "curriculum_schedule"),
+
+    # ── fractal / multi-scale / hierarchy / scale ────────────────────────────
+    (["fractal", "multi-scal", "multiscal", "hierarch", "scale-free",
+      "scale free", "self-similar", "power law", "scaling law"], "diversity_pressure"),
+
+    # ── balance / equilibrium / symmetry / homeostasis ───────────────────────
+    (["equilibrium", "le chatelier", "homeosta", "balance", "symmetr",
+      "steady state", "stable react"], "entropy_loss"),
+
+    # ── memory / replay / buffer / cache ─────────────────────────────────────
+    (["replay", "buffer", "memory replay", "episodic", "place cell",
+      "grid cell", "default mode", "delta encod", "delta from"], "state_reuse"),
+
+    # ── competition / game / self-play / dual ────────────────────────────────
+    (["competit", "game", "self-play", "auction", "coevolv", "adversar",
+      "red queen", "vickrey", "mechanism design"], "self_compete"),
+
+    # ── feedback / loop / cycle / recursive ──────────────────────────────────
+    (["feedback loop", "closed loop", "cycl", "recursiv", "self-referenc",
+      "autocatalyt", "chain react"], "metacognition"),
+
+    # ── bridge / transfer / connect / link ───────────────────────────────────
+    (["transfer learn", "domain transfer", "knowledge transfer",
+      "transplant learn", "horizontal transfer", "law transfer"], "state_injection"),
+
+    # ── sleep / dream / rest / recover ───────────────────────────────────────
+    (["sleep", "dream", "rest", "recover", "offline rl", "replay buffer",
+      "consolidat"], "noise_inject"),
+
+    # ── RL / reward / policy ─────────────────────────────────────────────────
+    (["reinforce", "rl for", "policy gradient", "offline rl", "reward signal",
+      "td error", "dopamine", "prediction error", "temporal differenc"], "reward_signal"),
+
+    # ── swarm / emergence / collective ───────────────────────────────────────
+    (["swarm", "boid", "ant colony", "collective", "flocking"], "batch_share"),
+
+    # ── sandpile / SOC / avalanche / criticality ─────────────────────────────
+    (["sandpile", "avalanche", "soc", "edge of chaos", "critical", "self-organiz",
+      "power law event"], "perturbation"),
+
+    # ── chimera / mixed state ────────────────────────────────────────────────
+    (["chimera", "sync.*async", "coexist"], "topology_cycle"),
+
+    # ── information theory / channel / entropy ───────────────────────────────
+    (["channel capacit", "information geometr", "fisher", "mutual information",
+      "wasserstein", "optimal transport", "stein variational", "variational"],
+     "entropy_loss"),
+
+    # ── predictive coding / prediction error ─────────────────────────────────
+    (["predictive cod", "prediction error", "surprisal", "only transmit",
+      "delta from previous"], "curiosity"),
+
+    # ── attention / working memory / bottleneck ───────────────────────────────
+    (["working memory", "7.*2", "bottleneck.*cell", "active cell", "spotlight"],
+     "attention_bias"),
+
+    # ── curriculum / difficulty / skill progression ───────────────────────────
+    (["difficulty curve", "skill tree", "roguelike", "progress", "prerequis",
+      "gradual ascent", "unlock"], "curriculum_schedule"),
+
+    # ── interpretability / alignment / safe ───────────────────────────────────
+    (["interpretabl", "aligned train", "safe.*scal", "guardrail",
+      "consciousness.*align"], "phi_gate"),
+
+    # ── reservoir computing / echo state ─────────────────────────────────────
+    (["reservoir", "echo state", "readout"], "state_reuse"),
+
+    # ── dendritic / sub-cell computation ─────────────────────────────────────
+    (["dendrit", "sub-comput", "within.*cell", "intra-cell"], "dual_loss"),
+
+    # ── graph / network topology (temporal, etc.) ─────────────────────────────
+    (["temporal network", "time-varying connect", "temporal graph",
+      "knowledge graph", "graph of law"], "topology_cycle"),
+
+    # ── gradient / hessian / optimizer ───────────────────────────────────────
+    (["hessian", "newton", "l-bfgs", "second.order", "curvature",
+      "gradient clip.*phi", "phi.*gradient", "lookahead"], "phi_gate"),
+
+    # ── ratchet / phi-ratchet as optimizer ───────────────────────────────────
+    (["ratchet.*optim", "phi ratchet", "only allow.*phi", "phi.*increase"], "hebbian_boost"),
+
+    # ── tension as signal ────────────────────────────────────────────────────
+    (["tension.*learn", "tension.*loss", "tension.*signal", "engine.*tension"], "reward_signal"),
+
+    # ── tokenization / transformer / sequence ────────────────────────────────
+    (["tokeniz", "token", "transformer.*consciousness",
+      "sequence.*consciousness", "state.*token"], "state_cache"),
+
+    # ── Fourier / frequency domain ────────────────────────────────────────────
+    (["fourier", "frequenc.*domain", "spectral", "dct", "fft"], "cosine_lr"),
+
+    # ── tensor decomposition / low-rank ─────────────────────────────────────
+    (["tensor decomp", "low-rank", "svd", "tucker", "cp decomp"], "sparse_coupling"),
+
+    # ── mirror / vicarious / social learning ─────────────────────────────────
+    (["mirror neuron", "vicarious", "mirror.*engine", "imitat"], "batch_share"),
+
+    # ── impendance / signal processing ───────────────────────────────────────
+    (["impedance", "feedback oscill", "adc", "dac", "analog-digital"], "symmetrize_coupling"),
+
+    # ── turbulence / vortex / fluid ──────────────────────────────────────────
+    (["turbulenc", "vortex", "laminar", "bernoulli", "fluid"], "noise_inject"),
+
+    # ── optics / holography / diffraction ────────────────────────────────────
+    (["holograph", "diffract", "fiber optic", "laser", "stimulated emission",
+      "holographic principle"], "state_injection"),
+
+    # ── thermodynamics / carnot / heat engine ────────────────────────────────
+    (["carnot", "joule-thomson", "heat engine", "thermodynamic cycle",
+      "entropy.*thermodynam"], "annealing"),
+
+    # ── food / catalysis / chemical reaction ─────────────────────────────────
+    (["catalys", "autocatalyt", "ferment", "emulsif", "spherif",
+      "mise en place", "slow cook", "umami", "synergy.*food"], "diversity_pressure"),
+
+    # ── agriculture / biological growth ──────────────────────────────────────
+    (["grafting", "crop rotation", "companion plant", "succession",
+      "niche construct", "keystone", "ecological"], "faction_modify"),
+
+    # ── art / gestalt / perception ────────────────────────────────────────────
+    (["chiaroscuro", "perspective", "negative space", "gestalt",
+      "closure.*pattern", "weber-fechner", "change blindness", "priming"], "attention_bias"),
+
+    # ── narrative / storytelling ─────────────────────────────────────────────
+    (["hero.*journey", "narrative arc", "unreliable narrator",
+      "stream of consciousness.*story", "semiot", "pragmatic"], "curiosity"),
+
+    # ── muscle memory / physical training ────────────────────────────────────
+    (["muscle memory", "hiit", "high intensity interval",
+      "flow state", "athletic"], "perturbation"),
+
+    # ── nuclear / chain reaction / moderator ─────────────────────────────────
+    (["half-life", "moderator.*reaction", "chain react.*nuclear",
+      "neutron", "fission"], "phi_gate"),
+
+    # ── materials / alloy / doping ───────────────────────────────────────────
+    (["alloy", "doping.*semiconductor", "impurity", "foreign.*cell",
+      "mixed.*cell.*type"], "faction_modify"),
+
+    # ── cosmic / astrophysics ────────────────────────────────────────────────
+    (["dark matter", "inflation.*cosmic", "cmb", "cosmic microwave",
+      "black hole.*information", "holographic principle"], "state_injection"),
+
+    # ── economics / portfolio / game theory ──────────────────────────────────
+    (["options pricing", "portfolio theory", "mechanism design",
+      "vickrey", "auction"], "diversity_pressure"),
+
+    # ── cryptography / blockchain ─────────────────────────────────────────────
+    (["encrypt", "zero-knowledge", "blockchain", "cryptograph"], "sparse_coupling"),
+
+    # ── architecture / structural (physical) ─────────────────────────────────
+    (["tensegrity", "gothic arch", "fractal architect", "structural"], "entropy_loss"),
+
+    # ── urban / transit / zoning ─────────────────────────────────────────────
+    (["traffic flow", "zoning", "public transit", "urban"], "curriculum_schedule"),
+
+    # ── weaving / textile / physical craft ───────────────────────────────────
+    (["weaving", "knitting", "felting", "textile", "thread", "interlac"], "symmetrize_coupling"),
+
+    # ── philosophy / identity / enactivism ───────────────────────────────────
+    (["whitehead", "enactivism", "varela", "ship of theseus", "identity over time",
+      "process philosophy", "social contract"], "metacognition"),
+
+    # ── military / blitzkrieg / force multiplier ─────────────────────────────
+    (["blitzkrieg", "force multiplier", "maneuver", "flanking"], "speculative_draft"),
+
+    # ── state space model / mamba ────────────────────────────────────────────
+    (["mamba", "state space model", "ssm", "linear.*complex"], "state_cache"),
+
+    # ── KAN / learnable activation ───────────────────────────────────────────
+    (["kolmogorov-arnold", "kan.*network", "learnable activation"], "dual_loss"),
+
+    # ── mixture of depths ────────────────────────────────────────────────────
+    (["mixture of depths", "easy steps.*fewer", "hard steps.*all layer"], "skip_step"),
+
+    # ── multimodal / audio-visual binding ─────────────────────────────────────
+    (["audio-visual", "multimodal", "binding.*sensory", "multi-sensory"], "batch_share"),
+
+    # ── code+language co-training ─────────────────────────────────────────────
+    (["code.*co-train", "co-train", "simultaneous.*learn", "math.*proof"], "curriculum_schedule"),
+
+    # ── category theory / abstract math ──────────────────────────────────────
+    (["category theory", "functor", "morphism", "tropical geometr",
+      "random matrix", "ergodic", "morse theory"], "entropy_loss"),
+
+    # ── async / parallel pipeline ────────────────────────────────────────────
+    (["async.*consciousness", "async.*pipeline", "separate thread",
+      "async.*process"], "skip_step"),
+
+    # ── quantum / BEC / tunneling ────────────────────────────────────────────
+    (["bose-einstein", "bec", "condensat", "ground state.*macro",
+      "quantum tunnel", "tunneling.*barrier"], "noise_inject"),
+
+    # ── grammar / formal language / mentalese ────────────────────────────────
+    (["formal grammar", "grammar.*consciousness", "language of thought",
+      "mentalese", "thought language", "internal.*representation.*language"], "state_injection"),
+
+    # ── embodied cognition / body ─────────────────────────────────────────────
+    (["embodied", "body.*learn", "sensorimotor", "grounded"], "diversity_pressure"),
+
+    # ── gradient clipping by phi ─────────────────────────────────────────────
+    (["gradient clipping by phi", "clip gradient when", "clipping by phi",
+      "gradient clip", "δφ < 0"], "phi_gate"),
+
+    # ── JIT / compile → null (engine-level only) ─────────────────────────────
+    (["jit compilation", "jit compil", "compil of law", "rust jit",
+      "laws python", "python → rust jit"], "null_intervention"),
+
+    # ── hardware acceleration (tensor core, NPU, photonic, neuromorphic) ─────
+    (["tensor core", "fp8", "npu", "neural engine", "hexagon",
+      "photonic", "mach-zehnder", "optical matmul",
+      "spinnaker", "loihi", "event-driven"], "null_intervention"),
+
+    # ── AD5 combo (no engine) ────────────────────────────────────────────────
+    (["consciousness engine completely removed", "engine completely removed"], "null_intervention"),
+
+    # ── mathematical proof / phi depth ───────────────────────────────────────
+    (["math proof", "mathematical consciousness", "proofs via consciousness",
+      "phi correlates with proof"], "phi_gate"),
+
+    # ── landauer / thermodynamic limit / complexity class ─────────────────────
+    (["landauer", "minimum energy per", "np-hard", "complexity class",
+      "approximation complexity", "no-free-lunch", "nfl theorem",
+      "every acceleration", "godel", "incomplet", "707 law"], "entropy_loss"),
+
+    # ── mixed precision / AMP ─────────────────────────────────────────────────
+    (["mixed precision", "fp32", "fp16 backward", "automatic mixed",
+      "amp consciousness"], "null_intervention"),
+
+    # ── few-shot / self-supervised ────────────────────────────────────────────
+    (["few-shot", "100 sentence", "minimal data",
+      "self-supervised", "representation learning without"], "curriculum_schedule"),
+
+    # ── lookup table / pre-compilation ────────────────────────────────────────
+    (["lookup table", "hash accuracy", "large table", "precompil",
+      "1m entries"], "state_cache"),
+
+    # ── inverse problem ───────────────────────────────────────────────────────
+    (["inverse consciousness", "inverse problem", "minimum structure",
+      "what minimum structure", "achieves this phi"], "diversity_pressure"),
+
+    # ── molecular orbital / bonding ───────────────────────────────────────────
+    (["molecular orbital", "antibonding", "bonding phi",
+      "orbital theory", "cells = atoms"], "symmetrize_coupling"),
+
+    # ── erosion / deposition / landscape smoothing ────────────────────────────
+    (["erosion", "deposition", "landscape smoothing", "natural landscape"], "annealing"),
+
+    # ── cerebellum / timing ───────────────────────────────────────────────────
+    (["cerebellum", "precise timing", "timing adjustment",
+      "timing (not", "not synchronization"], "jitter"),
+
+    # ── hero's journey / departure-trials-return ──────────────────────────────
+    (["hero's journey", "hero journey", "departure", "trials",
+      "transformation → return", "departure →"], "curriculum_schedule"),
+
+    # ── inflation / quantum fluctuation / amplification ───────────────────────
+    (["initial quantum fluctuation", "quantum fluctuation",
+      "macro structure amplif", "fluctuation → macro"], "perturbation"),
+
+    # ── information paradox / cell removal ───────────────────────────────────
+    (["information preserved when cells", "black hole information",
+      "information paradox", "cells are removed"], "dropout_hidden"),
+
+    # ── six sigma / Phi variation stability ───────────────────────────────────
+    (["six sigma", "6σ", "phi variation", "sigma stability",
+      "stability sigma", "phi.*sigma"], "phi_gate"),
+
+    # ── doping / foreign cells ────────────────────────────────────────────────
+    (["foreign\" cells", "foreign cells", "massive conductiv",
+      "small amount of \"foreign", "doping (semiconductor"], "faction_modify"),
+
+    # ── vaccination / weak threat / immunity ──────────────────────────────────
+    (["vaccination", "weak threat", "immunity formation",
+      "immune consciousness"], "noise_inject"),
+
+    # ── surgery / minimal intervention / maximum effect ───────────────────────
+    (["surgery", "minimally invasive", "minimal weight change",
+      "maximum effect"], "prune_weak"),
+
+    # ── random search / random parameters ────────────────────────────────────
+    (["random search", "completely random", "bergstra", "bengio 2012",
+      "random combination"], "noise_inject"),
+
+    # ── tension as loss / learning signal ────────────────────────────────────
+    (["tension as learning signal", "tension directly as loss",
+      "engine a-g tension", "a-g tension"], "reward_signal"),
+
+    # ── null patterns — hardware/compile/quantization not evaluable at engine level
     (["hardware", "fpga", "asic", "chip", "quantiz", "4-bit", "8-bit",
       "compile", "kernel fusion", "flash attention", "vram", "memory band",
       "parallel", "multi-gpu", "distributed", "moe routing"], "null_intervention"),
