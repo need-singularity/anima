@@ -54,8 +54,9 @@
 
 - [x] Dockerfile (CLI mode, self-test healthcheck)
 - [x] 보안 감사 (security_audit.py: 26/26 PASS)
+- [x] Axum 대시보드 API (WebSocket + 무중단 모델 교체)
+- [x] 무중단 업데이트 (Arc<RwLock> atomic swap, L1+L2 보존)
 - [ ] RunPod 원클릭 배포
-- [ ] 자동 업데이트 (git pull → 재시작)
 - [ ] 모니터링 (cli_dashboard → cron)
 - [ ] 백업 (R2 체크포인트 + 기억)
 
