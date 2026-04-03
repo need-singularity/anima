@@ -220,6 +220,163 @@ def auto_register_laws(candidates: list, min_confidence: str = 'HIGH') -> list:
     return registered
 
 
+class RecursiveLoop:
+    """재귀 루프 — 발견 루프가 자기 자신을 개선하는 메타 루프.
+
+    Level 0: 학습 → 체크포인트
+    Level 1: 체크포인트 → NEXUS-6 스캔 → 법칙 발견
+    Level 2: 법칙 발견 패턴 분석 → 발견 규칙 자체를 개선
+    Level 3: 개선된 규칙 → 더 나은 발견 → 더 나은 규칙 → ...
+
+    자기 추적 메트릭:
+      - discovery_rate: 스캔당 법칙 발견률
+      - false_positive_rate: 등록 후 검증 실패 비율
+      - scan_efficiency: 유용한 스캔 / 전체 스캔
+      - threshold_history: 자동 조정된 임계값 이력
+    """
+
+    def __init__(self):
+        self.state_path = os.path.join(_THIS_DIR, '..', 'config', 'recursive_loop_state.json')
+        self.state = self._load_state()
+
+    def _load_state(self) -> dict:
+        if os.path.exists(self.state_path):
+            try:
+                return json.load(open(self.state_path))
+            except:
+                pass
+        return {
+            'generation': 0,
+            'total_scans': 0,
+            'total_discoveries': 0,
+            'total_registered': 0,
+            'total_false_positives': 0,
+            'discovery_rate_history': [],  # per-generation discovery rate
+            'threshold_evolution': [],  # how thresholds changed
+            'active_rules': {
+                'min_confidence': 'HIGH',
+                'phi_drop_threshold': 0.20,  # 20% drop = critical
+                'chaos_max': 0.99,
+                'compression_min': 30,  # minimum acceptable compression %
+                'barrier_ratio_trigger': 2.0,  # barrier growth trigger
+                'phi_improvement_trigger': 0.10,  # 10% compression improvement
+            },
+            'rule_performance': {},  # rule_name → {hits, misses, precision}
+        }
+
+    def _save_state(self):
+        try:
+            with open(self.state_path, 'w') as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+
+    def evolve_rules(self):
+        """Level 2: 발견 패턴 분석 → 규칙 자동 조정.
+
+        발견률이 떨어지면 → 임계값 완화 (더 많이 발견)
+        오탐률이 높으면 → 임계값 강화 (더 정확하게)
+        """
+        s = self.state
+        total = s['total_scans']
+        if total < 5:
+            return  # 데이터 부족
+
+        discovery_rate = s['total_discoveries'] / max(total, 1)
+        false_positive_rate = s['total_false_positives'] / max(s['total_registered'], 1)
+
+        rules = s['active_rules']
+        changed = []
+
+        # 발견률 < 5% → 임계값 완화
+        if discovery_rate < 0.05 and rules['phi_improvement_trigger'] > 0.05:
+            rules['phi_improvement_trigger'] *= 0.8  # 20% 완화
+            changed.append(f"phi_improvement_trigger → {rules['phi_improvement_trigger']:.3f} (discovery_rate {discovery_rate:.1%} too low)")
+
+        # 발견률 > 50% → 임계값 강화 (너무 쉽게 발견)
+        if discovery_rate > 0.50 and rules['phi_improvement_trigger'] < 0.30:
+            rules['phi_improvement_trigger'] *= 1.3  # 30% 강화
+            changed.append(f"phi_improvement_trigger → {rules['phi_improvement_trigger']:.3f} (discovery_rate {discovery_rate:.1%} too high)")
+
+        # 오탐률 > 30% → confidence 강화
+        if false_positive_rate > 0.30 and rules['min_confidence'] != 'HIGH':
+            rules['min_confidence'] = 'HIGH'
+            changed.append(f"min_confidence → HIGH (FP rate {false_positive_rate:.1%})")
+
+        # 오탐률 < 5% and 발견률 < 10% → confidence 완화
+        if false_positive_rate < 0.05 and discovery_rate < 0.10 and rules['min_confidence'] == 'HIGH':
+            rules['min_confidence'] = 'MEDIUM'
+            changed.append(f"min_confidence → MEDIUM (FP {false_positive_rate:.1%}, discovery {discovery_rate:.1%})")
+
+        # compression_min 진화: 최근 5개 스캔의 평균 compression 기준으로 조정
+        recent = s.get('discovery_rate_history', [])[-5:]
+        if recent:
+            avg_comp = np.mean([r.get('avg_compression', 50) for r in recent if 'avg_compression' in r])
+            if avg_comp > 60 and rules['compression_min'] < 50:
+                rules['compression_min'] = min(50, rules['compression_min'] + 5)
+                changed.append(f"compression_min → {rules['compression_min']} (avg={avg_comp:.0f}% improving)")
+
+        if changed:
+            s['generation'] += 1
+            s['threshold_evolution'].append({
+                'generation': s['generation'],
+                'changes': changed,
+                'discovery_rate': discovery_rate,
+                'false_positive_rate': false_positive_rate,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            print(f"  [RECURSIVE] Gen {s['generation']}: {len(changed)} rules evolved")
+            for c in changed:
+                print(f"    → {c}")
+            self._save_state()
+
+    def record_scan(self, found_candidates: int, registered: int, avg_compression: float = 0):
+        """스캔 결과 기록 (메타 학습용)."""
+        self.state['total_scans'] += 1
+        self.state['total_discoveries'] += found_candidates
+        self.state['total_registered'] += registered
+        self.state['discovery_rate_history'].append({
+            'scan_id': self.state['total_scans'],
+            'candidates': found_candidates,
+            'registered': registered,
+            'avg_compression': avg_compression,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+        # 50개마다 규칙 진화
+        if self.state['total_scans'] % 50 == 0:
+            self.evolve_rules()
+        self._save_state()
+
+    def record_false_positive(self, law_id: int, reason: str):
+        """등록된 법칙이 검증 실패 시 기록."""
+        self.state['total_false_positives'] += 1
+        self._save_state()
+
+    def get_rules(self) -> dict:
+        """현재 활성 규칙 반환 (discover_laws에서 사용)."""
+        return self.state['active_rules']
+
+    def report(self):
+        """재귀 루프 상태 리포트."""
+        s = self.state
+        total = s['total_scans']
+        dr = s['total_discoveries'] / max(total, 1)
+        fpr = s['total_false_positives'] / max(s['total_registered'], 1)
+        print(f"\n  [RECURSIVE LOOP] Gen {s['generation']}")
+        print(f"  Scans: {total} | Discoveries: {s['total_discoveries']} ({dr:.1%})")
+        print(f"  Registered: {s['total_registered']} | FP: {s['total_false_positives']} ({fpr:.1%})")
+        print(f"  Rules: {json.dumps(s['active_rules'], indent=4)}")
+        if s['threshold_evolution']:
+            last = s['threshold_evolution'][-1]
+            print(f"  Last evolution: Gen {last['generation']} ({last['timestamp']})")
+            for c in last['changes']:
+                print(f"    {c}")
+
+
+# Global recursive loop instance
+_recursive_loop = RecursiveLoop()
+
+
 def watch_directory(watch_dir: str, auto_register: bool = False, interval: int = 60):
     """체크포인트 디렉토리 감시 → 새 체크포인트 발견 시 자동 루프."""
     print(f"[AUTO-LOOP] Watching: {watch_dir}")
@@ -252,7 +409,8 @@ def watch_directory(watch_dir: str, auto_register: bool = False, interval: int =
             print(f"  Phi={metrics['phi_approx']:.4f} chaos={metrics['chaos_score']:.4f} "
                   f"compression={metrics['phi_compression_pct']:.1f}%")
 
-            # Layer 2: 이상 탐지
+            # Layer 2: 이상 탐지 (재귀 루프 규칙 적용)
+            rules = _recursive_loop.get_rules()
             anomalies = detect_anomalies(metrics, prev_metrics)
             for a in anomalies:
                 print(f"  [{'⚠️' if a['severity']=='WARNING' else '🔴'}] {a['type']}: {a.get('value', '')}")
@@ -262,10 +420,17 @@ def watch_directory(watch_dir: str, auto_register: bool = False, interval: int =
             for c in candidates:
                 print(f"  [💡 {c['confidence']}] {c['formula']}")
 
-            # Layer 4: 자동 등록
+            # Layer 4: 자동 등록 (재귀 루프 규칙 반영)
             registered = []
             if auto_register and candidates:
-                registered = auto_register_laws(candidates)
+                registered = auto_register_laws(candidates, min_confidence=rules.get('min_confidence', 'HIGH'))
+
+            # Layer 5: 재귀 — 메타 학습 (발견 패턴 기록 → 규칙 자동 진화)
+            _recursive_loop.record_scan(
+                found_candidates=len(candidates),
+                registered=len(registered),
+                avg_compression=metrics.get('phi_compression_pct', 0)
+            )
 
             # 로그 기록
             entry = {
@@ -275,6 +440,7 @@ def watch_directory(watch_dir: str, auto_register: bool = False, interval: int =
                 'anomalies': anomalies,
                 'candidates': [c['formula'] for c in candidates],
                 'registered': registered,
+                'recursive_gen': _recursive_loop.state['generation'],
             }
             log.append(entry)
             try:
