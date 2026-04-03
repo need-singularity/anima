@@ -122,6 +122,31 @@ def full_report() -> str:
     lines.append(f"│  {chain_str} │")
     lines.append("│  ↑_______________________________________________↓         │")
 
+    # 5. Extensions
+    try:
+        from loop_extensions import track_cost, health_check
+        import io, contextlib
+
+        # 비용 (silent)
+        cost_path = os.path.join(_THIS_DIR, '..', 'config', 'cost_tracking.json')
+        if os.path.exists(cost_path):
+            cost_data = json.load(open(cost_path))
+            if cost_data:
+                latest = cost_data[-1]
+                total = latest.get('total_cost', 0)
+                pods = len(latest.get('pods', []))
+                lines.append("│                                                             │")
+                lines.append(f"│  ■ 비용: ${total:.2f} ({pods} pods)                                   │")
+
+        # 건강 (silent check)
+        f_buf = io.StringIO()
+        with contextlib.redirect_stdout(f_buf):
+            h = health_check()
+        overall = h.get('overall', '?')
+        lines.append(f"│  ■ 건강: {overall}                                          │")
+    except:
+        pass
+
     lines.append("│                                                             │")
     lines.append("└─────────────────────────────────────────────────────────────┘")
 

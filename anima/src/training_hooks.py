@@ -184,11 +184,51 @@ class TrainingHooks:
             print(f"\n  [CLOSED-LOOP] Final measurement...")
             self._run_closed_loop(len(self.step_log))
 
+        # [GAP 1] bench_v2 자동 실행
+        try:
+            import subprocess
+            print(f"\n  [BENCH] Running bench_v2.py --verify...")
+            bench_path = os.path.join(os.path.dirname(__file__), 'bench_v2.py')
+            if os.path.exists(bench_path):
+                r = subprocess.run(['python3', bench_path, '--verify'],
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    print(f"  [BENCH] ✅ PASS")
+                else:
+                    print(f"  [BENCH] ❌ FAIL")
+                    if _nexus_gate:
+                        from nexus_gate import _notify
+                        _notify(f"bench_v2 --verify FAILED after training")
+        except Exception as e:
+            print(f"  [BENCH] skip: {e}")
+
+        # [GAP 5] 루프 상태 자동 커밋
+        try:
+            import subprocess
+            config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+            subprocess.run(['git', 'add',
+                           os.path.join(config_dir, 'recursive_loop_state.json'),
+                           os.path.join(config_dir, 'nexus_violations.json'),
+                           os.path.join(config_dir, 'self_growth_log.json'),
+                           os.path.join(config_dir, 'auto_wire_state.json')],
+                          capture_output=True, cwd=os.path.join(config_dir, '..', '..'))
+            subprocess.run(['git', 'commit', '-m', 'auto: loop state update (training complete)'],
+                          capture_output=True, cwd=os.path.join(config_dir, '..', '..'))
+        except Exception:
+            pass
+
         print(f"{'='*60}")
 
         try:
             from auto_discovery_loop import _recursive_loop
             _recursive_loop.report()
+        except Exception:
+            pass
+
+        # [GAP 7] 지식 전달 (완료된 학습 → 다음 planned)
+        try:
+            from loop_extensions import auto_transfer_chain
+            auto_transfer_chain()
         except Exception:
             pass
 

@@ -236,6 +236,12 @@ def auto_register_laws(candidates: list, min_confidence: str = 'HIGH') -> list:
                 json.dump(d, f, indent=2, ensure_ascii=False)
             registered.append({'id': next_id, 'formula': cand['formula']})
             print(f"  [LAW {next_id}] {cand['formula']}")
+            # GAP 4: DD 문서 자동 생성
+            try:
+                from loop_extensions import auto_generate_dd
+                auto_generate_dd(next_id, cand['formula'], cand.get('evidence', ''))
+            except Exception:
+                pass
         except Exception as e:
             print(f"  [ERROR] Registration failed: {e}")
 
