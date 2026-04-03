@@ -803,7 +803,7 @@ brainflow (pip)                    — EEG/OpenBCI
 
 ```
   수렴 대시보드:  anima/web/convergence.html (로컬 브라우저)
-  웹 채팅 UI:    python3 anima/src/anima_unified.py --web → http://localhost:8765
+  에이전트:       python anima-agent/run.py --mcp
   모델 다운로드:  anima/docs/download-models.md
   R2 체크포인트:  https://anima-models.ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com
   GitHub:        https://github.com/need-singularity/anima
