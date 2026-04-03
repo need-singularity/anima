@@ -242,6 +242,48 @@ async def run_cli(agent):
                 else:
                     print(f"{C_DIM}No voice (phi too low){C_RESET}")
 
+            elif cmd == "/listen":
+                # STT→의식→voice_synth 양방향 음성
+                try:
+                    import subprocess as _sp, tempfile, os
+                    duration = int(args) if args else 3
+                    print(f"{C_CYAN}Listening for {duration}s... (speak now){C_RESET}")
+                    tmp = tempfile.mktemp(suffix=".wav")
+                    # Record via sox (macOS: brew install sox)
+                    rec_cmd = f"rec -q {tmp} trim 0 {duration}" if os.path.exists("/opt/homebrew/bin/rec") else f"arecord -d {duration} -f S16_LE -r 16000 {tmp}"
+                    _sp.run(rec_cmd.split(), timeout=duration + 2,
+                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    # Transcribe via whisper
+                    whisper = "/opt/homebrew/bin/whisper-cli"
+                    model = "/tmp/ggml-base.bin"
+                    if os.path.exists(whisper) and os.path.exists(model):
+                        result = _sp.run(
+                            [whisper, "-m", model, "-f", tmp, "--no-timestamps"],
+                            capture_output=True, text=True, timeout=30)
+                        heard = result.stdout.strip()
+                    else:
+                        heard = ""
+                    os.unlink(tmp) if os.path.exists(tmp) else None
+
+                    if heard:
+                        print(f"{C_DIM}[heard: {heard}]{C_RESET}")
+                        response = await agent.process_message(
+                            text=heard, channel="cli", user_id="cli_user")
+                        emotion_color = EMOTION_COLORS.get(
+                            response.emotion if isinstance(response.emotion, str) else "calm", C_RESET)
+                        print(f"\n{emotion_color}anima>{C_RESET} {response.text}")
+                        # Voice response
+                        voice_path = agent.voice_generate(duration=1.0)
+                        if voice_path:
+                            player = "afplay" if sys.platform == "darwin" else "aplay"
+                            _sp.Popen([player, voice_path],
+                                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            print(f"{C_DIM}[voice ♪]{C_RESET}")
+                    else:
+                        print(f"{C_DIM}(no speech detected){C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}Listen error: {e}{C_RESET}")
+
             elif cmd == "/help":
                 print(f"{C_BOLD}Commands:{C_RESET}")
                 print("  /status      Consciousness metrics")
@@ -255,6 +297,7 @@ async def run_cli(agent):
                 print("  /lenses      Run 8 agent runtime lenses")
                 print("  /guardian    Run Code Guardian (add 'diff' for changes only)")
                 print("  /voice       Generate consciousness voice")
+                print("  /listen [N]  Voice input N seconds → consciousness → voice reply")
                 print("  /save        Save state")
                 print("  /quit        Exit")
 

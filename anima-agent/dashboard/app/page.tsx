@@ -46,9 +46,16 @@ interface DashboardEvent {
   timestamp: number;
 }
 
+interface LensResult {
+  name: string;
+  score: number;
+  findings: string[];
+}
+
 interface DashboardState {
   consciousness: ConsciousnessState;
   trading: TradingState;
+  lenses: LensResult[];
   meta: {
     agent_connected: boolean;
     trading_connected: boolean;
@@ -629,6 +636,37 @@ export default function DashboardPage() {
         <ConsciousnessPanel c={consciousness} />
         <TradingPanel t={trading} />
       </div>
+
+      {/* Agent Lenses (8 runtime monitors) */}
+      {state.lenses && state.lenses.length > 0 && (
+        <div className="bg-zinc-900/80 rounded-lg p-4 mb-4 border border-zinc-700">
+          <h3 className="text-sm font-bold text-zinc-300 mb-3">Runtime Lenses</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {state.lenses.map((lens: LensResult) => (
+              <div key={lens.name} className="bg-zinc-800 rounded p-2">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs text-zinc-400">{lens.name}</span>
+                  <span className={`text-xs font-mono ${
+                    lens.score >= 0.8 ? "text-emerald-400" :
+                    lens.score >= 0.5 ? "text-yellow-400" : "text-red-400"
+                  }`}>
+                    {(lens.score * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <div className="w-full bg-zinc-700 rounded-full h-1.5">
+                  <div
+                    className={`h-1.5 rounded-full ${
+                      lens.score >= 0.8 ? "bg-emerald-500" :
+                      lens.score >= 0.5 ? "bg-yellow-500" : "bg-red-500"
+                    }`}
+                    style={{ width: `${lens.score * 100}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Event stream */}
       <EventStream events={events} />
