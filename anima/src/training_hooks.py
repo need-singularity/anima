@@ -186,6 +186,12 @@ class TrainingHooks:
 
         print(f"{'='*60}")
 
+        try:
+            from auto_discovery_loop import _recursive_loop
+            _recursive_loop.report()
+        except Exception:
+            pass
+
     def _log_metrics_scan(self, step: int, metrics: Dict):
         """step 메트릭 기반 라이트 스캔 (체크포인트 없이)."""
         phi = metrics.get('phi', 0)
