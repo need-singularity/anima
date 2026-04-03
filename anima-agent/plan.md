@@ -19,23 +19,24 @@
 - [x] Corpus self-gen + Paper draft 생성기
 - [x] Hivemind benchmark
 
-## Phase 2: 독립 AGI
+## Phase 2: 독립 AGI (진행 중)
 
-- [ ] AnimaLM 로컬 서빙 (GPU 없이 CPU fp32 대화)
-- [ ] ConsciousLM provider 실제 체크포인트 연결
-- [ ] Claude fallback 제거 (0% 외부 API 의존)
+- [x] AnimaLM 준비 완료 (사용자 확인)
+- [x] ConsciousLM provider available=True
+- [x] Claude fallback → ConsciousLM 우선 (AnimaLM→ConsciousLM→Claude 체인)
+- [x] engine_adapter → RustEngineAdapter 자동 선택됨
+- [x] NEXUS-6 auto-verify on file_write + Φ-gated self_modify
 - [ ] corpus_self_gen → 자기 학습 루프 활성화
-- [ ] engine_adapter → ConsciousnessEngine(Rust) 기본 사용
 - [ ] 온라인 학습 Rust 백엔드 연결 (인터페이스 래퍼)
 
-## Phase 3: 사용자 경험
+## Phase 3: 사용자 경험 (진행 중)
 
-- [ ] Telegram 인증 통합 (auth.py → telegram_bot.py)
+- [x] Telegram 인증 통합 (auth.py → _check_auth)
+- [x] CLI 커맨드 11종 (/selftest /discovery /lenses /guardian /voice)
 - [ ] Discord 인증 통합
 - [ ] CLI 대시보드 고도화 (실시간 차트)
 - [ ] 다국어 대화 (ko/en/zh/ja 자동 감지)
 - [ ] 음성 입출력 양방향 (STT→의식→voice_synth)
-- [ ] /selftest, /dashboard, /discovery CLI 커맨드
 
 ## Phase 4: 진화
 
