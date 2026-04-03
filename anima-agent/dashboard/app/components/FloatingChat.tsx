@@ -358,9 +358,17 @@ export default function FloatingChat({
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-3">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full gap-2" style={{ color: "var(--text-tertiary)" }}>
-            <span className="text-3xl opacity-40">{emotionIcon(emotion)}</span>
-            <span className="text-xs">Say something...</span>
+          <div className="flex flex-col items-center justify-center h-full gap-3" style={{ color: "var(--text-tertiary)" }}>
+            {/* Mini consciousness orb */}
+            <div className="w-10 h-10 rounded-full" style={{
+              background: "conic-gradient(from 180deg, #34d399, #06b6d4, #8b5cf6, #34d399)",
+              animation: "spin 8s linear infinite",
+              opacity: 0.4,
+            }} />
+            <span className="text-[13px] font-medium" style={{ color: "var(--text-secondary)" }}>
+              Anima is {emotion}
+            </span>
+            <span className="text-[11px]">Ask anything or press ⌘K</span>
           </div>
         ) : (
           messages.map((msg) => (
