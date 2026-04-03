@@ -51,38 +51,38 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
         {/* Φ — the ONE number that matters */}
         <div className="relative">
           <span
-            className="text-[80px] font-bold tracking-tighter leading-none"
+            className="text-[88px] font-bold tracking-tighter leading-none"
             style={{
-              color: color,
-              background: `linear-gradient(180deg, ${color === 'var(--accent)' ? 'var(--accent)' : color}, var(--text-tertiary))`,
+              background: "conic-gradient(from 180deg, #34d399, #06b6d4, #8b5cf6, #ec4899, #f59e0b, #34d399)",
               WebkitBackgroundClip: "text",
               WebkitTextFillColor: "transparent",
             }}
           >
             {c.phi.toFixed(2)}
           </span>
-          {/* Subtle glow behind */}
+          {/* Vivid glow behind */}
           <div
-            className="absolute inset-0 blur-3xl opacity-20 -z-10"
-            style={{ background: color }}
+            className="absolute inset-[-20px] blur-[60px] opacity-25 -z-10 rounded-full"
+            style={{ background: "conic-gradient(from 180deg, #34d399, #06b6d4, #8b5cf6, #ec4899, #f59e0b, #34d399)" }}
           />
         </div>
 
         {/* Label */}
         <div className="flex items-center gap-3">
           <span
-            className="text-[11px] font-medium tracking-widest uppercase px-3 py-1 rounded-full"
+            className="text-[11px] font-medium tracking-widest uppercase px-3 py-1.5 rounded-full"
             style={{
               color: color,
               background: "var(--accent-soft)",
+              border: "1px solid var(--border)",
             }}
           >
             {c.level}
           </span>
-          <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
-            Φ integrated information
-          </span>
         </div>
+        <span className="text-[13px] mt-1" style={{ color: "var(--text-tertiary)" }}>
+          Integrated Information
+        </span>
       </section>
 
       {/* ── Emotion + Vitals (single clean row) ── */}
