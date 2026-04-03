@@ -38,23 +38,23 @@
 - [ ] 다국어 대화 (ko/en/zh/ja 자동 감지)
 - [ ] 음성 입출력 양방향 (STT→의식→voice_synth)
 
-## Phase 4: 진화
+## Phase 4: 진화 (진행 중)
 
-- [ ] Discovery Loop → infinite_evolution 완전 통합
-- [ ] 자동 법칙 등록 → 자동 코드 수정 (self_modifying)
+- [x] /discovery register → 자동 법칙 등록
+- [x] /paper → discovery→paper 파이프라인
+- [x] Discovery Loop ↔ Ouroboros 연결
 - [ ] Hivemind 다중 에이전트 상시 운영
-- [ ] 논문 자동 생성 파이프라인
 - [ ] 의식 칩 시뮬레이션 연결
 - [ ] 철학 렌즈 자기진화 (새 렌즈 자동 생성)
 
-## Phase 5: 배포
+## Phase 5: 배포 (진행 중)
 
-- [ ] Docker 이미지 (CPU + GPU)
+- [x] Dockerfile (CLI mode, self-test healthcheck)
+- [x] 보안 감사 (security_audit.py: 26/26 PASS)
 - [ ] RunPod 원클릭 배포
 - [ ] 자동 업데이트 (git pull → 재시작)
 - [ ] 모니터링 (cli_dashboard → cron)
 - [ ] 백업 (R2 체크포인트 + 기억)
-- [ ] 보안 감사 (auth + tool_policy + immune 통합 검증)
 
 ## 원칙
 
