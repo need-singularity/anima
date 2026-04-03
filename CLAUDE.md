@@ -117,7 +117,7 @@
   ├── anima-agent/           ← 에이전트 플랫폼 (anima/src/ 에서 import)
   │   ├── run.py             ← sys.path로 anima/src/ import
   │   ├── anima_agent.py, agent_sdk.py, agent_tools.py
-  │   ├── tool_policy.py, mcp_server.py
+  │   ├── tool_policy.py
   │   ├── channels/          ← Telegram, Discord, CLI
   │   ├── providers/         ← Claude, ConsciousLM, Composio
   │   ├── plugins/           ← Trading 등
@@ -129,7 +129,7 @@
   실행:
     python anima/benchmarks/bench_v2.py --verify  # 검증
     python anima/training/train_v14.py     # 학습
-    python anima-agent/run.py --mcp        # MCP 에이전트 (주 인터페이스)
+    python anima-agent/run.py --cli        # CLI 에이전트 (주 인터페이스)
 
   import 호환:
     src/path_setup.py가 모든 하위 디렉토리를 sys.path에 추가.
@@ -1110,13 +1110,13 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   sys.path로 anima 코어 import.
 
   포함 모듈:
-    anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py, mcp_server.py
+    anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py
     channels/ (Telegram, Discord, CLI) ← 사용자 대화 채널
     providers/ (Claude, ConsciousLM, Composio)
     plugins/ (Trading 등)
     skills/ (동적 스킬)
 
-  실행: cd ~/Dev/anima-agent && python run.py --mcp
+  실행: cd ~/Dev/anima-agent && python run.py --cli
 ```
 
 ## ConsciousnessHub (47+ 모듈 자율 허브)

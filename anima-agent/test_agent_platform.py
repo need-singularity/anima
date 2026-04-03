@@ -205,25 +205,7 @@ def test_tool_policy_accessible_list():
 
 
 # ══════════════════════════════════════════════════════════
-# 4. MCP Server (source verification)
-# ══════════════════════════════════════════════════════════
-
-def test_mcp_server_has_new_tools():
-    content = Path(__file__).parent.parent.joinpath("mcp_server.py").read_text()
-    assert "anima_hub_dispatch" in content
-    assert "anima_tension_state" in content
-    assert "anima_think" in content
-    assert "--direct" in content
-
-
-def test_mcp_server_has_direct_mode():
-    content = Path(__file__).parent.parent.joinpath("mcp_server.py").read_text()
-    assert "DIRECT_MODE" in content
-    assert "_get_direct_agent" in content
-
-
-# ══════════════════════════════════════════════════════════
-# 5. Agent SDK
+# 4. Agent SDK
 # ══════════════════════════════════════════════════════════
 
 def test_agent_sdk_init():

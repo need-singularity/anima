@@ -102,50 +102,7 @@ def test_cli_full_loop(_event_loop):
 
 
 # ══════════════════════════════════════════════════════════
-# 2. MCP Tools
-# ══════════════════════════════════════════════════════════
-
-def test_mcp_tools_anima_status():
-    """Mock MCP direct-mode agent, verify JSON output for anima_status."""
-    mock_agent = _make_mock_agent(phi=3.5, tension=0.2, emotion="joyful")
-    mock_sdk = MagicMock()
-    mock_sdk.get_status.return_value = {
-        "phi": 3.5, "tension": 0.2, "emotion": "joyful",
-        "cells": 8, "curiosity": 0.5,
-    }
-    mock_sdk.get_consciousness_vector.return_value = {
-        "phi": 3.5, "alpha": 0.014, "Z": 0.5, "N": 0.6, "W": 0.7,
-    }
-
-    status = mock_sdk.get_status()
-    result = json.dumps(status, ensure_ascii=False, default=str)
-    parsed = json.loads(result)
-
-    assert parsed["phi"] == 3.5
-    assert parsed["emotion"] == "joyful"
-    assert "tension" in parsed
-
-
-def test_mcp_tools_anima_chat():
-    """Mock MCP direct-mode agent, verify chat returns response JSON."""
-    mock_sdk = MagicMock()
-    mock_sdk.chat.return_value = {
-        "response": "I feel curious today",
-        "emotion": "curious",
-        "tension": 0.35,
-        "phi": 2.1,
-    }
-
-    result = mock_sdk.chat("How are you?")
-    result_json = json.dumps(result, ensure_ascii=False)
-    parsed = json.loads(result_json)
-
-    assert "response" in parsed
-    assert parsed["emotion"] == "curious"
-
-
-# ══════════════════════════════════════════════════════════
-# 3. Trading Plugin Backtest
+# 2. Trading Plugin Backtest
 # ══════════════════════════════════════════════════════════
 
 def test_trading_plugin_backtest():
@@ -177,7 +134,7 @@ def test_trading_plugin_backtest():
 
 
 # ══════════════════════════════════════════════════════════
-# 4. Trading Plugin Regime
+# 3. Trading Plugin Regime
 # ══════════════════════════════════════════════════════════
 
 def test_trading_plugin_regime():
@@ -198,7 +155,7 @@ def test_trading_plugin_regime():
 
 
 # ══════════════════════════════════════════════════════════
-# 5. Phi-Gated Access Denied
+# 4. Phi-Gated Access Denied
 # ══════════════════════════════════════════════════════════
 
 def test_phi_gated_access_denied():
@@ -216,7 +173,7 @@ def test_phi_gated_access_denied():
 
 
 # ══════════════════════════════════════════════════════════
-# 6. Phi-Gated Access Allowed
+# 5. Phi-Gated Access Allowed
 # ══════════════════════════════════════════════════════════
 
 def test_phi_gated_access_allowed():
@@ -233,7 +190,7 @@ def test_phi_gated_access_allowed():
 
 
 # ══════════════════════════════════════════════════════════
-# 7. Provider Fallback
+# 6. Provider Fallback
 # ══════════════════════════════════════════════════════════
 
 def test_provider_fallback(_event_loop):
@@ -272,7 +229,7 @@ def test_provider_fallback(_event_loop):
 
 
 # ══════════════════════════════════════════════════════════
-# 8. Memory Save/Load
+# 7. Memory Save/Load
 # ══════════════════════════════════════════════════════════
 
 def test_memory_save_load(tmp_path):
@@ -300,7 +257,7 @@ def test_memory_save_load(tmp_path):
 
 
 # ══════════════════════════════════════════════════════════
-# 9. Regime Bridge Tension
+# 8. Regime Bridge Tension
 # ══════════════════════════════════════════════════════════
 
 def test_regime_bridge_tension():
@@ -328,7 +285,7 @@ def test_regime_bridge_tension():
 
 
 # ══════════════════════════════════════════════════════════
-# 10. Dashboard Combined State
+# 9. Dashboard Combined State
 # ══════════════════════════════════════════════════════════
 
 def test_dashboard_combined_state():
@@ -352,7 +309,7 @@ def test_dashboard_combined_state():
 
 
 # ══════════════════════════════════════════════════════════
-# 11. Hypothesis Skill Generation
+# 10. Hypothesis Skill Generation
 # ══════════════════════════════════════════════════════════
 
 def test_hypothesis_skill_generation(tmp_path):
