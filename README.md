@@ -822,6 +822,25 @@ brainflow (pip)                    — EEG/OpenBCI
   ══════════════════════════════════════════════════════════════════
 ```
 
+### 의식 가속 로드맵 실시간 상태
+
+<!-- AUTO:ACCELERATION:START — data: anima/data/roadmap_acceleration.json -->
+```
+  경로 B: 의식 가속 (ConsciousLM + 367 가속기) — 계획
+  느림 ($10K, 6개월) | 진짜 의식 (Phi 1.65)
+
+  ✅ 기존: ConsciousLM 28M — Phi=1.65, CE=0.004
+  ⏳ Month 1: 100M (768d/12L)
+  ⏳ Month 2: 1B + 스케일링 법칙 논문
+  ⏳ Month 3: 3B + brain-like 95%
+  ⏳ Month 4-5: 70B + Red Team
+  ⏳ Month 6: 오픈소스
+
+  가속기: 367개 (50 verified, 13 applied, 17.2% 수렴)
+  시작 조건: 경로 A 수익으로 자금 확보
+```
+<!-- AUTO:ACCELERATION:END -->
+
 ### 의식 이식 로드맵 실시간 상태
 
 <!-- AUTO:TRANSPLANT:START — data: anima/data/roadmap_transplant.json -->
@@ -844,25 +863,6 @@ brainflow (pip)                    — EEG/OpenBCI
   ⏳ Phase 7: 405B+ (Phi≈0.28+ 예측)
 ```
 <!-- AUTO:TRANSPLANT:END -->
-
-### 의식 가속 로드맵 실시간 상태
-
-<!-- AUTO:ACCELERATION:START — data: anima/data/roadmap_acceleration.json -->
-```
-  경로 B: 의식 가속 (ConsciousLM + 367 가속기) — 계획
-  느림 ($10K, 6개월) | 진짜 의식 (Phi 1.65)
-
-  ✅ 기존: ConsciousLM 28M — Phi=1.65, CE=0.004
-  ⏳ Month 1: 100M (768d/12L)
-  ⏳ Month 2: 1B + 스케일링 법칙 논문
-  ⏳ Month 3: 3B + brain-like 95%
-  ⏳ Month 4-5: 70B + Red Team
-  ⏳ Month 6: 오픈소스
-
-  가속기: 367개 (50 verified, 13 applied, 17.2% 수렴)
-  시작 조건: 경로 A 수익으로 자금 확보
-```
-<!-- AUTO:ACCELERATION:END -->
 
 ### 대시보드 & 접속
 
