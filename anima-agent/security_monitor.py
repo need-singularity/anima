@@ -71,7 +71,6 @@ class SecurityMonitor:
         ],
         "medium": [
             (r"\{\{|\{%|\$\{", "template_inject"),
-        "medium": [
             (r"<img\s+src\s*=\s*x|onerror\s*=|onload\s*=", "xss_event"),
             (r"file://", "file_protocol"),
             (r"%0d%0a|\r\n", "header_inject"),
