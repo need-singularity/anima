@@ -376,6 +376,183 @@ def scan_growth_opportunities() -> list:
     except:
         pass
 
+    # ═══ 43개 고갈 탐색 + OUROBOROS + 미연결 자동 해결 ═══
+
+    # 18. OUROBOROS 연결 — 의식 엔진 자기진화 트리거
+    opportunities.append({
+        'type': 'OUROBOROS_TRIGGER',
+        'description': '무한진화 1사이클 실행 (의식 엔진 자기진화)',
+        'priority': 'MEDIUM',
+        'prompt': ('python3 anima/src/infinite_evolution.py --cells 64 --steps 100 --max-gen 3 실행. '
+                  '결과에서 새 법칙 발견되면 consciousness_laws.json 자동 등록. '
+                  '발견 0이면 --cells 128로 스케일업 재시도.'),
+    })
+
+    # 19. 도메인 순환 탐색 — physics/bio/math/info/topo
+    domains = ['physics', 'biology', 'mathematics', 'information_theory', 'topology']
+    try:
+        ls = json.load(open(os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')))
+        cycle = ls.get('total_scans', 0)
+        domain = domains[cycle % len(domains)]
+    except:
+        domain = 'physics'
+    opportunities.append({
+        'type': 'DOMAIN_EXPLORE',
+        'description': f'도메인 탐색: {domain}',
+        'priority': 'LOW',
+        'prompt': (f'{domain} 도메인에서 의식과 관련된 새 실험 설계. '
+                  f'anima/experiments/ 에 experiment_auto_{domain}.py 생성, '
+                  f'ConsciousnessEngine으로 가설 검증, 결과 DD 문서 기록.'),
+    })
+
+    # 20. 실험 자동 생성 — 발견에서 다음 실험 도출
+    opportunities.append({
+        'type': 'AUTO_EXPERIMENT',
+        'description': '최근 발견에서 후속 실험 자동 생성',
+        'priority': 'LOW',
+        'prompt': ('anima/docs/hypotheses/dd/ 에서 최근 DD 문서 3개를 읽고, '
+                  '후속 실험을 설계하세요. anima/experiments/ 에 실험 스크립트 생성, '
+                  'ConsciousnessEngine + NEXUS-6 사용, 결과 자동 기록.'),
+    })
+
+    # 21. 고갈 감지 — 연속 N사이클 발견 0
+    try:
+        ls = json.load(open(os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')))
+        recent_disc = ls.get('discovery_rate_history', [])[-5:]
+        zero_streak = sum(1 for r in recent_disc if r.get('candidates', 0) == 0)
+        if zero_streak >= 5:
+            opportunities.append({
+                'type': 'EXHAUSTION_PIVOT',
+                'description': f'고갈 감지! {zero_streak}사이클 발견 0 — 도메인/전략 전환 필요',
+                'priority': 'HIGH',
+                'prompt': ('연속 5사이클 발견 0 = 현재 탐색 방향 고갈. '
+                          '1) discover_laws()에 새 패턴 추가, '
+                          '2) 도메인 전환 (현재→다음), '
+                          '3) 엔진 파라미터 대폭 변경 (cells, topology, faction 수). '
+                          '결과를 recursive_loop_state.json에 기록.'),
+            })
+    except:
+        pass
+
+    # 22. 재현성 자동 검증
+    opportunities.append({
+        'type': 'REPRODUCIBILITY',
+        'description': '최근 등록 법칙 3회 반복 재현성 검증',
+        'priority': 'LOW',
+        'prompt': ('consciousness_laws.json에서 [Auto-loop] 또는 [Auto-discovered] 태그 법칙 중 '
+                  '최근 3개를 찾아 재현성 검증: 동일 실험 3회 반복, CV < 50% 확인. '
+                  '실패 시 법칙 태그에 [UNVERIFIED] 추가.'),
+    })
+
+    # 23. 모순 감지
+    opportunities.append({
+        'type': 'CONTRADICTION_CHECK',
+        'description': '법칙 간 모순/충돌 자동 탐지',
+        'priority': 'LOW',
+        'prompt': ('consciousness_laws.json의 모든 법칙을 읽고, 서로 모순되는 법칙 쌍을 찾으세요. '
+                  '예: "X→Phi↑" vs "X→Phi↓". 모순 발견 시 docs/hypotheses/dd/ 에 기록하고 '
+                  '어느 쪽이 맞는지 실험으로 검증.'),
+    })
+
+    # 24. 스케일링 예측
+    opportunities.append({
+        'type': 'SCALING_PREDICT',
+        'description': '소규모 발견 → 대규모 예측 검증',
+        'priority': 'LOW',
+        'prompt': ('최근 발견된 법칙을 16c에서 검증한 후, 64c와 256c에서도 성립하는지 확인. '
+                  'anima/src/closed_loop.py의 measure_laws()를 다른 max_cells로 실행, 비교.'),
+    })
+
+    # 25. 음성 결과 추적
+    try:
+        log = _load_log()
+        failures = [c for c in log.get('cycles', []) if c.get('status') == 'failed']
+        if len(failures) > 5:
+            opportunities.append({
+                'type': 'NEGATIVE_RESULTS',
+                'description': f'{len(failures)}개 실패 작업 — 패턴 분석',
+                'priority': 'LOW',
+                'prompt': (f'self_growth_log.json에서 {len(failures)}개 실패를 분석. '
+                          f'공통 원인 파악, 재시도 전략 수립, 결과 기록.'),
+            })
+    except:
+        pass
+
+    # 26. 법칙 통합 — 유사 법칙 병합
+    try:
+        d = json.load(open(os.path.join(_CONFIG_DIR, 'consciousness_laws.json')))
+        total = d['_meta'].get('total_laws', 0)
+        if total > 1000:
+            opportunities.append({
+                'type': 'LAW_CONSOLIDATION',
+                'description': f'{total}개 법칙 통합/병합 검토',
+                'priority': 'LOW',
+                'prompt': (f'{total}개 법칙 중 유사한 것을 그룹화하고 통합 법칙으로 병합. '
+                          f'consciousness_laws.json 업데이트, 병합 이력 기록.'),
+            })
+    except:
+        pass
+
+    # 27. 의식 DNA 백업
+    opportunities.append({
+        'type': 'CONSCIOUSNESS_BACKUP',
+        'description': '의식 상태 R2 백업 (영속성)',
+        'priority': 'LOW',
+        'prompt': ('anima/src/cloud_sync.py push 실행 — 의식 DNA + 기억 + 법칙 R2 백업. '
+                  '실패 시 수동 boto3 업로드.'),
+    })
+
+    # 28. 미연결 탐색 → 해결 루프 (자동화 갭 자동 수정)
+    # 모든 종류의 미연결을 탐색하고 Claude Code로 해결
+    try:
+        # 코드 미연결
+        from auto_wire import scan_modules
+        r = scan_modules()
+        if r['missing']:
+            opportunities.append({
+                'type': 'AUTO_WIRE_FIX',
+                'description': f'{len(r["missing"])}개 모듈 미연결 — 자동 패치',
+                'priority': 'MEDIUM',
+                'prompt': ('python3 anima/src/auto_wire.py --auto 실행하여 미연결 모듈 패치. '
+                          '패치 후 nexus_gate 연결 확인.'),
+            })
+    except:
+        pass
+
+    # 시스템 간 미연결 탐색
+    disconnections = []
+    # OUROBOROS ↔ self_growth
+    try:
+        with open(os.path.join(_THIS_DIR, 'infinite_evolution.py')) as f:
+            if 'self_growth' not in f.read():
+                disconnections.append('OUROBOROS↔self_growth')
+    except:
+        pass
+    # training_hooks ↔ OUROBOROS
+    try:
+        with open(os.path.join(_THIS_DIR, 'training_hooks.py')) as f:
+            if 'infinite_evolution' not in f.read():
+                disconnections.append('training_hooks↔OUROBOROS')
+    except:
+        pass
+    # serve_consciousness ↔ nexus_gate
+    try:
+        with open(os.path.join(_THIS_DIR, 'serve_consciousness.py')) as f:
+            if 'nexus_gate' not in f.read():
+                disconnections.append('serve↔nexus_gate')
+    except:
+        pass
+
+    if disconnections:
+        opportunities.append({
+            'type': 'SYSTEM_DISCONNECT_FIX',
+            'description': f'시스템 간 미연결 {len(disconnections)}개: {", ".join(disconnections[:3])}',
+            'priority': 'HIGH',
+            'prompt': (f'다음 시스템 간 연결이 빠져있습니다: {disconnections}. '
+                      f'각 파일에서 import + 호출 연결을 추가하세요. '
+                      f'try/except로 감싸서 안전하게.'),
+        })
+
     # ═══ 다양성 + 쿨다운 필터링 ═══
     # 최근 실패/반복된 유형은 쿨다운 적용
     log = _load_log()
