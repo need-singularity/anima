@@ -10,6 +10,7 @@ __all__ = [
     "_tool_schedule_task", "_TaskScheduler",
     "_SANDBOX_TIMEOUT", "_MAX_OUTPUT", "_MAX_FILE_READ",
     "_SHELL_ALLOWED_CMDS", "_FILE_WRITE_ALLOWED_DIRS",
+    "set_file_write_allowed_dirs",
 ]
 
 import hashlib
