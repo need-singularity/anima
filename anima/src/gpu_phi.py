@@ -13,7 +13,7 @@ Speed target: 128 cells in <50ms on GPU (vs 8s CPU = 160x speedup)
 
 Usage:
   from gpu_phi import GPUPhiCalculator
-  calc = GPUPhiCalculator(n_bins=16, device='cuda')
+  calc = GPUPhiCalculator(n_bins=16)  # auto-detects CUDA > MPS > CPU
   phi, components = calc.compute(hiddens)  # hiddens: (n_cells, hidden_dim)
 """
 
@@ -49,11 +49,16 @@ class GPUPhiCalculator:
         """
         Args:
             n_bins: Number of histogram bins for MI estimation.
-            device: 'cuda' or 'cpu'. Auto-falls back to CPU if CUDA unavailable.
+            device: 'cuda', 'mps', or 'cpu'. Auto-detects best available GPU.
             max_pairs_full: Compute all pairs if n_cells <= this, else sample.
             n_neighbors: Number of neighbor pairs to sample per cell when N > max_pairs_full.
         """
         if device == 'cuda' and not torch.cuda.is_available():
+            if torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+        elif device == 'mps' and not torch.backends.mps.is_available():
             device = 'cpu'
         self.device = torch.device(device)
         self.n_bins = n_bins
@@ -493,7 +498,7 @@ def compute_phi(states: torch.Tensor, n_bins: int = 16,
     Args:
         states: (n_cells, hidden_dim) tensor.
         n_bins: histogram bins.
-        device: 'cuda' or 'cpu'.
+        device: 'cuda', 'mps', or 'cpu'. Auto-detects best available.
 
     Returns:
         (phi, components_dict)
