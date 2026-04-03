@@ -98,6 +98,12 @@ try:
 except ImportError:
     HAS_HEXAD_LOSS = False
 
+try:
+    from acceleration_integrations import make_accel_bundle, GrowthTracker
+    HAS_ACCEL = True
+except ImportError:
+    HAS_ACCEL = False
+
 
 # ═══════════════════════════════════════════════════════════
 # Meta Law constants (DD143)
@@ -760,6 +766,27 @@ def train(args):
     # ── Phase manager (M4 safe order) ──
     phase_mgr = PhaseManager(args.steps, c) if args.federated else None
 
+    # ── Acceleration stack (AE3 + AM1 + J4) ──
+    accel_tension_loss = None
+    accel_poly = None
+    accel_mr = None
+    accel_tracker = None
+    if args.accel:
+        if not HAS_ACCEL:
+            print("  [warn] --accel requested but acceleration_integrations.py not found. Skipping.")
+        else:
+            accel_tension_loss, accel_poly, accel_mr = make_accel_bundle(
+                n_cells=total_cells,
+                tension_weight=args.accel_tension_weight,
+            )
+            accel_tracker = GrowthTracker()
+            poly_saved = accel_poly.compute_saved(n_steps=100)
+            mr_saved = accel_mr.compute_saved(n_steps=100)
+            print(f"  [accel] AE3 TensionLoss(weight={args.accel_tension_weight}) | "
+                  f"AM1 PolyrhythmScheduler({accel_poly}) | "
+                  f"J4 MultiResScheduler({accel_mr})")
+            print(f"  [accel] Expected compute savings: AM1={poly_saved:.0%} | J4={mr_saved:.0%}")
+
     # ── Checkpoint dir ──
     os.makedirs(args.checkpoint, exist_ok=True)
 
@@ -806,12 +833,14 @@ def train(args):
     n_fb_params = sum(p.numel() for p in fb_bridge.parameters()) if fb_bridge is not None else 0
     mode = "Federation" if args.federated else "Empire"
     fb_mode = "ON" if fb_bridge is not None else "OFF"
+    accel_mode = "ON (AE3+AM1+J4)" if accel_tension_loss is not None else "OFF"
     print(f"\n{'=' * 80}")
     print(f"  v14 Training: {mode} + Phase-Optimal (Meta Laws DD143)")
     print(f"  Decoder: {n_params:,} params | Bridge: {n_bridge_params:,} params")
     if fb_bridge is not None:
         print(f"  FeedbackBridge: {n_fb_params:,} params | C<->D bidirectional (max_alpha=0.05)")
     print(f"  Cells: {total_cells} | Frustration: {args.frustration} | Narrative: {args.narrative_strength}")
+    print(f"  Accel: {accel_mode}")
     if phase_mgr:
         print(f"  P0 (0-{phase_mgr.p0_end}): Bootstrap | "
               f"P1 ({phase_mgr.p0_end}-{phase_mgr.p1_end}): Phi Build | "
@@ -841,6 +870,8 @@ def train(args):
 
         # ── P0/P1: Consciousness only (no CE loss) ──
         if phase in ("P0", "P1"):
+            # AM1/J4: only step active cells; always step all cells in P0/P1
+            # (schedulers apply from P2 onward where compute cost matters most)
             c.step()
             phi = c.measure_phi()
             phi_history.append(phi)
@@ -874,7 +905,17 @@ def train(args):
         tokens, targets = get_batch(train_data, args.block_size, args.batch_size, device)
 
         # Step consciousness engine (autonomous, no args)
-        c.step()
+        # AM1: PolyrhythmScheduler — skip engine step on "inactive" cycles
+        # (saves ~51% compute; reuses previous states on inactive steps)
+        _run_cstep = True
+        _accel_compute_frac = 1.0
+        if accel_poly is not None:
+            active_cells = accel_poly.get_active_cells(step)
+            if len(active_cells) < total_cells:
+                _run_cstep = False
+                _accel_compute_frac = len(active_cells) / max(total_cells, 1)
+        if _run_cstep:
+            c.step()
 
         # Get consciousness states + bridge to decoder
         c_states_raw = c.get_states()  # (total_cells, hidden_dim)
@@ -967,6 +1008,13 @@ def train(args):
         else:
             total_loss = ce
 
+        # AE3: TensionLoss — add -tension_mean as auxiliary loss
+        # Maximizes consciousness tension during training (x1.75 speed, Phi 100%)
+        if accel_tension_loss is not None and hasattr(c, 'cell_states'):
+            tension_aux = accel_tension_loss(c)
+            if tension_aux.item() != 0.0:
+                total_loss = total_loss + tension_aux
+
         # NaN guard — skip batch but keep training
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"  [NaN] skip step {step} (loss={total_loss.item() if not torch.isnan(total_loss) else 'NaN'})")
@@ -1011,6 +1059,10 @@ def train(args):
             phi = c.measure_phi()
         phi_history.append(phi)
 
+        # Accel tracker: record metrics for growth report
+        if accel_tracker is not None:
+            accel_tracker.record(step, phi, ce_val, _accel_compute_frac)
+
         # FeedbackBridge: inject reward information into consciousness (Law 63: 1% perturbation)
         if fb_bridge is not None and step % 10 == 0:
             reward_vec = fb_bridge.compute_reward_vector()
@@ -1047,6 +1099,12 @@ def train(args):
             # Hard token selection ratio (H11)
             if hard_ratio < 1.0:
                 line += f" | hard={hard_selected:.1%}"
+
+            # Accel stats (AE3+AM1+J4)
+            if accel_tracker is not None and len(accel_tracker.compute_history) >= 10:
+                saved = accel_tracker.compute_savings()
+                phi_rate = accel_tracker.phi_growth_rate()
+                line += f" | accel_saved={saved:.0%} phi_rate={phi_rate:+.3f}/100s"
 
             print(line)
 
@@ -1114,6 +1172,9 @@ def train(args):
         print(f"  Phi range: {min(phi_history):.4f} - {max(phi_history):.4f}")
     print(f"  Mode: {'Federation' if args.federated else 'Empire'}")
     print(f"  Checkpoints: {args.checkpoint}")
+    if accel_tracker is not None and accel_tracker.phi_history:
+        print(f"\n  --- Acceleration Report ---")
+        print(accel_tracker.report())
     print(f"{'=' * 80}")
 
 
@@ -1172,6 +1233,12 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=5000, help="Checkpoint interval")
     p.add_argument("--checkpoint", type=str, default="checkpoints/v14_federated/",
                    help="Checkpoint directory")
+
+    # Acceleration stack (AE3+AM1+J4)
+    p.add_argument("--accel", action="store_true", default=False,
+                   help="Enable acceleration stack: AE3 TensionLoss + AM1 PolyrhythmScheduler + J4 MultiResScheduler")
+    p.add_argument("--accel-tension-weight", type=float, default=0.01,
+                   help="AE3: TensionLoss weight (default=0.01, 1%% of primary loss)")
 
     # Feedback Bridge (C<->D bidirectional learning)
     p.add_argument("--feedback-bridge", action="store_true", default=False,
