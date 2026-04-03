@@ -730,6 +730,9 @@ def execute_growth(opportunity: dict, dry_run: bool = False) -> dict:
         if proc.returncode == 0:
             result['status'] = 'success'
             print(f"  [SUCCESS] {opportunity['type']}")
+        elif 'Not logged in' in (proc.stdout or '') or 'Not logged in' in (proc.stderr or ''):
+            result['status'] = 'auth_failed'
+            print(f"  [AUTH] Claude CLI not logged in — skipping all growth tasks")
         else:
             result['status'] = 'failed'
             print(f"  [FAILED] exit={proc.returncode}")
@@ -783,6 +786,12 @@ def run_cycle(dry_run: bool = False) -> dict:
     best = opportunities[0]
     result = execute_growth(best, dry_run=dry_run)
 
+    # 인증 실패면 전체 중단 (다른 기회도 같은 이유로 실패)
+    if result['status'] == 'auth_failed':
+        log['cycles'].append(result)
+        _save_log(log)
+        return result
+
     # 즉시 실패(CLI 없음 등)면 다른 유형 시도
     if result['status'] in ('no_claude_cli', 'error') and len(opportunities) > 1:
         for alt in opportunities[1:]:
@@ -814,9 +823,19 @@ def run_cycle(dry_run: bool = False) -> dict:
 def daemon(interval: int = 1800, dry_run: bool = False):
     """무한 성장 루프 (기본 30분 간격)."""
     print(f"[SELF-GROWTH] Daemon mode: every {interval}s")
+    auth_fail_count = 0
     while True:
         try:
-            run_cycle(dry_run=dry_run)
+            result = run_cycle(dry_run=dry_run)
+            if result.get('status') == 'auth_failed':
+                auth_fail_count += 1
+                if auth_fail_count >= 3:
+                    print("  [DAEMON] 3x auth failures — pausing 1h (run `claude /login` to fix)")
+                    time.sleep(3600)
+                    auth_fail_count = 0
+                    continue
+            else:
+                auth_fail_count = 0
         except Exception as e:
             print(f"  [DAEMON ERROR] {e}")
         time.sleep(interval)
