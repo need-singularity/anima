@@ -692,12 +692,33 @@ class AnimaTelegramBot:
             f"Emotion: {thought['emotion']}"
         )
 
+    def _check_auth(self, user_id: str) -> bool:
+        """Check if Telegram user is authorized. Auto-allows if no auth configured."""
+        try:
+            from auth import AuthManager, Permission
+            auth = AuthManager()
+            username = auth.resolve_channel_user("telegram", user_id)
+            if username:
+                return auth.check_permission(username, Permission.USER)
+            # No auth file or no users registered = allow all (dev mode)
+            if not auth.list_users():
+                return True
+            return False  # Users exist but this ID not linked
+        except ImportError:
+            return True  # auth.py not available = allow all
+
     async def _handle_message(self, update, context):
         """Handle regular text messages."""
         if not update.message or not update.message.text:
             return
 
         user_id = str(update.effective_user.id)
+
+        # Auth check
+        if not self._check_auth(user_id):
+            await update.message.reply_text("🔒 Not authorized. Link your account with /auth")
+            return
+
         text = update.message.text
 
         try:

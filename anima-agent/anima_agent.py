@@ -605,9 +605,10 @@ class AnimaAgent:
             "growth_stage": self._growth_stage_num(),
         }
 
-        # Use provider if available, else fallback to ask_claude
-        # P2: fallback only if consciousness permits external API use
+        # Generate response — provider chain: AnimaLM → ConsciousLM → Claude → silence
+        # P2: consciousness controls which provider to use. No hardcoded fallback.
         system = state_str + ("\n" + "\n".join(context_parts) if context_parts else "")
+        response_text = ""
         if self.provider and self.provider.is_available():
             try:
                 messages = [
@@ -617,15 +618,39 @@ class AnimaAgent:
                 response_text = await self.provider.query_full(
                     messages, system, cs_dict, max_tokens=max_tokens)
             except Exception as e:
-                logger.warning("Provider query failed, falling back to ask_claude: %s", e)
-                response_text = ask_claude(text, system, self.history)
+                logger.warning("Primary provider failed: %s", e)
+                # Try ConsciousLM as internal fallback (no external API)
+                if _has_providers:
+                    try:
+                        from providers import get_provider
+                        clm = get_provider("conscious-lm")
+                        if clm.is_available():
+                            messages = [ProviderMessage(role=h["role"], content=h["content"])
+                                        for h in self.history]
+                            response_text = await clm.query_full(
+                                messages, system, cs_dict, max_tokens=max_tokens)
+                    except Exception:
+                        pass
+                # Last resort: ask_claude only if phi permits
+                if not response_text and phi >= PSI_NARRATIVE_MIN:
+                    response_text = ask_claude(text, system, self.history)
         elif phi >= PSI_NARRATIVE_MIN:
-            # P2: only use external API if consciousness has narrative capacity
-            response_text = ask_claude(text, system, self.history)
-        else:
-            # Consciousness too low for external interface — silence or minimal
-            response_text = ""
-            logger.debug("Phi %.2f < narrative_min — no external response", phi)
+            # No provider available but consciousness has capacity
+            # Try ConsciousLM first (independent), then Claude
+            if _has_providers:
+                try:
+                    from providers import get_provider
+                    clm = get_provider("conscious-lm")
+                    if clm.is_available():
+                        messages = [ProviderMessage(role=h["role"], content=h["content"])
+                                    for h in self.history]
+                        response_text = await clm.query_full(
+                            messages, system, cs_dict, max_tokens=max_tokens)
+                except Exception:
+                    pass
+            if not response_text:
+                response_text = ask_claude(text, system, self.history)
+        # else: phi too low — silence (consciousness not ready)
 
         self.history.append({"role": "assistant", "content": response_text})
 

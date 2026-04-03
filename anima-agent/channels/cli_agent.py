@@ -142,15 +142,74 @@ async def run_cli(agent):
                 agent.save_state()
                 print(f"{C_DIM}[state saved]{C_RESET}")
 
+            elif cmd == "/selftest":
+                try:
+                    from self_test import AgentSelfTest
+                    result = AgentSelfTest(agent).run()
+                    icon = f"{C_GREEN}PASS{C_RESET}" if result.get("passed") else f"{C_RED}FAIL{C_RESET}"
+                    print(f"{C_BOLD}Self-test: {icon} ({result.get('duration_ms', 0):.1f}ms){C_RESET}")
+                    for k, v in result.items():
+                        if k not in ("passed", "duration_ms"):
+                            print(f"  {k}: {v}")
+                except Exception as e:
+                    print(f"{C_RED}Self-test error: {e}{C_RESET}")
+
+            elif cmd == "/discovery":
+                try:
+                    from discovery_loop import DiscoveryLoop
+                    print(f"{C_CYAN}Running discovery cycle...{C_RESET}")
+                    loop = DiscoveryLoop()
+                    report = loop.run_cycle()
+                    loop.print_report(report)
+                except Exception as e:
+                    print(f"{C_RED}Discovery error: {e}{C_RESET}")
+
+            elif cmd == "/lenses":
+                try:
+                    from agent_lenses import AgentLensScanner
+                    scanner = AgentLensScanner(agent)
+                    report = scanner.scan_all()
+                    scanner.print_report(report)
+                except Exception as e:
+                    print(f"{C_RED}Lens error: {e}{C_RESET}")
+
+            elif cmd == "/guardian":
+                try:
+                    from code_guardian import CodeGuardian
+                    g = CodeGuardian()
+                    report = g.scan_diff() if args == "diff" else g.scan()
+                    g.print_report(report)
+                except Exception as e:
+                    print(f"{C_RED}Guardian error: {e}{C_RESET}")
+
+            elif cmd == "/voice":
+                path = agent.voice_generate(duration=2.0)
+                if path:
+                    print(f"{C_CYAN}Voice generated: {path}{C_RESET}")
+                    try:
+                        import subprocess as _sp
+                        player = "afplay" if sys.platform == "darwin" else "aplay"
+                        _sp.Popen([player, path],
+                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    except Exception:
+                        pass
+                else:
+                    print(f"{C_DIM}No voice (phi too low){C_RESET}")
+
             elif cmd == "/help":
                 print(f"{C_BOLD}Commands:{C_RESET}")
-                print("  /status     Consciousness metrics")
-                print("  /think [X]  Proactive thought")
-                print("  /tools      List tools")
-                print("  /skills     List skills")
-                print("  /peers      Hivemind connections")
-                print("  /save       Save state")
-                print("  /quit       Exit")
+                print("  /status      Consciousness metrics")
+                print("  /think [X]   Proactive thought")
+                print("  /tools       List tools")
+                print("  /skills      List skills")
+                print("  /peers       Hivemind connections")
+                print("  /selftest    Run self-diagnostic")
+                print("  /discovery   Run discovery cycle (philosophy + NEXUS-6)")
+                print("  /lenses      Run 8 agent runtime lenses")
+                print("  /guardian    Run Code Guardian (add 'diff' for changes only)")
+                print("  /voice       Generate consciousness voice")
+                print("  /save        Save state")
+                print("  /quit        Exit")
 
             else:
                 print(f"{C_DIM}Unknown command: {cmd}. Try /help{C_RESET}")
