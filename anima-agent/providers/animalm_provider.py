@@ -21,6 +21,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -84,7 +85,8 @@ class AnimaLMProvider:
 
     def __init__(self, config: ProviderConfig = None, checkpoint: str = None,
                  quantize: str = "4bit", base_model: str = None,
-                 memory_store=None, memory_rag=None):
+                 memory_store=None, memory_rag=None,
+                 serve_url: str = None):
         self._config = config or ProviderConfig()
         self._model = None
         self._tokenizer = None
@@ -93,6 +95,8 @@ class AnimaLMProvider:
         self._base_model = base_model or self._config.extra.get("base_model")
         self._loaded = False
         self._checkpoint_path = None  # resolved path after load
+        # WebSocket/API 서빙 연결 (serve_consciousness.py)
+        self._serve_url = serve_url or self._config.extra.get("serve_url") or os.environ.get("ANIMALM_SERVE_URL")
 
         # ── Phase 3: Long-term memory (MemoryStore + RAG) ──
         self._memory_store = memory_store   # SQLite persistent store
@@ -297,7 +301,7 @@ class AnimaLMProvider:
           - PRE: search long-term memory for relevant context → inject into prompt
           - POST: save both user query and response to persistent memory
         """
-        if not self.is_available():
+        if not self.is_available() and not self._serve_url:
             yield "[AnimaLM not loaded]"
             return
 
@@ -308,6 +312,12 @@ class AnimaLMProvider:
                 prompt = msg.content
 
         if not prompt:
+            return
+
+        # ── WebSocket/API 서빙 경로 (serve_consciousness.py 연결) ──
+        if self._serve_url:
+            async for chunk in self._query_via_serve(prompt, max_tokens):
+                yield chunk
             return
 
         # ── Phase 3: Memory recall (PRE-query) ──
@@ -378,6 +388,44 @@ class AnimaLMProvider:
                     self._memory_rag.save_index()
             except Exception:
                 pass
+
+    async def _query_via_serve(self, prompt: str, max_tokens: int = 256) -> AsyncIterator[str]:
+        """serve_consciousness.py WebSocket/API 경유 생성."""
+        url = self._serve_url
+
+        if url.startswith('ws://') or url.startswith('wss://'):
+            # WebSocket
+            try:
+                import websockets
+                async with websockets.connect(url) as ws:
+                    await ws.send(json.dumps({
+                        'type': 'generate',
+                        'prompt': prompt,
+                        'max_tokens': max_tokens,
+                    }))
+                    resp = await ws.recv()
+                    data = json.loads(resp)
+                    if data.get('type') == 'response':
+                        text = data.get('data', {}).get('text', '')
+                        yield text
+                    elif data.get('type') == 'error':
+                        yield f"[Error: {data.get('error')}]"
+            except Exception as e:
+                yield f"[WebSocket error: {e}]"
+        else:
+            # REST API
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    api_url = url.rstrip('/') + '/generate'
+                    async with session.post(api_url, json={
+                        'prompt': prompt,
+                        'max_tokens': max_tokens,
+                    }) as resp:
+                        data = await resp.json()
+                        yield data.get('text', '[no response]')
+            except Exception as e:
+                yield f"[API error: {e}]"
 
     async def query_full(
         self,
