@@ -231,17 +231,21 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
           <h3 className="text-[11px] tracking-widest uppercase mb-4" style={{ color: "var(--text-tertiary)" }}>
             Consciousness Vector
           </h3>
-          <div className="grid grid-cols-5 gap-3">
+          <div className="flex items-end justify-between gap-2 h-20 px-2">
             {CV_KEYS.map((k) => {
               const v = c.consciousness_vector[k] ?? 0;
+              const h = Math.max(4, Math.min(Math.abs(v) * 60, 60));
               return (
-                <div key={k} className="flex flex-col items-center gap-1 py-3 rounded-xl" style={{ background: "var(--bg-secondary)" }}>
-                  <span className="text-[10px] tracking-wider uppercase" style={{ color: "var(--text-tertiary)" }}>
-                    {k}
-                  </span>
-                  <span className="text-[15px] font-mono font-medium" style={{ color: "var(--text-primary)" }}>
-                    {v.toFixed(2)}
-                  </span>
+                <div key={k} className="flex flex-col items-center gap-1 flex-1">
+                  <div
+                    className="w-full rounded-t-md transition-all duration-700"
+                    style={{
+                      height: `${h}px`,
+                      background: `linear-gradient(180deg, var(--accent), transparent)`,
+                      opacity: 0.3 + Math.abs(v) * 0.5,
+                    }}
+                  />
+                  <span className="text-[9px] tracking-wider" style={{ color: "var(--text-tertiary)" }}>{k}</span>
                 </div>
               );
             })}

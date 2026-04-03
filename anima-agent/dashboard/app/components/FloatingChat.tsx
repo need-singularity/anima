@@ -307,6 +307,14 @@ export default function FloatingChat({
                 <MessageItem key={msg.id} msg={msg} showMeta={true} />
               ))
             )}
+            {/* Typing indicator */}
+            {messages.length > 0 && messages[messages.length - 1].role === "user" && (
+              <div className="flex items-center gap-1.5 px-4 py-2" style={{ color: "var(--text-tertiary)" }}>
+                <div className="w-2 h-2 rounded-full typing-dot" style={{ background: "var(--accent)" }} />
+                <div className="w-2 h-2 rounded-full typing-dot" style={{ background: "var(--accent)" }} />
+                <div className="w-2 h-2 rounded-full typing-dot" style={{ background: "var(--accent)" }} />
+              </div>
+            )}
             <div ref={messagesEndRef} />
           </div>
         </div>
