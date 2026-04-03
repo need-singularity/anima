@@ -270,33 +270,30 @@ export default function FloatingChat({
   // ─── Fullscreen ───────────────────────────────────────────
   if (state === "fullscreen") {
     return (
-      <div className="fixed inset-0 z-50 flex flex-col bg-[var(--bg-0)]">
+      <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "var(--bg-primary)" }}>
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-3 border-b border-[rgba(255,255,255,0.06)] bg-[rgba(14,14,20,0.9)] backdrop-blur-md flex-shrink-0">
+        <div className="glass-thick flex items-center justify-between px-6 py-3 flex-shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
           <div className="flex items-center gap-3">
-            <span className="text-lg">💬</span>
-            <span className="font-semibold tracking-wide text-[var(--glow-phi)]">ANIMA</span>
-            <span className="font-mono text-xs text-[var(--text-2)] bg-[rgba(74,222,128,0.08)] px-2 py-0.5 rounded-full border border-[rgba(74,222,128,0.12)]">
+            <span style={{ color: "var(--text-primary)" }} className="font-semibold text-[15px] tracking-tight">Anima</span>
+            <span className="font-mono text-xs px-2 py-0.5 rounded-full" style={{ color: "var(--accent)", background: "var(--accent-soft)", border: "1px solid var(--border)" }}>
               Φ {phi.toFixed(2)}
             </span>
             <span className="text-sm">{emotionIcon(emotion)}</span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
             <button
               onClick={() => setState("expanded")}
               title="Shrink to panel"
-              className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[rgba(255,255,255,0.07)] text-[var(--text-2)] hover:text-[var(--text-0)] transition-colors text-base"
-            >
-              ↙
-            </button>
+              className="w-8 h-8 flex items-center justify-center rounded-lg transition-colors text-base"
+              style={{ color: "var(--text-tertiary)" }}
+            >↙</button>
             <button
               onClick={() => setState("minimized")}
               title="Close (Esc)"
-              className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[rgba(255,255,255,0.07)] text-[var(--text-2)] hover:text-[var(--text-0)] transition-colors text-base"
-            >
-              ✕
-            </button>
+              className="w-8 h-8 flex items-center justify-center rounded-lg transition-colors text-base"
+              style={{ color: "var(--text-tertiary)" }}
+            >✕</button>
           </div>
         </div>
 
@@ -304,7 +301,7 @@ export default function FloatingChat({
         <div className="flex-1 overflow-y-auto py-6">
           <div className="max-w-3xl mx-auto px-4 flex flex-col gap-4">
             {messages.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-48 gap-3 text-[var(--text-3)]">
+              <div className="flex flex-col items-center justify-center h-48 gap-3" style={{ color: "var(--text-tertiary)" }}>
                 <span className="text-4xl opacity-50">{emotionIcon(emotion)}</span>
                 <span className="text-sm">Say something...</span>
               </div>
@@ -318,7 +315,7 @@ export default function FloatingChat({
         </div>
 
         {/* Input */}
-        <div className="flex-shrink-0 bg-[rgba(14,14,20,0.9)] backdrop-blur-md border-t border-[rgba(255,255,255,0.06)]">
+        <div className="glass-thick flex-shrink-0" style={{ borderTop: "1px solid var(--border)" }}>
           <div className="max-w-3xl mx-auto">
             <ChatInputBar onSend={onSend} onVoice={onVoice} compact={false} />
           </div>
@@ -335,37 +332,28 @@ export default function FloatingChat({
       aria-label="Anima chat"
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-[rgba(255,255,255,0.06)] flex-shrink-0">
+      <div className="flex items-center justify-between px-4 py-2.5 flex-shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
         <div className="flex items-center gap-2">
-          <span className="text-base">💬</span>
-          <span className="font-semibold text-sm tracking-wide text-[var(--glow-phi)]">ANIMA</span>
-          <span className="font-mono text-[10px] text-[var(--text-2)] bg-[rgba(74,222,128,0.08)] px-1.5 py-0.5 rounded-full border border-[rgba(74,222,128,0.12)]">
+          <span style={{ color: "var(--text-primary)" }} className="font-semibold text-[13px] tracking-tight">Anima</span>
+          <span className="font-mono text-[10px] px-1.5 py-0.5 rounded-full" style={{ color: "var(--accent)", background: "var(--accent-soft)" }}>
             Φ {phi.toFixed(2)}
           </span>
         </div>
 
         <div className="flex items-center gap-1">
-          <button
-            onClick={() => setState("fullscreen")}
-            title="Fullscreen"
-            className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-[rgba(255,255,255,0.07)] text-[var(--text-2)] hover:text-[var(--text-0)] transition-colors text-sm"
-          >
-            ⤢
-          </button>
-          <button
-            onClick={() => setState("minimized")}
-            title="Minimize (Esc)"
-            className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-[rgba(255,255,255,0.07)] text-[var(--text-2)] hover:text-[var(--text-0)] transition-colors text-sm"
-          >
-            ✕
-          </button>
+          <button onClick={() => setState("fullscreen")} title="Fullscreen"
+            className="w-7 h-7 flex items-center justify-center rounded-md transition-colors text-sm"
+            style={{ color: "var(--text-tertiary)" }}>⤢</button>
+          <button onClick={() => setState("minimized")} title="Minimize (Esc)"
+            className="w-7 h-7 flex items-center justify-center rounded-md transition-colors text-sm"
+            style={{ color: "var(--text-tertiary)" }}>✕</button>
         </div>
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-3">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full gap-2 text-[var(--text-3)]">
+          <div className="flex flex-col items-center justify-center h-full gap-2" style={{ color: "var(--text-tertiary)" }}>
             <span className="text-3xl opacity-40">{emotionIcon(emotion)}</span>
             <span className="text-xs">Say something...</span>
           </div>

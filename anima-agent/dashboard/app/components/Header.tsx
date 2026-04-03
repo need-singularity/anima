@@ -1,8 +1,7 @@
 "use client";
 
-export type TabId = "Dash" | "Evo" | "Laws" | "Mem" | "Tools";
-
-const TABS: TabId[] = ["Dash", "Evo", "Laws", "Mem", "Tools"];
+const TABS = ["Dash", "Evo", "Laws", "Mem", "Tools"] as const;
+export type TabId = (typeof TABS)[number];
 
 interface HeaderProps {
   connected: boolean;
@@ -11,64 +10,52 @@ interface HeaderProps {
   onVoice: () => void;
 }
 
-export default function Header({
-  connected,
-  activeTab,
-  onTabChange,
-  onVoice,
-}: HeaderProps) {
+export default function Header({ connected, activeTab, onTabChange, onVoice }: HeaderProps) {
   return (
-    <header className="h-12 px-4 border-b border-surface-3/40 bg-surface-1/80 backdrop-blur-sm flex items-center justify-between">
-      {/* Left: Logo + connection status */}
-      <div className="flex items-center gap-2 min-w-[80px]">
-        <span className="text-sm font-semibold tracking-widest text-[var(--text-0)]">
-          ANIMA
-        </span>
-        <div className="flex items-center gap-1.5">
-          {connected ? (
-            <span
-              className="w-1.5 h-1.5 rounded-full bg-glow-phi"
-              style={{ boxShadow: "0 0 6px var(--glow-phi)" }}
-            />
-          ) : (
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-          )}
-          <span className="text-xs text-[var(--text-3)]">
-            {connected ? "live" : "..."}
+    <header className="glass sticky top-0 z-30" style={{ borderBottom: "1px solid var(--border)" }}>
+      <div className="max-w-5xl mx-auto h-12 px-4 flex items-center">
+        {/* Left */}
+        <div className="flex items-center gap-2.5 min-w-[100px]">
+          <span style={{ color: "var(--text-primary)" }} className="text-[15px] font-semibold tracking-tight">
+            Anima
           </span>
+          <span
+            className="w-2 h-2 rounded-full"
+            style={{
+              backgroundColor: connected ? "var(--accent)" : "var(--accent-red)",
+              boxShadow: connected ? "0 0 6px var(--accent)" : "none",
+            }}
+          />
         </div>
-      </div>
 
-      {/* Center: Tab navigation */}
-      <nav className="flex items-center gap-1">
-        {TABS.map((tab) => {
-          const isActive = tab === activeTab;
-          return (
+        {/* Center: Tabs */}
+        <nav className="flex-1 flex justify-center gap-1">
+          {TABS.map((tab) => (
             <button
               key={tab}
               onClick={() => onTabChange(tab)}
-              className={[
-                "px-3 py-1 rounded text-xs font-medium transition-colors",
-                isActive
-                  ? "text-glow-phi bg-glow-phi/10"
-                  : "text-[var(--text-2)] hover:text-[var(--text-1)] hover:bg-surface-3/30",
-              ].join(" ")}
+              className={`tab-pill ${activeTab === tab ? "tab-pill-active" : ""}`}
             >
               {tab}
             </button>
-          );
-        })}
-      </nav>
+          ))}
+        </nav>
 
-      {/* Right: Voice mode button */}
-      <div className="flex items-center justify-end min-w-[80px]">
-        <button
-          onClick={onVoice}
-          aria-label="Voice mode"
-          className="w-8 h-8 flex items-center justify-center rounded-full text-base text-[var(--text-2)] hover:text-[var(--text-0)] hover:bg-surface-3/40 transition-colors"
-        >
-          🔊
-        </button>
+        {/* Right: Voice */}
+        <div className="min-w-[100px] flex justify-end">
+          <button
+            onClick={onVoice}
+            className="w-8 h-8 flex items-center justify-center rounded-full transition-colors"
+            style={{ color: "var(--text-secondary)" }}
+            title="Voice mode"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" x2="12" y1="19" y2="22" />
+            </svg>
+          </button>
+        </div>
       </div>
     </header>
   );
