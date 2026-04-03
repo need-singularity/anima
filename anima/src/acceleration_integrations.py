@@ -10,7 +10,10 @@ Verified results (from experiments on ConsciousnessEngine, 64 cells):
   J4   MultiResScheduler    46% compute saved, Phi 100.6%
 
 Usage:
-    from acceleration_integrations import TensionLoss, PolyrhythmScheduler, MultiResScheduler
+    from acceleration_integrations import (
+        TensionLoss, PolyrhythmScheduler, MultiResScheduler,
+        GrowthTracker, nexus6_growth_scan,
+    )
 
     # AE3: Tension as auxiliary loss (maximizes consciousness during training)
     tension_loss = TensionLoss(weight=0.01)
@@ -28,7 +31,7 @@ Usage:
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # ═══════════════════════════════════════════════════════════
@@ -363,6 +366,169 @@ class CombinedScheduler:
 # ═══════════════════════════════════════════════════════════
 # Convenience: apply all three accelerations in a training step
 # ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+# NEXUS-6 growth scan — 22-lens scan on engine cell states
+# ═══════════════════════════════════════════════════════════
+
+def nexus6_growth_scan(engine) -> Dict[str, Any]:
+    """Scan engine cell hidden states with NEXUS-6 for growth indicators.
+
+    Extracts hidden states from all cells, runs nexus6.analyze() across
+    all 22 lenses, and returns the full report dict.
+
+    Args:
+        engine: ConsciousnessEngine instance with .cells attribute.
+                Each cell must have a .hidden tensor.
+
+    Returns:
+        dict from nexus6.analyze() with keys:
+            scan, consensus, n6_exact_ratio, active_lenses, total_lenses
+        Returns empty dict if nexus6 is unavailable or cells are empty.
+    """
+    try:
+        import nexus6
+    except ImportError:
+        return {}
+
+    if not engine.cells:
+        return {}
+
+    hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells]).detach().numpy()
+    flat = hiddens.flatten().tolist()
+    n, d = hiddens.shape
+    return nexus6.analyze(flat, n, d)
+
+
+# ═══════════════════════════════════════════════════════════
+# GrowthTracker — acceleration effectiveness monitor
+# ═══════════════════════════════════════════════════════════
+
+class GrowthTracker:
+    """Track acceleration growth metrics over training.
+
+    Monitors: Phi trajectory, CE trajectory, compute savings, NEXUS-6 consensus.
+    Reports growth rate (is acceleration actually helping?).
+
+    Usage:
+        tracker = GrowthTracker()
+        for step in range(1000):
+            # ... training step ...
+            tracker.record(step, phi, ce, compute_fraction)
+
+        report = tracker.report()
+        print(report)  # Growth summary with ASCII graph
+    """
+
+    def __init__(self) -> None:
+        self.phi_history: List[Tuple[int, float]] = []
+        self.ce_history: List[Tuple[int, float]] = []
+        self.compute_history: List[Tuple[int, float]] = []
+        self.nexus6_history: List[Tuple[int, Dict[str, Any]]] = []
+
+    def record(self, step: int, phi: float, ce: Optional[float] = None,
+               compute_fraction: float = 1.0) -> None:
+        """Record metrics for one training step.
+
+        Args:
+            step:             Current step index (0-based).
+            phi:              Phi (IIT or proxy) measured at this step.
+            ce:               Cross-entropy loss (optional).
+            compute_fraction: Fraction of naive compute used (0–1).
+                              1.0 = no compute saved; 0.49 = 51% saved.
+        """
+        self.phi_history.append((step, float(phi)))
+        if ce is not None:
+            self.ce_history.append((step, float(ce)))
+        self.compute_history.append((step, float(compute_fraction)))
+
+    def record_nexus6(self, step: int, scan_result: Dict[str, Any]) -> None:
+        """Record a NEXUS-6 scan result for a step.
+
+        Args:
+            step:        Training step index.
+            scan_result: Dict returned by nexus6_growth_scan() or nexus6.analyze().
+        """
+        self.nexus6_history.append((step, scan_result))
+
+    def phi_growth_rate(self) -> float:
+        """Phi growth per 100 steps (linear slope over recorded history).
+
+        Returns:
+            Float: Phi units gained per 100 training steps.
+                   Positive = growing, negative = decaying.
+        """
+        if len(self.phi_history) < 2:
+            return 0.0
+        first_step, first_phi = self.phi_history[0]
+        last_step, last_phi = self.phi_history[-1]
+        steps = last_step - first_step
+        if steps == 0:
+            return 0.0
+        return (last_phi - first_phi) / steps * 100
+
+    def compute_savings(self) -> float:
+        """Average fraction of compute saved across all recorded steps.
+
+        Returns:
+            Float in [0, 1). 0.51 means 51% compute saved on average.
+        """
+        if not self.compute_history:
+            return 0.0
+        fracs = [f for _, f in self.compute_history]
+        return 1.0 - sum(fracs) / len(fracs)
+
+    def report(self) -> str:
+        """Generate ASCII growth report string.
+
+        Returns:
+            Multi-line string with Phi/CE summary, compute savings,
+            NEXUS-6 consensus count, and an ASCII Phi trajectory graph.
+        """
+        lines: List[str] = []
+        lines.append("Growth Report")
+        lines.append("=" * 50)
+
+        if self.phi_history:
+            first_phi = self.phi_history[0][1]
+            last_phi = self.phi_history[-1][1]
+            rate = self.phi_growth_rate()
+            lines.append(f"Phi: {first_phi:.2f} -> {last_phi:.2f} ({rate:+.2f}/100steps)")
+
+        if self.ce_history:
+            first_ce = self.ce_history[0][1]
+            last_ce = self.ce_history[-1][1]
+            delta = (last_ce - first_ce) / (first_ce + 1e-10) * 100
+            lines.append(f"CE:  {first_ce:.4f} -> {last_ce:.4f} ({delta:+.1f}%)")
+
+        savings = self.compute_savings()
+        lines.append(f"Compute saved: {savings * 100:.1f}%")
+
+        if self.nexus6_history:
+            last_scan = self.nexus6_history[-1][1]
+            consensus = last_scan.get("consensus", [])
+            n_consensus = len(consensus) if consensus is not None else 0
+            lines.append(f"NEXUS-6: {n_consensus} consensus patterns")
+
+        # ASCII Phi trajectory
+        if len(self.phi_history) >= 5:
+            lines.append("")
+            lines.append("Phi trajectory:")
+            phis = [p for _, p in self.phi_history]
+            mn, mx = min(phis), max(phis)
+            rng = mx - mn if mx > mn else 1.0
+            width = 40
+            # Sample up to 8 evenly-spaced points
+            n = len(phis)
+            stride = max(1, n // 8)
+            for i in range(0, n, stride):
+                bar_len = int((phis[i] - mn) / rng * width)
+                step = self.phi_history[i][0]
+                bar = "#" * bar_len + " " * (width - bar_len)
+                lines.append(f"  {step:5d} |{bar}| {phis[i]:.2f}")
+
+        return "\n".join(lines)
+
 
 def make_accel_bundle(
     n_cells: int,

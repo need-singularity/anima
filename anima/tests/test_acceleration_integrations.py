@@ -18,6 +18,8 @@ from acceleration_integrations import (
     PolyrhythmScheduler,
     MultiResScheduler,
     CombinedScheduler,
+    GrowthTracker,
+    nexus6_growth_scan,
     make_accel_bundle,
 )
 
@@ -396,6 +398,184 @@ class TestComputeSavings(unittest.TestCase):
         frac = mr.compute_fraction(n)
         saved = mr.compute_saved(n)
         self.assertAlmostEqual(frac + saved, 1.0, places=6)
+
+
+# ── GrowthTracker ─────────────────────────────────────────────────────────────
+
+class TestGrowthTracker(unittest.TestCase):
+
+    def test_record_stores_phi(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0)
+        tracker.record(10, phi=1.5)
+        self.assertEqual(len(tracker.phi_history), 2)
+        self.assertEqual(tracker.phi_history[0], (0, 1.0))
+        self.assertEqual(tracker.phi_history[1], (10, 1.5))
+
+    def test_record_stores_ce_when_provided(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0, ce=2.5)
+        tracker.record(10, phi=1.5)  # no CE
+        self.assertEqual(len(tracker.ce_history), 1)
+        self.assertEqual(tracker.ce_history[0], (0, 2.5))
+
+    def test_record_stores_compute_fraction(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0, compute_fraction=0.5)
+        self.assertEqual(tracker.compute_history[0], (0, 0.5))
+
+    def test_phi_growth_rate_positive_growth(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0)
+        tracker.record(100, phi=2.0)
+        # +1.0 Phi over 100 steps → +1.0 per 100 steps
+        self.assertAlmostEqual(tracker.phi_growth_rate(), 1.0, places=5)
+
+    def test_phi_growth_rate_negative_growth(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=2.0)
+        tracker.record(50, phi=1.0)
+        # -1.0 over 50 steps → -2.0 per 100 steps
+        self.assertAlmostEqual(tracker.phi_growth_rate(), -2.0, places=5)
+
+    def test_phi_growth_rate_single_point_returns_zero(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.5)
+        self.assertEqual(tracker.phi_growth_rate(), 0.0)
+
+    def test_phi_growth_rate_empty_returns_zero(self):
+        tracker = GrowthTracker()
+        self.assertEqual(tracker.phi_growth_rate(), 0.0)
+
+    def test_compute_savings_full_compute(self):
+        tracker = GrowthTracker()
+        for step in range(10):
+            tracker.record(step, phi=1.0, compute_fraction=1.0)
+        self.assertAlmostEqual(tracker.compute_savings(), 0.0, places=6)
+
+    def test_compute_savings_half_compute(self):
+        tracker = GrowthTracker()
+        for step in range(10):
+            tracker.record(step, phi=1.0, compute_fraction=0.49)
+        self.assertAlmostEqual(tracker.compute_savings(), 0.51, places=5)
+
+    def test_compute_savings_empty_returns_zero(self):
+        tracker = GrowthTracker()
+        self.assertEqual(tracker.compute_savings(), 0.0)
+
+    def test_report_returns_string(self):
+        tracker = GrowthTracker()
+        for step in range(10):
+            tracker.record(step, phi=float(step), ce=2.0 - step * 0.01,
+                           compute_fraction=0.5)
+        report = tracker.report()
+        self.assertIsInstance(report, str)
+        self.assertIn("Growth Report", report)
+        self.assertIn("Phi:", report)
+        self.assertIn("CE:", report)
+        self.assertIn("Compute saved:", report)
+
+    def test_report_includes_ascii_graph_when_enough_points(self):
+        tracker = GrowthTracker()
+        for step in range(20):
+            tracker.record(step, phi=float(step))
+        report = tracker.report()
+        self.assertIn("Phi trajectory:", report)
+        self.assertIn("#", report)
+
+    def test_report_no_ce_history(self):
+        """report() must not crash if no CE was recorded."""
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0)
+        tracker.record(100, phi=2.0)
+        report = tracker.report()
+        self.assertNotIn("CE:", report)
+
+    def test_record_nexus6(self):
+        tracker = GrowthTracker()
+        fake_scan = {"consensus": [object(), object()], "active_lenses": 22}
+        tracker.record_nexus6(step=50, scan_result=fake_scan)
+        self.assertEqual(len(tracker.nexus6_history), 1)
+        self.assertEqual(tracker.nexus6_history[0][0], 50)
+
+    def test_report_includes_nexus6_when_recorded(self):
+        tracker = GrowthTracker()
+        tracker.record(0, phi=1.0)
+        # Fake scan result with consensus list
+        class FakeConsensus:
+            pass
+        fake_scan = {"consensus": [FakeConsensus(), FakeConsensus()], "active_lenses": 22}
+        tracker.record_nexus6(0, fake_scan)
+        report = tracker.report()
+        self.assertIn("NEXUS-6", report)
+        self.assertIn("2 consensus patterns", report)
+
+
+# ── nexus6_growth_scan ────────────────────────────────────────────────────────
+
+class TestNexus6GrowthScan(unittest.TestCase):
+
+    def _make_engine_with_cells(self, n_cells: int = 4, hidden_dim: int = 8):
+        """Minimal engine stub with .cells having .hidden tensors."""
+        class FakeCell:
+            def __init__(self):
+                self.hidden = torch.randn(1, hidden_dim)
+
+        class FakeEngine:
+            def __init__(self):
+                self.cells = [FakeCell() for _ in range(n_cells)]
+
+        return FakeEngine()
+
+    def test_returns_dict(self):
+        engine = self._make_engine_with_cells()
+        result = nexus6_growth_scan(engine)
+        self.assertIsInstance(result, dict)
+
+    def test_empty_cells_returns_empty_dict(self):
+        class FakeEngine:
+            cells = []
+
+        result = nexus6_growth_scan(FakeEngine())
+        self.assertEqual(result, {})
+
+    def test_no_crash_on_real_engine_shape(self):
+        """If nexus6 is available, scan should complete without error."""
+        engine = self._make_engine_with_cells(n_cells=8, hidden_dim=16)
+        try:
+            result = nexus6_growth_scan(engine)
+            # If nexus6 available, should return non-empty dict
+            # If not available, returns {}
+            self.assertIsInstance(result, dict)
+        except Exception as e:
+            self.fail(f"nexus6_growth_scan raised unexpectedly: {e}")
+
+
+# ── nexus6_verify in batch runner ─────────────────────────────────────────────
+
+class TestNexus6VerifyInBatchRunner(unittest.TestCase):
+
+    def test_evaluate_hypothesis_includes_nexus6_key(self):
+        """evaluate_hypothesis result must always include 'nexus6' key."""
+        import sys
+        import os
+        _src = os.path.join(os.path.dirname(__file__), '..', 'src')
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+
+        from accel_batch_runner import evaluate_hypothesis
+
+        fake_hyp = {
+            "id": "TEST1",
+            "name": "Test hypothesis",
+            "description": "do nothing",
+            "series": "TEST",
+            "stage": "brainstorm",
+        }
+        result = evaluate_hypothesis(fake_hyp, n_cells=4, n_steps=5, n_repeats=1)
+        self.assertIn("nexus6", result,
+                      "evaluate_hypothesis result must contain 'nexus6' key")
+        self.assertIsInstance(result["nexus6"], dict)
 
 
 if __name__ == '__main__':

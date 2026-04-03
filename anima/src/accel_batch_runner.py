@@ -59,6 +59,63 @@ BATCH_SIZE = 50
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NEXUS-6 verification — scan engine states after evaluation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def nexus6_verify(engine: ConsciousnessEngine) -> Dict:
+    """Run NEXUS-6 scan on engine cell hidden states after evaluation.
+
+    Extracts hidden vectors from all cells, runs nexus6.analyze() across
+    all available lenses, and returns a compact summary dict suitable for
+    embedding in hypothesis evaluation results.
+
+    Args:
+        engine: ConsciousnessEngine instance whose cells have been stepped.
+
+    Returns:
+        dict with keys:
+            lenses (int):          Number of active lenses in the scan.
+            consensus_count (int): Number of consensus patterns found.
+            patterns (list):       Top patterns with pattern_id, agreeing_lenses,
+                                   weighted_score, level.
+            n6_exact (float):      Fraction of metrics matching n=6 exactly.
+        Returns empty dict if nexus6 is unavailable or engine has no cells.
+    """
+    try:
+        import nexus6
+    except ImportError:
+        return {}
+
+    if not hasattr(engine, "cells") or not engine.cells:
+        return {}
+
+    try:
+        hiddens = torch.stack([c.hidden.squeeze() for c in engine.cells]).detach().numpy()
+        n, d = hiddens.shape
+        flat = hiddens.flatten().tolist()
+
+        report = nexus6.analyze(flat, n, d)
+        consensus = report.get("consensus", []) or []
+
+        return {
+            "lenses": report.get("active_lenses", 0),
+            "consensus_count": len(consensus),
+            "patterns": [
+                {
+                    "pattern": c.pattern_id,
+                    "lenses": c.agreeing_lenses,
+                    "score": c.weighted_score,
+                    "level": c.level,
+                }
+                for c in consensus
+            ],
+            "n6_exact": report.get("n6_exact_ratio", 0.0),
+        }
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Phi measurement (fast proxy — avoids engine's heavy _measure_phi_iit)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -182,6 +239,7 @@ def evaluate_hypothesis(
                     "phi_runs": [],
                     "mapped_template": None,
                     "elapsed_sec": time.time() - t0,
+                    "nexus6": {},
                 }
 
         # Remaining unmapped: run as null intervention (null baseline)
@@ -198,6 +256,7 @@ def evaluate_hypothesis(
 
     # 3. Run n_repeats evaluations
     phi_means = []
+    _last_engine = None  # keep final engine for NEXUS-6 scan
     for repeat in range(n_repeats):
         torch.manual_seed(42 + repeat)
         np.random.seed(42 + repeat)
@@ -217,6 +276,7 @@ def evaluate_hypothesis(
             phi_history.append(phi)
 
         phi_means.append(float(np.mean(phi_history)))
+        _last_engine = engine  # retain for post-eval NEXUS-6 scan
 
     # 4. Compute retention and CV
     phi_arr = np.array(phi_means)
@@ -253,6 +313,9 @@ def evaluate_hypothesis(
         verdict = "VERIFIED"
         reason = f"retention={avg_retention:.1f}% in [90%, 95%)"
 
+    # 6. NEXUS-6 scan on final engine state
+    nexus6_result = nexus6_verify(_last_engine) if _last_engine is not None else {}
+
     return {
         "id": hyp_id,
         "name": hyp_name,
@@ -265,6 +328,7 @@ def evaluate_hypothesis(
         "phi_runs": phi_means,
         "mapped_template": intervention.name,
         "elapsed_sec": time.time() - t0,
+        "nexus6": nexus6_result,
     }
 
 
