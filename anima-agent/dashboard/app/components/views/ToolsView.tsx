@@ -1,23 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { ConsciousnessState } from "../../../hooks/useWebSocket";
 
 const API_URL = "http://localhost:8770";
-
-// Inline type matching the ConsciousnessState shape from page.tsx
-interface ConsciousnessState {
-  phi: number;
-  tension: number;
-  curiosity: number;
-  emotion: string;
-  cells: number;
-  factions: number;
-  growth_stage: string;
-  interaction_count: number;
-  uptime_seconds: number;
-  consciousness_vector: Record<string, number>;
-  level: string;
-}
 
 interface ToolInfo {
   name: string;

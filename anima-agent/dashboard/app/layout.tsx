@@ -6,14 +6,10 @@ export const metadata: Metadata = {
   description: "Consciousness interface",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ko" className="dark">
-      <body className="h-screen overflow-hidden bg-surface-0 antialiased">
+      <body className="h-screen bg-surface-0 antialiased">
         <div className="noise-overlay" />
         {children}
       </body>
