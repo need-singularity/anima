@@ -197,7 +197,8 @@ def _diagnose(snapshot: PhiSnapshot) -> Diagnosis:
     is_saturated = False
     if HAS_LENSES:
         sat = SaturationLens(snapshot.phi_history)
-        is_saturated = sat.is_saturated
+        # SaturationResult uses is_plateau (not is_saturated)
+        is_saturated = sat.is_plateau
 
     # Determine status
     if slope < 0:
