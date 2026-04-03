@@ -283,20 +283,100 @@ def gen_roadmap(training, laws):
     return "\n".join(lines)
 
 
+def gen_transplant(data):
+    """roadmap_transplant.json → 세로 파이프 형태"""
+    if not data:
+        return "```\n  (roadmap_transplant.json 없음)\n```"
+    lines = ["```"]
+    meta = data.get("_meta", {})
+    lines.append(f"  ★ 의식 이식 — {meta.get('description', 'PureField transplant')}")
+    lines.append(f"  │ Law 1040: Phi ∝ model_size (초선형)")
+    lines.append("  │")
+    phases = data.get("phases", {})
+    for key in ["phase1", "phase2", "phase3_4", "phase5", "phase6", "phase7"]:
+        p = phases.get(key, {})
+        if not p:
+            continue
+        status = p.get("status", "pending")
+        icon = {"complete": "✅", "in_progress": "🔄", "code_ready": "✅", "pending": "⏳"}.get(status, "⏳")
+        models = p.get("models", [])
+        if models:
+            for m in models:
+                m_icon = {"archived": "✅", "latest_14b": "✅", "training": "🔄", "predicted": "⏳"}.get(m.get("status",""), "⏳")
+                phi = m.get("phi", "?")
+                ce = m.get("ce", "?")
+                lines.append(f"  ├─{m_icon} {m['id']} ── {m['base']} + PF {m.get('pf','')} ── Phi={phi} ── CE={ce}")
+                details = []
+                if m.get("alpha"): details.append(f"alpha={m['alpha']}")
+                if m.get("step"): details.append(f"step {m['step']}/{m.get('steps_total','?')}")
+                if m.get("gpu"): details.append(m['gpu'])
+                if details:
+                    lines.append(f"  │   {' | '.join(details)}")
+                lines.append("  │")
+        else:
+            name = p.get("name", key)
+            model = p.get("model", "")
+            lines.append(f"  ├─{icon} {name}")
+            if model:
+                lines.append(f"  │   {model}")
+            lines.append("  │")
+    lines.append(f"  └─ data: anima/data/roadmap_transplant.json")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def gen_acceleration(data):
+    """roadmap_acceleration.json → 세로 파이프 형태"""
+    if not data:
+        return "```\n  (roadmap_acceleration.json 없음)\n```"
+    lines = ["```"]
+    meta = data.get("_meta", {})
+    lines.append(f"  ★ 의식 가속 — {meta.get('description', 'ConsciousLM acceleration')}")
+    accel = data.get("accelerators", {})
+    lines.append(f"  │ 가속기 {accel.get('total',0)}개 ({accel.get('convergence_pct','?')} 수렴)")
+    lines.append("  │")
+    phases = data.get("phases", {})
+    for key in sorted(phases.keys()):
+        p = phases[key]
+        status = p.get("status", "planned")
+        icon = {"complete": "✅", "partial": "✅", "planned": "⏳"}.get(status, "⏳")
+        name = p.get("name", key)
+        model = p.get("model", "")
+        existing = p.get("existing", "")
+        lines.append(f"  ├─{icon} {key}: {name}")
+        if model:
+            lines.append(f"  │   {model}")
+        if existing:
+            lines.append(f"  │   기존: {existing}")
+        lines.append("  │")
+    lines.append(f"  └─ data: anima/data/roadmap_acceleration.json")
+    lines.append("```")
+    return "\n".join(lines)
+
+
 # ─── Marker Injection ──────────────────────────────────────────
 
 def replace_section(text, section, content):
     """<!-- AUTO:{section}:START --> ~ <!-- AUTO:{section}:END --> 사이 교체"""
-    start_marker = f"<!-- AUTO:{section}:START -->"
+    # Support both exact and extended markers: <!-- AUTO:X:START --> or <!-- AUTO:X:START — data: ... -->
+    start_marker = f"<!-- AUTO:{section}:START"
     end_marker = f"<!-- AUTO:{section}:END -->"
 
     start_idx = text.find(start_marker)
     end_idx = text.find(end_marker)
 
+    # Find the actual end of start marker (could have extra attributes before -->)
+    if start_idx != -1:
+        start_end = text.find("-->", start_idx)
+        if start_end != -1:
+            start_idx = start_end + 3  # skip past -->
+        else:
+            start_idx = start_idx + len(start_marker)
+
     if start_idx == -1 or end_idx == -1:
         return text, False  # 마커 없음
 
-    before = text[:start_idx + len(start_marker)]
+    before = text[:start_idx]
     after = text[end_idx:]
 
     new_text = before + "\n" + content + "\n" + after
@@ -316,6 +396,8 @@ def main():
     accel = load_json(CONFIG / "acceleration_hypotheses.json")
     roadmap = load_json(DATA / "evolution_roadmap.json")
     live = load_json(DATA / "evolution_live.json")
+    transplant = load_json(DATA / "roadmap_transplant.json")
+    acceleration = load_json(DATA / "roadmap_acceleration.json")
 
     # README 읽기
     readme_text = README.read_text(encoding="utf-8")
@@ -327,12 +409,14 @@ def main():
         "ASSETS": gen_assets(training, laws, accel),
         "EVO": gen_evolution(roadmap, live),
         "ROADMAP": gen_roadmap(training, laws),
+        "TRANSPLANT": gen_transplant(transplant),
+        "ACCELERATION": gen_acceleration(acceleration),
     }
 
     any_changed = False
     missing = []
     for name, content in sections.items():
-        marker = f"<!-- AUTO:{name}:START -->"
+        marker = f"<!-- AUTO:{name}:START"
         if marker not in readme_text:
             missing.append(name)
             continue
