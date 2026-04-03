@@ -235,6 +235,14 @@ class ConsciousnessHub:
             'infinite_evolution': ('infinite_evolution', 'InfiniteEvolution',
                              ['무한 진화', 'infinite evolution', '자기 진화', 'self-evolution',
                               '무한 루프', 'infinite loop', 'Law 146', '닫힌 원']),
+            'multiscale':   ('multiscale_consciousness', 'MultiscaleHierarchy',
+                             ['멀티스케일', 'multiscale', '계층', 'hierarchy',
+                              '셀 파이', 'cell phi', '파벌 파이', 'faction phi',
+                              '4단계', '4 level', '창발 계층', 'emergence hierarchy']),
+            'emotion_explorer': ('emotion_explorer', 'EmotionExplorer',
+                             ['감정 탐색', 'emotion explorer', '호기심', 'curiosity',
+                              '탐색 방향', 'explore direction', '예측 오차', 'prediction error',
+                              '호기심 탐색', 'curiosity driven', 'pe map', 'curiosity map']),
         }
 
         if not lazy_load:
