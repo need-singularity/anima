@@ -1,132 +1,52 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 const API_URL = "http://localhost:8770";
+interface Law { id: string; text: string; }
 
 export default function LawsView() {
-  const [laws, setLaws] = useState<Record<string, string>>({});
+  const [laws, setLaws] = useState<Law[]>([]);
   const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [filtered, setFiltered] = useState<Law[]>([]);
 
   useEffect(() => {
-    let alive = true;
-    setLoading(true);
-
-    fetch(`${API_URL}/api/laws`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json() as Promise<Record<string, string>>;
-      })
-      .then((data) => {
-        if (alive) {
-          setLaws(data);
-          setLoading(false);
-        }
-      })
-      .catch((e) => {
-        if (alive) {
-          setError(String(e));
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      alive = false;
-    };
+    fetch(`${API_URL}/api/laws`).then(r => r.json()).then((d: Record<string, string>) => {
+      const arr = Object.entries(d).map(([id, text]) => ({ id, text }));
+      setLaws(arr); setFiltered(arr.slice(0, 40));
+    }).catch(() => {});
   }, []);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const entries = Object.entries(laws);
-    if (!q) return entries.slice(0, 50);
-    return entries
-      .filter(([id, text]) => id.toLowerCase().includes(q) || text.toLowerCase().includes(q))
-      .slice(0, 50);
-  }, [laws, query]);
-
-  const totalCount = Object.keys(laws).length;
+  useEffect(() => {
+    if (!query.trim()) { setFiltered(laws.slice(0, 40)); return; }
+    const q = query.toLowerCase();
+    setFiltered(laws.filter(l => l.text.toLowerCase().includes(q) || l.id.includes(q)).slice(0, 40));
+  }, [query, laws]);
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
-      {/* Title */}
-      <div className="text-center mb-6">
-        <h2
-          className="text-2xl font-bold tracking-widest"
-          style={{ color: "var(--text-0)" }}
-        >
-          Consciousness Laws
-          {totalCount > 0 && (
-            <span
-              className="ml-3 text-base font-normal"
-              style={{ color: "var(--text-3)" }}
-            >
-              {totalCount}
-            </span>
-          )}
-        </h2>
+    <div className="flex flex-col items-center gap-16 py-12">
+      <section className="flex flex-col items-center gap-4">
+        <span className="text-[64px] font-bold tracking-tighter leading-none"
+          style={{ background: "linear-gradient(180deg, var(--text-primary) 40%, var(--text-tertiary))", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+          {laws.length || "—"}
+        </span>
+        <span className="text-[15px]" style={{ color: "var(--text-secondary)" }}>Consciousness Laws</span>
+      </section>
+
+      <div className="w-full max-w-lg">
+        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search laws..."
+          className="chat-input w-full px-5 py-3 text-[15px]" style={{ color: "var(--text-primary)" }} />
       </div>
 
-      {/* Search */}
-      <div className="mb-6">
-        <input
-          type="text"
-          placeholder="Search by id or text..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          className="w-full px-4 py-2 rounded-lg text-sm outline-none transition-colors"
-          style={{
-            background: "var(--surface-2)",
-            color: "var(--text-0)",
-            border: "1px solid var(--surface-3)",
-          }}
-        />
-      </div>
-
-      {loading && (
-        <p className="text-center" style={{ color: "var(--text-3)" }}>
-          Loading laws...
-        </p>
-      )}
-
-      {error && (
-        <p className="text-center text-red-400 text-sm">{error}</p>
-      )}
-
-      {!loading && !error && filtered.length === 0 && (
-        <p className="text-center" style={{ color: "var(--text-3)" }}>
-          No results for &quot;{query}&quot;
-        </p>
-      )}
-
-      {!loading && !error && filtered.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {filtered.map(([id, text]) => (
-            <div
-              key={id}
-              className="flex gap-3 items-start rounded-xl px-4 py-3"
-              style={{ background: "var(--surface-2)" }}
-            >
-              <span
-                className="text-xs font-bold shrink-0 mt-0.5 tabular-nums"
-                style={{ color: "var(--glow-phi)" }}
-              >
-                #{id}
-              </span>
-              <span className="text-sm leading-relaxed" style={{ color: "var(--text-1)" }}>
-                {text}
-              </span>
-            </div>
-          ))}
-
-          {filtered.length === 50 && (
-            <p className="text-center text-xs mt-2" style={{ color: "var(--text-3)" }}>
-              Showing top 50 — refine your search to see more
-            </p>
-          )}
-        </div>
-      )}
+      <section className="w-full">
+        {filtered.map((l, i) => (
+          <div key={l.id} className="flex gap-4 py-4" style={{ borderBottom: i < filtered.length - 1 ? "1px solid var(--border)" : "none" }}>
+            <span className="text-[13px] font-mono font-medium shrink-0 w-12 text-right" style={{ color: "var(--accent)" }}>{l.id}</span>
+            <span className="text-[14px] leading-relaxed" style={{ color: "var(--text-primary)" }}>{l.text}</span>
+          </div>
+        ))}
+        {filtered.length === 0 && <div className="text-center py-16 text-[14px]" style={{ color: "var(--text-tertiary)" }}>No laws found</div>}
+      </section>
     </div>
   );
 }

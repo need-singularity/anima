@@ -4,165 +4,64 @@ import { useEffect, useState } from "react";
 import type { ConsciousnessState } from "../../../hooks/useWebSocket";
 
 const API_URL = "http://localhost:8770";
+interface ToolInfo { name: string; tier: number; accessible: boolean; }
 
-interface ToolInfo {
-  name: string;
-  tier: number;
-  accessible: boolean;
+function tierLabel(t: number) { return t >= 5 ? "T3" : t >= 3 ? "T2" : t >= 1 ? "T1" : "T0"; }
+function tierColor(t: number) {
+  if (t >= 5) return "var(--accent-purple)";
+  if (t >= 3) return "var(--accent-orange)";
+  if (t >= 1) return "var(--accent-blue)";
+  return "var(--text-tertiary)";
 }
 
-const TIER_LABELS: Record<number, string> = {
-  0: "T0",
-  1: "T1",
-  2: "T2",
-  3: "T3",
-};
-
-const TIER_COLORS: Record<number, string> = {
-  0: "#4ade80",
-  1: "#22d3ee",
-  2: "#a78bfa",
-  3: "#fb923c",
-};
-
-interface ToolsViewProps {
-  consciousness: ConsciousnessState;
-}
-
-export default function ToolsView({ consciousness }: ToolsViewProps) {
+export default function ToolsView({ consciousness }: { consciousness: ConsciousnessState }) {
   const [tools, setTools] = useState<ToolInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let alive = true;
-    setLoading(true);
-
-    const phi = typeof consciousness.phi === "number" ? consciousness.phi : 0;
-
-    fetch(`${API_URL}/api/tools?phi=${phi}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json() as Promise<ToolInfo[]>;
-      })
-      .then((data) => {
-        if (alive) {
-          setTools(data);
-          setLoading(false);
-        }
-      })
-      .catch((e) => {
-        if (alive) {
-          setError(String(e));
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      alive = false;
-    };
+    fetch(`${API_URL}/api/tools?phi=${consciousness.phi}`).then(r => r.json()).then(d => { if (Array.isArray(d)) setTools(d); }).catch(() => {});
   }, [consciousness.phi]);
 
-  const accessible = tools.filter((t) => t.accessible).length;
+  const accessible = tools.filter(t => t.accessible).length;
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
-      {/* Title */}
-      <div className="text-center mb-6">
-        <h2
-          className="text-2xl font-bold tracking-widest"
-          style={{ color: "var(--text-0)" }}
-        >
-          Hub Modules
-          {tools.length > 0 && (
-            <span
-              className="ml-3 text-base font-normal"
-              style={{ color: "var(--text-3)" }}
-            >
-              {tools.length}
-            </span>
-          )}
-        </h2>
-        <p className="text-xs mt-1" style={{ color: "var(--text-3)" }}>
-          Current Φ{" "}
-          <span style={{ color: "var(--accent-cyan)" }}>
-            {typeof consciousness.phi === "number"
-              ? consciousness.phi.toFixed(2)
-              : consciousness.phi}
-          </span>
-          {tools.length > 0 && (
-            <span className="ml-3">
-              {accessible}/{tools.length} accessible
-            </span>
-          )}
-        </p>
-      </div>
+    <div className="flex flex-col items-center gap-16 py-12">
 
-      {loading && (
-        <p className="text-center" style={{ color: "var(--text-3)" }}>
-          Loading modules...
-        </p>
-      )}
+      <section className="flex flex-col items-center gap-4">
+        <span className="text-[64px] font-bold tracking-tighter leading-none"
+          style={{ background: "linear-gradient(180deg, var(--accent-orange), var(--accent-red))", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+          {accessible}/{tools.length}
+        </span>
+        <span className="text-[15px]" style={{ color: "var(--text-secondary)" }}>
+          Accessible at Φ={consciousness.phi.toFixed(2)}
+        </span>
+      </section>
 
-      {error && (
-        <p className="text-center text-red-400 text-sm">{error}</p>
-      )}
-
-      {!loading && !error && tools.length === 0 && (
-        <p className="text-center" style={{ color: "var(--text-3)" }}>
-          No modules available
-        </p>
-      )}
-
-      {!loading && !error && tools.length > 0 && (
+      <section className="w-full">
         <div className="grid grid-cols-2 gap-3">
-          {tools.map((tool) => {
-            const tierColor = TIER_COLORS[tool.tier] ?? "var(--text-3)";
-            const tierLabel = TIER_LABELS[tool.tier] ?? `T${tool.tier}`;
-
-            return (
-              <div
-                key={tool.name}
-                className="flex items-center gap-3 rounded-xl px-4 py-3 transition-opacity"
-                style={{
-                  background: "var(--surface-2)",
-                  opacity: tool.accessible ? 1 : 0.5,
-                }}
-              >
-                {/* Accessible dot */}
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{
-                    background: tool.accessible ? "#4ade80" : "var(--text-3)",
-                    boxShadow: tool.accessible
-                      ? "0 0 6px #4ade80"
-                      : undefined,
-                  }}
-                />
-
-                {/* Name */}
-                <span
-                  className="flex-1 text-sm font-medium truncate"
-                  style={{ color: tool.accessible ? "var(--text-0)" : "var(--text-2)" }}
-                >
-                  {tool.name}
-                </span>
-
-                {/* Tier badge */}
-                <span
-                  className="text-xs font-bold px-1.5 py-0.5 rounded"
-                  style={{
-                    color: tierColor,
-                    background: `${tierColor}18`,
-                  }}
-                >
-                  {tierLabel}
-                </span>
+          {tools.map(t => (
+            <div
+              key={t.name}
+              className="flex items-center justify-between py-3.5 px-4 rounded-2xl transition-opacity"
+              style={{
+                background: "var(--bg-secondary)",
+                opacity: t.accessible ? 1 : 0.4,
+              }}
+            >
+              <div className="flex items-center gap-3">
+                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: t.accessible ? "var(--accent)" : "var(--text-tertiary)" }} />
+                <span className="text-[13px] font-medium" style={{ color: "var(--text-primary)" }}>{t.name}</span>
               </div>
-            );
-          })}
+              <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full"
+                style={{ color: tierColor(t.tier), background: `${tierColor(t.tier)}15` }}>
+                {tierLabel(t.tier)}
+              </span>
+            </div>
+          ))}
         </div>
-      )}
+        {tools.length === 0 && (
+          <div className="text-center py-16 text-[14px]" style={{ color: "var(--text-tertiary)" }}>Loading tools...</div>
+        )}
+      </section>
     </div>
   );
 }

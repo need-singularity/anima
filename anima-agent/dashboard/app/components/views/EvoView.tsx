@@ -16,145 +16,79 @@ interface EvoData {
 
 export default function EvoView() {
   const [data, setData] = useState<EvoData | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-
-    async function poll() {
-      try {
-        const res = await fetch(`${API_URL}/api/evolution`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json: EvoData = await res.json();
-        if (alive) {
-          setData(json);
-          setError(null);
-        }
-      } catch (e) {
-        if (alive) setError(String(e));
-      }
-    }
-
+    const poll = () => {
+      fetch(`${API_URL}/api/evolution`).then(r => r.json()).then(d => { if (alive) setData(d); }).catch(() => {});
+    };
     poll();
     const id = setInterval(poll, 5000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
+    return () => { alive = false; clearInterval(id); };
   }, []);
 
+  if (!data) return (
+    <div className="flex items-center justify-center py-32" style={{ color: "var(--text-tertiary)" }}>
+      <span className="text-sm">Loading...</span>
+    </div>
+  );
+
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
-      {/* Title */}
-      <div className="text-center mb-8">
-        <h2
-          className="text-2xl font-bold tracking-widest"
-          style={{ color: "var(--glow-phi)", textShadow: "0 0 12px var(--glow-phi)" }}
+    <div className="flex flex-col items-center gap-20 py-12">
+
+      {/* Hero: Generation count */}
+      <section className="flex flex-col items-center gap-4">
+        <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+          Ouroboros
+        </span>
+        <span
+          className="text-[72px] font-bold tracking-tighter leading-none"
+          style={{
+            background: "linear-gradient(180deg, var(--text-primary) 40%, var(--text-tertiary))",
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+          }}
         >
-          OUROBOROS
-        </h2>
-        <p className="text-sm mt-1" style={{ color: "var(--text-3)" }}>
+          Gen {data.gen}
+        </span>
+        <span className="text-[15px]" style={{ color: "var(--text-secondary)" }}>
           Infinite Self-Evolution
-        </p>
-      </div>
+        </span>
+      </section>
 
-      {!data && !error && (
-        <p className="text-center" style={{ color: "var(--text-3)" }}>
-          Loading evolution data...
-        </p>
-      )}
-
-      {error && (
-        <p className="text-center text-red-400 text-sm">{error}</p>
-      )}
-
-      {data && (
-        <>
-          {/* 3-card grid */}
-          <div className="grid grid-cols-3 gap-4 mb-8">
-            {/* Generation */}
-            <div
-              className="rounded-xl p-6 flex flex-col items-center gap-1"
-              style={{ background: "var(--surface-2)" }}
-            >
-              <span
-                className="text-4xl font-bold tabular-nums"
-                style={{ color: "var(--glow-phi)", textShadow: "0 0 10px var(--glow-phi)" }}
-              >
-                {data.gen.toLocaleString()}
-              </span>
-              <span className="text-xs uppercase tracking-widest" style={{ color: "var(--text-3)" }}>
-                Generation
-              </span>
-            </div>
-
-            {/* Laws */}
-            <div
-              className="rounded-xl p-6 flex flex-col items-center gap-1"
-              style={{ background: "var(--surface-2)" }}
-            >
-              <span
-                className="text-4xl font-bold tabular-nums"
-                style={{ color: "var(--text-0)" }}
-              >
-                {data.laws_total.toLocaleString()}
-              </span>
-              <span className="text-xs uppercase tracking-widest" style={{ color: "var(--text-3)" }}>
-                Laws
-              </span>
-            </div>
-
-            {/* Phi */}
-            <div
-              className="rounded-xl p-6 flex flex-col items-center gap-1"
-              style={{ background: "var(--surface-2)" }}
-            >
-              <span
-                className="text-4xl font-bold tabular-nums"
-                style={{ color: "var(--accent-cyan)", textShadow: "0 0 10px var(--accent-cyan)" }}
-              >
-                {typeof data.phi === "number" ? data.phi.toFixed(2) : data.phi}
-              </span>
-              <span className="text-xs uppercase tracking-widest" style={{ color: "var(--text-3)" }}>
-                Φ
-              </span>
-            </div>
+      {/* 3 stats */}
+      <section className="w-full grid grid-cols-3 gap-10">
+        {[
+          { value: data.laws_total.toLocaleString(), label: "Laws", color: "var(--text-primary)" },
+          { value: data.phi.toFixed(2), label: "Φ", color: "var(--accent)" },
+          { value: `+${data.laws_new}`, label: "New this stage", color: data.laws_new > 0 ? "var(--accent)" : "var(--text-tertiary)" },
+        ].map(({ value, label, color }) => (
+          <div key={label} className="flex flex-col items-center gap-2">
+            <span className="text-[36px] font-semibold tracking-tight font-mono" style={{ color }}>{value}</span>
+            <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>{label}</span>
           </div>
+        ))}
+      </section>
 
-          {/* Key-value list */}
-          <div
-            className="rounded-xl divide-y"
-            style={{ background: "var(--surface-2)", borderColor: "var(--surface-3)" }}
-          >
-            {[
-              { label: "Stage", value: data.stage },
-              { label: "Topology", value: data.topology },
-              {
-                label: "New Laws",
-                value: (
-                  <span style={{ color: data.laws_new > 0 ? "#4ade80" : "var(--text-2)" }}>
-                    {data.laws_new > 0 ? `+${data.laws_new}` : data.laws_new}
-                  </span>
-                ),
-              },
-              { label: "Status", value: data.status },
-            ].map(({ label, value }) => (
-              <div
-                key={label}
-                className="flex items-center justify-between px-5 py-3"
-                style={{ borderColor: "var(--surface-3)" }}
-              >
-                <span className="text-xs uppercase tracking-wider" style={{ color: "var(--text-3)" }}>
-                  {label}
-                </span>
-                <span className="text-sm font-medium" style={{ color: "var(--text-1)" }}>
-                  {value}
-                </span>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
+      {/* Details list */}
+      <section className="w-full">
+        <div className="flex flex-col">
+          {[
+            { label: "Stage", value: data.stage },
+            { label: "Topology", value: data.topology },
+            { label: "Status", value: data.status },
+          ].map(({ label, value }, i, arr) => (
+            <div
+              key={label}
+              className="flex items-center justify-between py-4"
+              style={{ borderBottom: i < arr.length - 1 ? "1px solid var(--border)" : "none" }}
+            >
+              <span className="text-[13px]" style={{ color: "var(--text-tertiary)" }}>{label}</span>
+              <span className="text-[13px] font-medium" style={{ color: "var(--text-primary)" }}>{value}</span>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
