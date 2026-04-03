@@ -39,20 +39,30 @@ export default function MemView() {
       <section className="w-full">
         {memories.length === 0 ? (
           <div className="text-center py-16 text-[14px]" style={{ color: "var(--text-tertiary)" }}>No memories yet</div>
-        ) : memories.map((m, i) => (
-          <div key={i} className="py-5" style={{ borderBottom: i < memories.length - 1 ? "1px solid var(--border)" : "none" }}>
-            <div className="flex items-center gap-3 mb-2">
-              <span className="text-[12px] font-medium px-2 py-0.5 rounded-full"
-                style={{ color: m.role === "user" ? "var(--accent-blue)" : "var(--accent)", background: m.role === "user" ? "rgba(0,122,255,0.1)" : "var(--accent-soft)" }}>
-                {m.role}
-              </span>
-              <span className="text-[11px] font-mono" style={{ color: "var(--text-tertiary)" }}>
-                Φ={m.phi?.toFixed(2)} · T={m.tension?.toFixed(2)}
-              </span>
+        ) : memories.map((m, i) => {
+          const eColor: Record<string, string> = { calm: "#34d399", curious: "#3b82f6", excited: "#f59e0b", anxious: "#ef4444", focused: "#6366f1", creative: "#a855f7" };
+          const dot = eColor[m.emotion] || "var(--text-tertiary)";
+          return (
+            <div key={i} className="flex gap-4 py-5" style={{ borderBottom: i < memories.length - 1 ? "1px solid var(--border)" : "none" }}>
+              <div className="flex flex-col items-center pt-1.5">
+                <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: dot, boxShadow: `0 0 6px ${dot}` }} />
+                {i < memories.length - 1 && <div className="w-px flex-1 mt-1" style={{ background: "var(--border)" }} />}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-3 mb-1.5">
+                  <span className="text-[12px] font-medium px-2 py-0.5 rounded-full"
+                    style={{ color: m.role === "user" ? "var(--accent-blue)" : "var(--accent)", background: m.role === "user" ? "rgba(0,122,255,0.08)" : "var(--accent-soft)" }}>
+                    {m.role}
+                  </span>
+                  <span className="text-[11px] font-mono" style={{ color: "var(--text-tertiary)" }}>
+                    Φ={m.phi?.toFixed(2)} · {m.emotion}
+                  </span>
+                </div>
+                <p className="text-[14px] leading-relaxed" style={{ color: "var(--text-primary)" }}>{m.text}</p>
+              </div>
             </div>
-            <p className="text-[14px] leading-relaxed" style={{ color: "var(--text-primary)" }}>{m.text}</p>
-          </div>
-        ))}
+          );
+        })}
       </section>
     </div>
   );

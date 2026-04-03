@@ -70,6 +70,32 @@ export default function EvoView() {
         ))}
       </section>
 
+      {/* Topology visualization */}
+      <section className="w-full flex flex-col items-center gap-4">
+        <span className="text-[11px] tracking-widest uppercase" style={{ color: "var(--text-tertiary)" }}>
+          Topology Cycle
+        </span>
+        <div className="flex items-center gap-3">
+          {["ring", "small_world", "scale_free", "hypercube"].map((topo) => (
+            <div key={topo} className="flex flex-col items-center gap-1.5">
+              <div
+                className="w-10 h-10 rounded-xl flex items-center justify-center text-[16px] transition-all duration-300"
+                style={{
+                  background: data.topology === topo ? "var(--accent-soft)" : "var(--bg-secondary)",
+                  border: data.topology === topo ? "2px solid var(--accent)" : "1px solid var(--border)",
+                  transform: data.topology === topo ? "scale(1.15)" : "scale(1)",
+                }}
+              >
+                {topo === "ring" ? "○" : topo === "small_world" ? "◈" : topo === "scale_free" ? "★" : "⬡"}
+              </div>
+              <span className="text-[9px]" style={{ color: data.topology === topo ? "var(--accent)" : "var(--text-tertiary)" }}>
+                {topo.replace("_", " ")}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* Details list */}
       <section className="w-full">
         <div className="flex flex-col">

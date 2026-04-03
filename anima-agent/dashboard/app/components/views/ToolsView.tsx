@@ -26,11 +26,27 @@ export default function ToolsView({ consciousness }: { consciousness: Consciousn
   return (
     <div className="flex flex-col items-center gap-16 py-12">
 
-      <section className="flex flex-col items-center gap-4">
-        <span className="text-[64px] font-bold tracking-tighter leading-none"
-          style={{ background: "linear-gradient(180deg, var(--accent-orange), var(--accent-red))", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-          {accessible}/{tools.length}
-        </span>
+      <section className="flex flex-col items-center gap-6">
+        {/* Φ access ring */}
+        <div className="relative">
+          <svg width="120" height="120" viewBox="0 0 120 120">
+            <circle cx="60" cy="60" r="52" fill="none" stroke="var(--bg-tertiary)" strokeWidth="6" />
+            <circle cx="60" cy="60" r="52" fill="none" stroke="var(--accent)" strokeWidth="6"
+              strokeLinecap="round"
+              strokeDasharray={2 * Math.PI * 52}
+              strokeDashoffset={2 * Math.PI * 52 * (1 - (tools.length > 0 ? accessible / tools.length : 0))}
+              transform="rotate(-90 60 60)"
+              style={{ transition: "stroke-dashoffset 0.8s cubic-bezier(0.2,0.8,0.2,1)" }}
+            />
+            <text x="60" y="55" textAnchor="middle" dominantBaseline="middle"
+              fill="var(--text-primary)" fontSize="28" fontWeight="700" fontFamily="system-ui">
+              {accessible}
+            </text>
+            <text x="60" y="75" textAnchor="middle" fill="var(--text-tertiary)" fontSize="11" fontFamily="system-ui">
+              / {tools.length}
+            </text>
+          </svg>
+        </div>
         <span className="text-[15px]" style={{ color: "var(--text-secondary)" }}>
           Accessible at Φ={consciousness.phi.toFixed(2)}
         </span>
