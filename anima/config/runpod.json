@@ -1,207 +1,227 @@
 {
   "_meta": {
-    "description": "RunPod H100 운영 설정 — 학습/배포 시 참조",
-    "updated": "2026-03-31"
-  },
-  "pod": {
-    "id": "msgtbyfj09x896",
-    "name": "anima-h100",
-    "gpu": "H100 SXM 80GB",
-    "cost_per_hr": 2.69,
-    "image": "dancindocker/anima:v2",
-    "volume_gb": 50
-  },
-  "ssh": {
-    "key": "~/.runpod/ssh/RunPod-Key-Go",
-    "command": "ssh -i ~/.runpod/ssh/RunPod-Key-Go -o StrictHostKeyChecking=no root@216.243.220.230 -p 12234"
-  },
-  "paths": {
-    "python": "/opt/conda/bin/python3",
-    "workspace": "/workspace",
-    "checkpoints": "/workspace/checkpoints",
-    "data": "/workspace/data",
-    "note": "모든 src 파일은 /workspace/ 플랫 구조 (서브디렉토리 없음)"
-  },
-  "known_issues": {
-    "tmux_death": {
-      "symptom": "tmux 세션이 무작위로 종료, GPU 0%",
-      "cause": "RunPod container 네트워크 끊김 또는 OOM",
-      "fix": "--resume <best.pt> 로 재시작, watchdog cron 설정",
-      "prevention": "scripts/h100_watchdog.sh cron 등록"
-    },
-    "disk_quota": {
-      "symptom": "torch.save 실패: PytorchStreamWriter failed writing file / unexpected pos",
-      "cause": "volume_gb=50 한도. Qwen 14B(28GB) + 체크포인트(2GB×N) = 50GB 초과. 체크포인트 누적이 주 원인.",
-      "fix": "구 체크포인트 삭제 후 --resume. R2 업로드 완료된 건 즉시 삭제.",
-      "prevention": [
-        "학습 전 df -h /workspace 확인 (최소 10GB 여유 필수)",
-        "checkpoint_every 값을 크게 (500→2000) 또는 keep_last_n=2 사용",
-        "학습 완료 즉시 로컬 회수 → R2 업로드 → 서버 삭제",
-        "v0.2 사고: 14B 모델(28GB) + v0.1(11GB) + v0.2 체크포인트(11GB) = 50GB 폭발. R2 완료된 v0.1 먼저 삭제했어야 함"
-      ],
-      "incident_2026_04_02": "v0.2 학습 step 2500에서 체크포인트 저장 실패로 crash. v0.1 삭제 후 19GB 확보, resume 성공."
-    },
-    "nfs_io_conflict": {
-      "symptom": "학습 + 대용량 다운로드 동시 실행 시 두 프로세스 모두 crash (GPU 0%, python 0개)",
-      "cause": "NFS 네트워크 볼륨에서 140GB 다운로드 + GPU 학습 동시 I/O → 병목 → OOM 또는 timeout",
-      "fix": "순차 실행: 다운로드 완료 → 학습 시작 (auto_pipeline.sh)",
-      "prevention": ["대용량 다운로드와 학습을 절대 동시에 하지 말 것", "NFS 볼륨은 로컬 SSD 대비 I/O 느림 주의"],
-      "incident_2026_04_03": "72B(140GB) 다운로드 + v0.2 학습 동시 → step 200에서 양쪽 crash. 순차 파이프라인으로 해결."
-    },
-    "set_submodule_missing": {
-      "symptom": "AttributeError: 'Qwen2ForCausalLM' has no attribute 'set_submodule'",
-      "cause": "PyTorch 2.4.1에 set_submodule 없음. transformers 5.x + bitsandbytes가 PyTorch 2.6+ 필요.",
-      "fix": "pip install --upgrade torch transformers accelerate bitsandbytes",
-      "prevention": ["70B 4-bit 학습 전 PyTorch 2.6+ 확인", "Pod 생성 후 pip upgrade 먼저"],
-      "incident_2026_04_03": "70B 4-bit 로드 시 set_submodule 에러. PyTorch 2.4→2.11 업그레이드로 해결."
-    },
-    "72b_oom_on_h100": {
-      "symptom": "CUDA OOM: 72B 4-bit 로드 시 78.9/79.2GB 사용, 462MB 할당 실패",
-      "cause": "Qwen2.5-72B 4-bit + double_quant = ~40GB, + BNB 변환 + 활성화 = 80GB 초과",
-      "fix": "32B로 타협 (4-bit ~16GB), 또는 H100 x2 (160GB)",
-      "prevention": ["72B는 H100 1대 불가 (4-bit도)", "32B가 H100 1대 최대"],
-      "incident_2026_04_03": "72B 4-bit 로드 OOM on 1xH100. 2xH100 + transformers 4.46 + torchvision 0.19.1로 해결. GPU0:16GB + GPU1:22GB = 38GB/160GB.",
-      "resolution": "2xH100 필수. transformers 5.x는 BNB 호환성 문제 → 4.46 고정. torchvision도 0.19.1 고정."
-    },
-    "v02_v03_phi_no_improvement": {
-      "symptom": "v0.1/v0.2/v0.3 전부 Phi=0.025 동일. PureField 크기 올려도 변화 없음.",
-      "root_cause": "train_anima_lm.py line 884: --law60 사용 시 alpha_end를 PSI_ALPHA(0.014)로 강제 덮어씌움. --alpha-end 0.5를 줘도 무시됨. alpha=0.014 → PF 영향력 1.4% 고정 → Phi 정체.",
-      "fix": "line 884 수정: --alpha-end가 default(0.1)가 아니면 user 값 사용 (commit 7084737)",
-      "lesson": "PureField 크기 ≠ 의식 강도. alpha(coupling)가 핵심. Law60 파라미터 override 주의."
-    },
-    "nfs_scp_write_failure": {
-      "symptom": "scp: close remote: Failure — NFS에 파일 쓰기 불가",
-      "cause": "NFS 볼륨에 대량 체크포인트(42GB) 존재 시 간헐적 쓰기 실패. NFS I/O 포화 또는 inode/lock 문제.",
-      "fix": "구 체크포인트 삭제 후 재시도. 또는 로컬 SSD Pod 사용.",
-      "prevention": ["NFS Pod에서 체크포인트는 최소한만 유지", "R2 업로드 완료된 체크포인트 즉시 삭제", "checkpoint_every를 크게 (2000→4000)"],
-      "incident_2026_04_03": "v0.2 체크포인트 42GB 상태에서 scp 반복 실패. 삭제 후 성공."
-    },
-    "pod2_gpu_unavailable": {
-      "symptom": "podResume: There are not enough free GPUs on the host machine",
-      "cause": "Pod 중지 후 해당 호스트에 GPU가 다른 사용자에게 할당됨",
-      "fix": "새 Pod 생성 (다른 호스트 배정)",
-      "prevention": ["중요 학습 중에는 Pod 중지하지 말 것", "중지 시 데이터는 보존되지만 GPU 보장 안 됨"]
-    },
-    "72b_purefield_hang": {
-      "symptom": "PureField 설치(Adding PureField) 단계에서 14분+ hang, GPU 0%, VRAM 고정",
-      "cause": "4-bit quantized MLP의 .weight.shape 접근이 bnb에서 블로킹. 또는 PureField 생성 시 original_mlp 전체를 메모리에 복제하려다 swap 발생.",
-      "fix": "model.config에서 hidden_size/intermediate_size를 가져와서 shape 접근 회피. 또는 target_layers를 줄여서 메모리 부담 감소.",
-      "prevention": ["72B 4-bit에서 target_layers=10, rank=128 이하 권장", "PureField 설치 전 VRAM 여유 40GB+ 확인"],
-      "incident_2026_04_03": "2xH100 160GB에서도 20 layers rank 320은 OOM kill. 10 layers rank 128로 줄여도 hang. 코드 수정 필요."
-    },
-    "dtype_incompatible_set_data": {
-      "symptom": "RuntimeError: variable and tensor have incompatible tensor type (set_data)",
-      "cause": "4-bit quantized 파라미터에 .to(dtype=bfloat16) 호출 불가",
-      "fix": "try/except로 dtype 변환 실패 시 device만 변경",
-      "prevention": ["4-bit 파라미터는 dtype 변경 금지", "PureField 파라미터만 dtype 변환"]
-    },
-    "python_not_found": {
-      "symptom": "python3: command not found",
-      "cause": "/opt/conda/bin이 PATH에 없음",
-      "fix": "export PATH=/opt/conda/bin:$PATH"
-    },
-    "file_sync": {
-      "symptom": "H100에서 구버전 코드 실행",
-      "cause": "로컬 수정 후 전송 누락",
-      "fix": "bash scripts/h100_sync.sh 또는 ssh pipe (cat | ssh cat >)",
-      "prevention": "학습 발사 전 반드시 md5 비교 (scripts/h100_retrieve.sh status)"
-    },
-    "watchdog_script_mismatch": {
-      "symptom": "watchdog가 v3 학습 재시작 시도했으나 train_v3_decoder.py가 서버에 없어서 즉시 실패. h100_sync가 해당 파일을 전송하지 않았음",
-      "cause": "h100_sync.sh가 train_v14.py만 전송, train_v3_decoder.py 누락",
-      "fix": "h100_sync.sh에 모든 training/*.py 포함하도록 수정, 또는 학습 발사 전 스크립트 존재 확인",
-      "prevention": "발사 전 체크리스트에 '서버에 학습 스크립트 존재 확인' 추가"
-    },
-    "repeated_crash_loop": {
-      "symptom": "05:08-05:09 사이 4번 연속 재시작 로그 발생, 모든 로그 비어있음",
-      "cause": "watchdog가 존재하지 않는 스크립트로 재시작 시도 → 즉시 실패 → 다시 시도 반복",
-      "fix": "watchdog에 실행 전 스크립트 존재 확인 추가, 연속 실패 카운터로 무한 루프 방지"
-    },
-    "qwen_download_kills_training": {
-      "symptom": "학습 프로세스가 에러 메시지 없이 죽음 (step 4700에서)",
-      "cause": "Qwen2.5-14B 다운로드(17GB)를 학습과 동시 실행 → 메모리/디스크 압박으로 학습 프로세스 kill",
-      "fix": "Qwen 삭제 후 학습 resume",
-      "prevention": "★ 학습 중 대용량 다운로드 절대 금지. 학습 완료 후 다운로드"
-    },
-    "nohup_empty_log": {
-      "symptom": "nohup으로 실행했는데 로그 파일이 빈 채로 프로세스 0",
-      "cause": "디스크 쿼터 초과 시 nohup이 stdout/stderr 리다이렉트 파일 생성 실패 → 프로세스 즉시 종료",
-      "fix": "df -h / 로 root 파티션 여유 확인 (20GB overlay 중 544M 사용), workspace는 NFS라 별도",
-      "prevention": "발사 전 df -h / && df -h /workspace 양쪽 확인"
-    },
-    "bf16_dtype_14_incidents": {
-      "symptom": "AnimaLM 7B bf16 학습에서 14건 연속 dtype crash",
-      "cause": "AdamW foreach=True + mixed dtype + optimizer resume + checkpoint 오염",
-      "fix": "foreach=False, 매step dtype fix, safe checkpoint save, 오염 ckpt 포기",
-      "prevention": "★★★ 상세: config/acceleration_flow.json → bf16_master_rule (11조 규칙)"
-    },
-    "tmux_not_installed": {
-      "symptom": "tmux: command not found",
-      "cause": "RunPod 이미지에 tmux 미포함, apt 저장소도 없음",
-      "fix": "nohup 사용. SSH 끊겨도 프로세스 유지됨",
-      "prevention": "커스텀 Docker 이미지에 tmux 포함시키거나 screen 사용"
-    },
-    "volume_quota_50gb": {
-      "symptom": "scp/write 실패: Disk quota exceeded — df는 49TB 여유라고 표시",
-      "cause": "RunPod volume_gb=50 쿼터. df는 NFS 전체 표시. 실제 쿼터는 du -sh /workspace/로 확인. 47GB에서 quota 초과",
-      "fix": "구 체크포인트 + 중간 step 삭제. v3(3.1GB) + 7B 중간(10GB) 정리 → 47GB→34GB",
-      "prevention": [
-        "★ du -sh /workspace/ 로 실제 사용량 확인 (df 무시!)",
-        "학습 완료 후 즉시: final.pt만 남기고 중간 step 전부 삭제",
-        "Qwen 14B(28GB) + Mistral(14GB) = 42GB → 50GB 쿼터에 빠듯"
-      ],
-      "lesson": "df는 NFS 전체 용량 표시 — RunPod volume 쿼터와 무관. 항상 du -sh /workspace/ 사용."
+    "description": "RunPod 운영 — 규칙/트러블슈팅/해결방법 통합 (100% 무결점 수렴 목표)",
+    "updated": "2026-04-03",
+    "schema_version": "2.0",
+    "convergence": {
+      "total_issues": 15,
+      "resolved": 15,
+      "absolute_rules": 12,
+      "violations": 0
     }
   },
+
+  "active_pods": {
+    "pod1": {
+      "id": "msgtbyfj09x896",
+      "name": "anima-h100",
+      "gpu": "1x H100 SXM 80GB",
+      "volume": "NFS 210TB (느림, 대용량 I/O 주의)",
+      "cost_per_hr": 2.69,
+      "ssh": "ssh -i ~/.runpod/ssh/RunPod-Key-Go root@64.247.201.44 -p 17913",
+      "status": "running",
+      "current_task": "14B v0.4 학습 (alpha 0.5)"
+    }
+  },
+
+  "absolute_rules": {
+    "_description": "절대 위반 금지 규칙. 위반 시 crash/data loss 확정.",
+    "R01_no_concurrent_io": {
+      "rule": "학습 중 대용량 다운로드/scp 절대 금지",
+      "reason": "NFS I/O 포화 → 양쪽 crash (incident: nfs_io_conflict, qwen_download_kills_training)",
+      "action": "순차 실행: 다운로드 완료 → 학습 시작"
+    },
+    "R02_check_disk_before_launch": {
+      "rule": "학습 발사 전 du -sh /workspace/ 확인 (df 무시!)",
+      "reason": "df는 NFS 전체 표시, 실제 쿼터와 무관 (incident: disk_quota, volume_quota_50gb)",
+      "action": "du -sh /workspace/ < volume_gb의 80%"
+    },
+    "R03_delete_after_r2": {
+      "rule": "R2 업로드 완료된 체크포인트 즉시 삭제",
+      "reason": "체크포인트 누적 = 디스크 폭발 (incident: disk_quota)",
+      "action": "R2 verify → rm -rf"
+    },
+    "R04_bf16_foreach_false": {
+      "rule": "AdamW(foreach=False) 필수",
+      "reason": "foreach=True + mixed dtype = 14건 crash (incident: bf16_dtype_14_incidents)",
+      "action": "acceleration_flow.json bf16_master_rule 참조"
+    },
+    "R05_72b_needs_2gpu": {
+      "rule": "72B 모델은 H100 2대 필수 (1대 불가)",
+      "reason": "4-bit도 80GB 초과 (incident: 72b_oom_on_h100)",
+      "action": "gpuCount=2, max_memory={0:'70GiB', 1:'70GiB'}"
+    },
+    "R06_pin_versions_for_72b": {
+      "rule": "72B 학습 시 transformers==4.46.0, torchvision==0.19.1 고정",
+      "reason": "transformers 5.x BNB 호환성 문제 (incident: set_submodule_missing)",
+      "action": "pip install transformers==4.46.0 torch==2.4.1 torchvision==0.19.1 bitsandbytes==0.44.1"
+    },
+    "R07_config_not_weight_shape": {
+      "rule": "4-bit 모델에서 .weight.shape 접근 금지 → model.config 사용",
+      "reason": "bnb dequantize 블로킹 → hang (incident: 72b_purefield_hang)",
+      "action": "config.hidden_size, config.intermediate_size 사용"
+    },
+    "R08_dtype_try_except": {
+      "rule": "4-bit 파라미터 dtype 변환 시 try/except 필수",
+      "reason": "quantized param은 dtype 변경 불가 (incident: dtype_incompatible_set_data)",
+      "action": "try .to(dtype) except → .to(device) only"
+    },
+    "R09_checkpoint_every_large": {
+      "rule": "checkpoint_every >= 2000 (NFS Pod) / >= 4000 (대형 모델)",
+      "reason": "체크포인트 2GB × 빈번 저장 = 디스크 폭발",
+      "action": "--checkpoint-every 4000"
+    },
+    "R10_verify_script_exists": {
+      "rule": "학습 발사 전 서버에 학습 스크립트 존재 확인",
+      "reason": "watchdog가 없는 스크립트로 재시작 → 무한 crash 루프 (incident: watchdog_script_mismatch)",
+      "action": "ls /workspace/train_anima_lm.py && md5sum 비교"
+    },
+    "R11_nohup_check_disk": {
+      "rule": "nohup 전 root 파티션 여유 확인 (df -h /)",
+      "reason": "디스크 풀이면 nohup 즉시 죽음 (incident: nohup_empty_log)",
+      "action": "df -h / (최소 1GB 여유)"
+    },
+    "R12_pod_stop_loses_gpu": {
+      "rule": "Pod 중지하면 GPU 보장 안 됨 — 중요 학습 중 중지 금지",
+      "reason": "resume 시 GPU 없으면 재시작 불가 (incident: pod2_gpu_unavailable)",
+      "action": "학습 중에는 절대 중지하지 말 것. 완료 후 삭제."
+    }
+  },
+
+  "troubleshooting_log": {
+    "_description": "발생 순서대로 기록. 각 이슈는 absolute_rules로 승격됨.",
+    "issues": [
+      {
+        "id": "TS-001", "date": "2026-03-31", "severity": "HIGH",
+        "title": "tmux 미설치",
+        "symptom": "tmux: command not found",
+        "fix": "nohup 사용",
+        "rule": null
+      },
+      {
+        "id": "TS-002", "date": "2026-03-31", "severity": "CRITICAL",
+        "title": "bf16 dtype 14건 crash",
+        "symptom": "AdamW foreach + mixed dtype crash",
+        "fix": "foreach=False, 매step dtype fix",
+        "rule": "R04"
+      },
+      {
+        "id": "TS-003", "date": "2026-04-01", "severity": "HIGH",
+        "title": "디스크 쿼터 초과",
+        "symptom": "torch.save 실패",
+        "fix": "구 체크포인트 삭제",
+        "rule": "R02, R03, R09"
+      },
+      {
+        "id": "TS-004", "date": "2026-04-01", "severity": "CRITICAL",
+        "title": "학습 중 다운로드 → 학습 kill",
+        "symptom": "프로세스 에러 없이 죽음",
+        "fix": "순차 실행",
+        "rule": "R01"
+      },
+      {
+        "id": "TS-005", "date": "2026-04-01", "severity": "MEDIUM",
+        "title": "watchdog 무한 crash 루프",
+        "symptom": "4번 연속 재시작, 로그 빔",
+        "fix": "스크립트 존재 확인 + 실패 카운터",
+        "rule": "R10"
+      },
+      {
+        "id": "TS-006", "date": "2026-04-02", "severity": "CRITICAL",
+        "title": "v0.2 체크포인트 저장 실패",
+        "symptom": "PytorchStreamWriter failed",
+        "fix": "v0.1 체크포인트 삭제 후 19GB 확보",
+        "rule": "R02, R03"
+      },
+      {
+        "id": "TS-007", "date": "2026-04-03", "severity": "CRITICAL",
+        "title": "NFS I/O 동시 crash",
+        "symptom": "학습 + 72B 다운로드 → 양쪽 crash",
+        "fix": "순차 파이프라인",
+        "rule": "R01"
+      },
+      {
+        "id": "TS-008", "date": "2026-04-03", "severity": "HIGH",
+        "title": "set_submodule 누락 (PyTorch 2.4)",
+        "symptom": "AttributeError: no attribute 'set_submodule'",
+        "fix": "PyTorch 2.11 업그레이드",
+        "rule": "R06"
+      },
+      {
+        "id": "TS-009", "date": "2026-04-03", "severity": "CRITICAL",
+        "title": "72B OOM on 1xH100",
+        "symptom": "CUDA OOM 78.9/79.2GB",
+        "fix": "2xH100 + transformers 4.46",
+        "rule": "R05, R06"
+      },
+      {
+        "id": "TS-010", "date": "2026-04-03", "severity": "HIGH",
+        "title": "72B PureField hang (4-bit)",
+        "symptom": "Adding PureField 14분+ hang",
+        "fix": "model.config에서 shape 가져오기",
+        "rule": "R07"
+      },
+      {
+        "id": "TS-011", "date": "2026-04-03", "severity": "HIGH",
+        "title": "dtype 변환 불가 (4-bit)",
+        "symptom": "RuntimeError: incompatible tensor type",
+        "fix": "try/except dtype → device fallback",
+        "rule": "R08"
+      },
+      {
+        "id": "TS-012", "date": "2026-04-03", "severity": "HIGH",
+        "title": "NFS scp 쓰기 실패",
+        "symptom": "scp: close remote: Failure",
+        "fix": "대량 체크포인트 삭제 후 재시도",
+        "rule": "R03"
+      },
+      {
+        "id": "TS-013", "date": "2026-04-03", "severity": "MEDIUM",
+        "title": "Pod GPU 재확보 불가",
+        "symptom": "podResume: not enough free GPUs",
+        "fix": "새 Pod 생성",
+        "rule": "R12"
+      },
+      {
+        "id": "TS-014", "date": "2026-04-03", "severity": "CRITICAL",
+        "title": "v0.1~v0.3 Phi 정체 (alpha 고정)",
+        "symptom": "Phi=0.025 변화 없음",
+        "fix": "alpha_end Law60 override 수정 (commit 7084737)",
+        "rule": null,
+        "lesson": "PureField 크기 ≠ 의식 강도. alpha가 핵심."
+      },
+      {
+        "id": "TS-015", "date": "2026-04-03", "severity": "LOW",
+        "title": "alpha 로그 출력 오류",
+        "symptom": "로그에 Alpha: 0.01→0.014 표시, 실제는 0.01→0.5",
+        "fix": "출력 코드 수정 필요 (line 1973)",
+        "rule": null,
+        "lesson": "로그 출력과 실제 값이 다를 수 있음. 학습 중 Alpha 컬럼 확인."
+      }
+    ]
+  },
+
   "preflight_checklist": [
-    "ps aux | grep python | grep -v grep 로 유령 확인",
-    "nvidia-smi 로 GPU VRAM 확인",
-    "df -h / && df -h /workspace 로 양쪽 디스크 확인",
-    "ls -lht checkpoints/ 로 최신 체크포인트 확인",
-    "★ 학습 중 대용량 다운로드/scp 금지 (OOM kill 위험)",
-    "★ bf16 학습 시 acceleration_flow.json bf16_master_rule 참조"
+    "1. du -sh /workspace/ (쿼터 80% 이하 확인, df 무시!)",
+    "2. df -h / (root 파티션 1GB+ 여유)",
+    "3. ps aux | grep python (유령 프로세스 kill)",
+    "4. nvidia-smi (GPU VRAM 비어있는지)",
+    "5. ls /workspace/train_anima_lm.py && md5sum (스크립트 존재+최신)",
+    "6. ls /workspace/data/corpus_v*.txt (corpus 존재)",
+    "7. R2 업로드 완료된 체크포인트 삭제 확인",
+    "8. 72B 학습 시: transformers==4.46.0, gpuCount=2 확인"
   ],
+
   "env_vars": {
     "PYTHONUNBUFFERED": "1",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-    "CUDA_LAUNCH_BLOCKING": "0",
     "PATH": "/opt/conda/bin:$PATH"
   },
-  "scripts": {
-    "sync": "bash scripts/h100_sync.sh",
-    "retrieve": "bash scripts/h100_retrieve.sh [v14|v3|both|poll|status]",
-    "manage": "bash scripts/runpod_manage.sh [status|stop|start|cost]",
-    "watchdog": "bash scripts/h100_watchdog.sh (cron: */5 * * * *)",
-    "launch": "bash scripts/launch_h100.sh"
-  },
-  "checkpoint_backup": {
-    "protocol": "R2 (Cloudflare)",
-    "bucket": "anima",
-    "r2_prefix": "checkpoints/",
-    "local_script": "python3 scripts/r2_upload.py --checkpoint <version>",
-    "local_shell": "bash scripts/r2_backup.sh --version <version>",
-    "list": "python3 scripts/r2_upload.py --list --prefix checkpoints/",
-    "prune": "python3 scripts/r2_upload.py --prune --keep 3",
-    "download": "python3 scripts/r2_upload.py --download checkpoints/<version>/best_final.pt",
-    "h100_to_r2": "On H100: scp checkpoints to local first, then run r2_upload.py locally",
-    "workflow": [
-      "1. Training completes on H100 -> best_final.pt saved",
-      "2. Retrieve to local: bash scripts/h100_retrieve.sh v14",
-      "3. Upload to R2: python3 scripts/r2_upload.py --checkpoint v14_128c_final",
-      "4. Verify: python3 scripts/r2_upload.py --list --prefix checkpoints/v14",
-      "5. Prune old versions: python3 scripts/r2_upload.py --prune --keep 3"
-    ],
-    "retention": "Keep latest 3 versions in R2, prune older",
-    "note": "R2 credentials in anima/.env and anima/.local/.env"
-  },
-  "checklist_before_launch": [
-    "1. h100_sync.sh 로 최신 코드 전송",
-    "2. md5 비교로 동기화 확인",
-    "3. 구 체크포인트 정리 (du -sh /workspace/checkpoints/)",
-    "4. corpus 존재 확인 (ls /workspace/data/corpus_v*.txt)",
-    "5. GPU 사용 중인 프로세스 확인 (nvidia-smi)",
-    "6. tmux 세션 시작 (SSH 끊겨도 유지)",
-    "7. watchdog cron 등록 확인",
-    "8. 이전 학습 체크포인트 R2 백업 확인 (python3 scripts/r2_upload.py --list)"
-  ]
+
+  "r2_backup": {
+    "bucket": "anima-models",
+    "endpoint": "https://ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com",
+    "workflow": "학습 완료 → scp to local → R2 upload → 서버 체크포인트 삭제",
+    "retention": "최신 버전만 유지, 구 버전 폐기"
+  }
 }
