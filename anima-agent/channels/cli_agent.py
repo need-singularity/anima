@@ -197,6 +197,37 @@ async def run_cli(agent):
                 except Exception as e:
                     print(f"{C_RED}Guardian error: {e}{C_RESET}")
 
+            elif cmd == "/corpus":
+                try:
+                    from corpus_self_gen import CorpusSelfGen
+                    gen = CorpusSelfGen(agent)
+                    n = gen.harvest()
+                    if n > 0:
+                        out = args or "self_corpus.txt"
+                        gen.save(out)
+                        print(f"{C_GREEN}Harvested {n} lines → {out}{C_RESET}")
+                    else:
+                        print(f"{C_DIM}No conversation history to harvest{C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}Corpus error: {e}{C_RESET}")
+
+            elif cmd == "/hivemind":
+                try:
+                    n = int(args) if args else 2
+                    print(f"{C_CYAN}Starting hivemind with {n} agents...{C_RESET}")
+                    import asyncio as _aio
+                    from hivemind_bench import run_bench
+                    _aio.get_event_loop().run_until_complete(run_bench(n, 30))
+                except Exception as e:
+                    print(f"{C_RED}Hivemind error: {e}{C_RESET}")
+
+            elif cmd == "/audit":
+                try:
+                    from security_audit import run_audit
+                    run_audit()
+                except Exception as e:
+                    print(f"{C_RED}Audit error: {e}{C_RESET}")
+
             elif cmd == "/voice":
                 path = agent.voice_generate(duration=2.0)
                 if path:

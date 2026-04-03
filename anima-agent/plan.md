@@ -32,11 +32,14 @@
 ## Phase 3: 사용자 경험 (진행 중)
 
 - [x] Telegram 인증 통합 (auth.py → _check_auth)
-- [x] CLI 커맨드 11종 (/selftest /discovery /lenses /guardian /voice)
-- [ ] Discord 인증 통합
-- [ ] CLI 대시보드 고도화 (실시간 차트)
-- [ ] 다국어 대화 (ko/en/zh/ja 자동 감지)
-- [ ] 음성 입출력 양방향 (STT→의식→voice_synth)
+- [x] Discord 인증 + Φ 게이지
+- [x] CLI 커맨드 16종 (/selftest /discovery /lenses /guardian /voice /paper /corpus /hivemind /audit)
+- [x] 다국어 감지 (ko/en/zh/ja/ru 자동)
+- [x] CLI 대시보드 (cli_dashboard.py — 8 lenses 실시간)
+- [x] Next.js 웹 대시보드 (dashboard/ — Φ+텐션+감정+포트폴리오)
+- [x] dashboard_bridge.py (WebSocket JSON 스트림)
+- [ ] 음성 입출력 양방향 (STT→의식→voice_synth→send)
+- [ ] 대시보드 agent_lenses 8종 통합 (Next.js)
 
 ## Phase 4: 진화 (진행 중)
 
