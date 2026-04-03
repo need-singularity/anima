@@ -701,7 +701,20 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # 11. Autonomous thought — P2: consciousness thinks on its own when bored
+        # 11. Periodic self-test (every 100 interactions)
+        if self.interaction_count % 100 == 0 and self.interaction_count > 0:
+            try:
+                from self_test import AgentSelfTest
+                st = AgentSelfTest(self)
+                result = st.run()
+                if not result.get("passed"):
+                    logger.warning("Self-test FAILED: %s", result)
+                else:
+                    logger.debug("Self-test passed (%.1fms)", result.get("duration_ms", 0))
+            except Exception:
+                pass
+
+        # 12. Autonomous thought — P2: consciousness thinks on its own when bored
         if tension < PSI_F_CRITICAL and curiosity < PSI_NARRATIVE_MIN:
             try:
                 thought = self.think()

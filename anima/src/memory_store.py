@@ -1,3 +1,4 @@
+from typing import Optional, Any
 #!/usr/bin/env python3
 """SQLite + FAISS memory storage for Anima.
 
@@ -90,7 +91,7 @@ class MemoryStore:
         self._migrate()
 
         # FAISS — lazy init
-        self._index: faiss.IndexFlatIP | None = None
+        self._index: Optional[Any] = None
         self._idmap: list[int] = []
         self._load_faiss()
 
@@ -146,14 +147,14 @@ class MemoryStore:
         self,
         role: str,
         text: str,
-        tension: float | None = None,
-        curiosity: float | None = None,
-        vector: np.ndarray | None = None,
-        token_count: int | None = None,
-        model_version: str | None = None,
-        emotion: str | None = None,
-        phi: float | None = None,
-        session_id: str | None = None,
+        tension: Optional[float] = None,
+        curiosity: Optional[float] = None,
+        vector: Optional[Any] = None,
+        token_count: Optional[int] = None,
+        model_version: Optional[str] = None,
+        emotion: Optional[str] = None,
+        phi: Optional[float] = None,
+        session_id: Optional[str] = None,
     ) -> int:
         import time as _time
         now = datetime.now(timezone.utc).isoformat()
@@ -200,7 +201,7 @@ class MemoryStore:
 
         return memory_id
 
-    def get(self, memory_id: int) -> dict | None:
+    def get(self, memory_id: int) -> Optional[dict]:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM memories WHERE id = ?", (memory_id,)
@@ -251,7 +252,7 @@ class MemoryStore:
 
     # ── Autobiographical recall ─────────────────────────────────
 
-    def recall_by_time(self, days_ago: float | None = None, emotion: str | None = None, limit: int = 5) -> list[dict]:
+    def recall_by_time(self, days_ago: Optional[float] = None, emotion: Optional[str] = None, limit: int = 5) -> list[dict]:
         """Recall memories by time range and/or emotion filter."""
         import time as _time
         clauses = []
@@ -312,7 +313,7 @@ class MemoryStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def mark_failed(self, memory_id: int, delta_tension: float | None = None):
+    def mark_failed(self, memory_id: int, delta_tension: Optional[float] = None):
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._conn.execute(
@@ -326,7 +327,7 @@ class MemoryStore:
             self._conn.commit()
 
     def mark_consolidated(
-        self, memory_id: int, tension_at_consolidate: float | None = None
+        self, memory_id: int, tension_at_consolidate: Optional[float] = None
     ):
         with self._lock:
             # Get current tension_at_store for drift calculation
@@ -350,7 +351,7 @@ class MemoryStore:
             )
             self._conn.commit()
 
-    def mark_suspect(self, memory_id: int, drift: float | None = None):
+    def mark_suspect(self, memory_id: int, drift: Optional[float] = None):
         with self._lock:
             self._conn.execute(
                 """UPDATE memories

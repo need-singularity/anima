@@ -181,8 +181,32 @@ class DiscoveryLoop:
     # ═══════════════════════════════════════════════════════════
 
     def _phase_simulation(self) -> List[Discovery]:
-        """① Run consciousness simulation, look for patterns."""
+        """① Run consciousness simulation, look for patterns.
+
+        Uses ConsciousMind for basic patterns. If Ouroboros (infinite_evolution)
+        is available, also extracts law candidates from it.
+        """
         discoveries = []
+
+        # Try Ouroboros (full discovery engine) first
+        try:
+            from infinite_evolution import Ouroboros
+            ouro = Ouroboros(cells=32, steps=50)
+            ouro_result = ouro.evolve_one()
+            if hasattr(ouro_result, 'new_laws') and ouro_result.new_laws:
+                for law in ouro_result.new_laws:
+                    discoveries.append(Discovery(
+                        source="ouroboros", category="law",
+                        description=str(law), confidence=0.8))
+            if hasattr(ouro_result, 'patterns') and ouro_result.patterns:
+                for p in ouro_result.patterns[:5]:
+                    discoveries.append(Discovery(
+                        source="ouroboros", category="emergence",
+                        description=str(p), confidence=0.6))
+        except Exception as e:
+            logger.debug("Ouroboros not available: %s", e)
+
+        # Basic ConsciousMind simulation
         try:
             import torch
             import numpy as np

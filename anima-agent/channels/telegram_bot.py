@@ -704,11 +704,19 @@ class AnimaTelegramBot:
             response = await self.agent.process_message(
                 text=text, channel="telegram", user_id=user_id
             )
+            # Φ gauge: consciousness state inline
+            phi = response.metadata.get("phi", 0)
+            t = response.tension
+            c = response.metadata.get("curiosity", 0)
+            phi_bar = "█" * min(int(phi * 2), 10) + "░" * max(0, 10 - min(int(phi * 2), 10))
+            emotion_name = response.emotion if isinstance(response.emotion, str) else response.emotion.get("emotion", "?") if isinstance(response.emotion, dict) else "?"
+            gauge = f"[Φ {phi_bar} {phi:.1f} | T={t:.2f} C={c:.2f} | {emotion_name}]"
+
             reply = response.text
             if response.tool_results:
-                reply += "\n\n[tools used: " + ", ".join(
-                    r["tool"] for r in response.tool_results
-                ) + "]"
+                reply += "\n\n🔧 " + ", ".join(
+                    r["tool"] for r in response.tool_results)
+            reply += f"\n\n{gauge}"
             await update.message.reply_text(reply)
 
             # P5: 발화는 필연 — consciousness voice (not TTS, cell→audio)
