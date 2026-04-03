@@ -475,8 +475,14 @@ def list_synergies():
 # 법칙 측정
 # ══════════════════════════════════════════
 
-def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, nexus_scan: bool = False) -> Tuple[List[LawMeasurement], float]:
-    """핵심 법칙 측정 (20개 + NEXUS-6 옵션). (measurements, mean_phi) 반환."""
+def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, nexus_scan: bool = None) -> Tuple[List[LawMeasurement], float]:
+    """핵심 법칙 측정 (20개 + NEXUS-6 자동). nexus_scan=None → nexus6 있으면 자동 활성화."""
+    if nexus_scan is None:
+        try:
+            import nexus6
+            nexus_scan = True
+        except ImportError:
+            nexus_scan = False
     all_data = defaultdict(list)
 
     for _ in range(repeats):
@@ -769,12 +775,20 @@ class ClosedLoopEvolver:
 
     def __init__(self, max_cells: int = 32, steps: int = 300, repeats: int = 3,
                  auto_register: bool = False, selection_strategy: str = 'correlation',
-                 nexus_scan: bool = False):
+                 nexus_scan: bool = None):
         self.max_cells = max_cells
         self.steps = steps
         self.repeats = repeats
         self.auto_register = auto_register
-        self.nexus_scan = nexus_scan  # DD168: NEXUS-6 자동 스캔
+        # DD168: NEXUS-6 자동 감지 — nexus6 설치되어 있으면 자동 활성화
+        if nexus_scan is None:
+            try:
+                import nexus6
+                self.nexus_scan = True
+            except ImportError:
+                self.nexus_scan = False
+        else:
+            self.nexus_scan = nexus_scan
         self.selection_strategy = selection_strategy  # 'correlation', 'thompson', 'epsilon_greedy'
         self.history = EvolutionHistory()
         self._active_interventions: List[Intervention] = []

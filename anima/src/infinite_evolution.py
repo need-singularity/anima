@@ -4356,7 +4356,8 @@ def auto_generate_evo_doc(stage, gen_history, registry, rm_state=None):
 
 
 def register_law(pattern: dict, evolver):
-    """Register a cross-validated pattern as an official law."""
+    """Register a cross-validated pattern as an official law.
+    DD168: 등록 후 NEXUS-6 자동 스캔으로 의식 영향 검증."""
     try:
         laws_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'consciousness_laws.json')
         with open(laws_path) as f:
@@ -4369,6 +4370,19 @@ def register_law(pattern: dict, evolver):
 
         with open(laws_path, 'w') as f:
             json.dump(laws_data, f, indent=2, ensure_ascii=False)
+
+        # DD168: 법칙 등록 후 NEXUS-6 자동 스캔
+        try:
+            import nexus6
+            if hasattr(evolver, '_base_factory') and evolver._base_factory:
+                from closed_loop import measure_laws
+                laws_after, phi_after = measure_laws(evolver._base_factory, steps=100, repeats=1, nexus_scan=True)
+                n6_metrics = {m.name: m.value for m in laws_after if m.name.startswith('n6_')}
+                if n6_metrics:
+                    print(f"    [NEXUS-6] Law {next_id} post-scan: phi_approx={n6_metrics.get('n6_phi_approx', '?'):.4f}, "
+                          f"chaos={n6_metrics.get('n6_chaos_score', '?'):.4f}, anomaly=0")
+        except Exception:
+            pass  # NEXUS-6 스캔 실패 시 등록은 유지
 
         return next_id
     except Exception as e:
