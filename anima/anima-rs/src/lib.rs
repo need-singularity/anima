@@ -691,6 +691,26 @@ fn law_discovery_buffer_series(metric: usize) -> PyResult<Vec<f32>> {
     Ok(buf.series(metric))
 }
 
+// ── Regime Bridge submodule ──────────────────────────────────────
+
+#[pyfunction]
+#[pyo3(name = "action_gate", signature = (tension, pain, phi))]
+fn regime_bridge_action_gate(tension: f64, pain: f64, phi: f64) -> PyResult<f64> {
+    Ok(anima_regime_bridge::action_gate(tension, pain, phi))
+}
+
+#[pyfunction]
+#[pyo3(name = "pain_from_var", signature = (var_pct, var_floor, var_ceiling))]
+fn regime_bridge_pain_from_var(var_pct: f64, var_floor: f64, var_ceiling: f64) -> PyResult<f64> {
+    Ok(anima_regime_bridge::pain_from_var(var_pct, var_floor, var_ceiling))
+}
+
+#[pyfunction]
+#[pyo3(name = "soc_criticality", signature = (returns, window))]
+fn regime_bridge_soc_criticality(returns: Vec<f64>, window: usize) -> PyResult<f64> {
+    Ok(anima_regime_bridge::soc_criticality(&returns, window))
+}
+
 // ── Agent Tools submodule ─────────────────────────────────────────
 
 #[pyfunction]
@@ -836,6 +856,13 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     agent_tools.add_function(wrap_pyfunction!(agent_tools_score_intent, &agent_tools)?)?;
     agent_tools.add_function(wrap_pyfunction!(agent_tools_classify_state, &agent_tools)?)?;
     m.add_submodule(&agent_tools)?;
+
+    // regime_bridge submodule (hot-path: trading action gate, pain, SOC criticality)
+    let regime_bridge = PyModule::new(py, "regime_bridge")?;
+    regime_bridge.add_function(wrap_pyfunction!(regime_bridge_action_gate, &regime_bridge)?)?;
+    regime_bridge.add_function(wrap_pyfunction!(regime_bridge_pain_from_var, &regime_bridge)?)?;
+    regime_bridge.add_function(wrap_pyfunction!(regime_bridge_soc_criticality, &regime_bridge)?)?;
+    m.add_submodule(&regime_bridge)?;
 
     Ok(())
 }
