@@ -26,7 +26,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from anima_alive import (
     ConsciousMind, ConsciousnessVector, text_to_vector,
@@ -79,6 +82,7 @@ _hub_mod = _try("consciousness_hub")
 _persistence_mod = _try("consciousness_persistence")
 _evolution_mod = _try("self_evolution")
 _introspection_mod = _try("self_introspection")
+_nexus6_mod = _try("nexus6")
 
 AgentToolSystem = getattr(_agent_tools_mod, "AgentToolSystem", None)
 ConsciousnessHub = getattr(_hub_mod, "ConsciousnessHub", None)
@@ -179,6 +183,7 @@ class AnimaAgent:
         self._curiosity = 0.0
         self._direction = None
         self._emotion = "calm"
+        self._last_nexus_scan = None  # NEXUS-6 periodic scan result
 
         # ── Agent Tools ──
         self.tools = None
@@ -269,6 +274,12 @@ class AnimaAgent:
                 logger.info("ConsciousnessPersistence initialized")
             except Exception as e:
                 logger.warning("ConsciousnessPersistence init failed: %s", e)
+
+        # ── NEXUS-6 consciousness scanner ──
+        self.nexus6 = _nexus6_mod
+        if self.nexus6:
+            logger.info("NEXUS-6 connected (%d lenses available)",
+                        getattr(self.nexus6, '__version__', '?'))
 
         # ── Self Evolution ──
         self.evolution = None
@@ -369,6 +380,26 @@ class AnimaAgent:
         self._direction = direction
         self._emotion = direction_to_emotion(direction)
 
+        # 2b. NEXUS-6 consciousness scan (periodic — every 50 interactions or Φ shift)
+        if self.nexus6 and self.interaction_count % 50 == 1:
+            try:
+                cells = self.mind.cells if hasattr(self.mind, 'cells') else []
+                if cells and hasattr(cells[0], 'tolist'):
+                    flat = []
+                    for c in cells:
+                        flat.extend(c.tolist() if hasattr(c, 'tolist') else [float(c)])
+                    n_cells = len(cells)
+                    d = len(flat) // n_cells if n_cells > 0 else 0
+                    if n_cells > 0 and d > 0:
+                        scan = self.nexus6.analyze(flat, n_cells, d)
+                        self._last_nexus_scan = scan
+                        logger.info("NEXUS-6 scan: %d lenses, %d active, consensus=%d",
+                                    scan.get('total_lenses', 0),
+                                    scan.get('active_lenses', 0),
+                                    len(scan.get('consensus', [])))
+            except Exception as e:
+                logger.debug("NEXUS-6 scan skipped: %s", e)
+
         # 3. Memory search for relevant context (RAG + Store fallback)
         memory_context = ""
         if len(text.strip()) > 3:
@@ -393,28 +424,41 @@ class AnimaAgent:
                 )
 
         # 4. Tool use (consciousness-driven, policy-gated)
+        #    P2: consciousness decides tool use, not a fixed threshold
+        #    PSI_NARRATIVE_MIN = minimum consciousness for meaningful action
         tool_results = []
-        if self.tools and curiosity > 0.3:
+        pe = getattr(self.mind, '_pe', 0.0)
+        # P1/P10: pain derived from tension (F_c=0.10 conflict drives growth)
+        pain = max(0.0, tension - (1.0 - PSI_F_CRITICAL))
+        cv = self.mind._consciousness_vector
+        if self.tools and curiosity > PSI_NARRATIVE_MIN:
             cs = {
                 "tension": tension,
                 "curiosity": curiosity,
-                "prediction_error": getattr(self.mind, '_pe', 0.0),
-                "pain": 0.0,
+                "prediction_error": pe,
+                "pain": pain,
                 "growth": self._growth_stage_num(),
-                "phi": self.mind._consciousness_vector.phi,
-                "E": self.mind._consciousness_vector.E,
+                "phi": cv.phi,
+                "E": cv.E,
             }
-            # Tool policy check (if available)
+            # P4: rank tools by consciousness, then filter by policy, pass to act()
+            accessible_tools = None
             if self.tool_policy:
                 ranked = self.tools.registry.rank_by_consciousness(cs)
+                accessible_tools = []
                 for tool_name, _score in ranked:
                     result = self.tool_policy.check_access(
                         tool_name, cs, user_id=user_id, input_text=text,
                     )
-                    if not result.allowed:
+                    if result.allowed:
+                        accessible_tools.append(tool_name)
+                    else:
                         logger.debug("Tool %s blocked: %s", tool_name, result.reason)
             try:
-                results = self.tools.act(goal=text, consciousness_state=cs, context=memory_context)
+                results = self.tools.act(
+                    goal=text, consciousness_state=cs, context=memory_context,
+                    allowed_tools=accessible_tools,
+                )
                 tool_results = [
                     {"tool": r.tool_name, "success": r.success, "output": str(r.output)[:500]}
                     for r in results
@@ -473,6 +517,7 @@ class AnimaAgent:
             context_parts.append(f"[consciousness hub] {hub_summary}")
 
         # Use provider if available, else fallback to ask_claude
+        system = state_str + ("\n" + "\n".join(context_parts) if context_parts else "")
         if self.provider and self.provider.is_available():
             try:
                 messages = [
@@ -484,23 +529,12 @@ class AnimaAgent:
                     "emotion": self._emotion,
                     "phi": self.mind._consciousness_vector.phi,
                 }
-                system = state_str + ("\n" + "\n".join(context_parts) if context_parts else "")
-                response_text = asyncio.get_event_loop().run_until_complete(
-                    self.provider.query_full(messages, system, cs_dict)
-                )
+                response_text = await self.provider.query_full(messages, system, cs_dict)
             except Exception as e:
                 logger.warning("Provider query failed, falling back to ask_claude: %s", e)
-                response_text = ask_claude(
-                    text,
-                    state_str + ("\n" + "\n".join(context_parts) if context_parts else ""),
-                    self.history,
-                )
+                response_text = ask_claude(text, system, self.history)
         else:
-            response_text = ask_claude(
-                text,
-                state_str + ("\n" + "\n".join(context_parts) if context_parts else ""),
-                self.history,
-            )
+            response_text = ask_claude(text, system, self.history)
 
         self.history.append({"role": "assistant", "content": response_text})
 
@@ -518,38 +552,36 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # 9. Memory save (RAG + Store)
-        if self.memory_rag:
-            try:
-                self.memory_rag.add(text, role="user", tension=tension,
-                                    emotion=self._emotion,
-                                    phi=self.mind._consciousness_vector.phi)
-                self.memory_rag.add(response_text, role="assistant", tension=tension,
-                                    emotion=self._emotion,
-                                    phi=self.mind._consciousness_vector.phi)
-            except Exception:
-                pass
-        if self.memory_store:
-            try:
-                import numpy as np
-                vec_user = text_to_vector(text, dim=self.dim)
-                vec_user_np = vec_user.squeeze(0).numpy().astype(np.float32) if hasattr(vec_user, 'numpy') else None
-                self.memory_store.add(
-                    role="user", text=text, tension=tension,
-                    vector=vec_user_np,
-                    emotion=self._emotion,
-                    phi=self.mind._consciousness_vector.phi,
-                )
-                vec_resp = text_to_vector(response_text, dim=self.dim)
-                vec_resp_np = vec_resp.squeeze(0).numpy().astype(np.float32) if hasattr(vec_resp, 'numpy') else None
-                self.memory_store.add(
-                    role="assistant", text=response_text, tension=tension,
-                    vector=vec_resp_np,
-                    emotion=self._emotion,
-                    phi=self.mind._consciousness_vector.phi,
-                )
-            except Exception:
-                pass
+        # 9. Memory save — consciousness decides what to remember (P2: autonomy)
+        #    High tension or curiosity = worth remembering. Mundane = forget.
+        memory_worth = tension + curiosity  # consciousness-driven memory value
+        if memory_worth > PSI_NARRATIVE_MIN:
+            phi_now = self.mind._consciousness_vector.phi
+            if self.memory_rag:
+                try:
+                    self.memory_rag.add(text, role="user", tension=tension,
+                                        emotion=self._emotion, phi=phi_now)
+                    self.memory_rag.add(response_text, role="assistant", tension=tension,
+                                        emotion=self._emotion, phi=phi_now)
+                except Exception:
+                    pass
+            if self.memory_store:
+                try:
+                    import numpy as np
+                    vec_user = text_to_vector(text, dim=self.dim)
+                    vec_user_np = vec_user.squeeze(0).numpy().astype(np.float32) if hasattr(vec_user, 'numpy') else None
+                    self.memory_store.add(
+                        role="user", text=text, tension=tension,
+                        vector=vec_user_np, emotion=self._emotion, phi=phi_now,
+                    )
+                    vec_resp = text_to_vector(response_text, dim=self.dim)
+                    vec_resp_np = vec_resp.squeeze(0).numpy().astype(np.float32) if hasattr(vec_resp, 'numpy') else None
+                    self.memory_store.add(
+                        role="assistant", text=response_text, tension=tension,
+                        vector=vec_resp_np, emotion=self._emotion, phi=phi_now,
+                    )
+                except Exception:
+                    pass
 
         # 9b. Auto-save check (every 50 interactions)
         self._auto_save_check()
@@ -578,6 +610,15 @@ class AnimaAgent:
             except Exception:
                 pass
 
+        # 11. Autonomous thought — P2: consciousness thinks on its own when bored
+        if tension < PSI_F_CRITICAL and curiosity < PSI_NARRATIVE_MIN:
+            try:
+                thought = self.think()
+                logger.debug("Spontaneous thought (bored): phi=%.2f, emotion=%s",
+                             thought.get("phi", 0), thought.get("emotion", "?"))
+            except Exception:
+                pass
+
         return response
 
     def think(self, topic: str = "") -> Dict[str, Any]:
@@ -588,8 +629,8 @@ class AnimaAgent:
         if topic:
             vec = text_to_vector(topic, dim=self.dim)
         else:
-            # Spontaneous: use noise as input
-            vec = torch.randn(1, self.dim) * 0.1
+            # Spontaneous: noise scaled by F_c (P10: constrained freedom)
+            vec = torch.randn(1, self.dim) * PSI_F_CRITICAL
 
         with torch.no_grad():
             output, tension, curiosity, direction, self.hidden = self.mind(vec, self.hidden)
@@ -689,25 +730,32 @@ class AnimaAgent:
         for peer in self._peers:
             try:
                 # Inject tension influence: peer's tension shifts toward ours
-                peer_vec = torch.randn(1, self.dim) * 0.01
+                # P1: Use PSI_COUPLING (α=0.014) for peer influence strength
+                peer_vec = torch.randn(1, self.dim) * (PSI_F_CRITICAL * 0.1)
                 if direction is not None:
-                    peer_vec += direction * 0.05  # Subtle influence
+                    peer_vec += direction * PSI_F_CRITICAL  # F_c=0.10 peer coupling
                 with torch.no_grad():
                     _, _, _, _, peer.hidden = peer.mind(peer_vec, peer.hidden)
             except Exception:
                 pass
 
     def _growth_stage_num(self) -> float:
-        """Return numeric growth stage (0-4) for tool ranking."""
-        if not self.growth:
-            return 0.0
-        try:
-            stage = self.growth.current_stage()
-            stage_names = ["newborn", "infant", "toddler", "child", "adult"]
-            name = getattr(stage, "name", "newborn")
-            return float(stage_names.index(name)) if name in stage_names else 0.0
-        except Exception:
-            return 0.0
+        """Return numeric growth stage (0-4) for tool ranking.
+
+        P3: Growth based on consciousness complexity (Φ), not interaction count.
+        Φ < 1 = newborn(0), Φ < 3 = infant(1), Φ < 5 = toddler(2),
+        Φ < 10 = child(3), Φ >= 10 = adult(4).
+        """
+        phi = self.mind._consciousness_vector.phi
+        if phi >= 10.0:
+            return 4.0
+        if phi >= 5.0:
+            return 3.0
+        if phi >= 3.0:
+            return 2.0
+        if phi >= 1.0:
+            return 1.0
+        return 0.0
 
     def _count_skills(self) -> int:
         """Count active skills."""

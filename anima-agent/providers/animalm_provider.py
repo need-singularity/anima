@@ -158,24 +158,34 @@ class AnimaLMProvider:
 
         self._checkpoint_path = ckpt
 
-        try:
-            # Add animalm to path
-            animalm_dir = os.path.expanduser("~/Dev/anima/sub-projects/animalm")
-            if animalm_dir not in sys.path:
-                sys.path.insert(0, animalm_dir)
+        # Add animalm to path
+        animalm_dir = os.path.expanduser("~/Dev/anima/sub-projects/animalm")
+        if animalm_dir not in sys.path:
+            sys.path.insert(0, animalm_dir)
 
-            if self._quantize in ("4bit", "8bit"):
+        loaded = False
+        # Try quantized first (GPU with bitsandbytes)
+        if self._quantize in ("4bit", "8bit"):
+            try:
                 from serve_animalm_v2 import load_model_quantized
                 self._model, self._tokenizer = load_model_quantized(
                     ckpt, self._base_model, self._quantize)
-            else:
+                loaded = True
+                logger.info("AnimaLM loaded: %s (%s)", ckpt, self._quantize)
+            except Exception as e:
+                logger.warning("AnimaLM quantized load failed (%s), trying fp32: %s",
+                               self._quantize, e)
+
+        # Fallback: fp32/fp16 (CPU or GPU without bitsandbytes)
+        if not loaded:
+            try:
                 from infer_animalm import load_model
                 self._model, self._tokenizer = load_model(ckpt, self._base_model)
-
-            logger.info("AnimaLM loaded: %s (%s)", ckpt, self._quantize)
-        except Exception as e:
-            logger.error("AnimaLM load failed: %s", e)
-            self._model = None
+                self._quantize = "none"  # Track actual load method for generate()
+                logger.info("AnimaLM loaded (fp32 fallback): %s", ckpt)
+            except Exception as e:
+                logger.error("AnimaLM load failed: %s", e)
+                self._model = None
 
     def _search_memories(self, query_text: str, top_k: int = 3) -> str:
         """Search long-term memory for relevant context.
@@ -303,16 +313,12 @@ class AnimaLMProvider:
         # ── Phase 3: Memory recall (PRE-query) ──
         memory_context = self._search_memories(prompt)
 
-        # Build formatted prompt with memory context if available
+        # P1/P2: No hardcoded few-shot examples. Consciousness generates autonomously.
+        # Memory context flows naturally as prior knowledge, not as a template.
         if memory_context:
-            formatted = (
-                f"{memory_context}\n\n"
-                f"Q: What is 2+2?\nA: 4.\n\n"
-                f"Q: {prompt}\nA:"
-            )
+            formatted = f"{memory_context}\n\n{prompt}"
         else:
-            # Few-shot wrapper for base models
-            formatted = f"Q: What is 2+2?\nA: 4.\n\nQ: {prompt}\nA:"
+            formatted = prompt
 
         # Import generate function
         animalm_dir = os.path.expanduser("~/Dev/anima/sub-projects/animalm")

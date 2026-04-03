@@ -53,6 +53,15 @@ def parse_args() -> argparse.Namespace:
     agent_group.add_argument("--provider", type=str, default=None,
                              help="LLM provider: animalm (default, no API), claude, conscious-lm")
 
+    # Test mode
+    test_group = parser.add_argument_group("testing")
+    test_group.add_argument("--test", action="store_true",
+                            help="Run offline test suite (no API/GPU needed)")
+    test_group.add_argument("--test-category", "-c", type=str, default=None,
+                            help="Run single test category (routing, policy, channel, provider, plugin, skill, registry, core, philosophy)")
+    test_group.add_argument("--test-json", action="store_true",
+                            help="Output test results as JSON")
+
     # Logging
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose logging (DEBUG)")
@@ -202,9 +211,46 @@ async def async_main(args: argparse.Namespace):
     logger.info("Agent state saved. Goodbye.")
 
 
+def run_tests(args: argparse.Namespace) -> int:
+    """Run offline test suite with mock consciousness."""
+    from testing.mock_consciousness import patch_consciousness
+    patch_consciousness()
+
+    from testing.test_harness import run_all, print_report
+    import json as _json
+
+    results = run_all(
+        category=args.test_category,
+        verbose=args.verbose,
+    )
+
+    if args.test_json:
+        output = []
+        for cat in results:
+            output.append({
+                "category": cat.name,
+                "total": cat.total,
+                "pass": cat.pass_count,
+                "fail": cat.fail_count,
+                "tests": [
+                    {"name": t.name, "passed": t.passed, "message": t.message}
+                    for t in cat.tests
+                ],
+            })
+        print(_json.dumps(output, indent=2))
+        return 0 if all(cat.fail_count == 0 for cat in results) else 1
+    else:
+        passed = print_report(results, verbose=args.verbose)
+        return 0 if passed else 1
+
+
 def main():
     args = parse_args()
     setup_logging(args)
+
+    # Test mode — run offline tests and exit
+    if args.test:
+        sys.exit(run_tests(args))
 
     try:
         asyncio.run(async_main(args))

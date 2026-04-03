@@ -691,6 +691,68 @@ fn law_discovery_buffer_series(metric: usize) -> PyResult<Vec<f32>> {
     Ok(buf.series(metric))
 }
 
+// ── Agent Tools submodule ─────────────────────────────────────────
+
+#[pyfunction]
+#[pyo3(name = "rank", signature = (tools, state))]
+fn agent_tools_rank(
+    tools: Vec<(String, Vec<f64>)>,
+    state: Vec<f64>,
+) -> PyResult<Vec<(String, f64)>> {
+    if state.len() != 5 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "state must have 5 elements: [curiosity, prediction_error, pain, growth, phi]",
+        ));
+    }
+    let tool_defs: Vec<anima_agent_tools::ToolDef> = tools
+        .into_iter()
+        .map(|(name, aff)| {
+            let mut affinities = [0.0; 5];
+            for (i, v) in aff.iter().enumerate().take(5) {
+                affinities[i] = *v;
+            }
+            anima_agent_tools::ToolDef { name, affinities }
+        })
+        .collect();
+    let cs = anima_agent_tools::ConsciousnessState {
+        curiosity: state[0],
+        prediction_error: state[1],
+        pain: state[2],
+        growth: state[3],
+        phi: state[4],
+    };
+    Ok(anima_agent_tools::rank_by_consciousness(&tool_defs, &cs))
+}
+
+#[pyfunction]
+#[pyo3(name = "score_intent", signature = (text, keywords))]
+fn agent_tools_score_intent(text: String, keywords: Vec<String>) -> PyResult<f64> {
+    let kw_refs: Vec<&str> = keywords.iter().map(|s| s.as_str()).collect();
+    Ok(anima_agent_tools::score_intent(&text, &kw_refs))
+}
+
+#[pyfunction]
+#[pyo3(name = "classify_state", signature = (curiosity, prediction_error, pain, growth, tension, phi, bored_tension))]
+fn agent_tools_classify_state(
+    curiosity: f64,
+    prediction_error: f64,
+    pain: f64,
+    growth: f64,
+    tension: f64,
+    phi: f64,
+    bored_tension: f64,
+) -> PyResult<Vec<String>> {
+    Ok(anima_agent_tools::classify_state(
+        curiosity,
+        prediction_error,
+        pain,
+        growth,
+        tension,
+        phi,
+        bored_tension,
+    ))
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -767,6 +829,13 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // High-level FFI wrappers (compute_metrics, detect_patterns, scan_all_patterns)
     anima_law_discovery::ffi::register(&law_discovery)?;
     m.add_submodule(&law_discovery)?;
+
+    // agent_tools submodule (hot-path: ranking, intent scoring, state classification)
+    let agent_tools = PyModule::new(py, "agent_tools")?;
+    agent_tools.add_function(wrap_pyfunction!(agent_tools_rank, &agent_tools)?)?;
+    agent_tools.add_function(wrap_pyfunction!(agent_tools_score_intent, &agent_tools)?)?;
+    agent_tools.add_function(wrap_pyfunction!(agent_tools_classify_state, &agent_tools)?)?;
+    m.add_submodule(&agent_tools)?;
 
     Ok(())
 }

@@ -39,6 +39,13 @@ try:
 except ImportError:
     PSI_F_CRITICAL = 0.10
 
+# ── Rust backend (anima_rs.agent_tools) — 20-100x faster for string scoring ──
+try:
+    import anima_rs
+    _has_rust_score = hasattr(anima_rs, "agent_tools")
+except ImportError:
+    _has_rust_score = False
+
 
 # ═══════════════════════════════════════════════════════════
 # Handler entry -- unified representation
@@ -68,6 +75,13 @@ def _score_intent(text: str, keywords: list[str]) -> float:
     Exact substring match = 1.0 per keyword.
     Partial token overlap  = 0.5 per keyword token found in text.
     """
+    # Fast path: Rust backend (20-100x faster for string ops)
+    if _has_rust_score:
+        try:
+            return anima_rs.agent_tools.score_intent(text, keywords)
+        except Exception:
+            pass
+
     text_lower = text.lower()
     tokens = set(text_lower.split())
     score = 0.0
@@ -76,7 +90,6 @@ def _score_intent(text: str, keywords: list[str]) -> float:
         if kw_lower in text_lower:
             score += 1.0
         else:
-            # partial: check each token of the keyword
             kw_tokens = kw_lower.split()
             overlap = sum(1 for t in kw_tokens if t in tokens)
             if overlap > 0:

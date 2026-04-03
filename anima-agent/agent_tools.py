@@ -48,6 +48,13 @@ try:
 except ImportError:
     PSI_F_CRITICAL, PSI_NARRATIVE_MIN = 0.10, 0.2
 
+# ── Rust backend (anima_rs.agent_tools) — 10-50x faster for hot paths ──
+try:
+    import anima_rs
+    _has_rust_agent_tools = hasattr(anima_rs, "agent_tools")
+except ImportError:
+    _has_rust_agent_tools = False
+
 
 # ---------------------------------------------------------------------------
 # 1. Data structures
@@ -158,6 +165,18 @@ class ToolRegistry:
         growth = state.get('growth', 0.0)
         phi = state.get('phi', 0.0)
 
+        # Fast path: Rust backend (10-50x faster)
+        if _has_rust_agent_tools:
+            try:
+                tools = [
+                    (name, [td.curiosity_affinity, td.pe_affinity, td.pain_affinity,
+                            td.growth_affinity, td.phi_affinity])
+                    for name, td in self._tools.items()
+                ]
+                return anima_rs.agent_tools.rank(tools, [curiosity, pe, pain, growth, phi])
+            except Exception:
+                pass  # Fall through to Python
+
         scores = []
         for name, td in self._tools.items():
             score = (
@@ -165,7 +184,7 @@ class ToolRegistry:
                 + td.pe_affinity * pe
                 + td.pain_affinity * pain
                 + td.growth_affinity * growth
-                + td.phi_affinity * min(phi / 10.0, 1.0)  # normalize phi
+                + td.phi_affinity * min(phi / 10.0, 1.0)
             )
             scores.append((name, score))
 
@@ -1591,13 +1610,17 @@ class ActionPlanner:
 
         return candidates[:max_tools]
 
-    def plan(self, goal: str, state: dict, context: str = "") -> ActionPlan:
+    def plan(self, goal: str, state: dict, context: str = "",
+             allowed_tools: Optional[list] = None) -> ActionPlan:
         """Create an action plan for a goal given consciousness state.
 
         This is a simple rule-based planner. For complex multi-step plans,
         the LLM (ConsciousLM or Claude) should generate the plan as JSON.
+        If allowed_tools is provided, only those tools are considered.
         """
         tools = self.select_tools(state, goal)
+        if allowed_tools is not None:
+            tools = [t for t in tools if t in allowed_tools]
         steps = []
 
         for i, tool_name in enumerate(tools):
@@ -2183,12 +2206,15 @@ class AgentToolSystem:
 
     # --- High-level API ---
 
-    def act(self, goal: str, consciousness_state: dict, context: str = "") -> list[ToolResult]:
+    def act(self, goal: str, consciousness_state: dict, context: str = "",
+            allowed_tools: Optional[list] = None) -> list:
         """Full cycle: plan -> execute -> return results.
 
         This is the main entry point for autonomous tool use.
+        If allowed_tools is provided (from policy check), only those tools are used.
         """
-        plan = self.planner.plan(goal, consciousness_state, context)
+        plan = self.planner.plan(goal, consciousness_state, context,
+                                 allowed_tools=allowed_tools)
         return self.execute_plan(plan)
 
     def suggest_actions(self, goal: str, consciousness_state: dict,
