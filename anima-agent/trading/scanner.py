@@ -16,14 +16,13 @@ import json
 import logging
 import time
 import urllib.request
-import urllib.error
 from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 
 from trading.data import MarketData, fetch_ohlcv
-from trading.regime import RegimeDetector, MarketRegime
+from trading.regime import RegimeDetector
 
 logger = logging.getLogger(__name__)
 

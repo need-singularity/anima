@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
 from typing import Any, Optional, TYPE_CHECKING
 
 from plugins.base import PluginBase, PluginManifest

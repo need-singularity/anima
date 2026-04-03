@@ -27,7 +27,7 @@ Usage:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)

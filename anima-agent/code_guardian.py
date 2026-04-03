@@ -41,7 +41,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 AGENT_DIR = Path(__file__).parent
 RULES_FILE = AGENT_DIR / "code_rules.json"

@@ -18,15 +18,13 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-
-import numpy as np
 
 from trading.broker import Broker, BinanceBroker, PaperBroker, OrderResult
 from trading.portfolio import Portfolio
-from trading.risk import RiskManager, RiskLimits, ConsciousnessGate
-from trading.regime import RegimePolicy, MarketRegime
+from trading.risk import RiskManager, ConsciousnessGate
+from trading.regime import RegimePolicy
 
 logger = logging.getLogger(__name__)
 

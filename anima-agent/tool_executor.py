@@ -11,9 +11,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any
-
-from tool_registry import ToolDef, ToolResult, ToolRegistry
+from tool_registry import ToolResult, ToolRegistry
 from tool_implementations import _TaskScheduler
 
 logger = logging.getLogger(__name__)

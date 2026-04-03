@@ -13,9 +13,9 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
-from providers.base import BaseProvider, ProviderMessage, ProviderConfig
+from providers.base import BaseProvider, ProviderConfig
 from providers.claude_provider import ClaudeProvider
 from providers.conscious_lm_provider import ConsciousLMProvider
 from providers.animalm_provider import AnimaLMProvider

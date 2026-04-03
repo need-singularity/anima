@@ -15,7 +15,6 @@ Standalone test (no discord dependency):
     python channels/discord_bot.py --test
 """
 
-import asyncio
 import logging
 import os
 import sys

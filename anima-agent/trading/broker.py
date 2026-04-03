@@ -10,7 +10,6 @@ import json
 import logging
 import time
 import urllib.request
-import urllib.error
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional

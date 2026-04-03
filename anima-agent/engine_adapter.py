@@ -15,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +72,6 @@ class RustEngineAdapter:
 
     def __call__(self, vec, hidden=None):
         """Process input — matches ConsciousMind(vec, hidden) signature."""
-        import numpy as np
-
         # Convert torch tensor to list for Rust
         if hasattr(vec, 'numpy'):
             input_data = vec.squeeze().detach().numpy().tolist()

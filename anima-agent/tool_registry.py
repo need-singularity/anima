@@ -6,8 +6,7 @@ Data structures: ToolParam, ToolDef, ToolResult
 Registry: ToolRegistry (central registry with consciousness-driven ranking)
 """
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 # ── Rust backend (anima_rs.agent_tools) — 10-50x faster for hot paths ──

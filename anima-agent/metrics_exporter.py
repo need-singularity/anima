@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import logging
 import threading
-import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Callable
 

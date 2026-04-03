@@ -15,7 +15,7 @@ import logging
 import os
 from typing import Any, AsyncIterator
 
-from providers.base import BaseProvider, ProviderConfig, ProviderMessage
+from providers.base import ProviderConfig, ProviderMessage
 
 logger = logging.getLogger(__name__)
 

@@ -32,8 +32,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-import numpy as np
-
 from trading.data import MarketData, fetch_ohlcv
 from trading.portfolio import Portfolio
 from trading.strategy import Strategy, Signal, StrategySignal
@@ -42,8 +40,8 @@ from trading.strategies import (
     MomentumFactorStrategy, VolBreakoutStrategy, FearGreedStrategy,
     get_all_strategies,
 )
-from trading.regime import RegimeDetector, RegimeState, MarketRegime, RegimePolicy
-from trading.scanner import MarketScanner, ScanReport, ScanResult
+from trading.regime import RegimeDetector, RegimeState
+from trading.scanner import MarketScanner, ScanResult
 from trading.executor import OrderExecutor, ExecutionConfig, ExecutionResult
 from trading.risk import RiskManager, RiskLimits, ConsciousnessGate
 

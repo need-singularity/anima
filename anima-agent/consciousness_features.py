@@ -16,8 +16,7 @@ import json
 import logging
 import os
 import sys
-import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +287,6 @@ def emotion_music(agent, duration: float = 3.0) -> Dict:
     """Generate music from consciousness state. tension→tempo, phi→complexity."""
     try:
         from voice_synth import VoiceSynth
-        import numpy as np
 
         phi = agent.mind._consciousness_vector.phi
         tension = agent._tension

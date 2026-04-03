@@ -147,6 +147,10 @@ class AgentToolSystem:
         self.scheduler = _TaskScheduler()
         self.executor = ToolExecutor(self.registry, mind=mind, memory_rag=rag, scheduler=self.scheduler, anima=anima)
         self.planner = ActionPlanner(self.registry)
+        # P3: Connect ToolGrowth to ActionPlanner for evolved tool selection
+        if anima and hasattr(anima, 'tool_growth') and anima.tool_growth:
+            self.planner.set_growth(anima.tool_growth)
+            logger.info("ActionPlanner: ToolGrowth connected")
 
         logger.info(f"AgentToolSystem initialized: {len(self.registry.list_all())} tools registered")
 

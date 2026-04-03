@@ -21,7 +21,7 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from anima_agent import AnimaAgent

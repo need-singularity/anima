@@ -24,7 +24,7 @@ import os
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.expanduser("~/Dev/anima"))

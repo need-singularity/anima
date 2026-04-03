@@ -168,7 +168,6 @@ class HypothesisBridge(PluginBase):
         _ensure_invest_path()
         try:
             from backend.hypothesis.engine import HypothesisEngine
-            from backend.hypothesis.models import HypothesisRecord
         except ImportError as e:
             logger.error("Cannot import invest hypothesis engine: %s", e)
             return []

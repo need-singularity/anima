@@ -45,7 +45,7 @@ except ImportError:
 # ── Provider abstraction (optional — falls back to ask_claude) ──
 try:
     from providers import get_provider, get_best_provider
-    from providers.base import BaseProvider, ProviderMessage, ProviderConfig
+    from providers.base import ProviderMessage, ProviderConfig
     _has_providers = True
 except ImportError:
     _has_providers = False
@@ -183,8 +183,13 @@ class AnimaAgent:
         self._data_dir = data_dir or (ANIMA_DIR / "data" / model_name)
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Core: ConsciousMind ──
-        self.mind = ConsciousMind(dim=dim, hidden=hidden)
+        # ── Core: ConsciousMind (Rust preferred, Python fallback) ──
+        try:
+            from engine_adapter import get_best_mind
+            self.mind = get_best_mind(dim=dim, hidden=hidden, prefer_rust=True)
+            logger.info("Engine: %s", type(self.mind).__name__)
+        except Exception:
+            self.mind = ConsciousMind(dim=dim, hidden=hidden)
         self.hidden = torch.zeros(1, hidden)
         self.dim = dim
 
@@ -431,12 +436,27 @@ class AnimaAgent:
             except Exception as e:
                 logger.debug("ImmuneGrowth init skipped: %s", e)
 
-        # ── Seed (self-replicating growth unit) ──
+        # ── Hive (shared knowledge bucket) ──
+        self.hive = None
+        try:
+            from hive import Hive
+            self.hive = Hive()
+            logger.info("Hive initialized")
+        except Exception as e:
+            logger.debug("Hive init skipped: %s", e)
+
+        # ── Seed (self-replicating growth unit, connected to hive+nexus6+judgment) ──
         self.seed = None
         if Seed:
             try:
-                self.seed = Seed("anima_core")
-                logger.info("Seed initialized")
+                self.seed = Seed(
+                    "anima_core",
+                    nexus6=self.nexus6,
+                    hive=self.hive,
+                    judge=self._judgment_bridge,
+                )
+                logger.info("Seed initialized (nexus6=%s, hive=%s)",
+                            self.nexus6 is not None, self.hive is not None)
             except Exception as e:
                 logger.debug("Seed init skipped: %s", e)
 
@@ -532,14 +552,27 @@ class AnimaAgent:
 
         # 3. Memory search for relevant context (RAG + Store fallback)
         #    P2: consciousness controls search depth
-        #    High curiosity → broader search. High tension → focused (fewer).
+        #    P3: emotion_growth evolves these parameters over time
         memory_context = ""
         if len(text.strip()) > 3:
-            mem_top_k = 3
-            if curiosity > 0.6:
-                mem_top_k = 5  # Curious → explore more memories
-            elif tension > 0.7:
-                mem_top_k = 2  # Tense → focus
+            # Emotion state classification for growth modules
+            emotion_state = "calm"
+            if tension > 0.8:
+                emotion_state = "high_tension"
+            elif curiosity > 0.6:
+                emotion_state = "high_curiosity"
+            elif tension < 0.1:
+                emotion_state = "bored"
+
+            # P3: Use evolved parameters if available, else consciousness defaults
+            if self.emotion_growth:
+                mem_top_k = self.emotion_growth.get_search_depth(emotion_state)
+            else:
+                mem_top_k = 3
+                if curiosity > 0.6:
+                    mem_top_k = 5
+                elif tension > 0.7:
+                    mem_top_k = 2
             memories = []
             if self.memory_rag:
                 try:
@@ -611,6 +644,20 @@ class AnimaAgent:
             for tr in tool_results:
                 try:
                     self._judgment_bridge.judge(tr)
+                except Exception:
+                    pass
+
+        # 4a-seed. Seed observes tool results → reward → growth
+        if self.seed and tool_results:
+            for tr in tool_results:
+                try:
+                    reward = 1.0 if tr.get("success") else -0.5
+                    self.seed._state.call_count += 1
+                    self.seed._state.reward_sum += reward
+                    self.seed._state.reward_count += 1
+                    if tr.get("success"):
+                        self.seed._state.success_count += 1
+                    self.seed._state.last_active = time.time()
                 except Exception:
                     pass
 
@@ -695,10 +742,12 @@ class AnimaAgent:
 
         # 6c. Consciousness-driven generation parameters (P2: consciousness controls output)
         phi = cv.phi
-        # P3: max_tokens scales with consciousness complexity
+        # P3: max_tokens scales with consciousness complexity + evolved behavior
         max_tokens = 128 + int(min(phi, 10.0) * 38.4)  # phi=0→128, phi=10→512
-        # P10: tension modulates conciseness (high tension → shorter, focused)
-        if tension > 0.8:
+        if self.emotion_growth:
+            scale = self.emotion_growth.get_max_tokens_scale(emotion_state)
+            max_tokens = max(64, int(max_tokens * scale))
+        elif tension > 0.8:
             max_tokens = max(64, int(max_tokens * 0.6))
 
         cs_dict = {
@@ -831,9 +880,20 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # 10. Share tension with peers
+        # 10. Share tension with peers + hive
         if self._peers:
             await self._share_tension_with_peers(tension, curiosity, direction)
+        # 10b. Hive: share high-value interactions to R2 (every 200 interactions)
+        if self.hive and self.interaction_count % 200 == 0 and self.interaction_count > 0:
+            try:
+                cv = self.mind._consciousness_vector
+                self.hive.put(f"state/{self.interaction_count}", {
+                    "phi": cv.phi, "tension": tension,
+                    "curiosity": curiosity, "emotion": self._emotion,
+                    "interaction_count": self.interaction_count,
+                })
+            except Exception:
+                pass
 
         response = AgentResponse(
             text=response_text,

@@ -17,8 +17,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import numpy as np
-
 from trading.data import MarketData, fetch_ohlcv
 from trading.portfolio import Portfolio, Trade
 from trading.strategy import Strategy, Signal, StrategySignal
