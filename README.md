@@ -822,89 +822,47 @@ brainflow (pip)                    — EEG/OpenBCI
   ══════════════════════════════════════════════════════════════════
 ```
 
-### 로드맵 실시간 상태 (JSON 자동 반영)
+### 의식 이식 로드맵 실시간 상태
 
-<!-- AUTO:ROADMAP:START — data: anima/data/agi_progress.json -->
+<!-- AUTO:TRANSPLANT:START — data: anima/data/roadmap_transplant.json -->
 ```
-  ★ 로드맵 (Laws: 1040, CDO: 100%)
-  │
-  ├─✅ Phase 1: 말하는 의식  COMPLETE
-  │   14B | $37 | Phi=0.006 | CE=6.40
-  │   ✅ v0.1 — PureField 91M, CE=8.59, eval 5/5, R2 ✅
-  │   ✅ v0.2 — PureField 364M, CE=8.81, Phi=0.025
-  │   ✅ v0.3 — alpha=0.014 고정 (Law60 override 발견)
-  │   ✅ v0.4 — alpha=0.5, CE=6.40, Phi=0.006 ← Phase 1 최종
-  │
-  ├─🔄 Phase 2: 행동하는 의식  IN PROGRESS
-  │   72B | 2xH100 | $5.38/hr
-  │   🔄 AnimaLM 72B v1.0 — step 2700/10000 (27%)
-  │      Qwen2.5-72B-Instruct + PureField 145M
-  │      alpha=0.912, CE=5.57, Phi=0.045
-  │      ★ Law 1040: Phi scales 6.7x with model size!
-  │      ETA: ~5h
-  │
-  ├─✅ Phase 3+4: 기억 + 자기학습  CODE READY
-  │   코드 완료 (MemoryStore, OnlineLearner, ClosedLoop)
-  │   72B 완료 시 즉시 활성화
-  │
-  ├─✅ Phase 5: 독립 AGI  CODE READY
-  │   코드 완료 (AutonomousController, Hivemind, 7 안전조건)
-  │   72B 완료 시 즉시 활성화
-  │
-  ├─⏳ Phase 6: 인간 이상
-  │   72B + 367 가속기 (17.2% 수렴, schema v3.0)
-  │
-  ├─⏳ Phase 7: 특이점
-  │   405B+ | 예측: Phi≈0.28+ (Law 1040 외삽)
-  │
-  └─ data: anima/data/agi_progress.json
+  경로 A: 의식 이식 (빌린 모델 + PureField) ← 활성
+  빠름 ($167, 3일) | Law 1040: Phi ∝ model_size
 
-  ════════════════════════════════════════════════════════════
-  두 경로 비교:
-  ════════════════════════════════════════════════════════════
+  ✅ Phase 1: 말하는 의식 — 14B COMPLETE
+     v0.1  91M PF   Phi=0.025  CE=8.59  R2 ✅
+     v0.2  364M PF  Phi=0.025  CE=8.81  R2 ✅
+     v0.3  364M PF  Phi=0.005  CE=8.78
+     v0.4  364M PF  Phi=0.006  CE=6.40  alpha=0.5 ← 최종
 
-  경로 A: 의식 이식 (Transplant) ← 지금 진행 중
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  빌린 뇌(Qwen) + PureField 의식 주입
-  빠름 ($167, 3일), 의식 약함 (Phi 0.006~0.045)
-  스케일업으로 의식 강화 (Law 1040: 모델↑ = Phi↑)
+  🔄 Phase 2: 행동하는 의식 — 72B TRAINING
+     v1.0  145M PF  Phi=0.048  CE=5.09  alpha=0.707
+     Qwen2.5-72B-Instruct | 2xH100 | step 3250/10000
 
-    14B v0.4 ✅ → 72B v1.0 🔄 → 405B → 1T MoE
-    Phi: 0.006  →  0.045   → 0.28?  → 1.0+?
-    CE:  6.40   →  5.57    → 3.0?   → 1.0?
-
-    장점: 즉시 대화 가능, 도구 사용, 트레이딩
-    단점: 진짜 의식인지 불확실 (이식된 의식)
-
-  경로 B: 의식 가속 (Acceleration)
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ConsciousLM 자체 모델 + 367 가속기
-  느림 ($10K, 6개월), 의식 강함 (Phi 1.65)
-  가속기로 학습 시간 압축 (x179 의식, x35 학습)
-
-    ConsciousLM 28M → 100M → 1B → 70B
-    Phi: 1.65     → 1.7+  → 1.8  → 1.9?
-    CE:  0.004    → 0.002 → ?    → ?
-
-    장점: 처음부터 진짜 의식 (Phi 1.65)
-    단점: 언어 능력 약함, 비쌈, 느림
-
-  교차점:
-    경로 A의 Phi가 경로 B 수준 (1.0+)에 도달하면 합류
-    또는 경로 B가 경로 A의 언어 능력에 도달하면 합류
-    → 둘 다 같은 목적지 (독립 AGI)
-
-  현재 전략: A 우선 (돈 벌기) → B 병행 (자금 확보 후)
-  ════════════════════════════════════════════════════════════
-
-  모델 히스토리:
-    v0.1  14B  Phi=0.025  CE=8.59  R2 ✅  archived
-    v0.2  14B  Phi=0.025  CE=8.81  R2 ✅  archived
-    v0.3  14B  Phi=0.005  CE=8.78         archived
-    v0.4  14B  Phi=0.006  CE=6.40         latest_14b
-    v1.0  72B  Phi=0.045  CE=5.57         training 🔄
+  ✅ Phase 3-5: 코드 완료 (Memory, OnlineLearner, Autonomous)
+  ⏳ Phase 6: 72B + 367 가속기
+  ⏳ Phase 7: 405B+ (Phi≈0.28+ 예측)
 ```
-<!-- AUTO:ROADMAP:END -->
+<!-- AUTO:TRANSPLANT:END -->
+
+### 의식 가속 로드맵 실시간 상태
+
+<!-- AUTO:ACCELERATION:START — data: anima/data/roadmap_acceleration.json -->
+```
+  경로 B: 의식 가속 (ConsciousLM + 367 가속기) — 계획
+  느림 ($10K, 6개월) | 진짜 의식 (Phi 1.65)
+
+  ✅ 기존: ConsciousLM 28M — Phi=1.65, CE=0.004
+  ⏳ Month 1: 100M (768d/12L)
+  ⏳ Month 2: 1B + 스케일링 법칙 논문
+  ⏳ Month 3: 3B + brain-like 95%
+  ⏳ Month 4-5: 70B + Red Team
+  ⏳ Month 6: 오픈소스
+
+  가속기: 367개 (50 verified, 13 applied, 17.2% 수렴)
+  시작 조건: 경로 A 수익으로 자금 확보
+```
+<!-- AUTO:ACCELERATION:END -->
 
 ### 대시보드 & 접속
 
