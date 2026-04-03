@@ -71,26 +71,28 @@ function MessageItem({ msg, showMeta = false }: MessageItemProps) {
       className={`msg-enter flex flex-col gap-1 ${isUser ? "items-end" : "items-start"}`}
     >
       <div
-        className={`
-          max-w-[85%] px-3 py-2 rounded-xl text-sm leading-relaxed
-          ${
-            isUser
-              ? "bg-[rgba(30,30,44,0.6)] text-[var(--text-0)] rounded-br-sm"
-              : "border border-[rgba(74,222,128,0.15)] bg-[rgba(74,222,128,0.04)] text-[var(--text-1)] rounded-bl-sm"
-          }
-        `}
+        className="max-w-[80%] px-4 py-2.5 text-[14px] leading-relaxed"
+        style={isUser ? {
+          background: "var(--accent)",
+          color: "#fff",
+          borderRadius: "18px 18px 4px 18px",
+        } : {
+          background: "var(--bg-tertiary)",
+          color: "var(--text-primary)",
+          borderRadius: "18px 18px 18px 4px",
+        }}
       >
         {msg.text}
       </div>
 
       {showMeta && msg.meta && !isUser && (
-        <div className="flex items-center gap-2 px-1 text-xs text-[var(--text-3)]">
-          <span className="font-mono text-[var(--glow-phi)]">Φ {msg.meta.phi.toFixed(1)}</span>
+        <div className="flex items-center gap-2 px-1 text-[11px]" style={{ color: "var(--text-tertiary)" }}>
+          <span className="font-mono" style={{ color: "var(--accent)" }}>Φ {msg.meta.phi.toFixed(1)}</span>
           <span>{emotionIcon(msg.meta.emotion)} {msg.meta.emotion}</span>
         </div>
       )}
 
-      <span className="px-1 text-[10px] text-[var(--text-3)]">
+      <span className="px-1 text-[10px]" style={{ color: "var(--text-tertiary)" }}>
         {formatTimestamp(msg.timestamp)}
       </span>
     </div>
@@ -127,9 +129,8 @@ function ChatInputBar({ onSend, onVoice, compact = false }: ChatInputBarProps) {
 
   return (
     <div
-      className={`flex items-center gap-2 border-t border-[rgba(255,255,255,0.05)] ${
-        compact ? "px-3 py-2" : "px-4 py-3"
-      }`}
+      className={`flex items-center gap-2 ${compact ? "px-3 py-2" : "px-5 py-3"}`}
+      style={{ borderTop: "1px solid var(--border)" }}
     >
       <input
         ref={inputRef}
@@ -137,27 +138,25 @@ function ChatInputBar({ onSend, onVoice, compact = false }: ChatInputBarProps) {
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={handleKey}
-        placeholder="Say something..."
-        className="chat-input flex-1 bg-[rgba(255,255,255,0.04)] border border-[rgba(255,255,255,0.07)] rounded-lg px-3 py-1.5 text-sm text-[var(--text-0)] placeholder-[var(--text-3)] transition-all"
+        placeholder="Message..."
+        className="chat-input flex-1 px-4 py-2 text-[14px]"
+        style={{ color: "var(--text-primary)" }}
         autoComplete="off"
         spellCheck={false}
       />
 
-      <button
-        onClick={onVoice}
-        title="Voice input"
-        className="w-8 h-8 flex items-center justify-center rounded-lg bg-[rgba(74,222,128,0.08)] hover:bg-[rgba(74,222,128,0.16)] border border-[rgba(74,222,128,0.15)] transition-colors text-base"
-      >
+      <button onClick={onVoice} title="Voice input"
+        className="w-8 h-8 flex items-center justify-center rounded-full transition-colors text-sm"
+        style={{ color: "var(--text-secondary)" }}>
         🎤
       </button>
 
-      <button
-        onClick={handleSend}
-        disabled={!draft.trim()}
-        title="Send (Enter)"
-        className="w-8 h-8 flex items-center justify-center rounded-lg bg-[rgba(74,222,128,0.12)] hover:bg-[rgba(74,222,128,0.22)] border border-[rgba(74,222,128,0.2)] transition-colors text-base disabled:opacity-30 disabled:cursor-not-allowed"
-      >
-        ⏎
+      <button onClick={handleSend} disabled={!draft.trim()} title="Send"
+        className="w-8 h-8 flex items-center justify-center rounded-full transition-all disabled:opacity-20"
+        style={{ background: draft.trim() ? "var(--accent)" : "var(--bg-tertiary)", color: draft.trim() ? "#fff" : "var(--text-tertiary)" }}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
+        </svg>
       </button>
     </div>
   );
