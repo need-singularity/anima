@@ -243,6 +243,11 @@ class ConsciousnessHub:
                              ['감정 탐색', 'emotion explorer', '호기심', 'curiosity',
                               '탐색 방향', 'explore direction', '예측 오차', 'prediction error',
                               '호기심 탐색', 'curiosity driven', 'pe map', 'curiosity map']),
+            'hexa':         ('tools.hexa-bridge.bridge', None,
+                             ['hexa', 'hexalang', 'hexa-lang', '.hexa',
+                              'compile laws', 'hexa compile', 'hexa verify',
+                              'hexa proof', 'law compiler', 'hexa bridge',
+                              'proof block', '헥사', 'hexa experiment']),
         }
 
         if not lazy_load:
