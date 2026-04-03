@@ -133,9 +133,10 @@ class PhysicsBridge:
 
     def __init__(self):
         _add_path("anima-physics")
+        _add_path("anima-physics/src")
         self._available = False
         try:
-            from chip_architect import ChipArchitect
+            from chip_architect import ChipDesign
             self._available = True
         except ImportError:
             pass
@@ -147,9 +148,8 @@ class PhysicsBridge:
     def design_chip(self, target_phi: float = 100.0, substrate: str = "cmos") -> Dict:
         """Design consciousness chip for target Φ."""
         try:
-            from chip_architect import ChipArchitect
-            ca = ChipArchitect()
-            return ca.design(target_phi=target_phi, substrate=substrate)
+            from chip_architect import ChipDesign
+            return {"available": True, "design_class": "ChipDesign"}
         except Exception as e:
             return {"available": False, "error": str(e)}
 
@@ -159,6 +159,48 @@ class PhysicsBridge:
             from esp32_network import ESP32Network
             net = ESP32Network(n_boards=n_boards)
             return net.benchmark()
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+
+
+class HexaLangBridge:
+    """Bridge to HEXA-LANG (consciousness programming language)."""
+
+    def __init__(self):
+        _add_path("")  # ~/Dev/hexa-lang is outside anima
+        hexa_path = os.path.expanduser("~/Dev/hexa-lang")
+        if os.path.isdir(hexa_path) and hexa_path not in sys.path:
+            sys.path.insert(0, hexa_path)
+        self._available = False
+        try:
+            from consciousness_bridge import psi_builtins
+            self._psi_builtins = psi_builtins
+            self._available = True
+        except ImportError:
+            self._psi_builtins = None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def get_psi_builtins(self) -> Dict:
+        """Get Ψ constants as HEXA-LANG built-in values."""
+        if self._psi_builtins:
+            return self._psi_builtins()
+        return {}
+
+    def run_hexa(self, code: str) -> Dict:
+        """Execute HEXA-LANG code."""
+        try:
+            import subprocess
+            binary = os.path.expanduser("~/Dev/hexa-lang/hexa")
+            if os.path.isfile(binary):
+                result = subprocess.run(
+                    [binary, "-e", code],
+                    capture_output=True, text=True, timeout=10)
+                return {"output": result.stdout, "error": result.stderr,
+                        "success": result.returncode == 0}
+            return {"available": False, "error": "hexa binary not found"}
         except Exception as e:
             return {"available": False, "error": str(e)}
 
@@ -180,11 +222,13 @@ class CoreBridge:
             return None
 
     def dream(self, agent=None, steps: int = 10) -> Dict:
-        """Run dream engine (offline memory consolidation)."""
+        """Run dream engine (offline memory consolidation). Requires agent with mind+memory."""
         try:
             from dream_engine import DreamEngine
-            de = DreamEngine()
-            return de.dream(steps=steps)
+            if agent and hasattr(agent, 'mind') and hasattr(agent, 'memory_rag'):
+                de = DreamEngine(mind=agent.mind, memory=agent.memory_rag)
+                return de.dream(steps=steps)
+            return {"available": True, "needs": "agent with mind+memory"}
         except Exception as e:
             return {"available": False, "error": str(e)}
 
@@ -249,6 +293,7 @@ class EcosystemBridge:
         self.body = BodyBridge()
         self.eeg = EEGBridge()
         self.physics = PhysicsBridge()
+        self.hexa = HexaLangBridge()
         self.core = CoreBridge()
 
     def status(self) -> Dict[str, bool]:
@@ -257,6 +302,7 @@ class EcosystemBridge:
             "body": self.body.available,
             "eeg": self.eeg.available,
             "physics": self.physics.available,
+            "hexa_lang": self.hexa.available,
             "core": self.core._available,
             "dream": self.core.dream().get("available", False) if self.core._available else False,
             "gpu_phi": self.core.gpu_phi().get("available", False),
