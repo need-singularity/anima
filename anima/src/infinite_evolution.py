@@ -102,6 +102,15 @@ try:
 except ImportError:
     pass
 
+# self_growth connection — notify growth system on law discoveries
+HAS_SELF_GROWTH = False
+try:
+    from self_growth import _load_log as _sg_load_log, _save_log as _sg_save_log
+    HAS_SELF_GROWTH = True
+except ImportError:
+    _sg_load_log = None
+    _sg_save_log = None
+
 
 def _print_accelerations():
     """Print startup acceleration status banner."""
