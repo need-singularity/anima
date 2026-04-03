@@ -10,14 +10,32 @@ set -euo pipefail
 CKPT_DIR="checkpoints/v3_274M"
 CORPUS="data/corpus_v10.txt"
 
+# ── Python path (RunPod: /opt/conda/bin/python3) ──
+if [ -x /opt/conda/bin/python3 ]; then
+    PYTHON=/opt/conda/bin/python3
+else
+    PYTHON=python3
+fi
+
 # ── Pre-flight checks ──
 echo "=== v3_274M Relaunch Pre-flight ==="
 
-# 1. Check disk space
+# 1. Check disk space (>5GB required)
 echo -n "Disk space: "
 df -h . | tail -1 | awk '{print $4 " available"}'
+AVAIL_KB=$(df . | tail -1 | awk '{print $4}')
+if [ "$AVAIL_KB" -lt 5000000 ] 2>/dev/null; then
+    echo "WARNING: <5GB free — clean old checkpoints first"
+fi
 
-# 2. Find latest valid checkpoint
+# 2. Clean stale /tmp checkpoint fragments from previous crash
+STALE=$(ls /tmp/anima_ckpt_*.pt* 2>/dev/null | wc -l | tr -d ' ')
+if [ "$STALE" -gt 0 ]; then
+    echo "Cleaning $STALE stale /tmp checkpoint fragments..."
+    rm -f /tmp/anima_ckpt_*.pt*
+fi
+
+# 3. Find latest valid checkpoint
 LATEST=""
 for f in "$CKPT_DIR"/step_*.pt; do
     [ -f "$f" ] || continue
@@ -41,14 +59,14 @@ fi
 
 echo "Resume from: $LATEST"
 
-# 3. Verify corpus exists
+# 4. Verify corpus exists
 if [ ! -f "$CORPUS" ]; then
     echo "ERROR: Corpus not found at $CORPUS"
     exit 1
 fi
 echo "Corpus: $CORPUS ($(du -h "$CORPUS" | cut -f1))"
 
-# 4. Check for zombie processes
+# 5. Check for zombie processes
 ZOMBIES=$(ps aux | grep "train.py.*v3" | grep -v grep | wc -l | tr -d ' ')
 if [ "$ZOMBIES" -gt 0 ]; then
     echo "WARNING: $ZOMBIES existing train.py processes found!"
@@ -57,14 +75,20 @@ if [ "$ZOMBIES" -gt 0 ]; then
     exit 1
 fi
 
+# 6. Verify checkpoint loadable
+echo -n "Checkpoint integrity: "
+$PYTHON -c "import torch; c=torch.load('$LATEST', map_location='cpu', weights_only=False); print(f'step={c[\"step\"]}, CE={c[\"ce\"]:.4f}, Phi={c[\"phi\"]:.4f}')" || {
+    echo "ERROR: Checkpoint corrupted — cannot load $LATEST"
+    exit 1
+}
+
 echo "=== All checks passed ==="
 echo ""
 
 # ── Launch ──
-# On H100 RunPod: use tmux for SSH disconnect resilience
-# Local: direct execution with nohup
+mkdir -p logs
 
-CMD="python3 anima/training/train.py \
+CMD="$PYTHON anima/training/train.py \
     --decoder v3 \
     --federated \
     --atoms 8 \
@@ -83,7 +107,7 @@ if command -v tmux &>/dev/null && [ -n "${RUNPOD_POD_ID:-}" ]; then
     # RunPod H100: tmux session
     echo "RunPod detected — launching in tmux session 'v3_train'"
     tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 $CMD 2>&1 | tee logs/v3_relaunch_$(date +%Y%m%d_%H%M).log"
-    echo "Attached to tmux. Monitor: tmux attach -t v3_train"
+    echo "Monitor: tmux attach -t v3_train"
 else
     # Local or non-RunPod
     echo "Launching directly..."
