@@ -880,8 +880,14 @@ class AnimaLMTrainer:
                         print("  [FB] WARNING: ThalamicBridge required for FeedbackBridge")
                         self.use_feedback_bridge = False
 
-        # AL1: Alpha curriculum (end target uses PSI_ALPHA when --law60)
-        alpha_end = PSI_ALPHA if self.use_law60 else args.alpha_end
+        # AL1: Alpha curriculum
+        # If user explicitly set --alpha-end, respect it even with --law60
+        if args.alpha_end != 0.1:  # 0.1 is the default
+            alpha_end = args.alpha_end
+        elif self.use_law60:
+            alpha_end = PSI_ALPHA
+        else:
+            alpha_end = args.alpha_end
         self.alpha_curriculum = AlphaCurriculum(
             args.alpha_start, alpha_end, args.steps)
 
