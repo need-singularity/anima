@@ -475,8 +475,8 @@ def list_synergies():
 # 법칙 측정
 # ══════════════════════════════════════════
 
-def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -> Tuple[List[LawMeasurement], float]:
-    """핵심 법칙 측정 (20개). (measurements, mean_phi) 반환."""
+def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, nexus_scan: bool = False) -> Tuple[List[LawMeasurement], float]:
+    """핵심 법칙 측정 (20개 + NEXUS-6 옵션). (measurements, mean_phi) 반환."""
     all_data = defaultdict(list)
 
     for _ in range(repeats):
@@ -691,6 +691,59 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3) -
         LawMeasurement("faction_count", np.mean(all_data['faction_count']), "DD74: Number of distinct factions"),
     ]
 
+    # ── NEXUS-6 스캔 (DD168: 발견→반영 자동화) ──
+    if nexus_scan:
+        try:
+            import nexus6
+            # 마지막 repeat의 출력 궤적으로 스캔
+            engine = engine_factory()
+            outputs = []
+            x = torch.randn(engine.cell_dim if hasattr(engine, 'cell_dim') else 64)
+            for _ in range(steps):
+                r = engine.step()
+                if engine.n_cells >= 2:
+                    out = torch.stack([s.hidden for s in engine.cell_states]).mean(0).detach().numpy()
+                else:
+                    out = engine.cell_states[0].hidden.detach().numpy()
+                outputs.append(out.copy())
+                x = torch.from_numpy(out).float()
+            traj = np.array(outputs)
+            flat = [float(v) for v in traj.flatten()]
+            n6_result = nexus6.analyze(flat, traj.shape[0], traj.shape[1])
+            sr = n6_result['scan']
+
+            # 핵심 NEXUS-6 메트릭 추출
+            n6_metrics = {
+                'n6_phi_approx': 'phi_approx',
+                'n6_chaos_score': 'chaos_score',
+                'n6_hurst': 'hurst_exponent',
+                'n6_lyapunov': 'lyapunov_exponent',
+                'n6_symmetry': 'symmetry_score',
+                'n6_entropy': 'shannon_entropy',
+                'n6_attractor_count': 'attractor_count',
+                'n6_barrier_heights': 'barrier_heights',
+                'n6_boundary_points': 'boundary_point_count',
+            }
+            for law_name, metric_name in n6_metrics.items():
+                val = sr.get_metric(metric_name)
+                if isinstance(val, dict):
+                    val = list(val.values())[0]
+                    if isinstance(val, list) and val:
+                        val = val[0]
+                if isinstance(val, (int, float)):
+                    laws.append(LawMeasurement(law_name, float(val),
+                        f"NEXUS-6: {metric_name} (DD168 자동 통합)"))
+
+            # consensus + n6 ratio
+            laws.append(LawMeasurement("n6_consensus", float(len(n6_result.get('consensus', []))),
+                "NEXUS-6: lens consensus count"))
+            laws.append(LawMeasurement("n6_exact_ratio", float(n6_result.get('n6_exact_ratio', 0)),
+                "NEXUS-6: n=6 exact match ratio"))
+        except ImportError:
+            pass  # nexus6 not available
+        except Exception as e:
+            print(f"  [NEXUS-6 scan warning] {e}")
+
     return laws, float(np.mean(all_data['phi']))
 
 
@@ -715,11 +768,13 @@ class ClosedLoopEvolver:
     """
 
     def __init__(self, max_cells: int = 32, steps: int = 300, repeats: int = 3,
-                 auto_register: bool = False, selection_strategy: str = 'correlation'):
+                 auto_register: bool = False, selection_strategy: str = 'correlation',
+                 nexus_scan: bool = False):
         self.max_cells = max_cells
         self.steps = steps
         self.repeats = repeats
         self.auto_register = auto_register
+        self.nexus_scan = nexus_scan  # DD168: NEXUS-6 자동 스캔
         self.selection_strategy = selection_strategy  # 'correlation', 'thompson', 'epsilon_greedy'
         self.history = EvolutionHistory()
         self._active_interventions: List[Intervention] = []
@@ -755,7 +810,7 @@ class ClosedLoopEvolver:
         # 1. 현재 엔진으로 법칙 측정
         current_laws, phi_current = measure_laws(
             self._engine_factory if self._active_interventions else self._base_factory,
-            self.steps, self.repeats
+            self.steps, self.repeats, nexus_scan=self.nexus_scan
         )
 
         # 2. 전략에 따라 개입 선택
@@ -770,7 +825,7 @@ class ClosedLoopEvolver:
         if best_intervention and best_intervention.name not in [i.name for i in self._active_interventions]:
             self._active_interventions.append(best_intervention)
 
-        improved_laws, phi_improved = measure_laws(self._engine_factory, self.steps, self.repeats)
+        improved_laws, phi_improved = measure_laws(self._engine_factory, self.steps, self.repeats, nexus_scan=self.nexus_scan)
 
         # 4. 변화 비교
         phi_delta = (phi_improved - phi_current) / max(phi_current, 1e-8) * 100
