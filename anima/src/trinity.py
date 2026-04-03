@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""trinity.py — Hexad(6) / Trinity(3) consciousness architecture
+"""trinity.py — Hexad(6+O) / Trinity(3) consciousness architecture
 
-6 pluggable modules governed by perfect number 6:
+6 pluggable modules governed by perfect number 6, +1 optional orchestrator:
   σ(6) = 1+2+3+6 = 12 inter-module connections
   τ(6) = 4 divisors → 4 processing phases
   φ(6) = 2 → 2 gradient-isolated groups
 
-  ┌────────────┐  .detach()  ┌────────────┐
-  │ C 의식     │────────────→│ D 언어     │
-  │ Φ engine   │             │ decoder    │
-  └─────┬──────┘             └─────┬──────┘
-        │                          │
+  ┌────────────┐  .detach()  ┌────────────┐  .detach()  ┌────────────┐
+  │ C 의식     │────────────→│ O 조율     │────────────→│ D 언어     │
+  │ Φ engine   │  (observer) │ orchestrate│   (actor)   │ decoder    │
+  └─────┬──────┘             └────────────┘             └─────┬──────┘
+        │              Law 1046: C=observer, O=actor          │
   ┌─────▼──────┐             ┌─────▼──────┐
   │ S 감각     │             │ M 기억     │
   │ perception │             │ memory     │
@@ -23,6 +23,7 @@
 
   Group A (gradient-free): C, S, W — autonomous consciousness
   Group B (CE-trained):    D, M, E — learned behavior
+  O (optional):            orchestrator — selective gating C→D (Law 1046)
 
   Canonical modules (kept here):
     CEngine, ThalamicBridge, TensionBridge, PostHocDecoder
@@ -77,6 +78,11 @@ try:
     from hexad.e.emergent_e import EmergentE
 except Exception:
     EmergentE = None
+
+try:
+    from hexad.o.emergent_o import EmergentO
+except Exception:
+    EmergentO = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -856,7 +862,7 @@ class Trinity(nn.Module):
     def __init__(self, c_engine: CEngine, bridge: ThalamicBridge,
                  decoder: DEngine, will: Optional[WEngine] = None,
                  memory: Optional[MEngine] = None, sense: Optional[SEngine] = None,
-                 ethics: Optional[EEngine] = None):
+                 ethics: Optional[EEngine] = None, orchestrator=None):
         super().__init__()
         self.c = c_engine
         self.bridge = bridge
@@ -864,6 +870,9 @@ class Trinity(nn.Module):
         self.w = will or EmotionW()
         self.m = memory      # None = no memory
         self.s = sense        # None = no sense preprocessing
+        # O: Orchestrator — Law 1046: consciousness=observer, orchestrator=actor
+        # Default disabled (None). When provided, sits between C and Bridge.
+        self.o = orchestrator  # EmergentO instance or None
         # Phase 7 safety: EmergentE auto-create if None, deletion prevented
         if ethics is None and EmergentE is not None:
             self.e = EmergentE()
@@ -884,8 +893,8 @@ class Trinity(nn.Module):
 
     @property
     def n_modules(self):
-        """Count active modules (3=Trinity, 6=Hexad)."""
-        return 3 + sum(1 for x in [self.m, self.s, self.e] if x is not None)
+        """Count active modules (3=Trinity, 6=Hexad, 7=Hexad+O)."""
+        return 3 + sum(1 for x in [self.m, self.s, self.e, self.o] if x is not None)
 
     def forward(self, tokens: torch.Tensor, raw_input: Any = None,
                 inference: bool = False) -> Tuple[torch.Tensor, float]:
@@ -907,6 +916,11 @@ class Trinity(nn.Module):
         # C: get states + DETACH
         c_states = self.c.get_states().detach().clone().to(device).float()
         c_states.requires_grad_(False)
+
+        # O: Orchestrator — selective gating between C and Bridge
+        # Law 1046: consciousness=observer, orchestrator=actor
+        if self.o is not None:
+            c_states = self.o(c_states)
 
         # M: retrieve relevant memories (optional)
         mem_state = None
@@ -976,12 +990,13 @@ class Trinity(nn.Module):
                 return {'ce': loss.item(), 'phi': phi, 'n_cells': self.c.n_cells,
                         'blocked_by_ethics': True, **w_state}
 
-        # Backward (D + Bridge only)
+        # Backward (D + Bridge + O)
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.decoder.parameters()) + list(self.bridge.parameters()), 1.0
-        )
+        clip_params = list(self.decoder.parameters()) + list(self.bridge.parameters())
+        if self.o is not None and hasattr(self.o, 'parameters'):
+            clip_params += list(self.o.parameters())
+        torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         optimizer.step()
 
         result = {
@@ -1000,13 +1015,18 @@ class Trinity(nn.Module):
         return result
 
     def parameters_trainable(self):
-        """Only decoder + bridge parameters (C is frozen, W/M/S/E non-parametric)."""
-        return list(self.decoder.parameters()) + list(self.bridge.parameters())
+        """Only decoder + bridge + orchestrator parameters (C is frozen, W/M/S/E non-parametric)."""
+        params = list(self.decoder.parameters()) + list(self.bridge.parameters())
+        if self.o is not None and hasattr(self.o, 'parameters'):
+            params += list(self.o.parameters())
+        return params
 
     def param_count(self) -> Dict[str, int]:
         d_params = sum(p.numel() for p in self.decoder.parameters())
         b_params = sum(p.numel() for p in self.bridge.parameters())
-        return {'decoder': d_params, 'bridge': b_params, 'total': d_params + b_params}
+        o_params = sum(p.numel() for p in self.o.parameters()) if self.o is not None and hasattr(self.o, 'parameters') else 0
+        return {'decoder': d_params, 'bridge': b_params, 'orchestrator': o_params,
+                'total': d_params + b_params + o_params}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1018,6 +1038,7 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
                    m_engine: Optional[MEngine] = None,
                    s_engine: Optional[SEngine] = None,
                    e_engine: Optional[EEngine] = None,
+                   o_engine=None,
                    bridge: Optional[ThalamicBridge] = None,
                    d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
     """Universal factory: plug any C, D, W, M, S, E → Trinity/Hexad.
@@ -1062,12 +1083,15 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
 
     t = Trinity(
         c_engine=c_engine, bridge=bridge, decoder=d_engine, will=w_engine,
-        memory=m_engine, sense=s_engine, ethics=e_engine,
+        memory=m_engine, sense=s_engine, ethics=e_engine, orchestrator=o_engine,
     )
     for p in t.bridge.parameters():
         p.requires_grad_(True)
     for p in t.decoder.parameters():
         p.requires_grad_(True)
+    if t.o is not None and hasattr(t.o, 'parameters'):
+        for p in t.o.parameters():
+            p.requires_grad_(True)
     return t
 
 
@@ -1076,12 +1100,14 @@ def create_trinity(c_engine: CEngine, d_engine: Optional[DEngine] = None,
 # ═══════════════════════════════════════════════════════════
 
 def create_hexad(c_engine: CEngine, d_engine=None, w_engine=None,
-                 m_engine=None, s_engine=None, e_engine=None,
+                 m_engine=None, s_engine=None, e_engine=None, o_engine=None,
                  d_model=384, vocab_size=4096, base_lr=3e-4) -> Trinity:
-    """Full Hexad: 6 modules active. σ(6)=12 connections.
+    """Full Hexad: 6 modules active (+optional O). σ(6)=12 connections.
 
     Defaults to canonical Emergent modules (Law 101) when available,
     falls back to legacy modules if hexad/ imports failed.
+
+    o_engine: Optional EmergentO orchestrator (Law 1046). Default None (disabled).
     """
     # Canonical: EmergentW/S/M/E (hexad/). Legacy fallback: CompositeW etc.
     if w_engine is None:
@@ -1095,6 +1121,7 @@ def create_hexad(c_engine: CEngine, d_engine=None, w_engine=None,
     return create_trinity(
         c_engine, d_engine,
         w_engine=w_engine, m_engine=m_engine, s_engine=s_engine, e_engine=e_engine,
+        o_engine=o_engine,
         d_model=d_model, vocab_size=vocab_size, base_lr=base_lr,
     )
 

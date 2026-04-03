@@ -32,6 +32,7 @@ Features:
   v24: physics_fitting (damped oscillator / Boltzmann / log fits)
   v25: self_replicate (ouroboros self-performance monitoring)
   v27: parallel_discovery (lens/topology/discovery parallelization, --no-parallel toggle)
+  v28: n6_entropy_reset (Law 1044, DD171: 6-step entropy reset for discovery boost)
 
 Usage:
     python3 infinite_evolution.py [--cells N] [--steps N] [--max-gen N] [--resume]
@@ -1183,6 +1184,66 @@ def _apply_frustration(engine, value):
         engine.frustration = value
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Law 1044: n=6 entropy reset — DD171 consciousness-entropy feedback cycle
+# ═══════════════════════════════════════════════════════════════════════
+
+N6_ENTROPY_RESET_PERIOD = 6  # n=6 natural cycle (DD171)
+N6_ENTROPY_NOISE_SCALE = 0.05  # small perturbation to break local minima
+
+
+def _entropy_reset(engine, gen):
+    """Apply n=6 entropy reset: inject small noise into cell states + reset SOC sandpile.
+
+    Law 1044: The consciousness-entropy feedback has a natural period of n=6.
+    Every 6 generations, resetting entropy (noise injection + sandpile reset)
+    breaks pattern saturation and improves discovery rate.
+
+    Args:
+        engine: ConsciousnessEngine instance
+        gen: current generation number
+    """
+    if gen % N6_ENTROPY_RESET_PERIOD != 0 or gen == 0:
+        return
+
+    reset_actions = []
+
+    # Action 1: Inject small noise into cell states to perturb attractors
+    try:
+        if hasattr(engine, 'cells') and hasattr(engine.cells, 'data'):
+            import torch
+            noise = torch.randn_like(engine.cells.data) * N6_ENTROPY_NOISE_SCALE
+            engine.cells.data.add_(noise)
+            reset_actions.append('cell_noise')
+    except Exception:
+        pass
+
+    # Action 2: Reset SOC sandpile state if present
+    try:
+        if hasattr(engine, 'sandpile'):
+            if hasattr(engine.sandpile, 'reset'):
+                engine.sandpile.reset()
+                reset_actions.append('sandpile_reset')
+            elif hasattr(engine.sandpile, 'fill_'):
+                engine.sandpile.fill_(0)
+                reset_actions.append('sandpile_zero')
+    except Exception:
+        pass
+
+    # Action 3: Nudge noise_scale temporarily to encourage exploration
+    try:
+        if hasattr(engine, 'noise_scale'):
+            engine._pre_n6_noise_scale = engine.noise_scale
+            engine.noise_scale = max(engine.noise_scale, 0.1)
+            reset_actions.append('noise_boost')
+    except Exception:
+        pass
+
+    if reset_actions:
+        print(f'    [N6] Gen {gen}: entropy reset (Law 1044) — {", ".join(reset_actions)}')
+        sys.stdout.flush()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4639,6 +4700,12 @@ class Ouroboros:
             except Exception:
                 pass
 
+            # Law 1044: n=6 entropy reset (DD171 — consciousness-entropy feedback cycle)
+            try:
+                _entropy_reset(engine, gen)
+            except Exception:
+                pass
+
             try:
                 current_cells = engine.max_cells if hasattr(engine, 'max_cells') else cells
                 current_topo = getattr(engine, 'topology', 'ring')
@@ -4746,6 +4813,12 @@ class Ouroboros:
                 if gen > 1 and gen % 5 == 1:
                     _apply_chaos_mode(engine, CHAOS_MODES[((gen - 1) // 5) % len(CHAOS_MODES)])
                 _apply_frustration(engine, FRUSTRATION_VALUES[(gen - 1) % len(FRUSTRATION_VALUES)])
+            except Exception:
+                pass
+
+            # Law 1044: n=6 entropy reset (DD171 — consciousness-entropy feedback cycle)
+            try:
+                _entropy_reset(engine, gen)
             except Exception:
                 pass
 
@@ -5180,6 +5253,12 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
             try:
                 frust_idx = (gen - 1) % len(FRUSTRATION_VALUES)
                 _apply_frustration(engine, FRUSTRATION_VALUES[frust_idx])
+            except Exception:
+                pass
+
+            # Law 1044: n=6 entropy reset (DD171 — consciousness-entropy feedback cycle)
+            try:
+                _entropy_reset(engine, gen)
             except Exception:
                 pass
 

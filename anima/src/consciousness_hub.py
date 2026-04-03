@@ -172,6 +172,9 @@ class ConsciousnessHub:
             'emergent_e':   ('hexad.e.emergent_e', 'EmergentE',
                              ['윤리', 'ethics', '공감', 'empathy', '허용', 'allowed',
                               'emergent e', '창발 윤리']),
+            'emergent_o':   ('hexad.o.emergent_o', 'EmergentO',
+                             ['조율', 'orchestrator', '오케스트레이터', 'orchestration',
+                              'emergent o', '창발 조율', 'gating', '게이팅']),
             'closed_loop':  ('closed_loop', 'ClosedLoopEvolver',
                              ['폐쇄', 'closed loop', '법칙 진화', 'law evolution',
                               '역추적', 'backtrack', '파이프라인', 'pipeline']),
@@ -360,6 +363,9 @@ class ConsciousnessHub:
             'ca_astronomer': ('consciousness_applications', 'ConsciousAstronomer',
                              ['천문 분석', 'astronomer', 'artificial signal',
                               'natural signal', '인공 신호', 'SETI']),
+            'phi_curvature': ('phi_curvature', 'PhiCurvatureCalculator',
+                             ['곡률', 'curvature', '중력', 'gravity', '리만', 'riemannian',
+                              'scalar curvature', '스칼라 곡률', 'Law 1043']),
         }
 
         if not lazy_load:
