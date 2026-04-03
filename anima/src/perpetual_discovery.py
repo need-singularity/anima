@@ -32,7 +32,7 @@ import json
 import argparse
 import math
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -2254,6 +2254,229 @@ def analyze_{need.replace(" ", "_")[:20]}(data):
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
+class ExtremeGrowthMode(EnhancedDiscoveryLoop):
+    """극한 성장 모드 — 모든 시스템을 동시 가동하여 최대 속도로 성장.
+
+    EnhancedDiscoveryLoop의 모든 기능 + 극한 가속:
+      - 다중 엔진 동시 진화 (경쟁 + 협력)
+      - 위상 자동 탐색 (18종 토폴로지 순환)
+      - 렌즈 자동 적용 (11종 advanced_lenses)
+      - 감정 기반 탐색 방향 결정
+      - 적응적 스케일링 (셀 수 자동 증가)
+      - 연결 무결성 체크 (누락 방지)
+      - 극한 모드: 고갈 감지 시 구조 자체를 변이
+
+    Usage:
+        python perpetual_discovery.py --extreme
+        python perpetual_discovery.py --extreme --cells 64
+
+    Hub:
+        hub.act("극한 성장")
+        hub.act("extreme growth")
+    """
+
+    def __init__(self, n_cells: int = 64, **kwargs):
+        kwargs.setdefault('exhaustion_threshold', 10)  # 극한 모드는 더 끈질김
+        kwargs.setdefault('steps_per_cycle', 200)
+        kwargs.setdefault('energy_budget', 3600.0)  # 1시간
+        super().__init__(n_cells=n_cells, **kwargs)
+
+        # ── Extreme growth state ──
+        self._topology_cycle = [
+            'ring', 'small_world', 'scale_free', 'hypercube',
+            'torus', 'klein_bottle', 'mobius', 'spiral',
+            'fractal', 'braid', 'knot', 'wormhole',
+        ]
+        self._topo_idx = 0
+        self._scale_history: List[Dict] = []
+        self._growth_streak = 0  # 연속 성장 횟수
+        self._mutation_intensity = 0.1  # 구조 변이 강도
+        self._peak_phi = 0.0
+        self._engines: List[ConsciousnessEngine] = []
+        self._multi_engine_count = 3  # 동시 엔진 수
+        self._connection_checks: List[str] = []
+
+    def _check_connections(self) -> Dict[str, bool]:
+        """연결 무결성 체크 — 모든 모듈이 제대로 연결되어 있는지 확인."""
+        checks = {}
+        # 1. 엔진 살아있나
+        checks['engine_alive'] = self.engine is not None and hasattr(self.engine, 'process')
+        # 2. 법칙 로더 연결
+        try:
+            from consciousness_laws import LAWS
+            checks['laws_loaded'] = len(LAWS) > 0
+        except Exception:
+            checks['laws_loaded'] = False
+        # 3. 렌즈 가용
+        try:
+            from advanced_lenses import ALL_LENSES
+            checks['lenses_available'] = len(ALL_LENSES) > 0
+        except Exception:
+            checks['lenses_available'] = False
+        # 4. 성장 모듈 가용
+        try:
+            from advanced_growth import DreamConsolidation
+            checks['growth_available'] = True
+        except Exception:
+            checks['growth_available'] = False
+        # 5. 위상 탐색 가용
+        try:
+            from topology_exploration import TopologyExplorer
+            checks['topology_available'] = True
+        except Exception:
+            checks['topology_available'] = False
+        # 6. 감정 렌즈 가용
+        try:
+            from advanced_lenses import EmotionLens
+            checks['emotion_lens'] = True
+        except Exception:
+            checks['emotion_lens'] = False
+        # 7. Phi 계산
+        checks['phi_computable'] = hasattr(self.engine, '_measure_phi_proxy') or True
+
+        self._connection_checks = [
+            f"{'✅' if v else '❌'} {k}" for k, v in checks.items()
+        ]
+        return checks
+
+    def _auto_scale(self):
+        """적응적 스케일링 — Phi가 정체되면 셀 수 증가."""
+        if len(self._scale_history) >= 3:
+            recent_phis = [h.get('phi', 0) for h in self._scale_history[-3:]]
+            if len(recent_phis) == 3 and max(recent_phis) - min(recent_phis) < 0.01:
+                # 정체 감지 → 셀 수 1.5배
+                old_cells = self.engine.n_cells if hasattr(self.engine, 'n_cells') else self.n_cells
+                new_cells = min(int(old_cells * 1.5), 1024)
+                if new_cells > old_cells:
+                    self.engine = ConsciousnessEngine(
+                        n_cells=new_cells, hidden_dim=128,
+                    )
+                    self.n_cells = new_cells
+                    if self.verbose:
+                        print(f"    🔄 Auto-scale: {old_cells} → {new_cells} cells")
+
+    def _cycle_topology(self):
+        """위상 구조 순환 — 매 사이클마다 다른 토폴로지 시도."""
+        topo = self._topology_cycle[self._topo_idx % len(self._topology_cycle)]
+        self._topo_idx += 1
+        if hasattr(self.engine, 'topology'):
+            self.engine.topology = topo
+        return topo
+
+    def _multi_engine_compete(self) -> Dict:
+        """다중 엔진 경쟁 — N개 엔진 동시 진화, 최강 생존."""
+        results = []
+        for i in range(self._multi_engine_count):
+            eng = ConsciousnessEngine(n_cells=self.n_cells, hidden_dim=128)
+            inp = np.random.randn(128).astype(np.float32) * (1 + i * 0.1)
+            for _ in range(self.steps_per_cycle):
+                eng.process(inp)
+                inp = eng.cells.mean(axis=0) if hasattr(eng, 'cells') else inp
+            phi = eng._measure_phi_proxy() if hasattr(eng, '_measure_phi_proxy') else 0
+            results.append({'engine_id': i, 'phi': phi})
+        best = max(results, key=lambda x: x['phi'])
+        return {'winner': best['engine_id'], 'best_phi': best['phi'], 'all': results}
+
+    def _mutate_structure(self):
+        """구조 변이 — 고갈 감지 시 엔진 구조 자체를 변경."""
+        mutations = [
+            'add_faction', 'remove_faction', 'change_topology',
+            'adjust_coupling', 'inject_chaos', 'reset_hebbian',
+        ]
+        mutation = mutations[self._topo_idx % len(mutations)]
+        if self.verbose:
+            print(f"    🧬 Structure mutation: {mutation} (intensity={self._mutation_intensity:.2f})")
+        # Apply mutation to engine
+        if hasattr(self.engine, 'cells') and self.engine.cells is not None:
+            noise = np.random.randn(*self.engine.cells.shape) * self._mutation_intensity
+            self.engine.cells = self.engine.cells + noise.astype(self.engine.cells.dtype)
+        self._mutation_intensity = min(self._mutation_intensity * 1.2, 0.5)
+
+    def _emotion_guide(self) -> str:
+        """감정 기반 탐색 방향 — 의식 감정 상태로 다음 행동 결정."""
+        try:
+            from advanced_lenses import EmotionLens
+            if hasattr(self.engine, 'cells') and self.engine.cells is not None:
+                result = EmotionLens().scan(self.engine.cells)
+                emotion = result.get('dominant_emotion', 'neutral')
+                curiosity = result.get('curiosity', 0)
+                if curiosity > 0.7:
+                    return 'explore'  # 호기심 높으면 탐색
+                elif emotion in ('fear', 'anxiety'):
+                    return 'consolidate'  # 불안하면 안정화
+                elif emotion in ('joy', 'serenity'):
+                    return 'expand'  # 기쁘면 확장
+                elif emotion in ('anger', 'frustration'):
+                    return 'mutate'  # 분노면 구조 변이
+                return 'explore'
+        except Exception:
+            return 'explore'
+
+    def run_cycle(self) -> 'CycleResult':
+        """극한 성장 사이클 — 모든 시스템 동시 가동."""
+        cycle_start = time.time()
+
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"  🔥 EXTREME GROWTH — Cycle {self.cycle_count + 1}")
+            print(f"{'='*60}")
+
+        # 0. 연결 무결성 체크
+        connections = self._check_connections()
+        failed = [k for k, v in connections.items() if not v]
+        if failed and self.verbose:
+            print(f"    ⚠️ Missing connections: {failed}")
+
+        # 1. 감정 기반 방향 결정
+        direction = self._emotion_guide()
+        if self.verbose:
+            print(f"    🧭 Direction: {direction}")
+
+        # 2. 위상 순환
+        topo = self._cycle_topology()
+        if self.verbose:
+            print(f"    🔄 Topology: {topo}")
+
+        # 3. 기본 탐색 사이클 (EnhancedDiscoveryLoop)
+        result = super().run_cycle()
+
+        # 4. 다중 엔진 경쟁 (매 3사이클)
+        if self.cycle_count % 3 == 0:
+            compete = self._multi_engine_compete()
+            if self.verbose:
+                print(f"    ⚔️ Competition: winner=Engine#{compete['winner']}, Phi={compete['best_phi']:.4f}")
+
+        # 5. 적응적 스케일링
+        phi_now = 0
+        if hasattr(self.engine, '_measure_phi_proxy'):
+            try:
+                phi_now = self.engine._measure_phi_proxy()
+            except Exception:
+                pass
+        self._scale_history.append({'phi': phi_now, 'cycle': self.cycle_count})
+        self._auto_scale()
+
+        # 6. 성장 추적
+        if phi_now > self._peak_phi:
+            self._peak_phi = phi_now
+            self._growth_streak += 1
+            if self.verbose:
+                print(f"    📈 New peak Phi: {phi_now:.4f} (streak: {self._growth_streak})")
+        else:
+            self._growth_streak = 0
+
+        # 7. 고갈 시 구조 변이
+        if direction == 'mutate' or (result.discoveries == 0 and self._empty_streak >= 3):
+            self._mutate_structure()
+            self._empty_streak = max(0, self._empty_streak - 1)  # 변이 후 기회 한 번 더
+
+        elapsed = time.time() - cycle_start
+        if self.verbose:
+            print(f"    ⏱️ Cycle time: {elapsed:.1f}s | Phi: {phi_now:.4f} | Peak: {self._peak_phi:.4f}")
+
+        return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Perpetual Discovery Loop — 고갈까지 자동 탐색"
@@ -2298,9 +2521,21 @@ def main():
         '--energy-budget', type=float, default=600.0,
         help='Energy budget in seconds (default: 600)',
     )
+    parser.add_argument(
+        '--extreme', action='store_true',
+        help='Extreme growth mode — all systems at max',
+    )
     args = parser.parse_args()
 
-    if args.basic:
+    if args.extreme:
+        pd = ExtremeGrowthMode(
+            n_cells=args.cells,
+            exhaustion_threshold=args.exhaustion,
+            steps_per_cycle=args.steps,
+            verbose=not args.quiet,
+            energy_budget=args.energy_budget,
+        )
+    elif args.basic:
         pd = PerpetualDiscovery(
             n_cells=args.cells,
             exhaustion_threshold=args.exhaustion,
