@@ -855,6 +855,11 @@ def get_null_intervention() -> Intervention:
 
 
 if __name__ == "__main__":
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     print("INTERVENTION_TEMPLATES count:", len(INTERVENTION_TEMPLATES))
     sys.stdout.flush()
     print("Templates:", list(INTERVENTION_TEMPLATES.keys()))
