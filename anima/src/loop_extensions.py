@@ -152,6 +152,89 @@ def track_cost() -> dict:
 
 
 # ══════════════════════════════════════════
+# 다운로드 페이지 자동 업데이트
+# ══════════════════════════════════════════
+
+def auto_update_download_page():
+    """training_runs.json에서 완료된 모델 → download-models.md Version History 자동 갱신."""
+    runs_path = os.path.join(_CONFIG_DIR, 'training_runs.json')
+    dl_path = os.path.join(_THIS_DIR, '..', 'docs', 'download-models.md')
+
+    if not os.path.exists(runs_path) or not os.path.exists(dl_path):
+        return
+
+    try:
+        data = json.load(open(runs_path))
+        content = open(dl_path).read()
+
+        # Version History 테이블 재생성
+        rows = []
+        rows.append("| Version | Date | Base | PureField | Phi | CE | Alpha | Status |")
+        rows.append("|---------|------|------|-----------|-----|-----|-------|--------|")
+
+        # 완료된 runs + planned
+        all_runs = []
+        for k, v in data.get('runs', {}).items():
+            if 'animalm' in k:
+                all_runs.append((k, v))
+        for k, v in data.get('next_planned', {}).items():
+            if 'animalm' in k:
+                all_runs.append((k, v))
+
+        # 최신순 정렬
+        all_runs.sort(key=lambda x: x[1].get('date', ''), reverse=True)
+
+        for name, run in all_runs:
+            status = run.get('status', 'planned')
+            if status.startswith('complete'):
+                st = 'available'
+            elif status.startswith('in_progress'):
+                st = '🔄'
+            elif status == 'planned':
+                st = '⏳'
+            else:
+                continue
+
+            # 이름에서 버전 추출
+            ver = name.replace('animalm_', '').replace('_', ' ')
+            base = run.get('model', run.get('base_model', '?')).split('+')[0].strip()
+            if 'Qwen' in str(run.get('model', '')):
+                base = 'Qwen' + str(run.get('model', '')).split('Qwen')[1].split('+')[0].split('(')[0].strip()
+            pf = run.get('purefield', {})
+            if isinstance(pf, dict):
+                pf_str = f"{pf.get('target_layers', '?')}L, r{pf.get('rank', '?')}"
+            else:
+                pf_str = '—'
+            phi = run.get('phi_best', run.get('phi_at_5000', '—'))
+            ce = run.get('ce_best', run.get('ce_at_5000', '—'))
+            alpha = run.get('alpha', '—')
+            date = run.get('date', '—')
+
+            if isinstance(phi, float):
+                phi = f"{phi:.3f}"
+            if isinstance(ce, float):
+                ce = f"{ce:.2f}"
+
+            # 최신 완료 모델 = Latest
+            if st == 'available' and not any('**Latest**' in r for r in rows):
+                st = '**Latest**'
+
+            rows.append(f"| {ver} | {date} | {base} | {pf_str} | {phi} | {ce} | {alpha} | {st} |")
+
+        # 기존 테이블 교체
+        table_text = '\n'.join(rows)
+        import re
+        pattern = r'\| Version \|.*?\n\|[-\|]+\n(.*?\n)*?(?=\n>|\n---|\n##|\Z)'
+        if re.search(pattern, content):
+            content = re.sub(pattern, table_text + '\n', content)
+
+        open(dl_path, 'w').write(content)
+        print(f"  [DOWNLOAD] Page updated ({len(all_runs)} models)")
+    except Exception as e:
+        print(f"  [DOWNLOAD] Update failed: {e}")
+
+
+# ══════════════════════════════════════════
 # GAP 4: DD 문서 자동 생성
 # ══════════════════════════════════════════
 

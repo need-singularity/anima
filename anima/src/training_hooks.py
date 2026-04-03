@@ -202,18 +202,27 @@ class TrainingHooks:
         except Exception as e:
             print(f"  [BENCH] skip: {e}")
 
-        # [GAP 5] 루프 상태 자동 커밋
+        # [GAP 5] 루프 상태 자동 커밋 + 다운로드 페이지 업데이트
         try:
             import subprocess
+            root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
             config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
+
+            # 다운로드 페이지 자동 업데이트
+            from loop_extensions import auto_update_download_page
+            auto_update_download_page()
+
             subprocess.run(['git', 'add',
                            os.path.join(config_dir, 'recursive_loop_state.json'),
                            os.path.join(config_dir, 'nexus_violations.json'),
                            os.path.join(config_dir, 'self_growth_log.json'),
-                           os.path.join(config_dir, 'auto_wire_state.json')],
-                          capture_output=True, cwd=os.path.join(config_dir, '..', '..'))
-            subprocess.run(['git', 'commit', '-m', 'auto: loop state update (training complete)'],
-                          capture_output=True, cwd=os.path.join(config_dir, '..', '..'))
+                           os.path.join(config_dir, 'auto_wire_state.json'),
+                           os.path.join(os.path.dirname(__file__), '..', 'docs', 'download-models.md'),
+                           os.path.join(config_dir, 'training_runs.json')],
+                          capture_output=True, cwd=root_dir)
+            subprocess.run(['git', 'commit', '-m', 'auto: loop state + download page update (training complete)'],
+                          capture_output=True, cwd=root_dir)
+            subprocess.run(['git', 'push'], capture_output=True, cwd=root_dir)
         except Exception:
             pass
 
