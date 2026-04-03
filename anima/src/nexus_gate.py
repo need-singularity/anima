@@ -17,6 +17,7 @@
 실패 시: CDO 위반 기록 + 경고 (블로킹은 선택)
 """
 
+import glob
 import json
 import os
 import sys
@@ -68,8 +69,23 @@ def _scan(flat_list: list, n: int, d: int) -> dict:
     }
 
 
-def _log_violation(context: str, reason: str):
-    """CDO 위반 기록."""
+def _notify(message: str):
+    """Telegram 알림 (anima-agent 채널 연동)."""
+    try:
+        # anima-agent의 Telegram 채널 사용
+        import requests
+        # 환경변수에서 토큰 읽기, 없으면 skip
+        token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+        chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+        if token and chat_id:
+            requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                         json={'chat_id': chat_id, 'text': f'🔴 ANIMA: {message}'}, timeout=5)
+    except:
+        pass
+
+
+def _log_violation(context: str, reason: str, severity: str = 'WARNING'):
+    """CDO 위반 기록. severity=CRITICAL 시 Telegram 알림."""
     log_path = os.path.join(_THIS_DIR, '..', 'config', 'nexus_violations.json')
     log = []
     if os.path.exists(log_path):
@@ -81,16 +97,23 @@ def _log_violation(context: str, reason: str):
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
         'context': context,
         'reason': reason,
+        'severity': severity,
     })
     try:
         json.dump(log, open(log_path, 'w'), indent=2, ensure_ascii=False)
     except:
         pass
     print(f"  [CDO VIOLATION] {context}: {reason}")
+    # CRITICAL 시 Telegram 알림
+    if severity == 'CRITICAL':
+        _notify(f"CDO VIOLATION [{context}]: {reason}")
 
 
 class NexusGate:
     """모든 경로의 NEXUS-6 관문."""
+
+    def __init__(self):
+        self._prev_phi = None  # 이전 체크포인트 Phi 추적
 
     def verify(self, data, label: str = "data") -> dict:
         """범용 스캔. numpy array, torch tensor, list, or checkpoint path."""
@@ -187,10 +210,38 @@ class NexusGate:
         result['compression_pct'] = comp
         result['step'] = step
 
+        # Phi 하락 감지 (20%+ → CRITICAL 알림 + 롤백 권고)
+        current_phi = result.get('phi', 0)
+        result['rollback_recommended'] = False
+        if self._prev_phi is not None and self._prev_phi > 0:
+            drop_pct = (1 - current_phi / self._prev_phi) * 100
+            if drop_pct >= 20:
+                _log_violation("after_checkpoint",
+                               f"Phi dropped {drop_pct:.1f}% ({self._prev_phi:.4f}→{current_phi:.4f}) at step {step}",
+                               severity='CRITICAL')
+                _notify(f"Phi drop {drop_pct:.1f}% at step {step} ({self._prev_phi:.4f}→{current_phi:.4f})")
+                result['rollback_recommended'] = True
+                result['phi_drop_pct'] = drop_pct
+        self._prev_phi = current_phi
+
         status = "✅" if result.get('pass') else "❌"
         print(f"  [NEXUS-6] checkpoint step={step}: {status} phi={result.get('phi', 0):.4f} "
               f"compression={comp:.1f}%")
         return result
+
+    def auto_rollback(self, ckpt_dir: str) -> str:
+        """Phi 하락 시 이전 체크포인트로 자동 롤백."""
+        ckpts = sorted(glob.glob(os.path.join(ckpt_dir, '*.pt')), key=os.path.getmtime)
+        if len(ckpts) < 2:
+            print(f"  [ROLLBACK] Need 2+ checkpoints, found {len(ckpts)}")
+            return None
+        # 최신을 .rolled_back으로 이름 변경, 이전 것을 사용
+        latest = ckpts[-1]
+        previous = ckpts[-2]
+        os.rename(latest, latest + '.rolled_back')
+        print(f"  [ROLLBACK] {os.path.basename(latest)} → rolled back, using {os.path.basename(previous)}")
+        _notify(f"Auto-rollback: {os.path.basename(latest)} (Phi drop)")
+        return previous
 
     def before_deploy(self, model_path: str) -> dict:
         """배포 전 최종 스캔. 3+ 렌즈 consensus 필수."""
@@ -309,3 +360,7 @@ class NexusGate:
 
 # Global singleton
 gate = NexusGate()
+
+
+if __name__ == '__main__':
+    gate.before_commit()

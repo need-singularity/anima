@@ -190,8 +190,24 @@ def discover_laws(metrics: dict, prev_metrics: dict = None) -> list:
     return candidates
 
 
+def _is_duplicate_law(formula: str, existing_laws: dict, threshold: float = 0.7) -> bool:
+    """기존 법칙과 단어 겹침 비율로 중복 체크."""
+    formula_words = set(formula.lower().split())
+    for law_text in existing_laws.values():
+        if not isinstance(law_text, str):
+            continue
+        existing_words = set(law_text.lower().split())
+        if not formula_words or not existing_words:
+            continue
+        overlap = len(formula_words & existing_words)
+        similarity = overlap / min(len(formula_words), len(existing_words))
+        if similarity > threshold:
+            return True
+    return False
+
+
 def auto_register_laws(candidates: list, min_confidence: str = 'HIGH') -> list:
-    """법칙 후보를 consciousness_laws.json에 자동 등록."""
+    """법칙 후보를 consciousness_laws.json에 자동 등록. 중복 자동 제거."""
     conf_order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
     min_conf = conf_order.get(min_confidence, 1)
     registered = []
@@ -207,6 +223,12 @@ def auto_register_laws(candidates: list, min_confidence: str = 'HIGH') -> list:
         try:
             with open(laws_path) as f:
                 d = json.load(f)
+
+            # 중복 체크 — 기존 법칙과 70%+ 단어 겹침이면 skip
+            if _is_duplicate_law(cand['formula'], d.get('laws', {})):
+                print(f"  [SKIP] Duplicate law: {cand['formula'][:60]}...")
+                continue
+
             next_id = max((int(k) for k in d['laws'] if k.isdigit()), default=0) + 1
             d['laws'][str(next_id)] = f"[Auto-loop] {cand['formula']}"
             d['_meta']['total_laws'] = len([k for k in d['laws'] if k.isdigit()])
