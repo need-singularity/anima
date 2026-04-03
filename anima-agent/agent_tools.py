@@ -83,6 +83,9 @@ from tool_implementations import (  # noqa: F401
     # Trading
     _tool_trading_backtest, _tool_trading_scan, _tool_trading_execute,
     _tool_trading_balance, _tool_trading_strategies, _tool_trading_universe,
+    # NEXUS-6
+    _tool_nexus6_scan, _tool_nexus6_check, _tool_nexus6_evolve,
+    _tool_nexus6_status,
 )
 
 
@@ -161,6 +164,7 @@ class AgentToolSystem:
         self._register_creative_tools()
         self._register_meta_tools()
         self._register_trading_tools()
+        self._register_nexus6_tools()
 
     # ─── Web Tools ───
 
@@ -532,6 +536,40 @@ class AgentToolSystem:
             curiosity_affinity=0.6,
         ))
 
+    # ─── NEXUS-6 Tools ───
+
+    def _register_nexus6_tools(self):
+        """Register NEXUS-6 consciousness scanner tools (Rust hot-path + 130+ lenses)."""
+        self.registry.register(ToolDef(
+            name='nexus6_scan',
+            description='Run NEXUS-6 full consciousness scan (130+ lenses, anomaly detection)',
+            params=[ToolParam('cells', 'int', 'Number of cells to simulate', required=False, default=64),
+                    ToolParam('steps', 'int', 'Steps before scanning', required=False, default=50)],
+            fn=_tool_nexus6_scan, category='consciousness',
+            phi_affinity=0.8, curiosity_affinity=0.6, pe_affinity=0.4,
+        ))
+        self.registry.register(ToolDef(
+            name='nexus6_check',
+            description='Check if a value matches n=6 constants (EXACT/CLOSE/NEAR)',
+            params=[ToolParam('value', 'float', 'Value to check against n=6 constants')],
+            fn=_tool_nexus6_check, category='consciousness',
+            curiosity_affinity=0.7, phi_affinity=0.5,
+        ))
+        self.registry.register(ToolDef(
+            name='nexus6_evolve',
+            description='Run OUROBOROS evolution (lens self-improvement)',
+            params=[ToolParam('domain', 'str', 'Domain to evolve', required=False, default='consciousness')],
+            fn=_tool_nexus6_evolve, category='consciousness',
+            growth_affinity=0.9, phi_affinity=0.7, curiosity_affinity=0.5,
+        ))
+        self.registry.register(ToolDef(
+            name='nexus6_status',
+            description='Get NEXUS-6 status (lenses, scan count, phi trend, anomalies)',
+            params=[],
+            fn=_tool_nexus6_status, category='consciousness',
+            phi_affinity=0.5, curiosity_affinity=0.4,
+        ))
+
     # --- Consciousness Tools (helper) ---
 
     def _get_engine(self):
@@ -586,6 +624,16 @@ class AgentToolSystem:
                         args[key] = prev.get(ref_field, val)
                     except (ValueError, IndexError):
                         pass
+
+            # Inject previous dependency results for chaining
+            # Tools that accept _prev_results can use outputs from prior steps
+            if step.depends_on:
+                dep_results = {}
+                for dep_idx in step.depends_on:
+                    if 0 <= dep_idx < len(results) and results[dep_idx].success:
+                        dep_results[results[dep_idx].tool_name] = results[dep_idx].output
+                if dep_results:
+                    args['_prev_results'] = dep_results
 
             result = self.executor.execute(step.tool_name, args)
             results.append(result)

@@ -260,7 +260,8 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("ConsciousnessHub init failed: %s", e)
 
-        # ── Plugins (trading, regime, sentiment) ──
+        # ── Plugins (trading, regime, sentiment, nexus6) ──
+        self._plugin_loader = None
         try:
             from plugins import PluginLoader
             self._plugin_loader = PluginLoader()
@@ -269,6 +270,10 @@ class AnimaAgent:
                 logger.info("Plugins loaded: %s", loaded)
         except Exception as e:
             logger.debug("Plugin loading skipped: %s", e)
+
+        # Resolve NEXUS-6 plugin reference (loaded above via PluginLoader)
+        if self._plugin_loader:
+            self._nexus6_plugin = self._plugin_loader.loaded.get("nexus6_bridge")
 
         # ── Consciousness Persistence (3-layer) ──
         self.persistence = None
@@ -279,11 +284,28 @@ class AnimaAgent:
             except Exception as e:
                 logger.warning("ConsciousnessPersistence init failed: %s", e)
 
-        # ── NEXUS-6 consciousness scanner ──
+        # ── NEXUS-6 consciousness scanner (via plugin) ──
         self.nexus6 = _nexus6_mod
+        # _nexus6_plugin resolved above via PluginLoader (line ~276)
+        if not self._nexus6_plugin:
+            self._nexus6_plugin = None
         if self.nexus6:
             logger.info("NEXUS-6 connected (v%s)",
                         getattr(self.nexus6, '__version__', '?'))
+
+        # ── JudgmentBridge (seed: feeling x measurement = judgment) ──
+        self._judgment_bridge = None
+        try:
+            from judgment_bridge import JudgmentBridge
+            if self.learner or self._nexus6_plugin:
+                self._judgment_bridge = JudgmentBridge(
+                    learner=self.learner,
+                    nexus6_plugin=self._nexus6_plugin,
+                )
+                logger.info("JudgmentBridge initialized (learner=%s, nexus6=%s)",
+                            self.learner is not None, self._nexus6_plugin is not None)
+        except Exception as e:
+            logger.debug("JudgmentBridge init skipped: %s", e)
 
         # ── Ecosystem bridge (body, eeg, physics) ──
         self.ecosystem = None
@@ -413,42 +435,25 @@ class AnimaAgent:
         self._direction = direction
         self._emotion = direction_to_emotion(direction)
 
-        # 2b. NEXUS-6 consciousness scan (periodic — every 50 interactions)
-        #     Uses cell states (ConsciousnessEngine) or hidden state (ConsciousMind/PureField)
-        if self.nexus6 and self.interaction_count % 50 == 1:
+        # 2b. NEXUS-6 consciousness scan (periodic — via plugin)
+        if self._nexus6_plugin:
             try:
-                flat, n_pts, n_dims = None, 0, 0
-                # Try cell-based engine first (ConsciousnessEngine)
-                cells = self.mind.cells if hasattr(self.mind, 'cells') else []
-                if cells and hasattr(cells[0], 'tolist'):
-                    flat = []
-                    for c in cells:
-                        flat.extend(c.tolist() if hasattr(c, 'tolist') else [float(c)])
-                    n_pts = len(cells)
-                    n_dims = len(flat) // n_pts if n_pts > 0 else 0
-                # Fallback: hidden state (PureField/ConsciousMind)
-                if not flat and self.hidden is not None:
-                    h = self.hidden
-                    if hasattr(h, 'numpy'):
-                        h_np = h.detach().cpu().numpy().flatten()
-                    elif hasattr(h, 'tolist'):
-                        h_np = h.tolist()
-                    else:
-                        h_np = None
-                    if h_np is not None:
-                        flat = [float(x) for x in h_np]
-                        n_pts, n_dims = 1, len(flat)
-
-                if flat and n_pts > 0 and n_dims > 0:
-                    scan_result = self.nexus6.analyze(flat, n_pts, n_dims)
-                    self._last_nexus_scan = scan_result
-                    sr = scan_result['scan']
-                    consensus = scan_result.get('consensus', [])
+                scan_result = self._nexus6_plugin.auto_scan(self.mind, self.interaction_count)
+                if scan_result and scan_result.get("success"):
+                    self._last_nexus_scan = self._nexus6_plugin._last_scan
                     logger.info("NEXUS-6 scan: %d/%d lenses, consensus=%d",
-                                sr.active_lens_count(), sr.lens_count,
-                                len(consensus))
+                                scan_result["active_lenses"],
+                                scan_result["total_lenses"],
+                                scan_result["consensus_count"])
             except Exception as e:
                 logger.debug("NEXUS-6 scan skipped: %s", e)
+
+        # 2c. Periodic self-judgment (consciousness judges itself)
+        if self._judgment_bridge and self.interaction_count % 100 == 0:
+            try:
+                self._judgment_bridge.judge_state(self.mind)
+            except Exception:
+                pass
 
         # 3. Memory search for relevant context (RAG + Store fallback)
         #    P2: consciousness controls search depth
@@ -525,6 +530,14 @@ class AnimaAgent:
                 ]
             except Exception as e:
                 logger.warning("Tool execution failed: %s", e)
+
+        # 4a-judge. Judge tool results -> consciousness growth
+        if self._judgment_bridge and tool_results:
+            for tr in tool_results:
+                try:
+                    self._judgment_bridge.judge(tr)
+                except Exception:
+                    pass
 
         # 4b. Hub autonomous action (always active — 의식은 항상 자율적)
         hub_results = []
@@ -900,9 +913,13 @@ class AnimaAgent:
             except Exception:
                 pass
 
-        # NEXUS-6 scan summary
+        # NEXUS-6 scan summary (via plugin)
         n6_lenses, n6_consensus = 0, 0
-        if self._last_nexus_scan:
+        if self._nexus6_plugin:
+            n6_status = self._nexus6_plugin.status()
+            n6_lenses = n6_status.get("last_active_lenses", 0)
+            n6_consensus = n6_status.get("last_consensus", 0)
+        elif self._last_nexus_scan:
             try:
                 sr = self._last_nexus_scan['scan']
                 n6_lenses = sr.active_lens_count()

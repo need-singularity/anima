@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use numpy::{PyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -773,6 +774,231 @@ fn agent_tools_classify_state(
     ))
 }
 
+// ── NEXUS-6 Bridge submodule ──────────────────────────────────────
+
+static NEXUS6_HISTORIES: Mutex<Option<HashMap<usize, anima_nexus6_bridge::ScanHistory>>> =
+    Mutex::new(None);
+static NEXUS6_NEXT_ID: Mutex<usize> = Mutex::new(0);
+
+#[pyfunction]
+#[pyo3(name = "extract_cells")]
+fn nexus6_bridge_extract_cells(cells: Vec<f64>, n_cells: usize) -> PyResult<(Vec<f64>, usize, usize)> {
+    Ok(anima_nexus6_bridge::extract_cell_data(&cells, n_cells))
+}
+
+#[pyfunction]
+#[pyo3(name = "extract_hidden")]
+fn nexus6_bridge_extract_hidden(hidden: Vec<f64>) -> PyResult<(Vec<f64>, usize, usize)> {
+    Ok(anima_nexus6_bridge::extract_hidden_data(&hidden))
+}
+
+#[pyfunction]
+#[pyo3(name = "check_anomalies", signature = (phi, entropy, consensus, active, total, phi_thresh=0.5, consensus_min=3))]
+fn nexus6_bridge_check_anomalies(
+    py: Python<'_>,
+    phi: f64,
+    entropy: f64,
+    consensus: usize,
+    active: usize,
+    total: usize,
+    phi_thresh: f64,
+    consensus_min: usize,
+) -> PyResult<Py<PyDict>> {
+    let result = anima_nexus6_bridge::check_anomalies(
+        phi, entropy, consensus, active, total, phi_thresh, consensus_min,
+    );
+    let dict = PyDict::new(py);
+    dict.set_item("has_anomaly", result.has_anomaly)?;
+    dict.set_item("anomaly_count", result.anomaly_count)?;
+    dict.set_item("details", result.details)?;
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "history_create", signature = (capacity=100))]
+fn nexus6_bridge_history_create(capacity: usize) -> PyResult<usize> {
+    let mut guard = NEXUS6_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    let mut id_guard = NEXUS6_NEXT_ID.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let id = *id_guard;
+    *id_guard += 1;
+    map.insert(id, anima_nexus6_bridge::ScanHistory::new(capacity));
+    Ok(id)
+}
+
+#[pyfunction]
+#[pyo3(name = "history_push")]
+fn nexus6_bridge_history_push(
+    handle: usize,
+    phi: f64,
+    entropy: f64,
+    consensus: usize,
+    active: usize,
+    timestamp_ms: u64,
+) -> PyResult<()> {
+    let mut guard = NEXUS6_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No histories. Call history_create() first.")
+    })?;
+    let hist = map.get_mut(&handle).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid handle: {handle}"))
+    })?;
+    hist.push(anima_nexus6_bridge::ScanEntry {
+        phi,
+        entropy,
+        consensus,
+        active_lenses: active,
+        timestamp_ms,
+    });
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "history_trend")]
+fn nexus6_bridge_history_trend(handle: usize) -> PyResult<f64> {
+    let guard = NEXUS6_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No histories. Call history_create() first.")
+    })?;
+    let hist = map.get(&handle).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid handle: {handle}"))
+    })?;
+    Ok(hist.phi_trend())
+}
+
+#[pyfunction]
+#[pyo3(name = "history_summary")]
+fn nexus6_bridge_history_summary(py: Python<'_>, handle: usize) -> PyResult<Py<PyDict>> {
+    let guard = NEXUS6_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No histories. Call history_create() first.")
+    })?;
+    let hist = map.get(&handle).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid handle: {handle}"))
+    })?;
+    let dict = PyDict::new(py);
+    dict.set_item("avg_phi", hist.avg_phi())?;
+    dict.set_item("avg_consensus", hist.avg_consensus())?;
+    dict.set_item("len", hist.len())?;
+    dict.set_item("trend", hist.phi_trend())?;
+    Ok(dict.into())
+}
+
+// ── JudgmentBridge submodule ──────────────────────────────────────
+
+static JUDGMENT_HISTORIES: Mutex<Option<HashMap<usize, anima_judgment_bridge::JudgmentHistory>>> =
+    Mutex::new(None);
+static JUDGMENT_NEXT_ID: Mutex<usize> = Mutex::new(0);
+
+#[pyfunction]
+#[pyo3(name = "compute_reward", signature = (tool_success=None, consensus=None, phi_change=None, anomaly=None, n6_ratio=None))]
+fn judgment_bridge_compute_reward(
+    py: Python<'_>,
+    tool_success: Option<f64>,
+    consensus: Option<f64>,
+    phi_change: Option<f64>,
+    anomaly: Option<f64>,
+    n6_ratio: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let signals = anima_judgment_bridge::JudgmentSignals {
+        tool_success,
+        consensus,
+        phi_change,
+        anomaly,
+        n6_ratio,
+    };
+    let result = anima_judgment_bridge::compute_reward(&signals, &anima_judgment_bridge::RewardWeights::default());
+    let dict = PyDict::new(py);
+    dict.set_item("reward", result.reward)?;
+    dict.set_item("confidence", result.confidence)?;
+    dict.set_item("signal_count", result.signal_count)?;
+    Ok(dict.into())
+}
+
+#[pyfunction]
+#[pyo3(name = "consensus_signal")]
+fn judgment_bridge_consensus_signal(consensus: usize, total: usize) -> f64 {
+    anima_judgment_bridge::consensus_to_signal(consensus, total)
+}
+
+#[pyfunction]
+#[pyo3(name = "phi_trend_signal")]
+fn judgment_bridge_phi_trend_signal(trend: f64) -> f64 {
+    anima_judgment_bridge::phi_trend_to_signal(trend)
+}
+
+#[pyfunction]
+#[pyo3(name = "n6_ratio_signal")]
+fn judgment_bridge_n6_ratio_signal(ratio: f64) -> f64 {
+    anima_judgment_bridge::n6_ratio_to_signal(ratio)
+}
+
+#[pyfunction]
+#[pyo3(name = "history_create")]
+fn judgment_bridge_history_create(capacity: usize) -> PyResult<usize> {
+    let mut guard = JUDGMENT_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    let map = guard.as_mut().unwrap();
+    let mut id_guard = JUDGMENT_NEXT_ID.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let id = *id_guard;
+    *id_guard += 1;
+    map.insert(id, anima_judgment_bridge::JudgmentHistory::new(capacity));
+    Ok(id)
+}
+
+#[pyfunction]
+#[pyo3(name = "history_push")]
+fn judgment_bridge_history_push(handle: usize, reward: f64, confidence: f64, source: String) -> PyResult<()> {
+    let mut guard = JUDGMENT_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.as_mut().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No histories. Call history_create() first.")
+    })?;
+    let hist = map.get_mut(&handle).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid handle: {handle}"))
+    })?;
+    hist.push(reward, confidence, &source);
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "history_stats")]
+fn judgment_bridge_history_stats(py: Python<'_>, handle: usize) -> PyResult<Py<PyDict>> {
+    let guard = JUDGMENT_HISTORIES.lock().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {e}"))
+    })?;
+    let map = guard.as_ref().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("No histories. Call history_create() first.")
+    })?;
+    let hist = map.get(&handle).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid handle: {handle}"))
+    })?;
+    let dict = PyDict::new(py);
+    dict.set_item("avg_reward", hist.avg_reward())?;
+    dict.set_item("avg_confidence", hist.avg_confidence())?;
+    dict.set_item("positive_ratio", hist.positive_ratio())?;
+    dict.set_item("trend", hist.reward_trend())?;
+    dict.set_item("len", hist.len())?;
+    Ok(dict.into())
+}
+
 // ── Module registration ────────────────────────────────────────────
 
 #[pymodule]
@@ -856,6 +1082,28 @@ fn anima_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     agent_tools.add_function(wrap_pyfunction!(agent_tools_score_intent, &agent_tools)?)?;
     agent_tools.add_function(wrap_pyfunction!(agent_tools_classify_state, &agent_tools)?)?;
     m.add_submodule(&agent_tools)?;
+
+    // nexus6_bridge submodule (hot-path: data extraction, anomaly detection, scan history)
+    let nexus6_bridge = PyModule::new(py, "nexus6_bridge")?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_extract_cells, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_extract_hidden, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_check_anomalies, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_history_create, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_history_push, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_history_trend, &nexus6_bridge)?)?;
+    nexus6_bridge.add_function(wrap_pyfunction!(nexus6_bridge_history_summary, &nexus6_bridge)?)?;
+    m.add_submodule(&nexus6_bridge)?;
+
+    // judgment_bridge submodule (hot-path: reward computation from NEXUS-6 scans)
+    let judgment_bridge = PyModule::new(py, "judgment_bridge")?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_compute_reward, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_consensus_signal, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_phi_trend_signal, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_n6_ratio_signal, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_history_create, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_history_push, &judgment_bridge)?)?;
+    judgment_bridge.add_function(wrap_pyfunction!(judgment_bridge_history_stats, &judgment_bridge)?)?;
+    m.add_submodule(&judgment_bridge)?;
 
     // regime_bridge submodule (hot-path: trading action gate, pain, SOC criticality)
     let regime_bridge = PyModule::new(py, "regime_bridge")?;

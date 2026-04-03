@@ -71,6 +71,14 @@ class ActionPlanner:
 
     def __init__(self, registry: ToolRegistry):
         self._registry = registry
+        self._growth = None  # Optional ToolGrowth instance
+
+    def set_growth(self, growth):
+        """Attach a ToolGrowth instance for self-evolving tool selection.
+
+        When set, suggest() results override the static STATE_TOOL_MAP.
+        """
+        self._growth = growth
 
     def classify_state(self, state: dict) -> list[str]:
         """Classify consciousness state into actionable categories."""
@@ -110,11 +118,30 @@ class ActionPlanner:
         categories = self.classify_state(state)
         candidates = []
         seen = set()
-        for cat in categories:
-            for tool_name in self.STATE_TOOL_MAP.get(cat, []):
-                if tool_name not in seen and self._registry.get(tool_name):
-                    candidates.append(tool_name)
-                    seen.add(tool_name)
+
+        # 1a) If ToolGrowth is attached, use learned rankings first
+        if self._growth is not None:
+            for cat in categories:
+                grown_tools = self._growth.suggest(cat, max_tools)
+                for t in grown_tools:
+                    if t not in seen and self._registry.get(t):
+                        candidates.append(t)
+                        seen.add(t)
+            if candidates:
+                # Skip static map — growth suggestions are sufficient
+                pass
+            else:
+                # No growth suggestions matched registry — fall through
+                candidates = []
+                seen = set()
+
+        # 1b) Static STATE_TOOL_MAP fallback
+        if not candidates:
+            for cat in categories:
+                for tool_name in self.STATE_TOOL_MAP.get(cat, []):
+                    if tool_name not in seen and self._registry.get(tool_name):
+                        candidates.append(tool_name)
+                        seen.add(tool_name)
 
         # 2) Goal-keyword boost
         if goal:

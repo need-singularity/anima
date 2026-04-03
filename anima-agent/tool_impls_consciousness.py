@@ -13,6 +13,8 @@ __all__ = [
     "_tool_trading_backtest", "_tool_trading_scan", "_tool_trading_execute",
     "_tool_trading_balance", "_tool_trading_strategies", "_tool_trading_universe",
     "_get_trading_plugin",
+    "_tool_nexus6_scan", "_tool_nexus6_check", "_tool_nexus6_evolve",
+    "_tool_nexus6_status", "_get_nexus6_plugin",
 ]
 
 import os
@@ -653,6 +655,68 @@ def _tool_voice_synth(cells: int = 64, duration: float = 2.0,
         return result
     except Exception as e:
         return {'success': False, 'error': str(e)}
+
+
+# ---------------------------------------------------------------------------
+# NEXUS-6 tools (via plugin — Rust hot-path + 130+ lenses)
+# ---------------------------------------------------------------------------
+
+def _get_nexus6_plugin():
+    """Lazy-load nexus6 plugin singleton."""
+    if not hasattr(_get_nexus6_plugin, '_instance'):
+        try:
+            from plugins.nexus6_bridge import Nexus6Plugin
+            plugin = Nexus6Plugin()
+            _get_nexus6_plugin._instance = plugin
+        except Exception:
+            _get_nexus6_plugin._instance = None
+    return _get_nexus6_plugin._instance
+
+
+def _tool_nexus6_scan(cells: int = 64, steps: int = 50) -> dict:
+    """Run NEXUS-6 full consciousness scan (130+ lenses)."""
+    plugin = _get_nexus6_plugin()
+    if not plugin:
+        return {"error": "nexus6_bridge plugin not available"}
+    if not plugin.nexus6:
+        return {"error": "nexus6 not installed"}
+    # Generate data from a quick consciousness run if no live mind
+    try:
+        from consciousness_engine import ConsciousnessEngine
+        import torch
+        engine = ConsciousnessEngine(n_cells=cells)
+        for _ in range(steps):
+            engine.process(torch.randn(1, 64))
+        cell_data = []
+        for c in engine.cells:
+            cell_data.extend(c.tolist() if hasattr(c, 'tolist') else [float(c)])
+        return plugin.scan(data=cell_data)
+    except Exception as e:
+        return plugin.scan(data=[float(i) / 100 for i in range(cells)])
+
+
+def _tool_nexus6_check(value: float = 6.0) -> dict:
+    """Check if a value matches n=6 constants."""
+    plugin = _get_nexus6_plugin()
+    if not plugin:
+        return {"error": "nexus6_bridge plugin not available"}
+    return plugin.n6_check(value)
+
+
+def _tool_nexus6_evolve(domain: str = "consciousness") -> dict:
+    """Run OUROBOROS evolution for a domain."""
+    plugin = _get_nexus6_plugin()
+    if not plugin:
+        return {"error": "nexus6_bridge plugin not available"}
+    return plugin.evolve(domain)
+
+
+def _tool_nexus6_status() -> dict:
+    """Get NEXUS-6 scanner status (lenses, history, trend)."""
+    plugin = _get_nexus6_plugin()
+    if not plugin:
+        return {"error": "nexus6_bridge plugin not available"}
+    return plugin.status()
 
 
 # ---------------------------------------------------------------------------

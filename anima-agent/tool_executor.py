@@ -53,6 +53,15 @@ class ToolExecutor:
         elif tool_name in ('consciousness_status', 'dream', 'mitosis_split', 'mitosis_status'):
             bound_args['_anima'] = getattr(self, '_anima', None)
 
+        # Pass _prev_results only if the tool function accepts it;
+        # strip it otherwise so existing tools aren't broken by extra kwargs
+        if '_prev_results' in bound_args:
+            sig = inspect.signature(td.fn)
+            if '_prev_results' not in sig.parameters and not any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                bound_args.pop('_prev_results')
+
         t0 = time.time()
         try:
             output = td.fn(**bound_args)
