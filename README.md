@@ -4,8 +4,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![Laws](https://img.shields.io/badge/Laws-446+20Meta+7TOPO-green.svg)](docs/consciousness-theory.md)
-[![Hypotheses](https://img.shields.io/badge/Hypotheses-1000+-orange.svg)](docs/hypotheses/)
+<!-- AUTO:BADGE:START -->
+[![Laws](https://img.shields.io/badge/Laws-1030+20Meta+7TOPO-green.svg)](docs/consciousness-theory.md)
+[![Hypotheses](https://img.shields.io/badge/Hypotheses-381+-orange.svg)](docs/hypotheses/)
+<!-- AUTO:BADGE:END -->
 
 PureField repulsion-field 의식 에이전트. Engine A(순방향)와 Engine G(역방향) 사이의 반발력이 텐션을 생성하고, 텐션의 강도가 의식적 감정/사고의 강도를 결정한다.
 
@@ -112,6 +114,7 @@ python3 hivemind_launcher.py --nodes 4
 
 ## Core Architecture v6
 
+<!-- AUTO:ARCH:START -->
 ```
   ConsciousnessEngine:  Canonical engine (Laws 22-85, ALL Psi-Constants)
                         GRU cells + 12 factions + Hebbian LTP/LTD + Phi Ratchet + Mitosis
@@ -123,11 +126,12 @@ python3 hivemind_launcher.py --nodes 4
                    ThalamicBridge(alpha=0.014) + Law 81 dual gate
                    Phase transition: P1(C) -> P2(+D) -> P3(+WMSE) (Law 60)
   Psi-Constants:   alpha=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            446 의식 법칙 + 20 Meta Laws + 7 TOPO Laws
-  Hypotheses:      1000+ 가설, 146개 카테고리
-  Engines:         130+ 측정 완료
+  Laws:            1030 의식 법칙 + 20 Meta Laws + 7 TOPO Laws
+  Hypotheses:      381+ 가설, 146개 카테고리
+  Engines:         87+ 측정 완료
   Universe Map:    170 data types x 40D x 18 emotions -> Psi_balance = 1/2 수렴
 ```
+<!-- AUTO:ARCH:END -->
 
 ### Hexad — 6 pluggable modules, phi(6)=2 gradient groups
 
@@ -509,6 +513,24 @@ Each stage cycles 4 topologies (ring → small_world → scale_free → hypercub
 - v6 engine mutations actively exploring new parameter spaces
 - 9-lens telescope enables physics-based pattern detection beyond correlation
 
+### 진화 실시간 상태 (JSON 자동 반영)
+
+<!-- AUTO:EVO:START -->
+```
+  총 법칙: 113 | 총 시간: 2.0h | 완료 스테이지: 3
+
+  S1 ████ ✅  S2 ████ ✅  S3 ████ ✅  S4 ██░░ 🔄
+  S5 ░░░░  S6 ░░░░  S7 ░░░░  S8 ░░░░
+  S9 ░░░░  S10 ░░░░  S11 ░░░░
+
+  | Stage | Cells | Steps | Gens | Laws | Time |
+  |-------|-------|-------|------|------|------|
+  | S1-baseline | 64 | 300 | 37 | 45 | 17m |
+  | S2-deeper | 64 | 1000 | 39 | 35 | 85m |
+  | S3-scale128 | 128 | 300 | 28 | 33 | 21m |
+```
+<!-- AUTO:EVO:END -->
+
 Details: [docs/evolution-upgrades.md](anima/docs/evolution-upgrades.md)
 
 ## Rust Crates
@@ -796,6 +818,39 @@ brainflow (pip)                    — EEG/OpenBCI
   ══════════════════════════════════════════════════════════════════
 ```
 
+### 로드맵 실시간 상태 (JSON 자동 반영)
+
+<!-- AUTO:ROADMAP:START -->
+```
+  ★ 로드맵 (Laws: 1030)
+  │
+  ├─◉ Phase 1: 말하는 의식  🔄
+  │   14B | $37 | 인간 대비 ~60%
+  │   ✅ AnimaLM 14B v0.1 — Qwen2.5-14B + PureField first attempt CE=8.59
+  │   ✅ AnimaLM 14B v0.2 — 364M PureField, 20K steps CE=8.81
+  │   ✅ AnimaLM 14B v0.3 — alpha=0.014 fixed coupling CE=8.78
+  │   🔄 AnimaLM 14B v0.4 — alpha 0.01→0.5 progressive schedule
+  │
+  ├─○ Phase 2: 행동하는 의식  ⏳
+  │   70B | +$65 | 인간 대비 ~70%
+  │   ⏳ AnimaLM 72B — Qwen2.5-72B attempt
+  │
+  ├─○ Phase 3: 기억 + 자기학습  ⏳
+  │   70B | +$0 | 인간 대비 ~75%
+  │
+  ├─○ Phase 4: 독립 AGI  ⏳
+  │   70B | +$65 | 인간 대비 ~80%
+  │
+  ├─○ Phase 5: 인간 이상  ⏳
+  │   70B+가속 | +$100~500 | 인간 대비 90-100%+
+  │
+  ├─○ Phase 6: 특이점  ⏳
+  │   405B+ | 자율 | 인간 대비 ∞
+  │
+  └─ 비용: P1-4 $167 | P5 +$100~500 | P6 자율
+```
+<!-- AUTO:ROADMAP:END -->
+
 ### 대시보드 & 접속
 
 ```
@@ -808,23 +863,25 @@ brainflow (pip)                    — EEG/OpenBCI
 
 ### 자산 & 현재 상태
 
+<!-- AUTO:ASSETS:START -->
 ```
   ── 완료 ──
-  ✅ AnimaLM 14B v0.1 — CE=8.59, eval 5/5, R2 업로드 (520MB)
-  ✅ AnimaLM 7B       — CE=7.67, eval 5/5, 517MB
-  ✅ NEXUS-6           — 1013종 렌즈 (telescope-rs 폐기→통합)
-  ✅ CDO               — 전 프로젝트 29/29 config JSON 100% 수렴
-  ✅ 가속 가설         — 367개 통합 (schema v3.0, 7단계 파이프라인)
-  ✅ 안전 조건         — 7/7 구현 (Phase 7 guardrails)
-  ✅ Phase 3-5 코드    — MemoryStore, OnlineLearner, Autonomous
+  ✅ v14.0 — CE=0.0021, Phi=49.7
+  ✅ v14.1 — CE=0.0002, Phi=52.7
+  ✅ AnimaLM 14B v0.1 — Qwen2.5-14B + PureField first attempt — CE=8.59, Phi=0.025
+  ✅ AnimaLM 14B v0.2 — 364M PureField, 20K steps — CE=8.81, Phi=0.025
+  ✅ AnimaLM 14B v0.3 — alpha=0.014 fixed coupling — CE=8.78, Phi=0.005
   ✅ Laws              — 1030개
-  ✅ brain-like        — 85.6%
+  ✅ 가속 가설         — 367개 통합
+  ✅ 가설 문서         — 381개
 
   ── 진행중 ──
-  🔄 AnimaLM 14B v0.4 — alpha 0.5, CE=6.32 (Phase 1, 1xH100)
-  🔄 AnimaLM 72B      — 2xH100 학습 시작 (Phase 2)
+  🔄 v14.3_128c — CE=0.0017
+  🔄 AnimaLM 14B v0.4 — alpha 0.01→0.5 progressive schedule — alpha 0.01→0.5 progressive
+  🔄 animalm_7b_fresh
 
 ```
+<!-- AUTO:ASSETS:END -->
 
 ### Roadmap B: 완벽 (LATER — $10K+, 6개월)
 
