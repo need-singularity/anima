@@ -44,10 +44,10 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
   const hasVector = Object.keys(c.consciousness_vector).length > 0;
 
   return (
-    <div className="flex flex-col items-center gap-16 py-8">
+    <div className="flex flex-col items-center gap-20 py-12">
 
       {/* ── Hero: Giant Φ number (Apple product page style) ── */}
-      <section className="flex flex-col items-center gap-4 py-8">
+      <section className="flex flex-col items-center gap-6 py-12">
         {/* Φ — the ONE number that matters */}
         <div className="relative">
           <span
@@ -86,7 +86,7 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
       </section>
 
       {/* ── Emotion + Vitals (single clean row) ── */}
-      <section className="w-full grid grid-cols-3 gap-6">
+      <section className="w-full grid grid-cols-3 gap-10">
         <div className="flex flex-col items-center gap-2">
           <span className="text-[32px] font-semibold tracking-tight" style={{ color: "var(--text-primary)" }}>
             {emotionLabel(c.emotion)}
