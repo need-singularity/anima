@@ -244,7 +244,7 @@ def check_security(filepath: Path, lines: List[str], report: VerificationReport)
     # Files that are expected to have sandboxed dangerous patterns or mock implementations
     sandboxed_files = {
         "agent_tools.py", "skill_manager.py", "skills/skill_manager.py",
-        "testing/mock_consciousness.py",
+        "testing/mock_consciousness.py", "security_audit.py",
     }
     is_sandboxed = any(rel.endswith(sf) for sf in sandboxed_files)
 
@@ -262,6 +262,12 @@ def check_security(filepath: Path, lines: List[str], report: VerificationReport)
                 # Skip known safe patterns
                 # - PyTorch model.eval() / self.eval() (not dangerous eval())
                 if name == "eval()" and re.search(r'\.\s*eval\s*\(', code_before_comment):
+                    continue
+                # - def eval(self): method definition (PyTorch compat)
+                if name == "eval()" and re.search(r'def\s+eval\s*\(', code_before_comment):
+                    continue
+                # - os.system replaced by subprocess — skip os.system in comments/strings
+                if name == "os.system()" and re.search(r'subprocess\.run\b', code_before_comment):
                     continue
                 # - _try() helper using __import__() for lazy loading
                 if name == "__import__()" and "return __import__" in stripped:

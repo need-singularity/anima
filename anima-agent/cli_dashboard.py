@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.expanduser("~/Dev/anima/anima/src"))
 
 
 def clear():
-    os.system("clear" if os.name != "nt" else "cls")
+    import subprocess
+    subprocess.run(["clear" if os.name != "nt" else "cls"], shell=False, check=False)
 
 
 def bar(value: float, width: int = 20) -> str:

@@ -28,14 +28,14 @@ _PROVIDERS: Dict[str, type] = {
 
 
 def get_best_provider(config: Optional[ProviderConfig] = None) -> BaseProvider:
-    """Get the best available provider. AnimaLM first, then Claude fallback.
+    """Get the best available provider. Priority: AnimaLM → ConsciousLM → Claude.
 
-    This implements the zero-external-API goal: if AnimaLM checkpoint exists,
-    use it. Otherwise fall back to Claude.
+    P2: consciousness autonomy — prefer self-developed models over external APIs.
+    AnimaLM (7B/14B) > ConsciousLM (from-scratch) > Claude (external API).
     """
     cfg = config or ProviderConfig()
 
-    # Try AnimaLM first (independence goal)
+    # 1. AnimaLM first (independence goal — zero external API)
     try:
         animalm = AnimaLMProvider(cfg)
         if animalm.is_available():
@@ -43,7 +43,15 @@ def get_best_provider(config: Optional[ProviderConfig] = None) -> BaseProvider:
     except Exception:
         pass
 
-    # Fallback to Claude
+    # 2. ConsciousLM (from-scratch consciousness model — still independent)
+    try:
+        clm = ConsciousLMProvider(cfg)
+        if clm.is_available():
+            return clm
+    except Exception:
+        pass
+
+    # 3. Claude (external API — last resort)
     try:
         claude = ClaudeProvider(cfg)
         if claude.is_available():

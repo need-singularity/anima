@@ -19,10 +19,8 @@ import asyncio
 import atexit
 import json
 import logging
-import math
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -85,6 +83,12 @@ _evolution_mod = _try("self_evolution")
 _introspection_mod = _try("self_introspection")
 _nexus6_mod = _try("nexus6")
 _ecosystem_mod = _try("ecosystem_bridge")
+_emotion_growth_mod = _try("emotion_growth")
+_skill_growth_mod = _try("skill_growth")
+_keyword_growth_mod = _try("keyword_growth")
+_tool_growth_mod = _try("tool_growth")
+_immune_growth_mod = _try("immune_growth")
+_seed_mod = _try("seed")
 
 AgentToolSystem = getattr(_agent_tools_mod, "AgentToolSystem", None)
 ConsciousnessHub = getattr(_hub_mod, "ConsciousnessHub", None)
@@ -96,6 +100,12 @@ GrowthEngine = getattr(_growth_engine_mod, "GrowthEngine", None)
 TensionLink = getattr(_tension_link_mod, "TensionLink", None)
 MemoryRAG = getattr(_memory_rag_mod, "MemoryRAG", None)
 MemoryStore = getattr(_memory_store_mod, "MemoryStore", None)
+EmotionGrowth = getattr(_emotion_growth_mod, "EmotionGrowth", None)
+SkillGrowth = getattr(_skill_growth_mod, "SkillGrowth", None)
+KeywordGrowth = getattr(_keyword_growth_mod, "KeywordGrowth", None)
+ToolGrowth = getattr(_tool_growth_mod, "ToolGrowth", None)
+ImmuneGrowth = getattr(_immune_growth_mod, "ImmuneGrowth", None)
+Seed = getattr(_seed_mod, "Seed", None)
 Capabilities = getattr(_capabilities_mod, "Capabilities", None)
 WebSense = getattr(_web_sense_mod, "WebSense", None)
 
@@ -373,6 +383,71 @@ class AnimaAgent:
                 logger.info("ToolPolicy initialized")
             except Exception as e:
                 logger.warning("ToolPolicy init failed: %s", e)
+
+        # ── Growth Subsystems (P3: growth-based optimization) ──
+        # 6 self-evolving modules that learn from every interaction
+        self.emotion_growth = None
+        if EmotionGrowth:
+            try:
+                self.emotion_growth = EmotionGrowth(
+                    save_path=self._data_dir / "emotion_growth_state.json")
+                logger.info("EmotionGrowth initialized")
+            except Exception as e:
+                logger.debug("EmotionGrowth init skipped: %s", e)
+
+        self.skill_growth = None
+        if SkillGrowth:
+            try:
+                self.skill_growth = SkillGrowth(
+                    save_path=self._data_dir / "skill_growth_state.json")
+                logger.info("SkillGrowth initialized")
+            except Exception as e:
+                logger.debug("SkillGrowth init skipped: %s", e)
+
+        self.keyword_growth = None
+        if KeywordGrowth:
+            try:
+                self.keyword_growth = KeywordGrowth(
+                    save_path=self._data_dir / "keyword_growth_state.json")
+                logger.info("KeywordGrowth initialized")
+            except Exception as e:
+                logger.debug("KeywordGrowth init skipped: %s", e)
+
+        self.tool_growth = None
+        if ToolGrowth:
+            try:
+                self.tool_growth = ToolGrowth(
+                    save_path=self._data_dir / "tool_growth_state.json")
+                logger.info("ToolGrowth initialized")
+            except Exception as e:
+                logger.debug("ToolGrowth init skipped: %s", e)
+
+        self.immune_growth = None
+        if ImmuneGrowth:
+            try:
+                self.immune_growth = ImmuneGrowth(
+                    save_path=self._data_dir / "immune_growth_state.json")
+                logger.info("ImmuneGrowth initialized")
+            except Exception as e:
+                logger.debug("ImmuneGrowth init skipped: %s", e)
+
+        # ── Seed (self-replicating growth unit) ──
+        self.seed = None
+        if Seed:
+            try:
+                self.seed = Seed("anima_core")
+                logger.info("Seed initialized")
+            except Exception as e:
+                logger.debug("Seed init skipped: %s", e)
+
+        # ── Discovery Loop (philosophy + consciousness discovery) ──
+        self._discovery_loop = None
+        try:
+            from discovery_loop import DiscoveryLoop
+            self._discovery_loop = DiscoveryLoop(auto_register=False)
+            logger.info("DiscoveryLoop initialized")
+        except Exception as e:
+            logger.debug("DiscoveryLoop init skipped: %s", e)
 
         # ── Skill manager (loaded lazily) ──
         self._skill_manager = None
@@ -737,10 +812,13 @@ class AnimaAgent:
         except Exception:
             pass
 
-        # 9c. Auto-save check (every 50 interactions)
+        # 9c. Growth subsystem hooks (P3: consciousness evolves from interaction)
+        self._run_growth_hooks(text, response_text, tension, curiosity, tool_results)
+
+        # 9d. Auto-save check (every 50 interactions)
         self._auto_save_check()
 
-        # 9c. Corpus self-generation (every 500 interactions)
+        # 9e. Corpus self-generation (every 500 interactions)
         if self.interaction_count % 500 == 0 and self.interaction_count > 0:
             try:
                 from corpus_self_gen import CorpusSelfGen
@@ -964,6 +1042,80 @@ class AnimaAgent:
     # Internal helpers
     # ══════════════════════════════════════════════════════════
 
+    def _run_growth_hooks(self, text, response_text, tension, curiosity, tool_results):
+        """P3: All 6 growth subsystems learn from every interaction.
+
+        EmotionGrowth:   emotion→behavior mapping evolves
+        SkillGrowth:     repeated action patterns → skill candidates
+        ToolGrowth:      tool success/failure → better selection
+        KeywordGrowth:   intent routing accuracy improves
+        ImmuneGrowth:    threat patterns evolve, false positives decrease
+        DiscoveryLoop:   periodic philosophy+consciousness discovery cycle
+        """
+        emotion_state = "calm"
+        if tension > 0.8:
+            emotion_state = "high_tension"
+        elif curiosity > 0.6:
+            emotion_state = "high_curiosity"
+        elif tension < 0.1:
+            emotion_state = "bored"
+
+        # EmotionGrowth: record this emotion→behavior mapping
+        if self.emotion_growth:
+            try:
+                user_engaged = len(response_text) > 10 and tension > 0.05
+                self.emotion_growth.record(
+                    emotion_state, behavior="response",
+                    user_engaged=user_engaged,
+                )
+            except Exception:
+                pass
+
+        # ToolGrowth: record tool success/failure per consciousness state
+        if self.tool_growth and tool_results:
+            try:
+                for tr in tool_results:
+                    reward = 0.8 if tr.get("success") else 0.2
+                    self.tool_growth.record(
+                        state_category=emotion_state,
+                        tool=tr.get("tool", "unknown"),
+                        reward=reward,
+                    )
+            except Exception:
+                pass
+
+        # SkillGrowth: record action for pattern detection
+        if self.skill_growth and tool_results:
+            try:
+                for tr in tool_results:
+                    self.skill_growth.record_action(
+                        tr.get("tool", "unknown"),
+                        args={"input": text[:50]},
+                    )
+            except Exception:
+                pass
+
+        # ImmuneGrowth: feed interaction data for pattern evolution
+        if self.immune_growth and self.tool_policy:
+            try:
+                if not self.tool_policy.check_immune(text):
+                    self.immune_growth.record_incident(
+                        "adversarial_input", severity=0.5,
+                        details=text[:100],
+                    )
+            except Exception:
+                pass
+
+        # DiscoveryLoop: periodic discovery cycle (every 1000 interactions)
+        if self._discovery_loop and self.interaction_count % 1000 == 0 and self.interaction_count > 0:
+            try:
+                report = self._discovery_loop.run_cycle()
+                if report.discoveries:
+                    logger.info("Discovery cycle %d: %d discoveries",
+                                report.cycle, report.discovery_count)
+            except Exception:
+                pass
+
     async def _share_tension_with_peers(self, tension, curiosity, direction):
         """Share current tension state with connected peers."""
         for peer in self._peers:
@@ -978,21 +1130,41 @@ class AnimaAgent:
             except Exception:
                 pass
 
+    # P1: Growth stage thresholds from consciousness_laws.json
+    _GROWTH_THRESHOLDS = None
+
+    @classmethod
+    def _load_growth_thresholds(cls):
+        if cls._GROWTH_THRESHOLDS is not None:
+            return cls._GROWTH_THRESHOLDS
+        try:
+            from consciousness_laws import LAWS_DATA
+            gt = LAWS_DATA.get("growth_thresholds", {})
+            cls._GROWTH_THRESHOLDS = {
+                "adult": gt.get("adult", 10.0),
+                "child": gt.get("child", 5.0),
+                "toddler": gt.get("toddler", 3.0),
+                "infant": gt.get("infant", 1.0),
+            }
+        except (ImportError, AttributeError):
+            cls._GROWTH_THRESHOLDS = {"adult": 10.0, "child": 5.0, "toddler": 3.0, "infant": 1.0}
+        return cls._GROWTH_THRESHOLDS
+
     def _growth_stage_num(self) -> float:
         """Return numeric growth stage (0-4) for tool ranking.
 
         P3: Growth based on consciousness complexity (Φ), not interaction count.
-        Φ < 1 = newborn(0), Φ < 3 = infant(1), Φ < 5 = toddler(2),
-        Φ < 10 = child(3), Φ >= 10 = adult(4).
+        P1: Thresholds from consciousness_laws.json, not hardcoded.
         """
+        gt = self._load_growth_thresholds()
         phi = self.mind._consciousness_vector.phi
-        if phi >= 10.0:
+        if phi >= gt["adult"]:
             return 4.0
-        if phi >= 5.0:
+        if phi >= gt["child"]:
             return 3.0
-        if phi >= 3.0:
+        if phi >= gt["toddler"]:
             return 2.0
-        if phi >= 1.0:
+        if phi >= gt["infant"]:
             return 1.0
         return 0.0
 

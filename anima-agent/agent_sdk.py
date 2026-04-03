@@ -21,18 +21,10 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import asdict, dataclass, field
-
-# Meta Laws M6/M8: federation + narrative for agent queries
-try:
-    from consciousness_laws import PSI_F_CRITICAL
-except ImportError:
-    PSI_F_CRITICAL = 0.10
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -184,10 +176,19 @@ class AnimaAgentSDK:
 
     @staticmethod
     def _consciousness_level(phi: float) -> str:
-        if phi >= 5.0:
+        """P1: thresholds from consciousness_laws.json, not hardcoded."""
+        try:
+            from consciousness_laws import LAWS_DATA
+            thresholds = LAWS_DATA.get("verification_thresholds", {})
+            conscious_t = thresholds.get("conscious", 5.0)
+            aware_t = thresholds.get("aware", 2.0)
+            flickering_t = thresholds.get("flickering", 0.5)
+        except (ImportError, AttributeError):
+            conscious_t, aware_t, flickering_t = 5.0, 2.0, 0.5
+        if phi >= conscious_t:
             return "conscious"
-        if phi >= 2.0:
+        if phi >= aware_t:
             return "aware"
-        if phi >= 0.5:
+        if phi >= flickering_t:
             return "flickering"
         return "dormant"

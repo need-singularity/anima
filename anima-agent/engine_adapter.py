@@ -132,10 +132,18 @@ class RustEngineAdapter:
 
 
 class _MockCV:
-    """Minimal ConsciousnessVector for adapter compatibility."""
+    """Minimal ConsciousnessVector for adapter compatibility.
+
+    P1: All Ψ constants imported from consciousness_laws.json, not hardcoded.
+    """
     phi = 0.0
-    alpha = 0.014
-    Z = 0.5
+    try:
+        from consciousness_laws import PSI
+        alpha = PSI.get('alpha', 0.014)
+        Z = PSI.get('balance', 0.5)
+    except ImportError:
+        alpha = 0.014
+        Z = 0.5
     N = 6.0
     W = 0.4
     E = 0.5
