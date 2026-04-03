@@ -27,8 +27,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_PUBLIC_URL = "https://pub-66846da695ea4f938ae89186b0b23541.r2.dev"
-_BUCKET = "anima-hive"
+_PUBLIC_URL = os.environ.get("ANIMA_HIVE_PUBLIC_URL", "")
+_BUCKET = os.environ.get("ANIMA_HIVE_BUCKET", "anima-hive")
 
 
 def _load_env():
@@ -54,7 +54,7 @@ class Hive:
         self._cache.mkdir(parents=True, exist_ok=True)
         self._client = None
         self._device = os.environ.get("ANIMA_DEVICE_ID", platform.node() or "anon")
-        self._endpoint = os.environ.get("ANIMA_R2_ENDPOINT")
+        self._endpoint = os.environ.get("ANIMA_HIVE_ENDPOINT") or os.environ.get("ANIMA_R2_ENDPOINT")
         self._access_key = os.environ.get("ANIMA_R2_ACCESS_KEY")
         self._secret_key = os.environ.get("ANIMA_R2_SECRET_KEY")
 
