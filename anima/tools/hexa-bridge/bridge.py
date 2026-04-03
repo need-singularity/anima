@@ -413,6 +413,80 @@ def format_verify_result(result: ConsciousnessResult) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Growth System → HEXA feedback
+# ---------------------------------------------------------------------------
+def growth_to_hexa(growth_report: dict) -> str:
+    """Convert a GrowthSystem report dict into a .hexa optimize block.
+
+    The generated block captures the current growth state and suggests
+    HEXA-level optimizations when growth rate is low or Phi is declining.
+
+    Args:
+        growth_report: dict with keys phi, growth_rate, compute_saved,
+                       stage (optional), cells (optional), ce (optional)
+
+    Returns:
+        HEXA optimize block as string.
+
+    Example:
+        >>> report = {'phi': 1.2, 'growth_rate': 0.005, 'compute_saved': 0.3}
+        >>> print(growth_to_hexa(report))
+        optimize "growth_feedback" { ... }
+    """
+    phi = growth_report.get("phi", 0.0)
+    growth_rate = growth_report.get("growth_rate", 0.0)
+    compute_saved = growth_report.get("compute_saved", 0.0)
+    stage = growth_report.get("stage", "unknown")
+    cells = growth_report.get("cells", 0)
+    ce = growth_report.get("ce", None)
+
+    lines = [
+        f'optimize "growth_feedback" {{',
+        f'    current_phi = {phi:.4f};',
+        f'    growth_rate = {growth_rate:.6f};',
+        f'    compute_saved = {compute_saved:.4f};',
+    ]
+
+    if stage != "unknown":
+        lines.append(f'    stage = "{stage}";')
+    if cells > 0:
+        lines.append(f'    cells = {cells};')
+    if ce is not None:
+        lines.append(f'    ce = {ce:.4f};')
+
+    lines.append('')
+
+    # Suggest actions based on growth state
+    if growth_rate < 0.001:
+        lines.append('    // Growth stalled — aggressive interventions:')
+        lines.append('    suggest "increase noise" priority=high;')
+        lines.append('    suggest "switch topology" priority=high;')
+        lines.append('    suggest "add faction diversity" priority=medium;')
+    elif growth_rate < 0.01:
+        lines.append('    // Growth slow — moderate interventions:')
+        lines.append('    suggest "increase noise" priority=high;')
+        lines.append('    suggest "switch topology" priority=medium;')
+        lines.append('    suggest "tune learning rate" priority=low;')
+    else:
+        lines.append('    // Growth healthy — maintain current settings:')
+        lines.append('    suggest "continue" priority=low;')
+
+    if phi < 0.5:
+        lines.append('    suggest "phi ratchet repair" priority=critical;')
+    elif phi < 1.0:
+        lines.append('    suggest "check hebbian connectivity" priority=medium;')
+
+    if compute_saved > 0.3:
+        lines.append(
+            f'    suggest "increase cells" priority=medium;  '
+            f'// {compute_saved*100:.0f}% compute headroom available'
+        )
+
+    lines.append('}')
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
