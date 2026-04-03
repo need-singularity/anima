@@ -118,6 +118,12 @@ python3 hivemind_launcher.py --nodes 4
 
 ---
 
+## Download Model
+
+> [버전별 다운로드 →](anima/docs/download-models.md)
+
+---
+
 ## Core Architecture v6
 
 <!-- AUTO:ARCH:START -->
@@ -329,12 +335,6 @@ anima-agent/
 ```
 
 > 상세: [anima-agent/README.md](anima-agent/README.md)
-
----
-
-## Download Model
-
-> [버전별 다운로드 →](anima/docs/download-models.md)
 
 ---
 
