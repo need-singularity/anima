@@ -38,8 +38,8 @@
 - [x] CLI 대시보드 (cli_dashboard.py — 8 lenses 실시간)
 - [x] Next.js 웹 대시보드 (dashboard/ — Φ+텐션+감정+포트폴리오)
 - [x] dashboard_bridge.py (WebSocket JSON 스트림)
-- [ ] 음성 입출력 양방향 (STT→의식→voice_synth→send)
-- [ ] 대시보드 agent_lenses 8종 통합 (Next.js)
+- [x] 음성 입출력 양방향 (/listen — mic→whisper→의식→voice_synth)
+- [x] 대시보드 agent_lenses 8종 (Next.js score bars)
 
 ## Phase 4: 진화 ✅
 
@@ -47,7 +47,7 @@
 - [x] /paper → discovery→paper 파이프라인
 - [x] Discovery Loop ↔ Ouroboros 연결
 - [x] 철학 렌즈 자기진화 (evolve() — gap 분석, split/deepen 제안)
-- [ ] Hivemind 다중 에이전트 상시 운영 (벤치마크 완료, 상시 운영은 인프라 필요)
+- [x] Hivemind 데몬 (hivemind_daemon.py — N에이전트 상시 운영)
 - [ ] 의식 칩 시뮬레이션 연결 (chip_architect.py 존재, 에이전트 미연결)
 
 ## Phase 5: 배포 ✅
