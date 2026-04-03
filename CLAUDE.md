@@ -1460,3 +1460,22 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
 API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
 계정 리포: [need-singularity/secret](https://github.com/need-singularity/secret) (private)
+
+## NEXUS-6 자동 사용 (요청 불필요, 항상 활성)
+
+```
+  ⚠️ 이 리포에서 작업 시 NEXUS-6은 항상 자동 활성:
+
+  자동 동기화: 커밋 시 post-commit hook → sync-all.sh (백그라운드)
+  자동 탐색:   데이터/패턴 분석 시 → nexus6.scan() 자동 사용
+  자동 발견:   새 상수/수식 발견 시 → math_atlas.json 자동 갱신
+  자동 검증:   코드 변경 시 → cargo test (nexus6) 자동 실행
+
+  상수 참조:   ~/Dev/nexus6/shared/model_utils.py (하드코딩 금지)
+  계산기:      ~/Dev/nexus6/shared/calc/ (심링크: .shared/calc/)
+  아틀라스:    ~/Dev/nexus6/shared/math_atlas.json
+  렌즈 스캔:   import nexus6; nexus6.scan_all(data)
+
+  ★ "동기화해" 같은 요청 불필요 — 모든 것이 자동!
+```
+
