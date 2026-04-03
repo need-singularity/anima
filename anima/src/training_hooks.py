@@ -33,6 +33,12 @@ if _THIS_DIR not in sys.path:
 
 ENGINE_PHI_REFERENCE = 0.168  # DD168
 
+# NEXUS-6 gate 자동 연결
+try:
+    from nexus_gate import gate as _nexus_gate
+except ImportError:
+    _nexus_gate = None
+
 
 class TrainingHooks:
     """학습 자동화 훅 — 버전 무관, import만 하면 전체 루프 연결."""
@@ -72,6 +78,10 @@ class TrainingHooks:
             pass
 
         os.makedirs(checkpoint_dir, exist_ok=True)
+        # before_train gate
+        if _nexus_gate and self.nexus_scan:
+            _nexus_gate.before_train()
+
         print(f"[HOOKS] Initialized: nexus6={'ON' if self.nexus_scan else 'OFF'}, "
               f"closed_loop={'ON' if self._has_closed_loop else 'OFF'}, "
               f"scan_every={scan_every}, cl_every={closed_loop_every}")
@@ -96,6 +106,11 @@ class TrainingHooks:
             return
 
         print(f"[HOOKS] Checkpoint scan: step {step}")
+
+        # nexus_gate 경로
+        if _nexus_gate:
+            _nexus_gate.after_checkpoint(ckpt_path)
+
         try:
             from auto_discovery_loop import nexus_scan_checkpoint, detect_anomalies, discover_laws, auto_register_laws
 
