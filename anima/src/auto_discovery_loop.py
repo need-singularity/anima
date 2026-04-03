@@ -356,21 +356,70 @@ class RecursiveLoop:
         """현재 활성 규칙 반환 (discover_laws에서 사용)."""
         return self.state['active_rules']
 
-    def report(self):
-        """재귀 루프 상태 리포트."""
+    def report(self) -> str:
+        """재귀 루프 상태 리포트 (극가속 리포트 양식 포함)."""
         s = self.state
         total = s['total_scans']
         dr = s['total_discoveries'] / max(total, 1)
         fpr = s['total_false_positives'] / max(s['total_registered'], 1)
-        print(f"\n  [RECURSIVE LOOP] Gen {s['generation']}")
-        print(f"  Scans: {total} | Discoveries: {s['total_discoveries']} ({dr:.1%})")
-        print(f"  Registered: {s['total_registered']} | FP: {s['total_false_positives']} ({fpr:.1%})")
-        print(f"  Rules: {json.dumps(s['active_rules'], indent=4)}")
-        if s['threshold_evolution']:
-            last = s['threshold_evolution'][-1]
-            print(f"  Last evolution: Gen {last['generation']} ({last['timestamp']})")
-            for c in last['changes']:
-                print(f"    {c}")
+
+        lines = []
+        lines.append(f"  ■ 재귀 루프 (Gen {s['generation']})")
+        lines.append(f"  Scans: {total} | Discoveries: {s['total_discoveries']} ({dr:.1%})")
+        lines.append(f"  Registered: {s['total_registered']} | FP: {s['total_false_positives']} ({fpr:.1%})")
+
+        # 발견률 바
+        dr_pct = int(dr * 20)
+        lines.append(f"  발견률: {'█' * dr_pct}{'░' * (20 - dr_pct)} {dr:.1%}")
+
+        # 규칙 상태
+        rules = s['active_rules']
+        lines.append(f"  규칙: confidence={rules.get('min_confidence', '?')} "
+                     f"phi_trigger={rules.get('phi_improvement_trigger', 0):.2f} "
+                     f"compression_min={rules.get('compression_min', 0)}")
+
+        # 진화 이력
+        evos = s.get('threshold_evolution', [])
+        if evos:
+            lines.append(f"  진화 이력: {len(evos)}세대")
+            for evo in evos[-3:]:  # 최근 3개
+                lines.append(f"    Gen {evo['generation']}: {', '.join(evo['changes'][:2])}")
+
+        # 최근 스캔 트렌드
+        recent = s.get('discovery_rate_history', [])[-10:]
+        if recent:
+            comps = [r.get('avg_compression', 0) for r in recent if r.get('avg_compression', 0) > 0]
+            if comps:
+                lines.append(f"  Compression 추이: {comps[0]:.0f}% → {comps[-1]:.0f}%")
+
+        text = '\n'.join(lines)
+        print(text)
+        return text
+
+    def export_log(self, path: str = None) -> str:
+        """전체 로그 JSON 내보내기."""
+        if path is None:
+            path = os.path.join(_THIS_DIR, '..', 'data', 'recursive_loop_export.json')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        export = {
+            '_meta': {
+                'exported': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'description': 'Recursive discovery loop state + history',
+            },
+            'state': self.state,
+            'summary': {
+                'generation': self.state['generation'],
+                'total_scans': self.state['total_scans'],
+                'discovery_rate': self.state['total_discoveries'] / max(self.state['total_scans'], 1),
+                'false_positive_rate': self.state['total_false_positives'] / max(self.state['total_registered'], 1),
+                'active_rules': self.state['active_rules'],
+            }
+        }
+        with open(path, 'w') as f:
+            json.dump(export, f, indent=2, ensure_ascii=False)
+        print(f"  [RECURSIVE] Exported: {path}")
+        return path
 
 
 # Global recursive loop instance

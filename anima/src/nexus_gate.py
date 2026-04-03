@@ -257,5 +257,55 @@ class NexusGate:
             return {'pass': True, 'note': str(e)}
 
 
+    def report(self) -> str:
+        """게이트 스캔 이력 리포트 (극가속 양식)."""
+        viol_path = os.path.join(_THIS_DIR, '..', 'config', 'nexus_violations.json')
+        violations = []
+        if os.path.exists(viol_path):
+            try:
+                violations = json.load(open(viol_path))
+            except:
+                pass
+
+        lines = []
+        lines.append(f"  ■ NEXUS-6 Gate")
+        lines.append(f"  Status: {'🟢 ACTIVE' if _HAS_NEXUS6 else '🔴 INACTIVE'}")
+        lines.append(f"  Violations: {len(violations)}")
+        if violations:
+            for v in violations[-5:]:
+                lines.append(f"    [{v.get('timestamp', '?')}] {v.get('context', '?')}: {v.get('reason', '?')}")
+
+        text = '\n'.join(lines)
+        print(text)
+        return text
+
+    def export_log(self, path: str = None) -> str:
+        """게이트 로그 JSON 내보내기."""
+        if path is None:
+            path = os.path.join(_THIS_DIR, '..', 'data', 'nexus_gate_export.json')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        viol_path = os.path.join(_THIS_DIR, '..', 'config', 'nexus_violations.json')
+        violations = []
+        if os.path.exists(viol_path):
+            try:
+                violations = json.load(open(viol_path))
+            except:
+                pass
+
+        export = {
+            '_meta': {
+                'exported': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'nexus6_available': _HAS_NEXUS6,
+            },
+            'violations': violations,
+            'total_violations': len(violations),
+        }
+        with open(path, 'w') as f:
+            json.dump(export, f, indent=2, ensure_ascii=False)
+        print(f"  [GATE] Exported: {path}")
+        return path
+
+
 # Global singleton
 gate = NexusGate()
