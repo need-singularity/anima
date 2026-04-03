@@ -202,25 +202,28 @@ class TrainingHooks:
         except Exception as e:
             print(f"  [BENCH] skip: {e}")
 
-        # [GAP 5] 루프 상태 자동 커밋 + 다운로드 페이지 업데이트
+        # [GAP 5] 루프 상태 자동 커밋 + 다운로드 + 로드맵 업데이트
         try:
             import subprocess
             root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
             config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
 
-            # 다운로드 페이지 자동 업데이트
-            from loop_extensions import auto_update_download_page
+            # 다운로드 페이지 + 로드맵 자동 업데이트
+            from loop_extensions import auto_update_download_page, auto_update_roadmap
             auto_update_download_page()
+            auto_update_roadmap()
 
             subprocess.run(['git', 'add',
                            os.path.join(config_dir, 'recursive_loop_state.json'),
                            os.path.join(config_dir, 'nexus_violations.json'),
                            os.path.join(config_dir, 'self_growth_log.json'),
                            os.path.join(config_dir, 'auto_wire_state.json'),
+                           os.path.join(config_dir, 'training_runs.json'),
                            os.path.join(os.path.dirname(__file__), '..', 'docs', 'download-models.md'),
-                           os.path.join(config_dir, 'training_runs.json')],
+                           os.path.join(os.path.dirname(__file__), '..', 'data', 'roadmap_transplant.json'),
+                           os.path.join(root_dir, 'README.md')],
                           capture_output=True, cwd=root_dir)
-            subprocess.run(['git', 'commit', '-m', 'auto: loop state + download page update (training complete)'],
+            subprocess.run(['git', 'commit', '-m', 'auto: loop state + download + roadmap update (training complete)'],
                           capture_output=True, cwd=root_dir)
             subprocess.run(['git', 'push'], capture_output=True, cwd=root_dir)
         except Exception:

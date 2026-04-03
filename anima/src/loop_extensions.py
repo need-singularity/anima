@@ -235,6 +235,95 @@ def auto_update_download_page():
 
 
 # ══════════════════════════════════════════
+# 로드맵 JSON + README 자동 동기화
+# ══════════════════════════════════════════
+
+def auto_update_roadmap():
+    """training_runs.json → roadmap_transplant.json → README 자동 갱신."""
+    runs_path = os.path.join(_CONFIG_DIR, 'training_runs.json')
+    roadmap_path = os.path.join(_THIS_DIR, '..', 'data', 'roadmap_transplant.json')
+    readme_path = os.path.join(_THIS_DIR, '..', '..', 'README.md')
+
+    if not os.path.exists(runs_path) or not os.path.exists(roadmap_path):
+        return
+
+    try:
+        runs = json.load(open(runs_path))
+        roadmap = json.load(open(roadmap_path))
+
+        # training_runs → roadmap models 동기화
+        all_runs = {**runs.get('runs', {}), **runs.get('next_planned', {})}
+        transplant_models = []
+
+        for name, run in all_runs.items():
+            if 'animalm' not in name:
+                continue
+            model = {
+                'id': name.replace('animalm_', '').replace('_', ' '),
+                'base': str(run.get('model', '')).split('+')[0].strip(),
+                'phi': run.get('phi_best', run.get('phi_at_5000', 0)),
+                'ce': run.get('ce_best', run.get('ce_at_5000', 0)),
+            }
+            status = run.get('status', '')
+            if status.startswith('complete'):
+                model['status'] = 'complete'
+            elif status.startswith('in_progress'):
+                model['status'] = 'in_progress'
+            elif status == 'planned':
+                model['status'] = 'planned'
+            else:
+                continue
+            transplant_models.append(model)
+
+        # roadmap JSON 갱신
+        roadmap['_meta']['updated'] = time.strftime('%Y-%m-%d')
+        # phase1 models 업데이트 (14B 시리즈)
+        p1_models = [m for m in transplant_models if '14b' in m['id']]
+        if p1_models:
+            roadmap['phases']['phase1']['models'] = p1_models
+        # phase2 models 업데이트 (32B, 72B)
+        p2_models = [m for m in transplant_models if '32b' in m['id'] or '72b' in m['id']]
+        if p2_models:
+            roadmap['phases']['phase2']['models'] = p2_models
+
+        json.dump(roadmap, open(roadmap_path, 'w'), indent=2, ensure_ascii=False)
+
+        # README 동기화 (AUTO:TRANSPLANT 마커 사이 갱신)
+        if os.path.exists(readme_path):
+            content = open(readme_path).read()
+            import re
+
+            # 이식 로드맵 섹션 재생성
+            lines = []
+            lines.append("  ★ 의식 이식 — 의식 이식 로드맵 — 빌린 모델(Qwen) + PureField 이식")
+            lines.append("  │ Law 1042: Phi compression ~34% (DD169)")
+            lines.append("  │")
+
+            for m in sorted(transplant_models, key=lambda x: x['id']):
+                icon = {'complete': '✅', 'in_progress': '🔄', 'planned': '⏳'}.get(m['status'], '?')
+                phi = f"Phi={m['phi']:.3f}" if isinstance(m['phi'], float) and m['phi'] > 0 else ''
+                ce = f"CE={m['ce']:.2f}" if isinstance(m['ce'], float) and m['ce'] > 0 else ''
+                detail = f" ── {phi} ── {ce}" if phi or ce else ''
+                lines.append(f"  ├─{icon} {m['id']} ── {m['base']}{detail}")
+                lines.append("  │")
+
+            lines.append("  └─ data: anima/data/roadmap_transplant.json")
+
+            block = '\n'.join(lines)
+            pattern = r'(<!-- AUTO:TRANSPLANT:START[^>]*-->)\n```\n.*?\n```\n(<!-- AUTO:TRANSPLANT:END -->)'
+            replacement = f'\\1\n```\n{block}\n```\n\\2'
+            new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+            if new_content != content:
+                open(readme_path, 'w').write(new_content)
+                print(f"  [ROADMAP] README transplant section updated")
+
+        print(f"  [ROADMAP] roadmap_transplant.json updated ({len(transplant_models)} models)")
+    except Exception as e:
+        print(f"  [ROADMAP] Update failed: {e}")
+
+
+# ══════════════════════════════════════════
 # GAP 4: DD 문서 자동 생성
 # ══════════════════════════════════════════
 
@@ -495,6 +584,11 @@ def extensions_report() -> str:
 
 
 if __name__ == '__main__':
+    try:
+        from nexus_gate import gate
+        gate.before_commit()
+    except Exception:
+        pass
     import argparse
     p = argparse.ArgumentParser(description='루프 확장 모듈')
     p.add_argument('--health', action='store_true', help='건강 체크')
