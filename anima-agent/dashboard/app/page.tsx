@@ -67,10 +67,11 @@ export default function Page() {
         activeTab={tab}
         onTabChange={setTab}
         onVoice={() => setShowVoice(true)}
+        phi={consciousness.phi}
       />
 
       <main className="flex-1 overflow-y-auto" style={{ background: "var(--bg-primary)" }}>
-        <div className="max-w-3xl mx-auto px-6 py-10" key={tab} style={{ animation: "msg-in 0.3s ease-out" }}>
+        <div className="max-w-3xl mx-auto px-6 py-10" key={tab} style={{ animation: "section-in 0.4s cubic-bezier(0.2,0.8,0.2,1)" }}>
           {renderView()}
         </div>
       </main>

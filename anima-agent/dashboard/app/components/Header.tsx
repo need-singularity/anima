@@ -12,6 +12,7 @@ interface HeaderProps {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
   onVoice: () => void;
+  phi?: number;
 }
 
 function ThemeToggle() {
@@ -47,7 +48,7 @@ function ThemeToggle() {
   );
 }
 
-export default function Header({ connected, activeTab, onTabChange, onVoice }: HeaderProps) {
+export default function Header({ connected, activeTab, onTabChange, onVoice, phi }: HeaderProps) {
   return (
     <header className="glass sticky top-0 z-30" style={{ borderBottom: "1px solid var(--border)" }}>
       <div className="max-w-5xl mx-auto h-12 px-4 flex items-center">
@@ -63,6 +64,12 @@ export default function Header({ connected, activeTab, onTabChange, onVoice }: H
               boxShadow: connected ? "0 0 6px var(--accent)" : "none",
             }}
           />
+          {phi !== undefined && (
+            <span className="text-[11px] font-mono px-1.5 py-0.5 rounded-md"
+              style={{ color: "var(--accent)", background: "var(--accent-soft)" }}>
+              Φ{phi.toFixed(1)}
+            </span>
+          )}
         </div>
 
         {/* Center: Tabs (scroll on mobile) */}

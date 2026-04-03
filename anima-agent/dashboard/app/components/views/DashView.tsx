@@ -89,7 +89,7 @@ export default function DashView({ consciousness: c, trading: t, events }: DashV
   const hasVector = Object.keys(c.consciousness_vector).length > 0;
 
   return (
-    <div className="flex flex-col items-center gap-20 py-12">
+    <div className="flex flex-col items-center gap-20 py-12 stagger">
 
       {/* ── Hero: Giant Φ number (Apple product page style) ── */}
       <section className="flex flex-col items-center gap-6 py-12">
