@@ -149,6 +149,14 @@ class LawParser:
       - Quantitative: explicit numbers like "+12.3%", "×1.5", "0.014"
     """
 
+    @staticmethod
+    def _safe_float(s, default=None):
+        """Parse float safely, returning default on failure."""
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return default
+
     def __init__(self):
         """Auto-load and parse all laws from consciousness_laws.json."""
         self.all_laws = LAWS if LAWS else {}
@@ -796,7 +804,10 @@ class LawParser:
         # 8. Explicit parameter value: "gate=0.001"
         for m in self._RE_PARAM_VALUE.finditer(law_text):
             param = m.group('param').lower()
-            val = float(m.group('val'))
+            try:
+                val = float(m.group('val'))
+            except ValueError:
+                continue
             target = self._normalize_target(param)
             if not any(mod.target == target for mod in mods):
                 mods.append(Modification(

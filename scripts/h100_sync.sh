@@ -56,10 +56,12 @@ declare -a SYNC_GROUPS=(
   "$REPO_ROOT/scripts/preflight_training.sh|$DEST/preflight_training.sh|single|preflight_training.sh"
   "$REPO_ROOT/scripts/merge_corpus.sh|$DEST/merge_corpus.sh|single|merge_corpus.sh"
   "$REPO_ROOT/scripts/h100_watchdog.sh|$DEST/h100_watchdog.sh|single|h100_watchdog.sh"
+  "$REPO_ROOT/anima/scripts/relaunch_v3_274M.sh|$DEST/relaunch_v3_274M.sh|single|relaunch_v3_274M.sh"
 )
 
 # ── Large file definitions (rsync with MD5 skip) ──
 declare -a LARGE_FILES=(
+  "$REPO_ROOT/anima/data/corpus_v10.txt|$DEST/data/corpus_v10.txt|corpus_v10.txt"
   "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt|$DEST/data/corpus_v11_multilingual.txt|corpus_v11_multilingual.txt"
   "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model|$DEST/data/tokenizer_64k_multilingual.model|tokenizer_64k_multilingual.model"
 )

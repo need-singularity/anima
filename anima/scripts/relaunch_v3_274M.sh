@@ -7,8 +7,25 @@
 
 set -euo pipefail
 
-CKPT_DIR="checkpoints/v3_274M"
-CORPUS="data/corpus_v10.txt"
+# ── Detect environment and set paths ──
+# RunPod: /workspace (h100_sync flattens anima/src -> /workspace/, training -> /workspace/training/)
+# Local:  repo root (~/Dev/anima), structure preserved
+if [ -n "${RUNPOD_POD_ID:-}" ] || [ -d /workspace/training ]; then
+    # RunPod layout
+    WORK_DIR="/workspace"
+    CKPT_DIR="/workspace/checkpoints/v3_274M"
+    CORPUS="/workspace/data/corpus_v10.txt"
+    TRAIN_SCRIPT="training/train.py"
+else
+    # Local layout (repo root)
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    WORK_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    CKPT_DIR="$WORK_DIR/anima/checkpoints/v3_274M"
+    CORPUS="$WORK_DIR/anima/data/corpus_v10.txt"
+    TRAIN_SCRIPT="anima/training/train.py"
+fi
+
+cd "$WORK_DIR"
 
 # ── Python path (RunPod: /opt/conda/bin/python3) ──
 if [ -x /opt/conda/bin/python3 ]; then
@@ -88,7 +105,7 @@ echo ""
 # ── Launch ──
 mkdir -p logs
 
-CMD="$PYTHON anima/training/train.py \
+CMD="$PYTHON $TRAIN_SCRIPT \
     --decoder v3 \
     --federated \
     --atoms 8 \
