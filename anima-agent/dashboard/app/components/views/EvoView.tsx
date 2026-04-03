@@ -44,7 +44,7 @@ export default function EvoView() {
         <span
           className="text-[72px] font-bold tracking-tighter leading-none"
           style={{
-            background: "linear-gradient(180deg, var(--text-primary) 40%, var(--text-tertiary))",
+            background: "conic-gradient(from 220deg, #06b6d4, #8b5cf6, #ec4899, #06b6d4)",
             WebkitBackgroundClip: "text",
             WebkitTextFillColor: "transparent",
           }}
