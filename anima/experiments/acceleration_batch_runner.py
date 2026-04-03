@@ -435,7 +435,10 @@ CATEGORY_MAP = {
 
 def get_experiment_fn(hypothesis: Dict):
     """Map hypothesis category to experiment function."""
-    cat = (hypothesis.get('category') or '').lower()
+    if hypothesis is None:
+        return experiment_generic
+    raw_cat = hypothesis.get('category')
+    cat = (raw_cat if isinstance(raw_cat, str) else '').lower()
 
     # Try exact match
     if cat in CATEGORY_MAP:
@@ -584,7 +587,7 @@ def run_single_hypothesis(hid: str, hypothesis: Dict, baseline: Dict) -> Dict:
         avg_result['verdict'] = compute_verdict(avg_result, hypothesis)
 
         # Reproducibility
-        avg_result['reproducible'] = avg_result['cv'] < 0.5
+        avg_result['reproducible'] = bool(avg_result['cv'] < 0.5)
 
         print(f"\n  ═══ RESULT ═══")
         print(f"  Phi: {avg_result['phi_final']:.4f} ± {avg_result['phi_std']:.4f}")
@@ -679,8 +682,21 @@ def run_batch(pending: List[Tuple[str, Dict]], data: Dict):
         RESULTS_DIR,
         f"batch_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     )
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            import numpy as np
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
     with open(results_path, 'w') as f:
-        json.dump(batch_results, f, indent=2)
+        json.dump(batch_results, f, indent=2, cls=NumpyEncoder)
 
     # Print summary
     print(f"\n\n{'='*60}")

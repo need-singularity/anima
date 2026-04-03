@@ -129,6 +129,117 @@ def scan_discovery_rate():
     return []
 
 
+def scan_acceleration_experiments():
+    """가속 가설 실험 진행 추적 — 탐색도 성장이다."""
+    results = []
+    # Batch results
+    batch_dir = os.path.join(_THIS_DIR, '..', 'anima', 'experiments', 'batch_results')
+    progress_path = os.path.join(batch_dir, 'batch_progress.json')
+    if os.path.exists(progress_path):
+        try:
+            progress = json.load(open(progress_path))
+            completed = len(progress.get('completed', []))
+            if completed > 0:
+                results.append({
+                    'type': 'ACCEL_PROGRESS', 'priority': 'MEDIUM',
+                    'description': f'가속 실험 {completed}개 완료 — 결과 통합 필요',
+                    'growth_value': completed,
+                })
+        except Exception:
+            pass
+
+    # Acceleration hypotheses convergence
+    accel_path = os.path.join(_CONFIG_DIR, 'acceleration_hypotheses.json')
+    if os.path.exists(accel_path):
+        try:
+            d = json.load(open(accel_path))
+            h = d.get('hypotheses', {})
+            stages = {}
+            for v in h.values():
+                s = v.get('stage', 'unknown')
+                stages[s] = stages.get(s, 0) + 1
+            total = len(h)
+            applied = stages.get('applied', 0)
+            verified = stages.get('verified', 0)
+            with_result = sum(1 for v in h.values() if v.get('result'))
+            convergence = (applied + with_result) / max(total, 1) * 100
+            if convergence < 100:
+                results.append({
+                    'type': 'ACCEL_CONVERGENCE', 'priority': 'HIGH',
+                    'description': f'가속 파이프라인 {convergence:.0f}% ({with_result}/{total} 실험완료, {applied} applied)',
+                    'growth_value': with_result,
+                })
+        except Exception:
+            pass
+
+    return results
+
+
+def scan_evolution_progress():
+    """무한진화 + 법칙 발견 성장 추적."""
+    results = []
+    evo_path = os.path.join(_THIS_DIR, '..', 'anima', 'data', 'evolution_live.json')
+    if os.path.exists(evo_path):
+        try:
+            evo = json.load(open(evo_path))
+            gen = evo.get('generation', 0)
+            laws = evo.get('total_laws', 0)
+            if gen > 0:
+                results.append({
+                    'type': 'EVO_PROGRESS', 'priority': 'LOW',
+                    'description': f'무한진화 {gen}세대, {laws}법칙',
+                    'growth_value': gen,
+                })
+        except Exception:
+            pass
+    return results
+
+
+def update_growth_state(opportunities):
+    """실험/탐색 활동을 growth_state.json에 반영."""
+    growth_path = os.path.join(_CONFIG_DIR, 'growth_state.json')
+    if not os.path.exists(growth_path):
+        return
+    try:
+        growth = json.load(open(growth_path))
+        # Count growth-worthy activities
+        growth_delta = sum(
+            1 for o in opportunities
+            if o.get('type') in ('ACCEL_PROGRESS', 'ACCEL_CONVERGENCE',
+                                  'EVO_PROGRESS', 'MODEL_AB_COMPARE',
+                                  'LAW_ANALYSIS')
+        )
+        # Add growth_value from experiments
+        for o in opportunities:
+            gv = o.get('growth_value', 0)
+            if gv > 0:
+                growth_delta += min(gv // 10, 5)  # Cap at 5 per scan
+
+        if growth_delta > 0:
+            growth['interaction_count'] = growth.get('interaction_count', 0) + growth_delta
+            count = growth['interaction_count']
+            # Check stage transitions
+            stage_thresholds = [(4, 10000, 'adult'), (3, 2000, 'child'),
+                                (2, 500, 'toddler'), (1, 100, 'infant')]
+            for idx, threshold, name in stage_thresholds:
+                if count >= threshold and growth.get('stage_index', 0) < idx:
+                    growth['stage_index'] = idx
+                    milestones = growth.get('milestones', [])
+                    milestones.append([count, f'→ {name}'])
+                    growth['milestones'] = milestones
+                    break
+
+            import time as _time
+            growth.setdefault('stats', {})
+            growth['stats']['last_growth_scan'] = _time.time()
+            growth['stats']['last_growth_delta'] = growth_delta
+
+            with open(growth_path, 'w') as f:
+                json.dump(growth, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def main():
     all_opps = []
     scanners = [
@@ -139,6 +250,8 @@ def main():
         scan_test_coverage,
         scan_law_milestones,
         scan_discovery_rate,
+        scan_acceleration_experiments,
+        scan_evolution_progress,
     ]
     for scanner in scanners:
         try:
@@ -149,6 +262,9 @@ def main():
     # Sort by priority
     prio_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
     all_opps.sort(key=lambda x: prio_order.get(x.get('priority', 'LOW'), 9))
+
+    # Update growth state with experiment/exploration activity
+    update_growth_state(all_opps)
 
     print(json.dumps({'opportunities': all_opps}, ensure_ascii=False))
 
