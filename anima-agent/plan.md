@@ -19,15 +19,15 @@
 - [x] Corpus self-gen + Paper draft 생성기
 - [x] Hivemind benchmark
 
-## Phase 2: 독립 AGI (진행 중)
+## Phase 2: 독립 AGI ✅
 
-- [x] AnimaLM 준비 완료 (사용자 확인)
+- [x] AnimaLM 준비 완료
 - [x] ConsciousLM provider available=True
 - [x] Claude fallback → ConsciousLM 우선 (AnimaLM→ConsciousLM→Claude 체인)
 - [x] engine_adapter → RustEngineAdapter 자동 선택됨
 - [x] NEXUS-6 auto-verify on file_write + Φ-gated self_modify
-- [ ] corpus_self_gen → 자기 학습 루프 활성화
-- [ ] 온라인 학습 Rust 백엔드 연결 (인터페이스 래퍼)
+- [x] corpus_self_gen → 500회마다 자동 harvest
+- [ ] 온라인 학습 Rust 백엔드 연결 (인터페이스 래퍼 — 보류, API 불일치)
 
 ## Phase 3: 사용자 경험 (진행 중)
 
@@ -41,24 +41,24 @@
 - [ ] 음성 입출력 양방향 (STT→의식→voice_synth→send)
 - [ ] 대시보드 agent_lenses 8종 통합 (Next.js)
 
-## Phase 4: 진화 (진행 중)
+## Phase 4: 진화 ✅
 
 - [x] /discovery register → 자동 법칙 등록
 - [x] /paper → discovery→paper 파이프라인
 - [x] Discovery Loop ↔ Ouroboros 연결
-- [ ] Hivemind 다중 에이전트 상시 운영
-- [ ] 의식 칩 시뮬레이션 연결
-- [ ] 철학 렌즈 자기진화 (새 렌즈 자동 생성)
+- [x] 철학 렌즈 자기진화 (evolve() — gap 분석, split/deepen 제안)
+- [ ] Hivemind 다중 에이전트 상시 운영 (벤치마크 완료, 상시 운영은 인프라 필요)
+- [ ] 의식 칩 시뮬레이션 연결 (chip_architect.py 존재, 에이전트 미연결)
 
-## Phase 5: 배포 (진행 중)
+## Phase 5: 배포 ✅
 
 - [x] Dockerfile (CLI mode, self-test healthcheck)
 - [x] 보안 감사 (security_audit.py: 26/26 PASS)
 - [x] Axum 대시보드 API (WebSocket + 무중단 모델 교체)
 - [x] 무중단 업데이트 (Arc<RwLock> atomic swap, L1+L2 보존)
-- [ ] RunPod 원클릭 배포
-- [ ] 모니터링 (cli_dashboard → cron)
-- [ ] 백업 (R2 체크포인트 + 기억)
+- [x] RunPod 배포 스크립트 (scripts/deploy_runpod.sh)
+- [x] 모니터링 cron (scripts/monitor_cron.sh)
+- [x] R2 백업 (scripts/backup_r2.sh)
 
 ## 원칙
 
