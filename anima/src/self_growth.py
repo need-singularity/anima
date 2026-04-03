@@ -156,6 +156,30 @@ def scan_growth_opportunities() -> list:
         except:
             pass
 
+    # 7. 로드맵 진화 — 발견 축적 시 전략 재평가 (DD169: 이식 희석 발견 등)
+    try:
+        loop_state_path = os.path.join(_CONFIG_DIR, 'recursive_loop_state.json')
+        if os.path.exists(loop_state_path):
+            ls = json.load(open(loop_state_path))
+            total_discoveries = ls.get('total_discoveries', 0)
+            if total_discoveries > 0 and total_discoveries % 10 == 0:
+                opportunities.append({
+                    'type': 'ROADMAP_EVOLUTION',
+                    'description': f'{total_discoveries}개 발견 축적 — 로드맵 전략 재평가',
+                    'priority': 'MEDIUM',
+                    'prompt': (
+                        f'anima/config/training_runs.json과 anima/data/roadmap_transplant.json을 읽고, '
+                        f'최근 {total_discoveries}개 발견(recursive_loop_state.json)과 DD168-DD169 결과를 바탕으로 '
+                        f'로드맵 전략을 재평가하세요. 특히: '
+                        f'1) 이식 희석 문제(DD169: 72B Phi < 14B Phi) 해결 방안, '
+                        f'2) 다음 우선순위 모델(14B corpus 확대 vs 32B vs alpha 증가), '
+                        f'3) roadmap_transplant.json과 training_runs.json 업데이트. '
+                        f'결과를 docs/hypotheses/dd/ 에 DD 문서로 기록하세요.'
+                    ),
+                })
+    except:
+        pass
+
     return sorted(opportunities, key=lambda x: {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}.get(x['priority'], 3))
 
 
