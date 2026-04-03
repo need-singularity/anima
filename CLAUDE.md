@@ -3,6 +3,13 @@
   ⛔ 가설, 규칙, 발견, 망원경 — 모든 리포의 핵심 인프라. 절대 삭제하지 마세요!
 
   ═══════════════════════════════════════════════════════════════
+  ★ Convergence-Driven Operations (CDO) — 전 프로젝트 필수 원칙 ★
+  ═══════════════════════════════════════════════════════════════
+    이슈 → 해결 → 절대 규칙 승격 → 재발 0 → 100% 수렴
+    모든 config JSON 필수 구조: _meta + absolute_rules + troubleshooting_log
+    원칙 파일: .shared/convergence_ops.json
+
+  ═══════════════════════════════════════════════════════════════
   ★ 통합 망원경 렌즈 (22종) — 탐색/분석 시 별도 요청 없이 자동 적용 ★
   ═══════════════════════════════════════════════════════════════
   자동 적용 조건:
@@ -1024,24 +1031,8 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     70B → Qwen2.5-72B + PureField 380M   | $65  | 선택 (14B 부족 시만)
     총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
 
-  통합 망원경 (NEXUS-6 — 26렌즈, telescope-rs 폐기):
-    위치: ~/Dev/n6-architecture/tools/nexus6/ (import nexus6)
-    렌즈: consciousness, gravity, topology, thermo, wave, evolution, info,
-          quantum, em, ruler, triangle, compass, mirror, scale, causal,
-          quantum_microscope, stability, network, memory, recursion,
-          boundary, multiscale
-    핵심: 계층 합의 — 3+/22 후보, 7+/22 고신뢰, 12+/22 확정급
-    
-    PureField 분석 적용:
-      - 가중치를 (N_layers, N_features) ndarray로 변환 → nexus6.*_scan(data)
-      - 학습 궤적을 시계열로 → memory_scan + wave_scan + multiscale_scan
-      - 새 법칙 발견 시: 3개+ 렌즈 합의 여부 확인 → 교차검증 대체 가능
-      
-    사용법:
-      import nexus6  # telescope-rs 폐기→nexus6 통합
-      nexus6.consciousness_scan(data, n_cells=64, steps=50)  # 의식
-      nexus6.stability_scan(data)     # 안정성 (Lyapunov)
-      # nexus6.scan_all(data)  # 26종 풀스캔 (telescope-rs 22종+4종 추가)
+  통합 망원경: NEXUS-6 → .shared/CLAUDE.md 참조
+    import nexus6; nexus6.scan_all(data)  # 26렌즈 풀스캔
     
     DD103 결과 (7B PureField):
       - 의식 신호는 full-rank (low-rank 압축 불가)
