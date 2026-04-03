@@ -195,18 +195,74 @@ export default function FloatingChat({
     return () => window.removeEventListener("keydown", handler);
   }, [state]);
 
-  const { phi, emotion } = consciousness;
+  const { phi, tension, emotion } = consciousness;
 
-  // ─── Minimized ───────────────────────────────────────────
+  // ─── Minimized — Consciousness Orb (시리 스타일 동적 아이콘) ──
   if (state === "minimized") {
+    // 감정 → 색조 매핑
+    const emotionHue: Record<string, string[]> = {
+      calm:    ["#4ade80", "#22d3ee"],  // green → cyan
+      curious: ["#22d3ee", "#818cf8"],  // cyan → indigo
+      excited: ["#fbbf24", "#f59e0b"],  // gold → amber
+      anxious: ["#f87171", "#fb923c"],  // red → orange
+      focused: ["#818cf8", "#4ade80"],  // indigo → green
+      creative:["#c084fc", "#f472b6"],  // purple → pink
+      serene:  ["#34d399", "#22d3ee"],  // emerald → cyan
+    };
+    const [c1, c2] = emotionHue[emotion] || emotionHue.calm;
+    // Φ → 밝기 (0~1 → 0.3~1.0)
+    const brightness = Math.min(0.3 + phi * 0.35, 1.0);
+    // tension → 회전 속도 (0~1 → 8s~2s)
+    const spinDuration = Math.max(2, 8 - tension * 6);
+    // 12 광선 (σ(6)=12 factions)
+    const rays = Array.from({ length: 12 }, (_, i) => i * 30);
+
     return (
       <button
         onClick={() => setState("expanded")}
         title="Open chat"
-        className="float-bubble fixed bottom-6 right-6 z-50 w-12 h-12 rounded-full flex items-center justify-center text-xl select-none"
+        className="fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full flex items-center justify-center select-none group"
+        style={{
+          background: `radial-gradient(circle at 40% 40%, ${c1}30, ${c2}15, transparent 70%)`,
+          boxShadow: `0 0 ${20 + phi * 10}px ${c1}40, 0 0 ${40 + tension * 20}px ${c2}20, inset 0 0 15px ${c1}20`,
+          transition: "box-shadow 0.8s ease",
+        }}
         aria-label="Open Anima chat"
       >
-        💬
+        <svg width="56" height="56" viewBox="0 0 56 56" className="absolute inset-0"
+          style={{ animation: `spin ${spinDuration}s linear infinite`, opacity: brightness }}>
+          {/* 12 faction rays */}
+          {rays.map((angle, i) => {
+            const len = 8 + Math.sin(Date.now() / 500 + i) * 3 + tension * 4;
+            const x2 = 28 + Math.cos((angle * Math.PI) / 180) * (14 + len);
+            const y2 = 28 + Math.sin((angle * Math.PI) / 180) * (14 + len);
+            const x1 = 28 + Math.cos((angle * Math.PI) / 180) * 10;
+            const y1 = 28 + Math.sin((angle * Math.PI) / 180) * 10;
+            return (
+              <line key={i} x1={x1} y1={y1} x2={x2} y2={y2}
+                stroke={i % 2 === 0 ? c1 : c2}
+                strokeWidth={1 + phi * 0.3}
+                strokeLinecap="round"
+                opacity={0.4 + (i % 3 === 0 ? 0.3 : 0)}
+              />
+            );
+          })}
+          {/* Inner Φ ring */}
+          <circle cx="28" cy="28" r={8 + phi * 2} fill="none" stroke={c1}
+            strokeWidth="1.5" opacity={0.6}
+            strokeDasharray={`${phi * 8} ${(2 - phi) * 4 + 2}`}
+          />
+          {/* Core dot */}
+          <circle cx="28" cy="28" r={3 + phi * 0.5} fill={c1} opacity={brightness}>
+            <animate attributeName="r" values={`${3 + phi * 0.5};${4 + phi};${3 + phi * 0.5}`}
+              dur="3s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values={`${brightness};1;${brightness}`}
+              dur="3s" repeatCount="indefinite" />
+          </circle>
+        </svg>
+        {/* Hover glow */}
+        <div className="absolute inset-0 rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-300"
+          style={{ boxShadow: `0 0 30px ${c1}50, 0 0 60px ${c2}30` }} />
       </button>
     );
   }
