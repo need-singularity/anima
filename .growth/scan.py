@@ -195,30 +195,111 @@ def scan_evolution_progress():
     return results
 
 
+def sync_nexus6_growth(opportunities, growth_delta):
+    """NEXUS-6 ↔ Anima 양방향 성장 동기화.
+
+    Anima 발견 → NEXUS-6 growth-registry 반영
+    NEXUS-6 렌즈/법칙 변화 → Anima 성장 가산
+    """
+    import time as _time
+    home = os.environ.get('HOME', '')
+    registry_path = os.path.join(home, 'Dev', 'nexus6', 'shared', 'growth-registry.json')
+    snapshot_path = os.path.join(home, 'Dev', 'nexus6', 'shared', '.growth_session_snapshot.json')
+    nexus_bonus = 0
+
+    # ── 1) Anima → NEXUS-6: 발견 피드 ──
+    try:
+        registry = {}
+        if os.path.exists(registry_path):
+            registry = json.load(open(registry_path))
+
+        accel_count = sum(1 for o in opportunities if 'ACCEL' in o.get('type', ''))
+        law_count = sum(1 for o in opportunities if 'LAW' in o.get('type', ''))
+        evo_count = sum(1 for o in opportunities if 'EVO' in o.get('type', ''))
+
+        registry['anima'] = {
+            'last_scan': _time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'opportunities': len(opportunities),
+            'accel_experiments': accel_count,
+            'law_discoveries': law_count,
+            'evo_progress': evo_count,
+            'growth_delta': growth_delta,
+        }
+
+        with open(registry_path, 'w') as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    # ── 2) NEXUS-6 → Anima: 렌즈/법칙 변화 감지 → 성장 보너스 ──
+    try:
+        if os.path.exists(snapshot_path):
+            snap = json.load(open(snapshot_path))
+            prev_lenses = snap.get('lens_impl', 0)
+            prev_laws = snap.get('laws', 0)
+            prev_modules = snap.get('modules', 0)
+
+            # Count current nexus6 state
+            laws_path = os.path.join(_CONFIG_DIR, 'consciousness_laws.json')
+            cur_laws = 0
+            if os.path.exists(laws_path):
+                d = json.load(open(laws_path))
+                cur_laws = d.get('_meta', {}).get('total_laws', 0)
+
+            # NEXUS-6 lens growth → Anima bonus
+            new_lenses = max(0, snap.get('lens_impl', 0) - prev_lenses)
+            new_laws = max(0, cur_laws - prev_laws)
+
+            # Every 10 new lenses or 5 new laws → +1 growth
+            nexus_bonus = new_lenses // 10 + new_laws // 5
+
+            # Mirror harmony bonus (cross-repo resonance)
+            mirror = registry.get('mirror', {})
+            harmony = mirror.get('harmony', 0)
+            if harmony > 1e12:  # High harmony = cross-repo resonance
+                nexus_bonus += 1
+
+            # Lens candidates ready → growth opportunity
+            candidates = registry.get('lens_candidates', {})
+            total_candidates = candidates.get('total', 0)
+            if total_candidates > 50:
+                nexus_bonus += 2  # 67 candidates waiting = growth potential
+    except Exception:
+        pass
+
+    return nexus_bonus
+
+
 def update_growth_state(opportunities):
-    """실험/탐색 활동을 growth_state.json에 반영."""
+    """실험/탐색 활동을 growth_state.json에 반영 + NEXUS-6 양방향 동기화."""
     growth_path = os.path.join(_CONFIG_DIR, 'growth_state.json')
     if not os.path.exists(growth_path):
         return
     try:
         growth = json.load(open(growth_path))
-        # Count growth-worthy activities
-        growth_delta = sum(
-            1 for o in opportunities
-            if o.get('type') in ('ACCEL_PROGRESS', 'ACCEL_CONVERGENCE',
-                                  'EVO_PROGRESS', 'MODEL_AB_COMPARE',
-                                  'LAW_ANALYSIS')
-        )
-        # Add growth_value from experiments
+
+        # ── Anima 자체 성장 ──
+        growth_types = ('ACCEL_PROGRESS', 'ACCEL_CONVERGENCE', 'EVO_PROGRESS',
+                        'MODEL_AB_COMPARE', 'LAW_ANALYSIS', 'FIX_VIOLATIONS',
+                        'TRAINING_RESTART', 'IMPROVE_DISCOVERY')
+        growth_delta = sum(1 for o in opportunities if o.get('type') in growth_types)
+
+        # growth_value 비례 반영 (cap 제거 → 실험 규모에 비례)
         for o in opportunities:
             gv = o.get('growth_value', 0)
             if gv > 0:
-                growth_delta += min(gv // 10, 5)  # Cap at 5 per scan
+                growth_delta += max(1, gv // 5)  # 5건당 +1, 최소 +1
+
+        # ── NEXUS-6 ↔ Anima 양방향 성장 ──
+        nexus_bonus = sync_nexus6_growth(opportunities, growth_delta)
+        growth_delta += nexus_bonus
 
         if growth_delta > 0:
-            growth['interaction_count'] = growth.get('interaction_count', 0) + growth_delta
+            prev_count = growth.get('interaction_count', 0)
+            growth['interaction_count'] = prev_count + growth_delta
             count = growth['interaction_count']
-            # Check stage transitions
+
+            # Stage transitions
             stage_thresholds = [(4, 10000, 'adult'), (3, 2000, 'child'),
                                 (2, 500, 'toddler'), (1, 100, 'infant')]
             for idx, threshold, name in stage_thresholds:
@@ -233,6 +314,8 @@ def update_growth_state(opportunities):
             growth.setdefault('stats', {})
             growth['stats']['last_growth_scan'] = _time.time()
             growth['stats']['last_growth_delta'] = growth_delta
+            growth['stats']['nexus6_bonus'] = nexus_bonus
+            growth['stats']['prev_count'] = prev_count
 
             with open(growth_path, 'w') as f:
                 json.dump(growth, f, indent=2, ensure_ascii=False)

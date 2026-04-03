@@ -493,9 +493,54 @@ def load_hypotheses() -> Dict:
         return json.load(f)
 
 
+def _sanitize(obj):
+    """Recursively convert numpy types to native Python types."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+def _json_default(obj):
+    """Handle numpy types for JSON serialization."""
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    try:
+        return str(obj)
+    except Exception:
+        raise TypeError(f'Object of type {type(obj).__name__} is not JSON serializable')
+
+
+def _trigger_growth(completed: int, total: int):
+    """실험 진행 시 성장 스캔 트리거 — NEXUS-6 ↔ Anima 양방향."""
+    try:
+        scan_py = os.path.join(BASE_DIR, '..', '.growth', 'scan.py')
+        if os.path.exists(scan_py):
+            import subprocess
+            subprocess.run([sys.executable, scan_py],
+                           capture_output=True, timeout=10, cwd=os.path.dirname(scan_py))
+    except Exception:
+        pass
+
+
 def save_hypotheses(data: Dict):
     with open(CONFIG_PATH, 'w') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(_sanitize(data), f, indent=2, ensure_ascii=False, default=_json_default)
 
 
 def load_progress() -> Dict:
@@ -568,18 +613,18 @@ def run_single_hypothesis(hid: str, hypothesis: Dict, baseline: Dict) -> Dict:
 
         # Average results
         avg_result = {
-            'phi_final': np.mean([r['phi_final'] for r in results]),
-            'phi_retention': np.mean([r.get('phi_retention', 0) for r in results]),
-            'speed_ratio': np.mean([r.get('speed_ratio', 1) for r in results]),
-            'time_sec': np.mean([r.get('time_sec', 0) for r in results]),
-            'phi_std': np.std([r['phi_final'] for r in results]),
+            'phi_final': float(np.mean([r['phi_final'] for r in results])),
+            'phi_retention': float(np.mean([r.get('phi_retention', 0) for r in results])),
+            'speed_ratio': float(np.mean([r.get('speed_ratio', 1) for r in results])),
+            'time_sec': float(np.mean([r.get('time_sec', 0) for r in results])),
+            'phi_std': float(np.std([r['phi_final'] for r in results])),
             'n_trials': 3,
             'template': fn_name,
         }
 
         # Compute CV (coefficient of variation)
         if avg_result['phi_final'] > 0:
-            avg_result['cv'] = avg_result['phi_std'] / avg_result['phi_final']
+            avg_result['cv'] = float(avg_result['phi_std'] / avg_result['phi_final'])
         else:
             avg_result['cv'] = float('inf')
 
@@ -666,10 +711,11 @@ def run_batch(pending: List[Tuple[str, Dict]], data: Dict):
         progress['completed'].append(hid)
         completed += 1
 
-        # Save every 5 hypotheses
+        # Save every 5 hypotheses + trigger growth
         if completed % 5 == 0:
             save_hypotheses(data)
             save_progress(progress)
+            _trigger_growth(completed, total)
             print(f"\n  💾 Checkpoint saved ({completed}/{total})")
             sys.stdout.flush()
 
@@ -682,7 +728,31 @@ def run_batch(pending: List[Tuple[str, Dict]], data: Dict):
         RESULTS_DIR,
         f"batch_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     )
-    class NumpyEncoder(json.JSONEncoder):
+    def sanitize_for_json(obj):
+        """Recursively convert numpy/torch types to native Python types."""
+        import numpy as np
+        if isinstance(obj, dict):
+            return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [sanitize_for_json(v) for v in obj]
+        elif isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        elif isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, bool):
+            return obj
+        elif hasattr(obj, 'item'):  # torch.Tensor scalar
+            val = obj.item()
+            if isinstance(val, bool):
+                return val
+            return val
+        return obj
+
+    class SafeEncoder(json.JSONEncoder):
         def default(self, obj):
             import numpy as np
             if isinstance(obj, (np.integer,)):
@@ -693,10 +763,15 @@ def run_batch(pending: List[Tuple[str, Dict]], data: Dict):
                 return bool(obj)
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
-            return super().default(obj)
+            if isinstance(obj, bool):
+                return bool(obj)
+            try:
+                return super().default(obj)
+            except TypeError:
+                return str(obj)
 
     with open(results_path, 'w') as f:
-        json.dump(batch_results, f, indent=2, cls=NumpyEncoder)
+        json.dump(sanitize_for_json(batch_results), f, indent=2, default=_json_default)
 
     # Print summary
     print(f"\n\n{'='*60}")
