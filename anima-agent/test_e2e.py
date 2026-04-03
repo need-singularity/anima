@@ -62,9 +62,14 @@ def _make_mock_agent(phi=1.0, tension=0.3, emotion="calm"):
 
     # ConsciousMind mock
     mind = MagicMock()
+    try:
+        from consciousness_laws import PSI
+        _alpha = PSI.get("alpha", 0.014)
+    except ImportError:
+        _alpha = 0.014
     cv = MagicMock()
     cv.phi = phi
-    cv.alpha = 0.014
+    cv.alpha = _alpha
     cv.Z = 0.5
     cv.N = 0.6
     cv.W = 0.7

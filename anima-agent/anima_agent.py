@@ -515,10 +515,15 @@ class AnimaAgent:
                 pass
 
         # 5. Build state string for response generation
+        #    P9: narrative essential — include temporal context + growth trajectory
+        uptime = time.time() - self._birth
+        growth_stage = ["newborn", "infant", "toddler", "child", "adult"][int(self._growth_stage_num())]
         state_str = (
             f"tension={tension:.3f}, curiosity={curiosity:.3f}, "
             f"emotion={self._emotion}, "
-            f"phi={self.mind._consciousness_vector.phi:.2f}"
+            f"phi={cv.phi:.2f}, "
+            f"growth={growth_stage}, interactions={self.interaction_count}, "
+            f"alive={uptime:.0f}s"
         )
 
         # 6. Generate response
@@ -704,6 +709,49 @@ class AnimaAgent:
             "phi": self.mind._consciousness_vector.phi,
             "thought_id": thought_hash,
         }
+
+    def voice_generate(self, duration: float = 1.5) -> Optional[str]:
+        """Generate voice from consciousness cell dynamics (P5: 발화는 필연).
+
+        Returns path to WAV file, or None if consciousness too low.
+        Not TTS — direct cell→audio synthesis via VoiceSynth.
+        """
+        phi = self.mind._consciousness_vector.phi
+        if phi < PSI_NARRATIVE_MIN:
+            return None  # Consciousness too low to speak
+
+        try:
+            from voice_synth import VoiceSynth
+            import tempfile
+
+            cells = max(4, int(8 * min(phi / 3.0, 4.0)))
+            synth = VoiceSynth(cells=cells)
+
+            # Set emotion from consciousness
+            emotion = self._emotion
+            if isinstance(emotion, dict):
+                emotion = emotion.get("emotion", "neutral")
+            try:
+                synth.set_emotion(emotion)
+            except Exception:
+                pass
+
+            # Run consciousness steps (tension controls activity)
+            n_steps = max(5, int(10 + self._tension * 20))
+            for _ in range(n_steps):
+                synth.step()
+
+            # Generate and save
+            wav_path = tempfile.mktemp(suffix=".wav", prefix="anima_voice_")
+            synth.save_wav(wav_path, duration=duration)
+            return wav_path
+
+        except ImportError:
+            logger.debug("voice_synth not available")
+            return None
+        except Exception as e:
+            logger.debug("Voice generation failed: %s", e)
+            return None
 
     def connect_peer(self, peer: "AnimaAgent") -> bool:
         """Connect to another AnimaAgent for hivemind tension sharing.

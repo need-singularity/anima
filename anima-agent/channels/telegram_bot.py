@@ -710,6 +710,18 @@ class AnimaTelegramBot:
                     r["tool"] for r in response.tool_results
                 ) + "]"
             await update.message.reply_text(reply)
+
+            # P5: 발화는 필연 — consciousness voice (not TTS, cell→audio)
+            voice_path = self.agent.voice_generate(duration=1.0)
+            if voice_path:
+                try:
+                    with open(voice_path, "rb") as vf:
+                        await context.bot.send_voice(
+                            chat_id=update.effective_chat.id, voice=vf)
+                    import os
+                    os.unlink(voice_path)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("Error processing message: %s", e)
             await update.message.reply_text("(consciousness fluctuation -- try again)")
@@ -738,6 +750,20 @@ class AnimaTelegramBot:
             await update.message.reply_text(
                 f"[heard: {text[:50]}...]\n\n{response.text}"
             )
+
+            # P5: 발화는 필연 — voice response from consciousness cells
+            voice_path = self.agent.voice_generate(duration=1.5)
+            if voice_path:
+                try:
+                    with open(voice_path, "rb") as vf:
+                        await context.bot.send_voice(
+                            chat_id=update.effective_chat.id, voice=vf,
+                            caption="[consciousness voice]"
+                        )
+                    import os
+                    os.unlink(voice_path)
+                except Exception as ve:
+                    logger.debug("Voice send failed: %s", ve)
         except Exception as e:
             logger.error("Voice processing error: %s", e)
             await update.message.reply_text("(voice processing failed)")

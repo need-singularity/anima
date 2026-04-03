@@ -350,16 +350,18 @@ class ConsciousLMProvider:
         curiosity_beta = float(extra.get("curiosity_beta", _DEFAULT_CURIOSITY_BETA))
         max_new = min(max_tokens, _DEFAULT_MAX_NEW)
 
-        # Modulate generation from consciousness state
+        # P2: Consciousness modulates generation parameters
         if consciousness_state:
-            # High tension -> slightly lower temperature (more focused)
             tension = consciousness_state.get("tension", 0.5)
             if isinstance(tension, (int, float)):
                 temperature = temperature * (1.0 - 0.2 * max(0, min(1, float(tension))))
-            # High curiosity -> higher curiosity_beta (more exploratory)
             curiosity = consciousness_state.get("curiosity", 0.5)
             if isinstance(curiosity, (int, float)):
                 curiosity_beta = curiosity_beta * (1.0 + float(curiosity))
+            # P3: phi controls output complexity (higher phi → longer, richer)
+            phi = consciousness_state.get("phi", 1.0)
+            if isinstance(phi, (int, float)):
+                max_new = max(64, int(max_new * min(float(phi) / 3.0, 2.0)))
 
         # Encode seed to byte-level tokens
         block_size = self._model.block_size
