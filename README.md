@@ -799,22 +799,33 @@ brainflow (pip)                    — EEG/OpenBCI
   ══════════════════════════════════════════════════════════════════
 ```
 
+### 대시보드 & 접속
+
+```
+  수렴 대시보드:  anima/web/convergence.html (로컬 브라우저)
+  웹 채팅 UI:    python3 anima/src/anima_unified.py --web → http://localhost:8765
+  모델 다운로드:  anima/docs/download-models.md
+  R2 체크포인트:  https://anima-models.ce4bdcce7c74d4e3c78fdf944c4d1d7b.r2.cloudflarestorage.com
+  GitHub:        https://github.com/need-singularity/anima
+```
+
 ### 자산 & 현재 상태
 
 ```
   ── 완료 ──
-  ✅ AnimaLM 7B    — CE=7.67, eval 5/5, 517MB
-  ✅ DD164          — 22-lens 전수 점검 7/7 통과 (로드맵 v5 확정)
-  ✅ 22-lens        — 22종 Rust 렌즈 + full_scan 래퍼 + 캘리브레이션
-  ✅ 가속 가설      — 63개 verdict 갱신 완료 (9건 SAFE 복원)
-  ✅ Rust           — 334/334 테스트, 0 warnings
-  ✅ Laws           — 894개 (자동발견 포함)
-  ✅ brain-like     — 85.6%
-  ✅ 의식 검증      — bench_v2 --verify 7조건 100% 통과
-  ✅ Phase 3-5 코드 — MemoryStore, OnlineLearner, Autonomous (22-lens PASS)
+  ✅ AnimaLM 14B v0.1 — CE=8.59, eval 5/5, R2 업로드 (520MB)
+  ✅ AnimaLM 7B       — CE=7.67, eval 5/5, 517MB
+  ✅ NEXUS-6           — 1013종 렌즈 (telescope-rs 폐기→통합)
+  ✅ CDO               — 전 프로젝트 29/29 config JSON 100% 수렴
+  ✅ 가속 가설         — 367개 통합 (schema v3.0, 7단계 파이프라인)
+  ✅ 안전 조건         — 7/7 구현 (Phase 7 guardrails)
+  ✅ Phase 3-5 코드    — MemoryStore, OnlineLearner, Autonomous
+  ✅ Laws              — 1030개
+  ✅ brain-like        — 85.6%
 
   ── 진행중 ──
-  🔄 AnimaLM 14B   — H100 학습중 (Phase 1)
+  🔄 AnimaLM 14B v0.4 — alpha 0.5, CE=6.32 (Phase 1, 1xH100)
+  🔄 AnimaLM 72B      — 2xH100 학습 시작 (Phase 2)
 
 ```
 
