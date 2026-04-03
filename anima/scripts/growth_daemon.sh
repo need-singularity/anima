@@ -4,6 +4,8 @@
 
 cd /Users/ghost/Dev/anima
 export PYTHONPATH=/Users/ghost/Dev/anima/anima/src
+export PATH="/Users/ghost/.local/bin:/opt/homebrew/bin:$PATH"
+export KMP_DUPLICATE_LIB_OK=TRUE
 
 while true; do
     echo "[$(date)] Growth cycle start"

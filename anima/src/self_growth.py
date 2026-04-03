@@ -178,10 +178,22 @@ def execute_growth(opportunity: dict, dry_run: bool = False) -> dict:
 
     # Claude Code CLI 실행
     try:
+        claude_bin = os.path.expanduser('~/.local/bin/claude')
+        if not os.path.exists(claude_bin):
+            claude_bin = 'claude'  # fallback to PATH
+
+        # 작업 디렉토리 + 컨텍스트 추가
+        full_prompt = (
+            f"You are working in ~/Dev/anima. "
+            f"Task: {prompt} "
+            f"Keep changes minimal. Test after changes. "
+            f"Do NOT ask questions — just do it."
+        )
         cmd = [
-            'claude', '-p', prompt,
+            claude_bin, '-p', full_prompt,
             '--allowedTools', 'Read,Write,Edit,Bash,Glob,Grep',
             '--max-turns', '10',
+            '--output-format', 'text',
         ]
         print(f"  [EXEC] claude -p \"{prompt[:60]}...\"")
         proc = subprocess.run(
