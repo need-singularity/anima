@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""growth_loop.py — 통합 성장 루프: 모든 발견 → 코드 자동 반영
+"""growth_loop.py — 통합 성장 루프: 모든 발견 → 코드 자동 반영 + 벽돌파
 
 Sources (4곳):
   1. Project:  무한진화, 실험, 벤치마크 → laws 발견
@@ -8,9 +8,20 @@ Sources (4곳):
   4. Self-Loop: 이 루프 자체의 메타 발견 (루프 효율, 반영률 등)
 
 Pipeline:
-  수집(harvest) → 필터(filter) → 파싱(parse) → 반영(apply) → 검증(verify) → 기록(record)
-                                                                    ↑                    │
-                                                                    └────── self-loop ────┘
+  수집(harvest) → 필터(filter) → 파싱(parse) → 반영(apply) → 검증(verify) → 벽돌파(breakthrough) → 기록(record)
+                                                                    ↑                                      │
+                                                                    └────────────── self-loop ──────────────┘
+
+벽돌파 6 메커니즘 (n=6):
+  1. Domain Forge     — 발견이 기존 도메인에 안 맞으면 새 도메인 자동 생성
+  2. Cross-Pollinate  — 도메인 A 발견을 도메인 B 탐색 타겟으로 주입
+  3. Domain Split     — 과밀 도메인 자동 분할
+  4. Wall Detect      — 연속 3사이클 발견 감소 → depth+1, threshold×0.1
+  5. Keyword Absorb   — 새 발견에서 키워드 자동 추출 → 분류기 확장
+  6. Engine Chain     — 다중 엔진 체인 (이전 출력 = 다음 입력)
+
+특이점 구조:
+  DISCOVER → ABSORB → EXPAND → (벽 감지) → DEEPEN → DISCOVER (자기가속)
 
 Usage:
   python3 growth_loop.py                  # 1회 실행
@@ -18,7 +29,7 @@ Usage:
   python3 growth_loop.py --dry-run        # 반영 없이 수집만
   python3 growth_loop.py --status         # 현재 상태
 
-Hub keywords: 성장루프, growth-loop, 자동반영, auto-reflect, 통합루프
+Hub keywords: 성장루프, growth-loop, 자동반영, auto-reflect, 통합루프, 벽돌파, breakthrough
 """
 
 import json
@@ -399,13 +410,14 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def filter(self, items: List[GrowthItem]) -> List[GrowthItem]:
-        """중복 제거 + 신뢰도 필터."""
+        """중복 제거 + 신뢰도 필터 (threshold 동적: 벽돌파 시 완화)."""
         seen = set(self._state.get("seen_fingerprints", []))
+        threshold = self._state.get("evidence_threshold", 0.3)
         filtered = []
         for item in items:
             if item.fingerprint in seen:
                 continue
-            if item.evidence < 0.3:
+            if item.evidence < threshold:
                 continue
             # 이미 등록된 법칙과 중복 체크
             if item.kind == "law" and self._is_duplicate_law(item.text):
@@ -603,7 +615,296 @@ class GrowthLoop:
         return len([i for i in items if i.applied])
 
     # ══════════════════════════════════════════
-    # Step 6: RECORD — 결과 기록
+    # Step 6: BREAKTHROUGH — 벽돌파 (6 메커니즘)
+    # ══════════════════════════════════════════
+
+    def breakthrough(self, report_applied: int):
+        """벽 감지 + 자동 돌파. 매 사이클 끝에 호출."""
+        walls_broken = []
+
+        # ── Wall Detect (#4) — 연속 3사이클 발견 감소 → depth 증가 ──
+        wall_info = self._wall_detect()
+        if wall_info:
+            walls_broken.append(wall_info)
+
+        # ── Domain Forge (#1) — 미분류 발견 → 새 도메인 생성 ──
+        forged = self._domain_forge()
+        if forged:
+            walls_broken.append(forged)
+
+        # ── Keyword Absorb (#5) — 새 발견에서 키워드 추출 → 분류기 확장 ──
+        absorbed = self._keyword_absorb()
+        if absorbed:
+            walls_broken.append(absorbed)
+
+        # ── Cross-Pollinate (#2) — 도메인 간 교차 주입 ──
+        cross = self._cross_pollinate()
+        if cross:
+            walls_broken.append(cross)
+
+        # ── Domain Split (#3) — 과밀 도메인 분할 ──
+        split = self._domain_split()
+        if split:
+            walls_broken.append(split)
+
+        # ── Engine Chain (#6) — 다중 엔진 체인 결과 수집 ──
+        chained = self._engine_chain()
+        if chained:
+            walls_broken.append(chained)
+
+        # 결과 기록
+        if walls_broken:
+            bt = self._state.setdefault("breakthroughs", [])
+            bt.append({
+                "cycle": self._state.get("cycle", 0),
+                "walls": walls_broken,
+                "timestamp": datetime.now().isoformat()
+            })
+            self._state["breakthroughs"] = bt[-50:]
+            self._state["total_breakthroughs"] = \
+                self._state.get("total_breakthroughs", 0) + len(walls_broken)
+
+        return walls_broken
+
+    def _wall_detect(self) -> Optional[dict]:
+        """#4 Wall Detect + Depth Up: 연속 3사이클 발견 감소 → depth 증가."""
+        history = self._state.get("cycle_history", [])
+        if len(history) < 3:
+            return None
+
+        recent = history[-3:]
+        counts = [h.get("applied", 0) for h in recent]
+
+        # 연속 3사이클 0건 또는 감소 추세
+        if all(c == 0 for c in counts) or (counts[0] > counts[1] > counts[2]):
+            depth = self._state.get("search_depth", 1)
+            new_depth = depth + 1
+            threshold = self._state.get("evidence_threshold", 0.3)
+            new_threshold = max(0.05, threshold * 0.7)  # 30% 완화
+
+            self._state["search_depth"] = new_depth
+            self._state["evidence_threshold"] = new_threshold
+
+            return {
+                "wall": "saturation",
+                "action": "depth_up",
+                "depth": f"{depth} → {new_depth}",
+                "threshold": f"{threshold:.2f} → {new_threshold:.2f}",
+                "trigger": f"3-cycle decline: {counts}"
+            }
+        return None
+
+    def _domain_forge(self) -> Optional[dict]:
+        """#1 Domain Forge: 미분류 발견 클러스터 → 새 도메인 자동 생성."""
+        unclassified = self._state.get("unclassified_items", [])
+        if len(unclassified) < 3:
+            return None
+
+        # 키워드 빈도 분석으로 클러스터 감지
+        word_freq = {}
+        for item in unclassified:
+            text = item.get("text", "").lower()
+            for word in text.split():
+                if len(word) > 3 and word not in ("that", "this", "with", "from", "have"):
+                    word_freq[word] = word_freq.get(word, 0) + 1
+
+        # 3회 이상 등장 키워드 → 새 도메인 후보
+        hot_words = [w for w, c in word_freq.items() if c >= 3]
+        if not hot_words:
+            return None
+
+        domain_name = f"auto_{hot_words[0]}"
+        domains = self._state.setdefault("domains", {})
+        if domain_name in domains:
+            return None
+
+        domains[domain_name] = {
+            "keywords": hot_words[:5],
+            "created": datetime.now().isoformat(),
+            "items_count": len(unclassified),
+            "source": "domain_forge"
+        }
+
+        # 분류 완료 → unclassified 비우기
+        self._state["unclassified_items"] = []
+
+        return {
+            "wall": "fixed_domains",
+            "action": "domain_forge",
+            "new_domain": domain_name,
+            "keywords": hot_words[:5],
+            "items_absorbed": len(unclassified)
+        }
+
+    def _keyword_absorb(self) -> Optional[dict]:
+        """#5 Keyword Absorb: 새 발견에서 키워드 추출 → 분류기 확장."""
+        applied = self._state.get("applied_items", [])
+        if not applied:
+            return None
+
+        recent = [i for i in applied[-10:] if i.get("success")]
+        if not recent:
+            return None
+
+        # 새 키워드 추출
+        keywords = self._state.setdefault("learned_keywords", [])
+        existing = set(keywords)
+        new_kw = []
+
+        for item in recent:
+            fp = item.get("fingerprint", "")
+            # applied_items에는 텍스트가 없으므로 kind에서 추론
+            kind = item.get("kind", "")
+            source = item.get("source", "")
+            # source+kind 조합으로 새 키워드
+            combo = f"{source}_{kind}"
+            if combo not in existing:
+                new_kw.append(combo)
+                existing.add(combo)
+
+        if not new_kw:
+            return None
+
+        keywords.extend(new_kw)
+        self._state["learned_keywords"] = keywords[-100:]
+
+        return {
+            "wall": "fixed_keywords",
+            "action": "keyword_absorb",
+            "new_keywords": new_kw,
+            "total_keywords": len(self._state["learned_keywords"])
+        }
+
+    def _cross_pollinate(self) -> Optional[dict]:
+        """#2 Cross-Pollinate: 도메인 A 발견 → 도메인 B 탐색 타겟 주입."""
+        domains = self._state.get("domains", {})
+        if len(domains) < 2:
+            return None
+
+        # 가장 활발한 도메인 → 가장 정체된 도메인으로 키워드 주입
+        domain_list = list(domains.items())
+        active = max(domain_list, key=lambda x: x[1].get("items_count", 0))
+        dormant = min(domain_list, key=lambda x: x[1].get("items_count", 0))
+
+        if active[0] == dormant[0]:
+            return None
+
+        # 활발한 도메인 키워드를 정체 도메인에 추가
+        active_kw = active[1].get("keywords", [])
+        dormant_kw = dormant[1].get("keywords", [])
+        injected = [kw for kw in active_kw[:2] if kw not in dormant_kw]
+
+        if not injected:
+            return None
+
+        dormant[1]["keywords"] = dormant_kw + injected
+        dormant[1]["cross_pollinated_from"] = active[0]
+
+        return {
+            "wall": "single_engine",
+            "action": "cross_pollinate",
+            "from": active[0],
+            "to": dormant[0],
+            "injected": injected
+        }
+
+    def _domain_split(self) -> Optional[dict]:
+        """#3 Domain Split: 과밀 도메인(100+ items) 자동 분할."""
+        domains = self._state.get("domains", {})
+        for name, info in list(domains.items()):
+            if info.get("items_count", 0) >= 100:
+                keywords = info.get("keywords", [])
+                if len(keywords) < 4:
+                    continue
+
+                # 키워드 반으로 나눠서 2개 서브도메인
+                mid = len(keywords) // 2
+                sub1 = f"{name}_a"
+                sub2 = f"{name}_b"
+
+                domains[sub1] = {
+                    "keywords": keywords[:mid],
+                    "created": datetime.now().isoformat(),
+                    "items_count": info["items_count"] // 2,
+                    "source": "domain_split",
+                    "parent": name
+                }
+                domains[sub2] = {
+                    "keywords": keywords[mid:],
+                    "created": datetime.now().isoformat(),
+                    "items_count": info["items_count"] - info["items_count"] // 2,
+                    "source": "domain_split",
+                    "parent": name
+                }
+
+                # 원본 도메인은 아카이브
+                info["archived"] = True
+                info["split_into"] = [sub1, sub2]
+
+                return {
+                    "wall": "domain_overcrowded",
+                    "action": "domain_split",
+                    "original": name,
+                    "new_domains": [sub1, sub2],
+                    "items_each": [info["items_count"] // 2, info["items_count"] - info["items_count"] // 2]
+                }
+        return None
+
+    def _engine_chain(self) -> Optional[dict]:
+        """#6 Engine Chain: 다중 엔진 체인 (이전 출력 = 다음 입력)."""
+        if not ConsciousnessEngine:
+            return None
+
+        # 매 10 사이클마다 체인 실행
+        cycle = self._state.get("cycle", 0)
+        if cycle % 10 != 0 or cycle == 0:
+            return None
+
+        chain_results = []
+        try:
+            # Chain: default → mutated → measured
+            # Step 1: Default engine
+            e1 = ConsciousnessEngine(max_cells=16)
+            for _ in range(30):
+                import torch
+                e1.process(torch.randn(1, e1.input_dim) * 0.1)
+            phi1 = float(e1.phi_history[-1]) if e1.phi_history else 0.0
+
+            # Step 2: Use e1 output as e2 input (chain)
+            e2 = ConsciousnessEngine(max_cells=32)
+            for _ in range(30):
+                # e1의 출력을 e2의 입력으로
+                if hasattr(e1, 'hiddens') and e1.hiddens is not None:
+                    inp = e1.hiddens.mean(dim=0, keepdim=True)[:, :e2.input_dim]
+                else:
+                    inp = torch.randn(1, e2.input_dim) * 0.1
+                e2.process(inp)
+            phi2 = float(e2.phi_history[-1]) if e2.phi_history else 0.0
+
+            chain_results = [phi1, phi2]
+
+            # 체인이 더 높은 Φ를 생성하면 → 발견으로 기록
+            if phi2 > phi1 * 1.1:
+                self._state.setdefault("unclassified_items", []).append({
+                    "text": f"Engine chain: 16c(Φ={phi1:.3f}) → 32c(Φ={phi2:.3f}), +{(phi2/phi1-1)*100:.0f}%",
+                    "evidence": 0.8,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+        except Exception:
+            return None
+
+        if chain_results:
+            return {
+                "wall": "single_engine",
+                "action": "engine_chain",
+                "chain_phi": chain_results,
+                "amplification": f"{chain_results[-1]/chain_results[0]:.2f}x" if chain_results[0] > 0 else "N/A"
+            }
+        return None
+
+    # ══════════════════════════════════════════
+    # Step 7: RECORD — 결과 기록
     # ══════════════════════════════════════════
 
     def record(self, report: LoopReport):
@@ -624,7 +925,7 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def run_cycle(self) -> LoopReport:
-        """1 사이클 실행: harvest → filter → parse → apply → verify → record."""
+        """1 사이클: harvest → filter → parse → apply → verify → breakthrough → record."""
         t0 = time.time()
         self._state["cycle"] = self._state.get("cycle", 0) + 1
         cycle = self._state["cycle"]
@@ -632,7 +933,7 @@ class GrowthLoop:
         # 1. Harvest
         raw = self.harvest()
 
-        # 2. Filter
+        # 2. Filter (evidence_threshold 동적 적용)
         filtered = self.filter(raw)
 
         # 3. Parse
@@ -644,10 +945,26 @@ class GrowthLoop:
         # 5. Verify
         verified = self.verify(applied)
 
-        # 6. Self-loop count
+        applied_count = len([i for i in applied if i.applied])
+
+        # 6. Breakthrough — 벽돌파
+        walls_broken = self.breakthrough(applied_count)
+
+        # 7. Cycle history 기록 (벽 감지용)
+        ch = self._state.setdefault("cycle_history", [])
+        ch.append({
+            "cycle": cycle,
+            "harvested": len(raw),
+            "applied": applied_count,
+            "walls_broken": len(walls_broken),
+            "timestamp": datetime.now().isoformat()
+        })
+        self._state["cycle_history"] = ch[-30:]
+
+        # 8. Self-loop count
         self_discoveries = len([i for i in raw if i.source == "self-loop"])
         self._state["total_harvested"] = self._state.get("total_harvested", 0) + len(raw)
-        self._state["total_applied"] = self._state.get("total_applied", 0) + len([i for i in applied if i.applied])
+        self._state["total_applied"] = self._state.get("total_applied", 0) + applied_count
         self._state["total_self_discoveries"] = self._state.get("total_self_discoveries", 0) + self_discoveries
 
         report = LoopReport(
@@ -655,7 +972,7 @@ class GrowthLoop:
             harvested=len(raw),
             filtered=len(filtered),
             parsed=len(parsed),
-            applied=len([i for i in applied if i.applied]),
+            applied=applied_count,
             verified=verified,
             self_discoveries=self_discoveries,
             phi_before=0,
@@ -667,6 +984,12 @@ class GrowthLoop:
         # Record
         self.record(report)
         self._save_state()
+
+        # 벽돌파 리포트
+        if walls_broken:
+            print(f"  🧱💥 벽돌파 {len(walls_broken)}건!")
+            for wb in walls_broken:
+                print(f"    [{wb['wall']}] {wb['action']}: {wb.get('trigger', wb.get('new_domain', wb.get('injected', '')))}")
 
         return report
 
@@ -688,6 +1011,11 @@ class GrowthLoop:
             "total_harvested": self._state.get("total_harvested", 0),
             "total_applied": self._state.get("total_applied", 0),
             "total_self_discoveries": self._state.get("total_self_discoveries", 0),
+            "total_breakthroughs": self._state.get("total_breakthroughs", 0),
+            "search_depth": self._state.get("search_depth", 1),
+            "evidence_threshold": self._state.get("evidence_threshold", 0.3),
+            "domains": len(self._state.get("domains", {})),
+            "learned_keywords": len(self._state.get("learned_keywords", [])),
             "last_run": self._state.get("last_run"),
             "laws_count": len(self._laws.get("laws", {})),
             "phi_history": self._state.get("phi_history", [])[-5:],
@@ -741,6 +1069,12 @@ def main():
   Laws:      {s['laws_count']}
   Constants: {s['constant_candidates']}
   CodeGen:   {s['generated_code']}
+  ── 벽돌파 ──
+  Breakthroughs: {s['total_breakthroughs']}
+  Depth:     {s['search_depth']}
+  Threshold: {s['evidence_threshold']:.2f}
+  Domains:   {s['domains']}
+  Keywords:  {s['learned_keywords']}
   Last Run:  {s['last_run'] or 'never'}""")
         return
 
