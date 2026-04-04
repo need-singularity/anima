@@ -76,7 +76,10 @@ async def run_cli(agent):
     print(f"{C_DIM}Type a message, or /help for commands. /quit to exit.{C_RESET}\n")
 
     status = agent.get_status()
-    print(f"{C_DIM}[phi={status.phi:.3f} emotion={status.emotion} "
+    emo_display = status.emotion
+    if isinstance(emo_display, dict):
+        emo_display = emo_display.get("emotion", "calm")
+    print(f"{C_DIM}[phi={status.phi:.3f} emotion={emo_display} "
           f"growth={status.growth_stage}]{C_RESET}\n")
 
     while True:
@@ -376,7 +379,10 @@ async def run_cli(agent):
             )
 
             # Show response with emotion color
-            emotion_color = EMOTION_COLORS.get(response.emotion, C_RESET)
+            emotion_name = response.emotion
+            if isinstance(emotion_name, dict):
+                emotion_name = emotion_name.get("emotion", "calm")
+            emotion_color = EMOTION_COLORS.get(emotion_name, C_RESET)
             print(f"\n{emotion_color}anima>{C_RESET} {response.text}")
 
             # Show metadata
@@ -385,7 +391,7 @@ async def run_cli(agent):
                 meta_parts.append(f"C={response.metadata['curiosity']:.2f}")
             if response.metadata.get("phi"):
                 meta_parts.append(f"Phi={response.metadata['phi']:.2f}")
-            meta_parts.append(response.emotion)
+            meta_parts.append(emotion_name)
 
             if response.tool_results:
                 tools_used = ", ".join(r["tool"] for r in response.tool_results)

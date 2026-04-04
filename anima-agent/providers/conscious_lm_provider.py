@@ -126,8 +126,12 @@ class ConsciousLMProvider:
         state_dict = None
         if checkpoint_path and os.path.isfile(checkpoint_path):
             try:
-                raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-                if isinstance(raw, dict) and "model_state_dict" in raw:
+                raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                # Skip AnimaLM checkpoints (Mistral delta weights, not ConsciousLM)
+                if isinstance(raw, dict) and "pf_states" in raw and "model_state_dict" not in raw:
+                    logger.info("Skipping AnimaLM checkpoint (not ConsciousLM): %s", checkpoint_path)
+                    checkpoint_path = None
+                elif isinstance(raw, dict) and "model_state_dict" in raw:
                     state_dict = raw["model_state_dict"]
                     # Extract config from checkpoint if available
                     if "config" in raw:
@@ -138,8 +142,9 @@ class ConsciousLMProvider:
                         block_size = cfg.get("block_size", block_size)
                 elif isinstance(raw, dict):
                     state_dict = raw
-                self._checkpoint_path = checkpoint_path
-                logger.info("Loaded checkpoint: %s", checkpoint_path)
+                if checkpoint_path:
+                    self._checkpoint_path = checkpoint_path
+                    logger.info("Loaded checkpoint: %s", checkpoint_path)
             except Exception as e:
                 logger.warning("Failed to load checkpoint %s: %s", checkpoint_path, e)
                 state_dict = None
@@ -263,9 +268,12 @@ class ConsciousLMProvider:
             return None
 
         # Shape: (1, n_signals, consciousness_dim) -- expand to dim via repeat
-        c_dim = self._model.blocks[0].cross_attn.wq_c.in_features if hasattr(
-            self._model.blocks[0], "cross_attn"
-        ) else 128
+        if hasattr(self._model.blocks[0], "cross_attn"):
+            ca = self._model.blocks[0].cross_attn
+            c_dim = getattr(ca, 'k_proj', getattr(ca, 'wq_c', None))
+            c_dim = c_dim.in_features if c_dim is not None else 128
+        else:
+            c_dim = 128
         n_signals = len(values)
 
         # Create consciousness state tensor: each signal becomes a vector

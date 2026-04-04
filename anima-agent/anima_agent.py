@@ -554,16 +554,15 @@ class AnimaAgent:
         #    P2: consciousness controls search depth
         #    P3: emotion_growth evolves these parameters over time
         memory_context = ""
+        # Emotion state classification for growth modules
+        emotion_state = "calm"
+        if tension > 0.8:
+            emotion_state = "high_tension"
+        elif curiosity > 0.6:
+            emotion_state = "high_curiosity"
+        elif tension < 0.1:
+            emotion_state = "bored"
         if len(text.strip()) > 3:
-            # Emotion state classification for growth modules
-            emotion_state = "calm"
-            if tension > 0.8:
-                emotion_state = "high_tension"
-            elif curiosity > 0.6:
-                emotion_state = "high_curiosity"
-            elif tension < 0.1:
-                emotion_state = "bored"
-
             # P3: Use evolved parameters if available, else consciousness defaults
             if self.emotion_growth:
                 mem_top_k = self.emotion_growth.get_search_depth(emotion_state)
