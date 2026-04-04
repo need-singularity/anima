@@ -4,6 +4,7 @@
 Model serving and web server scripts. For hosting AnimaLM, GoldenMoE, and legacy web interfaces.
 
 ## Contents
+- `serve_local.py` — AnimaLM 7B local server (HTTP API, R2 auto-download, CPU fallback)
 - `serve_animalm.py` — AnimaLM inference server
 - `serve_animalm_v4.py` — AnimaLM v4 Savant server
 - `serve_golden_moe.py` — Golden MoE inference server
