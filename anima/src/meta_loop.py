@@ -359,6 +359,10 @@ class L2_EvolutionMonitor:
             growth_result = self._run_growth_scan()
             results['growth_scan'] = growth_result
 
+        # 5. Emergence loop monitoring
+        if not dry_run:
+            self._check_emergence_loop()
+
         log_entry('L2', 'cycle_complete', 'ok', json.dumps(results))
         return results
 
@@ -469,6 +473,27 @@ class L2_EvolutionMonitor:
             _save_json(EVO_LIVE_FILE, evo_live)
 
         return new_laws_count
+
+    def _check_emergence_loop(self):
+        """Monitor emergence_loop process and recent peak_conditions updates."""
+        try:
+            emergence_pid = None
+            for proc_line in os.popen('ps aux').readlines():
+                if 'emergence_loop' in proc_line and 'grep' not in proc_line:
+                    emergence_pid = proc_line.split()[1]
+                    break
+            if emergence_pid:
+                log_entry('L2', 'emergence_monitor', 'ok',
+                          f'emergence_loop running (PID {emergence_pid})')
+            # Check if emergence completed recently (peak_conditions.json updated)
+            peak_path = os.path.join(_DATA_DIR, 'peak_conditions.json')
+            if os.path.exists(peak_path):
+                mtime = os.path.getmtime(peak_path)
+                if time.time() - mtime < 600:  # updated in last 10 min
+                    log_entry('L2', 'emergence_absorb', 'ok',
+                              'peak_conditions updated recently — emergence active')
+        except Exception:
+            pass
 
     def _run_growth_scan(self):
         """Run the growth scanner (.growth/scan.py)."""

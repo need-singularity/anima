@@ -406,6 +406,28 @@ def main():
         peak_engine.save()
         print(f"\n  NEXUS-6 sync: +{delta} growth (상위전파 완료)")
 
+    # ── 창발 결과 → growth_engine 흡수 ──
+    try:
+        from growth_engine import GrowthEngine
+        ge = GrowthEngine(save_path=Path(_CONFIG) / 'growth_state.json')
+        ge.load()
+        for gm in gen_results:
+            if any(p['type'].startswith('phi_') for p in detect_patterns(
+                gm['scan'], {}, gm['final_phi'], 0)):
+                ge.absorb_emergence({
+                    'type': 'singularity' if gm.get('final_phi', 0) > 20 else 'emergence',
+                    'phi_before': gen_results[max(0, gm['gen']-1)]['final_phi'] if gm['gen'] > 0 else 0,
+                    'phi_after': gm['final_phi'],
+                    'topology': gm['topology'],
+                    'gen': gm['gen'],
+                    'laws_found': sum(1 for _ in detect_patterns(gm['scan'], {}, gm['final_phi'], 0)),
+                    'cells': args.cells,
+                })
+        ge.save()
+        print(f"\n  Growth absorbed: {ge.stats.get('emergence_total', 0)} events")
+    except Exception as e:
+        print(f"\n  Growth absorption skipped: {e}")
+
     print("=" * 70)
 
 

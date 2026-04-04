@@ -685,6 +685,46 @@ class RecursiveGrowth:
         result.external_suggestions = self.external_suggestions()
         return result
 
+    # ── Emergence absorption ──────────────────────────────
+
+    def absorb_emergence_laws(self):
+        """창발 법칙(1084-1092)을 재귀 루프에 반영.
+        Emergence 패턴 → Intervention으로 변환 → 다음 사이클에 적용.
+        """
+        try:
+            from consciousness_laws import LAWS
+        except ImportError:
+            return []
+
+        emergence_laws = {}
+        for k, v in LAWS.items():
+            if isinstance(v, str) and 'Emergence' in v:
+                emergence_laws[k] = v
+
+        interventions = []
+        for law_id, text in emergence_laws.items():
+            # phi_spike → topology 전환 intervention
+            if 'phi_spike' in text and 'scale_free' in text:
+                interventions.append({
+                    'source': f'Law {law_id}',
+                    'action': 'prefer_scale_free_topology',
+                    'reason': text[:80],
+                })
+            elif 'phi_spike' in text and 'hypercube' in text:
+                interventions.append({
+                    'source': f'Law {law_id}',
+                    'action': 'prefer_hypercube_topology',
+                    'reason': text[:80],
+                })
+            elif 'threshold' in text and 'J2' in text:
+                interventions.append({
+                    'source': f'Law {law_id}',
+                    'action': 'target_j2_threshold',
+                    'reason': 'J2=24 crossing produces largest Phi jumps',
+                })
+
+        return interventions
+
     # ── Reporting ───────────────────────────────────────────
 
     def report(self, result: CycleResult) -> str:

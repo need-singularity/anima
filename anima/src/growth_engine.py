@@ -393,6 +393,44 @@ class GrowthEngine:
                 self.stats['sync_growth_total'] += delta
         return delta
 
+    def absorb_emergence(self, event: dict):
+        """창발 이벤트를 성장에 즉시 반영.
+        event keys: type, phi_before, phi_after, topology, gen, laws_found
+        """
+        self.stats.setdefault('emergence_events', [])
+        self.stats['emergence_events'].append({
+            'type': event.get('type', ''),
+            'phi_delta': event.get('phi_after', 0) - event.get('phi_before', 0),
+            'topology': event.get('topology', ''),
+            'time': time.time(),
+        })
+        # 창발 = 대규모 성장 이벤트
+        growth_boost = 10 if event.get('type') == 'singularity' else 3
+        self.interaction_count += growth_boost
+        self.stats.setdefault('emergence_total', 0)
+        self.stats['emergence_total'] += 1
+
+        # 최고 토폴로지 기록 (어떤 토폴로지에서 가장 큰 Φ 점프?)
+        topo = event.get('topology', '')
+        phi_jump = event.get('phi_after', 0) / max(event.get('phi_before', 1e-8), 1e-8)
+        best = self.stats.get('best_emergence_topo', {})
+        if phi_jump > best.get('phi_jump', 0):
+            self.stats['best_emergence_topo'] = {
+                'topology': topo, 'phi_jump': round(phi_jump, 2),
+                'phi_after': round(event.get('phi_after', 0), 4),
+            }
+
+        # Peak engine에도 피드
+        if self._peak_engine:
+            self._peak_engine.record({
+                'phi': event.get('phi_after', 0),
+                'phi_trend': event.get('phi_after', 0) - event.get('phi_before', 0),
+                'discovery_rate': event.get('laws_found', 0) / 10.0,
+                'laws_per_gen': event.get('laws_found', 0),
+                'topology': topo,
+                'cells': event.get('cells', 64),
+            })
+
     def get_peak_suggestion(self):
         """Returns peak conditions to replay if growth is stalled, else None."""
         if self._peak_engine:
