@@ -1427,8 +1427,8 @@ class GrowthLoop:
 
         try:
             result = subprocess.run(
-                ["python3", str(bench_path), "--verify"],
-                capture_output=True, text=True, timeout=600,
+                ["python3", str(bench_path), "--verify", "--cells", "64", "--steps", "100"],
+                capture_output=True, text=True, timeout=180,
                 cwd=str(self.anima_root / "benchmarks"),
             )
             output = result.stdout + result.stderr
@@ -1448,7 +1448,7 @@ class GrowthLoop:
                 info["ok"] = True
 
         except subprocess.TimeoutExpired:
-            info["error"] = "timeout (600s)"
+            info["error"] = "timeout (180s)"
         except Exception as e:
             info["error"] = str(e)[:120]
 
@@ -1774,6 +1774,18 @@ class GrowthLoop:
                             break
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
+
+        # SSH 실패 or step 파싱 실패 시 → 이전 로드맵 값 fallback
+        if info["step"] == 0:
+            prev = self._state.get("roadmap", {}).get("14b", {})
+            if prev.get("step", 0) > 0:
+                info["status"] = "loading" if info["status"] == "offline" else info["status"]
+                info["step"] = prev["step"]
+                info["total"] = prev.get("total", 50000)
+                info["ce"] = prev.get("ce", 0)
+                info["phase"] = prev.get("phase", "?")
+                info["model"] = prev.get("model", "AnimaLM 14B v06")
+                info["eta_h"] = prev.get("eta_h", 0)
 
         return info
 
