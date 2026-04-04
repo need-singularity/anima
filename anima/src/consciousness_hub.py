@@ -372,6 +372,12 @@ class ConsciousnessHub:
             'phi_curvature': ('phi_curvature', 'PhiCurvatureCalculator',
                              ['곡률', 'curvature', '중력', 'gravity', '리만', 'riemannian',
                               'scalar curvature', '스칼라 곡률', 'Law 1043']),
+            'nexus6_bridge': ('nexus6_bridge', 'Nexus6Bridge',
+                             ['nexus6', 'n6', '넥서스', '렌즈', 'lens', 'scan',
+                              'bridge', '브릿지', 'nexus bridge', 'n6 bridge',
+                              'causal scan', 'gravity scan', 'stability scan',
+                              'topology scan', 'fast phi', 'feasibility',
+                              'forge lenses', 'recommend lenses']),
         }
 
         if not lazy_load:

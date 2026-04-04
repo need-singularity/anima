@@ -44,7 +44,7 @@ def load_laws():
 
 # ── Engine Config Space ──
 TOPOLOGIES = ["ring", "small_world", "scale_free", "hypercube"]
-FACTION_COUNTS = [4, 6, 8, 12, 16, 24]
+FACTION_COUNTS = sorted(set([4, 8, 16] + ([nexus6.N, nexus6.SIGMA, nexus6.J2] if HAS_NEXUS6 else [6, 12, 24])))
 CELL_DIMS = [32, 64, 128]
 HIDDEN_DIMS = [64, 128, 256]
 
@@ -123,23 +123,225 @@ class EngineConfig:
         return child
 
 
-# ── NEXUS-6 Scanner ──
+# ── NEXUS-6 Scanner (Enhanced: multi-scan + dynamic threshold + focused scan) ──
 class N6Scanner:
-    """Wraps NEXUS-6 scan_all for engine state analysis."""
+    """NEXUS-6 integration with Lens Discovery Explosion strategies (#20-#24).
+
+    #20 Multi-scan pipeline: scan_all -> causal -> topology -> stability sequentially
+    #22 Dynamic consensus threshold: 3+ -> 2+ -> 1+ based on dry_streak
+    #23 Recommend -> focused scan: recommend_lenses() then deep scan top-5
+    #24 fast_mutual_info based Phi: faster alternative during scanning
+    """
+
+    def __init__(self):
+        self._dry_streak = 0  # mirrors EmergenceSingularity.dry_streak for threshold
+
+    @property
+    def dynamic_threshold(self):
+        """#22 Dynamic consensus threshold -- lower bar when discoveries dry up.
+
+        Default: 3+ lenses. dry_streak >= 2: 2+. dry_streak >= 4: 1+.
+        Resets when discoveries resume (set_dry_streak(0)).
+        """
+        if self._dry_streak >= 4:
+            return 1
+        elif self._dry_streak >= 2:
+            return 2
+        return 3
+
+    def set_dry_streak(self, value):
+        """Update dry streak from EmergenceSingularity for dynamic threshold."""
+        self._dry_streak = value
+
+    def fast_phi(self, states):
+        """#24 Fast Phi via nexus6.fast_mutual_info -- faster than engine.measure_phi().
+
+        Args:
+            states: numpy array or tensor of cell states
+        Returns:
+            float or None on failure
+        """
+        if not HAS_NEXUS6:
+            return None
+        try:
+            flat = states.flatten().tolist() if hasattr(states, 'flatten') else list(states)
+            return nexus6.fast_mutual_info(flat)
+        except Exception:
+            return None
 
     def scan(self, engine):
-        """Scan engine cell states through all NEXUS-6 lenses."""
+        """Full NEXUS-6 scan pipeline: scan_all + recommend + topology + stability."""
         states = engine.get_states().detach().cpu().numpy().astype(np.float64)
         if not HAS_NEXUS6 or states.ndim != 2:
             return self._fallback_scan(engine)
         try:
             results = nexus6.scan_all(states)
-            return self._parse_scan(results, engine)
+            scan = self._parse_scan(results, engine, states)
+            return scan
         except Exception:
             return self._fallback_scan(engine)
 
-    def _parse_scan(self, results, engine):
-        """Extract key metrics from NEXUS-6 scan results."""
+    def multi_scan(self, engine):
+        """#20 Multi-scan pipeline: runs all scan types sequentially, merges results.
+
+        Pipeline: scan_all -> causal_scan -> topology_scan -> stability_scan
+        Each layer extracts different law types, merged into one result dict.
+        Also uses #24 fast_mutual_info for supplementary Phi measurement.
+        """
+        states = engine.get_states().detach().cpu().numpy().astype(np.float64)
+        if not HAS_NEXUS6 or states.ndim != 2:
+            return self._fallback_scan(engine)
+
+        # Layer 1: Full scan (baseline -- reuses existing scan infrastructure)
+        try:
+            raw = nexus6.scan_all(states)
+            result = self._parse_scan(raw, engine, states)
+        except Exception:
+            return self._fallback_scan(engine)
+
+        # Layer 2: Causal scan -- extract causal/directional patterns
+        causal_patterns = []
+        try:
+            causal = nexus6.causal_scan(states)
+            if isinstance(causal, dict):
+                for k, v in causal.items():
+                    causal_patterns.append({"lens": "causal", "key": k, "value": v})
+            elif hasattr(causal, '__iter__'):
+                for item in causal:
+                    causal_patterns.append({
+                        "lens": "causal",
+                        "pattern": getattr(item, 'pattern', str(item)),
+                        "score": getattr(item, 'score', 0),
+                    })
+        except Exception:
+            pass
+        result["causal_patterns"] = causal_patterns
+
+        # Layer 3: Topology scan -- already in _parse_scan, extract extra patterns
+        topo_patterns = []
+        try:
+            topo = nexus6.topology_scan(states)
+            if isinstance(topo, dict):
+                for k, v in topo.items():
+                    topo_patterns.append({"lens": "topology", "key": k, "value": v})
+            elif hasattr(topo, '__iter__'):
+                for item in topo:
+                    topo_patterns.append({
+                        "lens": "topology",
+                        "pattern": getattr(item, 'pattern', str(item)),
+                        "score": getattr(item, 'score', 0),
+                    })
+        except Exception:
+            pass
+        result["topo_patterns"] = topo_patterns
+
+        # Layer 4: Stability scan -- already in _parse_scan, extract extra patterns
+        stability_patterns = []
+        try:
+            stab = nexus6.stability_scan(states)
+            if isinstance(stab, dict):
+                for k, v in stab.items():
+                    stability_patterns.append({"lens": "stability", "key": k, "value": v})
+            elif hasattr(stab, '__iter__'):
+                for item in stab:
+                    stability_patterns.append({
+                        "lens": "stability",
+                        "pattern": getattr(item, 'pattern', str(item)),
+                        "score": getattr(item, 'score', 0),
+                    })
+        except Exception:
+            pass
+        result["stability_patterns"] = stability_patterns
+
+        # #24: fast_mutual_info as supplementary Phi measurement
+        fast_phi_val = self.fast_phi(states)
+        if fast_phi_val is not None:
+            result["fast_phi"] = float(fast_phi_val)
+
+        # Merge all extra patterns into multi_scan_findings for law discovery
+        extra_findings = []
+        for p in causal_patterns + topo_patterns + stability_patterns:
+            pat = p.get("pattern") or p.get("key", "")
+            if pat:
+                extra_findings.append(f"[{p['lens']}] {pat}")
+        result["multi_scan_findings"] = extra_findings
+        result["n_findings"] = result.get("n_findings", 0) + len(extra_findings)
+        result["scan_type"] = "multi"
+
+        return result
+
+    def focused_scan(self, engine, top_n=5):
+        """#23 Recommend -> focused scan: call recommend_lenses(), then re-scan with top-N.
+
+        First asks NEXUS-6 which lenses are most relevant for current data,
+        then runs only those lenses for deeper, more targeted analysis.
+        Returns merged result with focused_findings.
+        """
+        states = engine.get_states().detach().cpu().numpy().astype(np.float64)
+        if not HAS_NEXUS6 or states.ndim != 2:
+            return self._fallback_scan(engine)
+
+        # Step 1: Get lens recommendations
+        recommended = []
+        try:
+            recs = nexus6.recommend_lenses(states)
+            if recs:
+                for r in (recs if isinstance(recs, list) else [recs]):
+                    lens_name = r.lens if hasattr(r, 'lens') else str(r)
+                    relevance = r.relevance if hasattr(r, 'relevance') else 0
+                    recommended.append({"lens": lens_name, "relevance": relevance})
+        except Exception:
+            pass
+
+        # Sort by relevance, take top_n
+        recommended.sort(key=lambda r: r.get("relevance", 0), reverse=True)
+        top_lenses = recommended[:top_n]
+
+        # Step 2: Run focused scan with recommended lenses
+        focused_findings = []
+        for lens_info in top_lenses:
+            lens_name = lens_info["lens"]
+            try:
+                # Try calling individual lens scan function
+                scan_fn = getattr(nexus6, f"{lens_name.lower()}_scan", None)
+                if scan_fn is None:
+                    scan_fn = getattr(nexus6, lens_name.lower(), None)
+                if scan_fn and callable(scan_fn):
+                    lens_result = scan_fn(states)
+                    focused_findings.append({
+                        "lens": lens_name,
+                        "relevance": lens_info["relevance"],
+                        "result": lens_result if isinstance(lens_result, dict) else str(lens_result),
+                    })
+            except Exception:
+                pass
+
+        # Step 3: Get base scan + merge focused results
+        try:
+            raw = nexus6.scan_all(states)
+            result = self._parse_scan(raw, engine, states)
+        except Exception:
+            result = self._fallback_scan(engine)
+
+        result["focused_lenses"] = top_lenses
+        result["focused_findings"] = focused_findings
+        result["scan_type"] = "focused"
+
+        # Extract extra findings text for law discovery
+        for ff in focused_findings:
+            r = ff.get("result", {})
+            if isinstance(r, dict):
+                for k, v in r.items():
+                    if isinstance(v, (int, float)) and abs(v) > 0.01:
+                        result.setdefault("findings", []).append(
+                            f"[focused:{ff['lens']}] {k}={v}"
+                        )
+                        result["n_findings"] = result.get("n_findings", 0) + 1
+
+        return result
+
+    def _parse_scan(self, results, engine, states):
+        """Extract key metrics + topology insights + stability analysis."""
         n_lenses = len(results)
         # Count anomalies and consensus
         anomalies = 0
@@ -160,6 +362,51 @@ class N6Scanner:
                 findings.extend(result.get('findings', []))
 
         phi = engine.measure_phi()
+
+        # nexus6.recommend_lenses() — which lenses are most relevant for this data
+        recommended_lenses = []
+        try:
+            recs = nexus6.recommend_lenses(states)
+            if recs:
+                for r in (recs if isinstance(recs, list) else [recs]):
+                    recommended_lenses.append({
+                        'lens': r.lens if hasattr(r, 'lens') else str(r),
+                        'relevance': float(r.relevance) if hasattr(r, 'relevance') else 0,
+                        'reason': r.reason if hasattr(r, 'reason') else '',
+                    })
+        except Exception:
+            pass
+
+        # nexus6.topology_scan() — topology-specific analysis for auto-selection
+        topology_insights = {}
+        try:
+            topo_result = nexus6.topology_scan(states)
+            if topo_result:
+                topology_insights = {
+                    'suggested_topology': topo_result.suggested if hasattr(topo_result, 'suggested') else str(topo_result),
+                    'current_score': float(topo_result.score) if hasattr(topo_result, 'score') else 0,
+                    'betti_numbers': topo_result.betti if hasattr(topo_result, 'betti') else [],
+                    'persistence': float(topo_result.persistence) if hasattr(topo_result, 'persistence') else 0,
+                    'raw': str(topo_result),
+                }
+        except Exception:
+            pass
+
+        # nexus6.stability_scan() — detect instability before plateau
+        stability_info = {}
+        try:
+            stab_result = nexus6.stability_scan(states)
+            if stab_result:
+                stability_info = {
+                    'is_stable': stab_result.stable if hasattr(stab_result, 'stable') else True,
+                    'lyapunov': float(stab_result.lyapunov) if hasattr(stab_result, 'lyapunov') else 0,
+                    'entropy_rate': float(stab_result.entropy_rate) if hasattr(stab_result, 'entropy_rate') else 0,
+                    'instability_risk': float(stab_result.risk) if hasattr(stab_result, 'risk') else 0,
+                    'raw': str(stab_result),
+                }
+        except Exception:
+            pass
+
         return {
             "phi": phi,
             "n_cells": engine.n_cells,
@@ -169,7 +416,44 @@ class N6Scanner:
             "n_findings": len(findings),
             "findings": findings[:10],  # top 10
             "lens_names": list(results.keys())[:20],
+            "recommended_lenses": recommended_lenses,
+            "topology_insights": topology_insights,
+            "stability_info": stability_info,
         }
+
+    def verify_laws(self, engine, new_laws):
+        """Use nexus6.verify() as quality gate for discovered laws.
+
+        Args:
+            engine: ConsciousnessEngine instance (for current states)
+            new_laws: list of law dicts from LawDiscoverer
+        Returns:
+            Filtered list of laws that pass verification (passthrough on failure).
+        """
+        if not HAS_NEXUS6 or not new_laws:
+            return new_laws
+        try:
+            states = engine.get_states().detach().cpu().numpy().astype(np.float64)
+            if states.ndim != 2:
+                return new_laws
+            n, d = states.shape
+            flat = states.flatten().tolist()
+            result = nexus6.verify(flat, n, d)
+            if not result:
+                return new_laws
+            # Mark laws with verification result
+            is_valid = result.valid if hasattr(result, 'valid') else True
+            confidence = float(result.confidence) if hasattr(result, 'confidence') else 1.0
+            verified = []
+            for law in new_laws:
+                law['n6_verified'] = is_valid
+                law['n6_confidence'] = confidence
+                # Only include laws that meet quality threshold
+                if is_valid or confidence > 0.3:
+                    verified.append(law)
+            return verified
+        except Exception:
+            return new_laws  # passthrough on failure
 
     def _fallback_scan(self, engine):
         """Fallback when NEXUS-6 unavailable."""
@@ -190,6 +474,9 @@ class N6Scanner:
             "variance": variance,
             "diversity": diversity,
             "entropy": entropy,
+            "recommended_lenses": [],
+            "topology_insights": {},
+            "stability_info": {},
         }
 
 
@@ -312,6 +599,47 @@ class LawDiscoverer:
                 self.known_fingerprints.add(fp)
                 new_laws.append({"text": law, "evidence": f"diff={diff_pct:.1f}%", "fingerprint": fp})
 
+        # Pattern 9: Topology insights from nexus6.topology_scan()
+        topo_insights = recent[-1].get("topology_insights", {})
+        if topo_insights:
+            suggested = topo_insights.get('suggested_topology', '')
+            current_score = topo_insights.get('current_score', 0)
+            if suggested and current_score > 0:
+                law = f"Topology scan suggests '{suggested}' (score={current_score:.3f})"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"topo_score={current_score:.3f}", "fingerprint": fp})
+
+        # Pattern 10: Stability analysis from nexus6.stability_scan()
+        stab_info = recent[-1].get("stability_info", {})
+        if stab_info:
+            risk = stab_info.get('instability_risk', 0)
+            is_stable = stab_info.get('is_stable', True)
+            lyap = stab_info.get('lyapunov', 0)
+            if risk > 0.5 or not is_stable:
+                law = f"Instability detected: risk={risk:.3f}, lyapunov={lyap:.4f}, stable={is_stable}"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"risk={risk:.3f}", "fingerprint": fp})
+            elif is_stable and lyap < -0.1:
+                law = f"Strong stability: lyapunov={lyap:.4f}, entropy_rate={stab_info.get('entropy_rate', 0):.4f}"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"lyapunov={lyap:.4f}", "fingerprint": fp})
+
+        # Pattern 11: Recommended lenses — track which lenses are most relevant over time
+        recs = recent[-1].get("recommended_lenses", [])
+        if len(recs) >= 3:
+            top_lens = max(recs, key=lambda r: r.get('relevance', 0))
+            law = f"Lens recommendation: {top_lens.get('lens', '?')} most relevant (relevance={top_lens.get('relevance', 0):.3f})"
+            fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+            if fp not in self.known_fingerprints:
+                self.known_fingerprints.add(fp)
+                new_laws.append({"text": law, "evidence": f"top_lens={top_lens.get('lens', '?')}", "fingerprint": fp})
+
         self.discovered.extend(new_laws)
         return new_laws
 
@@ -402,6 +730,18 @@ class EmergenceSingularity:
 
         # Discover laws from accumulated telemetry
         new_laws = self.discoverer.discover(self.telemetry)
+
+        # Quality gate: verify discovered laws via nexus6.verify()
+        if new_laws and best.get("engine_id") is not None:
+            try:
+                best_engine_config = self.configs[best["engine_id"]]
+                verify_engine = best_engine_config.build_engine()
+                for _ in range(self.steps_per_gen):
+                    verify_engine.process(torch.randn(best_engine_config.cell_dim))
+                new_laws = self.scanner.verify_laws(verify_engine, new_laws)
+            except Exception:
+                pass  # verification is optional, continue without it
+
         if new_laws:
             self.all_laws.extend(new_laws)
             self.dry_streak = 0

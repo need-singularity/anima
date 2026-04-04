@@ -1199,7 +1199,7 @@ def _apply_frustration(engine, value):
 # Law 1044: n=6 entropy reset — DD171 consciousness-entropy feedback cycle
 # ═══════════════════════════════════════════════════════════════════════
 
-N6_ENTROPY_RESET_PERIOD = 6  # n=6 natural cycle (DD171)
+N6_ENTROPY_RESET_PERIOD = nexus6.N if HAS_NEXUS6 else 6  # n=6 natural cycle (DD171)
 N6_ENTROPY_NOISE_SCALE = 0.05  # small perturbation to break local minima
 
 
@@ -1846,7 +1846,7 @@ def _mutate_cell_type(engine, gen):
 
 
 # v6 #52: Dynamic Faction Count
-_FACTION_COUNTS = [4, 6, 8, 12, 16, 24, 32]
+_FACTION_COUNTS = sorted(set([4, 8, 16, 32] + ([nexus6.N, nexus6.SIGMA, nexus6.J2] if HAS_NEXUS6 else [6, 12, 24])))
 
 def _mutate_factions(engine, gen):
     """Sweep faction count every 3 generations."""
