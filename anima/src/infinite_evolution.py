@@ -90,7 +90,7 @@ except ImportError:
 
 HAS_TELESCOPE = False
 try:
-    import telescope_rs
+    import nexus6  # telescope-rs → nexus6 통합 (2026-04-04)
     HAS_TELESCOPE = True
 except ImportError:
     pass
@@ -197,8 +197,8 @@ def _run_single_lens(lens_name, data, n_cells=64, steps=50):
     """Run a single telescope_rs lens scan. Returns dict or None on failure."""
     try:
         if lens_name == 'consciousness':
-            return telescope_rs.consciousness_scan(data, n_cells=n_cells, steps=steps)
-        scan_fn = getattr(telescope_rs, f'{lens_name}_scan', None)
+            return nexus6.consciousness_scan(data, n_cells=n_cells, steps=steps)
+        scan_fn = getattr(nexus6, f'{lens_name}_scan', None)
         if scan_fn is None:
             return None
         return scan_fn(data)

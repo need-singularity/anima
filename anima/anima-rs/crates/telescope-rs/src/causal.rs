@@ -263,7 +263,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize,
         }
     }
 
-    causal_pairs.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap());
+    causal_pairs.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal));
 
     CausalResult { causal_pairs, granger_matrix, te_matrix, n_features: d }
 }

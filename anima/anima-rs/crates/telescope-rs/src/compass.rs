@@ -83,7 +83,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> CompassResult 
         .filter(|&(_, &k)| k > high_threshold)
         .map(|(i, &k)| (i, k))
         .collect();
-    high_curvature_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    high_curvature_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     high_curvature_regions.truncate(50);
 
     // Circular structures: find samples at approximately constant distance from a center
@@ -102,7 +102,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> CompassResult 
                 d2.sqrt()
             })
             .collect();
-        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Check for a "shell" — cluster of distances near the same value
         if dists.len() < 3 { continue; }

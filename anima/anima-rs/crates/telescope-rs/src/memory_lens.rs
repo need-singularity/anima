@@ -112,7 +112,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> MemoryResult {
             dists.push(d);
         }
     }
-    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let eps = if dists.is_empty() { 1.0 } else {
         let p10 = (dists.len() as f64 * 0.1) as usize;

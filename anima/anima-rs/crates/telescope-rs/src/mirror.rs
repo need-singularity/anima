@@ -33,8 +33,8 @@ fn reflection_symmetry(values: &[f64]) -> f64 {
         }
     }
 
-    pos_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    neg_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    pos_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    neg_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     if pos_devs.is_empty() || neg_devs.is_empty() {
         return 0.0;
@@ -87,7 +87,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> MirrorResult {
         .filter(|&(_, &s)| s < 0.5)
         .map(|(i, &s)| (i, s))
         .collect();
-    broken_symmetries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    broken_symmetries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     MirrorResult {
         reflection_scores,

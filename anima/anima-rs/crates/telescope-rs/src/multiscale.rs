@@ -105,7 +105,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> MultiscaleResu
     let total_energy: f64 = wavelet_energy.iter().sum();
     let dominant_scale = wavelet_energy.iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0);
 

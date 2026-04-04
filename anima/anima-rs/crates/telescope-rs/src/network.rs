@@ -79,7 +79,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> NetworkResult 
     }
 
     let mut sorted_mi = mi_vals.clone();
-    sorted_mi.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    sorted_mi.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let top_20_idx = (sorted_mi.len() as f64 * 0.2) as usize;
     let threshold = if top_20_idx < sorted_mi.len() {
         sorted_mi[top_20_idx.max(1)]

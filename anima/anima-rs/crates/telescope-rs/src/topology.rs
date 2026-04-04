@@ -84,7 +84,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize,
             edges.push((dist_matrix[i * n + j], i, j));
         }
     }
-    edges.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    edges.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let max_dist = edges.last().map(|e| e.0).unwrap_or(1.0);
     let step_size = max_dist / n_filtration_steps as f64;

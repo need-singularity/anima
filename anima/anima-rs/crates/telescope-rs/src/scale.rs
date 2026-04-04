@@ -166,7 +166,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> ScaleResult {
                 .map(|i| data[i * n_features + j].abs())
                 .filter(|&v| v > 1e-12)
                 .collect();
-            col.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             if col.len() < 4 { return 0.0; }
 
             // Empirical CCDF: P(X > x) vs x in log-log

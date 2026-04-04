@@ -208,7 +208,7 @@ impl ConsciousnessLens {
         let mut tension_indexed: Vec<(usize, f64)> = tensions.iter().enumerate()
             .map(|(i, &t)| (i % n_samples, t))
             .collect();
-        tension_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        tension_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top_n = (n_samples as f64 * 0.1).ceil() as usize;
         let anomalies: Vec<(usize, f64)> = tension_indexed.into_iter()
             .take(top_n.max(1))

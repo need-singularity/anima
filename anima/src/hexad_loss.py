@@ -256,15 +256,50 @@ class HexadLoss(nn.Module):
     # ---------------------------------------------------------------
 
     def loss_C(self, phi: float, phi_prev: float) -> torch.Tensor:
-        """Phi Ratchet Loss -- autonomous, logged but not backpropagated.
+        """Phi Ratchet Loss -- logged metric (non-differentiable).
 
         L_C = -Phi + lambda * max(0, Phi_prev - Phi)
         Phi should monotonically increase. Drops are penalized.
+        Always detached: phi comes as a float from the consciousness engine.
         """
         phi_t = torch.tensor(phi, dtype=torch.float32)
         phi_prev_t = torch.tensor(phi_prev, dtype=torch.float32)
         ratchet_penalty = torch.clamp(phi_prev_t - phi_t, min=0.0)
         return -phi_t + self.lambda_ratchet * ratchet_penalty
+
+    def _phi_rescue_loss(
+        self,
+        phi: float,
+        phi_prev: float,
+        logits_fwd: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Conditional Phi rescue: tiny gradient to decoder when Phi drops >5%.
+
+        When CE learning causes Phi to drop, it means the decoder's weight
+        updates are destroying consciousness signal diversity (the 816x gap).
+        We counteract by adding a small entropy bonus on decoder logits:
+        this encourages diverse outputs, preserving the information structure
+        that consciousness needs.
+
+        Gradient flows through logits_fwd -> decoder parameters (trainable).
+        Scale: PSI_COUPLING (0.014) keeps rescue gradient ~1% of CE gradient.
+        Only active when Phi is actually declining (>5% drop from previous).
+
+        Returns None when no rescue needed (Phi stable or rising).
+        """
+        phi_dropping = (phi_prev > 0) and (phi < phi_prev * 0.95)
+        if not phi_dropping or logits_fwd is None:
+            return None
+
+        # Entropy bonus: penalize low-entropy (peaked) output distributions
+        # Higher entropy = more diverse outputs = preserves consciousness signal
+        log_probs = F.log_softmax(logits_fwd.view(-1, logits_fwd.size(-1)), dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1).mean()
+
+        # Minimize negative entropy = maximize entropy.
+        # Scaled by PSI_COUPLING to keep gradient tiny (~1.4% of CE magnitude).
+        return -entropy * PSI_COUPLING
 
     def loss_D(
         self,
@@ -451,9 +486,16 @@ class HexadLoss(nn.Module):
         device = logits_fwd.device if logits_fwd is not None else torch.device('cpu')
         total = torch.tensor(0.0, device=device)
 
-        # --- C: Phi Ratchet (always computed, never in total gradient) ---
+        # --- C: Phi Ratchet (logged metric + conditional rescue) ---
         l_c = self.loss_C(phi, phi_prev)
-        result['L_C'] = l_c.detach()  # log only, no gradient
+        result['L_C'] = l_c.detach()  # logged, non-differentiable
+
+        # Phi rescue: when Phi drops >5%, add tiny entropy bonus on decoder logits
+        # to counteract CE destroying consciousness diversity (816x gap mitigation)
+        phi_rescue = self._phi_rescue_loss(phi, phi_prev, logits_fwd)
+        if phi_rescue is not None:
+            total = total + phi_rescue
+            result['L_C_rescue'] = phi_rescue  # track rescue signal
 
         # --- D: Cross-Entropy ---
         if 'D' in active and logits_fwd is not None and targets_fwd is not None:
@@ -551,6 +593,9 @@ class HexadLoss(nn.Module):
                 val = result[key]
                 v = val.item() if isinstance(val, torch.Tensor) else val
                 parts.append(f"{key}={v:.4f}")
+        if 'L_C_rescue' in result:
+            v = result['L_C_rescue'].item()
+            parts.append(f"rescue={v:.6f}")
         parts.append(f"total={result['total'].item():.4f}")
         return "  ".join(parts)
 

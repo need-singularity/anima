@@ -123,7 +123,8 @@ pub fn normalize_zscore_into(
     for i in 0..n_samples {
         let row = i * n_features;
         for j in 0..n_features {
-            out[row + j] = (data[row + j] - means[j]) / stds[j];
+            let s = if stds[j] < 1e-12 { 1.0 } else { stds[j] };
+            out[row + j] = (data[row + j] - means[j]) / s;
         }
     }
 }
@@ -166,7 +167,7 @@ pub fn knn_indices(data: &[f64], n_samples: usize, n_features: usize, k: usize) 
                 .collect();
             let nth = k.min(dists.len() - 1);
             dists.select_nth_unstable_by(nth, |a, b| {
-                a.0.partial_cmp(&b.0).unwrap()
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
             });
             dists[..k].iter().map(|&(_, j)| j).collect()
         })

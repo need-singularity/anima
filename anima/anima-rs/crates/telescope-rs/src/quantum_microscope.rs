@@ -75,7 +75,7 @@ fn eigenvalues_symmetric(mat: &[f64], d: usize) -> Vec<f64> {
     }
 
     let mut eigenvalues: Vec<f64> = (0..d).map(|i| a[i * d + i]).collect();
-    eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     eigenvalues
 }
 

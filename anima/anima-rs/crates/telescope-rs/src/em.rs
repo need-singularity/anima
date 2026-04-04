@@ -45,7 +45,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EMResult {
                 (j, d2.sqrt())
             })
             .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Gradient = weighted sum of directions to neighbors (closer = heavier)
         let mut total_weight = 0.0;
@@ -79,7 +79,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EMResult {
                 (j, d2.sqrt())
             })
             .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Divergence = dot(gradient_i, direction_to_neighbor) averaged over k neighbors
         for &(j, d) in dists.iter().take(k) {
@@ -111,8 +111,8 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EMResult {
         }
     }
 
-    sources.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    sinks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    sources.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sinks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     sources.truncate(50);
     sinks.truncate(50);
 

@@ -54,7 +54,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
         .into_iter()
         .filter(|x| x.2 > mi_threshold)
         .collect();
-    entanglement_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    entanglement_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     entanglement_pairs.truncate(50);
 
     // 2. Tunneling: samples close in last-half features but far in first-half
@@ -92,7 +92,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
     tunneling_paths.sort_by(|a, b| {
         let ratio_a = a.3 / (a.2 + 1e-12);
         let ratio_b = b.3 / (b.2 + 1e-12);
-        ratio_a.partial_cmp(&ratio_b).unwrap()
+        ratio_a.partial_cmp(&ratio_b).unwrap_or(std::cmp::Ordering::Equal)
     });
     tunneling_paths.truncate(50);
 
@@ -113,7 +113,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
                     (j, d2)
                 })
                 .collect();
-            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
             // Local variance among k-nearest
             let neighbors: Vec<usize> = dists.iter().take(k).map(|&(j, _)| j).collect();
@@ -136,7 +136,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> QuantumResult 
         })
         .collect();
 
-    superposed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    superposed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top_n = (n_samples as f64 * 0.1).ceil() as usize;
     superposed.truncate(top_n.max(1));
 

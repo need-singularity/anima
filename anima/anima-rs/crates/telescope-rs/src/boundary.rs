@@ -67,7 +67,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> BoundaryResult
                 (b, d)
             })
             .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Local density = 1 / mean distance to k neighbors
         let k_actual = k.min(dists.len());
@@ -93,7 +93,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> BoundaryResult
                 (b, d)
             })
             .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let k_actual = k.min(dists.len());
         if k_actual == 0 { continue; }

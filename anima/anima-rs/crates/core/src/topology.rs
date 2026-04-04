@@ -69,9 +69,12 @@ fn build_small_world<R: Rng>(n: usize, p: f32, rng: &mut R) -> Vec<f32> {
                 adj[i * n + j] = 0.0;
                 adj[j * n + i] = 0.0;
                 let mut k = rng.gen_range(0..n);
-                while k == i || adj[i * n + k] > 0.5 {
+                let mut attempts = 0;
+                while (k == i || adj[i * n + k] > 0.5) && attempts < n * 10 {
                     k = rng.gen_range(0..n);
+                    attempts += 1;
                 }
+                if attempts >= n * 10 { continue; } // skip this rewire
                 adj[i * n + k] = 1.0;
                 adj[k * n + i] = 1.0;
             }

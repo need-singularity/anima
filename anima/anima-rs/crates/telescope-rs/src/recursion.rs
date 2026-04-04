@@ -115,7 +115,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> RecursionResul
             }
         }
     }
-    feedback_loops.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    feedback_loops.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     feedback_loops.truncate(20);
 
     // 3. Fixed points: states where row[t] ≈ row[t+1]

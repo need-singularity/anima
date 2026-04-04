@@ -71,7 +71,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EvolutionResul
                     (j, d2)
                 })
                 .collect();
-            neighbor_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            neighbor_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             // Is fitter than all k-nearest?
             neighbor_dists.iter().take(k_neighbors).all(|&(j, _)| fitness_landscape[i] >= fitness_landscape[j])
         })
@@ -94,7 +94,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> EvolutionResul
                     pdists.push(d2);
                 }
             }
-            pdists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            pdists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             pdists.get(pdists.len() / 2).copied().unwrap_or(f64::INFINITY)
         }
     };

@@ -60,6 +60,10 @@ pub fn softmax(x: &[f32]) -> Vec<f32> {
     let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = x.iter().map(|&v| (v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
+    let n = exps.len();
+    if sum < f32::EPSILON {
+        return vec![1.0 / n as f32; n];
+    }
     exps.iter().map(|&e| e / sum).collect()
 }
 

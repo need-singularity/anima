@@ -54,7 +54,7 @@ pub fn scan(data: &[f64], n_samples: usize, n_features: usize) -> GravityResult 
             dists.push(dist_sq(data, i, j, n_features).sqrt());
         }
     }
-    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let bandwidth = if dists.is_empty() {
         1.0
     } else {
