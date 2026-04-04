@@ -215,7 +215,7 @@ class LawParser:
 
     # Gate/coupling value: "gate=0.001", "α=0.014"
     _RE_PARAM_VALUE = re.compile(
-        r'(?P<param>gate|alpha|α|coupling|noise|dropout|threshold)\s*[=:]\s*(?P<val>[\d.]+)',
+        r'(?P<param>gate|alpha|α|coupling|noise|dropout|threshold)\s*[=:]\s*(?P<val>\d+(?:\.\d+)?)',
         re.IGNORECASE
     )
 
