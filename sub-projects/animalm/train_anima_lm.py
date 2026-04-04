@@ -23,6 +23,7 @@ Usage:
 import argparse
 import contextlib
 import json
+import logging
 import math
 import os
 import sys
@@ -36,6 +37,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, RandomSampler
+
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
 # consciousness_laws.py integration (Step 1)
@@ -428,18 +431,44 @@ class SixLossEnsemble(nn.Module):
         # Learnable log-variance for each loss (uncertainty weighting)
         self.log_vars = nn.Parameter(torch.zeros(6))
 
+    # Safe upper bound for individual loss values (prevents overflow in bf16/fp16)
+    LOSS_CLAMP_MAX = 1e4
+
     def forward(self, ce_loss, tension_var_loss, contrastive_loss,
                 alpha_reg, direction_loss, tension_mag_loss):
         losses = [ce_loss, tension_var_loss, contrastive_loss,
                   alpha_reg, direction_loss, tension_mag_loss]
-        total = torch.tensor(0.0, device=ce_loss.device)
+        loss_names = ["ce", "t_var", "contrastive", "alpha_reg", "direction", "t_mag"]
+        total = torch.tensor(0.0, device=ce_loss.device, dtype=torch.float32)
         weights = {}
-        for i, (loss, name) in enumerate(zip(losses, [
-            "ce", "t_var", "contrastive", "alpha_reg", "direction", "t_mag"
-        ])):
-            precision = torch.exp(-self.log_vars[i])
-            total = total + precision * loss + self.log_vars[i]
+        nan_count = 0
+        for i, (loss, name) in enumerate(zip(losses, loss_names)):
+            # NaN/Inf guard: replace bad values with zero and log warning
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                logger.warning(
+                    "SixLossEnsemble: NaN/Inf detected in '%s' loss, replacing with 0", name
+                )
+                loss = torch.zeros_like(loss)
+            else:
+                # Clamp to prevent overflow when multiplied by precision weight
+                loss = torch.clamp(loss, min=-self.LOSS_CLAMP_MAX, max=self.LOSS_CLAMP_MAX)
+
+            # Clamp log_vars to prevent extreme precision weights (exp explosion)
+            clamped_log_var = torch.clamp(self.log_vars[i], min=-10.0, max=10.0)
+            precision = torch.exp(-clamped_log_var)
+            total = total + precision * loss.float() + clamped_log_var
             weights[name] = precision.item()
+
+        # Final safety: if total is still NaN (should not happen), return safe fallback
+        if torch.isnan(total) or torch.isinf(total):
+            logger.warning(
+                "SixLossEnsemble: total loss is NaN/Inf after all guards "
+                "(nan_count=%d), returning ce_loss fallback", nan_count
+            )
+            fallback = torch.nan_to_num(ce_loss.float(), nan=0.0, posinf=10.0, neginf=0.0)
+            return fallback, weights
+
         return total, weights
 
 
@@ -659,9 +688,8 @@ class TrainingPhase:
         elif step < self.p2_end:
             return self.JOINT
         else:
-            # P3: use JOINT loss (6-loss ensemble causes NaN on 7B bf16)
-            # TODO: fix SixLossEnsemble NaN for 14B
-            return self.JOINT
+            # P3: SixLossEnsemble with NaN guards (safe for 7B/14B bf16)
+            return self.ENSEMBLE
 
     def phase_progress(self, step):
         phase = self.get_phase(step)

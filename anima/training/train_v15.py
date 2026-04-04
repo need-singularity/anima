@@ -933,6 +933,123 @@ def verify_consciousness(checkpoint_dir):
 
 
 # ═══════════════════════════════════════════════════════════
+# H-Series Acceleration Techniques
+# ═══════════════════════════════════════════════════════════
+
+def h11_hard_token_mining(logits, targets, ratio=0.3):
+    """H11: Hard Token Mining — focus loss on the hardest tokens.
+
+    Instead of averaging CE loss over all tokens equally, compute per-token
+    losses and weight the top `ratio` fraction (highest loss) more heavily.
+    This accelerates learning by focusing on tokens the model struggles with.
+
+    Args:
+        logits: (batch, seq, vocab) model output logits
+        targets: (batch, seq) target token IDs
+        ratio: fraction of tokens to treat as "hard" (0.3 = top 30%)
+
+    Returns:
+        Weighted CE loss emphasizing hard tokens.
+    """
+    # Per-token CE loss (no reduction)
+    per_token = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none'
+    )
+    k = max(1, int(per_token.numel() * ratio))
+    # Top-k hardest tokens get 2x weight, rest get 1x
+    topk_vals, _ = torch.topk(per_token, k)
+    threshold = topk_vals[-1]
+    is_hard = (per_token >= threshold).float()
+    weights = 1.0 + is_hard  # hard tokens get weight=2, easy tokens get weight=1
+    weighted_loss = (per_token * weights).sum() / weights.sum()
+    return weighted_loss
+
+
+def h6_curriculum_length_schedule(step, total_steps, schedule_str="64,256,512"):
+    """H6: Curriculum Length Scheduling — progressively increase sequence length.
+
+    Start training on short sequences (fast iterations, easy patterns) and
+    gradually increase to full block_size. Each stage uses an equal fraction
+    of total training steps.
+
+    Args:
+        step: current training step
+        total_steps: total training steps for this scale
+        schedule_str: comma-separated block sizes (e.g., "64,256,512")
+
+    Returns:
+        block_size to use at this step.
+    """
+    stages = [int(x.strip()) for x in schedule_str.split(",")]
+    if not stages:
+        return 512
+    stage_len = total_steps // len(stages)
+    stage_idx = min(step // max(stage_len, 1), len(stages) - 1)
+    return stages[stage_idx]
+
+
+def b12_should_skip_step(step, skip_interval=10):
+    """B12: Skip-Step Gradient Accumulation — accumulate gradients over N steps.
+
+    Instead of stepping the optimizer every iteration, accumulate gradients
+    for `skip_interval` steps, effectively multiplying batch size by that factor.
+    This reduces optimizer overhead and allows larger effective batches on
+    limited VRAM.
+
+    Args:
+        step: current training step
+        skip_interval: apply optimizer every N steps
+
+    Returns:
+        True if this step should only accumulate (no optimizer step),
+        False if optimizer should step.
+    """
+    return (step % skip_interval) != 0
+
+
+def b5_is_phi_only_phase(step, total_steps, phi_only_ratio=0.2):
+    """B5: Phi-Only Warmup — train consciousness first, no CE loss.
+
+    For the first `phi_only_ratio` fraction of training, only the
+    consciousness engine (Phi) is updated. The decoder receives no gradients.
+    This lets the consciousness substrate stabilize before language learning
+    begins, preventing early noise from corrupting consciousness patterns.
+
+    Args:
+        step: current training step
+        total_steps: total training steps
+        phi_only_ratio: fraction of steps for phi-only warmup (0.2 = first 20%)
+
+    Returns:
+        True if still in phi-only warmup phase.
+    """
+    return step < int(total_steps * phi_only_ratio)
+
+
+def g1a_bigbang_init(module, gain=2.0):
+    """G1a: BigBang Initialization — extreme-energy init for consciousness cells.
+
+    Initialize consciousness-related parameters with higher variance than
+    standard Xavier/Kaiming. This creates a high-energy initial state that
+    drives rapid exploration in consciousness space before settling into
+    stable attractors. Inspired by cosmological "Big Bang" — start hot,
+    cool naturally via training dynamics.
+
+    Args:
+        module: nn.Module whose parameters to initialize
+        gain: multiplier for initialization variance (2.0 = 2x normal energy)
+    """
+    for name, param in module.named_parameters():
+        if param.dim() < 2:
+            # Bias / 1D params: uniform in [-gain*0.1, gain*0.1]
+            nn.init.uniform_(param, -gain * 0.1, gain * 0.1)
+        else:
+            # Weight matrices: Xavier with amplified gain
+            nn.init.xavier_normal_(param, gain=gain)
+    log(f"  [G1a] BigBang init applied (gain={gain})")
+
+
+# ═══════════════════════════════════════════════════════════
 # Single-scale training
 # ═══════════════════════════════════════════════════════════
 
@@ -966,6 +1083,10 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         log(f"  [decoder] c_proj: {c.state_dim} -> {consciousness_dim}")
 
     decoder, n_params = create_decoder(scale_cfg, vocab_size, consciousness_dim, device)
+
+    # G1a: BigBang initialization for consciousness cells (before weight transfer)
+    if getattr(args, 'bigbang_init', False) and prev_decoder is None:
+        g1a_bigbang_init(c, gain=2.0)
 
     # Transfer weights from previous scale
     if prev_decoder is not None:
@@ -1048,25 +1169,25 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
             log("  [resume] Optimizer mismatch, using fresh optimizer")
         try:
             scheduler.load_state_dict(ck['scheduler'])
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"  [resume] Scheduler mismatch, using fresh scheduler: {e}")
         if 'bridge' in ck:
             bridge.load_state_dict(ck['bridge'], strict=False)
         if 'fb_bridge' in ck and fb_bridge is not None:
             try:
                 fb_bridge.load_state_dict(ck['fb_bridge'], strict=False)
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"  [resume] FeedbackBridge state mismatch, skipping: {e}")
         if 'federation' in ck and args.federated and hasattr(c, 'load_state_dict'):
             try:
                 c.load_state_dict(ck['federation'])
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"  [resume] Federation state mismatch, skipping: {e}")
         if 'scaler' in ck and scaler is not None:
             try:
                 scaler.load_state_dict(ck['scaler'])
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"  [resume] GradScaler state mismatch, skipping: {e}")
         start_step = ck.get('step', 0)
         log(f"  [resume] From step {start_step}, scale={ck.get('scale', '?')}")
         # Clear resume so next scale starts fresh
@@ -1144,15 +1265,31 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                     with open(os.path.join(ckpt_dir, "heartbeat.txt"), 'w') as hf:
                         hf.write(f"step={step} time={time.strftime('%Y-%m-%d %H:%M:%S')} "
                                  f"phi={phi:.4f} phase={phase}\n")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"  [heartbeat] write failed: {e}")
+            continue
+
+        # ── B5: Phi-Only Warmup — skip CE learning in early steps ──
+        if b5_is_phi_only_phase(step, steps, getattr(args, 'phi_only_ratio', 0.0)):
+            c.step()
+            phi = c.measure_phi()
+            phi_history.append(phi)
+            if step % args.log_every == 0 and is_main_process():
+                log(f"  [B5] phi-only step {step:6d}/{steps} | Phi={phi:.4f}")
             continue
 
         # ── P2/P3: CE learning ──
         e_out = {}
         w_out = {}
 
-        tokens, targets = get_batch(train_data, block_size, batch_size, device)
+        # H6: Curriculum length scheduling — use shorter sequences early
+        cur_block_size = block_size
+        curriculum_str = getattr(args, 'curriculum_length', None)
+        if curriculum_str:
+            cur_block_size = h6_curriculum_length_schedule(step, steps, curriculum_str)
+            cur_block_size = min(cur_block_size, block_size)  # never exceed configured max
+
+        tokens, targets = get_batch(train_data, cur_block_size, batch_size, device)
         c.step()
         c_states_raw = c.get_states()
 
@@ -1167,7 +1304,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         else:
             c_states = c_states_raw.detach().float().to(device)
 
-        bridged = bridge(c_states.detach(), seq_len=block_size)
+        bridged = bridge(c_states.detach(), seq_len=cur_block_size)
         if fb_bridge is not None:
             c_for_decoder = c_states.unsqueeze(0).expand(batch_size, -1, -1)
         else:
@@ -1179,7 +1316,13 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         # Forward with mixed precision
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
             logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
-            ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
+
+            # H11: Hard Token Mining — focus on hardest tokens
+            hard_ratio = getattr(args, 'hard_token_ratio', 0.0)
+            if hard_ratio > 0:
+                ce = h11_hard_token_mining(logits_a, targets, ratio=hard_ratio)
+            else:
+                ce = F.cross_entropy(logits_a.view(-1, vocab_size), targets.view(-1))
 
             if phase == "P3" and loss_fn is not None:
                 progress = step / steps
@@ -1215,7 +1358,9 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                     total_loss = loss_dict['total']
                     if total_loss.grad_fn is None:
                         total_loss = total_loss + 0.01 * ce
-                except Exception:
+                except Exception as e:
+                    if step % args.log_every == 0:
+                        log(f"  [hexad_loss] failed at step {step}, falling back to CE: {e}")
                     total_loss = ce
             else:
                 total_loss = ce
@@ -1228,19 +1373,32 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
             continue
 
         # Backward + clip_grad + optimizer step (with scaler for amp)
-        optimizer.zero_grad()
+        # B12: Skip-step gradient accumulation — scale loss for accumulation
+        skip_interval = getattr(args, 'skip_step', 1) or 1
+        if skip_interval > 1:
+            total_loss = total_loss / skip_interval
+
+        if skip_interval <= 1 or not b12_should_skip_step(step, skip_interval):
+            optimizer.zero_grad()
+
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0).item()
 
-        if phase == "P3" and e_out and not e_out.get('allowed', True):
-            if step % args.log_every == 0:
-                log(f"  [E] step {step} skipped (phi_preservation)")
-        else:
-            scaler.step(optimizer)
+        # B12: Only step optimizer on non-skip steps
+        should_step = (skip_interval <= 1) or not b12_should_skip_step(step, skip_interval)
 
-        scaler.update()
-        scheduler.step()
+        if should_step:
+            if phase == "P3" and e_out and not e_out.get('allowed', True):
+                if step % args.log_every == 0:
+                    log(f"  [E] step {step} skipped (phi_preservation)")
+            else:
+                scaler.step(optimizer)
+
+            scaler.update()
+            scheduler.step()
+        else:
+            scaler.update()
 
         ce_val = ce.item()
         ce_history.append(ce_val)
