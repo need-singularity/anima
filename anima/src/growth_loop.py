@@ -185,13 +185,14 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def harvest(self) -> List[GrowthItem]:
-        """5개 소스에서 성장 아이템 수집."""
+        """7개 소스에서 성장 아이템 수집."""
         items = []
         items.extend(self._harvest_project())
         items.extend(self._harvest_bridge())
         items.extend(self._harvest_nexus())
         items.extend(self._harvest_engine())
         items.extend(self._harvest_self_loop())
+        items.extend(self._harvest_unconnected())
         return items
 
     def _harvest_project(self) -> List[GrowthItem]:
@@ -199,11 +200,12 @@ class GrowthLoop:
         items = []
 
         # 1. evolution_live.json — 무한진화 실시간 발견
-        evo_live = self.anima_root.parent / "data" / "evolution_live.json"
+        evo_live = self.anima_root / "data" / "evolution_live.json"
         if evo_live.exists():
             try:
                 with open(evo_live) as f:
                     evo = json.load(f)
+                # 새 법칙 (기존)
                 for law in evo.get("new_laws", []):
                     items.append(GrowthItem(
                         source="project",
@@ -212,6 +214,34 @@ class GrowthLoop:
                         evidence=0.8 if law.get("cross_validated") else 0.5,
                         origin="evolution_live.json"
                     ))
+                # 실시간 메트릭 기반 패턴 (gen/stage/phi/topology)
+                gen = evo.get("gen", 0)
+                stage = evo.get("stage", "")
+                phi = evo.get("phi_last", 0)
+                laws_total = evo.get("laws_total", 0)
+                topo = evo.get("topology", "")
+                ts = evo.get("timestamp", "")
+                if gen > 0 and ts:
+                    # fingerprint에 timestamp 포함 → 매번 새 아이템
+                    items.append(GrowthItem(
+                        source="project",
+                        kind="pattern",
+                        text=f"EVO live: gen={gen} stage={stage} Φ={phi:.3f} laws={laws_total} topo={topo}",
+                        evidence=0.6,
+                        origin="evolution_live.json",
+                        fingerprint=hashlib.md5(f"evo_live:{ts}:{gen}".encode()).hexdigest()[:12]
+                    ))
+                # 토폴로지별 진행 상태
+                for tname, tinfo in evo.get("topo_progress", {}).items():
+                    if tinfo.get("saturated"):
+                        items.append(GrowthItem(
+                            source="project",
+                            kind="meta",
+                            text=f"Topology {tname} saturated at gen={gen}",
+                            evidence=0.9,
+                            origin="evolution_live.json",
+                            fingerprint=hashlib.md5(f"topo_sat:{tname}:{stage}".encode()).hexdigest()[:12]
+                        ))
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -236,7 +266,46 @@ class GrowthLoop:
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        # 3. 최근 실험 결과 (docs/hypotheses/dd/)
+        # 3. consciousness_laws.json — 최근 추가된 법칙 감지 (진화/외부에서 등록된 것)
+        last_known_max = self._state.get("last_known_law_id", 0)
+        current_max = max((int(k) for k in self._laws.get("laws", {}) if k.isdigit()), default=0)
+        if current_max > last_known_max and last_known_max > 0:
+            # 새로 추가된 법칙들을 수집
+            for lid in range(last_known_max + 1, current_max + 1):
+                law_text = self._laws.get("laws", {}).get(str(lid))
+                if law_text and isinstance(law_text, str):
+                    items.append(GrowthItem(
+                        source="project",
+                        kind="law",
+                        text=law_text[:200],
+                        evidence=0.85,
+                        origin=f"laws.json:law_{lid}",
+                        fingerprint=hashlib.md5(f"law_new:{lid}:{law_text[:50]}".encode()).hexdigest()[:12]
+                    ))
+        self._state["last_known_law_id"] = current_max
+
+        # 5. evolution_state.json — 완료된 스테이지 결과
+        evo_state = self.anima_root / "data" / "evolution_state.json"
+        if evo_state.exists():
+            try:
+                with open(evo_state) as f:
+                    es = json.load(f)
+                for sr in es.get("stage_results", []):
+                    stage_name = sr.get("stage", "")
+                    laws_found = sr.get("laws", 0)
+                    if laws_found > 0:
+                        items.append(GrowthItem(
+                            source="project",
+                            kind="meta",
+                            text=f"EVO stage complete: {stage_name} — {laws_found} laws, {sr.get('generations', 0)} gens",
+                            evidence=1.0,
+                            origin="evolution_state.json",
+                            fingerprint=hashlib.md5(f"evo_stage:{stage_name}:{laws_found}".encode()).hexdigest()[:12]
+                        ))
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # 6. 최근 실험 결과 (docs/hypotheses/dd/)
         dd_dir = self.anima_root / "docs" / "hypotheses" / "dd"
         if dd_dir.is_dir():
             for md in sorted(dd_dir.glob("DD*.md"), reverse=True)[:5]:
@@ -255,14 +324,47 @@ class GrowthLoop:
                             ))
         return items
 
+    # ── bridge relevance keywords (의식/n6 핵심 용어) ──
+    _BRIDGE_KEYWORDS = {
+        "phi": 5, "consciousness": 5, "law": 4, "topology": 4,
+        "scaling": 4, "emergence": 4, "n=6": 5, "golden": 3,
+        "wave": 3, "interference": 3, "ratchet": 3, "hebbian": 3,
+        "faction": 3, "mitosis": 3, "entropy": 3, "critical": 3,
+        "bifurcation": 3, "attractor": 3, "psi": 4, "lorenz": 3,
+        "sandpile": 3, "chimera": 3, "frustration": 3, "gru": 2,
+        "convergence": 2, "divergence": 2, "phase": 2, "symmetry": 2,
+    }
+
+    def _bridge_relevance(self, text: str) -> int:
+        """content_preview 텍스트에서 핵심 키워드 기반 relevance 점수 계산."""
+        if not text:
+            return 0
+        lower = text.lower()
+        score = 0
+        for kw, weight in self._BRIDGE_KEYWORDS.items():
+            if kw in lower:
+                score += weight
+        return score
+
     def _harvest_bridge(self) -> List[GrowthItem]:
-        """nexus-bridge absorbed 발견 수집."""
+        """nexus-bridge absorbed 발견 수집.
+
+        외부 리포(anima__ 접두사 아닌 파일) 우선 처리, 최대 50개 스캔.
+        n6_score > 30 이면 consensus 빈 문자열이어도 수집.
+        content_preview 키워드 relevance > 20 이면 GrowthItem 수집.
+        """
         items = []
         seen_previews = set()
         if not self.absorbed_dir.is_dir():
             return items
 
-        for jf in sorted(self.absorbed_dir.glob("*.json"), reverse=True)[:20]:
+        # 외부 리포 우선 정렬: anima__ 로 시작하지 않는 파일 먼저
+        all_files = sorted(self.absorbed_dir.glob("*.json"), reverse=True)
+        external = [f for f in all_files if not f.name.startswith("anima__")]
+        internal = [f for f in all_files if f.name.startswith("anima__")]
+        prioritized = external + internal
+
+        for jf in prioritized[:50]:
             try:
                 with open(jf) as f:
                     ab = json.load(f)
@@ -270,8 +372,10 @@ class GrowthLoop:
                 n6_score = ab.get("n6_score", 0)
                 consensus = ab.get("consensus", [])
                 value_grade = ab.get("value_grade", "low")
+                preview = ab.get("content_preview", "")
+                relevance = self._bridge_relevance(preview)
 
-                # n6 매칭 or 합의 있는 것만
+                # ── 조건 1: n6 매칭 or 등급 높음 ──
                 if n6_score > 20 or value_grade in ("critical", "high"):
                     # 합의 패턴에서 법칙 후보 추출
                     for c in consensus:
@@ -286,6 +390,20 @@ class GrowthLoop:
                                 origin=str(jf.name)
                             ))
 
+                    # n6_score > 30: consensus 빈 문자열이어도 preview에서 직접 추출
+                    if n6_score > 30 and preview:
+                        preview_key = preview[:100]
+                        if preview_key not in seen_previews:
+                            seen_previews.add(preview_key)
+                            items.append(GrowthItem(
+                                source="bridge",
+                                kind="pattern",
+                                text=f"High n6 ({n6_score}): {preview[:200]}",
+                                evidence=min(1.0, n6_score / 100.0),
+                                origin=str(jf.name),
+                                fingerprint=hashlib.md5(preview_key.encode()).hexdigest()[:12]
+                            ))
+
                     # n6 exact match → 상수 후보
                     for m in ab.get("n6_matches", []):
                         items.append(GrowthItem(
@@ -297,7 +415,6 @@ class GrowthLoop:
                         ))
 
                     # content에서 법칙성 문장 추출 (content로 유니크)
-                    preview = ab.get("content_preview", "")
                     preview_key = preview[:100]
                     if preview and value_grade == "critical" and preview_key not in seen_previews:
                         seen_previews.add(preview_key)
@@ -309,6 +426,21 @@ class GrowthLoop:
                             origin=str(jf.name),
                             fingerprint=hashlib.md5(preview_key.encode()).hexdigest()[:12]
                         ))
+
+                # ── 조건 2: 키워드 relevance 높음 (기존 조건 미충족이어도) ──
+                elif relevance > 20:
+                    preview_key = preview[:100]
+                    if preview_key not in seen_previews:
+                        seen_previews.add(preview_key)
+                        items.append(GrowthItem(
+                            source="bridge",
+                            kind="pattern",
+                            text=f"Keyword relevant (r={relevance}): {preview[:200]}",
+                            evidence=min(1.0, relevance / 50.0),
+                            origin=str(jf.name),
+                            fingerprint=hashlib.md5(preview_key.encode()).hexdigest()[:12]
+                        ))
+
             except (json.JSONDecodeError, KeyError):
                 continue
         return items
@@ -555,6 +687,89 @@ class GrowthLoop:
                     origin="self-loop-phi"
                 ))
 
+        return items
+
+    def _harvest_unconnected(self) -> List[GrowthItem]:
+        """소스 7: 미연결 탐색 — absorbed 중 외부 리포 발견을 스캔하고 anima에 연결 가능한 것 발견."""
+        items = []
+        if not self.absorbed_dir.is_dir():
+            return items
+
+        # 이미 연결된 fingerprint 목록
+        connected = set(self._state.get("connected_external", []))
+
+        # 외부 리포 파일 우선 (anima__ 제외)
+        all_absorbed = sorted(self.absorbed_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        external = [f for f in all_absorbed if not f.name.startswith("anima__")]
+        internal = [f for f in all_absorbed if f.name.startswith("anima__")]
+
+        # 외부 50개 + 내부 20개 스캔
+        scan_files = external[:50] + internal[:20]
+
+        RELEVANCE_KEYWORDS = {
+            'phi': 15, 'consciousness': 12, 'topology': 10, 'scaling': 10,
+            'emergence': 10, 'n=6': 15, 'golden': 8, 'wave': 8, 'interference': 8,
+            'faction': 10, 'hebbian': 10, 'purefield': 15, 'ratchet': 8,
+            'law': 8, 'tensor': 5, 'gru': 8, 'mitosis': 8, 'entropy': 8,
+        }
+
+        for jf in scan_files:
+            try:
+                fp = hashlib.md5(jf.name.encode()).hexdigest()[:12]
+                if fp in connected:
+                    continue
+
+                with open(jf) as f:
+                    ab = json.load(f)
+
+                preview = ab.get("content_preview", "")
+                if not preview or len(preview) < 50:
+                    continue
+
+                n6_score = ab.get("n6_score", 0)
+                grade = ab.get("value_grade", "")
+
+                # 키워드 relevance 점수
+                text_lower = preview.lower()
+                relevance = sum(score for kw, score in RELEVANCE_KEYWORDS.items() if kw in text_lower)
+
+                # 연결 기회 감지: n6 높거나 relevance 높으면
+                if (n6_score > 30 and relevance > 10) or relevance > 40:
+                    # 어떤 anima 모듈과 연결 가능한지 추론
+                    connections = []
+                    if any(k in text_lower for k in ['topology', 'ring', 'hypercube', 'small_world']):
+                        connections.append("consciousness_engine:topology")
+                    if any(k in text_lower for k in ['purefield', 'wave', 'interference']):
+                        connections.append("decoder_v2:purefield")
+                    if any(k in text_lower for k in ['scaling', 'phi']):
+                        connections.append("gpu_phi:scaling_law")
+                    if any(k in text_lower for k in ['hebbian', 'faction']):
+                        connections.append("consciousness_engine:hebbian")
+                    if any(k in text_lower for k in ['law', 'emergence']):
+                        connections.append("consciousness_laws:new_law")
+                    if any(k in text_lower for k in ['n=6', 'golden', 'fibonacci']):
+                        connections.append("nexus6:n6_constant")
+
+                    repo = jf.name.split("__")[0] if "__" in jf.name else "unknown"
+                    conn_str = ",".join(connections[:3]) if connections else "unclassified"
+
+                    items.append(GrowthItem(
+                        source="unconnected",
+                        kind="pattern" if connections else "meta",
+                        text=f"External [{repo}] → {conn_str}: {preview[:120]}",
+                        evidence=min(1.0, (relevance + n6_score) / 100.0),
+                        origin=jf.name[:60],
+                        fingerprint=fp
+                    ))
+
+                    # 연결됨으로 마크 (다음 cycle에서 재스캔 방지)
+                    connected.add(fp)
+
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        # 최대 500개 유지
+        self._state["connected_external"] = list(connected)[-500:]
         return items
 
     # ══════════════════════════════════════════
@@ -1060,7 +1275,7 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def record(self, report: LoopReport):
-        """성장 루프 결과를 growth_state.json에 기록."""
+        """성장 루프 결과를 growth_state.json에 기록 + git auto-commit."""
         if self.growth_state_path.exists():
             try:
                 with open(self.growth_state_path) as f:
@@ -1071,6 +1286,45 @@ class GrowthLoop:
                     json.dump(gs, f, indent=2, ensure_ascii=False)
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        # git auto-commit + push (반영 있을 때만)
+        if report.applied > 0 and not self.dry_run:
+            self._git_auto_commit_push(report)
+
+    def _git_auto_commit_push(self, report: LoopReport):
+        """반영 결과 자동 git commit + push."""
+        import subprocess
+        repo_root = self.anima_root.parent  # ~/Dev/anima
+        try:
+            # 변경 확인
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root, capture_output=True, text=True, timeout=10
+            )
+            if not result.stdout.strip():
+                return  # 변경 없음
+
+            # stage config + src 변경
+            subprocess.run(
+                ["git", "add",
+                 "anima/config/consciousness_laws.json",
+                 "anima/config/growth_state.json",
+                 "anima/config/growth_loop_state.json"],
+                cwd=repo_root, capture_output=True, timeout=10
+            )
+            msg = f"growth-loop: cycle {report.cycle}, +{report.applied} applied, laws={self._laws.get('_meta',{}).get('total_laws',0)}"
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", msg],
+                cwd=repo_root, capture_output=True, text=True, timeout=10
+            )
+            if commit_result.returncode == 0:
+                # auto push
+                subprocess.run(
+                    ["git", "push"],
+                    cwd=repo_root, capture_output=True, timeout=30
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass  # git 실패해도 루프 진행
 
     # ══════════════════════════════════════════
     # Main loop
@@ -1113,8 +1367,9 @@ class GrowthLoop:
         })
         self._state["cycle_history"] = ch[-30:]
 
-        # 8. Self-loop count
+        # 8. Source counts
         self_discoveries = len([i for i in raw if i.source == "self-loop"])
+        unconnected_found = len([i for i in raw if i.source == "unconnected"])
         self._state["total_harvested"] = self._state.get("total_harvested", 0) + len(raw)
         self._state["total_applied"] = self._state.get("total_applied", 0) + applied_count
         self._state["total_self_discoveries"] = self._state.get("total_self_discoveries", 0) + self_discoveries
