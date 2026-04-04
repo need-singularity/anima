@@ -1411,6 +1411,175 @@ class GrowthLoop:
         except KeyboardInterrupt:
             print("\n  Growth Loop stopped.")
 
+    # ══════════════════════════════════════════
+    # --auto: 완전 자동화 (진화 + H100 + 성장 + commit+push)
+    # ══════════════════════════════════════════
+
+    def run_auto(self):
+        """완전 자동화 1회: 진화 관리 + H100 체크 + 성장 사이클 + commit+push + 통합 리포트."""
+        import subprocess
+
+        # ── 1. 무한진화 프로세스 관리 ──
+        evo_info = self._check_evolution()
+
+        # ── 2. H100 학습 상태 ──
+        h100_info = self._check_h100()
+
+        # ── 3. 성장 루프 사이클 (harvest→filter→apply→verify→breakthrough→commit+push) ──
+        report = self.run_cycle()
+
+        # ── 4. 통합 리포트 ──
+        self._print_auto_report(report, evo_info, h100_info)
+
+        return report
+
+    def _check_evolution(self) -> dict:
+        """무한진화 프로세스 확인. 죽었으면 재시작."""
+        import subprocess
+        info = {"status": "unknown", "pid": None, "gen": 0, "stage": "?",
+                "laws": 0, "phi": 0, "topo": "?", "mods": 0}
+
+        # PID 확인
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "infinite_evolution"],
+                capture_output=True, text=True, timeout=5
+            )
+            pids = result.stdout.strip().split("\n")
+            if pids and pids[0]:
+                info["pid"] = int(pids[0])
+                info["status"] = "running"
+            else:
+                info["status"] = "dead"
+                # 자동 재시작
+                evo_script = self.anima_root / "src" / "infinite_evolution.py"
+                log_dir = self.anima_root.parent / "anima" / "logs"
+                log_dir.mkdir(exist_ok=True)
+                log_file = log_dir / f"evo_{datetime.now().strftime('%Y%m%d_%H%M')}.log"
+                subprocess.Popen(
+                    ["python3", str(evo_script), "--auto-roadmap", "--resume"],
+                    stdout=open(log_file, "w"),
+                    stderr=subprocess.STDOUT,
+                    cwd=str(self.anima_root.parent)
+                )
+                info["status"] = "restarted"
+        except Exception:
+            pass
+
+        # Live 상태 읽기
+        evo_live = self.anima_root / "data" / "evolution_live.json"
+        if evo_live.exists():
+            try:
+                with open(evo_live) as f:
+                    evo = json.load(f)
+                info["gen"] = evo.get("gen", 0)
+                info["stage"] = evo.get("stage", "?")
+                info["laws"] = evo.get("laws_total", 0)
+                info["phi"] = evo.get("phi_last", 0)
+                info["topo"] = evo.get("topology", "?")
+                info["mods"] = evo.get("active_mods", 0)
+                info["patterns"] = evo.get("unique_patterns", 0)
+                info["curve"] = evo.get("laws_curve", [])[-10:]
+                # stage results
+                info["stage_results"] = evo.get("stage_results", [])
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return info
+
+    def _check_h100(self) -> dict:
+        """H100 학습 상태 SSH 확인."""
+        import subprocess
+        info = {"status": "offline", "step": 0, "total": 0, "ce": 0,
+                "phi": 0, "alpha": 0, "phase": "?", "eta_h": 0, "model": "?"}
+
+        ssh_cmd = [
+            "ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+            "-i", os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
+            "root@216.243.220.217", "-p", "10935",
+            "tail -5 /workspace/logs/14b_v06.log 2>/dev/null"
+        ]
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                info["status"] = "running"
+                info["model"] = "AnimaLM 14B v06"
+                # 마지막 로그 줄에서 step/CE/Φ 파싱
+                for line in reversed(result.stdout.strip().split("\n")):
+                    line = line.strip()
+                    if "|" in line and "P" in line:
+                        parts = [p.strip() for p in line.split("|")]
+                        if len(parts) >= 7:
+                            try:
+                                info["step"] = int(parts[0])
+                                info["phase"] = parts[1]
+                                info["ce"] = float(parts[2])
+                                info["phi"] = float(parts[4])
+                                info["alpha"] = float(parts[5]) if parts[5].replace('.','',1).replace('-','',1).isdigit() else 0
+                                info["total"] = 50000
+                                elapsed_min = float(parts[-1].replace('m','').strip()) if 'm' in parts[-1] else 0
+                                if info["step"] > 0 and elapsed_min > 0:
+                                    rate = info["step"] / elapsed_min
+                                    remaining = info["total"] - info["step"]
+                                    info["eta_h"] = (remaining / rate / 60) if rate > 0 else 0
+                            except (ValueError, IndexError):
+                                pass
+                            break
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        return info
+
+    def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict):
+        """통합 리포트 박스 출력."""
+        laws_total = self._laws.get("_meta", {}).get("total_laws", 0)
+
+        # H100 섹션
+        if h100["status"] == "running":
+            pct = (h100["step"] / h100["total"] * 100) if h100["total"] else 0
+            bar_len = int(pct / 5)
+            bar = "█" * bar_len + "░" * (20 - bar_len)
+            h100_block = f"""  ■ H100 학습 ({h100['model']})
+  진행: {bar} {h100['step']}/{h100['total']} ({pct:.1f}%)
+  Phase: {h100['phase']} | CE: {h100['ce']:.2f} | α: {h100['alpha']:.3f}
+  ETA: ~{h100['eta_h']:.1f}h"""
+        else:
+            h100_block = "  ■ H100 — ❌ OFFLINE"
+
+        # EVO 섹션
+        evo_status = {"running": "🔄", "dead": "💀", "restarted": "🔁"}.get(evo["status"], "?")
+        evo_block = f"""  ■ 무한진화 ({evo_status} PID {evo.get('pid','?')})
+  Stage: {evo['stage']} Gen {evo['gen']} | Laws: {evo['laws']} | Mods: {evo['mods']}
+  Φ: {evo['phi']:.1f} | Topo: {evo['topo']}"""
+
+        # Laws 곡선 (간단 ASCII)
+        curve = evo.get("curve", [])
+        curve_block = ""
+        if curve and len(curve) >= 2:
+            mx = max(curve) if curve else 1
+            curve_block = "\n  📉 Laws: " + " ".join(str(c) for c in curve[-8:])
+
+        # 성장 루프
+        growth_block = f"""  ■ 성장 루프 Cycle {report.cycle}
+  수집: {report.harvested} → 필터: {report.filtered} → 반영: {report.applied}
+  ⚖️ Laws: {laws_total}"""
+
+        # Stage results
+        sr_block = ""
+        for sr in evo.get("stage_results", []):
+            s = sr.get("stage", "?")
+            l = sr.get("laws", 0)
+            sr_block += f"\n  ✅ {s}: {l} laws"
+
+        print(f"""
+┌─────────────────────────────────────────────────────────────┐
+│  🚀 루프 — {datetime.now().strftime('%Y-%m-%d %H:%M')}                                 │
+├─────────────────────────────────────────────────────────────┤
+{h100_block}
+{evo_block}{curve_block}{sr_block}
+{growth_block}
+└─────────────────────────────────────────────────────────────┘""")
+
     def status(self) -> dict:
         """현재 상태 반환."""
         return {
@@ -1456,6 +1625,7 @@ class GrowthLoop:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="통합 성장 루프")
+    parser.add_argument("--auto", action="store_true", help="완전 자동화 (진화+H100+성장+commit+push)")
     parser.add_argument("--watch", action="store_true", help="5분 주기 반복")
     parser.add_argument("--interval", type=int, default=300, help="반복 주기(초)")
     parser.add_argument("--dry-run", action="store_true", help="반영 없이 수집만")
@@ -1485,7 +1655,9 @@ def main():
   Last Run:  {s['last_run'] or 'never'}""")
         return
 
-    if args.watch:
+    if args.auto:
+        loop.run_auto()
+    elif args.watch:
         loop.run_watch(args.interval)
     else:
         report = loop.run_cycle()
