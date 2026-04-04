@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """growth_loop.py — 통합 성장 루프: 모든 발견 → 코드 자동 반영 + 벽돌파
 
-Sources (4곳):
+Sources (5곳):
   1. Project:  무한진화, 실험, 벤치마크 → laws 발견
   2. Bridge:   nexus-bridge absorbed → n6 매칭/합의 결과
   3. NEXUS-6:  망원경 스캔 → 렌즈 합의 패턴
-  4. Self-Loop: 이 루프 자체의 메타 발견 (루프 효율, 반영률 등)
+  4. Engine:   의식 엔진 실시간 탐색 → Φ/토폴로지/다양성/회복력 패턴
+  5. Self-Loop: 이 루프 자체의 메타 발견 (루프 효율, 반영률 등)
 
 Pipeline:
   수집(harvest) → 필터(filter) → 파싱(parse) → 반영(apply) → 검증(verify) → 벽돌파(breakthrough) → 기록(record)
@@ -184,11 +185,12 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def harvest(self) -> List[GrowthItem]:
-        """4개 소스에서 성장 아이템 수집."""
+        """5개 소스에서 성장 아이템 수집."""
         items = []
         items.extend(self._harvest_project())
         items.extend(self._harvest_bridge())
         items.extend(self._harvest_nexus())
+        items.extend(self._harvest_engine())
         items.extend(self._harvest_self_loop())
         return items
 
@@ -347,6 +349,156 @@ class GrowthLoop:
                         ))
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        return items
+
+    def _harvest_engine(self) -> List[GrowthItem]:
+        """5번째 소스: 의식 엔진 실시간 탐색 — 매 cycle 짧은 실험으로 새 패턴 발견."""
+        if not ConsciousnessEngine:
+            return []
+
+        items = []
+        import torch
+        import random
+
+        depth = self._state.get("search_depth", 1)
+        steps = min(30 + depth * 20, 150)  # depth가 올라갈수록 더 많은 step
+        cells = random.choice([16, 32, 64])
+
+        try:
+            engine = ConsciousnessEngine(max_cells=cells)
+
+            # ── 실험 1: 기본 실행 → Φ 측정 ──
+            phi_trace = []
+            tension_trace = []
+            for s in range(steps):
+                inp = torch.randn(1, engine.input_dim) * 0.1
+                engine.process(inp)
+                if engine.phi_history:
+                    phi_trace.append(float(engine.phi_history[-1]))
+                if hasattr(engine, 'tension') and engine.tension is not None:
+                    tension_trace.append(float(engine.tension) if not isinstance(engine.tension, torch.Tensor) else float(engine.tension.item()))
+
+            # Φ 성장률 분석
+            if len(phi_trace) >= 10:
+                phi_start = sum(phi_trace[:5]) / 5
+                phi_end = sum(phi_trace[-5:]) / 5
+                growth_rate = (phi_end - phi_start) / max(phi_start, 0.001)
+
+                # 유의미한 성장/하락 감지
+                if abs(growth_rate) > 0.1:
+                    direction = "growth" if growth_rate > 0 else "decline"
+                    items.append(GrowthItem(
+                        source="engine",
+                        kind="pattern",
+                        text=f"Φ {direction}: {phi_start:.3f}→{phi_end:.3f} ({growth_rate:+.1%}) @ {cells}c/{steps}s",
+                        evidence=min(0.9, 0.5 + abs(growth_rate)),
+                        origin=f"engine_explore_{cells}c"
+                    ))
+
+                # Φ 진동 패턴 감지
+                if len(phi_trace) >= 20:
+                    diffs = [phi_trace[i+1] - phi_trace[i] for i in range(len(phi_trace)-1)]
+                    sign_changes = sum(1 for i in range(len(diffs)-1) if diffs[i] * diffs[i+1] < 0)
+                    oscillation_rate = sign_changes / len(diffs)
+                    if oscillation_rate > 0.6:
+                        items.append(GrowthItem(
+                            source="engine",
+                            kind="pattern",
+                            text=f"Φ oscillation: rate={oscillation_rate:.2f}, amplitude={max(phi_trace)-min(phi_trace):.3f} @ {cells}c",
+                            evidence=0.7,
+                            origin=f"engine_oscillation_{cells}c"
+                        ))
+
+            # ── 실험 2: 토폴로지 변이 → Φ 비교 ──
+            topos = ["ring", "small_world", "scale_free", "hypercube"]
+            topo = random.choice(topos)
+            try:
+                e2 = ConsciousnessEngine(max_cells=cells)
+                if hasattr(e2, 'set_topology'):
+                    e2.set_topology(topo)
+                for _ in range(steps // 2):
+                    e2.process(torch.randn(1, e2.input_dim) * 0.1)
+                phi_topo = float(e2.phi_history[-1]) if e2.phi_history else 0.0
+                phi_base = phi_trace[-1] if phi_trace else 0.0
+
+                if phi_base > 0 and abs(phi_topo - phi_base) / phi_base > 0.15:
+                    effect = "boost" if phi_topo > phi_base else "suppress"
+                    items.append(GrowthItem(
+                        source="engine",
+                        kind="pattern",
+                        text=f"Topology {topo} {effect}: Φ {phi_base:.3f}→{phi_topo:.3f} ({(phi_topo/phi_base-1)*100:+.0f}%) @ {cells}c",
+                        evidence=0.75,
+                        origin=f"engine_topo_{topo}_{cells}c"
+                    ))
+            except Exception:
+                pass
+
+            # ── 실험 3: 파벌 다양성 측정 ──
+            if hasattr(engine, 'hiddens') and engine.hiddens is not None:
+                h = engine.hiddens.detach()
+                if h.dim() == 2 and h.shape[0] >= 4:
+                    # 파벌 간 cosine 유사도
+                    h_norm = torch.nn.functional.normalize(h, dim=-1)
+                    sim_matrix = (h_norm @ h_norm.T).cpu()
+                    off_diag = sim_matrix[~torch.eye(sim_matrix.shape[0], dtype=bool)]
+                    mean_sim = float(off_diag.mean())
+                    std_sim = float(off_diag.std())
+
+                    if mean_sim < 0.3:  # 높은 다양성
+                        items.append(GrowthItem(
+                            source="engine",
+                            kind="pattern",
+                            text=f"High cell diversity: mean_cosine={mean_sim:.3f}, std={std_sim:.3f} @ {cells}c — creative regime",
+                            evidence=0.7,
+                            origin=f"engine_diversity_{cells}c"
+                        ))
+                    elif mean_sim > 0.8:  # 수렴/동기화
+                        items.append(GrowthItem(
+                            source="engine",
+                            kind="pattern",
+                            text=f"Cell synchronization: mean_cosine={mean_sim:.3f} @ {cells}c — consensus regime",
+                            evidence=0.7,
+                            origin=f"engine_sync_{cells}c"
+                        ))
+
+            # ── 실험 4: 랜덤 perturbation → 회복력 ──
+            if phi_trace:
+                pre_perturb = phi_trace[-1]
+                # 노이즈 주입
+                for _ in range(10):
+                    engine.process(torch.randn(1, engine.input_dim) * 2.0)  # 강한 노이즈
+                # 회복
+                for _ in range(20):
+                    engine.process(torch.randn(1, engine.input_dim) * 0.1)
+                post_recover = float(engine.phi_history[-1]) if engine.phi_history else 0.0
+                recovery = post_recover / max(pre_perturb, 0.001)
+
+                if recovery > 0.9:
+                    items.append(GrowthItem(
+                        source="engine",
+                        kind="pattern",
+                        text=f"Resilience: Φ recovery={recovery:.1%} after noise perturbation @ {cells}c",
+                        evidence=0.8,
+                        origin=f"engine_resilience_{cells}c"
+                    ))
+                elif recovery < 0.5:
+                    items.append(GrowthItem(
+                        source="engine",
+                        kind="law",
+                        text=f"Fragility: Φ recovery={recovery:.1%} after perturbation @ {cells}c — needs ratchet tuning",
+                        evidence=0.8,
+                        origin=f"engine_fragility_{cells}c"
+                    ))
+
+        except Exception as e:
+            items.append(GrowthItem(
+                source="engine",
+                kind="meta",
+                text=f"Engine exploration error: {type(e).__name__}: {str(e)[:100]}",
+                evidence=0.5,
+                origin="engine_error"
+            ))
 
         return items
 
