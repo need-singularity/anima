@@ -1691,10 +1691,11 @@ def main():
   Last Run:  {s['last_run'] or 'never'}""")
         return
 
-    if args.auto:
-        loop.run_auto()
-    elif args.watch:
+    if args.watch:
         loop.run_watch(args.interval)
+    elif args.auto or not (args.status or args.dry_run):
+        # 기본 = --auto (로드맵 진행이 최우선)
+        loop.run_auto()
     else:
         report = loop.run_cycle()
         loop._print_report(report)
