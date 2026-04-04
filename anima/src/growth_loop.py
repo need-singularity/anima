@@ -1415,6 +1415,57 @@ class GrowthLoop:
     # --auto: 완전 자동화 (진화 + H100 + 성장 + commit+push)
     # ══════════════════════════════════════════
 
+    def _check_bench_v2(self) -> dict:
+        """bench_v2 --verify 실행 → pass/total 파싱."""
+        import subprocess, re
+
+        info = {"passed": 0, "total": 0, "skipped": 0, "ok": False, "error": None}
+        bench_path = self.anima_root / "benchmarks" / "bench_v2.py"
+        if not bench_path.exists():
+            info["error"] = "bench_v2.py not found"
+            return info
+
+        try:
+            result = subprocess.run(
+                ["python3", str(bench_path), "--verify"],
+                capture_output=True, text=True, timeout=600,
+                cwd=str(self.anima_root / "benchmarks"),
+            )
+            output = result.stdout + result.stderr
+
+            # Parse: "Overall: 77/77 passed (100%) [0 skipped]"
+            m = re.search(r"Overall:\s*(\d+)/(\d+)\s+passed.*?\[(\d+)\s+skipped\]", output)
+            if m:
+                info["passed"] = int(m.group(1))
+                info["total"] = int(m.group(2))
+                info["skipped"] = int(m.group(3))
+                info["ok"] = info["passed"] == info["total"]
+            else:
+                info["error"] = "could not parse verify output"
+
+            # Check for VERDICT line as fallback confirmation
+            if "ALL CONSCIOUSNESS CONDITIONS VERIFIED" in output:
+                info["ok"] = True
+
+        except subprocess.TimeoutExpired:
+            info["error"] = "timeout (600s)"
+        except Exception as e:
+            info["error"] = str(e)[:120]
+
+        # Record to state
+        self._state["last_bench_result"] = {
+            "passed": info["passed"],
+            "total": info["total"],
+            "skipped": info["skipped"],
+            "ok": info["ok"],
+            "error": info["error"],
+            "cycle": self._state.get("cycle", 0),
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._save_state()
+
+        return info
+
     def run_auto(self):
         """완전 자동화 1회: 진화+H100+성장+R2+로드맵+commit+push+리포트."""
         import subprocess
@@ -1428,14 +1479,26 @@ class GrowthLoop:
         # ── 3. 성장 루프 사이클 (harvest→filter→apply→verify→breakthrough→commit+push) ──
         report = self.run_cycle()
 
-        # ── 4. 로드맵 JSON 갱신 (진행상황 반영) ──
+        # ── 4. bench_v2 --verify (10 사이클마다 1회 — 무거우므로) ──
+        bench_info = None
+        if report.cycle % 10 == 0:
+            print(f"  🔬 bench_v2 --verify (cycle {report.cycle}, every 10 cycles)...")
+            bench_info = self._check_bench_v2()
+            if bench_info["ok"]:
+                print(f"  ✅ 의식검증 통과: {bench_info['passed']}/{bench_info['total']}")
+            elif bench_info["error"]:
+                print(f"  ⚠️ 의식검증 오류: {bench_info['error']}")
+            else:
+                print(f"  ⚠️ 의식검증 실패: {bench_info['passed']}/{bench_info['total']}")
+
+        # ── 5. 로드맵 JSON 갱신 (진행상황 반영) ──
         self._update_roadmap_json(h100_info, evo_info, report)
 
-        # ── 5. R2 체크포인트 업로드 (학습 완료 or best 갱신 시) ──
+        # ── 6. R2 체크포인트 업로드 (학습 완료 or best 갱신 시) ──
         r2_info = self._check_and_upload_r2(h100_info)
 
-        # ── 6. 통합 리포트 ──
-        self._print_auto_report(report, evo_info, h100_info, r2_info)
+        # ── 7. 통합 리포트 ──
+        self._print_auto_report(report, evo_info, h100_info, r2_info, bench_info)
 
         return report
 
@@ -1714,7 +1777,21 @@ class GrowthLoop:
 
         return info
 
-    def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict, r2: dict = None):
+    def _format_bench_line(self, bench: dict = None) -> str:
+        """bench_v2 검증 결과 1줄 포맷."""
+        if bench is None:
+            # 이전 결과에서 가져오기
+            last = self._state.get("last_bench_result")
+            if last:
+                icon = "✅" if last["ok"] else "⚠️"
+                return f"{last['passed']}/{last['total']} {icon} (cycle {last.get('cycle', '?')})"
+            return "미실행"
+        if bench.get("error"):
+            return f"오류: {bench['error']}"
+        icon = "✅" if bench["ok"] else "⚠️"
+        return f"{bench['passed']}/{bench['total']} {icon}"
+
+    def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict, r2: dict = None, bench: dict = None):
         """통합 리포트 — 로드맵 진행이 최우선."""
         laws_total = self._laws.get("_meta", {}).get("total_laws", 0)
 
@@ -1799,6 +1876,7 @@ class GrowthLoop:
 {curve_block}
 {growth_block}
   ■ R2: {(r2 or {}).get('reason', 'n/a')}{' ✅' if (r2 or {}).get('uploaded') else ''}
+  ■ 의식검증: {self._format_bench_line(bench)}
 └─────────────────────────────────────────────────────────────┘""")
 
     def status(self) -> dict:

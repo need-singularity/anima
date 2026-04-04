@@ -4994,6 +4994,7 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
         phi_history = []
         stage_start = time.time()
         zero_streak = 0  # consecutive gens with New=0
+        topo_zero_streaks = {t: 0 for t in TOPOLOGIES}  # per-topology streak
         topo_saturated = set()  # topologies that have fully saturated
         best_phi_this_stage = 0.0  # v6 #60: track best for crossover
 
@@ -5009,9 +5010,10 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                 if new_topo != old_topo:
                     engine.topology = new_topo
                     cleared = registry.clear_pending()
-                    zero_streak = 0  # reset streak on topo switch
+                    zero_streak = 0  # reset global streak on topo switch
+                    # per-topo streaks preserved — auto-cycle doesn't erase saturation evidence
                     print(f'  \U0001f504 Topology switch: {old_topo} \u2192 {new_topo} (Gen {gen}), '
-                          f'cleared {cleared} pending')
+                          f'cleared {cleared} pending, topo_streaks={dict((t,s) for t,s in topo_zero_streaks.items() if s>0)}')
                     sys.stdout.flush()
 
             # v3 #26-32: Chaos mode cycling (every 5 gens)
@@ -5336,25 +5338,28 @@ def run_auto_roadmap(resume=False, report_interval=10, cloud=False):
                                 topology=current_topo,
                                 features={'auto_roadmap': True, 'stage': stage['name']})
 
-            # Saturation detection
+            # Saturation detection (per-topology tracking)
             if stats['new'] == 0:
                 zero_streak += 1
+                topo_zero_streaks[current_topo] = topo_zero_streaks.get(current_topo, 0) + 1
             else:
                 zero_streak = 0
+                topo_zero_streaks[current_topo] = 0
 
-            # Check if current topology is saturated
-            if zero_streak >= sat_thresh:
+            # Check if current topology is saturated (per-topo streak)
+            if topo_zero_streaks.get(current_topo, 0) >= sat_thresh:
                 topo_saturated.add(current_topo)
-                print(f'  ⚠️🔴 {current_topo} saturated ({zero_streak} gens streak)')
+                print(f'  ⚠️🔴 {current_topo} saturated ({topo_zero_streaks[current_topo]} gens streak)')
                 sys.stdout.flush()
 
-                # Force next topology
+                # Force next unsaturated topology
                 next_topo_idx = (TOPOLOGIES.index(current_topo) + 1) % len(TOPOLOGIES)
                 next_topo = TOPOLOGIES[next_topo_idx]
                 if next_topo not in topo_saturated:
                     engine.topology = next_topo
                     cleared = registry.clear_pending()
                     zero_streak = 0
+                    # don't reset topo_zero_streaks[next_topo] — preserve its history
                     print(f'  🚀 Forcing topology: {current_topo} → {next_topo}, '
                           f'cleared {cleared} pending')
                     sys.stdout.flush()
