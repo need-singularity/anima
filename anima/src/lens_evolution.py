@@ -169,9 +169,9 @@ class LensEvolver:
         scan_lens_count = 0
         scan_highlights = {}
         if all_states:
-            flat = np.concatenate(all_states).astype(np.float64).tolist()
+            flat_2d = _to_scan_array(all_states)
             try:
-                scan_result = _nexus6.scan_all(flat)
+                scan_result = _nexus6.scan_all(flat_2d)
                 scan_lens_count = len(scan_result)
                 # Extract top highlights (lenses with most entries)
                 for lens_name, metrics in scan_result.items():
@@ -279,8 +279,8 @@ class LensEvolver:
         if not states:
             return {}
 
-        flat = np.concatenate(states).astype(np.float64).tolist()
-        full_scan = _nexus6.scan_all(flat)
+        flat_2d = _to_scan_array(states)
+        full_scan = _nexus6.scan_all(flat_2d)
 
         # Filter to recommended lenses only
         focused = {}
@@ -470,6 +470,30 @@ def _cells_to_numpy(cells: Any) -> Optional[np.ndarray]:
             return np.concatenate([c.flatten() for c in cells])
 
     return None
+
+
+def _to_scan_array(states: List[np.ndarray]) -> np.ndarray:
+    """Convert list of flat state arrays to 2D float64 array for scan_all.
+
+    nexus6.scan_all requires a 2D numpy float64 array.
+    Cell counts may vary (mitosis), so we pad/truncate to uniform width.
+    """
+    if not states:
+        return np.zeros((1, 1), dtype=np.float64)
+    # Find max length and pad shorter arrays
+    max_len = max(len(s) for s in states)
+    padded = []
+    for s in states:
+        if len(s) < max_len:
+            p = np.zeros(max_len, dtype=np.float64)
+            p[:len(s)] = s
+            padded.append(p)
+        else:
+            padded.append(s[:max_len].astype(np.float64))
+    stacked = np.array(padded, dtype=np.float64)
+    if stacked.ndim == 1:
+        stacked = stacked.reshape(1, -1)
+    return np.ascontiguousarray(stacked)
 
 
 def _safe_serialize(v: Any) -> Any:

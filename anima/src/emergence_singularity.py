@@ -361,7 +361,10 @@ class N6Scanner:
                     scores.append(result['score'])
                 findings.extend(result.get('findings', []))
 
-        phi = engine.measure_phi()
+        # #24: Use fast_mutual_info when available, fall back to engine.measure_phi()
+        phi = self.fast_phi(states)
+        if phi is None:
+            phi = engine.measure_phi()
 
         # nexus6.recommend_lenses() — which lenses are most relevant for this data
         recommended_lenses = []
@@ -640,8 +643,112 @@ class LawDiscoverer:
                 self.known_fingerprints.add(fp)
                 new_laws.append({"text": law, "evidence": f"top_lens={top_lens.get('lens', '?')}", "fingerprint": fp})
 
+        # Pattern 12 (#20): Causal patterns from multi_scan pipeline
+        causal_patterns = recent[-1].get("causal_patterns", [])
+        for cp in causal_patterns:
+            pat = cp.get("pattern") or cp.get("key", "")
+            score = cp.get("score") or cp.get("value", 0)
+            if pat and (isinstance(score, (int, float)) and abs(score) > 0.1):
+                law = f"Causal pattern: {pat} (score={score:.3f})"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"causal_score={score}", "fingerprint": fp, "type": "causal"})
+
+        # Pattern 13 (#20): Topology patterns from multi_scan pipeline
+        topo_patterns = recent[-1].get("topo_patterns", [])
+        for tp in topo_patterns:
+            pat = tp.get("pattern") or tp.get("key", "")
+            score = tp.get("score") or tp.get("value", 0)
+            if pat and (isinstance(score, (int, float)) and abs(score) > 0.1):
+                law = f"Topological invariant: {pat} (score={score:.3f})"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"topo_score={score}", "fingerprint": fp, "type": "topology"})
+
+        # Pattern 14 (#20): Stability patterns from multi_scan pipeline
+        stab_patterns = recent[-1].get("stability_patterns", [])
+        for sp in stab_patterns:
+            pat = sp.get("pattern") or sp.get("key", "")
+            score = sp.get("score") or sp.get("value", 0)
+            if pat and (isinstance(score, (int, float)) and abs(score) > 0.1):
+                law = f"Stability characteristic: {pat} (score={score:.3f})"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"stability_score={score}", "fingerprint": fp, "type": "stability"})
+
+        # Pattern 15 (#20): Multi-scan cross-layer findings
+        msf = recent[-1].get("multi_scan_findings", [])
+        for finding in msf:
+            if finding and len(finding) > 10:
+                law = f"Multi-scan finding: {finding}"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": "multi_scan", "fingerprint": fp, "type": "multi_scan"})
+
+        # Pattern 16 (#23): Focused scan findings (deep analysis of recommended lenses)
+        focused = recent[-1].get("focused_findings", [])
+        for ff in focused:
+            lens = ff.get("lens", "")
+            r = ff.get("result", {})
+            if isinstance(r, dict):
+                for k, v in r.items():
+                    if isinstance(v, (int, float)) and abs(v) > 0.05:
+                        law = f"Focused lens {lens}: {k}={v:.4f}"
+                        fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                        if fp not in self.known_fingerprints:
+                            self.known_fingerprints.add(fp)
+                            new_laws.append({"text": law, "evidence": f"focused:{lens}", "fingerprint": fp, "type": "focused"})
+
+        # Pattern 17 (#24): fast_phi vs engine phi divergence (indicates interesting dynamics)
+        fast_phi = recent[-1].get("fast_phi")
+        engine_phi = recent[-1].get("phi", 0)
+        if fast_phi is not None and engine_phi > 0:
+            divergence = abs(fast_phi - engine_phi) / max(engine_phi, 0.01)
+            if divergence > 0.2:
+                law = f"Phi measurement divergence: fast_mi={fast_phi:.3f} vs engine={engine_phi:.3f} (div={divergence:.1%})"
+                fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                if fp not in self.known_fingerprints:
+                    self.known_fingerprints.add(fp)
+                    new_laws.append({"text": law, "evidence": f"divergence={divergence:.3f}", "fingerprint": fp, "type": "phi_divergence"})
+
         self.discovered.extend(new_laws)
         return new_laws
+
+    def discover_with_threshold(self, telemetry_history, consensus_threshold=3):
+        """#22 Discovery with dynamic consensus threshold.
+
+        Same as discover() but uses the provided threshold for consensus-based
+        patterns instead of the hardcoded value of 3.
+        Lower threshold = more permissive = more discoveries when dry.
+        """
+        # Run base discovery
+        laws = self.discover(telemetry_history)
+
+        # Additional: re-check findings with lower threshold
+        if not telemetry_history:
+            return laws
+
+        recent = telemetry_history[-10:]
+        last = recent[-1]
+        findings = last.get("findings", [])
+
+        # With lower threshold, promote findings that wouldn't pass at threshold=3
+        if consensus_threshold < 3 and findings:
+            for finding in findings:
+                finding_str = str(finding)
+                if len(finding_str) > 10:
+                    law = f"Low-threshold finding (t={consensus_threshold}): {finding_str[:80]}"
+                    fp = hashlib.md5(law[:50].encode()).hexdigest()[:8]
+                    if fp not in self.known_fingerprints:
+                        self.known_fingerprints.add(fp)
+                        laws.append({"text": law, "evidence": f"threshold={consensus_threshold}",
+                                    "fingerprint": fp, "type": "dynamic_threshold"})
+
+        return laws
 
 
 # ── Emergence Singularity Engine ──
@@ -692,10 +799,23 @@ class EmergenceSingularity:
         return configs[:self.n_engines]
 
     def run_generation(self):
-        """Run one generation: all engines compete, best survive + mutate."""
+        """Run one generation: all engines compete, best survive + mutate.
+
+        Uses Lens Discovery Explosion strategies:
+          #20: multi_scan() replaces single scan() for richer pattern extraction
+          #22: dynamic consensus threshold via scanner.dynamic_threshold
+          #23: focused_scan() every 5th generation for deep analysis
+          #24: fast_phi used inside multi_scan for faster Phi measurement
+        """
         self.gen += 1
         gen_results = []
         gen_start = time.time()
+
+        # #22: Sync dry_streak to scanner for dynamic threshold
+        self.scanner.set_dry_streak(self.dry_streak)
+
+        # #23: Every 5th generation, use focused_scan for deep analysis
+        use_focused = (self.gen % 5 == 0)
 
         for i, config in enumerate(self.configs):
             try:
@@ -704,8 +824,18 @@ class EmergenceSingularity:
                 for _ in range(self.steps_per_gen):
                     engine.process(torch.randn(config.cell_dim))
 
-                # Scan with NEXUS-6
-                scan = self.scanner.scan(engine)
+                # #20: Use multi_scan instead of single scan for richer extraction
+                # #23: Every 5th gen, also do focused_scan on best engine candidate
+                scan = self.scanner.multi_scan(engine)
+
+                # #23: Focused scan on first engine every 5th gen (deep analysis)
+                if use_focused and i == 0:
+                    focused = self.scanner.focused_scan(engine, top_n=5)
+                    # Merge focused findings into scan
+                    scan["focused_findings"] = focused.get("focused_findings", [])
+                    scan["focused_lenses"] = focused.get("focused_lenses", [])
+                    scan["scan_type"] = "multi+focused"
+
                 scan["config"] = config.to_dict()
                 scan["engine_id"] = i
                 scan["gen"] = self.gen
@@ -728,8 +858,12 @@ class EmergenceSingularity:
             self.best_phi = best["phi"]
             self.best_config = self.configs[best["engine_id"]]
 
-        # Discover laws from accumulated telemetry
-        new_laws = self.discoverer.discover(self.telemetry)
+        # #22: Use dynamic threshold for discovery when in dry streak
+        threshold = self.scanner.dynamic_threshold
+        if threshold < 3:
+            new_laws = self.discoverer.discover_with_threshold(self.telemetry, threshold)
+        else:
+            new_laws = self.discoverer.discover(self.telemetry)
 
         # Quality gate: verify discovered laws via nexus6.verify()
         if new_laws and best.get("engine_id") is not None:
@@ -771,6 +905,9 @@ class EmergenceSingularity:
             "anomalies": best.get("anomalies", 0),
             "time": gen_time,
             "laws_this_gen": [l["text"][:80] for l in new_laws],
+            "scan_type": best.get("scan_type", "standard"),
+            "consensus_threshold": threshold,
+            "fast_phi": best.get("fast_phi"),
         }
 
     def is_exhausted(self):
@@ -783,6 +920,7 @@ class EmergenceSingularity:
         print(f"  Engines: {self.n_engines} | Cells: ≤{self.max_cells} | Steps/gen: {self.steps_per_gen}")
         print(f"  NEXUS-6: {'✅ ' + str(len(nexus6.scan_all.__doc__ or '')) + ' lenses' if HAS_NEXUS6 else '❌ fallback mode'}")
         print(f"  Exhaustion patience: {self.exhaustion_patience} dry generations")
+        print(f"  Strategies: #20 multi-scan | #22 dynamic threshold | #23 focused(5th gen) | #24 fast_phi")
         print(f"{'='*70}\n")
         sys.stdout.flush()
 
@@ -799,10 +937,18 @@ class EmergenceSingularity:
         law_indicator = f"🔬 +{r['new_laws']}" if r['new_laws'] > 0 else "  —"
         dry = f"💀×{r['dry_streak']}" if r['dry_streak'] > 0 else ""
         lenses = f"🔭{r['n_lenses']}" if r['n_lenses'] > 0 else ""
+        # Show scan type and threshold when non-default
+        scan_tag = ""
+        scan_type = r.get("scan_type", "standard")
+        threshold = r.get("consensus_threshold", 3)
+        if scan_type != "standard" and scan_type != "multi":
+            scan_tag = f" [{scan_type}]"
+        if threshold < 3:
+            scan_tag += f" t={threshold}"
 
         print(f"  Gen {r['gen']:4d} │ Φ {r['best_phi']:7.2f} (avg {r['mean_phi']:5.2f}) │ "
               f"cells {r['best_cells']:3d} │ {law_indicator} │ total {r['total_laws']:3d} │ "
-              f"{dry} {lenses} │ {r['time']:.1f}s")
+              f"{dry} {lenses}{scan_tag} │ {r['time']:.1f}s")
 
         if r['new_laws'] > 0:
             for law_text in r['laws_this_gen']:

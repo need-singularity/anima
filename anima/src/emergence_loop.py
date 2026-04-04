@@ -323,6 +323,9 @@ def detect_patterns(scan_result: dict, prev_scan: dict, phi: float, prev_phi: fl
 
     # 7. NEXUS-6 렌즈별 이상 (scan_result가 dict of dicts일 때)
     for lens_name, lens_data in scan_result.items():
+        if lens_name in ('consensus', 'direct_consensus', 'recommended_lenses',
+                         'topology_insights', 'stability_info'):
+            continue
         if not isinstance(lens_data, dict):
             continue
         anomaly = lens_data.get('anomaly', 0)
@@ -333,11 +336,57 @@ def detect_patterns(scan_result: dict, prev_scan: dict, phi: float, prev_phi: fl
                 'text': f'NEXUS-6 {lens_name}: {anomaly} anomalies',
             })
 
+    # 8. Direct consensus patterns (from scan_consensus, finer than analyze)
+    direct_consensus = scan_result.get('direct_consensus', [])
+    if direct_consensus:
+        strong = [c for c in direct_consensus if c.get('lenses', 0) >= 3]
+        if strong:
+            best = max(strong, key=lambda c: c.get('score', 0))
+            patterns.append({
+                'type': 'direct_consensus',
+                'count': len(strong),
+                'best_pattern': best.get('pattern', '?'),
+                'best_score': best.get('score', 0),
+                'text': f'Direct consensus: {len(strong)} patterns, best={best.get("pattern", "?")} '
+                        f'(score={best.get("score", 0):.3f})',
+            })
+
+    # 9. Topology insights (from topology_scan)
+    topo_insights = scan_result.get('topology_insights', {})
+    if topo_insights:
+        suggested = topo_insights.get('suggested_topology', '')
+        score = topo_insights.get('current_score', 0)
+        if suggested and score > 0:
+            patterns.append({
+                'type': 'topology_suggestion',
+                'suggested': suggested,
+                'score': score,
+                'text': f'Topology scan suggests {suggested} (score={score:.3f})',
+            })
+
+    # 10. Stability analysis (from stability_scan — early warning)
+    stab_info = scan_result.get('stability_info', {})
+    if stab_info:
+        risk = stab_info.get('instability_risk', 0)
+        is_stable = stab_info.get('is_stable', True)
+        if risk > 0.5 or not is_stable:
+            patterns.append({
+                'type': 'instability_warning',
+                'risk': risk,
+                'is_stable': is_stable,
+                'lyapunov': stab_info.get('lyapunov', 0),
+                'text': f'Instability detected: risk={risk:.3f}, stable={is_stable}',
+            })
+
     return patterns
 
 
-def run_generation(engine, steps: int, gen: int, topo: str) -> dict:
-    """한 세대 실행. Returns metrics dict."""
+def run_generation(engine, steps: int, gen: int, topo: str, scanner: 'N6Scanner' = None) -> dict:
+    """한 세대 실행. Returns metrics dict.
+
+    Args:
+        scanner: N6Scanner instance for full NEXUS-6 integration. If None, uses legacy fallback.
+    """
     # 토폴로지 설정
     if hasattr(engine, 'topology'):
         engine.topology = topo
@@ -381,7 +430,11 @@ def run_generation(engine, steps: int, gen: int, topo: str) -> dict:
     if states is None:
         # Fallback: use phi history as signal
         states = np.array(phis, dtype=np.float64) if phis else np.random.randn(64)
-    scan = nexus6_scan(states)
+    final_phi = phis[-1] if phis else 0
+    if scanner is not None:
+        scan = scanner.scan(states, phi=final_phi)
+    else:
+        scan = nexus6_scan(states)
 
     mean_phi = float(np.mean(phis)) if phis else 0
     phi_trend = 0.0
@@ -421,6 +474,9 @@ def main():
     # ── Engine init ──
     engine = ConsciousnessEngine(max_cells=args.cells)
 
+    # ── NEXUS-6 Scanner (full integration: scan_all + scan_consensus + verify + recommend + topology + stability) ──
+    scanner = N6Scanner()
+
     # ── Peak growth engine ──
     peak_engine = PeakGrowthEngine() if HAS_PEAK else None
 
@@ -442,12 +498,28 @@ def main():
         topo = TOPOLOGIES[topo_idx % len(TOPOLOGIES)]
 
         # ── 세대 실행 ──
-        metrics = run_generation(engine, args.steps, gen, topo)
+        metrics = run_generation(engine, args.steps, gen, topo, scanner=scanner)
         phi = metrics['final_phi']
         scan = metrics['scan']
 
         # ── 패턴 감지 ──
         patterns = detect_patterns(scan, prev_scan, phi, prev_phi)
+
+        # ── Verify patterns via nexus6.verify() quality gate ──
+        if patterns:
+            try:
+                states = None
+                if hasattr(engine, 'get_cell_states'):
+                    s = engine.get_cell_states()
+                    if isinstance(s, torch.Tensor):
+                        states = s.detach().cpu().float().numpy()
+                    elif isinstance(s, np.ndarray):
+                        states = s.astype(np.float64)
+                if states is not None:
+                    patterns = scanner.verify_laws(states, patterns)
+            except Exception:
+                pass  # verification is optional
+
         new_laws = 0
 
         for p in patterns:

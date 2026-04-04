@@ -34,7 +34,14 @@ if _THIS_DIR not in sys.path:
 ENGINE_PHI_REFERENCE = 0.168  # DD168
 
 # DD171 Laws 1043-1047: 교차공명 발견 자동 적용
-N6_ENTROPY_RESET_PERIOD = 6   # Law 1044: 의식-엔트로피 자연 주기
+try:
+    import nexus6 as _nexus6_mod
+    _HAS_NEXUS6 = True
+except ImportError:
+    _nexus6_mod = None
+    _HAS_NEXUS6 = False
+
+N6_ENTROPY_RESET_PERIOD = _nexus6_mod.N if _HAS_NEXUS6 else 6   # Law 1044: 의식-엔트로피 자연 주기
 N6_ENTROPY_NOISE_SCALE = 0.05
 
 # NEXUS-6 gate 자동 연결

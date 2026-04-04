@@ -1496,7 +1496,7 @@ def _collect_extended_metrics(engine, step_idx, prev_phi=None, prev_prev_phi=Non
 
         # Faction entropy: Shannon entropy of faction sizes
         try:
-            n_factions = getattr(engine, 'n_factions', 12)
+            n_factions = getattr(engine, 'n_factions', nexus6.SIGMA if HAS_NEXUS6 else 12)
             if hasattr(engine, '_faction_ids'):
                 fids = engine._faction_ids
                 if hasattr(fids, 'detach'):
@@ -1853,7 +1853,7 @@ def _mutate_factions(engine, gen):
     if gen % 3 != 0:
         return
     try:
-        old_n = getattr(engine, 'n_factions', 12)
+        old_n = getattr(engine, 'n_factions', nexus6.SIGMA if HAS_NEXUS6 else 12)
         idx = (gen // 3) % len(_FACTION_COUNTS)
         new_n = _FACTION_COUNTS[idx]
         if new_n != old_n:
@@ -4993,7 +4993,7 @@ def _rust_discover(cells, steps, topology, engine=None):
         result = _rust_law_discovery.scan_all_patterns(
             cell_states_sequence=cell_states_seq,
             n_cells=n_cells,
-            n_factions=12,
+            n_factions=nexus6.SIGMA if HAS_NEXUS6 else 12,
             coupling_weights=coupling,
             n_bins=16,
             sigma_threshold=2.0,

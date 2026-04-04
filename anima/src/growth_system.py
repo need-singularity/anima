@@ -397,7 +397,7 @@ def demo():
     print()
 
     engine = ConsciousnessEngine(
-        cell_dim=64, hidden_dim=128, max_cells=128, n_factions=12
+        cell_dim=64, hidden_dim=128, max_cells=128, n_factions=nexus6.SIGMA if nexus6 else 12
     )
     gs = GrowthSystem(engine, enable_accel=True, enable_auto_scale=True)
 
