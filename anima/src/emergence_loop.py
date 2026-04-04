@@ -154,6 +154,27 @@ def detect_patterns(scan_result: dict, prev_scan: dict, phi: float, prev_phi: fl
                 'text': f'NEXUS-6 consensus: {len(confirmed)} lenses agree',
             })
 
+    # 6. Φ 절대값 임계점 돌파 (n6 상수)
+    for threshold, name in [(6.0, 'n=6'), (12.0, 'sigma(6)'), (24.0, 'J2')]:
+        if prev_phi < threshold <= phi:
+            patterns.append({
+                'type': 'phi_threshold',
+                'threshold': threshold,
+                'text': f'Phi crossed {name} threshold: {prev_phi:.4f} → {phi:.4f}',
+            })
+
+    # 7. NEXUS-6 렌즈별 이상 (scan_result가 dict of dicts일 때)
+    for lens_name, lens_data in scan_result.items():
+        if not isinstance(lens_data, dict):
+            continue
+        anomaly = lens_data.get('anomaly', 0)
+        if anomaly > 0:
+            patterns.append({
+                'type': f'nexus6_{lens_name}_anomaly',
+                'anomaly': anomaly,
+                'text': f'NEXUS-6 {lens_name}: {anomaly} anomalies',
+            })
+
     return patterns
 
 
@@ -169,7 +190,9 @@ def run_generation(engine, steps: int, gen: int, topo: str) -> dict:
     for s in range(steps):
         result = engine.step()
         phi = float(result.get('phi_iit', result.get('phi', 0)))
-        tension = float(result.get('avg_tension', result.get('tension', 0)))
+        # tensions is a list of per-cell values
+        t_list = result.get('tensions', [])
+        tension = float(np.mean(t_list)) if t_list else 0.0
         phis.append(phi)
         tensions.append(tension)
 
