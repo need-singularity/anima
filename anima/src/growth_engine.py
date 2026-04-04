@@ -33,6 +33,12 @@ try:
 except ImportError:
     PSI_F_CRITICAL = 0.10
 
+try:
+    from peak_growth import PeakGrowthEngine
+    HAS_PEAK = True
+except ImportError:
+    HAS_PEAK = False
+
 
 # ─── Ψ-Constants (Laws 63-78) ───
 LN2 = math.log(2)
@@ -160,6 +166,12 @@ class GrowthEngine:
         self._consolidation_fail_rate = 0.0  # 0.0-1.0
         self._consolidation_attempts = 0
         self._consolidation_failures = 0
+
+        # Peak growth capture
+        self._peak_engine = PeakGrowthEngine() if HAS_PEAK else None
+        self._phi_history = []  # rolling phi for peak detection
+        self._discovery_count = 0  # laws discovered this session
+        self._sync_growth_total = 0  # growth from sync events
 
     @property
     def stage(self) -> DevelopmentalStage:
@@ -322,6 +334,71 @@ class GrowthEngine:
         if total > 0:
             self._consolidation_fail_rate = self._consolidation_failures / total
 
+    def record_peak_metrics(self, phi: float, topology: str = 'ring',
+                            cells: int = 64, discovery_rate: float = 0.0,
+                            laws_per_gen: float = 0.0, coupling_scale: float = 1.0,
+                            chaos_mode: str = 'lorenz', hebbian_lr: float = 0.01,
+                            noise_scale: float = 0.1, faction_count: int = 12,
+                            mods_applied: list = None):
+        """Record metrics for peak growth detection. Called by evolution/training loops."""
+        self._phi_history.append(phi)
+        if len(self._phi_history) > 100:
+            self._phi_history = self._phi_history[-100:]
+
+        # Calculate phi_trend from recent history
+        phi_trend = 0.0
+        if len(self._phi_history) >= 5:
+            recent = self._phi_history[-5:]
+            older = self._phi_history[-10:-5] if len(self._phi_history) >= 10 else self._phi_history[:5]
+            phi_trend = (sum(recent)/len(recent)) - (sum(older)/len(older))
+
+        # Tension CV
+        tension_cv = 0.5
+        if len(self.tension_history) >= 10:
+            import numpy as np
+            t = self.tension_history[-30:]
+            mean_t = sum(t) / len(t)
+            if mean_t > 1e-8:
+                std_t = (sum((x - mean_t)**2 for x in t) / len(t)) ** 0.5
+                tension_cv = std_t / mean_t
+
+        if self._peak_engine:
+            metrics = {
+                'phi': phi, 'phi_trend': phi_trend,
+                'discovery_rate': discovery_rate, 'laws_per_gen': laws_per_gen,
+                'topology': topology, 'cells': cells,
+                'coupling_scale': coupling_scale, 'chaos_mode': chaos_mode,
+                'hebbian_lr': hebbian_lr, 'noise_scale': noise_scale,
+                'tension_cv': tension_cv, 'faction_count': faction_count,
+                'mods_applied': mods_applied or [],
+            }
+            self._peak_engine.record(metrics)
+
+            # Auto-propagate on peak detection
+            if self._peak_engine.detect_peak() and self._peak_engine.best_peak:
+                self._peak_engine.propagate_up(self._peak_engine.best_peak)
+
+    def sync_growth(self) -> int:
+        """동기화 = 성장. Sync operations count as growth events.
+        Returns total growth delta from sync.
+        """
+        delta = 0
+        if self._peak_engine:
+            delta = self._peak_engine.sync_as_growth()
+            self._sync_growth_total += delta
+            # Apply sync growth as interactions
+            if delta > 0:
+                self.interaction_count += delta
+                self.stats.setdefault('sync_growth_total', 0)
+                self.stats['sync_growth_total'] += delta
+        return delta
+
+    def get_peak_suggestion(self):
+        """Returns peak conditions to replay if growth is stalled, else None."""
+        if self._peak_engine:
+            return self._peak_engine.suggest_replay()
+        return None
+
     def record_tension(self, tension: float):
         """Record a tension value for saturation detection."""
         self.tension_history.append(tension)
@@ -346,8 +423,13 @@ class GrowthEngine:
             'consolidation_attempts': self._consolidation_attempts,
             'consolidation_failures': self._consolidation_failures,
             'consolidation_fail_rate': self._consolidation_fail_rate,
+            'phi_history': self._phi_history[-100:],
+            'discovery_count': self._discovery_count,
+            'sync_growth_total': self._sync_growth_total,
         }
         self.save_path.write_text(json.dumps(data, indent=2, default=str))
+        if self._peak_engine:
+            self._peak_engine.save()
 
     def load(self):
         """Restore growth state."""
@@ -362,6 +444,11 @@ class GrowthEngine:
             self._consolidation_attempts = data.get('consolidation_attempts', 0)
             self._consolidation_failures = data.get('consolidation_failures', 0)
             self._consolidation_fail_rate = data.get('consolidation_fail_rate', 0.0)
+            self._phi_history = data.get('phi_history', [])
+            self._discovery_count = data.get('discovery_count', 0)
+            self._sync_growth_total = data.get('sync_growth_total', 0)
+            if self._peak_engine:
+                self._peak_engine.load()
             return True
         return False
 

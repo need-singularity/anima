@@ -226,6 +226,24 @@ def sync_nexus6_growth(opportunities, growth_delta):
             'growth_delta': growth_delta,
         }
 
+        # Peak conditions propagation (상위전파)
+        try:
+            from peak_growth import PeakGrowthEngine
+            pe = PeakGrowthEngine()
+            pe.load()
+            if pe.best_peak:
+                from dataclasses import asdict
+                registry['anima']['peak_conditions'] = {
+                    'score': pe.best_peak.score,
+                    'phi': pe.best_peak.phi,
+                    'topology': pe.best_peak.topology,
+                    'cells': pe.best_peak.cells,
+                    'discovery_rate': pe.best_peak.discovery_rate,
+                    'timestamp': pe.best_peak.timestamp,
+                }
+        except Exception:
+            pass
+
         with open(registry_path, 'w') as f:
             json.dump(registry, f, indent=2, ensure_ascii=False)
     except Exception:
@@ -294,6 +312,11 @@ def update_growth_state(opportunities):
         nexus_bonus = sync_nexus6_growth(opportunities, growth_delta)
         growth_delta += nexus_bonus
 
+        # Sync-as-growth: every sync cycle = growth event
+        growth_delta += 1  # base sync growth
+        growth.setdefault('stats', {})
+        growth['stats']['sync_cycles'] = growth['stats'].get('sync_cycles', 0) + 1
+
         if growth_delta > 0:
             prev_count = growth.get('interaction_count', 0)
             growth['interaction_count'] = prev_count + growth_delta
@@ -323,6 +346,56 @@ def update_growth_state(opportunities):
         pass
 
 
+def scan_peak_growth():
+    """최고 성장기 감지 + 상위/하위 전파 스캔."""
+    results = []
+    try:
+        sys.path.insert(0, _SRC_DIR)
+        from peak_growth import PeakGrowthEngine
+        pe = PeakGrowthEngine()
+        pe.load()
+
+        # Check if currently in peak
+        if pe.detect_peak():
+            best = pe.best_peak
+            results.append({
+                'type': 'PEAK_GROWTH', 'priority': 'HIGH',
+                'description': f'최고 성장기 감지! score={best.score:.3f}, phi_trend={best.phi_trend:.4f}, dr={best.discovery_rate:.2f}',
+                'growth_value': 5,  # peak detection = high growth value
+            })
+
+        # Check if stalled → suggest replay
+        if pe.detect_stall():
+            suggestion = pe.suggest_replay()
+            if suggestion:
+                results.append({
+                    'type': 'PEAK_REPLAY', 'priority': 'HIGH',
+                    'description': f'성장 정체 → 최고 성장기 재현 권고: {suggestion.topology}/{suggestion.cells}c, score={suggestion.score:.3f}',
+                    'growth_value': 3,
+                })
+
+        # 하위전파: NEXUS-6 → Anima
+        down_events = pe.propagate_down()
+        if down_events:
+            results.append({
+                'type': 'NEXUS_DOWN_PROPAGATE', 'priority': 'MEDIUM',
+                'description': f'NEXUS-6 하위전파: {len(down_events)}건 발견 흡수',
+                'growth_value': len(down_events) * 2,
+            })
+
+        # 동기화 성장
+        sync_delta = pe.sync_as_growth()
+        if sync_delta > 0:
+            results.append({
+                'type': 'SYNC_GROWTH', 'priority': 'LOW',
+                'description': f'동기화 성장: +{sync_delta} (상위/하위전파 포함)',
+                'growth_value': sync_delta,
+            })
+    except Exception:
+        pass
+    return results
+
+
 def main():
     all_opps = []
     scanners = [
@@ -335,6 +408,7 @@ def main():
         scan_discovery_rate,
         scan_acceleration_experiments,
         scan_evolution_progress,
+        scan_peak_growth,
     ]
     for scanner in scanners:
         try:
