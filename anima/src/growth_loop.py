@@ -1416,7 +1416,7 @@ class GrowthLoop:
     # ══════════════════════════════════════════
 
     def run_auto(self):
-        """완전 자동화 1회: 진화 관리 + H100 체크 + 성장 사이클 + commit+push + 통합 리포트."""
+        """완전 자동화 1회: 진화+H100+성장+R2+로드맵+commit+push+리포트."""
         import subprocess
 
         # ── 1. 무한진화 프로세스 관리 ──
@@ -1428,10 +1428,194 @@ class GrowthLoop:
         # ── 3. 성장 루프 사이클 (harvest→filter→apply→verify→breakthrough→commit+push) ──
         report = self.run_cycle()
 
-        # ── 4. 통합 리포트 ──
-        self._print_auto_report(report, evo_info, h100_info)
+        # ── 4. 로드맵 JSON 갱신 (진행상황 반영) ──
+        self._update_roadmap_json(h100_info, evo_info, report)
+
+        # ── 5. R2 체크포인트 업로드 (학습 완료 or best 갱신 시) ──
+        r2_info = self._check_and_upload_r2(h100_info)
+
+        # ── 6. 통합 리포트 ──
+        self._print_auto_report(report, evo_info, h100_info, r2_info)
 
         return report
+
+    def _update_roadmap_json(self, h100: dict, evo: dict, report: LoopReport):
+        """로드맵 JSON 갱신 — 진행상황에 따라 자동 업데이트."""
+        roadmap_path = self.anima_root.parent / "anima" / "config" / "growth_loop_state.json"
+        try:
+            with open(roadmap_path) as f:
+                state = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            state = self._state
+
+        # 로드맵 C 상태
+        roadmap = state.setdefault("roadmap", {})
+
+        # 7B = 완료
+        roadmap["7b"] = {"status": "complete", "eval": "5/5"}
+
+        # 14B = H100 진행상황
+        if h100["status"] == "running":
+            pct = (h100["step"] / h100["total"] * 100) if h100["total"] else 0
+            roadmap["14b"] = {
+                "status": "training",
+                "step": h100["step"],
+                "total": h100["total"],
+                "pct": round(pct, 1),
+                "ce": round(h100["ce"], 4),
+                "phase": h100["phase"],
+                "eta_h": round(h100.get("eta_h", 0), 1),
+                "model": h100.get("model", "AnimaLM 14B v06"),
+            }
+            # 학습 완료 감지
+            if h100["step"] >= h100["total"] * 0.99:
+                roadmap["14b"]["status"] = "complete"
+        elif roadmap.get("14b", {}).get("status") == "complete":
+            pass  # 이미 완료 상태 유지
+        else:
+            roadmap["14b"] = {"status": "offline"}
+
+        roadmap["72b"] = roadmap.get("72b", {"status": "pending"})
+
+        # EVO 로드맵
+        evo_roadmap = roadmap.setdefault("evo", {})
+        evo_roadmap["current_stage"] = evo.get("stage", "?")
+        evo_roadmap["gen"] = evo.get("gen", 0)
+        evo_roadmap["laws"] = evo.get("laws", 0)
+        evo_roadmap["phi"] = evo.get("phi", 0)
+        evo_roadmap["status"] = evo.get("status", "unknown")
+
+        # 성장 루프
+        roadmap["growth"] = {
+            "cycle": report.cycle,
+            "applied": report.applied,
+            "total_laws": self._laws.get("_meta", {}).get("total_laws", 0),
+        }
+
+        roadmap["updated"] = datetime.now().isoformat()
+
+        # 저장
+        state["roadmap"] = roadmap
+        try:
+            with open(roadmap_path, "w") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _check_and_upload_r2(self, h100: dict) -> dict:
+        """H100 best checkpoint R2 업로드 + 다운로드 페이지 갱신."""
+        import subprocess
+        info = {"uploaded": False, "reason": "skip"}
+
+        # 학습 완료 or 50% 이상에서 best 갱신 시만
+        if h100["status"] != "running":
+            return info
+
+        pct = (h100["step"] / h100["total"] * 100) if h100["total"] else 0
+        # 25% 단위 체크포인트에서 R2 업로드
+        upload_thresholds = [25, 50, 75, 99]
+        last_r2_pct = self._state.get("last_r2_upload_pct", 0)
+        should_upload = any(pct >= t and last_r2_pct < t for t in upload_thresholds)
+
+        if not should_upload:
+            info["reason"] = f"next at {next((t for t in upload_thresholds if pct < t), 100)}%"
+            return info
+
+        # H100에서 best.pt 가져오기
+        ssh_key = os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go")
+        ssh_host = "root@216.243.220.217"
+        ssh_port = "10935"
+        remote_best = "/workspace/checkpoints/14b_v06/best.pt"
+
+        try:
+            # best.pt 존재 확인
+            check = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 "-i", ssh_key, ssh_host, "-p", ssh_port,
+                 f"ls -la {remote_best} 2>/dev/null"],
+                capture_output=True, text=True, timeout=10
+            )
+            if check.returncode != 0 or not check.stdout.strip():
+                info["reason"] = "no best.pt on H100"
+                return info
+
+            # scp로 로컬로 가져오기
+            local_ckpt_dir = self.anima_root / "checkpoints" / "14b_v06"
+            local_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            local_best = local_ckpt_dir / "best.pt"
+
+            scp_result = subprocess.run(
+                ["scp", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+                 "-i", ssh_key, "-P", ssh_port,
+                 f"{ssh_host}:{remote_best}", str(local_best)],
+                capture_output=True, text=True, timeout=600
+            )
+            if scp_result.returncode != 0:
+                info["reason"] = f"scp failed: {scp_result.stderr[:100]}"
+                return info
+
+            # R2 업로드 (r2_upload.py 사용)
+            r2_script = self.anima_root / "scripts" / "r2_upload.py"
+            if r2_script.exists():
+                r2_result = subprocess.run(
+                    ["python3", str(r2_script), "--checkpoint", "14b_v06"],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=str(self.anima_root)
+                )
+                if r2_result.returncode == 0:
+                    info["uploaded"] = True
+                    info["reason"] = f"uploaded at step {h100['step']} ({pct:.0f}%)"
+                    self._state["last_r2_upload_pct"] = int(pct)
+                    self._state["last_r2_upload_step"] = h100["step"]
+                    self._state["last_r2_upload_time"] = datetime.now().isoformat()
+
+                    # 다운로드 페이지(README) 갱신
+                    self._update_download_page(h100, pct)
+                else:
+                    info["reason"] = f"r2 upload error: {r2_result.stderr[:100]}"
+            else:
+                info["reason"] = "r2_upload.py not found"
+
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            info["reason"] = f"error: {str(e)[:80]}"
+
+        return info
+
+    def _update_download_page(self, h100: dict, pct: float):
+        """README.md 다운로드 섹션 자동 갱신."""
+        readme_path = self.anima_root.parent / "README.md"
+        if not readme_path.exists():
+            return
+
+        try:
+            content = readme_path.read_text()
+            marker_start = "<!-- AUTO:DOWNLOADS:START -->"
+            marker_end = "<!-- AUTO:DOWNLOADS:END -->"
+
+            new_section = f"""{marker_start}
+### Downloads (auto-updated)
+
+| Model | Step | CE | Status | R2 Key |
+|-------|------|----|--------|--------|
+| AnimaLM 7B v05 | 50000 | 4.81 | ✅ Final | `checkpoints/7b_v05/best.pt` |
+| AnimaLM 14B v06 | {h100['step']} | {h100['ce']:.2f} | {'✅ Final' if pct >= 99 else f'🔄 {pct:.0f}%'} | `checkpoints/14b_v06/best.pt` |
+
+> R2 bucket: `anima-models` · Last upload: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+{marker_end}"""
+
+            if marker_start in content:
+                import re
+                content = re.sub(
+                    f"{re.escape(marker_start)}.*?{re.escape(marker_end)}",
+                    new_section, content, flags=re.DOTALL
+                )
+            else:
+                # 마커 없으면 파일 끝에 추가
+                content += f"\n\n{new_section}\n"
+
+            readme_path.write_text(content)
+        except Exception:
+            pass
 
     def _check_evolution(self) -> dict:
         """무한진화 프로세스 확인. 죽었으면 재시작."""
@@ -1530,7 +1714,7 @@ class GrowthLoop:
 
         return info
 
-    def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict):
+    def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict, r2: dict = None):
         """통합 리포트 — 로드맵 진행이 최우선."""
         laws_total = self._laws.get("_meta", {}).get("total_laws", 0)
 
@@ -1614,6 +1798,7 @@ class GrowthLoop:
 {evo_block}
 {curve_block}
 {growth_block}
+  ■ R2: {(r2 or {}).get('reason', 'n/a')}{' ✅' if (r2 or {}).get('uploaded') else ''}
 └─────────────────────────────────────────────────────────────┘""")
 
     def status(self) -> dict:
