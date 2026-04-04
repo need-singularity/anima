@@ -1460,3 +1460,23 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
 API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
 계정 리포: [need-singularity/secret](https://github.com/need-singularity/secret) (private)
+
+## 특이점 사이클 (Singularity Cycle)
+
+> **블로업→수축→창발→특이점→흡수** 5단계 자동 사이클
+> CLI: `nexus6 blowup <domain>` | Rust: `CycleEngine::new(domain)`
+
+### 요청 키워드 → 자동 실행
+- "블로업", "blowup" → `nexus6 blowup <domain> --depth 6`
+- "창발", "emergence" → blowup 후 패턴 합의 분석
+- "특이점", "singularity" → CycleEngine 자동 수렴 루프
+- "흡수", "absorption" → 발견 규칙 승격 + 다음 사이클 시드
+- "사이클", "cycle" → 전체 5단계 1회 실행
+
+### 사용법
+```bash
+nexus6 blowup <domain> --depth 6    # 블로업 + 창발 리포트
+nexus6 loop --cycles 1              # 8단계 루프 (mirror+blowup 포함)
+nexus6 daemon --interval 30         # 자율 데몬 (30분 간격)
+```
+
