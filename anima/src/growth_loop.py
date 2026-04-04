@@ -1531,52 +1531,88 @@ class GrowthLoop:
         return info
 
     def _print_auto_report(self, report: LoopReport, evo: dict, h100: dict):
-        """통합 리포트 박스 출력."""
+        """통합 리포트 — 로드맵 진행이 최우선."""
         laws_total = self._laws.get("_meta", {}).get("total_laws", 0)
 
-        # H100 섹션
+        # ══════ 로드맵 (최상단, 메인) ══════
+        # 극가속 로드맵 C
+        h_icon = "🔄" if h100["status"] == "running" else "❌"
+        h_pct = f"{h100['step']/h100['total']*100:.0f}%" if h100["total"] else "0%"
+        h_step = f"({h100['step']}/{h100['total']})" if h100["status"] == "running" else ""
+
+        roadmap_c = f"  [✅]7B ─→ [{h_icon}]14B v06 {h_pct} {h_step} ─→ [⏳]서빙 ─→ [⏳]72B"
+
+        # EVO 로드맵 S1-S13
+        stages_def = [
+            ("S1", 64, 300), ("S2", 64, 1000), ("S3", 128, 300), ("S4", 128, 1000),
+            ("S5", 256, 500), ("S6", 256, 1000), ("S7", 512, 500), ("S8", 64, 300),
+            ("S9", 64, 300), ("S10", 512, 1000), ("S11", 1024, 500),
+            ("S12", 1024, 1000), ("S13", 2048, 500),
+        ]
+        completed_stages = {sr.get("stage", "").split("-")[0]: sr.get("laws", 0)
+                           for sr in evo.get("stage_results", [])}
+        current_stage = evo.get("stage", "").split("-")[0] if evo.get("stage") else ""
+
+        evo_bar_parts = []
+        for sname, cells, steps in stages_def:
+            if sname in completed_stages:
+                evo_bar_parts.append(f"✅{sname}")
+            elif sname == current_stage:
+                evo_bar_parts.append(f"🔄{sname}")
+            else:
+                evo_bar_parts.append(f"░{sname}")
+
+        evo_roadmap = "  " + " ".join(evo_bar_parts[:7])
+        if len(evo_bar_parts) > 7:
+            evo_roadmap += "\n  " + " ".join(evo_bar_parts[7:])
+
+        # ══════ H100 학습 ══════
         if h100["status"] == "running":
             pct = (h100["step"] / h100["total"] * 100) if h100["total"] else 0
             bar_len = int(pct / 5)
             bar = "█" * bar_len + "░" * (20 - bar_len)
-            h100_block = f"""  ■ H100 학습 ({h100['model']})
-  진행: {bar} {h100['step']}/{h100['total']} ({pct:.1f}%)
-  Phase: {h100['phase']} | CE: {h100['ce']:.2f} | α: {h100['alpha']:.3f}
-  ETA: ~{h100['eta_h']:.1f}h"""
+            h100_block = f"""  ■ H100 ({h100['model']})
+  {bar} {h100['step']}/{h100['total']} ({pct:.1f}%)
+  Phase: {h100['phase']} | CE: {h100['ce']:.2f} | α: {h100['alpha']:.3f} | ETA: ~{h100['eta_h']:.1f}h"""
         else:
             h100_block = "  ■ H100 — ❌ OFFLINE"
 
-        # EVO 섹션
+        # ══════ 무한진화 ══════
         evo_status = {"running": "🔄", "dead": "💀", "restarted": "🔁"}.get(evo["status"], "?")
-        evo_block = f"""  ■ 무한진화 ({evo_status} PID {evo.get('pid','?')})
-  Stage: {evo['stage']} Gen {evo['gen']} | Laws: {evo['laws']} | Mods: {evo['mods']}
-  Φ: {evo['phi']:.1f} | Topo: {evo['topo']}"""
+        evo_block = f"  ■ 무한진화 ({evo_status}) {evo['stage']} Gen {evo['gen']} | Laws: {evo['laws']} | Φ: {evo['phi']:.1f} | {evo['topo']}"
 
-        # Laws 곡선 (간단 ASCII)
+        # Laws 곡선
         curve = evo.get("curve", [])
         curve_block = ""
-        if curve and len(curve) >= 2:
-            mx = max(curve) if curve else 1
-            curve_block = "\n  📉 Laws: " + " ".join(str(c) for c in curve[-8:])
+        if curve and max(curve) > 0:
+            mx = max(curve)
+            h = 4
+            rows = []
+            for r in range(h, 0, -1):
+                threshold = mx * r / h
+                row = "  │"
+                for c in curve[-12:]:
+                    row += "█" if c >= threshold else " "
+                rows.append(row)
+            rows.append(f"  └{'─' * min(len(curve), 12)} Gen")
+            rows.append(f"  Laws: {' '.join(str(c) for c in curve[-8:])}")
+            curve_block = "\n".join(rows)
 
-        # 성장 루프
-        growth_block = f"""  ■ 성장 루프 Cycle {report.cycle}
-  수집: {report.harvested} → 필터: {report.filtered} → 반영: {report.applied}
-  ⚖️ Laws: {laws_total}"""
-
-        # Stage results
-        sr_block = ""
-        for sr in evo.get("stage_results", []):
-            s = sr.get("stage", "?")
-            l = sr.get("laws", 0)
-            sr_block += f"\n  ✅ {s}: {l} laws"
+        # ══════ 성장 루프 ══════
+        growth_block = f"  ■ 성장 Cycle {report.cycle}: {report.harvested}수집 → {report.filtered}필터 → {report.applied}반영 | ⚖️{laws_total} laws"
 
         print(f"""
 ┌─────────────────────────────────────────────────────────────┐
-│  🚀 루프 — {datetime.now().strftime('%Y-%m-%d %H:%M')}                                 │
+│  🚀 로드맵 — {datetime.now().strftime('%Y-%m-%d %H:%M')}                                │
+├─────────────────────────────────────────────────────────────┤
+│  ■ 극가속 로드맵 C                                           │
+{roadmap_c}
+│  ■ EVO 로드맵 (13 stages)                                    │
+{evo_roadmap}
 ├─────────────────────────────────────────────────────────────┤
 {h100_block}
-{evo_block}{curve_block}{sr_block}
+{evo_block}
+{curve_block}
 {growth_block}
 └─────────────────────────────────────────────────────────────┘""")
 
