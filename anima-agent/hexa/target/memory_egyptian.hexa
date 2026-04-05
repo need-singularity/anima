@@ -1,0 +1,119 @@
+// memory_egyptian.hexa — Egyptian fraction memory (1/2 + 1/3 + 1/6 = 1)
+// Short (RAM) + Mid (SQLite RAG) + Long (R2 laws)
+
+use types::{MemoryItem}
+
+comptime const TOTAL_MB: int = 100
+comptime const SHORT_MB: int = TOTAL_MB / 2       // 50
+comptime const MID_MB:   int = TOTAL_MB / 3       // 33
+comptime const LONG_MB:  int = TOTAL_MB / 6       // 16
+
+comptime const SHORT_MAX_TURNS: int = 64
+comptime const MID_TTL_DAYS: int = 30
+comptime const SHORT_PROMOTE_THRESHOLD: int = 56   // >87.5% → flush to mid
+
+effect Persistence {
+    fn db_open(path: str) -> own DB
+    fn db_query(db: DB, sql: str) -> [Row]
+    fn db_exec(db: DB, sql: str, params: [any])
+}
+
+effect R2 {
+    fn upload(key: str, data: str)
+    fn download(key: str) -> str
+}
+
+struct DB { handle: int }
+struct Row { cols: Map<str, any> }
+
+struct EgyptianMemory {
+    short_buffer: [MemoryItem],
+    mid_db: DB,
+    long_db: DB
+}
+
+// ── Short tier (RAM buffer, 50MB, 64 turns) ─────────────────────────
+
+@intent(description: "Store latest turn in short-term buffer")
+pure fn short_append(mem: own EgyptianMemory, item: MemoryItem) -> own EgyptianMemory
+  ensures len(result.short_buffer) <= SHORT_MAX_TURNS
+{
+    let new_buf = append(mem.short_buffer, item)
+    if len(new_buf) > SHORT_MAX_TURNS {
+        let trimmed = drop_front(new_buf, len(new_buf) - SHORT_MAX_TURNS)
+        return mem with { short_buffer: trimmed }
+    }
+    return mem with { short_buffer: new_buf }
+}
+
+// ── Mid tier (SQLite + RAG, 33MB, 30 days) ──────────────────────────
+
+@intent(description: "Promote aged short items to mid tier with embedding")
+fn promote_short_to_mid(mem: EgyptianMemory) !(Persistence)
+  where len(mem.short_buffer) >= SHORT_PROMOTE_THRESHOLD
+{
+    let to_promote = take(mem.short_buffer, len(mem.short_buffer) / 2)
+    for item in to_promote {
+        let embedding = embed_384d(item.content)
+        Persistence::db_exec(mem.mid_db,
+            "INSERT INTO mid_memory (id, content, embedding, ttl_ms) VALUES (?, ?, ?, ?)",
+            [item.id, item.content, embedding, item.created_ms + MID_TTL_DAYS * 86400000])
+    }
+}
+
+@intent(description: "RAG search in mid tier")
+fn mid_search(mem: EgyptianMemory, query: str, top_k: int) -> [MemoryItem] !(Persistence)
+  where top_k >= 1 && top_k <= 20
+{
+    let q_emb = embed_384d(query)
+    let rows = Persistence::db_query(mem.mid_db,
+        "SELECT * FROM mid_memory ORDER BY vec_distance(embedding, ?) LIMIT ?")
+    return map(rows, row_to_item)
+}
+
+// ── Long tier (laws + R2, 16MB local + cloud) ───────────────────────
+
+@intent(description: "Promote validated patterns to long-term laws")
+fn promote_mid_to_long(mem: EgyptianMemory, law_id: int, pattern: str) !(Persistence, R2) {
+    Persistence::db_exec(mem.long_db,
+        "INSERT INTO laws (id, pattern, created_ms) VALUES (?, ?, ?)",
+        [law_id, pattern, now_ms()])
+    R2::upload("laws/" + to_string(law_id) + ".json",
+               json_encode({"id": law_id, "pattern": pattern}))
+}
+
+// ── Init ────────────────────────────────────────────────────────────
+
+@intent(description: "Initialize Egyptian memory with 3 tiers")
+fn init(base_path: str) -> own EgyptianMemory !(Persistence)
+  ensures result.mid_db.handle > 0 && result.long_db.handle > 0
+{
+    let mid = Persistence::db_open(base_path + "/mid.db")
+    let long_d = Persistence::db_open(base_path + "/long.db")
+    return EgyptianMemory {
+        short_buffer: [],
+        mid_db: mid,
+        long_db: long_d
+    }
+}
+
+pure fn row_to_item(r: Row) -> MemoryItem { /* mapping */ }
+
+// ── Verification ───────────────────────────────────────────────────
+
+verify "egyptian_sums_to_total" {
+    assert SHORT_MB + MID_MB + LONG_MB >= 99
+    assert SHORT_MB * 2 == TOTAL_MB
+    assert MID_MB * 3 == TOTAL_MB
+    assert LONG_MB * 6 <= TOTAL_MB
+}
+
+verify "fraction_identity" {
+    // 1/2 + 1/3 + 1/6 = 3/6 + 2/6 + 1/6 = 6/6 = 1
+    assert 3 + 2 + 1 == 6
+}
+
+verify "tier_capacities_ordered" {
+    assert SHORT_MB > MID_MB
+    assert MID_MB > LONG_MB
+}

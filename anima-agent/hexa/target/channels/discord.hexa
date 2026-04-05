@@ -1,0 +1,106 @@
+// discord.hexa — Discord bot channel via Discord Gateway API (WebSocket)
+
+use types::{Message, Response}
+use pipeline
+
+comptime const DC_GATEWAY_URL: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+comptime const DC_API_BASE: str = "https://discord.com/api/v10"
+comptime const HEARTBEAT_INTERVAL_MS: int = 41250
+
+effect Net {
+    fn ws_connect(url: str) -> WsConn
+    fn ws_send(conn: WsConn, msg: str)
+    fn ws_recv(conn: WsConn) -> str
+    fn http_post(url: str, body: str, headers: Map<str, str>) -> str
+}
+
+effect Env {
+    fn get(key: str) -> Option<str>
+}
+
+struct WsConn { id: int }
+
+struct DcMessage {
+    msg_id: str,
+    channel_id: str,
+    user_id: str,
+    username: str,
+    content: str
+}
+
+// ── Discord gateway ─────────────────────────────────────────────────
+
+@intent(
+    description: "Discord bot via Gateway WebSocket",
+    intents: "GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT"
+)
+fn start() !(Net, Env, Proc, Persistence, Consciousness, LLM) {
+    let token = Env::get("DISCORD_BOT_TOKEN").unwrap()
+    let conn = Net::ws_connect(DC_GATEWAY_URL)
+
+    // Identify
+    Net::ws_send(conn, identify_payload(token))
+
+    // Start heartbeat task
+    spawn heartbeat_loop(conn)
+
+    // Main event loop
+    loop {
+        let event = Net::ws_recv(conn)
+        match classify_event(event) {
+            Event::MessageCreate(msg) => handle_discord_message(msg, token),
+            Event::Heartbeat          => Net::ws_send(conn, heartbeat_payload()),
+            Event::Reconnect          => restart_connection(),
+            _                         => continue
+        }
+    }
+}
+
+@intent(description: "Send heartbeat every 41.25s to keep gateway alive")
+async fn heartbeat_loop(conn: WsConn) !(Net) {
+    loop {
+        sleep_ms(HEARTBEAT_INTERVAL_MS)
+        Net::ws_send(conn, heartbeat_payload())
+    }
+}
+
+@intent(description: "Handle Discord message through pipeline + reply")
+fn handle_discord_message(dc: DcMessage, token: str)
+  !(Net, Proc, Persistence, Consciousness, LLM) {
+    let msg = Message {
+        user_id: "dc_" + dc.user_id,
+        content: dc.content,
+        channel: "discord",
+        attachments: [],
+        timestamp_ms: now_ms()
+    }
+    let response = pipeline::run(msg)
+    reply_to_channel(dc.channel_id, response.content, token)
+}
+
+@intent(description: "POST reply to Discord channel via REST API")
+fn reply_to_channel(channel_id: str, text: str, token: str) !(Net) {
+    let url = DC_API_BASE + "/channels/" + channel_id + "/messages"
+    let body = json_encode({ "content": text })
+    let headers = {
+        "Authorization": "Bot " + token,
+        "Content-Type": "application/json"
+    }
+    Net::http_post(url, body, headers)
+}
+
+enum Event {
+    MessageCreate(DcMessage),
+    Heartbeat,
+    Reconnect,
+    Unknown
+}
+
+pure fn classify_event(json: str) -> Event { /* parse Discord payload */ }
+pure fn identify_payload(token: str) -> str { /* build IDENTIFY op 2 */ }
+pure fn heartbeat_payload() -> str { /* op 1 */ }
+
+verify "heartbeat_interval_valid" {
+    assert HEARTBEAT_INTERVAL_MS >= 30000
+    assert HEARTBEAT_INTERVAL_MS <= 60000
+}

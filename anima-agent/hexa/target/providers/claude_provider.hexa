@@ -1,0 +1,95 @@
+// claude_provider.hexa — Claude API provider via HTTPS
+
+use types::{Message, ProviderConfig}
+
+comptime const CLAUDE_API_URL: str = "https://api.anthropic.com/v1/messages"
+comptime const CLAUDE_API_VERSION: str = "2023-06-01"
+comptime const CLAUDE_MODEL: str = "claude-opus-4-6"
+comptime const MAX_TOKENS_DEFAULT: int = 4096
+
+effect Net {
+    fn http_post(url: str, body: str, headers: Map<str, str>) -> str
+}
+
+effect Env {
+    fn get(key: str) -> Option<str>
+}
+
+struct ClaudeResponse {
+    content: str,
+    input_tokens: int,
+    output_tokens: int,
+    stop_reason: str
+}
+
+// ── Provider impl ───────────────────────────────────────────────────
+
+@intent(
+    description: "Claude Opus 4.6 provider via Anthropic API",
+    model: CLAUDE_MODEL,
+    context_window: 1000000
+)
+pub fn generate(prompt: str, max_tokens: int) -> str !(Net, Env)
+  where max_tokens > 0 && max_tokens <= 200000
+{
+    let api_key = Env::get("ANTHROPIC_API_KEY").unwrap()
+    let body = json_encode({
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    let headers = {
+        "x-api-key": api_key,
+        "anthropic-version": CLAUDE_API_VERSION,
+        "content-type": "application/json"
+    }
+    let response = Net::http_post(CLAUDE_API_URL, body, headers)
+    let parsed = parse_claude_response(response)
+    return parsed.content
+}
+
+@intent(description: "Generate with tool use (Claude tool calling)")
+pub fn generate_with_tools(prompt: str, tools: [ToolSchema]) -> ClaudeResponse !(Net, Env) {
+    let api_key = Env::get("ANTHROPIC_API_KEY").unwrap()
+    let body = json_encode({
+        "model": CLAUDE_MODEL,
+        "max_tokens": MAX_TOKENS_DEFAULT,
+        "tools": tools,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    let headers = claude_headers(api_key)
+    let response = Net::http_post(CLAUDE_API_URL, body, headers)
+    return parse_claude_response(response)
+}
+
+pure fn claude_headers(api_key: str) -> Map<str, str> {
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": CLAUDE_API_VERSION,
+        "content-type": "application/json"
+    }
+}
+
+pure fn parse_claude_response(json: str) -> ClaudeResponse {
+    let data = json_decode(json)
+    return ClaudeResponse {
+        content: data.content[0].text,
+        input_tokens: data.usage.input_tokens,
+        output_tokens: data.usage.output_tokens,
+        stop_reason: data.stop_reason
+    }
+}
+
+struct ToolSchema {
+    name: str,
+    description: str,
+    input_schema: any
+}
+
+verify "claude_model_is_opus_46" {
+    assert CLAUDE_MODEL == "claude-opus-4-6"
+}
+
+verify "api_url_https" {
+    assert starts_with(CLAUDE_API_URL, "https://")
+}

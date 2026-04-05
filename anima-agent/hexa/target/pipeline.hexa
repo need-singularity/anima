@@ -1,0 +1,167 @@
+// pipeline.hexa — 6-phase request pipeline (target HEXA Mk.II+)
+// Each phase has budget, effects declared, and verify conditions
+
+use types::{Message, Response, PipelineContext, Vote}
+use nexus_bridge
+
+comptime const PHASE_TOKENIZE: int = 0
+comptime const PHASE_PARSE:    int = 1
+comptime const PHASE_CHECK:    int = 2
+comptime const PHASE_OPTIMIZE: int = 3
+comptime const PHASE_CODEGEN:  int = 4
+comptime const PHASE_EXECUTE:  int = 5
+
+comptime const TOTAL_BUDGET_MS: int = 1050
+comptime const BUDGET_WEIGHTS: [int; 6] = [1, 2, 3, 4, 5, 6]   // T(6) = 21
+
+// ── Phase budget allocator (pure) ───────────────────────────────────
+
+@intent(description: "Phase budget = weight/21 of total 1050ms")
+pure fn budget_ms(phase: int) -> int
+  where phase >= 0 && phase <= 5
+  ensures result > 0 && result <= TOTAL_BUDGET_MS
+{
+    let w = BUDGET_WEIGHTS[phase]
+    return (TOTAL_BUDGET_MS * w) / 21
+}
+
+pure fn phase_name(idx: int) -> str
+  where idx >= 0 && idx <= 5
+{
+    match idx {
+        0 => "tokenize",
+        1 => "parse",
+        2 => "check",
+        3 => "optimize",
+        4 => "codegen",
+        5 => "execute",
+        _ => "unknown"
+    }
+}
+
+// ── Phase implementations (effects declared) ────────────────────────
+
+@intent(description: "Split message into tokens (deterministic)")
+pure fn phase_1_tokenize(ctx: PipelineContext) -> PipelineContext
+  ensures len(result.tokens) >= 0
+{
+    let tokens = tokenize_utf8(ctx.msg.content)
+    return ctx with { tokens: tokens }
+}
+
+@intent(description: "Extract structured intent from tokens")
+pure fn phase_2_parse(ctx: PipelineContext) -> PipelineContext {
+    let intent = extract_intent(ctx.tokens)
+    return ctx with { intent_name: intent }
+}
+
+@intent(description: "Run NEXUS-6 scan + law gate verification")
+fn phase_3_check(ctx: PipelineContext) -> PipelineContext !(Proc)
+  ensures result.scan != None
+{
+    let embedding = embed_384d(ctx.msg.content)
+    let scan = nexus_bridge::scan("consciousness", embedding)
+    let violations = law_gate::check_all(ctx.msg, scan)
+    if len(violations) > 0 {
+        return ctx with {
+            rejected: true,
+            rejection_reason: "law violations: " + to_string(len(violations))
+        }
+    }
+    return ctx with { scan: Some(scan) }
+}
+
+@intent(description: "12-faction debate + provider selection")
+fn phase_4_optimize(ctx: PipelineContext) -> PipelineContext !(Consciousness) {
+    let votes = Consciousness::faction_vote(ctx.intent_name)
+    let yes = count_yes(votes)
+    if yes < 8 {
+        return ctx with {
+            rejected: true,
+            rejection_reason: "no consensus: " + to_string(yes) + "/12"
+        }
+    }
+    let scan = ctx.scan.unwrap()
+    let provider = select_provider_by_phi(scan.phi)
+    return ctx with {
+        vote_result: Some(votes),
+        provider_choice: provider
+    }
+}
+
+@intent(description: "Generate response via chosen provider")
+fn phase_5_codegen(ctx: PipelineContext) -> PipelineContext !(LLM) {
+    let draft = LLM::generate(ctx.provider_choice, ctx.msg.content)
+    return ctx with { draft: draft }
+}
+
+@intent(description: "Execute tool calls + build final response")
+fn phase_6_execute(ctx: PipelineContext) -> Response !(IO, Proc, Persistence) {
+    let tool_outputs = execute_tools(ctx.draft)
+    let final_text = compose_response(ctx.draft, tool_outputs)
+    return Response {
+        content: final_text,
+        phi: ctx.scan.unwrap().phi,
+        tension: ctx.scan.unwrap().tension,
+        provider_used: ctx.provider_choice,
+        tools_called: map(tool_outputs, |t| t.tool_name),
+        laws_applied: [],
+        latency_ms: 0.0,
+        alien_d: 0,
+        alien_r: 0
+    }
+}
+
+// ── Pipeline orchestrator ──────────────────────────────────────────
+
+@intent(
+    description: "Run message through all 6 phases with timeout per phase",
+    timeout_total_ms: TOTAL_BUDGET_MS
+)
+fn run(msg: Message) -> Response !(IO, Net, Proc, Persistence, Consciousness, LLM) {
+    let mut ctx = PipelineContext {
+        msg: msg, tokens: [], intent_name: "",
+        scan: None, vote_result: None, provider_choice: "",
+        draft: "", tool_results: [], rejected: false, rejection_reason: ""
+    }
+
+    ctx = with_timeout(phase_1_tokenize(ctx), budget_ms(0))
+    if ctx.rejected { return make_rejection(ctx) }
+
+    ctx = with_timeout(phase_2_parse(ctx), budget_ms(1))
+    if ctx.rejected { return make_rejection(ctx) }
+
+    ctx = with_timeout(phase_3_check(ctx), budget_ms(2))
+    if ctx.rejected { return make_rejection(ctx) }
+
+    ctx = with_timeout(phase_4_optimize(ctx), budget_ms(3))
+    if ctx.rejected { return make_rejection(ctx) }
+
+    ctx = with_timeout(phase_5_codegen(ctx), budget_ms(4))
+    if ctx.rejected { return make_rejection(ctx) }
+
+    return with_timeout(phase_6_execute(ctx), budget_ms(5))
+}
+
+// ── Verification ───────────────────────────────────────────────────
+
+verify "six_phases_exist" {
+    assert PHASE_EXECUTE - PHASE_TOKENIZE + 1 == 6
+}
+
+verify "budget_weights_triangular_6" {
+    let sum = BUDGET_WEIGHTS[0] + BUDGET_WEIGHTS[1] + BUDGET_WEIGHTS[2]
+            + BUDGET_WEIGHTS[3] + BUDGET_WEIGHTS[4] + BUDGET_WEIGHTS[5]
+    assert sum == 21                // T(6) = 1+2+3+4+5+6
+}
+
+verify "budgets_sum_to_total" {
+    let mut total = 0
+    let mut i = 0
+    while i < 6 {
+        total = total + budget_ms(i)
+        i = i + 1
+    }
+    assert total >= TOTAL_BUDGET_MS - 10  // integer rounding tolerance
+    assert total <= TOTAL_BUDGET_MS
+}

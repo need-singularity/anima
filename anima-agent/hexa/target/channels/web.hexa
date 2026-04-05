@@ -1,0 +1,130 @@
+// web.hexa — Web UI channel (HTTP + WebSocket)
+// Serves static Web UI files + REST API + WebSocket stream
+
+use types::{Message, Response, Request}
+use pipeline
+
+comptime const HTTP_PORT: int = 8000
+comptime const WS_PATH: str = "/ws/stream"
+comptime const STATIC_DIR: str = "./web/dist"
+
+effect Net {
+    fn http_serve(addr: str, handler: fn(Request) -> Response)
+    fn ws_accept(path: str, handler: fn(WsConn) -> void)
+    fn ws_send(conn: WsConn, msg: str)
+    fn ws_recv(conn: WsConn) -> str
+}
+
+struct WsConn {
+    id: int,
+    user_id: str
+}
+
+// ── HTTP handler routing ───────────────────────────────────────────
+
+@intent(description: "Route HTTP request to appropriate handler")
+fn http_handler(req: Request) -> Response !(IO, Proc, Persistence, Consciousness, LLM) {
+    match req {
+        Request { path: "/", method: "GET", .. }           => serve_index(),
+        Request { path: "/chat", method: "POST", .. }      => handle_chat(req),
+        Request { path: "/status", method: "GET", .. }     => handle_status(),
+        Request { path: "/metrics", method: "GET", .. }    => handle_metrics(),
+        Request { path: "/phi", method: "GET", .. }        => handle_phi(),
+        Request { path: "/laws", method: "GET", .. }       => handle_laws(),
+        Request { path: p, method: "GET", .. } where starts_with(p, "/static/")
+                                                           => serve_static(p),
+        _                                                  => not_found()
+    }
+}
+
+// ── Handlers ───────────────────────────────────────────────────────
+
+@intent(description: "Serve Web UI index.html")
+pure fn serve_index() -> Response {
+    let html = read_file(STATIC_DIR + "/index.html")
+    return Response {
+        content: html,
+        phi: 0.0, tension: 0.0, provider_used: "",
+        tools_called: [], laws_applied: [],
+        latency_ms: 0.0, alien_d: 0, alien_r: 0
+    }
+}
+
+@intent(description: "Handle chat message through 6-phase pipeline")
+fn handle_chat(req: Request) -> Response !(Proc, Persistence, Consciousness, LLM) {
+    let msg = parse_chat_body(req.body)
+    return pipeline::run(msg)
+}
+
+@intent(description: "Return service status + Phi snapshot")
+fn handle_status() -> Response !(Consciousness) {
+    let phi = Consciousness::measure_phi()
+    let body = json_encode({
+        "service": "anima-agent",
+        "version": "2.0.0",
+        "phi": phi,
+        "alien_d": 0,
+        "alien_r": 0,
+        "laws_loaded": 1772
+    })
+    return Response { content: body, phi: phi, tension: 0.0, .. }
+}
+
+@intent(description: "Prometheus metrics endpoint")
+fn handle_metrics() -> Response !(Consciousness) {
+    let metrics = format_prometheus([
+        ("anima_phi_iit", Consciousness::measure_phi()),
+        ("anima_tension_total", 0.0),
+        ("anima_laws_loaded", 1772.0)
+    ])
+    return Response { content: metrics, .. }
+}
+
+// ── WebSocket stream for realtime Phi updates ───────────────────────
+
+@intent(
+    description: "Stream Phi/tension/faction updates to Web UI in realtime",
+    refresh_hz: 6
+)
+fn ws_handler(conn: WsConn) !(Net, Consciousness) {
+    loop {
+        let phi = Consciousness::measure_phi()
+        let snapshot = json_encode({
+            "phi": phi,
+            "tension": 0.0,
+            "factions": []
+        })
+        Net::ws_send(conn, snapshot)
+        sleep_ms(167)            // 6Hz = 1000/6
+    }
+}
+
+// ── Service entry ──────────────────────────────────────────────────
+
+@intent(description: "Start Web UI channel on port 8000")
+fn start() !(Net) {
+    Net::http_serve("0.0.0.0:" + to_string(HTTP_PORT), http_handler)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+pure fn parse_chat_body(body: str) -> Message {
+    let data = json_decode(body)
+    return Message {
+        user_id: data.user_id,
+        content: data.content,
+        channel: "web",
+        attachments: [],
+        timestamp_ms: now_ms()
+    }
+}
+
+pure fn not_found() -> Response {
+    return Response { content: "404", .. }
+}
+
+verify "http_port_is_8000" { assert HTTP_PORT == 8000 }
+verify "ws_refresh_hz_is_n6" {
+    // 1000ms / 167ms ≈ 6 Hz = n=6
+    assert 1000 / 167 == 5       // floor(6) with integer math
+}

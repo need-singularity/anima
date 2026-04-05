@@ -1,0 +1,91 @@
+// telegram.hexa — Telegram bot channel via HTTP long-polling
+// Uses Telegram Bot API over HTTPS
+
+use types::{Message, Response}
+use pipeline
+
+comptime const TG_API_BASE: str = "https://api.telegram.org/bot"
+comptime const POLL_INTERVAL_SEC: int = 1
+comptime const POLL_TIMEOUT_SEC: int = 30
+
+effect Net {
+    fn http_get(url: str) -> str
+    fn http_post(url: str, body: str) -> str
+}
+
+effect Env {
+    fn get(key: str) -> Option<str>
+}
+
+struct TgUpdate {
+    update_id: int,
+    message_text: str,
+    chat_id: int,
+    user_id: int,
+    username: str
+}
+
+// ── Telegram service ────────────────────────────────────────────────
+
+@intent(
+    description: "Telegram bot via long-polling getUpdates",
+    api_version: "7.0"
+)
+fn start() !(Net, Env, Proc, Persistence, Consciousness, LLM) {
+    let token = Env::get("TELEGRAM_BOT_TOKEN").unwrap()
+    let api_url = TG_API_BASE + token
+
+    let mut last_update_id = 0
+
+    loop {
+        let updates = poll_updates(api_url, last_update_id + 1)
+        for update in updates {
+            let response = handle_telegram_message(update)
+            send_message(api_url, update.chat_id, response.content)
+            last_update_id = update.update_id
+        }
+        sleep_ms(POLL_INTERVAL_SEC * 1000)
+    }
+}
+
+@intent(description: "Long-poll Telegram for new messages")
+fn poll_updates(api_url: str, offset: int) -> [TgUpdate] !(Net) {
+    let url = api_url + "/getUpdates"
+             + "?offset=" + to_string(offset)
+             + "&timeout=" + to_string(POLL_TIMEOUT_SEC)
+    let response = Net::http_get(url)
+    return parse_tg_updates(response)
+}
+
+@intent(description: "Send message reply via Telegram API")
+fn send_message(api_url: str, chat_id: int, text: str) !(Net) {
+    let url = api_url + "/sendMessage"
+    let body = json_encode({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
+    Net::http_post(url, body)
+}
+
+@intent(description: "Transform Telegram update to anima Message + run pipeline")
+fn handle_telegram_message(u: TgUpdate) -> Response !(Proc, Persistence, Consciousness, LLM) {
+    let msg = Message {
+        user_id: "tg_" + to_string(u.user_id),
+        content: u.message_text,
+        channel: "telegram",
+        attachments: [],
+        timestamp_ms: now_ms()
+    }
+    return pipeline::run(msg)
+}
+
+pure fn parse_tg_updates(json: str) -> [TgUpdate] {
+    // Parse Telegram JSON response
+    return []
+}
+
+verify "poll_timeout_reasonable" {
+    assert POLL_TIMEOUT_SEC >= 10
+    assert POLL_TIMEOUT_SEC <= 60
+}

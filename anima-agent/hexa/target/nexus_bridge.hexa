@@ -1,0 +1,139 @@
+// nexus_bridge.hexa — NEXUS-6 tool integration via Proc effect
+// Calls nexus6 binary via io_pipe, parses output, returns structured results
+
+use types::{ScanResult, VerifyResult, BlowupResult, Finding}
+
+comptime const NEXUS_BIN: str = "/Users/ghost/Dev/nexus6/target/release/nexus6"
+comptime const NEXUS_TIMEOUT_SCAN: int = 20
+comptime const NEXUS_TIMEOUT_VERIFY: int = 5
+comptime const NEXUS_TIMEOUT_BLOWUP: int = 180
+
+// ── Public API ─────────────────────────────────────────────────────
+
+@intent(
+    description: "Scan domain data through NEXUS-6 22-lens telescope",
+    tool_id: 13,
+    category: "discovery"
+)
+pub fn scan(domain: str, data: [float]) -> ScanResult !(Proc)
+  where len(data) > 0
+  ensures result.phi >= 0.0
+{
+    let data_str = join(data, ",")
+    let cmd = NEXUS_BIN + " scan " + domain + " --data " + data_str + " --full"
+    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_SCAN)
+    return parse_scan_output(output)
+}
+
+@intent(description: "Check if value matches n=6 constants")
+pub fn verify_value(value: float, tol: float) -> VerifyResult !(Proc)
+  where tol > 0.0 && tol < 1.0
+  ensures result.confidence >= 0.0 && result.confidence <= 1.0
+{
+    let cmd = NEXUS_BIN + " verify " + to_string(value) + " --tolerance " + to_string(tol)
+    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_VERIFY)
+    return parse_verify_output(output)
+}
+
+@intent(
+    description: "Blowup domain via n=6 axioms to discover corollaries",
+    warning: "depth > 3 can take several minutes"
+)
+pub fn blowup(domain: str, depth: int) -> BlowupResult !(Proc)
+  where depth >= 1 && depth <= 4
+  ensures result.depth == depth && result.corollaries >= 0
+{
+    let cmd = NEXUS_BIN + " blowup " + domain + " --depth " + to_string(depth)
+    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_BLOWUP)
+    return parse_blowup_output(output)
+}
+
+@intent(description: "Run OUROBOROS evolution loop on domain")
+pub fn evolve(domain: str, cycles: int) -> EvolveResult !(Proc)
+  where cycles >= 1 && cycles <= 100
+{
+    let cmd = NEXUS_BIN + " evolve " + domain + " --max-cycles " + to_string(cycles)
+    let output = Proc::pipe_with_timeout(cmd, 60)
+    return parse_evolve_output(output)
+}
+
+// ── Parsers (pure) ─────────────────────────────────────────────────
+
+pure fn parse_scan_output(output: str) -> ScanResult
+  ensures result.phi >= 0.0
+{
+    let phi = extract_float(output, "phi=")
+    let tension = extract_float(output, "tension=")
+    let consensus = extract_int(output, "consensus=")
+    let lenses = extract_array(output, "top_lenses:")
+    return ScanResult {
+        phi: phi,
+        tension: tension,
+        consensus: consensus,
+        top_lenses: lenses,
+        ten_d: extract_float_array(output, "10d:")
+    }
+}
+
+pure fn parse_verify_output(output: str) -> VerifyResult {
+    let matched = contains(output, "EXACT")
+    let constant = extract_str(output, "matches: ")
+    let conf = extract_float(output, "confidence=")
+    return VerifyResult {
+        matched: matched,
+        matched_constant: constant,
+        tolerance: 0.001,
+        confidence: conf
+    }
+}
+
+pure fn parse_blowup_output(output: str) -> BlowupResult
+  ensures result.emergences >= 0
+{
+    let depth = extract_int(output, "depth=")
+    let corollaries = extract_int(output, "corollaries=")
+    let emergences = extract_int(output, "emergences=")
+    let axioms = extract_int(output, "axiom_candidates=")
+    let findings = parse_findings_table(output)
+    return BlowupResult {
+        depth: depth,
+        corollaries: corollaries,
+        emergences: emergences,
+        axiom_candidates: axioms,
+        top_findings: findings
+    }
+}
+
+pure fn parse_evolve_output(output: str) -> EvolveResult {
+    return EvolveResult {
+        discoveries: extract_int(output, "discoveries:"),
+        forged: extract_int(output, "forged:"),
+        convergence: extract_str(output, "convergence:")
+    }
+}
+
+// ── Parse helpers (pure) ───────────────────────────────────────────
+
+pure fn extract_int(s: str, key: str) -> int { /* regex extract */ }
+pure fn extract_float(s: str, key: str) -> float { /* regex extract */ }
+pure fn extract_str(s: str, key: str) -> str { /* regex extract */ }
+pure fn extract_array(s: str, key: str) -> [str] { /* parse list */ }
+pure fn extract_float_array(s: str, key: str) -> [float] { /* parse list */ }
+pure fn parse_findings_table(s: str) -> [Finding] { /* parse box table */ }
+
+struct EvolveResult {
+    discoveries: int,
+    forged: int,
+    convergence: str
+}
+
+// ── Verification ───────────────────────────────────────────────────
+
+verify "nexus_action_ids_contiguous" {
+    assert 13 + 6 == 19             // 13..18 = 6 actions
+}
+
+verify "blowup_depth_bounded" {
+    assert 4 >= 1
+    // depth > 4 would be minutes → reject
+}

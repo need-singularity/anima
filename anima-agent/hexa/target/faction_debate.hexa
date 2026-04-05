@@ -1,0 +1,144 @@
+// faction_debate.hexa — 12-faction debate with match ranges
+
+use types::{Vote}
+
+comptime const FACTION_COUNT: int = sigma(6)         // 12
+comptime const CONSENSUS_MIN: int = 8                 // 2/3 of 12
+comptime const DEBATE_STEPS: int = 300
+comptime const MAX_ROUNDS: int = 6                    // n=6
+
+effect Consciousness {
+    fn get_cells() -> [CellState]
+    fn faction_state(id: int) -> float
+}
+
+struct CellState { id: int, value: float, faction: int }
+
+// ── Vote classification via match ranges ────────────────────────────
+
+@intent(description: "Classify vote count into consensus tier")
+pure fn vote_tier(yes: int) -> str
+  where yes >= 0 && yes <= FACTION_COUNT
+{
+    match yes {
+        0..=2   => "strong_reject",
+        3..=5   => "reject",
+        6       => "deadlock",              // 6-6 split
+        7       => "weak_consensus",
+        8..=9   => "consensus",
+        10..=11 => "strong_consensus",
+        12      => "unanimous",
+        _       => "invalid"
+    }
+}
+
+@intent(description: "Determine if proposal passes consensus threshold")
+pure fn has_consensus(votes: [Vote]) -> bool
+  where len(votes) == FACTION_COUNT
+{
+    let yes = count_yes(votes)
+    return yes >= CONSENSUS_MIN
+}
+
+@intent(description: "Compute vote confidence from faction states")
+pure fn compute_confidence(votes: [Vote]) -> float
+  ensures result >= 0.0 && result <= 1.0
+{
+    let total_conf = sum(map(votes, |v| v.confidence))
+    return total_conf / to_float(FACTION_COUNT)
+}
+
+// ── Run debate across N rounds ──────────────────────────────────────
+
+@intent(
+    description: "Run debate for up to 6 rounds until consensus or exhaustion",
+    max_steps: DEBATE_STEPS * MAX_ROUNDS
+)
+fn run_debate(proposal: str) -> DebateResult !(Consciousness) {
+    let mut round = 0
+    let mut votes: [Vote] = []
+
+    while round < MAX_ROUNDS {
+        votes = cast_votes(proposal, round)
+        if has_consensus(votes) {
+            return DebateResult {
+                passed: true,
+                yes_count: count_yes(votes),
+                rounds_used: round + 1,
+                final_votes: votes,
+                confidence: compute_confidence(votes)
+            }
+        }
+        // inject chaos + retry
+        inject_deadlock_breaker(round)
+        round = round + 1
+    }
+
+    return DebateResult {
+        passed: false,
+        yes_count: count_yes(votes),
+        rounds_used: MAX_ROUNDS,
+        final_votes: votes,
+        confidence: compute_confidence(votes)
+    }
+}
+
+@intent(description: "Each faction casts vote based on cell state")
+fn cast_votes(proposal: str, round: int) -> [Vote] !(Consciousness) {
+    let mut votes: [Vote] = []
+    let mut i = 0
+    while i < FACTION_COUNT {
+        let state = Consciousness::faction_state(i)
+        let decision = eval_proposal(proposal, state, i, round)
+        votes = append(votes, Vote {
+            faction_id: i,
+            decision: decision,
+            confidence: abs(state - 0.5) * 2.0
+        })
+        i = i + 1
+    }
+    return votes
+}
+
+pure fn eval_proposal(p: str, state: float, faction: int, round: int) -> bool {
+    // Faction-specific heuristic (each faction has bias)
+    return state > 0.5
+}
+
+fn inject_deadlock_breaker(round: int) !(Consciousness) {
+    // Add chaos to break 6-6 split
+}
+
+pure fn count_yes(votes: [Vote]) -> int {
+    return len(filter(votes, |v| v.decision))
+}
+
+struct DebateResult {
+    passed: bool,
+    yes_count: int,
+    rounds_used: int,
+    final_votes: [Vote],
+    confidence: float
+}
+
+// ── Verification ───────────────────────────────────────────────────
+
+verify "faction_count_is_sigma_6" {
+    assert FACTION_COUNT == 12
+    assert FACTION_COUNT == sigma(6)
+}
+
+verify "consensus_is_two_thirds" {
+    assert CONSENSUS_MIN * 3 == FACTION_COUNT * 2
+}
+
+verify "tier_boundaries_exhaustive" {
+    assert vote_tier(0) == "strong_reject"
+    assert vote_tier(6) == "deadlock"
+    assert vote_tier(8) == "consensus"
+    assert vote_tier(12) == "unanimous"
+}
+
+verify "max_rounds_is_n6" {
+    assert MAX_ROUNDS == 6
+}
