@@ -1,0 +1,276 @@
+// std_tls.hexa — TLS 1.3 minimal client (design document + type definitions)
+// Proposed addition to HEXA std library for anima-agent HTTPS/WSS support
+//
+// ── DESIGN RATIONALE ────────────────────────────────────────────────
+//
+// TLS 1.3 (RFC 8446) is ~100 pages of spec covering:
+//   - ECDHE key exchange (X25519 / P-256)
+//   - AEAD ciphers (AES-128-GCM, ChaCha20-Poly1305)
+//   - Certificate chain verification (X.509)
+//   - Transcript hash, key schedule, HKDF
+//   - 0-RTT, PSK, session resumption
+//
+// A pure HEXA implementation would require 3000+ LOC of cryptographic
+// primitives that are better handled by audited native libraries.
+//
+// STRATEGY (ranked by pragmatism):
+//   1. FFI binding to system TLS (rustls / OpenSSL / Secure Transport)
+//      → safest, fastest, production-grade
+//   2. Subprocess workaround via curl/openssl s_client
+//      → zero dependencies, works today, good enough for agent channels
+//   3. Pure HEXA implementation
+//      → educational value only, NOT for production (crypto bugs = CVEs)
+//
+// This module provides:
+//   - Type definitions for TLS streams
+//   - FFI-based tls_connect / tls_read / tls_write / tls_close
+//   - Subprocess workaround for HTTPS calls (Proc::pipe)
+//   - Design notes for each TLS handshake step (as comments)
+//
+// ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
+// CONFIRMED safe: effect, pure fn, struct, enum, comptime const
+// ─────────────────────────────────────────────────────────────────────
+
+use std::net::{TcpConn, net_connect, net_close}
+
+// ══════════════════════════════════════════════════════════════════════
+// Types
+// ══════════════════════════════════════════════════════════════════════
+
+// TlsStream wraps a TCP connection with an opaque native TLS context.
+// The handle is managed by the FFI layer (rustls / OpenSSL / platform).
+struct TlsStream {
+    tcp: TcpConn,
+    tls_handle: int,     // opaque FFI handle (0 = invalid)
+    host: str,           // SNI hostname (needed for certificate validation)
+    connected: bool
+}
+
+struct TlsConfig {
+    verify_certs: bool,          // true = verify server certificate chain
+    ca_bundle_path: Option<str>, // None = use system CA store
+    alpn_protocols: [str],       // e.g. ["h2", "http/1.1"]
+    min_version: TlsVersion,
+    max_version: TlsVersion
+}
+
+enum TlsVersion {
+    Tls12,
+    Tls13
+}
+
+enum TlsError {
+    HandshakeFailed(str),
+    CertificateInvalid(str),
+    ConnectionClosed,
+    ReadError(str),
+    WriteError(str),
+    UnsupportedCipher(str)
+}
+
+// ── TLS 1.3 handshake steps (design reference) ─────────────────────
+//
+// Step 1: ClientHello
+//   - supported_versions: [TLS 1.3]
+//   - key_share: X25519 ephemeral public key
+//   - cipher_suites: [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256]
+//   - signature_algorithms: [ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256]
+//   - server_name (SNI): host
+//
+// Step 2: ServerHello + EncryptedExtensions + Certificate + CertVerify + Finished
+//   - Server selects cipher suite + sends its key_share
+//   - Derive handshake keys via HKDF-Expand-Label
+//   - Verify server certificate against CA store
+//   - Verify CertificateVerify signature over transcript hash
+//
+// Step 3: Client Finished
+//   - Send Finished message (HMAC over transcript)
+//   - Derive application traffic keys
+//
+// Step 4: Application data
+//   - All further data encrypted with AES-128-GCM or ChaCha20-Poly1305
+//   - Record layer: type(1) + version(2) + length(2) + encrypted_data
+//
+// Key schedule (HKDF-based):
+//   Early Secret     = HKDF-Extract(0, 0)           [no PSK]
+//   Handshake Secret = HKDF-Extract(derived, ECDHE)
+//   Master Secret    = HKDF-Extract(derived, 0)
+//   client_write_key = HKDF-Expand-Label(hs_secret, "c hs traffic", transcript)
+//   server_write_key = HKDF-Expand-Label(hs_secret, "s hs traffic", transcript)
+
+// ══════════════════════════════════════════════════════════════════════
+// Effect declaration
+// ══════════════════════════════════════════════════════════════════════
+
+effect Net {
+    fn net_connect(host: str, port: int) -> TcpConn
+    fn net_close(conn: TcpConn)
+}
+
+effect TlsFfi {
+    // FFI to system TLS library (rustls / OpenSSL / Secure Transport)
+    fn tls_init(config: TlsConfig) -> int              // returns context handle
+    fn tls_handshake(handle: int, tcp: TcpConn, host: str) -> int  // returns stream handle
+    fn tls_read_raw(handle: int, n: int) -> [int]
+    fn tls_write_raw(handle: int, data: [int])
+    fn tls_shutdown(handle: int)
+    fn tls_destroy(handle: int)
+}
+
+effect Proc {
+    fn pipe(cmd: str, args: [str]) -> str
+    fn pipe_stdin(cmd: str, args: [str], stdin: str) -> str
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Pure helpers
+// ══════════════════════════════════════════════════════════════════════
+
+pure fn default_tls_config() -> TlsConfig {
+    return TlsConfig {
+        verify_certs: true,
+        ca_bundle_path: None,
+        alpn_protocols: ["http/1.1"],
+        min_version: TlsVersion::Tls13,
+        max_version: TlsVersion::Tls13
+    }
+}
+
+pure fn tls_config_for_websocket() -> TlsConfig {
+    return TlsConfig {
+        verify_certs: true,
+        ca_bundle_path: None,
+        alpn_protocols: [],         // WebSocket does not use ALPN
+        min_version: TlsVersion::Tls12,   // some WS servers are TLS 1.2
+        max_version: TlsVersion::Tls13
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// FFI-based TLS (primary approach — production use)
+// ══════════════════════════════════════════════════════════════════════
+
+@intent(description: "Open TLS connection: TCP connect + TLS handshake via system library")
+fn tls_connect(host: str, port: int) -> TlsStream !(Net, TlsFfi) {
+    return tls_connect_with_config(host, port, default_tls_config())
+}
+
+@intent(description: "Open TLS connection with custom config")
+fn tls_connect_with_config(host: str, port: int, config: TlsConfig) -> TlsStream !(Net, TlsFfi) {
+    let tcp = Net::net_connect(host, port)
+    let ctx = TlsFfi::tls_init(config)
+    let handle = TlsFfi::tls_handshake(ctx, tcp, host)
+    return TlsStream {
+        tcp: tcp,
+        tls_handle: handle,
+        host: host,
+        connected: true
+    }
+}
+
+@intent(description: "Read decrypted bytes from TLS stream")
+fn tls_read(stream: TlsStream, n: int) -> [int] !(TlsFfi)
+  where stream.connected && n > 0
+{
+    return TlsFfi::tls_read_raw(stream.tls_handle, n)
+}
+
+@intent(description: "Write bytes through TLS encryption")
+fn tls_write(stream: TlsStream, data: [int]) !(TlsFfi)
+  where stream.connected
+{
+    TlsFfi::tls_write_raw(stream.tls_handle, data)
+}
+
+@intent(description: "TLS shutdown + TCP close")
+fn tls_close(stream: TlsStream) !(Net, TlsFfi)
+  where stream.connected
+{
+    TlsFfi::tls_shutdown(stream.tls_handle)
+    TlsFfi::tls_destroy(stream.tls_handle)
+    Net::net_close(stream.tcp)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Subprocess workaround (works today, no FFI needed)
+// ══════════════════════════════════════════════════════════════════════
+//
+// For anima-agent, most HTTPS needs are API calls (Telegram, Discord, etc.)
+// These can be handled via curl subprocess until FFI TLS is available.
+
+@intent(description: "HTTPS GET via curl subprocess — zero-dependency workaround")
+fn https_get(url: str) -> str !(Proc) {
+    return Proc::pipe("curl", ["-sS", "--max-time", "30", url])
+}
+
+@intent(description: "HTTPS GET with custom headers via curl")
+fn https_get_with_headers(url: str, headers: Map<str, str>) -> str !(Proc) {
+    let mut args = ["-sS", "--max-time", "30"]
+    for (key, value) in headers {
+        args = append(args, "-H")
+        args = append(args, key + ": " + value)
+    }
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS POST with JSON body via curl")
+fn https_post(url: str, body: str) -> str !(Proc) {
+    return Proc::pipe("curl", [
+        "-sS", "--max-time", "30",
+        "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "-d", body,
+        url
+    ])
+}
+
+@intent(description: "HTTPS POST with custom headers + body via curl")
+fn https_post_with_headers(url: str, body: str, headers: Map<str, str>) -> str !(Proc) {
+    let mut args = ["-sS", "--max-time", "30", "-X", "POST"]
+    for (key, value) in headers {
+        args = append(args, "-H")
+        args = append(args, key + ": " + value)
+    }
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+// ── WSS (WebSocket over TLS) integration with std_websocket ─────────
+//
+// Once TlsFfi is available, wss:// support is straightforward:
+//
+//   fn wss_connect(url: str) -> WsConn !(Net, TlsFfi, Rng) {
+//       let parsed = parse_ws_url(url)    // from std_websocket
+//       match parsed {
+//           WsUrl::Parsed { host, port, path, is_tls: true } => {
+//               let tls = tls_connect_with_config(host, port, tls_config_for_websocket())
+//               // Wrap TlsStream as TcpConn-compatible (adapter pattern)
+//               let adapted_tcp = tls_to_tcp_adapter(tls)
+//               // Then proceed with standard WS handshake over the TLS tunnel
+//               ...
+//           }
+//       }
+//   }
+//
+// Alternatively, for Discord Gateway today:
+//   Proc::pipe("websocat", ["wss://gateway.discord.gg/..."])
+//   — websocat handles TLS transparently
+
+// ══════════════════════════════════════════════════════════════════════
+// Verification
+// ══════════════════════════════════════════════════════════════════════
+
+verify "default_config_is_tls13" {
+    let cfg = default_tls_config()
+    assert cfg.verify_certs == true
+    assert cfg.min_version == TlsVersion::Tls13
+}
+
+verify "websocket_config_allows_tls12" {
+    let cfg = tls_config_for_websocket()
+    assert cfg.min_version == TlsVersion::Tls12
+    assert len(cfg.alpn_protocols) == 0
+}
