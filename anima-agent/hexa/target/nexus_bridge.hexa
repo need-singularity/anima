@@ -1,5 +1,5 @@
 // nexus_bridge.hexa — NEXUS-6 tool integration via Proc effect
-// Calls nexus6 binary via io_pipe, parses output, returns structured results
+// Calls nexus6 binary via subprocess, parses JSON output, caches results
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const, where clause
@@ -7,17 +7,178 @@
 //   (only @evolve confirmed; general @attribute dispatch unknown)
 // ─────────────────────────────────────────────────────────────────────
 
-use types::{ScanResult, VerifyResult, BlowupResult, Finding}
+use types::{ScanResult, VerifyResult, BlowupResult, Finding, Option}
 
 comptime const NEXUS_BIN: str = "/Users/ghost/Dev/nexus6/target/release/nexus6"
 comptime const NEXUS_TIMEOUT_SCAN: int = 20
 comptime const NEXUS_TIMEOUT_VERIFY: int = 5
 comptime const NEXUS_TIMEOUT_BLOWUP: int = 180
+comptime const NEXUS_TIMEOUT_EVOLVE: int = 60
+comptime const CACHE_MAX_ENTRIES: int = 64
+comptime const CACHE_TTL_MS: int = 300000    // 5 minutes
+
+// ── Cache for recent scan results (dedup) ─────────────────────────
+
+struct CacheEntry {
+    key: str,
+    result_json: str,
+    created_ms: int
+}
+
+// Module-level cache: btree keyed by domain+data_hash
+let mut scan_cache: any = btree_new()
+let mut cache_keys: [str] = []    // ordered insertion for LRU eviction
+
+// ── Cache helpers ─────────────────────────────────────────────────
+
+pure fn cache_key(domain: str, data: [float]) -> str {
+    // Hash domain + first/last/len of data for fast dedup
+    let data_sig = to_string(len(data))
+                 + "_" + to_string(match len(data) > 0 { true => data[0], false => 0.0 })
+                 + "_" + to_string(match len(data) > 0 { true => data[len(data) - 1], false => 0.0 })
+    return sha256(domain + ":" + data_sig)
+}
+
+fn cache_get(key: str) -> Option<ScanResult> {
+    let entry = btree_get(scan_cache, key)
+    match entry {
+        Some(e) => {
+            // Check TTL
+            if timestamp() - e.created_ms > CACHE_TTL_MS {
+                // Expired — remove
+                btree_set(scan_cache, key, None)
+                return None
+            }
+            return Some(ScanResult::from_json(e.result_json))
+        },
+        None => return None
+    }
+}
+
+fn cache_put(key: str, result: ScanResult) {
+    // Evict oldest if at capacity
+    if len(cache_keys) >= CACHE_MAX_ENTRIES {
+        let oldest_key = cache_keys[0]
+        btree_set(scan_cache, oldest_key, None)
+        cache_keys = slice(cache_keys, 1, len(cache_keys))
+    }
+    let entry = CacheEntry {
+        key: key,
+        result_json: result.to_json(),
+        created_ms: timestamp()
+    }
+    btree_set(scan_cache, key, entry)
+    cache_keys = append(cache_keys, key)
+}
+
+// ── Process execution with error handling ─────────────────────────
+
+struct ProcResult {
+    stdout: str,
+    stderr: str,
+    exit_code: int
+}
+
+fn exec_nexus(args: str, timeout_s: int) -> ProcResult !(Proc) {
+    let cmd = NEXUS_BIN + " " + args
+    let parts = split(cmd, " ")
+    let bin = parts[0]
+    let cmd_args = slice(parts, 1, len(parts))
+
+    // Check binary exists
+    if !file_exists(NEXUS_BIN) {
+        return ProcResult {
+            stdout: "",
+            stderr: "nexus6 binary not found at " + NEXUS_BIN,
+            exit_code: -1
+        }
+    }
+
+    let proc = Proc::spawn(bin, cmd_args)
+    let deadline = timestamp() + timeout_s * 1000
+
+    let mut stdout = ""
+    let mut stderr = ""
+
+    // Read stdout and stderr with timeout
+    loop {
+        let out_chunk = process_try_read(proc.stdout_handle, 65536)
+        let err_chunk = process_try_read(proc.stderr_handle, 65536)
+        stdout = stdout + out_chunk
+        stderr = stderr + err_chunk
+
+        if process_has_exited(proc.pid) {
+            // Read remaining data
+            let final_out = process_read_all(proc.stdout_handle)
+            let final_err = process_read_all(proc.stderr_handle)
+            stdout = stdout + final_out
+            stderr = stderr + final_err
+            break
+        }
+        if timestamp() > deadline {
+            process_kill(proc.pid)
+            return ProcResult {
+                stdout: stdout,
+                stderr: stderr + "\n[TIMEOUT after " + to_string(timeout_s) + "s]",
+                exit_code: -2
+            }
+        }
+        sleep(10)
+    }
+
+    let exit_code = process_wait(proc.pid)
+    return ProcResult {
+        stdout: stdout,
+        stderr: stderr,
+        exit_code: exit_code
+    }
+}
+
+fn exec_nexus_stdin(args: str, stdin_data: str, timeout_s: int) -> ProcResult !(Proc) {
+    let cmd = NEXUS_BIN + " " + args
+    let parts = split(cmd, " ")
+    let bin = parts[0]
+    let cmd_args = slice(parts, 1, len(parts))
+
+    if !file_exists(NEXUS_BIN) {
+        return ProcResult {
+            stdout: "",
+            stderr: "nexus6 binary not found at " + NEXUS_BIN,
+            exit_code: -1
+        }
+    }
+
+    let proc = Proc::spawn_with_stdin(bin, cmd_args, stdin_data)
+    let deadline = timestamp() + timeout_s * 1000
+
+    let mut stdout = ""
+    loop {
+        let chunk = process_try_read(proc.stdout_handle, 65536)
+        stdout = stdout + chunk
+        if process_has_exited(proc.pid) {
+            stdout = stdout + process_read_all(proc.stdout_handle)
+            break
+        }
+        if timestamp() > deadline {
+            process_kill(proc.pid)
+            return ProcResult {
+                stdout: stdout,
+                stderr: "[TIMEOUT after " + to_string(timeout_s) + "s]",
+                exit_code: -2
+            }
+        }
+        sleep(10)
+    }
+
+    let stderr = process_read_all(proc.stderr_handle)
+    let exit_code = process_wait(proc.pid)
+    return ProcResult { stdout: stdout, stderr: stderr, exit_code: exit_code }
+}
 
 // ── Public API ─────────────────────────────────────────────────────
 
-@intent(  // FALLBACK: verify scan_intent { assert tool_id == 13 } + comment
-    description: "Scan domain data through NEXUS-6 22-lens telescope",
+@intent(
+    description: "Scan domain data through NEXUS-6 multi-lens telescope",
     tool_id: 13,
     category: "discovery"
 )
@@ -25,107 +186,286 @@ pub fn scan(domain: str, data: [float]) -> ScanResult !(Proc)
   where len(data) > 0
   ensures result.phi >= 0.0
 {
-    let data_str = join(data, ",")
-    let cmd = NEXUS_BIN + " scan " + domain + " --data " + data_str + " --full"
-    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_SCAN)
-    return parse_scan_output(output)
+    // Check cache first
+    let ck = cache_key(domain, data)
+    let cached = cache_get(ck)
+    match cached {
+        Some(result) => return result,
+        None => {}
+    }
+
+    // Serialize data as JSON array for stdin
+    let data_json = json_stringify(data)
+    let args = "scan " + domain + " --format json --stdin --full"
+    let proc_result = exec_nexus_stdin(args, data_json, NEXUS_TIMEOUT_SCAN)
+
+    if proc_result.exit_code != 0 {
+        io_write("[nexus_bridge] scan failed (exit=" + to_string(proc_result.exit_code)
+               + "): " + proc_result.stderr)
+        return ScanResult::empty()
+    }
+
+    let result = parse_scan_json(proc_result.stdout)
+
+    // Cache the result
+    cache_put(ck, result)
+
+    return result
 }
 
-@intent(description: "Check if value matches n=6 constants")  // FALLBACK: verify block + comment
+@intent(description: "Check if value matches n=6 constants")
 pub fn verify_value(value: float, tol: float) -> VerifyResult !(Proc)
   where tol > 0.0 && tol < 1.0
   ensures result.confidence >= 0.0 && result.confidence <= 1.0
 {
-    let cmd = NEXUS_BIN + " verify " + to_string(value) + " --tolerance " + to_string(tol)
-    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_VERIFY)
-    return parse_verify_output(output)
+    let args = "n6-check " + to_string(value) + " --tolerance " + to_string(tol) + " --format json"
+    let proc_result = exec_nexus(args, NEXUS_TIMEOUT_VERIFY)
+
+    if proc_result.exit_code != 0 {
+        io_write("[nexus_bridge] verify failed: " + proc_result.stderr)
+        return VerifyResult::no_match()
+    }
+
+    return parse_verify_json(proc_result.stdout)
 }
 
-@intent(  // FALLBACK: verify blowup_intent { assert ... } + comment
+@intent(
     description: "Blowup domain via n=6 axioms to discover corollaries",
     warning: "depth > 3 can take several minutes"
 )
 pub fn blowup(domain: str, depth: int) -> BlowupResult !(Proc)
-  where depth >= 1 && depth <= 4
+  where depth >= 1 && depth <= 6
   ensures result.depth == depth && result.corollaries >= 0
 {
-    let cmd = NEXUS_BIN + " blowup " + domain + " --depth " + to_string(depth)
-    let output = Proc::pipe_with_timeout(cmd, NEXUS_TIMEOUT_BLOWUP)
-    return parse_blowup_output(output)
+    let args = "blowup " + domain + " --depth " + to_string(depth) + " --format json"
+    let proc_result = exec_nexus(args, NEXUS_TIMEOUT_BLOWUP)
+
+    if proc_result.exit_code != 0 {
+        io_write("[nexus_bridge] blowup failed: " + proc_result.stderr)
+        return BlowupResult {
+            depth: depth,
+            corollaries: 0,
+            emergences: 0,
+            axiom_candidates: 0,
+            top_findings: []
+        }
+    }
+
+    return parse_blowup_json(proc_result.stdout)
 }
 
-@intent(description: "Run OUROBOROS evolution loop on domain")  // FALLBACK: verify block + comment
+@intent(description: "Run OUROBOROS evolution loop on domain")
 pub fn evolve(domain: str, cycles: int) -> EvolveResult !(Proc)
   where cycles >= 1 && cycles <= 100
 {
-    let cmd = NEXUS_BIN + " evolve " + domain + " --max-cycles " + to_string(cycles)
-    let output = Proc::pipe_with_timeout(cmd, 60)
-    return parse_evolve_output(output)
+    let args = "evolve " + domain + " --max-cycles " + to_string(cycles) + " --format json"
+    let proc_result = exec_nexus(args, NEXUS_TIMEOUT_EVOLVE)
+
+    if proc_result.exit_code != 0 {
+        io_write("[nexus_bridge] evolve failed: " + proc_result.stderr)
+        return EvolveResult { discoveries: 0, forged: 0, convergence: "failed" }
+    }
+
+    return parse_evolve_json(proc_result.stdout)
 }
 
-// ── Parsers (pure) ─────────────────────────────────────────────────
+@intent(description: "Quick consensus check — scan + return consensus count only")
+pub fn quick_consensus(domain: str, data: [float]) -> int !(Proc)
+  where len(data) > 0
+  ensures result >= 0
+{
+    let result = scan(domain, data)
+    return result.consensus
+}
 
-pure fn parse_scan_output(output: str) -> ScanResult
+@intent(description: "Multi-domain scan — run scan across multiple domains, return best")
+pub fn multi_scan(domains: [str], data: [float]) -> ScanResult !(Proc)
+  where len(domains) > 0 && len(data) > 0
+{
+    let mut best = ScanResult::empty()
+    for domain in domains {
+        let result = scan(domain, data)
+        if result.consensus > best.consensus {
+            best = result
+        }
+    }
+    return best
+}
+
+// ── JSON parsers (pure — operate on nexus6 JSON output) ───────────
+
+pure fn parse_scan_json(output: str) -> ScanResult
   ensures result.phi >= 0.0
 {
-    let phi = extract_float(output, "phi=")
-    let tension = extract_float(output, "tension=")
-    let consensus = extract_int(output, "consensus=")
-    let lenses = extract_array(output, "top_lenses:")
+    let obj = json_parse(output)
+
+    // Extract phi — might be nested under "summary" or top-level
+    let phi = extract_json_float(obj, "phi")
+    let tension = extract_json_float(obj, "tension")
+    let consensus = extract_json_int(obj, "consensus")
+
+    // Extract top_lenses array
+    let lenses_raw = btree_get(obj, "top_lenses")
+    let top_lenses: [str] = match lenses_raw {
+        Some(arr) => arr,
+        None => {
+            // Try nested path: summary.top_lenses
+            let summary = btree_get(obj, "summary")
+            match summary {
+                Some(s) => match btree_get(s, "top_lenses") {
+                    Some(arr) => arr,
+                    None      => []
+                },
+                None => []
+            }
+        }
+    }
+
+    // Extract 10-dimensional consciousness vector
+    let ten_d_raw = btree_get(obj, "ten_d")
+    let ten_d: [float; 10] = match ten_d_raw {
+        Some(arr) => pad_or_truncate_10(arr),
+        None => {
+            let cv = btree_get(obj, "consciousness_vector")
+            match cv {
+                Some(arr) => pad_or_truncate_10(arr),
+                None      => [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            }
+        }
+    }
+
     return ScanResult {
         phi: phi,
         tension: tension,
         consensus: consensus,
-        top_lenses: lenses,
-        ten_d: extract_float_array(output, "10d:")
+        top_lenses: top_lenses,
+        ten_d: ten_d
     }
 }
 
-pure fn parse_verify_output(output: str) -> VerifyResult {
-    let matched = contains(output, "EXACT")
-    let constant = extract_str(output, "matches: ")
-    let conf = extract_float(output, "confidence=")
+pure fn parse_verify_json(output: str) -> VerifyResult {
+    let obj = json_parse(output)
+
+    let matched_raw = btree_get(obj, "matched")
+    let matched: bool = match matched_raw {
+        Some(b) => b,
+        None => {
+            // Check for "result": "EXACT" format
+            let result_str = extract_json_str(obj, "result")
+            result_str == "EXACT" || result_str == "exact"
+        }
+    }
+
+    let constant = extract_json_str(obj, "matched_constant")
+    let alt_constant = match len(constant) > 0 {
+        true  => constant,
+        false => extract_json_str(obj, "constant_name")
+    }
+
+    let tolerance = extract_json_float(obj, "tolerance")
+    let confidence = extract_json_float(obj, "confidence")
+    // If confidence not provided, infer from match status
+    let final_confidence = match confidence > 0.0 {
+        true  => confidence,
+        false => match matched { true => 1.0, false => 0.0 }
+    }
+
     return VerifyResult {
         matched: matched,
-        matched_constant: constant,
-        tolerance: 0.001,
-        confidence: conf
+        matched_constant: alt_constant,
+        tolerance: match tolerance > 0.0 { true => tolerance, false => 0.001 },
+        confidence: final_confidence
     }
 }
 
-pure fn parse_blowup_output(output: str) -> BlowupResult
+pure fn parse_blowup_json(output: str) -> BlowupResult
   ensures result.emergences >= 0
 {
-    let depth = extract_int(output, "depth=")
-    let corollaries = extract_int(output, "corollaries=")
-    let emergences = extract_int(output, "emergences=")
-    let axioms = extract_int(output, "axiom_candidates=")
-    let findings = parse_findings_table(output)
+    let obj = json_parse(output)
+
+    let depth = extract_json_int(obj, "depth")
+    let corollaries = extract_json_int(obj, "corollaries")
+    let emergences = extract_json_int(obj, "emergences")
+    let axiom_candidates = extract_json_int(obj, "axiom_candidates")
+
+    // Parse findings array
+    let findings_raw = btree_get(obj, "findings")
+    let top_findings: [Finding] = match findings_raw {
+        Some(arr) => {
+            let mut findings: [Finding] = []
+            let mut i = 0
+            while i < len(arr) {
+                let f = arr[i]
+                findings = append(findings, Finding {
+                    rank:       extract_json_int(f, "rank"),
+                    expr:       extract_json_str(f, "expr"),
+                    value:      extract_json_float(f, "value"),
+                    confidence: extract_json_float(f, "confidence"),
+                    category:   extract_json_str(f, "category")
+                })
+                i = i + 1
+            }
+            findings
+        },
+        None => []
+    }
+
     return BlowupResult {
         depth: depth,
         corollaries: corollaries,
         emergences: emergences,
-        axiom_candidates: axioms,
-        top_findings: findings
+        axiom_candidates: axiom_candidates,
+        top_findings: top_findings
     }
 }
 
-pure fn parse_evolve_output(output: str) -> EvolveResult {
+pure fn parse_evolve_json(output: str) -> EvolveResult {
+    let obj = json_parse(output)
     return EvolveResult {
-        discoveries: extract_int(output, "discoveries:"),
-        forged: extract_int(output, "forged:"),
-        convergence: extract_str(output, "convergence:")
+        discoveries: extract_json_int(obj, "discoveries"),
+        forged: extract_json_int(obj, "forged"),
+        convergence: extract_json_str(obj, "convergence")
     }
 }
 
-// ── Parse helpers (pure) ───────────────────────────────────────────
+// ── JSON extraction helpers (pure, null-safe) ─────────────────────
 
-pure fn extract_int(s: str, key: str) -> int { /* regex extract */ }
-pure fn extract_float(s: str, key: str) -> float { /* regex extract */ }
-pure fn extract_str(s: str, key: str) -> str { /* regex extract */ }
-pure fn extract_array(s: str, key: str) -> [str] { /* parse list */ }
-pure fn extract_float_array(s: str, key: str) -> [float] { /* parse list */ }
-pure fn parse_findings_table(s: str) -> [Finding] { /* parse box table */ }
+pure fn extract_json_float(obj: any, key: str) -> float {
+    let val = btree_get(obj, key)
+    match val {
+        Some(v) => to_float(v),
+        None    => 0.0
+    }
+}
+
+pure fn extract_json_int(obj: any, key: str) -> int {
+    let val = btree_get(obj, key)
+    match val {
+        Some(v) => to_int(v),
+        None    => 0
+    }
+}
+
+pure fn extract_json_str(obj: any, key: str) -> str {
+    let val = btree_get(obj, key)
+    match val {
+        Some(v) => to_string(v),
+        None    => ""
+    }
+}
+
+pure fn pad_or_truncate_10(arr: [float]) -> [float; 10] {
+    let mut result: [float; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let count = match len(arr) > 10 { true => 10, false => len(arr) }
+    let mut i = 0
+    while i < count {
+        result[i] = arr[i]
+        i = i + 1
+    }
+    return result
+}
+
+// ── EvolveResult type ─────────────────────────────────────────────
 
 struct EvolveResult {
     discoveries: int,
@@ -133,13 +473,42 @@ struct EvolveResult {
     convergence: str
 }
 
-// ── Verification ───────────────────────────────────────────────────
+impl EvolveResult {
+    pure fn is_converged(self) -> bool {
+        return self.convergence == "converged" || self.convergence == "complete"
+    }
 
-verify "nexus_action_ids_contiguous" {
-    assert 13 + 6 == 19             // 13..18 = 6 actions
+    pure fn to_json(self) -> str {
+        let obj = btree_new()
+        btree_set(obj, "discoveries", self.discoveries)
+        btree_set(obj, "forged", self.forged)
+        btree_set(obj, "convergence", self.convergence)
+        return json_stringify(obj)
+    }
 }
 
-verify "blowup_depth_bounded" {
-    assert 4 >= 1
-    // depth > 4 would be minutes → reject
+// ── Verification ───────────────────────────────────────────────────
+
+verify "nexus_binary_path_set" {
+    assert len(NEXUS_BIN) > 0
+    assert contains(NEXUS_BIN, "nexus6")
+}
+
+verify "timeouts_ordered" {
+    assert NEXUS_TIMEOUT_VERIFY < NEXUS_TIMEOUT_SCAN
+    assert NEXUS_TIMEOUT_SCAN < NEXUS_TIMEOUT_EVOLVE
+    assert NEXUS_TIMEOUT_EVOLVE < NEXUS_TIMEOUT_BLOWUP
+}
+
+verify "cache_capacity_bounded" {
+    assert CACHE_MAX_ENTRIES > 0
+    assert CACHE_MAX_ENTRIES <= 256
+    assert CACHE_TTL_MS > 0
+}
+
+verify "empty_scan_is_safe" {
+    let empty = ScanResult::empty()
+    assert empty.phi == 0.0
+    assert empty.consensus == 0
+    assert len(empty.top_lenses) == 0
 }

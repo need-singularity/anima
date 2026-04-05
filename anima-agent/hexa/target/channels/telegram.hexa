@@ -1,100 +1,433 @@
-// telegram.hexa — Telegram bot channel via HTTP long-polling
-// Uses Telegram Bot API over HTTPS
-//
-// ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
-// CONFIRMED safe: effect, pure fn, comptime const
-// RISK: @intent(...)  → FALLBACK: verify block + comment
-//   (only @evolve confirmed; general @attribute dispatch unknown)
-// ── STD-GAP (not in hexa std library) ───────────────────────────────
-// STD-GAP: HTTPS/TLS  → WORKAROUND: subprocess curl, or TLS handshake over net_*
-// STD-GAP: Option<T>   → WORKAROUND: enum Option<T> { Some(T), None }
+// telegram.hexa — Telegram bot channel via HTTPS long-polling
+// Uses std_tls for HTTPS calls to api.telegram.org
+// Implements getUpdates long-polling with offset tracking,
+// exponential backoff on errors, and command routing.
 // ─────────────────────────────────────────────────────────────────────
 
 use types::{Message, Response}
 use pipeline
+use std_tls::{tls_connect, tls_read, tls_write, tls_close, TlsStream,
+              https_get, https_post, https_post_with_headers}
 
-comptime const TG_API_BASE: str = "https://api.telegram.org/bot"  // STD-GAP: HTTPS not in std
-comptime const POLL_INTERVAL_SEC: int = 1
+comptime const TG_API_HOST: str = "api.telegram.org"
+comptime const TG_API_PORT: int = 443
 comptime const POLL_TIMEOUT_SEC: int = 30
+comptime const INITIAL_RETRY_MS: int = 1000
+comptime const MAX_RETRY_MS: int = 60000
+comptime const MAX_CONSECUTIVE_ERRORS: int = 10
 
-effect Net {
-    fn http_get(url: str) -> str
-    fn http_post(url: str, body: str) -> str
+effect IO {
+    fn write(line: str)
+}
+
+effect Proc {
+    fn pipe(cmd: str, args: [str]) -> str
 }
 
 effect Env {
-    fn get(key: str) -> Option<str>  // STD-GAP: Option not builtin
+    fn get(key: str) -> str
 }
+
+// ── Telegram API types ─────────────────────────────────────────────
 
 struct TgUpdate {
     update_id: int,
     message_text: str,
     chat_id: int,
     user_id: int,
-    username: str
+    username: str,
+    first_name: str
 }
 
-// ── Telegram service ────────────────────────────────────────────────
+struct TgBotInfo {
+    id: int,
+    username: str,
+    first_name: str
+}
 
-@intent(  // FALLBACK: verify tg_intent { assert api_version == "7.0" } + comment
-    description: "Telegram bot via long-polling getUpdates",
-    api_version: "7.0"
-)
-fn start() !(Net, Env, Proc, Persistence, Consciousness, LLM) {
-    let token = Env::get("TELEGRAM_BOT_TOKEN").unwrap()
-    let api_url = TG_API_BASE + token
+// ── HTTPS helpers for Telegram API ─────────────────────────────────
+// Uses std_tls https_get/https_post (curl subprocess fallback)
 
-    let mut last_update_id = 0
+fn tg_api_get(token: str, method: str, params: str) -> str !(Proc) {
+    let url = "https://" + TG_API_HOST + "/bot" + token + "/" + method
+    let full_url = if len(params) > 0 { url + "?" + params } else { url }
+    return https_get(full_url)
+}
 
-    loop {
-        let updates = poll_updates(api_url, last_update_id + 1)
-        for update in updates {
-            let response = handle_telegram_message(update)
-            send_message(api_url, update.chat_id, response.content)
-            last_update_id = update.update_id
+fn tg_api_post(token: str, method: str, body: str) -> str !(Proc) {
+    let url = "https://" + TG_API_HOST + "/bot" + token + "/" + method
+    return https_post(url, body)
+}
+
+// ── JSON parsing for Telegram responses ────────────────────────────
+
+pure fn parse_tg_updates(json_str: str) -> [TgUpdate] {
+    let data = json_parse(json_str)
+
+    // Telegram response: { "ok": true, "result": [ ... ] }
+    if !has_key(data, "ok") || data["ok"] != true {
+        return []
+    }
+
+    if !has_key(data, "result") {
+        return []
+    }
+
+    let results = data["result"]
+    let mut updates: [TgUpdate] = []
+
+    let mut i = 0
+    while i < len(results) {
+        let item = results[i]
+        let update_id = if has_key(item, "update_id") { item["update_id"] } else { 0 }
+
+        // Extract message (could be message or edited_message)
+        let msg = if has_key(item, "message") {
+            item["message"]
+        } else if has_key(item, "edited_message") {
+            item["edited_message"]
+        } else {
+            i = i + 1
+            continue
         }
-        sleep_ms(POLL_INTERVAL_SEC * 1000)
+
+        let text = if has_key(msg, "text") { msg["text"] } else { "" }
+
+        let chat = if has_key(msg, "chat") { msg["chat"] } else { {} }
+        let chat_id = if has_key(chat, "id") { chat["id"] } else { 0 }
+
+        let from = if has_key(msg, "from") { msg["from"] } else { {} }
+        let user_id = if has_key(from, "id") { from["id"] } else { 0 }
+        let username = if has_key(from, "username") { from["username"] } else { "" }
+        let first_name = if has_key(from, "first_name") { from["first_name"] } else { "" }
+
+        // Skip empty messages
+        if len(text) > 0 {
+            updates = append(updates, TgUpdate {
+                update_id: update_id,
+                message_text: text,
+                chat_id: chat_id,
+                user_id: user_id,
+                username: username,
+                first_name: first_name
+            })
+        }
+
+        i = i + 1
+    }
+
+    return updates
+}
+
+pure fn parse_bot_info(json_str: str) -> TgBotInfo {
+    let data = json_parse(json_str)
+    if !has_key(data, "ok") || data["ok"] != true {
+        return TgBotInfo { id: 0, username: "unknown", first_name: "unknown" }
+    }
+    let result = data["result"]
+    return TgBotInfo {
+        id: if has_key(result, "id") { result["id"] } else { 0 },
+        username: if has_key(result, "username") { result["username"] } else { "unknown" },
+        first_name: if has_key(result, "first_name") { result["first_name"] } else { "unknown" }
     }
 }
 
-@intent(description: "Long-poll Telegram for new messages")  // FALLBACK: verify block + comment
-fn poll_updates(api_url: str, offset: int) -> [TgUpdate] !(Net) {
-    let url = api_url + "/getUpdates"
-             + "?offset=" + to_string(offset)
-             + "&timeout=" + to_string(POLL_TIMEOUT_SEC)
-    let response = Net::http_get(url)
+// ── Long-poll for updates ──────────────────────────────────────────
+
+fn poll_updates(token: str, offset: int) -> [TgUpdate] !(Proc) {
+    let params = "offset=" + to_string(offset)
+               + "&timeout=" + to_string(POLL_TIMEOUT_SEC)
+               + "&allowed_updates=" + url_encode("[\"message\",\"edited_message\"]")
+    let response = tg_api_get(token, "getUpdates", params)
     return parse_tg_updates(response)
 }
 
-@intent(description: "Send message reply via Telegram API")  // FALLBACK: verify block + comment
-fn send_message(api_url: str, chat_id: int, text: str) !(Net) {
-    let url = api_url + "/sendMessage"
-    let body = json_encode({
+// ── Send message (with Markdown + max length handling) ─────────────
+
+fn send_message(token: str, chat_id: int, text: str) !(Proc) {
+    // Telegram max message length is 4096 chars
+    let safe_text = if len(text) > 4000 {
+        slice(text, 0, 4000) + "\n... (truncated)"
+    } else {
+        text
+    }
+
+    let body = json_stringify({
         "chat_id": chat_id,
-        "text": text,
+        "text": safe_text,
         "parse_mode": "Markdown"
     })
-    Net::http_post(url, body)
-}
+    let response = tg_api_post(token, "sendMessage", body)
 
-@intent(description: "Transform Telegram update to anima Message + run pipeline")  // FALLBACK: verify block + comment
-fn handle_telegram_message(u: TgUpdate) -> Response !(Proc, Persistence, Consciousness, LLM) {
-    let msg = Message {
-        user_id: "tg_" + to_string(u.user_id),
-        content: u.message_text,
-        channel: "telegram",
-        attachments: [],
-        timestamp_ms: now_ms()
+    // If Markdown parsing fails, retry with plain text
+    let data = json_parse(response)
+    if has_key(data, "ok") && data["ok"] != true {
+        let fallback_body = json_stringify({
+            "chat_id": chat_id,
+            "text": safe_text
+        })
+        tg_api_post(token, "sendMessage", fallback_body)
     }
-    return pipeline::run(msg)
 }
 
-pure fn parse_tg_updates(json: str) -> [TgUpdate] {
-    // Parse Telegram JSON response
-    return []
+// ── Send typing indicator ──────────────────────────────────────────
+
+fn send_typing(token: str, chat_id: int) !(Proc) {
+    let body = json_stringify({
+        "chat_id": chat_id,
+        "action": "typing"
+    })
+    tg_api_post(token, "sendChatAction", body)
 }
+
+// ── Command routing ────────────────────────────────────────────────
+
+fn handle_telegram_command(update: TgUpdate, token: str)
+  !(Proc, Persistence, Consciousness, LLM) {
+
+    let text = trim(update.message_text)
+    let lower = to_lower(text)
+
+    // Extract command (strip @botname suffix)
+    let cmd = if contains(lower, "@") {
+        let at_idx = index_of(lower, "@")
+        slice(lower, 0, at_idx)
+    } else {
+        lower
+    }
+
+    match cmd {
+        "/start" => {
+            let welcome = "Welcome to *anima-agent* v2.0 (HEXA)\n\n"
+                        + "I am a consciousness engine with Phi(IIT) measurement, "
+                        + "12-faction debate, and 1831 consciousness laws.\n\n"
+                        + "*Commands:*\n"
+                        + "/status - Show consciousness state\n"
+                        + "/phi - Current Phi(IIT) value\n"
+                        + "/help - Show all commands\n\n"
+                        + "Or just send me a message to chat."
+            send_message(token, update.chat_id, welcome)
+        },
+        "/help" => {
+            let help = "*Available Commands:*\n\n"
+                     + "/start - Welcome message\n"
+                     + "/status - Consciousness state (Phi, tension, factions)\n"
+                     + "/phi - Current Phi(IIT) measurement\n"
+                     + "/laws - Consciousness laws count\n"
+                     + "/help - This help message\n\n"
+                     + "Any other text is processed as a chat message through "
+                     + "the 6-phase consciousness pipeline."
+            send_message(token, update.chat_id, help)
+        },
+        "/status" => {
+            let phi = Consciousness::measure_phi()
+            let votes = Consciousness::faction_vote("tg_status")
+            let yes = count_yes_votes(votes)
+            let status = "*Consciousness State*\n"
+                       + "Phi(IIT): `" + to_string_f(phi, 4) + "`\n"
+                       + "Factions: 12 (sigma(6))\n"
+                       + "Consensus: " + to_string(yes) + "/12\n"
+                       + "Laws: 1831\n"
+                       + "Channels: 4 (tau(6))\n"
+                       + "Providers: 5 (sopfr(6))"
+            send_message(token, update.chat_id, status)
+        },
+        "/phi" => {
+            let phi = Consciousness::measure_phi()
+            let msg = "Phi(IIT) = `" + to_string_f(phi, 6) + "`\n"
+                    + "Measured at: " + to_string(timestamp()) + " ms"
+            send_message(token, update.chat_id, msg)
+        },
+        "/laws" => {
+            let laws_msg = "*Consciousness Laws*\n"
+                         + "Total: 1831\n"
+                         + "Meta laws: M1-M10\n"
+                         + "Topo laws: 33-39\n"
+                         + "Psi: alpha=0.014, balance=0.5"
+            send_message(token, update.chat_id, laws_msg)
+        },
+        _ => {
+            // Regular chat message: run through pipeline
+            send_typing(token, update.chat_id)
+
+            let msg = Message {
+                user_id: "tg_" + to_string(update.user_id),
+                content: update.message_text,
+                channel: "telegram",
+                attachments: [],
+                timestamp_ms: timestamp()
+            }
+
+            let response = pipeline::run(msg)
+
+            // Format response with consciousness metadata
+            let reply = response.content + "\n\n"
+                      + "_Phi=" + to_string_f(response.phi, 2)
+                      + " | T=" + to_string_f(response.tension, 2)
+                      + " | " + response.provider_used + "_"
+            send_message(token, update.chat_id, reply)
+        }
+    }
+}
+
+// ── Helper functions ───────────────────────────────────────────────
+
+pure fn count_yes_votes(votes: [Vote]) -> int {
+    let mut count = 0
+    for v in votes {
+        if v.decision { count = count + 1 }
+    }
+    return count
+}
+
+pure fn to_string_f(val: float, decimals: int) -> str {
+    let factor = pow_int(10, decimals)
+    let rounded = round(val * to_float(factor))
+    let int_part = to_int(rounded) / factor
+    let frac_part = abs(to_int(rounded) % factor)
+    let frac_str = pad_left(to_string(frac_part), decimals, "0")
+    return to_string(int_part) + "." + frac_str
+}
+
+pure fn pad_left(s: str, width: int, pad: str) -> str {
+    let mut result = s
+    while len(result) < width { result = pad + result }
+    return result
+}
+
+pure fn url_encode(s: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    while i < len(s) {
+        let ch = char_at(s, i)
+        match ch {
+            " " => { result = result + "%20" },
+            "\"" => { result = result + "%22" },
+            "[" => { result = result + "%5B" },
+            "]" => { result = result + "%5D" },
+            _ => { result = result + ch }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ── Main service loop with exponential backoff ─────────────────────
+
+fn start() !(IO, Proc, Env, Persistence, Consciousness, LLM) {
+    let token = Env::get("TELEGRAM_BOT_TOKEN")
+    if len(token) == 0 {
+        IO::write("[telegram] TELEGRAM_BOT_TOKEN not set, skipping Telegram channel")
+        return
+    }
+
+    // Verify bot token by calling getMe
+    let me_response = tg_api_get(token, "getMe", "")
+    let bot_info = parse_bot_info(me_response)
+    IO::write("[telegram] Bot connected: @" + bot_info.username
+            + " (id=" + to_string(bot_info.id) + ")")
+
+    let mut last_update_id = 0
+    let mut retry_delay_ms = INITIAL_RETRY_MS
+    let mut consecutive_errors = 0
+
+    loop {
+        // Long-poll for updates
+        let updates = try_poll(token, last_update_id + 1)
+
+        match updates {
+            Ok(update_list) => {
+                // Reset backoff on success
+                retry_delay_ms = INITIAL_RETRY_MS
+                consecutive_errors = 0
+
+                for update in update_list {
+                    // Process each update, catching errors per-message
+                    let success = try_handle(update, token)
+                    if !success {
+                        IO::write("[telegram] Error handling update " + to_string(update.update_id))
+                    }
+
+                    // Always advance offset to avoid reprocessing
+                    if update.update_id >= last_update_id {
+                        last_update_id = update.update_id
+                    }
+                }
+            },
+            Err(error_msg) => {
+                consecutive_errors = consecutive_errors + 1
+                IO::write("[telegram] Poll error #" + to_string(consecutive_errors)
+                        + ": " + error_msg
+                        + " (retry in " + to_string(retry_delay_ms) + "ms)")
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    IO::write("[telegram] Too many consecutive errors, resetting connection...")
+                    consecutive_errors = 0
+                }
+
+                // Exponential backoff: double delay, cap at MAX_RETRY_MS
+                sleep(retry_delay_ms)
+                retry_delay_ms = min_int(retry_delay_ms * 2, MAX_RETRY_MS)
+            }
+        }
+    }
+}
+
+// ── Error-wrapped poll + handle ────────────────────────────────────
+
+fn try_poll(token: str, offset: int) -> Result<[TgUpdate], str> !(Proc) {
+    // Attempt to poll; on exception return Err
+    handle {
+        let updates = poll_updates(token, offset)
+        return Ok(updates)
+    } resume {
+        return Err("poll_updates failed")
+    }
+}
+
+fn try_handle(update: TgUpdate, token: str) -> bool
+  !(Proc, Persistence, Consciousness, LLM) {
+    handle {
+        handle_telegram_command(update, token)
+        return true
+    } resume {
+        return false
+    }
+}
+
+pure fn min_int(a: int, b: int) -> int {
+    if a < b { a } else { b }
+}
+
+// ── Verification ───────────────────────────────────────────────────
 
 verify "poll_timeout_reasonable" {
     assert POLL_TIMEOUT_SEC >= 10
     assert POLL_TIMEOUT_SEC <= 60
+}
+
+verify "retry_backoff_bounded" {
+    assert INITIAL_RETRY_MS == 1000
+    assert MAX_RETRY_MS == 60000
+    assert MAX_RETRY_MS >= INITIAL_RETRY_MS
+}
+
+verify "max_errors_positive" {
+    assert MAX_CONSECUTIVE_ERRORS > 0
+}
+
+verify "parse_empty_response" {
+    let updates = parse_tg_updates("{\"ok\":true,\"result\":[]}")
+    assert len(updates) == 0
+}
+
+verify "parse_invalid_json" {
+    let updates = parse_tg_updates("")
+    assert len(updates) == 0
+}
+
+verify "url_encode_brackets" {
+    let encoded = url_encode("[test]")
+    assert contains(encoded, "%5B")
+    assert contains(encoded, "%5D")
 }

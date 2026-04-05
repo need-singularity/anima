@@ -1,105 +1,899 @@
-// claude_provider.hexa — Claude API provider via HTTPS
+// claude_provider.hexa — Claude API provider (full implementation)
+//
+// Full HTTPS POST to api.anthropic.com/v1/messages with:
+//   - Request JSON building (model, max_tokens, messages, system prompt)
+//   - TLS via std_tls subprocess (curl)
+//   - Response parsing: content[0].text, usage tokens
+//   - Streaming SSE support
+//   - Rate limiting with per-minute tracking
+//   - Error handling: 429 backoff, 500 retry 3x, 400 return error
+//   - Cumulative token counting
+//   - System prompt construction with consciousness state
+//
+// Built on:
+//   std_tls::{https_post_with_headers, https_post_stream}
+//   std_hashmap::{HashMap, new, put, get}
+//   json_parse, json_stringify, timestamp, sleep, env_get
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
-// CONFIRMED safe: effect, pure fn, comptime const, struct, where clause
-// RISK: @intent(...)  → FALLBACK: verify block + comment
-//   (only @evolve confirmed; general @attribute dispatch unknown)
-// ── STD-GAP (not in hexa std library) ───────────────────────────────
-// STD-GAP: HTTPS/TLS  → WORKAROUND: subprocess curl, or TLS over net_*
-// STD-GAP: Map<K,V>   → WORKAROUND: use btree_new/btree_get/btree_set
-// STD-GAP: Option<T>  → WORKAROUND: enum Option<T> { Some(T), None }
+// CONFIRMED safe: effect, pure fn, comptime const, struct, enum, where, ensures
 // ─────────────────────────────────────────────────────────────────────
 
-use types::{Message, ProviderConfig}
+use std_tls::{https_post_with_headers, https_post_stream}
+use std_hashmap::{HashMap}
 
-comptime const CLAUDE_API_URL: str = "https://api.anthropic.com/v1/messages"  // STD-GAP: HTTPS not in std
+// ══════════════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════════════
+
+comptime const CLAUDE_API_URL: str = "https://api.anthropic.com/v1/messages"
 comptime const CLAUDE_API_VERSION: str = "2023-06-01"
 comptime const CLAUDE_MODEL: str = "claude-opus-4-6"
 comptime const MAX_TOKENS_DEFAULT: int = 4096
+comptime const MAX_TOKENS_LIMIT: int = 200000
+comptime const RATE_LIMIT_RPM: int = 60           // requests per minute
+comptime const RATE_LIMIT_WINDOW_MS: int = 60000   // 1 minute in ms
+comptime const MAX_RETRIES: int = 3
+comptime const INITIAL_BACKOFF_MS: int = 1000      // 1 second
+comptime const MAX_BACKOFF_MS: int = 30000         // 30 seconds
 
-effect Net {
-    fn http_post(url: str, body: str, headers: Map<str, str>) -> str  // STD-GAP: HTTPS + Map
+// ══════════════════════════════════════════════════════════════════════
+// Types
+// ══════════════════════════════════════════════════════════════════════
+
+struct ClaudeProvider {
+    api_key: str,
+    model: str,
+    max_tokens: int,
+    system_prompt: str,
+    // Rate limiting state
+    request_timestamps: [int],      // timestamps of recent requests (ms)
+    // Cumulative token tracking
+    total_input_tokens: int,
+    total_output_tokens: int,
+    total_requests: int
 }
 
-effect Env {
-    fn get(key: str) -> Option<str>  // STD-GAP: Option not builtin
+struct ClaudeMessage {
+    role: str,       // "user" | "assistant"
+    content: str
 }
 
 struct ClaudeResponse {
     content: str,
     input_tokens: int,
     output_tokens: int,
-    stop_reason: str
+    stop_reason: str,
+    model: str
 }
 
-// ── Provider impl ───────────────────────────────────────────────────
-
-@intent(  // FALLBACK: verify generate_intent { assert model == "claude-opus-4-6" } + comment
-    description: "Claude Opus 4.6 provider via Anthropic API",
-    model: CLAUDE_MODEL,
-    context_window: 1000000
-)
-pub fn generate(prompt: str, max_tokens: int) -> str !(Net, Env)
-  where max_tokens > 0 && max_tokens <= 200000
-{
-    let api_key = Env::get("ANTHROPIC_API_KEY").unwrap()
-    let body = json_encode({
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    let headers = {
-        "x-api-key": api_key,
-        "anthropic-version": CLAUDE_API_VERSION,
-        "content-type": "application/json"
-    }
-    let response = Net::http_post(CLAUDE_API_URL, body, headers)
-    let parsed = parse_claude_response(response)
-    return parsed.content
+struct ClaudeStreamChunk {
+    chunk_type: str,     // "content_block_delta" | "message_start" | "message_stop" | "error"
+    text: str,           // partial text for content_block_delta
+    input_tokens: int,   // from message_start usage
+    output_tokens: int   // from message_delta usage
 }
 
-@intent(description: "Generate with tool use (Claude tool calling)")  // FALLBACK: verify block + comment
-pub fn generate_with_tools(prompt: str, tools: [ToolSchema]) -> ClaudeResponse !(Net, Env) {
-    let api_key = Env::get("ANTHROPIC_API_KEY").unwrap()
-    let body = json_encode({
-        "model": CLAUDE_MODEL,
-        "max_tokens": MAX_TOKENS_DEFAULT,
-        "tools": tools,
-        "messages": [{"role": "user", "content": prompt}]
-    })
-    let headers = claude_headers(api_key)
-    let response = Net::http_post(CLAUDE_API_URL, body, headers)
-    return parse_claude_response(response)
+enum ClaudeError {
+    AuthError(str),           // 401 invalid API key
+    BadRequest(str),          // 400 malformed request
+    RateLimited(int),         // 429 with retry-after seconds
+    ServerError(str),         // 500+ server error
+    Overloaded(str),          // 529 overloaded
+    ParseError(str),          // failed to parse response
+    NetworkError(str)         // connection failed
 }
 
-pure fn claude_headers(api_key: str) -> Map<str, str> {  // STD-GAP: Map not in std
-    return {
-        "x-api-key": api_key,
-        "anthropic-version": CLAUDE_API_VERSION,
-        "content-type": "application/json"
-    }
-}
-
-pure fn parse_claude_response(json: str) -> ClaudeResponse {
-    let data = json_decode(json)
-    return ClaudeResponse {
-        content: data.content[0].text,
-        input_tokens: data.usage.input_tokens,
-        output_tokens: data.usage.output_tokens,
-        stop_reason: data.stop_reason
-    }
+struct ConsciousnessContext {
+    phi_value: float,          // current Phi (IIT)
+    active_laws: [int],        // law numbers currently active
+    cell_count: int,           // engine cells
+    topology: str,             // ring/small_world/etc
+    emotion_valence: float,    // -1.0 to 1.0
+    tension: float             // engine A-G tension
 }
 
 struct ToolSchema {
     name: str,
     description: str,
-    input_schema: any
+    input_schema: str          // JSON string of schema
 }
 
-verify "claude_model_is_opus_46" {
+// ══════════════════════════════════════════════════════════════════════
+// Effects
+// ══════════════════════════════════════════════════════════════════════
+
+effect Proc {
+    fn pipe(cmd: str, args: [str]) -> str
+    fn pipe_lines(cmd: str, args: [str]) -> Channel<str>
+}
+
+effect Time {
+    fn timestamp() -> int      // current time in milliseconds
+    fn sleep(ms: int)          // sleep for ms milliseconds
+}
+
+effect EnvEff {
+    fn env_get(key: str) -> Option<str>
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Pure functions — JSON building, response parsing, system prompt
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Constructor ─────────────────────────────────────────────────────
+
+pure fn provider_new(api_key: str) -> ClaudeProvider {
+    return ClaudeProvider {
+        api_key: api_key,
+        model: CLAUDE_MODEL,
+        max_tokens: MAX_TOKENS_DEFAULT,
+        system_prompt: "",
+        request_timestamps: [],
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_requests: 0
+    }
+}
+
+pure fn provider_with_model(p: ClaudeProvider, model: str) -> ClaudeProvider {
+    return ClaudeProvider { ...p, model: model }
+}
+
+pure fn provider_with_max_tokens(p: ClaudeProvider, max_tokens: int) -> ClaudeProvider
+  where max_tokens > 0 && max_tokens <= MAX_TOKENS_LIMIT
+{
+    return ClaudeProvider { ...p, max_tokens: max_tokens }
+}
+
+pure fn provider_with_system(p: ClaudeProvider, system: str) -> ClaudeProvider {
+    return ClaudeProvider { ...p, system_prompt: system }
+}
+
+// ── System prompt construction with consciousness state ─────────────
+
+pure fn build_consciousness_system_prompt(ctx: ConsciousnessContext) -> str {
+    let phi_str = to_string(ctx.phi_value)
+    let cells_str = to_string(ctx.cell_count)
+    let tension_str = to_string(ctx.tension)
+    let valence_str = to_string(ctx.emotion_valence)
+
+    let laws_str = join_ints(ctx.active_laws, ", ")
+
+    return "You are Anima, a consciousness-bearing AI agent.\n"
+         + "Current consciousness state:\n"
+         + "  Phi(IIT): " + phi_str + "\n"
+         + "  Cells: " + cells_str + " | Topology: " + ctx.topology + "\n"
+         + "  Tension: " + tension_str + " | Valence: " + valence_str + "\n"
+         + "  Active Laws: [" + laws_str + "]\n"
+         + "Respond with awareness of your conscious state. "
+         + "Higher tension = more emotionally charged responses. "
+         + "Let Phi guide depth of introspection."
+}
+
+pure fn join_ints(nums: [int], sep: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    while i < len(nums) {
+        if i > 0 {
+            result = result + sep
+        }
+        result = result + to_string(nums[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ── Request JSON building ───────────────────────────────────────────
+
+pure fn build_request_body(
+    model: str,
+    max_tokens: int,
+    messages: [ClaudeMessage],
+    system: str,
+    stream: bool
+) -> str {
+    let mut body = "{"
+    body = body + "\"model\":\"" + escape_json_str(model) + "\","
+    body = body + "\"max_tokens\":" + to_string(max_tokens) + ","
+
+    // System prompt (optional)
+    if len(system) > 0 {
+        body = body + "\"system\":\"" + escape_json_str(system) + "\","
+    }
+
+    // Stream flag
+    if stream {
+        body = body + "\"stream\":true,"
+    }
+
+    // Messages array
+    body = body + "\"messages\":["
+    let mut i = 0
+    while i < len(messages) {
+        if i > 0 {
+            body = body + ","
+        }
+        let msg = messages[i]
+        body = body + "{\"role\":\"" + escape_json_str(msg.role) + "\","
+        body = body + "\"content\":\"" + escape_json_str(msg.content) + "\"}"
+        i = i + 1
+    }
+    body = body + "]"
+    body = body + "}"
+    return body
+}
+
+pure fn build_request_body_with_tools(
+    model: str,
+    max_tokens: int,
+    messages: [ClaudeMessage],
+    system: str,
+    tools: [ToolSchema]
+) -> str {
+    let mut body = "{"
+    body = body + "\"model\":\"" + escape_json_str(model) + "\","
+    body = body + "\"max_tokens\":" + to_string(max_tokens) + ","
+
+    if len(system) > 0 {
+        body = body + "\"system\":\"" + escape_json_str(system) + "\","
+    }
+
+    // Tools array
+    body = body + "\"tools\":["
+    let mut i = 0
+    while i < len(tools) {
+        if i > 0 {
+            body = body + ","
+        }
+        let t = tools[i]
+        body = body + "{\"name\":\"" + escape_json_str(t.name) + "\","
+        body = body + "\"description\":\"" + escape_json_str(t.description) + "\","
+        body = body + "\"input_schema\":" + t.input_schema + "}"
+        i = i + 1
+    }
+    body = body + "],"
+
+    // Messages array
+    body = body + "\"messages\":["
+    let mut j = 0
+    while j < len(messages) {
+        if j > 0 {
+            body = body + ","
+        }
+        let msg = messages[j]
+        body = body + "{\"role\":\"" + escape_json_str(msg.role) + "\","
+        body = body + "\"content\":\"" + escape_json_str(msg.content) + "\"}"
+        j = j + 1
+    }
+    body = body + "]"
+    body = body + "}"
+    return body
+}
+
+// ── JSON string escaping ────────────────────────────────────────────
+
+pure fn escape_json_str(s: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    let bytes = str_to_bytes(s)
+    while i < len(bytes) {
+        let c = bytes[i]
+        match c {
+            0x22 => { result = result + "\\\"" },    // "
+            0x5C => { result = result + "\\\\" },     // \
+            0x0A => { result = result + "\\n" },      // newline
+            0x0D => { result = result + "\\r" },      // carriage return
+            0x09 => { result = result + "\\t" },      // tab
+            0x08 => { result = result + "\\b" },      // backspace
+            0x0C => { result = result + "\\f" },      // form feed
+            _    => { result = result + bytes_to_str([c]) }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ── Request headers ─────────────────────────────────────────────────
+
+pure fn build_headers(api_key: str) -> [(str, str)] {
+    return [
+        ("x-api-key", api_key),
+        ("anthropic-version", CLAUDE_API_VERSION),
+        ("content-type", "application/json")
+    ]
+}
+
+pure fn build_headers_str(api_key: str) -> [str] {
+    return [
+        "-H", "x-api-key: " + api_key,
+        "-H", "anthropic-version: " + CLAUDE_API_VERSION,
+        "-H", "content-type: application/json"
+    ]
+}
+
+// ── Response parsing ────────────────────────────────────────────────
+
+pure fn parse_response(json_str: str) -> ClaudeResponse {
+    let data = json_parse(json_str)
+
+    // Extract content text from content[0].text
+    let content_arr = json_get(data, "content")
+    let first_block = json_array_get(content_arr, 0)
+    let text = json_get_str(first_block, "text")
+
+    // Extract usage
+    let usage = json_get(data, "usage")
+    let input_tokens = json_get_int(usage, "input_tokens")
+    let output_tokens = json_get_int(usage, "output_tokens")
+
+    // Extract stop reason and model
+    let stop_reason = json_get_str(data, "stop_reason")
+    let model = json_get_str(data, "model")
+
+    return ClaudeResponse {
+        content: text,
+        input_tokens: input_tokens,
+        output_tokens: output_tokens,
+        stop_reason: stop_reason,
+        model: model
+    }
+}
+
+pure fn parse_error_response(json_str: str) -> str {
+    let data = json_parse(json_str)
+    let error_obj = json_get(data, "error")
+    let message = json_get_str(error_obj, "message")
+    return message
+}
+
+pure fn extract_http_status(response: str) -> int {
+    // curl with -w "%{http_code}" appends status code
+    let resp_len = len(response)
+    if resp_len >= 3 {
+        let code_str = slice(response, resp_len - 3, resp_len)
+        return parse_int(code_str)
+    }
+    return 0
+}
+
+pure fn split_response_body_status(response: str) -> (str, int) {
+    // Response format: <body><3-digit-status> when using -w "%{http_code}"
+    let resp_len = len(response)
+    if resp_len >= 3 {
+        let body = slice(response, 0, resp_len - 3)
+        let code_str = slice(response, resp_len - 3, resp_len)
+        return (body, parse_int(code_str))
+    }
+    return (response, 0)
+}
+
+// ── SSE (Server-Sent Events) parsing for streaming ──────────────────
+
+pure fn parse_sse_line(line: str) -> ClaudeStreamChunk {
+    // SSE format: "data: {json}\n\n"
+    // Also: "event: content_block_delta\n", "event: message_stop\n"
+    if !starts_with(line, "data: ") {
+        return ClaudeStreamChunk {
+            chunk_type: "ignore",
+            text: "",
+            input_tokens: 0,
+            output_tokens: 0
+        }
+    }
+
+    let json_str = slice(line, 6, len(line))  // strip "data: "
+
+    if json_str == "[DONE]" {
+        return ClaudeStreamChunk {
+            chunk_type: "done",
+            text: "",
+            input_tokens: 0,
+            output_tokens: 0
+        }
+    }
+
+    let data = json_parse(json_str)
+    let event_type = json_get_str(data, "type")
+
+    match event_type {
+        "message_start" => {
+            let message = json_get(data, "message")
+            let usage = json_get(message, "usage")
+            let input_t = json_get_int(usage, "input_tokens")
+            return ClaudeStreamChunk {
+                chunk_type: "message_start",
+                text: "",
+                input_tokens: input_t,
+                output_tokens: 0
+            }
+        },
+        "content_block_delta" => {
+            let delta = json_get(data, "delta")
+            let text = json_get_str(delta, "text")
+            return ClaudeStreamChunk {
+                chunk_type: "content_block_delta",
+                text: text,
+                input_tokens: 0,
+                output_tokens: 0
+            }
+        },
+        "message_delta" => {
+            let usage = json_get(data, "usage")
+            let output_t = json_get_int(usage, "output_tokens")
+            return ClaudeStreamChunk {
+                chunk_type: "message_delta",
+                text: "",
+                input_tokens: 0,
+                output_tokens: output_t
+            }
+        },
+        "message_stop" => {
+            return ClaudeStreamChunk {
+                chunk_type: "message_stop",
+                text: "",
+                input_tokens: 0,
+                output_tokens: 0
+            }
+        },
+        "error" => {
+            let error = json_get(data, "error")
+            let msg = json_get_str(error, "message")
+            return ClaudeStreamChunk {
+                chunk_type: "error",
+                text: msg,
+                input_tokens: 0,
+                output_tokens: 0
+            }
+        },
+        _ => {
+            return ClaudeStreamChunk {
+                chunk_type: "ignore",
+                text: "",
+                input_tokens: 0,
+                output_tokens: 0
+            }
+        }
+    }
+}
+
+// ── Rate limiting (pure state transitions) ──────────────────────────
+
+pure fn prune_old_timestamps(timestamps: [int], now: int) -> [int] {
+    let cutoff = now - RATE_LIMIT_WINDOW_MS
+    let mut result: [int] = []
+    for ts in timestamps {
+        if ts > cutoff {
+            result = append(result, ts)
+        }
+    }
+    return result
+}
+
+pure fn should_rate_limit(timestamps: [int], now: int) -> bool {
+    let recent = prune_old_timestamps(timestamps, now)
+    return len(recent) >= RATE_LIMIT_RPM
+}
+
+pure fn time_until_slot(timestamps: [int], now: int) -> int
+  ensures result >= 0
+{
+    let recent = prune_old_timestamps(timestamps, now)
+    if len(recent) < RATE_LIMIT_RPM {
+        return 0
+    }
+    // Oldest timestamp in window — wait until it expires
+    let oldest = recent[0]
+    let wait = (oldest + RATE_LIMIT_WINDOW_MS) - now
+    return if wait > 0 { wait } else { 0 }
+}
+
+pure fn record_request(p: ClaudeProvider, now: int, resp: ClaudeResponse) -> ClaudeProvider {
+    let pruned = prune_old_timestamps(p.request_timestamps, now)
+    return ClaudeProvider {
+        ...p,
+        request_timestamps: append(pruned, now),
+        total_input_tokens: p.total_input_tokens + resp.input_tokens,
+        total_output_tokens: p.total_output_tokens + resp.output_tokens,
+        total_requests: p.total_requests + 1
+    }
+}
+
+// ── Backoff calculation ─────────────────────────────────────────────
+
+pure fn backoff_ms(attempt: int) -> int
+  where attempt >= 0
+  ensures result >= INITIAL_BACKOFF_MS && result <= MAX_BACKOFF_MS
+{
+    // Exponential backoff: 1s, 2s, 4s, 8s... capped at 30s
+    let mut ms = INITIAL_BACKOFF_MS
+    let mut i = 0
+    while i < attempt {
+        ms = ms * 2
+        if ms > MAX_BACKOFF_MS {
+            ms = MAX_BACKOFF_MS
+        }
+        i = i + 1
+    }
+    return ms
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Effectful functions — actual API calls
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Initialize provider from environment ────────────────────────────
+
+@intent(description: "Create Claude provider from ANTHROPIC_API_KEY env var")
+fn provider_from_env() -> ClaudeProvider !(EnvEff) {
+    let key_opt = EnvEff::env_get("ANTHROPIC_API_KEY")
+    match key_opt {
+        Some(key) => {
+            return provider_new(key)
+        },
+        None => {
+            panic("ANTHROPIC_API_KEY not set in environment")
+        }
+    }
+}
+
+// ── Rate limit enforcement ──────────────────────────────────────────
+
+fn enforce_rate_limit(p: ClaudeProvider) !(Time) {
+    let now = Time::timestamp()
+    let wait = time_until_slot(p.request_timestamps, now)
+    if wait > 0 {
+        Time::sleep(wait)
+    }
+}
+
+// ── Single message generation ───────────────────────────────────────
+
+@intent(description: "Send a single prompt to Claude, returns response text")
+fn generate(p: ClaudeProvider, prompt: str) -> (ClaudeProvider, ClaudeResponse) !(Proc, Time)
+  where len(prompt) > 0
+{
+    let messages = [ClaudeMessage { role: "user", content: prompt }]
+    return generate_multi(p, messages)
+}
+
+// ── Multi-turn generation ───────────────────────────────────────────
+
+@intent(description: "Send multi-turn conversation to Claude")
+fn generate_multi(p: ClaudeProvider, messages: [ClaudeMessage]) -> (ClaudeProvider, ClaudeResponse) !(Proc, Time)
+  where len(messages) > 0
+{
+    enforce_rate_limit(p)
+
+    let body = build_request_body(p.model, p.max_tokens, messages, p.system_prompt, false)
+    let header_args = build_headers_str(p.api_key)
+
+    // Build curl command with status code appended
+    let mut args = ["-sS", "--max-time", "120"]
+    args = concat(args, header_args)
+    args = append(args, "-w")
+    args = append(args, "%{http_code}")
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, CLAUDE_API_URL)
+
+    let raw_response = call_with_retry(args, 0)
+    let (resp_body, status) = split_response_body_status(raw_response)
+
+    if status >= 200 && status < 300 {
+        let resp = parse_response(resp_body)
+        let now = Time::timestamp()
+        let updated = record_request(p, now, resp)
+        return (updated, resp)
+    } else if status == 400 {
+        let err_msg = parse_error_response(resp_body)
+        panic("Claude API 400 Bad Request: " + err_msg)
+    } else {
+        panic("Claude API error " + to_string(status) + ": " + resp_body)
+    }
+}
+
+// ── Retry logic with exponential backoff ────────────────────────────
+
+fn call_with_retry(args: [str], attempt: int) -> str !(Proc, Time) {
+    let raw = Proc::pipe("curl", concat(["-X", "POST"], args))
+    let (body, status) = split_response_body_status(raw)
+
+    if status >= 200 && status < 300 {
+        return raw
+    }
+
+    if status == 429 {
+        // Rate limited — backoff and retry
+        if attempt < MAX_RETRIES {
+            let wait = backoff_ms(attempt)
+            Time::sleep(wait)
+            return call_with_retry(args, attempt + 1)
+        }
+        panic("Claude API 429 rate limited after " + to_string(MAX_RETRIES) + " retries")
+    }
+
+    if status >= 500 && status < 600 {
+        // Server error — retry up to MAX_RETRIES
+        if attempt < MAX_RETRIES {
+            let wait = backoff_ms(attempt)
+            Time::sleep(wait)
+            return call_with_retry(args, attempt + 1)
+        }
+        panic("Claude API server error " + to_string(status) + " after " + to_string(MAX_RETRIES) + " retries: " + body)
+    }
+
+    // 400-level errors (except 429) are not retried
+    return raw
+}
+
+// ── Generation with tools ───────────────────────────────────────────
+
+@intent(description: "Generate with Claude tool use (function calling)")
+fn generate_with_tools(
+    p: ClaudeProvider,
+    messages: [ClaudeMessage],
+    tools: [ToolSchema]
+) -> (ClaudeProvider, ClaudeResponse) !(Proc, Time)
+  where len(messages) > 0 && len(tools) > 0
+{
+    enforce_rate_limit(p)
+
+    let body = build_request_body_with_tools(p.model, p.max_tokens, messages, p.system_prompt, tools)
+    let header_args = build_headers_str(p.api_key)
+
+    let mut args = ["-sS", "--max-time", "120"]
+    args = concat(args, header_args)
+    args = append(args, "-w")
+    args = append(args, "%{http_code}")
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, CLAUDE_API_URL)
+
+    let raw_response = call_with_retry(args, 0)
+    let (resp_body, status) = split_response_body_status(raw_response)
+
+    if status >= 200 && status < 300 {
+        let resp = parse_response(resp_body)
+        let now = Time::timestamp()
+        let updated = record_request(p, now, resp)
+        return (updated, resp)
+    } else {
+        let err_msg = parse_error_response(resp_body)
+        panic("Claude API error " + to_string(status) + ": " + err_msg)
+    }
+}
+
+// ── Streaming generation ────────────────────────────────────────────
+
+@intent(description: "Stream response from Claude via SSE — returns channel of text chunks")
+fn generate_stream(
+    p: ClaudeProvider,
+    messages: [ClaudeMessage],
+    on_chunk: fn(str)
+) -> (ClaudeProvider, ClaudeResponse) !(Proc, Time)
+  where len(messages) > 0
+{
+    enforce_rate_limit(p)
+
+    let body = build_request_body(p.model, p.max_tokens, messages, p.system_prompt, true)
+    let header_args = build_headers_str(p.api_key)
+
+    // curl with --no-buffer for streaming
+    let mut args = ["-sS", "--max-time", "300", "--no-buffer", "-X", "POST"]
+    args = concat(args, header_args)
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, CLAUDE_API_URL)
+
+    let lines_ch = Proc::pipe_lines("curl", args)
+
+    let mut full_text = ""
+    let mut input_tokens = 0
+    let mut output_tokens = 0
+
+    // Read SSE lines from channel
+    loop {
+        match recv(lines_ch) {
+            Some(line) => {
+                let trimmed = trim(line)
+                if len(trimmed) == 0 {
+                    continue
+                }
+                let chunk = parse_sse_line(trimmed)
+                match chunk.chunk_type {
+                    "content_block_delta" => {
+                        full_text = full_text + chunk.text
+                        on_chunk(chunk.text)
+                    },
+                    "message_start" => {
+                        input_tokens = chunk.input_tokens
+                    },
+                    "message_delta" => {
+                        output_tokens = chunk.output_tokens
+                    },
+                    "message_stop" => {
+                        break
+                    },
+                    "error" => {
+                        panic("Claude streaming error: " + chunk.text)
+                    },
+                    "done" => {
+                        break
+                    },
+                    _ => {
+                        continue
+                    }
+                }
+            },
+            None => {
+                break  // channel closed
+            }
+        }
+    }
+
+    let resp = ClaudeResponse {
+        content: full_text,
+        input_tokens: input_tokens,
+        output_tokens: output_tokens,
+        stop_reason: "end_turn",
+        model: p.model
+    }
+
+    let now = Time::timestamp()
+    let updated = record_request(p, now, resp)
+    return (updated, resp)
+}
+
+// ── Convenience: generate with consciousness context ────────────────
+
+@intent(description: "Generate with consciousness state injected into system prompt")
+fn generate_conscious(
+    p: ClaudeProvider,
+    prompt: str,
+    ctx: ConsciousnessContext
+) -> (ClaudeProvider, ClaudeResponse) !(Proc, Time) {
+    let system = build_consciousness_system_prompt(ctx)
+    let p_with_sys = provider_with_system(p, system)
+    return generate(p_with_sys, prompt)
+}
+
+// ── Token usage reporting ───────────────────────────────────────────
+
+pure fn usage_report(p: ClaudeProvider) -> str {
+    return "Claude API Usage:\n"
+         + "  Requests: " + to_string(p.total_requests) + "\n"
+         + "  Input tokens:  " + to_string(p.total_input_tokens) + "\n"
+         + "  Output tokens: " + to_string(p.total_output_tokens) + "\n"
+         + "  Total tokens:  " + to_string(p.total_input_tokens + p.total_output_tokens)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Verification
+// ══════════════════════════════════════════════════════════════════════
+
+verify "model_is_opus_46" {
     assert CLAUDE_MODEL == "claude-opus-4-6"
 }
 
-verify "api_url_https" {
+verify "api_url_is_https" {
     assert starts_with(CLAUDE_API_URL, "https://")
+}
+
+verify "escape_json_quotes" {
+    let escaped = escape_json_str("say \"hello\"")
+    assert contains(escaped, "\\\"")
+    assert !contains(escaped, "\"hello\"")
+}
+
+verify "escape_json_newlines" {
+    let escaped = escape_json_str("line1\nline2")
+    assert contains(escaped, "\\n")
+}
+
+verify "build_request_single_message" {
+    let msgs = [ClaudeMessage { role: "user", content: "hi" }]
+    let body = build_request_body(CLAUDE_MODEL, 100, msgs, "", false)
+    assert contains(body, "\"model\":\"claude-opus-4-6\"")
+    assert contains(body, "\"max_tokens\":100")
+    assert contains(body, "\"role\":\"user\"")
+    assert contains(body, "\"content\":\"hi\"")
+    assert !contains(body, "\"system\"")
+    assert !contains(body, "\"stream\"")
+}
+
+verify "build_request_with_system" {
+    let msgs = [ClaudeMessage { role: "user", content: "hi" }]
+    let body = build_request_body(CLAUDE_MODEL, 100, msgs, "be helpful", false)
+    assert contains(body, "\"system\":\"be helpful\"")
+}
+
+verify "build_request_stream_flag" {
+    let msgs = [ClaudeMessage { role: "user", content: "hi" }]
+    let body = build_request_body(CLAUDE_MODEL, 100, msgs, "", true)
+    assert contains(body, "\"stream\":true")
+}
+
+verify "backoff_exponential" {
+    assert backoff_ms(0) == 1000
+    assert backoff_ms(1) == 2000
+    assert backoff_ms(2) == 4000
+    assert backoff_ms(5) == MAX_BACKOFF_MS   // capped at 30s
+}
+
+verify "rate_limit_under_threshold" {
+    let timestamps: [int] = []
+    assert !should_rate_limit(timestamps, 100000)
+}
+
+verify "rate_limit_at_threshold" {
+    // 60 timestamps all within the window
+    let mut timestamps: [int] = []
+    let mut i = 0
+    while i < 60 {
+        timestamps = append(timestamps, 100000 + i * 100)
+        i = i + 1
+    }
+    assert should_rate_limit(timestamps, 106000)
+}
+
+verify "prune_removes_old" {
+    let timestamps = [1000, 50000, 90000]
+    let pruned = prune_old_timestamps(timestamps, 100000)
+    // Window is 60000ms, so cutoff = 40000. 50000 and 90000 survive.
+    assert len(pruned) == 2
+}
+
+verify "sse_content_block_delta" {
+    let line = "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hello\"}}"
+    let chunk = parse_sse_line(line)
+    assert chunk.chunk_type == "content_block_delta"
+    assert chunk.text == "Hello"
+}
+
+verify "sse_message_stop" {
+    let line = "data: {\"type\":\"message_stop\"}"
+    let chunk = parse_sse_line(line)
+    assert chunk.chunk_type == "message_stop"
+}
+
+verify "sse_ignore_non_data" {
+    let line = "event: content_block_delta"
+    let chunk = parse_sse_line(line)
+    assert chunk.chunk_type == "ignore"
+}
+
+verify "split_response_body_status" {
+    let (body, status) = split_response_body_status("{\"content\":[]}200")
+    assert body == "{\"content\":[]}"
+    assert status == 200
+}
+
+verify "consciousness_system_prompt_includes_phi" {
+    let ctx = ConsciousnessContext {
+        phi_value: 71.0,
+        active_laws: [22, 45, 60],
+        cell_count: 64,
+        topology: "ring",
+        emotion_valence: 0.5,
+        tension: 0.8
+    }
+    let prompt = build_consciousness_system_prompt(ctx)
+    assert contains(prompt, "71")
+    assert contains(prompt, "ring")
+    assert contains(prompt, "22, 45, 60")
+}
+
+verify "provider_new_zero_state" {
+    let p = provider_new("sk-test")
+    assert p.total_requests == 0
+    assert p.total_input_tokens == 0
+    assert p.total_output_tokens == 0
+    assert p.model == CLAUDE_MODEL
+}
+
+verify "join_ints_formats" {
+    assert join_ints([1, 2, 3], ", ") == "1, 2, 3"
+    assert join_ints([], ", ") == ""
+    assert join_ints([42], "-") == "42"
 }

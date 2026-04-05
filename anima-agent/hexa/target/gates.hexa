@@ -1,0 +1,750 @@
+// gates.hexa — 8 missing declarations implemented (HEXA Mk.II+ target)
+//
+// Canonical spec: ~/Dev/airgenome/docs/gates.hexa
+// This file implements the 8 items identified in the spec audit.
+// All types, constants, and function signatures match the spec exactly.
+//
+// TARGETS Mk.II+ confirmed features:
+//   effect system, pure fn, ensures, comptime const, match ranges,
+//   consciousness block, select/spawn, where (preconditions).
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CONSTANTS (re-exported from spec)
+// ═══════════════════════════════════════════════════════════════════════
+
+comptime const AXIS_COUNT: usize = 6
+comptime const PAIR_COUNT: usize = 15          // C(6, 2)
+comptime const GENOME_BYTES: usize = 60        // see serialization layout below
+comptime const PAIR_THRESHOLD: f64 = 0.5       // default per-pair firing threshold
+comptime const SINGULARITY: f64 = 2.0 / 3.0    // Banach 1/3 work ceiling
+
+// ═══════════════════════════════════════════════════════════════════════
+//  ENUMS
+// ═══════════════════════════════════════════════════════════════════════
+
+enum Axis { Cpu, Ram, Gpu, Npu, Power, Io }
+
+enum GateId { Macos, Finder, Telegram, Chrome, Safari }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  EFFECTS (required by effectful functions)
+// ═══════════════════════════════════════════════════════════════════════
+
+effect ProcessList       // ps -axm (read-only)
+effect SysControl        // sysctl read (read-only)
+effect Clock             // SystemTime::now
+effect FileRead
+effect FileWrite
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [1] struct GateStream — per-gate time-series bundle
+// ═══════════════════════════════════════════════════════════════════════
+
+struct GateStream {
+    gate: GateId,
+    ram: [f64],            // rss_mb / total_ram_mb per sample
+    cpu: [f64],            // cpu_pct / 100 per sample
+    gpu: [f64],            // reserved (all zeros for now)
+    npu: [f64],            // reserved
+    power: [f64],          // AC proxy (all 1.0)
+    io: [f64],             // reserved
+    ts: [u32]              // timestamps per sample
+}
+
+pure fn gate_stream_len(s: borrow GateStream) -> usize {
+    s.ts.len()
+}
+
+pure fn gate_stream_axes(s: borrow GateStream) -> [[f64]; 6] {
+    [s.cpu, s.ram, s.gpu, s.npu, s.power, s.io]
+}
+
+pure fn gate_stream_new(gate: GateId, samples: usize) -> GateStream
+    where samples >= 1
+    ensures result.ts.len() == samples
+{
+    GateStream {
+        gate: gate,
+        ram:   [0.0; samples],
+        cpu:   [0.0; samples],
+        gpu:   [0.0; samples],
+        npu:   [0.0; samples],
+        power: [1.0; samples],
+        io:    [0.0; samples],
+        ts:    [0; samples]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [2] struct Signature — accumulated gate genome for historical analysis
+// ═══════════════════════════════════════════════════════════════════════
+
+struct GateGenome {
+    axes: [f32; 6],
+    firing_bits: u16,
+    ts: u32,
+    counters: [f32; 3],    // [procs, rss_mb, cpu_pct]
+    stats: [f32; 4]        // [min, max, mean, stddev]
+}
+
+struct Signature {
+    gate: GateId,
+    genome: GateGenome,
+    sample_count: u32,
+    first_ts: u32,
+    last_ts: u32
+}
+
+fn load_signatures(path: str) -> [Signature] !{ FileRead }
+    ensures result.len() >= 0
+{
+    let raw = FileRead.read(path)
+    let lines = raw.split("\n").filter(|l| l.len() > 0)
+    let mut sigs: [Signature] = []
+    for line in lines {
+        let parsed = parse_jsonl_line(line)
+        // Build signature from genome — single-sample signature
+        let sig = Signature {
+            gate: parsed.gate,
+            genome: parsed,
+            sample_count: 1,
+            first_ts: parsed.ts,
+            last_ts: parsed.ts
+        }
+        sigs.push(sig)
+    }
+    sigs
+}
+
+pure fn signature_time_range(s: borrow Signature) -> (u32, u32) {
+    (s.first_ts, s.last_ts)
+}
+
+pure fn signature_duration(s: borrow Signature) -> u32
+    ensures result == s.last_ts - s.first_ts
+{
+    s.last_ts - s.first_ts
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [3] fn aggregate_gate — parse ps snapshot, filter by gate, build genome
+// ═══════════════════════════════════════════════════════════════════════
+
+fn aggregate_gate(ps_snapshot: str, gate: GateId) -> GateGenome
+    ensures result.axes.len() == 6
+{
+    // Parse ps output: each line is "COMMAND  PID  %CPU  RSS"
+    // (ps -axm -o comm,pid,pcpu,rss format)
+    let lines = ps_snapshot.split("\n")
+    let mut total_cpu: f64 = 0.0
+    let mut total_rss: f64 = 0.0      // in MB
+    let mut proc_count: f64 = 0.0
+    let mut cpu_values: [f64] = []
+
+    for line in lines {
+        let fields = line.split_whitespace()
+        match fields.len() >= 4 {
+            false => { /* skip malformed lines */ },
+            true => {
+                let proc_name = fields[0]
+                let classified = classify(proc_name)
+                match classified {
+                    none => { /* skip unmatched */ },
+                    some(id) => {
+                        match id == gate {
+                            false => { /* skip wrong gate */ },
+                            true => {
+                                let cpu_pct = parse_f64(fields[2])
+                                let rss_kb = parse_f64(fields[3])
+                                total_cpu = total_cpu + cpu_pct
+                                total_rss = total_rss + rss_kb / 1024.0
+                                proc_count = proc_count + 1.0
+                                cpu_values.push(cpu_pct)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6-axis vitals: cpu%, ram MB, gpu%, npu%, power W, io ops/s
+    let cpu_axis = total_cpu / 100.0               // normalized
+    let ram_axis = total_rss                        // MB
+    let gpu_axis: f64 = 0.0                         // no public per-proc API
+    let npu_axis: f64 = 0.0                         // no public per-proc API
+    let power_axis: f64 = 1.0                       // AC proxy
+    let io_axis: f64 = 0.0                          // reserved
+
+    // Compute stats from cpu_values
+    let (v_min, v_max, v_mean, v_stddev) = compute_stats(cpu_values)
+
+    let axes: [f32; 6] = [
+        cpu_axis as f32, ram_axis as f32, gpu_axis as f32,
+        npu_axis as f32, power_axis as f32, io_axis as f32
+    ]
+
+    let genome = GateGenome {
+        axes: axes,
+        firing_bits: 0,       // placeholder, compute with firing() after
+        ts: 0,                // caller sets timestamp
+        counters: [proc_count as f32, total_rss as f32, total_cpu as f32],
+        stats: [v_min as f32, v_max as f32, v_mean as f32, v_stddev as f32]
+    }
+
+    // Compute firing bits from the 6-axis values
+    let final_genome = GateGenome {
+        axes: genome.axes,
+        firing_bits: firing(genome),
+        ts: genome.ts,
+        counters: genome.counters,
+        stats: genome.stats
+    }
+
+    final_genome
+}
+
+// Helper: compute min, max, mean, stddev from a list of f64
+pure fn compute_stats(values: [f64]) -> (f64, f64, f64, f64)
+    ensures values.len() == 0 implies result == (0.0, 0.0, 0.0, 0.0)
+{
+    match values.len() {
+        0 => (0.0, 0.0, 0.0, 0.0),
+        n => {
+            let mut v_min = values[0]
+            let mut v_max = values[0]
+            let mut v_sum: f64 = 0.0
+            for v in values {
+                match v < v_min { true => { v_min = v }, false => {} }
+                match v > v_max { true => { v_max = v }, false => {} }
+                v_sum = v_sum + v
+            }
+            let v_mean = v_sum / n as f64
+            let mut sq_sum: f64 = 0.0
+            for v in values {
+                let d = v - v_mean
+                sq_sum = sq_sum + d * d
+            }
+            let v_stddev = sqrt(sq_sum / n as f64)
+            (v_min, v_max, v_mean, v_stddev)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [4] fn classify — match process name to GateId
+// ═══════════════════════════════════════════════════════════════════════
+
+pure fn classify(proc_name: str) -> GateId?
+    ensures result is some(id) implies id in [GateId::Macos, GateId::Finder,
+        GateId::Telegram, GateId::Chrome, GateId::Safari]
+{
+    match proc_name {
+        // macOS system processes → Macos gate
+        "launchd" | "WindowServer" | "kernel_task"
+            | "mds" | "mds_stores" | "mds_worker"
+            | "opendirectoryd" | "syslogd" | "configd"
+            | "distnoted" | "logd" | "notifyd"
+            | "UserEventAgent" | "loginwindow"
+            | "cfprefsd" | "coreduetd" | "containermanagerd"
+            => GateId::Macos,
+
+        // Finder
+        "Finder" | "com.apple.Finder" | "com.apple.finder"
+            => GateId::Finder,
+
+        // Telegram
+        "Telegram" | "Telegram Desktop" | "com.telegram.desktop"
+            => GateId::Telegram,
+
+        // Chrome
+        "Google Chrome" | "Google Chrome Helper"
+            | "Google Chrome Helper (Renderer)"
+            | "Google Chrome Helper (GPU)"
+            | "Google Chrome Helper (Plugin)"
+            | "com.google.Chrome"
+            => GateId::Chrome,
+
+        // Safari
+        "Safari" | "com.apple.Safari"
+            | "com.apple.WebKit.WebContent"
+            | "com.apple.WebKit.Networking"
+            | "com.apple.WebKit.GPU"
+            => GateId::Safari,
+
+        // Unmatched
+        _ => none
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [5] fn firing — compute 15-bit firing mask from 6-axis GateGenome
+// ═══════════════════════════════════════════════════════════════════════
+
+// The 15 axis pairs in C(6,2) lexicographic order.
+// Pair index → (axis_a, axis_b):
+//   0: (Cpu, Ram)      1: (Cpu, Gpu)      2: (Cpu, Npu)
+//   3: (Cpu, Power)    4: (Cpu, Io)       5: (Ram, Gpu)
+//   6: (Ram, Npu)      7: (Ram, Power)    8: (Ram, Io)
+//   9: (Gpu, Npu)     10: (Gpu, Power)   11: (Gpu, Io)
+//  12: (Npu, Power)   13: (Npu, Io)      14: (Power, Io)
+
+pure fn firing(genome: GateGenome) -> u16
+    ensures result <= 0x7FFF           // bits 0-14 only
+{
+    let a = genome.axes                // [f32; 6] indexed by Axis ordinal
+
+    let mut bits: u16 = 0
+    let mut pair_idx: usize = 0
+
+    // Enumerate all C(6,2) pairs in lexicographic order
+    let mut i: usize = 0
+    loop {
+        match i >= AXIS_COUNT { true => { break }, false => {} }
+        let mut j: usize = i + 1
+        loop {
+            match j >= AXIS_COUNT { true => { break }, false => {} }
+
+            // Fire rule: both axes above PAIR_THRESHOLD
+            let ai = a[i] as f64
+            let aj = a[j] as f64
+            match ai > PAIR_THRESHOLD && aj > PAIR_THRESHOLD {
+                true  => { bits = bits | (1 << pair_idx) },
+                false => {}
+            }
+
+            pair_idx = pair_idx + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    bits
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [6] 15-pair rule set — G4 INVARIANT rules (explicit enumeration)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Each pair has a named threshold constant. Currently uniform at
+// PAIR_THRESHOLD = 0.5 but structured for per-pair calibration.
+
+comptime const PAIR_NAMES: [str; 15] = [
+    "Cpu×Ram",    "Cpu×Gpu",   "Cpu×Npu",   "Cpu×Power",  "Cpu×Io",
+    "Ram×Gpu",    "Ram×Npu",   "Ram×Power", "Ram×Io",
+    "Gpu×Npu",    "Gpu×Power", "Gpu×Io",
+    "Npu×Power",  "Npu×Io",
+    "Power×Io"
+]
+
+comptime const PAIR_INDICES: [(usize, usize); 15] = [
+    (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
+    (1, 2), (1, 3), (1, 4), (1, 5),
+    (2, 3), (2, 4), (2, 5),
+    (3, 4), (3, 5),
+    (4, 5)
+]
+
+// Per-pair threshold array (calibratable, defaults to uniform 0.5)
+comptime const PAIR_THRESHOLDS: [f64; 15] = [
+    0.5, 0.5, 0.5, 0.5, 0.5,    // Cpu×{Ram,Gpu,Npu,Power,Io}
+    0.5, 0.5, 0.5, 0.5,          // Ram×{Gpu,Npu,Power,Io}
+    0.5, 0.5, 0.5,                // Gpu×{Npu,Power,Io}
+    0.5, 0.5,                     // Npu×{Power,Io}
+    0.5                            // Power×Io
+]
+
+// Calibrated firing: per-pair thresholds (future use)
+pure fn firing_calibrated(genome: GateGenome) -> u16
+    ensures result <= 0x7FFF
+{
+    let a = genome.axes
+    let mut bits: u16 = 0
+    let mut k: usize = 0
+    loop {
+        match k >= PAIR_COUNT { true => { break }, false => {} }
+        let (i, j) = PAIR_INDICES[k]
+        let thresh = PAIR_THRESHOLDS[k]
+        match (a[i] as f64) > thresh && (a[j] as f64) > thresh {
+            true  => { bits = bits | (1 << k) },
+            false => {}
+        }
+        k = k + 1
+    }
+    bits
+}
+
+// Query which pairs are firing, returns list of pair names
+pure fn firing_pair_names(bits: u16) -> [str]
+    where bits <= 0x7FFF
+    ensures result.len() <= PAIR_COUNT
+{
+    let mut names: [str] = []
+    let mut k: usize = 0
+    loop {
+        match k >= PAIR_COUNT { true => { break }, false => {} }
+        match (bits >> k) & 1 == 1 {
+            true  => { names.push(PAIR_NAMES[k]) },
+            false => {}
+        }
+        k = k + 1
+    }
+    names
+}
+
+// Popcount of firing bits (number of active pair rules)
+pure fn firing_popcount(bits: u16) -> usize
+    ensures result <= PAIR_COUNT
+{
+    bits.count_ones() as usize
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [7] Genome serialization — 60B little-endian format
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  Layout (60 bytes total):
+//    offset  0: axes[6 × f32]       = 24 bytes
+//    offset 24: firing_bits [u16]   =  2 bytes
+//    offset 26: ts [u32]            =  4 bytes
+//    offset 30: counters[3 × f32]   = 12 bytes
+//    offset 42: stats[4 × f32]      = 16 bytes
+//    offset 58: padding [u8; 2]     =  2 bytes
+//    total:                           60 bytes = GENOME_BYTES
+
+pure fn genome_to_bytes(genome: GateGenome) -> [u8; 60]
+    ensures result.len() == GENOME_BYTES
+{
+    let mut buf: [u8; 60] = [0; 60]
+    let mut offset: usize = 0
+
+    // axes: 6 × f32 LE (24 bytes)
+    let mut i: usize = 0
+    loop {
+        match i >= 6 { true => { break }, false => {} }
+        let bytes = f32_to_le_bytes(genome.axes[i])
+        buf[offset]     = bytes[0]
+        buf[offset + 1] = bytes[1]
+        buf[offset + 2] = bytes[2]
+        buf[offset + 3] = bytes[3]
+        offset = offset + 4
+        i = i + 1
+    }
+
+    // firing_bits: u16 LE (2 bytes)
+    let fb = u16_to_le_bytes(genome.firing_bits)
+    buf[offset]     = fb[0]
+    buf[offset + 1] = fb[1]
+    offset = offset + 2
+
+    // ts: u32 LE (4 bytes)
+    let ts = u32_to_le_bytes(genome.ts)
+    buf[offset]     = ts[0]
+    buf[offset + 1] = ts[1]
+    buf[offset + 2] = ts[2]
+    buf[offset + 3] = ts[3]
+    offset = offset + 4
+
+    // counters: 3 × f32 LE (12 bytes)
+    let mut c: usize = 0
+    loop {
+        match c >= 3 { true => { break }, false => {} }
+        let bytes = f32_to_le_bytes(genome.counters[c])
+        buf[offset]     = bytes[0]
+        buf[offset + 1] = bytes[1]
+        buf[offset + 2] = bytes[2]
+        buf[offset + 3] = bytes[3]
+        offset = offset + 4
+        c = c + 1
+    }
+
+    // stats: 4 × f32 LE (16 bytes)
+    let mut s: usize = 0
+    loop {
+        match s >= 4 { true => { break }, false => {} }
+        let bytes = f32_to_le_bytes(genome.stats[s])
+        buf[offset]     = bytes[0]
+        buf[offset + 1] = bytes[1]
+        buf[offset + 2] = bytes[2]
+        buf[offset + 3] = bytes[3]
+        offset = offset + 4
+        s = s + 1
+    }
+
+    // padding: 2 bytes (already 0)
+    // offset == 58, buf[58] = 0, buf[59] = 0
+
+    buf
+}
+
+pure fn genome_from_bytes(bytes: [u8; 60]) -> GateGenome
+    where bytes.len() == GENOME_BYTES
+    ensures genome_to_bytes(result) == bytes
+{
+    let mut offset: usize = 0
+
+    // axes: 6 × f32 LE
+    let mut axes: [f32; 6] = [0.0; 6]
+    let mut i: usize = 0
+    loop {
+        match i >= 6 { true => { break }, false => {} }
+        axes[i] = f32_from_le_bytes([bytes[offset], bytes[offset+1],
+                                      bytes[offset+2], bytes[offset+3]])
+        offset = offset + 4
+        i = i + 1
+    }
+
+    // firing_bits: u16 LE
+    let firing_bits = u16_from_le_bytes([bytes[offset], bytes[offset+1]])
+    offset = offset + 2
+
+    // ts: u32 LE
+    let ts = u32_from_le_bytes([bytes[offset], bytes[offset+1],
+                                 bytes[offset+2], bytes[offset+3]])
+    offset = offset + 4
+
+    // counters: 3 × f32 LE
+    let mut counters: [f32; 3] = [0.0; 3]
+    let mut c: usize = 0
+    loop {
+        match c >= 3 { true => { break }, false => {} }
+        counters[c] = f32_from_le_bytes([bytes[offset], bytes[offset+1],
+                                          bytes[offset+2], bytes[offset+3]])
+        offset = offset + 4
+        c = c + 1
+    }
+
+    // stats: 4 × f32 LE
+    let mut stats: [f32; 4] = [0.0; 4]
+    let mut s: usize = 0
+    loop {
+        match s >= 4 { true => { break }, false => {} }
+        stats[s] = f32_from_le_bytes([bytes[offset], bytes[offset+1],
+                                       bytes[offset+2], bytes[offset+3]])
+        offset = offset + 4
+        s = s + 1
+    }
+
+    // skip 2 bytes padding
+
+    GateGenome {
+        axes: axes,
+        firing_bits: firing_bits,
+        ts: ts,
+        counters: counters,
+        stats: stats
+    }
+}
+
+// Hex encoding: 120 hex chars (2 per byte)
+pure fn genome_to_hex(genome: GateGenome) -> str
+    ensures result.len() == 120
+{
+    let bytes = genome_to_bytes(genome)
+    let mut hex: str = ""
+    let mut i: usize = 0
+    loop {
+        match i >= GENOME_BYTES { true => { break }, false => {} }
+        hex = hex + byte_to_hex(bytes[i])
+        i = i + 1
+    }
+    hex
+}
+
+pure fn genome_from_hex(hex: str) -> GateGenome
+    where hex.len() == 120
+{
+    let mut bytes: [u8; 60] = [0; 60]
+    let mut i: usize = 0
+    loop {
+        match i >= GENOME_BYTES { true => { break }, false => {} }
+        bytes[i] = hex_to_byte(hex[i*2], hex[i*2 + 1])
+        i = i + 1
+    }
+    genome_from_bytes(bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  [8] JSONL schema — genome_to_jsonl / parse_jsonl_line
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  genomes.jsonl — one JSON object per line:
+//    {"gate":"Macos","axes":[0.12,34.5,0.0,0.0,1.0,0.0],
+//     "firing":"0x001a","ts":1712400000,
+//     "counters":[5.0,34.5,12.3],"stats":[0.1,9.8,4.2,2.1]}
+
+pure fn gate_id_to_str(id: GateId) -> str {
+    match id {
+        GateId::Macos    => "Macos",
+        GateId::Finder   => "Finder",
+        GateId::Telegram => "Telegram",
+        GateId::Chrome   => "Chrome",
+        GateId::Safari   => "Safari"
+    }
+}
+
+pure fn str_to_gate_id(s: str) -> GateId?
+{
+    match s {
+        "Macos"    => GateId::Macos,
+        "Finder"   => GateId::Finder,
+        "Telegram" => GateId::Telegram,
+        "Chrome"   => GateId::Chrome,
+        "Safari"   => GateId::Safari,
+        _          => none
+    }
+}
+
+pure fn f32_array_to_json(arr: [f32], len: usize) -> str {
+    let mut s: str = "["
+    let mut i: usize = 0
+    loop {
+        match i >= len { true => { break }, false => {} }
+        match i > 0 { true => { s = s + "," }, false => {} }
+        s = s + f32_to_str(arr[i])
+        i = i + 1
+    }
+    s + "]"
+}
+
+pure fn genome_to_json(genome: GateGenome, gate: GateId) -> str {
+    let mut s: str = "{"
+    s = s + "\"gate\":\"" + gate_id_to_str(gate) + "\""
+    s = s + ",\"axes\":" + f32_array_to_json(genome.axes, 6)
+    s = s + ",\"firing\":\"0x" + u16_to_hex(genome.firing_bits) + "\""
+    s = s + ",\"ts\":" + u32_to_str(genome.ts)
+    s = s + ",\"counters\":" + f32_array_to_json(genome.counters, 3)
+    s = s + ",\"stats\":" + f32_array_to_json(genome.stats, 4)
+    s = s + "}"
+    s
+}
+
+// Serialize a 5-gate snapshot to JSONL (one line per gate)
+pure fn genome_to_jsonl(genomes: [GateGenome; 5]) -> str
+    ensures result.split("\n").filter(|l| l.len() > 0).len() == 5
+{
+    let gates: [GateId; 5] = [
+        GateId::Macos, GateId::Finder, GateId::Telegram,
+        GateId::Chrome, GateId::Safari
+    ]
+    let mut lines: str = ""
+    let mut i: usize = 0
+    loop {
+        match i >= 5 { true => { break }, false => {} }
+        lines = lines + genome_to_json(genomes[i], gates[i])
+        match i < 4 {
+            true  => { lines = lines + "\n" },
+            false => {}
+        }
+        i = i + 1
+    }
+    lines
+}
+
+// Parse a single JSONL line back to (GateId, GateGenome)
+pure fn parse_jsonl_line(line: str) -> GateGenome {
+    // Extract gate name: between first "gate":"  and next "
+    let gate_str = json_extract_str(line, "gate")
+    let gate = str_to_gate_id(gate_str)
+
+    // Extract axes: [f32; 6]
+    let axes_raw = json_extract_array_f32(line, "axes", 6)
+
+    // Extract firing: "0xNNNN" -> u16
+    let firing_hex = json_extract_str(line, "firing")
+    let firing_bits = hex_to_u16(firing_hex)
+
+    // Extract ts: u32
+    let ts = json_extract_u32(line, "ts")
+
+    // Extract counters: [f32; 3]
+    let counters = json_extract_array_f32(line, "counters", 3)
+
+    // Extract stats: [f32; 4]
+    let stats = json_extract_array_f32(line, "stats", 4)
+
+    GateGenome {
+        axes: [axes_raw[0], axes_raw[1], axes_raw[2],
+               axes_raw[3], axes_raw[4], axes_raw[5]],
+        firing_bits: firing_bits,
+        ts: ts,
+        counters: [counters[0], counters[1], counters[2]],
+        stats: [stats[0], stats[1], stats[2], stats[3]]
+    }
+}
+
+// Effectful: append a 5-gate snapshot to the genome log file
+fn append_genome_log(genomes: [GateGenome; 5]) !{ FileWrite, Clock }
+{
+    let jsonl = genome_to_jsonl(genomes)
+    FileWrite.append("data/genomes.jsonl", jsonl + "\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PRIMITIVE HELPERS (intrinsics / builtins assumed by the above)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These are intrinsic functions that the Mk.II+ runtime provides.
+// Listed here as declarations for completeness; the compiler maps
+// them to platform-native instructions.
+
+pure fn f32_to_le_bytes(v: f32) -> [u8; 4]
+pure fn f32_from_le_bytes(b: [u8; 4]) -> f32
+pure fn u16_to_le_bytes(v: u16) -> [u8; 2]
+pure fn u16_from_le_bytes(b: [u8; 2]) -> u16
+pure fn u32_to_le_bytes(v: u32) -> [u8; 4]
+pure fn u32_from_le_bytes(b: [u8; 4]) -> u32
+
+pure fn byte_to_hex(b: u8) -> str       // e.g. 0xAB -> "ab"
+pure fn hex_to_byte(hi: u8, lo: u8) -> u8
+pure fn u16_to_hex(v: u16) -> str        // 4 hex chars
+pure fn hex_to_u16(s: str) -> u16        // "0x001a" -> 26
+
+pure fn f32_to_str(v: f32) -> str
+pure fn u32_to_str(v: u32) -> str
+pure fn parse_f64(s: str) -> f64
+pure fn sqrt(v: f64) -> f64
+
+pure fn json_extract_str(json: str, key: str) -> str
+pure fn json_extract_u32(json: str, key: str) -> u32
+pure fn json_extract_array_f32(json: str, key: str, len: usize) -> [f32]
+
+// ═══════════════════════════════════════════════════════════════════════
+//  ROUNDTRIP INVARIANTS
+// ═══════════════════════════════════════════════════════════════════════
+
+invariant genome_bytes_roundtrip {
+    forall g: GateGenome,
+        genome_from_bytes(genome_to_bytes(g)) == g
+}
+
+invariant genome_hex_roundtrip {
+    forall g: GateGenome,
+        genome_from_hex(genome_to_hex(g)) == g
+}
+
+invariant firing_bits_bounded {
+    forall g: GateGenome,
+        firing(g) <= 0x7FFF
+}
+
+invariant firing_popcount_bounded {
+    forall bits: u16 where bits <= 0x7FFF,
+        firing_popcount(bits) <= 15
+}
+
+invariant classify_exhaustive {
+    // All 5 gates reachable
+    classify("launchd") == some(GateId::Macos)
+    and classify("Finder") == some(GateId::Finder)
+    and classify("Telegram") == some(GateId::Telegram)
+    and classify("Google Chrome") == some(GateId::Chrome)
+    and classify("Safari") == some(GateId::Safari)
+    and classify("unknown_proc") == none
+}
+
+invariant genome_serialization_size {
+    forall g: GateGenome,
+        genome_to_bytes(g).len() == 60
+        and genome_to_hex(g).len() == 120
+}

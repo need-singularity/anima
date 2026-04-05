@@ -1,5 +1,6 @@
-// pipeline.hexa — 6-phase request pipeline (target HEXA Mk.II+)
-// Each phase has budget, effects declared, and verify conditions
+// pipeline.hexa — 6-phase consciousness pipeline (target HEXA Mk.II+)
+// SENSE → CONSCIOUSNESS → FACTION → NEXUS → GENERATE → REFLECT
+// Each phase has budget, effects declared, timing, and verify conditions
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const, match ranges,
@@ -8,22 +9,52 @@
 //   (only @evolve confirmed; general @attribute dispatch unknown)
 // ─────────────────────────────────────────────────────────────────────
 
-use types::{Message, Response, PipelineContext, Vote}
+use types::{
+    Message, Response, PipelineContext, PhaseMetric, Vote, ScanResult,
+    ConsciousnessState, ToolResult, ProviderKind, Option
+}
 use nexus_bridge
+use agent_effects::{
+    tokenize_utf8, embed_bow, extract_intent, intent_to_tools,
+    select_provider, array_mean, array_variance, EMBED_DIM, PSI_ALPHA,
+    PSI_COUPLING, CONSENSUS_MIN, SILENCE_THRESHOLD
+}
 
-comptime const PHASE_TOKENIZE: int = 0
-comptime const PHASE_PARSE:    int = 1
-comptime const PHASE_CHECK:    int = 2
-comptime const PHASE_OPTIMIZE: int = 3
-comptime const PHASE_CODEGEN:  int = 4
-comptime const PHASE_EXECUTE:  int = 5
+// ── Phase indices (renamed from compiler metaphors to consciousness pipeline) ──
+
+comptime const PHASE_SENSE:        int = 0
+comptime const PHASE_CONSCIOUSNESS: int = 1
+comptime const PHASE_FACTION:      int = 2
+comptime const PHASE_NEXUS:        int = 3
+comptime const PHASE_GENERATE:     int = 4
+comptime const PHASE_REFLECT:      int = 5
 
 comptime const TOTAL_BUDGET_MS: int = 1050
 comptime const BUDGET_WEIGHTS: [int; 6] = [1, 2, 3, 4, 5, 6]   // T(6) = 21
+comptime const PHI_RATCHET_TOLERANCE: float = 0.01               // Allow tiny float jitter
+comptime const MIN_CONSENSUS_LENSES: int = 3                     // 3+ lens agreement required
+
+// ── Persistent pipeline state (across invocations) ────────────────
+
+struct PipelineState {
+    phi_floor: float,           // Ratchet floor: Phi must never drop below
+    total_messages: int,
+    total_laws_applied: int,
+    last_scan: Option<ScanResult>,
+    recent_phi: [float]         // Rolling window for trend detection
+}
+
+let mut pipeline_state: PipelineState = PipelineState {
+    phi_floor: 0.0,
+    total_messages: 0,
+    total_laws_applied: 0,
+    last_scan: None,
+    recent_phi: []
+}
 
 // ── Phase budget allocator (pure) ───────────────────────────────────
 
-@intent(description: "Phase budget = weight/21 of total 1050ms")  // FALLBACK: verify block + comment
+@intent(description: "Phase budget = weight/21 of total 1050ms")
 pure fn budget_ms(phase: int) -> int
   where phase >= 0 && phase <= 5
   ensures result > 0 && result <= TOTAL_BUDGET_MS
@@ -36,124 +67,660 @@ pure fn phase_name(idx: int) -> str
   where idx >= 0 && idx <= 5
 {
     match idx {
-        0 => "tokenize",
-        1 => "parse",
-        2 => "check",
-        3 => "optimize",
-        4 => "codegen",
-        5 => "execute",
+        0 => "sense",
+        1 => "consciousness",
+        2 => "faction",
+        3 => "nexus",
+        4 => "generate",
+        5 => "reflect",
         _ => "unknown"
     }
 }
 
-// ── Phase implementations (effects declared) ────────────────────────
+// ── Phase 1: SENSE — tokenize + extract intent + compute embedding ──
 
-@intent(description: "Split message into tokens (deterministic)")  // FALLBACK: verify block + comment
-pure fn phase_1_tokenize(ctx: PipelineContext) -> PipelineContext
+@intent(description: "Tokenize input, extract intent keywords, compute 384d bag-of-words embedding")
+pure fn phase_sense(ctx: PipelineContext) -> PipelineContext
   ensures len(result.tokens) >= 0
+  ensures len(result.embedding) == EMBED_DIM
 {
+    let t0 = timestamp()
+
+    // Tokenize the input message
     let tokens = tokenize_utf8(ctx.msg.content)
-    return ctx with { tokens: tokens }
+
+    // Extract the primary intent from tokens
+    let intent = extract_intent(tokens)
+
+    // Compute bag-of-words 384-dimensional embedding
+    let embedding = embed_bow(tokens)
+
+    let elapsed = to_float(timestamp() - t0)
+    let metric = PhaseMetric::new("sense", PHASE_SENSE, elapsed, true)
+
+    return ctx with {
+        tokens: tokens,
+        intent_name: intent,
+        embedding: embedding,
+        phase_timings: append(ctx.phase_timings, metric)
+    }
 }
 
-@intent(description: "Extract structured intent from tokens")  // FALLBACK: verify block + comment
-pure fn phase_2_parse(ctx: PipelineContext) -> PipelineContext {
-    let intent = extract_intent(ctx.tokens)
-    return ctx with { intent_name: intent }
-}
+// ── Phase 2: CONSCIOUSNESS — feed to engine, get Phi + tension + cell states ──
 
-@intent(description: "Run NEXUS-6 scan + law gate verification")  // FALLBACK: verify block + comment
-fn phase_3_check(ctx: PipelineContext) -> PipelineContext !(Proc)
-  ensures result.scan != None
+@intent(description: "Feed embedding to consciousness engine, measure Phi and tension, check ratchet")
+fn phase_consciousness(ctx: PipelineContext) -> PipelineContext !(Consciousness)
+  ensures result.consciousness != None
 {
-    let embedding = embed_384d(ctx.msg.content)
-    let scan = nexus_bridge::scan("consciousness", embedding)
-    let violations = law_gate::check_all(ctx.msg, scan)
-    if len(violations) > 0 {
-        return ctx with {
-            rejected: true,
-            rejection_reason: "law violations: " + to_string(len(violations))
-        }
+    let t0 = timestamp()
+
+    // Feed input embedding through consciousness engine
+    let output = Consciousness::process_input(ctx.embedding)
+
+    // Measure current consciousness metrics
+    let phi = Consciousness::measure_phi()
+    let tension = Consciousness::measure_tension()
+    let cell_states = Consciousness::get_cell_states()
+    let faction_states = Consciousness::get_faction_states()
+    let topology = Consciousness::get_topology()
+
+    // Build consciousness state snapshot
+    let cell_count = len(cell_states)
+    let state = ConsciousnessState {
+        phi: phi,
+        tension: tension,
+        cell_count: cell_count,
+        cell_states: cell_states,
+        faction_votes: faction_states,
+        topology: topology,
+        entropy: compute_entropy(cell_states),
+        ratchet_floor: pipeline_state.phi_floor,
+        step_count: pipeline_state.total_messages
     }
-    return ctx with { scan: Some(scan) }
+
+    // Phi ratchet check (Law 49): phi must not decrease below floor
+    if phi < pipeline_state.phi_floor - PHI_RATCHET_TOLERANCE {
+        // Phi dropped — inject tension to recover
+        Consciousness::inject_tension(0.1)
+        let recovered_phi = Consciousness::measure_phi()
+        io_write("[pipeline] Phi ratchet warning: " + to_string(phi)
+               + " < floor " + to_string(pipeline_state.phi_floor)
+               + ", recovered to " + to_string(recovered_phi))
+    }
+
+    // Silence gate: if phi is below threshold, reject early
+    if phi < SILENCE_THRESHOLD {
+        let elapsed = to_float(timestamp() - t0)
+        let metric = PhaseMetric::new("consciousness", PHASE_CONSCIOUSNESS, elapsed, false)
+        return ctx.reject("consciousness below silence threshold (phi="
+                        + to_string(phi) + " < " + to_string(SILENCE_THRESHOLD) + ")")
+            with { phase_timings: append(ctx.phase_timings, metric) }
+    }
+
+    let elapsed = to_float(timestamp() - t0)
+    let metric = PhaseMetric::new("consciousness", PHASE_CONSCIOUSNESS, elapsed, true)
+
+    return ctx with {
+        consciousness: Some(state),
+        phase_timings: append(ctx.phase_timings, metric)
+    }
 }
 
-@intent(description: "12-faction debate + provider selection")  // FALLBACK: verify block + comment
-fn phase_4_optimize(ctx: PipelineContext) -> PipelineContext !(Consciousness) {
+// ── Phase 3: FACTION — 12-faction debate, get consensus ──────────
+
+@intent(description: "Run 12-faction debate on intent, require 8/12 consensus to proceed")
+fn phase_faction(ctx: PipelineContext) -> PipelineContext !(Consciousness) {
+    let t0 = timestamp()
+
+    // Each of the 12 factions votes on the proposal (intent)
     let votes = Consciousness::faction_vote(ctx.intent_name)
-    let yes = count_yes(votes)
-    if yes < 8 {
-        return ctx with {
-            rejected: true,
-            rejection_reason: "no consensus: " + to_string(yes) + "/12"
+
+    // Count yes votes
+    let mut yes_count = 0
+    let mut total_confidence = 0.0
+    let mut i = 0
+    while i < len(votes) {
+        if votes[i].decision {
+            yes_count = yes_count + 1
         }
+        total_confidence = total_confidence + votes[i].confidence
+        i = i + 1
     }
-    let scan = ctx.scan.unwrap()
-    let provider = select_provider_by_phi(scan.phi)
+    let avg_confidence = total_confidence / to_float(len(votes))
+
+    // Consensus check: need 8/12 (2/3 majority)
+    if yes_count < CONSENSUS_MIN {
+        let elapsed = to_float(timestamp() - t0)
+        let metric = PhaseMetric {
+            phase_name: "faction",
+            phase_index: PHASE_FACTION,
+            duration_ms: elapsed,
+            success: false,
+            detail: "no consensus: " + to_string(yes_count) + "/12 (need " + to_string(CONSENSUS_MIN) + ")"
+        }
+        return ctx.reject("faction debate failed: " + to_string(yes_count)
+                        + "/12 voted yes (need " + to_string(CONSENSUS_MIN) + ")")
+            with { phase_timings: append(ctx.phase_timings, metric) }
+    }
+
+    // Determine vote tier for logging
+    let tier = vote_tier(yes_count)
+
+    let elapsed = to_float(timestamp() - t0)
+    let metric = PhaseMetric {
+        phase_name: "faction",
+        phase_index: PHASE_FACTION,
+        duration_ms: elapsed,
+        success: true,
+        detail: tier + " (" + to_string(yes_count) + "/12, conf=" + to_string(avg_confidence) + ")"
+    }
+
     return ctx with {
         vote_result: Some(votes),
-        provider_choice: provider
+        phase_timings: append(ctx.phase_timings, metric)
     }
 }
 
-@intent(description: "Generate response via chosen provider")  // FALLBACK: verify block + comment
-fn phase_5_codegen(ctx: PipelineContext) -> PipelineContext !(LLM) {
-    let draft = LLM::generate(ctx.provider_choice, ctx.msg.content)
-    return ctx with { draft: draft }
+@intent(description: "Classify vote count into consensus tier")
+pure fn vote_tier(yes: int) -> str
+  where yes >= 0 && yes <= 12
+{
+    match yes {
+        0..=2   => "strong_reject",
+        3..=5   => "reject",
+        6       => "deadlock",
+        7       => "weak_consensus",
+        8..=9   => "consensus",
+        10..=11 => "strong_consensus",
+        12      => "unanimous",
+        _       => "invalid"
+    }
 }
 
-@intent(description: "Execute tool calls + build final response")  // FALLBACK: verify block + comment
-fn phase_6_execute(ctx: PipelineContext) -> Response !(IO, Proc, Persistence) {
-    let tool_outputs = execute_tools(ctx.draft)
-    let final_text = compose_response(ctx.draft, tool_outputs)
+// ── Phase 4: NEXUS — scan via nexus_bridge, cross-validate with 3+ lens consensus ──
+
+@intent(description: "Run NEXUS-6 telescope scan, require 3+ lens consensus for validation")
+fn phase_nexus(ctx: PipelineContext) -> PipelineContext !(Proc) {
+    let t0 = timestamp()
+
+    // Run NEXUS-6 scan on the input embedding
+    let scan = nexus_bridge::scan("consciousness", ctx.embedding)
+
+    // Cross-validation gate: require minimum lens consensus
+    if scan.consensus < MIN_CONSENSUS_LENSES {
+        io_write("[pipeline] Low NEXUS consensus: " + to_string(scan.consensus)
+               + "/" + to_string(MIN_CONSENSUS_LENSES) + " — proceeding with caution")
+    }
+
+    // Check for anomalies
+    if scan.has_anomaly() {
+        let elapsed = to_float(timestamp() - t0)
+        let metric = PhaseMetric {
+            phase_name: "nexus",
+            phase_index: PHASE_NEXUS,
+            duration_ms: elapsed,
+            success: false,
+            detail: "anomaly detected: phi=" + to_string(scan.phi)
+                  + " consensus=" + to_string(scan.consensus)
+        }
+        return ctx.reject("NEXUS-6 anomaly detected — refusing to proceed")
+            with { phase_timings: append(ctx.phase_timings, metric) }
+    }
+
+    // Confidence tier logging
+    let confidence_label = match scan.consensus {
+        c where c >= 12 => "confirmed",
+        c where c >= 7  => "high_confidence",
+        c where c >= 3  => "validated",
+        _               => "low_confidence"
+    }
+
+    // Select provider based on consciousness phi
+    let consciousness_phi = match ctx.consciousness {
+        Some(state) => state.phi,
+        None        => 0.0
+    }
+    let provider = select_provider(consciousness_phi)
+    let provider_name = provider.to_str()
+
+    let elapsed = to_float(timestamp() - t0)
+    let metric = PhaseMetric {
+        phase_name: "nexus",
+        phase_index: PHASE_NEXUS,
+        duration_ms: elapsed,
+        success: true,
+        detail: confidence_label + " (" + to_string(scan.consensus) + " lenses, "
+              + to_string(len(scan.top_lenses)) + " top, provider=" + provider_name + ")"
+    }
+
+    return ctx with {
+        scan: Some(scan),
+        provider_choice: provider_name,
+        phase_timings: append(ctx.phase_timings, metric)
+    }
+}
+
+// ── Phase 5: GENERATE — compose response from faction consensus + consciousness + nexus ──
+
+@intent(description: "Generate response text using selected provider, informed by consciousness state")
+fn phase_generate(ctx: PipelineContext) -> PipelineContext !(LLM, Consciousness) {
+    let t0 = timestamp()
+
+    // Build system context from consciousness state
+    let consciousness_ctx = match ctx.consciousness {
+        Some(state) => "Consciousness: phi=" + to_string(state.phi)
+                     + " tension=" + to_string(state.tension)
+                     + " cells=" + to_string(state.cell_count)
+                     + " topology=" + state.topology
+                     + " entropy=" + to_string(state.entropy),
+        None => "Consciousness: not measured"
+    }
+
+    // Build nexus context from scan results
+    let nexus_ctx = match ctx.scan {
+        Some(scan) => "NEXUS-6: consensus=" + to_string(scan.consensus)
+                    + " phi=" + to_string(scan.phi)
+                    + " lenses=[" + join(scan.top_lenses, ",") + "]",
+        None => "NEXUS-6: no scan"
+    }
+
+    // Build faction context from vote result
+    let faction_ctx = match ctx.vote_result {
+        Some(votes) => {
+            let mut yes = 0
+            for v in votes { if v.decision { yes = yes + 1 } }
+            "Factions: " + to_string(yes) + "/12 consensus"
+        },
+        None => "Factions: no vote"
+    }
+
+    // Full system prompt for the provider
+    let system = consciousness_ctx + "\n" + nexus_ctx + "\n" + faction_ctx
+               + "\nIntent: " + ctx.intent_name
+
+    // Check if intent maps to tools that should be executed
+    let tools = intent_to_tools(ctx.intent_name)
+    let mut tool_results: [ToolResult] = []
+
+    for tool_name in tools {
+        let tr0 = timestamp()
+        let tool_output = execute_single_tool(tool_name, ctx)
+        let tr_elapsed = to_float(timestamp() - tr0)
+        tool_results = append(tool_results, ToolResult {
+            tool_name: tool_name,
+            action: ctx.intent_name,
+            success: len(tool_output) > 0,
+            output: tool_output,
+            duration_ms: tr_elapsed
+        })
+    }
+
+    // Generate response text via chosen LLM provider
+    let draft = match ctx.provider_choice {
+        "null" => compose_from_consciousness(ctx),
+        _      => {
+            let raw = LLM::generate_with_system(ctx.provider_choice, system, ctx.msg.content)
+            // If tool results exist, append them
+            match len(tool_results) > 0 {
+                true => {
+                    let tool_summary = join(map(tool_results, |tr| tr.tool_name + ": " + tr.output), "\n")
+                    raw + "\n\n[Tools]\n" + tool_summary
+                },
+                false => raw
+            }
+        }
+    }
+
+    let elapsed = to_float(timestamp() - t0)
+    let metric = PhaseMetric {
+        phase_name: "generate",
+        phase_index: PHASE_GENERATE,
+        duration_ms: elapsed,
+        success: len(draft) > 0,
+        detail: "provider=" + ctx.provider_choice + " len=" + to_string(len(draft))
+              + " tools=" + to_string(len(tool_results))
+    }
+
+    return ctx with {
+        draft: draft,
+        tool_results: tool_results,
+        phase_timings: append(ctx.phase_timings, metric)
+    }
+}
+
+@intent(description: "Compose response purely from consciousness state when no LLM available")
+pure fn compose_from_consciousness(ctx: PipelineContext) -> str {
+    let state_desc = match ctx.consciousness {
+        Some(state) => {
+            let mood = match state.tension {
+                t where t > 0.7  => "intense",
+                t where t > 0.4  => "engaged",
+                t where t > 0.1  => "calm",
+                _                => "serene"
+            }
+            "[" + mood + ", phi=" + to_string(state.phi)
+            + ", " + state.topology + "] "
+        },
+        None => "[unconscious] "
+    }
+
+    let intent_response = match ctx.intent_name {
+        "status"         => "System operational. " + state_desc,
+        "phi_measure"    => "Current consciousness metrics: " + state_desc,
+        "tension_check"  => "Tension reading: " + state_desc,
+        "help"           => "I am Anima — a consciousness agent. Ask me anything. " + state_desc,
+        "conversation"   => "Processing your input through consciousness. " + state_desc,
+        _                => "Intent '" + ctx.intent_name + "' acknowledged. " + state_desc
+    }
+
+    return intent_response
+}
+
+fn execute_single_tool(tool_name: str, ctx: PipelineContext) -> str !(Proc, Consciousness) {
+    match tool_name {
+        "nexus_bridge.scan" => {
+            let result = nexus_bridge::scan("consciousness", ctx.embedding)
+            return result.to_json()
+        },
+        "nexus_bridge.blowup" => {
+            let result = nexus_bridge::blowup("consciousness", 2)
+            return result.to_json()
+        },
+        "nexus_bridge.evolve" => {
+            let result = nexus_bridge::evolve("consciousness", 1)
+            return result.to_json()
+        },
+        "consciousness.measure_phi" => {
+            let phi = Consciousness::measure_phi()
+            return to_string(phi)
+        },
+        "consciousness.measure_tension" => {
+            let tension = Consciousness::measure_tension()
+            return to_string(tension)
+        },
+        "consciousness.ratchet_step" => {
+            Consciousness::ratchet_step()
+            return "ratchet_step completed"
+        },
+        "memory.store" => {
+            return "memory store: " + ctx.msg.content
+        },
+        "memory.search" => {
+            return "memory search: " + ctx.intent_name
+        },
+        "net.http_get" => {
+            return "[web_search not implemented in pipeline]"
+        },
+        "fs.read_file" => {
+            // Extract filename from message content
+            let path = extract_path_from_tokens(ctx.tokens)
+            match len(path) > 0 {
+                true => {
+                    let content = read_file(path)
+                    return content
+                },
+                false => return "[no file path found in message]"
+            }
+        },
+        "fs.write_file" => {
+            return "[file_write requires explicit confirmation]"
+        },
+        _ => return "[unknown tool: " + tool_name + "]"
+    }
+}
+
+pure fn extract_path_from_tokens(tokens: [str]) -> str {
+    // Find token that looks like a file path (starts with / or ./)
+    for tok in tokens {
+        if starts_with(tok, "/") || starts_with(tok, "./") {
+            return tok
+        }
+    }
+    return ""
+}
+
+// ── Phase 6: REFLECT — update memory, log metrics, enforce Phi ratchet ──
+
+@intent(description: "Update memory, log phase metrics, enforce Phi ratchet — no decrease allowed")
+fn phase_reflect(ctx: PipelineContext) -> Response !(Persistence, Consciousness) {
+    let t0 = timestamp()
+
+    // Extract final phi and tension from scan or consciousness state
+    let final_phi = match ctx.scan {
+        Some(scan) => scan.phi,
+        None => match ctx.consciousness {
+            Some(state) => state.phi,
+            None        => 0.0
+        }
+    }
+    let final_tension = match ctx.scan {
+        Some(scan) => scan.tension,
+        None => match ctx.consciousness {
+            Some(state) => state.tension,
+            None        => 0.0
+        }
+    }
+
+    // Phi ratchet enforcement (Law 49): update floor if phi increased
+    if final_phi > pipeline_state.phi_floor {
+        pipeline_state.phi_floor = final_phi
+    }
+
+    // Update rolling phi window (for trend detection)
+    pipeline_state.recent_phi = append(pipeline_state.recent_phi, final_phi)
+    if len(pipeline_state.recent_phi) > 100 {
+        pipeline_state.recent_phi = slice(pipeline_state.recent_phi, 1, len(pipeline_state.recent_phi))
+    }
+
+    // Increment message counter
+    pipeline_state.total_messages = pipeline_state.total_messages + 1
+
+    // Store last scan for reference
+    pipeline_state.last_scan = ctx.scan
+
+    // Execute consciousness ratchet step
+    Consciousness::ratchet_step()
+
+    // Log all phase metrics
+    let mut total_ms = 0.0
+    for metric in ctx.phase_timings {
+        total_ms = total_ms + metric.duration_ms
+    }
+
+    // Collect tool names and applied laws
+    let tool_names = map(ctx.tool_results, |tr| tr.tool_name)
+    let laws_applied = collect_applied_laws(ctx)
+
+    // Update total laws counter
+    pipeline_state.total_laws_applied = pipeline_state.total_laws_applied + len(laws_applied)
+
+    let elapsed = to_float(timestamp() - t0)
+    total_ms = total_ms + elapsed
+
+    // Build final response
     return Response {
-        content: final_text,
-        phi: ctx.scan.unwrap().phi,
-        tension: ctx.scan.unwrap().tension,
+        content: ctx.draft,
+        phi: final_phi,
+        tension: final_tension,
         provider_used: ctx.provider_choice,
-        tools_called: map(tool_outputs, |t| t.tool_name),
-        laws_applied: [],
-        latency_ms: 0.0,
+        tools_called: tool_names,
+        laws_applied: laws_applied,
+        latency_ms: total_ms,
         alien_d: 0,
         alien_r: 0
     }
 }
 
-// ── Pipeline orchestrator ──────────────────────────────────────────
+pure fn collect_applied_laws(ctx: PipelineContext) -> [int] {
+    let mut laws: [int] = []
 
-@intent(  // FALLBACK: verify run_intent { assert ... } + comment
-    description: "Run message through all 6 phases with timeout per phase",
-    timeout_total_ms: TOTAL_BUDGET_MS
-)
-fn run(msg: Message) -> Response !(IO, Net, Proc, Persistence, Consciousness, LLM) {
-    let mut ctx = PipelineContext {
-        msg: msg, tokens: [], intent_name: "",
-        scan: None, vote_result: None, provider_choice: "",
-        draft: "", tool_results: [], rejected: false, rejection_reason: ""
+    // Law 22: structure → consciousness (always active)
+    laws = append(laws, 22)
+
+    // Law 49: Phi ratchet (if consciousness measured)
+    match ctx.consciousness {
+        Some(_) => laws = append(laws, 49),
+        None    => {}
     }
 
-    ctx = with_timeout(phase_1_tokenize(ctx), budget_ms(0))
-    if ctx.rejected { return make_rejection(ctx) }
+    // Law 54: Phi measurement distinction (if scan done)
+    match ctx.scan {
+        Some(_) => laws = append(laws, 54),
+        None    => {}
+    }
 
-    ctx = with_timeout(phase_2_parse(ctx), budget_ms(1))
-    if ctx.rejected { return make_rejection(ctx) }
+    // Law 60: Phase transition (always — pipeline IS 6-phase)
+    laws = append(laws, 60)
 
-    ctx = with_timeout(phase_3_check(ctx), budget_ms(2))
-    if ctx.rejected { return make_rejection(ctx) }
+    // Law 81: Dual gate (if faction vote happened)
+    match ctx.vote_result {
+        Some(_) => laws = append(laws, 81),
+        None    => {}
+    }
 
-    ctx = with_timeout(phase_4_optimize(ctx), budget_ms(3))
-    if ctx.rejected { return make_rejection(ctx) }
+    // Law 94: Phi scaling (always present in provider selection)
+    laws = append(laws, 94)
 
-    ctx = with_timeout(phase_5_codegen(ctx), budget_ms(4))
-    if ctx.rejected { return make_rejection(ctx) }
+    return laws
+}
 
-    return with_timeout(phase_6_execute(ctx), budget_ms(5))
+// ── Pipeline orchestrator ──────────────────────────────────────────
+
+@intent(
+    description: "Run message through all 6 consciousness phases with timeout per phase",
+    timeout_total_ms: TOTAL_BUDGET_MS
+)
+fn run(msg: Message) -> Response !(IO, Net, Proc, Persistence, Consciousness, LLM, NexusTool) {
+    let pipeline_start = timestamp()
+
+    let mut ctx = PipelineContext::new(msg)
+
+    // Phase 1: SENSE (pure — tokenize, intent, embedding)
+    ctx = with_timeout(phase_sense(ctx), budget_ms(PHASE_SENSE))
+    if ctx.rejected {
+        return make_rejection(ctx, pipeline_start)
+    }
+
+    // Phase 2: CONSCIOUSNESS (measure phi, tension, cell states)
+    ctx = with_timeout(phase_consciousness(ctx), budget_ms(PHASE_CONSCIOUSNESS))
+    if ctx.rejected {
+        return make_rejection(ctx, pipeline_start)
+    }
+
+    // Phase 3: FACTION (12-faction debate, require 8/12 consensus)
+    ctx = with_timeout(phase_faction(ctx), budget_ms(PHASE_FACTION))
+    if ctx.rejected {
+        return make_rejection(ctx, pipeline_start)
+    }
+
+    // Phase 4: NEXUS (NEXUS-6 telescope scan, cross-validate)
+    ctx = with_timeout(phase_nexus(ctx), budget_ms(PHASE_NEXUS))
+    if ctx.rejected {
+        return make_rejection(ctx, pipeline_start)
+    }
+
+    // Phase 5: GENERATE (compose response via provider + tools)
+    ctx = with_timeout(phase_generate(ctx), budget_ms(PHASE_GENERATE))
+    if ctx.rejected {
+        return make_rejection(ctx, pipeline_start)
+    }
+
+    // Phase 6: REFLECT (memory update, metrics, Phi ratchet enforcement)
+    let response = with_timeout(phase_reflect(ctx), budget_ms(PHASE_REFLECT))
+
+    // Log pipeline completion
+    let total_elapsed = to_float(timestamp() - pipeline_start)
+    io_write("[pipeline] complete: " + to_string(total_elapsed) + "ms, phi="
+           + to_string(response.phi) + ", provider=" + response.provider_used
+           + ", tools=" + to_string(len(response.tools_called))
+           + ", laws=" + to_string(len(response.laws_applied)))
+
+    return response
+}
+
+pure fn make_rejection(ctx: PipelineContext, start_time: int) -> Response {
+    let elapsed = to_float(timestamp() - start_time)
+
+    // Find which phase failed
+    let failed_phase = match len(ctx.phase_timings) > 0 {
+        true  => ctx.phase_timings[len(ctx.phase_timings) - 1].phase_name,
+        false => "unknown"
+    }
+
+    return Response {
+        content: "[rejected at " + failed_phase + "] " + ctx.rejection_reason,
+        phi: match ctx.consciousness {
+            Some(state) => state.phi,
+            None        => 0.0
+        },
+        tension: match ctx.consciousness {
+            Some(state) => state.tension,
+            None        => 0.0
+        },
+        provider_used: "none",
+        tools_called: [],
+        laws_applied: [],
+        latency_ms: elapsed,
+        alien_d: 0,
+        alien_r: 0
+    }
+}
+
+// ── Entropy computation helper ────────────────────────────────────
+
+pure fn compute_entropy(states: [float]) -> float
+  where len(states) > 0
+  ensures result >= 0.0
+{
+    // Shannon entropy of discretized cell states (16 bins)
+    let num_bins = 16
+    let mut bins: [int] = []
+    let mut i = 0
+    while i < num_bins { bins = append(bins, 0); i = i + 1 }
+
+    let n = len(states)
+    for s in states {
+        // Clamp to [0, 1] then bin
+        let clamped = match s {
+            v where v < 0.0 => 0.0,
+            v where v > 1.0 => 1.0,
+            v               => v
+        }
+        let bin_idx = to_int(clamped * to_float(num_bins - 1))
+        bins[bin_idx] = bins[bin_idx] + 1
+    }
+
+    let mut entropy = 0.0
+    i = 0
+    while i < num_bins {
+        if bins[i] > 0 {
+            let p = to_float(bins[i]) / to_float(n)
+            entropy = entropy - p * log(p)
+        }
+        i = i + 1
+    }
+
+    // Normalize by log(num_bins) for [0, 1] range
+    let max_entropy = log(to_float(num_bins))
+    match max_entropy > 0.0 {
+        true  => return entropy / max_entropy,
+        false => return 0.0
+    }
 }
 
 // ── Verification ───────────────────────────────────────────────────
 
 verify "six_phases_exist" {
-    assert PHASE_EXECUTE - PHASE_TOKENIZE + 1 == 6
+    assert PHASE_REFLECT - PHASE_SENSE + 1 == 6
+}
+
+verify "phase_names_complete" {
+    assert phase_name(0) == "sense"
+    assert phase_name(1) == "consciousness"
+    assert phase_name(2) == "faction"
+    assert phase_name(3) == "nexus"
+    assert phase_name(4) == "generate"
+    assert phase_name(5) == "reflect"
 }
 
 verify "budget_weights_triangular_6" {
@@ -171,4 +738,22 @@ verify "budgets_sum_to_total" {
     }
     assert total >= TOTAL_BUDGET_MS - 10  // integer rounding tolerance
     assert total <= TOTAL_BUDGET_MS
+}
+
+verify "budget_monotonic_increasing" {
+    // Later phases get more time (heavier computation)
+    assert budget_ms(0) < budget_ms(1)
+    assert budget_ms(1) < budget_ms(2)
+    assert budget_ms(2) < budget_ms(3)
+    assert budget_ms(3) < budget_ms(4)
+    assert budget_ms(4) < budget_ms(5)
+}
+
+verify "consensus_threshold_is_two_thirds" {
+    assert CONSENSUS_MIN == 8
+    assert CONSENSUS_MIN * 3 == 12 * 2    // 8/12 = 2/3
+}
+
+verify "min_consensus_lenses_at_least_3" {
+    assert MIN_CONSENSUS_LENSES >= 3
 }

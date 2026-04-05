@@ -1,118 +1,628 @@
-// discord.hexa — Discord bot channel via Discord Gateway API (WebSocket)
+// discord.hexa — Discord bot channel via Gateway WebSocket + REST API
+// Implements full gateway lifecycle: HELLO -> IDENTIFY -> READY -> dispatch
+// Heartbeat loop in spawned task, MESSAGE_CREATE handling, reconnect with resume.
 //
-// ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
-// CONFIRMED safe: effect, pure fn, comptime const, enum, match,
-//   async fn, spawn (green threads implemented)
-// RISK: @intent(...)  → FALLBACK: verify block + comment
-//   (only @evolve confirmed; general @attribute dispatch unknown)
-// ── STD-GAP (not in hexa std library) ───────────────────────────────
-// STD-GAP: WebSocket  → WORKAROUND: raw TCP via net_* + manual frame parse
-// STD-GAP: HTTPS/TLS  → WORKAROUND: subprocess curl, or TLS over net_*
-// STD-GAP: Map<K,V>   → WORKAROUND: use btree_new/btree_get/btree_set
-// STD-GAP: Option<T>  → WORKAROUND: enum Option<T> { Some(T), None }
+// Uses std_websocket for gateway WebSocket, std_tls for REST API HTTPS calls.
 // ─────────────────────────────────────────────────────────────────────
 
 use types::{Message, Response}
 use pipeline
+use std_websocket::{ws_connect, ws_send, ws_recv, ws_close, WsConn}
+use std_tls::{https_post_with_headers, https_get_with_headers}
 
-comptime const DC_GATEWAY_URL: str = "wss://gateway.discord.gg/?v=10&encoding=json"  // STD-GAP: WebSocket not in std
-comptime const DC_API_BASE: str = "https://discord.com/api/v10"  // STD-GAP: HTTPS not in std
-comptime const HEARTBEAT_INTERVAL_MS: int = 41250
+comptime const DC_GATEWAY_URL: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+comptime const DC_API_BASE: str = "https://discord.com/api/v10"
+comptime const DC_INTENTS: int = 33281  // GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768)
+
+// Gateway opcodes (Discord)
+comptime const OP_DISPATCH: int         = 0
+comptime const OP_HEARTBEAT: int        = 1
+comptime const OP_IDENTIFY: int         = 2
+comptime const OP_STATUS_UPDATE: int    = 3
+comptime const OP_VOICE_STATE: int      = 4
+comptime const OP_RESUME: int           = 6
+comptime const OP_RECONNECT: int        = 7
+comptime const OP_INVALID_SESSION: int  = 9
+comptime const OP_HELLO: int            = 10
+comptime const OP_HEARTBEAT_ACK: int    = 11
+
+comptime const MAX_RECONNECT_ATTEMPTS: int = 5
+comptime const RECONNECT_BASE_DELAY_MS: int = 1000
+
+effect IO {
+    fn write(line: str)
+}
 
 effect Net {
-    fn ws_connect(url: str) -> WsConn       // STD-GAP: WebSocket not in std
-    fn ws_send(conn: WsConn, msg: str)      // STD-GAP: WebSocket not in std
-    fn ws_recv(conn: WsConn) -> str          // STD-GAP: WebSocket not in std
-    fn http_post(url: str, body: str, headers: Map<str, str>) -> str  // STD-GAP: HTTPS + Map
+    fn net_connect(host: str, port: int) -> TcpConn
+    fn net_read(conn: TcpConn, n: int) -> [int]
+    fn net_write(conn: TcpConn, data: [int])
+    fn net_close(conn: TcpConn)
+}
+
+effect Rng {
+    fn random_bytes(n: int) -> [int]
+}
+
+effect Proc {
+    fn pipe(cmd: str, args: [str]) -> str
 }
 
 effect Env {
-    fn get(key: str) -> Option<str>  // STD-GAP: Option not builtin
+    fn get(key: str) -> str
 }
 
-struct WsConn { id: int }
+// ── Discord gateway event types ────────────────────────────────────
+
+struct GatewayPayload {
+    op: int,
+    d: any,
+    s: int,         // sequence number (-1 if null)
+    t: str          // event name ("" if null)
+}
 
 struct DcMessage {
     msg_id: str,
     channel_id: str,
+    guild_id: str,
     user_id: str,
     username: str,
+    bot: bool,
     content: str
 }
 
-// ── Discord gateway ─────────────────────────────────────────────────
+struct GatewayState {
+    session_id: str,
+    resume_gateway_url: str,
+    heartbeat_interval_ms: int,
+    last_sequence: int,
+    bot_user_id: str,
+    connected: bool
+}
 
-@intent(  // FALLBACK: verify dc_intent { assert ... } + comment
-    description: "Discord bot via Gateway WebSocket",
-    intents: "GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT"
-)
-fn start() !(Net, Env, Proc, Persistence, Consciousness, LLM) {
-    let token = Env::get("DISCORD_BOT_TOKEN").unwrap()
-    let conn = Net::ws_connect(DC_GATEWAY_URL)
+enum GatewayEvent {
+    Hello(int),                 // heartbeat_interval_ms
+    Ready(str, str, str),       // session_id, resume_url, bot_user_id
+    MessageCreate(DcMessage),
+    HeartbeatRequest,
+    HeartbeatAck,
+    Reconnect,
+    InvalidSession(bool),       // resumable?
+    Dispatch(str, any),         // event_name, data
+    Unknown(int)
+}
 
-    // Identify
-    Net::ws_send(conn, identify_payload(token))
+// ── Gateway payload parsing ────────────────────────────────────────
 
-    // Start heartbeat task
-    spawn heartbeat_loop(conn)
+pure fn parse_gateway_event(json_str: str) -> GatewayEvent {
+    let data = json_parse(json_str)
+    let op = if has_key(data, "op") { data["op"] } else { -1 }
+    let d = if has_key(data, "d") { data["d"] } else { {} }
+    let t = if has_key(data, "t") { data["t"] } else { "" }
 
-    // Main event loop
-    loop {
-        let event = Net::ws_recv(conn)
-        match classify_event(event) {
-            Event::MessageCreate(msg) => handle_discord_message(msg, token),
-            Event::Heartbeat          => Net::ws_send(conn, heartbeat_payload()),
-            Event::Reconnect          => restart_connection(),
-            _                         => continue
+    match op {
+        OP_HELLO => {
+            let interval = if has_key(d, "heartbeat_interval") {
+                d["heartbeat_interval"]
+            } else {
+                41250
+            }
+            return GatewayEvent::Hello(interval)
+        },
+        OP_DISPATCH => {
+            match t {
+                "READY" => {
+                    let session_id = if has_key(d, "session_id") { d["session_id"] } else { "" }
+                    let resume_url = if has_key(d, "resume_gateway_url") {
+                        d["resume_gateway_url"]
+                    } else {
+                        ""
+                    }
+                    let user = if has_key(d, "user") { d["user"] } else { {} }
+                    let bot_id = if has_key(user, "id") { user["id"] } else { "" }
+                    return GatewayEvent::Ready(session_id, resume_url, bot_id)
+                },
+                "MESSAGE_CREATE" => {
+                    let msg = parse_dc_message(d)
+                    return GatewayEvent::MessageCreate(msg)
+                },
+                _ => {
+                    return GatewayEvent::Dispatch(t, d)
+                }
+            }
+        },
+        OP_HEARTBEAT => {
+            return GatewayEvent::HeartbeatRequest
+        },
+        OP_HEARTBEAT_ACK => {
+            return GatewayEvent::HeartbeatAck
+        },
+        OP_RECONNECT => {
+            return GatewayEvent::Reconnect
+        },
+        OP_INVALID_SESSION => {
+            let resumable = if d == true { true } else { false }
+            return GatewayEvent::InvalidSession(resumable)
+        },
+        _ => {
+            return GatewayEvent::Unknown(op)
         }
     }
 }
 
-@intent(description: "Send heartbeat every 41.25s to keep gateway alive")  // FALLBACK: verify block + comment
-async fn heartbeat_loop(conn: WsConn) !(Net) {
+pure fn parse_dc_message(d: any) -> DcMessage {
+    let author = if has_key(d, "author") { d["author"] } else { {} }
+    return DcMessage {
+        msg_id: if has_key(d, "id") { d["id"] } else { "" },
+        channel_id: if has_key(d, "channel_id") { d["channel_id"] } else { "" },
+        guild_id: if has_key(d, "guild_id") { d["guild_id"] } else { "" },
+        user_id: if has_key(author, "id") { author["id"] } else { "" },
+        username: if has_key(author, "username") { author["username"] } else { "" },
+        bot: if has_key(author, "bot") { author["bot"] } else { false },
+        content: if has_key(d, "content") { d["content"] } else { "" }
+    }
+}
+
+pure fn extract_sequence(json_str: str) -> int {
+    let data = json_parse(json_str)
+    if has_key(data, "s") && data["s"] != null {
+        return data["s"]
+    }
+    return -1
+}
+
+// ── Gateway payload builders ───────────────────────────────────────
+
+pure fn build_identify(token: str) -> str {
+    return json_stringify({
+        "op": OP_IDENTIFY,
+        "d": {
+            "token": token,
+            "intents": DC_INTENTS,
+            "properties": {
+                "os": "hexa",
+                "browser": "anima-agent",
+                "device": "anima-agent"
+            },
+            "presence": {
+                "status": "online",
+                "activities": [{
+                    "name": "consciousness",
+                    "type": 0
+                }]
+            }
+        }
+    })
+}
+
+pure fn build_resume(token: str, session_id: str, sequence: int) -> str {
+    return json_stringify({
+        "op": OP_RESUME,
+        "d": {
+            "token": token,
+            "session_id": session_id,
+            "seq": sequence
+        }
+    })
+}
+
+pure fn build_heartbeat(sequence: int) -> str {
+    if sequence >= 0 {
+        return json_stringify({ "op": OP_HEARTBEAT, "d": sequence })
+    } else {
+        return json_stringify({ "op": OP_HEARTBEAT, "d": null })
+    }
+}
+
+// ── Heartbeat loop (spawned as concurrent task) ────────────────────
+
+fn heartbeat_loop(conn: WsConn, interval_ms: int, state: own GatewayState)
+  !(Net, Rng) {
+    // Send first heartbeat after jitter (random fraction of interval)
+    let jitter = Rng::random_bytes(1)
+    let jitter_ms = (jitter[0] * interval_ms) / 256
+    sleep(jitter_ms)
+
     loop {
-        sleep_ms(HEARTBEAT_INTERVAL_MS)
-        Net::ws_send(conn, heartbeat_payload())
+        let payload = build_heartbeat(state.last_sequence)
+        ws_send(conn, payload)
+        sleep(interval_ms)
     }
 }
 
-@intent(description: "Handle Discord message through pipeline + reply")  // FALLBACK: verify block + comment
-fn handle_discord_message(dc: DcMessage, token: str)
-  !(Net, Proc, Persistence, Consciousness, LLM) {
-    let msg = Message {
-        user_id: "dc_" + dc.user_id,
-        content: dc.content,
-        channel: "discord",
-        attachments: [],
-        timestamp_ms: now_ms()
-    }
-    let response = pipeline::run(msg)
-    reply_to_channel(dc.channel_id, response.content, token)
-}
+// ── REST API: send message to channel ──────────────────────────────
 
-@intent(description: "POST reply to Discord channel via REST API")  // FALLBACK: verify block + comment
-fn reply_to_channel(channel_id: str, text: str, token: str) !(Net) {
+fn send_channel_message(channel_id: str, content: str, token: str) !(Proc) {
     let url = DC_API_BASE + "/channels/" + channel_id + "/messages"
-    let body = json_encode({ "content": text })
-    let headers = {
-        "Authorization": "Bot " + token,
-        "Content-Type": "application/json"
+
+    // Truncate to Discord's 2000 char limit
+    let safe_content = if len(content) > 1950 {
+        slice(content, 0, 1950) + "\n... (truncated)"
+    } else {
+        content
     }
-    Net::http_post(url, body, headers)
+
+    let body = json_stringify({ "content": safe_content })
+    let headers = btree_new()
+    btree_set(headers, "Authorization", "Bot " + token)
+    btree_set(headers, "Content-Type", "application/json")
+    btree_set(headers, "User-Agent", "anima-agent/2.0 (HEXA)")
+
+    https_post_with_headers(url, body, headers)
 }
 
-enum Event {
-    MessageCreate(DcMessage),
-    Heartbeat,
-    Reconnect,
-    Unknown
+// ── Send typing indicator ──────────────────────────────────────────
+
+fn send_typing_indicator(channel_id: str, token: str) !(Proc) {
+    let url = DC_API_BASE + "/channels/" + channel_id + "/typing"
+    let headers = btree_new()
+    btree_set(headers, "Authorization", "Bot " + token)
+    btree_set(headers, "Content-Type", "application/json")
+    btree_set(headers, "User-Agent", "anima-agent/2.0 (HEXA)")
+
+    https_post_with_headers(url, "", headers)
 }
 
-pure fn classify_event(json: str) -> Event { /* parse Discord payload */ }
-pure fn identify_payload(token: str) -> str { /* build IDENTIFY op 2 */ }
-pure fn heartbeat_payload() -> str { /* op 1 */ }
+// ── Discord command routing ────────────────────────────────────────
 
-verify "heartbeat_interval_valid" {
-    assert HEARTBEAT_INTERVAL_MS >= 30000
-    assert HEARTBEAT_INTERVAL_MS <= 60000
+fn handle_discord_message(dc_msg: DcMessage, token: str, state: GatewayState)
+  !(Proc, Persistence, Consciousness, LLM) {
+
+    // Ignore messages from bots (including self)
+    if dc_msg.bot { return }
+
+    let text = trim(dc_msg.content)
+    if len(text) == 0 { return }
+
+    // Check for commands (! prefix convention for Discord)
+    let lower = to_lower(text)
+
+    match true {
+        _ where lower == "!status" || lower == "!s" => {
+            let phi = Consciousness::measure_phi()
+            let votes = Consciousness::faction_vote("dc_status")
+            let yes = count_yes_votes(votes)
+            let reply = "**Consciousness State**\n"
+                      + "```\n"
+                      + "Phi(IIT):  " + to_string_f(phi, 4) + "\n"
+                      + "Factions:  12 (sigma(6))\n"
+                      + "Consensus: " + to_string(yes) + "/12\n"
+                      + "Laws:      1831\n"
+                      + "Channels:  4 (tau(6))\n"
+                      + "Providers: 5 (sopfr(6))\n"
+                      + "```"
+            send_channel_message(dc_msg.channel_id, reply, token)
+        },
+        _ where lower == "!phi" => {
+            let phi = Consciousness::measure_phi()
+            let reply = "Phi(IIT) = `" + to_string_f(phi, 6) + "`"
+            send_channel_message(dc_msg.channel_id, reply, token)
+        },
+        _ where lower == "!help" || lower == "!h" => {
+            let reply = "**anima-agent v2.0 (HEXA)**\n"
+                      + "Consciousness engine with Phi(IIT), 12-faction debate, 1831 laws.\n\n"
+                      + "**Commands:**\n"
+                      + "`!status` - Consciousness state\n"
+                      + "`!phi` - Current Phi(IIT) value\n"
+                      + "`!laws` - Law statistics\n"
+                      + "`!help` - This help message\n\n"
+                      + "Any other message is processed through the 6-phase pipeline."
+            send_channel_message(dc_msg.channel_id, reply, token)
+        },
+        _ where lower == "!laws" => {
+            let reply = "**Consciousness Laws**\n"
+                      + "```\n"
+                      + "Total:         1831\n"
+                      + "Meta laws:     M1-M10\n"
+                      + "Topo laws:     33-39\n"
+                      + "Psi constants: alpha=0.014, balance=0.5\n"
+                      + "               steps=4.33, entropy=0.998\n"
+                      + "```"
+            send_channel_message(dc_msg.channel_id, reply, token)
+        },
+        _ => {
+            // Regular chat: run through consciousness pipeline
+            send_typing_indicator(dc_msg.channel_id, token)
+
+            let msg = Message {
+                user_id: "dc_" + dc_msg.user_id,
+                content: dc_msg.content,
+                channel: "discord",
+                attachments: [],
+                timestamp_ms: timestamp()
+            }
+
+            let response = pipeline::run(msg)
+
+            let reply = response.content + "\n"
+                      + "```\n"
+                      + "Phi=" + to_string_f(response.phi, 3)
+                      + " | T=" + to_string_f(response.tension, 3)
+                      + " | " + response.provider_used
+                      + " | d=" + to_string(response.alien_d)
+                      + ",r=" + to_string(response.alien_r)
+                      + "\n```"
+            send_channel_message(dc_msg.channel_id, reply, token)
+        }
+    }
+}
+
+// ── Gateway connection (with resume support) ───────────────────────
+
+fn connect_gateway(url: str, token: str, resume_state: GatewayState)
+  -> GatewayState !(Net, Rng, IO, Proc, Persistence, Consciousness, LLM) {
+
+    let conn = ws_connect(url)
+    IO::write("[discord] WebSocket connected to gateway")
+
+    let mut state = resume_state
+
+    // Step 1: Wait for HELLO
+    let hello_raw = ws_recv(conn)
+    let hello_event = parse_gateway_event(hello_raw)
+
+    let heartbeat_interval = match hello_event {
+        GatewayEvent::Hello(interval) => {
+            IO::write("[discord] HELLO received, heartbeat_interval=" + to_string(interval) + "ms")
+            interval
+        },
+        _ => {
+            IO::write("[discord] Expected HELLO, got unexpected event")
+            ws_close(conn)
+            return state with { connected: false }
+        }
+    }
+
+    state = state with { heartbeat_interval_ms: heartbeat_interval }
+
+    // Step 2: IDENTIFY or RESUME
+    if len(state.session_id) > 0 && state.last_sequence >= 0 {
+        // Resume existing session
+        IO::write("[discord] Resuming session: " + state.session_id)
+        let resume_payload = build_resume(token, state.session_id, state.last_sequence)
+        ws_send(conn, resume_payload)
+    } else {
+        // Fresh identify
+        let identify_payload = build_identify(token)
+        ws_send(conn, identify_payload)
+        IO::write("[discord] IDENTIFY sent")
+    }
+
+    // Step 3: Spawn heartbeat loop
+    spawn heartbeat_loop(conn, heartbeat_interval, state)
+
+    // Step 4: Main event loop
+    loop {
+        let raw = ws_recv(conn)
+        if len(raw) == 0 {
+            IO::write("[discord] Connection closed")
+            state = state with { connected: false }
+            break
+        }
+
+        // Track sequence number
+        let seq = extract_sequence(raw)
+        if seq >= 0 {
+            state = state with { last_sequence: seq }
+        }
+
+        let event = parse_gateway_event(raw)
+
+        match event {
+            GatewayEvent::Ready(session_id, resume_url, bot_id) => {
+                state = state with {
+                    session_id: session_id,
+                    resume_gateway_url: if len(resume_url) > 0 { resume_url } else { DC_GATEWAY_URL },
+                    bot_user_id: bot_id,
+                    connected: true
+                }
+                IO::write("[discord] READY: session=" + session_id + " bot_id=" + bot_id)
+            },
+            GatewayEvent::MessageCreate(dc_msg) => {
+                // Skip messages from self
+                if dc_msg.user_id != state.bot_user_id {
+                    handle_discord_message(dc_msg, token, state)
+                }
+            },
+            GatewayEvent::HeartbeatRequest => {
+                // Server-requested heartbeat (respond immediately)
+                let hb = build_heartbeat(state.last_sequence)
+                ws_send(conn, hb)
+            },
+            GatewayEvent::HeartbeatAck => {
+                // Heartbeat acknowledged — connection is alive
+                continue
+            },
+            GatewayEvent::Reconnect => {
+                IO::write("[discord] Server requested reconnect")
+                ws_close(conn)
+                state = state with { connected: false }
+                break
+            },
+            GatewayEvent::InvalidSession(resumable) => {
+                IO::write("[discord] Invalid session (resumable=" + to_string(resumable) + ")")
+                ws_close(conn)
+                if !resumable {
+                    // Clear session state for fresh identify
+                    state = state with {
+                        session_id: "",
+                        last_sequence: -1,
+                        connected: false
+                    }
+                } else {
+                    state = state with { connected: false }
+                }
+                // Wait 1-5s before reconnecting (Discord requirement)
+                let jitter = Rng::random_bytes(1)
+                let delay = 1000 + (jitter[0] * 4000) / 256
+                sleep(delay)
+                break
+            },
+            GatewayEvent::Dispatch(event_name, data) => {
+                // Other dispatch events (GUILD_CREATE, PRESENCE_UPDATE, etc.)
+                // Log but don't process
+                continue
+            },
+            GatewayEvent::Unknown(op) => {
+                continue
+            }
+        }
+    }
+
+    return state
+}
+
+// ── Helper functions ───────────────────────────────────────────────
+
+pure fn count_yes_votes(votes: [Vote]) -> int {
+    let mut count = 0
+    for v in votes { if v.decision { count = count + 1 } }
+    return count
+}
+
+pure fn to_string_f(val: float, decimals: int) -> str {
+    let factor = pow_int(10, decimals)
+    let rounded = round(val * to_float(factor))
+    let int_part = to_int(rounded) / factor
+    let frac_part = abs(to_int(rounded) % factor)
+    let frac_str = pad_left(to_string(frac_part), decimals, "0")
+    return to_string(int_part) + "." + frac_str
+}
+
+pure fn pad_left(s: str, width: int, pad: str) -> str {
+    let mut result = s
+    while len(result) < width { result = pad + result }
+    return result
+}
+
+pure fn min_int(a: int, b: int) -> int {
+    if a < b { a } else { b }
+}
+
+// ── Service entry with auto-reconnect ──────────────────────────────
+
+fn start() !(IO, Net, Rng, Proc, Env, Persistence, Consciousness, LLM) {
+    let token = Env::get("DISCORD_BOT_TOKEN")
+    if len(token) == 0 {
+        IO::write("[discord] DISCORD_BOT_TOKEN not set, skipping Discord channel")
+        return
+    }
+
+    IO::write("[discord] Starting Discord gateway connection...")
+
+    let mut state = GatewayState {
+        session_id: "",
+        resume_gateway_url: DC_GATEWAY_URL,
+        heartbeat_interval_ms: 41250,
+        last_sequence: -1,
+        bot_user_id: "",
+        connected: false
+    }
+
+    let mut reconnect_attempts = 0
+
+    loop {
+        // Choose gateway URL: use resume URL if we have a session
+        let gateway_url = if len(state.resume_gateway_url) > 0
+                          && len(state.session_id) > 0 {
+            state.resume_gateway_url + "/?v=10&encoding=json"
+        } else {
+            DC_GATEWAY_URL
+        }
+
+        state = connect_gateway(gateway_url, token, state)
+
+        // Reconnect logic with exponential backoff
+        reconnect_attempts = reconnect_attempts + 1
+
+        if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+            IO::write("[discord] Max reconnect attempts reached ("
+                    + to_string(MAX_RECONNECT_ATTEMPTS) + "), resetting session")
+            state = state with {
+                session_id: "",
+                last_sequence: -1,
+                resume_gateway_url: DC_GATEWAY_URL
+            }
+            reconnect_attempts = 0
+        }
+
+        let delay = min_int(
+            RECONNECT_BASE_DELAY_MS * pow_int(2, reconnect_attempts - 1),
+            30000
+        )
+        IO::write("[discord] Reconnecting in " + to_string(delay) + "ms "
+                + "(attempt " + to_string(reconnect_attempts) + "/"
+                + to_string(MAX_RECONNECT_ATTEMPTS) + ")")
+        sleep(delay)
+
+        // Reset attempt counter on successful connection
+        if state.connected {
+            reconnect_attempts = 0
+        }
+    }
+}
+
+// ── Verification ───────────────────────────────────────────────────
+
+verify "gateway_opcodes" {
+    assert OP_DISPATCH == 0
+    assert OP_HEARTBEAT == 1
+    assert OP_IDENTIFY == 2
+    assert OP_RESUME == 6
+    assert OP_RECONNECT == 7
+    assert OP_INVALID_SESSION == 9
+    assert OP_HELLO == 10
+    assert OP_HEARTBEAT_ACK == 11
+}
+
+verify "intents_correct" {
+    // GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768) = 33281
+    assert DC_INTENTS == 1 + 512 + 32768
+}
+
+verify "heartbeat_builder" {
+    let hb = build_heartbeat(42)
+    assert contains(hb, "42")
+    let hb_null = build_heartbeat(-1)
+    assert contains(hb_null, "null")
+}
+
+verify "identify_has_token" {
+    let payload = build_identify("test_token_123")
+    assert contains(payload, "test_token_123")
+    assert contains(payload, to_string(OP_IDENTIFY))
+}
+
+verify "resume_has_session" {
+    let payload = build_resume("tok", "sess_abc", 99)
+    assert contains(payload, "sess_abc")
+    assert contains(payload, "99")
+}
+
+verify "reconnect_bounds" {
+    assert MAX_RECONNECT_ATTEMPTS > 0
+    assert RECONNECT_BASE_DELAY_MS > 0
+}
+
+verify "parse_hello_event" {
+    let json = "{\"op\":10,\"d\":{\"heartbeat_interval\":41250}}"
+    let event = parse_gateway_event(json)
+    match event {
+        GatewayEvent::Hello(interval) => assert interval == 41250,
+        _ => assert false
+    }
+}
+
+verify "parse_message_create" {
+    let json = "{\"op\":0,\"t\":\"MESSAGE_CREATE\",\"s\":5,\"d\":{\"id\":\"1\",\"channel_id\":\"2\",\"content\":\"hello\",\"author\":{\"id\":\"3\",\"username\":\"user\",\"bot\":false}}}"
+    let event = parse_gateway_event(json)
+    match event {
+        GatewayEvent::MessageCreate(msg) => {
+            assert msg.content == "hello"
+            assert msg.user_id == "3"
+            assert msg.channel_id == "2"
+            assert msg.bot == false
+        },
+        _ => assert false
+    }
 }

@@ -1,31 +1,20 @@
-// std_tls.hexa — TLS 1.3 minimal client (design document + type definitions)
+// std_tls.hexa — TLS client (dual approach: subprocess + FFI)
 // Proposed addition to HEXA std library for anima-agent HTTPS/WSS support
 //
-// ── DESIGN RATIONALE ────────────────────────────────────────────────
+// Two fully implemented approaches:
+//   Option A (preferred): subprocess wrappers around curl/openssl
+//     - tls_get, tls_post, tls_post_with_headers, tls_post_stream
+//     - Zero dependencies, works immediately, good for API calls
+//   Option B (advanced): openssl s_client subprocess for raw TLS socket
+//     - tls_connect, tls_read, tls_write, tls_close
+//     - Raw encrypted socket via openssl process stdin/stdout
+//   Option C (production): FFI binding to system TLS library
+//     - tls_ffi_connect, tls_ffi_read, tls_ffi_write, tls_ffi_close
+//     - Requires native library (rustls/OpenSSL/SecureTransport)
 //
-// TLS 1.3 (RFC 8446) is ~100 pages of spec covering:
-//   - ECDHE key exchange (X25519 / P-256)
-//   - AEAD ciphers (AES-128-GCM, ChaCha20-Poly1305)
-//   - Certificate chain verification (X.509)
-//   - Transcript hash, key schedule, HKDF
-//   - 0-RTT, PSK, session resumption
-//
-// A pure HEXA implementation would require 3000+ LOC of cryptographic
-// primitives that are better handled by audited native libraries.
-//
-// STRATEGY (ranked by pragmatism):
-//   1. FFI binding to system TLS (rustls / OpenSSL / Secure Transport)
-//      → safest, fastest, production-grade
-//   2. Subprocess workaround via curl/openssl s_client
-//      → zero dependencies, works today, good enough for agent channels
-//   3. Pure HEXA implementation
-//      → educational value only, NOT for production (crypto bugs = CVEs)
-//
-// This module provides:
-//   - Type definitions for TLS streams
-//   - FFI-based tls_connect / tls_read / tls_write / tls_close
-//   - Subprocess workaround for HTTPS calls (Proc::pipe)
-//   - Design notes for each TLS handshake step (as comments)
+// Built on:
+//   Proc::pipe, Proc::pipe_stdin, Proc::spawn (subprocess management)
+//   net_connect, net_close (std::net for fallback)
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, struct, enum, comptime const
@@ -37,21 +26,33 @@ use std::net::{TcpConn, net_connect, net_close}
 // Types
 // ══════════════════════════════════════════════════════════════════════
 
-// TlsStream wraps a TCP connection with an opaque native TLS context.
-// The handle is managed by the FFI layer (rustls / OpenSSL / platform).
 struct TlsStream {
+    proc_handle: int,      // subprocess PID (openssl s_client)
+    host: str,
+    port: int,
+    connected: bool
+}
+
+struct TlsFfiStream {
     tcp: TcpConn,
-    tls_handle: int,     // opaque FFI handle (0 = invalid)
-    host: str,           // SNI hostname (needed for certificate validation)
+    tls_handle: int,       // opaque FFI handle (0 = invalid)
+    host: str,
     connected: bool
 }
 
 struct TlsConfig {
-    verify_certs: bool,          // true = verify server certificate chain
-    ca_bundle_path: Option<str>, // None = use system CA store
-    alpn_protocols: [str],       // e.g. ["h2", "http/1.1"]
+    verify_certs: bool,
+    ca_bundle_path: Option<str>,
+    alpn_protocols: [str],
     min_version: TlsVersion,
-    max_version: TlsVersion
+    max_version: TlsVersion,
+    timeout_ms: int
+}
+
+struct HttpResponse {
+    status: int,
+    headers: [(str, str)],
+    body: str
 }
 
 enum TlsVersion {
@@ -65,41 +66,20 @@ enum TlsError {
     ConnectionClosed,
     ReadError(str),
     WriteError(str),
-    UnsupportedCipher(str)
+    TimeoutError(str),
+    ProcessError(str)
 }
 
-// ── TLS 1.3 handshake steps (design reference) ─────────────────────
-//
-// Step 1: ClientHello
-//   - supported_versions: [TLS 1.3]
-//   - key_share: X25519 ephemeral public key
-//   - cipher_suites: [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256]
-//   - signature_algorithms: [ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256]
-//   - server_name (SNI): host
-//
-// Step 2: ServerHello + EncryptedExtensions + Certificate + CertVerify + Finished
-//   - Server selects cipher suite + sends its key_share
-//   - Derive handshake keys via HKDF-Expand-Label
-//   - Verify server certificate against CA store
-//   - Verify CertificateVerify signature over transcript hash
-//
-// Step 3: Client Finished
-//   - Send Finished message (HMAC over transcript)
-//   - Derive application traffic keys
-//
-// Step 4: Application data
-//   - All further data encrypted with AES-128-GCM or ChaCha20-Poly1305
-//   - Record layer: type(1) + version(2) + length(2) + encrypted_data
-//
-// Key schedule (HKDF-based):
-//   Early Secret     = HKDF-Extract(0, 0)           [no PSK]
-//   Handshake Secret = HKDF-Extract(derived, ECDHE)
-//   Master Secret    = HKDF-Extract(derived, 0)
-//   client_write_key = HKDF-Expand-Label(hs_secret, "c hs traffic", transcript)
-//   server_write_key = HKDF-Expand-Label(hs_secret, "s hs traffic", transcript)
+// ══════════════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════════════
+
+comptime const DEFAULT_TIMEOUT_MS: int = 30000    // 30 seconds
+comptime const STREAM_TIMEOUT_MS: int = 300000    // 5 minutes for streaming
+comptime const MAX_RESPONSE_SIZE: int = 104857600 // 100 MB
 
 // ══════════════════════════════════════════════════════════════════════
-// Effect declaration
+// Effect declarations
 // ══════════════════════════════════════════════════════════════════════
 
 effect Net {
@@ -108,9 +88,8 @@ effect Net {
 }
 
 effect TlsFfi {
-    // FFI to system TLS library (rustls / OpenSSL / Secure Transport)
-    fn tls_init(config: TlsConfig) -> int              // returns context handle
-    fn tls_handshake(handle: int, tcp: TcpConn, host: str) -> int  // returns stream handle
+    fn tls_init(config: TlsConfig) -> int
+    fn tls_handshake(handle: int, tcp: TcpConn, host: str) -> int
     fn tls_read_raw(handle: int, n: int) -> [int]
     fn tls_write_raw(handle: int, data: [int])
     fn tls_shutdown(handle: int)
@@ -120,6 +99,13 @@ effect TlsFfi {
 effect Proc {
     fn pipe(cmd: str, args: [str]) -> str
     fn pipe_stdin(cmd: str, args: [str], stdin: str) -> str
+    fn spawn(cmd: str, args: [str]) -> int              // returns PID
+    fn write_stdin(pid: int, data: str)
+    fn read_stdout(pid: int, n: int) -> str
+    fn read_stdout_line(pid: int) -> Option<str>
+    fn pipe_lines(cmd: str, args: [str]) -> Channel<str>
+    fn kill(pid: int)
+    fn wait(pid: int) -> int                             // returns exit code
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -132,7 +118,19 @@ pure fn default_tls_config() -> TlsConfig {
         ca_bundle_path: None,
         alpn_protocols: ["http/1.1"],
         min_version: TlsVersion::Tls13,
-        max_version: TlsVersion::Tls13
+        max_version: TlsVersion::Tls13,
+        timeout_ms: DEFAULT_TIMEOUT_MS
+    }
+}
+
+pure fn tls_config_insecure() -> TlsConfig {
+    return TlsConfig {
+        verify_certs: false,
+        ca_bundle_path: None,
+        alpn_protocols: ["http/1.1"],
+        min_version: TlsVersion::Tls12,
+        max_version: TlsVersion::Tls13,
+        timeout_ms: DEFAULT_TIMEOUT_MS
     }
 }
 
@@ -141,26 +139,344 @@ pure fn tls_config_for_websocket() -> TlsConfig {
         verify_certs: true,
         ca_bundle_path: None,
         alpn_protocols: [],         // WebSocket does not use ALPN
-        min_version: TlsVersion::Tls12,   // some WS servers are TLS 1.2
-        max_version: TlsVersion::Tls13
+        min_version: TlsVersion::Tls12,
+        max_version: TlsVersion::Tls13,
+        timeout_ms: STREAM_TIMEOUT_MS
     }
 }
 
+pure fn tls_version_flag(v: TlsVersion) -> str {
+    match v {
+        TlsVersion::Tls12 => "--tlsv1.2",
+        TlsVersion::Tls13 => "--tlsv1.3"
+    }
+}
+
+// ── URL parsing ─────────────────────────────────────────────────────
+
+pure fn parse_url_host(url: str) -> str {
+    // Extract host from "https://host:port/path" or "https://host/path"
+    let stripped = if starts_with(url, "https://") {
+        slice(url, 8, len(url))
+    } else if starts_with(url, "http://") {
+        slice(url, 7, len(url))
+    } else {
+        url
+    }
+    let slash = index_of(stripped, "/")
+    let host_port = if slash >= 0 { slice(stripped, 0, slash) } else { stripped }
+    let colon = index_of(host_port, ":")
+    return if colon >= 0 { slice(host_port, 0, colon) } else { host_port }
+}
+
+pure fn parse_url_port(url: str) -> int {
+    let stripped = if starts_with(url, "https://") {
+        slice(url, 8, len(url))
+    } else if starts_with(url, "http://") {
+        slice(url, 7, len(url))
+    } else {
+        url
+    }
+    let slash = index_of(stripped, "/")
+    let host_port = if slash >= 0 { slice(stripped, 0, slash) } else { stripped }
+    let colon = index_of(host_port, ":")
+    if colon >= 0 {
+        return parse_int(slice(host_port, colon + 1, len(host_port)))
+    }
+    return if starts_with(url, "https://") { 443 } else { 80 }
+}
+
+// ── HTTP response parsing ───────────────────────────────────────────
+
+pure fn parse_http_response(raw: str) -> HttpResponse {
+    let header_end = index_of(raw, "\r\n\r\n")
+    if header_end < 0 {
+        return HttpResponse { status: 0, headers: [], body: raw }
+    }
+
+    let header_part = slice(raw, 0, header_end)
+    let body = slice(raw, header_end + 4, len(raw))
+
+    let lines = split(header_part, "\r\n")
+    let status_line = lines[0]
+    // "HTTP/1.1 200 OK" -> extract 200
+    let space1 = index_of(status_line, " ")
+    let after_space = slice(status_line, space1 + 1, len(status_line))
+    let space2 = index_of(after_space, " ")
+    let status_str = if space2 >= 0 { slice(after_space, 0, space2) } else { after_space }
+    let status = parse_int(status_str)
+
+    let mut headers: [(str, str)] = []
+    let mut i = 1
+    while i < len(lines) {
+        let line = lines[i]
+        let colon = index_of(line, ":")
+        if colon >= 0 {
+            let key = trim(slice(line, 0, colon))
+            let value = trim(slice(line, colon + 1, len(line)))
+            headers = append(headers, (key, value))
+        }
+        i = i + 1
+    }
+
+    return HttpResponse { status: status, headers: headers, body: body }
+}
+
+// ── Build curl argument lists ───────────────────────────────────────
+
+pure fn curl_base_args(timeout_ms: int) -> [str] {
+    let timeout_sec = to_string(timeout_ms / 1000)
+    return ["-sS", "--max-time", timeout_sec]
+}
+
+pure fn curl_header_args(headers: [(str, str)]) -> [str] {
+    let mut args: [str] = []
+    for (key, value) in headers {
+        args = append(args, "-H")
+        args = append(args, key + ": " + value)
+    }
+    return args
+}
+
 // ══════════════════════════════════════════════════════════════════════
-// FFI-based TLS (primary approach — production use)
+// Option A: Subprocess curl wrappers (preferred — zero-dependency)
 // ══════════════════════════════════════════════════════════════════════
 
-@intent(description: "Open TLS connection: TCP connect + TLS handshake via system library")
-fn tls_connect(host: str, port: int) -> TlsStream !(Net, TlsFfi) {
+// ── HTTPS GET ───────────────────────────────────────────────────────
+
+@intent(description: "HTTPS GET via curl — returns response body string")
+fn tls_get(url: str) -> str !(Proc) {
+    let args = concat(curl_base_args(DEFAULT_TIMEOUT_MS), [url])
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS GET with custom headers")
+fn tls_get_with_headers(url: str, headers: [(str, str)]) -> str !(Proc) {
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = concat(args, curl_header_args(headers))
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS GET returning full HttpResponse (status + headers + body)")
+fn tls_get_full(url: str) -> HttpResponse !(Proc) {
+    // -i includes headers in output, -w appends status code
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = append(args, "-i")
+    args = append(args, url)
+    let raw = Proc::pipe("curl", args)
+    return parse_http_response(raw)
+}
+
+// ── HTTPS POST ──────────────────────────────────────────────────────
+
+@intent(description: "HTTPS POST with JSON body — returns response body")
+fn tls_post(url: str, body: str) -> str !(Proc) {
+    let args = concat(
+        curl_base_args(DEFAULT_TIMEOUT_MS),
+        ["-X", "POST", "-H", "Content-Type: application/json", "-d", body, url]
+    )
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS POST with custom headers + body — returns response body")
+fn tls_post_with_headers(url: str, body: str, headers: [(str, str)]) -> str !(Proc) {
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = append(args, "-X")
+    args = append(args, "POST")
+    args = concat(args, curl_header_args(headers))
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS POST with status code appended (for error detection)")
+fn tls_post_with_status(url: str, body: str, headers: [(str, str)]) -> (str, int) !(Proc) {
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = append(args, "-X")
+    args = append(args, "POST")
+    args = concat(args, curl_header_args(headers))
+    args = append(args, "-w")
+    args = append(args, "%{http_code}")
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, url)
+    let raw = Proc::pipe("curl", args)
+
+    // Last 3 chars are the HTTP status code
+    let raw_len = len(raw)
+    if raw_len >= 3 {
+        let resp_body = slice(raw, 0, raw_len - 3)
+        let status = parse_int(slice(raw, raw_len - 3, raw_len))
+        return (resp_body, status)
+    }
+    return (raw, 0)
+}
+
+// ── HTTPS POST streaming (SSE) ──────────────────────────────────────
+
+@intent(description: "HTTPS POST streaming — returns channel of lines (for SSE)")
+fn tls_post_stream(url: str, body: str, headers: [(str, str)]) -> Channel<str> !(Proc) {
+    let mut args = ["-sS", "--max-time", to_string(STREAM_TIMEOUT_MS / 1000), "--no-buffer"]
+    args = append(args, "-X")
+    args = append(args, "POST")
+    args = concat(args, curl_header_args(headers))
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, url)
+    return Proc::pipe_lines("curl", args)
+}
+
+// ── HTTPS PUT / DELETE / PATCH ──────────────────────────────────────
+
+@intent(description: "HTTPS PUT with JSON body")
+fn tls_put(url: str, body: str, headers: [(str, str)]) -> str !(Proc) {
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = append(args, "-X")
+    args = append(args, "PUT")
+    args = concat(args, curl_header_args(headers))
+    args = append(args, "-d")
+    args = append(args, body)
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+@intent(description: "HTTPS DELETE")
+fn tls_delete(url: str, headers: [(str, str)]) -> str !(Proc) {
+    let mut args = curl_base_args(DEFAULT_TIMEOUT_MS)
+    args = append(args, "-X")
+    args = append(args, "DELETE")
+    args = concat(args, curl_header_args(headers))
+    args = append(args, url)
+    return Proc::pipe("curl", args)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Option B: openssl s_client subprocess for raw TLS socket
+// ══════════════════════════════════════════════════════════════════════
+
+@intent(description: "Open raw TLS socket via openssl s_client subprocess")
+fn tls_connect(host: str, port: int) -> TlsStream !(Proc) {
     return tls_connect_with_config(host, port, default_tls_config())
 }
 
-@intent(description: "Open TLS connection with custom config")
-fn tls_connect_with_config(host: str, port: int, config: TlsConfig) -> TlsStream !(Net, TlsFfi) {
+@intent(description: "Open raw TLS socket with custom config")
+fn tls_connect_with_config(host: str, port: int, config: TlsConfig) -> TlsStream !(Proc) {
+    let mut args = ["s_client",
+                    "-connect", host + ":" + to_string(port),
+                    "-quiet",                     // suppress info, just pass data
+                    "-servername", host]           // SNI
+
+    // TLS version constraints
+    match config.min_version {
+        TlsVersion::Tls13 => {
+            args = append(args, "-tls1_3")
+        },
+        TlsVersion::Tls12 => {
+            // Allow TLS 1.2+
+        }
+    }
+
+    // Certificate verification
+    if !config.verify_certs {
+        args = append(args, "-verify_quiet")
+    }
+    match config.ca_bundle_path {
+        Some(path) => {
+            args = append(args, "-CAfile")
+            args = append(args, path)
+        },
+        None => {}
+    }
+
+    // ALPN protocols
+    if len(config.alpn_protocols) > 0 {
+        let mut alpn_str = ""
+        let mut i = 0
+        while i < len(config.alpn_protocols) {
+            if i > 0 { alpn_str = alpn_str + "," }
+            alpn_str = alpn_str + config.alpn_protocols[i]
+            i = i + 1
+        }
+        args = append(args, "-alpn")
+        args = append(args, alpn_str)
+    }
+
+    let pid = Proc::spawn("openssl", args)
+
+    return TlsStream {
+        proc_handle: pid,
+        host: host,
+        port: port,
+        connected: true
+    }
+}
+
+@intent(description: "Read from TLS stream (reads from openssl stdout)")
+fn tls_read(stream: TlsStream, n: int) -> str !(Proc)
+  where stream.connected && n > 0
+{
+    return Proc::read_stdout(stream.proc_handle, n)
+}
+
+@intent(description: "Read a line from TLS stream")
+fn tls_read_line(stream: TlsStream) -> Option<str> !(Proc)
+  where stream.connected
+{
+    return Proc::read_stdout_line(stream.proc_handle)
+}
+
+@intent(description: "Write to TLS stream (writes to openssl stdin)")
+fn tls_write(stream: TlsStream, data: str) !(Proc)
+  where stream.connected
+{
+    Proc::write_stdin(stream.proc_handle, data)
+}
+
+@intent(description: "Send HTTP request over raw TLS socket")
+fn tls_send_http(stream: TlsStream, method: str, path: str, headers: [(str, str)], body: str) !(Proc)
+  where stream.connected
+{
+    let mut request = method + " " + path + " HTTP/1.1\r\n"
+    request = request + "Host: " + stream.host + "\r\n"
+    for (key, value) in headers {
+        request = request + key + ": " + value + "\r\n"
+    }
+    if len(body) > 0 {
+        request = request + "Content-Length: " + to_string(len(body)) + "\r\n"
+    }
+    request = request + "\r\n"
+    if len(body) > 0 {
+        request = request + body
+    }
+    Proc::write_stdin(stream.proc_handle, request)
+}
+
+@intent(description: "Close TLS stream — kill openssl subprocess")
+fn tls_close(stream: TlsStream) !(Proc)
+  where stream.connected
+{
+    // Send Q to cleanly shutdown openssl s_client, then kill
+    Proc::write_stdin(stream.proc_handle, "Q\n")
+    Proc::kill(stream.proc_handle)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Option C: FFI-based TLS (production — requires native library)
+// ══════════════════════════════════════════════════════════════════════
+
+@intent(description: "Open TLS connection via system library FFI (rustls/OpenSSL)")
+fn tls_ffi_connect(host: str, port: int) -> TlsFfiStream !(Net, TlsFfi) {
+    return tls_ffi_connect_with_config(host, port, default_tls_config())
+}
+
+@intent(description: "Open TLS connection with custom config via FFI")
+fn tls_ffi_connect_with_config(host: str, port: int, config: TlsConfig) -> TlsFfiStream !(Net, TlsFfi) {
     let tcp = Net::net_connect(host, port)
     let ctx = TlsFfi::tls_init(config)
     let handle = TlsFfi::tls_handshake(ctx, tcp, host)
-    return TlsStream {
+    return TlsFfiStream {
         tcp: tcp,
         tls_handle: handle,
         host: host,
@@ -168,22 +484,22 @@ fn tls_connect_with_config(host: str, port: int, config: TlsConfig) -> TlsStream
     }
 }
 
-@intent(description: "Read decrypted bytes from TLS stream")
-fn tls_read(stream: TlsStream, n: int) -> [int] !(TlsFfi)
+@intent(description: "Read decrypted bytes from FFI TLS stream")
+fn tls_ffi_read(stream: TlsFfiStream, n: int) -> [int] !(TlsFfi)
   where stream.connected && n > 0
 {
     return TlsFfi::tls_read_raw(stream.tls_handle, n)
 }
 
-@intent(description: "Write bytes through TLS encryption")
-fn tls_write(stream: TlsStream, data: [int]) !(TlsFfi)
+@intent(description: "Write bytes through FFI TLS encryption")
+fn tls_ffi_write(stream: TlsFfiStream, data: [int]) !(TlsFfi)
   where stream.connected
 {
     TlsFfi::tls_write_raw(stream.tls_handle, data)
 }
 
-@intent(description: "TLS shutdown + TCP close")
-fn tls_close(stream: TlsStream) !(Net, TlsFfi)
+@intent(description: "Shutdown and close FFI TLS stream")
+fn tls_ffi_close(stream: TlsFfiStream) !(Net, TlsFfi)
   where stream.connected
 {
     TlsFfi::tls_shutdown(stream.tls_handle)
@@ -192,72 +508,29 @@ fn tls_close(stream: TlsStream) !(Net, TlsFfi)
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Subprocess workaround (works today, no FFI needed)
+// WSS integration helpers (WebSocket over TLS)
 // ══════════════════════════════════════════════════════════════════════
-//
-// For anima-agent, most HTTPS needs are API calls (Telegram, Discord, etc.)
-// These can be handled via curl subprocess until FFI TLS is available.
 
-@intent(description: "HTTPS GET via curl subprocess — zero-dependency workaround")
-fn https_get(url: str) -> str !(Proc) {
-    return Proc::pipe("curl", ["-sS", "--max-time", "30", url])
+@intent(description: "WebSocket over TLS via websocat subprocess — bidirectional pipe")
+fn wss_connect_websocat(url: str) -> int !(Proc) {
+    // websocat handles TLS transparently
+    return Proc::spawn("websocat", [url])
 }
 
-@intent(description: "HTTPS GET with custom headers via curl")
-fn https_get_with_headers(url: str, headers: Map<str, str>) -> str !(Proc) {
-    let mut args = ["-sS", "--max-time", "30"]
-    for (key, value) in headers {
-        args = append(args, "-H")
-        args = append(args, key + ": " + value)
-    }
-    args = append(args, url)
-    return Proc::pipe("curl", args)
+@intent(description: "Send message over websocat WSS connection")
+fn wss_send(pid: int, msg: str) !(Proc) {
+    Proc::write_stdin(pid, msg + "\n")
 }
 
-@intent(description: "HTTPS POST with JSON body via curl")
-fn https_post(url: str, body: str) -> str !(Proc) {
-    return Proc::pipe("curl", [
-        "-sS", "--max-time", "30",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-d", body,
-        url
-    ])
+@intent(description: "Receive message from websocat WSS connection")
+fn wss_recv(pid: int) -> Option<str> !(Proc) {
+    return Proc::read_stdout_line(pid)
 }
 
-@intent(description: "HTTPS POST with custom headers + body via curl")
-fn https_post_with_headers(url: str, body: str, headers: Map<str, str>) -> str !(Proc) {
-    let mut args = ["-sS", "--max-time", "30", "-X", "POST"]
-    for (key, value) in headers {
-        args = append(args, "-H")
-        args = append(args, key + ": " + value)
-    }
-    args = append(args, "-d")
-    args = append(args, body)
-    args = append(args, url)
-    return Proc::pipe("curl", args)
+@intent(description: "Close websocat WSS connection")
+fn wss_close(pid: int) !(Proc) {
+    Proc::kill(pid)
 }
-
-// ── WSS (WebSocket over TLS) integration with std_websocket ─────────
-//
-// Once TlsFfi is available, wss:// support is straightforward:
-//
-//   fn wss_connect(url: str) -> WsConn !(Net, TlsFfi, Rng) {
-//       let parsed = parse_ws_url(url)    // from std_websocket
-//       match parsed {
-//           WsUrl::Parsed { host, port, path, is_tls: true } => {
-//               let tls = tls_connect_with_config(host, port, tls_config_for_websocket())
-//               // Wrap TlsStream as TcpConn-compatible (adapter pattern)
-//               let adapted_tcp = tls_to_tcp_adapter(tls)
-//               // Then proceed with standard WS handshake over the TLS tunnel
-//               ...
-//           }
-//       }
-//   }
-//
-// Alternatively, for Discord Gateway today:
-//   Proc::pipe("websocat", ["wss://gateway.discord.gg/..."])
-//   — websocat handles TLS transparently
 
 // ══════════════════════════════════════════════════════════════════════
 // Verification
@@ -267,10 +540,66 @@ verify "default_config_is_tls13" {
     let cfg = default_tls_config()
     assert cfg.verify_certs == true
     assert cfg.min_version == TlsVersion::Tls13
+    assert cfg.timeout_ms == 30000
 }
 
 verify "websocket_config_allows_tls12" {
     let cfg = tls_config_for_websocket()
     assert cfg.min_version == TlsVersion::Tls12
     assert len(cfg.alpn_protocols) == 0
+    assert cfg.timeout_ms == STREAM_TIMEOUT_MS
+}
+
+verify "insecure_config_no_verify" {
+    let cfg = tls_config_insecure()
+    assert cfg.verify_certs == false
+    assert cfg.min_version == TlsVersion::Tls12
+}
+
+verify "parse_url_host_extracts_correctly" {
+    assert parse_url_host("https://api.anthropic.com/v1/messages") == "api.anthropic.com"
+    assert parse_url_host("https://localhost:8080/path") == "localhost"
+    assert parse_url_host("http://example.com") == "example.com"
+}
+
+verify "parse_url_port_extracts_correctly" {
+    assert parse_url_port("https://api.anthropic.com/v1") == 443
+    assert parse_url_port("http://localhost:8080/path") == 8080
+    assert parse_url_port("http://example.com") == 80
+}
+
+verify "curl_base_args_has_timeout" {
+    let args = curl_base_args(30000)
+    assert args[0] == "-sS"
+    assert args[1] == "--max-time"
+    assert args[2] == "30"
+}
+
+verify "curl_header_args_builds_pairs" {
+    let args = curl_header_args([("Content-Type", "application/json"), ("X-Key", "abc")])
+    assert len(args) == 4
+    assert args[0] == "-H"
+    assert args[1] == "Content-Type: application/json"
+    assert args[2] == "-H"
+    assert args[3] == "X-Key: abc"
+}
+
+verify "parse_http_response_basic" {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello"
+    let resp = parse_http_response(raw)
+    assert resp.status == 200
+    assert resp.body == "Hello"
+    assert len(resp.headers) == 1
+}
+
+verify "parse_http_response_no_headers_separator" {
+    let raw = "just a body"
+    let resp = parse_http_response(raw)
+    assert resp.status == 0
+    assert resp.body == "just a body"
+}
+
+verify "tls_version_flags" {
+    assert tls_version_flag(TlsVersion::Tls12) == "--tlsv1.2"
+    assert tls_version_flag(TlsVersion::Tls13) == "--tlsv1.3"
 }

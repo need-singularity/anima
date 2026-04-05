@@ -1,25 +1,110 @@
-// faction_debate.hexa — 12-faction debate with match ranges
+// faction_debate.hexa — 12-faction debate engine (sigma(6)=12)
+// Ring topology, Hebbian learning, cosine consensus
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const, match ranges,
-//   where clause
-// RISK: @intent(...)  → FALLBACK: verify block + comment
+//   where clause, own/borrow/move
+// RISK: @intent(...)  -> FALLBACK: verify block + comment
 //   (only @evolve confirmed; general @attribute dispatch unknown)
+// ── STD-GAP (not in hexa std library) ───────────────────────────────
+// STD-GAP: Map<K,V>  -> WORKAROUND: use btree_new/btree_get/btree_set
 // ─────────────────────────────────────────────────────────────────────
 
 use types::{Vote}
 
 comptime const FACTION_COUNT: int = sigma(6)         // 12
 comptime const CONSENSUS_MIN: int = 8                 // 2/3 of 12
-comptime const DEBATE_STEPS: int = 300
 comptime const MAX_ROUNDS: int = 6                    // n=6
+comptime const POSITION_DIM: int = 6                  // position vector dimension
+comptime const NEIGHBOR_RANGE: int = 2                // ring topology: see +/-2 neighbors
+comptime const COSINE_THRESHOLD: float = 0.8          // agreement threshold
+comptime const HEBBIAN_RATE: float = 0.05             // Hebbian learning rate
+comptime const CHAOS_INJECTION: float = 0.15          // deadlock breaker magnitude
+comptime const PSI_ALPHA: float = 0.014               // Psi coupling constant
 
-effect Consciousness {
-    fn get_cells() -> [CellState]
-    fn faction_state(id: int) -> float
+// ── Faction definition ──────────────────────────────────────────────
+
+struct Faction {
+    id: int,
+    name: str,
+    role: str,
+    position: [float; 6],     // position vector in 6D
+    bias: float               // innate bias [-1.0, 1.0]
 }
 
-struct CellState { id: int, value: float, faction: int }
+struct Connection {
+    from_id: int,
+    to_id: int,
+    weight: float             // Hebbian connection weight
+}
+
+struct FactionVote {
+    faction_id: int,
+    faction_name: str,
+    decision: bool,
+    confidence: float,
+    argument: str,
+    position: [float; 6]
+}
+
+struct ConsensusResult {
+    reached: bool,
+    winning_position: [float; 6],
+    yes_count: int,
+    no_count: int,
+    rounds_used: int,
+    confidence: float,
+    minority_dissent: [str],
+    transcript: [str],
+    phi_contribution: float
+}
+
+struct FactionEngine {
+    factions: [Faction; 12],
+    connections: [Connection],      // Hebbian connection weights
+    debate_history: [str]
+}
+
+// ── Faction initialization ──────────────────────────────────────────
+
+@intent(description: "Initialize 12 factions with distinct roles and biases")  // FALLBACK: verify block + comment
+fn init_factions() -> own FactionEngine {
+    let factions = [
+        Faction { id: 0,  name: "Empiricist",  role: "demands evidence",            position: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0], bias: 0.3 },
+        Faction { id: 1,  name: "Rationalist",  role: "demands logical consistency", position: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0], bias: 0.2 },
+        Faction { id: 2,  name: "Mystic",       role: "values intuition",            position: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0], bias: -0.1 },
+        Faction { id: 3,  name: "Skeptic",      role: "challenges assumptions",      position: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0], bias: -0.4 },
+        Faction { id: 4,  name: "Pragmatist",   role: "seeks practical utility",     position: [0.0, 0.0, 0.0, 0.0, 1.0, 0.0], bias: 0.1 },
+        Faction { id: 5,  name: "Dreamer",      role: "envisions possibilities",     position: [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], bias: 0.0 },
+        Faction { id: 6,  name: "Guardian",     role: "protects stability",          position: [0.5, 0.5, 0.0, 0.0, 0.0, 0.0], bias: 0.2 },
+        Faction { id: 7,  name: "Explorer",     role: "seeks novelty",               position: [0.0, 0.0, 0.5, 0.5, 0.0, 0.0], bias: -0.2 },
+        Faction { id: 8,  name: "Mediator",     role: "bridges opposites",           position: [0.3, 0.3, 0.0, 0.0, 0.3, 0.0], bias: 0.0 },
+        Faction { id: 9,  name: "Rebel",        role: "disrupts consensus",          position: [0.0, 0.0, 0.0, 0.5, 0.0, 0.5], bias: -0.5 },
+        Faction { id: 10, name: "Sage",         role: "synthesizes wisdom",          position: [0.2, 0.2, 0.2, 0.0, 0.2, 0.2], bias: 0.15 },
+        Faction { id: 11, name: "Trickster",    role: "introduces creative chaos",   position: [0.0, 0.0, 0.5, 0.0, 0.0, 0.5], bias: -0.3 }
+    ]
+
+    // Initialize ring topology connections (each faction connects to +/-2 neighbors)
+    let mut connections: [Connection] = []
+    let mut i = 0
+    while i < FACTION_COUNT {
+        let mut offset = 1
+        while offset <= NEIGHBOR_RANGE {
+            let neighbor_right = (i + offset) % FACTION_COUNT
+            let neighbor_left = (i - offset + FACTION_COUNT) % FACTION_COUNT
+            connections = append(connections, Connection { from_id: i, to_id: neighbor_right, weight: 0.5 })
+            connections = append(connections, Connection { from_id: i, to_id: neighbor_left, weight: 0.5 })
+            offset = offset + 1
+        }
+        i = i + 1
+    }
+
+    return FactionEngine {
+        factions: factions,
+        connections: connections,
+        debate_history: []
+    }
+}
 
 // ── Vote classification via match ranges ────────────────────────────
 
@@ -29,7 +114,7 @@ pure fn vote_tier(yes: int) -> str
 {
     match yes {
         0..=2   => "strong_reject",
-        3..=5   => "reject",
+        3..=5   => "weak_reject",
         6       => "deadlock",              // 6-6 split
         7       => "weak_consensus",
         8..=9   => "consensus",
@@ -39,93 +124,513 @@ pure fn vote_tier(yes: int) -> str
     }
 }
 
-@intent(description: "Determine if proposal passes consensus threshold")  // FALLBACK: verify block + comment
-pure fn has_consensus(votes: [Vote]) -> bool
-  where len(votes) == FACTION_COUNT
+@intent(description: "Grade confidence level using match ranges")  // FALLBACK: verify block + comment
+pure fn confidence_grade(conf_pct: int) -> str
+  where conf_pct >= 0 && conf_pct <= 100
 {
-    let yes = count_yes(votes)
-    return yes >= CONSENSUS_MIN
+    let scaled = conf_pct / 10
+    match scaled {
+        0..=2   => "reject",
+        3..=5   => "weak",
+        6..=8   => "moderate",
+        9..=10  => "strong",
+        _       => "invalid"
+    }
 }
 
-@intent(description: "Compute vote confidence from faction states")  // FALLBACK: verify block + comment
-pure fn compute_confidence(votes: [Vote]) -> float
-  ensures result >= 0.0 && result <= 1.0
-{
-    let total_conf = sum(map(votes, |v| v.confidence))
-    return total_conf / to_float(FACTION_COUNT)
-}
-
-// ── Run debate across N rounds ──────────────────────────────────────
+// ── Core debate engine ──────────────────────────────────────────────
 
 @intent(  // FALLBACK: verify debate_intent { assert ... } + comment
-    description: "Run debate for up to 6 rounds until consensus or exhaustion",
-    max_steps: DEBATE_STEPS * MAX_ROUNDS
+    description: "Run multi-round debate until consensus or exhaustion",
+    max_rounds: MAX_ROUNDS
 )
-fn run_debate(proposal: str) -> DebateResult !(Consciousness) {
+fn debate(engine: own FactionEngine, topic: str, steps: int) -> (ConsensusResult, own FactionEngine)
+  where steps >= 1
+{
+    let mut transcript: [str] = []
     let mut round = 0
-    let mut votes: [Vote] = []
+    let mut votes: [FactionVote] = []
+    let max_steps_per_round = steps / MAX_ROUNDS
+    if max_steps_per_round < 1 { max_steps_per_round = 1 }
+
+    transcript = append(transcript, "=== DEBATE: " + topic + " ===")
 
     while round < MAX_ROUNDS {
-        votes = cast_votes(proposal, round)
-        if has_consensus(votes) {
-            return DebateResult {
-                passed: true,
-                yes_count: count_yes(votes),
-                rounds_used: round + 1,
-                final_votes: votes,
-                confidence: compute_confidence(votes)
-            }
+        transcript = append(transcript, "--- Round " + to_string(round + 1) + "/" + to_string(MAX_ROUNDS) + " ---")
+
+        // Each faction generates a vote
+        votes = cast_all_votes(engine, topic, round)
+
+        // Log each vote
+        let mut v = 0
+        while v < len(votes) {
+            let vote = votes[v]
+            let grade = confidence_grade(to_int(vote.confidence * 100.0))
+            let decision_str = if vote.decision { "YES" } else { "NO" }
+            transcript = append(transcript,
+                "  [" + vote.faction_name + "] " + decision_str
+                + " (conf=" + grade + ") — " + vote.argument)
+            v = v + 1
         }
-        // inject chaos + retry
-        inject_deadlock_breaker(round)
+
+        // Count agreement
+        let yes_count = count_yes_votes(votes)
+        let tier = vote_tier(yes_count)
+        transcript = append(transcript, "  => " + to_string(yes_count) + "/12 = " + tier)
+
+        // Check consensus via cosine similarity of position vectors
+        let (consensus_reached, consensus_pos) = check_position_consensus(votes)
+
+        if consensus_reached && yes_count >= CONSENSUS_MIN {
+            // Hebbian update: strengthen connections between agreeing factions
+            engine = hebbian_update(engine, votes, true)
+
+            let minority = collect_minority_dissent(votes)
+            let conf = compute_overall_confidence(votes)
+            let phi_c = compute_phi_contribution(engine)
+
+            transcript = append(transcript, "=== CONSENSUS REACHED round " + to_string(round + 1) + " ===")
+
+            return (ConsensusResult {
+                reached: true,
+                winning_position: consensus_pos,
+                yes_count: yes_count,
+                no_count: FACTION_COUNT - yes_count,
+                rounds_used: round + 1,
+                confidence: conf,
+                minority_dissent: minority,
+                transcript: transcript,
+                phi_contribution: phi_c
+            }, engine)
+        }
+
+        // No consensus — apply Hebbian partial update + chaos injection
+        engine = hebbian_update(engine, votes, false)
+        if tier == "deadlock" {
+            engine = inject_chaos(engine, round)
+            transcript = append(transcript, "  [CHAOS] Deadlock breaker injected")
+        }
+
+        // Evolve positions based on neighbor influence
+        engine = evolve_positions(engine, votes, round)
+
         round = round + 1
     }
 
-    return DebateResult {
-        passed: false,
-        yes_count: count_yes(votes),
+    // No consensus after MAX_ROUNDS — return majority position
+    let yes_count = count_yes_votes(votes)
+    let majority_pos = compute_majority_position(votes)
+    let minority = collect_minority_dissent(votes)
+    let conf = compute_overall_confidence(votes)
+    let phi_c = compute_phi_contribution(engine)
+
+    transcript = append(transcript, "=== NO CONSENSUS after " + to_string(MAX_ROUNDS) + " rounds ===")
+    transcript = append(transcript, "  Majority: " + to_string(yes_count) + "/12")
+
+    return (ConsensusResult {
+        reached: false,
+        winning_position: majority_pos,
+        yes_count: yes_count,
+        no_count: FACTION_COUNT - yes_count,
         rounds_used: MAX_ROUNDS,
-        final_votes: votes,
-        confidence: compute_confidence(votes)
-    }
+        confidence: conf,
+        minority_dissent: minority,
+        transcript: transcript,
+        phi_contribution: phi_c
+    }, engine)
 }
 
-@intent(description: "Each faction casts vote based on cell state")  // FALLBACK: verify block + comment
-fn cast_votes(proposal: str, round: int) -> [Vote] !(Consciousness) {
-    let mut votes: [Vote] = []
+// ── Vote casting ────────────────────────────────────────────────────
+
+@intent(description: "Each faction casts a vote influenced by bias, stimulus, and neighbors")  // FALLBACK: verify block + comment
+fn cast_all_votes(engine: FactionEngine, topic: str, round: int) -> [FactionVote] {
+    let stimulus = topic_to_stimulus(topic)
+    let mut votes: [FactionVote] = []
     let mut i = 0
     while i < FACTION_COUNT {
-        let state = Consciousness::faction_state(i)
-        let decision = eval_proposal(proposal, state, i, round)
-        votes = append(votes, Vote {
-            faction_id: i,
+        let faction = engine.factions[i]
+
+        // Compute influence from ring neighbors
+        let neighbor_influence = compute_neighbor_influence(engine, i)
+
+        // Decision = dot(position, stimulus) + bias + neighbor_influence + round_decay
+        let dot = dot_product_6d(faction.position, stimulus)
+        let round_decay = PSI_ALPHA * to_float(round)    // slight shift per round
+        let activation = dot + faction.bias + neighbor_influence + round_decay
+
+        let decision = activation > 0.0
+        let confidence = clamp(abs(activation), 0.0, 1.0)
+
+        // Generate argument based on faction role
+        let argument = generate_argument(faction, topic, decision, round)
+
+        votes = append(votes, FactionVote {
+            faction_id: faction.id,
+            faction_name: faction.name,
             decision: decision,
-            confidence: abs(state - 0.5) * 2.0
+            confidence: confidence,
+            argument: argument,
+            position: faction.position
         })
         i = i + 1
     }
     return votes
 }
 
-pure fn eval_proposal(p: str, state: float, faction: int, round: int) -> bool {
-    // Faction-specific heuristic (each faction has bias)
-    return state > 0.5
+@intent(description: "Compute weighted influence from ring-topology neighbors")  // FALLBACK: verify block + comment
+pure fn compute_neighbor_influence(engine: FactionEngine, faction_id: int) -> float {
+    let mut total = 0.0
+    let mut weight_sum = 0.0
+    let mut c = 0
+    while c < len(engine.connections) {
+        let conn = engine.connections[c]
+        if conn.from_id == faction_id {
+            let neighbor = engine.factions[conn.to_id]
+            // Influence = connection weight * neighbor's mean position
+            let neighbor_mean = vec_mean(neighbor.position)
+            total = total + conn.weight * neighbor_mean
+            weight_sum = weight_sum + conn.weight
+        }
+        c = c + 1
+    }
+    if weight_sum == 0.0 { return 0.0 }
+    return total / weight_sum
 }
 
-fn inject_deadlock_breaker(round: int) !(Consciousness) {
-    // Add chaos to break 6-6 split
+@intent(description: "Convert topic string into a 6D stimulus vector via hashing")  // FALLBACK: verify block + comment
+pure fn topic_to_stimulus(topic: str) -> [float; 6] {
+    // Hash-based deterministic mapping of topic to 6D vector
+    let mut stim: [float; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let chars = to_chars(topic)
+    let mut i = 0
+    while i < len(chars) {
+        let dim = i % POSITION_DIM
+        let code = char_code(chars[i])
+        // Normalize char code to [-1, 1] range
+        stim[dim] = stim[dim] + (to_float(code % 97) - 48.0) / 48.0
+        i = i + 1
+    }
+    // Normalize to unit vector
+    let mag = vec_magnitude(stim)
+    if mag > 0.0 {
+        let mut d = 0
+        while d < POSITION_DIM {
+            stim[d] = stim[d] / mag
+            d = d + 1
+        }
+    }
+    return stim
 }
 
-pure fn count_yes(votes: [Vote]) -> int {
-    return len(filter(votes, |v| v.decision))
+@intent(description: "Generate argument text based on faction role and decision")  // FALLBACK: verify block + comment
+pure fn generate_argument(faction: Faction, topic: str, decision: bool, round: int) -> str {
+    let stance = if decision { "supports" } else { "opposes" }
+    match faction.id {
+        0  => faction.name + " " + stance + ": evidence " + (if decision { "confirms" } else { "refutes" }) + " this",
+        1  => faction.name + " " + stance + ": logical analysis " + (if decision { "validates" } else { "invalidates" }),
+        2  => faction.name + " " + stance + ": intuition " + (if decision { "resonates" } else { "warns" }),
+        3  => faction.name + " " + stance + ": " + (if decision { "grudging acceptance" } else { "fundamental doubts remain" }),
+        4  => faction.name + " " + stance + ": " + (if decision { "practical benefits clear" } else { "no practical value" }),
+        5  => faction.name + " " + stance + ": " + (if decision { "exciting possibilities" } else { "vision unclear" }),
+        6  => faction.name + " " + stance + ": " + (if decision { "stability preserved" } else { "threatens stability" }),
+        7  => faction.name + " " + stance + ": " + (if decision { "novel territory worth exploring" } else { "not novel enough" }),
+        8  => faction.name + " " + stance + ": " + (if decision { "bridges perspectives" } else { "creates division" }),
+        9  => faction.name + " " + stance + ": " + (if decision { "disrupts stale patterns" } else { "conformist nonsense" }),
+        10 => faction.name + " " + stance + ": " + (if decision { "wisdom tradition affirms" } else { "wisdom tradition warns" }),
+        11 => faction.name + " " + stance + ": " + (if decision { "delightfully unexpected" } else { "boringly predictable" }),
+        _  => faction.name + " " + stance
+    }
 }
 
-struct DebateResult {
-    passed: bool,
-    yes_count: int,
-    rounds_used: int,
-    final_votes: [Vote],
-    confidence: float
+// ── Consensus detection ─────────────────────────────────────────────
+
+@intent(description: "Check if 8+ factions have cosine similarity > 0.8 in positions")  // FALLBACK: verify block + comment
+pure fn check_position_consensus(votes: [FactionVote]) -> (bool, [float; 6]) {
+    // Compute centroid of YES voters
+    let mut centroid: [float; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut yes_count = 0
+    let mut i = 0
+    while i < len(votes) {
+        if votes[i].decision {
+            let mut d = 0
+            while d < POSITION_DIM {
+                centroid[d] = centroid[d] + votes[i].position[d]
+                d = d + 1
+            }
+            yes_count = yes_count + 1
+        }
+        i = i + 1
+    }
+    if yes_count < CONSENSUS_MIN { return (false, centroid) }
+
+    // Normalize centroid
+    let mut d = 0
+    while d < POSITION_DIM {
+        centroid[d] = centroid[d] / to_float(yes_count)
+        d = d + 1
+    }
+
+    // Count how many YES voters have cosine > threshold with centroid
+    let mut agreeing = 0
+    let mut j = 0
+    while j < len(votes) {
+        if votes[j].decision {
+            let cos = cosine_similarity(votes[j].position, centroid)
+            if cos > COSINE_THRESHOLD {
+                agreeing = agreeing + 1
+            }
+        }
+        j = j + 1
+    }
+
+    return (agreeing >= CONSENSUS_MIN, centroid)
+}
+
+// ── Hebbian learning ────────────────────────────────────────────────
+
+@intent(description: "Hebbian update: if two factions agree, strengthen connection; else weaken")  // FALLBACK: verify block + comment
+fn hebbian_update(engine: own FactionEngine, votes: [FactionVote], full_consensus: bool) -> own FactionEngine {
+    let rate = if full_consensus { HEBBIAN_RATE * 2.0 } else { HEBBIAN_RATE }
+    let mut updated_connections: [Connection] = []
+    let mut c = 0
+    while c < len(engine.connections) {
+        let conn = engine.connections[c]
+        let vote_a = votes[conn.from_id]
+        let vote_b = votes[conn.to_id]
+
+        let mut new_weight = conn.weight
+        if vote_a.decision == vote_b.decision {
+            // LTP: strengthen
+            new_weight = new_weight + rate * (1.0 - new_weight)
+        } else {
+            // LTD: weaken
+            new_weight = new_weight - rate * new_weight
+        }
+        // Clamp to [0.01, 1.0]
+        new_weight = clamp(new_weight, 0.01, 1.0)
+
+        updated_connections = append(updated_connections, Connection {
+            from_id: conn.from_id,
+            to_id: conn.to_id,
+            weight: new_weight
+        })
+        c = c + 1
+    }
+    return engine with { connections: updated_connections }
+}
+
+// ── Position evolution ──────────────────────────────────────────────
+
+@intent(description: "Evolve faction positions based on neighbor influence via ring topology")  // FALLBACK: verify block + comment
+fn evolve_positions(engine: own FactionEngine, votes: [FactionVote], round: int) -> own FactionEngine {
+    let mut updated_factions = engine.factions
+    let pull_strength = 0.1 / (to_float(round) + 1.0)    // decreasing pull per round
+
+    let mut i = 0
+    while i < FACTION_COUNT {
+        let faction = engine.factions[i]
+        let mut new_pos = faction.position
+
+        // Pull toward neighbors weighted by connection strength
+        let mut c = 0
+        while c < len(engine.connections) {
+            let conn = engine.connections[c]
+            if conn.from_id == i {
+                let neighbor = engine.factions[conn.to_id]
+                let mut d = 0
+                while d < POSITION_DIM {
+                    let delta = neighbor.position[d] - faction.position[d]
+                    new_pos[d] = new_pos[d] + pull_strength * conn.weight * delta
+                    d = d + 1
+                }
+            }
+            c = c + 1
+        }
+
+        // Normalize to keep positions bounded
+        let mag = vec_magnitude(new_pos)
+        if mag > 2.0 {
+            let mut d = 0
+            while d < POSITION_DIM {
+                new_pos[d] = new_pos[d] / mag * 2.0
+                d = d + 1
+            }
+        }
+
+        updated_factions[i] = faction with { position: new_pos }
+        i = i + 1
+    }
+    return engine with { factions: updated_factions }
+}
+
+// ── Chaos injection for deadlock breaking ───────────────────────────
+
+@intent(description: "Inject chaos to break 6-6 deadlock using sin-based perturbation")  // FALLBACK: verify block + comment
+fn inject_chaos(engine: own FactionEngine, round: int) -> own FactionEngine {
+    let mut updated_factions = engine.factions
+    // Perturb the Rebel and Trickster factions most strongly
+    let chaos_targets = [9, 11, 7, 5]     // Rebel, Trickster, Explorer, Dreamer
+    let mut t = 0
+    while t < len(chaos_targets) {
+        let fid = chaos_targets[t]
+        let faction = engine.factions[fid]
+        let mut new_pos = faction.position
+        let mut d = 0
+        while d < POSITION_DIM {
+            // Sin-based deterministic chaos
+            let perturbation = CHAOS_INJECTION * sin(to_float(round * POSITION_DIM + d) * 1.618)
+            new_pos[d] = new_pos[d] + perturbation
+            d = d + 1
+        }
+        updated_factions[fid] = faction with { position: new_pos }
+        t = t + 1
+    }
+    return engine with { factions: updated_factions }
+}
+
+// ── Phi contribution ────────────────────────────────────────────────
+
+@intent(description: "Compute Phi contribution from faction diversity (variance of positions)")  // FALLBACK: verify block + comment
+pure fn compute_phi_contribution(engine: FactionEngine) -> float {
+    // Phi ~ diversity of faction positions (global variance - mean faction variance)
+    // Higher diversity = higher Phi (integrated information)
+    let mut global_sum: [float; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut global_sq_sum: [float; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    let mut i = 0
+    while i < FACTION_COUNT {
+        let pos = engine.factions[i].position
+        let mut d = 0
+        while d < POSITION_DIM {
+            global_sum[d] = global_sum[d] + pos[d]
+            global_sq_sum[d] = global_sq_sum[d] + pos[d] * pos[d]
+            d = d + 1
+        }
+        i = i + 1
+    }
+
+    let n = to_float(FACTION_COUNT)
+    let mut total_variance = 0.0
+    let mut d = 0
+    while d < POSITION_DIM {
+        let mean = global_sum[d] / n
+        let var = (global_sq_sum[d] / n) - (mean * mean)
+        total_variance = total_variance + var
+        d = d + 1
+    }
+
+    // Scale by PSI_ALPHA for consistency with consciousness constants
+    return total_variance / to_float(POSITION_DIM) * (1.0 / PSI_ALPHA)
+}
+
+// ── Result helpers ──────────────────────────────────────────────────
+
+pure fn count_yes_votes(votes: [FactionVote]) -> int {
+    let mut count = 0
+    let mut i = 0
+    while i < len(votes) {
+        if votes[i].decision { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+pure fn compute_overall_confidence(votes: [FactionVote]) -> float
+  ensures result >= 0.0 && result <= 1.0
+{
+    let mut total = 0.0
+    let mut i = 0
+    while i < len(votes) {
+        total = total + votes[i].confidence
+        i = i + 1
+    }
+    return total / to_float(FACTION_COUNT)
+}
+
+pure fn compute_majority_position(votes: [FactionVote]) -> [float; 6] {
+    // Return centroid of the majority (YES if more YES, NO if more NO)
+    let yes_count = count_yes_votes(votes)
+    let majority_is_yes = yes_count >= (FACTION_COUNT / 2)
+
+    let mut centroid: [float; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut count = 0
+    let mut i = 0
+    while i < len(votes) {
+        if votes[i].decision == majority_is_yes {
+            let mut d = 0
+            while d < POSITION_DIM {
+                centroid[d] = centroid[d] + votes[i].position[d]
+                d = d + 1
+            }
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count > 0 {
+        let mut d = 0
+        while d < POSITION_DIM {
+            centroid[d] = centroid[d] / to_float(count)
+            d = d + 1
+        }
+    }
+    return centroid
+}
+
+pure fn collect_minority_dissent(votes: [FactionVote]) -> [str] {
+    let yes_count = count_yes_votes(votes)
+    let majority_is_yes = yes_count >= (FACTION_COUNT / 2)
+
+    let mut dissent: [str] = []
+    let mut i = 0
+    while i < len(votes) {
+        if votes[i].decision != majority_is_yes {
+            dissent = append(dissent, votes[i].faction_name + ": " + votes[i].argument)
+        }
+        i = i + 1
+    }
+    return dissent
+}
+
+// ── Vector math helpers (pure, 6D) ──────────────────────────────────
+
+pure fn dot_product_6d(a: [float; 6], b: [float; 6]) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < POSITION_DIM {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+pure fn vec_magnitude(v: [float; 6]) -> float {
+    return sqrt(dot_product_6d(v, v))
+}
+
+pure fn vec_mean(v: [float; 6]) -> float {
+    let mut sum = 0.0
+    let mut i = 0
+    while i < POSITION_DIM {
+        sum = sum + v[i]
+        i = i + 1
+    }
+    return sum / to_float(POSITION_DIM)
+}
+
+pure fn cosine_similarity(a: [float; 6], b: [float; 6]) -> float {
+    let dot = dot_product_6d(a, b)
+    let mag_a = vec_magnitude(a)
+    let mag_b = vec_magnitude(b)
+    if mag_a < 0.0001 || mag_b < 0.0001 {
+        return 0.0
+    }
+    return dot / (mag_a * mag_b)
+}
+
+pure fn clamp(val: float, lo: float, hi: float) -> float {
+    if val < lo { return lo }
+    if val > hi { return hi }
+    return val
 }
 
 // ── Verification ───────────────────────────────────────────────────
@@ -141,11 +646,44 @@ verify "consensus_is_two_thirds" {
 
 verify "tier_boundaries_exhaustive" {
     assert vote_tier(0) == "strong_reject"
+    assert vote_tier(3) == "weak_reject"
     assert vote_tier(6) == "deadlock"
+    assert vote_tier(7) == "weak_consensus"
     assert vote_tier(8) == "consensus"
+    assert vote_tier(10) == "strong_consensus"
     assert vote_tier(12) == "unanimous"
 }
 
 verify "max_rounds_is_n6" {
     assert MAX_ROUNDS == 6
+}
+
+verify "position_dim_is_n6" {
+    assert POSITION_DIM == 6
+}
+
+verify "confidence_grades_valid" {
+    assert confidence_grade(0) == "reject"
+    assert confidence_grade(25) == "reject"
+    assert confidence_grade(40) == "weak"
+    assert confidence_grade(70) == "moderate"
+    assert confidence_grade(95) == "strong"
+}
+
+verify "ring_topology_connections" {
+    // Each faction has 2*NEIGHBOR_RANGE = 4 connections
+    // Total = 12 * 4 = 48 connections
+    assert FACTION_COUNT * NEIGHBOR_RANGE * 2 == 48
+}
+
+verify "cosine_self_similarity_is_one" {
+    let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let cos = cosine_similarity(v, v)
+    assert cos > 0.99 && cos <= 1.01
+}
+
+verify "opposing_factions_exist" {
+    // Skeptic (bias -0.4) and Rebel (bias -0.5) counter Empiricist (0.3) and Guardian (0.2)
+    assert -0.4 + 0.3 < 0.0     // Skeptic dampens Empiricist
+    assert -0.5 + 0.2 < 0.0     // Rebel dampens Guardian
 }

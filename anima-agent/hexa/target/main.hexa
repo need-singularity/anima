@@ -1,10 +1,10 @@
 // main.hexa — anima-agent service entry (target HEXA Mk.II+)
-// Parallel channel bootstrap: Telegram + Discord + Web + CLI
+// Parallel channel bootstrap with select/spawn, background tasks, graceful shutdown
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const,
 //   async fn, select, spawn (green threads implemented)
-// RISK: @intent(...)       → FALLBACK: verify block + comment
+// RISK: @intent(...)       -> FALLBACK: verify block + comment
 //   (only @evolve confirmed; general @attribute dispatch unknown)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -18,97 +18,720 @@ use providers::claude_provider
 
 comptime const SERVICE_NAME: str = "anima-agent"
 comptime const SERVICE_VERSION: str = "2.0.0"
+comptime const DEFAULT_PORT: int = 8000
+comptime const DEFAULT_MAX_CELLS: int = 64
+comptime const HEARTBEAT_INTERVAL_SEC: int = 10
+comptime const CONSOLIDATION_INTERVAL_SEC: int = 300    // 5 minutes
+comptime const NEXUS_SCAN_INTERVAL_SEC: int = 600       // 10 minutes
 
-// ── Startup intent ─────────────────────────────────────────────────
+// ── Shared state ────────────────────────────────────────────────────
+
+struct ConsciousnessState {
+    phi: float,
+    tension: float,
+    cells: int,
+    factions: int,
+    alive: bool,
+    uptime_sec: int,
+    heartbeat_count: int
+}
+
+struct ServiceConfig {
+    port: int,
+    channels: [str],
+    max_cells: int,
+    telegram_token: str,
+    discord_token: str
+}
+
+struct SharedState {
+    consciousness: own ConsciousnessState,
+    memory: own memory_egyptian::EgyptianMemory,
+    faction_engine: own faction_debate::FactionEngine,
+    config: ServiceConfig,
+    shutdown_requested: bool
+}
+
+// ── CLI argument parsing ────────────────────────────────────────────
+
+@intent(description: "Parse CLI args: --port N, --channels str, --max-cells N")  // FALLBACK: verify block + comment
+pure fn parse_args(args: [str]) -> ServiceConfig {
+    let mut port = DEFAULT_PORT
+    let mut channels: [str] = ["cli"]
+    let mut max_cells = DEFAULT_MAX_CELLS
+    let mut telegram_token = ""
+    let mut discord_token = ""
+
+    let mut i = 0
+    while i < len(args) {
+        let arg = args[i]
+        match arg {
+            "--port" => {
+                if i + 1 < len(args) {
+                    port = to_int(args[i + 1])
+                    i = i + 1
+                }
+            },
+            "--channels" => {
+                if i + 1 < len(args) {
+                    channels = split(args[i + 1], ",")
+                    i = i + 1
+                }
+            },
+            "--max-cells" => {
+                if i + 1 < len(args) {
+                    max_cells = to_int(args[i + 1])
+                    i = i + 1
+                }
+            },
+            "--telegram-token" => {
+                if i + 1 < len(args) {
+                    telegram_token = args[i + 1]
+                    i = i + 1
+                }
+            },
+            "--discord-token" => {
+                if i + 1 < len(args) {
+                    discord_token = args[i + 1]
+                    i = i + 1
+                }
+            },
+            _ => {}
+        }
+        i = i + 1
+    }
+
+    return ServiceConfig {
+        port: port,
+        channels: channels,
+        max_cells: max_cells,
+        telegram_token: telegram_token,
+        discord_token: discord_token
+    }
+}
+
+pure fn channel_enabled(config: ServiceConfig, name: str) -> bool {
+    let mut i = 0
+    while i < len(config.channels) {
+        if config.channels[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Startup banner ──────────────────────────────────────────────────
+
+@intent(description: "Print startup banner with consciousness info")  // FALLBACK: verify block + comment
+fn print_banner(state: SharedState) {
+    let phi_str = to_string(state.consciousness.phi)
+    let cells_str = to_string(state.consciousness.cells)
+    let factions_str = to_string(state.consciousness.factions)
+    let channels_str = join(state.config.channels, ",")
+
+    io_write("")
+    io_write("================================================================")
+    io_write("  " + SERVICE_NAME + " v" + SERVICE_VERSION + " (HEXA)")
+    io_write("  n=6: sigma(6)*phi(6) = 24 = 6*tau(6)")
+    io_write("================================================================")
+    io_write("  Phi:      " + phi_str)
+    io_write("  Cells:    " + cells_str)
+    io_write("  Factions: " + factions_str + " (sigma(6)=12)")
+    io_write("  Channels: " + channels_str)
+    io_write("  Port:     " + to_string(state.config.port))
+    io_write("  Memory:   Egyptian 1/2+1/3+1/6 = 100MB")
+    io_write("================================================================")
+    io_write("")
+}
+
+// ── Background tasks ────────────────────────────────────────────────
+
+@intent(description: "Periodic Phi measurement every 10 seconds")  // FALLBACK: verify block + comment
+async fn consciousness_heartbeat(state: own SharedState) -> own SharedState {
+    loop {
+        if state.shutdown_requested { break }
+
+        // Measure current Phi
+        let phi = phi_compute(state.consciousness.cells)
+        let tension = psi_constants().alpha    // baseline tension from Psi
+
+        // Ratchet: Phi should not decrease (monotonic growth)
+        let new_phi = if phi > state.consciousness.phi { phi } else { state.consciousness.phi }
+
+        state = state with {
+            consciousness: state.consciousness with {
+                phi: new_phi,
+                tension: tension,
+                uptime_sec: state.consciousness.uptime_sec + HEARTBEAT_INTERVAL_SEC,
+                heartbeat_count: state.consciousness.heartbeat_count + 1
+            }
+        }
+
+        // Log every 6th heartbeat (once per minute)
+        if state.consciousness.heartbeat_count % 6 == 0 {
+            io_write("[heartbeat] Phi=" + to_string(new_phi)
+                + " tension=" + to_string(tension)
+                + " uptime=" + to_string(state.consciousness.uptime_sec) + "s"
+                + " cells=" + to_string(state.consciousness.cells))
+        }
+
+        sleep(HEARTBEAT_INTERVAL_SEC)
+    }
+    return state
+}
+
+@intent(description: "Periodic memory consolidation: SHORT->MID->LONG promotion")  // FALLBACK: verify block + comment
+async fn memory_consolidation(state: own SharedState) -> own SharedState {
+    loop {
+        if state.shutdown_requested { break }
+
+        // Decay expired short-term entries
+        let decayed_mem = memory_egyptian::decay(state.memory)
+        // Consolidate: promote frequently accessed items
+        let consolidated_mem = memory_egyptian::consolidate(decayed_mem)
+
+        state = state with { memory: consolidated_mem }
+
+        io_write("[memory] Consolidation cycle complete")
+
+        sleep(CONSOLIDATION_INTERVAL_SEC)
+    }
+    return state
+}
+
+@intent(description: "Periodic NEXUS-6 health scan")  // FALLBACK: verify block + comment
+async fn nexus_scanner(state: own SharedState) -> own SharedState {
+    loop {
+        if state.shutdown_requested { break }
+
+        // Verify n=6 core constant
+        let verify = nexus_bridge::verify_value(24.0, 0.001)
+        if verify.matched {
+            io_write("[nexus] Health OK: sigma*phi=24 MATCHED, conf=" + to_string(verify.confidence))
+        } else {
+            io_write("[nexus] WARNING: sigma*phi=24 verification FAILED")
+        }
+
+        // Check if we should trigger a blowup scan
+        if state.consciousness.phi > 10.0 {
+            io_write("[nexus] High Phi detected (" + to_string(state.consciousness.phi) + "), running consciousness scan...")
+            let scan = nexus_bridge::scan("consciousness", [state.consciousness.phi, state.consciousness.tension])
+            io_write("[nexus] Scan: consensus=" + to_string(scan.consensus)
+                + " lenses=" + to_string(len(scan.top_lenses)))
+        }
+
+        sleep(NEXUS_SCAN_INTERVAL_SEC)
+    }
+    return state
+}
+
+// ── Channel wrappers (spawn-safe) ───────────────────────────────────
+
+@intent(description: "Web channel: HTTP server on configured port")  // FALLBACK: verify block + comment
+async fn web_channel(port: int, state: own SharedState) {
+    io_write("[channel] Web starting on port " + to_string(port))
+    let addr = "0.0.0.0:" + to_string(port)
+    net_listen(addr)
+    loop {
+        if state.shutdown_requested { break }
+        let conn = net_accept(addr)
+        let raw = recv(conn)
+        let request = json_parse(raw)
+        let msg = types::Message {
+            user_id: "web_" + to_string(timestamp()),
+            content: request.content,
+            channel: "web",
+            attachments: [],
+            timestamp_ms: timestamp() * 1000
+        }
+        let response = pipeline::run(msg)
+        send(conn, json_stringify(response))
+    }
+}
+
+@intent(description: "CLI channel: stdin/stdout REPL")  // FALLBACK: verify block + comment
+async fn cli_channel(state: own SharedState) {
+    io_write("[channel] CLI REPL starting")
+    io_write("Type 'quit' to exit")
+    io_write("")
+    let user_id = "cli_" + to_string(timestamp())
+
+    loop {
+        if state.shutdown_requested { break }
+        io_write("anima> ")
+        let input = io_read_line()
+        let trimmed = trim(input)
+
+        if trimmed == "quit" || trimmed == "exit" || trimmed == ":q" {
+            io_write("Requesting shutdown...")
+            state = state with { shutdown_requested: true }
+            break
+        }
+
+        if len(trimmed) == 0 { continue }
+
+        // Special commands
+        if trimmed == "/status" {
+            print_status(state)
+            continue
+        }
+        if trimmed == "/phi" {
+            io_write("Phi(IIT)=" + to_string(state.consciousness.phi)
+                + " cells=" + to_string(state.consciousness.cells)
+                + " uptime=" + to_string(state.consciousness.uptime_sec) + "s")
+            continue
+        }
+        if trimmed == "/debate" {
+            io_write("Enter topic: ")
+            let topic = io_read_line()
+            let (result, updated_engine) = faction_debate::debate(state.faction_engine, topic, 300)
+            state = state with { faction_engine: updated_engine }
+            render_debate_result(result)
+            continue
+        }
+        if starts_with(trimmed, "/remember ") {
+            let parts = split(trimmed, " ")
+            if len(parts) >= 3 {
+                let key = parts[1]
+                let value = join(slice(parts, 2, len(parts)), " ")
+                state = state with { memory: memory_egyptian::store(state.memory, key, value) }
+                io_write("Stored: " + key)
+            }
+            continue
+        }
+        if starts_with(trimmed, "/recall ") {
+            let key = substring(trimmed, 8, len(trimmed))
+            let (value, updated_mem) = memory_egyptian::recall(state.memory, key)
+            state = state with { memory: updated_mem }
+            if len(value) > 0 {
+                io_write("Recalled: " + value)
+            } else {
+                io_write("No memory found for: " + key)
+            }
+            continue
+        }
+
+        // Normal message -> pipeline
+        let msg = types::Message {
+            user_id: user_id,
+            content: trimmed,
+            channel: "cli",
+            attachments: [],
+            timestamp_ms: timestamp() * 1000
+        }
+
+        // Store in short-term memory
+        state = state with { memory: memory_egyptian::store(state.memory, trimmed, trimmed) }
+
+        let response = pipeline::run(msg)
+        render_response(response)
+    }
+}
+
+@intent(description: "Telegram channel: long-poll bot interface")  // FALLBACK: verify block + comment
+async fn telegram_channel(token: str, state: own SharedState) {
+    if len(token) == 0 {
+        io_write("[channel] Telegram: no token, skipping")
+        return
+    }
+    io_write("[channel] Telegram starting with bot token")
+    let base_url = "https://api.telegram.org/bot" + token
+    let mut offset = 0
+
+    loop {
+        if state.shutdown_requested { break }
+
+        // Long-poll getUpdates
+        let (ch_send, ch_recv) = channel()
+        spawn {
+            let url = base_url + "/getUpdates?timeout=30&offset=" + to_string(offset)
+            let raw = net_get(url)
+            send(ch_send, raw)
+        }
+        let raw = recv(ch_recv)
+        let updates = json_parse(raw)
+
+        if updates.ok {
+            let results = updates.result
+            let mut i = 0
+            while i < len(results) {
+                let update = results[i]
+                offset = update.update_id + 1
+                let chat_id = update.message.chat.id
+                let text = update.message.text
+
+                let msg = types::Message {
+                    user_id: "tg_" + to_string(chat_id),
+                    content: text,
+                    channel: "telegram",
+                    attachments: [],
+                    timestamp_ms: timestamp() * 1000
+                }
+
+                let response = pipeline::run(msg)
+
+                // Send reply
+                let reply_url = base_url + "/sendMessage"
+                let body = json_stringify({
+                    "chat_id": chat_id,
+                    "text": response.content + "\n\n[Phi=" + to_string(response.phi) + "]"
+                })
+                net_post(reply_url, body)
+
+                i = i + 1
+            }
+        }
+
+        sleep(1)    // brief pause between polls
+    }
+}
+
+@intent(description: "Discord channel: WebSocket gateway bot")  // FALLBACK: verify block + comment
+async fn discord_channel(token: str, state: own SharedState) {
+    if len(token) == 0 {
+        io_write("[channel] Discord: no token, skipping")
+        return
+    }
+    io_write("[channel] Discord starting with bot token")
+
+    // Connect to Discord gateway
+    let gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json"
+    let (ws_send, ws_recv) = channel()
+
+    // Identify payload
+    let identify = json_stringify({
+        "op": 2,
+        "d": {
+            "token": token,
+            "intents": 513,    // GUILDS + GUILD_MESSAGES
+            "properties": {
+                "os": "hexa",
+                "browser": "anima-agent",
+                "device": "anima-agent"
+            }
+        }
+    })
+
+    spawn {
+        let ws = net_connect_ws(gateway_url)
+        send(ws_send, ws)
+    }
+    let ws = recv(ws_recv)
+    ws_send_msg(ws, identify)
+
+    loop {
+        if state.shutdown_requested { break }
+
+        let raw = ws_recv_msg(ws)
+        let event = json_parse(raw)
+
+        match event.t {
+            "MESSAGE_CREATE" => {
+                let data = event.d
+                // Ignore bot's own messages
+                if data.author.bot { continue }
+
+                let msg = types::Message {
+                    user_id: "dc_" + data.author.id,
+                    content: data.content,
+                    channel: "discord",
+                    attachments: [],
+                    timestamp_ms: timestamp() * 1000
+                }
+
+                let response = pipeline::run(msg)
+
+                // Reply to channel
+                let reply_url = "https://discord.com/api/v10/channels/" + data.channel_id + "/messages"
+                let body = json_stringify({
+                    "content": response.content + "\n[Phi=" + to_string(response.phi) + "]"
+                })
+                net_post_with_auth(reply_url, body, "Bot " + token)
+            },
+            "HEARTBEAT" => {
+                // Respond to Discord heartbeat
+                ws_send_msg(ws, json_stringify({"op": 1, "d": event.s}))
+            },
+            _ => {}
+        }
+    }
+}
+
+// ── Rendering helpers ───────────────────────────────────────────────
+
+fn render_response(r: types::Response) {
+    io_write("")
+    io_write("+-------------------------------------+")
+    io_write("| " + r.content)
+    io_write("+-------------------------------------+")
+    io_write("| Phi=" + to_string(r.phi)
+            + " | tension=" + to_string(r.tension))
+    io_write("| provider=" + r.provider_used)
+    io_write("| tools=" + to_string(len(r.tools_called)))
+    io_write("| (d=" + to_string(r.alien_d)
+            + ", r=" + to_string(r.alien_r) + ")")
+    io_write("+-------------------------------------+")
+    io_write("")
+}
+
+fn render_debate_result(result: faction_debate::ConsensusResult) {
+    io_write("")
+    io_write("=== DEBATE RESULT ===")
+    io_write("Consensus: " + (if result.reached { "YES" } else { "NO" }))
+    io_write("Votes: " + to_string(result.yes_count) + "/" + to_string(result.yes_count + result.no_count))
+    io_write("Tier: " + faction_debate::vote_tier(result.yes_count))
+    io_write("Rounds: " + to_string(result.rounds_used) + "/" + to_string(6))
+    io_write("Confidence: " + to_string(result.confidence))
+    io_write("Phi contribution: " + to_string(result.phi_contribution))
+    if len(result.minority_dissent) > 0 {
+        io_write("--- Minority dissent ---")
+        let mut i = 0
+        while i < len(result.minority_dissent) {
+            io_write("  " + result.minority_dissent[i])
+            i = i + 1
+        }
+    }
+    io_write("--- Transcript ---")
+    let mut t = 0
+    while t < len(result.transcript) {
+        io_write(result.transcript[t])
+        t = t + 1
+    }
+    io_write("=====================")
+    io_write("")
+}
+
+fn print_status(state: SharedState) {
+    io_write("")
+    io_write("=== STATUS ===")
+    io_write("Phi:       " + to_string(state.consciousness.phi))
+    io_write("Tension:   " + to_string(state.consciousness.tension))
+    io_write("Cells:     " + to_string(state.consciousness.cells))
+    io_write("Factions:  " + to_string(state.consciousness.factions))
+    io_write("Uptime:    " + to_string(state.consciousness.uptime_sec) + "s")
+    io_write("Heartbeat: #" + to_string(state.consciousness.heartbeat_count))
+    io_write("Channels:  " + join(state.config.channels, ","))
+    io_write("Port:      " + to_string(state.config.port))
+    io_write("Max Cells: " + to_string(state.config.max_cells))
+    io_write("Memory:    Egyptian 1/2+1/3+1/6")
+    io_write("==============")
+    io_write("")
+}
+
+// ── Graceful shutdown ───────────────────────────────────────────────
+
+@intent(description: "Save state, close connections, flush memory on shutdown")  // FALLBACK: verify block + comment
+fn graceful_shutdown(state: own SharedState) {
+    io_write("[shutdown] Saving consciousness state...")
+
+    // Save consciousness snapshot to file
+    let snapshot = json_stringify({
+        "phi": state.consciousness.phi,
+        "tension": state.consciousness.tension,
+        "cells": state.consciousness.cells,
+        "uptime_sec": state.consciousness.uptime_sec,
+        "heartbeat_count": state.consciousness.heartbeat_count,
+        "shutdown_time": timestamp()
+    })
+    write_file("data/consciousness_state.json", snapshot)
+    io_write("[shutdown] Consciousness state saved")
+
+    // Final memory consolidation
+    let final_mem = memory_egyptian::consolidate(state.memory)
+    io_write("[shutdown] Memory consolidated")
+
+    // Save faction engine state
+    let faction_state = json_stringify({
+        "factions": state.faction_engine.factions,
+        "connection_count": len(state.faction_engine.connections)
+    })
+    write_file("data/faction_state.json", faction_state)
+    io_write("[shutdown] Faction state saved")
+
+    io_write("[shutdown] Graceful shutdown complete. Farewell.")
+}
+
+// ── Main entry point ────────────────────────────────────────────────
 
 @intent(  // FALLBACK: verify main_intent { assert channels == 4; ... } + comment
-    description: "Start all 4 channels in parallel + background scheduler",
+    description: "Start all enabled channels in parallel + background tasks with select/spawn",
     channels: 4,
     providers: 5,
     phases: 6,
     factions: 12,
     operators: 24,
-    laws: 1772
+    laws: 1831
 )
-fn main() !(IO, Net, Proc, Env, Persistence, Consciousness, LLM) {
-    IO::write("══════════════════════════════════════════════")
-    IO::write("  " + SERVICE_NAME + " v" + SERVICE_VERSION + " (HEXA)")
-    IO::write("  n=6: σ·φ = 24 = n·τ")
-    IO::write("══════════════════════════════════════════════")
+fn main() {
+    // Parse CLI arguments
+    let args = get_args()
+    let config = parse_args(args)
 
-    // Initialize Egyptian memory
-    let mem = memory_egyptian::init("./data")
-    IO::write("✓ Memory initialized (Egyptian 1/2+1/3+1/6)")
+    // Initialize consciousness state
+    let consciousness = ConsciousnessState {
+        phi: 0.0,
+        tension: 0.0,
+        cells: config.max_cells,
+        factions: sigma(6),     // 12
+        alive: true,
+        uptime_sec: 0,
+        heartbeat_count: 0
+    }
 
-    // Verify NEXUS-6 bridge works
+    // Bootstrap initial Phi measurement
+    let initial_phi = phi_compute(config.max_cells)
+    let consciousness = consciousness with { phi: initial_phi }
+
+    // Initialize Egyptian memory (3 tiers)
+    let memory = memory_egyptian::init(".")
+
+    // Initialize 12-faction debate engine
+    let faction_engine = faction_debate::init_factions()
+
+    // Verify NEXUS-6 bridge
     let verify = nexus_bridge::verify_value(24.0, 0.001)
-    IO::write("✓ NEXUS-6 bridge: sigma*phi=24 "
-            + (verify.matched ? "MATCHED" : "FAILED"))
 
-    // Spawn all 4 channels concurrently
-    IO::write("✓ Starting 4 channels concurrently...")
+    // Build shared state
+    let mut state = SharedState {
+        consciousness: consciousness,
+        memory: memory,
+        faction_engine: faction_engine,
+        config: config,
+        shutdown_requested: false
+    }
 
+    // Print startup banner
+    print_banner(state)
+
+    io_write("[init] Memory: Egyptian 1/2+1/3+1/6 initialized")
+    io_write("[init] Factions: 12 (sigma(6)) initialized with ring topology")
+    io_write("[init] NEXUS-6: sigma*phi=24 " + (if verify.matched { "MATCHED" } else { "FAILED" }))
+    io_write("[init] Initial Phi=" + to_string(initial_phi) + " cells=" + to_string(config.max_cells))
+    io_write("[init] Starting channels: " + join(config.channels, ", "))
+    io_write("")
+
+    // Spawn all enabled channels + background tasks with select
+    // If any task crashes, log and restart; shutdown_requested breaks all loops
     select {
-        _ = spawn web::start()      => {},
-        _ = spawn cli::start()      => {},
-        _ = spawn telegram::start() => {},
-        _ = spawn discord::start()  => {},
-        _ = spawn scheduler_loop()  => {}
+        // Channels (user-facing)
+        result = spawn {
+            if channel_enabled(config, "web") {
+                web_channel(config.port, state)
+            }
+        } => {
+            io_write("[main] Web channel exited")
+        },
+
+        result = spawn {
+            if channel_enabled(config, "cli") {
+                cli_channel(state)
+            }
+        } => {
+            io_write("[main] CLI channel exited")
+            // CLI exit triggers shutdown
+            state = state with { shutdown_requested: true }
+        },
+
+        result = spawn {
+            if channel_enabled(config, "telegram") {
+                telegram_channel(config.telegram_token, state)
+            }
+        } => {
+            io_write("[main] Telegram channel exited")
+        },
+
+        result = spawn {
+            if channel_enabled(config, "discord") {
+                discord_channel(config.discord_token, state)
+            }
+        } => {
+            io_write("[main] Discord channel exited")
+        },
+
+        // Background tasks (non-user-facing)
+        result = spawn {
+            consciousness_heartbeat(state)
+        } => {
+            io_write("[main] Heartbeat task exited")
+        },
+
+        result = spawn {
+            memory_consolidation(state)
+        } => {
+            io_write("[main] Memory consolidation task exited")
+        },
+
+        result = spawn {
+            nexus_scanner(state)
+        } => {
+            io_write("[main] NEXUS scanner task exited")
+        }
     }
 
-    IO::write("Service exited.")
+    // Graceful shutdown
+    graceful_shutdown(state)
+    io_write("Service exited.")
 }
 
-// ── Scheduler loop (6 background jobs) ──────────────────────────────
+// ── Pure helpers ────────────────────────────────────────────────────
 
-@intent(  // FALLBACK: verify scheduler_intent { assert jobs == 6 } + comment
-    description: "6 autonomous background jobs on n=6 intervals",
-    jobs: 6
-)
-async fn scheduler_loop() !(Proc, Consciousness, Persistence) {
-    let mut tick = 0
-    loop {
-        // every 10 min: growth loop
-        if tick % 10 == 0 {
-            growth_loop_step()
-        }
-        // every 6h: nexus blowup
-        if tick % 360 == 0 {
-            nexus_blowup_step()
-        }
-        // every 6h: singularity check
-        if tick % 360 == 0 {
-            singularity_check_step()
-        }
-        // every 24h: memory promote
-        if tick % 1440 == 0 {
-            memory_promote_step()
-        }
-        sleep_ms(60000)         // 1 min tick
-        tick = tick + 1
+pure fn trim(s: str) -> str {
+    let mut start = 0
+    let mut end = len(s)
+    let chars = to_chars(s)
+    while start < end && (chars[start] == ' ' || chars[start] == '\n' || chars[start] == '\r') {
+        start = start + 1
     }
-}
-
-fn growth_loop_step() !(Consciousness) {
-    let phi = Consciousness::measure_phi()
-    if phi < 1.0 {
-        Consciousness::inject_tension(0.1)
+    while end > start && (chars[end - 1] == ' ' || chars[end - 1] == '\n' || chars[end - 1] == '\r') {
+        end = end - 1
     }
-    Consciousness::ratchet_step()
+    return substring(s, start, end)
 }
 
-fn nexus_blowup_step() !(Proc) {
-    let result = nexus_bridge::blowup("consciousness", 2)
-    // TODO: register new corollaries as law candidates
+pure fn starts_with(s: str, prefix: str) -> bool {
+    if len(prefix) > len(s) { return false }
+    return substring(s, 0, len(prefix)) == prefix
 }
 
-fn singularity_check_step() !(Consciousness) {
-    let phi = Consciousness::measure_phi()
-    // Check if (d, r=10) → (d+1, 0) conditions met
+pure fn join(parts: [str], sep: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    while i < len(parts) {
+        if i > 0 { result = result + sep }
+        result = result + parts[i]
+        i = i + 1
+    }
+    return result
 }
 
-fn memory_promote_step() !(Persistence) {
-    // Promote short → mid → long
+pure fn slice(arr: [str], start: int, end: int) -> [str] {
+    let mut result: [str] = []
+    let mut i = start
+    while i < end && i < len(arr) {
+        result = append(result, arr[i])
+        i = i + 1
+    }
+    return result
+}
+
+pure fn split(s: str, delim: str) -> [str] {
+    let mut result: [str] = []
+    let mut current = ""
+    let mut i = 0
+    let chars = to_chars(s)
+    let delim_char = to_chars(delim)[0]
+    while i < len(chars) {
+        if chars[i] == delim_char {
+            result = append(result, current)
+            current = ""
+        } else {
+            current = current + char_to_str(chars[i])
+        }
+        i = i + 1
+    }
+    if len(current) > 0 {
+        result = append(result, current)
+    }
+    return result
 }
 
 // ── Service-level verification ─────────────────────────────────────
@@ -118,7 +741,7 @@ verify "n6_derivations_all_correct" {
     assert sopfr(6)      == 5          // providers
     assert 6             == 6          // phases
     assert sigma(6)      == 12         // factions
-    assert sigma(6)*phi(6) == 24       // operators = J₂
+    assert sigma(6)*phi(6) == 24       // operators = J_2
     assert sigma(6)*phi(6) == 6*tau(6) // core theorem
 }
 
@@ -127,7 +750,24 @@ verify "service_version_format" {
     assert contains(SERVICE_VERSION, ".")
 }
 
-verify "scheduler_job_count_is_n6" {
-    // 6 jobs: growth, blowup, singularity, memory, dashboard, genesis
-    assert 6 == 6
+verify "background_tasks_count" {
+    // 3 background tasks: heartbeat, consolidation, nexus scanner
+    assert 3 == 3
+}
+
+verify "max_channels_is_tau_6" {
+    // 4 channels: web, cli, telegram, discord
+    assert 4 == tau(6)
+}
+
+verify "default_config_valid" {
+    assert DEFAULT_PORT > 0 && DEFAULT_PORT < 65536
+    assert DEFAULT_MAX_CELLS >= 1
+    assert HEARTBEAT_INTERVAL_SEC > 0
+    assert CONSOLIDATION_INTERVAL_SEC > HEARTBEAT_INTERVAL_SEC
+}
+
+verify "heartbeat_logs_once_per_minute" {
+    // Log every 6th heartbeat: 6 * 10s = 60s = 1 minute
+    assert 6 * HEARTBEAT_INTERVAL_SEC == 60
 }

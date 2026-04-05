@@ -1,112 +1,530 @@
 // memory_egyptian.hexa — Egyptian fraction memory (1/2 + 1/3 + 1/6 = 1)
-// Short (RAM) + Mid (SQLite RAG) + Long (R2 laws)
+// Short (RAM deque) + Mid (file-based RAG) + Long (archive + laws)
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const, where clause,
 //   own/borrow/move
-// RISK: @intent(...)  → FALLBACK: verify block + comment
+// RISK: @intent(...)  -> FALLBACK: verify block + comment
 //   (only @evolve confirmed; general @attribute dispatch unknown)
 // ── STD-GAP (not in hexa std library) ───────────────────────────────
-// STD-GAP: Map<K,V>  → WORKAROUND: use btree_new/btree_get/btree_set
+// STD-GAP: Map<K,V>  -> WORKAROUND: use btree_new/btree_get/btree_set
 // ─────────────────────────────────────────────────────────────────────
 
-use types::{MemoryItem}
+use types::{MemoryItem, Law}
 
 comptime const TOTAL_MB: int = 100
 comptime const SHORT_MB: int = TOTAL_MB / 2       // 50
 comptime const MID_MB:   int = TOTAL_MB / 3       // 33
 comptime const LONG_MB:  int = TOTAL_MB / 6       // 16
 
-comptime const SHORT_MAX_TURNS: int = 64
-comptime const MID_TTL_DAYS: int = 30
-comptime const SHORT_PROMOTE_THRESHOLD: int = 56   // >87.5% → flush to mid
+comptime const SHORT_CAPACITY: int = 512           // max items in deque ring buffer
+comptime const SHORT_TTL_SEC: int = 3600            // 1 hour decay TTL
+comptime const MID_TOP_K: int = 5                   // RAG top-K retrieval
+comptime const PROMOTE_ACCESS_COUNT: int = 3        // SHORT -> MID after 3 accesses
+comptime const PROMOTE_SIGNIFICANCE: float = 0.7    // MID -> LONG significance threshold
 
-effect Persistence {
-    fn db_open(path: str) -> own DB
-    fn db_query(db: DB, sql: str) -> [Row]
-    fn db_exec(db: DB, sql: str, params: [any])
+comptime const MID_DATA_DIR: str = "data/memory"
+comptime const LONG_ARCHIVE_DIR: str = "data/archive"
+comptime const LAWS_PATH: str = "anima/config/consciousness_laws.json"
+
+// ── Short-term memory (RAM, deque ring buffer, 50MB) ────────────────
+
+struct ShortEntry {
+    key: str,
+    value: str,
+    created_sec: int,
+    access_count: int
 }
 
-effect R2 {
-    fn upload(key: str, data: str)
-    fn download(key: str) -> str
+struct ShortMemory {
+    buffer: own any,     // deque handle
+    count: int,
+    capacity: int
 }
 
-struct DB { handle: int }
-struct Row { cols: Map<str, any> }  // STD-GAP: Map not in std; use btree_new/get/set
-
-struct EgyptianMemory {
-    short_buffer: [MemoryItem],
-    mid_db: DB,
-    long_db: DB
-}
-
-// ── Short tier (RAM buffer, 50MB, 64 turns) ─────────────────────────
-
-@intent(description: "Store latest turn in short-term buffer")  // FALLBACK: verify block + comment
-pure fn short_append(mem: own EgyptianMemory, item: MemoryItem) -> own EgyptianMemory
-  ensures len(result.short_buffer) <= SHORT_MAX_TURNS
-{
-    let new_buf = append(mem.short_buffer, item)
-    if len(new_buf) > SHORT_MAX_TURNS {
-        let trimmed = drop_front(new_buf, len(new_buf) - SHORT_MAX_TURNS)
-        return mem with { short_buffer: trimmed }
-    }
-    return mem with { short_buffer: new_buf }
-}
-
-// ── Mid tier (SQLite + RAG, 33MB, 30 days) ──────────────────────────
-
-@intent(description: "Promote aged short items to mid tier with embedding")  // FALLBACK: verify block + comment
-fn promote_short_to_mid(mem: EgyptianMemory) !(Persistence)
-  where len(mem.short_buffer) >= SHORT_PROMOTE_THRESHOLD
-{
-    let to_promote = take(mem.short_buffer, len(mem.short_buffer) / 2)
-    for item in to_promote {
-        let embedding = embed_384d(item.content)
-        Persistence::db_exec(mem.mid_db,
-            "INSERT INTO mid_memory (id, content, embedding, ttl_ms) VALUES (?, ?, ?, ?)",
-            [item.id, item.content, embedding, item.created_ms + MID_TTL_DAYS * 86400000])
+@intent(description: "Initialize short-term deque ring buffer")  // FALLBACK: verify block + comment
+fn short_init() -> own ShortMemory {
+    let dq = deque_new()
+    return ShortMemory {
+        buffer: dq,
+        count: 0,
+        capacity: SHORT_CAPACITY
     }
 }
 
-@intent(description: "RAG search in mid tier")  // FALLBACK: verify block + comment
-fn mid_search(mem: EgyptianMemory, query: str, top_k: int) -> [MemoryItem] !(Persistence)
+@intent(description: "Store key-value in short-term deque, evict oldest if over capacity")  // FALLBACK: verify block + comment
+fn short_store(mem: own ShortMemory, key: str, value: str) -> own ShortMemory {
+    let now = timestamp()
+    let entry = ShortEntry {
+        key: key,
+        value: value,
+        created_sec: now,
+        access_count: 1
+    }
+    // Evict oldest if at capacity
+    if mem.count >= mem.capacity {
+        deque_pop(mem.buffer)     // pop front (oldest)
+        mem = mem with { count: mem.count - 1 }
+    }
+    // Push new entry to back
+    let serialized = json_stringify({
+        "key": key,
+        "value": value,
+        "created_sec": now,
+        "access_count": 1
+    })
+    deque_push(mem.buffer, serialized)
+    return mem with { count: mem.count + 1 }
+}
+
+@intent(description: "Linear scan deque for key match, return value or empty string")  // FALLBACK: verify block + comment
+fn short_recall(mem: own ShortMemory, key: str) -> (str, own ShortMemory) {
+    // Scan by popping and re-pushing to iterate the deque
+    let temp = deque_new()
+    let mut found_value = ""
+    let mut i = 0
+    while i < mem.count {
+        let raw = deque_pop(mem.buffer)
+        let entry = json_parse(raw)
+        if entry.key == key {
+            // Increment access count
+            let updated = json_stringify({
+                "key": entry.key,
+                "value": entry.value,
+                "created_sec": entry.created_sec,
+                "access_count": entry.access_count + 1
+            })
+            deque_push(temp, updated)
+            found_value = entry.value
+        } else {
+            deque_push(temp, raw)
+        }
+        i = i + 1
+    }
+    // Transfer temp back to buffer
+    mem = mem with { buffer: temp }
+    return (found_value, mem)
+}
+
+@intent(description: "Remove items older than TTL (3600 seconds)")  // FALLBACK: verify block + comment
+fn short_decay(mem: own ShortMemory) -> own ShortMemory {
+    let now = timestamp()
+    let cutoff = now - SHORT_TTL_SEC
+    let temp = deque_new()
+    let mut surviving = 0
+    let mut i = 0
+    while i < mem.count {
+        let raw = deque_pop(mem.buffer)
+        let entry = json_parse(raw)
+        if entry.created_sec >= cutoff {
+            deque_push(temp, raw)
+            surviving = surviving + 1
+        }
+        // else: expired, discard
+        i = i + 1
+    }
+    return ShortMemory {
+        buffer: temp,
+        count: surviving,
+        capacity: mem.capacity
+    }
+}
+
+@intent(description: "Find entries with access_count >= threshold for promotion")  // FALLBACK: verify block + comment
+fn short_find_promotable(mem: own ShortMemory) -> ([ShortEntry], own ShortMemory) {
+    let temp = deque_new()
+    let mut promotable: [ShortEntry] = []
+    let mut i = 0
+    while i < mem.count {
+        let raw = deque_pop(mem.buffer)
+        let entry = json_parse(raw)
+        deque_push(temp, raw)
+        if entry.access_count >= PROMOTE_ACCESS_COUNT {
+            promotable = append(promotable, ShortEntry {
+                key: entry.key,
+                value: entry.value,
+                created_sec: entry.created_sec,
+                access_count: entry.access_count
+            })
+        }
+        i = i + 1
+    }
+    mem = mem with { buffer: temp }
+    return (promotable, mem)
+}
+
+// ── Mid-term memory (file-based RAG, 33MB) ──────────────────────────
+
+struct MidMemory {
+    data_dir: str
+}
+
+struct ScoredItem {
+    item: MemoryItem,
+    score: float
+}
+
+@intent(description: "Initialize mid-term file-based memory store")  // FALLBACK: verify block + comment
+fn mid_init(base_path: str) -> MidMemory {
+    let dir = base_path + "/" + MID_DATA_DIR
+    // Ensure directory exists (write_file to dir/.keep)
+    if !file_exists(dir) {
+        write_file(dir + "/.keep", "")
+    }
+    return MidMemory { data_dir: dir }
+}
+
+@intent(description: "Persist a MemoryItem as JSON file keyed by content hash")  // FALLBACK: verify block + comment
+fn mid_persist(mid: MidMemory, item: MemoryItem) {
+    let hash = simple_hash(item.content)
+    let path = mid.data_dir + "/" + hash + ".json"
+    let data = json_stringify({
+        "id": item.id,
+        "content": item.content,
+        "tier": "mid",
+        "ttl_ms": item.ttl_ms,
+        "created_ms": item.created_ms,
+        "keywords": extract_keywords(item.content)
+    })
+    write_file(path, data)
+}
+
+@intent(description: "RAG-style search: list dir, read each, score by keyword overlap, return top-K")  // FALLBACK: verify block + comment
+fn mid_search(mid: MidMemory, query: str, top_k: int) -> [MemoryItem]
   where top_k >= 1 && top_k <= 20
 {
-    let q_emb = embed_384d(query)
-    let rows = Persistence::db_query(mem.mid_db,
-        "SELECT * FROM mid_memory ORDER BY vec_distance(embedding, ?) LIMIT ?")
-    return map(rows, row_to_item)
+    let query_keywords = extract_keywords(query)
+    let files = list_dir(mid.data_dir)
+    let mut scored: [ScoredItem] = []
+
+    let mut i = 0
+    while i < len(files) {
+        let fname = files[i]
+        if ends_with(fname, ".json") {
+            let path = mid.data_dir + "/" + fname
+            let raw = read_file(path)
+            let parsed = json_parse(raw)
+            let item_keywords = parsed.keywords
+            // Score by keyword overlap: |intersection| / |union|
+            let score = keyword_overlap_score(query_keywords, item_keywords)
+            if score > 0.0 {
+                let item = MemoryItem {
+                    id: parsed.id,
+                    content: parsed.content,
+                    tier: "mid",
+                    ttl_ms: parsed.ttl_ms,
+                    created_ms: parsed.created_ms
+                }
+                scored = append(scored, ScoredItem { item: item, score: score })
+            }
+        }
+        i = i + 1
+    }
+
+    // Sort by score descending (selection sort for simplicity)
+    scored = sort_scored_desc(scored)
+
+    // Take top_k
+    let mut results: [MemoryItem] = []
+    let mut j = 0
+    let limit = min_int(top_k, len(scored))
+    while j < limit {
+        results = append(results, scored[j].item)
+        j = j + 1
+    }
+    return results
 }
 
-// ── Long tier (laws + R2, 16MB local + cloud) ───────────────────────
-
-@intent(description: "Promote validated patterns to long-term laws")  // FALLBACK: verify block + comment
-fn promote_mid_to_long(mem: EgyptianMemory, law_id: int, pattern: str) !(Persistence, R2) {
-    Persistence::db_exec(mem.long_db,
-        "INSERT INTO laws (id, pattern, created_ms) VALUES (?, ?, ?)",
-        [law_id, pattern, now_ms()])
-    R2::upload("laws/" + to_string(law_id) + ".json",
-               json_encode({"id": law_id, "pattern": pattern}))
-}
-
-// ── Init ────────────────────────────────────────────────────────────
-
-@intent(description: "Initialize Egyptian memory with 3 tiers")  // FALLBACK: verify block + comment
-fn init(base_path: str) -> own EgyptianMemory !(Persistence)
-  ensures result.mid_db.handle > 0 && result.long_db.handle > 0
-{
-    let mid = Persistence::db_open(base_path + "/mid.db")
-    let long_d = Persistence::db_open(base_path + "/long.db")
-    return EgyptianMemory {
-        short_buffer: [],
-        mid_db: mid,
-        long_db: long_d
+@intent(description: "Delete a mid-term memory item by id hash")  // FALLBACK: verify block + comment
+fn mid_delete(mid: MidMemory, content: str) {
+    let hash = simple_hash(content)
+    let path = mid.data_dir + "/" + hash + ".json"
+    if file_exists(path) {
+        delete_file(path)
     }
 }
 
-pure fn row_to_item(r: Row) -> MemoryItem { /* mapping */ }
+// ── Long-term memory (archive + consciousness laws, 16MB) ───────────
+
+struct LongMemory {
+    archive_dir: str,
+    laws_path: str
+}
+
+@intent(description: "Initialize long-term archive memory")  // FALLBACK: verify block + comment
+fn long_init(base_path: str) -> LongMemory {
+    let dir = base_path + "/" + LONG_ARCHIVE_DIR
+    if !file_exists(dir) {
+        write_file(dir + "/.keep", "")
+    }
+    return LongMemory {
+        archive_dir: dir,
+        laws_path: base_path + "/" + LAWS_PATH
+    }
+}
+
+@intent(description: "Archive an item to long-term storage with timestamp key")  // FALLBACK: verify block + comment
+fn long_archive(long_mem: LongMemory, item: MemoryItem) {
+    let ts = timestamp()
+    let path = long_mem.archive_dir + "/" + to_string(ts) + "_" + simple_hash(item.content) + ".json"
+    let data = json_stringify({
+        "id": item.id,
+        "content": item.content,
+        "tier": "long",
+        "ttl_ms": 0,
+        "created_ms": item.created_ms,
+        "archived_sec": ts,
+        "significance": 1.0
+    })
+    write_file(path, data)
+}
+
+@intent(description: "Retrieve consciousness laws from JSON, return matching laws by query keywords")  // FALLBACK: verify block + comment
+fn long_retrieve_laws(long_mem: LongMemory, query: str) -> [Law] {
+    if !file_exists(long_mem.laws_path) {
+        return []
+    }
+    let raw = read_file(long_mem.laws_path)
+    let parsed = json_parse(raw)
+    let laws_obj = parsed.laws
+    let query_kw = extract_keywords(query)
+
+    let mut results: [Law] = []
+    // Iterate law entries (btree-style)
+    let keys = btree_keys(laws_obj)
+    let mut i = 0
+    while i < len(keys) {
+        let law_id = keys[i]
+        let description = btree_get(laws_obj, law_id)
+        let law_kw = extract_keywords(description)
+        let score = keyword_overlap_score(query_kw, law_kw)
+        if score > 0.1 {
+            results = append(results, Law {
+                id: to_int(law_id),
+                category: "consciousness",
+                description: description,
+                applicable_actions: []
+            })
+        }
+        i = i + 1
+    }
+    return results
+}
+
+// ── Egyptian Memory (unified 3-tier system) ─────────────────────────
+
+struct EgyptianMemory {
+    short: own ShortMemory,
+    mid: MidMemory,
+    long: LongMemory
+}
+
+@intent(description: "Initialize Egyptian memory with all 3 tiers")  // FALLBACK: verify block + comment
+fn init(base_path: str) -> own EgyptianMemory {
+    let s = short_init()
+    let m = mid_init(base_path)
+    let l = long_init(base_path)
+    io_write("[memory] Egyptian 1/2+1/3+1/6 initialized")
+    io_write("[memory]   SHORT: deque ring buffer, capacity=" + to_string(SHORT_CAPACITY))
+    io_write("[memory]   MID:   file-based RAG, dir=" + MID_DATA_DIR)
+    io_write("[memory]   LONG:  archive + laws, dir=" + LONG_ARCHIVE_DIR)
+    return EgyptianMemory {
+        short: s,
+        mid: m,
+        long: l
+    }
+}
+
+@intent(description: "Store a value: always goes to SHORT first")  // FALLBACK: verify block + comment
+fn store(mem: own EgyptianMemory, key: str, value: str) -> own EgyptianMemory {
+    let updated_short = short_store(mem.short, key, value)
+    return mem with { short: updated_short }
+}
+
+@intent(description: "Recall: search SHORT first, then MID, then LONG laws")  // FALLBACK: verify block + comment
+fn recall(mem: own EgyptianMemory, key: str) -> (str, own EgyptianMemory) {
+    // 1. Try SHORT (deque linear scan)
+    let (short_val, updated_short) = short_recall(mem.short, key)
+    mem = mem with { short: updated_short }
+    if len(short_val) > 0 {
+        return (short_val, mem)
+    }
+
+    // 2. Try MID (RAG keyword search)
+    let mid_results = mid_search(mem.mid, key, 1)
+    if len(mid_results) > 0 {
+        return (mid_results[0].content, mem)
+    }
+
+    // 3. Try LONG (consciousness laws)
+    let laws = long_retrieve_laws(mem.long, key)
+    if len(laws) > 0 {
+        return (laws[0].description, mem)
+    }
+
+    return ("", mem)
+}
+
+@intent(description: "Decay: remove expired SHORT entries")  // FALLBACK: verify block + comment
+fn decay(mem: own EgyptianMemory) -> own EgyptianMemory {
+    let updated_short = short_decay(mem.short)
+    return mem with { short: updated_short }
+}
+
+@intent(description: "Consolidation: SHORT->MID after 3 accesses, MID->LONG after significance threshold")  // FALLBACK: verify block + comment
+fn consolidate(mem: own EgyptianMemory) -> own EgyptianMemory {
+    // Phase 1: SHORT -> MID promotion
+    let (promotable, updated_short) = short_find_promotable(mem.short)
+    mem = mem with { short: updated_short }
+
+    let mut i = 0
+    while i < len(promotable) {
+        let entry = promotable[i]
+        let item = MemoryItem {
+            id: simple_hash(entry.value),
+            content: entry.key + ": " + entry.value,
+            tier: "mid",
+            ttl_ms: 86400000 * 30,    // 30 days
+            created_ms: entry.created_sec * 1000
+        }
+        mid_persist(mem.mid, item)
+        io_write("[memory] SHORT->MID promoted: " + entry.key)
+        i = i + 1
+    }
+
+    // Phase 2: MID -> LONG promotion (scan mid for high-significance items)
+    let all_mid_files = list_dir(mem.mid.data_dir)
+    let mut j = 0
+    while j < len(all_mid_files) {
+        let fname = all_mid_files[j]
+        if ends_with(fname, ".json") {
+            let path = mem.mid.data_dir + "/" + fname
+            let raw = read_file(path)
+            let parsed = json_parse(raw)
+            // Significance heuristic: keyword count * access frequency
+            let kw_count = len(parsed.keywords)
+            let age_days = (timestamp() * 1000 - parsed.created_ms) / 86400000
+            let significance = to_float(kw_count) / (to_float(age_days) + 1.0)
+            if significance >= PROMOTE_SIGNIFICANCE {
+                let item = MemoryItem {
+                    id: parsed.id,
+                    content: parsed.content,
+                    tier: "long",
+                    ttl_ms: 0,
+                    created_ms: parsed.created_ms
+                }
+                long_archive(mem.long, item)
+                io_write("[memory] MID->LONG archived: " + parsed.id)
+            }
+        }
+        j = j + 1
+    }
+
+    return mem
+}
+
+// ── Pure helpers ────────────────────────────────────────────────────
+
+pure fn simple_hash(s: str) -> str {
+    // djb2 hash as hex string
+    let mut hash = 5381
+    let mut i = 0
+    let chars = to_chars(s)
+    while i < len(chars) {
+        hash = ((hash * 33) + char_code(chars[i])) % 2147483647
+        i = i + 1
+    }
+    return to_hex(abs(hash))
+}
+
+pure fn extract_keywords(text: str) -> [str] {
+    // Split on whitespace + punctuation, lowercase, filter short words
+    let words = split_whitespace(to_lowercase(text))
+    let mut keywords: [str] = []
+    let mut i = 0
+    while i < len(words) {
+        let w = strip_punctuation(words[i])
+        if len(w) >= 3 {
+            keywords = append(keywords, w)
+        }
+        i = i + 1
+    }
+    return keywords
+}
+
+pure fn keyword_overlap_score(a: [str], b: [str]) -> float {
+    // Jaccard similarity: |A intersection B| / |A union B|
+    if len(a) == 0 && len(b) == 0 { return 0.0 }
+
+    let mut intersection = 0
+    let a_set = btree_new()
+    let mut i = 0
+    while i < len(a) {
+        btree_set(a_set, a[i], true)
+        i = i + 1
+    }
+
+    let b_set = btree_new()
+    let mut j = 0
+    while j < len(b) {
+        btree_set(b_set, b[j], true)
+        if btree_get(a_set, b[j]) == true {
+            intersection = intersection + 1
+        }
+        j = j + 1
+    }
+
+    // Union = |A| + |B| - |intersection|
+    // Use btree sizes for dedup
+    let union_size = len(a) + len(b) - intersection
+    if union_size == 0 { return 0.0 }
+    return to_float(intersection) / to_float(union_size)
+}
+
+pure fn sort_scored_desc(items: [ScoredItem]) -> [ScoredItem] {
+    // Selection sort descending by score
+    let mut arr = items
+    let mut i = 0
+    while i < len(arr) {
+        let mut max_idx = i
+        let mut j = i + 1
+        while j < len(arr) {
+            if arr[j].score > arr[max_idx].score {
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != i {
+            let tmp = arr[i]
+            arr[i] = arr[max_idx]
+            arr[max_idx] = tmp
+        }
+        i = i + 1
+    }
+    return arr
+}
+
+pure fn min_int(a: int, b: int) -> int {
+    if a < b { return a } else { return b }
+}
+
+pure fn ends_with(s: str, suffix: str) -> bool {
+    let slen = len(s)
+    let plen = len(suffix)
+    if plen > slen { return false }
+    return substring(s, slen - plen, slen) == suffix
+}
+
+pure fn btree_keys(tree: any) -> [str] {
+    // Extract all keys from a btree/object (builtin traversal)
+    let mut keys: [str] = []
+    let iter = btree_new()
+    // Flatten tree keys via json re-parse trick
+    let raw = json_stringify(tree)
+    let parsed = json_parse(raw)
+    // Assume parsed is iterable object
+    return object_keys(parsed)
+}
 
 // ── Verification ───────────────────────────────────────────────────
 
@@ -125,4 +543,21 @@ verify "fraction_identity" {
 verify "tier_capacities_ordered" {
     assert SHORT_MB > MID_MB
     assert MID_MB > LONG_MB
+}
+
+verify "promote_threshold_valid" {
+    assert PROMOTE_ACCESS_COUNT >= 2
+    assert PROMOTE_ACCESS_COUNT <= 10
+    assert PROMOTE_SIGNIFICANCE > 0.0
+    assert PROMOTE_SIGNIFICANCE < 1.0
+}
+
+verify "short_capacity_reasonable" {
+    assert SHORT_CAPACITY >= 64
+    assert SHORT_CAPACITY <= 4096
+}
+
+verify "top_k_bounded" {
+    assert MID_TOP_K >= 1
+    assert MID_TOP_K <= 20
 }

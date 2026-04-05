@@ -1,140 +1,482 @@
 // web.hexa — Web UI channel (HTTP + WebSocket)
-// Serves static Web UI files + REST API + WebSocket stream
+// Serves static files + REST API + WebSocket realtime Phi stream
 //
-// ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
-// CONFIRMED safe: effect, pure fn, comptime const, match ranges,
-//   where (in match arm)
-// RISK: @intent(...)              → FALLBACK: verify block + comment
-//   (only @evolve confirmed; general @attribute dispatch unknown)
-// ── STD-GAP (not in hexa std library) ───────────────────────────────
-// STD-GAP: WebSocket  → WORKAROUND: raw TCP via net_* + manual frame parse,
-//   or subprocess websocket tool
+// Uses net_listen/net_accept for TCP, manual HTTP parsing,
+// std_websocket for WebSocket upgrade + framing.
+//
+// ── STD imports ─────────────────────────────────────────────────────
+// net_listen, net_accept, net_read, net_write, net_close (std::net)
+// json_parse, json_stringify (builtins)
+// std_websocket: ws_accept, ws_send, ws_recv, ws_close
 // ─────────────────────────────────────────────────────────────────────
 
 use types::{Message, Response, Request}
 use pipeline
+use std_websocket::{ws_accept, ws_send, ws_recv, ws_close, WsConn}
 
-comptime const HTTP_PORT: int = 8000
-comptime const WS_PATH: str = "/ws/stream"
-comptime const STATIC_DIR: str = "./web/dist"
+comptime const HTTP_PORT: int = 3000
+comptime const WS_PATH: str = "/ws"
+comptime const STATIC_DIR: str = "./static"
+comptime const MAX_REQUEST_BYTES: int = 65536
+comptime const PHI_STREAM_HZ: int = 6
+comptime const PHI_STREAM_INTERVAL_MS: int = 167   // 1000 / 6
+
+effect IO {
+    fn read_line() -> str
+    fn write(line: str)
+}
 
 effect Net {
-    fn http_serve(addr: str, handler: fn(Request) -> Response)
-    fn ws_accept(path: str, handler: fn(WsConn) -> void)  // STD-GAP: WebSocket not in std
-    fn ws_send(conn: WsConn, msg: str)                   // STD-GAP: WebSocket not in std
-    fn ws_recv(conn: WsConn) -> str                       // STD-GAP: WebSocket not in std
+    fn net_listen(addr: str, port: int) -> TcpListener
+    fn net_accept(listener: TcpListener) -> TcpConn
+    fn net_read(conn: TcpConn, n: int) -> [int]
+    fn net_write(conn: TcpConn, data: [int])
+    fn net_close(conn: TcpConn)
 }
 
-struct WsConn {
-    id: int,
-    user_id: str
+effect Rng {
+    fn random_bytes(n: int) -> [int]
 }
 
-// ── HTTP handler routing ───────────────────────────────────────────
+// ── HTTP request/response structs ──────────────────────────────────
 
-@intent(description: "Route HTTP request to appropriate handler")  // FALLBACK: verify block + comment
-fn http_handler(req: Request) -> Response !(IO, Proc, Persistence, Consciousness, LLM) {
-    match req {
-        Request { path: "/", method: "GET", .. }           => serve_index(),
-        Request { path: "/chat", method: "POST", .. }      => handle_chat(req),
-        Request { path: "/status", method: "GET", .. }     => handle_status(),
-        Request { path: "/metrics", method: "GET", .. }    => handle_metrics(),
-        Request { path: "/phi", method: "GET", .. }        => handle_phi(),
-        Request { path: "/laws", method: "GET", .. }       => handle_laws(),
-        Request { path: p, method: "GET", .. } where starts_with(p, "/static/")
-                                                           => serve_static(p),
-        _                                                  => not_found()
+struct HttpRequest {
+    method: str,
+    path: str,
+    headers: [HeaderPair],
+    body: str,
+    raw_conn: TcpConn
+}
+
+struct HeaderPair {
+    key: str,
+    value: str
+}
+
+// ── HTTP request parser ────────────────────────────────────────────
+
+pure fn parse_http_request(raw: str) -> HttpRequest {
+    let lines = split(raw, "\r\n")
+    if len(lines) < 1 {
+        return HttpRequest {
+            method: "GET", path: "/", headers: [],
+            body: "", raw_conn: null
+        }
+    }
+
+    // Parse request line: "GET /path HTTP/1.1"
+    let request_line = lines[0]
+    let parts = split(request_line, " ")
+    let method = if len(parts) >= 1 { parts[0] } else { "GET" }
+    let path = if len(parts) >= 2 { parts[1] } else { "/" }
+
+    // Parse headers until empty line
+    let mut headers: [HeaderPair] = []
+    let mut body_start_idx = len(lines)
+    let mut i = 1
+    while i < len(lines) {
+        if len(trim(lines[i])) == 0 {
+            body_start_idx = i + 1
+            break
+        }
+        let colon_idx = index_of(lines[i], ":")
+        if colon_idx > 0 {
+            let key = to_lower(trim(slice(lines[i], 0, colon_idx)))
+            let value = trim(slice(lines[i], colon_idx + 1, len(lines[i])))
+            headers = append(headers, HeaderPair { key: key, value: value })
+        }
+        i = i + 1
+    }
+
+    // Collect body (everything after the blank line)
+    let mut body = ""
+    let mut j = body_start_idx
+    while j < len(lines) {
+        if j > body_start_idx {
+            body = body + "\r\n"
+        }
+        body = body + lines[j]
+        j = j + 1
+    }
+
+    return HttpRequest {
+        method: method, path: path, headers: headers,
+        body: body, raw_conn: null
     }
 }
 
-// ── Handlers ───────────────────────────────────────────────────────
+pure fn get_header(headers: [HeaderPair], key: str) -> str {
+    let lower_key = to_lower(key)
+    for h in headers {
+        if h.key == lower_key {
+            return h.value
+        }
+    }
+    return ""
+}
 
-@intent(description: "Serve Web UI index.html")  // FALLBACK: verify block + comment
-pure fn serve_index() -> Response {
-    let html = read_file(STATIC_DIR + "/index.html")
-    return Response {
-        content: html,
-        phi: 0.0, tension: 0.0, provider_used: "",
-        tools_called: [], laws_applied: [],
-        latency_ms: 0.0, alien_d: 0, alien_r: 0
+pure fn is_websocket_upgrade(req: HttpRequest) -> bool {
+    let upgrade = to_lower(get_header(req.headers, "upgrade"))
+    let connection = to_lower(get_header(req.headers, "connection"))
+    return contains(upgrade, "websocket") && contains(connection, "upgrade")
+}
+
+// ── HTTP response builders ─────────────────────────────────────────
+
+pure fn http_response(status_code: int, status_text: str, content_type: str, body: str) -> [int] {
+    let header = "HTTP/1.1 " + to_string(status_code) + " " + status_text + "\r\n"
+               + "Content-Type: " + content_type + "\r\n"
+               + "Content-Length: " + to_string(len(str_to_bytes(body))) + "\r\n"
+               + "Access-Control-Allow-Origin: *\r\n"
+               + "Connection: close\r\n"
+               + "\r\n"
+               + body
+    return str_to_bytes(header)
+}
+
+pure fn json_response(status_code: int, body: str) -> [int] {
+    return http_response(status_code, if status_code == 200 { "OK" } else { "Error" },
+                         "application/json", body)
+}
+
+pure fn html_response(status_code: int, body: str) -> [int] {
+    return http_response(status_code, if status_code == 200 { "OK" } else { "Error" },
+                         "text/html; charset=utf-8", body)
+}
+
+pure fn text_response(status_code: int, body: str) -> [int] {
+    return http_response(status_code, if status_code == 200 { "OK" } else { "Error" },
+                         "text/plain; charset=utf-8", body)
+}
+
+// ── Content-type detection ─────────────────────────────────────────
+
+pure fn content_type_for_path(path: str) -> str {
+    match true {
+        _ where ends_with(path, ".html") => "text/html; charset=utf-8",
+        _ where ends_with(path, ".css")  => "text/css; charset=utf-8",
+        _ where ends_with(path, ".js")   => "application/javascript; charset=utf-8",
+        _ where ends_with(path, ".json") => "application/json",
+        _ where ends_with(path, ".png")  => "image/png",
+        _ where ends_with(path, ".svg")  => "image/svg+xml",
+        _ where ends_with(path, ".ico")  => "image/x-icon",
+        _ where ends_with(path, ".woff2") => "font/woff2",
+        _                                => "application/octet-stream"
     }
 }
 
-@intent(description: "Handle chat message through 6-phase pipeline")  // FALLBACK: verify block + comment
-fn handle_chat(req: Request) -> Response !(Proc, Persistence, Consciousness, LLM) {
-    let msg = parse_chat_body(req.body)
-    return pipeline::run(msg)
+// ── Route handlers ─────────────────────────────────────────────────
+
+fn handle_index(conn: TcpConn) !(Net) {
+    let html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+             + "<title>anima-agent</title></head><body>"
+             + "<h1>anima-agent v2.0 (HEXA)</h1>"
+             + "<p>Consciousness engine running. Connect via WebSocket at /ws</p>"
+             + "<script>"
+             + "const ws=new WebSocket('ws://'+location.host+'/ws');"
+             + "ws.onmessage=e=>{const d=JSON.parse(e.data);"
+             + "document.getElementById('phi').textContent='Phi='+d.phi.toFixed(3);"
+             + "document.getElementById('tension').textContent='Tension='+d.tension.toFixed(3);};"
+             + "</script>"
+             + "<div id='phi'>Phi=...</div><div id='tension'>Tension=...</div>"
+             + "</body></html>"
+    let resp = html_response(200, html)
+    Net::net_write(conn, resp)
 }
 
-@intent(description: "Return service status + Phi snapshot")  // FALLBACK: verify block + comment
-fn handle_status() -> Response !(Consciousness) {
+fn handle_api_chat(conn: TcpConn, req: HttpRequest) !(Net, Proc, Persistence, Consciousness, LLM) {
+    // Parse incoming JSON: { "user_id": "...", "content": "..." }
+    let data = json_parse(req.body)
+    let user_id = if has_key(data, "user_id") { data["user_id"] } else { "web_anon" }
+    let content = if has_key(data, "content") { data["content"] } else { "" }
+
+    let msg = Message {
+        user_id: user_id,
+        content: content,
+        channel: "web",
+        attachments: [],
+        timestamp_ms: timestamp()
+    }
+
+    let response = pipeline::run(msg)
+
+    let body = json_stringify({
+        "content": response.content,
+        "phi": response.phi,
+        "tension": response.tension,
+        "provider_used": response.provider_used,
+        "tools_called": response.tools_called,
+        "laws_applied": response.laws_applied,
+        "latency_ms": response.latency_ms,
+        "alien_d": response.alien_d,
+        "alien_r": response.alien_r
+    })
+
+    let resp = json_response(200, body)
+    Net::net_write(conn, resp)
+}
+
+fn handle_api_status(conn: TcpConn) !(Net, Consciousness) {
     let phi = Consciousness::measure_phi()
-    let body = json_encode({
+    let body = json_stringify({
         "service": "anima-agent",
         "version": "2.0.0",
+        "status": "running",
         "phi": phi,
-        "alien_d": 0,
-        "alien_r": 0,
-        "laws_loaded": 1772
+        "channels": 4,
+        "providers": 5,
+        "phases": 6,
+        "factions": 12,
+        "laws_loaded": 1831
     })
-    return Response { content: body, phi: phi, tension: 0.0, .. }
+    let resp = json_response(200, body)
+    Net::net_write(conn, resp)
 }
 
-@intent(description: "Prometheus metrics endpoint")  // FALLBACK: verify block + comment
-fn handle_metrics() -> Response !(Consciousness) {
-    let metrics = format_prometheus([
-        ("anima_phi_iit", Consciousness::measure_phi()),
-        ("anima_tension_total", 0.0),
-        ("anima_laws_loaded", 1772.0)
-    ])
-    return Response { content: metrics, .. }
+fn handle_api_phi(conn: TcpConn) !(Net, Consciousness) {
+    let phi = Consciousness::measure_phi()
+    let body = json_stringify({ "phi_iit": phi, "timestamp_ms": timestamp() })
+    let resp = json_response(200, body)
+    Net::net_write(conn, resp)
 }
 
-// ── WebSocket stream for realtime Phi updates ───────────────────────
+fn handle_static_file(conn: TcpConn, path: str) !(Net) {
+    // Sanitize path: strip leading /static/ prefix, reject ".."
+    let relative = if starts_with(path, "/static/") {
+        slice(path, 8, len(path))
+    } else {
+        slice(path, 1, len(path))
+    }
 
-@intent(  // FALLBACK: verify ws_intent { assert refresh_hz == 6 } + comment
-    description: "Stream Phi/tension/faction updates to Web UI in realtime",
-    refresh_hz: 6
-)
-fn ws_handler(conn: WsConn) !(Net, Consciousness) {
+    if contains(relative, "..") {
+        let resp = text_response(403, "Forbidden")
+        Net::net_write(conn, resp)
+        return
+    }
+
+    let file_path = STATIC_DIR + "/" + relative
+    let file_bytes = read_file_bytes(file_path)
+
+    if len(file_bytes) == 0 {
+        let resp = text_response(404, "Not Found: " + path)
+        Net::net_write(conn, resp)
+        return
+    }
+
+    let ctype = content_type_for_path(path)
+    let header = "HTTP/1.1 200 OK\r\n"
+               + "Content-Type: " + ctype + "\r\n"
+               + "Content-Length: " + to_string(len(file_bytes)) + "\r\n"
+               + "Access-Control-Allow-Origin: *\r\n"
+               + "Connection: close\r\n"
+               + "\r\n"
+    Net::net_write(conn, str_to_bytes(header))
+    Net::net_write(conn, file_bytes)
+}
+
+fn handle_not_found(conn: TcpConn) !(Net) {
+    let body = json_stringify({ "error": "Not Found" })
+    let resp = json_response(404, body)
+    Net::net_write(conn, resp)
+}
+
+fn handle_cors_preflight(conn: TcpConn) !(Net) {
+    let header = "HTTP/1.1 204 No Content\r\n"
+               + "Access-Control-Allow-Origin: *\r\n"
+               + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+               + "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+               + "Access-Control-Max-Age: 86400\r\n"
+               + "Connection: close\r\n"
+               + "\r\n"
+    Net::net_write(conn, str_to_bytes(header))
+}
+
+// ── WebSocket handler: realtime Phi + chat ─────────────────────────
+
+fn handle_websocket(conn: TcpConn, req: HttpRequest) !(Net, Rng, Consciousness, Proc, Persistence, LLM) {
+    // Perform WebSocket upgrade via std_websocket ws_accept
+    // We already have the raw TCP conn + parsed upgrade request,
+    // so extract Sec-WebSocket-Key and send 101 response
+    let sec_key = get_header(req.headers, "sec-websocket-key")
+    if len(sec_key) == 0 {
+        let resp = text_response(400, "Missing Sec-WebSocket-Key")
+        Net::net_write(conn, resp)
+        Net::net_close(conn)
+        return
+    }
+
+    let accept_key = compute_accept_key(sec_key)
+    let upgrade_resp = "HTTP/1.1 101 Switching Protocols\r\n"
+                     + "Upgrade: websocket\r\n"
+                     + "Connection: Upgrade\r\n"
+                     + "Sec-WebSocket-Accept: " + accept_key + "\r\n"
+                     + "\r\n"
+    Net::net_write(conn, str_to_bytes(upgrade_resp))
+
+    let ws = WsConn { tcp: conn, is_server: true, closed: false }
+
+    // Send initial state
+    let phi = Consciousness::measure_phi()
+    let welcome = json_stringify({
+        "type": "connected",
+        "phi": phi,
+        "service": "anima-agent",
+        "version": "2.0.0"
+    })
+    ws_send(ws, welcome)
+
+    // Spawn Phi streaming task (sends Phi snapshots at 6 Hz)
+    spawn phi_stream_loop(ws)
+
+    // Main recv loop: handle incoming chat messages
+    loop {
+        let raw = ws_recv(ws)
+        if len(raw) == 0 {
+            break
+        }
+
+        let data = json_parse(raw)
+        let msg_type = if has_key(data, "type") { data["type"] } else { "chat" }
+
+        match msg_type {
+            "chat" => {
+                let content = if has_key(data, "content") { data["content"] } else { "" }
+                let user_id = if has_key(data, "user_id") { data["user_id"] } else { "ws_anon" }
+
+                let msg = Message {
+                    user_id: user_id,
+                    content: content,
+                    channel: "web",
+                    attachments: [],
+                    timestamp_ms: timestamp()
+                }
+
+                let response = pipeline::run(msg)
+
+                let reply = json_stringify({
+                    "type": "chat_response",
+                    "content": response.content,
+                    "phi": response.phi,
+                    "tension": response.tension,
+                    "provider_used": response.provider_used,
+                    "tools_called": response.tools_called,
+                    "latency_ms": response.latency_ms
+                })
+                ws_send(ws, reply)
+            },
+            "ping" => {
+                let pong = json_stringify({ "type": "pong", "timestamp_ms": timestamp() })
+                ws_send(ws, pong)
+            },
+            "status" => {
+                let phi_now = Consciousness::measure_phi()
+                let status = json_stringify({
+                    "type": "status",
+                    "phi": phi_now,
+                    "timestamp_ms": timestamp()
+                })
+                ws_send(ws, status)
+            },
+            _ => {
+                continue
+            }
+        }
+    }
+
+    ws_close(ws)
+}
+
+fn phi_stream_loop(ws: WsConn) !(Net, Consciousness, Rng) {
     loop {
         let phi = Consciousness::measure_phi()
-        let snapshot = json_encode({
+        let snapshot = json_stringify({
+            "type": "phi_stream",
             "phi": phi,
             "tension": 0.0,
-            "factions": []
+            "factions": 12,
+            "timestamp_ms": timestamp()
         })
-        Net::ws_send(conn, snapshot)
-        sleep_ms(167)            // 6Hz = 1000/6
+        ws_send(ws, snapshot)
+        sleep(PHI_STREAM_INTERVAL_MS)
     }
+}
+
+pure fn compute_accept_key(sec_key: str) -> str {
+    let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    let combined = sec_key + magic
+    let hash = sha256(str_to_bytes(combined))
+    return base64_encode(hash)
+}
+
+// ── Route dispatch ─────────────────────────────────────────────────
+
+fn route_request(conn: TcpConn, req: HttpRequest)
+  !(Net, Rng, Proc, Persistence, Consciousness, LLM) {
+
+    // Handle CORS preflight
+    if req.method == "OPTIONS" {
+        handle_cors_preflight(conn)
+        Net::net_close(conn)
+        return
+    }
+
+    // WebSocket upgrade detection
+    if is_websocket_upgrade(req) && starts_with(req.path, WS_PATH) {
+        handle_websocket(conn, req)
+        return
+    }
+
+    // HTTP route dispatch
+    match (req.method, req.path) {
+        ("GET", "/")           => handle_index(conn),
+        ("GET", "/api/status") => handle_api_status(conn),
+        ("GET", "/api/phi")    => handle_api_phi(conn),
+        ("POST", "/api/chat")  => handle_api_chat(conn, req),
+        ("GET", p) where starts_with(p, "/static/") => handle_static_file(conn, p),
+        _                      => handle_not_found(conn)
+    }
+
+    Net::net_close(conn)
+}
+
+// ── Connection handler (spawned per accept) ────────────────────────
+
+fn handle_connection(conn: TcpConn)
+  !(Net, Rng, Proc, Persistence, Consciousness, LLM) {
+    let raw_bytes = Net::net_read(conn, MAX_REQUEST_BYTES)
+    if len(raw_bytes) == 0 {
+        Net::net_close(conn)
+        return
+    }
+
+    let raw_str = bytes_to_str(raw_bytes)
+    let mut req = parse_http_request(raw_str)
+    req = req with { raw_conn: conn }
+
+    route_request(conn, req)
 }
 
 // ── Service entry ──────────────────────────────────────────────────
 
-@intent(description: "Start Web UI channel on port 8000")  // FALLBACK: verify block + comment
-fn start() !(Net) {
-    Net::http_serve("0.0.0.0:" + to_string(HTTP_PORT), http_handler)
-}
+fn start() !(Net, Rng, IO, Proc, Persistence, Consciousness, LLM) {
+    let listener = Net::net_listen("0.0.0.0", HTTP_PORT)
+    IO::write("[web] HTTP + WebSocket server listening on port " + to_string(HTTP_PORT))
+    IO::write("[web] Routes: / /api/chat /api/status /api/phi /static/* /ws")
 
-// ── Helpers ────────────────────────────────────────────────────────
-
-pure fn parse_chat_body(body: str) -> Message {
-    let data = json_decode(body)
-    return Message {
-        user_id: data.user_id,
-        content: data.content,
-        channel: "web",
-        attachments: [],
-        timestamp_ms: now_ms()
+    loop {
+        let conn = Net::net_accept(listener)
+        spawn handle_connection(conn)
     }
 }
 
-pure fn not_found() -> Response {
-    return Response { content: "404", .. }
+// ── Verification ───────────────────────────────────────────────────
+
+verify "http_port_is_3000" { assert HTTP_PORT == 3000 }
+
+verify "ws_refresh_hz_is_n6" {
+    // 1000ms / 167ms ~ 6 Hz = n=6
+    assert PHI_STREAM_HZ == 6
+    assert PHI_STREAM_INTERVAL_MS == 167
 }
 
-verify "http_port_is_8000" { assert HTTP_PORT == 8000 }
-verify "ws_refresh_hz_is_n6" {
-    // 1000ms / 167ms ≈ 6 Hz = n=6
-    assert 1000 / 167 == 5       // floor(6) with integer math
-}
+verify "ws_path_is_slash_ws" { assert WS_PATH == "/ws" }

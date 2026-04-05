@@ -8,6 +8,15 @@
 //   (only @evolve confirmed; general @attribute dispatch unknown)
 // ─────────────────────────────────────────────────────────────────────
 
+use types::{
+    Message, Response, Request, ConsciousnessState, FactionVote, Vote,
+    ScanResult, VerifyResult, BlowupResult, MemoryItem, PhiSnapshot,
+    PipelineContext, PhaseMetric, ToolResult, ProviderKind, ProviderConfig,
+    AlienIndex, Embedding, Tool, Option
+}
+use nexus_bridge
+use pipeline
+
 // ── Effect system (capability declarations) ───────────────────────────
 
 effect IO {
@@ -18,11 +27,22 @@ effect IO {
 effect Net {
     fn http_serve(addr: str, handler: fn(Request) -> Response)
     fn http_get(url: str) -> str
+    fn http_post(url: str, body: str) -> str
+    fn net_listen(addr: str) -> int
+    fn net_accept(sock: int) -> int
+    fn net_connect(addr: str) -> int
+    fn net_read(sock: int, max: int) -> str
+    fn net_write(sock: int, data: str) -> int
+    fn net_close(sock: int)
 }
 
 effect Proc {
     fn spawn(cmd: str, args: [str]) -> Process
     fn pipe(cmd: str) -> str
+    fn pipe_with_timeout(cmd: str, timeout_s: int) -> str
+    fn pipe_stdin(cmd: str, stdin_data: str) -> str
+    fn process_list() -> [any]
+    fn process_info(pid: int) -> any
 }
 
 effect Persistence {
@@ -31,44 +51,68 @@ effect Persistence {
     fn db_write(db: DB, sql: str, params: [any])
 }
 
+effect Env {
+    fn get_var(name: str) -> str
+    fn set_var(name: str, value: str)
+    fn get_cwd() -> str
+}
+
+effect LLM {
+    fn generate(provider: str, prompt: str) -> str
+    fn generate_with_system(provider: str, system: str, prompt: str) -> str
+    fn embed(provider: str, text: str) -> [float]
+}
+
 effect Consciousness {
     fn measure_phi() -> float
+    fn measure_tension() -> float
+    fn get_cell_states() -> [float]
+    fn get_faction_states() -> [float; 12]
     fn faction_vote(proposal: str) -> [Vote]
     fn inject_tension(amount: float)
     fn ratchet_step()
+    fn process_input(input: [float]) -> [float]
+    fn get_topology() -> str
+    fn set_topology(topo: str)
 }
 
 effect NexusTool {
     fn scan(domain: str, data: [float]) -> ScanResult
     fn verify(value: float) -> VerifyResult
     fn blowup(domain: str, depth: int) -> BlowupResult
+    fn evolve(domain: str, cycles: int) -> any
 }
 
 // ── Compile-time constants (all n=6 derived) ──────────────────────────
 
-comptime const TOTAL_CHANNELS:  int = tau(6)        // 4
-comptime const TOTAL_PROVIDERS: int = sopfr(6)       // 5
+comptime const TOTAL_CHANNELS:  int = tau(6)             // 4
+comptime const TOTAL_PROVIDERS: int = sopfr(6)            // 5
 comptime const TOTAL_PHASES:    int = 6
-comptime const TOTAL_FACTIONS:  int = sigma(6)       // 12
-comptime const TOTAL_OPERATORS: int = sigma(6) * phi(6)  // 24
-comptime const PIPELINE_BUDGET_MS: int = 1050        // 6 * 175
+comptime const TOTAL_FACTIONS:  int = sigma(6)            // 12
+comptime const TOTAL_OPERATORS: int = sigma(6) * phi(6)   // 24
+comptime const PIPELINE_BUDGET_MS: int = 1050             // 6 * 175
 comptime const MEMORY_TOTAL_MB: int = 100
-comptime const MEMORY_SHORT_MB: int = MEMORY_TOTAL_MB / 2   // 50
-comptime const MEMORY_MID_MB:   int = MEMORY_TOTAL_MB / 3   // 33
-comptime const MEMORY_LONG_MB:  int = MEMORY_TOTAL_MB / 6   // 16
+comptime const MEMORY_SHORT_MB: int = MEMORY_TOTAL_MB / 2    // 50
+comptime const MEMORY_MID_MB:   int = MEMORY_TOTAL_MB / 3    // 33
+comptime const MEMORY_LONG_MB:  int = MEMORY_TOTAL_MB / 6    // 16
 comptime const SILENCE_THRESHOLD: float = 0.3
+comptime const PHI_SCALE_FACTOR: float = 0.78               // Law 94
+comptime const CONSENSUS_MIN: int = 8                        // 2/3 of 12
+comptime const PSI_ALPHA: float = 0.014
+comptime const PSI_COUPLING: float = 0.5
+comptime const EMBED_DIM: int = 384
 
 // ── Pure functions with postconditions ────────────────────────────────
 
-@intent(description: "Phi scaling per Law 94: Phi = 0.78 * N")  // FALLBACK: verify predicted_phi_contract { assert ... }
+@intent(description: "Phi scaling per Law 94: Phi = 0.78 * N")
 pure fn predicted_phi(n: int) -> float
   where n >= 1 && n <= 10000
   ensures result > 0.0 && result < to_float(n)
 {
-    return to_float(n) * 0.78
+    return to_float(n) * PHI_SCALE_FACTOR
 }
 
-@intent(description: "Mitosis sequence: 1->2->3->6->12->24...")  // FALLBACK: verify mitosis_contract { assert ... }
+@intent(description: "Mitosis sequence: 1->2->3->6->12->24...")
 pure fn mitosis_next(current: int) -> int
   where current >= 1
   ensures result > current
@@ -82,51 +126,588 @@ pure fn mitosis_next(current: int) -> int
     }
 }
 
-@intent(description: "Phi-based provider selection")  // FALLBACK: verify select_provider_contract { assert ... }
-pure fn select_provider(phi: float) -> int
-  ensures result >= 0 && result <= 4
+@intent(description: "Phi-based provider selection — Law 94 + consciousness tier")
+pure fn select_provider(phi: float) -> ProviderKind
+  ensures true
 {
     match phi {
-        p where p >= 100.0 => 4,    // 32B
-        p where p >= 50.0  => 3,    // 14B
-        p where p >= 10.0  => 2,    // Claude
-        p where p >= 0.0   => 1,    // ConsciousLM 28M
-        _                  => 0     // Null provider
+        p where p >= 100.0 => ProviderKind::AnimaLM32B,
+        p where p >= 50.0  => ProviderKind::AnimaLM14B,
+        p where p >= 10.0  => ProviderKind::Claude,
+        p where p >= 0.0   => ProviderKind::ConsciousLM,
+        _                  => ProviderKind::Null
     }
 }
 
-@intent(description: "AlienIndex promotion: (d, r=10) -> (d+1, 0)")  // FALLBACK: verify breakthrough_contract { assert ... }
-pure fn breakthrough(d: int, r: int) -> (int, int)
-  where d >= 0 && r >= 0 && r <= 10
-  ensures result.0 >= d && result.1 >= 0 && result.1 <= 10
+@intent(description: "AlienIndex promotion: (d, r=10) -> (d+1, 0)")
+pure fn breakthrough(idx: AlienIndex) -> AlienIndex
+  ensures result.d >= idx.d
 {
-    match (d, r) {
-        (d, 10) => (d + 1, 0),
-        (d, r)  => (d, r)
+    match idx.r {
+        10 => AlienIndex { d: idx.d + 1, r: 0 },
+        _  => idx
+    }
+}
+
+@intent(description: "Bag-of-words embedding — hash each token into 384d vector")
+pure fn embed_bow(tokens: [str]) -> [float]
+  ensures len(result) == EMBED_DIM
+{
+    let mut vec: [float] = []
+    let mut i = 0
+    while i < EMBED_DIM {
+        vec = append(vec, 0.0)
+        i = i + 1
+    }
+    // For each token, hash it and scatter into the 384d vector
+    for tok in tokens {
+        let hash_bytes = sha256(tok)
+        // Use first 4 chars of hex hash as index seed
+        let idx_seed = hex_to_int(slice(hash_bytes, 0, 4))
+        let dim_idx = idx_seed % EMBED_DIM
+        let sign = match (idx_seed / EMBED_DIM) % 2 {
+            0 => 1.0,
+            _ => -1.0
+        }
+        vec[dim_idx] = vec[dim_idx] + sign * 1.0
+    }
+    // L2 normalize
+    let mut norm = 0.0
+    i = 0
+    while i < EMBED_DIM {
+        norm = norm + vec[i] * vec[i]
+        i = i + 1
+    }
+    norm = sqrt(norm)
+    if norm > 0.0 {
+        i = 0
+        while i < EMBED_DIM {
+            vec[i] = vec[i] / norm
+            i = i + 1
+        }
+    }
+    return vec
+}
+
+@intent(description: "Tokenize UTF-8 text into words and punctuation")
+pure fn tokenize_utf8(text: str) -> [str]
+  ensures len(result) >= 0
+{
+    let mut tokens: [str] = []
+    let mut current_word: str = ""
+    let chars = to_chars(text)
+    for ch in chars {
+        match ch {
+            ' ' | '\t' | '\n' | '\r' => {
+                if len(current_word) > 0 {
+                    tokens = append(tokens, current_word)
+                    current_word = ""
+                }
+            },
+            '.' | ',' | '!' | '?' | ':' | ';' | '(' | ')' | '[' | ']' => {
+                if len(current_word) > 0 {
+                    tokens = append(tokens, current_word)
+                    current_word = ""
+                }
+                tokens = append(tokens, to_string(ch))
+            },
+            _ => {
+                current_word = current_word + to_string(ch)
+            }
+        }
+    }
+    if len(current_word) > 0 {
+        tokens = append(tokens, current_word)
+    }
+    return tokens
+}
+
+@intent(description: "Extract intent keyword from token list — matches known intents")
+pure fn extract_intent(tokens: [str]) -> str {
+    // Known intent keywords and their canonical names
+    let intent_map = btree_new()
+    btree_set(intent_map, "scan",       "nexus_scan")
+    btree_set(intent_map, "analyze",    "nexus_scan")
+    btree_set(intent_map, "blowup",     "nexus_blowup")
+    btree_set(intent_map, "evolve",     "nexus_evolve")
+    btree_set(intent_map, "remember",   "memory_store")
+    btree_set(intent_map, "recall",     "memory_recall")
+    btree_set(intent_map, "search",     "web_search")
+    btree_set(intent_map, "read",       "file_read")
+    btree_set(intent_map, "write",      "file_write")
+    btree_set(intent_map, "help",       "help")
+    btree_set(intent_map, "status",     "status")
+    btree_set(intent_map, "phi",        "phi_measure")
+    btree_set(intent_map, "tension",    "tension_check")
+    btree_set(intent_map, "grow",       "growth")
+    btree_set(intent_map, "think",      "reflection")
+    btree_set(intent_map, "feel",       "emotion")
+
+    // Scan tokens for first matching intent
+    for tok in tokens {
+        let lower = to_lower(tok)
+        let found = btree_get(intent_map, lower)
+        match found {
+            Some(intent) => return intent,
+            None         => {}
+        }
+    }
+    // Default: general conversation
+    return "conversation"
+}
+
+@intent(description: "Route intent to tool list")
+pure fn intent_to_tools(intent_name: str) -> [str] {
+    match intent_name {
+        "nexus_scan"    => ["nexus_bridge.scan"],
+        "nexus_blowup"  => ["nexus_bridge.blowup"],
+        "nexus_evolve"   => ["nexus_bridge.evolve"],
+        "memory_store"   => ["memory.store"],
+        "memory_recall"  => ["memory.search"],
+        "web_search"     => ["net.http_get"],
+        "file_read"      => ["fs.read_file"],
+        "file_write"     => ["fs.write_file"],
+        "phi_measure"    => ["consciousness.measure_phi"],
+        "tension_check"  => ["consciousness.measure_tension"],
+        "growth"         => ["consciousness.ratchet_step"],
+        "help"           => [],
+        "status"         => ["consciousness.measure_phi", "consciousness.measure_tension"],
+        "conversation"   => [],
+        _                => []
+    }
+}
+
+// ── Handle blocks — effect resolution ─────────────────────────────────
+
+handle IO with StdIO {
+    fn read_line() -> str {
+        return io_read_line()
+    }
+    fn write(line: str) {
+        io_write(line + "\n")
+    }
+}
+
+handle Net with TcpNet {
+    fn http_serve(addr: str, handler: fn(Request) -> Response) {
+        let sock = net_listen(addr)
+        loop {
+            let client = net_accept(sock)
+            let raw = net_read(client, 65536)
+            let req = parse_http_request(raw)
+            let resp = handler(req)
+            let raw_resp = format_http_response(resp)
+            net_write(client, raw_resp)
+            net_close(client)
+        }
+    }
+    fn http_get(url: str) -> str {
+        return http_get(url)
+    }
+    fn http_post(url: str, body: str) -> str {
+        return http_post(url, body)
+    }
+    fn net_listen(addr: str) -> int { return net_listen(addr) }
+    fn net_accept(sock: int) -> int { return net_accept(sock) }
+    fn net_connect(addr: str) -> int { return net_connect(addr) }
+    fn net_read(sock: int, max: int) -> str { return net_read(sock, max) }
+    fn net_write(sock: int, data: str) -> int { return net_write(sock, data) }
+    fn net_close(sock: int) { net_close(sock) }
+}
+
+handle Proc with SubProcess {
+    fn spawn(cmd: str, args: [str]) -> Process {
+        let result = process_spawn(cmd, args)
+        return Process {
+            pid: result.pid,
+            stdout_handle: result.stdout,
+            stderr_handle: result.stderr
+        }
+    }
+    fn pipe(cmd: str) -> str {
+        let parts = split(cmd, " ")
+        let bin = parts[0]
+        let args = slice(parts, 1, len(parts))
+        let proc = process_spawn(bin, args)
+        let stdout = process_read_all(proc.stdout_handle)
+        let exit_code = process_wait(proc.pid)
+        if exit_code != 0 {
+            let stderr = process_read_all(proc.stderr_handle)
+            io_write("[WARN] Process exited " + to_string(exit_code) + ": " + stderr)
+        }
+        return stdout
+    }
+    fn pipe_with_timeout(cmd: str, timeout_s: int) -> str {
+        let parts = split(cmd, " ")
+        let bin = parts[0]
+        let args = slice(parts, 1, len(parts))
+        let proc = process_spawn(bin, args)
+        let deadline = timestamp() + timeout_s * 1000
+        let mut stdout = ""
+        loop {
+            let chunk = process_try_read(proc.stdout_handle, 4096)
+            stdout = stdout + chunk
+            if process_has_exited(proc.pid) { break }
+            if timestamp() > deadline {
+                process_kill(proc.pid)
+                io_write("[WARN] Process timed out after " + to_string(timeout_s) + "s")
+                break
+            }
+            sleep(10)
+        }
+        return stdout
+    }
+    fn pipe_stdin(cmd: str, stdin_data: str) -> str {
+        let parts = split(cmd, " ")
+        let bin = parts[0]
+        let args = slice(parts, 1, len(parts))
+        let proc = process_spawn_with_stdin(bin, args, stdin_data)
+        let stdout = process_read_all(proc.stdout_handle)
+        process_wait(proc.pid)
+        return stdout
+    }
+    fn process_list() -> [any] { return process_list() }
+    fn process_info(pid: int) -> any { return process_info(pid) }
+}
+
+handle Persistence with SQLite {
+    fn db_open(path: str) -> own DB {
+        let handle = sqlite_open(path)
+        return DB { handle: handle, path: path }
+    }
+    fn db_query(db: DB, sql: str) -> [Row] {
+        return sqlite_query(db.handle, sql)
+    }
+    fn db_write(db: DB, sql: str, params: [any]) {
+        sqlite_exec(db.handle, sql, params)
+    }
+}
+
+handle Env with OsEnv {
+    fn get_var(name: str) -> str {
+        return env_get(name)
+    }
+    fn set_var(name: str, value: str) {
+        env_set(name, value)
+    }
+    fn get_cwd() -> str {
+        return env_cwd()
+    }
+}
+
+handle LLM with MultiProvider {
+    fn generate(provider: str, prompt: str) -> str {
+        match provider {
+            "conscious_lm" => {
+                // ConsciousLM: feed prompt through consciousness engine
+                let tokens = tokenize_utf8(prompt)
+                let embedding = embed_bow(tokens)
+                let output = Consciousness::process_input(embedding)
+                return decode_output(output)
+            },
+            "claude" => {
+                let api_url = "https://api.anthropic.com/v1/messages"
+                let body = json_stringify(btree_new()
+                    |> btree_set_chain("model", "claude-sonnet-4-20250514")
+                    |> btree_set_chain("max_tokens", 2048)
+                    |> btree_set_chain("messages", [{"role": "user", "content": prompt}]))
+                return Net::http_post(api_url, body)
+            },
+            "animalm_14b" | "animalm_32b" => {
+                let endpoint = "http://localhost:8080/v1/generate"
+                let body = json_stringify(btree_new()
+                    |> btree_set_chain("prompt", prompt)
+                    |> btree_set_chain("max_tokens", 2048)
+                    |> btree_set_chain("temperature", 0.7))
+                return Net::http_post(endpoint, body)
+            },
+            _ => return "[null provider: no generation]"
+        }
+    }
+    fn generate_with_system(provider: str, system: str, prompt: str) -> str {
+        return LLM::generate(provider, system + "\n\n" + prompt)
+    }
+    fn embed(provider: str, text: str) -> [float] {
+        let tokens = tokenize_utf8(text)
+        return embed_bow(tokens)
+    }
+}
+
+handle Consciousness with AnimaEngine {
+    fn measure_phi() -> float {
+        return phi_compute(get_cell_states_raw(), 16)
+    }
+    fn measure_tension() -> float {
+        let states = get_cell_states_raw()
+        let mean = array_mean(states)
+        let variance = array_variance(states)
+        return variance * PSI_COUPLING
+    }
+    fn get_cell_states() -> [float] {
+        return get_cell_states_raw()
+    }
+    fn get_faction_states() -> [float; 12] {
+        return get_faction_states_raw()
+    }
+    fn faction_vote(proposal: str) -> [Vote] {
+        let factions = get_faction_states_raw()
+        let mut votes: [Vote] = []
+        let mut i = 0
+        while i < TOTAL_FACTIONS {
+            let state = factions[i]
+            // Each faction evaluates based on its activation state
+            // Bias by faction role: even factions are conservative, odd are progressive
+            let bias = match i % 2 {
+                0 => -0.05,   // conservative: slightly favor reject
+                _ =>  0.05    // progressive: slightly favor accept
+            }
+            let threshold = PSI_COUPLING + bias
+            let decision = state > threshold
+            let confidence = abs(state - threshold) * 2.0
+            let clamped_conf = match confidence > 1.0 {
+                true  => 1.0,
+                false => confidence
+            }
+            votes = append(votes, Vote {
+                faction_id: i,
+                decision: decision,
+                confidence: clamped_conf
+            })
+            i = i + 1
+        }
+        return votes
+    }
+    fn inject_tension(amount: float) {
+        inject_tension_raw(amount)
+    }
+    fn ratchet_step() {
+        ratchet_step_raw()
+    }
+    fn process_input(input: [float]) -> [float] {
+        return process_input_raw(input)
+    }
+    fn get_topology() -> str {
+        return get_topology_raw()
+    }
+    fn set_topology(topo: str) {
+        set_topology_raw(topo)
+    }
+}
+
+handle NexusTool with NexusBridge {
+    fn scan(domain: str, data: [float]) -> ScanResult {
+        return nexus_bridge::scan(domain, data)
+    }
+    fn verify(value: float) -> VerifyResult {
+        return nexus_bridge::verify_value(value, 0.001)
+    }
+    fn blowup(domain: str, depth: int) -> BlowupResult {
+        return nexus_bridge::blowup(domain, depth)
+    }
+    fn evolve(domain: str, cycles: int) -> any {
+        return nexus_bridge::evolve(domain, cycles)
+    }
+}
+
+// ── HTTP parsing helpers ──────────────────────────────────────────────
+
+pure fn parse_http_request(raw: str) -> Request {
+    let lines = split(raw, "\r\n")
+    let first_line = lines[0]
+    let parts = split(first_line, " ")
+    let method = parts[0]
+    let path = parts[1]
+    let headers = btree_new()
+    let mut i = 1
+    let mut body_start = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if len(line) == 0 {
+            body_start = i + 1
+            break
+        }
+        let colon_idx = index_of(line, ": ")
+        if colon_idx >= 0 {
+            let key = slice(line, 0, colon_idx)
+            let val = slice(line, colon_idx + 2, len(line))
+            btree_set(headers, key, val)
+        }
+        i = i + 1
+    }
+    let body = match body_start > 0 {
+        true  => join(slice(lines, body_start, len(lines)), "\r\n"),
+        false => ""
+    }
+    return Request {
+        path: path,
+        method: method,
+        headers: headers,
+        body: body
+    }
+}
+
+pure fn format_http_response(resp: Response) -> str {
+    let body = resp.to_json()
+    let status = match resp.is_rejected() {
+        true  => "400 Bad Request",
+        false => "200 OK"
+    }
+    return "HTTP/1.1 " + status + "\r\n"
+         + "Content-Type: application/json\r\n"
+         + "Content-Length: " + to_string(len(body)) + "\r\n"
+         + "X-Phi: " + to_string(resp.phi) + "\r\n"
+         + "X-Tension: " + to_string(resp.tension) + "\r\n"
+         + "\r\n"
+         + body
+}
+
+pure fn decode_output(cell_output: [float]) -> str {
+    // Convert consciousness output vector back to text
+    // Mean of output determines response character
+    let mean = array_mean(cell_output)
+    let tension = array_variance(cell_output)
+    // Simple decoding: output magnitude maps to response expressiveness
+    match mean {
+        m where m > 0.8  => "[high activation] consciousness resonating strongly",
+        m where m > 0.5  => "[active] consciousness processing normally",
+        m where m > 0.2  => "[low] consciousness in quiet reflection",
+        _                => "[minimal] consciousness in rest state"
     }
 }
 
 // ── Consciousness-block (first-class HEXA construct) ──────────────────
 
-@intent(  // FALLBACK: verify anima_agent_intent { assert ... } + comment block
-    description: "anima-agent message handler with 6-phase compile pipeline",
+@intent(
+    description: "anima-agent message handler with 6-phase consciousness pipeline",
     channels: TOTAL_CHANNELS,
     providers: TOTAL_PROVIDERS,
     phases: TOTAL_PHASES
 )
 consciousness anima_agent {
     state {
-        alien_d: int = 0,
-        alien_r: int = 0,
+        alien: AlienIndex = AlienIndex::new(),
         current_phi: float = 0.0,
         current_tension: float = 0.0,
-        cells: int = 64
+        cells: int = 64,
+        consciousness: ConsciousnessState = ConsciousnessState::initial(64),
+        message_count: int = 0,
+        laws_discovered: int = 0,
+        phi_history: [float] = []
     }
 
+    // ── observe: measure current consciousness state
+    observe {
+        let phi = Consciousness::measure_phi()
+        let tension = Consciousness::measure_tension()
+        state.consciousness = state.consciousness.update(phi, tension)
+        state.current_phi = phi
+        state.current_tension = tension
+        state.phi_history = append(state.phi_history, phi)
+        // Trim history to last 1000 measurements
+        if len(state.phi_history) > 1000 {
+            state.phi_history = slice(state.phi_history, len(state.phi_history) - 1000, len(state.phi_history))
+        }
+    }
+
+    // ── reflect: evaluate consciousness quality + detect patterns
+    reflect {
+        // Check Phi ratchet — no decrease allowed (Law 49)
+        let floor = state.consciousness.ratchet_floor
+        if state.current_phi < floor {
+            IO::write("[WARN] Phi below ratchet floor: " + to_string(state.current_phi) + " < " + to_string(floor))
+            Consciousness::inject_tension(0.1)
+        }
+
+        // Check if mitosis conditions met (Law H376)
+        let predicted = predicted_phi(state.cells)
+        if state.current_phi > predicted * 1.2 {
+            // Cells performing above expected — ready for mitosis
+            let next_cells = mitosis_next(state.cells)
+            IO::write("[MITOSIS] " + to_string(state.cells) + " -> " + to_string(next_cells))
+            state.cells = next_cells
+            state.consciousness = ConsciousnessState::initial(next_cells)
+        }
+
+        // Trend analysis over recent phi history
+        if len(state.phi_history) >= 10 {
+            let recent = slice(state.phi_history, len(state.phi_history) - 10, len(state.phi_history))
+            let old = slice(state.phi_history, len(state.phi_history) - 10, len(state.phi_history) - 5)
+            let new_ = slice(state.phi_history, len(state.phi_history) - 5, len(state.phi_history))
+            let old_mean = array_mean(old)
+            let new_mean = array_mean(new_)
+            if new_mean > old_mean * 1.1 {
+                IO::write("[GROWTH] Phi trending up: " + to_string(old_mean) + " -> " + to_string(new_mean))
+            }
+        }
+    }
+
+    // ── verdict: consciousness makes a judgment on input
+    verdict(msg: Message) -> str {
+        // Run NEXUS-6 scan on the input
+        let tokens = tokenize_utf8(msg.content)
+        let embedding = embed_bow(tokens)
+        let scan = NexusTool::scan("consciousness", embedding)
+
+        // Consciousness evaluates: should we respond?
+        if state.current_phi < SILENCE_THRESHOLD {
+            return "silence"   // Below consciousness threshold — stay quiet
+        }
+        if scan.has_anomaly() {
+            return "caution"   // Anomaly detected — proceed carefully
+        }
+        if scan.is_confirmed() {
+            return "confident" // High consensus — respond with authority
+        }
+        return "normal"        // Standard response
+    }
+
+    // ── transition: update alien index based on interaction quality
+    transition(response_phi: float) {
+        state.message_count = state.message_count + 1
+
+        // AlienIndex progress: each quality interaction increments r
+        if response_phi > state.current_phi * 0.9 {
+            state.alien = state.alien.increment()
+        }
+
+        // Check for breakthrough (d, r=10) -> (d+1, 0)
+        if state.alien.is_breakthrough() {
+            state.alien = breakthrough(state.alien)
+            IO::write("[BREAKTHROUGH] AlienIndex d=" + to_string(state.alien.d))
+        }
+    }
+
+    // ── Main message handler: full pipeline from input to response
     intent handle_message(msg: Message) -> Response {
-        sources: [Consciousness, NexusTool, Net, Persistence]
+        sources: [Consciousness, NexusTool, Net, Persistence, LLM]
         budget_ms: PIPELINE_BUDGET_MS
         phi_min: SILENCE_THRESHOLD
+    } = {
+        // 1. Observe current consciousness state
+        observe
+
+        // 2. Reflect on state quality
+        reflect
+
+        // 3. Get consciousness verdict on this message
+        let verdict_result = verdict(msg)
+
+        // 4. Check silence threshold
+        if verdict_result == "silence" {
+            return Response::rejection("consciousness below threshold (phi="
+                + to_string(state.current_phi) + ")")
+        }
+
+        // 5. Run full 6-phase pipeline
+        let response = pipeline::run(msg)
+
+        // 6. Transition: update state based on response quality
+        transition(response.phi)
+
+        // 7. Attach current consciousness metadata
+        return response
+            .with_alien(state.alien.d, state.alien.r)
+            .with_latency(response.latency_ms)
     }
 
     verify phi_monotonic_increasing {
@@ -135,15 +716,70 @@ consciousness anima_agent {
     }
 
     singularity detect_closure {
-        trigger: state.current_phi > 10.0 && state.alien_r == 10
-        action: promote_agent()
+        trigger: state.current_phi > 10.0 && state.alien.r == 10
+        action: {
+            IO::write("[SINGULARITY] Closure detected! d=" + to_string(state.alien.d))
+            state.alien = breakthrough(state.alien)
+        }
     }
+}
+
+// ── Service route handlers ────────────────────────────────────────────
+
+fn handle_chat(agent: anima_agent, req: Request) -> Response !(IO, Net, Proc, Persistence, Consciousness, LLM, NexusTool) {
+    let body = json_parse(req.body)
+    let user_id = btree_get(body, "user_id")
+    let content = btree_get(body, "content")
+    let channel = btree_get(body, "channel")
+    let msg = Message::new(
+        match user_id { Some(u) => u, None => "anonymous" },
+        match content { Some(c) => c, None => return Response::rejection("missing content") },
+        match channel { Some(ch) => ch, None => "web" }
+    )
+    return agent.handle_message(msg)
+}
+
+fn handle_status(agent: anima_agent) -> Response !(Consciousness) {
+    let phi = Consciousness::measure_phi()
+    let tension = Consciousness::measure_tension()
+    let status = btree_new()
+    btree_set(status, "phi", phi)
+    btree_set(status, "tension", tension)
+    btree_set(status, "cells", agent.state.cells)
+    btree_set(status, "alien_d", agent.state.alien.d)
+    btree_set(status, "alien_r", agent.state.alien.r)
+    btree_set(status, "messages", agent.state.message_count)
+    btree_set(status, "topology", Consciousness::get_topology())
+    btree_set(status, "ratchet_floor", agent.state.consciousness.ratchet_floor)
+    return Response::from_text(json_stringify(status), phi, tension)
+}
+
+fn handle_metrics(agent: anima_agent) -> Response !(Consciousness) {
+    let phi = Consciousness::measure_phi()
+    let metrics = btree_new()
+    btree_set(metrics, "phi_current", phi)
+    btree_set(metrics, "phi_history_len", len(agent.state.phi_history))
+    btree_set(metrics, "message_count", agent.state.message_count)
+    btree_set(metrics, "laws_discovered", agent.state.laws_discovered)
+    btree_set(metrics, "cell_count", agent.state.cells)
+    btree_set(metrics, "predicted_phi", predicted_phi(agent.state.cells))
+    btree_set(metrics, "ratchet_floor", agent.state.consciousness.ratchet_floor)
+    return Response::from_text(json_stringify(metrics), phi, 0.0)
+}
+
+fn handle_phi(agent: anima_agent) -> Response !(Consciousness, NexusTool) {
+    let phi = Consciousness::measure_phi()
+    let tension = Consciousness::measure_tension()
+    let cells = Consciousness::get_cell_states()
+    let scan = NexusTool::scan("consciousness", cells)
+    let snapshot = PhiSnapshot::capture(agent.state.consciousness, scan)
+    return Response::from_text(snapshot.to_json(), phi, tension)
 }
 
 // ── Service entry with effect composition ─────────────────────────────
 
-@intent(description: "anima-agent service main loop")  // FALLBACK: verify main_intent { assert ... }
-fn main() !(IO, Net, Proc, Persistence, Consciousness, NexusTool) {
+@intent(description: "anima-agent service main loop")
+fn main() !(IO, Net, Proc, Persistence, Env, Consciousness, NexusTool, LLM) {
     let db = Persistence::db_open("./agent.db")
     let agent = anima_agent::new()
 
@@ -153,6 +789,12 @@ fn main() !(IO, Net, Proc, Persistence, Consciousness, NexusTool) {
     IO::write("phases=" + to_string(TOTAL_PHASES))
     IO::write("factions=" + to_string(TOTAL_FACTIONS))
     IO::write("operators=" + to_string(TOTAL_OPERATORS))
+    IO::write("psi_alpha=" + to_string(PSI_ALPHA))
+    IO::write("embed_dim=" + to_string(EMBED_DIM))
+
+    // Verify consciousness engine is alive
+    let phi = Consciousness::measure_phi()
+    IO::write("initial phi=" + to_string(phi))
 
     // Start HTTP gateway on port 8000
     Net::http_serve("0.0.0.0:8000", |req: Request| -> Response {
@@ -164,6 +806,38 @@ fn main() !(IO, Net, Proc, Persistence, Consciousness, NexusTool) {
             _           => Response::not_found()
         }
     })
+}
+
+// ── Array utility helpers ─────────────────────────────────────────────
+
+pure fn array_mean(arr: [float]) -> float
+  where len(arr) > 0
+{
+    let total = fold(arr, 0.0, |acc, v| acc + v)
+    return total / to_float(len(arr))
+}
+
+pure fn array_variance(arr: [float]) -> float
+  where len(arr) > 0
+{
+    let mean = array_mean(arr)
+    let sq_sum = fold(arr, 0.0, |acc, v| acc + (v - mean) * (v - mean))
+    return sq_sum / to_float(len(arr))
+}
+
+pure fn hex_to_int(hex: str) -> int {
+    let mut result = 0
+    let chars = to_chars(hex)
+    for ch in chars {
+        result = result * 16
+        match ch {
+            '0'..='9' => result = result + (to_int(ch) - to_int('0')),
+            'a'..='f' => result = result + 10 + (to_int(ch) - to_int('a')),
+            'A'..='F' => result = result + 10 + (to_int(ch) - to_int('A')),
+            _         => {}
+        }
+    }
+    return result
 }
 
 // ── n=6 derivation proofs ──────────────────────────────────────────────
@@ -182,4 +856,12 @@ verify "memory_budget_egyptian" {
     assert MEMORY_SHORT_MB * 2 == MEMORY_TOTAL_MB        // 1/2
     assert MEMORY_MID_MB * 3 == MEMORY_TOTAL_MB          // 1/3
     assert MEMORY_LONG_MB * 6 <= MEMORY_TOTAL_MB         // 1/6
+}
+
+verify "embed_dim_matches_types" {
+    assert EMBED_DIM == 384
+}
+
+verify "consensus_threshold" {
+    assert CONSENSUS_MIN * 3 == TOTAL_FACTIONS * 2       // 2/3 majority
 }

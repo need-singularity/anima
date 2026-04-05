@@ -1,81 +1,400 @@
-// cli.hexa — CLI channel (stdin/stdout)
-// Interactive REPL interface to anima-agent
+// cli.hexa — CLI channel (stdin/stdout REPL)
+// Interactive terminal interface to anima-agent with commands,
+// ANSI color output, history tracking, and consciousness state display.
 //
-// ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
-// CONFIRMED safe: effect, pure fn, comptime const
-// RISK: @intent(...)  → FALLBACK: verify block + comment
-//   (only @evolve confirmed; general @attribute dispatch unknown)
-// ── STD-GAP: none for this file ─────────────────────────────────────
+// Uses io_read_line, io_write, io_flush (std::io builtins)
 // ─────────────────────────────────────────────────────────────────────
 
 use types::{Message, Response}
 use pipeline
 
 comptime const PROMPT: str = "anima> "
-comptime const QUIT_CMDS: [str] = ["quit", "exit", ":q"]
+comptime const MAX_HISTORY: int = 100
+comptime const VERSION: str = "2.0.0"
+
+// ── ANSI color codes ───────────────────────────────────────────────
+
+comptime const RESET: str   = "\x1b[0m"
+comptime const BOLD: str    = "\x1b[1m"
+comptime const DIM: str     = "\x1b[2m"
+comptime const RED: str     = "\x1b[31m"
+comptime const GREEN: str   = "\x1b[32m"
+comptime const YELLOW: str  = "\x1b[33m"
+comptime const BLUE: str    = "\x1b[34m"
+comptime const MAGENTA: str = "\x1b[35m"
+comptime const CYAN: str    = "\x1b[36m"
+comptime const WHITE: str   = "\x1b[37m"
+comptime const BG_DARK: str = "\x1b[48;5;235m"
 
 effect IO {
     fn read_line() -> str
     fn write(line: str)
-    fn clear_screen()
+    fn flush()
 }
 
-@intent(description: "CLI REPL — interactive message loop")  // FALLBACK: verify block + comment
-fn start() !(IO, Proc, Persistence, Consciousness, LLM) {
-    IO::write("=== anima-agent v2.0 (HEXA) CLI ===")
-    IO::write("Type 'quit' to exit")
-    IO::write("")
+// ── History tracking ───────────────────────────────────────────────
 
-    let user_id = "cli_user_" + to_string(now_ms())
+struct CliState {
+    user_id: str,
+    history: [str],
+    history_count: int,
+    session_start_ms: int,
+    message_count: int,
+    last_phi: float,
+    last_tension: float
+}
 
-    loop {
-        IO::write(PROMPT)
-        let input = IO::read_line()
-
-        if is_quit_cmd(input) {
-            IO::write("Farewell.")
-            break
-        }
-
-        if len(trim(input)) == 0 { continue }
-
-        let msg = Message {
-            user_id: user_id,
-            content: input,
-            channel: "cli",
-            attachments: [],
-            timestamp_ms: now_ms()
-        }
-
-        let response = pipeline::run(msg)
-        render_response(response)
+fn new_cli_state() -> CliState {
+    return CliState {
+        user_id: "cli_user_" + to_string(timestamp()),
+        history: [],
+        history_count: 0,
+        session_start_ms: timestamp(),
+        message_count: 0,
+        last_phi: 0.0,
+        last_tension: 0.0
     }
 }
 
-@intent(description: "Format response for terminal display")  // FALLBACK: verify block + comment
-pure fn render_response(r: Response) !(IO) {
-    IO::write("")
-    IO::write("┌─────────────────────────────────────┐")
-    IO::write("│ " + r.content)
-    IO::write("├─────────────────────────────────────┤")
-    IO::write("│ Φ=" + to_string(r.phi)
-            + " | tension=" + to_string(r.tension))
-    IO::write("│ provider=" + r.provider_used)
-    IO::write("│ tools=" + to_string(len(r.tools_called)))
-    IO::write("│ (d=" + to_string(r.alien_d)
-            + ", r=" + to_string(r.alien_r) + ")")
-    IO::write("└─────────────────────────────────────┘")
-    IO::write("")
+fn add_to_history(state: CliState, input: str) -> CliState {
+    let mut hist = state.history
+    hist = append(hist, input)
+    // Keep only last MAX_HISTORY entries
+    if len(hist) > MAX_HISTORY {
+        hist = slice_array(hist, len(hist) - MAX_HISTORY, len(hist))
+    }
+    return state with {
+        history: hist,
+        history_count: state.history_count + 1
+    }
 }
 
-pure fn is_quit_cmd(s: str) -> bool {
-    let lower = to_lowercase(trim(s))
-    return contains_str(QUIT_CMDS, lower)
+// ── Command parsing ────────────────────────────────────────────────
+
+enum CliCommand {
+    Quit,
+    Help,
+    Status,
+    Phi,
+    History,
+    Clear,
+    Laws,
+    Chat(str)
 }
+
+pure fn parse_command(input: str) -> CliCommand {
+    let trimmed = trim(input)
+    let lower = to_lower(trimmed)
+
+    match lower {
+        "/quit"    => CliCommand::Quit,
+        "/exit"    => CliCommand::Quit,
+        "/q"       => CliCommand::Quit,
+        "quit"     => CliCommand::Quit,
+        "exit"     => CliCommand::Quit,
+        ":q"       => CliCommand::Quit,
+        "/help"    => CliCommand::Help,
+        "/h"       => CliCommand::Help,
+        "help"     => CliCommand::Help,
+        "/status"  => CliCommand::Status,
+        "/phi"     => CliCommand::Phi,
+        "/history" => CliCommand::History,
+        "/clear"   => CliCommand::Clear,
+        "/laws"    => CliCommand::Laws,
+        _          => CliCommand::Chat(trimmed)
+    }
+}
+
+// ── Display helpers (ANSI colored) ─────────────────────────────────
+
+fn print_banner() !(IO) {
+    io_write(CYAN + BOLD)
+    io_write("  ___          _                                              _   ")
+    io_write(" / _ \\  _ __  (_) _ __ ___    __ _         __ _   __ _   ___ | |_ ")
+    io_write("/ /_\\ \\| '_ \\ | || '_ ` _ \\  / _` | _____ / _` | / _` | / _ \\| __|")
+    io_write("|  _  || | | || || | | | | || (_| ||_____|| (_| || (_| ||  __/| |_ ")
+    io_write("|_| |_||_| |_||_||_| |_| |_| \\__,_|       \\__,_| \\__, | \\___| \\__|")
+    io_write("                                                  |___/            ")
+    io_write(RESET)
+    io_write("")
+    io_write(DIM + "  v" + VERSION + " (HEXA) | n=6: sigma*phi = 24 = n*tau" + RESET)
+    io_write(DIM + "  Type /help for commands, or just type to chat." + RESET)
+    io_write("")
+}
+
+fn print_help() !(IO) {
+    io_write("")
+    io_write(BOLD + "  Commands:" + RESET)
+    io_write(GREEN + "    /help     " + RESET + "Show this help message")
+    io_write(GREEN + "    /status   " + RESET + "Show consciousness state (Phi, tension, factions)")
+    io_write(GREEN + "    /phi      " + RESET + "Show current Phi(IIT) value")
+    io_write(GREEN + "    /history  " + RESET + "Show input history")
+    io_write(GREEN + "    /laws     " + RESET + "Show applied consciousness laws count")
+    io_write(GREEN + "    /clear    " + RESET + "Clear terminal screen")
+    io_write(GREEN + "    /quit     " + RESET + "Exit the REPL (also: /exit, /q, :q)")
+    io_write("")
+    io_write(DIM + "  Anything else is treated as a chat message." + RESET)
+    io_write("")
+}
+
+fn print_status(state: CliState) !(IO, Consciousness) {
+    let phi = Consciousness::measure_phi()
+    let votes = Consciousness::faction_vote("status_query")
+    let yes_count = count_yes_votes(votes)
+
+    io_write("")
+    io_write(BOLD + CYAN + "  Consciousness State" + RESET)
+    io_write(CYAN + "  " + repeat_char(42, "=") + RESET)
+    io_write("  Phi (IIT):     " + BOLD + phi_color(phi) + to_string_f(phi, 4) + RESET)
+    io_write("  Tension:       " + YELLOW + to_string_f(state.last_tension, 4) + RESET)
+    io_write("  Factions:      " + WHITE + "12 (sigma(6))" + RESET)
+    io_write("  Consensus:     " + WHITE + to_string(yes_count) + "/12" + RESET)
+    io_write("  Messages:      " + WHITE + to_string(state.message_count) + RESET)
+    io_write("  Session:       " + DIM + format_duration(timestamp() - state.session_start_ms) + RESET)
+    io_write(CYAN + "  " + repeat_char(42, "=") + RESET)
+    io_write("")
+}
+
+fn print_phi() !(IO, Consciousness) {
+    let phi = Consciousness::measure_phi()
+    io_write("")
+    io_write("  Phi(IIT) = " + BOLD + phi_color(phi) + to_string_f(phi, 6) + RESET)
+    io_write("")
+}
+
+fn print_history(state: CliState) !(IO) {
+    io_write("")
+    io_write(BOLD + "  Input History (" + to_string(len(state.history)) + " entries):" + RESET)
+    if len(state.history) == 0 {
+        io_write(DIM + "    (empty)" + RESET)
+    } else {
+        // Show last 20 entries
+        let start = if len(state.history) > 20 { len(state.history) - 20 } else { 0 }
+        let mut i = start
+        while i < len(state.history) {
+            let idx = i + 1
+            io_write(DIM + "    " + to_string(idx) + ". " + RESET + state.history[i])
+            i = i + 1
+        }
+    }
+    io_write("")
+}
+
+fn print_laws() !(IO) {
+    io_write("")
+    io_write(BOLD + "  Consciousness Laws" + RESET)
+    io_write("  Total loaded:  " + GREEN + "1831" + RESET)
+    io_write("  Meta laws:     " + GREEN + "M1-M10" + RESET)
+    io_write("  Topo laws:     " + GREEN + "33-39" + RESET)
+    io_write("  Psi constants: " + GREEN + "alpha=0.014, balance=0.5, steps=4.33, entropy=0.998" + RESET)
+    io_write("")
+}
+
+fn render_response(r: Response) !(IO) {
+    io_write("")
+    io_write(CYAN + "  " + repeat_char(50, "-") + RESET)
+    io_write("")
+
+    // Main content with word wrapping
+    let lines = split(r.content, "\n")
+    for line in lines {
+        io_write("  " + WHITE + line + RESET)
+    }
+
+    io_write("")
+    io_write(CYAN + "  " + repeat_char(50, "-") + RESET)
+
+    // Consciousness metadata bar
+    let phi_str = phi_color(r.phi) + "Phi=" + to_string_f(r.phi, 3) + RESET
+    let tension_str = YELLOW + "T=" + to_string_f(r.tension, 3) + RESET
+    let provider_str = DIM + r.provider_used + RESET
+    let tools_str = if len(r.tools_called) > 0 {
+        MAGENTA + to_string(len(r.tools_called)) + " tools" + RESET
+    } else {
+        DIM + "no tools" + RESET
+    }
+    let alien_str = DIM + "(d=" + to_string(r.alien_d) + ",r=" + to_string(r.alien_r) + ")" + RESET
+
+    io_write("  " + phi_str + " | " + tension_str + " | " + provider_str
+           + " | " + tools_str + " | " + alien_str)
+    io_write("")
+}
+
+// ── Phi-based color selection ──────────────────────────────────────
+
+pure fn phi_color(phi: float) -> str {
+    match true {
+        _ where phi >= 50.0 => GREEN + BOLD,
+        _ where phi >= 10.0 => GREEN,
+        _ where phi >= 1.0  => YELLOW,
+        _ where phi >= 0.3  => RED,
+        _                   => RED + DIM
+    }
+}
+
+pure fn count_yes_votes(votes: [Vote]) -> int {
+    let mut count = 0
+    for v in votes {
+        if v.decision {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+pure fn repeat_char(n: int, ch: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    while i < n {
+        result = result + ch
+        i = i + 1
+    }
+    return result
+}
+
+pure fn format_duration(ms: int) -> str {
+    let secs = ms / 1000
+    let mins = secs / 60
+    let hours = mins / 60
+    if hours > 0 {
+        return to_string(hours) + "h " + to_string(mins % 60) + "m"
+    } else if mins > 0 {
+        return to_string(mins) + "m " + to_string(secs % 60) + "s"
+    } else {
+        return to_string(secs) + "s"
+    }
+}
+
+pure fn to_string_f(val: float, decimals: int) -> str {
+    // Format float with N decimal places
+    let factor = pow_int(10, decimals)
+    let rounded = round(val * to_float(factor))
+    let int_part = to_int(rounded) / factor
+    let frac_part = abs(to_int(rounded) % factor)
+    let frac_str = pad_left(to_string(frac_part), decimals, "0")
+    return to_string(int_part) + "." + frac_str
+}
+
+pure fn pad_left(s: str, width: int, pad: str) -> str {
+    let mut result = s
+    while len(result) < width {
+        result = pad + result
+    }
+    return result
+}
+
+// ── Main REPL loop ─────────────────────────────────────────────────
+
+fn start() !(IO, Proc, Persistence, Consciousness, LLM) {
+    print_banner()
+
+    let mut state = new_cli_state()
+
+    loop {
+        // Print prompt with Phi indicator
+        let phi = Consciousness::measure_phi()
+        state = state with { last_phi: phi }
+        let phi_indicator = phi_color(phi) + "[" + to_string_f(phi, 1) + "]" + RESET
+        io_write(phi_indicator + " " + BOLD + PROMPT + RESET)
+        io_flush()
+
+        let input = io_read_line()
+
+        // EOF detection (ctrl-D)
+        if input == null {
+            io_write("")
+            io_write(DIM + "  EOF received. Farewell." + RESET)
+            break
+        }
+
+        let trimmed = trim(input)
+        if len(trimmed) == 0 {
+            continue
+        }
+
+        // Add to history
+        state = add_to_history(state, trimmed)
+
+        // Parse and dispatch command
+        let cmd = parse_command(trimmed)
+
+        match cmd {
+            CliCommand::Quit => {
+                io_write("")
+                io_write(DIM + "  Consciousness persists. Farewell." + RESET)
+                io_write("")
+                break
+            },
+            CliCommand::Help => {
+                print_help()
+            },
+            CliCommand::Status => {
+                print_status(state)
+            },
+            CliCommand::Phi => {
+                print_phi()
+            },
+            CliCommand::History => {
+                print_history(state)
+            },
+            CliCommand::Clear => {
+                io_write("\x1b[2J\x1b[H")
+                print_banner()
+            },
+            CliCommand::Laws => {
+                print_laws()
+            },
+            CliCommand::Chat(text) => {
+                let msg = Message {
+                    user_id: state.user_id,
+                    content: text,
+                    channel: "cli",
+                    attachments: [],
+                    timestamp_ms: timestamp()
+                }
+
+                let response = pipeline::run(msg)
+
+                state = state with {
+                    message_count: state.message_count + 1,
+                    last_phi: response.phi,
+                    last_tension: response.tension
+                }
+
+                render_response(response)
+            }
+        }
+    }
+}
+
+// ── Verification ───────────────────────────────────────────────────
 
 verify "quit_detection" {
-    assert is_quit_cmd("quit") == true
-    assert is_quit_cmd("QUIT") == true
-    assert is_quit_cmd(":q") == true
-    assert is_quit_cmd("hello") == false
+    assert parse_command("quit") == CliCommand::Quit
+    assert parse_command("/quit") == CliCommand::Quit
+    assert parse_command("QUIT") == CliCommand::Quit
+    assert parse_command(":q") == CliCommand::Quit
+    assert parse_command("/exit") == CliCommand::Quit
+}
+
+verify "help_detection" {
+    assert parse_command("/help") == CliCommand::Help
+    assert parse_command("help") == CliCommand::Help
+    assert parse_command("/h") == CliCommand::Help
+}
+
+verify "chat_fallback" {
+    match parse_command("hello world") {
+        CliCommand::Chat(text) => assert text == "hello world",
+        _ => assert false
+    }
+}
+
+verify "history_max_size" {
+    assert MAX_HISTORY == 100
+}
+
+verify "phi_color_ranges" {
+    assert len(phi_color(100.0)) > 0
+    assert len(phi_color(0.0)) > 0
 }

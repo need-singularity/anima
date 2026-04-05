@@ -1,15 +1,26 @@
 // std_hashmap.hexa — HashMap built on BTreeMap + SHA-256 bucket hashing
 // Proposed addition to HEXA std library
 //
-// HEXA provides BTreeMap (ordered, O(log n)) but no hash-based map.
-// This module wraps btree_* primitives with SHA-256 hashing to provide
-// amortized O(1) get/put via bucket distribution.
+// Full implementation:
+//   - HashMap.new() / with_capacity() — constructors
+//   - HashMap.put(key, value) -> Option<any> (returns old value)
+//   - HashMap.get(key) -> Option<any>
+//   - HashMap.remove(key) -> Option<any>
+//   - HashMap.contains(key) -> bool
+//   - HashMap.keys() -> [str]
+//   - HashMap.values() -> [any]
+//   - HashMap.entries() -> [(str, any)]
+//   - HashMap.len() -> int
+//   - HashMap.clear()
+//   - Collision handling via chaining in BTree buckets with index suffix
+//   - Iterator, map, filter, fold, merge, get_or_default
+//   - Auto-rehash when load factor exceeds threshold
 //
 // Architecture:
 //   HashMap<K, V> = BTreeMap<int, [(K, V)]>
-//   - Key K is hashed via sha256 -> truncated to bucket index
-//   - Each bucket is a BTreeMap entry holding a list of (K, V) pairs
-//   - Collisions resolved by linear scan within bucket (small lists)
+//   - Key K hashed via sha256 -> truncated to bucket index
+//   - Each bucket holds a list of (K, V) pairs (chained collision resolution)
+//   - SHA-256 ensures uniform distribution across buckets
 //
 // Built on existing primitives:
 //   btree_new, btree_get, btree_set, btree_remove, btree_keys (std::collections)
@@ -27,13 +38,15 @@ use std::crypto::{sha256}
 comptime const DEFAULT_BUCKET_COUNT: int = 256    // 2^8, power of 2 for fast modulo
 comptime const MAX_BUCKET_COUNT: int = 65536      // 2^16
 comptime const LOAD_FACTOR_THRESHOLD: float = 0.75
+comptime const REHASH_GROWTH_FACTOR: int = 2      // double bucket count on rehash
 
 // ── Types ───────────────────────────────────────────────────────────
 
 struct HashMap<K, V> {
     buckets: BTreeMap<int, [(K, V)]>,
     bucket_count: int,
-    size: int
+    size: int,
+    key_list: [K]      // maintained for O(1) keys() without btree traversal
 }
 
 enum HashMapEntry<K, V> {
@@ -54,14 +67,16 @@ pure fn hash_key(key: str, bucket_count: int) -> int
     let digest = sha256(str_to_bytes(key))
     // Take first 4 bytes of SHA-256 as 32-bit integer (big-endian)
     let h = (digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]
-    // Modulo by bucket count (bit-AND when bucket_count is power of 2)
+    // Modulo by bucket count (works for any bucket_count; bit-AND optimization
+    // applies when bucket_count is power of 2, but modulo is always correct)
     return h % bucket_count
 }
 
-pure fn hash_int_key(key: int, bucket_count: int) -> int
+pure fn hash_any_key(key: any, bucket_count: int) -> int
   where bucket_count > 0
   ensures result >= 0 && result < bucket_count
 {
+    // Convert any key type to string for hashing
     return hash_key(to_string(key), bucket_count)
 }
 
@@ -79,7 +94,8 @@ pure fn new<K, V>() -> HashMap<K, V>
     return HashMap {
         buckets: btree_new(),
         bucket_count: DEFAULT_BUCKET_COUNT,
-        size: 0
+        size: 0,
+        key_list: []
     }
 }
 
@@ -90,14 +106,16 @@ pure fn with_capacity<K, V>(bucket_count: int) -> HashMap<K, V>
     return HashMap {
         buckets: btree_new(),
         bucket_count: bucket_count,
-        size: 0
+        size: 0,
+        key_list: []
     }
 }
 
 // ── Core operations ─────────────────────────────────────────────────
 
-pure fn put<V>(map: HashMap<str, V>, key: str, value: V) -> HashMap<str, V>
-  ensures result.size >= map.size && result.size <= map.size + 1
+// put: insert or update, returns (updated_map, old_value_if_existed)
+pure fn put<V>(map: HashMap<str, V>, key: str, value: V) -> (HashMap<str, V>, Option<V>)
+  ensures result.0.size >= map.size && result.0.size <= map.size + 1
 {
     let idx = hash_key(key, map.bucket_count)
     let bucket = match btree_get(map.buckets, idx) {
@@ -105,31 +123,52 @@ pure fn put<V>(map: HashMap<str, V>, key: str, value: V) -> HashMap<str, V>
         None    => []
     }
 
-    // Check if key already exists in bucket — update in place
+    // Scan bucket for existing key — replace if found
     let mut new_bucket: [(str, V)] = []
-    let mut found = false
+    let mut old_value: Option<V> = None
     for (k, v) in bucket {
         if k == key {
             new_bucket = append(new_bucket, (key, value))
-            found = true
+            old_value = Some(v)
         } else {
             new_bucket = append(new_bucket, (k, v))
         }
     }
 
     // Key not found — append new entry
+    let found = match old_value {
+        Some(_) => true,
+        None    => false
+    }
     if !found {
         new_bucket = append(new_bucket, (key, value))
     }
 
     let new_buckets = btree_set(map.buckets, idx, new_bucket)
     let new_size = if found { map.size } else { map.size + 1 }
+    let new_keys = if found { map.key_list } else { append(map.key_list, key) }
 
-    return HashMap {
+    let new_map = HashMap {
         buckets: new_buckets,
         bucket_count: map.bucket_count,
-        size: new_size
+        size: new_size,
+        key_list: new_keys
     }
+
+    // Auto-rehash if load factor exceeded
+    if load_factor(new_map) > LOAD_FACTOR_THRESHOLD && new_map.bucket_count < MAX_BUCKET_COUNT {
+        return (rehash(new_map), old_value)
+    }
+
+    return (new_map, old_value)
+}
+
+// put_simple: insert/update without returning old value (convenience)
+pure fn put_simple<V>(map: HashMap<str, V>, key: str, value: V) -> HashMap<str, V>
+  ensures result.size >= map.size && result.size <= map.size + 1
+{
+    let (new_map, _) = put(map, key, value)
+    return new_map
 }
 
 pure fn get<V>(map: HashMap<str, V>, key: str) -> Option<V> {
@@ -147,44 +186,106 @@ pure fn get<V>(map: HashMap<str, V>, key: str) -> Option<V> {
     }
 }
 
-pure fn contains_key<V>(map: HashMap<str, V>, key: str) -> bool {
+pure fn contains<V>(map: HashMap<str, V>, key: str) -> bool {
     match get(map, key) {
         Some(_) => true,
         None    => false
     }
 }
 
-pure fn remove<V>(map: HashMap<str, V>, key: str) -> HashMap<str, V>
-  ensures result.size <= map.size
+// remove: returns (updated_map, removed_value_if_existed)
+pure fn remove<V>(map: HashMap<str, V>, key: str) -> (HashMap<str, V>, Option<V>)
+  ensures result.0.size <= map.size
 {
     let idx = hash_key(key, map.bucket_count)
     match btree_get(map.buckets, idx) {
         Some(bucket) => {
             let mut new_bucket: [(str, V)] = []
-            let mut found = false
+            let mut removed: Option<V> = None
             for (k, v) in bucket {
                 if k == key {
-                    found = true
-                    // skip — effectively removes the entry
+                    removed = Some(v)
                 } else {
                     new_bucket = append(new_bucket, (k, v))
                 }
             }
 
-            let new_buckets = if len(new_bucket) == 0 {
-                btree_remove(map.buckets, idx)
-            } else {
-                btree_set(map.buckets, idx, new_bucket)
-            }
+            match removed {
+                Some(_) => {
+                    let new_buckets = if len(new_bucket) == 0 {
+                        btree_remove(map.buckets, idx)
+                    } else {
+                        btree_set(map.buckets, idx, new_bucket)
+                    }
 
-            return HashMap {
-                buckets: new_buckets,
-                bucket_count: map.bucket_count,
-                size: if found { map.size - 1 } else { map.size }
+                    // Remove key from key_list
+                    let new_keys = remove_from_list(map.key_list, key)
+
+                    return (HashMap {
+                        buckets: new_buckets,
+                        bucket_count: map.bucket_count,
+                        size: map.size - 1,
+                        key_list: new_keys
+                    }, removed)
+                },
+                None => {
+                    return (map, None)
+                }
             }
         },
-        None => map  // key not present, return unchanged
+        None => (map, None)
     }
+}
+
+// remove_simple: remove without returning old value (convenience)
+pure fn remove_simple<V>(map: HashMap<str, V>, key: str) -> HashMap<str, V>
+  ensures result.size <= map.size
+{
+    let (new_map, _) = remove(map, key)
+    return new_map
+}
+
+// ── Clear ───────────────────────────────────────────────────────────
+
+pure fn clear<K, V>(map: HashMap<K, V>) -> HashMap<K, V>
+  ensures result.size == 0
+{
+    return HashMap {
+        buckets: btree_new(),
+        bucket_count: map.bucket_count,
+        size: 0,
+        key_list: []
+    }
+}
+
+// ── Rehash (internal) ───────────────────────────────────────────────
+
+pure fn rehash<V>(map: HashMap<str, V>) -> HashMap<str, V>
+  ensures result.size == map.size
+{
+    let new_count = min(map.bucket_count * REHASH_GROWTH_FACTOR, MAX_BUCKET_COUNT)
+    let mut new_map = with_capacity(new_count)
+    let all = entries(map)
+    for (k, v) in all {
+        new_map = put_simple(new_map, k, v)
+    }
+    return new_map
+}
+
+pure fn min(a: int, b: int) -> int {
+    return if a < b { a } else { b }
+}
+
+// ── List helper ─────────────────────────────────────────────────────
+
+pure fn remove_from_list(list: [str], item: str) -> [str] {
+    let mut result: [str] = []
+    for x in list {
+        if x != item {
+            result = append(result, x)
+        }
+    }
+    return result
 }
 
 // ── Iteration ───────────────────────────────────────────────────────
@@ -192,34 +293,19 @@ pure fn remove<V>(map: HashMap<str, V>, key: str) -> HashMap<str, V>
 pure fn keys<V>(map: HashMap<str, V>) -> [str]
   ensures len(result) == map.size
 {
-    let mut result: [str] = []
-    let bucket_indices = btree_keys(map.buckets)
-    for idx in bucket_indices {
-        match btree_get(map.buckets, idx) {
-            Some(bucket) => {
-                for (k, _) in bucket {
-                    result = append(result, k)
-                }
-            },
-            None => {}
-        }
-    }
-    return result
+    return map.key_list
 }
 
 pure fn values<V>(map: HashMap<str, V>) -> [V]
   ensures len(result) == map.size
 {
     let mut result: [V] = []
-    let bucket_indices = btree_keys(map.buckets)
-    for idx in bucket_indices {
-        match btree_get(map.buckets, idx) {
-            Some(bucket) => {
-                for (_, v) in bucket {
-                    result = append(result, v)
-                }
+    for k in map.key_list {
+        match get(map, k) {
+            Some(v) => {
+                result = append(result, v)
             },
-            None => {}
+            None => {}   // should never happen if key_list is consistent
         }
     }
     return result
@@ -245,7 +331,7 @@ pure fn entries<V>(map: HashMap<str, V>) -> [(str, V)]
 
 // ── Utility ─────────────────────────────────────────────────────────
 
-pure fn len<K, V>(map: HashMap<K, V>) -> int
+pure fn map_len<K, V>(map: HashMap<K, V>) -> int
   ensures result >= 0
 {
     return map.size
@@ -261,6 +347,34 @@ pure fn load_factor<K, V>(map: HashMap<K, V>) -> float
     return to_float(map.size) / to_float(map.bucket_count)
 }
 
+// ── Get with default ────────────────────────────────────────────────
+
+pure fn get_or<V>(map: HashMap<str, V>, key: str, default: V) -> V {
+    match get(map, key) {
+        Some(v) => v,
+        None    => default
+    }
+}
+
+pure fn get_or_put<V>(map: HashMap<str, V>, key: str, default: V) -> (HashMap<str, V>, V) {
+    match get(map, key) {
+        Some(v) => (map, v),
+        None    => {
+            let (new_map, _) = put(map, key, default)
+            (new_map, default)
+        }
+    }
+}
+
+// ── Entry API ───────────────────────────────────────────────────────
+
+pure fn entry<V>(map: HashMap<str, V>, key: str) -> HashMapEntry<str, V> {
+    match get(map, key) {
+        Some(v) => HashMapEntry::Occupied(key, v),
+        None    => HashMapEntry::Vacant(key)
+    }
+}
+
 // ── Merge / bulk operations ─────────────────────────────────────────
 
 pure fn merge<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> HashMap<str, V>
@@ -269,7 +383,23 @@ pure fn merge<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> HashMap<str, V>
     let mut result = a
     let b_entries = entries(b)
     for (k, v) in b_entries {
-        result = put(result, k, v)
+        result = put_simple(result, k, v)
+    }
+    return result
+}
+
+pure fn merge_with<V>(a: HashMap<str, V>, b: HashMap<str, V>, resolve: fn(V, V) -> V) -> HashMap<str, V> {
+    let mut result = a
+    let b_entries = entries(b)
+    for (k, v) in b_entries {
+        match get(result, k) {
+            Some(existing) => {
+                result = put_simple(result, k, resolve(existing, v))
+            },
+            None => {
+                result = put_simple(result, k, v)
+            }
+        }
     }
     return result
 }
@@ -277,9 +407,9 @@ pure fn merge<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> HashMap<str, V>
 pure fn from_entries<V>(items: [(str, V)]) -> HashMap<str, V>
   ensures result.size <= len(items)
 {
-    let mut map = new()
+    let mut map: HashMap<str, V> = new()
     for (k, v) in items {
-        map = put(map, k, v)
+        map = put_simple(map, k, v)
     }
     return map
 }
@@ -287,10 +417,19 @@ pure fn from_entries<V>(items: [(str, V)]) -> HashMap<str, V>
 // ── Map / filter / fold ─────────────────────────────────────────────
 
 pure fn map_values<V, U>(map: HashMap<str, V>, f: fn(V) -> U) -> HashMap<str, U> {
-    let mut result = new()
+    let mut result: HashMap<str, U> = new()
     let all = entries(map)
     for (k, v) in all {
-        result = put(result, k, f(v))
+        result = put_simple(result, k, f(v))
+    }
+    return result
+}
+
+pure fn map_entries<V, U>(map: HashMap<str, V>, f: fn(str, V) -> U) -> HashMap<str, U> {
+    let mut result: HashMap<str, U> = new()
+    let all = entries(map)
+    for (k, v) in all {
+        result = put_simple(result, k, f(k, v))
     }
     return result
 }
@@ -298,11 +437,11 @@ pure fn map_values<V, U>(map: HashMap<str, V>, f: fn(V) -> U) -> HashMap<str, U>
 pure fn filter<V>(map: HashMap<str, V>, pred: fn(str, V) -> bool) -> HashMap<str, V>
   ensures result.size <= map.size
 {
-    let mut result = new()
+    let mut result: HashMap<str, V> = new()
     let all = entries(map)
     for (k, v) in all {
         if pred(k, v) {
-            result = put(result, k, v)
+            result = put_simple(result, k, v)
         }
     }
     return result
@@ -317,20 +456,50 @@ pure fn fold<V, A>(map: HashMap<str, V>, init: A, f: fn(A, str, V) -> A) -> A {
     return acc
 }
 
-// ── Get with default ────────────────────────────────────────────────
-
-pure fn get_or<V>(map: HashMap<str, V>, key: str, default: V) -> V {
-    match get(map, key) {
-        Some(v) => v,
-        None    => default
+pure fn for_each<V>(map: HashMap<str, V>, f: fn(str, V)) {
+    let all = entries(map)
+    for (k, v) in all {
+        f(k, v)
     }
 }
 
-pure fn get_or_put<V>(map: HashMap<str, V>, key: str, default: V) -> (HashMap<str, V>, V) {
-    match get(map, key) {
-        Some(v) => (map, v),
-        None    => (put(map, key, default), default)
+// ── Set operations ──────────────────────────────────────────────────
+
+pure fn key_intersection<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> [str] {
+    let mut result: [str] = []
+    for k in a.key_list {
+        if contains(b, k) {
+            result = append(result, k)
+        }
     }
+    return result
+}
+
+pure fn key_difference<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> [str] {
+    let mut result: [str] = []
+    for k in a.key_list {
+        if !contains(b, k) {
+            result = append(result, k)
+        }
+    }
+    return result
+}
+
+// ── Equality ────────────────────────────────────────────────────────
+
+pure fn equals<V>(a: HashMap<str, V>, b: HashMap<str, V>) -> bool {
+    if a.size != b.size {
+        return false
+    }
+    for k in a.key_list {
+        match (get(a, k), get(b, k)) {
+            (Some(va), Some(vb)) => {
+                if va != vb { return false }
+            },
+            _ => { return false }
+        }
+    }
+    return true
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -340,50 +509,71 @@ pure fn get_or_put<V>(map: HashMap<str, V>, key: str, default: V) -> (HashMap<st
 verify "new_map_is_empty" {
     let m: HashMap<str, int> = new()
     assert is_empty(m)
-    assert len(m) == 0
+    assert map_len(m) == 0
 }
 
 verify "put_then_get" {
     let m = new()
-    let m = put(m, "alpha", 1)
-    let m = put(m, "beta", 2)
+    let (m, old1) = put(m, "alpha", 1)
+    let (m, old2) = put(m, "beta", 2)
+    assert old1 == None
+    assert old2 == None
     assert get(m, "alpha") == Some(1)
     assert get(m, "beta") == Some(2)
     assert get(m, "gamma") == None
-    assert len(m) == 2
+    assert map_len(m) == 2
 }
 
-verify "put_overwrites" {
+verify "put_overwrites_returns_old" {
     let m = new()
-    let m = put(m, "key", 10)
-    let m = put(m, "key", 20)
+    let (m, old1) = put(m, "key", 10)
+    let (m, old2) = put(m, "key", 20)
+    assert old1 == None
+    assert old2 == Some(10)
     assert get(m, "key") == Some(20)
-    assert len(m) == 1   // size must not double-count
+    assert map_len(m) == 1
 }
 
-verify "remove_works" {
+verify "remove_returns_value" {
     let m = new()
-    let m = put(m, "a", 1)
-    let m = put(m, "b", 2)
-    let m = remove(m, "a")
+    let m = put_simple(m, "a", 1)
+    let m = put_simple(m, "b", 2)
+    let (m, removed) = remove(m, "a")
+    assert removed == Some(1)
     assert get(m, "a") == None
     assert get(m, "b") == Some(2)
-    assert len(m) == 1
+    assert map_len(m) == 1
 }
 
-verify "remove_missing_key_is_noop" {
+verify "remove_missing_key_returns_none" {
     let m = new()
-    let m = put(m, "x", 99)
-    let m2 = remove(m, "nonexistent")
-    assert len(m2) == 1
+    let m = put_simple(m, "x", 99)
+    let (m2, removed) = remove(m, "nonexistent")
+    assert removed == None
+    assert map_len(m2) == 1
     assert get(m2, "x") == Some(99)
+}
+
+verify "contains_works" {
+    let m = from_entries([("a", 1), ("b", 2)])
+    assert contains(m, "a") == true
+    assert contains(m, "b") == true
+    assert contains(m, "c") == false
+}
+
+verify "clear_empties_map" {
+    let m = from_entries([("a", 1), ("b", 2), ("c", 3)])
+    let cleared = clear(m)
+    assert map_len(cleared) == 0
+    assert is_empty(cleared)
+    assert get(cleared, "a") == None
 }
 
 verify "keys_values_entries_consistent" {
     let m = new()
-    let m = put(m, "a", 1)
-    let m = put(m, "b", 2)
-    let m = put(m, "c", 3)
+    let m = put_simple(m, "a", 1)
+    let m = put_simple(m, "b", 2)
+    let m = put_simple(m, "c", 3)
     assert len(keys(m)) == 3
     assert len(values(m)) == 3
     assert len(entries(m)) == 3
@@ -392,7 +582,7 @@ verify "keys_values_entries_consistent" {
 verify "from_entries_roundtrip" {
     let items = [("x", 10), ("y", 20), ("z", 30)]
     let m = from_entries(items)
-    assert len(m) == 3
+    assert map_len(m) == 3
     assert get(m, "x") == Some(10)
     assert get(m, "y") == Some(20)
     assert get(m, "z") == Some(30)
@@ -405,16 +595,21 @@ verify "merge_combines" {
     assert get(merged, "a") == Some(1)
     assert get(merged, "b") == Some(99)   // b's value wins
     assert get(merged, "c") == Some(3)
-    assert len(merged) == 3
+    assert map_len(merged) == 3
+}
+
+verify "merge_with_resolver" {
+    let a = from_entries([("x", 10)])
+    let b = from_entries([("x", 20)])
+    let merged = merge_with(a, b, |old, new_val| old + new_val)
+    assert get(merged, "x") == Some(30)
 }
 
 verify "hash_distribution_no_single_bucket" {
-    // Verify that 4 distinct keys hash to at least 2 different buckets
     let h1 = hash_key("alpha", DEFAULT_BUCKET_COUNT)
     let h2 = hash_key("beta", DEFAULT_BUCKET_COUNT)
     let h3 = hash_key("gamma", DEFAULT_BUCKET_COUNT)
     let h4 = hash_key("delta", DEFAULT_BUCKET_COUNT)
-    // SHA-256 should distribute well — at least 2 distinct buckets
     let distinct = len(unique([h1, h2, h3, h4]))
     assert distinct >= 2
 }
@@ -434,7 +629,7 @@ verify "load_factor_computation" {
 verify "filter_reduces_size" {
     let m = from_entries([("a", 1), ("b", 2), ("c", 3)])
     let filtered = filter(m, |k, v| v > 1)
-    assert len(filtered) == 2
+    assert map_len(filtered) == 2
     assert get(filtered, "a") == None
     assert get(filtered, "b") == Some(2)
 }
@@ -449,4 +644,71 @@ verify "fold_sums" {
     let m = from_entries([("a", 1), ("b", 2), ("c", 3)])
     let total = fold(m, 0, |acc, _k, v| acc + v)
     assert total == 6
+}
+
+verify "get_or_returns_default" {
+    let m: HashMap<str, int> = new()
+    assert get_or(m, "missing", 42) == 42
+    let m = put_simple(m, "present", 7)
+    assert get_or(m, "present", 42) == 7
+}
+
+verify "get_or_put_inserts_on_miss" {
+    let m: HashMap<str, int> = new()
+    let (m, val) = get_or_put(m, "key", 100)
+    assert val == 100
+    assert map_len(m) == 1
+    let (m, val2) = get_or_put(m, "key", 200)
+    assert val2 == 100   // already existed, returns original
+    assert map_len(m) == 1
+}
+
+verify "entry_api_works" {
+    let m = from_entries([("a", 1)])
+    match entry(m, "a") {
+        HashMapEntry::Occupied(k, v) => {
+            assert k == "a"
+            assert v == 1
+        },
+        _ => { assert false }
+    }
+    match entry(m, "b") {
+        HashMapEntry::Vacant(k) => {
+            assert k == "b"
+        },
+        _ => { assert false }
+    }
+}
+
+verify "key_intersection_works" {
+    let a = from_entries([("a", 1), ("b", 2), ("c", 3)])
+    let b = from_entries([("b", 20), ("c", 30), ("d", 40)])
+    let inter = key_intersection(a, b)
+    assert len(inter) == 2
+    // "b" and "c" should be in intersection
+}
+
+verify "key_difference_works" {
+    let a = from_entries([("a", 1), ("b", 2), ("c", 3)])
+    let b = from_entries([("b", 20), ("c", 30)])
+    let diff = key_difference(a, b)
+    assert len(diff) == 1  // only "a"
+}
+
+verify "equals_identical_maps" {
+    let a = from_entries([("x", 1), ("y", 2)])
+    let b = from_entries([("x", 1), ("y", 2)])
+    assert equals(a, b) == true
+}
+
+verify "equals_different_maps" {
+    let a = from_entries([("x", 1)])
+    let b = from_entries([("x", 2)])
+    assert equals(a, b) == false
+}
+
+verify "with_capacity_custom_buckets" {
+    let m: HashMap<str, int> = with_capacity(512)
+    assert m.bucket_count == 512
+    assert is_empty(m)
 }

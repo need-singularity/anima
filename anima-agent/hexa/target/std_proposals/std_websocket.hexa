@@ -1,11 +1,21 @@
 // std_websocket.hexa — WebSocket protocol (RFC 6455) over TCP
 // Proposed addition to HEXA std library for anima-agent channels
 //
+// Full implementation:
+//   - ws_connect: TCP + HTTP upgrade handshake + Sec-WebSocket-Accept validation
+//   - ws_accept: read client upgrade + compute accept key + send 101
+//   - Frame encoding: FIN, opcode (text/binary/close/ping/pong), mask, 7/16/64-bit length
+//   - Frame decoding: header parse + length + mask XOR unmask
+//   - ws_send: encode frame + net_write
+//   - ws_recv: net_read + decode + auto ping/pong handling
+//   - ws_close: close frame + wait for response + net_close
+//   - ws_send_binary: binary frame support
+//   - Fragmentation support: continuation frames
+//
 // Built entirely on existing primitives:
 //   net_connect, net_read, net_write, net_close  (std::net / TCP)
 //   base64_encode                                (std::encoding)
 //   sha256                                       (std::crypto)
-//   json_parse, json_stringify                   (builtins)
 //
 // ── RISK AUDIT (Mk.II+ parse risk) ──────────────────────────────────
 // CONFIRMED safe: effect, pure fn, ensures, comptime const, where, struct, enum
@@ -27,14 +37,23 @@ comptime const OPCODE_CLOSE:        int = 0x08
 comptime const OPCODE_PING:         int = 0x09
 comptime const OPCODE_PONG:         int = 0x0A
 
-comptime const MAX_FRAME_PAYLOAD: int = 65536  // 64 KB default limit
+comptime const MAX_FRAME_PAYLOAD: int = 65536      // 64 KB default limit
+comptime const MAX_MESSAGE_SIZE: int = 16777216     // 16 MB assembled message limit
+comptime const CLOSE_NORMAL: int = 1000
+comptime const CLOSE_GOING_AWAY: int = 1001
+comptime const CLOSE_PROTOCOL_ERROR: int = 1002
+comptime const CLOSE_TOO_LARGE: int = 1009
+comptime const CLOSE_TIMEOUT_MS: int = 5000         // 5 seconds to wait for close response
 
 // ── Types ───────────────────────────────────────────────────────────
 
 struct WsConn {
     tcp: TcpConn,
     is_server: bool,
-    closed: bool
+    closed: bool,
+    // Fragmentation state
+    fragment_opcode: int,       // opcode of first fragment (0 = no fragment in progress)
+    fragment_buffer: [int]      // accumulated payload from continuation frames
 }
 
 struct WsFrame {
@@ -42,6 +61,11 @@ struct WsFrame {
     opcode: int,
     masked: bool,
     mask_key: [int; 4],
+    payload: [int]
+}
+
+struct WsMessage {
+    opcode: int,       // OPCODE_TEXT or OPCODE_BINARY
     payload: [int]
 }
 
@@ -60,10 +84,12 @@ enum WsError {
     FrameTooLarge(int),
     InvalidFrame(str),
     ConnectionClosed,
-    ProtocolError(str)
+    ProtocolError(str),
+    MessageTooLarge(int),
+    CloseTimeout
 }
 
-// ── Effect declaration ──────────────────────────────────────────────
+// ── Effect declarations ─────────────────────────────────────────────
 
 effect Net {
     fn net_connect(host: str, port: int) -> TcpConn
@@ -78,6 +104,11 @@ effect Rng {
     fn random_bytes(n: int) -> [int]
 }
 
+effect Time {
+    fn timestamp() -> int
+    fn sleep(ms: int)
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Pure functions — frame encoding / decoding / handshake generation
 // ══════════════════════════════════════════════════════════════════════
@@ -90,9 +121,12 @@ pure fn parse_ws_url(url: str) -> WsUrl
     let is_tls = starts_with(url, "wss://")
     let stripped = if is_tls {
         slice(url, 6, len(url))
+    } else if starts_with(url, "ws://") {
+        slice(url, 5, len(url))
     } else {
-        slice(url, 5, len(url))  // "ws://"
+        panic("Invalid WebSocket URL: must start with ws:// or wss://")
     }
+
     let slash_idx = index_of(stripped, "/")
     let host_port = if slash_idx >= 0 { slice(stripped, 0, slash_idx) } else { stripped }
     let path = if slash_idx >= 0 { slice(stripped, slash_idx, len(stripped)) } else { "/" }
@@ -113,7 +147,7 @@ pure fn parse_ws_url(url: str) -> WsUrl
     }
 }
 
-// ── Sec-WebSocket-Key generation ────────────────────────────────────
+// ── Sec-WebSocket-Key generation & validation ───────────────────────
 
 pure fn generate_sec_key(random_16: [int]) -> str
   where len(random_16) == 16
@@ -122,8 +156,10 @@ pure fn generate_sec_key(random_16: [int]) -> str
 }
 
 pure fn compute_accept_key(sec_key: str) -> str {
+    // SHA-1 hash of (key + magic GUID), then base64 encode
+    // Note: RFC 6455 specifies SHA-1, not SHA-256
     let combined = sec_key + WS_MAGIC_GUID
-    let hash = sha256(str_to_bytes(combined))
+    let hash = sha1(str_to_bytes(combined))
     return base64_encode(hash)
 }
 
@@ -137,6 +173,32 @@ pure fn build_upgrade_request(host: str, path: str, sec_key: str) -> str {
          + "Sec-WebSocket-Key: " + sec_key + "\r\n"
          + "Sec-WebSocket-Version: " + to_string(WS_VERSION) + "\r\n"
          + "\r\n"
+}
+
+pure fn build_upgrade_request_with_protocols(host: str, path: str, sec_key: str, protocols: [str]) -> str {
+    let base = "GET " + path + " HTTP/1.1\r\n"
+             + "Host: " + host + "\r\n"
+             + "Upgrade: websocket\r\n"
+             + "Connection: Upgrade\r\n"
+             + "Sec-WebSocket-Key: " + sec_key + "\r\n"
+             + "Sec-WebSocket-Version: " + to_string(WS_VERSION) + "\r\n"
+
+    if len(protocols) > 0 {
+        let proto_str = join_strs(protocols, ", ")
+        return base + "Sec-WebSocket-Protocol: " + proto_str + "\r\n\r\n"
+    }
+    return base + "\r\n"
+}
+
+pure fn join_strs(items: [str], sep: str) -> str {
+    let mut result = ""
+    let mut i = 0
+    while i < len(items) {
+        if i > 0 { result = result + sep }
+        result = result + items[i]
+        i = i + 1
+    }
+    return result
 }
 
 // ── HTTP upgrade response builder (server side) ─────────────────────
@@ -156,8 +218,9 @@ pure fn validate_upgrade_response(response: str, expected_accept: str) -> bool {
     let lower = to_lower(response)
     let has_101 = contains(lower, "101")
     let has_upgrade = contains(lower, "upgrade: websocket")
+    let has_connection = contains(lower, "connection: upgrade")
     let has_accept = contains(response, expected_accept)
-    return has_101 && has_upgrade && has_accept
+    return has_101 && has_upgrade && has_connection && has_accept
 }
 
 // ── Extract Sec-WebSocket-Key from client request ───────────────────
@@ -173,16 +236,36 @@ pure fn extract_sec_key(request: str) -> Option<str> {
     return None
 }
 
+// ── Validate that client request is a proper WebSocket upgrade ──────
+
+pure fn validate_upgrade_request(request: str) -> bool {
+    let lower = to_lower(request)
+    let has_get = starts_with(lower, "get ")
+    let has_upgrade = contains(lower, "upgrade: websocket")
+    let has_connection = contains(lower, "connection:")
+    let has_key = contains(lower, "sec-websocket-key:")
+    let has_version = contains(lower, "sec-websocket-version:")
+    return has_get && has_upgrade && has_connection && has_key && has_version
+}
+
 // ── Frame encoding (pure) ───────────────────────────────────────────
 
 pure fn encode_frame(payload: [int], opcode: int, mask: bool, mask_key: [int; 4]) -> [int]
   where opcode >= 0x00 && opcode <= 0x0A
   ensures len(result) >= 2
 {
+    return encode_frame_with_fin(payload, opcode, mask, mask_key, true)
+}
+
+pure fn encode_frame_with_fin(payload: [int], opcode: int, mask: bool, mask_key: [int; 4], fin: bool) -> [int]
+  where opcode >= 0x00 && opcode <= 0x0A
+  ensures len(result) >= 2
+{
     let mut frame: [int] = []
 
     // Byte 0: FIN(1) + RSV(000) + opcode(4)
-    let byte0 = 0x80 | (opcode & 0x0F)   // FIN=1 always (no fragmentation)
+    let fin_bit = if fin { 0x80 } else { 0x00 }
+    let byte0 = fin_bit | (opcode & 0x0F)
     frame = append(frame, byte0)
 
     // Byte 1: MASK(1) + payload length(7)
@@ -205,7 +288,7 @@ pure fn encode_frame(payload: [int], opcode: int, mask: bool, mask_key: [int; 4]
         }
     }
 
-    // Masking key (4 bytes, client->server only)
+    // Masking key (4 bytes, client->server only per RFC 6455)
     if mask {
         frame = append(frame, mask_key[0])
         frame = append(frame, mask_key[1])
@@ -213,7 +296,7 @@ pure fn encode_frame(payload: [int], opcode: int, mask: bool, mask_key: [int; 4]
         frame = append(frame, mask_key[3])
     }
 
-    // Payload (masked if client->server)
+    // Payload (XOR masked if mask=true)
     let mut j = 0
     while j < plen {
         let byte = if mask {
@@ -233,11 +316,30 @@ pure fn encode_text_frame(text: str, mask: bool, mask_key: [int; 4]) -> [int] {
     return encode_frame(payload, OPCODE_TEXT, mask, mask_key)
 }
 
+pure fn encode_binary_frame(data: [int], mask: bool, mask_key: [int; 4]) -> [int] {
+    return encode_frame(data, OPCODE_BINARY, mask, mask_key)
+}
+
 pure fn encode_close_frame(code: int, mask: bool, mask_key: [int; 4]) -> [int]
   where code >= 1000 && code <= 4999
 {
     let payload = [(code >> 8) & 0xFF, code & 0xFF]
     return encode_frame(payload, OPCODE_CLOSE, mask, mask_key)
+}
+
+pure fn encode_close_frame_with_reason(code: int, reason: str, mask: bool, mask_key: [int; 4]) -> [int]
+  where code >= 1000 && code <= 4999
+{
+    let mut payload = [(code >> 8) & 0xFF, code & 0xFF]
+    let reason_bytes = str_to_bytes(reason)
+    payload = concat(payload, reason_bytes)
+    return encode_frame(payload, OPCODE_CLOSE, mask, mask_key)
+}
+
+pure fn encode_ping_frame(data: [int], mask: bool, mask_key: [int; 4]) -> [int]
+  where len(data) <= 125   // control frames max 125 bytes payload
+{
+    return encode_frame(data, OPCODE_PING, mask, mask_key)
 }
 
 pure fn encode_pong_frame(ping_payload: [int], mask: bool, mask_key: [int; 4]) -> [int] {
@@ -253,9 +355,13 @@ pure fn decode_frame(data: [int]) -> WsFrame
     let byte1 = data[1]
 
     let fin = (byte0 & 0x80) != 0
+    let rsv = (byte0 >> 4) & 0x07
     let opcode = byte0 & 0x0F
     let masked = (byte1 & 0x80) != 0
     let len7 = byte1 & 0x7F
+
+    // RSV bits must be 0 unless extensions are negotiated
+    // (we don't support extensions, so nonzero RSV = protocol error)
 
     let mut offset = 2
     let mut payload_len = len7
@@ -279,7 +385,7 @@ pure fn decode_frame(data: [int]) -> WsFrame
         offset = offset + 4
     }
 
-    // Unmask payload
+    // Unmask payload via XOR with rotating mask key
     let mut payload: [int] = []
     let mut j = 0
     while j < payload_len && (offset + j) < len(data) {
@@ -302,9 +408,36 @@ pure fn decode_frame(data: [int]) -> WsFrame
 }
 
 pure fn frame_payload_as_text(frame: WsFrame) -> str
-  where frame.opcode == OPCODE_TEXT
+  where frame.opcode == OPCODE_TEXT || frame.opcode == OPCODE_CONTINUATION
 {
     return bytes_to_str(frame.payload)
+}
+
+// ── Parse close frame payload ───────────────────────────────────────
+
+pure fn parse_close_payload(payload: [int]) -> (int, str) {
+    if len(payload) < 2 {
+        return (CLOSE_NORMAL, "")
+    }
+    let code = (payload[0] << 8) | payload[1]
+    let reason = if len(payload) > 2 {
+        bytes_to_str(slice_array(payload, 2, len(payload)))
+    } else {
+        ""
+    }
+    return (code, reason)
+}
+
+pure fn slice_array(arr: [int], start: int, end: int) -> [int]
+  where start >= 0 && end <= len(arr)
+{
+    let mut result: [int] = []
+    let mut i = start
+    while i < end {
+        result = append(result, arr[i])
+        i = i + 1
+    }
+    return result
 }
 
 // ── Compute total bytes needed to read one frame header ─────────────
@@ -322,19 +455,127 @@ pure fn frame_header_size(first_two: [int]) -> int
     }
 }
 
+// ── Compute total frame size from header ────────────────────────────
+
+pure fn frame_total_size(header: [int]) -> int
+  where len(header) >= 2
+{
+    let hdr_size = frame_header_size(header)
+    let len7 = header[1] & 0x7F
+    let payload_len = if len7 <= 125 {
+        len7
+    } else if len7 == 126 {
+        (header[2] << 8) | header[3]
+    } else {
+        let mut pl = 0
+        let mut i = 0
+        while i < 8 {
+            pl = (pl << 8) | header[2 + i]
+            i = i + 1
+        }
+        pl
+    }
+    return hdr_size + payload_len
+}
+
+// ── Check if opcode is a control frame ──────────────────────────────
+
+pure fn is_control_frame(opcode: int) -> bool {
+    return opcode >= 0x08
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Effectful functions — actual I/O over TCP
 // ══════════════════════════════════════════════════════════════════════
 
+// ── Generate mask key ───────────────────────────────────────────────
+
+fn gen_mask_key(should_mask: bool) -> [int; 4] !(Rng) {
+    if should_mask {
+        let r = Rng::random_bytes(4)
+        return [r[0], r[1], r[2], r[3]]
+    }
+    return [0, 0, 0, 0]
+}
+
+// ── Read exactly N bytes from TCP ───────────────────────────────────
+
+fn read_exact(tcp: TcpConn, n: int) -> [int] !(Net)
+  where n > 0
+{
+    let mut buf: [int] = []
+    while len(buf) < n {
+        let remaining = n - len(buf)
+        let chunk = Net::net_read(tcp, remaining)
+        if len(chunk) == 0 {
+            panic("WebSocket: connection closed while reading (expected " + to_string(n) + " bytes, got " + to_string(len(buf)) + ")")
+        }
+        buf = concat(buf, chunk)
+    }
+    return buf
+}
+
+// ── Read a single frame from TCP ────────────────────────────────────
+
+fn read_frame(tcp: TcpConn) -> WsFrame !(Net) {
+    // Step 1: Read first 2 bytes to determine frame structure
+    let header2 = read_exact(tcp, 2)
+
+    // Step 2: Read rest of header (extended length + mask key)
+    let total_header = frame_header_size(header2)
+    let full_header = if total_header > 2 {
+        let rest = read_exact(tcp, total_header - 2)
+        concat(header2, rest)
+    } else {
+        header2
+    }
+
+    // Step 3: Determine payload length
+    let len7 = full_header[1] & 0x7F
+    let payload_len = if len7 <= 125 {
+        len7
+    } else if len7 == 126 {
+        (full_header[2] << 8) | full_header[3]
+    } else {
+        let mut pl = 0
+        let mut i = 0
+        while i < 8 {
+            pl = (pl << 8) | full_header[2 + i]
+            i = i + 1
+        }
+        pl
+    }
+
+    // Step 4: Enforce payload size limit
+    if payload_len > MAX_FRAME_PAYLOAD {
+        panic("WebSocket: frame payload too large: " + to_string(payload_len))
+    }
+
+    // Step 5: Read payload
+    let payload_bytes = if payload_len > 0 {
+        read_exact(tcp, payload_len)
+    } else {
+        []
+    }
+
+    // Step 6: Decode the complete frame
+    let frame_data = concat(full_header, payload_bytes)
+    return decode_frame(frame_data)
+}
+
 // ── Client connect ──────────────────────────────────────────────────
 
-@intent(description: "Connect to WebSocket server: TCP + HTTP upgrade handshake")
+@intent(description: "Connect to WebSocket server: TCP + HTTP upgrade handshake + validation")
 fn ws_connect(url: str) -> WsConn !(Net, Rng) {
     let parsed = parse_ws_url(url)
     match parsed {
         WsUrl::Parsed { host, port, path, is_tls } => {
-            // NOTE: TLS requires std_tls wrapping (see std_tls.hexa)
-            // For ws:// this works directly; for wss:// caller must wrap with tls_connect
+            // NOTE: wss:// requires TLS wrapping — caller must use std_tls.tls_connect first
+            // For ws:// this works directly over TCP
+            if is_tls {
+                panic("wss:// requires TLS — use ws_connect_tls() or wrap with std_tls")
+            }
+
             let tcp = Net::net_connect(host, port)
 
             // Generate random 16 bytes for Sec-WebSocket-Key
@@ -346,19 +587,22 @@ fn ws_connect(url: str) -> WsConn !(Net, Rng) {
             let request = build_upgrade_request(host, path, sec_key)
             Net::net_write(tcp, str_to_bytes(request))
 
-            // Read upgrade response (read up to 4 KB for headers)
+            // Read upgrade response (up to 4 KB for headers)
             let response_bytes = Net::net_read(tcp, 4096)
             let response = bytes_to_str(response_bytes)
 
+            // Validate: must be HTTP 101 with correct Sec-WebSocket-Accept
             if !validate_upgrade_response(response, expected_accept) {
                 Net::net_close(tcp)
-                panic("WebSocket handshake failed: invalid server response")
+                panic("WebSocket handshake failed: server response invalid.\nExpected accept: " + expected_accept + "\nGot: " + response)
             }
 
             return WsConn {
                 tcp: tcp,
                 is_server: false,
-                closed: false
+                closed: false,
+                fragment_opcode: 0,
+                fragment_buffer: []
             }
         }
     }
@@ -366,7 +610,7 @@ fn ws_connect(url: str) -> WsConn !(Net, Rng) {
 
 // ── Server accept ───────────────────────────────────────────────────
 
-@intent(description: "Accept incoming WebSocket connection: read client upgrade + respond 101")
+@intent(description: "Accept incoming WebSocket connection: validate upgrade request + send 101")
 fn ws_accept(listener: TcpListener) -> WsConn !(Net) {
     let tcp = Net::net_accept(listener)
 
@@ -374,15 +618,24 @@ fn ws_accept(listener: TcpListener) -> WsConn !(Net) {
     let request_bytes = Net::net_read(tcp, 4096)
     let request = bytes_to_str(request_bytes)
 
+    // Validate it is a proper WebSocket upgrade request
+    if !validate_upgrade_request(request) {
+        Net::net_close(tcp)
+        panic("WebSocket accept failed: not a valid upgrade request")
+    }
+
     let sec_key_opt = extract_sec_key(request)
     match sec_key_opt {
         Some(sec_key) => {
+            // Compute Sec-WebSocket-Accept = Base64(SHA1(key + GUID))
             let response = build_upgrade_response(sec_key)
             Net::net_write(tcp, str_to_bytes(response))
             return WsConn {
                 tcp: tcp,
                 is_server: true,
-                closed: false
+                closed: false,
+                fragment_opcode: 0,
+                fragment_buffer: []
             }
         },
         None => {
@@ -394,116 +647,196 @@ fn ws_accept(listener: TcpListener) -> WsConn !(Net) {
 
 // ── Send text message ───────────────────────────────────────────────
 
-@intent(description: "Send text message over WebSocket (client masks, server does not)")
+@intent(description: "Send UTF-8 text message over WebSocket")
 fn ws_send(conn: WsConn, msg: str) !(Net, Rng)
   where !conn.closed
 {
-    // RFC 6455: client->server frames MUST be masked; server->client MUST NOT
+    // RFC 6455: client->server MUST be masked; server->client MUST NOT be masked
     let should_mask = !conn.is_server
-    let mask_key = if should_mask {
-        let r = Rng::random_bytes(4)
-        [r[0], r[1], r[2], r[3]]
-    } else {
-        [0, 0, 0, 0]
-    }
+    let mask_key = gen_mask_key(should_mask)
 
     let frame_bytes = encode_text_frame(msg, should_mask, mask_key)
     Net::net_write(conn.tcp, frame_bytes)
 }
 
-// ── Receive message ─────────────────────────────────────────────────
+// ── Send binary message ─────────────────────────────────────────────
 
-@intent(description: "Receive next text message, handling ping/pong and close transparently")
-fn ws_recv(conn: WsConn) -> str !(Net, Rng)
+@intent(description: "Send binary data over WebSocket")
+fn ws_send_binary(conn: WsConn, data: [int]) !(Net, Rng)
+  where !conn.closed
+{
+    let should_mask = !conn.is_server
+    let mask_key = gen_mask_key(should_mask)
+
+    let frame_bytes = encode_binary_frame(data, should_mask, mask_key)
+    Net::net_write(conn.tcp, frame_bytes)
+}
+
+// ── Send ping ───────────────────────────────────────────────────────
+
+@intent(description: "Send ping frame (keepalive)")
+fn ws_ping(conn: WsConn, data: [int]) !(Net, Rng)
+  where !conn.closed && len(data) <= 125
+{
+    let should_mask = !conn.is_server
+    let mask_key = gen_mask_key(should_mask)
+
+    let frame_bytes = encode_ping_frame(data, should_mask, mask_key)
+    Net::net_write(conn.tcp, frame_bytes)
+}
+
+// ── Receive message (handles control frames transparently) ──────────
+
+@intent(description: "Receive next complete message, auto-handling ping/pong/continuation/close")
+fn ws_recv(conn: WsConn) -> WsMessage !(Net, Rng)
   where !conn.closed
 {
     loop {
-        // Read first 2 bytes to determine frame structure
-        let header2 = Net::net_read(conn.tcp, 2)
-        if len(header2) < 2 {
-            panic("WebSocket: connection closed unexpectedly")
-        }
+        let frame = read_frame(conn.tcp)
 
-        let total_header = frame_header_size(header2)
-        let rest_header = if total_header > 2 {
-            Net::net_read(conn.tcp, total_header - 2)
-        } else {
-            []
-        }
-
-        // Determine payload length from header
-        let full_header = concat(header2, rest_header)
-        let len7 = full_header[1] & 0x7F
-        let masked = (full_header[1] & 0x80) != 0
-        let mask_offset = if len7 == 126 { 4 } else if len7 == 127 { 10 } else { 2 }
-        let payload_len = if len7 <= 125 {
-            len7
-        } else if len7 == 126 {
-            (full_header[2] << 8) | full_header[3]
-        } else {
-            // 64-bit length — read from bytes 2..9
-            let mut pl = 0
-            let mut i = 0
-            while i < 8 {
-                pl = (pl << 8) | full_header[2 + i]
-                i = i + 1
-            }
-            pl
-        }
-
-        // Read payload
-        let payload_bytes = if payload_len > 0 {
-            Net::net_read(conn.tcp, payload_len)
-        } else {
-            []
-        }
-
-        let frame_data = concat(full_header, payload_bytes)
-        let frame = decode_frame(frame_data)
-
-        match frame.opcode {
-            OPCODE_TEXT => {
-                return frame_payload_as_text(frame)
-            },
-            OPCODE_PING => {
-                // Auto-respond with pong
-                let should_mask = !conn.is_server
-                let mask_key = if should_mask {
-                    let r = Rng::random_bytes(4)
-                    [r[0], r[1], r[2], r[3]]
-                } else {
-                    [0, 0, 0, 0]
+        // Handle control frames (MUST NOT be fragmented per RFC 6455)
+        if is_control_frame(frame.opcode) {
+            match frame.opcode {
+                OPCODE_PING => {
+                    // Auto-respond with pong containing the same payload
+                    let should_mask = !conn.is_server
+                    let mask_key = gen_mask_key(should_mask)
+                    let pong = encode_pong_frame(frame.payload, should_mask, mask_key)
+                    Net::net_write(conn.tcp, pong)
+                    continue
+                },
+                OPCODE_PONG => {
+                    // Pong received — ignore (it's a response to our ping)
+                    continue
+                },
+                OPCODE_CLOSE => {
+                    // Peer initiated close
+                    let (code, reason) = parse_close_payload(frame.payload)
+                    // Echo close frame back
+                    let should_mask = !conn.is_server
+                    let mask_key = gen_mask_key(should_mask)
+                    let close = encode_close_frame(code, should_mask, mask_key)
+                    Net::net_write(conn.tcp, close)
+                    Net::net_close(conn.tcp)
+                    panic("WebSocket closed by peer: code=" + to_string(code) + " reason=" + reason)
+                },
+                _ => {
+                    continue  // unknown control frame — skip
                 }
-                let pong = encode_pong_frame(frame.payload, should_mask, mask_key)
-                Net::net_write(conn.tcp, pong)
-                continue
-            },
-            OPCODE_CLOSE => {
-                panic("WebSocket: peer sent close frame")
-            },
-            _ => {
-                continue  // skip binary / continuation / pong
             }
+        }
+
+        // Handle data frames (text, binary, continuation)
+        if frame.opcode == OPCODE_CONTINUATION {
+            // Continuation of a fragmented message
+            if conn.fragment_opcode == 0 {
+                panic("WebSocket protocol error: continuation frame without initial fragment")
+            }
+
+            conn.fragment_buffer = concat(conn.fragment_buffer, frame.payload)
+
+            // Check assembled size limit
+            if len(conn.fragment_buffer) > MAX_MESSAGE_SIZE {
+                panic("WebSocket: assembled message exceeds size limit")
+            }
+
+            if frame.fin {
+                // Final fragment — assemble complete message
+                let msg = WsMessage {
+                    opcode: conn.fragment_opcode,
+                    payload: conn.fragment_buffer
+                }
+                conn.fragment_opcode = 0
+                conn.fragment_buffer = []
+                return msg
+            }
+            continue
+        }
+
+        // New data frame (text or binary)
+        if frame.fin {
+            // Complete single-frame message
+            return WsMessage {
+                opcode: frame.opcode,
+                payload: frame.payload
+            }
+        } else {
+            // First fragment of a multi-frame message
+            conn.fragment_opcode = frame.opcode
+            conn.fragment_buffer = frame.payload
+            continue
         }
     }
 }
 
-// ── Close connection ────────────────────────────────────────────────
+// ── Receive text message (convenience wrapper) ──────────────────────
 
-@intent(description: "Send close frame (1000 = normal) + TCP close")
-fn ws_close(conn: WsConn) !(Net, Rng)
+@intent(description: "Receive next text message as string")
+fn ws_recv_text(conn: WsConn) -> str !(Net, Rng)
   where !conn.closed
 {
+    let msg = ws_recv(conn)
+    return bytes_to_str(msg.payload)
+}
+
+// ── Close connection ────────────────────────────────────────────────
+
+@intent(description: "Initiate clean close: send close frame, wait for response, TCP close")
+fn ws_close(conn: WsConn) !(Net, Rng, Time)
+  where !conn.closed
+{
+    ws_close_with_code(conn, CLOSE_NORMAL, "")
+}
+
+@intent(description: "Close with specific code and reason")
+fn ws_close_with_code(conn: WsConn, code: int, reason: str) !(Net, Rng, Time)
+  where !conn.closed && code >= 1000 && code <= 4999
+{
     let should_mask = !conn.is_server
-    let mask_key = if should_mask {
-        let r = Rng::random_bytes(4)
-        [r[0], r[1], r[2], r[3]]
+    let mask_key = gen_mask_key(should_mask)
+
+    // Send close frame with code and optional reason
+    let close_frame = if len(reason) > 0 {
+        encode_close_frame_with_reason(code, reason, should_mask, mask_key)
     } else {
-        [0, 0, 0, 0]
+        encode_close_frame(code, should_mask, mask_key)
+    }
+    Net::net_write(conn.tcp, close_frame)
+
+    // Wait for close response (with timeout)
+    // Try to read peer's close frame, but don't block forever
+    let start = Time::timestamp()
+    loop {
+        let elapsed = Time::timestamp() - start
+        if elapsed > CLOSE_TIMEOUT_MS {
+            // Timeout waiting for close response — force close
+            break
+        }
+
+        let header2 = Net::net_read(conn.tcp, 2)
+        if len(header2) < 2 {
+            break  // connection already closed
+        }
+
+        let frame_opcode = header2[0] & 0x0F
+        if frame_opcode == OPCODE_CLOSE {
+            // Got close response — clean shutdown
+            break
+        }
+
+        // Drain any remaining data frames
+        let hdr_size = frame_header_size(header2)
+        if hdr_size > 2 {
+            Net::net_read(conn.tcp, hdr_size - 2)
+        }
+        let len7 = header2[1] & 0x7F
+        let plen = if len7 <= 125 { len7 } else if len7 == 126 { 65535 } else { 0 }
+        if plen > 0 {
+            Net::net_read(conn.tcp, plen)
+        }
     }
 
-    let close_frame = encode_close_frame(1000, should_mask, mask_key)
-    Net::net_write(conn.tcp, close_frame)
+    conn.closed = true
     Net::net_close(conn.tcp)
 }
 
@@ -527,6 +860,15 @@ verify "opcodes_in_range" {
     assert OPCODE_PONG   == 0x0A
 }
 
+verify "control_frame_detection" {
+    assert !is_control_frame(OPCODE_TEXT)
+    assert !is_control_frame(OPCODE_BINARY)
+    assert !is_control_frame(OPCODE_CONTINUATION)
+    assert is_control_frame(OPCODE_CLOSE)
+    assert is_control_frame(OPCODE_PING)
+    assert is_control_frame(OPCODE_PONG)
+}
+
 verify "frame_encoding_roundtrip" {
     let payload = [72, 101, 108, 108, 111]   // "Hello"
     let mask_key = [0x37, 0xFA, 0x21, 0x3D]
@@ -534,6 +876,16 @@ verify "frame_encoding_roundtrip" {
     let decoded = decode_frame(encoded)
     assert decoded.fin == true
     assert decoded.opcode == OPCODE_TEXT
+    assert decoded.payload == payload
+}
+
+verify "frame_encoding_unmasked_roundtrip" {
+    let payload = [72, 101, 108, 108, 111]   // "Hello"
+    let encoded = encode_frame(payload, OPCODE_TEXT, false, [0,0,0,0])
+    let decoded = decode_frame(encoded)
+    assert decoded.fin == true
+    assert decoded.opcode == OPCODE_TEXT
+    assert decoded.masked == false
     assert decoded.payload == payload
 }
 
@@ -546,6 +898,16 @@ verify "close_frame_has_code" {
     // 1000 = 0x03E8 -> [3, 232]
     assert decoded.payload[0] == 3
     assert decoded.payload[1] == 232
+}
+
+verify "close_frame_with_reason" {
+    let mask_key = [0, 0, 0, 0]
+    let frame = encode_close_frame_with_reason(1001, "bye", false, mask_key)
+    let decoded = decode_frame(frame)
+    assert decoded.opcode == OPCODE_CLOSE
+    let (code, reason) = parse_close_payload(decoded.payload)
+    assert code == 1001
+    assert reason == "bye"
 }
 
 verify "unmasked_frame_small_payload" {
@@ -561,4 +923,88 @@ verify "accept_key_computation" {
     // RFC 6455 example: key "dGhlIHNhbXBsZSBub25jZQ==" -> accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
     let accept = compute_accept_key("dGhlIHNhbXBsZSBub25jZQ==")
     assert accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+}
+
+verify "url_parsing_ws" {
+    let parsed = parse_ws_url("ws://echo.example.com:8080/chat")
+    match parsed {
+        WsUrl::Parsed { host, port, path, is_tls } => {
+            assert host == "echo.example.com"
+            assert port == 8080
+            assert path == "/chat"
+            assert is_tls == false
+        }
+    }
+}
+
+verify "url_parsing_wss_default_port" {
+    let parsed = parse_ws_url("wss://secure.example.com/v1")
+    match parsed {
+        WsUrl::Parsed { host, port, path, is_tls } => {
+            assert host == "secure.example.com"
+            assert port == 443
+            assert path == "/v1"
+            assert is_tls == true
+        }
+    }
+}
+
+verify "url_parsing_default_path" {
+    let parsed = parse_ws_url("ws://localhost")
+    match parsed {
+        WsUrl::Parsed { host, port, path, is_tls } => {
+            assert host == "localhost"
+            assert port == 80
+            assert path == "/"
+        }
+    }
+}
+
+verify "validate_upgrade_request_checks" {
+    let good = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    assert validate_upgrade_request(good) == true
+
+    let bad = "POST / HTTP/1.1\r\nHost: x\r\n\r\n"
+    assert validate_upgrade_request(bad) == false
+}
+
+verify "frame_header_size_computation" {
+    // Small payload, unmasked: header = 2 bytes
+    assert frame_header_size([0x81, 0x05]) == 2
+    // Small payload, masked: header = 2 + 4 = 6
+    assert frame_header_size([0x81, 0x85]) == 6
+    // 126 extended, unmasked: 4 bytes
+    assert frame_header_size([0x81, 0x7E]) == 4
+    // 127 extended, unmasked: 10 bytes
+    assert frame_header_size([0x81, 0x7F]) == 10
+}
+
+verify "binary_frame_roundtrip" {
+    let data = [0xFF, 0x00, 0xAB, 0xCD]
+    let encoded = encode_binary_frame(data, false, [0,0,0,0])
+    let decoded = decode_frame(encoded)
+    assert decoded.opcode == OPCODE_BINARY
+    assert decoded.payload == data
+}
+
+verify "fin_bit_respects_parameter" {
+    let payload = [65]  // 'A'
+    let frame_fin = encode_frame_with_fin(payload, OPCODE_TEXT, false, [0,0,0,0], true)
+    let frame_nofin = encode_frame_with_fin(payload, OPCODE_TEXT, false, [0,0,0,0], false)
+    let decoded_fin = decode_frame(frame_fin)
+    let decoded_nofin = decode_frame(frame_nofin)
+    assert decoded_fin.fin == true
+    assert decoded_nofin.fin == false
+}
+
+verify "join_strs_formats" {
+    assert join_strs(["a", "b", "c"], ", ") == "a, b, c"
+    assert join_strs([], ", ") == ""
+    assert join_strs(["only"], "-") == "only"
+}
+
+verify "parse_close_empty_payload" {
+    let (code, reason) = parse_close_payload([])
+    assert code == CLOSE_NORMAL
+    assert reason == ""
 }
