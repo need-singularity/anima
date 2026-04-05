@@ -61,12 +61,16 @@ def _lazy_load_memory():
     except ImportError:
         logger.debug("text_to_vector not available")
 
-# Default checkpoint search paths (ordered by priority)
+# Default checkpoint search paths (ordered by priority: newest/largest first)
 _CHECKPOINT_PATHS = [
-    # Exact paths from requirements
+    # 14B v0.6 (latest, 50K steps, Qwen2.5-14B + PureField)
+    os.path.expanduser("~/Dev/anima/anima/checkpoints/animalm_14b_v06/final.pt"),
+    "/workspace/checkpoints/animalm_14b_v06/final.pt",
+    # 14B v0.5 (fallback)
+    os.path.expanduser("~/Dev/anima/anima/checkpoints/animalm_14b_v05/final.pt"),
+    # 7B (legacy fallback)
     os.path.expanduser("~/Dev/anima/anima/checkpoints/animalm_7b_final.pt"),
     "/workspace/checkpoints/animalm_7b_fresh/final.pt",
-    # Directory-based search (fallback)
 ]
 _CHECKPOINT_DIRS = [
     os.path.expanduser("~/Dev/anima/anima/checkpoints"),
@@ -129,6 +133,10 @@ class AnimaLMProvider:
             if not os.path.isdir(d):
                 continue
             for pattern in [
+                # Prefer larger/newer models first
+                "animalm_32b_*/final.pt",
+                "animalm_14b_*/final.pt",
+                "animalm_14b_*.pt",
                 "animalm_7b_*/final.pt",
                 "animalm_7b_*.pt",
                 "*/final.pt",
@@ -157,6 +165,17 @@ class AnimaLMProvider:
             return
 
         self._checkpoint_path = ckpt
+
+        # Auto-detect base model from checkpoint filename
+        if not self._base_model:
+            ckpt_lower = ckpt.lower()
+            if "32b" in ckpt_lower:
+                self._base_model = "Qwen/Qwen2.5-32B-Instruct"
+            elif "14b" in ckpt_lower:
+                self._base_model = "Qwen/Qwen2.5-14B-Instruct"
+            elif "7b" in ckpt_lower:
+                self._base_model = "mistralai/Mistral-7B-Instruct-v0.2"
+            logger.info("AnimaLM base auto-detected: %s", self._base_model)
 
         try:
             # Add animalm to path
