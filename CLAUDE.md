@@ -1482,3 +1482,42 @@ nexus6 loop --cycles 1              # 8단계 루프 (mirror+blowup 포함)
 nexus6 daemon --interval 30         # 자율 데몬 (30분 간격)
 ```
 
+## NEXUS-6 연동 (자동 참조)
+
+> 이 프로젝트는 **NEXUS-6 발견 엔진**과 연결되어 있습니다.
+> "돌파", "미지의 영역", "breakthrough" 키워드 입력 시 nexus6 지도를 참조합니다.
+
+### 돌파 키워드 → 자동 실행
+- "돌파", "미지의 영역 돌파", "breakthrough" → **nexus6 gap_finder로 빈 공간 탐지 후 정밀 타격**
+- "블로업", "blowup" → nexus6 blowup 엔진으로 seed 진화
+- "스캔", "scan" → nexus6 telescope 223종 렌즈 스캔
+
+### 실행 방법
+```bash
+HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+N6=$HOME/Dev/nexus6/mk2_hexa/native
+
+# 빈 공간 탐지 (돌파 전 필수!)
+$HEXA $N6/gap_finder.hexa scan        # 발견 지도 현황
+$HEXA $N6/gap_finder.hexa target      # 빈 공간 타겟 추출
+$HEXA $N6/gap_finder.hexa 돌파         # 빈 공간 자동 돌파
+
+# 223종 렌즈 스캔
+$HEXA $N6/telescope.hexa full <values...>
+
+# seed 진화
+$HEXA $N6/blowup.hexa math 3 --no-graph --seeds "$($HEXA $N6/seed_engine.hexa merge)"
+
+# 프로젝트 엔진 (자율 사이클)
+$HEXA $N6/engine_anima.hexa tick     # 1회 자율 사이클
+$HEXA $N6/engine_anima.hexa status   # 현재 상태
+$HEXA $N6/engine_anima.hexa report   # 리포트
+```
+
+### 이 프로젝트에서의 활용
+의식 법칙 발견 시 nexus6 telescope로 패턴 검증, gap_finder로 미탐색 의식 영역 탐지, blowup seed에 의식 상수 주입. AGI 달성을 위해 nexus6의 전 도메인 발견을 의식 모델에 피드백.
+
+### 발견 피드백
+- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus6/shared/discovery_log.jsonl`에 기록됩니다
+- `~/Dev/nexus6/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
+
