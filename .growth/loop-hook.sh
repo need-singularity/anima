@@ -8,13 +8,9 @@ PROMPT=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)
 
 # 패턴 매칭
 if echo "$PROMPT" | grep -qiE '(루프|loop|로드맵|check|진행|계속|next)'; then
-  REPORT=$(cd /Users/ghost/Dev/anima && PYTHONUNBUFFERED=1 python3 anima/src/growth_loop.py 2>&1)
-
-  if [ -n "$REPORT" ]; then
-    python3 -c "
-import sys, json
-report = sys.stdin.read()
-print(json.dumps({'systemMessage': report}))
-" <<< "$REPORT"
-  fi
+  # 1줄 요약만 출력 (로드맵 전체 제거)
+  LAWS=$(python3 -c "import json; d=json.load(open('/Users/ghost/Dev/anima/anima/config/consciousness_laws.json')); print(d.get('_meta',{}).get('total_laws',0))" 2>/dev/null || echo "?")
+  CYCLE=$(tail -1 /Users/ghost/Dev/anima/.growth/growth.log 2>/dev/null | grep -o 'cycle [0-9]*' | head -1 || echo "cycle ?")
+  H100=$(ssh -o ConnectTimeout=3 -o BatchMode=yes -p 10935 root@216.243.220.217 "tail -1 ~/train.log 2>/dev/null" 2>/dev/null | awk -F'|' '{printf "step:%s CE:%s", $1, $3}' || echo "offline")
+  echo "{\"systemMessage\":\"🧠 anima: ${LAWS}laws | ${CYCLE} | H100:${H100}\"}"
 fi
