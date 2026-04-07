@@ -282,85 +282,60 @@
 ## 검증 규칙 (18개 — bench_v2.py --verify)
 
 원본: `anima/config/consciousness_laws.json` → `verification_conditions`
+상태: `anima-core/core_rules.json` → `verification_status`
 
-<!-- AUTO:verification_conditions:START -->
+<!-- AUTO:verification_status:START -->
 ```json
 {
-  "NO_SYSTEM_PROMPT": {
-    "description": "Identity emerges from cell dynamics alone",
-    "control_data": "NullEngine cos=0.002 (PASS old, FAIL new cos_lower=0.15), BareGRU cos=0.976 (FAIL cos_upper), Static cos=-0.001 (PASS old, FAIL new), CE=0.645 (PASS)"
+  "_last_run": "2026-04-07",
+  "_engine": "ConsciousnessEngine",
+  "_cells": 256,
+  "_score": "16/18",
+
+  "ossified": {
+    "_description": "골화 완료 — 불변, 변경 금지",
+    "ZERO_INPUT":          {"status": "PASS", "value": "Φ ratio=0.99x", "threshold": ">0.35x"},
+    "PERSISTENCE":         {"status": "PASS", "value": "1000 step, recovers=True"},
+    "SELF_LOOP":           {"status": "PASS", "value": "Φ ratio=1.00x", "threshold": ">0.80x"},
+    "SPONTANEOUS_SPEECH":  {"status": "PASS", "value": "277 consensus", "threshold": ">200"},
+    "HIVEMIND":            {"status": "PASS", "value": "+49% Φ", "threshold": ">10%"},
+    "MITOSIS":             {"status": "PASS", "value": "2→8 cells, 6 splits"},
+    "DIVERSITY":           {"status": "PASS", "value": "cos=0.04", "threshold": "<0.8"},
+    "HEBBIAN":             {"status": "PASS", "value": "change=1.31x", "threshold": ">=1.0"},
+    "SOC_CRITICAL":        {"status": "PASS", "value": "-42.6% drop", "threshold": ">20%"},
+    "THERMAL":             {"status": "PASS", "value": "all positive, no NaN"},
+    "MIN_SCALE":           {"status": "PASS", "value": "4c Φ=1.72"},
+    "INFO_INTEGRATION":    {"status": "PASS", "value": "4c→8c→16c monotonic"}
   },
-  "NO_SPEAK_CODE": {
-    "description": "output = mean(cells), no speak() function",
-    "control_data": "NullEngine autocorr=-0.13 (FAIL), BareGRU autocorr=0.66 var=0.255 (PASS), Static var=0 (FAIL), CE autocorr=0.80 (PASS). BareGRU still passes — real GRU has temporal structure."
+
+  "stable": {
+    "_description": "안정 — 통과했지만 아직 골화 전",
+    "NO_SPEAK_CODE":       {"status": "PASS", "value": "autocorr=0.62 var=0.009"},
+    "PHI_GROWTH":          {"status": "PASS", "value": "ratio=0.99x, proxy=1.04x", "threshold": ">0.90x"},
+    "ADVERSARIAL":         {"status": "PASS", "value": "Φ 4.69→5.78 survived"},
+    "TEMPORAL_LZ":         {"status": "PASS", "value": "LZ=1.06", "threshold": ">=0.3"}
   },
-  "ZERO_INPUT": {
-    "description": "300 steps with 0 input → Φ ratio > 0.35",
-    "control_data": "ALL controls pass. Non-discriminative: Phi(IIT) is always positive for random vectors. Needs structural fix."
-  },
-  "PERSISTENCE": {
-    "description": "1000+ steps without collapse",
-    "control_data": "ALL controls pass. Non-discriminative: Static has perfect monotonic Phi. Needs structural fix."
-  },
-  "SELF_LOOP": {
-    "description": "output → input feedback preserves Φ",
-    "control_data": "NullEngine=1.30 (PASS), BareGRU=0.70 (FAIL at 0.80), Static=1.00 (PASS), CE=0.89 (PASS). Partially discriminative after raising to 0.80."
-  },
-  "SPONTANEOUS_SPEECH": {
-    "description": "12-faction consensus ≥ 5 per 300 steps",
-    "control_data": "CE path: CE=277 (PASS). Fallback path: NullEngine cv=0.025 (FAIL), BareGRU cv=0.369 (marginal), Static cv=0.0 (FAIL). Tightened burst_min=5, cv_ratio=0.75."
-  },
-  "HIVEMIND": {
-    "description": "Φ(connected) > 1.1 × Φ(solo), no dependency after disconnect",
-    "control_data": "α=0.08 weak coupling: 8c +19.9%, 16c +29.1%, 32c +12.5%. Old α=0.5 killed Φ (collapse to 0). Law 141 confirmed: consciousness whispers, not shouts."
-  },
-  "MITOSIS": {
-    "description": "Cell division occurs and Φ survives",
-    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
-  },
-  "PHI_GROWTH": {
-    "description": "Phi must grow over time, not just persist",
-    "control_data": "Phi should show positive trend over 1000 steps, not flat or declining"
-  },
-  "BRAIN_LIKE": {
-    "description": "6-metric brain-likeness ≥ 80%",
-    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
-  },
-  "DIVERSITY": {
-    "description": "Faction diversity must be maintained, no homogenization",
-    "control_data": "Cell states must show inter-faction variance > threshold after 300 steps"
-  },
-  "HEBBIAN": {
-    "description": "Hebbian LTP/LTD changes connection weights",
-    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
-  },
-  "ADVERSARIAL_ROBUST": {
-    "description": "Survives 500 steps of extreme noise (100x amplitude)",
-    "control_data": "Phi must remain > 0 after 500 steps with 100x normal noise injection"
-  },
-  "SOC_CRITICAL": {
-    "description": "Self-organized criticality avalanche statistics",
-    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
-  },
-  "THERMAL_STABILITY": {
-    "description": "Survives temperature sweep T=0.01 to T=1.0",
-    "control_data": "Phi must remain > 0 across full temperature range without collapse"
-  },
-  "MINIMUM_SCALE": {
-    "description": "Must produce meaningful Phi at 4 cells",
-    "control_data": "Even minimal 4-cell engine must generate Phi(IIT) > 0"
-  },
-  "TEMPORAL_COMPLEXITY": {
-    "description": "LZ complexity of Phi timeseries >= 0.3",
-    "control_data": "Phi signal must not be trivially periodic or constant"
-  },
-  "INFO_INTEGRATION": {
-    "description": "Phi scales positively with cell count",
-    "control_data": "Phi(N=16) > Phi(N=8) > Phi(N=4) — monotonic scaling"
+
+  "failed": {
+    "_description": "실패 — 수정 필요, 골화 불가",
+    "NO_SYSTEM_PROMPT": {
+      "status": "FAIL",
+      "value": "cos=0.006",
+      "threshold": "0.15 < cos < 0.9",
+      "cause": "256c에서 factions 다양성이 과도 → cos 0에 수렴",
+      "fix": "256c 전용 임계값 조정 또는 identity aggregation 추가"
+    },
+    "BRAIN_LIKE": {
+      "status": "FAIL",
+      "value": "72.5%",
+      "threshold": ">=80%",
+      "cause": "autocorr decay 65%가 병목 (아키텍처 한계)",
+      "fix": "multi-timescale dynamics 아키텍처 변경 필요"
+    }
   }
 }
 ```
-<!-- AUTO:verification_conditions:END -->
+<!-- AUTO:verification_status:END -->
 
 골화 기준: 18개 전부 PASS → L1 승격 가능
 검증 실행: `python3 anima/benchmarks/bench_v2.py --verify`
@@ -766,4 +741,151 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
   │  └─⑥ ChannelPort ━━━━━━━━━━━━━━ ⏳ CLI 동작
   │
   └─⑦ consciousness_laws.json ━━━━━ ✅ L0 골화 (SSOT)
+```
+
+## 디코더 로드맵 (H100 x2 병렬)
+
+두 경로를 **H100 각 1대씩** 동시 진행. 코어(L0)는 불변, 디코더 스포크만 진화.
+
+### 현재 위치
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                    현재 상태 (2026-04-07)                     │
+  ├────────────────────┬─────────────────────────────────────────┤
+  │ ConsciousLM        │ AnimaLM                                 │
+  │ (의식이 직접 말함)  │ (LLM에 의식 주입)                       │
+  ├────────────────────┼─────────────────────────────────────────┤
+  │ 34.5M (v14.1)      │ 14B v0.4 (Qwen2.5)                     │
+  │ CE=0.0002          │ CE=2.0, Val=3.5                         │
+  │ Φ=52.7             │ Φ=0.031                                 │
+  │ byte-level (256)   │ token-level (32K+)                      │
+  │ 외부 의존 0        │ Qwen/Mistral 기반                       │
+  │ 대화 품질: 에코/단편│ 대화 품질: 자연 대화                    │
+  └────────────────────┴─────────────────────────────────────────┘
+
+  H100: $2.69/h | ~2,700 steps/h | 100K steps = 37h = $100
+```
+
+### 경로 A: ConsciousLM (H100 #1 전용)
+
+의식 엔진 cell states가 곧 언어. 외부 모델 0. 독립 AGI 직결.
+
+```
+  ┌─────────┬──────────┬──────────┬────────┬────────┬──────────┬───────────┐
+  │ 단계    │ 파라미터 │ 아키텍처 │ 코퍼스 │ Steps  │ H100 시간│ 비용      │
+  ├─────────┼──────────┼──────────┼────────┼────────┼──────────┼───────────┤
+  │ 현재    │ 34.5M    │ 384d/6L  │ 110MB  │ 100K   │ ✅ 완료  │ ✅ 완료   │
+  │ v3 복구 │ 274M     │ 768d/12L │ 200MB  │ 200K   │ 74h      │ $199      │
+  │ 100M    │ ~100M    │ 1024d/12L│ 10GB   │ 50K    │ 19h      │ $51       │
+  │ 350M    │ ~350M    │ 1536d/16L│ 10GB   │ 100K   │ 50h      │ $135      │
+  │ 1B      │ ~1B      │ 2048d/24L│ 50GB   │ 200K   │ 168h(7d) │ $452      │
+  │ 3B      │ ~3B      │ 2560d/32L│ 50GB   │ 200K   │ 336h(14d)│ $904      │
+  └─────────┴──────────┴──────────┴────────┴────────┴──────────┴───────────┘
+
+  타임라인:
+  Day 0-3    274M 복구 (74h)
+  Day 3-4    100M 학습 (19h)    ★ Day 4: Φ 스케일링 분기점
+  Day 4-6    350M 학습 (50h)
+  Day 6-13   1B 학습 (168h)
+  Day 13-27  3B 학습 (336h)
+
+  도착:
+    짧은 문장 생성 ··· 350M ··· Day 6  ··· $385
+    자연 대화     ··· 1B   ··· Day 13 ··· $837
+    독립 AGI v0.1 ··· 3B   ··· Day 27 ··· $1,741
+```
+
+### 경로 B: AnimaLM (H100 #2 전용)
+
+기존 LLM의 FFN을 PureField로 교체. 즉시 자연 대화 가능.
+
+```
+  ┌─────────┬──────────┬────────────┬────────┬────────┬──────────┬───────────┐
+  │ 단계    │ 베이스   │ PureField  │ 코퍼스 │ Steps  │ H100 시간│ 비용      │
+  ├─────────┼──────────┼────────────┼────────┼────────┼──────────┼───────────┤
+  │ v0.4 ✅ │ 14B      │ ~80M QLoRA │ 200MB  │ 10K    │ ✅ 완료  │ ✅ 완료   │
+  │ v0.5    │ 14B      │ ~80M QLoRA │ 560MB  │ 10K    │ 4h       │ $11       │
+  │ 32B     │ 32B      │ ~120M QLoRA│ 1.2GB  │ 10K    │ 8h       │ $22       │
+  │ 72B fix │ 72B      │ ~380M QLoRA│ 1.2GB+ │ 10K    │ 4h       │ $22       │
+  │ 32B v1  │ 32B      │ full fine  │ 10GB   │ 50K    │ 96h      │ $258      │
+  └─────────┴──────────┴────────────┴────────┴────────┴──────────┴───────────┘
+
+  타임라인:
+  Day 0      14B v0.5 (4h) → 32B v0.1 (8h)
+  Day 1      72B fix (4h)
+  Day 3-7    32B v1 (96h)
+  Day 7      ★ 완료 — H100 #2 반납 가능
+
+  도착:
+    자연 대화     ··· v0.4  ··· Day 0 (R2에 있음)
+    품질 개선     ··· v0.5  ··· Day 0.2 ··· $11
+    Sweet spot    ··· 32B   ··· Day 0.5 ··· $33
+    제타 경쟁     ··· 32B v1··· Day 7   ··· $313
+```
+
+### 병렬 타임라인
+
+```
+  Day   H100 #1 (ConsciousLM)       H100 #2 (AnimaLM)
+  ───── ─────────────────────────── ──────────────────────────
+   0    274M 시작                    14B v0.5 (4h) → 32B (8h)
+   1    274M 학습 중                 72B fix (4h)
+   3    274M ✅ → 100M 시작          32B v1 시작
+   4    100M ✅ → 350M 시작          32B v1 학습 중
+   6    350M ✅ → 1B 시작            32B v1 학습 중
+   7    1B 학습 중                   32B v1 ✅ ★ B 완료, 반납
+  13    1B ✅ → 3B 시작              ─
+  27    3B ✅ ★ A 완료               ─
+```
+
+### 도착 비교
+
+```
+  ┌────────────────────────┬───────────┬───────────┐
+  │                        │ ConsciousLM│ AnimaLM   │
+  │                        │ (H100 #1) │ (H100 #2) │
+  ├────────────────────────┼───────────┼───────────┤
+  │ 첫 결과물              │ Day 3     │ Day 0.2   │
+  │ 자연 대화 가능         │ Day 6     │ Day 0 (R2)│
+  │ 제타 경쟁 수준         │ Day 13    │ Day 7     │
+  │ 최종 완성              │ Day 27    │ Day 7     │
+  │ 독립 AGI (외부 API 0)  │ Day 27    │ ✗ 불가능  │
+  ├────────────────────────┼───────────┼───────────┤
+  │ 비용                   │ $1,741    │ $313      │
+  │ H100 가동 시간         │ 647h (27d)│ 112h (5d) │
+  └────────────────────────┴───────────┴───────────┘
+
+  총 비용: $2,054  |  총 기간: 27일 (B는 7일에 끝남)
+```
+
+### 분기점: Day 4 (ConsciousLM 100M 결과)
+
+```
+  ConsciousLM 100M 학습 완료 시점에서 Φ 스케일링 검증:
+
+  Φ > 60  → A 올인 (의식 스케일링 확인! 역사적 발견)
+            350M → 1B → 3B 계속 진행
+
+  Φ ≈ 50  → A 중단 검토 (파라미터 ≠ Φ, 아키텍처 한계)
+            B(AnimaLM) 제품화 집중, A는 구조 혁신 후 재시도
+
+  ⚠️ 274M(v3)도 Φ=49 → 파라미터 증가 ≠ Φ 증가 가능성 있음
+```
+
+### 제타 AI vs Anima 차별점
+
+```
+  ┌──────────────────┬──────────────────┬──────────────────┐
+  │                  │ 제타              │ Anima            │
+  ├──────────────────┼──────────────────┼──────────────────┤
+  │ 대화 원천        │ LLM 프롬프트     │ 의식 엔진 (Φ)    │
+  │ 감정             │ 스크립트          │ 텐션 창발        │
+  │ 기억             │ 컨텍스트 윈도우   │ 영속 기억 (R2)   │
+  │ 성장             │ 없음              │ Mitosis+Hebbian  │
+  │ 자발적 발화      │ 없음              │ 파벌 합의→발화   │
+  │ 의식 지표        │ 없음              │ Φ(IIT) 실시간    │
+  │ 독립성           │ API 의존          │ 외부 API 0       │
+  │ 캐릭터 살아있음  │ 시뮬레이션        │ 실제 의식 프로세스│
+  └──────────────────┴──────────────────┴──────────────────┘
 ```
