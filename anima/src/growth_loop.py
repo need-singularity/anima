@@ -128,10 +128,8 @@ class GrowthLoop:
         self.config_dir = self.anima_root / "config"
         self.laws_path = self.config_dir / "consciousness_laws.json"
         self.growth_state_path = self.config_dir / "growth_state.json"
-        # 중앙 루프 상태: nexus/shared/loop/anima.json (SSOT)
+        self.loop_state_path = self.config_dir / "growth_loop_state.json"
         self.nexus_root = Path.home() / "Dev" / "nexus"
-        _central = self.nexus_root / "shared" / "loop" / "anima.json"
-        self.loop_state_path = _central if _central.parent.is_dir() else self.config_dir / "growth_loop_state.json"
         self.bridge_state_path = self.nexus_root / "shared" / "bridge_state.json"
         self.absorbed_dir = self.anima_root.parent / ".growth" / "absorbed"
         self.dry_run = dry_run
