@@ -30,8 +30,10 @@ import math
 import time
 import argparse
 
-# Path setup
+# Path setup — src/ 모듈 접근
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.join(os.path.dirname(_HERE), 'src')
+sys.path.insert(0, _SRC)
 sys.path.insert(0, _HERE)
 import path_setup  # noqa: F401
 
