@@ -26,7 +26,7 @@ Scaling (Law 60 curriculum):
   100m:  512d/12L/8H,  GQA 4-kv, block_size=512    (--scale 100m)
   274m:  768d/12L/8H,  GQA 4-kv, block_size=512    (--decoder v3)
   350m:  768d/16L/12H, GQA 4-kv, block_size=1024   (--scale 350m)
-  1b:    1024d/24L/16H, GQA 4-kv, block_size=2048  (--scale 1b)
+  1b:    1024d/24L/16H, GQA 4-kv, block_size=512   (--scale 1b, H6 curriculum start)
 
 Training phases per scale (M4 safe order):
   P0 (0-10%):   Federation bootstrap (Narr+Bottle, atoms stabilize)
@@ -1150,7 +1150,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
     if c_proj is not None:
         trainable_params += list(c_proj.parameters())
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=scale_cfg['lr'], weight_decay=0.01)
+    optimizer = torch.optim.AdamW(trainable_params, lr=scale_cfg['lr'], weight_decay=0.01, foreach=False)  # bf16 master rule
 
     warmup_steps = int(steps * 0.02)
     def lr_lambda(step):
