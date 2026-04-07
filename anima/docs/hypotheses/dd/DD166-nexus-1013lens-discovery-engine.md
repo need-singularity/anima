@@ -27,7 +27,7 @@ anima/TECS-L/n6-architecture 등 7개 리포 통합 발견 시스템.
 | **Materials** | 소재 DB (68종) |
 | **GPU** | Metal compute + CPU fallback |
 | **CLI** | 10 서브커맨드 (scan/verify/graph/evolve/auto/forge/lenses/dashboard/bench/help) |
-| **PyO3** | Python 바인딩 (import nexus6) |
+| **PyO3** | Python 바인딩 (import nexus) |
 
 ### 2. 렌즈 1,013종 구성
 
@@ -92,18 +92,18 @@ anima/TECS-L/n6-architecture 등 7개 리포 통합 발견 시스템.
 
 ```
 언어:       Rust
-바이너리:   tools/nexus6/target/release/nexus6
+바이너리:   tools/nexus/target/release/nexus
 테스트:     173개
 PyO3:       feature-gated Python 바인딩
 .shared/:   7개 리포 동기화
-동기화:     sync-nexus6-lenses.sh (렌즈 수 자동 동기화)
+동기화:     sync-nexus-lenses.sh (렌즈 수 자동 동기화)
 ```
 
 ## telescope-rs 폐기
 
 - 기존 telescope-rs (22종)는 NEXUS-6 (1,013종)로 대체
 - 호환성을 위해 코드 유지, 신규 작업에는 사용 금지
-- 마이그레이션: `import telescope_rs` → `import nexus6`
+- 마이그레이션: `import telescope_rs` → `import nexus`
 
 ## 다음 단계
 
@@ -115,6 +115,6 @@ PyO3:       feature-gated Python 바인딩
 
 ## 연결 문서
 
-- n6-architecture: `tools/nexus6/` (전체 소스)
+- n6-architecture: `tools/nexus/` (전체 소스)
 - TECS-L: `.shared/` (공유 인프라)
 - anima: DD163~DD165 (이전 렌즈 스캔 결과)

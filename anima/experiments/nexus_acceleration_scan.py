@@ -6,10 +6,10 @@ Scans all 400 acceleration hypotheses (63 existing + 337 new) through
 the NEXUS-6 discovery engine (1013 lenses) via subprocess CLI calls.
 
 Usage:
-    python3 nexus6_acceleration_scan.py [--dry-run] [--parallel N]
+    python3 nexus_acceleration_scan.py [--dry-run] [--parallel N]
 
 Output:
-    anima/data/nexus6_1013lens_acceleration_results.json
+    anima/data/nexus_1013lens_acceleration_results.json
 """
 
 import json
@@ -27,10 +27,10 @@ from typing import Any, Dict, List, Optional, Tuple
 ANIMA_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_JSON = ANIMA_ROOT / "config" / "acceleration_hypotheses.json"
 BRAINSTORM_MD = ANIMA_ROOT / "docs" / "hypotheses" / "accel" / "acceleration-brainstorm-402.md"
-OUTPUT_JSON = ANIMA_ROOT / "data" / "nexus6_1013lens_acceleration_results.json"
+OUTPUT_JSON = ANIMA_ROOT / "data" / "nexus_1013lens_acceleration_results.json"
 
-NEXUS6_DIR = Path.home() / "Dev" / "n6-architecture" / "tools" / "nexus6"
-NEXUS6_BIN = NEXUS6_DIR / "target" / "debug" / "nexus6"
+NEXUS_DIR = Path.home() / "Dev" / "n6-architecture" / "tools" / "nexus"
+NEXUS_BIN = NEXUS_DIR / "target" / "debug" / "nexus"
 CARGO_BIN = Path.home() / ".cargo" / "bin" / "cargo"
 
 # ── Domain Mapping ───────────────────────────────────────────────────────────
@@ -219,31 +219,31 @@ def parse_brainstorm_hypotheses() -> List[Dict[str, Any]]:
 
 
 # ── NEXUS-6 Build ────────────────────────────────────────────────────────────
-def ensure_nexus6_binary() -> str:
-    """Ensure nexus6 binary is built; return path."""
-    if NEXUS6_BIN.exists():
-        return str(NEXUS6_BIN)
+def ensure_nexus_binary() -> str:
+    """Ensure nexus binary is built; return path."""
+    if NEXUS_BIN.exists():
+        return str(NEXUS_BIN)
 
-    print("[BUILD] nexus6 binary not found, building...")
+    print("[BUILD] nexus binary not found, building...")
     result = subprocess.run(
         [str(CARGO_BIN), "build"],
-        cwd=str(NEXUS6_DIR),
+        cwd=str(NEXUS_DIR),
         capture_output=True,
         text=True,
         timeout=300,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to build nexus6:\n{result.stderr}")
-    print("[BUILD] nexus6 built successfully.")
-    return str(NEXUS6_BIN)
+        raise RuntimeError(f"Failed to build nexus:\n{result.stderr}")
+    print("[BUILD] nexus built successfully.")
+    return str(NEXUS_BIN)
 
 
 # ── NEXUS-6 CLI Calls ───────────────────────────────────────────────────────
-def run_nexus6(args: List[str], timeout: int = 60) -> Dict[str, Any]:
-    """Run nexus6 with given args and return structured result."""
+def run_nexus(args: List[str], timeout: int = 60) -> Dict[str, Any]:
+    """Run nexus with given args and return structured result."""
     try:
         result = subprocess.run(
-            [str(NEXUS6_BIN)] + args,
+            [str(NEXUS_BIN)] + args,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -265,7 +265,7 @@ def run_nexus6(args: List[str], timeout: int = 60) -> Dict[str, Any]:
         return {
             "success": False,
             "stdout": "",
-            "stderr": "nexus6 binary not found",
+            "stderr": "nexus binary not found",
             "returncode": -2,
         }
     except Exception as e:
@@ -283,13 +283,13 @@ def scan_hypothesis(hyp: Dict[str, Any]) -> Dict[str, Any]:
     domain = domain_for_category(hyp.get("category", ""))
 
     # 1. Scan
-    scan_result = run_nexus6(["scan", domain, "--full"])
+    scan_result = run_nexus(["scan", domain, "--full"])
 
     # 2. Verify (if numeric value extractable)
     verify_result: Optional[Dict[str, Any]] = None
     numeric_val = extract_numeric(hyp.get("expected", ""))
     if numeric_val is not None:
-        verify_result = run_nexus6(["verify", str(numeric_val)])
+        verify_result = run_nexus(["verify", str(numeric_val)])
 
     # Parse n6_match from scan output
     n6_match = False
@@ -387,13 +387,13 @@ def main() -> None:
     print(f"  Parallel:   {parallel}")
     print()
 
-    # 1. Ensure nexus6 binary
+    # 1. Ensure nexus binary
     if not dry_run:
-        nexus6_path = ensure_nexus6_binary()
-        print(f"[NEXUS-6] Binary: {nexus6_path}")
+        nexus_path = ensure_nexus_binary()
+        print(f"[NEXUS-6] Binary: {nexus_path}")
 
         # Get lens count
-        lens_info = run_nexus6(["lenses", "--count"])
+        lens_info = run_nexus(["lenses", "--count"])
         print(f"[NEXUS-6] Lens count: {lens_info.get('stdout', 'unknown')}")
     print()
 
@@ -423,7 +423,7 @@ def main() -> None:
         # Still save a skeleton output
         skeleton = {
             "scan_date": datetime.now().strftime("%Y-%m-%d"),
-            "nexus6_version": "0.1.0",
+            "nexus_version": "0.1.0",
             "total_lenses": 1013,
             "hypotheses_scanned": len(all_hypotheses),
             "dry_run": True,
@@ -506,7 +506,7 @@ def main() -> None:
     # 4. Save results
     output = {
         "scan_date": datetime.now().strftime("%Y-%m-%d"),
-        "nexus6_version": "0.1.0",
+        "nexus_version": "0.1.0",
         "total_lenses": 1013,
         "hypotheses_scanned": len(results),
         "scan_time_seconds": round(elapsed, 1),

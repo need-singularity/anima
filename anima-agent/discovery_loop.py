@@ -87,7 +87,7 @@ class DiscoveryLoop:
         # Lazy imports
         self._scanner = None
         self._guardian = None
-        self._nexus6 = None
+        self._nexus = None
 
     @property
     def scanner(self):
@@ -104,14 +104,14 @@ class DiscoveryLoop:
         return self._guardian
 
     @property
-    def nexus6(self):
-        if self._nexus6 is None:
+    def nexus(self):
+        if self._nexus is None:
             try:
-                import nexus6
-                self._nexus6 = nexus6
+                import nexus
+                self._nexus = nexus
             except ImportError:
                 pass
-        return self._nexus6
+        return self._nexus
 
     # ═══════════════════════════════════════════════════════════
     # Main cycle
@@ -130,7 +130,7 @@ class DiscoveryLoop:
         report.discoveries.extend(sim_discoveries)
 
         # ② NEXUS-6 scan → consensus patterns
-        n6_discoveries, n6_info = self._phase_nexus6_scan()
+        n6_discoveries, n6_info = self._phase_nexus_scan()
         report.discoveries.extend(n6_discoveries)
         report.n6_active_lenses = n6_info.get("active", 0)
         report.n6_consensus = n6_info.get("consensus", 0)
@@ -266,12 +266,12 @@ class DiscoveryLoop:
 
         return discoveries
 
-    def _phase_nexus6_scan(self) -> tuple:
+    def _phase_nexus_scan(self) -> tuple:
         """② NEXUS-6 analysis of consciousness data."""
         discoveries = []
         info = {"active": 0, "consensus": 0}
 
-        if not self.nexus6:
+        if not self.nexus:
             return discoveries, info
 
         try:
@@ -292,7 +292,7 @@ class DiscoveryLoop:
 
             data = np.array(states, dtype=np.float32)
             flat = data.flatten().tolist()
-            result = self.nexus6.analyze(flat, data.shape[0], data.shape[1])
+            result = self.nexus.analyze(flat, data.shape[0], data.shape[1])
 
             scan = result["scan"]
             consensus = result.get("consensus", [])
@@ -310,11 +310,11 @@ class DiscoveryLoop:
                     val = float(values[0])
                     if val == 0:
                         continue
-                    m = self.nexus6.n6_check(val)
+                    m = self.nexus.n6_check(val)
                     d = m.to_dict()
                     if d["grade"] == "EXACT":
                         discoveries.append(Discovery(
-                            source="nexus6",
+                            source="nexus",
                             category="n6_match",
                             description=f"{lens_name}.{metric}={val:.4f} → {d['constant_name']} (EXACT)",
                             confidence=1.0,
@@ -325,7 +325,7 @@ class DiscoveryLoop:
             # Consensus patterns
             for c in consensus:
                 discoveries.append(Discovery(
-                    source="nexus6",
+                    source="nexus",
                     category="emergence",
                     description=f"Consensus: {c}",
                     confidence=0.7,

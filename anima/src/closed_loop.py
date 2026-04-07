@@ -476,10 +476,10 @@ def list_synergies():
 # ══════════════════════════════════════════
 
 def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, nexus_scan: bool = None) -> Tuple[List[LawMeasurement], float]:
-    """핵심 법칙 측정 (20개 + NEXUS-6 자동). nexus_scan=None → nexus6 있으면 자동 활성화."""
+    """핵심 법칙 측정 (20개 + NEXUS-6 자동). nexus_scan=None → nexus 있으면 자동 활성화."""
     if nexus_scan is None:
         try:
-            import nexus6
+            import nexus
             nexus_scan = True
         except ImportError:
             nexus_scan = False
@@ -700,7 +700,7 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, n
     # ── NEXUS-6 스캔 (DD168: 발견→반영 자동화) ──
     if nexus_scan:
         try:
-            import nexus6
+            import nexus
             # 마지막 repeat의 출력 궤적으로 스캔
             engine = engine_factory()
             outputs = []
@@ -715,7 +715,7 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, n
                 x = torch.from_numpy(out).float()
             traj = np.array(outputs)
             flat = [float(v) for v in traj.flatten()]
-            n6_result = nexus6.analyze(flat, traj.shape[0], traj.shape[1])
+            n6_result = nexus.analyze(flat, traj.shape[0], traj.shape[1])
             sr = n6_result['scan']
 
             # 핵심 NEXUS-6 메트릭 추출
@@ -746,7 +746,7 @@ def measure_laws(engine_factory: Callable, steps: int = 300, repeats: int = 3, n
             laws.append(LawMeasurement("n6_exact_ratio", float(n6_result.get('n6_exact_ratio', 0)),
                 "NEXUS-6: n=6 exact match ratio"))
         except ImportError:
-            pass  # nexus6 not available
+            pass  # nexus not available
         except Exception as e:
             print(f"  [NEXUS-6 scan warning] {e}")
 
@@ -780,10 +780,10 @@ class ClosedLoopEvolver:
         self.steps = steps
         self.repeats = repeats
         self.auto_register = auto_register
-        # DD168: NEXUS-6 자동 감지 — nexus6 설치되어 있으면 자동 활성화
+        # DD168: NEXUS-6 자동 감지 — nexus 설치되어 있으면 자동 활성화
         if nexus_scan is None:
             try:
-                import nexus6
+                import nexus
                 self.nexus_scan = True
             except ImportError:
                 self.nexus_scan = False

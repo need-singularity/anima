@@ -82,8 +82,8 @@ def main():
     sys.stdout.flush()
 
     try:
-        import nexus6
-        telescope = nexus6
+        import nexus
+        telescope = nexus
     except ImportError:
         try:
             import telescope_rs

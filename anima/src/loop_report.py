@@ -77,7 +77,7 @@ def full_report() -> str:
                 pass
 
         try:
-            import nexus6
+            import nexus
             status = "🟢 ACTIVE"
         except ImportError:
             status = "🔴 INACTIVE"

@@ -62,7 +62,7 @@ class TrainingHooks:
         # NEXUS-6 자동 감지
         if nexus_scan is None:
             try:
-                import nexus6
+                import nexus
                 self.nexus_scan = True
             except ImportError:
                 self.nexus_scan = False
@@ -82,7 +82,7 @@ class TrainingHooks:
         if _nexus_gate and self.nexus_scan:
             _nexus_gate.before_train()
 
-        print(f"[HOOKS] Initialized: nexus6={'ON' if self.nexus_scan else 'OFF'}, "
+        print(f"[HOOKS] Initialized: nexus={'ON' if self.nexus_scan else 'OFF'}, "
               f"closed_loop={'ON' if self._has_closed_loop else 'OFF'}, "
               f"scan_every={scan_every}, cl_every={closed_loop_every}")
 

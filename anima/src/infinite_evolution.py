@@ -90,7 +90,7 @@ except ImportError:
 
 HAS_TELESCOPE = False
 try:
-    import nexus6  # telescope-rs → nexus6 통합 (2026-04-04)
+    import nexus  # telescope-rs → nexus 통합 (2026-04-04)
     HAS_TELESCOPE = True
 except ImportError:
     pass
@@ -197,8 +197,8 @@ def _run_single_lens(lens_name, data, n_cells=64, steps=50):
     """Run a single telescope_rs lens scan. Returns dict or None on failure."""
     try:
         if lens_name == 'consciousness':
-            return nexus6.consciousness_scan(data, n_cells=n_cells, steps=steps)
-        scan_fn = getattr(nexus6, f'{lens_name}_scan', None)
+            return nexus.consciousness_scan(data, n_cells=n_cells, steps=steps)
+        scan_fn = getattr(nexus, f'{lens_name}_scan', None)
         if scan_fn is None:
             return None
         return scan_fn(data)
@@ -4373,7 +4373,7 @@ def register_law(pattern: dict, evolver):
 
         # DD168: 법칙 등록 후 NEXUS-6 자동 스캔
         try:
-            import nexus6
+            import nexus
             if hasattr(evolver, '_base_factory') and evolver._base_factory:
                 from closed_loop import measure_laws
                 laws_after, phi_after = measure_laws(evolver._base_factory, steps=100, repeats=1, nexus_scan=True)

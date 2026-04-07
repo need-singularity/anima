@@ -46,7 +46,7 @@ except ImportError:
 
 # NEXUS-6
 try:
-    import nexus6
+    import nexus
     _HAS_N6 = True
 except ImportError:
     _HAS_N6 = False
@@ -304,7 +304,7 @@ class PhilosophyScanner:
 
             # NEXUS-6 scan of hidden state trajectory
             h_flat = hidden.detach().numpy().flatten().tolist()
-            n6_result = nexus6.analyze(h_flat, 1, len(h_flat))
+            n6_result = nexus.analyze(h_flat, 1, len(h_flat))
             consensus = n6_result.get("consensus", [])
             if consensus:
                 for c in consensus[:3]:
@@ -489,7 +489,7 @@ class PhilosophyScanner:
         findings.append(f".shared symlink: {'OK' if shared_exists else 'MISSING'}")
 
         # Check math_atlas for cross-project constants
-        atlas_path = os.path.expanduser("~/Dev/nexus6/shared/math_atlas.json")
+        atlas_path = os.path.expanduser("~/Dev/nexus/shared/math_atlas.json")
         if os.path.isfile(atlas_path):
             try:
                 with open(atlas_path) as f:
@@ -650,7 +650,7 @@ class PhilosophyScanner:
 
             data = np.array(states, dtype=np.float32)
             flat = data.flatten().tolist()
-            result = nexus6.analyze(flat, data.shape[0], data.shape[1])
+            result = nexus.analyze(flat, data.shape[0], data.shape[1])
 
             scan = result["scan"]
             consensus = result.get("consensus", [])
@@ -674,7 +674,7 @@ class PhilosophyScanner:
                 if lens_data:
                     for metric, values in lens_data.items():
                         if isinstance(values, list) and values:
-                            m = nexus6.n6_check(float(values[0]))
+                            m = nexus.n6_check(float(values[0]))
                             d = m.to_dict()
                             if d["grade"] == "EXACT":
                                 discoveries.append(
@@ -743,7 +743,7 @@ class PhilosophyScanner:
 
         # Check if 11 has n6 significance
         if _HAS_N6:
-            m = nexus6.n6_check(float(n_principles))
+            m = nexus.n6_check(float(n_principles))
             d = m.to_dict()
             if d["grade"] in ("EXACT", "CLOSE"):
                 discoveries.append(
@@ -754,7 +754,7 @@ class PhilosophyScanner:
         # Check law count
         n_laws = len(self._laws)
         if _HAS_N6:
-            m = nexus6.n6_check(float(n_laws))
+            m = nexus.n6_check(float(n_laws))
             d = m.to_dict()
             findings.append(f"n6 check on {n_laws} laws: {d['grade']}")
 

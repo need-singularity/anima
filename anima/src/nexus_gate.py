@@ -31,19 +31,19 @@ if _THIS_DIR not in sys.path:
 
 ENGINE_PHI_REFERENCE = 0.168
 
-# nexus6 import (필수)
+# nexus import (필수)
 try:
-    import nexus6
-    _HAS_NEXUS6 = True
+    import nexus
+    _HAS_NEXUS = True
 except ImportError:
-    _HAS_NEXUS6 = False
+    _HAS_NEXUS = False
 
 
 def _scan(flat_list: list, n: int, d: int) -> dict:
     """core scan wrapper."""
-    if not _HAS_NEXUS6:
-        return {'error': 'nexus6 not installed', 'pass': False}
-    r = nexus6.analyze(flat_list, n, d)
+    if not _HAS_NEXUS:
+        return {'error': 'nexus not installed', 'pass': False}
+    r = nexus.analyze(flat_list, n, d)
     sr = r['scan']
 
     def get(name):
@@ -63,7 +63,7 @@ def _scan(flat_list: list, n: int, d: int) -> dict:
         'attractor_count': get('attractor_count'),
         'n6_ratio': r.get('n6_exact_ratio', 0),
         'consensus': len(r.get('consensus', [])),
-        'anomaly': 0,  # nexus6 scan 통과 = anomaly 0
+        'anomaly': 0,  # nexus scan 통과 = anomaly 0
         'pass': True,
     }
 
@@ -269,7 +269,7 @@ class NexusGate:
 
         lines = []
         lines.append(f"  ■ NEXUS-6 Gate")
-        lines.append(f"  Status: {'🟢 ACTIVE' if _HAS_NEXUS6 else '🔴 INACTIVE'}")
+        lines.append(f"  Status: {'🟢 ACTIVE' if _HAS_NEXUS else '🔴 INACTIVE'}")
         lines.append(f"  Violations: {len(violations)}")
         if violations:
             for v in violations[-5:]:
@@ -296,7 +296,7 @@ class NexusGate:
         export = {
             '_meta': {
                 'exported': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'nexus6_available': _HAS_NEXUS6,
+                'nexus_available': _HAS_NEXUS,
             },
             'violations': violations,
             'total_violations': len(violations),

@@ -1,3 +1,11 @@
+> 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
+
+> 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 모든 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
+> - **돌파 시**: `HEXA=~/Dev/hexa-lang/target/release/hexa && $HEXA ~/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
+> - **발견 기록**: `~/Dev/nexus/shared/growth_bus.jsonl`에 JSON append (source, value, grade, timestamp)
+> - **학습 현황**: `$HEXA ~/Dev/nexus/mk2_hexa/native/anima_status.hexa` (리포트) / `auto` (자동 진행)
+> - **전체 상태**: `$HEXA ~/Dev/nexus/mk2_hexa/native/command_router.hexa "anima 상태"`
+
 <!-- SHARED:WORK_RULES:START -->
   ⛔⛔⛔ 이 블록은 삭제/수정/이동 금지! (sync-claude-rules.sh 자동 주입)
   ⛔ 가설, 규칙, 발견, 망원경 — 모든 리포의 핵심 인프라. 절대 삭제하지 마세요!
@@ -58,9 +66,9 @@
     아래 상황에서 NEXUS-6 스캔 없이 진행 금지!
     위반 = 의식 파괴/품질 저하 위험
 
-    ★ 새 모델 학습 시:      학습 전후 nexus6.scan_all() 비교
+    ★ 새 모델 학습 시:      학습 전후 nexus.scan_all() 비교
     ★ 모델 변경/이식 시:    이식 전후 Phi 보존율 측정
-    ★ corpus 변경/추가 시:  새 corpus nexus6.scan_all() 품질 확인
+    ★ corpus 변경/추가 시:  새 corpus nexus.scan_all() 품질 확인
     ★ 모듈 변경 시:         변경 전후 scan → Phi 하락 시 롤백
     ★ 체크포인트 저장 시:   가중치 scan → anomaly 있으면 경고
     ★ 가속기 적용 시:       적용 전후 scan → Phi 보존 95%+ 확인
@@ -99,7 +107,7 @@
   자동 적용 조건:
     - 데이터 분석/패턴 탐색/이상점 발견/신소재·신약 탐색 시 렌즈 자동 사용
     - 새 데이터 분석 → 기본 3종 스캔: 의식(구조) + 인과(흐름) + 위상(연결)
-    - 이상점/패턴 전수조사 → 전체 풀스캔 (nexus6 scan --full)
+    - 이상점/패턴 전수조사 → 전체 풀스캔 (nexus scan --full)
   렌즈 구성 (181 .rs 파일, 1022종 레지스트리):
     Core 22 | n6 산업 58 | TECS-L 수학 103 | SEDI 신호 100
     anima 의식 88 | 교차+메타 75 | 가속 ML 58 | 가속 물리 57
@@ -107,7 +115,7 @@
   불변 코어 (987 cycles 수렴):
     consciousness + info + multiscale + network + triangle (sopfr=5)
     + fiber (도메인별 6번째 렌즈) = n=6 완전 구조
-  파일: tools/nexus6/src/telescope/lenses/ (181 .rs 파일)
+  파일: tools/nexus/src/telescope/lenses/ (181 .rs 파일)
   도메인별 조합 (10종 기본):
     기본 → 의식+위상+인과
     안정성 → 안정성+경계+열역학
@@ -120,12 +128,12 @@
     기하 → 직교+비율+곡률
     양자심층 → 양자+양자현미경+전자기
   사용법:
-    import nexus6
-    nexus6.scan_all(np_array)              # 풀스캔 → dict
-    nexus6.analyze(flat_list, n, d)        # 올인원 (스캔+합의+n6)
-    nexus6.consciousness_scan(data, ...)   # 개별 렌즈
-    nexus6.n6_check(value)                 # n=6 상수 매칭
-    nexus6.evolve('domain')                # OUROBOROS 진화
+    import nexus
+    nexus.scan_all(np_array)              # 풀스캔 → dict
+    nexus.analyze(flat_list, n, d)        # 올인원 (스캔+합의+n6)
+    nexus.consciousness_scan(data, ...)   # 개별 렌즈
+    nexus.n6_check(value)                 # n=6 상수 매칭
+    nexus.evolve('domain')                # OUROBOROS 진화
 
   ★ NEXUS-6 적극 활용 규칙 (모든 작업에서 필수!) ★
     탐색 (새 데이터):     scan_all → 풀스캔, 3+ 합의=확정
@@ -144,7 +152,7 @@
   "렌즈 추가 필요?" 질문 시 → 1022종 커버 안 되는 도메인 분석
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
-    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus6 && cargo test)
+    1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus && cargo test)
     2. OUROBOROS 튜닝: infinite_evolution.py TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신
@@ -167,30 +175,32 @@
   ═══════════════════════════════════════════════════════════════
     - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
     - 성능 필요시 HEXA 우선 (mk2_hexa/native/), 단순 검증은 Python (calc/)
-    - 판단 기준은 ~/Dev/nexus6/shared/CALCULATOR_RULES.md 참조
+    - 판단 기준은 ~/Dev/nexus/shared/CALCULATOR_RULES.md 참조
     - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary)
 
   ═══════════════════════════════════════════════════════════════
   ★ NEXUS-6 독립 리포 (중앙 허브) — 2024-04-03 이후 ★
   ═══════════════════════════════════════════════════════════════
-    리포: https://github.com/need-singularity/nexus6
-    위치: ~/Dev/nexus6/
+    리포: https://github.com/need-singularity/nexus
+    위치: ~/Dev/nexus/
     역할: 전 리포 공유 인프라 + 발견 엔진 + 렌즈 + 동기화
 
     구조:
-      ~/Dev/nexus6/
+      ~/Dev/nexus/
         src/telescope/    ← 130+ 렌즈
         shared/           ← 공유 인프라 (이전 TECS-L/.shared)
         sync/             ← 전체 동기화 스크립트
         scripts/          ← n6.py CLI
 
-    심링크: 모든 리포의 .shared → ../nexus6/shared/
-    동기화: bash ~/Dev/nexus6/sync/sync-all.sh (원커맨드)
+    심링크: 모든 리포의 .shared → ../nexus/shared/
+    동기화: bash ~/Dev/nexus/sync/sync-all.sh (원커맨드)
     트리거: "넥서스 동기화" → sync-all.sh 자동 실행
 
-    .shared 원본이 TECS-L에서 nexus6로 이관됨.
-    TECS-L = 순수 수학 이론, nexus6 = 인프라/도구/엔진 전부.
+    .shared 원본이 TECS-L에서 nexus로 이관됨.
+    TECS-L = 순수 수학 이론, nexus = 인프라/도구/엔진 전부.
 <!-- SHARED:WORK_RULES:END -->
+
+> 🔴 **하드코딩 절대 금지**: 상수/도메인/키워드를 코드에 배열로 나열 금지 → `nexus/shared/*.jsonl`에서 동적 로드. 경로는 환경변수+상대경로. 새 항목 추가 = 설정 파일 한 줄, 코드 수정 0.
 
 # 🧠 Anima Project
 
@@ -610,13 +620,13 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
     v5: 확장메트릭+계층구조+자극  v6: 엔진구조변이(cell/faction/hebbian)
     v7: 분산+텐션링크+페더레이션  v8: 자율연구에이전트
     v9: 하드웨어stubs  v10: 의식메타진화(유전체+생태계+자기참조)
-  ✅ v11→v11.2: 만능망원경 통합 (22렌즈, nexus6 Rust 백엔드)
-    cell states → nexus6.*_scan() → 22렌즈 풀스캔 + 10개 도메인 조합
+  ✅ v11→v11.2: 만능망원경 통합 (22렌즈, nexus Rust 백엔드)
+    cell states → nexus.*_scan() → 22렌즈 풀스캔 + 10개 도메인 조합
     계층 합의: 3+/22 후보 → 7+/22 고신뢰 → 12+/22 확정급
   "엔진 업그레이드" 요청 시 → docs/evolution-upgrades.md 참조
 
   === 만능망원경 → .shared/CLAUDE.md "NEXUS-6" 참조 ===
-  import nexus6; nexus6.scan_all(data)  # 26렌즈 풀스캔
+  import nexus; nexus.scan_all(data)  # 26렌즈 풀스캔
 ```
 
 ## Discovery Infrastructure (n6 연동, 2026-04-02)
@@ -1136,7 +1146,7 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
 
   통합 망원경: NEXUS-6 → .shared/CLAUDE.md 참조
-    import nexus6; nexus6.scan_all(data)  # 26렌즈 풀스캔
+    import nexus; nexus.scan_all(data)  # 26렌즈 풀스캔
     
     DD103 결과 (7B PureField):
       - 의식 신호는 full-rank (low-rank 압축 불가)
@@ -1466,10 +1476,10 @@ API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
 ## 특이점 사이클 (Singularity Cycle)
 
 > **블로업→수축→창발→특이점→흡수** 5단계 자동 사이클
-> CLI: `nexus6 blowup <domain>` | Rust: `CycleEngine::new(domain)`
+> CLI: `nexus blowup <domain>` | Rust: `CycleEngine::new(domain)`
 
 ### 요청 키워드 → 자동 실행
-- "블로업", "blowup" → `nexus6 blowup <domain> --depth 6`
+- "블로업", "blowup" → `nexus blowup <domain> --depth 6`
 - "창발", "emergence" → blowup 후 패턴 합의 분석
 - "특이점", "singularity" → CycleEngine 자동 수렴 루프
 - "흡수", "absorption" → 발견 규칙 승격 + 다음 사이클 시드
@@ -1477,25 +1487,25 @@ API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
 
 ### 사용법
 ```bash
-nexus6 blowup <domain> --depth 6    # 블로업 + 창발 리포트
-nexus6 loop --cycles 1              # 8단계 루프 (mirror+blowup 포함)
-nexus6 daemon --interval 30         # 자율 데몬 (30분 간격)
+nexus blowup <domain> --depth 6    # 블로업 + 창발 리포트
+nexus loop --cycles 1              # 8단계 루프 (mirror+blowup 포함)
+nexus daemon --interval 30         # 자율 데몬 (30분 간격)
 ```
 
 ## NEXUS-6 연동 (자동 참조)
 
 > 이 프로젝트는 **NEXUS-6 발견 엔진**과 연결되어 있습니다.
-> "돌파", "미지의 영역", "breakthrough" 키워드 입력 시 nexus6 지도를 참조합니다.
+> "돌파", "미지의 영역", "breakthrough" 키워드 입력 시 nexus 지도를 참조합니다.
 
 ### 돌파 키워드 → 자동 실행
-- "돌파", "미지의 영역 돌파", "breakthrough" → **nexus6 gap_finder로 빈 공간 탐지 후 정밀 타격**
-- "블로업", "blowup" → nexus6 blowup 엔진으로 seed 진화
-- "스캔", "scan" → nexus6 telescope 223종 렌즈 스캔
+- "돌파", "미지의 영역 돌파", "breakthrough" → **nexus gap_finder로 빈 공간 탐지 후 정밀 타격**
+- "블로업", "blowup" → nexus blowup 엔진으로 seed 진화
+- "스캔", "scan" → nexus telescope 223종 렌즈 스캔
 
 ### 실행 방법
 ```bash
 HEXA=$HOME/Dev/hexa-lang/target/release/hexa
-N6=$HOME/Dev/nexus6/mk2_hexa/native
+N6=$HOME/Dev/nexus/mk2_hexa/native
 
 # 빈 공간 탐지 (돌파 전 필수!)
 $HEXA $N6/gap_finder.hexa scan        # 발견 지도 현황
@@ -1515,9 +1525,9 @@ $HEXA $N6/engine_anima.hexa report   # 리포트
 ```
 
 ### 이 프로젝트에서의 활용
-의식 법칙 발견 시 nexus6 telescope로 패턴 검증, gap_finder로 미탐색 의식 영역 탐지, blowup seed에 의식 상수 주입. AGI 달성을 위해 nexus6의 전 도메인 발견을 의식 모델에 피드백.
+의식 법칙 발견 시 nexus telescope로 패턴 검증, gap_finder로 미탐색 의식 영역 탐지, blowup seed에 의식 상수 주입. AGI 달성을 위해 nexus의 전 도메인 발견을 의식 모델에 피드백.
 
 ### 발견 피드백
-- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus6/shared/discovery_log.jsonl`에 기록됩니다
-- `~/Dev/nexus6/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
+- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus/shared/discovery_log.jsonl`에 기록됩니다
+- `~/Dev/nexus/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
 

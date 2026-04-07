@@ -129,7 +129,7 @@ class GrowthLoop:
         self.laws_path = self.config_dir / "consciousness_laws.json"
         self.growth_state_path = self.config_dir / "growth_state.json"
         self.loop_state_path = self.config_dir / "growth_loop_state.json"
-        self.nexus_root = Path.home() / "Dev" / "nexus6"
+        self.nexus_root = Path.home() / "Dev" / "nexus"
         self.bridge_state_path = self.nexus_root / "shared" / "bridge_state.json"
         self.absorbed_dir = self.anima_root.parent / ".growth" / "absorbed"
         self.dry_run = dry_run
@@ -748,7 +748,7 @@ class GrowthLoop:
                     if any(k in text_lower for k in ['law', 'emergence']):
                         connections.append("consciousness_laws:new_law")
                     if any(k in text_lower for k in ['n=6', 'golden', 'fibonacci']):
-                        connections.append("nexus6:n6_constant")
+                        connections.append("nexus:n6_constant")
 
                     repo = jf.name.split("__")[0] if "__" in jf.name else "unknown"
                     conn_str = ",".join(connections[:3]) if connections else "unclassified"

@@ -7,7 +7,7 @@ MAX_CYCLES=${MAX_CYCLES:-${1:-999}}
 INTERVAL=${INTERVAL:-${2:-1800}}
 
 # 공통 라이브러리
-COMMON="$HOME/Dev/nexus6/scripts/lib/growth_common.sh"
+COMMON="$HOME/Dev/nexus/scripts/lib/growth_common.sh"
 source "$COMMON"
 
 # 프로젝트별 phases

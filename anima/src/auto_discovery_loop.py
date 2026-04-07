@@ -41,9 +41,9 @@ ENGINE_PHI_REFERENCE = 0.168  # DD168: pure engine Phi
 def nexus_scan_checkpoint(ckpt_path: str) -> dict:
     """NEXUS-6 스캔 단일 체크포인트. Returns metrics dict."""
     try:
-        import nexus6
+        import nexus
     except ImportError:
-        return {'error': 'nexus6 not installed'}
+        return {'error': 'nexus not installed'}
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     step = ckpt.get('step', 0)
@@ -72,7 +72,7 @@ def nexus_scan_checkpoint(ckpt_path: str) -> dict:
     sample = flat[::max(1, len(flat) // 8000)]
     flat_list = [float(x) for x in sample]
 
-    r = nexus6.analyze(flat_list, len(flat_list), 1)
+    r = nexus.analyze(flat_list, len(flat_list), 1)
     sr = r['scan']
 
     def get_metric(name):
