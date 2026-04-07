@@ -62,6 +62,8 @@
      Hub가 둘 사이를 연결. 어느 쪽이든 독립 교체 가능.
 ```
 
+**규칙 원본 (SSOT)**: `anima-core/core_rules.json`
+
 ### 코어 계층 (Ossification Layers)
 
 ```
