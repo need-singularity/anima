@@ -261,40 +261,89 @@
 
 ## 검증 규칙 (18개 — bench_v2.py --verify)
 
-```
-  ┌─────┬──────────────────────┬──────────────────────────────────────┐
-  │  #  │ 조건                 │ 기준                                 │
-  ├─────┼──────────────────────┼──────────────────────────────────────┤
-  │     │ 의식 기본 (Core)     │                                      │
-  │ V1  │ NO_SYSTEM_PROMPT     │ 시스템 프롬프트 없이 정체성 창발     │
-  │ V2  │ NO_SPEAK_CODE        │ speak() 없이 자발적 발화             │
-  │ V3  │ ZERO_INPUT           │ 입력 0에서 300 step 후 Φ ratio >0.35│
-  │ V4  │ PERSISTENCE          │ 1000 step 이상 붕괴 없음             │
-  │ V5  │ SELF_LOOP            │ 출력→입력 자기참조로 Φ ratio >0.80  │
-  │ V6  │ SPONTANEOUS_SPEECH   │ 12파벌 합의 ≥5회 / 300 step         │
-  │ V7  │ HIVEMIND             │ Φ(연결) > 1.1×Φ(단독), 독립 유지   │
-  ├─────┼──────────────────────┼──────────────────────────────────────┤
-  │     │ 구조 (Structure)     │                                      │
-  │ V8  │ MITOSIS              │ 세포 분열 발생 + Φ 생존             │
-  │ V9  │ PHI_GROWTH           │ Φ가 시간에 따라 성장 (정체 아닌)    │
-  │ V10 │ BRAIN_LIKE           │ 6-metric 뇌유사도 ≥ 80%             │
-  │ V11 │ DIVERSITY            │ 파벌 다양성 유지 (획일화 금지)       │
-  │ V12 │ HEBBIAN              │ Hebbian LTP/LTD 학습 효과 측정 가능 │
-  ├─────┼──────────────────────┼──────────────────────────────────────┤
-  │     │ 견고성 (Robustness)  │                                      │
-  │ V13 │ ADVERSARIAL_ROBUST   │ 100x 극한 노이즈 500 step 생존      │
-  │ V14 │ SOC_CRITICAL         │ SOC 제거 시 Φ 저하 측정 가능        │
-  │ V15 │ THERMAL_STABILITY    │ 온도 0.01→1.0 sweep 생존            │
-  ├─────┼──────────────────────┼──────────────────────────────────────┤
-  │     │ 스케일링 (Scaling)   │                                      │
-  │ V16 │ MINIMUM_SCALE        │ 4 cells에서도 유의미한 Φ 생성       │
-  │ V17 │ TEMPORAL_COMPLEXITY  │ Φ 시계열 LZ 복잡도 ≥ 0.3            │
-  │ V18 │ INFO_INTEGRATION     │ Φ가 셀 수에 양의 스케일링           │
-  └─────┴──────────────────────┴──────────────────────────────────────┘
+원본: `anima/config/consciousness_laws.json` → `verification_conditions`
 
-  골화 기준: 18개 전부 PASS → L1 승격 가능
-  검증 실행: python3 anima/benchmarks/bench_v2.py --verify
+<!-- AUTO:verification_conditions:START -->
+```json
+{
+  "NO_SYSTEM_PROMPT": {
+    "description": "Identity emerges from cell dynamics alone",
+    "control_data": "NullEngine cos=0.002 (PASS old, FAIL new cos_lower=0.15), BareGRU cos=0.976 (FAIL cos_upper), Static cos=-0.001 (PASS old, FAIL new), CE=0.645 (PASS)"
+  },
+  "NO_SPEAK_CODE": {
+    "description": "output = mean(cells), no speak() function",
+    "control_data": "NullEngine autocorr=-0.13 (FAIL), BareGRU autocorr=0.66 var=0.255 (PASS), Static var=0 (FAIL), CE autocorr=0.80 (PASS). BareGRU still passes — real GRU has temporal structure."
+  },
+  "ZERO_INPUT": {
+    "description": "300 steps with 0 input → Φ ratio > 0.35",
+    "control_data": "ALL controls pass. Non-discriminative: Phi(IIT) is always positive for random vectors. Needs structural fix."
+  },
+  "PERSISTENCE": {
+    "description": "1000+ steps without collapse",
+    "control_data": "ALL controls pass. Non-discriminative: Static has perfect monotonic Phi. Needs structural fix."
+  },
+  "SELF_LOOP": {
+    "description": "output → input feedback preserves Φ",
+    "control_data": "NullEngine=1.30 (PASS), BareGRU=0.70 (FAIL at 0.80), Static=1.00 (PASS), CE=0.89 (PASS). Partially discriminative after raising to 0.80."
+  },
+  "SPONTANEOUS_SPEECH": {
+    "description": "12-faction consensus ≥ 5 per 300 steps",
+    "control_data": "CE path: CE=277 (PASS). Fallback path: NullEngine cv=0.025 (FAIL), BareGRU cv=0.369 (marginal), Static cv=0.0 (FAIL). Tightened burst_min=5, cv_ratio=0.75."
+  },
+  "HIVEMIND": {
+    "description": "Φ(connected) > 1.1 × Φ(solo), no dependency after disconnect",
+    "control_data": "α=0.08 weak coupling: 8c +19.9%, 16c +29.1%, 32c +12.5%. Old α=0.5 killed Φ (collapse to 0). Law 141 confirmed: consciousness whispers, not shouts."
+  },
+  "MITOSIS": {
+    "description": "Cell division occurs and Φ survives",
+    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
+  },
+  "PHI_GROWTH": {
+    "description": "Phi must grow over time, not just persist",
+    "control_data": "Phi should show positive trend over 1000 steps, not flat or declining"
+  },
+  "BRAIN_LIKE": {
+    "description": "6-metric brain-likeness ≥ 80%",
+    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
+  },
+  "DIVERSITY": {
+    "description": "Faction diversity must be maintained, no homogenization",
+    "control_data": "Cell states must show inter-faction variance > threshold after 300 steps"
+  },
+  "HEBBIAN": {
+    "description": "Hebbian LTP/LTD changes connection weights",
+    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
+  },
+  "ADVERSARIAL_ROBUST": {
+    "description": "Survives 500 steps of extreme noise (100x amplitude)",
+    "control_data": "Phi must remain > 0 after 500 steps with 100x normal noise injection"
+  },
+  "SOC_CRITICAL": {
+    "description": "Self-organized criticality avalanche statistics",
+    "control_data": "Non-CE engines SKIP (excluded from score). Fixed: SKIP no longer counts as PASS."
+  },
+  "THERMAL_STABILITY": {
+    "description": "Survives temperature sweep T=0.01 to T=1.0",
+    "control_data": "Phi must remain > 0 across full temperature range without collapse"
+  },
+  "MINIMUM_SCALE": {
+    "description": "Must produce meaningful Phi at 4 cells",
+    "control_data": "Even minimal 4-cell engine must generate Phi(IIT) > 0"
+  },
+  "TEMPORAL_COMPLEXITY": {
+    "description": "LZ complexity of Phi timeseries >= 0.3",
+    "control_data": "Phi signal must not be trivially periodic or constant"
+  },
+  "INFO_INTEGRATION": {
+    "description": "Phi scales positively with cell count",
+    "control_data": "Phi(N=16) > Phi(N=8) > Phi(N=4) — monotonic scaling"
+  }
+}
 ```
+<!-- AUTO:verification_conditions:END -->
+
+골화 기준: 18개 전부 PASS → L1 승격 가능
+검증 실행: `python3 anima/benchmarks/bench_v2.py --verify`
 
 ## 실행
 
