@@ -1,0 +1,234 @@
+// serving/serve.hexa — AnimaLM serving with quantization + HTTP API
+// Source: models/animalm/serve_animalm_v2.py (256 LOC)
+// Phase 5: structural port. PyTorch tensor ops -> TODO comments.
+// CLI: hexa serving/serve.hexa start --checkpoint <path> --port 8080 --quantize 4bit
+
+// --- Hyperparameters (SSOT) ---
+comptime const DEFAULT_PORT         = 8080
+comptime const DEFAULT_QUANTIZE     = "4bit"    // 4bit | 8bit | bf16 | float16
+comptime const DEFAULT_MAX_TOKENS   = 256
+comptime const DEFAULT_TEMPERATURE  = 0.8
+comptime const DEFAULT_TOP_P        = 0.9
+comptime const DEFAULT_TOP_K        = 50
+comptime const DEFAULT_REP_PENALTY  = 1.2
+comptime const CONTEXT_WINDOW       = 512       // last N tokens fed to model
+comptime const FEW_SHOT_TEMPLATE    = "Q: What is 2+2?\nA: 4.\n\nQ: {PROMPT}\nA:"
+
+// --- Device detection ---
+struct DeviceInfo {
+    name: string,       // "cuda" | "mps" | "cpu"
+    has_cuda: bool,
+    has_mps: bool
+}
+
+fn detect_device(requested: string) -> DeviceInfo {
+    // TODO[pytorch]: torch.cuda.is_available(), torch.backends.mps.is_available()
+    // Auto-detect: cuda > mps > cpu
+    if requested != "auto" {
+        return DeviceInfo { name: requested, has_cuda: requested == "cuda", has_mps: requested == "mps" }
+    }
+    DeviceInfo { name: "auto", has_cuda: false, has_mps: false }
+}
+
+// --- Quantization config ---
+struct QuantConfig {
+    mode: string,       // "4bit" | "8bit" | "bf16" | "float16"
+    compute_dtype: string,
+    quant_type: string, // "nf4" for 4bit
+    double_quant: bool
+}
+
+fn quant_config_new(mode: string, device: string) -> QuantConfig {
+    // 4bit/8bit requires CUDA; fallback on non-CUDA
+    let effective = mode
+    if (mode == "4bit" || mode == "8bit") && device != "cuda" {
+        effective = if device == "mps" { "float16" } else { "bf16" }
+    }
+    QuantConfig {
+        mode: effective,
+        compute_dtype: "bfloat16",
+        quant_type: "nf4",
+        double_quant: true
+    }
+}
+
+// --- Base model resolution ---
+comptime const MODEL_CANDIDATES = [
+    "/workspace/models/mistral-7b-v0.1",
+    "/workspace/models/qwen2.5-14b",
+    "models/mistral-7b-v0.1",
+    "models/qwen2.5-14b"
+]
+comptime const FALLBACK_HF_MODEL = "mistralai/Mistral-7B-v0.1"
+
+fn resolve_base_model(explicit: string) -> string {
+    if explicit != "" { return explicit }
+    // TODO[runtime]: iterate MODEL_CANDIDATES, os.path.exists() check
+    // fallback: FALLBACK_HF_MODEL
+    FALLBACK_HF_MODEL
+}
+
+// --- PureField MLP (parallel repulsion field) ---
+struct PureFieldMLP {
+    hidden_size: int,
+    intermediate_size: int,
+    is_savant: bool,
+    rank: int
+}
+
+fn purefield_new(h: int, inter: int, is_savant: bool, rank: int) -> PureFieldMLP {
+    PureFieldMLP { hidden_size: h, intermediate_size: inter, is_savant: is_savant, rank: rank }
+}
+
+// --- Model + Tokenizer handle ---
+struct ServedModel {
+    base_path: string,
+    checkpoint_path: string,
+    quantize: string,
+    device: string,
+    target_layers: int,
+    savant_layers: int,
+    rank: int,
+    step: int,
+    loaded: bool
+}
+
+fn load_model_quantized(checkpoint_path: string, base_model: string,
+                        quantize: string, device: string) -> ServedModel {
+    let dev = detect_device(device)
+    let qcfg = quant_config_new(quantize, dev.name)
+    let base = resolve_base_model(base_model)
+
+    // TODO[pytorch]: AutoModelForCausalLM.from_pretrained(base, quantization_config=qcfg)
+    // TODO[pytorch]: AutoTokenizer.from_pretrained(base)
+    // TODO[pytorch]: torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    // TODO[pytorch]: read ckpt["args"]["target_layers"], savant_layers, qlora_rank
+    // TODO[pytorch]: for i in range(start, total_layers): replace layer.mlp with PureFieldMLP
+    // TODO[pytorch]: load pf_states into PureField layers
+    // TODO[pytorch]: cast PureField params to device + pf_dtype (float16 for mps, bfloat16 otherwise)
+    // TODO[pytorch]: print VRAM/MPS memory report
+    // TODO[pytorch]: model.eval()
+
+    ServedModel {
+        base_path: base,
+        checkpoint_path: checkpoint_path,
+        quantize: qcfg.mode,
+        device: dev.name,
+        target_layers: 8,
+        savant_layers: 2,
+        rank: 128,
+        step: 0,
+        loaded: true
+    }
+}
+
+// --- Generation (autoregressive sampling) ---
+struct GenerateParams {
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float
+}
+
+fn default_gen_params() -> GenerateParams {
+    GenerateParams {
+        max_new_tokens: DEFAULT_MAX_TOKENS,
+        temperature: DEFAULT_TEMPERATURE,
+        top_p: DEFAULT_TOP_P,
+        top_k: DEFAULT_TOP_K,
+        repetition_penalty: DEFAULT_REP_PENALTY
+    }
+}
+
+fn generate(model: ServedModel, prompt: string, params: GenerateParams) -> string {
+    // TODO[pytorch]: @torch.no_grad()
+    // TODO[pytorch]: input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    // TODO[pytorch]: generated = input_ids.clone()
+    // TODO[pytorch]: autocast(device_type, dtype) context
+    // TODO[pytorch]: for _ in range(max_new_tokens):
+    //   outputs = model(generated[:, -CONTEXT_WINDOW:])
+    //   logits = outputs.logits[:, -1, :]
+    //   repetition_penalty: divide logits for seen tokens
+    //   temperature scaling: logits / temperature
+    //   top_k filtering: zero out below threshold
+    //   softmax -> probs
+    //   top_p (nucleus) sampling: cumsum mask, renormalize, multinomial
+    //   append next_token; break on eos
+    // TODO[pytorch]: return tokenizer.decode(output_ids, skip_special_tokens=True)
+    "generated(" + prompt + ")"
+}
+
+// --- HTTP server ---
+struct ServerConfig {
+    host: string,
+    port: int
+}
+
+fn serve_http(model: ServedModel, port: int) -> void {
+    let cfg = ServerConfig { host: "0.0.0.0", port: port }
+    println("Serving on http://" + cfg.host + ":" + to_string(cfg.port))
+    println("  POST /  {\"prompt\": \"...\", \"max_tokens\": 256}")
+
+    // TODO[runtime]: HTTPServer loop
+    // POST handler:
+    //   parse JSON body: prompt, max_tokens, temperature, bare
+    //   if !bare: wrap prompt in FEW_SHOT_TEMPLATE
+    //   response = generate(model, prompt, params)
+    //   strip trailing "Q:" artifacts
+    //   return JSON {"response": response}
+    // GET handler:
+    //   return JSON {"status": "ok", "model": "AnimaLM"}
+}
+
+// --- Interactive REPL ---
+fn interactive(model: ServedModel) -> void {
+    println("\n=== AnimaLM Interactive (quantized) ===")
+    // TODO[runtime]: while true:
+    //   prompt = input("You: ").strip()
+    //   if quit/exit/q/eof: break
+    //   text = generate(model, prompt, default_gen_params())
+    //   println("Anima: " + text)
+}
+
+// --- CLI entry ---
+fn main(args: list) -> void {
+    // Expected: hexa serving/serve.hexa start --checkpoint <path> [--port N] [--quantize 4bit] [--device auto] [--interactive]
+    let checkpoint = arg_value(args, "--checkpoint", "")
+    let base = arg_value(args, "--base", "")
+    let quantize = arg_value(args, "--quantize", DEFAULT_QUANTIZE)
+    let port = to_int(arg_value(args, "--port", to_string(DEFAULT_PORT)))
+    let device = arg_value(args, "--device", "auto")
+    let is_interactive = arg_flag(args, "--interactive")
+
+    if checkpoint == "" {
+        println("ERROR: --checkpoint required")
+        println("Usage: hexa serving/serve.hexa start --checkpoint <path> --port 8080 --quantize 4bit")
+        return
+    }
+
+    let model = load_model_quantized(checkpoint, base, quantize, device)
+    println("Model loaded: " + model.base_path + " (" + model.quantize + ") on " + model.device)
+    println("  Step: " + to_string(model.step) + "  Layers: " + to_string(model.target_layers) + "/" + to_string(model.savant_layers))
+
+    if is_interactive {
+        interactive(model)
+    } else {
+        serve_http(model, port)
+    }
+}
+
+// --- Verification ---
+println("=== serve.hexa ===")
+println("port:", DEFAULT_PORT)
+println("quantize:", DEFAULT_QUANTIZE)
+println("context_window:", CONTEXT_WINDOW)
+println("top_k:", DEFAULT_TOP_K)
+println("top_p:", DEFAULT_TOP_P)
+
+theorem serve_invariants {
+    assert DEFAULT_PORT == 8080
+    assert CONTEXT_WINDOW == 512
+    assert DEFAULT_TOP_K == 50
+    assert DEFAULT_MAX_TOKENS == 256
+}
