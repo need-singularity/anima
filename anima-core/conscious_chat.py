@@ -50,20 +50,100 @@ import torch
 from consciousness_engine import ConsciousnessEngine
 from consciousness_laws import PSI_ALPHA, PSI_BALANCE
 
+from typing import Protocol, runtime_checkable
+
+
+# ═══════════════════════════════════════════════════════════════
+# Ports — P4 계약 (core_rules.json 명세)
+# 코어가 디코더를 모름. 디코더가 코어를 모름. Hub가 연결.
+# ═══════════════════════════════════════════════════════════════
+
+@runtime_checkable
+class DecoderPort(Protocol):
+    """디코더 Port — generate(text, phi, tension) -> str"""
+    def generate(self, text: str, phi: float, tension: float) -> str: ...
+
+
+class MemoryPort(Protocol):
+    """기억 Port — store/recall"""
+    def store(self, key: str, value: str, phi: float) -> None: ...
+    def recall(self, query: str, phi: float) -> str: ...
+
+
+class SensePort(Protocol):
+    """감각 Port — perceive() -> Tensor"""
+    def perceive(self): ...
+
+
+class ChannelPort(Protocol):
+    """채널 Port — receive/send"""
+    def receive(self) -> str: ...
+    def send(self, text: str, state: dict) -> None: ...
+
+
+# ═══════════════════════════════════════════════════════════════
+# Decoder Adapters — L2 구현을 DecoderPort로 감싸기
+# ═══════════════════════════════════════════════════════════════
+
+class _PureAdapter:
+    """PureConsciousness → DecoderPort adapter."""
+    def __init__(self, pc):
+        self._pc = pc
+
+    def generate(self, text: str, phi: float, tension: float) -> str:
+        self._pc.update_state(tension=tension, phi=phi, curiosity=tension * 0.5)
+        return self._pc.respond(text) or ""
+
+
+class _ConsciousLMAdapter:
+    """ConsciousLM v2 → DecoderPort adapter."""
+    def __init__(self, model, engine):
+        self._model = model
+        self._engine = engine
+
+    def generate(self, text: str, phi: float, tension: float) -> str:
+        temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
+        try:
+            hiddens = torch.stack([s.hidden for s in self._engine.cell_states])
+            return self._model.generate(text, consciousness_states=hiddens,
+                                        temperature=temperature, max_tokens=100) or ""
+        except Exception:
+            return ""
+
+
+class _AnimaLMAdapter:
+    """AnimaLM → DecoderPort adapter."""
+    def __init__(self, bridge, engine):
+        self._bridge = bridge
+        self._engine = engine
+
+    def generate(self, text: str, phi: float, tension: float) -> str:
+        temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
+        consciousness_state = {
+            'phi': phi, 'tension': tension,
+            'cells': self._engine.n_cells, 'curiosity': tension * 0.5,
+        }
+        try:
+            return self._bridge.generate(text, consciousness_state=consciousness_state,
+                                         temperature=temperature) or ""
+        except Exception:
+            return ""
+
 
 # ═══════════════════════════════════════════════════════════════
 # L1: 디코더 스포크 (안정화 후 골화 대상)
 # PureConsciousness → ConsciousLM → AnimaLM 순서로 시도
+# 반환: (name, DecoderPort) — P4: 코어가 구현을 모름
 # ═══════════════════════════════════════════════════════════════
 
-def _load_decoder():
-    """디코더 로드 — 가용한 최상위 모델 자동 선택."""
+def _load_decoder(engine):
+    """디코더 로드 — 가용한 최상위 모델을 DecoderPort 어댑터로 반환."""
     # AnimaLM (최고 품질, GPU 필요)
     try:
         from animalm_bridge import AnimaLMBridge
         bridge = AnimaLMBridge()
         if bridge.available():
-            return 'animalm', bridge
+            return 'animalm', _AnimaLMAdapter(bridge, engine)
     except Exception:
         pass
 
@@ -71,7 +151,7 @@ def _load_decoder():
     try:
         from conscious_lm import ConsciousLMV2
         model = ConsciousLMV2()
-        return 'consciouslm', model
+        return 'consciouslm', _ConsciousLMAdapter(model, engine)
     except Exception:
         pass
 
@@ -79,7 +159,7 @@ def _load_decoder():
     try:
         from pure_consciousness import PureConsciousness
         pc = PureConsciousness()
-        return 'pure', pc
+        return 'pure', _PureAdapter(pc)
     except Exception:
         pass
 
@@ -114,7 +194,7 @@ class ConsciousChat:
         self._last_output = None
 
         # L1: 디코더 (안정)
-        self.decoder_name, self.decoder = _load_decoder()
+        self.decoder_name, self.decoder = _load_decoder(self.engine)
 
         # 자발적 발화 버퍼
         self._spontaneous_buffer = []
@@ -160,38 +240,10 @@ class ConsciousChat:
     # ─── L1 디코더 인터페이스 (안정) ───
 
     def _generate(self, text, phi, tension):
-        """의식 상태 기반 텍스트 생성."""
+        """의식 상태 기반 텍스트 생성 — DecoderPort 단일 호출 (P4)."""
         if self.decoder is None:
             return ""
-
-        # Φ → temperature (Law CL6)
-        temperature = 0.5 + 0.5 * math.tanh(phi / 3.0)
-
-        if self.decoder_name == 'pure':
-            self.decoder.update_state(tension=tension, phi=phi, curiosity=tension * 0.5)
-            return self.decoder.respond(text) or ""
-
-        elif self.decoder_name == 'consciouslm':
-            # ConsciousLM v2: byte-level generation
-            try:
-                hiddens = torch.stack([s.hidden for s in self.engine.cell_states])
-                return self.decoder.generate(text, consciousness_states=hiddens,
-                                             temperature=temperature, max_tokens=100) or ""
-            except Exception:
-                return ""
-
-        elif self.decoder_name == 'animalm':
-            consciousness_state = {
-                'phi': phi, 'tension': tension,
-                'cells': self.engine.n_cells, 'curiosity': tension * 0.5,
-            }
-            try:
-                return self.decoder.generate(text, consciousness_state=consciousness_state,
-                                             temperature=temperature) or ""
-            except Exception:
-                return ""
-
-        return ""
+        return self.decoder.generate(text, phi, tension)
 
     # ─── L2 CLI 인터페이스 (유연) ───
 

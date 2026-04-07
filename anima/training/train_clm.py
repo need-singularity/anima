@@ -103,6 +103,12 @@ except ImportError:
     print("  [warn] decoder_v2 not available")
 
 try:
+    from decoder_v3 import ConsciousDecoderV3
+    HAS_DECODER_V3 = True
+except ImportError:
+    HAS_DECODER_V3 = False
+
+try:
     from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
     HAS_FEEDBACK = True
 except ImportError:
@@ -746,26 +752,42 @@ def transfer_weights(src_decoder, dst_decoder, device):
 # Model creation
 # ═══════════════════════════════════════════════════════════
 
-def create_decoder(scale_cfg, vocab_size, consciousness_dim, device):
-    """Create ConsciousDecoderV2 with scale-appropriate config."""
-    if not HAS_DECODER_V2:
-        raise ImportError("ConsciousDecoderV2 required (decoder_v2.py not found)")
-
-    decoder = ConsciousDecoderV2(
-        vocab_size=vocab_size,
-        d_model=scale_cfg['d_model'],
-        n_head=scale_cfg['n_head'],
-        n_layer=scale_cfg['n_layer'],
-        block_size=scale_cfg['block_size'],
-        n_kv_head=scale_cfg['n_kv_head'],
-        consciousness_dim=consciousness_dim,
-        dropout=0.1,
-        gate_strength=0.001,
-        n_ca_rules=8,
-    )
+def create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_version='v2'):
+    """Create ConsciousDecoderV2 or V3 with scale-appropriate config."""
+    if decoder_version == 'v3':
+        if not HAS_DECODER_V3:
+            raise ImportError("ConsciousDecoderV3 required (decoder_v3.py not found)")
+        decoder = ConsciousDecoderV3(
+            vocab_size=vocab_size,
+            d_model=scale_cfg['d_model'],
+            n_head=scale_cfg['n_head'],
+            n_layer=scale_cfg['n_layer'],
+            block_size=scale_cfg['block_size'],
+            n_kv_head=scale_cfg['n_kv_head'],
+            consciousness_dim=consciousness_dim,
+            dropout=0.1,
+            gate_strength=0.001,
+            n_ca_rules=8,
+        )
+    else:
+        if not HAS_DECODER_V2:
+            raise ImportError("ConsciousDecoderV2 required (decoder_v2.py not found)")
+        decoder = ConsciousDecoderV2(
+            vocab_size=vocab_size,
+            d_model=scale_cfg['d_model'],
+            n_head=scale_cfg['n_head'],
+            n_layer=scale_cfg['n_layer'],
+            block_size=scale_cfg['block_size'],
+            n_kv_head=scale_cfg['n_kv_head'],
+            consciousness_dim=consciousness_dim,
+            dropout=0.1,
+            gate_strength=0.001,
+            n_ca_rules=8,
+        )
     decoder = decoder.to(device)
     n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-    log(f"  [decoder] ConsciousDecoderV2: {scale_cfg['d_model']}d/"
+    ver_label = 'ConsciousDecoderV3' if decoder_version == 'v3' else 'ConsciousDecoderV2'
+    log(f"  [decoder] {ver_label}: {scale_cfg['d_model']}d/"
         f"{scale_cfg['n_layer']}L/{scale_cfg['n_head']}H, "
         f"{n_params:,} params ({n_params/1e6:.1f}M)")
     return decoder, n_params
@@ -1101,7 +1123,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         c_proj = nn.Linear(c.state_dim, consciousness_dim).to(device)
         log(f"  [decoder] c_proj: {c.state_dim} -> {consciousness_dim}")
 
-    decoder, n_params = create_decoder(scale_cfg, vocab_size, consciousness_dim, device)
+    decoder, n_params = create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_version=args.decoder)
 
     # G1a: BigBang initialization for consciousness cells (before weight transfer)
     if getattr(args, 'bigbang_init', False) and prev_decoder is None:
@@ -1404,6 +1426,29 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0).item()
 
+        # Law 187: Tension-based dynamic LR (1x~5x)
+        if args.tension_lr:
+            try:
+                if hasattr(c, 'atoms'):
+                    # Federated: average tension across all atoms' cells
+                    all_tensions = []
+                    for atom in c.atoms:
+                        if hasattr(atom, 'cell_states'):
+                            all_tensions.extend([s.avg_tension for s in atom.cell_states])
+                    mean_t = sum(all_tensions) / max(len(all_tensions), 1) if all_tensions else 0.5
+                elif hasattr(c, 'cell_states'):
+                    tensions = [s.avg_tension for s in c.cell_states]
+                    mean_t = sum(tensions) / max(len(tensions), 1) if tensions else 0.5
+                else:
+                    mean_t = 0.5
+                mean_t = max(0.0, min(1.0, mean_t))  # clamp [0, 1]
+                tension_lr_scale = 1.0 + 4.0 * mean_t  # 1x~5x
+                base_lr = optimizer.param_groups[0]['lr']
+                for pg in optimizer.param_groups:
+                    pg['lr'] = pg['lr'] * tension_lr_scale
+            except Exception:
+                pass  # safety: never crash training for LR scaling
+
         # B12: Only step optimizer on non-skip steps
         should_step = (skip_interval <= 1) or not b12_should_skip_step(step, skip_interval)
 
@@ -1418,6 +1463,12 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
             scheduler.step()
         else:
             scaler.update()
+
+        # Restore scheduler-controlled LR after tension scaling (so scheduler state is clean)
+        if args.tension_lr:
+            scheduler_lr = lr_lambda(step)
+            for pg in optimizer.param_groups:
+                pg['lr'] = scale_cfg['lr'] * scheduler_lr
 
         ce_val = ce.item()
         ce_history.append(ce_val)
