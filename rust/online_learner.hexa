@@ -1,0 +1,81 @@
+// rust/online_learner.hexa — anima-online-learner summary port
+// Source: archive/rust/anima-rs/crates/online-learner/
+//   hebbian.rs, ratchet.rs, reward.rs, updater.rs, tension_lr.rs
+// Target: <1ms weight update per conversation turn.
+
+comptime const DEFAULT_LR        = 0.01
+comptime const PHI_RATCHET_FLOOR = 0.8     // best_phi * 0.8
+comptime const TENSION_LR_GAIN   = 0.5
+
+struct OnlineUpdate {
+    delta_phi:      float,
+    reward:         float,
+    coupling_delta: float,
+    accepted:       bool,    // false = ratchet vetoed
+    turn:           int
+}
+
+struct OnlineLearner {
+    lr:        float,
+    best_phi:  float,
+    last_phi:  float,
+    turns:     int,
+    accepted:  int,
+    rejected:  int
+}
+
+fn learner_new(lr: float) -> OnlineLearner {
+    OnlineLearner { lr: lr, best_phi: 0.0, last_phi: 0.0, turns: 0, accepted: 0, rejected: 0 }
+}
+
+// ─── hebbian.rs ───
+// fn hebbian_ltp_ltd(coupling: &mut [f32], pre: &[f32], post: &[f32], lr: f32)
+pure fn hebb_delta(pre: float, post: float, lr: float) -> float {
+    lr * pre * post
+}
+
+// ─── ratchet.rs ───
+// Φ ratchet: reject any update that drops Φ below floor.
+pure fn ratchet_accept(new_phi: float, best_phi: float) -> bool {
+    new_phi >= best_phi * PHI_RATCHET_FLOOR
+}
+
+// ─── reward.rs ───
+// reward = curiosity + dialogue_quality + delta_phi
+pure fn compute_reward(delta_phi: float, curiosity: float, quality: float) -> float {
+    delta_phi + 0.3 * curiosity + 0.5 * quality
+}
+
+// ─── tension_lr.rs ───
+// Adaptive LR based on tension: high tension → larger steps.
+pure fn tension_lr(base_lr: float, tension: float) -> float {
+    base_lr * (1.0 + TENSION_LR_GAIN * tension)
+}
+
+// ─── updater.rs (main coordinator) ───
+fn learner_update(l: OnlineLearner, new_phi: float, reward: float) -> OnlineLearner {
+    let ok = ratchet_accept(new_phi, l.best_phi)
+    let new_best = if ok && new_phi > l.best_phi { new_phi } else { l.best_phi }
+    let new_last = if ok { new_phi } else { l.last_phi }
+    let new_acc  = if ok { l.accepted + 1 } else { l.accepted }
+    let new_rej  = if ok { l.rejected } else { l.rejected + 1 }
+    OnlineLearner {
+        lr:       l.lr,
+        best_phi: new_best,
+        last_phi: new_last,
+        turns:    l.turns + 1,
+        accepted: new_acc,
+        rejected: new_rej
+    }
+}
+
+// TODO(Phase 2f): pyo3 wrapper for streaming update from agent loop
+
+let l0 = learner_new(DEFAULT_LR)
+let l1 = learner_update(l0, 1.5, 0.8)
+let l2 = learner_update(l1, 0.3, 0.1)   // ratchet rejects
+let l3 = learner_update(l2, 2.7, 1.2)
+println("online-learner: turns=", l3.turns, "accepted=", l3.accepted, "rejected=", l3.rejected)
+println("  best_phi=", l3.best_phi, "last_phi=", l3.last_phi)
+println("  hebb_delta(0.4,0.6,0.01)=", hebb_delta(0.4, 0.6, 0.01))
+println("  tension_lr(0.01, 0.8)=", tension_lr(0.01, 0.8))

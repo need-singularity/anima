@@ -1,0 +1,70 @@
+// rust/vad_rs.hexa — vad-rs summary port
+// Source: archive/rust/vad-rs/src/main.rs
+//
+// Real-time Voice Activity Detection pipeline:
+//   Microphone → Ring Buffer → VAD → Speech Detector → WAV Writer
+//
+// Output: /tmp/anima_vad/segment_NNN.wav + /tmp/anima_vad/status.json
+
+comptime const FRAME_MS            = 30        // 30ms frames → <100ms latency
+comptime const ENERGY_THRESHOLD    = 0.015     // RMS energy
+comptime const ZCR_WEIGHT          = 0.3       // score = energy + ZCR_WEIGHT*zcr_norm
+comptime const SPEAK_FRAMES        = 3         // consecutive frames above threshold
+comptime const TRAIL_SILENCE_SECS  = 1.5       // silence to finalize segment
+comptime const PRE_SPEECH_FRAMES   = 5         // ring-buffer lookback before onset
+
+// ─── VAD state machine ───
+struct VadState {
+    state:           int,    // 0=Silence | 1=Speaking | 2=TrailSilence
+    speaking_frames: int,
+    silence_frames:  int,
+    segment_id:      int
+}
+
+fn vad_new() -> VadState {
+    VadState { state: 0, speaking_frames: 0, silence_frames: 0, segment_id: 0 }
+}
+
+// ─── Frame scoring ───
+pure fn frame_score(energy: float, zcr_norm: float) -> float {
+    energy + ZCR_WEIGHT * zcr_norm
+}
+
+pure fn is_speech(score: float) -> bool {
+    score >= ENERGY_THRESHOLD
+}
+
+// ─── State transitions ───
+fn vad_step(s: VadState, score: float) -> VadState {
+    let speech = is_speech(score)
+    if s.state == 0 {
+        // Silence → maybe Speaking
+        let new_sf = if speech { s.speaking_frames + 1 } else { 0 }
+        let new_state = if new_sf >= SPEAK_FRAMES { 1 } else { 0 }
+        VadState { state: new_state, speaking_frames: new_sf, silence_frames: 0, segment_id: s.segment_id }
+    } else if s.state == 1 {
+        // Speaking → maybe TrailSilence
+        let new_sl = if speech { 0 } else { s.silence_frames + 1 }
+        let new_state = if new_sl > 0 { 2 } else { 1 }
+        VadState { state: new_state, speaking_frames: s.speaking_frames, silence_frames: new_sl, segment_id: s.segment_id }
+    } else {
+        // TrailSilence → finalize or back to Speaking
+        let trail_limit = to_int(TRAIL_SILENCE_SECS * 1000.0 / to_float(FRAME_MS))
+        if speech {
+            VadState { state: 1, speaking_frames: s.speaking_frames, silence_frames: 0, segment_id: s.segment_id }
+        } else if s.silence_frames >= trail_limit {
+            VadState { state: 0, speaking_frames: 0, silence_frames: 0, segment_id: s.segment_id + 1 }
+        } else {
+            VadState { state: 2, speaking_frames: s.speaking_frames, silence_frames: s.silence_frames + 1, segment_id: s.segment_id }
+        }
+    }
+}
+
+// TODO: WAV writer + status.json + cpal microphone stream
+
+let v0 = vad_new()
+let v1 = vad_step(v0, 0.02)
+let v2 = vad_step(v1, 0.03)
+let v3 = vad_step(v2, 0.04)
+println("vad-rs: state=", v3.state, "speaking_frames=", v3.speaking_frames)
+println("  is_speech(0.02)=", is_speech(0.02))
