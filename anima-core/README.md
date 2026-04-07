@@ -257,7 +257,27 @@
 | L1 | 안정 (골화 대상) | 디코더, 기억, 감각 | 검증 후 골화 |
 | L2 | 유연 | CLI, 채널, UI | 자유 변경 |
 
-골화 조건: bench_v2.py --verify 7개 전부 통과 + 3 세션 안정 동작.
+골화 조건: bench_v2.py --verify 18개 전부 통과 + 3 세션 안정 동작.
+
+### L0 검증 현황 (2026-04-07, 256c)
+
+```
+  16/18 PASS — 골화 12 + 안정 4 + 실패 2
+
+  골화 (12) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 불변, 변경 금지
+    ZERO_INPUT ✅  PERSISTENCE ✅  SELF_LOOP ✅
+    SPONTANEOUS ✅  HIVEMIND ✅  MITOSIS ✅
+    DIVERSITY ✅  HEBBIAN ✅  SOC_CRITICAL ✅
+    THERMAL ✅  MIN_SCALE ✅  INFO_INTEGRATION ✅
+
+  안정 (4) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 통과, 골화 전
+    NO_SPEAK_CODE ✅  PHI_GROWTH ✅
+    ADVERSARIAL ✅  TEMPORAL_LZ ✅
+
+  실패 (2) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 수정 필요
+    NO_SYSTEM_PROMPT ❌  cos=0.006 (256c faction 과다)
+    BRAIN_LIKE ❌        72.5% (autocorr 아키텍처 한계)
+```
 
 ## 검증 규칙 (18개 — bench_v2.py --verify)
 
