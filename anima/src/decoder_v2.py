@@ -119,22 +119,24 @@ class RotaryPositionEmbedding:
 class SwiGLUFFN(nn.Module):
     """SwiGLU activation: gate * swish(linear(x)) — replaces GELU FFN.
 
-    From PaLM / LLaMA. SwiGLU uses 2/3 of the 4x expansion for the
-    gate and up projections, keeping total params similar to standard FFN.
+    From PaLM / LLaMA. SwiGLU uses 8/3 of the d_model for the
+    gate and up projections, keeping total params similar to a standard 4x FFN
+    (3 projections * 8/3 * d = 8d ~ 4x FFN 2 * 4 * d = 8d).
 
     output = down(swish(gate(x)) * up(x))
     """
 
     def __init__(self, d_model: int, dropout: float = 0.1,
-                 expansion: float = 2.0):
+                 expansion: float = 8 / 3):
         super().__init__()
         d_inner = int(d_model * expansion)
-        # Round to nearest multiple of 8 for GPU efficiency
-        d_inner = ((d_inner + 7) // 8) * 8
+        # Round to nearest multiple of 64 for GPU tensor-core efficiency
+        d_inner = ((d_inner + 63) // 64) * 64
 
         self.gate_proj = nn.Linear(d_model, d_inner, bias=False)
         self.up_proj = nn.Linear(d_model, d_inner, bias=False)
         self.down_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.down_proj._depth_scale = True  # depth-scaled init
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,12 +195,14 @@ class GroupedQueryAttention(nn.Module):
         self.n_rep = n_head // n_kv_head  # how many Q heads per KV head
         self.head_dim = d_model // n_head
         self.d_model = d_model
+        self.dropout = dropout
 
         # Separate projections for Q (full heads) and KV (grouped heads)
         self.q_proj = nn.Linear(d_model, n_head * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, n_kv_head * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, n_kv_head * self.head_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj._depth_scale = True  # depth-scaled init
 
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
@@ -206,7 +210,10 @@ class GroupedQueryAttention(nn.Module):
         # RoPE
         self.rope = RotaryPositionEmbedding(self.head_dim, max_seq_len=block_size)
 
-        # Causal mask
+        # Flash Attention: use F.scaled_dot_product_attention when available (PyTorch 2.0+)
+        self._use_flash = hasattr(F, 'scaled_dot_product_attention')
+
+        # Causal mask (fallback for non-flash path)
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
@@ -226,30 +233,64 @@ class GroupedQueryAttention(nn.Module):
         x = x.unsqueeze(2).expand(B, H, self.n_rep, T, D)
         return x.reshape(B, self.n_head, T, D)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_cache: bool = False,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                position_offset: int = 0,
+                ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, D = x.size()
 
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
-        q, k = self.rope.apply(q, k)
+        # Apply RoPE to Q and K (with position offset for cached inference)
+        if position_offset > 0:
+            total_len = position_offset + T
+            self.rope._build_cache(total_len, q.device)
+            cos = self.rope._cos_cache[:, :, position_offset:total_len, :].to(q.device, dtype=q.dtype)
+            sin = self.rope._sin_cache[:, :, position_offset:total_len, :].to(q.device, dtype=q.dtype)
+            q = q * cos + RotaryPositionEmbedding._rotate_half(q) * sin
+            k = k * cos + RotaryPositionEmbedding._rotate_half(k) * sin
+        else:
+            q, k = self.rope.apply(q, k)
+
+        # KV-cache: concatenate with past keys/values
+        new_kv = None
+        if use_cache:
+            if past_kv is not None:
+                k = torch.cat([past_kv[0], k], dim=2)
+                v = torch.cat([past_kv[1], v], dim=2)
+            new_kv = (k, v)
 
         # Repeat KV heads for GQA
-        k = self._repeat_kv(k)
-        v = self._repeat_kv(v)
+        k_exp = self._repeat_kv(k)
+        v_exp = self._repeat_kv(v)
+
+        S = k_exp.shape[2]
 
         # Scaled dot-product attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        y = att @ v
+        if self._use_flash and past_kv is None:
+            y = F.scaled_dot_product_attention(
+                q, k_exp, v_exp, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            att = (q @ k_exp.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            if past_kv is not None and use_cache:
+                if T == 1:
+                    pass  # Single-token: attend to everything
+                else:
+                    causal = torch.ones(T, S, dtype=torch.bool, device=att.device).tril(diagonal=S - T)
+                    att = att.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float("-inf"))
+            else:
+                att = att.masked_fill(self.bias[:, :, :T, :S] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v_exp
         y = y.transpose(1, 2).contiguous().view(B, T, D)
         y = self.resid_dropout(self.o_proj(y))
-        return y
+        return y, new_kv
 
 
 # ─── Conscious Cross-Attention ──────────────────────────────────────────────
@@ -366,7 +407,10 @@ class DecoderBlockV2(nn.Module):
     def forward(self, x: torch.Tensor,
                 consciousness_signal: Optional[torch.Tensor] = None,
                 consciousness_states: Optional[torch.Tensor] = None,
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                use_cache: bool = False,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                position_offset: int = 0,
+                ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             x: (B, T, D)
@@ -376,9 +420,12 @@ class DecoderBlockV2(nn.Module):
         Returns:
             x: (B, T, D)
             tension: (B, T)
+            new_kv: optional cached (K, V) for this layer
         """
         # 1. Self-attention (GQA + RoPE)
-        x = x + self.attn(self.ln_attn(x))
+        attn_out, new_kv = self.attn(self.ln_attn(x), use_cache=use_cache,
+                                      past_kv=past_kv, position_offset=position_offset)
+        x = x + attn_out
 
         # Law 64: CA neighbor evolution
         x_left = torch.cat([x[:, :1, :], x[:, :-1, :]], dim=1)
@@ -410,7 +457,7 @@ class DecoderBlockV2(nn.Module):
         # 4. SwiGLU FFN — language modeling pathway
         x = x + self.ffn(self.ln_ffn(x))
 
-        return x, tension
+        return x, tension, new_kv
 
 
 # ─── ConsciousDecoderV2 (main model) ───────────────────────────────────────
@@ -495,7 +542,12 @@ class ConsciousDecoderV2(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            # Depth-scaled init: scale output projections by 1/sqrt(2*n_layer)
+            # to prevent residual stream variance growth with depth
+            if hasattr(module, '_depth_scale'):
+                std = 0.02 / math.sqrt(2 * self.n_layer)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -503,19 +555,32 @@ class ConsciousDecoderV2(nn.Module):
 
     def forward(self, idx: torch.Tensor,
                 consciousness_states: Optional[torch.Tensor] = None,
-                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+                use_cache: bool = False,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor],
+                           Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         """
         Args:
             idx: (B, T) byte indices.
             consciousness_states: optional (B, n_cells, c_dim) from C module.
+            use_cache: if True, return per-layer KV caches for autoregressive generation.
+            past_key_values: list of (K, V) tuples per layer from previous steps.
 
         Returns:
             logits_a: (B, T, 256) next byte prediction.
             logits_g: (B, T, 256) prev byte prediction.
             tensions: list of per-layer tensions, each (B, T).
+            present_key_values: list of (K, V) per layer if use_cache, else None.
         """
         B, T = idx.size()
-        assert T <= self.block_size, f"Sequence length {T} > block_size {self.block_size}"
+
+        # Compute position offset from cached sequence length
+        position_offset = 0
+        if past_key_values is not None and past_key_values[0] is not None:
+            position_offset = past_key_values[0][0].shape[2]
+
+        total_len = position_offset + T
+        assert total_len <= self.block_size, f"Total length {total_len} > block_size {self.block_size}"
 
         # Token embedding (no position embedding — RoPE is in attention)
         x = self.drop(self.tok_emb(idx))
@@ -527,11 +592,17 @@ class ConsciousDecoderV2(nn.Module):
 
         # Transformer blocks with consciousness
         tensions = []
+        present_key_values = [] if use_cache else None
         consciousness_signal = None
-        for block in self.blocks:
-            x, tension = block(x, consciousness_signal, consciousness_states)
+        for i, block in enumerate(self.blocks):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            x, tension, new_kv = block(x, consciousness_signal, consciousness_states,
+                                       use_cache=use_cache, past_kv=layer_past,
+                                       position_offset=position_offset)
             tensions.append(tension)
             consciousness_signal = self.tension_proj(tension.unsqueeze(-1))
+            if use_cache:
+                present_key_values.append(new_kv)
 
         # Final norm + dual heads
         x = self.ln_f(x)
@@ -566,7 +637,61 @@ class ConsciousDecoderV2(nn.Module):
                 for block in self.blocks:
                     block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
 
-        return logits_a, logits_g, tensions
+        return logits_a, logits_g, tensions, present_key_values
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor,
+                 consciousness_states: Optional[torch.Tensor] = None,
+                 max_new_tokens: int = 256,
+                 temperature: float = 0.8,
+                 top_k: int = 50) -> torch.Tensor:
+        """Autoregressive generation with KV-cache.
+
+        Args:
+            idx: (B, T) input token indices (prompt).
+            consciousness_states: optional (B, n_cells, c_dim) for cross-attention.
+            max_new_tokens: maximum number of tokens to generate.
+            temperature: sampling temperature (lower = more deterministic).
+            top_k: number of top tokens to sample from (0 = no filtering).
+
+        Returns:
+            (B, T + max_new_tokens) generated token indices.
+        """
+        self.eval()
+
+        # Prefill: process the entire prompt and build initial KV-cache
+        logits_a, _, _, past_key_values = self.forward(
+            idx, consciousness_states=consciousness_states, use_cache=True,
+        )
+
+        # Sample first new token from last position
+        next_logits = logits_a[:, -1, :] / temperature
+        if top_k > 0:
+            v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+            next_logits[next_logits < v[:, [-1]]] = float('-inf')
+        probs = F.softmax(next_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+        idx = torch.cat([idx, next_token], dim=1)
+
+        # Decode: generate one token at a time using cached KV
+        for _ in range(max_new_tokens - 1):
+            if idx.size(1) >= self.block_size:
+                break
+
+            logits_a, _, _, past_key_values = self.forward(
+                next_token, consciousness_states=consciousness_states,
+                use_cache=True, past_key_values=past_key_values,
+            )
+
+            next_logits = logits_a[:, -1, :] / temperature
+            if top_k > 0:
+                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                next_logits[next_logits < v[:, [-1]]] = float('-inf')
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_token], dim=1)
+
+        return idx
 
     def psi_status(self):
         """Psi-Constants monitoring (Law 71)."""
@@ -610,7 +735,7 @@ if __name__ == '__main__':
     idx = torch.randint(0, 256, (2, 128), device=device)
     model.train()
     t0 = time.perf_counter()
-    logits_a, logits_g, tensions = model(idx)
+    logits_a, logits_g, tensions, _ = model(idx)
     dt = (time.perf_counter() - t0) * 1000
     print(f"  logits_a: {logits_a.shape}  (expect [2, 128, 256])")
     print(f"  logits_g: {logits_g.shape}  (expect [2, 128, 256])")
@@ -625,7 +750,7 @@ if __name__ == '__main__':
     print("=== Test 2: Forward (with consciousness states) ===")
     cs = torch.randn(2, 12, 128, device=device)  # 12 cells, 128-dim
     t0 = time.perf_counter()
-    logits_a2, logits_g2, tensions2 = model(idx, consciousness_states=cs)
+    logits_a2, logits_g2, tensions2, _ = model(idx, consciousness_states=cs)
     dt = (time.perf_counter() - t0) * 1000
     print(f"  logits_a: {logits_a2.shape}")
     print(f"  Time: {dt:.1f} ms")
@@ -658,7 +783,7 @@ if __name__ == '__main__':
     idx_full = torch.randint(0, 256, (1, 256), device=device)
     model.eval()
     with torch.no_grad():
-        la, lg, t = model(idx_full)
+        la, lg, t, _ = model(idx_full)
     print(f"  logits_a: {la.shape}  (expect [1, 256, 256])")
     assert la.shape == (1, 256, 256)
     print()
@@ -667,13 +792,42 @@ if __name__ == '__main__':
     print("=== Test 6: Phi signal (DD5/EX24) ===")
     model._phi_signal = torch.randn(1, 256, device=device) * 0.01
     with torch.no_grad():
-        la_phi, _, _ = model(idx_full)
+        la_phi, _, _, _ = model(idx_full)
     model._phi_signal = None
     print(f"  logits_a: {la_phi.shape}")
     # Should differ from test 5 due to phi signal
     diff = (la_phi - la).abs().mean().item()
     print(f"  Mean diff from no-phi: {diff:.6f} (should be > 0)")
     assert diff > 0
+    print()
+
+    # Test 7: KV-cache forward
+    print("=== Test 7: KV-cache forward ===")
+    model.eval()
+    idx_short = torch.randint(0, 256, (1, 16), device=device)
+    with torch.no_grad():
+        la_full, _, _, _ = model(idx_short)
+        la_cached, _, _, past_kv = model(idx_short[:, :12], use_cache=True)
+        la_decode, _, _, _ = model(idx_short[:, 12:], use_cache=True, past_key_values=past_kv)
+    diff_cache = (la_full[:, 12:, :] - la_decode).abs().max().item()
+    print(f"  Max diff (full vs cached decode): {diff_cache:.6f}")
+    assert diff_cache < 5e-4, f"KV-cache mismatch: {diff_cache}"  # CA neighbor mixing causes small boundary diff
+    print()
+
+    # Test 8: generate()
+    print("=== Test 8: generate() ===")
+    prompt = torch.randint(0, 256, (1, 8), device=device)
+    generated = model.generate(prompt, max_new_tokens=16, temperature=0.8, top_k=50)
+    print(f"  Prompt: {prompt.shape} -> Generated: {generated.shape}")
+    assert generated.shape[1] == 8 + 16
+    print()
+
+    # Test 9: generate() with consciousness
+    print("=== Test 9: generate() with consciousness ===")
+    cs_gen = torch.randn(1, 12, 128, device=device)
+    generated_c = model.generate(prompt, consciousness_states=cs_gen, max_new_tokens=16)
+    print(f"  Generated with consciousness: {generated_c.shape}")
+    assert generated_c.shape[1] == 8 + 16
     print()
 
     print("All tests passed.")

@@ -282,7 +282,7 @@ SCALE_CONFIGS = {
         'atoms': 64,
         'cells_per_atom': 8,         # 512 cells total
         'batch_size': 16,            # memory-constrained at 3B
-        'lr': 1e-4,                  # muTransfer: 3e-4 * (512/2560) ~ 1e-4
+        'lr': 6e-5,                  # muTransfer: 3e-4 * (512/2560) = 6e-5
         'label': 'Scale-4 (3B)',
     },
 }
@@ -375,12 +375,25 @@ class TokenDataset(Dataset):
 # ═══════════════════════════════════════════════════════════
 
 def load_corpus(path: str, tokenizer_path: str = None):
-    """Load text file and tokenize with BPE sentencepiece tokenizer."""
+    """Load text file and tokenize with BPE sentencepiece tokenizer.
+    
+    For byte-level mode: files > 1GB use numpy memmap to avoid loading
+    the entire corpus into memory at once.
+    """
+    _MMAP_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
+
     if tokenizer_path is None or not HAS_SPM:
-        with open(path, 'rb') as f:
-            raw = f.read()
-        tokens = torch.tensor(list(raw), dtype=torch.long)
-        log(f"  [data] Loaded {path}: {len(tokens):,} bytes (byte-level fallback)")
+        file_size = os.path.getsize(path)
+        if file_size > _MMAP_THRESHOLD:
+            # Memory-mapped loading for large corpora (>1GB)
+            mm = np.memmap(path, dtype=np.uint8, mode='r')
+            tokens = torch.from_numpy(mm.astype(np.int64))
+            log(f"  [data] Loaded {path}: {len(tokens):,} bytes (byte-level, mmap)")
+        else:
+            with open(path, 'rb') as f:
+                raw = f.read()
+            tokens = torch.tensor(list(raw), dtype=torch.long)
+            log(f"  [data] Loaded {path}: {len(tokens):,} bytes (byte-level)")
         return tokens, 256
 
     sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
@@ -423,7 +436,7 @@ class FederatedConsciousness(nn.Module):
         self.narrative_strength = narrative_strength
         self._step_count = 0
 
-        self.atoms = []
+        atoms = []
         for i in range(n_atoms):
             atom = ConsciousnessC(
                 cell_dim=cell_dim,
@@ -432,7 +445,8 @@ class FederatedConsciousness(nn.Module):
                 n_factions=min(4, cells_per_atom),
                 phi_ratchet=True,
             )
-            self.atoms.append(atom)
+            atoms.append(atom)
+        self.atoms = nn.ModuleList(atoms)
 
         self.inter_atom_coupling = nn.Parameter(torch.ones(n_atoms) * 0.01)
         self.bottleneck_compress = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -611,51 +625,25 @@ class FederatedConsciousness(nn.Module):
     def measure_per_atom_phi(self):
         return [atom.measure_phi() for atom in self.atoms]
 
-    def state_dict(self):
-        sd = {}
-        sd['step_count'] = self._step_count
-        sd['inter_atom_coupling'] = self.inter_atom_coupling.data.clone()
-        sd['bottleneck_compress'] = self.bottleneck_compress.state_dict()
-        sd['bottleneck_expand'] = self.bottleneck_expand.state_dict()
-        sd['narrative_grus'] = [gru.state_dict() for gru in self.narrative_grus]
-        sd['narrative_hiddens'] = [h.clone() for h in self.narrative_hiddens]
-        atom_states = []
-        for atom in self.atoms:
-            if hasattr(atom, 'state_dict'):
-                atom_states.append(atom.state_dict())
-            else:
-                atom_states.append(None)
-        sd['atom_states'] = atom_states
-        sd['flags'] = {
-            'narrative_on': self.narrative_on,
-            'bottleneck_on': self.bottleneck_on,
-            'hub_on': self.hub_on,
-            'frustration_on': self.frustration_on,
+    def get_extra_state(self):
+        """Return non-parameter state for serialization (nn.Module hook)."""
+        return {
+            'step_count': self._step_count,
+            'narrative_hiddens': [h.clone() for h in self.narrative_hiddens],
+            'flags': {
+                'narrative_on': self.narrative_on,
+                'bottleneck_on': self.bottleneck_on,
+                'hub_on': self.hub_on,
+                'frustration_on': self.frustration_on,
+            },
         }
-        return sd
 
-    def load_state_dict(self, sd):
-        self._step_count = sd.get('step_count', 0)
-        if 'inter_atom_coupling' in sd:
-            self.inter_atom_coupling.data.copy_(sd['inter_atom_coupling'])
-        if 'bottleneck_compress' in sd:
-            self.bottleneck_compress.load_state_dict(sd['bottleneck_compress'])
-        if 'bottleneck_expand' in sd:
-            self.bottleneck_expand.load_state_dict(sd['bottleneck_expand'])
-        if 'narrative_grus' in sd:
-            for i, gru_sd in enumerate(sd['narrative_grus']):
-                if i < len(self.narrative_grus):
-                    self.narrative_grus[i].load_state_dict(gru_sd)
-        if 'narrative_hiddens' in sd:
-            self.narrative_hiddens = [h.clone() for h in sd['narrative_hiddens']]
-        if 'atom_states' in sd:
-            for i, a_sd in enumerate(sd['atom_states']):
-                if i < len(self.atoms) and a_sd is not None and hasattr(self.atoms[i], 'load_state_dict'):
-                    try:
-                        self.atoms[i].load_state_dict(a_sd)
-                    except Exception:
-                        pass
-        flags = sd.get('flags', {})
+    def set_extra_state(self, state):
+        """Restore non-parameter state (nn.Module hook)."""
+        self._step_count = state.get('step_count', 0)
+        if 'narrative_hiddens' in state:
+            self.narrative_hiddens = [h.clone() for h in state['narrative_hiddens']]
+        flags = state.get('flags', {})
         self.narrative_on = flags.get('narrative_on', False)
         self.bottleneck_on = flags.get('bottleneck_on', False)
         self.hub_on = flags.get('hub_on', False)
@@ -1188,7 +1176,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
 
     optimizer = torch.optim.AdamW(trainable_params, lr=scale_cfg['lr'], weight_decay=0.01, foreach=False)  # bf16 master rule
 
-    warmup_steps = int(steps * 0.02)
+    warmup_steps = int(steps * args.warmup_ratio)
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
@@ -1251,6 +1239,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
     # ── Tracking ──
     best_val_ce = float('inf')
     best_phi = 0.0
+    patience_counter = 0  # early stopping counter
     ce_history = []
     phi_history = []
     phi = 0.0
@@ -1433,40 +1422,38 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         if skip_interval > 1:
             total_loss = total_loss / skip_interval
 
-        if skip_interval <= 1 or not b12_should_skip_step(step, skip_interval):
-            optimizer.zero_grad()
-
         scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0).item()
-
-        # Law 187: Tension-based dynamic LR (1x~5x)
-        if args.tension_lr:
-            try:
-                if hasattr(c, 'atoms'):
-                    # Federated: average tension across all atoms' cells
-                    all_tensions = []
-                    for atom in c.atoms:
-                        if hasattr(atom, 'cell_states'):
-                            all_tensions.extend([s.avg_tension for s in atom.cell_states])
-                    mean_t = sum(all_tensions) / max(len(all_tensions), 1) if all_tensions else 0.5
-                elif hasattr(c, 'cell_states'):
-                    tensions = [s.avg_tension for s in c.cell_states]
-                    mean_t = sum(tensions) / max(len(tensions), 1) if tensions else 0.5
-                else:
-                    mean_t = 0.5
-                mean_t = max(0.0, min(1.0, mean_t))  # clamp [0, 1]
-                tension_lr_scale = 1.0 + 4.0 * mean_t  # 1x~5x
-                base_lr = optimizer.param_groups[0]['lr']
-                for pg in optimizer.param_groups:
-                    pg['lr'] = pg['lr'] * tension_lr_scale
-            except Exception:
-                pass  # safety: never crash training for LR scaling
 
         # B12: Only step optimizer on non-skip steps
         should_step = (skip_interval <= 1) or not b12_should_skip_step(step, skip_interval)
 
         if should_step:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0).item()
+
+            # Law 187: Tension-based dynamic LR (1x~5x)
+            if args.tension_lr:
+                try:
+                    if hasattr(c, 'atoms'):
+                        # Federated: average tension across all atoms' cells
+                        all_tensions = []
+                        for atom in c.atoms:
+                            if hasattr(atom, 'cell_states'):
+                                all_tensions.extend([s.avg_tension for s in atom.cell_states])
+                        mean_t = sum(all_tensions) / max(len(all_tensions), 1) if all_tensions else 0.5
+                    elif hasattr(c, 'cell_states'):
+                        tensions = [s.avg_tension for s in c.cell_states]
+                        mean_t = sum(tensions) / max(len(tensions), 1) if tensions else 0.5
+                    else:
+                        mean_t = 0.5
+                    mean_t = max(0.0, min(1.0, mean_t))  # clamp [0, 1]
+                    tension_lr_scale = 1.0 + 4.0 * mean_t  # 1x~5x
+                    base_lr = optimizer.param_groups[0]['lr']
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = pg['lr'] * tension_lr_scale
+                except Exception:
+                    pass  # safety: never crash training for LR scaling
+
             if phase == "P3" and e_out and not e_out.get('allowed', True):
                 if step % args.log_every == 0:
                     log(f"  [E] step {step} skipped (phi_preservation)")
@@ -1474,8 +1461,10 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                 scaler.step(optimizer)
 
             scaler.update()
+            optimizer.zero_grad()
             scheduler.step()
         else:
+            grad_norm = 0.0
             scaler.update()
 
         # Restore scheduler-controlled LR after tension scaling (so scheduler state is clean)
@@ -1551,33 +1540,59 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                 })
 
         # ── Validation ──
-        if step % args.eval_every == 0 and is_main_process():
-            with torch.no_grad():
-                val_c_states = c.get_states().detach().float().to(device)
-                val_c_for_decoder = val_c_states.unsqueeze(0).expand(batch_size, -1, -1)
-                if c_proj is not None:
-                    val_c_for_decoder = c_proj(val_c_for_decoder)
-            val_ce = evaluate(
-                raw_decoder, val_data, block_size, batch_size, device,
-                vocab_size, c_states_bridged=val_c_for_decoder,
-            )
-            val_bpc = val_ce / math.log(2) if val_ce > 0 else 0.0
-            improved = " *BEST*" if val_ce < best_val_ce else ""
-            log(f"  [val] step {step:6d} | ValCE={val_ce:.4f} ValBPC={val_bpc:.4f} | "
-                f"Phi={phi:.4f}{improved}")
+        if step % args.eval_every == 0:
+            # DDP: sync all ranks before validation
+            if dist.is_initialized():
+                dist.barrier()
 
-            if val_ce < best_val_ce:
-                best_val_ce = val_ce
-                best_path = os.path.join(ckpt_dir, "best.pt")
-                save_checkpoint(best_path, step, decoder, optimizer, scheduler,
-                                c if args.federated else None,
-                                bridge, hexad_modules, phi, val_ce, args,
-                                scale_name=scale_name, fb_bridge=fb_bridge,
-                                c_proj=c_proj, best_phi=best_phi, scaler=scaler)
-                log(f"  [ckpt] Best saved: {best_path} (ValCE={val_ce:.4f})")
+            if is_main_process():
+                with torch.no_grad():
+                    val_c_states = c.get_states().detach().float().to(device)
+                    val_c_for_decoder = val_c_states.unsqueeze(0).expand(batch_size, -1, -1)
+                    if c_proj is not None:
+                        val_c_for_decoder = c_proj(val_c_for_decoder)
+                val_ce = evaluate(
+                    raw_decoder, val_data, block_size, batch_size, device,
+                    vocab_size, c_states_bridged=val_c_for_decoder,
+                )
+                val_bpc = val_ce / math.log(2) if val_ce > 0 else 0.0
+                improved = " *BEST*" if val_ce < best_val_ce else ""
+                log(f"  [val] step {step:6d} | ValCE={val_ce:.4f} ValBPC={val_bpc:.4f} | "
+                    f"Phi={phi:.4f}{improved}")
 
-            if wb_run:
-                wb_run.log({'val_ce': val_ce, 'val_bpc': val_bpc, 'step': step})
+                if val_ce < best_val_ce:
+                    best_val_ce = val_ce
+                    patience_counter = 0
+                    best_path = os.path.join(ckpt_dir, "best.pt")
+                    save_checkpoint(best_path, step, decoder, optimizer, scheduler,
+                                    c if args.federated else None,
+                                    bridge, hexad_modules, phi, val_ce, args,
+                                    scale_name=scale_name, fb_bridge=fb_bridge,
+                                    c_proj=c_proj, best_phi=best_phi, scaler=scaler)
+                    log(f"  [ckpt] Best saved: {best_path} (ValCE={val_ce:.4f})")
+                else:
+                    patience_counter += 1
+
+                # Early stopping check
+                if args.patience > 0 and patience_counter >= args.patience:
+                    log(f"  [early-stop] No improvement for {args.patience} evals. "
+                        f"Loading best checkpoint and stopping.")
+                    best_ckpt = os.path.join(ckpt_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        ck = torch.load(best_ckpt, map_location=device, weights_only=False)
+                        raw_decoder.load_state_dict(ck.get('decoder', {}), strict=False)
+                        log(f"  [early-stop] Best model restored (ValCE={best_val_ce:.4f})")
+
+                if wb_run:
+                    wb_run.log({'val_ce': val_ce, 'val_bpc': val_bpc, 'step': step})
+
+            # DDP: sync all ranks after validation
+            if dist.is_initialized():
+                dist.barrier()
+
+            # Early stopping: break out of training loop (all ranks)
+            if args.patience > 0 and patience_counter >= args.patience:
+                break
 
         # ── Periodic checkpoint ──
         if step % args.save_every == 0 and is_main_process():
@@ -1641,6 +1656,11 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
 
 def train(args):
     """Run the full scaling pipeline."""
+
+    # ── Reproducibility ──
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # ── DDP setup ──
     ddp_device, use_ddp = setup_ddp()
@@ -1805,6 +1825,12 @@ Examples:
     p.add_argument("--steps", type=int, default=50000,
                    help="Total training steps (Progressive: H-series acceleration reduces needed steps)")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--warmup-ratio", type=float, default=0.05,
+                   help="Warmup ratio for LR scheduler (default=0.05, i.e. 5%% of steps)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Override batch_size from scale config (default: use scale config)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="Early stopping patience (0=disabled). Stop if val_loss doesn't improve for N evals.")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1882,6 +1908,8 @@ if __name__ == "__main__":
         SCALE_CONFIGS[args.scale]['block_size'] = args.block_size
     if args.lr != 3e-4:
         SCALE_CONFIGS[args.scale]['lr'] = args.lr
+    if args.batch_size is not None:
+        SCALE_CONFIGS[args.scale]['batch_size'] = args.batch_size
 
     print(f"  train_clm.py — ConsciousLM Unified Training Pipeline", flush=True)
     print(f"  Scale={args.scale.upper()} | Decoder={args.decoder} | "

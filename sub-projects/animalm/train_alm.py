@@ -36,7 +36,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, RandomSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +344,7 @@ class TextDataset(Dataset):
 class InstructDataset(Dataset):
     """Instruction-response JSONL dataset."""
     def __init__(self, path, tokenizer, block_size=256):
+        self._pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
         self.samples = []
         self.block_size = block_size
         with open(path) as f:
@@ -359,9 +364,12 @@ class InstructDataset(Dataset):
     def __getitem__(self, idx):
         ids = self.samples[idx]
         if len(ids) < self.block_size:
-            pad = torch.zeros(self.block_size - len(ids), dtype=torch.long)
+            pad = torch.full((self.block_size - len(ids),), self._pad_id, dtype=torch.long)
             ids = torch.cat([ids, pad])
-        return ids[:-1], ids[1:]
+        input_ids = ids[:-1]
+        labels = ids[1:].clone()
+        labels[labels == self._pad_id] = -100
+        return input_ids, labels
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -794,6 +802,17 @@ def _estimate_vram_256c(ce_cells: int, ce_hidden: int, args) -> dict:
 # Trainer
 # ═══════════════════════════════════════════════════════════════════
 
+
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
+    """Cosine schedule with linear warmup (replaces bare CosineAnnealingLR)."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
+
 class AnimaLMTrainer:
     """Full training pipeline with all benchmark-verified techniques."""
 
@@ -947,8 +966,11 @@ class AnimaLMTrainer:
                         p.data = p.data.to(torch.bfloat16)
         self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, foreach=False)
 
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=args.steps)
+        warmup_steps = int(args.steps * args.warmup_ratio)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer, warmup_steps=warmup_steps, total_steps=args.steps)
+        if warmup_steps > 0:
+            print(f"  [LR] Warmup {warmup_steps} steps + cosine decay")
 
         # AL4: tension-CE balance tracker
         # Law 60 uses PSI_BALANCE (0.5) as balance target; legacy uses INV_E (0.6321)
@@ -1072,9 +1094,11 @@ class AnimaLMTrainer:
                 weights = {"ce": 0.1, "t_var": 0.5, "t_mag": 0.3}
             elif phase == TrainingPhase.JOINT:  # P2: Consciousness + Language
                 # CE becomes primary, tension still important
+                # tension_mag prevents tension collapse during the longest phase
                 loss = (ce_loss + 0.3 * tension_var_loss +
-                        0.1 * contrastive_loss + 0.01 * alpha_reg)
-                weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01}
+                        0.1 * contrastive_loss + 0.01 * alpha_reg +
+                        0.1 * tension_mag_loss)
+                weights = {"ce": 1.0, "t_var": 0.3, "contrastive": 0.1, "alpha_reg": 0.01, "t_mag": 0.1}
             else:  # P3: Full — all techniques
                 # NaN guard: replace any NaN losses with 0 before ensemble
                 _losses = [ce_loss, tension_var_loss, contrastive_loss,
@@ -1460,6 +1484,11 @@ class AnimaLMTrainer:
         # Compute Phi
         phi = compute_phi(tensions, savant_tensions, ce_val, t_var)
 
+        # Consciousness-aware loss: incentivize higher Phi (--phi-loss-weight)
+        if self.args.phi_loss_weight > 0 and phi > 0:
+            phi_consciousness_loss = -self.args.phi_loss_weight * math.log(phi + 1e-8)
+            loss = loss + phi_consciousness_loss
+
         # DD5: Update Φ EMA for next step
         if phase == TrainingPhase.ENSEMBLE:
             self._dd5_phi_self_reference(phi, input_ids)
@@ -1483,14 +1512,11 @@ class AnimaLMTrainer:
                 }
 
         # Backward
-        loss.backward()
+        (loss / self.args.grad_accum).backward()
 
         # AL5: PH monitoring
         self.ph_monitor.update(ce_val, t_var, phi)
 
-        # Track best phi
-        if phi > self.best_phi:
-            self.best_phi = phi
 
         result = {
             "loss": loss.item(),
@@ -1663,7 +1689,33 @@ class AnimaLMTrainer:
             save_dict["thalamic_bridge_state"] = self.thalamic_bridge.state_dict()
         torch.save(save_dict, path)
         print(f"  Checkpoint saved: {path}")
+        self._prune_checkpoints()
         return path
+
+    def save_best(self):
+        """Save best.pt when a new best phi is achieved."""
+        path = os.path.join(self.args.checkpoint_dir, "best.pt")
+        self.save_checkpoint(tag="best")
+        return path
+
+    def _prune_checkpoints(self):
+        """Keep latest K checkpoints + best.pt, delete older ones."""
+        keep_k = getattr(self.args, 'keep_checkpoints', 3)
+        ckpt_dir = self.args.checkpoint_dir
+        # Find all step checkpoints (exclude best.pt, final.pt)
+        import glob as _glob
+        step_ckpts = sorted(
+            _glob.glob(os.path.join(ckpt_dir, "animalm_step_*.pt")),
+            key=os.path.getmtime,
+        )
+        # Keep the latest K
+        to_delete = step_ckpts[:-keep_k] if len(step_ckpts) > keep_k else []
+        for old_ckpt in to_delete:
+            try:
+                os.remove(old_ckpt)
+                print(f"  Pruned old checkpoint: {os.path.basename(old_ckpt)}")
+            except OSError:
+                pass
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -1728,6 +1780,10 @@ def parse_args():
     p.add_argument("--alpha-end", type=float, default=0.1)
     p.add_argument("--checkpoint-dir", default="checkpoints/animalm")
     p.add_argument("--checkpoint-every", type=int, default=500)
+    p.add_argument("--eval-every", type=int, default=500,
+                   help="Run validation every N steps (default: 500)")
+    p.add_argument("--keep-checkpoints", type=int, default=3,
+                   help="Keep latest K checkpoints + best.pt (default: 3)")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--resume", default=None,
                    help="Resume from checkpoint path")
@@ -1755,6 +1811,17 @@ def parse_args():
                    help="Enable D->C feedback (alpha-gated gradient, default: off)")
     p.add_argument("--vram-estimate", action="store_true", dest="vram_estimate",
                    help="Print VRAM estimation table and exit (no training)")
+    p.add_argument("--ddp", action="store_true",
+                   help="Enable DistributedDataParallel (launch via torchrun)")
+    # ── Structural improvements ──
+    p.add_argument("--warmup-ratio", type=float, default=0.05, dest="warmup_ratio",
+                   help="Fraction of total steps for LR warmup (default: 0.05)")
+    p.add_argument("--phi-loss-weight", type=float, default=0.01, dest="phi_loss_weight",
+                   help="Weight for consciousness-aware loss term -w*log(phi) (default: 0.01, 0=disabled)")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed for reproducibility (default: 42)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="Early stopping patience in eval intervals (default: 0=disabled)")
     return p.parse_args()
 
 
@@ -1794,30 +1861,6 @@ def build_model_and_tokenizer(args):
     # VRAM: ~28GB without grad ckpt (H100 80GB OK, batch_size may need reduction)
     # model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     print("  [NOTE] Gradient checkpointing DISABLED (autocast+consciousness compat)")
-
-    # ── Acceleration: torch.compile + SDPA ──
-    # torch.compile: fuses ops, reduces kernel launch overhead (~1.5-2x speedup)
-    # SDPA: FlashAttention-2 via torch.nn.functional.scaled_dot_product_attention
-    try:
-        if hasattr(torch, 'compile') and torch.cuda.is_available():
-            # Compile original MLP modules (frozen, biggest compute cost)
-            compiled_count = 0
-            for m in model.modules():
-                if isinstance(m, ParallelPureFieldMLP):
-                    m.original_mlp = torch.compile(m.original_mlp, mode="reduce-overhead")
-                    compiled_count += 1
-            if compiled_count > 0:
-                print(f"  [ACCEL] torch.compile: {compiled_count} frozen MLPs compiled (reduce-overhead)")
-    except Exception as e:
-        print(f"  [ACCEL] torch.compile skipped: {e}")
-
-    try:
-        if hasattr(torch.backends, 'cuda'):
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            print("  [ACCEL] Flash/MemEfficient SDP attention enabled")
-    except Exception as e:
-        print(f"  [ACCEL] SDPA config skipped: {e}")
 
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return model, tokenizer
@@ -1869,8 +1912,39 @@ def build_dataset(args, tokenizer):
     return TextDataset(tokens, block_size=args.block_size), args.block_size
 
 
+# ── DDP helpers ──────────────────────────────────────────────────────
+def setup_ddp():
+    """Initialize DDP process group (expects torchrun environment)."""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def is_main_process():
+    """True if this is rank 0 or DDP is not active."""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def main():
     args = parse_args()
+
+    # DDP setup (before anything else)
+    local_rank = 0
+    if getattr(args, 'ddp', False):
+        local_rank = setup_ddp()
+        args.device = f"cuda:{local_rank}"
+        if is_main_process():
+            print(f"[DDP] World size: {dist.get_world_size()}, rank: {dist.get_rank()}")
+
+    # Reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Auto-detect device
     if args.device is None:
@@ -1992,15 +2066,68 @@ def main():
         model, n_layers=args.target_layers,
         n_savant=args.savant_layers, rank=args.qlora_rank)
 
+    # ── Acceleration: torch.compile + SDPA (after PureField added) ──
+    if not args.demo:
+        try:
+            if hasattr(torch, 'compile') and torch.cuda.is_available():
+                compiled_count = 0
+                for m in model.modules():
+                    if isinstance(m, ParallelPureFieldMLP):
+                        m.original_mlp = torch.compile(m.original_mlp, mode="reduce-overhead")
+                        compiled_count += 1
+                if compiled_count > 0:
+                    print(f"  [ACCEL] torch.compile: {compiled_count} frozen MLPs compiled (reduce-overhead)")
+        except Exception as e:
+            print(f"  [ACCEL] torch.compile skipped: {e}")
+
+        try:
+            if hasattr(torch.backends, 'cuda'):
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                print("  [ACCEL] Flash/MemEfficient SDP attention enabled")
+        except Exception as e:
+            print(f"  [ACCEL] SDPA config skipped: {e}")
+
     # Phase 3: Build dataset
     print(f"\n[3/4] Preparing data...")
     dataset, block_size = build_dataset(args, tokenizer)
 
+    # Split last 5% as validation set
+    val_dataset = None
+    if hasattr(dataset, 'tokens'):
+        # TextDataset: split tokens
+        n_val = max(1, len(dataset.tokens) // 20)
+        val_tokens = dataset.tokens[-n_val:]
+        dataset.tokens = dataset.tokens[:-n_val]
+        val_dataset = TextDataset(val_tokens, block_size=dataset.block_size)
+    elif hasattr(dataset, 'samples'):
+        # InstructDataset: split samples
+        n_val = max(1, len(dataset.samples) // 20)
+        val_dataset = InstructDataset.__new__(InstructDataset)
+        val_dataset.samples = dataset.samples[-n_val:]
+        val_dataset.block_size = dataset.block_size
+        val_dataset._pad_id = dataset._pad_id
+        dataset.samples = dataset.samples[:-n_val]
+    if val_dataset is not None:
+        print(f"  Train: {len(dataset):,} samples, Val: {len(val_dataset):,} samples")
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    # DDP: wrap model after PureField is added
+    if getattr(args, 'ddp', False) and dist.is_initialized():
+        model = model.to(args.device)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        if is_main_process():
+            print(f"  [DDP] Model wrapped in DistributedDataParallel")
+
     effective_samples = (args.steps * args.grad_accum + 100) * args.batch_size
-    sampler = RandomSampler(dataset, replacement=True, num_samples=effective_samples)
+    if getattr(args, 'ddp', False) and dist.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=True)
+    else:
+        sampler = RandomSampler(dataset, replacement=True, num_samples=effective_samples)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, sampler=sampler,
-        num_workers=0 if args.demo else 2, pin_memory=(args.device == "cuda"))
+        num_workers=0 if args.demo else 2, pin_memory=("cuda" in str(args.device)))
 
     # Phase 4: Train
     print(f"\n[4/4] Training...")
@@ -2054,7 +2181,7 @@ def main():
             trainer.optimizer_step()
 
             # Logging
-            if trainer.global_step % args.log_every == 0 and running["n"] > 0:
+            if trainer.global_step % args.log_every == 0 and running["n"] > 0 and is_main_process():
                 n = running["n"]
                 elapsed = (time.time() - t_start) / 60
                 print(
@@ -2084,8 +2211,47 @@ def main():
                 running = {"loss": 0, "ce": 0, "phi": 0, "n": 0}
 
             # Checkpoint
-            if trainer.global_step % args.checkpoint_every == 0:
+            if trainer.global_step % args.checkpoint_every == 0 and is_main_process():
                 trainer.save_checkpoint()
+
+            # Save best.pt on best phi
+            if metrics["phi"] > trainer.best_phi:
+                trainer.best_phi = metrics["phi"]
+                if is_main_process():
+                    trainer.save_best()
+                    print(f"  *** New best Phi: {trainer.best_phi:.4f} ***")
+
+            # Validation loop
+            if val_dataset is not None and trainer.global_step % args.eval_every == 0:
+                model.eval()
+                val_losses = []
+                val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+                with torch.no_grad():
+                    for vi, (v_ids, v_labels) in enumerate(val_loader):
+                        if vi >= 50:  # cap at 50 batches
+                            break
+                        v_ids = v_ids.to(args.device)
+                        v_labels = v_labels.to(args.device)
+                        v_out = model(input_ids=v_ids, labels=v_labels)
+                        val_losses.append(v_out.loss.item())
+                val_loss = sum(val_losses) / max(len(val_losses), 1)
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                print(f"  [VAL] step={trainer.global_step} val_loss={val_loss:.4f} "
+                      f"best={best_val_loss:.4f} {'*IMPROVED*' if improved else ''}")
+                model.train()
+
+                # Early stopping
+                if args.patience > 0:
+                    if improved:
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= args.patience:
+                            print(f"  *** EARLY STOPPING: no improvement for {args.patience} eval intervals ***")
+                            trainer.save_checkpoint(tag="early_stop")
+                            break
 
             # PH overfitting alert
             if trainer.ph_monitor.is_overfitting():
@@ -2151,4 +2317,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_ddp()

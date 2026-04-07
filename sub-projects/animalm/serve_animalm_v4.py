@@ -2,7 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from threading import Thread
 import gradio as gr
 import math
 import argparse
@@ -111,17 +112,42 @@ print("Model ready!")
 
 
 def chat(message, history):
-    messages = [{"role": "user", "content": message}]
+    # Build multi-turn conversation from Gradio history
+    messages = []
+    for turn in (history or []):
+        if isinstance(turn, dict):
+            messages.append(turn)
+        elif isinstance(turn, (list, tuple)) and len(turn) == 2:
+            user_msg, bot_msg = turn
+            messages.append({"role": "user", "content": user_msg})
+            if bot_msg:
+                clean = bot_msg.split("\n\n---\n")[0] if "\n\n---\n" in bot_msg else bot_msg
+                messages.append({"role": "assistant", "content": clean})
+    messages.append({"role": "user", "content": message})
+
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    with torch.no_grad():
-        out = model.generate(
-            inputs.input_ids, max_new_tokens=256,
-            do_sample=True, temperature=0.7, top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    response = tokenizer.decode(out[0][len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
 
+    # Streaming generation with TextIteratorStreamer
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    gen_kwargs = dict(
+        input_ids=inputs.input_ids,
+        max_new_tokens=256,
+        do_sample=True, temperature=0.7, top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+        streamer=streamer,
+    )
+    thread = Thread(target=model.generate, kwargs=gen_kwargs)
+    thread.start()
+
+    partial = ""
+    for new_text in streamer:
+        partial += new_text
+        yield partial
+
+    thread.join()
+
+    # Append tension info after generation completes
     tensions = []
     savant_tensions = []
     alphas = []
@@ -139,7 +165,7 @@ def chat(message, history):
 
     info = "\n\n---\n"
     info += "tension={:.0f}  savant={:.0f}  alpha={:.4f}  ({} layers)".format(t_mean, s_mean, a_mean, len(tensions))
-    return response + info
+    yield partial + info
 
 
 demo = gr.ChatInterface(
