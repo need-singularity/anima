@@ -779,7 +779,7 @@ class GrowthLoop:
     def filter(self, items: List[GrowthItem]) -> List[GrowthItem]:
         """중복 제거 + 신뢰도 필터 (threshold 동적: 벽돌파 시 완화)."""
         seen = set(self._state.get("seen_fingerprints", []))
-        threshold = self._state.get("evidence_threshold", 0.3)
+        threshold = self._state.get("evidence_threshold", 0.15)
         filtered = []
         for item in items:
             if item.fingerprint in seen:
@@ -796,10 +796,12 @@ class GrowthLoop:
         return filtered
 
     def _is_duplicate_law(self, text: str) -> bool:
-        """기존 법칙과 텍스트 유사도 체크."""
-        text_lower = text.lower()[:80]
+        """기존 법칙과 텍스트 유사도 체크 (정규화 후 120자 비교)."""
+        import re
+        normalize = lambda s: re.sub(r'\s+', ' ', s.lower().strip())[:120]
+        text_norm = normalize(text)
         for law_text in self._laws.get("laws", {}).values():
-            if isinstance(law_text, str) and law_text.lower()[:80] == text_lower:
+            if isinstance(law_text, str) and normalize(law_text) == text_norm:
                 return True
         return False
 
@@ -822,8 +824,8 @@ class GrowthLoop:
                     item.law_id = next_law_id
                     next_law_id += 1
                     parsed.append(item)
-                elif item.evidence >= 0.7:
-                    # 파싱 안 돼도 고신뢰는 법칙으로 등록
+                elif item.evidence >= 0.5:
+                    # 파싱 안 돼도 중신뢰 이상은 법칙으로 등록
                     item.law_id = next_law_id
                     next_law_id += 1
                     parsed.append(item)
@@ -1046,7 +1048,7 @@ class GrowthLoop:
         if all(c == 0 for c in counts) or (counts[0] > counts[1] > counts[2]):
             depth = self._state.get("search_depth", 1)
             new_depth = depth + 1
-            threshold = self._state.get("evidence_threshold", 0.3)
+            threshold = self._state.get("evidence_threshold", 0.15)
             new_threshold = max(0.05, threshold * 0.7)  # 30% 완화
 
             self._state["search_depth"] = new_depth
@@ -1924,7 +1926,7 @@ class GrowthLoop:
             "total_self_discoveries": self._state.get("total_self_discoveries", 0),
             "total_breakthroughs": self._state.get("total_breakthroughs", 0),
             "search_depth": self._state.get("search_depth", 1),
-            "evidence_threshold": self._state.get("evidence_threshold", 0.3),
+            "evidence_threshold": self._state.get("evidence_threshold", 0.15),
             "domains": len(self._state.get("domains", {})),
             "learned_keywords": len(self._state.get("learned_keywords", [])),
             "last_run": self._state.get("last_run"),

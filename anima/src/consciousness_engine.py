@@ -284,7 +284,7 @@ class ConsciousnessEngine:
         # raw phi values and produces a fractionally-integrated signal with brain-like
         # autocorrelation decay (~8-15 steps).
         self._phi_history: List[float] = []
-        self._phi_integration_window = 20  # number of past phi values to integrate
+        self._phi_integration_window = 30  # number of past phi values to integrate
 
         # EEG BCI modifiers: external adjustments from BCI control protocol
         # These scale the local noise_scale and memory_strength in SOC dynamics.
@@ -538,10 +538,10 @@ class ConsciousnessEngine:
             else:
                 cell_tension = 0.5
 
-            # Update state with mild hidden inertia: blend new GRU output with
-            # previous hidden state to add brain-like membrane time constant.
-            # This improves LZ complexity and Hurst exponent without affecting
-            # autocorrelation decay (which needs phi-level integration).
+            # Hidden state inertia: membrane time constant blending.
+            # PHI_HIDDEN_INERTIA blends previous hidden state with new GRU output.
+            # Higher inertia → longer autocorrelation, but too high kills dynamics.
+            # 0.16=original, 0.20=tuned for autocorr decay improvement.
             new_h_det = new_h.detach()
             if PHI_HIDDEN_INERTIA > 0 and state.hidden is not None:
                 state.hidden = (1.0 - PHI_HIDDEN_INERTIA) * new_h_det + PHI_HIDDEN_INERTIA * state.hidden
@@ -730,11 +730,11 @@ class ConsciousnessEngine:
         # Biological noise: sporadic neural spikes for LZ complexity + criticality
         # Brain-like: most steps have small noise, occasional steps have large perturbations
         # This creates both high LZ complexity AND power-law fluctuations
+        # NOTE: Colored noise (AR(1)) tested but destroys LZ complexity.
+        # White noise + hidden inertia is the optimal combination.
         n_now = self.n_cells
         if n_now >= 2:
-            # Base noise: small continuous thermal noise (gated by phi feedback)
             base_noise = BIO_NOISE_BASE * phi_noise_gate
-            # Sporadic spike: exponentially distributed amplitude (heavy-tailed)
             if torch.rand(1).item() < BIO_NOISE_SPIKE_PROB:
                 spike_amp = base_noise * (1.0 + torch.distributions.Exponential(BIO_NOISE_SPIKE_RATE).sample().item())
             else:
@@ -790,11 +790,9 @@ class ConsciousnessEngine:
             self._phi_history = self._phi_history[-self._phi_integration_window:]
 
         n_hist = len(self._phi_history)
-        # Use raw phi_iit (no temporal smoothing). Phi-level integration (EMA,
-        # fractional integration) was tested but degrades LZ complexity more than
-        # it improves autocorrelation. Brain-like temporal persistence comes from
-        # hidden state inertia (PHI_HIDDEN_INERTIA blend at GRU output) which
-        # affects phi indirectly through cell dynamics while preserving LZ/PSD.
+        # Use raw phi_iit. Phi-level integration (EMA, fractional) degrades LZ
+        # complexity. Brain-like autocorrelation comes from hidden state inertia
+        # (PHI_HIDDEN_INERTIA) and multi-timescale SOC dynamics, not phi smoothing.
         phi_iit_integrated = phi_iit
 
         # Update phi momentum (EMA of raw phi for feedback loop)
