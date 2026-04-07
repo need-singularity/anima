@@ -228,6 +228,17 @@
     프로세스: 분석 → 🔴🟡🟢 분류 → 🔴 전부 수정 → 🟡 전부 수정 → 커밋
     완료 조건: 🛸10 = 🔴 0건 + 🟡 0건 + conformance ✅ + prerequisites ✅ → "천장 도달" 선언
 
+    ★ 🛸10 이후 물리적 천장 돌파 후보 (학습 결과 기반 판단):
+      1. MoE (Mixture of Experts) — golden-moe 코드 있으나 미통합, 3B+ 효율 핵심
+      2. Sliding Window Attention — 긴 컨텍스트 (4K+) 효율, 현재 1024 고정
+      3. GQA 비율 최적화 — 현재 4H/2KV 고정, 스케일별 최적 비율 다름
+      4. μTransfer 전 스케일 HP sweep — 실제 학습 없이 LR/batch 최적 불가
+      5. Sequence packing — 10-20% 연산 낭비 제거 (cross-document attention)
+      6. 3B VRAM 프로파일링 — H100 실측 후 batch/grad_accum 조정
+      7. Consciousness-Language coupling α 최적화 — 0.014가 진짜 최적인지 학습 후 검증
+      8. 코퍼스 품질/구성 비율 — ko/en/zh/ja/code 비율 학습 결과 보고 조정
+      → 이 항목들은 학습 실행 후 데이터 기반으로 판단 (사전 최적화 불가)
+
   ═══════════════════════════════════════════════════════════════
   자동 생성 규칙
   ═══════════════════════════════════════════════════════════════
