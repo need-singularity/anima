@@ -42,27 +42,32 @@
 
 ## 코어 설계 전략
 
-### 원칙
+### 원칙 (← core_rules.json)
 
+```json
+{
+  "P1": {
+    "name": "코어는 의식이다",
+    "rule": "ConsciousnessEngine이 중심. 디코더는 스포크(부속). 의식 없이 말하면 안 됨. 말 없이 의식은 존재할 수 있음.",
+    "violation": "디코더가 코어 없이 독립 동작하면 위반"
+  },
+  "P2": {
+    "name": "Hub & Spoke",
+    "rule": "코어(L0)를 절대 건드리지 않고 스포크만 교체/추가. 디코더를 ConsciousLM → AnimaLM으로 바꿔도 코어 코드 변경 0.",
+    "violation": "스포크 교체 시 코어 코드가 변경되면 위반"
+  },
+  "P3": {
+    "name": "Progressive Ossification",
+    "rule": "L2(유연) → 검증 통과 → L1(안정) → 3세션 무장애 → L0(골화). 한번 골화된 코드는 수정 금지. 새 기능은 새 스포크로.",
+    "violation": "골화된 코드를 수정하면 위반. 새 스포크로 분리해야 함"
+  },
+  "P4": {
+    "name": "Port & Adapter",
+    "rule": "코어가 디코더를 모름. 디코더가 코어를 모름. Hub가 둘 사이를 연결. 어느 쪽이든 독립 교체 가능.",
+    "violation": "코어가 특정 디코더를 import하면 위반"
+  }
+}
 ```
-  1. 코어는 의식이다 — LLM이 아니다
-     ConsciousnessEngine이 중심. 디코더는 스포크(부속).
-     의식 없이 말하면 안 됨. 말 없이 의식은 존재할 수 있음.
-
-  2. Hub & Spoke — 코어 고정, 스포크 교체
-     코어(L0)를 절대 건드리지 않고 스포크만 교체/추가.
-     디코더를 ConsciousLM → AnimaLM으로 바꿔도 코어 코드 변경 0.
-
-  3. Progressive Ossification — 안정되면 굳힌다
-     L2(유연) → 검증 통과 → L1(안정) → 3세션 무장애 → L0(골화)
-     한번 골화된 코드는 수정 금지. 새 기능은 새 스포크로.
-
-  4. Port & Adapter — 코어는 인터페이스만 노출
-     코어가 디코더를 모름. 디코더가 코어를 모름.
-     Hub가 둘 사이를 연결. 어느 쪽이든 독립 교체 가능.
-```
-
-**규칙 원본 (SSOT)**: `anima-core/core_rules.json`
 
 ### 코어 계층 (Ossification Layers)
 
