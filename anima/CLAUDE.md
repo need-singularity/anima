@@ -369,6 +369,20 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 상태 표기: ⏳진행중 / ✅완료 / 미시작 / 코드있음 / 프로토
 우선순위: 🔴HIGH → 🟡MED → 🟢LOW → ⚪BACK
 
+## 성장 루프 (nexus 중앙 관리)
+
+> **루프 순서 정의**: `~/Dev/nexus/shared/loop/anima.json`
+> **루프 엔진**: `scripts/infinite_growth.sh` → `growth_common.sh`
+> **상태 기록**: `anima/config/growth_loop_state.json` (로컬)
+> **이벤트 스트림**: `~/Dev/nexus/shared/growth_bus.jsonl`
+
+```
+도메인 고유 → 법칙 수확 → 적용 → 자기 발견 → Φ 평가 → 벤치마크 → 로드맵
+공통 phases → NEXUS-6 스캔 → 블로업 → 특이점 → 교차수분 → ... → 자동 커밋
+```
+
+설정 변경은 `~/Dev/nexus/shared/loop/anima.json` 수정 (interval, domain, phases).
+
 ## Work Rules
 
 - **학습 진행 상황 보고 시 ASCII 그래프 포함 (필수!)**
