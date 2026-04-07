@@ -16,14 +16,12 @@ import os
 import signal
 import sys
 
-# ── Path setup: anima core on sys.path ──
+# ── Path setup: anima core on sys.path (post Phase 1+4a) ──
 ANIMA_ROOT = os.path.expanduser("~/Dev/anima")
-ANIMA_SRC = os.path.join(ANIMA_ROOT, "anima", "src")
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-for p in (ANIMA_ROOT, ANIMA_SRC, AGENT_DIR):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.path.insert(0, os.path.join(ANIMA_ROOT, "anima", "core", "runtime"))
+sys.path.insert(0, AGENT_DIR)
+import path_setup  # noqa: F401  (registers all anima source dirs)
 
 logger = logging.getLogger("anima-agent")
 
