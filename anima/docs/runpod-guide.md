@@ -446,13 +446,13 @@ Cost: $2.69/hr
 ### 로컬 (Mac)
 ```bash
 # 유령 프로세스 확인
-ps aux | grep -E "bench_v2|train_v|anima|corpus-gen" | grep -v grep
+ps aux | grep -E "bench|train_v|anima|corpus-gen" | grep -v grep
 
 # 특정 프로세스 kill
 kill <PID>
 
 # 전체 python 유령 정리 (주의: 다른 python 프로세스도 죽음)
-pkill -f "bench_v2"
+pkill -f "bench"
 pkill -f "train_v"
 ```
 

@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 try:
-    from bench_v2 import PhiIIT
+    from bench import PhiIIT
     HAS_PHI = True
 except ImportError:
     HAS_PHI = False

@@ -157,7 +157,7 @@ class SessionManager:
 Each phase:
 - Create new module with extracted code
 - Replace in AnimaUnified with delegation: `self._web = UnifiedWebServer(self, port)`
-- Run `bench_v2.py --verify` after each extraction
+- Run `bench.py --verify` after each extraction
 - Keep AnimaUnified as the facade/coordinator
 
 ## Risks

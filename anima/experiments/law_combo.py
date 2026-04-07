@@ -15,7 +15,7 @@ Setup (MitosisEngine cells):
   - Hub-spoke:      64 cells, 1 hub (32 cells) + 4 spokes (8 cells)
   - Combined:       64 cells, hub-spoke + dim=2 bottleneck
 
-500 steps each, Phi(IIT) via bench_v2.PhiIIT.
+500 steps each, Phi(IIT) via bench.PhiIIT.
 """
 
 import sys, os
@@ -37,7 +37,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from bench_v2 import PhiIIT
+    from bench import PhiIIT
     HAS_PHI = True
 except ImportError:
     HAS_PHI = False

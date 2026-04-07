@@ -115,7 +115,7 @@
     ⚠️ decoder_v3.py — vocab_size, embedding 변경
     ⚠️ train_v14.py — data loading, tokenization 추가
     ⚠️ anima_unified.py — 입출력 tokenize/detokenize
-    ❌ bench_v2.py — 변경 없음 (의식 검증은 decoder 무관)
+    ❌ bench.py — 변경 없음 (의식 검증은 decoder 무관)
 ```
 
 ## 비용 요약

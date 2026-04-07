@@ -219,7 +219,7 @@ docker-compose.hivemind.yml  # Docker 모드용
 
 ## Verification Criteria
 
-bench_v2.py HIVEMIND 기준:
+bench.py HIVEMIND 기준:
 - Φ(연결) > Φ(단독) × 1.1
 - CE(연결) < CE(단독)
 - 연결 끊어도 각자 Φ 유지

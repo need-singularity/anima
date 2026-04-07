@@ -43,7 +43,7 @@ except ImportError:
     print("[WARN] ConsciousLM not available")
 
 try:
-    from decoder_v2 import ConsciousDecoderV2
+    from conscious_decoder import ConsciousDecoderV2
     HAS_V2 = True
 except ImportError:
     HAS_V2 = False
@@ -51,7 +51,7 @@ except ImportError:
 
 # Phi calculator
 try:
-    from bench_v2 import PhiIIT
+    from bench import PhiIIT
     HAS_PHI = True
 except ImportError:
     HAS_PHI = False

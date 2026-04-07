@@ -100,7 +100,7 @@ DD128: 64c에서 +9.7% — Bottleneck이 64c 발산을 억제.
 ## 구현
 
 ```python
-# /tmp/dd128_phase_optimal.py → bench_v2.py에 통합 예정
+# /tmp/dd128_phase_optimal.py → bench.py에 통합 예정
 class PhaseOptimalEngine(BenchEngine):
     # 1. Narrative (0.05 strength)
     # 2. Bottleneck (every 8 steps, 70/30 blend)

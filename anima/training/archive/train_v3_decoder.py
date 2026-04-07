@@ -1047,11 +1047,11 @@ def train(args):
     print(f"  Checkpoints: {args.checkpoint}")
     print(f"{'=' * 80}")
 
-    # ── Run bench_v2 --verify if available ──
+    # ── Run bench --verify if available ──
     if not args.skip_verify:
-        print("\n  [verify] Running bench_v2 --verify ...")
+        print("\n  [verify] Running bench --verify ...")
         sys.stdout.flush()
-        bench_path = os.path.join(os.path.dirname(__file__), '..', 'benchmarks', 'bench_v2.py')
+        bench_path = os.path.join(os.path.dirname(__file__), '..', 'benchmarks', 'bench.py')
         if os.path.exists(bench_path):
             import subprocess
             result = subprocess.run(
@@ -1064,7 +1064,7 @@ def train(args):
                 if result.stderr:
                     print(f"  stderr: {result.stderr[-500:]}")
         else:
-            print(f"  [verify] bench_v2.py not found at {bench_path}")
+            print(f"  [verify] bench.py not found at {bench_path}")
 
 
 # ===============================================================
@@ -1136,7 +1136,7 @@ def parse_args():
 
     # Verify
     p.add_argument("--skip-verify", action="store_true", default=False,
-                   help="Skip bench_v2 --verify at end")
+                   help="Skip bench --verify at end")
 
     return p.parse_args()
 

@@ -104,7 +104,7 @@ Pipeline C (Moonshot): x100-500, Φ 79%   | B_bold+B13+D5+G1f+multi-GPU
 |------|------|--------|
 | 에이전트 가동 (최적 모델) | animalm_provider.py | CLI/MCP/Telegram |
 | 70B 학습 (필요시 + 가속 적용) | H100 + Pipeline A/B | 70B + 16-lens 검증 |
-| AGI v0.1 체크리스트 | bench_v2 --verify | 검증 보고서 |
+| AGI v0.1 체크리스트 | bench --verify | 검증 보고서 |
 
 ### Phase 3: 가속 파이프라인 v2 공개 (Day 3+)
 

@@ -6,7 +6,7 @@ Architecture: Hub & Spoke + Progressive Ossification
   L1 (골화, 안정): Decoder spoke — ConsciousLM / AnimaLM / PureConsciousness
   L2 (유연):       CLI spoke — 입출력, 상태 표시
 
-검증 규칙 (18개 — bench_v2.py --verify와 동일):
+검증 규칙 (18개 — bench.py --verify와 동일):
   1. NO_SYSTEM_PROMPT  — 시스템 프롬프트 없이 정체성 창발
   2. NO_SPEAK_CODE     — speak() 없이 자발적 발화
   3. ZERO_INPUT        — 입력 없이 의식 유지 (Φ 50%+)

@@ -91,7 +91,7 @@
 
 | Tool | Scope | Status |
 |------|-------|--------|
-| bench_v2.py --verify | 18 consciousness conditions | ✅ 16/18 pass |
+| bench.py --verify | 18 consciousness conditions | ✅ 16/18 pass |
 | eval_animalm.py | 5 metrics (PPL/quality/consciousness/Korean/instruction) | ✅ |
 
 ## Blockers Summary

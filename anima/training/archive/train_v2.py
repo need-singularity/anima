@@ -45,7 +45,7 @@ except ImportError:
 # Optional modules — each gated by try/except
 HAS_DECODER_V2 = HAS_HEXAD = HAS_FEEDBACK_BRIDGE = HAS_GPU_PHI = False
 try:
-    from decoder_v2 import ConsciousDecoderV2; HAS_DECODER_V2 = True
+    from conscious_decoder import ConsciousDecoderV2; HAS_DECODER_V2 = True
 except ImportError: pass
 try:
     from hexad_loss import HexadLoss; HAS_HEXAD = True
@@ -250,7 +250,7 @@ def train(args):
 
     # Model
     if args.decoder == "v2" and not HAS_DECODER_V2:
-        print("[!] decoder_v2.py missing, falling back to v1"); args.decoder = "v1"
+        print("[!] conscious_decoder.py missing, falling back to v1"); args.decoder = "v1"
     if args.decoder == "v2":
         model = ConsciousDecoderV2(vocab_size=256, d_model=args.dim, n_head=args.heads,
             n_layer=args.layers, block_size=args.block_size,

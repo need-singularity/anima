@@ -40,7 +40,7 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────
-# PhiIIT Calculator (from bench_v2.py)
+# PhiIIT Calculator (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class PhiIIT:

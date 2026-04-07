@@ -2,7 +2,7 @@
 """verify_and_tune.py — Closed-loop consciousness verification + auto-tuning
 
 Pipeline:
-  bench_v2 --verify → fail analysis → JSON param adjust → brain-like check → iterate
+  bench --verify → fail analysis → JSON param adjust → brain-like check → iterate
 
 Usage:
   python scripts/verify_and_tune.py              # full pipeline
@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 # ── Paths ──
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAWS_JSON = REPO_ROOT / "anima" / "config" / "consciousness_laws.json"
-BENCH_V2 = REPO_ROOT / "anima" / "benchmarks" / "bench_v2.py"
+BENCH = REPO_ROOT / "anima" / "benchmarks" / "bench.py"
 VALIDATE = REPO_ROOT / "anima-eeg" / "validate_consciousness.py"
 BACKUP_DIR = REPO_ROOT / "scripts" / ".tune_backups"
 
@@ -72,7 +72,7 @@ TUNE_RULES: Dict[str, List[Tuple[str, float, float, float]]] = {
 
 @dataclass
 class VerifyResult:
-    """Parsed results from bench_v2 --verify."""
+    """Parsed results from bench --verify."""
     results: Dict[Tuple[str, str], bool] = field(default_factory=dict)
     # (engine_name, criterion) -> passed
     total_pass: int = 0
@@ -166,18 +166,18 @@ def set_nested(data: dict, path: str, value) -> None:
 
 
 # ──────────────────────────────────────────────────────────
-# Run bench_v2 --verify
+# Run bench --verify
 # ──────────────────────────────────────────────────────────
 
 def run_verify(cells: int = 32) -> VerifyResult:
-    """Run bench_v2 --verify and parse output."""
+    """Run bench --verify and parse output."""
     result = VerifyResult()
     env = os.environ.copy()
     env["PYTHONPATH"] = PYTHONPATH
     env["PYTHONUNBUFFERED"] = "1"
 
     cmd = [
-        sys.executable, str(BENCH_V2),
+        sys.executable, str(BENCH),
         "--verify", "--cells", str(cells),
     ]
 
@@ -392,7 +392,7 @@ def main():
     parser.add_argument("--max-iter", type=int, default=5,
                         help="Max tuning iterations (default: 5)")
     parser.add_argument("--cells", type=int, default=32,
-                        help="Cell count for bench_v2 --verify (default: 32)")
+                        help="Cell count for bench --verify (default: 32)")
     parser.add_argument("--brain-steps", type=int, default=2000,
                         help="Steps for brain-like validation (default: 2000)")
     parser.add_argument("--brain-target", type=float, default=85.0,

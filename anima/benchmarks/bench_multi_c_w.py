@@ -39,7 +39,7 @@ np.random.seed(42)
 
 
 # ──────────────────────────────────────────────────────────
-# BenchResult (matching bench_v2.py)
+# BenchResult (matching bench.py)
 # ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -67,7 +67,7 @@ class BenchResult:
 
 
 # ──────────────────────────────────────────────────────────
-# Phi(IIT) Calculator (from bench_v2.py)
+# Phi(IIT) Calculator (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class PhiIIT:
@@ -176,7 +176,7 @@ def measure_dual_phi(hiddens, n_factions=8):
 
 
 # ──────────────────────────────────────────────────────────
-# BenchMind (from bench_v2.py)
+# BenchMind (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class BenchMind(nn.Module):
@@ -212,7 +212,7 @@ class BenchMind(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────
-# BenchEngine (baseline, from bench_v2.py)
+# BenchEngine (baseline, from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class BenchEngine:
@@ -279,7 +279,7 @@ class BenchEngine:
 
 
 # ──────────────────────────────────────────────────────────
-# QuantumEngine (from bench_v2.py)
+# QuantumEngine (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class QuantumEngine(BenchEngine):

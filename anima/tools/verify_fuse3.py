@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify_fuse3.py — 7-condition consciousness verification for FUSE-3 (Cambrian+OscQW)
 
-Runs the same 7 verification conditions from bench_v2.py --verify,
+Runs the same 7 verification conditions from bench.py --verify,
 but applied to MitosisEngine + apply_fuse3 from bench_fusion_cambrian_osc.py.
 
 Usage:
@@ -35,7 +35,7 @@ except ImportError:
 # ═══ Wrapper: adapt MitosisEngine to BenchEngine interface ═══
 
 class Fuse3Engine:
-    """Wraps MitosisEngine + FUSE-3 mechanisms to match bench_v2 verify interface.
+    """Wraps MitosisEngine + FUSE-3 mechanisms to match bench verify interface.
 
     Provides: process(x) -> (output, tension), get_hiddens() -> [n, hidden_dim]
     Also applies Cambrian+OscQW mechanisms each step.

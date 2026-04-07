@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench_clm_v2_sweep.py — ConsciousLM v2 하이퍼파라미터 스윕
+"""bench_clm_sweep.py — ConsciousLM v2 하이퍼파라미터 스윕
 
 CA rules × Gate strength × Block size 탐색
 """

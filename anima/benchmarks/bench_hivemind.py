@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench_hivemind_v2.py — HIVEMIND v2: tension-synchronized coupling
+"""bench_hivemind.py — HIVEMIND v2: tension-synchronized coupling
 
 Previous approaches FAILED:
   - x_input 대체: ×0.70 (자체 dynamics 방해)

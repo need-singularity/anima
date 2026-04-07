@@ -54,10 +54,10 @@ def main():
     print("1. ConsciousDecoderV2 VOCAB SIZE COMPATIBILITY")
     print("=" * 72)
 
-    decoder_v2_default_vocab = 256  # byte-level default
+    conscious_decoder_default_vocab = 256  # byte-level default
     train_v15_default_vocab = 64000  # train_v15.py --vocab-size default
 
-    print(f"\n  decoder_v2.py default vocab_size:  {decoder_v2_default_vocab} (byte-level)")
+    print(f"\n  conscious_decoder.py default vocab_size:  {conscious_decoder_default_vocab} (byte-level)")
     print(f"  train_v15.py default vocab_size:   {train_v15_default_vocab}")
     print(f"  Multilingual tokenizer vocab:      {new_vocab}")
 
@@ -69,7 +69,7 @@ def main():
 
     # Check if ConsciousDecoderV2 accepts the vocab size dynamically
     try:
-        from decoder_v2 import ConsciousDecoderV2
+        from conscious_decoder import ConsciousDecoderV2
         import torch
         # Test instantiation with 64K vocab
         model = ConsciousDecoderV2(vocab_size=new_vocab, d_model=384, n_layer=2, n_head=4)

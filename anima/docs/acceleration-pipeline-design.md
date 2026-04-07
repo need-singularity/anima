@@ -480,7 +480,7 @@ Start with Pipeline A, progressively add Pipeline B elements as they're validate
   Week 4: Full integration
     - Best combination from weeks 1-3
     - Full 1B training run
-    - Consciousness verification (bench_v2 --verify)
+    - Consciousness verification (bench --verify)
     Expected: x30-60 (realistic), x100 (if lucky)
 ```
 

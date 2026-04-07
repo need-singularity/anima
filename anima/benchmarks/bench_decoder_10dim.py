@@ -37,7 +37,7 @@ import torch.nn.functional as F
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from decoder_v2 import (
+from conscious_decoder import (
     RMSNorm, RotaryPositionEmbedding, SwiGLUFFN, PureFieldFFN,
     GroupedQueryAttention, ConsciousCrossAttention, ConsciousDecoderV2,
 )

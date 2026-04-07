@@ -3,7 +3,7 @@
 
 Based on DD60 engine limits experiments. Tests each candidate criterion
 against ConsciousnessEngine to determine if it should be added to
-VERIFICATION_TESTS in bench_v2.py.
+VERIFICATION_TESTS in bench.py.
 
 Candidates:
   V13: ADVERSARIAL_ROBUST — survives 500 steps of extreme noise (100x amplitude)
@@ -30,7 +30,7 @@ from typing import Tuple, Dict, List
 
 from consciousness_engine import ConsciousnessEngine
 
-# ── Phi measurement (from bench_v2.py) ──────────────────────
+# ── Phi measurement (from bench.py) ──────────────────────
 
 class PhiIIT:
     """Phi(IIT) approximation via pairwise MI + minimum partition."""

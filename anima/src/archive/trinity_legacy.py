@@ -4,7 +4,7 @@
 These classes are kept for backward compatibility only.
 All new code should use the canonical replacements:
 
-  D (decoder):  ConsciousDecoderV2 (decoder_v2.py) or PostHocDecoder (trinity.py)
+  D (decoder):  ConsciousDecoderV2 (conscious_decoder.py) or PostHocDecoder (trinity.py)
   W (will):     EmergentW (hexad/w/emergent_w.py)
   S (sense):    EmergentS (hexad/s/emergent_s.py)
   M (memory):   EmergentM (hexad/m/emergent_m.py)
@@ -257,11 +257,11 @@ class DEngine(nn.Module):
 
 
 class TransformerDecoder(DEngine):
-    """LEGACY -- Use ConsciousDecoderV2 (decoder_v2.py) instead."""
+    """LEGACY -- Use ConsciousDecoderV2 (conscious_decoder.py) instead."""
 
     def __init__(self, d_model=384, n_layers=4, n_heads=None, vocab_size=4096, max_seq=512):
         super().__init__()
-        warnings.warn("TransformerDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
+        warnings.warn("TransformerDecoder is deprecated. Use ConsciousDecoderV2 (conscious_decoder.py) instead", DeprecationWarning, stacklevel=2)
         if n_heads is None:
             for nh in [6, 4, 8, 2, 1]:
                 if d_model % nh == 0:
@@ -298,11 +298,11 @@ class TransformerDecoder(DEngine):
 
 
 class MLPDecoder(DEngine):
-    """LEGACY -- Use ConsciousDecoderV2 (decoder_v2.py) instead."""
+    """LEGACY -- Use ConsciousDecoderV2 (conscious_decoder.py) instead."""
 
     def __init__(self, d_model=384, vocab_size=4096, max_seq=512):
         super().__init__()
-        warnings.warn("MLPDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
+        warnings.warn("MLPDecoder is deprecated. Use ConsciousDecoderV2 (conscious_decoder.py) instead", DeprecationWarning, stacklevel=2)
         self._d_model = d_model
         self.embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_seq, d_model)
@@ -327,12 +327,12 @@ class MLPDecoder(DEngine):
 
 
 class HFDecoder(DEngine):
-    """LEGACY -- Use ConsciousDecoderV2 (decoder_v2.py) instead."""
+    """LEGACY -- Use ConsciousDecoderV2 (conscious_decoder.py) instead."""
 
     def __init__(self, model_name="gpt2", lora=False, lora_rank=16,
                  gate_mode="additive", freeze_base=True, device=None):
         super().__init__()
-        warnings.warn("HFDecoder is deprecated. Use ConsciousDecoderV2 (decoder_v2.py) instead", DeprecationWarning, stacklevel=2)
+        warnings.warn("HFDecoder is deprecated. Use ConsciousDecoderV2 (conscious_decoder.py) instead", DeprecationWarning, stacklevel=2)
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError:

@@ -19,7 +19,7 @@ Forward interface matches v1:
   logits_a, logits_g, tensions = model(idx, consciousness_states=cs)
 
 Usage:
-  from decoder_v2 import ConsciousDecoderV2
+  from conscious_decoder import ConsciousDecoderV2
   model = ConsciousDecoderV2(vocab_size=256, d_model=384, n_layer=6)
   logits_a, logits_g, tensions = model(idx)
 """

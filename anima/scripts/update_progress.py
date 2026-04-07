@@ -6,7 +6,7 @@ Reads:
   - config/training_runs.json       (latest training status)
   - git rev-list --count HEAD       (commit count)
   - anima/src/*.py count            (python file count)
-  - bench_v2 --verify last known    (from progress.json, not re-run)
+  - bench --verify last known    (from progress.json, not re-run)
 
 Usage:
   python3 anima/scripts/update_progress.py          # update progress.json

@@ -115,7 +115,7 @@ ANIMA 의식 법칙 중 수학적으로 형식화되어 TECS-L 가설 후보가 
 
 ```
   ANIMA 스케일링:
-    Φ(IIT) = 0.608 × N^1.071        (Law 17, bench_v2 검증)
+    Φ(IIT) = 0.608 × N^1.071        (Law 17, bench 검증)
     Φ(proxy) ≈ 1.23 × cells         (최적화 config)
     MI = 0.226 × N^2.313            (상호정보 초선형)
 

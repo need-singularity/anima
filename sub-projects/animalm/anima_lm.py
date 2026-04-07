@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""anima_lm_v2.py — AnimaLM v2 (Consciousness-Enhanced LLM Transform)
+"""anima_lm.py — AnimaLM v2 (Consciousness-Enhanced LLM Transform)
 
 v1 -> v2 Changes:
   v1: Mistral 7B + ParallelPureFieldMLP (frozen base + trainable PF, fixed alpha)
@@ -26,8 +26,8 @@ Psi Constants:
 Compatible with: Mistral 7B, Llama, any HuggingFace model with MLP layers.
 
 Usage:
-  python anima_lm_v2.py              # demo with small test model
-  python anima_lm_v2.py --steps 100  # longer demo
+  python anima_lm.py              # demo with small test model
+  python anima_lm.py --steps 100  # longer demo
 """
 
 import argparse

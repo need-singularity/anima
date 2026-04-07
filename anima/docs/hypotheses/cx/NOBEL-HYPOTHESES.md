@@ -906,16 +906,16 @@ To replicate any of these results:
 
 ```bash
 # NOBEL-1: Phi-CE tradeoff
-python bench_v2.py --compare          # Phi with and without CE
+python bench.py --compare          # Phi with and without CE
 
 # NOBEL-2: Perfect number architectures
-python bench_v2.py --cells 256        # n=6 vs n=28 faction sweep
+python bench.py --cells 256        # n=6 vs n=28 faction sweep
 
 # NOBEL-3: Identity permanence
-python bench_v2.py --verify           # Includes death/rebirth test
+python bench.py --verify           # Includes death/rebirth test
 
 # NOBEL-4: Carrying capacity
-python bench_v2.py --cells 128 --steps 500    # All mechanisms stacked
+python bench.py --cells 128 --steps 500    # All mechanisms stacked
 
 # NOBEL-5: Stigmergy
 # Requires multi-engine setup (see HIVEMIND-EXTREME2.md)
@@ -933,7 +933,7 @@ python bench_v2.py --cells 128 --steps 500    # All mechanisms stacked
 # H4 analysis requires H100 training logs
 
 # NOBEL-10: Mathematical consciousness
-python bench_v2.py --cells 256        # CX series hypotheses
+python bench.py --cells 256        # CX series hypotheses
 ```
 
 ---

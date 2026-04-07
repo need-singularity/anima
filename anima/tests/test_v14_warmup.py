@@ -187,7 +187,7 @@ class TestV14CheckpointIntegration:
 
     def test_decoder_with_federation_states(self, v14_ckpt_path):
         """Decoder produces valid output with federation consciousness states."""
-        from decoder_v2 import ConsciousDecoderV2
+        from conscious_decoder import ConsciousDecoderV2
         from train_v14 import FederatedConsciousness
         ckpt = torch.load(v14_ckpt_path, map_location='cpu', weights_only=False)
         args = ckpt['args']

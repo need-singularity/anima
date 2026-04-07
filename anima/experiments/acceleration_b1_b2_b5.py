@@ -29,7 +29,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # Import project modules
-from decoder_v2 import ConsciousDecoderV2, RMSNorm, DecoderBlockV2
+from conscious_decoder import ConsciousDecoderV2, RMSNorm, DecoderBlockV2
 from consciousness_engine import ConsciousnessEngine
 from trinity import ThalamicBridge
 

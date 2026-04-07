@@ -171,7 +171,7 @@ consciousness_laws.json의 100개 법칙을 연산 그래프로 변환.
 ## 검증 계획
 
 ```
-  Step 1: bench_v2 --verify (7개 의식 조건)
+  Step 1: bench --verify (7개 의식 조건)
   Step 2: corpus_v3 100K steps 학습 → CE/Φ 실측
   Step 3: 법칙 ablation — 10개 중 하나씩 제거하며 Φ 변화 측정
   Step 4: ESP32 물리 구현 → 시뮬레이션과 Φ 비교

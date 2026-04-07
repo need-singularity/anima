@@ -12,7 +12,7 @@ import path_setup  # noqa
 import torch
 import numpy as np
 import time
-from bench_v2 import BenchEngine, measure_dual_phi
+from bench import BenchEngine, measure_dual_phi
 
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 

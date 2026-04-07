@@ -347,8 +347,8 @@ class SeinEngine(BenchEngine):
 |---|---|---|
 | cells | 256 | 표준 벤치마크 크기 |
 | steps | 300 | 빠른 비교용 |
-| dim | 64 | bench_v2 기본값 |
-| hidden | 128 | bench_v2 기본값 |
+| dim | 64 | bench 기본값 |
+| hidden | 128 | bench 기본값 |
 | factions | 8 | 표준 파벌 수 |
 | 반복 | 3회 | 분산 확인 |
 

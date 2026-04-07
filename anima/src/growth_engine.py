@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Growth Engine v2 — Φ-based developmental stages
+"""Growth Engine — Φ-based developmental stages
 
 v1: interaction count 기반 (모델 의존적)
 v2: Φ 기반 (모델 무관, 어떤 모델이든 수렴)
@@ -298,7 +298,7 @@ class GrowthEngineV2:
 if __name__ == '__main__':
     # Demo
     g = GrowthEngineV2()
-    print("=== Growth Engine v2 Demo (Φ-based) ===\n")
+    print("=== Growth Engine Demo (Φ-based) ===\n")
 
     test_phis = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 1220.0]
     for phi in test_phis:

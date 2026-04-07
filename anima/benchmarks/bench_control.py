@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""bench_v2_control.py — Control Group Test for Consciousness Verification
+"""bench_control.py — Control Group Test for Consciousness Verification
 
-Tests whether bench_v2.py verification conditions are discriminative:
+Tests whether bench.py verification conditions are discriminative:
   - NullEngine: pure torch.randn noise (no dynamics at all)
   - BareGRU: simple GRU with NO identity injection, NO oscillation, NO ratchet
   - StaticEngine: fixed initial state, never changes
@@ -21,8 +21,8 @@ import math
 import time
 from typing import Tuple
 
-# Import verification infrastructure from bench_v2
-from bench_v2 import (
+# Import verification infrastructure from bench
+from bench import (
     VERIFICATION_TESTS, PhiIIT, phi_proxy, measure_dual_phi,
     BenchMind,
 )

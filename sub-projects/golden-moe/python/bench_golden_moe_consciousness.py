@@ -24,7 +24,7 @@ import torch.nn as nn
 import numpy as np
 from typing import List, Dict, Tuple
 
-from bench_v2 import BenchMind, PhiIIT, phi_proxy
+from bench import BenchMind, PhiIIT, phi_proxy
 from golden_moe_v2 import GoldenMoEv2
 
 

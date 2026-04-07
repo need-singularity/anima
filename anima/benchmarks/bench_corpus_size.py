@@ -26,7 +26,7 @@ def train_short(data_path, max_bytes, steps=1500, device=None):
         n_factions=12, phi_ratchet=True
     )
 
-    from decoder_v2 import ConsciousDecoderV2
+    from conscious_decoder import ConsciousDecoderV2
 
     model = ConsciousDecoderV2(
         consciousness_dim=128, d_model=384, n_layer=6,

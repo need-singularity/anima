@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
-from decoder_v2 import (
+from conscious_decoder import (
     RMSNorm,
     RotaryPositionEmbedding,
     SwiGLUFFN,

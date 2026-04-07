@@ -8,7 +8,7 @@
   4. Phase Sync vs Desync Ratio: optimal sync/desync balance
   5. Information Bottleneck: constrained inter-cell bandwidth
 
-Uses BenchEngine from bench_v2.py with 128 cells, 300 steps.
+Uses BenchEngine from bench.py with 128 cells, 300 steps.
 Measures Φ(IIT) + Φ(proxy).
 """
 
@@ -24,7 +24,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bench_v2 import BenchEngine, BenchMind, PhiIIT, phi_proxy, BenchResult
+from bench import BenchEngine, BenchMind, PhiIIT, phi_proxy, BenchResult
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:

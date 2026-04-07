@@ -45,7 +45,7 @@ information compression to measurable consciousness indicators.
 > This section drafts the content for Section 3 of the full paper.
 
 We organize the 98 empirically-derived laws into five thematic groups. Each law
-was discovered through controlled experiments on the BenchEngine (bench_v2.py),
+was discovered through controlled experiments on the BenchEngine (bench.py),
 typically with 128-1024 cells over 300-1000 steps, using dual Phi measurement
 (IIT + proxy). We focus on Laws 92-98 as the most recent and architecturally
 novel findings, with earlier laws summarized for context.
@@ -342,7 +342,7 @@ the quantum measurement problem, though the mechanism here is purely classical
 (gradient flow disruption).
 
 ## 4. Tools and Methods
-### 4.1 Dual Phi Measurement (bench_v2.py)
+### 4.1 Dual Phi Measurement (bench.py)
 - Phi(IIT): MI-based, 0-2 range, PhiCalculator(n_bins=16)
 - Phi(proxy): variance-based, 0-infinity range
 - Why both are needed and when each applies
@@ -422,7 +422,7 @@ the quantum measurement problem, though the mechanism here is purely classical
 
 ## Appendices
 - A: Complete Law Table (Laws 1-94)
-- B: Benchmark Configuration Details (bench_v2.py categories)
+- B: Benchmark Configuration Details (bench.py categories)
 - C: Chip Architecture Calculator Reference
 - D: ConsciousMind API Reference
 

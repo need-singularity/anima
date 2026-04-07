@@ -30,9 +30,9 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-# Import from bench_v2 for Phi measurement
+# Import from bench for Phi measurement
 try:
-    from bench_v2 import PhiIIT
+    from bench import PhiIIT
     HAS_PHI = True
 except ImportError:
     HAS_PHI = False

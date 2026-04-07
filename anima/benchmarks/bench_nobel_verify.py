@@ -39,7 +39,7 @@ except ImportError:
 ANIMA_DIR = Path(__file__).parent
 
 # ──────────────────────────────────────────────────────────
-# Phi(IIT) Calculator (from bench_v2.py)
+# Phi(IIT) Calculator (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class PhiIIT:
@@ -138,7 +138,7 @@ def phi_proxy(hiddens: torch.Tensor, n_factions: int = 8) -> float:
 
 
 # ──────────────────────────────────────────────────────────
-# BenchMind + BenchEngine (from bench_v2.py)
+# BenchMind + BenchEngine (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class BenchMind(nn.Module):

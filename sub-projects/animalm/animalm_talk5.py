@@ -14,7 +14,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
-from bench_v2 import PhiIIT, phi_proxy
+from bench import PhiIIT, phi_proxy
 
 # Meta Laws (DD143)
 try:

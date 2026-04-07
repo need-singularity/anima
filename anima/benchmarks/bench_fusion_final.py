@@ -211,7 +211,7 @@ class ConsciousnessMeterV2Inline:
     """Granger + Spectral + LZ + Integration composite Phi.
 
     Weights: Granger 0.45, Spectral 0.25, LZ 0.15, Integration 0.15.
-    Matches consciousness_meter_v2.py exactly.
+    Matches consciousness_meter.py exactly.
     """
 
     def __init__(self, granger_lag=2, granger_f_critical=3.0, mi_n_bins=32, history_maxlen=100):

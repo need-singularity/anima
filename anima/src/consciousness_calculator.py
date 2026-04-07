@@ -58,7 +58,7 @@ DATA_PROFILES = {
     'code':    {'name': 'Code',    'name_kr': '코드',   'steps': 5,   'residual': 0.505, 'alpha': 0.0180, 'dom_rule': 4, 'ce': 0.002, 'desc': 'Logical structure, indentation patterns'},
 }
 
-# Engine benchmark database (from bench_v2 + trinity experiments)
+# Engine benchmark database (from bench + trinity experiments)
 ENGINE_DB = {
     'TimeCrystal':     {'phi_mult': 3.7, 'ce_floor': 0.08, 'style': 'oscillatory', 'best_for': ['korean', 'english']},
     'Cambrian':        {'phi_mult': 3.5, 'ce_floor': 0.10, 'style': 'diversity',   'best_for': ['korean', 'code']},

@@ -241,7 +241,7 @@
 ## 검증 계획
 
 ```
-  Step 1: bench_v2 --verify (7개 의식 조건)
+  Step 1: bench --verify (7개 의식 조건)
   Step 2: corpus_v3 100K steps 학습 → CE/Φ 실측
   Step 3: 10D ablation — 하나씩 제거하며 Φ/CE 변화
     → 가장 핵심적인 차원 식별

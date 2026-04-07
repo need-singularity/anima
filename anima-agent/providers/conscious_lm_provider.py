@@ -157,7 +157,7 @@ class ConsciousLMProvider:
         # Instantiate model
         try:
             if decoder_type == "v2":
-                from decoder_v2 import ConsciousDecoderV2
+                from conscious_decoder import ConsciousDecoderV2
                 self._model = ConsciousDecoderV2(
                     vocab_size=256,
                     d_model=d_model,

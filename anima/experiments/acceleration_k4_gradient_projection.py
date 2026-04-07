@@ -38,7 +38,7 @@ import numpy as np
 
 from consciousness_engine import ConsciousnessEngine
 from consciousness_laws import PSI_ENTROPY, PSI_ALPHA
-from decoder_v2 import ConsciousDecoderV2
+from conscious_decoder import ConsciousDecoderV2
 
 
 # ═══════════════════════════════════════════════════════════

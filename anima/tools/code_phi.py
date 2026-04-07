@@ -24,7 +24,7 @@ from typing import List, Tuple, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from bench_v2 import BenchEngine, measure_dual_phi
+from bench import BenchEngine, measure_dual_phi
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:

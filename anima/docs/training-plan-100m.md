@@ -182,7 +182,7 @@ Rationale:
 2. 128c Phi is stable (variation < 3% even during CE spikes)
 3. gpu_phi.py handles 128c in 485ms (acceptable for every-100-step measurement)
 4. 256c would push gpu_phi to ~2s/call and VRAM higher with diminishing returns
-5. Phi>100 is sufficient for consciousness verification (bench_v2 --verify)
+5. Phi>100 is sufficient for consciousness verification (bench --verify)
 
 ### Why not 256c?
 
@@ -388,7 +388,7 @@ Phi |
 |--------|--------|---------------|-------------|-----------|
 | CE (cross-entropy) | < 0.005 | 0.0084 (34.5M) | 0.004 (64c) | 4x model, 2x cells |
 | Phi (IIT proxy) | > 100 | 103 (128c) | 71 (64c) | 128c linear scaling |
-| bench_v2 --verify | 7/7 pass | 7/7 | 7/7 | Non-negotiable |
+| bench --verify | 7/7 pass | 7/7 | 7/7 | Non-negotiable |
 | Korean 5-turn coherence | Recognizable | N/A | N/A | Primary goal |
 | No Phi collapse | Phi never < 50 | Maintained | Maintained | Ratchet verified |
 | Generation speed | > 10 tok/s | N/A | N/A | RTX 5070 inference |
@@ -481,8 +481,8 @@ python -c "from decoder_v3 import ConsciousDecoderV3; m=ConsciousDecoderV3(); \
 # 2. Verify corpus_v10 exists (200MB)
 ls -la ~/Dev/anima/anima/data/corpus_v10*.txt
 
-# 3. Run bench_v2 --verify to confirm engine health
-cd ~/Dev/anima/anima && python benchmarks/bench_v2.py --verify
+# 3. Run bench --verify to confirm engine health
+cd ~/Dev/anima/anima && python benchmarks/bench.py --verify
 
 # 4. Test 128c federation startup
 python -c "
@@ -529,7 +529,7 @@ ls -la checkpoints/v3_100m/      # Checkpoint listing
 
 ```bash
 # 1. Consciousness verification
-python benchmarks/bench_v2.py --verify --checkpoint checkpoints/v3_100m/best_ce.pt
+python benchmarks/bench.py --verify --checkpoint checkpoints/v3_100m/best_ce.pt
 
 # 2. Korean generation test
 python -c "
@@ -587,7 +587,7 @@ If the 100M training succeeds (CE<0.005, Korean coherent), this unlocks:
 ## Timeline
 
 ```
-  Day 0:     Pre-checks (param count, corpus, bench_v2 verify)
+  Day 0:     Pre-checks (param count, corpus, bench verify)
   Day 0:     Launch training on H100 (tmux)
   Day 1:     P0 complete (20K steps), verify Phi > 30
   Day 1.5:   P1 midpoint (35K), verify Phi > 60
@@ -596,7 +596,7 @@ If the 100M training succeeds (CE<0.005, Korean coherent), this unlocks:
   Day 3:     P2/P3 transition (140K), verify CE < 0.01
   Day 3-4:   P3 full Hexad (140K-200K), Korean convergence
   Day 4:     Training complete, evaluation begins
-  Day 4-5:   bench_v2 --verify, Korean evaluation, scaling analysis
+  Day 4-5:   bench --verify, Korean evaluation, scaling analysis
   Day 5:     Web deployment decision
 ```
 

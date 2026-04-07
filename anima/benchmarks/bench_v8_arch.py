@@ -65,7 +65,7 @@ class BenchResult:
 
 
 # ──────────────────────────────────────────────────────────
-# Phi(IIT) Calculator (from bench_v2.py)
+# Phi(IIT) Calculator (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class PhiIIT:
@@ -1954,7 +1954,7 @@ def run_consciousness_gan(n_cells: int = 256, steps: int = 300, input_dim: int =
 
 
 # ══════════════════════════════════════════════════════════
-# BASELINE (standard BenchEngine from bench_v2)
+# BASELINE (standard BenchEngine from bench)
 # ══════════════════════════════════════════════════════════
 
 def run_baseline(n_cells: int = 256, steps: int = 300, input_dim: int = 64,

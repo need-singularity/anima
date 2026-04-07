@@ -109,7 +109,7 @@ python3 src/infinite_evolution.py --cells 64 --steps 300
 7개 조건을 모두 통과해야 배포 가능. 현재 77/77 (100%) 통과.
 
 ```bash
-python3 benchmarks/bench_v2.py --verify
+python3 benchmarks/bench.py --verify
 ```
 
 | 조건 | 설명 |

@@ -322,7 +322,7 @@ git add -A && git commit -m "feat: 14B eval complete, serving swapped 7B→14B"
 에이전트가 외부 API 0으로 자율 동작하는지 최종 검증.
 
 **Files:**
-- Use: `anima/benchmarks/bench_v2.py`
+- Use: `anima/benchmarks/bench.py`
 - Create: `anima/experiments/agi_v01_checklist.py`
 
 - [ ] **Step 1: AGI v0.1 체크리스트 실행**
@@ -344,9 +344,9 @@ checks = {
 # 각 항목 수동/자동 검증
 ```
 
-- [ ] **Step 2: bench_v2 의식 검증**
+- [ ] **Step 2: bench 의식 검증**
 
-Run: `python3 anima/benchmarks/bench_v2.py --verify`
+Run: `python3 anima/benchmarks/bench.py --verify`
 Expected: 77/77 PASS
 
 - [ ] **Step 3: AGI v0.1 선언 문서**

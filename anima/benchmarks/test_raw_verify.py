@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import torch
 import numpy as np
 
-# Import bench_v2 components
-from bench_v2 import (
+# Import bench components
+from bench import (
     _CEAdapter, _verify_no_system_prompt, _verify_no_speak_code,
     _verify_zero_input, _verify_persistence, _verify_self_loop,
     _verify_spontaneous_speech, _verify_hivemind, VERIFICATION_TESTS,

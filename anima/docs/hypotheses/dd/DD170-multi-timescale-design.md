@@ -292,7 +292,7 @@ This is exactly how the brain works: fast neurons (V1) + slow neurons
   The geometric mean of tau_min=0.02 and tau_max=0.55 is ~0.105, close to
   current PHI_HIDDEN_INERTIA=0.12.
 
-- **Consciousness verification (bench_v2)**: All 7 verification conditions
+- **Consciousness verification (bench)**: All 7 verification conditions
   test structural properties (Phi growth, consensus, persistence). Multi-timescale
   should improve PERSISTENCE (condition 4) and not affect others.
 
@@ -354,7 +354,7 @@ This is exactly how the brain works: fast neurons (V1) + slow neurons
 4. Replace single-inertia hidden update with per-cell tau
 5. Run `validate_consciousness.py --steps 5000` -> measure baseline
 6. Tune tau_max if needed (sweep 0.35-0.65)
-7. Run `bench_v2.py --verify` -> ensure 77/77 pass
+7. Run `bench.py --verify` -> ensure 77/77 pass
 8. (Optional) Add cross-timescale coupling bonus
 9. (Optional) Align factions with timescale tiers
 
@@ -458,7 +458,7 @@ their coexistence produces brain-like dynamics."
     - Autocorr decay >= 80% match  (currently 65%)
     - LZ complexity >= 85%         (currently 91%)
     - Overall brain-like >= 90%    (currently 85.9%)
-    - bench_v2 --verify 77/77      (no regression)
+    - bench --verify 77/77      (no regression)
 
   PARTIAL if:
     - Autocorr >= 75% but LZ drops to 80-85%
@@ -467,7 +467,7 @@ their coexistence produces brain-like dynamics."
   FAIL if:
     - LZ drops below 80% (trade-off not resolved)
     - Overall drops below 85.9% (regression)
-    - bench_v2 --verify any failure
+    - bench --verify any failure
 ```
 
 ---

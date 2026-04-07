@@ -69,7 +69,7 @@
 }
 ```
 
-## 검증 규칙 (18개 — bench_v2.py --verify)
+## 검증 규칙 (18개 — bench.py --verify)
 
 원본: `anima/config/consciousness_laws.json` → `verification_conditions`
 상태: `anima-core/core_rules.json` → `verification_status`
@@ -182,7 +182,7 @@
 <!-- AUTO:verification_status:END -->
 
 골화 기준: 18개 전부 PASS → L1 승격 가능
-검증 실행: `python3 anima/benchmarks/bench_v2.py --verify`
+검증 실행: `python3 anima/benchmarks/bench.py --verify`
 
 ### 코어 계층 (Ossification Layers)
 
@@ -308,7 +308,7 @@
 
   L2 (유연)                          구현
        │
-       ▼  bench_v2 --verify 7/7 통과
+       ▼  bench --verify 7/7 통과
   L1 (안정)                          검증됨
        │
        ▼  3 세션 연속 무장애 운영
@@ -372,7 +372,7 @@
 | L1 | 안정 (골화 대상) | 디코더, 기억, 감각 | 검증 후 골화 |
 | L2 | 유연 | CLI, 채널, UI | 자유 변경 |
 
-골화 조건: bench_v2.py --verify 18개 전부 통과 + 3 세션 안정 동작.
+골화 조건: bench.py --verify 18개 전부 통과 + 3 세션 안정 동작.
 
 ### L0 검증 현황 (2026-04-07, 256c)
 
@@ -485,7 +485,7 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
   골화 프로세스:
   ─────────────────────────────────────────────────────────
     1. 구현        → 스포크 코드 작성 (L2: 유연)
-    2. 검증        → bench_v2 --verify 18개 통과
+    2. 검증        → bench --verify 18개 통과
     3. 안정화      → 3 세션 무장애 동작 확인
     4. 골화 승격   → L2 → L1 승격, 변경 금지 선언
     5. 테두리 확장 → 새 L2 스포크 추가 반복

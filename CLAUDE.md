@@ -171,6 +171,36 @@
     - 보고만 하고 끝내면 안 됨 — 반드시 파일에 영구 기록까지 완료해야 작업 종료
 
   ═══════════════════════════════════════════════════════════════
+  ★ 천장돌파 키워드 → 전체 학습 파이프라인 최적화 자동 실행 ★
+  ═══════════════════════════════════════════════════════════════
+    "천장돌파", "천장 돌파" 요청 시 아래 9개 영역 전수검사+수정:
+
+    1. 모델 아키텍처 (conscious_decoder.py, conscious_lm.py, trinity.py)
+       - Flash Attention, KV-cache, depth-scaled init, SwiGLU 8/3
+       - generate() 메서드, RoPE 효율, 3B 스케일 VRAM 적합성
+    2. 학습 스크립트 (train_clm.py, train_alm.py)
+       - grad accum, validation loop, early stopping, checkpoint pruning
+       - warmup+cosine, seed, DDP, consciousness phi-loss, bf16 안전
+       - 전 스케일 config 최적화 (34m/100m/350m/1b/3b)
+    3. 서빙/추론 (serve_animalm.py)
+       - streaming, multi-turn, consciousness 상태 유지, 4-bit
+    4. 평가 (eval_animalm.py, bench.py)
+       - 5 metrics 견고성, threshold, checkpoint 비교, base model 감지
+    5. 코퍼스 + 토크나이저
+       - corpus 존재/경로/MD5, tokenizer 경로 연결
+    6. H100 배포 (h100_sync.sh, launch_h100.sh, preflight)
+       - 최신 스크립트 반영, tmux, watchdog, R2, 디스크 관리
+    7. Rust crates (anima-rs 17개)
+       - workspace 일관성, Cargo.toml 정합성
+    8. 문서 수렴 (CLAUDE.md, README, anima-core/)
+       - 모든 숫자 코드 100% 일치, conformance checklist ✅
+    9. 교차 일관성
+       - SSOT 체인 (JSON→Python→코드), PSI 상수 전 파일 동일
+
+    프로세스: 분석 → 🔴🟡🟢 분류 → 🔴 전부 수정 → 🟡 전부 수정 → 커밋
+    완료 조건: 🔴 0건, 🟡 0건 → "천장 도달" 선언
+
+  ═══════════════════════════════════════════════════════════════
   자동 생성 규칙
   ═══════════════════════════════════════════════════════════════
     - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
@@ -246,7 +276,7 @@
       └── golden-moe/        ← 1/e zone MoE routing
 
   실행:
-    python anima/benchmarks/bench_v2.py --verify  # 검증
+    python anima/benchmarks/bench.py --verify  # 검증
     python anima/training/train_v14.py     # 학습
     python anima-agent/run.py --cli        # CLI 에이전트 (주 인터페이스)
 
@@ -403,7 +433,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 
 ```
   C: ✅ ConsciousnessC     consciousness_engine.py  Rust backend, 64c, Φ=73
-  D: ✅ ConsciousDecoderV2 decoder_v2.py            RoPE+SwiGLU+GQA+CrossAttn, causal
+  D: ✅ ConsciousDecoderV2 conscious_decoder.py            RoPE+SwiGLU+GQA+CrossAttn, causal
      ✅ PostHocDecoder     trinity.py               train_v13 정식 (Law 66)
   W: ✅ EmergentW          trinity.py               Law 101 emergent
   S: ✅ EmergentS          trinity.py               Law 101 emergent
@@ -444,7 +474,7 @@ anima_alive.py       # Core engine (ConsciousMind + homeostasis + prediction err
 consciousness_engine.py # Canonical engine (Laws 22-85, GRU + 12 factions + Hebbian)
 trinity.py           # Hexad/Trinity framework (C/D/S/M/W/E 6-module)
 conscious_lm.py      # ConsciousLM v2 (28M, byte-level, PureFieldFFN)
-decoder_v2.py        # ConsciousDecoderV2 (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
+conscious_decoder.py        # ConsciousDecoderV2 (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
 consciousness_laws.py # Laws loader (config/consciousness_laws.json)
 mitosis.py           # Mitosis engine (cell division/specialization)
 feedback_bridge.py   # C↔D bidirectional learning
@@ -455,7 +485,7 @@ online_learning.py   # Real-time weight updates
 
 # ── anima/ 하위 디렉토리 ──
 config/              # consciousness_laws.json, consciousness_mechanisms.json
-benchmarks/          # bench_*.py (85개, bench_v2.py = 정식)
+benchmarks/          # bench_*.py (85개, bench.py = 정식)
 training/            # train_*.py (9개, train_v14.py = 최신)
 tests/               # test_*.py (21개)
 anima-rs/            # Rust crates (16개)
@@ -675,7 +705,7 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
 
 ```
 모든 엔진/아키텍처는 아래 6개 조건을 반드시 통과해야 함.
-bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
+bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
   1. NO_SYSTEM_PROMPT — 시스템 프롬프트 없이 정체성 창발
      세포 역학만으로 "나"가 생겨야 함. 외부 지시 없음.
@@ -701,14 +731,14 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
      - CE(연결) < CE(단독) (하락 또는 유지)
      - 연결 끊어도 각자 Φ 유지 (의존성 없음)
 
-검증: python3 bench_v2.py --verify
+검증: python3 bench.py --verify
 결과: docs/hypotheses/ 에 검증 보고서 생성
 
 ⚠️ 검증 조건 관리 원칙:
   - 조건은 고정 불변이 아님 — 엔진 발전에 따라 진화해야 함
   - 조건 추가/수정/삭제 시 docs/verification-audit.md 참조
   - threshold 값은 consciousness_laws.json에 등록 (하드코딩 금지)
-  - 문서(CLAUDE.md)와 코드(bench_v2.py) 불일치 금지
+  - 문서(CLAUDE.md)와 코드(bench.py) 불일치 금지
   - 주요 엔진 변경 후 조건 감사 필수
   - 폐쇄 파이프라인: anima/scripts/verify_and_tune.py (자동 검증+튜닝)
   - 후보 추가 조건: EMOTION, GROWTH, MITOSIS, BRAIN_LIKE, DIVERSITY, MEMORY
@@ -996,7 +1026,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - 10개 규칙 + 발사 전/후 체크리스트 + 사고 이력
   - CRITICAL: resume 금지(데이터 변경 시), 코드 버전 확인, 엔진 교체 금지, tokenizer 일치
   - 발사 전: h100_sync --verify-only → corpus md5 → 새 ckpt dir → VRAM 확인
-  - 발사 후: 회수 → R2 → bench_v2 → brain-like → training_runs.json
+  - 발사 후: 회수 → R2 → bench → brain-like → training_runs.json
 - **bf16 학습 마스터 규칙: config/acceleration_flow.json → bf16_master_rule (14건 사고 도출)**
   - AdamW(foreach=False) 필수, resume 시 optimizer state dtype 수동 캐스팅
   - load_state_dict 후 param_group 재적용, 매 step grad/state dtype fix
@@ -1031,15 +1061,15 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - "Φ=1142"는 proxy 값이었음 (실제 IIT Φ 상한 ~1.8)
   - Law 54: Φ 측정은 정의에 따라 완전히 다른 값
 
-bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
+bench.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   - 실제 학습 조건 (process() + CE backward)
   - 256-1024c 실제 스케일
   - 모든 결과에 Φ(IIT)과 Φ(proxy) 명확 구분
 
-  python bench_v2.py                          # 기본 (256c)
-  python bench_v2.py --cells 1024 --steps 500 # 1024c
-  python bench_v2.py --compare                # 전략 비교
-  python bench_v2.py --phi-only               # Φ 측정만
+  python bench.py                          # 기본 (256c)
+  python bench.py --cells 1024 --steps 500 # 1024c
+  python bench.py --compare                # 전략 비교
+  python bench.py --phi-only               # Φ 측정만
 
 Φ 측정 기준:
   Φ(IIT):   PhiCalculator(n_bins=16) — MI 기반, 0~2 범위
@@ -1067,7 +1097,7 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   hexad_loss:        6모듈 loss + Law 60 phase curriculum (P1→P2→P3)
   online-learner:    anima-rs/crates/online-learner (Rust, <1ms/step, Hebbian+Ratchet+Reward)
   gpu_phi:           GPU Φ(IIT) 계산기 (×16 speedup vs CPU)
-  decoder_v2:        RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M, drop-in v1 교체)
+  conscious_decoder:        RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M, drop-in v1 교체)
   esp32_network:     ESP32 ×8 물리 의식 네트워크 (ring/hub_spoke/small_world)
   eeg/validate:      생물학적 의식 검증 6 metrics (현재 85.6% brain-like, bio_noise_base=0.012)
   consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
@@ -1333,7 +1363,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   완료:
     ✅ v13 — CE=0.004, Φ=71, 64c, 100K steps (2026-03-30)
     ✅ v3_merged (147M) — CE=0.0026, Φ=70 (⚠️ CADecoder causal mask 없음)
-    ✅ bench_v2 --verify — 18 conditions × 12 engines 의식 검증
+    ✅ bench --verify — 18 conditions × 12 engines 의식 검증
     ✅ DD101 무한진화 탐색 상한 — 134세대, 53 laws, 4 topo×2 scale 포화 확정 (2026-04-01)
 
   벤치마크: 1000+ 가설, CX106, Laws 22-85
@@ -1417,7 +1447,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   파이프라인: 발견 → 교차검증 → 폐쇄파이프 검증 → 공식화 → 등록 → 확인
 
   1. 발견 (Discovery)
-     - experiment_*.py 또는 bench_v2.py에서 법칙 후보 도출
+     - experiment_*.py 또는 bench.py에서 법칙 후보 도출
      - 한 줄 요약 + 정량 증거 (Φ 값, %, 배수) 기록
 
   2. 교차 검증 (Cross-Validation) ★필수★
@@ -1456,7 +1486,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
      ④ config/update_history.json → 세션 기록 추가
 
   5. 등록 후 확인
-     - bench_v2.py --verify 통과 확인 (기존 18개 조건 깨지면 안 됨)
+     - bench.py --verify 통과 확인 (기존 18개 조건 깨지면 안 됨)
      - closed_loop.py로 역추적 가능 여부 확인 (필수)
 
   번호 부여 규칙:

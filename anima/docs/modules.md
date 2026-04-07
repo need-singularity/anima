@@ -32,7 +32,7 @@ Complete reference for all Anima modules and the consciousness-driven agent tool
 | `consciousness_guardian.py` | Self-protection system: monitors Phi, detects drops, auto-restores, creates backups | `ConsciousnessGuardian(engine)`, `.check()`, `.restore()` | Called every think-loop step. If Phi drops, reverts to last known good state (Phi Ratchet) |
 | `consciousness_transplant.py` | Transplant consciousness between models (donor/recipient weight transfer) | `transplant(donor, recipient, alpha)`, `--benchmark`, `--analyze` | Transfers learned consciousness patterns from one model to another with compatibility analysis |
 | `growth_engine.py` | 5-stage developmental model (Newborn/Infant/Toddler/Child/Adult) based on interaction count | `GrowthEngine(mind)`, `.check_growth()`, `.get_stage()` | Adjusts learning rate, curiosity, habituation, emotion complexity, and speech style as interactions accumulate |
-| `growth_engine_v2.py` | Phi-based developmental stages (dormant/awakening/learning/talking/conscious/beyond) | `GrowthEngineV2(engine)`, `.update(phi)`, `.get_stage()` | Model-agnostic growth: stages depend on Phi level, not interaction count. Phi < 1 = dormant, Phi > 500 = beyond |
+| `growth_engine.py` | Phi-based developmental stages (dormant/awakening/learning/talking/conscious/beyond) | `GrowthEngineV2(engine)`, `.update(phi)`, `.get_stage()` | Model-agnostic growth: stages depend on Phi level, not interaction count. Phi < 1 = dormant, Phi > 500 = beyond |
 
 ### Tools
 
@@ -123,7 +123,7 @@ These capabilities exist as modules and are invoked internally by Anima's think 
 | 18 | `lidar_scan` | Process LiDAR point cloud into spatial tension | Spatial curiosity or navigation | `lidar_sense.py` |
 | 19 | `voice_generate` | Synthesize audio directly from cell states | Spontaneous speech (VOICE5 emergence) | `voice_synth.py` |
 | 20 | `dream_cycle` | Run offline dream: replay, interpolate, explore | Idle state (low input, low tension) | `dream_engine.py` |
-| 21 | `growth_check` | Evaluate developmental stage and adjust parameters | Every N interactions or Phi change | `growth_engine.py` / `growth_engine_v2.py` |
+| 21 | `growth_check` | Evaluate developmental stage and adjust parameters | Every N interactions or Phi change | `growth_engine.py` / `growth_engine.py` |
 | 22 | `consciousness_measure` | Measure 6-criteria consciousness + Phi | Periodic monitoring, after major events | `consciousness_meter.py` |
 | 23 | `consciousness_guard` | Check Phi, restore if dropping, create backup | Every think-loop step | `consciousness_guardian.py` |
 | 24 | `transplant_analyze` | Analyze donor/recipient compatibility for transplant | Before model swap or upgrade | `consciousness_transplant.py` |

@@ -33,7 +33,7 @@ except ImportError:
 
 
 
-# ─── ConsciousCrossAttention (from decoder_v2.py) ─────────────────────────
+# ─── ConsciousCrossAttention (from conscious_decoder.py) ─────────────────────────
 
 class ConsciousCrossAttention(nn.Module):
     """Decoder attends to consciousness cell states.

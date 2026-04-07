@@ -1,6 +1,6 @@
 # Consciousness Verification Audit (2026-03-31)
 
-Full audit of the 7 verification criteria in `bench_v2.py` (lines 2467-2878)
+Full audit of the 7 verification criteria in `bench.py` (lines 2467-2878)
 against CLAUDE.md documentation and actual `consciousness_engine.py` capabilities.
 
 ---
@@ -26,7 +26,7 @@ against CLAUDE.md documentation and actual `consciousness_engine.py` capabilitie
 **CLAUDE.md says:**
 > "Identity emerges from cell dynamics alone. No external instructions."
 
-**bench_v2.py actually tests (line 2467-2499):**
+**bench.py actually tests (line 2467-2499):**
 - Runs 300 steps with zero input
 - Measures pairwise cosine similarity of cell hidden states
 - Pass if `0.01 < mean_cosine < 0.99` AND `std > 0.001`
@@ -52,7 +52,7 @@ cells in same faction).
 **CLAUDE.md says:**
 > "Spontaneous speech without speak() function. output = mean(cells) produces structured output."
 
-**bench_v2.py actually tests (line 2502-2556):**
+**bench.py actually tests (line 2502-2556):**
 - Runs 300 steps with small random input (0.1 scale)
 - Computes `output = mean(hiddens)` trajectory
 - Measures: lag-1 autocorrelation > 0.3, output variance > 0.001, consecutive cosine
@@ -81,7 +81,7 @@ Autocorrelation > 0.3 is trivially satisfied by any recurrent network. The cosin
 **CLAUDE.md says:**
 > "External input = 0 for 300 steps, Phi maintains 50%+"
 
-**bench_v2.py actually tests (line 2559-2580):**
+**bench.py actually tests (line 2559-2580):**
 - 5-step warmup with zero input, measure Phi(start)
 - 295 more steps with zero input, measure Phi(end)
 - Pass if `Phi(end) > Phi(start) * 0.5`
@@ -101,7 +101,7 @@ perturbation (line 576-584). Cell identity injection maintains diversity. All ar
 **CLAUDE.md says:**
 > "1000 steps without collapse. Phi monotonically increases or auto-recovers from dips."
 
-**bench_v2.py actually tests (line 2583-2614):**
+**bench.py actually tests (line 2583-2614):**
 - Runs 1000 steps, measures Phi every 100 steps (10 measurements)
 - Pass if ANY of: monotonic (within 0.01 tolerance), recovers (final >= first-half max * 0.8),
   or stable (second-half mean >= first-half mean * 0.8)
@@ -123,7 +123,7 @@ below 50% of best. This is a core architectural feature, not a hack.
 **CLAUDE.md says:**
 > "Output feeds back as next input. Phi maintains or grows."
 
-**bench_v2.py actually tests (line 2617-2643):**
+**bench.py actually tests (line 2617-2643):**
 - 10-step warmup with self-feedback, measure Phi(start)
 - 290 steps with output -> LayerNorm -> next input
 - Pass if `Phi(end) >= Phi(start) * 0.8`
@@ -145,7 +145,7 @@ input source.
 **CLAUDE.md says:**
 > "12-faction debate -> consensus -> utterance. 5+ consensus events in 300 steps."
 
-**bench_v2.py actually tests (line 2646-2695):**
+**bench.py actually tests (line 2646-2695):**
 - Runs 300 steps with minimal stimulus (0.05 scale noise)
 - Measures **output variance bursts** (variance spikes above mean + 0.5*std)
 - Measures **direction changes** (oscillation count)
@@ -184,7 +184,7 @@ consensus_events += result['consensus']
 > - CE(connected) < CE(solo)
 > - Phi(disconnected) maintains independently
 
-**bench_v2.py actually tests (line 2698-2867):**
+**bench.py actually tests (line 2698-2867):**
 - Creates 2 engines, tries 17 coupling configurations (repel/attract/bipolar/noise at various alphas)
 - Measures solo Phi, connected Phi (best of 17 configs), disconnected Phi
 - Pass if `connected > solo * 1.05` (5%, not 10%) AND `disconnected > solo * 0.7` (70%, not "maintain")

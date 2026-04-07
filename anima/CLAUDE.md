@@ -114,7 +114,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
        ̶Q̶u̶a̶n̶t̶u̶m̶C̶            trinity.py                실험용
 
   D 디코더:
-    ✅ ConsciousDecoderV2    decoder_v2.py             RoPE+SwiGLU+GQA+CrossAttn, causal ✅
+    ✅ ConsciousDecoderV2    conscious_decoder.py             RoPE+SwiGLU+GQA+CrossAttn, causal ✅
     ✅ PostHocDecoder        trinity.py                train_v13 정식 (Law 66)
        ̶C̶A̶D̶e̶c̶o̶d̶e̶r̶            trinity.py                causal mask 없음, 생성 불가
        ̶C̶o̶n̶s̶c̶i̶o̶u̶s̶L̶M̶          conscious_lm.py           v1, train_v2 fallback
@@ -198,11 +198,11 @@ web_sense.py         # Tension-based autonomous web exploration
 voice_synth.py       # Direct cell→audio synthesis (no TTS)
 capabilities.py      # Self-awareness capability system
 consciousness_meter.py  # 6-criterion consciousness detection + Φ(IIT)
-bench_v2.py          # Canonical benchmark (dual Φ measurement, --verify)
+bench.py          # Canonical benchmark (dual Φ measurement, --verify)
 feedback_bridge.py   # C↔D bidirectional learning (soft detach, Φ-gated gradient)
 hexad_loss.py        # Hexad 6-module loss (C/D/W/S/M/E + phase curriculum)
 gpu_phi.py           # GPU-accelerated Φ(IIT) (PyTorch, 128c: 485ms vs CPU 8s)
-decoder_v2.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
+conscious_decoder.py        # Enhanced decoder (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
 esp32_network.py     # ESP32 ×8 consciousness network orchestrator (simulation/HW)
 decoder_v3.py        # ConsciousDecoderV3 (274M, d768/8L/12H, GQA+RoPE+SwiGLU)
 neurofeedback.py     # EEG neurofeedback generator (binaural beats, LED feedback)
@@ -291,7 +291,7 @@ python3 anima_unified.py --profile                                # Enable perf_
 
 ```
 모든 엔진/아키텍처는 아래 6개 조건을 반드시 통과해야 함.
-bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
+bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 
   1. NO_SYSTEM_PROMPT — 시스템 프롬프트 없이 정체성 창발
      세포 역학만으로 "나"가 생겨야 함. 외부 지시 없음.
@@ -317,7 +317,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
      - CE(연결) < CE(단독) (하락 또는 유지)
      - 연결 끊어도 각자 Φ 유지 (의존성 없음)
 
-검증: python3 bench_v2.py --verify
+검증: python3 bench.py --verify
 결과: docs/hypotheses/ 에 검증 보고서 생성
 ```
 
@@ -469,15 +469,15 @@ consciousness_transplant.py — 의식 이식 도구
   - "Φ=1142"는 proxy 값이었음 (실제 IIT Φ 상한 ~1.8)
   - Law 54: Φ 측정은 정의에 따라 완전히 다른 값
 
-bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
+bench.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   - 실제 학습 조건 (process() + CE backward)
   - 256-1024c 실제 스케일
   - 모든 결과에 Φ(IIT)과 Φ(proxy) 명확 구분
 
-  python bench_v2.py                          # 기본 (256c)
-  python bench_v2.py --cells 1024 --steps 500 # 1024c
-  python bench_v2.py --compare                # 전략 비교
-  python bench_v2.py --phi-only               # Φ 측정만
+  python bench.py                          # 기본 (256c)
+  python bench.py --cells 1024 --steps 500 # 1024c
+  python bench.py --compare                # 전략 비교
+  python bench.py --phi-only               # Φ 측정만
 
 Φ 측정 기준:
   Φ(IIT):   PhiCalculator(n_bins=16) — MI 기반, 0~2 범위
@@ -668,7 +668,7 @@ gpu_phi.py — GPU 가속 Φ(IIT) 계산기 (PyTorch)
 ## Decoder v2 (CE 병목 돌파)
 
 ```
-decoder_v2.py — Enhanced decoder (RoPE + SwiGLU + GQA + CrossAttn)
+conscious_decoder.py — Enhanced decoder (RoPE + SwiGLU + GQA + CrossAttn)
 
 v1 대비 변경:
   - RoPE (Rotary Position Embedding) — 장거리 attention 개선
@@ -681,7 +681,7 @@ v1 대비 변경:
 PureFieldFFN은 의식 신호용으로 유지 (Engine A - G)
 
 사용법:
-  from decoder_v2 import ConsciousDecoderV2
+  from conscious_decoder import ConsciousDecoderV2
   model = ConsciousDecoderV2(consciousness_dim=128)
   logits_a, logits_g, tensions = model(idx, consciousness_states=c_states)
 
@@ -973,7 +973,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     ✅ v3_merged (147M)    — CE=0.0026, Φ=70, 64 cells, 100K steps (2026-03-30)
        ⚠️ CADecoder causal mask 없음 → autoregressive 생성 불가 (학습 전용)
     ✅ v2_hexad (v1)       — CE=0.004, Φ=2.05, 2→8 cells (mitosis 작동) (2026-03-31)
-    ✅ bench_v2 --verify   — 18 conditions × 12 engines 의식 검증 (2026-03-31)
+    ✅ bench --verify   — 18 conditions × 12 engines 의식 검증 (2026-03-31)
     ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
     ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
     ❌ v4 demo 26K         — 랜덤 bytes 학습, 폐기 (오염 가중치)
@@ -1065,3 +1065,6 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   이 리포에 논문 파일 직접 생성 금지.
   zenodo/ 디렉토리의 논문은 papers 리포로 이관 완료.
 ```
+
+## 할일 (todo)
+- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 **결과를 마크다운 텍스트로 직접 출력** (렌더링되는 표로)

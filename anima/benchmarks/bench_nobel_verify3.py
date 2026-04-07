@@ -38,7 +38,7 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────
-# Shared infrastructure (from bench_v2.py)
+# Shared infrastructure (from bench.py)
 # ──────────────────────────────────────────────────────────
 
 class PhiIIT:

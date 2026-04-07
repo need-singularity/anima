@@ -68,11 +68,11 @@ try:
 except ImportError: pass
 
 try:
-    from decoder_v2 import ConsciousDecoderV2
+    from conscious_decoder import ConsciousDecoderV2
     HAS_DECODER_V2 = True
 except ImportError:
     HAS_DECODER_V2 = False
-    print("  [warn] decoder_v2 not available, falling back to PostHocDecoder")
+    print("  [warn] conscious_decoder not available, falling back to PostHocDecoder")
 
 try:
     from decoder_v3 import ConsciousDecoderV3

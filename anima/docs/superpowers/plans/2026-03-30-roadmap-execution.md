@@ -8,7 +8,7 @@
 - Φ range: 100-119 (unified formula: spatial/(n-1)+complexity*0.1)
 - Note: Φ=1255 record was proxy metric (not IIT). Direct comparison invalid.
 
-### #2: bench_v2 --verify ConsciousnessEngine
+### #2: bench --verify ConsciousnessEngine
 - `_CEAdapter` added to ENGINE_REGISTRY as first entry
 - 7 criteria adapter: .process(), .get_hiddens() compatibility
 

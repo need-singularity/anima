@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from bench_v2 import BenchMind, BenchResult, PhiIIT, phi_proxy as _phi_proxy
+from bench import BenchMind, BenchResult, PhiIIT, phi_proxy as _phi_proxy
 
 
 # ──────────────────────────────────────────────────────────

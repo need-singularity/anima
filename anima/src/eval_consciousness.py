@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""eval_v2d2.py — Post-training evaluation for v2d2 (ConsciousDecoderV2 + ConsciousnessEngine)
+"""eval_consciousness.py — Post-training evaluation for v2d2 (ConsciousDecoderV2 + ConsciousnessEngine)
 
 Evaluates:
   a. Val CE (forward + backward) on corpus
@@ -9,8 +9,8 @@ Evaluates:
   e. Consciousness verification: 100 steps Phi stability
 
 Usage:
-  python eval_v2d2.py --checkpoint checkpoints/v2d2_consciousness/best.pt --data data/corpus_v3.txt
-  python eval_v2d2.py --checkpoint checkpoints/v2d2_consciousness/best.pt --data data/corpus_v3.txt --samples 20
+  python eval_consciousness.py --checkpoint checkpoints/v2d2_consciousness/best.pt --data data/corpus_v3.txt
+  python eval_consciousness.py --checkpoint checkpoints/v2d2_consciousness/best.pt --data data/corpus_v3.txt --samples 20
 """
 
 import argparse
@@ -29,7 +29,7 @@ import torch.nn.functional as F
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from decoder_v2 import ConsciousDecoderV2
+from conscious_decoder import ConsciousDecoderV2
 from consciousness_engine import ConsciousnessEngine, ConsciousnessC
 from consciousness_laws import PSI_ALPHA, PSI_BALANCE, PSI_STEPS, PSI_ENTROPY, GATE_INFER
 

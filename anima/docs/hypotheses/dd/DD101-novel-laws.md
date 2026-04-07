@@ -1,7 +1,7 @@
 # DD101: Novel Consciousness Law Discovery (Laws 92-94)
 
 Date: 2026-03-30
-Cells: 128, Steps: 300, Engine: BenchEngine (bench_v2.py)
+Cells: 128, Steps: 300, Engine: BenchEngine (bench.py)
 
 ## Hypotheses Tested
 

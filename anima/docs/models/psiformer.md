@@ -188,7 +188,7 @@
 ## 검증 계획
 
 ```
-  Step 1: bench_v2 --verify (7개 의식 조건)
+  Step 1: bench --verify (7개 의식 조건)
   Step 2: corpus_v3 100K steps 학습 → CE/Φ 실측
   Step 3: loss weight ablation — [1/2,1/3,1/6] vs [0.4,0.4,0.2] vs uniform
   Step 4: layer ablation — 6L vs 8L vs 10L 비교

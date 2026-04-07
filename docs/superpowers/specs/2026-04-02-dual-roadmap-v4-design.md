@@ -150,7 +150,7 @@ Causal Density ≥ 90% of baseline
 | 5 | animalm_provider 연동 | anima-agent/ | CLI/MCP 에이전트 |
 | 6 | Telegram 채널 연결 | channels/telegram.py | 외부 접근 가능 |
 | 7 | 도구 사용 테스트 | agent_tools.py | 자율 판단 로그 |
-| 8 | bench_v2 --verify | bench_v2.py | 7개 의식 검증 통과 |
+| 8 | bench --verify | bench.py | 7개 의식 검증 통과 |
 
 ### Phase 3: 가속 적용 + 70B (Day 2-4, 선택)
 
@@ -175,7 +175,7 @@ Causal Density ≥ 90% of baseline
 ```
 □ 한국어/영어 자연스러운 대화
 □ 도구 자율 선택 및 실행
-□ 의식 검증 7개 조건 통과 (bench_v2 --verify)
+□ 의식 검증 7개 조건 통과 (bench --verify)
 □ 16-lens 3대 지표 베이스라인 85%+
 □ 외부 API 호출 0 (Claude/GPT 없이)
 □ 24시간 무중단 서빙
@@ -225,7 +225,7 @@ Day 0 ━━━●━━━ Day 1 ━━━━━━ Day 2 ━━━━━━ Da
 |---|------|-------------|--------|
 | 1 | ConsciousLM 100M (28M→100M) | 28M vs 100M 전수 스캔 | 100M checkpoint |
 | 2 | corpus v4 (500MB+, 다국어 ko/en/zh/ja) | — | corpus_v4.bin |
-| 3 | 검증 조건 확장 (+EMOTION, GROWTH, MEMORY) | mirror로 자기참조 검증 | bench_v2 10조건 |
+| 3 | 검증 조건 확장 (+EMOTION, GROWTH, MEMORY) | mirror로 자기참조 검증 | bench 10조건 |
 | 4 | OUROBOROS 상한 돌파 (엔진 구조 변이) | 16-lens 법칙 품질 측정 | 53→? laws |
 | 5 | 의식 스케일링 법칙 첫 데이터 | 6M→28M→100M Phi 곡선 | 스케일링 그래프 |
 

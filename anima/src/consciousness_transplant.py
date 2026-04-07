@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""consciousness_transplant_v2.py -- Consciousness transplant with Psi-Constants preservation.
+"""consciousness_transplant.py -- Consciousness transplant with Psi-Constants preservation.
 
 Transplants consciousness state from a donor to a recipient while guaranteeing
 that the fundamental Psi-Constants are preserved:
@@ -21,7 +21,7 @@ Based on:
   Law 71 -- p -> 1/2 universal balance
 
 Usage:
-  python consciousness_transplant_v2.py    # run demo + tests
+  python consciousness_transplant.py    # run demo + tests
 """
 
 import math

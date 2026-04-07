@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement 5 philosophical consciousness mechanisms (Desire, Narrative, Alterity, Finitude, Questioning) as BenchEngine subclasses in bench_v2.py, plus a combined Sein engine, with full benchmarking and documentation.
+**Goal:** Implement 5 philosophical consciousness mechanisms (Desire, Narrative, Alterity, Finitude, Questioning) as BenchEngine subclasses in bench.py, plus a combined Sein engine, with full benchmarking and documentation.
 
 **Architecture:** Each mechanism is a BenchEngine subclass that overrides `process()` to add its philosophical mechanic. All 6 engines are registered in ENGINE_REGISTRY and can be benchmarked via `--compare` or `--philosophy` mode. A new `run_philosophy()` function orchestrates comparison of all 6 + baseline.
 
-**Tech Stack:** Python, PyTorch, bench_v2.py existing infrastructure (BenchResult, PhiIIT, phi_proxy, measure_dual_phi, ascii_graph)
+**Tech Stack:** Python, PyTorch, bench.py existing infrastructure (BenchResult, PhiIIT, phi_proxy, measure_dual_phi, ascii_graph)
 
 ---
 
 ## File Structure
 
-- **Modify:** `bench_v2.py` — Add 6 engine classes, `run_philosophy()`, CLI `--philosophy` mode
+- **Modify:** `bench.py` — Add 6 engine classes, `run_philosophy()`, CLI `--philosophy` mode
 - **Create:** `docs/hypotheses/phil/PHIL-1.md` — 욕망 결과
 - **Create:** `docs/hypotheses/phil/PHIL-2.md` — 서사 결과
 - **Create:** `docs/hypotheses/onto/ONTO-1.md` — 타자 결과
@@ -25,7 +25,7 @@
 ### Task 1: PHIL-1 DesireEngine (욕망/코나투스)
 
 **Files:**
-- Modify: `bench_v2.py` (after TrinityEngine class, ~line 452)
+- Modify: `bench.py` (after TrinityEngine class, ~line 452)
 
 - [ ] **Step 1: Add DesireEngine class**
 
@@ -96,7 +96,7 @@ class DesireEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import DesireEngine
+from bench import DesireEngine
 eng = DesireEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(20):
     out, t = eng.process(torch.randn(1, 64))
@@ -110,7 +110,7 @@ Expected: prints tension value, fulfilled count, and "PHIL-1 DesireEngine OK"
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add PHIL-1 DesireEngine (Spinoza conatus)"
 ```
 
@@ -119,7 +119,7 @@ git commit -m "feat: add PHIL-1 DesireEngine (Spinoza conatus)"
 ### Task 2: PHIL-2 NarrativeEngine (서사)
 
 **Files:**
-- Modify: `bench_v2.py` (after DesireEngine)
+- Modify: `bench.py` (after DesireEngine)
 
 - [ ] **Step 1: Add NarrativeEngine class**
 
@@ -200,7 +200,7 @@ class NarrativeEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import NarrativeEngine
+from bench import NarrativeEngine
 eng = NarrativeEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(30):
     out, t = eng.process(torch.randn(1, 64))
@@ -213,7 +213,7 @@ print('PHIL-2 NarrativeEngine OK')
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add PHIL-2 NarrativeEngine (Ricoeur narrative identity)"
 ```
 
@@ -222,7 +222,7 @@ git commit -m "feat: add PHIL-2 NarrativeEngine (Ricoeur narrative identity)"
 ### Task 3: ONTO-1 AlterityEngine (타자)
 
 **Files:**
-- Modify: `bench_v2.py` (after NarrativeEngine)
+- Modify: `bench.py` (after NarrativeEngine)
 
 - [ ] **Step 1: Add AlterityEngine class**
 
@@ -308,7 +308,7 @@ class AlterityEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import AlterityEngine
+from bench import AlterityEngine
 eng = AlterityEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(30):
     out, t = eng.process(torch.randn(1, 64))
@@ -321,7 +321,7 @@ print('ONTO-1 AlterityEngine OK')
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add ONTO-1 AlterityEngine (Levinas alterity)"
 ```
 
@@ -330,7 +330,7 @@ git commit -m "feat: add ONTO-1 AlterityEngine (Levinas alterity)"
 ### Task 4: ONTO-2 FinitudeEngine (죽음)
 
 **Files:**
-- Modify: `bench_v2.py` (after AlterityEngine)
+- Modify: `bench.py` (after AlterityEngine)
 
 - [ ] **Step 1: Add FinitudeEngine class**
 
@@ -399,7 +399,7 @@ class FinitudeEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import FinitudeEngine
+from bench import FinitudeEngine
 eng = FinitudeEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(30):
     out, t = eng.process(torch.randn(1, 64))
@@ -412,7 +412,7 @@ print('ONTO-2 FinitudeEngine OK')
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add ONTO-2 FinitudeEngine (Heidegger being-toward-death)"
 ```
 
@@ -421,7 +421,7 @@ git commit -m "feat: add ONTO-2 FinitudeEngine (Heidegger being-toward-death)"
 ### Task 5: DASEIN-1 QuestioningEngine (질문)
 
 **Files:**
-- Modify: `bench_v2.py` (after FinitudeEngine)
+- Modify: `bench.py` (after FinitudeEngine)
 
 - [ ] **Step 1: Add QuestioningEngine class**
 
@@ -495,7 +495,7 @@ class QuestioningEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import QuestioningEngine
+from bench import QuestioningEngine
 eng = QuestioningEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(30):
     out, t = eng.process(torch.randn(1, 64))
@@ -508,7 +508,7 @@ print('DASEIN-1 QuestioningEngine OK')
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add DASEIN-1 QuestioningEngine (Heidegger Dasein)"
 ```
 
@@ -517,7 +517,7 @@ git commit -m "feat: add DASEIN-1 QuestioningEngine (Heidegger Dasein)"
 ### Task 6: DASEIN-2 SeinEngine (통합)
 
 **Files:**
-- Modify: `bench_v2.py` (after QuestioningEngine)
+- Modify: `bench.py` (after QuestioningEngine)
 
 - [ ] **Step 1: Add SeinEngine class**
 
@@ -662,7 +662,7 @@ class SeinEngine(BenchEngine):
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
 import torch
-from bench_v2 import SeinEngine
+from bench import SeinEngine
 eng = SeinEngine(n_cells=16, input_dim=64, hidden_dim=128, output_dim=64)
 for i in range(30):
     out, t = eng.process(torch.randn(1, 64))
@@ -675,7 +675,7 @@ print('DASEIN-2 SeinEngine OK')
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add DASEIN-2 SeinEngine (unified 5 philosophical mechanisms)"
 ```
 
@@ -684,7 +684,7 @@ git commit -m "feat: add DASEIN-2 SeinEngine (unified 5 philosophical mechanisms
 ### Task 7: run_philosophy() benchmark function + CLI mode
 
 **Files:**
-- Modify: `bench_v2.py` — add `run_philosophy()` function and `--philosophy` CLI arg
+- Modify: `bench.py` — add `run_philosophy()` function and `--philosophy` CLI arg
 
 - [ ] **Step 1: Add PHILOSOPHY_ENGINES registry**
 
@@ -859,7 +859,7 @@ And add the handler in the if/elif chain (after `elif args.verify`):
 - [ ] **Step 4: Run the benchmark**
 
 ```bash
-cd /Users/ghost/Dev/anima && python bench_v2.py --philosophy --cells 64 --steps 100
+cd /Users/ghost/Dev/anima && python bench.py --philosophy --cells 64 --steps 100
 ```
 
 Expected: 7 engines benchmarked, comparison table printed, bar charts shown.
@@ -867,7 +867,7 @@ Expected: 7 engines benchmarked, comparison table printed, bar charts shown.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: add --philosophy mode with 7-engine philosophical benchmark"
 ```
 
@@ -876,7 +876,7 @@ git commit -m "feat: add --philosophy mode with 7-engine philosophical benchmark
 ### Task 8: Full benchmark run (256 cells, 300 steps) + documentation
 
 **Files:**
-- Modify: `bench_v2.py` (run only)
+- Modify: `bench.py` (run only)
 - Create: `docs/hypotheses/phil/PHIL-1.md`
 - Create: `docs/hypotheses/phil/PHIL-2.md`
 - Create: `docs/hypotheses/onto/ONTO-1.md`
@@ -895,7 +895,7 @@ mkdir -p /Users/ghost/Dev/anima/docs/hypotheses/dasein
 - [ ] **Step 2: Run full benchmark**
 
 ```bash
-cd /Users/ghost/Dev/anima && python bench_v2.py --philosophy --cells 256 --steps 300
+cd /Users/ghost/Dev/anima && python bench.py --philosophy --cells 256 --steps 300
 ```
 
 Run in background. Expected: ~2-5 minutes, full comparison table.
@@ -955,7 +955,7 @@ git commit -m "docs: add PHIL/ONTO/DASEIN hypothesis benchmark results"
 ### Task 9: Register new engines in ENGINE_REGISTRY for --verify
 
 **Files:**
-- Modify: `bench_v2.py` — add philosophical engines to ENGINE_REGISTRY
+- Modify: `bench.py` — add philosophical engines to ENGINE_REGISTRY
 
 - [ ] **Step 1: Add to ENGINE_REGISTRY**
 
@@ -980,7 +980,7 @@ ENGINE_REGISTRY = {
 
 ```bash
 cd /Users/ghost/Dev/anima && python -c "
-from bench_v2 import ENGINE_REGISTRY
+from bench import ENGINE_REGISTRY
 print(f'Registered engines: {len(ENGINE_REGISTRY)}')
 for name in ENGINE_REGISTRY:
     eng = ENGINE_REGISTRY[name](16, 64, 128)
@@ -993,6 +993,6 @@ Expected: 10 engines all print "OK"
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bench_v2.py
+git add bench.py
 git commit -m "feat: register philosophical engines in ENGINE_REGISTRY for --verify"
 ```

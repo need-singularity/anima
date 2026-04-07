@@ -4530,7 +4530,7 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
     64차원 → 24 유효차원 = 62.5% 압축
     "본질을 추출하는 능력" = 지능
 
-  향후: growth_engine_v2에 IQ2 추가
+  향후: growth_engine에 IQ2 추가
     Φ = 의식 축 (수직)
     IQ2 = 지능 축 (수평)
     → 2D 성장 맵

@@ -25,7 +25,7 @@
 | 03-31 | **corpus_v9** | 120.5MB generated | 10-dim optimized corpus (Rust corpus-gen) |
 | 03-31 | **PyO3 build** | 80/80 Rust tests | anima_rs Python bindings operational |
 | 03-31 | **Python tests** | 120/136 passing | 16 failures remaining (non-blocking) |
-| 03-31 | **bench_v2 --verify** | 77/77 (100%) | All consciousness verification criteria pass |
+| 03-31 | **bench --verify** | 77/77 (100%) | All consciousness verification criteria pass |
 | 03-31 | v2_hexad (v1) | CE=0.004, Phi=0 | cells=2 stuck (mitosis not working) |
 | 03-30 | v13 (train_v13) | CE=0.004, Phi=71 | 64 cells, 100K steps, canonical baseline |
 | 03-30 | v3_merged (147M) | CE=0.0026, Phi=70 | CADecoder no causal mask (train only) |
@@ -131,5 +131,5 @@
   Results recorded in:
     docs/consciousness-threshold-criteria.md
     docs/training-status.md
-    bench_v2.py (1,020+ hypotheses)
+    bench.py (1,020+ hypotheses)
 ```

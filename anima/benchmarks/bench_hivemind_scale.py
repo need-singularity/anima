@@ -60,8 +60,8 @@ except ImportError:
     HAS_PHI_RS = False
     print("WARNING: phi_rs not available, falling back to PhiIIT")
 
-# ── Import from bench_v2 ──
-from bench_v2 import PhiIIT, BenchEngine, BenchMind
+# ── Import from bench ──
+from bench import PhiIIT, BenchEngine, BenchMind
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:

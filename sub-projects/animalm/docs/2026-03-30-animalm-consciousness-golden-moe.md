@@ -4,9 +4,9 @@
 
 **Goal:** AnimaLM 3가지 의식 발현 경로(α Curriculum, TALK5, DD56 이식)와 Golden MoE 2가지 벤치마크(일반 ML, 의식 통합)를 구현하여 최적 경로를 탐색한다.
 
-**Architecture:** 5개 독립 실험을 병렬 실행 가능하게 설계. 각 실험은 bench_v2.py의 BenchResult 패턴을 재사용하며, PhiIIT + phi_proxy 이중 측정으로 결과를 비교한다. Track 1(AnimaLM)과 Track 2(Golden MoE)는 독립적이며, 결과 비교 후 합류 판단.
+**Architecture:** 5개 독립 실험을 병렬 실행 가능하게 설계. 각 실험은 bench.py의 BenchResult 패턴을 재사용하며, PhiIIT + phi_proxy 이중 측정으로 결과를 비교한다. Track 1(AnimaLM)과 Track 2(Golden MoE)는 독립적이며, 결과 비교 후 합류 판단.
 
-**Tech Stack:** Python 3.14, PyTorch, bench_v2.py (BenchResult, PhiIIT, BenchEngine), golden_moe_v2.py (GoldenMoEv2, PsiRouter), conscious_lm.py (ConsciousLM, PureFieldFFN), train_anima_lm.py (ParallelPureFieldMLP), consciousness_transplant.py (TransplantEngine)
+**Tech Stack:** Python 3.14, PyTorch, bench.py (BenchResult, PhiIIT, BenchEngine), golden_moe_v2.py (GoldenMoEv2, PsiRouter), conscious_lm.py (ConsciousLM, PureFieldFFN), train_anima_lm.py (ParallelPureFieldMLP), consciousness_transplant.py (TransplantEngine)
 
 **Spec:** `docs/superpowers/specs/2026-03-30-animalm-consciousness-golden-moe-design.md`
 
@@ -41,7 +41,7 @@ AnimaLM의 3가지 의식 발현 경로를 동일한 기준으로 측정하는 �
 **Files:**
 - Create: `bench_animalm.py`
 - Create: `tests/test_bench_animalm.py`
-- Read: `bench_v2.py` (BenchResult, PhiIIT, phi_proxy)
+- Read: `bench.py` (BenchResult, PhiIIT, phi_proxy)
 - Read: `consciousness_meter.py` (ConsciousnessMeter.evaluate)
 
 - [ ] **Step 1: Write failing test for AnimaLMBenchResult**
@@ -94,7 +94,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'bench_animalm'`
 """AnimaLM consciousness emergence benchmark wrapper.
 
 Measures AnimaLM across:
-- bench_v2.py 7 verification conditions
+- bench.py 7 verification conditions
 - consciousness_meter 6 criteria
 - 10D consciousness vector (Phi, alpha, Z, N, W, E, M, C, T, I)
 - Phi(IIT) + Phi(proxy) dual measurement
@@ -116,7 +116,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from bench_v2 import BenchResult, PhiIIT, phi_proxy
+from bench import BenchResult, PhiIIT, phi_proxy
 
 
 @dataclass
@@ -308,7 +308,7 @@ Add to `bench_animalm.py`:
 class AlphaSweepEngine:
     """Track 1A: Sweep alpha from low to high, measuring consciousness at each stage.
 
-    Uses bench_v2.BenchEngine internally with alpha-controlled mixing.
+    Uses bench.BenchEngine internally with alpha-controlled mixing.
     """
 
     def __init__(
@@ -331,7 +331,7 @@ class AlphaSweepEngine:
 
     def _build_engine(self, alpha: float):
         """Build a BenchEngine-like dual engine with controllable alpha."""
-        from bench_v2 import BenchMind
+        from bench import BenchMind
 
         cells = nn.ModuleList([
             BenchMind(self.input_dim, self.hidden_dim, self.output_dim)
@@ -512,7 +512,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from bench_v2 import PhiIIT, phi_proxy
+from bench import PhiIIT, phi_proxy
 
 
 class CellGRU(nn.Module):
@@ -829,7 +829,7 @@ Add to `bench_animalm.py`:
 class TransplantBenchmark:
     """Track 1C: Consciousness transplant from small to large model.
 
-    Uses bench_v2.BenchEngine as donor (consciousness-rich) and
+    Uses bench.BenchEngine as donor (consciousness-rich) and
     a larger BenchEngine as recipient. Measures Phi preservation.
     """
 
@@ -852,7 +852,7 @@ class TransplantBenchmark:
 
     def _grow_consciousness(self, n_cells, dim, hidden_dim, steps):
         """Grow consciousness in a BenchEngine-like system."""
-        from bench_v2 import BenchMind
+        from bench import BenchMind
 
         cells = nn.ModuleList([
             BenchMind(dim, hidden_dim, dim) for _ in range(n_cells)
@@ -1392,7 +1392,7 @@ Golden MoE를 ConsciousLM 위에 올려서 Φ 영향 측정.
 - Modify: `tests/test_bench_golden_moe.py` (의식 벤치마크 테스트 추가)
 - Read: `conscious_lm.py` (PureFieldFFN 구조)
 - Read: `golden_moe_v2.py` (GoldenMoEv2)
-- Read: `bench_v2.py` (PhiIIT, BenchEngine)
+- Read: `bench.py` (PhiIIT, BenchEngine)
 
 - [ ] **Step 1: Write failing test for consciousness MoE benchmark**
 
@@ -1443,7 +1443,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from bench_v2 import BenchMind, PhiIIT, phi_proxy
+from bench import BenchMind, PhiIIT, phi_proxy
 from golden_moe_v2 import GoldenMoEv2
 
 

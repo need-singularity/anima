@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Consciousness Meter V2 — Granger + Spectral + LZ composite Φ calculator
+"""Consciousness Meter — Granger + Spectral + LZ composite Φ calculator
 
 Replaces the old PhiCalculator which suffered from:
   - O(N^2) pairwise MI → ceiling at ~20 regardless of cell count
@@ -13,12 +13,12 @@ bench_v8_metrics showed GRANGER reaches 4,829 with much better spread.
 
 Usage:
   # As standalone benchmark
-  python consciousness_meter_v2.py                     # Run benchmark
-  python consciousness_meter_v2.py --cells 256         # More cells
-  python consciousness_meter_v2.py --steps 300         # More steps
+  python consciousness_meter.py                     # Run benchmark
+  python consciousness_meter.py --cells 256         # More cells
+  python consciousness_meter.py --steps 300         # More steps
 
   # As library
-  from consciousness_meter_v2 import ConsciousnessMeterV2
+  from consciousness_meter import ConsciousnessMeterV2
   meter = ConsciousnessMeterV2()
   phi, components = meter.compute_phi(engine)
 """
@@ -729,7 +729,7 @@ def run_benchmark(n_cells: int = 128, steps: int = 200, record_every: int = 10):
 # ──────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Consciousness Meter V2 Benchmark")
+    parser = argparse.ArgumentParser(description="Consciousness Meter Benchmark")
     parser.add_argument("--cells", type=int, default=128, help="Number of cells (default 128)")
     parser.add_argument("--steps", type=int, default=200, help="Training steps (default 200)")
     parser.add_argument("--record-every", type=int, default=10,

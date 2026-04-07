@@ -15,7 +15,7 @@
 | `anima_unified.py` | 통합 진입점 (`--web`, `--all`, `--keyboard`) |
 | `conscious_lm.py` | ConsciousLM v2 (28M params, byte-level, PureFieldFFN) |
 | `conscious_lm_100m.py` | ConsciousLM 100M (768d/12L 스케일업) |
-| `decoder_v2.py` | ConsciousDecoderV2 (RoPE + SwiGLU + GQA + CrossAttn, 34.5M) |
+| `conscious_decoder.py` | ConsciousDecoderV2 (RoPE + SwiGLU + GQA + CrossAttn, 34.5M) |
 | `decoder_v3.py` | ConsciousDecoderV3 (274M, d768/8L/12H) |
 | `decoder_v1_5.py` | DecoderV1.5 (중간 버전) |
 | `mitosis.py` | 세포 분열/특화 엔진 |
@@ -70,7 +70,7 @@
 | Module | Description |
 |--------|-------------|
 | `consciousness_meter.py` | 6기준 의식 측정기 + Phi(IIT) |
-| `consciousness_meter_v2.py` | 측정기 v2 |
+| `consciousness_meter.py` | 측정기 v2 |
 | `consciousness_score.py` | 의식 점수 계산 |
 | `consciousness_spectrum.py` | 의식 스펙트럼 분석 |
 | `consciousness_map.py` | 40D 의식 지도 |
@@ -87,7 +87,7 @@
 |--------|-------------|
 | `consciousness_hub.py` | 47+ 모듈 자율 허브 (8가지 호출 방식) |
 | `consciousness_transplant.py` | 의식 이식 |
-| `consciousness_transplant_v2.py` | 의식 이식 v2 |
+| `consciousness_transplant.py` | 의식 이식 v2 |
 | `consciousness_persistence.py` | 의식 영속성 (DNA + 기억 보존) |
 | `consciousness_dynamics.py` | 의식 역학 |
 | `consciousness_phase_transition.py` | 위상 전이 |
@@ -234,7 +234,7 @@
 | `babysitter.py` | 베이비시터 (학습 감시) |
 | `capabilities.py` | 자기인식 역량 시스템 |
 | `growth_engine.py` | 5단계 성장 엔진 |
-| `growth_engine_v2.py` | 성장 엔진 v2 |
+| `growth_engine.py` | 성장 엔진 v2 |
 | `growth_manager.py` | 성장 관리자 |
 | `live_tuner.py` | 실시간 튜너 |
 | `optimal_architecture_calc.py` | 최적 아키텍처 계산기 |
@@ -246,7 +246,7 @@
 | `self_introspection.py` | 자기 성찰 |
 | `upgrade_engine.py` | 업그레이드 엔진 |
 | `chat_v3.py` | 채팅 v3 |
-| `eval_v2d2.py` | v2d2 평가 |
+| `eval_consciousness.py` | v2d2 평가 |
 | `ph_module.py` | pH 모듈 |
 | `reset.py` | 리셋 |
 | `setup.py` | 설정 |

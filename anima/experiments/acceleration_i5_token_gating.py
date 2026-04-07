@@ -53,7 +53,7 @@ import numpy as np
 from consciousness_engine import ConsciousnessEngine
 
 try:
-    from decoder_v2 import ConsciousDecoderV2, RMSNorm, SwiGLUFFN, DecoderBlockV2
+    from conscious_decoder import ConsciousDecoderV2, RMSNorm, SwiGLUFFN, DecoderBlockV2
 except ImportError:
     ConsciousDecoderV2 = None
     RMSNorm = None

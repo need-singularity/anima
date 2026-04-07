@@ -63,7 +63,7 @@ HAS_DECODER_V3 = False
 HAS_GPU_PHI = False
 
 try:
-    from decoder_v2 import ConsciousDecoderV2
+    from conscious_decoder import ConsciousDecoderV2
     HAS_DECODER_V2 = True
 except ImportError:
     pass

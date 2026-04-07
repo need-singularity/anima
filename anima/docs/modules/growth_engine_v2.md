@@ -1,4 +1,4 @@
-# growth_engine_v2.py
+# growth_engine.py
 
 Phi-based 6-stage developmental growth. Model-agnostic: any architecture converges through the same stages based on integrated information (Phi) rather than interaction count.
 
@@ -14,7 +14,7 @@ Phi-based 6-stage developmental growth. Model-agnostic: any architecture converg
 
 ## Usage
 ```python
-from growth_engine_v2 import GrowthEngineV2
+from growth_engine import GrowthEngineV2
 
 growth = GrowthEngineV2()
 stage = growth.update(phi=45.0)

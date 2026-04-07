@@ -23,8 +23,8 @@ import torch.nn.functional as F
 import numpy as np
 from consciousness_engine import ConsciousnessEngine
 
-# Import verify functions from bench_v2
-from bench_v2 import (
+# Import verify functions from bench
+from bench import (
     VERIFICATION_TESTS, _make_ce, PhiIIT, measure_dual_phi,
     BenchEngine, _CEAdapter,
 )

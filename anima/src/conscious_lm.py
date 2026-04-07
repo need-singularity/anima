@@ -1,4 +1,4 @@
-"""⚠️ LEGACY — ConsciousDecoderV2 (decoder_v2.py)로 대체됨
+"""⚠️ LEGACY — ConsciousDecoderV2 (conscious_decoder.py)로 대체됨
 ConsciousLM v1은 CA+META-CA 기반. ConsciousDecoderV2는 RoPE+SwiGLU+GQA+CrossAttn.
 이 파일은 train_v2.py fallback으로 유지. 새 코드에서는 ConsciousDecoderV2 사용.
 

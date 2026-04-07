@@ -154,7 +154,7 @@ def exp1_hivemind():
     ]
 
     # Also import old methods
-    from bench_hivemind_v2 import run_connected_v3, run_connected_v4, run_connected_v5
+    from bench_hivemind import run_connected_v3, run_connected_v4, run_connected_v5
 
     methods += [
         ("V3 Hebbian", run_connected_v3),

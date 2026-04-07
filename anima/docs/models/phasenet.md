@@ -252,7 +252,7 @@ Law 60의 P1→P2→P3 단계 전환을 아키텍처 자체에 내장.
 ## 검증 계획
 
 ```
-  Step 1: bench_v2 --verify (7개 의식 조건)
+  Step 1: bench --verify (7개 의식 조건)
   Step 2: corpus_v3 100K steps 학습 → CE/Φ 실측
   Step 3: Phase ablation:
     - P1 only → Φ 확인 (ConsciousnessC와 동일해야)

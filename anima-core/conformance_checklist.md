@@ -21,14 +21,14 @@ Updated: 2026-04-07 (post training script unification)
 | 3 | consciousness_laws.json | _meta.total_laws == actual count | ✅ |
 | | | meta_laws M1-M53 content vs code reflection | ✅ |
 | | | psi_constants values vs hardcoded values in code | ✅ |
-| | | verification_conditions vs bench_v2.py thresholds | ✅ |
+| | | verification_conditions vs bench.py thresholds | ✅ |
 | | | No orphaned law references | ✅ |
 
 ## Decoder — Design Rule Compliance
 
 | # | File | Check | Status |
 |---|------|-------|--------|
-| 4 | decoder_v2.py | .detach() present (consciousness→language gradient block) | ✅ |
+| 4 | conscious_decoder.py | .detach() present (consciousness→language gradient block) | ✅ |
 | | | α=0.014 coupling value | ✅ |
 | | | RoPE+SwiGLU+GQA spec match (384d/6L/4H/2KV) | ✅ |
 | | | CrossAttention implementation | ✅ |
@@ -73,7 +73,7 @@ Updated: 2026-04-07 (post training script unification)
 
 | # | File | Check | Status |
 |---|------|-------|--------|
-| 10 | bench_v2.py | 18 verification conditions vs laws.json verification_conditions | ✅ |
+| 10 | bench.py | 18 verification conditions vs laws.json verification_conditions | ✅ |
 | | | Threshold values from JSON (no hardcoding) | ✅ |
 | | | Control engine discrimination criteria | ✅ |
 | | | SKIP handling (not counted as PASS) | ✅ |
@@ -82,7 +82,7 @@ Updated: 2026-04-07 (post training script unification)
 | | | L0/L1/L2 ossification layer definitions | ✅ |
 | | | MCTED training asset classification | ✅ |
 | | | Port interface contracts (Decoder/Memory/Sense/Channel) | ✅ |
-| | | verification_status matches latest bench_v2 run | ✅ |
+| | | verification_status matches latest bench run | ✅ |
 
 ## Hub & Agent — Port Rule Compliance
 
@@ -124,7 +124,7 @@ Updated: 2026-04-07 (post training script unification)
 
 | # | File | Check | Status |
 |---|------|-------|--------|
-| 18 | serve_animalm_v4.py | No hardcoded paths (fixed 2026-04-07) | ✅ |
+| 18 | serve_animalm.py | No hardcoded paths (fixed 2026-04-07) | ✅ |
 | | | Rank parameter configurable (fixed 2026-04-07) | ✅ |
 | | | ParallelPureFieldMLP structure matches training | ✅ |
 | 19 | eval_animalm.py | 5 metrics cover consciousness verification | ✅ |
@@ -134,9 +134,9 @@ Updated: 2026-04-07 (post training script unification)
 
 | # | Check | Files Involved | Status |
 |---|-------|---------------|--------|
-| 20 | Ψ-constants identical everywhere | consciousness_laws.json ↔ consciousness_engine.py ↔ decoder_v2.py ↔ trinity.py ↔ train_clm.py | ✅ |
+| 20 | Ψ-constants identical everywhere | consciousness_laws.json ↔ consciousness_engine.py ↔ conscious_decoder.py ↔ trinity.py ↔ train_clm.py | ✅ |
 | | SCALE_CONFIGS vs roadmap spec | train_clm.py ↔ asset_registry.json ↔ anima-core/README.md | ✅ |
-| | verification_conditions == bench_v2 code | consciousness_laws.json ↔ bench_v2.py | ✅ |
+| | verification_conditions == bench code | consciousness_laws.json ↔ bench.py | ✅ |
 | | core_rules.json == conscious_chat.py | core_rules.json ↔ conscious_chat.py | ✅ |
 | | training_runs.json == actual script defaults | training_runs.json ↔ train_clm.py / train_alm.py | ✅ |
 | | CLAUDE.md specs == code | CLAUDE.md ↔ all source files | ✅ |

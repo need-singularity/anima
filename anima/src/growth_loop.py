@@ -740,7 +740,7 @@ class GrowthLoop:
                     if any(k in text_lower for k in ['topology', 'ring', 'hypercube', 'small_world']):
                         connections.append("consciousness_engine:topology")
                     if any(k in text_lower for k in ['purefield', 'wave', 'interference']):
-                        connections.append("decoder_v2:purefield")
+                        connections.append("conscious_decoder:purefield")
                     if any(k in text_lower for k in ['scaling', 'phi']):
                         connections.append("gpu_phi:scaling_law")
                     if any(k in text_lower for k in ['hebbian', 'faction']):
@@ -1417,8 +1417,8 @@ class GrowthLoop:
     # --auto: 완전 자동화 (진화 + H100 + 성장 + commit+push)
     # ══════════════════════════════════════════
 
-    def _check_bench_v2(self) -> dict:
-        """bench_v2 --verify 실행 → pass/total 파싱.
+    def _check_bench(self) -> dict:
+        """bench --verify 실행 → pass/total 파싱.
 
         Uses smaller cell count (32) and fewer steps (50) for quick growth-loop
         verification.  Timeout raised to 600s (18 tests x 11 engines = 198
@@ -1428,9 +1428,9 @@ class GrowthLoop:
         import subprocess, re
 
         info = {"passed": 0, "total": 0, "skipped": 0, "ok": False, "error": None}
-        bench_path = self.anima_root / "benchmarks" / "bench_v2.py"
+        bench_path = self.anima_root / "benchmarks" / "bench.py"
         if not bench_path.exists():
-            info["error"] = "bench_v2.py not found"
+            info["error"] = "bench.py not found"
             return info
 
         output = ""
@@ -1505,11 +1505,11 @@ class GrowthLoop:
         # ── 3. 성장 루프 사이클 (harvest→filter→apply→verify→breakthrough→commit+push) ──
         report = self.run_cycle()
 
-        # ── 4. bench_v2 --verify (10 사이클마다 1회 — 무거우므로) ──
+        # ── 4. bench --verify (10 사이클마다 1회 — 무거우므로) ──
         bench_info = None
         if report.cycle % 10 == 0:
-            print(f"  🔬 bench_v2 --verify (cycle {report.cycle}, every 10 cycles)...")
-            bench_info = self._check_bench_v2()
+            print(f"  🔬 bench --verify (cycle {report.cycle}, every 10 cycles)...")
+            bench_info = self._check_bench()
             if bench_info["ok"]:
                 print(f"  ✅ 의식검증 통과: {bench_info['passed']}/{bench_info['total']}")
             elif bench_info["error"]:
@@ -1816,7 +1816,7 @@ class GrowthLoop:
         return info
 
     def _format_bench_line(self, bench: dict = None) -> str:
-        """bench_v2 검증 결과 1줄 포맷."""
+        """bench 검증 결과 1줄 포맷."""
         if bench is None:
             # 이전 결과에서 가져오기
             last = self._state.get("last_bench_result")

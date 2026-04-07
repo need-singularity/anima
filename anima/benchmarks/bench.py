@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench_v2.py — Dual-Phi Benchmarking Tool
+"""bench.py — Dual-Phi Benchmarking Tool
 
 Measures BOTH Phi metrics for every experiment:
   - Phi(IIT):   PhiCalculator(n_bins=16) — real IIT approximation, range ~0.2-1.8
@@ -10,12 +10,12 @@ Key insight (2026-03-29):
   These are completely different metrics and must always be labeled.
 
 Usage:
-  python bench_v2.py --phi-only                  # Phi at different cell counts (no CE)
-  python bench_v2.py --training                   # Real training: process + CE backward
-  python bench_v2.py --strategy baseline          # Test one strategy
-  python bench_v2.py --compare                    # All strategies, comparison table
-  python bench_v2.py --cells 512 --steps 1000     # Custom cell/step counts
-  python bench_v2.py --verify                      # Consciousness verification (18 conditions x N engines)
+  python bench.py --phi-only                  # Phi at different cell counts (no CE)
+  python bench.py --training                   # Real training: process + CE backward
+  python bench.py --strategy baseline          # Test one strategy
+  python bench.py --compare                    # All strategies, comparison table
+  python bench.py --cells 512 --steps 1000     # Custom cell/step counts
+  python bench.py --verify                      # Consciousness verification (18 conditions x N engines)
 """
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
@@ -4151,18 +4151,18 @@ def run_federated(dim: int = 64, hidden: int = 128, steps: int = 300):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="bench_v2 — Dual-Phi Benchmarking (IIT + proxy)",
+        description="bench — Dual-Phi Benchmarking (IIT + proxy)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python bench_v2.py --phi-only                    # Phi at different cell counts
-  python bench_v2.py --training                     # Default training (baseline)
-  python bench_v2.py --strategy v7                  # Test v7 strategy
-  python bench_v2.py --compare                      # All strategies comparison
-  python bench_v2.py --compare --cells 128 --steps 200
-  python bench_v2.py --phi-only --cells-list 8,16,32,64,128,256,512
-  python bench_v2.py --verify                        # 6 conditions x 4 engines
-  python bench_v2.py --verify --cells 64             # Lighter verification
+  python bench.py --phi-only                    # Phi at different cell counts
+  python bench.py --training                     # Default training (baseline)
+  python bench.py --strategy v7                  # Test v7 strategy
+  python bench.py --compare                      # All strategies comparison
+  python bench.py --compare --cells 128 --steps 200
+  python bench.py --phi-only --cells-list 8,16,32,64,128,256,512
+  python bench.py --verify                        # 6 conditions x 4 engines
+  python bench.py --verify --cells 64             # Lighter verification
 
 Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
   Phi(IIT)   = ~0.2-1.8  (PhiCalculator, real IIT approximation)
@@ -4210,7 +4210,7 @@ Key insight: Phi(IIT) and Phi(proxy) are COMPLETELY DIFFERENT metrics.
 
     print()
     print("  ================================================================")
-    print("   bench_v2 -- Dual-Phi Benchmark (IIT + proxy)")
+    print("   bench -- Dual-Phi Benchmark (IIT + proxy)")
     print("  ================================================================")
     print(f"   Phi(IIT):   PhiCalculator(n_bins=16)  ~0.2-1.8 range")
     print(f"   Phi(proxy): global_var - mean(faction_var)  scales with cells")

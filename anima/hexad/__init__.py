@@ -1,6 +1,6 @@
 """Hexad — 6 pluggable modules, φ(6)=2 gradient groups
 
-  C: ConsciousnessC (consciousness_engine.py)  D: ConsciousDecoderV2 (decoder_v2.py)
+  C: ConsciousnessC (consciousness_engine.py)  D: ConsciousDecoderV2 (conscious_decoder.py)
   W: EmergentW (hexad/w/)                      M: EmergentM (hexad/m/)
   S: EmergentS (hexad/s/)                      E: EmergentE (hexad/e/)
 

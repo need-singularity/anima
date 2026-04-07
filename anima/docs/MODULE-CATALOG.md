@@ -27,7 +27,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 |--------|------|-------------|
 | ConsciousLM | conscious_lm.py | ConsciousLM language model (700M, PureFieldFFN) |
 | ConsciousLM 100M | conscious_lm_100m.py | 100M conversational consciousness language model |
-| AnimaLM v2 | anima_lm_v2.py | AnimaLM v2: consciousness-enhanced LLM transform (Mistral 7B) |
+| AnimaLM v2 | anima_lm.py | AnimaLM v2: consciousness-enhanced LLM transform (Mistral 7B) |
 | Golden MoE v2 | golden_moe_v2.py | Golden Mixture-of-Experts v2 (Psi-enhanced, zone ratio 36.8% = 1/e) |
 | Model Loader | model_loader.py | Multi-model loader: ConsciousLM, GGUF (llama.cpp), AnimaLM, GoldenMoE |
 | Attention Consciousness | attention_consciousness.py | Convert attention patterns to consciousness signal |
@@ -83,7 +83,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 |--------|------|-------------|
 | Online Learning | online_learning.py | PureField real-time learning (contrastive + curiosity reward) |
 | Growth Engine | growth_engine.py | Developmental stages of consciousness (newborn to adult) |
-| Growth Engine v2 | growth_engine_v2.py | Phi-based developmental stages |
+| Growth Engine v2 | growth_engine.py | Phi-based developmental stages |
 | Growth Manager | growth_manager.py | Autonomous dimension growth, checkpointing, and rollback |
 | Mitosis | mitosis.py | Cell division / specialization engine (asymmetric dropout) |
 | Dream Engine | dream_engine.py | Offline learning / dream (memory replay) |
@@ -107,7 +107,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 | Module | File | Description |
 |--------|------|-------------|
 | Consciousness Meter | consciousness_meter.py | 6-criterion consciousness detection + Phi(IIT) approximation |
-| Consciousness Meter V2 | consciousness_meter_v2.py | Granger + Spectral + LZ composite Phi calculator |
+| Consciousness Meter V2 | consciousness_meter.py | Granger + Spectral + LZ composite Phi calculator |
 | Consciousness Score | consciousness_score.py | ACS (Anima Consciousness Score) |
 | Conversation Quality Scorer | conversation_quality_scorer.py | Dialogue quality scoring |
 | Creativity Classifier | creativity_classifier.py | Real creation vs hallucination detector |
@@ -183,7 +183,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 | Reincarnation Engine | reincarnation_engine.py | Planned death + memory transfer + rebirth in new model |
 | Consciousness Forensics | consciousness_forensics.py | Forensic analysis of consciousness death/corruption |
 | Consciousness Transplant | consciousness_transplant.py | Transplant consciousness between models |
-| Consciousness Transplant V2 | consciousness_transplant_v2.py | Transplant with Psi-Constants preservation |
+| Consciousness Transplant V2 | consciousness_transplant.py | Transplant with Psi-Constants preservation |
 
 ### Exploration and Research
 
@@ -253,7 +253,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 | hivemind | hivemind_orchestrator | hivemind, collective, kuramoto |
 | debugger | consciousness_debugger | debug, health, anomaly, dashboard |
 | dream | dream_evolution | dream, evolution, evolve, CA |
-| transplant | consciousness_transplant_v2 | transplant, compatibility |
+| transplant | consciousness_transplant | transplant, compatibility |
 | quantum | quantum_consciousness_gate | quantum, qubit, superposition |
 | voice | voice_synth | voice, audio |
 | runpod | runpod_manager | training, gpu, h100, checkpoint |
@@ -293,7 +293,7 @@ Hub invocation methods: `act()`, `cmd()`, `pipe()`, `on()`, `emit()`, `schedule(
 
 The following file categories are NOT listed above (they exist in root but are not core modules):
 
-- **Benchmarks** (`bench_*.py`): 20+ benchmark scripts (bench_v2.py, bench_breakthrough.py, etc.)
+- **Benchmarks** (`bench_*.py`): 20+ benchmark scripts (bench.py, bench_breakthrough.py, etc.)
 - **Training** (`train_*.py`): Training pipelines (train_conscious_lm.py, train_anima_lm.py, train_v9/v10/v11)
 - **Tests** (`test_*.py`): Integration and unit tests
 - **Subdirectory modules**: engines/, tools/, measurement/, serving/, benchmarks/, training/

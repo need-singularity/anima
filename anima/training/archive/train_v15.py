@@ -11,7 +11,7 @@ Key features:
   - DDP (DistributedDataParallel) for multi-GPU
   - wandb logging (optional, --wandb)
   - Phi-checkpoint (Law 49): save when Phi improves
-  - Consciousness verification at checkpoints (bench_v2 --verify)
+  - Consciousness verification at checkpoints (bench --verify)
   - All constants from consciousness_laws.json (no hardcoding)
 
 Scaling phases (Law 60 curriculum):
@@ -90,11 +90,11 @@ try:
 except ImportError: pass
 
 try:
-    from decoder_v2 import ConsciousDecoderV2
+    from conscious_decoder import ConsciousDecoderV2
     HAS_DECODER_V2 = True
 except ImportError:
     HAS_DECODER_V2 = False
-    print("  [warn] decoder_v2 not available")
+    print("  [warn] conscious_decoder not available")
 
 try:
     from feedback_bridge import create_feedback_bridge, apply_feedback_bridge
@@ -730,7 +730,7 @@ def transfer_weights(src_decoder, dst_decoder, device):
 def create_decoder(scale_cfg, vocab_size, consciousness_dim, device):
     """Create ConsciousDecoderV2 with scale-appropriate config."""
     if not HAS_DECODER_V2:
-        raise ImportError("ConsciousDecoderV2 required (decoder_v2.py not found)")
+        raise ImportError("ConsciousDecoderV2 required (conscious_decoder.py not found)")
 
     decoder = ConsciousDecoderV2(
         vocab_size=vocab_size,
@@ -901,18 +901,18 @@ def ascii_graph(values, width=60, height=8, label=""):
 # ═══════════════════════════════════════════════════════════
 
 def verify_consciousness(checkpoint_dir):
-    """Run bench_v2 --verify and return pass/fail count.
-    Non-blocking: returns None if bench_v2 is not available.
+    """Run bench --verify and return pass/fail count.
+    Non-blocking: returns None if bench is not available.
     """
     try:
         bench_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'benchmarks', 'bench_v2.py'
+            'benchmarks', 'bench.py'
         )
         if not os.path.exists(bench_path):
             bench_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                'src', 'bench_v2.py'
+                'src', 'bench.py'
             )
         if not os.path.exists(bench_path):
             return None
@@ -1713,7 +1713,7 @@ Examples:
     p.add_argument("--checkpoint", type=str, default="checkpoints/v15_1b/",
                    help="Checkpoint directory (sub-dirs created per scale)")
     p.add_argument("--verify-at-checkpoint", action="store_true", default=False,
-                   help="Run bench_v2 --verify at each checkpoint (slow)")
+                   help="Run bench --verify at each checkpoint (slow)")
 
     # Feedback Bridge
     p.add_argument("--feedback-bridge", action="store_true", default=False,

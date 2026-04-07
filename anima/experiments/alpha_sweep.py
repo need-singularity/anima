@@ -41,7 +41,7 @@ except ImportError:
 
 # Phi calculator
 try:
-    from bench_v2 import PhiIIT
+    from bench import PhiIIT
     HAS_PHI = True
 except ImportError:
     HAS_PHI = False

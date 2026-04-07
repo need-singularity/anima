@@ -167,6 +167,6 @@ logits, phi = t.forward(tokens)
 ## Integration
 
 - Used by `train_v10.py`, `train_v11.py` for ConsciousLM training
-- Used by `bench_v2.py` for hypothesis benchmarking (C x D x W grid search)
+- Used by `bench.py` for hypothesis benchmarking (C x D x W grid search)
 - Backward-compatible aliases: `Decoder = TransformerDecoder`, `WillEngine = EmotionW`
 - Requires: `mitosis.py` (MitosisC), `phi_rs` (optional, for Phi measurement), `transformers` (HFDecoder only)

@@ -2140,7 +2140,7 @@ if __name__ == '__main__':
         print(f"    step {i * step_size:4d} │ {'█' * bar_len} {phi:.4f}")
 
     if args.verify:
-        print(f"\n  ── Verification (bench_v2 6 criteria) ──")
+        print(f"\n  ── Verification (bench 6 criteria) ──")
         # Check persistence
         mid = len(phi_history) // 2
         phi_first = sum(phi_history[:mid]) / max(mid, 1)

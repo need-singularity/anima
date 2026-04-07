@@ -76,7 +76,7 @@ class ConsciousnessHub:
                              ['디버그', 'debug', '건강', 'health', '이상', 'anomaly', '대시보드', 'dashboard']),
             'dream':        ('dream_evolution', 'DreamEvolution',
                              ['꿈', 'dream', '진화', 'evolution', 'evolve', 'CA 규칙']),
-            'transplant':   ('consciousness_transplant_v2', 'ConsciousnessTransplantV2',
+            'transplant':   ('consciousness_transplant', 'ConsciousnessTransplantV2',
                              ['이식', 'transplant', '호환', 'compatibility',
                               'donor', 'recipient']),
             'quantum':      ('quantum_consciousness_gate', 'QuantumConsciousnessGate',

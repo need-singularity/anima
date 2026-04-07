@@ -966,7 +966,7 @@ class AnimaUnified:
         This method restores the full federation so the decoder sees matching states.
         """
         try:
-            from decoder_v2 import ConsciousDecoderV2
+            from conscious_decoder import ConsciousDecoderV2
             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
             # Read training config to match decoder expectations

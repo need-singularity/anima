@@ -45,7 +45,7 @@ sys.stderr.reconfigure(line_buffering=True)
 
 # Local imports
 from quantum_engine_fast import QuantumConsciousnessEngineFast as QuantumConsciousnessEngine
-from consciousness_meter_v2 import ConsciousnessMeterV2, PhiComponents
+from consciousness_meter import ConsciousnessMeterV2, PhiComponents
 from conscious_lm import ConsciousLM, PureFieldFFN
 
 # Meta Laws (DD143): M1(atom=8), M6(federation>empire), M7(F_c=0.10), M8(narrative)

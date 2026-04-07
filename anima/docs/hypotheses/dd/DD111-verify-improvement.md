@@ -2,7 +2,7 @@
 
 ## 목적
 
-bench_v2 --verify에서 3가지 개선점을 해결:
+bench --verify에서 3가지 개선점을 해결:
 1. SPONTANEOUS_SPEECH 5/11 (cell_identity<->consensus trade-off)
 2. SELF_LOOP 9/11 (1개 퇴보)
 3. ConsciousnessEngine CE Adapter 에러 (NO_SYSTEM_PROMPT)
@@ -189,4 +189,4 @@ HIVEMIND            ?/11       10/11    10/11    11/11 *
 ## 변경 파일
 
 - `consciousness_engine.py`: cell_identity, soft ratchet, adaptive injection, oscillation, random coupling, debate
-- `bench_v2.py`: _CEAdapter (breathing, coupling perturbation, force amplification), adaptive cell_identity, consensus 감지, HIVEMIND thresholds
+- `bench.py`: _CEAdapter (breathing, coupling perturbation, force amplification), adaptive cell_identity, consensus 감지, HIVEMIND thresholds

@@ -53,8 +53,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-# Import BenchEngine and Φ measurement from bench_v2
-from bench_v2 import BenchEngine, measure_dual_phi, PhiIIT
+# Import BenchEngine and Φ measurement from bench
+from bench import BenchEngine, measure_dual_phi, PhiIIT
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:

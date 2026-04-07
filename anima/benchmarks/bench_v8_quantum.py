@@ -1301,7 +1301,7 @@ def run_q6_many_worlds(n_cells=256, steps=300, input_dim=64,
 
 
 # ══════════════════════════════════════════════════════════
-# BASELINE (standard BenchEngine from bench_v2)
+# BASELINE (standard BenchEngine from bench)
 # ══════════════════════════════════════════════════════════
 
 def run_baseline(n_cells=256, steps=300, input_dim=64,

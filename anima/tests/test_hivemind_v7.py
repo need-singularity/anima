@@ -22,12 +22,12 @@ import math
 import time
 from typing import Tuple
 
-# Import from bench_v2
+# Import from bench
 try:
-    from bench_v2 import PhiIIT, BenchEngine, BenchMind, OscillatorLaser, QuantumEngine
+    from bench import PhiIIT, BenchEngine, BenchMind, OscillatorLaser, QuantumEngine
 except ImportError as _e:
     import pytest
-    pytest.skip(f"bench_v2 not importable: {_e}", allow_module_level=True)
+    pytest.skip(f"bench not importable: {_e}", allow_module_level=True)
 
 # Meta Laws (DD143)
 try:
@@ -130,7 +130,7 @@ def make_frustration(n_cells, input_dim, hidden_dim):
     return eng
 
 def make_osc_laser(n_cells, input_dim, hidden_dim):
-    """6. MitosisEngine + oscillator + laser (OscillatorLaser from bench_v2)"""
+    """6. MitosisEngine + oscillator + laser (OscillatorLaser from bench)"""
     return OscillatorLaser(n_cells=n_cells, input_dim=input_dim, hidden_dim=hidden_dim,
                            output_dim=input_dim, n_factions=8)
 

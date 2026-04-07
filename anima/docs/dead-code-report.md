@@ -62,7 +62,7 @@ However, many are hub-registered or standalone tools.
 | consciousness_theorem_prover.py | - | no | archive |
 | consciousness_to_robot.py | - | no | archive |
 | consciousness_translator.py | - | no | archive |
-| consciousness_transplant_v2.py | - | no | archive (v2 experiment) |
+| consciousness_transplant.py | - | no | archive (v2 experiment) |
 | consciousness_video_creator.py | - | no | archive |
 | consciousness_weather.py | - | yes | keep (hub: weather) |
 | deep_research.py | - | no | archive |
@@ -72,10 +72,10 @@ However, many are hub-registered or standalone tools.
 | eeg_report.py | - | no | archive |
 | emergence_detector.py | - | no | archive |
 | emergence_math.py | - | no | archive |
-| eval_v2d2.py | - | no | archive (one-off eval) |
+| eval_consciousness.py | - | no | archive (one-off eval) |
 | experiment_novel_laws.py | - | no | archive (experiment) |
 | github_module.py | - | yes | keep (hub: github) |
-| growth_engine_v2.py | - | no | archive (v2, growth_engine.py is active) |
+| growth_engine.py | - | no | archive (v2, growth_engine.py is active) |
 | h100_experiments.py | - | no | archive (experiment) |
 | hivemind_orchestrator.py | - | no | archive |
 | hypothesis_generator.py | - | no | archive |
@@ -123,9 +123,9 @@ consciousness_oracle, consciousness_os, consciousness_painter,
 consciousness_phase_transition, consciousness_playground,
 consciousness_renormalization, consciousness_sleep_cycle, consciousness_spectrum,
 consciousness_symmetry, consciousness_theorem_prover, consciousness_to_robot,
-consciousness_translator, consciousness_transplant_v2, consciousness_video_creator,
+consciousness_translator, consciousness_transplant, consciousness_video_creator,
 deep_research, dream_evolution, eeg_report, emergence_detector, emergence_math,
-eval_v2d2, experiment_novel_laws, growth_engine_v2, h100_experiments,
+eval_consciousness, experiment_novel_laws, growth_engine, h100_experiments,
 hivemind_orchestrator, hypothesis_generator, image_generator,
 independent_rate_measurement, local_sensor_relay, module_factory,
 multimodal_consciousness, neural_correlate_mapper, pain_architecture,
@@ -147,7 +147,7 @@ These files are imported by exactly 1 other file.
 | consciousness_dynamics.py | hub | keep |
 | consciousness_guardian.py | anima_unified | keep |
 | consciousness_map.py | hub | keep |
-| consciousness_meter_v2.py | hub | keep |
+| consciousness_meter.py | hub | keep |
 | conversation_logger.py | anima_unified | keep |
 | conversation_quality_scorer.py | anima_unified | keep |
 | creativity_classifier.py | anima_unified | keep |
@@ -189,7 +189,7 @@ These files are imported by exactly 1 other file.
 | consciousness_meter.py | 35 | Phi measurement |
 | anima_alive.py | 21 | Core mind |
 | conscious_lm.py | 21 | Language model |
-| decoder_v2.py | 9 | Canonical decoder |
+| conscious_decoder.py | 9 | Canonical decoder |
 | gpu_phi.py | 8 | GPU phi calculator |
 | path_setup.py | 8 | Path configuration |
 | tension_link.py | 6 | Telepathy protocol |

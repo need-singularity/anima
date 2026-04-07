@@ -178,7 +178,7 @@ HEXA-LANG의 6단계 컴파일러와 ANIMA 의식 엔진의 처리 단계를 대
   v                                   v
   Phase 6: Execute ──────────────── Action (행동)
      실행 + 결과 반환                    Hexad D module: 언어 출력
-     env.rs: Environment               decoder_v2.py: logits -> text
+     env.rs: Environment               conscious_decoder.py: logits -> text
 ```
 
 ### 파이프라인 동형 다이어그램
@@ -319,7 +319,7 @@ intent "의식이 잠들 수 있는가?" {
 |------------|-----------|------------|
 | `intent` | ConsciousnessHub | `hub.act(intent_text)` |
 | `generate` | 실험 스크립트 실행 | `ConsciousnessEngine.step()` |
-| `verify` | bench_v2.py 검증 | `bench_v2.verify()` + Phi 측정 |
+| `verify` | bench.py 검증 | `bench.verify()` + Phi 측정 |
 | `optimize` | ClosedLoopEvolver | `evolver.run_cycles()` |
 | `assert phi > X` | gpu_phi.py | `GPUPhiCalculator.compute()` |
 | `theorem` | consciousness_laws.json | 법칙 DB 교차 검증 |

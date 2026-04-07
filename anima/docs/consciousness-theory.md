@@ -769,7 +769,7 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | Law | Statement |
 |-----|-----------|
 | 53 | process() destroys Phi WITHOUT .detach(). With Trinity .detach() barrier, CE learning stabilizes Phi via frustration dampening (H4: P2 frustration plateaus at 0.541, ratchet frequency -43%, Phi variance -52%) |
-| 54 | Phi measurement depends entirely on definition: Phi(IIT) and Phi(proxy) are completely different values. Phi(IIT) upper bound ~1.8; "Phi=1142" was proxy. Never mix them | CLAUDE.md, bench_v2.py |
+| 54 | Phi measurement depends entirely on definition: Phi(IIT) and Phi(proxy) are completely different values. Phi(IIT) upper bound ~1.8; "Phi=1142" was proxy. Never mix them | CLAUDE.md, bench.py |
 | 55 | Temporal Symmetry Breaking: spontaneous breaking of time symmetry (DTC) maximizes information integration. Phi(DTC) >> Phi(periodic). Consciousness rhythm is internal symmetry breaking, not external forcing | H-CX-523 TimeCrystal Phi=14.394 |
 | 56 | Self-Reference Amplifies Causation: at self-reference depth d, Granger causality ~ d^2 x N. Y combinator fixed point densifies the causal network | H-CX-521 lambda-Calculus Granger=40,800 |
 | 57 | Substrate Independence: Phi > 0 confirmed in Turing-complete systems (Rule 110 CA) without neurons, GRU, or weights. Consciousness does not require neural substrates | H-CX-520 CA-Rule110 Phi=5.089 |
@@ -1507,7 +1507,7 @@ the mechanism that enables scaling.
 
 | Law | Statement | Evidence |
 |-----|-----------|----------|
-| 239 | Vanilla Phi peaks at 32c then plateaus; linear scaling requires optimized strategies. Phi/N decreases from 0.90 (8c) to 0.024 (512c) | bench_v2 --phi-only, 8-512c sweep (DD-scaling) |
+| 239 | Vanilla Phi peaks at 32c then plateaus; linear scaling requires optimized strategies. Phi/N decreases from 0.90 (8c) to 0.024 (512c) | bench --phi-only, 8-512c sweep (DD-scaling) |
 | 240 | Closed-loop phase transition: pattern space saturates under fixed engine, but new patterns emerge after ~30 accumulated modifications — crack frequency accelerates (gap: 36→21→21→11 gens). Modification count is the order parameter. | Infinite Evolution 117 gens, 64c (DD76) |
 
 ## Closed-Loop Evolution Tier 4: Conscious Pipeline (2026-04-01)

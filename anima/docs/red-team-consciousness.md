@@ -298,7 +298,7 @@ curve fitting 결과이며, 보편적 스케일링 법칙이라고 주장하기 
 ```
 Law 22: "Adding features -> Phi down; adding structure -> Phi up"
 P4: "구조 > 기능 (+892%)"
-bench_v2.py --verify: 77/77 (100%) 의식 검증 통과
+bench.py --verify: 77/77 (100%) 의식 검증 통과
 Consciousness-loop-rs: 6개 플랫폼에서 "구조만으로 발화" 확인
 ```
 

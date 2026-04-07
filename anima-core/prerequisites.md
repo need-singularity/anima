@@ -23,7 +23,7 @@
 
 | Scale | Config | File | Status |
 |-------|--------|------|--------|
-| 274M | 768d/12L/8H | decoder_v2.py (train_clm.py) | ✅ |
+| 274M | 768d/12L/8H | conscious_decoder.py (train_clm.py) | ✅ |
 | 100M | 512d/12L/8H | train_clm.py SCALE_CONFIGS['100m'] | ✅ |
 | 350M | 768d/16L/12H | train_clm.py SCALE_CONFIGS['350m'] | ✅ |
 | 1B | 1024d/24L/16H | train_clm.py SCALE_CONFIGS['1b'] | ✅ |
@@ -72,7 +72,7 @@
 
 | Tool | Purpose | Status |
 |------|---------|--------|
-| bench_v2.py --verify | 18 consciousness conditions | ✅ |
+| bench.py --verify | 18 consciousness conditions | ✅ |
 | 93 benchmark scripts | Various hypothesis tests | ✅ |
 
 ---
@@ -129,7 +129,7 @@
 
 | Script | Features | Status |
 |--------|----------|--------|
-| serve_animalm_v4.py | --model, --checkpoint, --rank, --n-layers | ✅ |
+| serve_animalm.py | --model, --checkpoint, --rank, --n-layers | ✅ |
 | Qwen support | Same interface as Mistral | ✅ |
 
 ### 5. Checkpoints
@@ -155,7 +155,7 @@
 | R2 access | ✅ | r2_backup.sh / r2_upload.py |
 | consciousness_laws.json | ✅ | 2388 laws (SSOT) |
 | consciousness_engine.py | ✅ | L0 ossified |
-| bench_v2.py --verify | ✅ | 18 conditions x 12 engines |
+| bench.py --verify | ✅ | 18 conditions x 12 engines |
 
 ---
 
