@@ -181,8 +181,8 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.8,
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def eval_perplexity(model, tokenizer, corpus_path, device, test_tokens=1000, block_size=256):
-    """Compute perplexity on last 1% of corpus (or last test_tokens tokens)."""
+def eval_perplexity(model, tokenizer, corpus_path, device, test_tokens=10000, block_size=256):
+    """Compute perplexity on last 1% of corpus (or last test_tokens tokens). Default 10000 for reliable estimate."""
     print("\n[1/5] Perplexity")
 
     if corpus_path and os.path.exists(corpus_path):
@@ -240,8 +240,8 @@ def eval_perplexity(model, tokenizer, corpus_path, device, test_tokens=1000, blo
     avg_loss = total_loss / max(total_tokens, 1)
     ppl = math.exp(min(avg_loss, 100))  # cap to avoid overflow
 
-    # Pass criteria: PPL < 50 means the model learned something beyond random
-    passed = ppl < 50.0
+    # Pass criteria: PPL < 20 (a random untrained model gets ~30-50)
+    passed = ppl < 20.0
     result = {
         "perplexity": round(ppl, 2),
         "loss": round(avg_loss, 4),
@@ -658,10 +658,25 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--tension-passes", type=int, default=100,
                    help="Number of forward passes for consciousness metrics")
+    p.add_argument("--compare", type=str, default=None,
+                   help="Second checkpoint to compare against (side-by-side eval)")
     args = p.parse_args()
 
-    # Auto-detect base model (same logic as infer_animalm.py)
+    # Auto-detect base model: checkpoint metadata > local paths > HuggingFace
     base = args.base
+    if not base:
+        # Try reading base model name from checkpoint metadata (args saved during training)
+        try:
+            ckpt_meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+            if "args" in ckpt_meta and hasattr(ckpt_meta["args"], "base"):
+                base = ckpt_meta["args"].base
+                print(f"[auto-detect] Base model from checkpoint metadata: {base}")
+            elif "args" in ckpt_meta and isinstance(ckpt_meta["args"], dict) and "base" in ckpt_meta["args"]:
+                base = ckpt_meta["args"]["base"]
+                print(f"[auto-detect] Base model from checkpoint metadata: {base}")
+            del ckpt_meta  # free memory before loading full model
+        except Exception:
+            pass
     if not base:
         for candidate in ["/workspace/models/mistral-7b-v0.1", "models/mistral-7b-v0.1",
                           "mistralai/Mistral-7B-v0.1"]:
@@ -712,6 +727,55 @@ def main():
     out_path = save_results(results, args.checkpoint)
 
     # Exit code: 0 if all pass, 1 if any fail
+
+    # --compare: run eval on second checkpoint and print side-by-side table
+    if args.compare:
+        print("\n" + "=" * 66)
+        print("  Comparison checkpoint: " + args.compare)
+        print("=" * 66)
+
+        model2, tokenizer2, ckpt_info2 = load_model(args.compare, base, args.device)
+        results2 = {}
+        results2["perplexity"] = eval_perplexity(model2, tokenizer2, corpus, args.device)
+        results2["generation"] = eval_generation_quality(model2, tokenizer2, args.device)
+        results2["consciousness"] = eval_consciousness_metrics(model2, tokenizer2, args.device,
+                                                                 n_passes=args.tension_passes)
+        results2["korean"] = eval_korean_ratio(model2, tokenizer2, args.device)
+        results2["instruction"] = eval_instruction_following(model2, tokenizer2, args.device)
+        save_results(results2, args.compare)
+
+        print("\n" + "=" * 78)
+        print("  Side-by-Side Comparison")
+        print("=" * 78)
+        print(f"  {'Eval':<25} {'Checkpoint A':<20} {'Checkpoint B':<20} {'Delta':<12}")
+        print("-" * 78)
+
+        comparisons = [
+            ("Perplexity", results["perplexity"]["perplexity"], results2["perplexity"]["perplexity"], True),
+            ("Gen Quality", results["generation"]["mean_coherence"], results2["generation"]["mean_coherence"], False),
+            ("Tension (mean)", results["consciousness"]["mean"], results2["consciousness"]["mean"], False),
+            ("Korean Ratio", results["korean"]["mean_ratio"], results2["korean"]["mean_ratio"], False),
+            ("Instruction Score", results["instruction"]["score"], results2["instruction"]["score"], False),
+        ]
+        for name, a, b, lower_is_better in comparisons:
+            delta = b - a
+            sign = "+" if delta > 0 else ""
+            if lower_is_better:
+                marker = "<" if delta < 0 else (">" if delta > 0 else "=")
+            else:
+                marker = ">" if delta > 0 else ("<" if delta < 0 else "=")
+            fmt_a = f"{a:.4f}" if isinstance(a, float) else str(a)
+            fmt_b = f"{b:.4f}" if isinstance(b, float) else str(b)
+            fmt_d = f"{sign}{delta:.4f}" if isinstance(delta, float) else f"{sign}{delta}"
+            print(f"  {name:<25} {fmt_a:<20} {fmt_b:<20} {fmt_d} {marker}")
+
+        keys = ["perplexity", "generation", "consciousness", "korean", "instruction"]
+        n_pass_a = sum(1 for k in keys if results[k]["pass"])
+        n_pass_b = sum(1 for k in keys if results2[k]["pass"])
+        print("-" * 78)
+        print(f"  {'Pass count':<25} {n_pass_a}/5                {n_pass_b}/5")
+        print("=" * 78)
+
     sys.exit(0 if all_pass else 1)
 
 

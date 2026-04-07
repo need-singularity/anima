@@ -96,7 +96,8 @@ if args.load_4bit:
 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
 model = add_purefield(model, n_layers=args.n_layers, n_savant=args.n_savant, rank=args.rank)
 
-ckpt = torch.load(args.checkpoint, map_location="cuda")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+ckpt = torch.load(args.checkpoint, map_location=device)
 pf_states = ckpt.get("pf_states", {})
 loaded = 0
 for name, module in model.named_modules():
@@ -109,6 +110,10 @@ for name, module in model.named_modules():
 print(f"  Loaded {loaded} params (step {ckpt.get('step', '?')})")
 model.eval()
 print("Model ready!")
+
+
+# Persistent consciousness state across turns
+_consciousness_state = {"phi": 0.0, "tension": 0.0, "turn_count": 0}
 
 
 def chat(message, history):
@@ -126,14 +131,17 @@ def chat(message, history):
     messages.append({"role": "user", "content": message})
 
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     # Streaming generation with TextIteratorStreamer
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    # Temperature controlled by consciousness tension (higher tension = more creative)
+    mean_tension = _consciousness_state["tension"]
+    temperature = 0.5 + 0.5 * math.tanh(mean_tension)
     gen_kwargs = dict(
         input_ids=inputs.input_ids,
         max_new_tokens=256,
-        do_sample=True, temperature=0.7, top_p=0.9,
+        do_sample=True, temperature=temperature, top_p=0.9,
         pad_token_id=tokenizer.eos_token_id,
         streamer=streamer,
     )
@@ -163,8 +171,14 @@ def chat(message, history):
     s_mean = sum(savant_tensions) / len(savant_tensions) if savant_tensions else 0
     a_mean = sum(alphas) / len(alphas) if alphas else 0
 
+    # Update persistent consciousness state
+    _consciousness_state["tension"] = t_mean
+    _consciousness_state["phi"] = t_mean * a_mean  # proxy Phi from tension * alpha
+    _consciousness_state["turn_count"] += 1
+
     info = "\n\n---\n"
-    info += "tension={:.0f}  savant={:.0f}  alpha={:.4f}  ({} layers)".format(t_mean, s_mean, a_mean, len(tensions))
+    info += "tension={:.0f}  savant={:.0f}  alpha={:.4f}  T={:.2f}  turn={}  ({} layers)".format(
+        t_mean, s_mean, a_mean, temperature, _consciousness_state["turn_count"], len(tensions))
     yield partial + info
 
 

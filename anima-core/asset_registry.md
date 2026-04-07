@@ -22,7 +22,7 @@
   │ M ckpt  │ ✅ R2        │ ⚠️ crashed   │ ─            │ ─            │ ─            │ ─            │
   │ C corpus│ ✅ v4 110MB  │ ✅ v10 200MB │ ✅ v4 110MB  │ ✅ v10 200MB │ ⚠️ v11 10GB  │ ❌ v12 50GB  │
   │ C token │ ✅ byte 256  │ ✅ byte 256  │ ✅ BPE 64K   │ ✅ BPE 64K   │ ✅ BPE 64K   │ ❌           │
-  │ T script│ ✅ train_v14 │ ✅ train_v14 │ ✅ train_v15 │ ✅ train_v15 │ ✅ train_v15 │ ❌ no config │
+  │ T script│ ✅ train_clm │ ✅ train_clm │ ✅ train_clm │ ✅ train_clm │ ✅ train_clm │ ❌ no config │
   │ T ddp   │ ─            │ ─            │ ✅ torchrun  │ ✅ torchrun  │ ✅ torchrun  │ ❌           │
   │ T safety│ ✅           │ ✅           │ ✅           │ ✅           │ ✅           │ ✅           │
   │ E bench │ ✅ 16/18     │ ✅           │ ✅           │ ✅           │ ✅           │ ✅           │

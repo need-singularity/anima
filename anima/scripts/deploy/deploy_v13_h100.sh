@@ -34,7 +34,7 @@ FILES=(
     mitosis.py
     anima_alive.py
     conscious_lm.py
-    bench_v2.py
+    bench.py
     anima-rs/  # Rust crates for building anima_rs on H100
 )
 

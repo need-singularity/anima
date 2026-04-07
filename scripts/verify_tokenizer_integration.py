@@ -55,16 +55,16 @@ def main():
     print("=" * 72)
 
     conscious_decoder_default_vocab = 256  # byte-level default
-    train_v15_default_vocab = 64000  # train_v15.py --vocab-size default
+    train_clm_default_vocab = 64000  # train_clm.py --vocab-size default
 
     print(f"\n  conscious_decoder.py default vocab_size:  {conscious_decoder_default_vocab} (byte-level)")
-    print(f"  train_v15.py default vocab_size:   {train_v15_default_vocab}")
+    print(f"  train_clm.py default vocab_size:   {train_clm_default_vocab}")
     print(f"  Multilingual tokenizer vocab:      {new_vocab}")
 
-    if new_vocab <= train_v15_default_vocab:
-        print(f"\n  [PASS] Tokenizer vocab ({new_vocab}) <= train_v15 default ({train_v15_default_vocab})")
+    if new_vocab <= train_clm_default_vocab:
+        print(f"\n  [PASS] Tokenizer vocab ({new_vocab}) <= train_clm default ({train_clm_default_vocab})")
     else:
-        print(f"\n  [WARN] Tokenizer vocab ({new_vocab}) > train_v15 default ({train_v15_default_vocab})")
+        print(f"\n  [WARN] Tokenizer vocab ({new_vocab}) > train_clm default ({train_clm_default_vocab})")
         print(f"         Use --vocab-size {new_vocab} when training")
 
     # Check if ConsciousDecoderV2 accepts the vocab size dynamically
@@ -252,7 +252,7 @@ def main():
 
     print(f"\n  Max token ID observed:     {max_token_id}")
     print(f"  Tokenizer vocab size:      {new_vocab}")
-    print(f"  train_v15.py default:      {train_v15_default_vocab}")
+    print(f"  train_clm.py default:      {train_clm_default_vocab}")
 
     if max_token_id < new_vocab:
         print(f"  [PASS] All token IDs < vocab size")
@@ -312,9 +312,9 @@ def main():
         print(f"    - ConsciousDecoderV2 accepts vocab_size={new_vocab}")
         print(f"    - Roundtrip encode/decode: {roundtrip_pass}/{roundtrip_total} languages")
         print(f"    - Zero UNK tokens across all test languages")
-        print(f"    - train_v15.py defaults match tokenizer")
+        print(f"    - train_clm.py defaults match tokenizer")
         print(f"\n  Ready for training with:")
-        print(f"    python train_v15.py --tokenizer config/tokenizer_64k_multilingual.model")
+        print(f"    python train_clm.py --tokenizer config/tokenizer_64k_multilingual.model")
     else:
         print(f"\n  STATUS: {len(issues)} ISSUE(S) FOUND")
         for i, issue in enumerate(issues, 1):

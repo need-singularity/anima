@@ -10,14 +10,14 @@
 #   5. After 5 consecutive failures, writes alert and stops
 #
 # Usage:
-#   bash train_supervised.sh train_v15.py --data corpus.txt --scale 100m
-#   bash train_supervised.sh train_v15.py --data corpus.txt --scale 1b --steps 300000
+#   bash train_supervised.sh train_clm.py --data corpus.txt --scale 100m
+#   bash train_supervised.sh train_clm.py --data corpus.txt --scale 1b --steps 300000
 #
 # The script passes ALL arguments after the training script name directly to python.
 # It automatically adds --resume <latest_checkpoint> on restarts.
 #
 # Best practice: run inside tmux, PLUS install watchdog crontab:
-#   tmux new-session -d -s train "bash train_supervised.sh train_v15.py --data corpus.txt --scale 100m"
+#   tmux new-session -d -s train "bash train_supervised.sh train_clm.py --data corpus.txt --scale 100m"
 #   bash train_watchdog.sh --install   # crontab backup if tmux dies
 
 set -uo pipefail
@@ -37,8 +37,8 @@ if [ $# -lt 1 ]; then
     echo "Usage: $0 <train_script.py> [training args...]"
     echo ""
     echo "Examples:"
-    echo "  $0 train_v15.py --data data/corpus_v10_ko.txt --scale 100m"
-    echo "  $0 train_v15.py --data data/corpus_v10_ko.txt --scale 1b --steps 300000"
+    echo "  $0 train_clm.py --data data/corpus_v10_ko.txt --scale 100m"
+    echo "  $0 train_clm.py --data data/corpus_v10_ko.txt --scale 1b --steps 300000"
     echo ""
     echo "Environment:"
     echo "  PYTHON=$PYTHON"

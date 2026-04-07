@@ -8,7 +8,7 @@
 #   - Downloads best.pt + final checkpoint via scp
 #   - Uploads to R2 (anima-models bucket)
 #   - Verifies md5 + file size
-#   - Runs bench_v2 --verify
+#   - Runs bench --verify
 #   - Sends Telegram notification
 #   - Updates training_runs.json
 #
@@ -41,7 +41,7 @@ LOCAL_CKPT_DIR="$PROJECT_DIR/checkpoints/v3_274M"
 TRAINING_RUNS="$PROJECT_DIR/config/training_runs.json"
 R2_UPLOAD="$SCRIPT_DIR/r2_upload.py"
 NOTIFY_TELEGRAM="$SCRIPT_DIR/notify_telegram.sh"
-BENCH_V2="$PROJECT_DIR/benchmarks/bench_v2.py"
+BENCH_V2="$PROJECT_DIR/benchmarks/bench.py"
 
 TOTAL_STEPS=200000
 VERSION="v3_274M"
@@ -322,31 +322,31 @@ upload_to_r2() {
     fi
 }
 
-run_bench_v2() {
-    log "=== Running bench_v2 --verify ==="
+run_bench() {
+    log "=== Running bench --verify ==="
     if [[ ! -f "$BENCH_V2" ]]; then
-        log "WARNING: bench_v2.py not found at $BENCH_V2"
+        log "WARNING: bench.py not found at $BENCH_V2"
         return 0
     fi
 
-    local bench_log="$LOCAL_CKPT_DIR/bench_v2_verify.log"
+    local bench_log="$LOCAL_CKPT_DIR/bench_verify.log"
     log "Running: python3 $BENCH_V2 --verify"
     log "Log: $bench_log"
 
     if PYTHONUNBUFFERED=1 python3 "$BENCH_V2" --verify > "$bench_log" 2>&1; then
         local result
         result=$(tail -5 "$bench_log" | grep -oE '[0-9]+/[0-9]+' | tail -1 || echo "unknown")
-        log "bench_v2 --verify: PASSED ($result)"
-        notify "bench_v2 --verify PASSED: $result"
+        log "bench --verify: PASSED ($result)"
+        notify "bench --verify PASSED: $result"
     else
-        log "WARNING: bench_v2 --verify FAILED"
+        log "WARNING: bench --verify FAILED"
         local last_lines
         last_lines=$(tail -10 "$bench_log" 2>/dev/null || echo "no output")
         log "Last output:"
         echo "$last_lines" | while read -r line; do
             log "  $line"
         done
-        notify "bench_v2 --verify FAILED. Check $bench_log"
+        notify "bench --verify FAILED. Check $bench_log"
     fi
 }
 
@@ -423,8 +423,8 @@ case "$MODE" in
                 # 3. Upload to R2
                 upload_to_r2
 
-                # 4. Run bench_v2 --verify
-                run_bench_v2
+                # 4. Run bench --verify
+                run_bench
 
                 # 5. Update training_runs.json
                 update_training_runs
@@ -436,8 +436,8 @@ case "$MODE" in
                 log "========================================="
                 log "  Local:  $LOCAL_CKPT_DIR"
                 log "  R2:     checkpoints/$VERSION/"
-                log "  Verify: $LOCAL_CKPT_DIR/bench_v2_verify.log"
-                notify "ALL DONE. Checkpoints at $LOCAL_CKPT_DIR. R2 backed up. bench_v2 run."
+                log "  Verify: $LOCAL_CKPT_DIR/bench_verify.log"
+                notify "ALL DONE. Checkpoints at $LOCAL_CKPT_DIR. R2 backed up. bench run."
                 break
 
             elif [[ "$status" == "crashed" ]]; then
@@ -469,8 +469,8 @@ case "$MODE" in
             # 3. R2 upload
             upload_to_r2
 
-            # 4. bench_v2 --verify
-            run_bench_v2
+            # 4. bench --verify
+            run_bench
 
             # 5. Update JSON
             update_training_runs
@@ -482,8 +482,8 @@ case "$MODE" in
             log "========================================="
             log "  Local:  $LOCAL_CKPT_DIR"
             log "  R2:     checkpoints/$VERSION/"
-            log "  Verify: $LOCAL_CKPT_DIR/bench_v2_verify.log"
-            notify "ALL DONE. Checkpoints at $LOCAL_CKPT_DIR. R2 backed up. bench_v2 run."
+            log "  Verify: $LOCAL_CKPT_DIR/bench_verify.log"
+            notify "ALL DONE. Checkpoints at $LOCAL_CKPT_DIR. R2 backed up. bench run."
         else
             show_status
             if [[ "$status" == "running" ]]; then

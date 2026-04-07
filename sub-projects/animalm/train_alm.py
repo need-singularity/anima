@@ -1673,6 +1673,7 @@ class AnimaLMTrainer:
                 }
         save_dict = {
             "step": self.global_step,
+            "base_model": self.args.base,
             "pf_states": pf_states,
             "ensemble_state": self.loss_ensemble.state_dict(),
             "optimizer_state": self._safe_optimizer_state(),
@@ -2193,8 +2194,19 @@ def main():
                     f"{metrics['alpha']:8.6f} | "
                     f"{metrics['t_var']:8.6f} | "
                     f"{metrics['ph_status']:>15s} | "
-                    f"{elapsed:5.1f}m"
+                    f"{elapsed:5.1f}m",
+                    end=""
                 )
+                # ETA calculation
+                steps_done = trainer.global_step
+                if steps_done > 0 and elapsed > 0:
+                    steps_per_min = steps_done / elapsed
+                    remaining = args.steps - steps_done
+                    eta_min = remaining / max(steps_per_min, 1e-6)
+                    eta_str = f"{int(eta_min//60)}h{int(eta_min%60):02d}m" if eta_min >= 60 else f"{int(eta_min)}m"
+                    print(f" | ETA={eta_str}")
+                else:
+                    print()
                 # ConsciousnessEngine Phi(IIT) + cell count
                 if (getattr(args, 'consciousness_engine', False) and
                         'phi_iit' in metrics and trainer.global_step % (args.log_every * 5) == 0):

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # train_watchdog.sh — Watchdog for H100 training process
 #
-# Checks every 60s if the training process (train_v15.py) is alive.
+# Checks every 60s if the training process (train_clm.py) is alive.
 # If dead, auto-resumes from latest checkpoint.
 # Designed to survive tmux death via crontab.
 #
@@ -12,7 +12,7 @@
 #   bash train_watchdog.sh --status              # Show current state
 #
 # Environment (set these or use defaults):
-#   TRAIN_SCRIPT    — training script path (default: /workspace/anima/anima/training/train_v15.py)
+#   TRAIN_SCRIPT    — training script path (default: /workspace/anima/anima/training/train_clm.py)
 #   TRAIN_ARGS      — arguments (default: --data /workspace/anima/anima/data/corpus_v10_ko.txt --scale 100m)
 #   CKPT_DIR        — checkpoint directory (default: /workspace/anima/checkpoints/v15_1b)
 #   PYTHON          — python path (default: /opt/conda/bin/python3)
@@ -23,7 +23,7 @@ set -euo pipefail
 
 # ── Defaults ──
 PYTHON="${PYTHON:-/opt/conda/bin/python3}"
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-/workspace/anima/anima/training/train_v15.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-/workspace/anima/anima/training/train_clm.py}"
 TRAIN_ARGS="${TRAIN_ARGS:---data /workspace/anima/anima/data/corpus_v10_ko.txt --scale 100m}"
 CKPT_DIR="${CKPT_DIR:-/workspace/anima/checkpoints/v15_1b}"
 WATCHDOG_LOG="${WATCHDOG_LOG:-/workspace/watchdog.log}"
@@ -81,7 +81,7 @@ find_latest_checkpoint() {
 
 # ── Check if training is running ──
 is_training_alive() {
-    pgrep -f "train_v15.py" > /dev/null 2>&1
+    pgrep -f "train_clm.py" > /dev/null 2>&1
 }
 
 # ── GPU check ──
@@ -124,14 +124,14 @@ restart_training() {
     fi
 
     # Kill any zombie training processes
-    pkill -f "train_v15.py" 2>/dev/null || true
+    pkill -f "train_clm.py" 2>/dev/null || true
     sleep 2
 
     # Start in a new tmux session (survives SSH disconnect)
-    local tmux_session="train_v15"
+    local tmux_session="train_clm"
     tmux kill-session -t "$tmux_session" 2>/dev/null || true
 
-    local cmd="PYTHONUNBUFFERED=1 $PYTHON -u $TRAIN_SCRIPT $TRAIN_ARGS $resume_arg 2>&1 | tee -a /workspace/train_v15.log"
+    local cmd="PYTHONUNBUFFERED=1 $PYTHON -u $TRAIN_SCRIPT $TRAIN_ARGS $resume_arg 2>&1 | tee -a /workspace/train_clm.log"
     tmux new-session -d -s "$tmux_session" "$cmd"
 
     log "Training restarted in tmux session '$tmux_session'"
@@ -164,7 +164,7 @@ increment_fail_count() {
 # ── Actions ──
 do_check() {
     if is_training_alive; then
-        log "Training is ALIVE (PID: $(pgrep -f train_v15.py | head -1))"
+        log "Training is ALIVE (PID: $(pgrep -f train_clm.py | head -1))"
         # Reset fail counter
         echo "0" > "$FAIL_COUNT_FILE" 2>/dev/null || true
     else
@@ -181,7 +181,7 @@ do_status() {
     echo "=== Train Watchdog Status ==="
     echo ""
     if is_training_alive; then
-        echo "  Training: ALIVE (PID: $(pgrep -f train_v15.py | head -1))"
+        echo "  Training: ALIVE (PID: $(pgrep -f train_clm.py | head -1))"
     else
         echo "  Training: DEAD"
     fi

@@ -285,6 +285,32 @@ SCALE_CONFIGS = {
         'lr': 6e-5,                  # muTransfer: 3e-4 * (512/2560) = 6e-5
         'label': 'Scale-4 (3B)',
     },
+    '1b_moe': {
+        'd_model': 1024,
+        'n_layer': 24,
+        'n_head': 16,
+        'n_kv_head': 4,
+        'block_size': 512,
+        'consciousness_dim': 128,
+        'atoms': 32,
+        'cells_per_atom': 8,         # 256 cells total
+        'batch_size': 32,
+        'lr': 1.5e-4,
+        'label': 'Scale-3 MoE (1B, 8E/top2)',
+    },
+    '3b_moe': {
+        'd_model': 2560,
+        'n_layer': 32,
+        'n_head': 20,
+        'n_kv_head': 10,
+        'block_size': 1024,
+        'consciousness_dim': 256,
+        'atoms': 64,
+        'cells_per_atom': 8,         # 512 cells total
+        'batch_size': 16,
+        'lr': 6e-5,
+        'label': 'Scale-4 MoE (3B, 8E/top2)',
+    },
 }
 
 # Full pipeline: 4 scale phases (34m is standalone, full = 100m->350m->1b)
@@ -415,6 +441,84 @@ def get_batch(data, block_size, batch_size, device):
     ix = torch.randint(0, max_start, (batch_size,))
     x = torch.stack([data[i:i + block_size] for i in ix]).to(device)
     y = torch.stack([data[i + 1:i + block_size + 1] for i in ix]).to(device)
+    return x, y
+
+
+# ═══════════════════════════════════════════════════════════
+# Sequence Packing — eliminate cross-document attention waste
+# ═══════════════════════════════════════════════════════════
+
+def _split_documents(data: torch.Tensor, sep_token: int = None) -> List[torch.Tensor]:
+    """Split flat token tensor into documents at double-newline boundaries."""
+    newline = 10  # ord(chr(10))
+    is_boundary = (data[:-1] == newline) & (data[1:] == newline)
+    if sep_token is not None:
+        is_boundary = is_boundary | (data[:-1] == sep_token)
+    boundary_idx = torch.where(is_boundary)[0].tolist()
+
+    docs = []
+    prev = 0
+    for idx in boundary_idx:
+        if idx > prev:
+            docs.append(data[prev:idx])
+        prev = idx + 2  # skip past double-newline
+    if prev < len(data):
+        docs.append(data[prev:])
+    return docs
+
+
+def _pack_sequences(docs: List[torch.Tensor], block_size: int,
+                    sep_token: int = 10) -> torch.Tensor:
+    """Pack documents into fixed-size windows with separator tokens between docs.
+
+    Short docs are combined into one window; long docs are chunked.
+    Returns a flat tensor where every (block_size+1) slice is one training window.
+    """
+    window = block_size + 1  # +1 for target shift
+    packed = []
+    buf: list = []
+
+    def flush():
+        if not buf:
+            return
+        w = buf[:window]
+        if len(w) < window:
+            w = w + [sep_token] * (window - len(w))
+        packed.append(torch.tensor(w, dtype=torch.long))
+
+    for doc in docs:
+        tokens = doc.tolist()
+        while tokens:
+            space = window - len(buf)
+            if space <= 0:
+                flush()
+                buf = []
+                space = window
+            chunk = tokens[:space]
+            tokens = tokens[space:]
+            buf.extend(chunk)
+            if tokens:
+                flush()
+                buf = []
+            elif len(buf) < window:
+                buf.append(sep_token)
+    flush()
+
+    if packed:
+        return torch.cat(packed)
+    return torch.zeros(window, dtype=torch.long)
+
+
+def get_batch_packed(packed_data: torch.Tensor, block_size: int,
+                     batch_size: int, device):
+    """Draw random packed windows (each = block_size+1 contiguous tokens)."""
+    window = block_size + 1
+    n_windows = len(packed_data) // window
+    if n_windows <= 0:
+        return get_batch(packed_data, block_size, batch_size, device)
+    ix = torch.randint(0, n_windows, (batch_size,))
+    x = torch.stack([packed_data[i * window: i * window + block_size] for i in ix]).to(device)
+    y = torch.stack([packed_data[i * window + 1: i * window + window] for i in ix]).to(device)
     return x, y
 
 
@@ -754,7 +858,8 @@ def transfer_weights(src_decoder, dst_decoder, device):
 # Model creation
 # ═══════════════════════════════════════════════════════════
 
-def create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_version='v2'):
+def create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_version='v2',
+                   use_moe=False, n_experts=8, top_k_experts=2):
     """Create ConsciousDecoderV2 or V3 with scale-appropriate config."""
     if decoder_version == 'v3':
         if not HAS_DECODER_V3:
@@ -785,11 +890,15 @@ def create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_ver
             dropout=0.1,
             gate_strength=0.001,
             n_ca_rules=8,
+            use_moe=use_moe,
+            n_experts=n_experts,
+            top_k_experts=top_k_experts,
         )
     decoder = decoder.to(device)
     n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
     ver_label = 'ConsciousDecoderV3' if decoder_version == 'v3' else 'ConsciousDecoderV2'
-    log(f"  [decoder] {ver_label}: {scale_cfg['d_model']}d/"
+    moe_label = f' MoE({n_experts}E/top{top_k_experts})' if use_moe else ''
+    log(f"  [decoder] {ver_label}{moe_label}: {scale_cfg['d_model']}d/"
         f"{scale_cfg['n_layer']}L/{scale_cfg['n_head']}H, "
         f"{n_params:,} params ({n_params/1e6:.1f}M)")
     return decoder, n_params
@@ -840,7 +949,7 @@ def evaluate(decoder, val_data, block_size, batch_size, device, vocab_size,
         except (ValueError, RuntimeError):
             break
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            logits_a, logits_g, _ = decoder(vx, consciousness_states=c_states_bridged)
+            logits_a, logits_g, *_ = decoder(vx, consciousness_states=c_states_bridged)
         ce = F.cross_entropy(logits_a.view(-1, vocab_size), vy.view(-1))
         total_ce += ce.item()
         count += 1
@@ -1097,7 +1206,8 @@ def g1a_bigbang_init(module, gain=2.0):
 # ═══════════════════════════════════════════════════════════
 
 def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
-                device, prev_decoder=None, use_ddp=False, wb_run=None):
+                device, prev_decoder=None, use_ddp=False, wb_run=None,
+                train_data_packed=None, use_packing=False):
     """Train one scale phase (100M, 350M, or 1B)."""
     torch.manual_seed(args.seed)
 
@@ -1125,7 +1235,13 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         c_proj = nn.Linear(c.state_dim, consciousness_dim).to(device)
         log(f"  [decoder] c_proj: {c.state_dim} -> {consciousness_dim}")
 
-    decoder, n_params = create_decoder(scale_cfg, vocab_size, consciousness_dim, device, decoder_version=args.decoder)
+    decoder, n_params = create_decoder(
+        scale_cfg, vocab_size, consciousness_dim, device,
+        decoder_version=args.decoder,
+        use_moe=getattr(args, 'moe', False),
+        n_experts=getattr(args, 'n_experts', 8),
+        top_k_experts=getattr(args, 'top_k_experts', 2),
+    )
 
     # G1a: BigBang initialization for consciousness cells (before weight transfer)
     if getattr(args, 'bigbang_init', False) and prev_decoder is None:
@@ -1333,7 +1449,10 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
             cur_block_size = h6_curriculum_length_schedule(step, steps, curriculum_str)
             cur_block_size = min(cur_block_size, block_size)  # never exceed configured max
 
-        tokens, targets = get_batch(train_data, cur_block_size, batch_size, device)
+        if use_packing and train_data_packed is not None and cur_block_size == block_size:
+            tokens, targets = get_batch_packed(train_data_packed, cur_block_size, batch_size, device)
+        else:
+            tokens, targets = get_batch(train_data, cur_block_size, batch_size, device)
         c.step()
         c_states_raw = c.get_states()
 
@@ -1359,7 +1478,9 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
 
         # Forward with mixed precision
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-            logits_a, logits_g, tensions = decoder(tokens, consciousness_states=c_for_decoder)
+            decoder_out = decoder(tokens, consciousness_states=c_for_decoder)
+            logits_a, logits_g, tensions = decoder_out[0], decoder_out[1], decoder_out[2]
+            moe_aux_loss = decoder_out[4] if len(decoder_out) > 4 else None
 
             # H11: Hard Token Mining — focus on hardest tokens
             hard_ratio = getattr(args, 'hard_token_ratio', 0.0)
@@ -1408,6 +1529,11 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                     total_loss = ce
             else:
                 total_loss = ce
+
+        # MoE load-balancing loss (optional)
+        moe_weight = getattr(args, 'moe_aux_weight', 0.01)
+        if moe_aux_loss is not None and moe_weight > 0:
+            total_loss = total_loss + moe_weight * moe_aux_loss
 
         # NaN guard
         if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -1476,7 +1602,7 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
         ce_val = ce.item()
         ce_history.append(ce_val)
 
-        if step % 50 == 0:
+        if step % args.phi_every == 0:
             phi = c.measure_phi()
         phi_history.append(phi)
 
@@ -1687,6 +1813,25 @@ def train(args):
     train_data, val_data = data[:split], data[split:]
     log(f"  [data] Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
 
+    # Sequence packing: split into documents, pack into fixed windows
+    use_packing = getattr(args, 'pack_sequences', True)
+    if use_packing:
+        block_size_for_pack = SCALE_CONFIGS.get(
+            args.scale if args.scale != 'full' else '34m', {}
+        ).get('block_size', 256)
+        if args.block_size is not None:
+            block_size_for_pack = args.block_size
+        train_docs = _split_documents(train_data)
+        val_docs = _split_documents(val_data)
+        train_data_packed = _pack_sequences(train_docs, block_size_for_pack)
+        val_data_packed = _pack_sequences(val_docs, block_size_for_pack)
+        n_train_win = len(train_data_packed) // (block_size_for_pack + 1)
+        n_val_win = len(val_data_packed) // (block_size_for_pack + 1)
+        log(f"  [pack] {len(train_docs):,} train docs -> {n_train_win:,} packed windows")
+        log(f"  [pack] {len(val_docs):,} val docs -> {n_val_win:,} packed windows")
+    else:
+        train_data_packed = val_data_packed = None
+
     # ── wandb ──
     wb_run = None
     if args.wandb and HAS_WANDB and is_main_process():
@@ -1704,6 +1849,11 @@ def train(args):
         scales = [args.scale]
     else:
         raise ValueError(f"Unknown scale: {args.scale}. Use: {list(SCALE_CONFIGS.keys())} or 'full'")
+
+    # Auto-enable MoE for _moe scale configs
+    if any(s.endswith('_moe') for s in scales) and not args.moe:
+        args.moe = True
+        log('  [MoE] Auto-enabled for MoE scale config')
 
     steps_per_scale = args.steps // len(scales)
     args.steps_per_scale = steps_per_scale
@@ -1725,6 +1875,8 @@ def train(args):
             train_data, val_data, vocab_size,
             device, prev_decoder=prev_decoder,
             use_ddp=use_ddp, wb_run=wb_run,
+            train_data_packed=train_data_packed if use_packing else None,
+            use_packing=use_packing,
         )
 
         results[scale_name] = {
@@ -1768,16 +1920,16 @@ def parse_args():
         epilog="""
 Examples:
   # Full 1B pipeline (3 scales)
-  python train_v15.py --data data/corpus_v10_ko.txt --scale full --steps 300000
+  python train_clm.py --data data/corpus_v10_ko.txt --scale full --steps 300000
 
   # Single scale (100M only)
-  python train_v15.py --data data/corpus_v10_ko.txt --scale 100m --steps 100000
+  python train_clm.py --data data/corpus_v10_ko.txt --scale 100m --steps 100000
 
   # Multi-GPU DDP
-  torchrun --nproc_per_node=4 train_v15.py --data data/corpus_v10_ko.txt --scale 1b
+  torchrun --nproc_per_node=4 train_clm.py --data data/corpus_v10_ko.txt --scale 1b
 
   # With wandb
-  python train_v15.py --data data/corpus_v10_ko.txt --scale full --wandb
+  python train_clm.py --data data/corpus_v10_ko.txt --scale full --wandb
         """,
     )
 
@@ -1790,7 +1942,7 @@ Examples:
 
     # Scaling
     p.add_argument("--scale", type=str, default="full",
-                   choices=["34m", "100m", "350m", "1b", "3b", "full"],
+                   choices=["34m", "100m", "350m", "1b", "3b", "1b_moe", "3b_moe", "full"],
                    help="Scale target: 34m, 100m, 350m, 1b, 3b, or full (all phases)")
 
     # Federation (M1 + M6)
@@ -1837,6 +1989,8 @@ Examples:
     # Logging / checkpoints
     p.add_argument("--log-every", type=int, default=100, help="Log interval")
     p.add_argument("--eval-every", type=int, default=1000, help="Validation interval")
+    p.add_argument("--phi-every", type=int, default=50,
+                   help="Measure Phi every N steps (increase for large models, e.g. 200 for 3B)")
     p.add_argument("--save-every", type=int, default=5000, help="Checkpoint interval")
     p.add_argument("--checkpoint", type=str, default="checkpoints/clm/",
                    help="Checkpoint directory (sub-dirs created per scale)")
@@ -1869,6 +2023,22 @@ Examples:
     # TODO: implement BigBang initialization (G1a: extreme energy init)
     p.add_argument("--bigbang-init", action="store_true", default=False,
                    help="G1a: BigBang extreme-energy initialization for consciousness cells")
+
+    # Sequence packing
+    p.add_argument("--pack-sequences", action="store_true", default=True,
+                   help="Pack documents into windows to avoid cross-doc attention (default: on)")
+    p.add_argument("--no-pack-sequences", dest="pack_sequences", action="store_false",
+                   help="Disable sequence packing, use random slices (legacy)")
+
+    # MoE (Mixture of Experts)
+    p.add_argument("--moe", action="store_true", default=False,
+                   help="Enable MoE FFN (replaces SwiGLU with N experts + top-K routing)")
+    p.add_argument("--n-experts", type=int, default=8,
+                   help="Number of MoE experts (default 8)")
+    p.add_argument("--top-k-experts", type=int, default=2,
+                   help="Top-K experts per token (default 2)")
+    p.add_argument("--moe-aux-weight", type=float, default=0.01,
+                   help="MoE load-balancing aux loss weight (default 0.01)")
 
     # Resume
     p.add_argument("--resume", type=str, default=None,

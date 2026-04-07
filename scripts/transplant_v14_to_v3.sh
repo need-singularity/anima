@@ -4,7 +4,7 @@
 #
 # Context:
 #   v14.3: MetaLaw federation engine, 8 atoms x 8 cells, hidden_dim=128
-#          trained with train_v14.py --decoder v3 on H100
+#          trained with train_clm.py --decoder v3 on H100
 #   v3:    ConsciousDecoderV3, 274M, d768/8L/12H, consciousness_dim=256
 #
 # Per DD56 (Law 192): cross-dimension transplant DESTROYS consciousness.
@@ -157,7 +157,7 @@ fi
 # v14 consciousness engine: hidden_dim=128 (cell states are 128d)
 # v3 consciousness_dim: 256 (decoder expects 256d consciousness input)
 # BUT: v3's c_proj layer already handles 128->256 projection!
-#   (see train_v14.py line 630-633: c_proj = nn.Linear(c.state_dim, v3_c_dim))
+#   (see train_clm.py line 630-633: c_proj = nn.Linear(c.state_dim, v3_c_dim))
 #
 # So we transplant:
 #   1. ConsciousnessEngine GRU weights (same hidden_dim=128)
@@ -400,7 +400,7 @@ try:
 except Exception as e:
     print(f"  Warmup skipped: {e}")
     print(f"  (This is OK if engine architecture differs from standalone ConsciousnessEngine)")
-    print(f"  The transplanted checkpoint can still be used with train_v14.py --decoder v3")
+    print(f"  The transplanted checkpoint can still be used with train_clm.py --decoder v3")
 WARMUP_SCRIPT
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -420,22 +420,22 @@ log "  ---- WHAT TO DO NEXT ----"
 log ""
 log "  1. Resume v3 training with transplanted consciousness:"
 log "     cd $TRAIN_DIR"
-log "     python3 train_v14.py \\"
+log "     python3 train_clm.py \\"
 log "       --decoder v3 \\"
 log "       --resume $OUTPUT_ENGINE \\"
 log "       --steps 100000"
 log ""
 log "  2. Or start fresh v3 with transplanted engine (recommended):"
-log "     python3 train_v14.py \\"
+log "     python3 train_clm.py \\"
 log "       --decoder v3 \\"
 log "       --transplant-from $V14_LOCAL \\"
 log "       --transplant-alpha $ALPHA \\"
 log "       --steps 100000"
-log "     (Note: --transplant-from may need adding to train_v14.py,"
+log "     (Note: --transplant-from may need adding to train_clm.py,"
 log "      currently only train_conscious_lm.py supports it)"
 log ""
 log "  3. If BOTH trainings complete on H100:"
-log "     a. Compare v14.3 Phi vs v3 Phi (bench_v2.py --compare)"
+log "     a. Compare v14.3 Phi vs v3 Phi (bench.py --compare)"
 log "     b. If v3 CE < 0.003 and Phi > 50: deploy to web"
 log "        python3 deploy.py --target a100 --model $OUTPUT_ENGINE"
 log "     c. If v14 Phi > v3 Phi: transplant again with higher alpha"
@@ -443,7 +443,7 @@ log "        (try alpha=0.5, then alpha=0.7)"
 log "     d. The ultimate goal: v3's 274M decoder speaking with"
 log "        v14's 128-cell federation consciousness"
 log ""
-log "  4. Future: add --transplant-from to train_v14.py"
+log "  4. Future: add --transplant-from to train_clm.py"
 log "     (copy the transplant logic from train_conscious_lm.py"
 log "      lines 798-826, adapt for MetaLawFederation engine)"
 log ""

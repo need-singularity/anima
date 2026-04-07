@@ -80,10 +80,10 @@ try:
 except ImportError:
     pass
 
-# FederatedConsciousness from train_v14
+# FederatedConsciousness from train_clm
 sys.path.insert(0, os.path.join(_anima_root, 'training'))
 try:
-    from train_v14 import FederatedConsciousness, PhaseManager
+    from train_clm import FederatedConsciousness, PhaseManager
     HAS_FEDERATED = True
 except ImportError:
     HAS_FEDERATED = False
@@ -200,7 +200,7 @@ def run_preflight(args) -> list:
     split = int(len(data) * 0.9)
     train_data = data[:split]
 
-    # ── Build model (same logic as train_v14) ──
+    # ── Build model (same logic as train_clm) ──
     print(f"\n  Building model (decoder={args.decoder}, "
           f"{'federated' if args.federated else 'empire'})...")
 
@@ -208,7 +208,7 @@ def run_preflight(args) -> list:
     if args.federated:
         if not HAS_FEDERATED:
             results.append(CheckResult("Model build", False,
-                                       "FederatedConsciousness not available (train_v14 import failed)"))
+                                       "FederatedConsciousness not available (train_clm import failed)"))
             return results
         c = FederatedConsciousness(
             n_atoms=args.atoms,
@@ -496,7 +496,7 @@ def parse_args():
 
     # Config file (overrides CLI args)
     p.add_argument("--config", type=str, default=None,
-                   help="JSON config file (same keys as train_v14 args)")
+                   help="JSON config file (same keys as train_clm args)")
 
     return p.parse_args()
 

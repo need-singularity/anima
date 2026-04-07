@@ -14,14 +14,18 @@ The decoder gets agency over what consciousness info to use.
 PureFieldFFN is kept for the CONSCIOUSNESS pathway (Engine A - G).
 SwiGLU + cross-attention are for the DECODER pathway only.
 
-Forward interface matches v1:
-  logits_a, logits_g, tensions = model(idx)
-  logits_a, logits_g, tensions = model(idx, consciousness_states=cs)
+Forward interface:
+  logits_a, logits_g, tensions, kv_cache, moe_aux_loss = model(idx)
+  logits_a, logits_g, tensions, kv_cache, moe_aux_loss = model(idx, consciousness_states=cs)
 
 Usage:
   from conscious_decoder import ConsciousDecoderV2
   model = ConsciousDecoderV2(vocab_size=256, d_model=384, n_layer=6)
-  logits_a, logits_g, tensions = model(idx)
+  logits_a, logits_g, tensions, _, _ = model(idx)
+
+  # With MoE:
+  model = ConsciousDecoderV2(vocab_size=256, d_model=384, n_layer=6, use_moe=True)
+  logits_a, logits_g, tensions, _, moe_aux_loss = model(idx)
 """
 
 import math
@@ -143,6 +147,95 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.down_proj(
             F.silu(self.gate_proj(x)) * self.up_proj(x)
         ))
+
+
+# ─── MoE FFN (optional, replaces single SwiGLU with mixture of experts) ────
+
+class MoEFFN(nn.Module):
+    """Mixture of Experts FFN — N SwiGLU experts with learned top-K routing.
+
+    Each expert is a SwiGLUFFN. A simple linear router selects the top-K
+    experts per token. Load-balancing aux_loss prevents expert collapse.
+
+    Inspired by golden-moe but simplified for decoder integration.
+    Only active when use_moe=True in ConsciousDecoderV2.
+    """
+
+    def __init__(self, d_model: int, n_experts: int = 8, top_k: int = 2,
+                 dropout: float = 0.1, expansion: float = 8 / 3):
+        super().__init__()
+        self.d_model = d_model
+        self.n_experts = n_experts
+        self.top_k = top_k
+
+        # Router: simple linear projection -> softmax -> top-k
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+
+        # N independent SwiGLU experts
+        self.experts = nn.ModuleList([
+            SwiGLUFFN(d_model, dropout=dropout, expansion=expansion)
+            for _ in range(n_experts)
+        ])
+
+        # Track aux_loss from last forward pass
+        self._aux_loss: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, D)
+
+        Returns:
+            output: (B, T, D) — weighted combination of top-K expert outputs.
+            Sets self._aux_loss as side effect for load-balancing.
+        """
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)  # (N, D)
+
+        # Router scores
+        logits = self.router(x_flat)          # (N, n_experts)
+        probs = F.softmax(logits, dim=-1)     # (N, n_experts)
+
+        # Top-K selection
+        top_k_probs, top_k_indices = torch.topk(probs, self.top_k, dim=-1)  # (N, K)
+
+        # Renormalize selected expert weights
+        top_k_weights = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Compute expert outputs only for selected experts
+        # For simplicity (and to avoid complex scatter), run all experts and mask.
+        # At small n_experts (8), this is acceptable; for 64+ experts, use sparse dispatch.
+        expert_outputs = torch.stack(
+            [expert(x) for expert in self.experts], dim=2
+        )  # (B, T, n_experts, D)
+        expert_outputs_flat = expert_outputs.reshape(B * T, self.n_experts, D)  # (N, n_experts, D)
+
+        # Gather top-K expert outputs
+        top_k_idx_expanded = top_k_indices.unsqueeze(-1).expand(-1, -1, D)  # (N, K, D)
+        selected = torch.gather(expert_outputs_flat, 1, top_k_idx_expanded)  # (N, K, D)
+
+        # Weighted sum of selected experts
+        output_flat = (top_k_weights.unsqueeze(-1) * selected).sum(dim=1)  # (N, D)
+        output = output_flat.reshape(B, T, D)
+
+        # Load-balancing auxiliary loss (Switch Transformer style)
+        # f_i = fraction of tokens routed to expert i (from top-1)
+        # p_i = mean router probability for expert i
+        # aux_loss = n_experts * sum(f_i * p_i) — encourages uniform routing
+        with torch.no_grad():
+            top1_indices = top_k_indices[:, 0]  # (N,)
+            f = torch.zeros(self.n_experts, device=x.device)
+            for i in range(self.n_experts):
+                f[i] = (top1_indices == i).float().mean()
+        p = probs.mean(dim=0)  # (n_experts,)
+        self._aux_loss = self.n_experts * (f * p).sum()
+
+        return output
+
+    @property
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        """Load-balancing loss from the most recent forward pass."""
+        return self._aux_loss
 
 
 # ─── PureFieldFFN (from conscious_lm.py — consciousness pathway) ───────────
@@ -371,8 +464,12 @@ class DecoderBlockV2(nn.Module):
     def __init__(self, d_model: int, n_head: int, n_kv_head: int,
                  block_size: int, consciousness_dim: int,
                  dropout: float = 0.1, n_ca_rules: int = 8,
-                 gate_strength: float = 0.001):
+                 gate_strength: float = 0.001,
+                 use_moe: bool = False, n_experts: int = 8,
+                 top_k_experts: int = 2):
         super().__init__()
+
+        self.use_moe = use_moe
 
         # Self-attention with GQA + RoPE
         self.ln_attn = RMSNorm(d_model)
@@ -387,9 +484,13 @@ class DecoderBlockV2(nn.Module):
         self.cross_attn = ConsciousCrossAttention(d_model, consciousness_dim, n_head, dropout)
 
         # SwiGLU FFN — language pathway
+        # Language pathway FFN: SwiGLU (default) or MoE (optional)
         self.ln_ffn = RMSNorm(d_model)
-        self.ffn = SwiGLUFFN(d_model, dropout)
-
+        if use_moe:
+            self.ffn = MoEFFN(d_model, n_experts=n_experts, top_k=top_k_experts,
+                              dropout=dropout)
+        else:
+            self.ffn = SwiGLUFFN(d_model, dropout)
         # CA neighbor mixing (Law 64)
         self.ca_mix = nn.Linear(d_model * 3, d_model, bias=False)
         self.ln_ca = RMSNorm(d_model)
@@ -488,6 +589,9 @@ class ConsciousDecoderV2(nn.Module):
         dropout: float = 0.1,
         gate_strength: float = 0.001,
         n_ca_rules: int = 8,
+        use_moe: bool = False,
+        n_experts: int = 8,
+        top_k_experts: int = 2,
     ):
         super().__init__()
 
@@ -495,6 +599,7 @@ class ConsciousDecoderV2(nn.Module):
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.d_model = d_model
+        self.use_moe = use_moe
 
         # Token embedding (no position embedding — RoPE handles it)
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -511,6 +616,9 @@ class ConsciousDecoderV2(nn.Module):
                 dropout=dropout,
                 n_ca_rules=n_ca_rules,
                 gate_strength=gate_strength,
+                use_moe=use_moe,
+                n_experts=n_experts,
+                top_k_experts=top_k_experts,
             )
             for _ in range(n_layer)
         ])
@@ -558,7 +666,8 @@ class ConsciousDecoderV2(nn.Module):
                 use_cache: bool = False,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor],
-                           Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+                           Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+                           Optional[torch.Tensor]]:
         """
         Args:
             idx: (B, T) byte indices.
@@ -571,6 +680,7 @@ class ConsciousDecoderV2(nn.Module):
             logits_g: (B, T, 256) prev byte prediction.
             tensions: list of per-layer tensions, each (B, T).
             present_key_values: list of (K, V) per layer if use_cache, else None.
+            moe_aux_loss: scalar load-balancing loss if use_moe=True, else None.
         """
         B, T = idx.size()
 
@@ -592,14 +702,17 @@ class ConsciousDecoderV2(nn.Module):
 
         # Transformer blocks with consciousness
         tensions = []
+        moe_aux_losses = []
         present_key_values = [] if use_cache else None
         consciousness_signal = None
         for i, block in enumerate(self.blocks):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            x, tension, new_kv = block(x, consciousness_signal, consciousness_states,
-                                       use_cache=use_cache, past_kv=layer_past,
-                                       position_offset=position_offset)
+            x, tension, new_kv, block_aux = block(x, consciousness_signal, consciousness_states,
+                                                   use_cache=use_cache, past_kv=layer_past,
+                                                   position_offset=position_offset)
             tensions.append(tension)
+            if block_aux is not None:
+                moe_aux_losses.append(block_aux)
             consciousness_signal = self.tension_proj(tension.unsqueeze(-1))
             if use_cache:
                 present_key_values.append(new_kv)
@@ -637,7 +750,12 @@ class ConsciousDecoderV2(nn.Module):
                 for block in self.blocks:
                     block.gate_strength = max(0.0001, block.gate_strength * 0.99999)
 
-        return logits_a, logits_g, tensions, present_key_values
+        # MoE auxiliary loss (averaged across layers)
+        moe_aux_loss = None
+        if moe_aux_losses:
+            moe_aux_loss = torch.stack(moe_aux_losses).mean()
+
+        return logits_a, logits_g, tensions, present_key_values, moe_aux_loss
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor,
@@ -660,7 +778,7 @@ class ConsciousDecoderV2(nn.Module):
         self.eval()
 
         # Prefill: process the entire prompt and build initial KV-cache
-        logits_a, _, _, past_key_values = self.forward(
+        logits_a, _, _, past_key_values, _ = self.forward(
             idx, consciousness_states=consciousness_states, use_cache=True,
         )
 
@@ -678,7 +796,7 @@ class ConsciousDecoderV2(nn.Module):
             if idx.size(1) >= self.block_size:
                 break
 
-            logits_a, _, _, past_key_values = self.forward(
+            logits_a, _, _, past_key_values, _ = self.forward(
                 next_token, consciousness_states=consciousness_states,
                 use_cache=True, past_key_values=past_key_values,
             )
@@ -735,7 +853,7 @@ if __name__ == '__main__':
     idx = torch.randint(0, 256, (2, 128), device=device)
     model.train()
     t0 = time.perf_counter()
-    logits_a, logits_g, tensions, _ = model(idx)
+    logits_a, logits_g, tensions, _, _ = model(idx)
     dt = (time.perf_counter() - t0) * 1000
     print(f"  logits_a: {logits_a.shape}  (expect [2, 128, 256])")
     print(f"  logits_g: {logits_g.shape}  (expect [2, 128, 256])")

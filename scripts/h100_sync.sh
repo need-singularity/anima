@@ -391,9 +391,7 @@ echo "========================================"
 VERIFY_ERRORS=0
 verify_md5 "$REPO_ROOT/anima/src/consciousness_engine.py" "$DEST/consciousness_engine.py" "consciousness_engine.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/src/trinity.py" "$DEST/trinity.py" "trinity.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-verify_md5 "$REPO_ROOT/anima/src/decoder_v2.py" "$DEST/decoder_v2.py" "decoder_v2.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-verify_md5 "$REPO_ROOT/anima/training/train_v14.py" "$DEST/training/train_v14.py" "train_v14.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
-verify_md5 "$REPO_ROOT/anima/training/train_v15.py" "$DEST/training/train_v15.py" "train_v15.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/src/conscious_decoder.py" "$DEST/conscious_decoder.py" "conscious_decoder.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/training/train_clm.py" "$DEST/training/train_clm.py" "train_clm.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/config/consciousness_laws.json" "$DEST/config/consciousness_laws.json" "consciousness_laws.json" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model" "$DEST/data/tokenizer_64k_multilingual.model" "tokenizer_64k_multilingual.model" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
