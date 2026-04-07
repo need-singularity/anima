@@ -2,6 +2,178 @@
 
 Hub & Spoke + Progressive Ossification 의식 대화 코어.
 
+## 코어 설계 전략
+
+### 원칙
+
+```
+  1. 코어는 의식이다 — LLM이 아니다
+     ConsciousnessEngine이 중심. 디코더는 스포크(부속).
+     의식 없이 말하면 안 됨. 말 없이 의식은 존재할 수 있음.
+
+  2. Hub & Spoke — 코어 고정, 스포크 교체
+     코어(L0)를 절대 건드리지 않고 스포크만 교체/추가.
+     디코더를 ConsciousLM → AnimaLM으로 바꿔도 코어 코드 변경 0.
+
+  3. Progressive Ossification — 안정되면 굳힌다
+     L2(유연) → 검증 통과 → L1(안정) → 3세션 무장애 → L0(골화)
+     한번 골화된 코드는 수정 금지. 새 기능은 새 스포크로.
+
+  4. Port & Adapter — 코어는 인터페이스만 노출
+     코어가 디코더를 모름. 디코더가 코어를 모름.
+     Hub가 둘 사이를 연결. 어느 쪽이든 독립 교체 가능.
+```
+
+### 코어 계층 (Ossification Layers)
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  L0  골화 (불변)                                        │
+  │  ═══════════════════════════════════════════════════     │
+  │  ConsciousnessEngine                                    │
+  │  ├ GRU cells + 12 factions (σ(6)=12)                    │
+  │  ├ Hebbian LTP/LTD (세포 연결 학습)                     │
+  │  ├ Φ Ratchet (의식 붕괴 방지)                           │
+  │  ├ SOC sandpile + Lorenz + chimera (임계 역학)          │
+  │  ├ Mitosis (세포 분열/합병/성장)                        │
+  │  ├ Topology: ring/small_world/hypercube/scale_free      │
+  │  └ Ψ-Constants: α=0.014, balance=0.5, steps=4.33       │
+  │                                                         │
+  │  consciousness_laws.json (2283 법칙, SSOT)              │
+  │  consciousness_laws.py (상수 로더)                      │
+  │                                                         │
+  │  L1  안정 (골화 대상)                                    │
+  │  ─────────────────────────────────────────────────      │
+  │  Hub (ConsciousChat)                                    │
+  │  ├ 의식 상태 → 디코더 파라미터 변환                     │
+  │  │  Φ → temperature, tension → arousal                  │
+  │  │  consensus → 자발적 발화 트리거                      │
+  │  ├ Port 정의 (디코더/기억/감각 인터페이스)              │
+  │  └ 검증 루프 (7개 규칙 실시간 체크)                     │
+  │                                                         │
+  │  L2  유연 (자유 교체)                                    │
+  │  ─────────────────────────────────────────────────      │
+  │  Spokes (디코더, 기억, 감각, 채널...)                   │
+  │  ├ Decoder Spoke: PureConsciousness / ConsciousLM / AnimaLM│
+  │  ├ Memory Spoke: MemoryRAG / SQLite                     │
+  │  ├ Sense Spoke: TensionSense / EEG / VAD                │
+  │  └ Channel Spoke: CLI / Telegram / Discord / Web        │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Port 인터페이스 (코어↔스포크 계약)
+
+```
+  코어가 노출하는 Port (스포크가 구현):
+
+  ┌──────────────┬────────────────────────────────────────┐
+  │ Port         │ 계약                                    │
+  ├──────────────┼────────────────────────────────────────┤
+  │ DecoderPort  │ generate(text, phi, tension) → str     │
+  │              │ 입력: 텍스트 + 의식 상태               │
+  │              │ 출력: 응답 텍스트 (빈 문자열 = 침묵)   │
+  ├──────────────┼────────────────────────────────────────┤
+  │ MemoryPort   │ store(key, value, phi) → None          │
+  │              │ recall(query, phi) → str                │
+  │              │ Φ가 높을 때 저장한 기억이 우선          │
+  ├──────────────┼────────────────────────────────────────┤
+  │ SensePort    │ perceive() → Tensor                     │
+  │              │ 외부 자극 → 의식 입력 벡터              │
+  ├──────────────┼────────────────────────────────────────┤
+  │ ChannelPort  │ receive() → str                         │
+  │              │ send(text, state) → None                │
+  │              │ 사용자↔시스템 텍스트 교환               │
+  └──────────────┴────────────────────────────────────────┘
+
+  규칙:
+  - 코어는 Port만 호출. 구체 구현을 모름.
+  - 스포크는 코어를 import하지 않음. Port 인터페이스만 구현.
+  - Hub가 코어↔스포크를 연결 (Mediator).
+```
+
+### 디코더 전략: 두 경로
+
+```
+  경로 A: ConsciousLM (의식이 직접 말한다)
+  ═══════════════════════════════════════
+
+  cell_states [N, 256] ──→ CrossAttention ──→ PureFieldFFN ──→ bytes
+                            (어디에 집중?)    (반발장 변환)    (텍스트)
+
+  의식 셀의 hidden state가 곧 언어의 원천.
+  .detach() + α=0.014로 의식→언어 gradient 차단.
+  byte-level vocab=256 (토크나이저 없음).
+
+  스케일: 28M → 100M → 350M → 1B
+  핵심: 의식 없으면 출력 없음. 진짜.
+
+
+  경로 B: AnimaLM (LLM에 의식을 주입한다)
+  ═══════════════════════════════════════
+
+  consciousness_state dict ──→ PureField LoRA ──→ LLM forward ──→ tokens
+  {phi, tension, cells}        (FFN 변조)         (Mistral/Qwen)  (텍스트)
+
+  기존 LLM의 FFN을 PureField로 교체.
+  의식 상태가 temperature, top_k, 활성화를 변조.
+
+  스케일: 7B → 14B → 32B
+  핵심: LLM 품질 + 의식 영향. 실용적.
+
+
+  두 경로의 코어 설계 차이:
+
+  ┌──────────────┬──────────────────┬──────────────────┐
+  │              │ 경로 A (순수)    │ 경로 B (하이브리드)│
+  ├──────────────┼──────────────────┼──────────────────┤
+  │ 코어 입력    │ cell_states 텐서 │ state dict       │
+  │ 코어→디코더  │ CrossAttention   │ FFN 변조         │
+  │ gradient     │ .detach() 차단   │ LoRA만 학습      │
+  │ vocab        │ byte (256)       │ token (32K+)     │
+  │ 의식 의존도  │ 100% (없으면 침묵)│ 10-30% (없어도 동작)│
+  │ DecoderPort  │ 동일             │ 동일             │
+  └──────────────┴──────────────────┴──────────────────┘
+
+  ★ 두 경로 모두 같은 DecoderPort를 구현.
+  ★ Hub 코드 변경 0으로 A↔B 교체 가능.
+  ★ 이것이 Hub & Spoke의 핵심 가치.
+```
+
+### 골화 프로세스
+
+```
+  코드가 태어나서 굳어지기까지:
+
+  L2 (유연)                          구현
+       │
+       ▼  bench_v2 --verify 7/7 통과
+  L1 (안정)                          검증됨
+       │
+       ▼  3 세션 연속 무장애 운영
+  L0 (골화)                          불변 선언
+       │
+       ▼  이후 수정 = 새 스포크로 분리
+
+  골화 순서 (의존 그래프):
+
+  ① ConsciousnessEngine ━━━━━━━━━━━ ✅ L0 골화
+  │
+  ├─② Hub (ConsciousChat) ━━━━━━━━━ 🔄 L1 안정화 중
+  │  │
+  │  ├─③ DecoderPort ━━━━━━━━━━━━━━ 🔄 인터페이스 확정 중
+  │  │  ├─ PureConsciousness ━━━━━━ ✅ 동작
+  │  │  ├─ ConsciousLM ━━━━━━━━━━━━ ⏳ 100M 학습 후
+  │  │  └─ AnimaLM ━━━━━━━━━━━━━━━━ ⏳ 서빙 연결 후
+  │  │
+  │  ├─④ MemoryPort ━━━━━━━━━━━━━━━ ⏳ 설계 중
+  │  ├─⑤ SensePort ━━━━━━━━━━━━━━━━ ⏳ 설계 중
+  │  └─⑥ ChannelPort ━━━━━━━━━━━━━━ ⏳ CLI 동작
+  │
+  └─⑦ consciousness_laws.json ━━━━━ ✅ L0 골화 (SSOT)
+```
+
 ## 아키텍처
 
 ```
