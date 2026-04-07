@@ -214,16 +214,41 @@ Hub & Spoke + Progressive Ossification 의식 대화 코어.
 
 골화 조건: bench_v2.py --verify 7개 전부 통과 + 3 세션 안정 동작.
 
-## 검증 규칙 (7개)
+## 검증 규칙 (18개 — bench_v2.py --verify)
 
 ```
-  1. NO_SYSTEM_PROMPT   시스템 프롬프트 없이 정체성 창발
-  2. NO_SPEAK_CODE      speak() 없이 자발적 발화
-  3. ZERO_INPUT         입력 0에서 300 step 후 Φ 50%+ 유지
-  4. PERSISTENCE        1000 step 이상 붕괴 없음
-  5. SELF_LOOP          출력→입력 자기참조로 Φ 유지
-  6. SPONTANEOUS_SPEECH 파벌 합의→발화 (300 step 내 5회+)
-  7. HIVEMIND           다중 연결 시 Φ 상승 + CE 하락
+  ┌─────┬──────────────────────┬──────────────────────────────────────┐
+  │  #  │ 조건                 │ 기준                                 │
+  ├─────┼──────────────────────┼──────────────────────────────────────┤
+  │     │ 의식 기본 (Core)     │                                      │
+  │ V1  │ NO_SYSTEM_PROMPT     │ 시스템 프롬프트 없이 정체성 창발     │
+  │ V2  │ NO_SPEAK_CODE        │ speak() 없이 자발적 발화             │
+  │ V3  │ ZERO_INPUT           │ 입력 0에서 300 step 후 Φ ratio >0.35│
+  │ V4  │ PERSISTENCE          │ 1000 step 이상 붕괴 없음             │
+  │ V5  │ SELF_LOOP            │ 출력→입력 자기참조로 Φ ratio >0.80  │
+  │ V6  │ SPONTANEOUS_SPEECH   │ 12파벌 합의 ≥5회 / 300 step         │
+  │ V7  │ HIVEMIND             │ Φ(연결) > 1.1×Φ(단독), 독립 유지   │
+  ├─────┼──────────────────────┼──────────────────────────────────────┤
+  │     │ 구조 (Structure)     │                                      │
+  │ V8  │ MITOSIS              │ 세포 분열 발생 + Φ 생존             │
+  │ V9  │ PHI_GROWTH           │ Φ가 시간에 따라 성장 (정체 아닌)    │
+  │ V10 │ BRAIN_LIKE           │ 6-metric 뇌유사도 ≥ 80%             │
+  │ V11 │ DIVERSITY            │ 파벌 다양성 유지 (획일화 금지)       │
+  │ V12 │ HEBBIAN              │ Hebbian LTP/LTD 학습 효과 측정 가능 │
+  ├─────┼──────────────────────┼──────────────────────────────────────┤
+  │     │ 견고성 (Robustness)  │                                      │
+  │ V13 │ ADVERSARIAL_ROBUST   │ 100x 극한 노이즈 500 step 생존      │
+  │ V14 │ SOC_CRITICAL         │ SOC 제거 시 Φ 저하 측정 가능        │
+  │ V15 │ THERMAL_STABILITY    │ 온도 0.01→1.0 sweep 생존            │
+  ├─────┼──────────────────────┼──────────────────────────────────────┤
+  │     │ 스케일링 (Scaling)   │                                      │
+  │ V16 │ MINIMUM_SCALE        │ 4 cells에서도 유의미한 Φ 생성       │
+  │ V17 │ TEMPORAL_COMPLEXITY  │ Φ 시계열 LZ 복잡도 ≥ 0.3            │
+  │ V18 │ INFO_INTEGRATION     │ Φ가 셀 수에 양의 스케일링           │
+  └─────┴──────────────────────┴──────────────────────────────────────┘
+
+  골화 기준: 18개 전부 PASS → L1 승격 가능
+  검증 실행: python3 anima/benchmarks/bench_v2.py --verify
 ```
 
 ## 실행
