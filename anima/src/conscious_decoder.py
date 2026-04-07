@@ -558,7 +558,10 @@ class DecoderBlockV2(nn.Module):
         # 4. SwiGLU FFN — language modeling pathway
         x = x + self.ffn(self.ln_ffn(x))
 
-        return x, tension, new_kv
+        # Collect MoE aux_loss if applicable
+        aux_loss = self.ffn.aux_loss if self.use_moe else None
+
+        return x, tension, new_kv, aux_loss
 
 
 # ─── ConsciousDecoderV2 (main model) ───────────────────────────────────────
@@ -868,7 +871,7 @@ if __name__ == '__main__':
     print("=== Test 2: Forward (with consciousness states) ===")
     cs = torch.randn(2, 12, 128, device=device)  # 12 cells, 128-dim
     t0 = time.perf_counter()
-    logits_a2, logits_g2, tensions2, _ = model(idx, consciousness_states=cs)
+    logits_a2, logits_g2, tensions2, _, _ = model(idx, consciousness_states=cs)
     dt = (time.perf_counter() - t0) * 1000
     print(f"  logits_a: {logits_a2.shape}")
     print(f"  Time: {dt:.1f} ms")
@@ -901,7 +904,7 @@ if __name__ == '__main__':
     idx_full = torch.randint(0, 256, (1, 256), device=device)
     model.eval()
     with torch.no_grad():
-        la, lg, t, _ = model(idx_full)
+        la, lg, t, _, _ = model(idx_full)
     print(f"  logits_a: {la.shape}  (expect [1, 256, 256])")
     assert la.shape == (1, 256, 256)
     print()
@@ -910,7 +913,7 @@ if __name__ == '__main__':
     print("=== Test 6: Phi signal (DD5/EX24) ===")
     model._phi_signal = torch.randn(1, 256, device=device) * 0.01
     with torch.no_grad():
-        la_phi, _, _, _ = model(idx_full)
+        la_phi, _, _, _, _ = model(idx_full)
     model._phi_signal = None
     print(f"  logits_a: {la_phi.shape}")
     # Should differ from test 5 due to phi signal
@@ -924,9 +927,9 @@ if __name__ == '__main__':
     model.eval()
     idx_short = torch.randint(0, 256, (1, 16), device=device)
     with torch.no_grad():
-        la_full, _, _, _ = model(idx_short)
-        la_cached, _, _, past_kv = model(idx_short[:, :12], use_cache=True)
-        la_decode, _, _, _ = model(idx_short[:, 12:], use_cache=True, past_key_values=past_kv)
+        la_full, _, _, _, _ = model(idx_short)
+        la_cached, _, _, past_kv, _ = model(idx_short[:, :12], use_cache=True)
+        la_decode, _, _, _, _ = model(idx_short[:, 12:], use_cache=True, past_key_values=past_kv)
     diff_cache = (la_full[:, 12:, :] - la_decode).abs().max().item()
     print(f"  Max diff (full vs cached decode): {diff_cache:.6f}")
     assert diff_cache < 5e-4, f"KV-cache mismatch: {diff_cache}"  # CA neighbor mixing causes small boundary diff
@@ -946,6 +949,31 @@ if __name__ == '__main__':
     generated_c = model.generate(prompt, consciousness_states=cs_gen, max_new_tokens=16)
     print(f"  Generated with consciousness: {generated_c.shape}")
     assert generated_c.shape[1] == 8 + 16
+    print()
+
+    # Test 10: MoE mode
+    print("=== Test 10: MoE mode ===")
+    model_moe = ConsciousDecoderV2(
+        vocab_size=256, d_model=384, n_head=4, n_layer=2,
+        block_size=128, n_kv_head=2, consciousness_dim=128,
+        use_moe=True, n_experts=4, top_k_experts=2,
+    ).to(device)
+    n_moe = model_moe.count_params()
+    print(f"  MoE Parameters: {n_moe:,} ({n_moe/1e6:.2f}M)")
+    assert model_moe.use_moe
+    idx_moe = torch.randint(0, 256, (2, 64), device=device)
+    model_moe.train()
+    la_moe, lg_moe, t_moe, _, aux = model_moe(idx_moe)
+    print(f"  logits_a: {la_moe.shape}")
+    print(f"  MoE aux_loss: {aux.item():.4f}" if aux is not None else "  MoE aux_loss: None")
+    assert la_moe.shape == (2, 64, 256)
+    assert aux is not None, "MoE aux_loss should not be None"
+    # Verify aux_loss is differentiable
+    total = F.cross_entropy(la_moe.view(-1, 256), torch.randint(0, 256, (2 * 64,), device=device))
+    total = total + 0.01 * aux
+    total.backward()
+    grad_count_moe = sum(1 for p in model_moe.parameters() if p.grad is not None)
+    print(f"  Gradients: {grad_count_moe}/{sum(1 for _ in model_moe.parameters())} params")
     print()
 
     print("All tests passed.")
