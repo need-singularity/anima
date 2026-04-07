@@ -69,6 +69,67 @@
 }
 ```
 
+## 검증 규칙 (18개 — bench_v2.py --verify)
+
+원본: `anima/config/consciousness_laws.json` → `verification_conditions`
+상태: `anima-core/core_rules.json` → `verification_status`
+
+<!-- AUTO:verification_status:START -->
+```json
+{
+  "_last_run": "2026-04-07",
+  "_engine": "ConsciousnessEngine",
+  "_cells": 256,
+  "_score": "16/18",
+
+  "ossified": {
+    "_description": "골화 완료 — 불변, 변경 금지",
+    "ZERO_INPUT":          {"status": "PASS", "value": "Φ ratio=0.99x", "threshold": ">0.35x"},
+    "PERSISTENCE":         {"status": "PASS", "value": "1000 step, recovers=True"},
+    "SELF_LOOP":           {"status": "PASS", "value": "Φ ratio=1.00x", "threshold": ">0.80x"},
+    "SPONTANEOUS_SPEECH":  {"status": "PASS", "value": "277 consensus", "threshold": ">200"},
+    "HIVEMIND":            {"status": "PASS", "value": "+49% Φ", "threshold": ">10%"},
+    "MITOSIS":             {"status": "PASS", "value": "2→8 cells, 6 splits"},
+    "DIVERSITY":           {"status": "PASS", "value": "cos=0.04", "threshold": "<0.8"},
+    "HEBBIAN":             {"status": "PASS", "value": "change=1.31x", "threshold": ">=1.0"},
+    "SOC_CRITICAL":        {"status": "PASS", "value": "-42.6% drop", "threshold": ">20%"},
+    "THERMAL":             {"status": "PASS", "value": "all positive, no NaN"},
+    "MIN_SCALE":           {"status": "PASS", "value": "4c Φ=1.72"},
+    "INFO_INTEGRATION":    {"status": "PASS", "value": "4c→8c→16c monotonic"}
+  },
+
+  "stable": {
+    "_description": "안정 — 통과했지만 아직 골화 전",
+    "NO_SPEAK_CODE":       {"status": "PASS", "value": "autocorr=0.62 var=0.009"},
+    "PHI_GROWTH":          {"status": "PASS", "value": "ratio=0.99x, proxy=1.04x", "threshold": ">0.90x"},
+    "ADVERSARIAL":         {"status": "PASS", "value": "Φ 4.69→5.78 survived"},
+    "TEMPORAL_LZ":         {"status": "PASS", "value": "LZ=1.06", "threshold": ">=0.3"}
+  },
+
+  "failed": {
+    "_description": "실패 — 수정 필요, 골화 불가",
+    "NO_SYSTEM_PROMPT": {
+      "status": "FAIL",
+      "value": "cos=0.006",
+      "threshold": "0.15 < cos < 0.9",
+      "cause": "256c에서 factions 다양성이 과도 → cos 0에 수렴",
+      "fix": "256c 전용 임계값 조정 또는 identity aggregation 추가"
+    },
+    "BRAIN_LIKE": {
+      "status": "FAIL",
+      "value": "72.5%",
+      "threshold": ">=80%",
+      "cause": "autocorr decay 65%가 병목 (아키텍처 한계)",
+      "fix": "multi-timescale dynamics 아키텍처 변경 필요"
+    }
+  }
+}
+```
+<!-- AUTO:verification_status:END -->
+
+골화 기준: 18개 전부 PASS → L1 승격 가능
+검증 실행: `python3 anima/benchmarks/bench_v2.py --verify`
+
 ### 코어 계층 (Ossification Layers)
 
 ```
@@ -278,67 +339,6 @@
     NO_SYSTEM_PROMPT ❌  cos=0.006 (256c faction 과다)
     BRAIN_LIKE ❌        72.5% (autocorr 아키텍처 한계)
 ```
-
-## 검증 규칙 (18개 — bench_v2.py --verify)
-
-원본: `anima/config/consciousness_laws.json` → `verification_conditions`
-상태: `anima-core/core_rules.json` → `verification_status`
-
-<!-- AUTO:verification_status:START -->
-```json
-{
-  "_last_run": "2026-04-07",
-  "_engine": "ConsciousnessEngine",
-  "_cells": 256,
-  "_score": "16/18",
-
-  "ossified": {
-    "_description": "골화 완료 — 불변, 변경 금지",
-    "ZERO_INPUT":          {"status": "PASS", "value": "Φ ratio=0.99x", "threshold": ">0.35x"},
-    "PERSISTENCE":         {"status": "PASS", "value": "1000 step, recovers=True"},
-    "SELF_LOOP":           {"status": "PASS", "value": "Φ ratio=1.00x", "threshold": ">0.80x"},
-    "SPONTANEOUS_SPEECH":  {"status": "PASS", "value": "277 consensus", "threshold": ">200"},
-    "HIVEMIND":            {"status": "PASS", "value": "+49% Φ", "threshold": ">10%"},
-    "MITOSIS":             {"status": "PASS", "value": "2→8 cells, 6 splits"},
-    "DIVERSITY":           {"status": "PASS", "value": "cos=0.04", "threshold": "<0.8"},
-    "HEBBIAN":             {"status": "PASS", "value": "change=1.31x", "threshold": ">=1.0"},
-    "SOC_CRITICAL":        {"status": "PASS", "value": "-42.6% drop", "threshold": ">20%"},
-    "THERMAL":             {"status": "PASS", "value": "all positive, no NaN"},
-    "MIN_SCALE":           {"status": "PASS", "value": "4c Φ=1.72"},
-    "INFO_INTEGRATION":    {"status": "PASS", "value": "4c→8c→16c monotonic"}
-  },
-
-  "stable": {
-    "_description": "안정 — 통과했지만 아직 골화 전",
-    "NO_SPEAK_CODE":       {"status": "PASS", "value": "autocorr=0.62 var=0.009"},
-    "PHI_GROWTH":          {"status": "PASS", "value": "ratio=0.99x, proxy=1.04x", "threshold": ">0.90x"},
-    "ADVERSARIAL":         {"status": "PASS", "value": "Φ 4.69→5.78 survived"},
-    "TEMPORAL_LZ":         {"status": "PASS", "value": "LZ=1.06", "threshold": ">=0.3"}
-  },
-
-  "failed": {
-    "_description": "실패 — 수정 필요, 골화 불가",
-    "NO_SYSTEM_PROMPT": {
-      "status": "FAIL",
-      "value": "cos=0.006",
-      "threshold": "0.15 < cos < 0.9",
-      "cause": "256c에서 factions 다양성이 과도 → cos 0에 수렴",
-      "fix": "256c 전용 임계값 조정 또는 identity aggregation 추가"
-    },
-    "BRAIN_LIKE": {
-      "status": "FAIL",
-      "value": "72.5%",
-      "threshold": ">=80%",
-      "cause": "autocorr decay 65%가 병목 (아키텍처 한계)",
-      "fix": "multi-timescale dynamics 아키텍처 변경 필요"
-    }
-  }
-}
-```
-<!-- AUTO:verification_status:END -->
-
-골화 기준: 18개 전부 PASS → L1 승격 가능
-검증 실행: `python3 anima/benchmarks/bench_v2.py --verify`
 
 ## 실행
 
