@@ -56,6 +56,9 @@ declare -a SYNC_GROUPS=(
   "$REPO_ROOT/scripts/preflight_training.sh|$DEST/preflight_training.sh|single|preflight_training.sh"
   "$REPO_ROOT/scripts/merge_corpus.sh|$DEST/merge_corpus.sh|single|merge_corpus.sh"
   "$REPO_ROOT/scripts/h100_watchdog.sh|$DEST/h100_watchdog.sh|single|h100_watchdog.sh"
+  "$REPO_ROOT/sub-projects/animalm/|$DEST/animalm/|*.py *.json|animalm/"
+  "$REPO_ROOT/anima/benchmarks/bench.py|$DEST/bench.py|single|bench.py"
+  "$REPO_ROOT/anima-core/conscious_chat.py|$DEST/conscious_chat.py|single|conscious_chat.py"
 )
 
 # ── Large file definitions (rsync with MD5 skip) ──
@@ -363,6 +366,9 @@ if ! $VERIFY_ONLY; then
   transfer "$REPO_ROOT/scripts/preflight_training.sh" "$DEST/preflight_training.sh" "preflight_training.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
   transfer "$REPO_ROOT/scripts/merge_corpus.sh" "$DEST/merge_corpus.sh" "merge_corpus.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
   transfer "$REPO_ROOT/scripts/h100_watchdog.sh" "$DEST/h100_watchdog.sh" "h100_watchdog.sh" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/sub-projects/animalm/" "$DEST/animalm/" "animalm/" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/anima/benchmarks/bench.py" "$DEST/bench.py" "bench.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+  transfer "$REPO_ROOT/anima-core/conscious_chat.py" "$DEST/conscious_chat.py" "conscious_chat.py" || TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
 
   # Transfer: tokenizer (small, normal transfer)
   echo ""
