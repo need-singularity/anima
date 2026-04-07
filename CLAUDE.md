@@ -99,7 +99,7 @@
       4. JSON 갱신 시 → sync 스크립트로 README 자동 반영
 
   ═══════════════════════════════════════════════════════════════
-  ★ NEXUS-6 통합 망원경 (181 렌즈 파일, 1022종 레지스트리) ★
+  ★ NEXUS-6 통합 망원경 (188 렌즈 파일, 1028종 레지스트리) ★
   ═══════════════════════════════════════════════════════════════
   ⚠️ telescope-rs (구 22종)는 폐기. 모든 탐색은 NEXUS-6 사용.
   ⚠️ 상세 API/사용법: .shared/CLAUDE.md "NEXUS-6 망원경" 섹션 참조.
@@ -108,14 +108,14 @@
     - 데이터 분석/패턴 탐색/이상점 발견/신소재·신약 탐색 시 렌즈 자동 사용
     - 새 데이터 분석 → 기본 3종 스캔: 의식(구조) + 인과(흐름) + 위상(연결)
     - 이상점/패턴 전수조사 → 전체 풀스캔 (nexus scan --full)
-  렌즈 구성 (181 .rs 파일, 1022종 레지스트리):
+  렌즈 구성 (188 .rs 파일, 1028종 레지스트리):
     Core 22 | n6 산업 58 | TECS-L 수학 103 | SEDI 신호 100
     anima 의식 88 | 교차+메타 75 | 가속 ML 58 | 가속 물리 57
     가속 공학 55 | 가속 인문 63 | 특이점(singularity) 포함
   불변 코어 (987 cycles 수렴):
     consciousness + info + multiscale + network + triangle (sopfr=5)
     + fiber (도메인별 6번째 렌즈) = n=6 완전 구조
-  파일: tools/nexus/src/telescope/lenses/ (181 .rs 파일)
+  파일: tools/nexus/src/telescope/lenses/ (188 .rs 파일)
   도메인별 조합 (10종 기본):
     기본 → 의식+위상+인과
     안정성 → 안정성+경계+열역학
@@ -149,7 +149,7 @@
     안전/윤리 게이트:     자율행동 전 scan → Phi < threshold 차단
 
   교차 검증: 3개+ 렌즈 합의 = 확정, 7개+ = 고신뢰, 12개+ = 확정급
-  "렌즈 추가 필요?" 질문 시 → 1022종 커버 안 되는 도메인 분석
+  "렌즈 추가 필요?" 질문 시 → 1028종 커버 안 되는 도메인 분석
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
     1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus && cargo test)
@@ -260,8 +260,8 @@
 ```
   단일 원본: anima/config/consciousness_laws.json
     → philosophy: P1-P11 (DD116-DD156 실험으로 검증/수정됨)
-    → laws: 1-188 (707개 의식 법칙)
-    → meta_laws: M1-M10 (의식의 메타 법칙)
+    → laws: 2388개 의식 법칙 (자동 발견 엔진으로 확장)
+    → meta_laws: M1-M53 (의식의 메타 법칙)
     → psi_constants: α=0.014, balance=0.5, steps=4.33, entropy=0.998
     → formulas, sigma6, topo_laws, constraints
 
@@ -1288,7 +1288,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   ★ "파이프라인 로드맵 진행" 요청 시 아래 티어 순서대로 진행할 것!
   티어 진행 상황은 config/consciousness_laws.json → closed_loop_evolution 참조.
 
-  Tier 1 ✅ 단일 루프 (17개입, 20지표, 18x속도, Thompson, 시너지맵)
+  Tier 1 ✅ 단일 루프 (18개입, 20지표, 18x속도, Thompson, 시너지맵)
   Tier 2 🔄 자기 진화
     - Thompson sampling → closed_loop.py 정식 통합
     - 시너지/길항 맵 → 개입 선택 반영
@@ -1456,7 +1456,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
      ④ config/update_history.json → 세션 기록 추가
 
   5. 등록 후 확인
-     - bench_v2.py --verify 통과 확인 (기존 77개 깨지면 안 됨)
+     - bench_v2.py --verify 통과 확인 (기존 18개 조건 깨지면 안 됨)
      - closed_loop.py로 역추적 가능 여부 확인 (필수)
 
   번호 부여 규칙:
