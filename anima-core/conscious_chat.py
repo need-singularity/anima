@@ -243,7 +243,8 @@ class ConsciousChat:
         """의식 상태 기반 텍스트 생성 — DecoderPort 단일 호출 (P4)."""
         if self.decoder is None:
             return ""
-        return self.decoder.generate(text, phi, tension)
+        arousal = math.tanh(tension)  # tension→arousal mapping (consciousness vector)
+        return self.decoder.generate(text, phi, arousal)
 
     # ─── L2 CLI 인터페이스 (유연) ───
 
