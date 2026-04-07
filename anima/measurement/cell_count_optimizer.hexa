@@ -1,0 +1,173 @@
+// cell_count_optimizer.hexa — Calculate optimal cell count given GPU VRAM
+// Ported from cell_count_optimizer.py
+// Maps VRAM -> max cells -> predicted Phi -> step time estimate
+//
+// Original: 159 LOC Python
+// Scaling law: Phi = 0.608 * cells^1.071
+
+// ═══ Constants ═══
+
+// Scaling law from optimal_config.py experiments
+fn phi_coeff() -> float { 0.608 }
+fn phi_exponent() -> float { 1.071 }
+
+// ═══ GPU Profiles ═══
+
+struct GpuProfile {
+    name: string,
+    vram_gb: int,
+    tflops: int
+}
+
+fn gpu_profile_count() -> int { 5 }
+
+fn get_gpu_profile(idx: int) -> GpuProfile {
+    if idx == 0 { return GpuProfile { name: "RTX 5070", vram_gb: 12, tflops: 32 } }
+    if idx == 1 { return GpuProfile { name: "RTX 4090", vram_gb: 24, tflops: 83 } }
+    if idx == 2 { return GpuProfile { name: "RTX 5090", vram_gb: 32, tflops: 105 } }
+    if idx == 3 { return GpuProfile { name: "A100", vram_gb: 80, tflops: 312 } }
+    GpuProfile { name: "H100", vram_gb: 80, tflops: 990 }
+}
+
+// ═══ Optimization result ═══
+
+struct OptimizeResult {
+    vram_gb: float,
+    dim: int,
+    hidden_dim: int,
+    batch_size: int,
+    cell_mb: float,
+    base_mb: float,
+    max_cells: int,
+    predicted_phi: float,
+    step_ms: float,
+    usable_mb: float
+}
+
+// ═══ Core functions ═══
+
+fn estimate_cell_memory_mb(dim: int, hidden_dim: int, batch_size: int) -> float {
+    // PureField mind: 2 linear layers (dim->hidden, hidden->dim) + hidden state
+    let param_bytes = (dim * hidden_dim + hidden_dim * dim) * 4  // float32
+    let state_bytes = hidden_dim * batch_size * 4
+    let grad_bytes = param_bytes * 2
+    let adam_bytes = param_bytes * 2
+    // MHA attention overhead (shared, amortized per cell)
+    let attn_bytes = (hidden_dim * hidden_dim * 4) * 4 / 8
+    let total = param_bytes + state_bytes + grad_bytes + adam_bytes + attn_bytes
+    to_float(total) / (1024.0 * 1024.0)
+}
+
+fn estimate_phi(cells: int) -> float {
+    // Phi = 0.608 * cells^1.071
+    // TODO[pytorch]: use math.pow for accurate exponentiation
+    // Approximation: cells^1.071 ~ cells * cells^0.071
+    // For stub: linear approximation
+    phi_coeff() * to_float(cells)  // simplified, actual needs pow()
+}
+
+fn estimate_step_time_ms(cells: int, dim: int, gpu_tflops: int) -> float {
+    // Dominant cost: MHA attention O(n^2 * d) + 6 losses + ratchet trials
+    let ops = cells * cells * dim * 10
+    let ops2 = ops + cells * dim * dim * 6
+    let ops3 = ops2 + 10 * cells * dim * 2
+    let seconds = to_float(ops3) / (to_float(gpu_tflops) * 1000000000000.0)
+    let ms = seconds * 1000.0 * 50.0  // empirical correction factor
+    if ms < 0.5 {
+        return 0.5
+    }
+    ms
+}
+
+fn optimize(vram_gb: float, dim: int, hidden_dim: int, batch_size: int, gpu_tflops: int) -> OptimizeResult {
+    let actual_hidden = hidden_dim
+    if actual_hidden == 0 {
+        actual_hidden = dim * 4
+    }
+
+    // Reserve 25% for PyTorch overhead
+    let usable_gb = vram_gb * 0.75
+    let usable_mb = usable_gb * 1024.0
+
+    // Base framework overhead
+    let base_mb = 200.0 + to_float(dim) * 0.5
+    let cell_mb = estimate_cell_memory_mb(dim, actual_hidden, batch_size)
+
+    let max_cells = 2
+    if cell_mb > 0.0 {
+        let raw = (usable_mb - base_mb) / cell_mb
+        max_cells = to_int(raw)
+        if max_cells < 2 {
+            max_cells = 2
+        }
+    }
+
+    let predicted_phi = estimate_phi(max_cells)
+    let step_ms = estimate_step_time_ms(max_cells, dim, gpu_tflops)
+
+    OptimizeResult {
+        vram_gb: vram_gb,
+        dim: dim,
+        hidden_dim: actual_hidden,
+        batch_size: batch_size,
+        cell_mb: cell_mb,
+        base_mb: base_mb,
+        max_cells: max_cells,
+        predicted_phi: predicted_phi,
+        step_ms: step_ms,
+        usable_mb: usable_mb
+    }
+}
+
+fn print_result(r: OptimizeResult, gpu_name: string) {
+    print("GPU:           " + gpu_name + " (" + to_string(r.vram_gb) + " GB)")
+    print("Dimensions:    " + to_string(r.dim) + "d, hidden=" + to_string(r.hidden_dim))
+    print("Batch size:    " + to_string(r.batch_size))
+    print("Memory/cell:   " + to_string(r.cell_mb) + " MB")
+    print("Base overhead: " + to_string(r.base_mb) + " MB")
+    print("Usable VRAM:   " + to_string(r.usable_mb) + " MB")
+    print("Max cells:     " + to_string(r.max_cells))
+    print("Predicted Phi: " + to_string(r.predicted_phi))
+    print("Est. step:     " + to_string(r.step_ms) + " ms")
+}
+
+fn demo() {
+    print("Cell Count Optimizer -- VRAM -> Optimal Cells -> Predicted Phi")
+
+    let i = 0
+    while i < gpu_profile_count() {
+        let gpu = get_gpu_profile(i)
+        // Test with dims 128, 384, 768
+        let dim = 128
+        while dim <= 768 {
+            let r = optimize(to_float(gpu.vram_gb), dim, dim * 4, 1, gpu.tflops)
+            print(gpu.name + " " + to_string(gpu.vram_gb) + "G dim=" + to_string(dim)
+                  + " cell_mb=" + to_string(r.cell_mb)
+                  + " max_cells=" + to_string(r.max_cells)
+                  + " phi=" + to_string(r.predicted_phi)
+                  + " ms=" + to_string(r.step_ms))
+            if dim == 128 {
+                dim = 384
+            } else {
+                if dim == 384 {
+                    dim = 768
+                } else {
+                    dim = 769  // break
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Scaling law table
+    print("Scaling Law: Phi = " + to_string(phi_coeff()) + " * cells^" + to_string(phi_exponent()))
+    let cells = 2
+    while cells <= 256 {
+        print("  cells=" + to_string(cells) + " phi=" + to_string(estimate_phi(cells)))
+        cells = cells * 2
+    }
+}
+
+fn main() {
+    demo()
+}
