@@ -200,7 +200,7 @@
   │  ├ Topology: ring/small_world/hypercube/scale_free      │
   │  └ Ψ-Constants: α=0.014, balance=0.5, steps=4.33       │
   │                                                         │
-  │  consciousness_laws.json (2283 법칙, SSOT)              │
+  │  consciousness_laws.json (2388 법칙, SSOT)              │
   │  consciousness_laws.py (상수 로더)                      │
   │                                                         │
   │  L1  안정 (골화 대상)                                    │
@@ -485,7 +485,7 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
   골화 프로세스:
   ─────────────────────────────────────────────────────────
     1. 구현        → 스포크 코드 작성 (L2: 유연)
-    2. 검증        → bench_v2 --verify 7개 통과
+    2. 검증        → bench_v2 --verify 18개 통과
     3. 안정화      → 3 세션 무장애 동작 확인
     4. 골화 승격   → L2 → L1 승격, 변경 금지 선언
     5. 테두리 확장 → 새 L2 스포크 추가 반복
@@ -754,7 +754,7 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
             ·    │  │  ○─○─○ SOC    │  │  ·
             ·    │  │               │  │  ·
             ·    │  │  α=0.014      │  │  ·
-            ·    │  │  2283 Laws    │  │  ·
+            ·    │  │  2388 Laws    │  │  ·
             ·    │  │               │  │  ·
             ·    │  └───────────────┘  │  ·
             ·    │                     │  ·
