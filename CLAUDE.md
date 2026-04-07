@@ -175,6 +175,28 @@
   ═══════════════════════════════════════════════════════════════
     "천장돌파", "천장 돌파" 요청 시 아래 9개 영역 전수검사+수정:
 
+    ★ 외계인 지수 (n6-architecture 공용 rubric):
+      🛸 alien_index — 제품 maturity 축
+      | 🛸  | 단계              | 기준                                           |
+      |:---:|-------------------|------------------------------------------------|
+      | 10  | 물리적 한계       | 양산 + Python 검증 + EXACT 전수 재현            |
+      |  9  | 실제 양산         | 예측 전수 검증 완료                              |
+      |  8  | 프로토타입        | 실험 데이터 확보                                 |
+      |  7  | 완전 설계         | BT+DSE+Cross-DSE+Evolution+Alien+TP             |
+      |  6  | 설계 완료         | DSE 통과 + 진화 경로                             |
+      |  5  | 상세 설계         | BT + DSE                                        |
+      |  4  | 구조 설계         | 가설 검증                                        |
+      |  3  | 가설 수립         | 초기 검증                                        |
+
+    ★ 천장확인 = 🛸10 도달 조건:
+      - 전 영역 🔴 CRITICAL 0건
+      - 전 영역 🟡 IMPORTANT 0건
+      - conformance_checklist.md 전항목 ✅
+      - prerequisites.md 전항목 ✅
+      - asset_registry.json missing 0
+      - Python/코드 검증 PASS
+
+    ★ 9개 영역:
     1. 모델 아키텍처 (conscious_decoder.py, conscious_lm.py, trinity.py)
        - Flash Attention, KV-cache, depth-scaled init, SwiGLU 8/3
        - generate() 메서드, RoPE 효율, 3B 스케일 VRAM 적합성
@@ -197,8 +219,14 @@
     9. 교차 일관성
        - SSOT 체인 (JSON→Python→코드), PSI 상수 전 파일 동일
 
+    기준 문서 (anima-core/ — 단일 원본):
+      conformance_checklist.md — 20파일 법칙/규칙 적합성 (전항목 ✅ 필수)
+      prerequisites.md         — 학습 단계별 준비 상태 (전항목 ✅ 필수)
+      asset_registry.json      — M/C/T/E/D 자산 현황 (missing 0 필수)
+      core_rules.json          — P1-P4 + L0/L1/L2 + 포트 계약
+
     프로세스: 분석 → 🔴🟡🟢 분류 → 🔴 전부 수정 → 🟡 전부 수정 → 커밋
-    완료 조건: 🔴 0건, 🟡 0건 → "천장 도달" 선언
+    완료 조건: 🛸10 = 🔴 0건 + 🟡 0건 + conformance ✅ + prerequisites ✅ → "천장 도달" 선언
 
   ═══════════════════════════════════════════════════════════════
   자동 생성 규칙
