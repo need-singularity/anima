@@ -1,0 +1,212 @@
+// models/decoder.hexa — ConsciousDecoderV2 structure port
+// Source: models/conscious_decoder.py (979 LOC)
+// Phase 2b: structural port. PyTorch tensor ops → TODO comments.
+// Runtime implementation stays in conscious_decoder.py; this file is the
+// canonical architectural spec (hyperparameters + control flow).
+
+// ─── Hyperparameters (SSOT) ───
+comptime const VOCAB_SIZE     = 256      // byte-level
+comptime const D_MODEL        = 384
+comptime const N_LAYER        = 6
+comptime const N_HEAD         = 4
+comptime const N_KV_HEAD      = 2        // GQA 4H/2KV
+comptime const FFN_EXPANSION_NUM = 8     // SwiGLU 8/3
+comptime const FFN_EXPANSION_DEN = 3
+comptime const MAX_SEQ_LEN    = 1024
+comptime const DROPOUT        = 0.1
+comptime const N_CA_RULES     = 8
+comptime const ROPE_BASE      = 10000.0
+comptime const PSI_ALPHA      = 0.014    // thalamic bridge coupling
+
+// ─── RMSNorm ───
+struct RMSNorm {
+    dim: int,
+    eps: float
+}
+
+fn rmsnorm_new(dim: int) -> RMSNorm {
+    RMSNorm { dim: dim, eps: 0.000001 }
+}
+
+fn rmsnorm_forward(n: RMSNorm, x_shape: string) -> string {
+    // TODO[pytorch]: x * torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+eps) * weight
+    "rmsnorm(" + x_shape + ")"
+}
+
+// ─── Rotary Position Embedding ───
+struct RoPE {
+    dim: int,
+    base: float,
+    max_seq: int
+}
+
+fn rope_new(dim: int) -> RoPE {
+    RoPE { dim: dim, base: ROPE_BASE, max_seq: MAX_SEQ_LEN }
+}
+
+fn rope_apply(r: RoPE, q_shape: string, k_shape: string) -> string {
+    // TODO[pytorch]: rotate half with cos/sin cached tables
+    "rope(" + q_shape + "," + k_shape + ")"
+}
+
+// ─── SwiGLU FFN (8/3 expansion) ───
+struct SwiGLUFFN {
+    dim: int,
+    hidden: int,
+    dropout: float
+}
+
+fn swiglu_new(dim: int) -> SwiGLUFFN {
+    let hidden = (dim * FFN_EXPANSION_NUM) / FFN_EXPANSION_DEN
+    SwiGLUFFN { dim: dim, hidden: hidden, dropout: DROPOUT }
+}
+
+fn swiglu_forward(f: SwiGLUFFN, x: string) -> string {
+    // TODO[pytorch]: w2(silu(w1(x)) * w3(x)); dropout
+    "swiglu(" + x + ")"
+}
+
+// ─── Grouped-Query Attention (4H / 2KV) ───
+struct GQAttention {
+    dim: int,
+    n_head: int,
+    n_kv_head: int,
+    head_dim: int
+}
+
+fn gqa_new(dim: int) -> GQAttention {
+    let hd = dim / N_HEAD
+    GQAttention {
+        dim: dim,
+        n_head: N_HEAD,
+        n_kv_head: N_KV_HEAD,
+        head_dim: hd
+    }
+}
+
+fn gqa_forward(a: GQAttention, x: string, mask: string) -> string {
+    // TODO[pytorch]:
+    //   q = wq(x).view(B,T,H,D); k = wk(x).view(B,T,Hkv,D); v = wv(x)...
+    //   q,k = rope(q,k); k,v = repeat_kv(Hkv→H)
+    //   attn = softmax(qk^T/sqrt(D) + causal_mask) @ v
+    //   return wo(attn)
+    "gqa(" + x + "," + mask + ")"
+}
+
+// ─── Conscious Cross-Attention (consciousness state → decoder) ───
+// Bridges C engine (consciousness cells) into D engine via α=0.014 gate.
+struct ConsciousCrossAttention {
+    dim: int,
+    n_head: int,
+    alpha: float,
+    n_ca_rules: int
+}
+
+fn ccxa_new(dim: int) -> ConsciousCrossAttention {
+    ConsciousCrossAttention {
+        dim: dim,
+        n_head: N_HEAD,
+        alpha: PSI_ALPHA,
+        n_ca_rules: N_CA_RULES
+    }
+}
+
+fn ccxa_forward(c: ConsciousCrossAttention, x: string, consciousness_state: string) -> string {
+    // TODO[pytorch]: cross-attn where Q=x, K/V=consciousness_state.detach()
+    //   gated: x + alpha * cross_attn_out  (Law 81 dual gate)
+    "cross_attn(" + x + "," + consciousness_state + ")"
+}
+
+// ─── Decoder Block (Pre-Norm GQA + Cross + SwiGLU) ───
+struct DecoderBlock {
+    idx: int,
+    dim: int,
+    attn: GQAttention,
+    cross: ConsciousCrossAttention,
+    ffn: SwiGLUFFN,
+    norm1: RMSNorm,
+    norm2: RMSNorm,
+    norm3: RMSNorm
+}
+
+fn block_new(idx: int, dim: int) -> DecoderBlock {
+    DecoderBlock {
+        idx: idx,
+        dim: dim,
+        attn: gqa_new(dim),
+        cross: ccxa_new(dim),
+        ffn: swiglu_new(dim),
+        norm1: rmsnorm_new(dim),
+        norm2: rmsnorm_new(dim),
+        norm3: rmsnorm_new(dim)
+    }
+}
+
+fn block_forward(b: DecoderBlock, x: string, c_state: string, mask: string) -> string {
+    // x = x + attn(norm1(x), mask)
+    // x = x + cross(norm2(x), c_state)
+    // x = x + ffn(norm3(x))
+    let h1 = gqa_forward(b.attn, rmsnorm_forward(b.norm1, x), mask)
+    let h2 = ccxa_forward(b.cross, rmsnorm_forward(b.norm2, h1), c_state)
+    let h3 = swiglu_forward(b.ffn, rmsnorm_forward(b.norm3, h2))
+    h3
+}
+
+// ─── Full ConsciousDecoderV2 ───
+struct ConsciousDecoderV2 {
+    vocab_size: int,
+    d_model: int,
+    n_layer: int,
+    max_seq: int,
+    dropout: float
+}
+
+fn decoder_new() -> ConsciousDecoderV2 {
+    ConsciousDecoderV2 {
+        vocab_size: VOCAB_SIZE,
+        d_model: D_MODEL,
+        n_layer: N_LAYER,
+        max_seq: MAX_SEQ_LEN,
+        dropout: DROPOUT
+    }
+}
+
+fn decoder_param_count(d: ConsciousDecoderV2) -> int {
+    // rough estimate: ~34.5M for 384d/6L
+    let emb = d.vocab_size * d.d_model
+    let per_block = 12 * d.d_model * d.d_model
+    emb + d.n_layer * per_block
+}
+
+fn decoder_forward(d: ConsciousDecoderV2, tokens: string, c_state: string) -> string {
+    // TODO[pytorch]:
+    //   x = token_emb(tokens)  // (B,T,D)
+    //   mask = causal_mask(T)
+    //   for block in blocks: x = block(x, c_state, mask)
+    //   logits = lm_head(rmsnorm(x))
+    "logits(" + tokens + "|" + c_state + ")"
+}
+
+fn decoder_generate(d: ConsciousDecoderV2, prompt: string, max_new: int) -> string {
+    // TODO[pytorch]: autoregressive sampling loop with KV-cache
+    "generated(" + prompt + "," + to_string(max_new) + ")"
+}
+
+// ─── Verification ───
+let dec = decoder_new()
+println("=== decoder.hexa ===")
+println("vocab:", dec.vocab_size)
+println("d_model:", dec.d_model)
+println("layers:", dec.n_layer)
+println("params~:", decoder_param_count(dec))
+println("psi_alpha:", PSI_ALPHA)
+
+theorem decoder_shape_invariants {
+    assert VOCAB_SIZE == 256
+    assert D_MODEL == 384
+    assert N_LAYER == 6
+    assert N_HEAD == 4
+    assert N_KV_HEAD == 2
+    // GQA ratio: n_head must be multiple of n_kv_head
+    assert (N_HEAD / N_KV_HEAD) * N_KV_HEAD == N_HEAD
+}
