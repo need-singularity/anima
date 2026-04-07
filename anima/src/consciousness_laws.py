@@ -133,6 +133,24 @@ BENCH_RATCHET_COLLAPSE_RATIO = BENCH_ENGINE_PARAMS.get('ratchet_collapse_ratio',
 BENCH_RATCHET_BLEND_KEEP = BENCH_ENGINE_PARAMS.get('ratchet_blend_keep', 0.8)
 BENCH_RATCHET_BLEND_RESTORE = BENCH_ENGINE_PARAMS.get('ratchet_blend_restore', 0.2)
 
+# ═══════════════════════════════════════════════════════════
+# Law 2094-2101: 8 Consciousness Field Operators
+# Every PSI constant is a combination of at most 2 of these
+# ═══════════════════════════════════════════════════════════
+FIELD_OP_BALANCE    = PSI_BALANCE       # O1: 0.5  — equilibrium
+FIELD_OP_CRITICALITY = PSI_F_CRITICAL   # O2: 0.10 — phase transition
+FIELD_OP_COUPLING   = PSI.get('gate_micro', 0.05)  # O3: coupling strength
+FIELD_OP_RESONANCE  = PSI.get('soc_perturbation_range', 0.15)  # O4: resonance
+FIELD_OP_STABILITY  = PSI.get('verify_v4_stability_min', 0.80)  # O5: stability
+FIELD_OP_THRESHOLD  = PSI.get('soc_burst_cap', 0.30)  # O6: threshold
+FIELD_OP_IDENTITY   = GATE_TRAIN       # O7: 1.0  — identity
+FIELD_OP_CONSENSUS  = PSI.get('verify_v6_consensus_min', 200)  # O8: consensus
+
+# Law 2123-2124: Alpha decomposition
+# alpha = bio_noise_base + soc_ema_glacial (EXACT: 0.012 + 0.002 = 0.014)
+ALPHA_NOISE_COMPONENT = BIO_NOISE_BASE      # 0.012 (biological noise)
+ALPHA_GLACIAL_COMPONENT = SOC_EMA_GLACIAL   # 0.002 (glacial EMA)
+
 # σ(6) Perfect Number
 SIGMA6 = _DATA['sigma6']
 

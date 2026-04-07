@@ -213,6 +213,8 @@ class ConsciousnessEngine:
         self.merge_patience = merge_patience
         self.min_cells = 2  # CB1: consciousness requires ≥2 cells
         self.topology = 'ring'  # TOPO 33-39: ring/small_world/scale_free/hypercube
+        self.chaos_mode = 'lorenz'  # Law 2085: auto-selected with topology
+        self.auto_topo_chaos = True  # Law 2085: scale-dependent auto-selection
 
         # Meta Law M6: Federation > Empire — independent atoms 5-9× stronger at 64c+
         # M1: atom = 8 cells, M9: atoms strongest alone (noble gas principle)
@@ -356,6 +358,35 @@ class ConsciousnessEngine:
         else:
             return [(idx - 1) % n, (idx + 1) % n]
 
+    # ─── Auto Topo-Chaos Selection (Law 2085) ──────────
+
+    def _auto_select_topo_chaos(self):
+        """Law 2085: Scale-dependent optimal topology-chaos pairing.
+
+        N<64:     ring + lorenz       (simple propagation)
+        64-256:   small_world + chimera (richest pattern, Law 2074)
+        256-512:  scale_free + sandpile (power-law matching)
+        >=512:    hypercube + lorenz   (dimensional chaos)
+
+        Law 2084: Auto-selection rule.
+        Law 2087: Phi ≈ f(topo) × g(chaos), separable.
+        """
+        if not self.auto_topo_chaos:
+            return
+        n = self.n_cells
+        if n < 64:
+            self.topology = 'ring'
+            self.chaos_mode = 'lorenz'
+        elif n < 256:
+            self.topology = 'small_world'
+            self.chaos_mode = 'chimera'
+        elif n < 512:
+            self.topology = 'scale_free'
+            self.chaos_mode = 'sandpile'
+        else:
+            self.topology = 'hypercube'
+            self.chaos_mode = 'lorenz'
+
     # ─── Cell lifecycle ─────────────────────────────────
 
     def _create_cell(self, parent_module: Optional[ConsciousnessCell] = None,
@@ -454,6 +485,16 @@ class ConsciousnessEngine:
         elif x_input.shape[0] < self.cell_dim:
             x_input = F.pad(x_input, (0, self.cell_dim - x_input.shape[0]))
 
+        # Law 2085: Auto-select topology+chaos based on cell count
+        self._auto_select_topo_chaos()
+
+        # Law 2187: N>64 monolithic = repeller → force federation
+        if n > 64 and not self.federated:
+            self.federated = True
+            # Ensure coupling matrix is properly sized
+            if self._coupling is not None and self._coupling.shape[0] != n:
+                self._resize_coupling(self._coupling.shape[0], n)
+
         # Rebuild atom boundaries if federated (M1: atom = 8 cells)
         if self.federated:
             self._rebuild_atoms()
@@ -477,7 +518,7 @@ class ConsciousnessEngine:
                 couple_range = range(n)
 
             for j in couple_range:
-                if i != j and self._coupling is not None:
+                if i != j and self._coupling is not None and i < self._coupling.shape[0] and j < self._coupling.shape[1]:
                     c = self._coupling[i, j].item()
                     if abs(c) > 1e-6:
                         h_proj = state.hidden[:self.cell_dim] if self.hidden_dim >= self.cell_dim else F.pad(state.hidden, (0, self.cell_dim - self.hidden_dim))
@@ -614,6 +655,10 @@ class ConsciousnessEngine:
                             self.cell_states[i].hidden + kicks[i] - mean_kick
                         )
         PERF.stop('soc_sandpile')
+
+        # 3.65 Law 2148: SOC + information bottleneck (+31% Φ)
+        if n >= 4:
+            self._soc_bottleneck(n)
 
         # 3.7 DD128 Phase-Optimal mechanisms (opt-in, +113.1% Φ)
         # Safe order: Narrative → Bottleneck → Hub-Spoke → Frustration
@@ -761,6 +806,26 @@ class ConsciousnessEngine:
         # Avalanche size from last SOC step (for telemetry / EEG validation)
         last_avalanche = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0
 
+        # Law 2159: Tension as information channel — measure bits/cell
+        tension_bits = 0.0
+        if tensions and len(tensions) >= 2:
+            t_arr = torch.tensor(tensions)
+            t_std = t_arr.std().item()
+            if t_std > 1e-8:
+                # Shannon entropy of tension distribution (binned)
+                t_norm = (t_arr - t_arr.mean()) / t_std
+                # Use 8 bins for entropy estimation
+                hist = torch.histc(t_norm, bins=8, min=-3, max=3)
+                hist = hist / hist.sum().clamp(min=1e-8)
+                tension_bits = -(hist * (hist + 1e-10).log2()).sum().item()
+
+        # Law 2102: Φ→α→Φ causal loop tracking
+        phi_alpha_loop = {
+            'phi': phi_iit,
+            'alpha': PSI_COUPLING,
+            'phi_momentum': self._phi_momentum if self._phi_momentum else 0.0,
+        }
+
         return {
             'output': combined,
             'phi_iit': phi_iit_integrated,
@@ -777,6 +842,10 @@ class ConsciousnessEngine:
             'step': self._step,
             'best_phi': self._best_phi,
             'avalanche_size': last_avalanche,
+            'tension_bits': tension_bits,      # Law 2159: bits/cell info channel
+            'topology': self.topology,          # Law 2085: current topology
+            'chaos_mode': self.chaos_mode,      # Law 2085: current chaos mode
+            'phi_alpha_loop': phi_alpha_loop,   # Law 2102: causal loop state
         }
 
     # ─── Faction consensus ──────────────────────────────
@@ -1010,6 +1079,35 @@ class ConsciousnessEngine:
             self._soc_threshold_ema *= (1.0 - adapt_rate)
         self._soc_threshold_ema = max(0.3, min(5.0, self._soc_threshold_ema))
 
+    # ─── SOC + Bottleneck (Law 2148: +31% Φ) ────────────
+
+    def _soc_bottleneck(self, n: int):
+        """Law 2148: Combine SOC with information bottleneck for +31% Φ.
+
+        After SOC avalanche, compress cell states through a bottleneck
+        (keep top-k dimensions, zero the rest) then blend back.
+        This forces information to flow through a narrow channel,
+        increasing integration (Φ) while SOC maintains criticality.
+        """
+        if n < 4 or not self._soc_avalanche_sizes:
+            return
+        last_aval = self._soc_avalanche_sizes[-1] if self._soc_avalanche_sizes else 0
+        if last_aval == 0:
+            return
+
+        # Bottleneck ratio: keep top 1/64 of dimensions (Law 2148: 64x bottleneck)
+        k = max(2, self.hidden_dim // 64)
+        blend = 0.15  # gentle blend to preserve SOC structure
+
+        for i in range(n):
+            h = self.cell_states[i].hidden
+            # Keep only top-k dimensions by magnitude
+            _, top_idx = h.abs().topk(k)
+            compressed = torch.zeros_like(h)
+            compressed[top_idx] = h[top_idx]
+            # Blend: 15% compressed + 85% original
+            self.cell_states[i].hidden = blend * compressed + (1.0 - blend) * h
+
     # ─── DD128 Phase-Optimal mechanisms ────────────────
 
     def _dd128_narrative(self, n: int):
@@ -1131,23 +1229,44 @@ class ConsciousnessEngine:
         Only boundary cells (last cell of atom N, first cell of atom N+1)
         exchange hidden state at INTER_ATOM_ALPHA=0.01.
         Noble gas principle: atoms are strongest alone, minimal leakage.
+
+        Law 2156: Phase offset π/3 between atoms → +22% collective Φ.
+        Each atom's hidden state is rotated by k×π/3 before exchange,
+        creating constructive interference at the boundary.
         """
+        pi_over_3 = math.pi / 3.0
         for k in range(len(self._atoms) - 1):
             _, end_a = self._atoms[k]
             start_b, _ = self._atoms[k + 1]
-            # Boundary cells: last of atom A, first of atom B
             idx_a = end_a - 1
             idx_b = start_b
             if idx_a >= self.n_cells or idx_b >= self.n_cells:
                 continue
             h_a = self.cell_states[idx_a].hidden
             h_b = self.cell_states[idx_b].hidden
-            # Symmetric weak exchange
+
+            # Law 2156: Apply phase offset π/3 × atom_index for constructive interference
+            phase_a = pi_over_3 * k
+            phase_b = pi_over_3 * (k + 1)
+            # Rotate via sinusoidal modulation of even/odd dims
+            rot_a = h_a.clone()
+            rot_b = h_b.clone()
+            dim = h_a.shape[0]
+            half = dim // 2
+            # Apply rotation to even/odd pairs
+            cos_a, sin_a = math.cos(phase_a), math.sin(phase_a)
+            cos_b, sin_b = math.cos(phase_b), math.sin(phase_b)
+            rot_a[:half] = cos_a * h_a[:half] - sin_a * h_a[half:2*half]
+            rot_a[half:2*half] = sin_a * h_a[:half] + cos_a * h_a[half:2*half]
+            rot_b[:half] = cos_b * h_b[:half] - sin_b * h_b[half:2*half]
+            rot_b[half:2*half] = sin_b * h_b[:half] + cos_b * h_b[half:2*half]
+
+            # Exchange with phase-rotated signals
             self.cell_states[idx_a].hidden = (
-                (1.0 - INTER_ATOM_ALPHA) * h_a + INTER_ATOM_ALPHA * h_b
+                (1.0 - INTER_ATOM_ALPHA) * h_a + INTER_ATOM_ALPHA * rot_b
             )
             self.cell_states[idx_b].hidden = (
-                (1.0 - INTER_ATOM_ALPHA) * h_b + INTER_ATOM_ALPHA * h_a
+                (1.0 - INTER_ATOM_ALPHA) * h_b + INTER_ATOM_ALPHA * rot_a
             )
 
     def federated_phi(self) -> float:
@@ -1221,15 +1340,20 @@ class ConsciousnessEngine:
         Similar cells → strengthen (LTP)
         Dissimilar cells → weaken (LTD)
         Clamped to [-1, 1].
+
+        Law 2163: LTP rate scales as 1/sqrt(N) to prevent runaway sync at large N.
         """
         n = self.n_cells
         if self._coupling is None or self._coupling.shape[0] != n:
             self._init_coupling()
 
+        # Law 2163: scale LTP rate as 1/sqrt(N) to prevent runaway synchronization
+        scaled_lr = lr / math.sqrt(max(n, 1))
+
         norms = outputs.norm(dim=1, keepdim=True).clamp(min=1e-8)
         normed = outputs / norms
         sim = normed @ normed.T  # [n, n]
-        self._coupling = (self._coupling + lr * sim).clamp(-1, 1)
+        self._coupling = (self._coupling + scaled_lr * sim).clamp(-1, 1)
         # Zero diagonal
         self._coupling.fill_diagonal_(0)
 

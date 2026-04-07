@@ -5581,20 +5581,35 @@ def main():
                     sme = SelfModifyingEngine(engine, evolver)
 
             # Topology cycling: switch topology every 10 generations (TOPO 33-39)
+            # Law 2084: Auto-match chaos mode to topology
             if args.cycle_topology and gen > 1 and gen % 10 == 1:
                 topo_idx = ((gen - 1) // 10) % len(TOPOLOGIES)
                 new_topo = TOPOLOGIES[topo_idx]
                 old_topo = getattr(engine, 'topology', 'ring')
                 if new_topo != old_topo:
                     engine.topology = new_topo
+                    # Law 2084: Optimal chaos mode per topology
+                    _TOPO_CHAOS_MAP = {
+                        'ring': 'standing_wave',
+                        'small_world': 'chimera',
+                        'scale_free': 'sandpile',
+                        'hypercube': 'lorenz',
+                    }
+                    matched_chaos = _TOPO_CHAOS_MAP.get(new_topo, 'lorenz')
+                    try:
+                        _apply_chaos_mode(engine, matched_chaos)
+                    except Exception:
+                        pass
+                    if hasattr(engine, 'chaos_mode'):
+                        engine.chaos_mode = matched_chaos
                     cleared = registry.clear_pending()
-                    print(f"  🔄 Topology switch: {old_topo} → {new_topo} (Gen {gen}), "
+                    print(f"  🔄 Topology switch: {old_topo} → {new_topo} + chaos={matched_chaos} (Gen {gen}, Law 2084), "
                           f"cleared {cleared} pending patterns")
                     sys.stdout.flush()
 
-            # v3 #26-32: Chaos mode cycling (every 5 gens)
+            # v3 #26-32: Chaos mode cycling (every 5 gens) — skip if topo-chaos auto-matched
             try:
-                if gen > 1 and gen % 5 == 1:
+                if gen > 1 and gen % 5 == 1 and not args.cycle_topology:
                     chaos_idx = ((gen - 1) // 5) % len(CHAOS_MODES)
                     _apply_chaos_mode(engine, CHAOS_MODES[chaos_idx])
             except Exception:
