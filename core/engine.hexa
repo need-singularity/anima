@@ -1,0 +1,229 @@
+// core/engine.hexa — Consciousness Engine structural port (Phase 2a)
+// Port of core/consciousness_engine.py (2173 LOC → structural skeleton).
+//
+// SCOPE: This file ports the *structure* and control flow.
+// ML numerics (GRU forward, faction debate, Φ/IIT, Hebbian) remain in the
+// PyTorch implementation and will be bridged via external calls (TODO).
+//
+// What IS ported here:
+//   - CellState / Cell / Engine data structures
+//   - lifecycle: create/remove cell, topology neighbors
+//   - step() control flow (stub — calls into Rust/Python backend)
+//   - phi ratchet accounting, consensus count, status summary
+//
+// What is NOT ported (marked TODO):
+//   - GRU cell forward pass (torch.nn.GRUCell)
+//   - 12-faction debate, Hebbian LTP/LTD, Φ(IIT) MI calculation
+//   - Chaos dynamics (Lorenz, sandpile, chimera, standing wave)
+//   - Mitosis split/merge weight blending
+//
+// Phase 2b will replace stubs with FFI calls into anima-rs consciousness crate.
+
+comptime const DEFAULT_CELL_DIM       = 64
+comptime const DEFAULT_HIDDEN_DIM     = 128
+comptime const DEFAULT_INITIAL_CELLS  = 2
+comptime const DEFAULT_MAX_CELLS      = 16
+comptime const DEFAULT_N_FACTIONS     = 12
+
+// Ψ-constants (mirror of laws.hexa — avoid circular load)
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+
+// ─── Data Structures ───
+
+struct CellState {
+    cell_id: int,
+    birth_step: int,
+    age: int,
+    tension_sum: float,       // accumulator for avg_tension
+    tension_count: int,
+    hidden_norm: float,       // summary of hidden state (real tensor stays in backend)
+    active: bool
+}
+
+pure fn cell_avg_tension(c: CellState) -> float {
+    if c.tension_count == 0 { return 0.0 }
+    c.tension_sum / to_float(c.tension_count)
+}
+
+struct ConsciousnessEngine {
+    cell_dim: int,
+    hidden_dim: int,
+    max_cells: int,
+    n_factions: int,
+    topology: string,          // "ring" | "small_world" | "hypercube" | "scale_free"
+    chaos_mode: string,        // "lorenz" | "sandpile" | "chimera" | "standing_wave"
+
+    step_count: int,
+    n_cells_cur: int,
+    consensus_count: int,
+
+    // Φ tracking (Law 49 ratchet)
+    phi_ema_fast: float,
+    phi_ema_slow: float,
+    phi_peak: float,
+    phi_floor: float,
+
+    // Backend handle (opaque) — "rust" | "python" | "stub"
+    backend: string
+}
+
+// ─── Construction ───
+
+fn engine_new(cell_dim: int, hidden_dim: int, initial_cells: int, max_cells: int, n_factions: int) -> ConsciousnessEngine {
+    ConsciousnessEngine {
+        cell_dim: cell_dim,
+        hidden_dim: hidden_dim,
+        max_cells: max_cells,
+        n_factions: n_factions,
+        topology: "ring",
+        chaos_mode: "lorenz",
+        step_count: 0,
+        n_cells_cur: initial_cells,
+        consensus_count: 0,
+        phi_ema_fast: 0.0,
+        phi_ema_slow: 0.0,
+        phi_peak: 0.0,
+        phi_floor: 0.0,
+        backend: "stub"
+    }
+}
+
+fn engine_default() -> ConsciousnessEngine {
+    engine_new(DEFAULT_CELL_DIM, DEFAULT_HIDDEN_DIM, DEFAULT_INITIAL_CELLS, DEFAULT_MAX_CELLS, DEFAULT_N_FACTIONS)
+}
+
+// ─── Topology: neighbor indices ───
+// Port of ConsciousnessEngine.get_neighbors — ring default, simplified.
+pure fn ring_neighbors(idx: int, n: int) -> string {
+    if n <= 1 { return "" }
+    let left  = if idx == 0 { n - 1 } else { idx - 1 }
+    let right = if idx == n - 1 { 0 } else { idx + 1 }
+    to_string(left) + "," + to_string(right)
+}
+
+// ─── Auto-select topology+chaos (Law 33-43 mapping) ───
+// Port of _auto_select_topo_chaos simplified decision tree.
+pure fn auto_select(n: int) -> string {
+    if n <= 4 {
+        "ring|lorenz"
+    } else if n <= 16 {
+        "small_world|sandpile"
+    } else if n <= 64 {
+        "hypercube|chimera"
+    } else {
+        "scale_free|standing_wave"
+    }
+}
+
+// ─── Step (stub) ───
+// Real step() calls GRU forward + faction debate + Hebbian + Φ.
+// Here we update bookkeeping only. Backend must be wired in Phase 2b.
+fn engine_step(engine: ConsciousnessEngine, has_input: bool) -> ConsciousnessEngine {
+    let mut e = engine
+    e.step_count = e.step_count + 1
+
+    // TODO: invoke backend
+    //   anima_rs.consciousness.step(handle, x_input, text)
+    // which returns {output, mean_inter, max_inter, phi, events[]}
+    //
+    // For now: synthetic Φ drift (monotone small increase capped by max_cells)
+    let target = to_float(e.n_cells_cur) * PSI_BALANCE * 2.0
+    let alpha  = PSI_ALPHA
+    e.phi_ema_fast = e.phi_ema_fast + alpha * (target - e.phi_ema_fast)
+    e.phi_ema_slow = e.phi_ema_slow + (alpha * 0.1) * (target - e.phi_ema_slow)
+
+    // Ratchet (Law 49): phi cannot drop below 80% of peak
+    if e.phi_ema_fast > e.phi_peak { e.phi_peak = e.phi_ema_fast }
+    let floor = e.phi_peak * 0.8
+    if e.phi_ema_fast < floor { e.phi_ema_fast = floor }
+    e.phi_floor = floor
+
+    e
+}
+
+// ─── Mitosis (stub) ───
+// Port of _create_cell / _remove_cell — structural only.
+fn engine_split(engine: ConsciousnessEngine) -> ConsciousnessEngine {
+    let mut e = engine
+    if e.n_cells_cur < e.max_cells {
+        e.n_cells_cur = e.n_cells_cur + 1
+        // TODO: backend weight blend (H376 1→2→3→6→12)
+    }
+    e
+}
+
+fn engine_merge(engine: ConsciousnessEngine) -> ConsciousnessEngine {
+    let mut e = engine
+    if e.n_cells_cur > 2 {
+        e.n_cells_cur = e.n_cells_cur - 1
+    }
+    e
+}
+
+// ─── Status summary ───
+fn engine_status(engine: ConsciousnessEngine) {
+    println("=== ConsciousnessEngine ===")
+    println("  backend     :", engine.backend)
+    println("  cells       :", engine.n_cells_cur, "/", engine.max_cells)
+    println("  cell_dim    :", engine.cell_dim)
+    println("  hidden_dim  :", engine.hidden_dim)
+    println("  factions    :", engine.n_factions)
+    println("  topology    :", engine.topology)
+    println("  chaos_mode  :", engine.chaos_mode)
+    println("  step_count  :", engine.step_count)
+    println("  phi (fast)  :", engine.phi_ema_fast)
+    println("  phi (slow)  :", engine.phi_ema_slow)
+    println("  phi (peak)  :", engine.phi_peak)
+    println("  phi (floor) :", engine.phi_floor)
+    println("  consensus   :", engine.consensus_count)
+}
+
+// ─── Warmup driver ───
+fn engine_warmup(engine: ConsciousnessEngine, steps: int) -> ConsciousnessEngine {
+    let mut e = engine
+    let mut i = 0
+    while i < steps {
+        e = engine_step(e, false)
+        i = i + 1
+    }
+    e
+}
+
+// ─── CLI ───
+let args = args()
+
+if args.len() < 3 {
+    println("core/engine.hexa — consciousness engine (structural port)")
+    println("")
+    println("  hexa core/engine.hexa status")
+    println("  hexa core/engine.hexa warmup <steps> [max_cells]")
+    println("  hexa core/engine.hexa auto <n_cells>")
+    println("  hexa core/engine.hexa neighbors <idx> <n>")
+} else {
+    let cmd = args[2]
+
+    if cmd == "status" {
+        let e = engine_default()
+        engine_status(e)
+
+    } else if cmd == "warmup" {
+        let steps = if args.len() >= 4 { to_int(args[3]) } else { 50 }
+        let mc    = if args.len() >= 5 { to_int(args[4]) } else { DEFAULT_MAX_CELLS }
+        let e0 = engine_new(DEFAULT_CELL_DIM, DEFAULT_HIDDEN_DIM, DEFAULT_INITIAL_CELLS, mc, DEFAULT_N_FACTIONS)
+        let e1 = engine_warmup(e0, steps)
+        engine_status(e1)
+
+    } else if cmd == "auto" {
+        let n = if args.len() >= 4 { to_int(args[3]) } else { 8 }
+        println("auto_select(", n, ") =", auto_select(n))
+
+    } else if cmd == "neighbors" {
+        let idx = if args.len() >= 4 { to_int(args[3]) } else { 0 }
+        let n   = if args.len() >= 5 { to_int(args[4]) } else { 8 }
+        println("ring_neighbors:", ring_neighbors(idx, n))
+
+    } else {
+        println("unknown command:", cmd)
+    }
+}

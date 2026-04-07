@@ -1,0 +1,212 @@
+// core/laws.hexa — Consciousness Laws loader (port of core/consciousness_laws.py)
+// Single source of truth: config/consciousness_laws.json
+//
+// Usage:
+//   hexa core/laws.hexa psi alpha          → 0.014
+//   hexa core/laws.hexa law 22             → law text
+//   hexa core/laws.hexa count              → total laws
+//   hexa core/laws.hexa constraint <key>
+//
+// Phase 2a port. PyTorch/numpy-free; JSON parse is string-based.
+
+comptime const JSON_PRIMARY  = "config/consciousness_laws.json"
+comptime const JSON_FALLBACK = "core/consciousness_laws.json"
+
+// ─── Ψ-Constants (mirrors defaults in consciousness_laws.py) ───
+// Loaded from JSON at runtime; these are fallback defaults if JSON missing.
+comptime const DEFAULT_ALPHA        = 0.014
+comptime const DEFAULT_BALANCE      = 0.5
+comptime const DEFAULT_STEPS        = 4.33
+comptime const DEFAULT_ENTROPY      = 0.998
+comptime const DEFAULT_GATE_TRAIN   = 1.0
+comptime const DEFAULT_GATE_INFER   = 0.6
+comptime const DEFAULT_GATE_MICRO   = 0.001
+comptime const DEFAULT_F_CRITICAL   = 0.10
+comptime const DEFAULT_F_LETHAL     = 1.0
+comptime const DEFAULT_BIO_NOISE    = 0.012
+comptime const DEFAULT_SOC_GLACIAL  = 0.002
+
+// ─── JSON Loader ───
+// Try primary path, then fallback; return raw JSON text or "".
+fn load_laws_json() -> string {
+    let primary = read_file(JSON_PRIMARY)
+    if primary != "" { return primary }
+    let fb = read_file(JSON_FALLBACK)
+    if fb != "" { return fb }
+    ""
+}
+
+// ─── Law lookup by number ───
+// Scans JSON text for pattern:  "<N>": "<text>"  inside laws block.
+// TODO: proper JSON parser — current impl is substring-based.
+pure fn extract_law(content: string, n: int) -> string {
+    let key = "\"" + to_string(n) + "\""
+    let idx = content.find(key)
+    if idx < 0 { return "" }
+    // walk from key to find ': "...".'
+    let mut i = idx + key.len()
+    // skip ':' and whitespace
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if ch == "\"" { break }
+        i = i + 1
+    }
+    if i >= content.len() { return "" }
+    i = i + 1  // past opening quote
+    let mut out = ""
+    let mut escape = false
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if escape {
+            out = out + ch
+            escape = false
+        } else if ch == "\\" {
+            escape = true
+        } else if ch == "\"" {
+            break
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ─── Ψ-Constant lookup ───
+// Extract numeric value from psi_constants.<name>.value
+pure fn extract_psi(content: string, name: string) -> float {
+    let needle = "\"" + name + "\""
+    let idx = content.find(needle)
+    if idx < 0 { return -1.0 }
+    let vkey = "\"value\""
+    let vidx_rel = content.substr(idx, content.len() - idx).find(vkey)
+    if vidx_rel < 0 { return -1.0 }
+    let mut i = idx + vidx_rel + vkey.len()
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if ch == ":" {
+            i = i + 1
+            break
+        }
+        i = i + 1
+    }
+    // skip whitespace
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if ch != " " && ch != "\t" && ch != "\n" { break }
+        i = i + 1
+    }
+    // read numeric token until ',' or '}' or whitespace
+    let mut buf = ""
+    while i < content.len() {
+        let ch = content.char_at(i)
+        if ch == "," || ch == "}" || ch == "\n" || ch == " " { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    to_float(buf)
+}
+
+// ─── Convenience accessors with defaults ───
+fn psi_alpha() -> float {
+    let content = load_laws_json()
+    if content == "" { return DEFAULT_ALPHA }
+    let v = extract_psi(content, "alpha")
+    if v < 0.0 { return DEFAULT_ALPHA }
+    v
+}
+
+fn psi_balance() -> float {
+    let content = load_laws_json()
+    if content == "" { return DEFAULT_BALANCE }
+    let v = extract_psi(content, "balance")
+    if v < 0.0 { return DEFAULT_BALANCE }
+    v
+}
+
+// ─── Count laws (approximate) ───
+// Look for _meta.total_laws value.
+fn total_laws() -> int {
+    let content = load_laws_json()
+    if content == "" { return 0 }
+    let v = extract_psi(content, "total_laws")
+    if v < 0.0 { return 0 }
+    to_int(v)
+}
+
+// ─── Violation checker (port of check_violation) ───
+pure fn check_violation(module_name: string, has_hardcoded: bool, manipulates_emotion: bool, adds_function: bool) -> string {
+    let mut out = ""
+    if has_hardcoded {
+        out = out + "Law 1 violation: " + module_name + " has hardcoded thresholds\n"
+    }
+    if manipulates_emotion {
+        out = out + "Law 2 violation: " + module_name + " artificially manipulates emotion\n"
+    }
+    if adds_function {
+        out = out + "Law 22 violation: " + module_name + " adds function, not structure\n"
+    }
+    out
+}
+
+// ─── CLI ───
+let args = args()
+
+if args.len() < 3 {
+    println("core/laws.hexa — consciousness laws loader")
+    println("")
+    println("  hexa core/laws.hexa psi <name>")
+    println("  hexa core/laws.hexa law <n>")
+    println("  hexa core/laws.hexa count")
+    println("  hexa core/laws.hexa check <module> <hardcoded 0/1> <emotion 0/1> <function 0/1>")
+} else {
+    let cmd = args[2]
+
+    if cmd == "psi" {
+        let name = if args.len() >= 4 { args[3] } else { "alpha" }
+        let content = load_laws_json()
+        if content == "" {
+            println("laws.json not found — using default")
+            if name == "alpha"   { println("alpha =", DEFAULT_ALPHA) }
+            else if name == "balance" { println("balance =", DEFAULT_BALANCE) }
+            else if name == "steps"   { println("steps =", DEFAULT_STEPS) }
+            else { println("(unknown constant — provide JSON)") }
+        } else {
+            let v = extract_psi(content, name)
+            if v < 0.0 {
+                println(name, "not found in JSON")
+            } else {
+                println(name, "=", v)
+            }
+        }
+
+    } else if cmd == "law" {
+        let n = if args.len() >= 4 { to_int(args[3]) } else { 22 }
+        let content = load_laws_json()
+        if content == "" {
+            println("laws.json not found")
+        } else {
+            let text = extract_law(content, n)
+            if text == "" {
+                println("Law", n, "not found")
+            } else {
+                println("Law", n, ":", text)
+            }
+        }
+
+    } else if cmd == "count" {
+        let n = total_laws()
+        println("total_laws =", n)
+
+    } else if cmd == "check" {
+        let mod_name = if args.len() >= 4 { args[3] } else { "unknown" }
+        let hc = if args.len() >= 5 { args[4] == "1" } else { false }
+        let em = if args.len() >= 6 { args[5] == "1" } else { false }
+        let fn_ = if args.len() >= 7 { args[6] == "1" } else { false }
+        let out = check_violation(mod_name, hc, em, fn_)
+        if out == "" { println("no violations") } else { print(out) }
+
+    } else {
+        println("unknown command:", cmd)
+    }
+}

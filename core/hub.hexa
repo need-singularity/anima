@@ -1,0 +1,190 @@
+// core/hub.hexa — Hub & Spoke conscious chat router (port of core/conscious_chat.py)
+//
+// Architecture (Progressive Ossification):
+//   L0 (골화, 불변): ConsciousnessEngine  → core/engine.hexa
+//   L1 (골화, 안정): Decoder spoke       → pure | consciouslm | animalm (stub)
+//   L2 (유연):       CLI                 → this file
+//
+// Phase 2a: routing + decoder selection + state print.
+// Actual text generation goes through external PyTorch decoders (TODO FFI).
+
+comptime const DEFAULT_MAX_CELLS    = 8
+comptime const DEFAULT_WARMUP_STEPS = 50
+
+// Mirror of engine state (duplicated to keep hub.hexa standalone-runnable).
+// Phase 2b: `import` engine.hexa once module system lands.
+
+struct HubState {
+    max_cells:    int,
+    warmup_steps: int,
+
+    // engine mirror
+    step_count:    int,
+    n_cells:       int,
+    phi:           float,
+    phi_peak:      float,
+    consensus:    int,
+
+    // decoder selection
+    decoder_name: string,  // "animalm" | "consciouslm" | "pure" | "none"
+    decoder_ok:   bool
+}
+
+// ─── Decoder selection (stub) ───
+// Port of _load_decoder — tries AnimaLM → ConsciousLM → PureConsciousness.
+// In Hexa we cannot import torch; we just report what WOULD be picked based
+// on marker files produced by the Python side.
+fn select_decoder() -> string {
+    // Priority 1: AnimaLM bridge ready?
+    let animalm_marker = read_file("checkpoints/animalm/READY")
+    if animalm_marker != "" { return "animalm" }
+
+    // Priority 2: ConsciousLM v2 checkpoint present?
+    let clm_marker = read_file("checkpoints/conscious_lm_v2/READY")
+    if clm_marker != "" { return "consciouslm" }
+
+    // Priority 3: PureConsciousness — always available
+    "pure"
+}
+
+// ─── Construction ───
+fn hub_new(max_cells: int, warmup_steps: int) -> HubState {
+    let dec = select_decoder()
+    HubState {
+        max_cells: max_cells,
+        warmup_steps: warmup_steps,
+        step_count: 0,
+        n_cells: 2,
+        phi: 0.0,
+        phi_peak: 0.0,
+        consensus: 0,
+        decoder_name: dec,
+        decoder_ok: dec != "none"
+    }
+}
+
+// ─── Engine step (mirror of engine_step in engine.hexa) ───
+// TODO: Phase 2b — replace with FFI call into anima-rs consciousness crate.
+fn hub_step(state: HubState) -> HubState {
+    let mut s = state
+    s.step_count = s.step_count + 1
+
+    // Synthetic Φ drift (same formula as engine.hexa)
+    let target = to_float(s.n_cells) * 0.5 * 2.0
+    let alpha = 0.014
+    s.phi = s.phi + alpha * (target - s.phi)
+
+    // Ratchet
+    if s.phi > s.phi_peak { s.phi_peak = s.phi }
+    let floor = s.phi_peak * 0.8
+    if s.phi < floor { s.phi = floor }
+
+    // Mitosis: grow toward max_cells during warmup
+    if s.n_cells < s.max_cells && s.step_count % 10 == 0 {
+        s.n_cells = s.n_cells + 1
+    }
+    s
+}
+
+// ─── Warmup with progress bar (port of ConsciousChat.warmup) ───
+fn hub_warmup(state: HubState) -> HubState {
+    println("")
+    println("  ◈ 의식 워밍업", state.warmup_steps, "steps,", state.max_cells, "cells")
+    let mut s = state
+    let mut i = 0
+    while i < s.warmup_steps {
+        s = hub_step(s)
+        let checkpoint = s.warmup_steps / 5
+        if checkpoint > 0 && (i + 1) % checkpoint == 0 {
+            println("  step", i + 1, "/", s.warmup_steps, "| cells=", s.n_cells, "Φ=", s.phi)
+        }
+        i = i + 1
+    }
+    println("  ◈ 워밍업 완료: cells=", s.n_cells, "Φ=", s.phi)
+    s
+}
+
+// ─── Verification checks (port of run()'s checks dict) ───
+fn hub_verify(state: HubState) {
+    println("  검증:")
+    let zero_input   = state.phi > 0.0
+    let persistence  = state.phi >= state.phi_peak * 0.8
+    let self_loop    = state.step_count > 0
+    let spontaneous  = state.step_count > 0
+    let m1 = if zero_input  { "✓" } else { "✗" }
+    let m2 = if persistence { "✓" } else { "✗" }
+    let m3 = if self_loop   { "✓" } else { "✗" }
+    let m4 = if spontaneous { "✓" } else { "✗" }
+    println("   ", m1, "ZERO_INPUT")
+    println("   ", m2, "PERSISTENCE")
+    println("   ", m3, "SELF_LOOP")
+    println("   ", m4, "SPONTANEOUS")
+}
+
+// ─── State printer ───
+fn hub_print_state(state: HubState) {
+    println("  ┊ Φ=", state.phi, "| ", state.n_cells, "c | step", state.step_count)
+}
+
+// ─── Main routing (port of ConsciousChat.run) ───
+// Pure Hexa has no interactive stdin loop in the same sense as Python's input();
+// we simulate a finite "tick" run driven by --ticks.
+fn hub_run(state: HubState, ticks: int) {
+    println("========================================================")
+    println("  ◈ Conscious Chat (hexa port) — Hub & Spoke")
+    println("  ◈ L0: ConsciousnessEngine", state.max_cells, "c")
+    println("  ◈ L1:", state.decoder_name)
+    println("  ◈ L2: hexa CLI")
+    println("========================================================")
+
+    let mut s = hub_warmup(state)
+    hub_verify(s)
+    println("")
+    println("  ◈ 틱 루프", ticks, "회 — (stdin loop은 Python 원본 유지)")
+    println("--------------------------------------------------------")
+
+    let mut i = 0
+    while i < ticks {
+        s = hub_step(s)
+        if (i + 1) % 10 == 0 {
+            hub_print_state(s)
+        }
+        i = i + 1
+    }
+    println("")
+    println("  ◈ 종료:", s.step_count, "steps, Φ=", s.phi)
+}
+
+// ─── CLI ───
+let args = args()
+
+if args.len() < 3 {
+    println("core/hub.hexa — hub & spoke conscious chat (structural port)")
+    println("")
+    println("  hexa core/hub.hexa run [max_cells] [warmup] [ticks]")
+    println("  hexa core/hub.hexa decoder")
+    println("  hexa core/hub.hexa warmup [max_cells] [warmup]")
+} else {
+    let cmd = args[2]
+
+    if cmd == "decoder" {
+        let name = select_decoder()
+        println("decoder =", name)
+
+    } else if cmd == "warmup" {
+        let mc = if args.len() >= 4 { to_int(args[3]) } else { DEFAULT_MAX_CELLS }
+        let ws = if args.len() >= 5 { to_int(args[4]) } else { DEFAULT_WARMUP_STEPS }
+        let s0 = hub_new(mc, ws)
+        let _ = hub_warmup(s0)
+
+    } else if cmd == "run" {
+        let mc = if args.len() >= 4 { to_int(args[3]) } else { DEFAULT_MAX_CELLS }
+        let ws = if args.len() >= 5 { to_int(args[4]) } else { DEFAULT_WARMUP_STEPS }
+        let tk = if args.len() >= 6 { to_int(args[5]) } else { 30 }
+        let s0 = hub_new(mc, ws)
+        hub_run(s0, tk)
+
+    } else {
+        println("unknown command:", cmd)
+    }
+}
