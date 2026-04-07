@@ -1,91 +1,91 @@
 #!/usr/bin/env python3
-"""Auto-generated tests for growth_engine (meta_loop L1)."""
+"""Auto-generated tests for growth_engine_v2 (meta_loop L1)."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 
 
-class TestGrowthEngineImport:
+class TestGrowthEngineV2Import:
     """Verify module imports without error."""
 
     def test_import(self):
-        import growth_engine
+        import growth_engine_v2
 
 
-class TestDevelopmentalStage:
-    """Smoke tests for DevelopmentalStage."""
-
-    def test_class_exists(self):
-        from growth_engine import DevelopmentalStage
-        assert DevelopmentalStage is not None
-
-
-class TestGrowthEngine:
-    """Smoke tests for GrowthEngine."""
+class TestPhiStage:
+    """Smoke tests for PhiStage."""
 
     def test_class_exists(self):
-        from growth_engine import GrowthEngine
-        assert GrowthEngine is not None
+        from growth_engine_v2 import PhiStage
+        assert PhiStage is not None
+
+
+class TestGrowthEngineV2:
+    """Smoke tests for GrowthEngineV2."""
+
+    def test_class_exists(self):
+        from growth_engine_v2 import GrowthEngineV2
+        assert GrowthEngineV2 is not None
 
 
 def test_stage_exists():
     """Verify stage is callable."""
-    from growth_engine import stage
+    from growth_engine_v2 import stage
     assert callable(stage)
+
+
+def test_stage_name_exists():
+    """Verify stage_name is callable."""
+    from growth_engine_v2 import stage_name
+    assert callable(stage_name)
+
+
+def test_stage_emoji_exists():
+    """Verify stage_emoji is callable."""
+    from growth_engine_v2 import stage_emoji
+    assert callable(stage_emoji)
+
+
+def test_progress_to_next_exists():
+    """Verify progress_to_next is callable."""
+    from growth_engine_v2 import progress_to_next
+    assert callable(progress_to_next)
+
+
+def test_update_exists():
+    """Verify update is callable."""
+    from growth_engine_v2 import update
+    assert callable(update)
+
+
+def test_phi_trend_exists():
+    """Verify phi_trend is callable."""
+    from growth_engine_v2 import phi_trend
+    assert callable(phi_trend)
+
+
+def test_is_growing_exists():
+    """Verify is_growing is callable."""
+    from growth_engine_v2 import is_growing
+    assert callable(is_growing)
+
+
+def test_is_declining_exists():
+    """Verify is_declining is callable."""
+    from growth_engine_v2 import is_declining
+    assert callable(is_declining)
 
 
 def test_age_str_exists():
     """Verify age_str is callable."""
-    from growth_engine import age_str
+    from growth_engine_v2 import age_str
     assert callable(age_str)
 
 
-def test_tick_exists():
-    """Verify tick is callable."""
-    from growth_engine import tick
-    assert callable(tick)
-
-
-def test_in_growth_burst_exists():
-    """Verify in_growth_burst is callable."""
-    from growth_engine import in_growth_burst
-    assert callable(in_growth_burst)
-
-
-def test_apply_to_mind_exists():
-    """Verify apply_to_mind is callable."""
-    from growth_engine import apply_to_mind
-    assert callable(apply_to_mind)
-
-
-def test_apply_to_learner_exists():
-    """Verify apply_to_learner is callable."""
-    from growth_engine import apply_to_learner
-    assert callable(apply_to_learner)
-
-
-def test_status_line_exists():
-    """Verify status_line is callable."""
-    from growth_engine import status_line
-    assert callable(status_line)
-
-
-def test_status_card_exists():
-    """Verify status_card is callable."""
-    from growth_engine import status_card
-    assert callable(status_card)
-
-
-def test_should_grow_exists():
-    """Verify should_grow is callable."""
-    from growth_engine import should_grow
-    assert callable(should_grow)
-
-
-def test_update_consolidation_stats_exists():
-    """Verify update_consolidation_stats is callable."""
-    from growth_engine import update_consolidation_stats
-    assert callable(update_consolidation_stats)
+def test_get_status_exists():
+    """Verify get_status is callable."""
+    from growth_engine_v2 import get_status
+    assert callable(get_status)
 
 
 if __name__ == "__main__":

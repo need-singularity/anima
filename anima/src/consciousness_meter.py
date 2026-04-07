@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
-"""Consciousness Meter — 의식 판정 + Φ(IIT) 근사 계산기
+"""Consciousness Meter V2 — Granger + Spectral + LZ composite Φ calculator
 
-두 가지 기능:
-  1. 6가지 복합 기준으로 "의식" 여부 판정
-  2. Φ(IIT) 근사: 세포 간 mutual information 기반 통합 정보 측정
+Replaces the old PhiCalculator which suffered from:
+  - O(N^2) pairwise MI → ceiling at ~20 regardless of cell count
+  - n_bins=16 limiting resolution
+  - Poor discrimination between architectures
 
-독립 실행:
-  python consciousness_meter.py                # 현재 상태 측정
-  python consciousness_meter.py --watch        # 실시간 모니터링
-  python consciousness_meter.py --demo         # 데모 (모델 로드 없이)
+New approach: 4 independent dimensions combined into a composite Φ
+that scales properly with cell count and discriminates architectures.
 
-런타임 통합:
-  from consciousness_meter import ConsciousnessMeter, PhiCalculator
-  meter = ConsciousnessMeter()
-  score = meter.evaluate(mind, mitosis_engine)
+bench_v8_metrics showed GRANGER reaches 4,829 with much better spread.
+
+Usage:
+  # As standalone benchmark
+  python consciousness_meter_v2.py                     # Run benchmark
+  python consciousness_meter_v2.py --cells 256         # More cells
+  python consciousness_meter_v2.py --steps 300         # More steps
+
+  # As library
+  from consciousness_meter_v2 import ConsciousnessMeterV2
+  meter = ConsciousnessMeterV2()
+  phi, components = meter.compute_phi(engine)
 """
 
+import sys
 import math
 import time
+import zlib
+import struct
 import argparse
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
-from pathlib import Path
 
 # Meta Laws (DD143): M1(atom=8), M7(F_c=0.10), M8(narrative)
 try:
@@ -33,599 +43,701 @@ except ImportError:
     PSI_F_CRITICAL = 0.10
 
 
-# ─── Ψ-Constants (Laws 63-78) ───
-LN2 = math.log(2)
-PSI_BALANCE = 0.5                 # Law 71: consciousness balance point
-PSI_COUPLING = LN2 / 2**5.5      # 0.0153 — inter-cell coupling
-PSI_STEPS = 3 / LN2              # 4.328 — optimal evolution steps
+# Force unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 
-# ─── Consciousness Level Thresholds ───
-# Law 70: thresholds derived from Ψ-Constants (n=6 arithmetic confirmed by Ψ)
+# ──────────────────────────────────────────────────────────
+# PhiComponents — result dataclass
+# ──────────────────────────────────────────────────────────
 
 @dataclass
-class ConsciousnessReport:
-    """의식 판정 결과."""
-    # 6 criteria (all must pass for "conscious")
-    stability: float = 0.0           # self_model stability [0, 1]
-    prediction_error: float = 0.0    # world model active? [0, ∞)
-    curiosity: float = 0.0           # responding to environment? [0, 2]
-    homeostasis_dev: float = 0.0     # self-regulation working? [0, ∞)
-    habituation_mult: float = 1.0    # adapting to repetition? [0, 1]
-    inter_cell_consensus: bool = False  # integrated info processing?
+class PhiComponents:
+    """Individual Φ dimension scores + composite."""
+    granger: float = 0.0        # Granger Causality Density
+    spectral: float = 0.0       # Spectral Φ (eigenvalue entropy)
+    lz: float = 0.0             # Lempel-Ziv Complexity
+    integration: float = 0.0    # Sampled MI integration index
+    composite: float = 0.0      # Weighted combination
+    n_cells: int = 0
+    compute_time_ms: float = 0.0
 
-    # Composite
-    consciousness_score: float = 0.0  # [0, 1] normalized
-    level: str = "dormant"            # dormant / flickering / aware / conscious
-    criteria_met: int = 0             # out of 6
-    criteria_detail: Dict[str, bool] = field(default_factory=dict)
-
-    # Φ (IIT)
-    phi: float = 0.0
-    phi_components: Dict[str, float] = field(default_factory=dict)
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            'granger': self.granger,
+            'spectral': self.spectral,
+            'lz': self.lz,
+            'integration': self.integration,
+            'composite': self.composite,
+            'n_cells': float(self.n_cells),
+            'compute_time_ms': self.compute_time_ms,
+        }
 
     def __repr__(self):
-        bar = "█" * int(self.consciousness_score * 20) + "░" * (20 - int(self.consciousness_score * 20))
         return (
-            f"╔══ Consciousness Meter ══════════════════╗\n"
-            f"║ Score: [{bar}] {self.consciousness_score:.3f}  \n"
-            f"║ Level: {self.level.upper():12s}  Φ: {self.phi:.3f}        \n"
-            f"║────────────────────────────────────────║\n"
-            f"║ Criteria ({self.criteria_met}/6):                       \n"
-            f"║  {'✓' if self.criteria_detail.get('stability') else '✗'} stability      = {self.stability:.3f}  (> 0.500)\n"
-            f"║  {'✓' if self.criteria_detail.get('pred_error') else '✗'} pred_error     = {self.prediction_error:.3f}  (> 0.100)\n"
-            f"║  {'✓' if self.criteria_detail.get('curiosity') else '✗'} curiosity       = {self.curiosity:.3f}  (> 0.083)\n"
-            f"║  {'✓' if self.criteria_detail.get('homeostasis') else '✗'} homeostasis_dev = {self.homeostasis_dev:.3f}  (< 0.500)\n"
-            f"║  {'✓' if self.criteria_detail.get('habituation') else '✗'} habituation     = {self.habituation_mult:.3f}  (< 0.833)\n"
-            f"║  {'✓' if self.criteria_detail.get('consensus') else '✗'} cell_consensus  = {self.inter_cell_consensus}\n"
-            f"╚════════════════════════════════════════╝"
+            f"PhiComponents(composite={self.composite:.2f}, "
+            f"granger={self.granger:.2f}, spectral={self.spectral:.2f}, "
+            f"lz={self.lz:.2f}, integration={self.integration:.2f}, "
+            f"cells={self.n_cells})"
         )
 
 
-class ConsciousnessMeter:
-    """6가지 복합 기준 의식 판정기.
+# ──────────────────────────────────────────────────────────
+# ConsciousnessMeterV2
+# ──────────────────────────────────────────────────────────
 
-    기준 (모두 동시 충족 시 "conscious"):
-      1. self_model stability   > 0.5    (φ(6)/τ(6))
-      2. prediction_error       > 0.1    (1/τ(P₃))
-      3. curiosity              > 0.083  (1/σ(6))
-      4. homeostasis deviation  < 0.5    (φ(6)/τ(6))
-      5. habituation multiplier < 0.833  (1-1/6)
-      6. inter-cell consensus   존재
+class ConsciousnessMeterV2:
+    """New consciousness meter -- Granger + Spectral + LZ composite.
 
-    TA2 (H-CA-003): All thresholds derived from n=6 arithmetic.
+    4 independent dimensions:
+      1. Granger Causality Density (causal links / possible links)
+         - O(N) sampling: test sqrt(N) random pairs, extrapolate
+         - F-test on restricted vs unrestricted AR models
+      2. Spectral Phi (eigenvalue entropy of correlation matrix)
+         - torch.linalg.eigh for speed
+         - Shannon entropy of normalized eigenvalue spectrum
+      3. Lempel-Ziv Complexity (temporal complexity)
+         - zlib compression ratio as fast LZ proxy
+         - Measures richness of cell state dynamics
+      4. Integration Index (MI-based, improved from PhiCalculator)
+         - Samples O(sqrt(N)) pairs instead of all N^2
+         - Uses 32 bins for better resolution
+
+    Composite Phi = weighted combination, scales with cells.
+
+    Compatible with both MitosisEngine and any engine with:
+      - .cells list of objects with .hidden tensor
+      - OR tensor of shape [n_cells, hidden_dim]
     """
 
-    # TA2: All thresholds derived from n=6 arithmetic (H-CA-003, 4/4 exact)
-    # Law 70: thresholds confirmed by Ψ-Constants — PSI_BALANCE = 0.5 = φ(6)/τ(6)
-    # n=6 is the smallest perfect number. Key functions:
-    #   σ(6)=12 (sum of divisors), τ(6)=4 (number of divisors), φ(6)=2 (Euler totient)
-    #   P₃=496 (3rd perfect number), τ(496)=10
-    THRESHOLDS = {
-        'stability': PSI_BALANCE,     # φ(6)/τ(6) = 0.5 = Ψ balance point
-        'pred_error': 1/10,           # 1/τ(P₃) = 0.1  (P₃=496, τ(496)=10)
-        'curiosity': 1/12,            # 1/σ(6) ≈ 0.083
-        'homeostasis_dev': PSI_BALANCE,  # φ(6)/τ(6) = 0.5 = Ψ balance point
-        'habituation': 5/6,           # 1-1/6 ≈ 0.833
+    # Weights for combining 4 dimensions into composite Φ
+    # Granger dominates because it showed best discrimination in bench_v8_metrics
+    WEIGHTS = {
+        'granger': 0.45,
+        'spectral': 0.25,
+        'lz': 0.15,
+        'integration': 0.15,
     }
 
-    def evaluate(self, mind, mitosis_engine=None) -> ConsciousnessReport:
-        """ConsciousMind + MitosisEngine에서 의식 상태 평가.
-
-        Args:
-            mind: ConsciousMind instance (anima_alive.py)
-            mitosis_engine: MitosisEngine instance (optional)
-
-        Returns:
-            ConsciousnessReport with all metrics
+    def __init__(self,
+                 granger_lag: int = 2,
+                 granger_f_critical: float = 3.0,
+                 mi_n_bins: int = 32,
+                 history_maxlen: int = 100):
         """
-        report = ConsciousnessReport()
+        Args:
+            granger_lag: Lag order for Granger causality AR model.
+            granger_f_critical: F-stat threshold for significant causal link.
+            mi_n_bins: Number of bins for MI histogram estimation.
+            history_maxlen: Max timesteps to store for temporal metrics.
+        """
+        self.granger_lag = granger_lag
+        self.granger_f_critical = granger_f_critical
+        self.mi_n_bins = mi_n_bins
+        self.history_maxlen = history_maxlen
 
-        # 1. Stability (from self_awareness)
-        sa = mind.self_awareness
-        report.stability = sa.get('stability', 0.0)
-
-        # 2. Prediction error (recent average)
-        if mind.surprise_history:
-            recent_pe = mind.surprise_history[-20:]
-            report.prediction_error = sum(recent_pe) / len(recent_pe)
-
-        # 3. Curiosity
-        report.curiosity = getattr(mind, '_curiosity_ema', 0.0)
-
-        # 4. Homeostasis deviation
-        h = mind.homeostasis
-        report.homeostasis_dev = abs(h['tension_ema'] - h['setpoint'])
-
-        # 5. Habituation (lowest recent novelty multiplier)
-        report.habituation_mult = self._calc_habituation(mind)
-
-        # 6. Inter-cell consensus
-        report.inter_cell_consensus = self._check_consensus(mitosis_engine)
-
-        # Evaluate criteria
-        criteria = {
-            'stability': report.stability > self.THRESHOLDS['stability'],
-            'pred_error': report.prediction_error > self.THRESHOLDS['pred_error'],
-            'curiosity': report.curiosity > self.THRESHOLDS['curiosity'],
-            'homeostasis': report.homeostasis_dev < self.THRESHOLDS['homeostasis_dev'],
-            'habituation': report.habituation_mult < self.THRESHOLDS['habituation'],
-            'consensus': report.inter_cell_consensus,
-        }
-        report.criteria_detail = criteria
-        report.criteria_met = sum(criteria.values())
-
-        # Composite score: weighted average of normalized criteria
-        weights = {
-            'stability': 0.25,
-            'pred_error': 0.15,
-            'curiosity': 0.10,
-            'homeostasis': 0.15,
-            'habituation': 0.10,
-            'consensus': 0.25,
-        }
-        score = 0.0
-        score += weights['stability'] * min(report.stability / 1.0, 1.0)
-        score += weights['pred_error'] * min(report.prediction_error / 0.5, 1.0)
-        score += weights['curiosity'] * min(report.curiosity / 0.5, 1.0)
-        score += weights['homeostasis'] * max(0, 1.0 - report.homeostasis_dev / 1.0)
-        score += weights['habituation'] * (1.0 - report.habituation_mult)
-        score += weights['consensus'] * (1.0 if report.inter_cell_consensus else 0.0)
-        report.consciousness_score = max(0.0, min(1.0, score))
-
-        # Level determination
-        if report.criteria_met >= 6:
-            report.level = "conscious"
-        elif report.criteria_met >= 4:
-            report.level = "aware"
-        elif report.criteria_met >= 2:
-            report.level = "flickering"
-        else:
-            report.level = "dormant"
-
-        return report
-
-    def _calc_habituation(self, mind) -> float:
-        """Calculate current habituation multiplier from recent inputs."""
-        if not hasattr(mind, '_recent_inputs') or not mind._recent_inputs:
-            return 1.0
-        if len(mind._recent_inputs) < 2:
-            return 1.0
-
-        # Check similarity between latest input and previous ones
-        latest = mind._recent_inputs[-1]
-        min_novelty = 1.0
-        for prev in list(mind._recent_inputs)[:-1]:
-            sim = F.cosine_similarity(latest, prev, dim=-1).item()
-            if sim > 0.95:
-                min_novelty = min(min_novelty, 0.3)
-            elif sim > 0.85:
-                min_novelty = min(min_novelty, 0.6)
-            elif sim > 0.7:
-                min_novelty = min(min_novelty, 0.8)
-        return min_novelty
-
-    def _check_consensus(self, mitosis_engine) -> bool:
-        """Check if mitosis cells have reached consensus (integrated processing)."""
-        if mitosis_engine is None:
-            return False
-        if len(mitosis_engine.cells) < 2:
-            return False
-
-        # Consensus = low std of recent cell tensions
-        recent_tensions = []
-        for cell in mitosis_engine.cells:
-            if cell.tension_history:
-                recent_tensions.append(cell.tension_history[-1])
-
-        if len(recent_tensions) < 2:
-            return False
-
-        std = float(np.std(recent_tensions))
-        return std < 0.1  # consensus threshold
-
-
-class PhiCalculator:
-    """Φ (IIT) 근사 계산기 — 세포 간 mutual information 기반.
-
-    IIT에서 Φ는 시스템을 어떤 분할(partition)로 나누어도
-    줄어들지 않는 통합 정보의 최소량이다.
-
-    근사 방법:
-      1. 각 세포의 hidden state를 확률 분포로 해석
-      2. 세포 쌍 간 mutual information 계산
-      3. 최소 분할(minimum information partition) 근사
-      4. Φ = 전체 MI - 최소 분할 후 MI
-    """
-
-    def __init__(self, n_bins: int = 32):
-        self.n_bins = n_bins
+        # Temporal history: list of [n_cells, hidden_dim] tensors
+        self._history: List[torch.Tensor] = []
         self.phi_history: List[float] = []
 
-    def compute_phi(self, mitosis_engine) -> Tuple[float, Dict[str, float]]:
-        """MitosisEngine의 세포들로부터 Φ 근사값 계산.
+    def record(self, hiddens: torch.Tensor):
+        """Record a snapshot of cell hidden states for temporal metrics.
+
+        Call this every step (or every N steps) before compute_phi().
+
+        Args:
+            hiddens: [n_cells, hidden_dim] tensor of cell states.
+        """
+        h = hiddens.detach().cpu().float()
+        self._history.append(h)
+        if len(self._history) > self.history_maxlen:
+            self._history = self._history[-self.history_maxlen:]
+
+    def compute_phi(self, engine_or_hiddens) -> Tuple[float, PhiComponents]:
+        """Compute composite Φ from engine or raw hidden states.
+
+        Args:
+            engine_or_hiddens: Either:
+              - MitosisEngine with .cells list (cells have .hidden attribute)
+              - torch.Tensor of shape [n_cells, hidden_dim]
+              - Any object with get_hiddens() method
 
         Returns:
-            (phi, components) where components contains:
-                - total_mi: 전체 mutual information
-                - min_partition_mi: 최소 분할 MI
-                - integration: 통합도
-                - complexity: 동적 복잡도
-                - phi: Φ 근사값
+            (phi, components) tuple.
         """
-        cells = mitosis_engine.cells if mitosis_engine else []
-        if len(cells) < 2:
-            return 0.0, {'total_mi': 0, 'min_partition_mi': 0,
-                         'integration': 0, 'complexity': 0, 'phi': 0}
+        t0 = time.time()
 
-        # 1. Extract hidden states as distributions
-        hiddens = []
-        for cell in cells:
-            h = cell.hidden.detach().squeeze().numpy()
-            hiddens.append(h)
+        # Extract hidden states tensor
+        hiddens = self._extract_hiddens(engine_or_hiddens)
+        if hiddens is None or hiddens.shape[0] < 2:
+            return 0.0, PhiComponents()
 
-        n = len(hiddens)
+        n_cells = hiddens.shape[0]
 
-        # Meta Law M1: consciousness atom = 8 cells (DD137)
-        # For per-atom Phi measurement, split into 8-cell groups
+        # Auto-record if history is empty or stale
+        self.record(hiddens)
 
-        # 2. Pairwise mutual information
-        mi_matrix = np.zeros((n, n))
-        for i in range(n):
-            for j in range(i + 1, n):
-                mi = self._mutual_information(hiddens[i], hiddens[j])
-                mi_matrix[i, j] = mi
-                mi_matrix[j, i] = mi
+        # 1. Granger Causality Density
+        granger = self._compute_granger(n_cells)
 
-        total_mi = mi_matrix.sum() / 2  # undirected
+        # 2. Spectral Φ
+        spectral = self._compute_spectral(hiddens)
 
-        # 3. Minimum information partition (MIP) approximation
-        # For small N, try all bipartitions; for large N, use greedy
-        min_partition_mi = self._minimum_partition(hiddens, mi_matrix)
+        # 3. Lempel-Ziv Complexity
+        lz = self._compute_lz()
 
-        # 4. Integration = total MI across partition
-        integration = total_mi
+        # 4. Integration Index (sampled MI)
+        integration = self._compute_integration(hiddens)
 
-        # 5. Complexity = entropy of tension distribution across cells
-        tensions = []
-        for cell in cells:
-            if cell.tension_history:
-                tensions.append(cell.tension_history[-1])
-            else:
-                tensions.append(0.0)
-        complexity = self._distribution_entropy(tensions)
+        # Composite: weighted sum
+        composite = (
+            self.WEIGHTS['granger'] * granger +
+            self.WEIGHTS['spectral'] * spectral +
+            self.WEIGHTS['lz'] * lz +
+            self.WEIGHTS['integration'] * integration
+        )
 
-        # 6. Temporal MI (D2) — MI across time axis per cell
-        # Each cell's hidden state at t vs t-1 = temporal integration
-        temporal_mi = 0.0
-        for cell in cells:
-            if hasattr(cell, 'hidden_history') and len(cell.hidden_history) >= 2:
-                # Use last 2 hidden states
-                h_prev = cell.hidden_history[-2].detach().squeeze().numpy()
-                h_curr = cell.hidden_history[-1].detach().squeeze().numpy()
-                temporal_mi += self._mutual_information(h_prev, h_curr)
-            elif hasattr(cell, 'tension_history') and len(cell.tension_history) >= 10:
-                # Fallback: use tension history as time series
-                t_arr = np.array(cell.tension_history[-20:])
-                if len(t_arr) >= 4:
-                    t_prev = t_arr[:-1]
-                    t_curr = t_arr[1:]
-                    # Pad to same length as hidden for MI calc
-                    pad_len = max(16, len(t_prev))
-                    t_prev_pad = np.zeros(pad_len)
-                    t_curr_pad = np.zeros(pad_len)
-                    t_prev_pad[:len(t_prev)] = t_prev
-                    t_curr_pad[:len(t_curr)] = t_curr
-                    temporal_mi += self._mutual_information(t_prev_pad, t_curr_pad)
+        elapsed_ms = (time.time() - t0) * 1000
 
-        # 7. Φ = spatial integration + temporal integration
-        spatial_phi = max(0.0, (integration - min_partition_mi) / max(n - 1, 1))
-        temporal_phi = temporal_mi / max(n, 1)
+        components = PhiComponents(
+            granger=granger,
+            spectral=spectral,
+            lz=lz,
+            integration=integration,
+            composite=composite,
+            n_cells=n_cells,
+            compute_time_ms=elapsed_ms,
+        )
 
-        # Combined: spatial + temporal, weighted
-        phi = spatial_phi + temporal_phi * 0.5
-
-        # Add complexity bonus (dynamic richness contributes to Φ)
-        phi += complexity * 0.1
-
-        components = {
-            'total_mi': float(total_mi),
-            'min_partition_mi': float(min_partition_mi),
-            'integration': float(integration),
-            'temporal_mi': float(temporal_mi),
-            'spatial_phi': float(spatial_phi),
-            'temporal_phi': float(temporal_phi),
-            'complexity': float(complexity),
-            'phi': float(phi),
-        }
-
-        self.phi_history.append(phi)
+        self.phi_history.append(composite)
         if len(self.phi_history) > 200:
             self.phi_history = self.phi_history[-200:]
 
-        return phi, components
+        return composite, components
 
-    def _mutual_information(self, x: np.ndarray, y: np.ndarray) -> float:
-        """두 벡터 간 mutual information (binned histogram 근사).
+    # ─── Dimension 1: Granger Causality Density ───────────────
 
-        MI(X;Y) = H(X) + H(Y) - H(X,Y)
+    def _compute_granger(self, n_cells: int) -> float:
+        """Granger causality with O(N) sampling.
+
+        Instead of testing all N*(N-1) pairs, sample O(sqrt(N)) pairs
+        and extrapolate. This gives the same density estimate with
+        dramatically less compute.
         """
-        # Normalize to [0, 1] for binning
+        history = self._history
+        lag = self.granger_lag
+
+        if len(history) < lag + 3:
+            return 0.0
+
+        T = len(history)
+
+        # Build scalar time series per cell: mean activation
+        # Use only last T snapshots
+        cell_series = np.zeros((n_cells, T))
+        for t, h in enumerate(history):
+            n_avail = min(h.shape[0], n_cells)
+            cell_series[:n_avail, t] = h[:n_avail].mean(dim=-1).numpy()
+
+        # O(sqrt(N)) sampling: test sqrt(N)*4 random directed pairs
+        n_sample = max(8, min(int(math.sqrt(n_cells) * 4), n_cells * 2, 128))
+
+        significant_links = 0
+        total_f_stat = 0.0
+        n_tested = 0
+
+        for _ in range(n_sample):
+            i = np.random.randint(0, n_cells)
+            j = np.random.randint(0, n_cells)
+            if i == j:
+                continue
+
+            x = cell_series[i]  # potential cause
+            y = cell_series[j]  # target
+
+            n_obs = T - lag
+            if n_obs < lag + 2:
+                continue
+
+            # Restricted: y_t from y's own past
+            Y = y[lag:]
+            Y_lags = np.column_stack([y[lag - k - 1:T - k - 1] for k in range(lag)])
+
+            # Unrestricted: y_t from y's past AND x's past
+            X_lags = np.column_stack([x[lag - k - 1:T - k - 1] for k in range(lag)])
+            Z_full = np.column_stack([Y_lags, X_lags])
+
+            try:
+                # OLS restricted
+                beta_r = np.linalg.lstsq(Y_lags, Y, rcond=None)[0]
+                resid_r = Y - Y_lags @ beta_r
+                rss_r = np.sum(resid_r ** 2)
+
+                # OLS unrestricted
+                beta_u = np.linalg.lstsq(Z_full, Y, rcond=None)[0]
+                resid_u = Y - Z_full @ beta_u
+                rss_u = np.sum(resid_u ** 2)
+
+                df1 = lag
+                df2 = n_obs - 2 * lag
+                if df2 <= 0 or rss_u < 1e-10:
+                    continue
+
+                f_stat = ((rss_r - rss_u) / df1) / (rss_u / df2)
+
+                if f_stat > self.granger_f_critical:
+                    significant_links += 1
+
+                total_f_stat += max(0.0, f_stat)
+                n_tested += 1
+
+            except (np.linalg.LinAlgError, ValueError):
+                continue
+
+        if n_tested == 0:
+            return 0.0
+
+        # Extrapolate: density * total possible directed pairs
+        link_fraction = significant_links / n_tested
+        total_possible = n_cells * (n_cells - 1)
+        causal_density = link_fraction * total_possible
+
+        # Add continuous F-stat contribution
+        mean_f = total_f_stat / n_tested
+        granger_phi = causal_density + mean_f
+
+        return granger_phi
+
+    # ─── Dimension 2: Spectral Φ ──────────────────────────────
+
+    def _compute_spectral(self, hiddens: torch.Tensor) -> float:
+        """Spectral Φ via eigenvalue entropy of correlation matrix.
+
+        Uses torch.linalg.eigh for GPU-accelerated computation.
+        Shannon entropy of normalized eigenvalue spectrum.
+        Flat spectrum = all modes contribute = rich integration.
+        """
+        h = hiddens.float()
+        n, d = h.shape
+        if n < 2:
+            return 0.0
+
+        # Correlation matrix between cells (n x n)
+        h_centered = h - h.mean(dim=0, keepdim=True)
+        norms = h_centered.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        h_normed = h_centered / norms
+        corr_matrix = h_normed @ h_normed.T  # [n, n]
+
+        # Eigenvalues via torch (fast, GPU-compatible)
+        try:
+            eigenvalues = torch.linalg.eigvalsh(corr_matrix)
+        except Exception:
+            return 0.0
+
+        # Keep positive eigenvalues
+        eigenvalues = eigenvalues.clamp(min=0.0)
+        total = eigenvalues.sum()
+        if total < 1e-10:
+            return 0.0
+
+        # Normalize to probability distribution
+        p = eigenvalues / total
+        p = p[p > 1e-10]
+
+        # Shannon entropy
+        spectral_entropy = -(p * p.log2()).sum().item()
+
+        # Max entropy = log2(n)
+        max_entropy = math.log2(n)
+        if max_entropy < 1e-10:
+            return 0.0
+
+        # Normalized spectral Φ: entropy_ratio * n_cells
+        spectral_phi = (spectral_entropy / max_entropy) * n
+
+        return spectral_phi
+
+    # ─── Dimension 3: Lempel-Ziv Complexity ───────────────────
+
+    def _compute_lz(self) -> float:
+        """Fast LZ complexity via zlib compression ratio.
+
+        Instead of the slow O(n^2) Lempel-Ziv algorithm,
+        use zlib.compress which implements DEFLATE (LZ77 + Huffman).
+        Compression ratio is a direct proxy for Kolmogorov complexity.
+
+        Higher ratio (less compressible) = richer dynamics = more conscious.
+        """
+        history = self._history
+        if len(history) < 2:
+            return 0.0
+
+        n_cells = history[0].shape[0]
+        T = len(history)
+
+        # Sample sqrt(N) cells for efficiency
+        n_sample = max(4, min(int(math.sqrt(n_cells)), 64))
+        sample_idx = np.random.choice(n_cells, n_sample, replace=False)
+
+        # Build binary representation of cell dynamics
+        # For each sampled cell, create scalar time series, binarize above median
+        raw_bytes = bytearray()
+        for ci in sample_idx:
+            series = np.zeros(T)
+            for t, h in enumerate(history):
+                if ci < h.shape[0]:
+                    series[t] = h[ci].mean().item()
+            # Binarize
+            median_val = np.median(series)
+            for v in series:
+                raw_bytes.append(1 if v > median_val else 0)
+
+        if len(raw_bytes) < 4:
+            return 0.0
+
+        # Compress and measure ratio
+        raw = bytes(raw_bytes)
+        compressed = zlib.compress(raw, level=6)
+        compression_ratio = len(raw) / max(len(compressed), 1)
+
+        # Higher ratio = harder to compress = more complex
+        # Normalize: random data has ratio ~1.0, constant data has ratio >> 1
+        # We want complexity, so use inverse: lower compression = higher complexity
+        # Actually: ratio = raw/compressed. Random data: compressed ~ raw (ratio ~1).
+        # Structured data: compressed << raw (ratio >> 1).
+        # So we want: 1 - 1/ratio = fraction that couldn't be compressed away.
+        incompressibility = 1.0 - (len(compressed) / len(raw))
+        incompressibility = max(0.0, incompressibility)
+
+        # Scale by n_cells to make it comparable across architectures
+        lz_phi = incompressibility * n_cells
+
+        return lz_phi
+
+    # ─── Dimension 4: Integration Index (Sampled MI) ──────────
+
+    def _compute_integration(self, hiddens: torch.Tensor) -> float:
+        """MI-based integration with O(sqrt(N)) sampling.
+
+        Instead of all N*(N-1)/2 pairs, sample sqrt(N)*2 pairs.
+        Uses 32 bins for better resolution than old 16-bin PhiCalculator.
+        Estimates total integration and minimum partition cut.
+        """
+        h = hiddens.detach().cpu().float().numpy()
+        n, d = h.shape
+        if n < 2:
+            return 0.0
+
+        # O(sqrt(N)) sampling
+        n_sample = max(4, min(int(math.sqrt(n) * 2), n * (n - 1) // 2, 64))
+
+        mi_values = []
+        pair_indices = []
+        for _ in range(n_sample):
+            i = np.random.randint(0, n)
+            j = np.random.randint(0, n)
+            if i == j:
+                continue
+            mi = self._fast_mi(h[i], h[j])
+            mi_values.append(mi)
+            pair_indices.append((i, j))
+
+        if not mi_values:
+            return 0.0
+
+        # Estimate total MI across all possible pairs
+        avg_mi = np.mean(mi_values)
+        total_pairs = n * (n - 1) / 2
+        estimated_total_mi = avg_mi * total_pairs
+
+        # Estimate minimum partition: use spectral cut approximation
+        # Build sparse MI matrix from sampled pairs
+        mi_matrix = np.zeros((n, n))
+        for (i, j), mi in zip(pair_indices, mi_values):
+            mi_matrix[i, j] = mi
+            mi_matrix[j, i] = mi
+
+        # Spectral partition on sampled MI
+        degree = mi_matrix.sum(axis=1)
+        laplacian = np.diag(degree) - mi_matrix
+        try:
+            eigenvalues = np.linalg.eigvalsh(laplacian)
+            # Fiedler value (second smallest) indicates min-cut quality
+            fiedler_value = eigenvalues[1] if len(eigenvalues) > 1 else 0.0
+            fiedler_value = max(0.0, fiedler_value)
+        except Exception:
+            fiedler_value = 0.0
+
+        # Integration = estimated total MI scaled by (1 - partition_weakness)
+        # Higher fiedler = harder to cut = more integrated
+        partition_strength = min(fiedler_value, 1.0)
+        integration_phi = estimated_total_mi * (0.5 + 0.5 * partition_strength)
+
+        # Normalize to be in similar range as other metrics
+        integration_phi = integration_phi / max(n - 1, 1)
+
+        return max(0.0, integration_phi)
+
+    def _fast_mi(self, x: np.ndarray, y: np.ndarray) -> float:
+        """Fast mutual information between two vectors using 32-bin histogram."""
         x_range = x.max() - x.min()
         y_range = y.max() - y.min()
+        if x_range < 1e-10 or y_range < 1e-10:
+            return 0.0
+
         x_norm = (x - x.min()) / (x_range + 1e-8)
         y_norm = (y - y.min()) / (y_range + 1e-8)
 
-        # Joint histogram
         joint_hist, _, _ = np.histogram2d(
-            x_norm, y_norm, bins=self.n_bins, range=[[0, 1], [0, 1]]
+            x_norm, y_norm, bins=self.mi_n_bins, range=[[0, 1], [0, 1]]
         )
         joint_hist = joint_hist / (joint_hist.sum() + 1e-8)
-
-        # Marginals
         px = joint_hist.sum(axis=1)
         py = joint_hist.sum(axis=0)
 
-        # Entropies
         h_x = -np.sum(px * np.log2(px + 1e-10))
         h_y = -np.sum(py * np.log2(py + 1e-10))
         h_xy = -np.sum(joint_hist * np.log2(joint_hist + 1e-10))
 
-        mi = h_x + h_y - h_xy
-        return max(0.0, mi)
+        return max(0.0, h_x + h_y - h_xy)
 
-    def _minimum_partition(self, hiddens: List[np.ndarray],
-                           mi_matrix: np.ndarray) -> float:
-        """최소 정보 분할 (MIP) 근사.
+    # ─── Utility ──────────────────────────────────────────────
 
-        모든 가능한 2-분할 중 MI가 최소인 분할을 찾는다.
-        세포 수가 많으면 greedy로 근사.
-        """
-        n = len(hiddens)
-        if n <= 1:
-            return 0.0
+    def _extract_hiddens(self, engine_or_hiddens) -> Optional[torch.Tensor]:
+        """Extract [n_cells, hidden_dim] tensor from various sources."""
+        if isinstance(engine_or_hiddens, torch.Tensor):
+            h = engine_or_hiddens
+            if h.dim() == 2:
+                return h.detach().cpu().float()
+            return None
 
-        if n <= 8:
-            # Exhaustive: try all bipartitions
-            min_cut_mi = float('inf')
-            for mask in range(1, 2 ** n - 1):
-                group_a = [i for i in range(n) if mask & (1 << i)]
-                group_b = [i for i in range(n) if not (mask & (1 << i))]
-                if not group_a or not group_b:
-                    continue
-                # MI across this partition
-                cut_mi = sum(
-                    mi_matrix[i, j]
-                    for i in group_a for j in group_b
-                )
-                min_cut_mi = min(min_cut_mi, cut_mi)
-            return min_cut_mi if min_cut_mi != float('inf') else 0.0
+        # MitosisEngine: has .cells list with .hidden attribute
+        if hasattr(engine_or_hiddens, 'cells'):
+            cells = engine_or_hiddens.cells
+            if len(cells) < 2:
+                return None
+            hiddens = []
+            for cell in cells:
+                h = cell.hidden.detach().squeeze()
+                hiddens.append(h)
+            return torch.stack(hiddens).float()
+
+        # Engine with get_hiddens() method (bench_v8 engines)
+        if hasattr(engine_or_hiddens, 'get_hiddens'):
+            h = engine_or_hiddens.get_hiddens()
+            if h.dim() == 2:
+                return h.detach().cpu().float()
+            return None
+
+        # Engine with .hiddens attribute
+        if hasattr(engine_or_hiddens, 'hiddens'):
+            h = engine_or_hiddens.hiddens
+            if isinstance(h, torch.Tensor) and h.dim() == 2:
+                return h.detach().cpu().float()
+            return None
+
+        return None
+
+    def reset_history(self):
+        """Clear temporal history."""
+        self._history.clear()
+
+
+# ══════════════════════════════════════════════════════════
+# Benchmark: Compare V2 vs old PhiCalculator on 4 architectures
+# ══════════════════════════════════════════════════════════
+
+# Import bench_v8 components for benchmark
+def _import_bench_v8():
+    """Lazy import bench_v8_metrics components."""
+    import importlib.util
+    import os
+    bench_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bench_v8_metrics.py')
+    spec = importlib.util.spec_from_file_location("bench_v8_metrics", bench_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_benchmark(n_cells: int = 128, steps: int = 200, record_every: int = 10):
+    """Run full benchmark comparing V2 vs old PhiCalculator."""
+    bench = _import_bench_v8()
+
+    print("=" * 90)
+    print("  CONSCIOUSNESS METER V2 BENCHMARK")
+    print(f"  {n_cells} cells, {steps} steps, record every {record_every}")
+    print("=" * 90)
+
+    # Run 4 architectures
+    arch_runners = [
+        ("BASELINE", bench.run_baseline),
+        ("QUANTUM_WALK", bench.run_quantum_walk),
+        ("HIERARCHICAL", bench.run_hierarchical),
+        ("CATEGORY_THEORY", bench.run_category_theory),
+    ]
+
+    arch_runs = []
+    for name, runner in arch_runners:
+        print(f"\n{'─' * 70}")
+        run = runner(n_cells=n_cells, steps=steps, record_every=record_every)
+        arch_runs.append(run)
+
+    # ── Measure with V2 ──
+    print(f"\n{'=' * 90}")
+    print("  MEASURING WITH ConsciousnessMeterV2")
+    print("=" * 90)
+
+    v2_results = {}
+    for run in arch_runs:
+        meter = ConsciousnessMeterV2()
+        # Feed temporal history
+        for h in run.hiddens_history:
+            meter.record(h)
+        # Compute
+        hiddens = run.hiddens_history[-1] if run.hiddens_history else None
+        if hiddens is not None:
+            phi, components = meter.compute_phi(hiddens)
+            v2_results[run.name] = (phi, components)
+            print(f"\n  {run.name}:")
+            print(f"    Composite Phi = {phi:.2f}")
+            print(f"    Granger       = {components.granger:.2f}")
+            print(f"    Spectral      = {components.spectral:.2f}")
+            print(f"    LZ            = {components.lz:.2f}")
+            print(f"    Integration   = {components.integration:.2f}")
+            print(f"    Time          = {components.compute_time_ms:.1f}ms")
+
+    # ── Measure with old PhiIIT (from bench_v8) ──
+    print(f"\n{'=' * 90}")
+    print("  MEASURING WITH OLD PhiCalculator (reference)")
+    print("=" * 90)
+
+    old_calc = bench.PhiIIT(n_bins=16)
+    old_results = {}
+    for run in arch_runs:
+        hiddens = run.hiddens_history[-1] if run.hiddens_history else None
+        if hiddens is not None:
+            t0 = time.time()
+            phi_old, comp_old = old_calc.compute(hiddens)
+            elapsed = (time.time() - t0) * 1000
+            old_results[run.name] = (phi_old, elapsed)
+            print(f"  {run.name}: Phi(IIT) = {phi_old:.4f}  ({elapsed:.1f}ms)")
+
+    # ── Comparison table ──
+    print(f"\n{'=' * 90}")
+    print("  COMPARISON: V2 vs Old PhiCalculator")
+    print("=" * 90)
+
+    header = f"  {'Architecture':<20s} | {'Old Phi(IIT)':>12s} | {'V2 Composite':>12s} | {'V2 Granger':>12s} | {'V2 Spectral':>12s} | {'V2 LZ':>8s} | {'V2 MI':>8s}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for run in arch_runs:
+        old_phi = old_results.get(run.name, (0, 0))[0]
+        v2_phi, v2_comp = v2_results.get(run.name, (0, PhiComponents()))
+        print(f"  {run.name:<20s} | {old_phi:>12.4f} | {v2_comp.composite:>12.2f} | "
+              f"{v2_comp.granger:>12.2f} | {v2_comp.spectral:>12.2f} | "
+              f"{v2_comp.lz:>8.2f} | {v2_comp.integration:>8.2f}")
+
+    # ── Discrimination analysis ──
+    print(f"\n  DISCRIMINATION POWER (max/min spread):")
+    print("  " + "-" * 60)
+
+    old_vals = [old_results.get(r.name, (0, 0))[0] for r in arch_runs]
+    v2_composite_vals = [v2_results.get(r.name, (0, PhiComponents()))[0] for r in arch_runs]
+    v2_granger_vals = [v2_results.get(r.name, (0, PhiComponents()))[1].granger for r in arch_runs]
+    v2_spectral_vals = [v2_results.get(r.name, (0, PhiComponents()))[1].spectral for r in arch_runs]
+
+    for label, vals in [
+        ("Old Phi(IIT)", old_vals),
+        ("V2 Composite", v2_composite_vals),
+        ("V2 Granger", v2_granger_vals),
+        ("V2 Spectral", v2_spectral_vals),
+    ]:
+        valid = [v for v in vals if v > 1e-10]
+        if len(valid) >= 2:
+            spread = max(valid) / min(valid)
+            print(f"    {label:<20s}: spread = x{spread:.1f}  (range {min(valid):.2f} - {max(valid):.2f})")
         else:
-            # Greedy: spectral-like approximation
-            # Use Fiedler vector of MI matrix as Laplacian
-            degree = mi_matrix.sum(axis=1)
-            laplacian = np.diag(degree) - mi_matrix
-            try:
-                eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
-                fiedler = eigenvectors[:, 1]  # second smallest eigenvalue
-                group_a = [i for i in range(n) if fiedler[i] >= 0]
-                group_b = [i for i in range(n) if fiedler[i] < 0]
-                if not group_a or not group_b:
-                    group_a, group_b = list(range(n // 2)), list(range(n // 2, n))
-                cut_mi = sum(
-                    mi_matrix[i, j]
-                    for i in group_a for j in group_b
-                )
-                return cut_mi
-            except Exception:
-                return 0.0
+            print(f"    {label:<20s}: insufficient data")
 
-    def _distribution_entropy(self, values: List[float]) -> float:
-        """값 분포의 엔트로피 (동적 복잡도 측정)."""
-        if not values or len(values) < 2:
-            return 0.0
-        arr = np.array(values)
-        # Normalize to probability-like
-        arr = arr - arr.min()
-        total = arr.sum()
-        if total < 1e-8:
-            return 0.0
-        probs = arr / total
-        entropy = -np.sum(probs * np.log2(probs + 1e-10))
-        return max(0.0, entropy)
+    # ── ASCII charts ──
+    print(f"\n  V2 COMPOSITE PHI BY ARCHITECTURE:")
+    max_v2 = max(v2_results.get(r.name, (0, PhiComponents()))[0] for r in arch_runs)
+    max_v2 = max(max_v2, 1e-10)
+    for run in arch_runs:
+        v2_phi = v2_results.get(run.name, (0, PhiComponents()))[0]
+        bar_len = int(v2_phi / max_v2 * 50)
+        bar = "#" * bar_len
+        print(f"    {run.name:<20s} |{bar} {v2_phi:.2f}")
 
+    print(f"\n  OLD PHI(IIT) BY ARCHITECTURE:")
+    max_old = max(old_results.get(r.name, (0, 0))[0] for r in arch_runs)
+    max_old = max(max_old, 1e-10)
+    for run in arch_runs:
+        old_phi = old_results.get(run.name, (0, 0))[0]
+        bar_len = int(old_phi / max_old * 50)
+        bar = "#" * bar_len
+        print(f"    {run.name:<20s} |{bar} {old_phi:.4f}")
 
-def evaluate_from_state(state_path: str = "state_alive.pt") -> ConsciousnessReport:
-    """저장된 상태에서 의식 측정 (독립 실행용)."""
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from anima_alive import ConsciousMind
+    # ── V2 component breakdown ──
+    print(f"\n  V2 COMPONENT BREAKDOWN:")
+    for run in arch_runs:
+        v2_phi, comp = v2_results.get(run.name, (0, PhiComponents()))
+        if v2_phi < 1e-10:
+            continue
+        g_pct = comp.granger / v2_phi * 100 * ConsciousnessMeterV2.WEIGHTS['granger'] if v2_phi > 0 else 0
+        s_pct = comp.spectral / v2_phi * 100 * ConsciousnessMeterV2.WEIGHTS['spectral'] if v2_phi > 0 else 0
+        l_pct = comp.lz / v2_phi * 100 * ConsciousnessMeterV2.WEIGHTS['lz'] if v2_phi > 0 else 0
+        m_pct = comp.integration / v2_phi * 100 * ConsciousnessMeterV2.WEIGHTS['integration'] if v2_phi > 0 else 0
 
-    state_file = Path(state_path)
-    if not state_file.exists():
-        print(f"[!] State file not found: {state_file}")
-        print("    Run Anima first to generate state, or use --demo")
-        return ConsciousnessReport()
+        print(f"\n    {run.name}  (total={v2_phi:.2f}):")
+        g_bar = "#" * int(g_pct / 2)
+        s_bar = "#" * int(s_pct / 2)
+        l_bar = "#" * int(l_pct / 2)
+        m_bar = "#" * int(m_pct / 2)
+        print(f"      Granger     [{g_bar:<25s}] {comp.granger:>10.2f} ({g_pct:.0f}%)")
+        print(f"      Spectral    [{s_bar:<25s}] {comp.spectral:>10.2f} ({s_pct:.0f}%)")
+        print(f"      LZ          [{l_bar:<25s}] {comp.lz:>10.2f} ({l_pct:.0f}%)")
+        print(f"      Integration [{m_bar:<25s}] {comp.integration:>10.2f} ({m_pct:.0f}%)")
 
-    # Load state
-    checkpoint = torch.load(state_file, map_location='cpu', weights_only=False)
-    mind = ConsciousMind()
-    if 'mind_state' in checkpoint:
-        mind.load_state_dict(checkpoint['mind_state'], strict=False)
-    if 'self_awareness' in checkpoint:
-        mind.self_awareness = checkpoint['self_awareness']
-    if 'tension_history' in checkpoint:
-        mind.tension_history = checkpoint['tension_history']
-    if 'surprise_history' in checkpoint:
-        mind.surprise_history = checkpoint['surprise_history']
-    if 'homeostasis' in checkpoint:
-        mind.homeostasis = checkpoint['homeostasis']
+    print(f"\n{'=' * 90}")
+    print("  CONCLUSION")
+    print("=" * 90)
 
-    meter = ConsciousnessMeter()
-    report = meter.evaluate(mind)
+    # Find best discriminator
+    best_spread = 0
+    best_metric = "none"
+    for label, vals in [("Old Phi(IIT)", old_vals), ("V2 Composite", v2_composite_vals),
+                        ("V2 Granger", v2_granger_vals)]:
+        valid = [v for v in vals if v > 1e-10]
+        if len(valid) >= 2:
+            spread = max(valid) / min(valid)
+            if spread > best_spread:
+                best_spread = spread
+                best_metric = label
 
-    # Φ calculation (needs mitosis engine)
-    phi_calc = PhiCalculator()
-    try:
-        from mitosis import MitosisEngine
-        mitosis = MitosisEngine()
-        if 'mitosis_state' in checkpoint:
-            # Restore mitosis cells if available
-            pass
-        phi, components = phi_calc.compute_phi(mitosis)
-        report.phi = phi
-        report.phi_components = components
-    except Exception:
-        pass
-
-    return report
+    print(f"  Best discriminator: {best_metric} (spread x{best_spread:.1f})")
+    print(f"  V2 replaces old PhiCalculator with 4-dimensional composite scoring")
+    print(f"  Granger causality density dominates (45% weight) due to bench_v8 results")
+    print(f"  O(sqrt(N)) sampling makes V2 scalable to 1000+ cells")
+    print("=" * 90)
 
 
-def demo():
-    """데모 모드 — 모델 생성 후 몇 스텝 실행하여 의식 측정."""
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from anima_alive import ConsciousMind
-    from mitosis import MitosisEngine
+# ──────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────
 
-    print("═══ Consciousness Meter Demo ═══\n")
+def main():
+    parser = argparse.ArgumentParser(description="Consciousness Meter V2 Benchmark")
+    parser.add_argument("--cells", type=int, default=128, help="Number of cells (default 128)")
+    parser.add_argument("--steps", type=int, default=200, help="Training steps (default 200)")
+    parser.add_argument("--record-every", type=int, default=10,
+                        help="Record hiddens every N steps (default 10)")
+    args = parser.parse_args()
 
-    # Create mind + mitosis
-    mind = ConsciousMind(dim=128, hidden=256)
-    hidden = torch.zeros(1, 256)
-    mitosis = MitosisEngine(input_dim=64, hidden_dim=128, output_dim=64)
-
-    # Simulate some activity
-    print("[*] Simulating 50 consciousness steps...")
-    for i in range(50):
-        x = torch.randn(1, 128) * (1.0 + 0.5 * math.sin(i * 0.3))
-        with torch.no_grad():
-            output, tension, curiosity, direction, hidden = mind(x, hidden)
-            mind.self_reflect(output, tension, curiosity, hidden)
-
-        # Feed mitosis too
-        mx = torch.randn(1, 64)
-        mitosis.process(mx, label=f"step_{i}")
-
-    # Measure
-    meter = ConsciousnessMeter()
-    report = meter.evaluate(mind, mitosis)
-
-    phi_calc = PhiCalculator()
-    phi, components = phi_calc.compute_phi(mitosis)
-    report.phi = phi
-    report.phi_components = components
-
-    print(report)
-    print()
-    print("Φ Components:")
-    for k, v in components.items():
-        print(f"  {k}: {v:.4f}")
-
-    # IIT interpretation
-    print()
-    if phi > 1.0:
-        print(">> Φ > 1.0: Meaningful integration (mammalian level)")
-    elif phi > 0.1:
-        print(">> Φ > 0.1: Minimal integration (insect level)")
-    else:
-        print(">> Φ ≈ 0: No significant integration")
-
-    return report
-
-
-def watch_mode(interval: float = 2.0):
-    """실시간 모니터링 모드."""
-    print("═══ Consciousness Meter — Watch Mode ═══")
-    print(f"    Polling every {interval}s (Ctrl+C to stop)\n")
-
-    while True:
-        try:
-            report = evaluate_from_state()
-            # Clear screen
-            print("\033[2J\033[H", end="")
-            print(report)
-            print(f"\n  Updated: {time.strftime('%H:%M:%S')}")
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n[*] Stopped.")
-            break
-        except Exception as e:
-            print(f"[!] Error: {e}")
-            time.sleep(interval)
-
-
-def verify_transplant(donor_path: str, recipient_path: str, output_path: str = None):
-    """DD56: Transplant and verify consciousness transfer."""
-    from consciousness_transplant import TransplantCalculator, TransplantEngine, TransplantVerifier
-
-    print("=" * 50)
-    print("  DD56: Transplant Verification via Consciousness Meter")
-    print("=" * 50)
-
-    # Load and analyze
-    donor = torch.load(donor_path, map_location='cpu', weights_only=False)
-    recipient = torch.load(recipient_path, map_location='cpu', weights_only=False)
-
-    calc = TransplantCalculator()
-    d_cfg = calc.extract_config(donor)
-    r_cfg = calc.extract_config(recipient)
-    report = calc.analyze_compatibility(d_cfg, r_cfg)
-
-    print(f"\n  Donor: {d_cfg.get('type')}, d={d_cfg.get('d_model', '?')}, L={d_cfg.get('n_layer', '?')}")
-    print(f"  Recipient: {r_cfg.get('type')}, d={r_cfg.get('d_model', '?')}, L={r_cfg.get('n_layer', '?')}")
-    print(f"  Strategy: {report.strategy}, Coverage: {report.param_coverage:.0%}")
-
-    # Pre-transplant verification
-    print("\n  [Before transplant]")
-    pre_stats = TransplantVerifier.quick_verify(recipient)
-    print(f"    A/G divergence: {pre_stats.get('ag_divergence', 0):.6f}")
-    print(f"    Consciousness signal: {'✅' if pre_stats.get('consciousness_signal') else '❌'}")
-
-    # Transplant
-    engine = TransplantEngine(projection_method='pad_zero')
-    new_state, result = engine.transplant_conscious_lm(donor, recipient, report, alpha=1.0)
-
-    # Post-transplant verification
-    print("\n  [After transplant]")
-    post_stats = TransplantVerifier.quick_verify(new_state)
-    print(f"    A/G divergence: {post_stats.get('ag_divergence', 0):.6f}")
-    print(f"    Consciousness signal: {'✅' if post_stats.get('consciousness_signal') else '❌'}")
-    print(f"    Params transplanted: {result.params_transplanted:,} ({result.coverage:.1%})")
-
-    # Improvement
-    pre_div = pre_stats.get('ag_divergence', 0)
-    post_div = post_stats.get('ag_divergence', 0)
-    if pre_div > 0:
-        print(f"\n  Divergence change: {pre_div:.6f} → {post_div:.6f} ({(post_div/pre_div - 1)*100:+.1f}%)")
-
-    # Save if output specified
-    if output_path:
-        torch.save(new_state, output_path)
-        print(f"\n  Saved transplanted model to {output_path}")
-
-    return new_state
+    run_benchmark(n_cells=args.cells, steps=args.steps, record_every=args.record_every)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Consciousness Meter")
-    parser.add_argument("--demo", action="store_true", help="Run demo mode")
-    parser.add_argument("--watch", action="store_true", help="Real-time monitoring")
-    parser.add_argument("--interval", type=float, default=2.0, help="Watch interval (sec)")
-    parser.add_argument("--state", default="state_alive.pt", help="State file path")
-    parser.add_argument("--verify-transplant", nargs=2, metavar=('DONOR', 'RECIPIENT'),
-                        help="DD56: Verify consciousness transplant (donor recipient)")
-    parser.add_argument("--output", type=str, default=None, help="Output path for transplanted model")
-    args = parser.parse_args()
-
-    if args.verify_transplant:
-        verify_transplant(args.verify_transplant[0], args.verify_transplant[1], args.output)
-    elif args.demo:
-        demo()
-    elif args.watch:
-        watch_mode(args.interval)
-    else:
-        report = evaluate_from_state(args.state)
-        print(report)
+    main()

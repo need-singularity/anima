@@ -1,115 +1,59 @@
 #!/usr/bin/env python3
-"""Auto-generated tests for consciousness_transplant (meta_loop L1)."""
+"""Auto-generated tests for consciousness_transplant_v2 (meta_loop L1)."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 
 
-class TestConsciousnessTransplantImport:
+class TestConsciousnessTransplantV2Import:
     """Verify module imports without error."""
 
     def test_import(self):
-        import consciousness_transplant
+        import consciousness_transplant_v2
 
 
-class TestCompatibilityReport:
-    """Smoke tests for CompatibilityReport."""
-
-    def test_class_exists(self):
-        from consciousness_transplant import CompatibilityReport
-        assert CompatibilityReport is not None
-
-
-class TestTransplantResult:
-    """Smoke tests for TransplantResult."""
+class TestConsciousnessTransplantV2:
+    """Smoke tests for ConsciousnessTransplantV2."""
 
     def test_class_exists(self):
-        from consciousness_transplant import TransplantResult
-        assert TransplantResult is not None
+        from consciousness_transplant_v2 import ConsciousnessTransplantV2
+        assert ConsciousnessTransplantV2 is not None
 
 
-class TestVerificationResult:
-    """Smoke tests for VerificationResult."""
-
-    def test_class_exists(self):
-        from consciousness_transplant import VerificationResult
-        assert VerificationResult is not None
+def test_binary_entropy_exists():
+    """Verify binary_entropy is callable."""
+    from consciousness_transplant_v2 import binary_entropy
+    assert callable(binary_entropy)
 
 
-class TestTransplantCalculator:
-    """Smoke tests for TransplantCalculator."""
-
-    def test_class_exists(self):
-        from consciousness_transplant import TransplantCalculator
-        assert TransplantCalculator is not None
+def test_make_state_exists():
+    """Verify make_state is callable."""
+    from consciousness_transplant_v2 import make_state
+    assert callable(make_state)
 
 
-class TestTransplantEngine:
-    """Smoke tests for TransplantEngine."""
-
-    def test_class_exists(self):
-        from consciousness_transplant import TransplantEngine
-        assert TransplantEngine is not None
+def test_main_exists():
+    """Verify main is callable."""
+    from consciousness_transplant_v2 import main
+    assert callable(main)
 
 
 def test_analyze_compatibility_exists():
     """Verify analyze_compatibility is callable."""
-    from consciousness_transplant import analyze_compatibility
+    from consciousness_transplant_v2 import analyze_compatibility
     assert callable(analyze_compatibility)
 
 
 def test_transplant_exists():
     """Verify transplant is callable."""
-    from consciousness_transplant import transplant
+    from consciousness_transplant_v2 import transplant
     assert callable(transplant)
 
 
-def test_verify_transplant_quality_exists():
-    """Verify verify_transplant_quality is callable."""
-    from consciousness_transplant import verify_transplant_quality
-    assert callable(verify_transplant_quality)
-
-
-def test_verify_transplant_exists():
-    """Verify verify_transplant is callable."""
-    from consciousness_transplant import verify_transplant
-    assert callable(verify_transplant)
-
-
-def test_run_benchmark_exists():
-    """Verify run_benchmark is callable."""
-    from consciousness_transplant import run_benchmark
-    assert callable(run_benchmark)
-
-
-def test_demo_exists():
-    """Verify demo is callable."""
-    from consciousness_transplant import demo
-    assert callable(demo)
-
-
-def test_main_exists():
-    """Verify main is callable."""
-    from consciousness_transplant import main
-    assert callable(main)
-
-
-def test_extract_config_exists():
-    """Verify extract_config is callable."""
-    from consciousness_transplant import extract_config
-    assert callable(extract_config)
-
-
-def test_analyze_compatibility_exists():
-    """Verify analyze_compatibility is callable."""
-    from consciousness_transplant import analyze_compatibility
-    assert callable(analyze_compatibility)
-
-
-def test_compute_projection_matrix_exists():
-    """Verify compute_projection_matrix is callable."""
-    from consciousness_transplant import compute_projection_matrix
-    assert callable(compute_projection_matrix)
+def test_verify_exists():
+    """Verify verify is callable."""
+    from consciousness_transplant_v2 import verify
+    assert callable(verify)
 
 
 if __name__ == "__main__":
