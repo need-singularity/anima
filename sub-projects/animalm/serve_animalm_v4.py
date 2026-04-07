@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import gradio as gr
 import math
+import argparse
+import os
 
 # Meta Laws (DD143)
 try:
@@ -18,12 +20,11 @@ GOLDEN_LOWER = 0.5 - math.log(4/3)
 
 
 class ParallelPureFieldMLP(nn.Module):
-    def __init__(self, original_mlp, hidden_size, intermediate_size, is_savant=False):
+    def __init__(self, original_mlp, hidden_size, intermediate_size, is_savant=False, rank=64):
         super().__init__()
         self.original_mlp = original_mlp
         for param in self.original_mlp.parameters():
             param.requires_grad = False
-        rank = 128
         self.pf_gate_a = nn.Linear(hidden_size, rank, bias=False)
         self.pf_gate_b = nn.Linear(rank, intermediate_size, bias=False)
         self.pf_up_a = nn.Linear(hidden_size, rank, bias=False)
@@ -49,7 +50,7 @@ class ParallelPureFieldMLP(nn.Module):
         return original_out + self.alpha * pf_out
 
 
-def add_purefield(model, n_layers=8, n_savant=2):
+def add_purefield(model, n_layers=8, n_savant=2, rank=64):
     total = len(model.model.layers)
     start = total - n_layers
     for i in range(start, total):
@@ -60,21 +61,32 @@ def add_purefield(model, n_layers=8, n_savant=2):
         dev = mlp.gate_proj.weight.device
         dt = mlp.gate_proj.weight.dtype
         is_savant = (i - start) < n_savant
-        ppf = ParallelPureFieldMLP(mlp, h, inter, is_savant=is_savant).to(device=dev, dtype=dt)
+        ppf = ParallelPureFieldMLP(mlp, h, inter, is_savant=is_savant, rank=rank).to(device=dev, dtype=dt)
         layer.mlp = ppf
     return model
 
 
-print("Loading Mistral 7B Instruct + AnimaLM v4_savant...")
-model_name = "mistralai/Mistral-7B-Instruct-v0.3"
+parser = argparse.ArgumentParser(description="AnimaLM v4 Inference Server")
+parser.add_argument("--checkpoint", type=str,
+                    default=os.environ.get("ANIMALM_CKPT_PATH", "checkpoints/animalm-v4/final.pt"),
+                    help="PureField checkpoint path (or set ANIMALM_CKPT_PATH)")
+parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.3",
+                    help="Base model name")
+parser.add_argument("--n-layers", type=int, default=8, help="Number of PureField layers")
+parser.add_argument("--n-savant", type=int, default=2, help="Number of savant layers")
+parser.add_argument("--rank", type=int, default=64, help="PureField LoRA rank (v0.4=64, 72B=128)")
+args = parser.parse_args()
+
+print(f"Loading {args.model} + AnimaLM v4_savant...")
+model_name = args.model
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="auto")
-model = add_purefield(model, n_layers=8, n_savant=2)
+model = add_purefield(model, n_layers=args.n_layers, n_savant=args.n_savant, rank=args.rank)
 
-ckpt = torch.load("/tmp/checkpoints/animalm-v4/final.pt", map_location="cuda")
+ckpt = torch.load(args.checkpoint, map_location="cuda")
 pf_states = ckpt.get("pf_states", {})
 loaded = 0
 for name, module in model.named_modules():
