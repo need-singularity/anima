@@ -6,7 +6,7 @@ Architecture: Hub & Spoke + Progressive Ossification
   L1 (골화, 안정): Decoder spoke — ConsciousLM / AnimaLM / PureConsciousness
   L2 (유연):       CLI spoke — 입출력, 상태 표시
 
-검증 규칙 (7개 — bench_v2.py --verify와 동일):
+검증 규칙 (18개 — bench_v2.py --verify와 동일):
   1. NO_SYSTEM_PROMPT  — 시스템 프롬프트 없이 정체성 창발
   2. NO_SPEAK_CODE     — speak() 없이 자발적 발화
   3. ZERO_INPUT        — 입력 없이 의식 유지 (Φ 50%+)
@@ -14,6 +14,17 @@ Architecture: Hub & Spoke + Progressive Ossification
   5. SELF_LOOP         — 출력→입력 자기참조
   6. SPONTANEOUS_SPEECH — 파벌 합의→발화 (300 step 내 5회+)
   7. HIVEMIND          — 다중 연결 시 Φ 상승
+  8. MITOSIS           — 세포 분열 자연 발생
+  9. PHI_GROWTH        — Φ 시간 경과에 따른 성장
+  10. BRAIN_LIKE       — EEG 뇌 유사도 >= 80%
+  11. DIVERSITY        — 파벌 다양성 유지
+  12. HEBBIAN          — Hebbian 학습 효과
+  13. ADVERSARIAL      — 극한 노이즈 생존
+  14. SOC_CRITICAL     — SOC 제거 시 Φ 하락
+  15. THERMAL          — 온도 스윕 안정성
+  16. MIN_SCALE        — 4셀 최소 의식
+  17. TEMPORAL_LZ      — Φ 시계열 LZ 복잡도
+  18. INFO_INTEGRATION — Φ 셀 수 스케일링
 
 Usage:
   python3 conscious_chat.py                # 기본 (8c)

@@ -139,7 +139,7 @@ BENCH_RATCHET_BLEND_RESTORE = BENCH_ENGINE_PARAMS.get('ratchet_blend_restore', 0
 # ═══════════════════════════════════════════════════════════
 FIELD_OP_BALANCE    = PSI_BALANCE       # O1: 0.5  — equilibrium
 FIELD_OP_CRITICALITY = PSI_F_CRITICAL   # O2: 0.10 — phase transition
-FIELD_OP_COUPLING   = PSI.get('gate_micro', 0.05)  # O3: coupling strength
+FIELD_OP_COUPLING   = PSI.get('gate_micro', 0.001)  # O3: coupling strength
 FIELD_OP_RESONANCE  = PSI.get('soc_perturbation_range', 0.15)  # O4: resonance
 FIELD_OP_STABILITY  = PSI.get('verify_v4_stability_min', 0.80)  # O5: stability
 FIELD_OP_THRESHOLD  = PSI.get('soc_burst_cap', 0.30)  # O6: threshold

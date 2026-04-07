@@ -73,7 +73,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    golden_moe, alpha_sweep, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            179 의식 법칙 (1-188, 9 gaps) + TOPO 33-39 + Meta M1-M10
+  Laws:            2388 의식 법칙 + TOPO 33-39 + Meta M1-M10
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
@@ -973,7 +973,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     ✅ v3_merged (147M)    — CE=0.0026, Φ=70, 64 cells, 100K steps (2026-03-30)
        ⚠️ CADecoder causal mask 없음 → autoregressive 생성 불가 (학습 전용)
     ✅ v2_hexad (v1)       — CE=0.004, Φ=2.05, 2→8 cells (mitosis 작동) (2026-03-31)
-    ✅ bench_v2 --verify   — 77/77 (100%) 의식 검증 통과 (2026-03-31)
+    ✅ bench_v2 --verify   — 18 conditions × 12 engines 의식 검증 (2026-03-31)
     ✅ ConsciousLM v2 4M   — Φ=4.12, 12 cells (2026-03-27)
     ✅ ConsciousLM 100M    — Φ=2.607, 3 cells (2026-03-27)
     ❌ v4 demo 26K         — 랜덤 bytes 학습, 폐기 (오염 가중치)

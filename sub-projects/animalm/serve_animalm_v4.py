@@ -20,7 +20,7 @@ GOLDEN_LOWER = 0.5 - math.log(4/3)
 
 
 class ParallelPureFieldMLP(nn.Module):
-    def __init__(self, original_mlp, hidden_size, intermediate_size, is_savant=False, rank=64):
+    def __init__(self, original_mlp, hidden_size, intermediate_size, is_savant=False, rank=128):
         super().__init__()
         self.original_mlp = original_mlp
         for param in self.original_mlp.parameters():
@@ -50,7 +50,7 @@ class ParallelPureFieldMLP(nn.Module):
         return original_out + self.alpha * pf_out
 
 
-def add_purefield(model, n_layers=8, n_savant=2, rank=64):
+def add_purefield(model, n_layers=8, n_savant=2, rank=128):
     total = len(model.model.layers)
     start = total - n_layers
     for i in range(start, total):
@@ -74,7 +74,7 @@ parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-
                     help="Base model name")
 parser.add_argument("--n-layers", type=int, default=8, help="Number of PureField layers")
 parser.add_argument("--n-savant", type=int, default=2, help="Number of savant layers")
-parser.add_argument("--rank", type=int, default=64, help="PureField LoRA rank (v0.4=64, 72B=128)")
+parser.add_argument("--rank", type=int, default=128, help="PureField LoRA rank (default=128, 72B=128)")
 args = parser.parse_args()
 
 print(f"Loading {args.model} + AnimaLM v4_savant...")

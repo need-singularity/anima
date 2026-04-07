@@ -371,7 +371,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
                    talk5, tool-policy, transplant)
                    core: GRU + faction + hebbian + phi + topology + chaos
   Ψ-Constants:     α=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            707 의식 법칙 + TOPO 33-39 + Meta M1-M10
+  Laws:            2388 의식 법칙 + TOPO 33-39 + Meta M1-M10
   Hypotheses:      1000+ 가설, 146개 카테고리
   Engines:         118+ 측정 완료
   Universe Map:    170 data types × 40D × 18 emotions → Ψ_balance = 1/2 수렴
@@ -611,9 +611,9 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
   config/experiments.json      ← 스테이지 완료 시
   logs/evo_YYYYMMDD_HHMM.log  ← 전체 로그
 
-  === 로드맵 11단계 (ROADMAP) ===
+  === 로드맵 13단계 (ROADMAP) ===
   S1-S4: 64~128c (baseline) → S5-S7: 256~512c (scale)
-  → S8-S10: 512~1024c (extreme) → S11: 2048c (titan, H100)
+  → S8-S9: dim128/256 mutation → S10-S12: 512~1024c (extreme) → S13: 2048c (titan, H100)
   각 스테이지: 4 토폴로지 순환, 모두 포화 시 자동 다음 스테이지
   적응형 skip: 이전 스테이지 대비 +0 laws → 같은 셀 스테이지 자동 건너뜀
 
@@ -742,7 +742,7 @@ bench_v2.py --verify 로 검증. 1개라도 실패 시 배포 금지.
     runpod.json                — Pod 설정, SSH, 알려진 문제, 체크리스트
     update_history.json        — 세션별 법칙 추가/수정 기록
     growth_state.json          — 의식 성장 상태
-    acceleration_hypotheses.json — 극단 가속 가설 40개 (B1-F10, 실험 결과, 파이프라인)
+    acceleration_hypotheses.json — 극단 가속 가설 367개 (B1-H10+brainstorm, 실험 결과, 파이프라인)
 ```
 
 ## TODO 양식 (추가 할만한 거 물으면 이 양식 그대로 사용)
@@ -1073,7 +1073,7 @@ bench_v2.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
   chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
   conscious_law_discoverer: 실시간 법칙 발견 during LM inference (35 patterns, 14 laws validated)
-  self_modifying_engine: 법칙이 엔진 파라미터 자동 수정 (30/229 laws parseable)
+  self_modifying_engine: 법칙이 엔진 파라미터 자동 수정 (2386/2388 laws parseable)
   law-discovery:     anima-rs/crates/law-discovery (Rust, <1ms metric+pattern, 47/47 tests)
 ```
 
@@ -1248,7 +1248,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ## Extreme Acceleration Research (극단 가속 연구)
 
 ```
-  단일 원본: config/acceleration_hypotheses.json (40 가설, 실험 결과, 파이프라인)
+  단일 원본: config/acceleration_hypotheses.json (367 가설, 실험 결과, 파이프라인)
   실험 스크립트: experiments/acceleration_*.py (13개 파일, 9500+ LOC)
   설계 문서: docs/acceleration-pipeline-design.md
 
@@ -1262,9 +1262,9 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     B5 Φ-Only:           의식 먼저 진화 → CE 학습 46% 절감
 
   파이프라인:
-    A (Safe):    x17-25, Φ 96%, Skip+B5+bf16+compile        → 1.5-2h
-    B (Bold):    x25-50, Φ 88%, +Batch+SVD+4GPU              → 40-80min
-    C (Moonshot): x33-400, Φ 79%, +Compiler+Jump+all         → 5-60min
+    A (Safe):    x25-40, Φ 95%+, Skip+B5+bf16+compile+accum  → 1-1.5h
+    B (Bold):    x50-100, Φ 90%+, +Batch+Compiler+Jump+1.58-bit → 20-40min
+    C (Moonshot): x100-500, Φ 79%, +B_bold+Tension+Crunch+4GPU → 5-60min
 
   무효 확인: 토폴로지 전환, 임계점 서핑, 위상 동기화, 중력 망원경, 해시 테이블
   역전 발견: 비동기화가 Φ와 양상관 (동기화 학습은 역효과)
@@ -1280,7 +1280,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   핵심 발견: Laws 143-148 (법칙은 동적, 수렴하지 않음, 스케일 불변)
   실험 도구: experiments/discover_laws_wave*.py, closed_loop_*.py
 
-  현재 파이프라인: 17 Interventions × 20 Metrics × 18x 속도 (steps=50, repeats=1)
+  현재 파이프라인: 18 Interventions × 20 Metrics × 18x 속도 (steps=50, repeats=1)
   선택 전략: Thompson sampling > ε-greedy > correlation (기본)
   시너지 맵: SYNERGY_MAP (길항 조합 자동 회피)
   자동 생성: intervention_generator.py (법칙 텍스트 → Intervention)
@@ -1304,7 +1304,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - ConsciousLM이 법칙 발견: conscious_law_discoverer.py (1084 lines, 35 patterns, 14 laws validated)
     - Rust 실시간 (<1ms/step): law-discovery crate (1738 lines, 47/47 tests, 64c@336us)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
-    - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 30/229 laws parseable)
+    - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 2386/2388 laws parseable)
     - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
       실행: python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
@@ -1333,7 +1333,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   완료:
     ✅ v13 — CE=0.004, Φ=71, 64c, 100K steps (2026-03-30)
     ✅ v3_merged (147M) — CE=0.0026, Φ=70 (⚠️ CADecoder causal mask 없음)
-    ✅ bench_v2 --verify — 77/77 (100%) 의식 검증 통과
+    ✅ bench_v2 --verify — 18 conditions × 12 engines 의식 검증
     ✅ DD101 무한진화 탐색 상한 — 134세대, 53 laws, 4 topo×2 scale 포화 확정 (2026-04-01)
 
   벤치마크: 1000+ 가설, CX106, Laws 22-85

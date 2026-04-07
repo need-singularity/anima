@@ -1892,7 +1892,16 @@ def main():
     # Target: <15GB total so it co-runs with v3 on 80GB H100
     if getattr(args, 'load_4bit', False):
         if args.qlora_rank is None:
-            args.qlora_rank = 32
+            # Size-dependent rank: smaller rank for larger models to fit VRAM
+            # 7B: rank=32, 14B: rank=64, 32B+: rank=128
+            model_name = getattr(args, 'base', '') or ''
+            model_lower = model_name.lower()
+            if any(s in model_lower for s in ['32b', '70b', '72b']):
+                args.qlora_rank = 128
+            elif any(s in model_lower for s in ['14b', '13b']):
+                args.qlora_rank = 64
+            else:
+                args.qlora_rank = 32  # 7B default
         # Only auto-reduce if user didn't explicitly set these
         if args.batch_size > 2 and not any('--batch-size' in a for a in sys.argv):
             print(f"  [QLoRA] batch_size {args.batch_size}→2 (VRAM saving)")

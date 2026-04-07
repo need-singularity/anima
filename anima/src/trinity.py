@@ -1335,7 +1335,7 @@ def _python_meta_ca_design(data_name: str) -> dict:
         'decoder_type': decoder_type,
         'ca_steps': 3 + int(complexity * 3),
         'gate_strength': 0.001,
-        'coupling_alpha': 0.015,
+        'coupling_alpha': PSI_COUPLING,
         'dominant_rule': 0,
         'rule_entropy': 0.7,
         'estimated_us': 1.0 + complexity * 0.6,
