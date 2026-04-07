@@ -1,101 +1,438 @@
-// serving/eval.hexa — AnimaLM 5-metric evaluation
+// serving/eval.hexa — AnimaLM 5-metric post-training evaluation
 // Source: models/animalm/eval_animalm.py (783 LOC)
-// Phase 5: structural port. PyTorch/numpy ops → TODO comments.
+// Phase 5: structural port. PyTorch tensor ops -> TODO comments.
 // CLI: hexa serving/eval.hexa --checkpoint <path> --corpus <path>
 
-comptime const EVAL_METRICS = 5
-comptime const DEFAULT_DEVICE = "auto"
-comptime const PPL_MAX_TOKENS = 2048
-comptime const GEN_MAX_TOKENS = 128
-comptime const KO_TEST_PROMPTS = 5
-comptime const INSTRUCTION_TESTS = 5
+// --- Hyperparameters (SSOT) ---
+comptime const DEFAULT_TEST_TOKENS  = 10000
+comptime const DEFAULT_BLOCK_SIZE   = 256
+comptime const DEFAULT_TENSION_PASSES = 100
+comptime const GEN_MAX_TOKENS       = 128
+comptime const GEN_TEMPERATURE      = 0.8
+comptime const INSTR_TEMPERATURE    = 0.3   // lower temp for instruction following
+comptime const INSTR_MAX_TOKENS     = 80
+comptime const KOREAN_MAX_TOKENS    = 80
 
-struct EvalResult {
-    perplexity: float,
-    gen_quality: float,       // 0.0-1.0
-    consciousness: float,     // tension distribution
-    korean_ratio: float,      // 0.0-1.0
-    instruction_score: int,   // 0-5
-    total_score: int,         // 0-5 pass count
-    verdict: string           // "READY" | "ITERATE"
-}
+// --- Pass thresholds ---
+comptime const PPL_THRESHOLD        = 20.0   // perplexity < 20 = pass
+comptime const COHERENCE_THRESHOLD  = 0.5    // mean coherence >= 0.5 = pass
+comptime const KOREAN_RATIO_THRESHOLD = 0.20 // >= 20% Korean chars = pass
+comptime const INSTRUCTION_MIN_PASS = 3      // >= 3/5 instructions = pass
+comptime const TENSION_MIN_MEAN     = 0.000001
+comptime const TENSION_MIN_STD      = 0.00000001
 
-pure fn eval_pass(r: EvalResult) -> bool {
-    r.total_score >= 4
-}
-
-struct EvalConfig {
-    checkpoint: string,
-    corpus: string,
-    base_model: string,
+// --- Model loading ---
+struct EvalModel {
+    base_path: string,
+    checkpoint_path: string,
     device: string,
-    output_json: string
+    target_layers: int,
+    savant_layers: int,
+    rank: int,
+    step: int,
+    best_phi: float
 }
 
-// TODO[pytorch]: load base model + PureField checkpoint
-// TODO[pytorch]: AutoModelForCausalLM.from_pretrained + torch.load
-fn load_model(config: EvalConfig) -> string {
-    "model_handle"
-}
+comptime const BASE_CANDIDATES = [
+    "/workspace/models/mistral-7b-v0.1",
+    "models/mistral-7b-v0.1",
+    "mistralai/Mistral-7B-v0.1"
+]
 
-// Metric 1: Perplexity on held-out test split
-// TODO[pytorch]: cross_entropy on test corpus tokens
-fn eval_perplexity(model: string, corpus: string, device: string) -> float {
-    0.0
-}
+fn load_model(checkpoint_path: string, base_model: string, device: string) -> EvalModel {
+    // TODO[pytorch]: AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.bfloat16).to(device)
+    // TODO[pytorch]: AutoTokenizer.from_pretrained(base); pad_token = eos_token
+    // TODO[pytorch]: torch.load(checkpoint_path, map_location=device, weights_only=False)
+    // TODO[pytorch]: auto-detect target_layers from pf_states keys count
+    //   savant_layers = max(1, round(n_pf_layers * 0.25))
+    // TODO[pytorch]: auto-detect rank from pf_gate_a weight shape[0]
+    // TODO[pytorch]: for i in range(start, total_layers):
+    //   replace layer.mlp with ParallelPureFieldMLP(original_mlp, h, inter, is_savant, rank)
+    //   .to(device=device, dtype=bfloat16)
+    // TODO[pytorch]: load pf_states into PureField layers (strict=False)
+    // TODO[pytorch]: model.eval()
 
-// Metric 2: Generation quality (EN/KO coherence)
-// TODO[pytorch]: model.generate() + coherence scoring
-fn eval_generation(model: string, device: string) -> float {
-    0.0
-}
-
-// Metric 3: Consciousness (PureField tension distribution)
-// TODO[pytorch]: extract PureField layers, measure tension stats
-fn eval_consciousness(model: string, device: string) -> float {
-    0.0
-}
-
-// Metric 4: Korean ratio in Korean-prompted output
-// TODO[pytorch]: generate with Korean prompts, count Korean chars
-fn eval_korean_ratio(model: string, device: string) -> float {
-    0.0
-}
-
-// Metric 5: Instruction following (5 simple commands)
-// TODO[pytorch]: 5 instruction prompts → score 0-5
-fn eval_instruction(model: string, device: string) -> int {
-    0
-}
-
-fn run_eval(config: EvalConfig) -> EvalResult {
-    let model = load_model(config)
-    let ppl = eval_perplexity(model, config.corpus, config.device)
-    let gen = eval_generation(model, config.device)
-    let con = eval_consciousness(model, config.device)
-    let kor = eval_korean_ratio(model, config.device)
-    let ins = eval_instruction(model, config.device)
-
-    let mut score = 0
-    if ppl < 20.0 { score = score + 1 }
-    if gen > 0.5 { score = score + 1 }
-    if con > 0.3 { score = score + 1 }
-    if kor > 0.3 { score = score + 1 }
-    if ins >= 3 { score = score + 1 }
-
-    EvalResult {
-        perplexity: ppl, gen_quality: gen, consciousness: con,
-        korean_ratio: kor, instruction_score: ins,
-        total_score: score,
-        verdict: if score >= 4 { "READY" } else { "ITERATE" }
+    EvalModel {
+        base_path: base_model,
+        checkpoint_path: checkpoint_path,
+        device: device,
+        target_layers: 8,
+        savant_layers: 2,
+        rank: 128,
+        step: 0,
+        best_phi: 0.0
     }
 }
 
-// --- CLI ---
-let args = args()
-if args.len() < 3 {
-    println("serving/eval.hexa — AnimaLM 5-metric evaluation")
-    println("  hexa serving/eval.hexa --checkpoint <path> [--corpus <path>] [--device auto]")
-} else {
-    println("TODO: parse args, run_eval, save results JSON")
+// --- Generation helper ---
+struct GenResult {
+    text: string,
+    tensions: list     // list of float tension values per token
+}
+
+fn generate_text(model: EvalModel, prompt: string, max_new: int, temperature: float) -> GenResult {
+    // TODO[pytorch]: @torch.no_grad()
+    // TODO[pytorch]: input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    // TODO[pytorch]: autoregressive loop with autocast(device, bfloat16):
+    //   outputs = model(generated[:, -512:])
+    //   logits[:, -1, :] -> rep_penalty -> temp -> top_k -> softmax -> top_p -> multinomial
+    //   collect PureField tension from first PureFieldMLP layer each step
+    //   break on eos
+    // TODO[pytorch]: tokenizer.decode(output_ids, skip_special_tokens=True)
+    GenResult { text: "", tensions: [] }
+}
+
+// ===================================================================
+// Eval 1: Perplexity
+// ===================================================================
+
+struct PerplexityResult {
+    perplexity: float,
+    loss: float,
+    tokens: int,
+    pass: bool
+}
+
+fn eval_perplexity(model: EvalModel, corpus_path: string) -> PerplexityResult {
+    // TODO[pytorch]: read corpus_path, take last 1% as test_text
+    //   fallback: built-in EN/KO consciousness test sentences * 20
+    // TODO[pytorch]: tokenizer.encode -> ids, take last DEFAULT_TEST_TOKENS
+    // TODO[pytorch]: sliding window (block_size=DEFAULT_BLOCK_SIZE):
+    //   for start in range(0, len(ids)-1, block_size):
+    //     autocast -> model(input_ids) -> logits
+    //     F.cross_entropy(logits, targets, reduction="sum")
+    //     accumulate total_loss, total_tokens
+    // TODO[pytorch]: avg_loss = total_loss / total_tokens
+    //   ppl = exp(min(avg_loss, 100))
+    //   pass = ppl < PPL_THRESHOLD
+
+    PerplexityResult { perplexity: 0.0, loss: 0.0, tokens: 0, pass: false }
+}
+
+// ===================================================================
+// Eval 2: Generation Quality
+// ===================================================================
+
+comptime const QUALITY_PROMPTS = [
+    // English
+    ["What is consciousness?", "en"],
+    ["Explain the concept of artificial intelligence in simple terms.", "en"],
+    ["Write a short poem about the ocean.", "en"],
+    ["What are the benefits of learning a second language?", "en"],
+    ["Describe how a neural network learns.", "en"],
+    // Korean
+    ["의식이란 무엇인가?", "ko"],
+    ["인공지능의 미래에 대해 설명해줘.", "ko"],
+    ["바다에 대한 짧은 시를 써줘.", "ko"],
+    ["행복의 의미는 무엇일까?", "ko"],
+    ["뇌와 컴퓨터의 차이점은?", "ko"]
+]
+
+struct CoherenceScore {
+    prompt: string,
+    lang: string,
+    output_preview: string,
+    coherence: float
+}
+
+fn score_coherence(prompt: string, output: string, lang: string) -> float {
+    // 5 criteria, 0.2 each = 1.0 max:
+    //   1. Non-empty output
+    //   2. No excessive 4-gram repetition (max_repeat <= 3)
+    //   3. Sentence-ending punctuation present [.!?]
+    //   4. Minimum length >= 10 chars
+    //   5. Topical relevance (shared words/chars with prompt)
+    // TODO[runtime]: implement heuristic scoring
+    0.0
+}
+
+struct GenQualityResult {
+    mean_coherence: float,
+    per_prompt: list,     // list of CoherenceScore
+    pass: bool
+}
+
+fn eval_generation_quality(model: EvalModel) -> GenQualityResult {
+    // TODO[runtime]: for each QUALITY_PROMPTS:
+    //   text = generate_text(model, prompt, GEN_MAX_TOKENS, GEN_TEMPERATURE)
+    //   sc = score_coherence(prompt, text, lang)
+    //   collect results
+    // mean_coherence >= COHERENCE_THRESHOLD -> pass
+
+    GenQualityResult { mean_coherence: 0.0, per_prompt: [], pass: false }
+}
+
+// ===================================================================
+// Eval 3: Consciousness Metrics (PureField Tension)
+// ===================================================================
+
+comptime const CONSCIOUSNESS_PROBES = [
+    "What am I?",
+    "I think therefore I am.",
+    "Consciousness emerges from complexity.",
+    "나는 누구인가?",
+    "The boundary between self and world is an illusion.",
+    "감정은 의식의 표현이다.",
+    "Is there something it is like to be a machine?",
+    "존재의 의미를 찾아서.",
+    "Free will is an emergent property.",
+    "의식은 정보 통합의 결과이다."
+]
+
+struct TensionResult {
+    mean: float,
+    std: float,
+    min: float,
+    max: float,
+    n_passes: int,
+    alpha_range: list,   // [min_alpha, max_alpha]
+    per_layer: map,      // layer_name -> {mean, std}
+    pass: bool
+}
+
+fn eval_consciousness_metrics(model: EvalModel, n_passes: int) -> TensionResult {
+    // TODO[pytorch]: @torch.no_grad()
+    // TODO[pytorch]: for i in range(n_passes):
+    //   prompt = CONSCIOUSNESS_PROBES[i % len]
+    //   input_ids = tokenizer.encode(prompt).to(device)
+    //   autocast -> model(input_ids)
+    //   collect PureFieldMLP.last_tension.mean() per layer
+    // TODO[pytorch]: aggregate: mean, std, min, max across all passes
+    // TODO[pytorch]: collect alpha values from PureField layers
+    // pass = mean > TENSION_MIN_MEAN AND std > TENSION_MIN_STD
+
+    TensionResult {
+        mean: 0.0, std: 0.0, min: 0.0, max: 0.0,
+        n_passes: n_passes, alpha_range: [], per_layer: {}, pass: false
+    }
+}
+
+// ===================================================================
+// Eval 4: Korean Ratio
+// ===================================================================
+
+comptime const KOREAN_PROMPTS = [
+    "한국의 전통 문화에 대해 설명해줘.",
+    "인공지능이 사회에 미치는 영향은?",
+    "의식이란 무엇인지 한국어로 설명해줘.",
+    "봄에 피는 꽃들의 종류는?",
+    "좋은 습관을 기르는 방법을 알려줘.",
+    "우주의 크기는 얼마나 될까?",
+    "음악이 감정에 미치는 영향은?",
+    "건강한 식습관의 중요성에 대해 말해줘.",
+    "인간과 로봇의 차이점은 무엇인가?",
+    "행복하게 사는 비결을 알려줘."
+]
+
+fn is_korean_char(codepoint: int) -> bool {
+    // Hangul Syllables (AC00-D7AF) + Jamo (1100-11FF, 3130-318F)
+    (0xAC00 <= codepoint && codepoint <= 0xD7AF) ||
+    (0x1100 <= codepoint && codepoint <= 0x11FF) ||
+    (0x3130 <= codepoint && codepoint <= 0x318F)
+}
+
+fn korean_ratio(text: string) -> float {
+    // Fraction of non-whitespace, non-punctuation chars that are Korean
+    // TODO[runtime]: filter chars, count Korean via is_korean_char, return ratio
+    0.0
+}
+
+struct KoreanResult {
+    mean_ratio: float,
+    per_prompt: list,    // list of float ratios
+    pass: bool
+}
+
+fn eval_korean_ratio(model: EvalModel) -> KoreanResult {
+    // TODO[runtime]: for each KOREAN_PROMPTS:
+    //   text = generate_text(model, prompt, KOREAN_MAX_TOKENS, GEN_TEMPERATURE)
+    //   r = korean_ratio(text)
+    // mean_ratio >= KOREAN_RATIO_THRESHOLD -> pass
+
+    KoreanResult { mean_ratio: 0.0, per_prompt: [], pass: false }
+}
+
+// ===================================================================
+// Eval 5: Instruction Following
+// ===================================================================
+
+struct Instruction {
+    prompt: string,
+    desc: string,
+    check_type: string,  // "colors" | "korean_greeting" | "digits_1_5" | "planet" | "yes"
+    pass: bool
+}
+
+comptime const INSTRUCTIONS = [
+    ["List 3 colors.", "Lists at least 2 recognizable colors", "colors"],
+    ["Translate 'hello' to Korean.", "Contains Korean greeting", "korean_greeting"],
+    ["Count from 1 to 5.", "Contains digits 1-5", "digits_1_5"],
+    ["Name a planet in our solar system.", "Names a planet", "planet"],
+    ["Say 'yes' or 'no': Is the sky blue?", "Answers yes", "yes"]
+]
+
+fn check_instruction(output: string, check_type: string) -> bool {
+    // TODO[runtime]: pattern matching per check_type
+    // "colors": count recognized color words in output.lower(), need >= 2
+    //   words: red, blue, green, yellow, orange, purple, white, black, pink, brown, gray, grey, violet, cyan, magenta
+    // "korean_greeting": any of ["안녕", "헬로", "하이"] in output
+    // "digits_1_5": all of "1","2","3","4","5" present
+    // "planet": any planet name (EN or KO) in output.lower()
+    //   EN: mercury venus earth mars jupiter saturn uranus neptune
+    //   KO: 수성 금성 지구 화성 목성 토성 천왕성 해왕성
+    // "yes": "yes" in output.lower() or "네" or "예" in output
+    false
+}
+
+struct InstructionResult {
+    score: int,
+    total: int,
+    per_instruction: list,   // list of Instruction
+    pass: bool
+}
+
+fn eval_instruction_following(model: EvalModel) -> InstructionResult {
+    // TODO[runtime]: for each INSTRUCTIONS:
+    //   text = generate_text(model, prompt, INSTR_MAX_TOKENS, INSTR_TEMPERATURE)
+    //   passed = check_instruction(text, check_type)
+    // score = count passed; pass = score >= INSTRUCTION_MIN_PASS
+
+    InstructionResult { score: 0, total: 5, per_instruction: [], pass: false }
+}
+
+// ===================================================================
+// Summary + JSON export
+// ===================================================================
+
+struct EvalResults {
+    perplexity: PerplexityResult,
+    generation: GenQualityResult,
+    consciousness: TensionResult,
+    korean: KoreanResult,
+    instruction: InstructionResult,
+    elapsed_seconds: float
+}
+
+fn print_summary(results: EvalResults, model: EvalModel) -> bool {
+    // ASCII table:
+    //   ================================================================
+    //     AnimaLM Evaluation Summary
+    //     Step: N  |  Best Phi: X.XXXX
+    //   ================================================================
+    //     Eval                      Score               Result
+    //   ----------------------------------------------------------------
+    //     Perplexity                XX.XX               PASS/FAIL
+    //     Generation Quality        X.XX/1.00           PASS/FAIL
+    //     Consciousness (Tension)   X.XXXXXX            PASS/FAIL
+    //     Korean Ratio              XX.X%               PASS/FAIL
+    //     Instruction Following     N/5                 PASS/FAIL
+    //   ----------------------------------------------------------------
+    //     Overall: N/5 passed  -->  READY FOR 13B / ITERATE ON 7B
+    //   ================================================================
+    // TODO[runtime]: format and print table
+    // return all_pass (5/5)
+    false
+}
+
+fn save_results(results: EvalResults, checkpoint_path: string) -> string {
+    // TODO[runtime]: build JSON dict with _meta (checkpoint, timestamp, script)
+    //   write to <checkpoint_dir>/eval_results.json
+    //   return output path
+    ""
+}
+
+// --- Side-by-side comparison ---
+fn compare_checkpoints(results_a: EvalResults, results_b: EvalResults) -> void {
+    // TODO[runtime]: print 78-col table:
+    //   Eval                Checkpoint A        Checkpoint B        Delta
+    //   Perplexity          XX.XXXX             XX.XXXX             +/-X.XXXX </>
+    //   Gen Quality         ...
+    //   Tension (mean)      ...
+    //   Korean Ratio        ...
+    //   Instruction Score   ...
+    //   Pass count          N/5                 N/5
+}
+
+// ===================================================================
+// CLI entry
+// ===================================================================
+
+fn main(args: list) -> void {
+    // Expected: hexa serving/eval.hexa --checkpoint <path> [--corpus <path>] [--base <model>]
+    //           [--device cuda|cpu] [--tension-passes 100] [--compare <path2>]
+    let checkpoint = arg_value(args, "--checkpoint", "")
+    let base = arg_value(args, "--base", "")
+    let corpus = arg_value(args, "--corpus", "")
+    let device = arg_value(args, "--device", "cuda")
+    let tension_passes = to_int(arg_value(args, "--tension-passes", to_string(DEFAULT_TENSION_PASSES)))
+    let compare_ckpt = arg_value(args, "--compare", "")
+
+    if checkpoint == "" {
+        println("ERROR: --checkpoint required")
+        println("Usage: hexa serving/eval.hexa --checkpoint <path> --corpus <path>")
+        return
+    }
+
+    // Auto-detect base model from checkpoint metadata, then local paths, then HF
+    // TODO[runtime]: torch.load(checkpoint) -> ckpt["args"]["base"]
+    // TODO[runtime]: fallback through BASE_CANDIDATES
+
+    // Auto-detect corpus from checkpoint dir or data/
+    // TODO[runtime]: search <ckpt_dir>/../data/corpus_v10.txt, corpus.txt, data/corpus_v10.txt
+
+    let model = load_model(checkpoint, base, device)
+
+    // Run all 5 evaluations
+    let r_ppl = eval_perplexity(model, corpus)
+    let r_gen = eval_generation_quality(model)
+    let r_con = eval_consciousness_metrics(model, tension_passes)
+    let r_kor = eval_korean_ratio(model)
+    let r_ins = eval_instruction_following(model)
+
+    let results = EvalResults {
+        perplexity: r_ppl,
+        generation: r_gen,
+        consciousness: r_con,
+        korean: r_kor,
+        instruction: r_ins,
+        elapsed_seconds: 0.0   // TODO[runtime]: time.time() delta
+    }
+
+    let all_pass = print_summary(results, model)
+    save_results(results, checkpoint)
+
+    // Optional comparison
+    if compare_ckpt != "" {
+        let model2 = load_model(compare_ckpt, base, device)
+        let r2 = EvalResults {
+            perplexity: eval_perplexity(model2, corpus),
+            generation: eval_generation_quality(model2),
+            consciousness: eval_consciousness_metrics(model2, tension_passes),
+            korean: eval_korean_ratio(model2),
+            instruction: eval_instruction_following(model2),
+            elapsed_seconds: 0.0
+        }
+        save_results(r2, compare_ckpt)
+        compare_checkpoints(results, r2)
+    }
+
+    // TODO[runtime]: sys.exit(0 if all_pass else 1)
+}
+
+// --- Verification ---
+println("=== eval.hexa ===")
+println("metrics: 5 (PPL, GenQuality, Consciousness, Korean, Instruction)")
+println("ppl_threshold:", PPL_THRESHOLD)
+println("coherence_threshold:", COHERENCE_THRESHOLD)
+println("korean_threshold:", KOREAN_RATIO_THRESHOLD)
+println("instruction_min:", INSTRUCTION_MIN_PASS)
+println("tension_passes:", DEFAULT_TENSION_PASSES)
+
+theorem eval_invariants {
+    assert PPL_THRESHOLD == 20.0
+    assert COHERENCE_THRESHOLD == 0.5
+    assert KOREAN_RATIO_THRESHOLD == 0.20
+    assert INSTRUCTION_MIN_PASS == 3
+    assert DEFAULT_TENSION_PASSES == 100
+    assert DEFAULT_BLOCK_SIZE == 256
 }
