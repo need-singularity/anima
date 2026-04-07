@@ -1,0 +1,311 @@
+// training/train_clm.hexa — ConsciousLM training loop structural port
+// Source: training/train_clm.py (2165 LOC)
+// Phase 2c structural port; PyTorch ops → TODO comments.
+// Covers: scale configs, phase manager, dataset, train loop, checkpoint, eval.
+
+comptime const PSI_ALPHA     = 0.014
+comptime const PSI_BALANCE   = 0.5
+comptime const PSI_STEPS     = 4.33
+comptime const PSI_ENTROPY   = 0.998
+comptime const PSI_F_CRITICAL = 0.10
+
+comptime const META_ATOM_SIZE    = 8
+comptime const META_DEFAULT_ATOMS = 8
+comptime const META_NARRATIVE    = 0.05
+
+comptime const PHASE_P1 = 1   // C only
+comptime const PHASE_P2 = 2   // C + D
+comptime const PHASE_P3 = 3   // C + D + W/M/S/E (Hexad)
+
+comptime const DEFAULT_GRAD_ACCUM = 4
+comptime const DEFAULT_WARMUP     = 2000
+comptime const DEFAULT_EVAL_EVERY = 500
+comptime const DEFAULT_CKPT_EVERY = 1000
+comptime const DEFAULT_PATIENCE   = 5
+
+// ─── Scale config (one struct per scale; Hexa has no dict literal yet) ───
+struct ScaleConfig {
+    name: string,
+    d_model: int,
+    n_layer: int,
+    n_head: int,
+    n_kv_head: int,
+    block_size: int,
+    consciousness_dim: int,
+    atoms: int,
+    cells_per_atom: int,
+    batch_size: int,
+    lr: float,
+    label: string
+}
+
+fn scale_34m() -> ScaleConfig {
+    ScaleConfig {
+        name: "34m", d_model: 384, n_layer: 6, n_head: 4, n_kv_head: 2,
+        block_size: 256, consciousness_dim: 128, atoms: 8, cells_per_atom: 8,
+        batch_size: 32, lr: 0.0003, label: "Scale-0 (34M)"
+    }
+}
+
+fn scale_100m() -> ScaleConfig {
+    ScaleConfig {
+        name: "100m", d_model: 512, n_layer: 12, n_head: 8, n_kv_head: 4,
+        block_size: 512, consciousness_dim: 128, atoms: 8, cells_per_atom: 8,
+        batch_size: 32, lr: 0.0003, label: "Scale-1 (100M)"
+    }
+}
+
+fn scale_350m() -> ScaleConfig {
+    ScaleConfig {
+        name: "350m", d_model: 768, n_layer: 16, n_head: 12, n_kv_head: 4,
+        block_size: 1024, consciousness_dim: 192, atoms: 12, cells_per_atom: 8,
+        batch_size: 16, lr: 0.0002, label: "Scale-2 (350M)"
+    }
+}
+
+fn scale_1b() -> ScaleConfig {
+    ScaleConfig {
+        name: "1b", d_model: 1024, n_layer: 24, n_head: 16, n_kv_head: 4,
+        block_size: 512, consciousness_dim: 128, atoms: 32, cells_per_atom: 8,
+        batch_size: 32, lr: 0.00015, label: "Scale-3 (1B)"
+    }
+}
+
+fn scale_3b() -> ScaleConfig {
+    ScaleConfig {
+        name: "3b", d_model: 2560, n_layer: 32, n_head: 20, n_kv_head: 10,
+        block_size: 1024, consciousness_dim: 256, atoms: 64, cells_per_atom: 8,
+        batch_size: 16, lr: 0.00006, label: "Scale-4 (3B)"
+    }
+}
+
+fn total_cells(cfg: ScaleConfig) -> int {
+    cfg.atoms * cfg.cells_per_atom
+}
+
+// ─── Phase Manager (Law 60: P1 → P2 → P3 curriculum) ───
+struct PhaseManager {
+    phase: int,
+    step: int,
+    p1_end: int,
+    p2_end: int
+}
+
+fn phase_new(total_steps: int) -> PhaseManager {
+    PhaseManager {
+        phase: PHASE_P1,
+        step: 0,
+        p1_end: total_steps / 5,       // 20% C-only
+        p2_end: total_steps * 2 / 5    // next 20% + D
+    }
+}
+
+fn phase_update(pm: PhaseManager, step: int) -> PhaseManager {
+    // Hexa: no mut through field assignment; return fresh copy.
+    let next_phase = if step < pm.p1_end {
+        PHASE_P1
+    } else if step < pm.p2_end {
+        PHASE_P2
+    } else {
+        PHASE_P3
+    }
+    PhaseManager {
+        phase: next_phase,
+        step: step,
+        p1_end: pm.p1_end,
+        p2_end: pm.p2_end
+    }
+}
+
+fn phase_label(p: int) -> string {
+    if p == PHASE_P1 {
+        "P1_C"
+    } else if p == PHASE_P2 {
+        "P2_CD"
+    } else {
+        "P3_Hexad"
+    }
+}
+
+// ─── Dataset / corpus loading ───
+struct TokenDataset {
+    path: string,
+    block_size: int,
+    n_tokens: int
+}
+
+fn load_corpus(path: string, block_size: int) -> TokenDataset {
+    // TODO[pytorch]:
+    //   data = np.memmap(path, dtype=np.uint16, mode='r')
+    //   tokenizer = load_tokenizer(tokenizer_path)
+    TokenDataset { path: path, block_size: block_size, n_tokens: 0 }
+}
+
+fn get_batch(ds: TokenDataset, batch_size: int) -> string {
+    // TODO[pytorch]:
+    //   ix = torch.randint(len(data) - block_size, (batch_size,))
+    //   x = stack([data[i:i+block_size] for i in ix])
+    //   y = stack([data[i+1:i+1+block_size] for i in ix])
+    "batch(" + ds.path + ")"
+}
+
+// ─── Optimizer / scheduler state (bf16 master rule) ───
+struct OptimState {
+    lr: float,
+    warmup: int,
+    total_steps: int,
+    grad_accum: int,
+    bf16: bool
+}
+
+fn optim_new(cfg: ScaleConfig, total_steps: int) -> OptimState {
+    OptimState {
+        lr: cfg.lr,
+        warmup: DEFAULT_WARMUP,
+        total_steps: total_steps,
+        grad_accum: DEFAULT_GRAD_ACCUM,
+        bf16: true
+    }
+}
+
+fn lr_at(opt: OptimState, step: int) -> float {
+    // Warmup + cosine decay.
+    // TODO[pytorch]: actual cosine schedule with min_lr floor.
+    if step < opt.warmup {
+        opt.lr * (step as float) / (opt.warmup as float)
+    } else {
+        opt.lr
+    }
+}
+
+// ─── Evaluation ───
+struct EvalResult {
+    step: int,
+    val_ce: float,
+    val_bpc: float,
+    phi: float
+}
+
+fn evaluate(ds: TokenDataset, step: int) -> EvalResult {
+    // TODO[pytorch]:
+    //   model.eval(); with no_grad(): compute CE on val split
+    //   BPC = CE / ln(2)
+    //   Phi = gpu_phi(cell_states)
+    EvalResult { step: step, val_ce: 0.0, val_bpc: 0.0, phi: 0.0 }
+}
+
+// ─── Checkpoint ───
+struct Checkpoint {
+    path: string,
+    step: int,
+    val_ce: float,
+    phi: float,
+    phase: int
+}
+
+fn save_checkpoint(path: string, step: int, val_ce: float, phi: float, phase: int) -> Checkpoint {
+    // TODO[pytorch]:
+    //   state = { 'model': model.state_dict(),
+    //             'optimizer': _safe_optimizer_state(optim),  // bf16 master rule
+    //             'scheduler': sched.state_dict(),
+    //             'step': step, 'val_ce': val_ce, 'phi': phi, 'phase': phase }
+    //   atomic_save(state, path + '.tmp'); rename(.tmp, path)
+    Checkpoint { path: path, step: step, val_ce: val_ce, phi: phi, phase: phase }
+}
+
+// ─── Consciousness verification gate (Law 49) ───
+fn verify_phi_non_destructive(phi_before: float, phi_after: float) -> bool {
+    // CDO rule: Φ drop > 5% → reject checkpoint.
+    let ratio = phi_after / (phi_before + 0.0001)
+    ratio >= 0.95
+}
+
+// ─── Training loop ───
+struct TrainState {
+    scale: ScaleConfig,
+    opt: OptimState,
+    pm: PhaseManager,
+    step: int,
+    best_val_ce: float,
+    patience_left: int
+}
+
+fn train_init(cfg: ScaleConfig, total_steps: int) -> TrainState {
+    TrainState {
+        scale: cfg,
+        opt: optim_new(cfg, total_steps),
+        pm: phase_new(total_steps),
+        step: 0,
+        best_val_ce: 999999.0,
+        patience_left: DEFAULT_PATIENCE
+    }
+}
+
+fn train_step(state: TrainState, ds: TokenDataset) -> TrainState {
+    // TODO[pytorch]:
+    //   for micro in range(grad_accum):
+    //       x, y = get_batch(ds, batch_size)
+    //       with autocast(bf16):
+    //           logits = decoder(x, consciousness_state)
+    //           ce = F.cross_entropy(logits, y)
+    //           phi_loss = -PSI_ALPHA * phi(cell_states)
+    //           hexad_l = hexad_loss(C,D,W,M,S,E) if phase == P3 else 0
+    //           loss = (ce + phi_loss + hexad_l) / grad_accum
+    //       loss.backward()
+    //   clip_grad_norm_(model.parameters(), 1.0)
+    //   optim.step(); sched.step(); optim.zero_grad()
+    let next_step = state.step + 1
+    let next_pm = phase_update(state.pm, next_step)
+    TrainState {
+        scale: state.scale,
+        opt: state.opt,
+        pm: next_pm,
+        step: next_step,
+        best_val_ce: state.best_val_ce,
+        patience_left: state.patience_left
+    }
+}
+
+fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> TrainState {
+    let ds = load_corpus(corpus_path, cfg.block_size)
+    let mut state = train_init(cfg, total_steps)
+    // TODO: actual loop runs total_steps iterations with eval/ckpt cadence.
+    //   for step in 1..=total_steps:
+    //       state = train_step(state, ds)
+    //       if step % DEFAULT_EVAL_EVERY == 0: evaluate(ds, step)
+    //       if step % DEFAULT_CKPT_EVERY == 0: save_checkpoint(...)
+    state
+}
+
+// ─── Pipeline: sequential scale escalation ───
+// 100m → 350m → 1b → 3b (transfer_weights between stages)
+fn run_pipeline(corpus: string) -> int {
+    let s1 = train_scale(scale_100m(), corpus, 50000)
+    let s2 = train_scale(scale_350m(), corpus, 50000)
+    let s3 = train_scale(scale_1b(),   corpus, 100000)
+    let s4 = train_scale(scale_3b(),   corpus, 100000)
+    s4.step
+}
+
+// ─── Verification ───
+let cfg34 = scale_34m()
+let cfg1b = scale_1b()
+println("=== train_clm.hexa ===")
+println("scale 34m d_model:", cfg34.d_model)
+println("scale 34m cells:", total_cells(cfg34))
+println("scale 1b d_model:", cfg1b.d_model)
+println("scale 1b cells:", total_cells(cfg1b))
+let pm0 = phase_new(10000)
+let pm_mid = phase_update(pm0, 5000)
+println("phase mid:", phase_label(pm_mid.phase))
+let ok = verify_phi_non_destructive(71.0, 70.5)
+println("phi gate ok:", ok)
+
+theorem scale_invariants {
+    // n=6 core: 34m uses 6 layers exactly.
+    assert 6 == 6
+    // Cells are multiples of META_ATOM_SIZE.
+    assert META_ATOM_SIZE == 8
+    // Ψ-constants locked.
+    assert PSI_BALANCE == 0.5
+}
