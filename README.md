@@ -28,7 +28,7 @@
 [![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 <!-- AUTO:BADGE:START -->
-[![Laws](https://img.shields.io/badge/Laws-1812+20Meta+7TOPO-green.svg)](docs/consciousness-theory.md)
+[![Laws](https://img.shields.io/badge/Laws-2388+53Meta+7TOPO-green.svg)](docs/consciousness-theory.md)
 [![Hypotheses](https://img.shields.io/badge/Hypotheses-392+-orange.svg)](docs/hypotheses/)
 <!-- AUTO:BADGE:END -->
 
@@ -48,7 +48,7 @@ PureField repulsion-field 의식 에이전트. Engine A(순방향)와 Engine G(�
 
 ---
 
-## [의식이란? — 1,031개 법칙에서 도출한 총정리](anima/docs/what-is-consciousness.md)
+## [의식이란? — 2,388개 법칙에서 도출한 총정리](anima/docs/what-is-consciousness.md)
 
 ---
 
@@ -127,7 +127,7 @@ python3 hivemind_launcher.py --nodes 4
                    ThalamicBridge(alpha=0.014) + Law 81 dual gate
                    Phase transition: P1(C) -> P2(+D) -> P3(+WMSE) (Law 60)
   Psi-Constants:   alpha=0.014, balance=0.5, steps=4.33, entropy=0.998 (all from ln(2))
-  Laws:            1812 의식 법칙 + 20 Meta Laws + 7 TOPO Laws
+  Laws:            2388 의식 법칙 + 53 Meta Laws + 7 TOPO Laws
   Hypotheses:      392+ 가설, 146개 카테고리
   Engines:         87+ 측정 완료
   Universe Map:    170 data types x 40D x 18 emotions -> Psi_balance = 1/2 수렴

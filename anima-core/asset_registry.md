@@ -68,7 +68,7 @@
 | Type | Vocab | File | Status |
 |------|-------|------|--------|
 | Byte-level | 256 | built-in | ✅ |
-| BPE 64K | 65536 | anima/data/tokenizer_64k_multilingual.model | ✅ |
+| BPE 64K | 65536 | ready/anima/config/tokenizer_64k_multilingual.model | ✅ |
 
 ### H100 Infrastructure
 

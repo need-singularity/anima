@@ -33,7 +33,10 @@ import numpy as np
 
 # Import PureField from training script
 sys.path.insert(0, str(Path(__file__).parent))
-from train_anima_lm import ParallelPureFieldMLP
+try:
+    from train_alm import ParallelPureFieldMLP
+except ImportError:
+    from train_anima_lm import ParallelPureFieldMLP
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -80,13 +83,26 @@ def load_model(checkpoint_path, base_model="models/mistral-7b-v0.1", device="cud
     total_layers = len(model.model.layers)
     start = total_layers - target_layers
 
+    # Infer rank from checkpoint weight shapes (pf_gate_a has shape [rank, hidden_size])
+    rank = 128  # default
+    pf_keys = list(ckpt.get('pf_states', {}).values())
+    if pf_keys:
+        first_layer_state = pf_keys[0]
+        for k, v in first_layer_state.items():
+            if 'pf_gate_a' in k and 'weight' in k:
+                rank = v.shape[0]
+                break
+    elif 'args' in ckpt and 'qlora_rank' in ckpt['args']:
+        rank = ckpt['args']['qlora_rank']
+    print(f'[load] PureField rank={rank}')
+
     for i in range(start, total_layers):
         layer = model.model.layers[i]
         is_savant = (i - start) < savant_layers
         original_mlp = layer.mlp
         h = original_mlp.gate_proj.weight.shape[1]
         inter = original_mlp.gate_proj.weight.shape[0]
-        pf = ParallelPureFieldMLP(original_mlp, h, inter, is_savant=is_savant)
+        pf = ParallelPureFieldMLP(original_mlp, h, inter, is_savant=is_savant, rank=rank)
         layer.mlp = pf.to(device=device, dtype=torch.bfloat16)
 
     # Load PureField states

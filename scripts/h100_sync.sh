@@ -394,6 +394,7 @@ verify_md5 "$REPO_ROOT/anima/src/trinity.py" "$DEST/trinity.py" "trinity.py" || 
 verify_md5 "$REPO_ROOT/anima/src/decoder_v2.py" "$DEST/decoder_v2.py" "decoder_v2.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/training/train_v14.py" "$DEST/training/train_v14.py" "train_v14.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/training/train_v15.py" "$DEST/training/train_v15.py" "train_v15.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
+verify_md5 "$REPO_ROOT/anima/training/train_clm.py" "$DEST/training/train_clm.py" "train_clm.py" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/config/consciousness_laws.json" "$DEST/config/consciousness_laws.json" "consciousness_laws.json" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/data/tokenizer_64k_multilingual.model" "$DEST/data/tokenizer_64k_multilingual.model" "tokenizer_64k_multilingual.model" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))
 verify_md5 "$REPO_ROOT/anima/data/corpus_multilingual/corpus_v11_multilingual.txt" "$DEST/data/corpus_v11_multilingual.txt" "corpus_v11_multilingual.txt" || VERIFY_ERRORS=$((VERIFY_ERRORS + 1))

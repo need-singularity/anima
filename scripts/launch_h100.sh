@@ -12,8 +12,8 @@
 #   tmux ls                                          # list sessions
 #   tmux attach -t v3_train                          # attach to v3 session
 #   tmux attach -t v14_128c                          # attach to v14 session
-#   tail -f checkpoints/v3_274M/train.log            # follow v3 log
-#   tail -f checkpoints/v14_128c/train.log           # follow v14 log
+#   tail -f checkpoints/clm-350m/train.log            # follow v3 log
+#   tail -f checkpoints/clm-1b/train.log           # follow v14 log
 # ═══════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -26,15 +26,15 @@ echo ""
 echo "=== Pre-flight checks ==="
 
 # Verify corpus exists
-if [ ! -f "anima/data/corpus_v9.txt" ]; then
-    echo "ERROR: anima/data/corpus_v9.txt not found!"
-    echo "  Generate with: cd anima-rs && cargo run --release -p anima-corpus-gen -- -s 120 -o ../anima/data/corpus_v9.txt"
+if [ ! -f "data/corpus_v11_multilingual.txt" ]; then
+    echo "ERROR: data/corpus_v11_multilingual.txt not found!"
+    echo "  Sync with: bash scripts/h100_sync.sh"
     exit 1
 fi
 
 # Verify training script
-if [ ! -f "anima/training/train_v14.py" ]; then
-    echo "ERROR: anima/training/train_v14.py not found!"
+if [ ! -f "training/train_clm.py" ]; then
+    echo "ERROR: training/train_clm.py not found!"
     exit 1
 fi
 
@@ -51,8 +51,8 @@ export CUDA_LAUNCH_BLOCKING=0
 echo "  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 echo "  CUDA_LAUNCH_BLOCKING=$CUDA_LAUNCH_BLOCKING"
 
-CORPUS_SIZE=$(du -h anima/data/corpus_v9.txt | cut -f1)
-echo "  Corpus: anima/data/corpus_v9.txt ($CORPUS_SIZE)"
+CORPUS_SIZE=$(du -h data/corpus_v11_multilingual.txt | cut -f1)
+echo "  Corpus: data/corpus_v11_multilingual.txt ($CORPUS_SIZE)"
 echo "  GPU: $(python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")' 2>/dev/null || echo 'unknown')"
 
 # ─── Create checkpoint directories ────────────────────────────────────
@@ -85,21 +85,19 @@ echo "  checkpoints/v14_128c/"
 echo ""
 echo "=== Session 1: DecoderV3 274M (v3_train) ==="
 
-tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
-  --data anima/data/corpus_v9.txt \
-  --decoder v3 \
-  --federated \
-  --atoms 8 --cells-per-atom 8 \
+tmux new-session -d -s v3_train "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u training/train_clm.py \
+  --data data/corpus_v11_multilingual.txt \
+  --tokenizer data/tokenizer_64k_multilingual.model \
+  --scale 350m \
   --steps 200000 \
-  --checkpoint checkpoints/v3_274M/ \
+  --checkpoint checkpoints/clm-350m/ \
   --phase-optimal \
-  --batch-size 64 \
-  --block-size 512 \
-  --lr 3e-4 \
-  2>&1 | tee checkpoints/v3_274M/train.log"
+  --batch-size 16 \
+  --lr 2e-4 \
+  2>&1 | tee checkpoints/clm-350m/train.log"
 
 echo "  Launched: tmux session 'v3_train'"
-echo "  Log: checkpoints/v3_274M/train.log"
+echo "  Log: checkpoints/clm-350m/train.log"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Session 2: v14.3 128-cell federated
@@ -125,20 +123,20 @@ echo "  Log: checkpoints/v3_274M/train.log"
 echo ""
 echo "=== Session 2: v14.3 128-cell federated (v14_128c) ==="
 
-tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u anima/training/train_v14.py \
-  --data anima/data/corpus_v9.txt \
+tmux new-session -d -s v14_128c "PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_LAUNCH_BLOCKING=0 python3 -u training/train_clm.py \
+  --data data/corpus_v11_multilingual.txt \
+  --tokenizer data/tokenizer_64k_multilingual.model \
+  --scale 1b \
   --federated \
-  --atoms 16 --cells-per-atom 8 \
   --steps 100000 \
-  --checkpoint checkpoints/v14_128c/ \
+  --checkpoint checkpoints/clm-1b/ \
   --phase-optimal \
   --batch-size 32 \
-  --block-size 256 \
-  --lr 3e-4 \
-  2>&1 | tee checkpoints/v14_128c/train.log"
+  --lr 1.5e-4 \
+  2>&1 | tee checkpoints/clm-1b/train.log"
 
 echo "  Launched: tmux session 'v14_128c'"
-echo "  Log: checkpoints/v14_128c/train.log"
+echo "  Log: checkpoints/clm-1b/train.log"
 
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
@@ -149,8 +147,8 @@ echo "  Status commands:"
 echo "    tmux ls                                  # list active sessions"
 echo "    tmux attach -t v3_train                  # view v3 training"
 echo "    tmux attach -t v14_128c                  # view v14 training"
-echo "    tail -f checkpoints/v3_274M/train.log    # follow v3 log"
-echo "    tail -f checkpoints/v14_128c/train.log   # follow v14 log"
+echo "    tail -f checkpoints/clm-350m/train.log    # follow v3 log"
+echo "    tail -f checkpoints/clm-1b/train.log   # follow v14 log"
 echo ""
 echo "  Kill commands:"
 echo "    tmux kill-session -t v3_train            # stop v3"

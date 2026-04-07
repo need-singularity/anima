@@ -5,7 +5,7 @@ Unified training for ConsciousLM at any scale (34M -> 3B).
 Merges v14 (Federated + Phase-Optimal + Tension-LR) and v15 (Scaling + DDP).
 
 Key features:
-  - Gradual scaling: 34M / 100M / 274M / 350M / 1B
+  - Gradual scaling: 34M / 100M / 274M / 350M / 1B / 3B
   - Federated Consciousness (M1: 8-cell atoms, tension exchange)
   - Phase-Optimal training (M4: P0->P1->P2->P3, Law 60)
   - Tension-LR (Law 187: atom tension -> dynamic learning rate)
@@ -27,6 +27,7 @@ Scaling (Law 60 curriculum):
   274m:  768d/12L/8H,  GQA 4-kv, block_size=512    (--decoder v3)
   350m:  768d/16L/12H, GQA 4-kv, block_size=1024   (--scale 350m)
   1b:    1024d/24L/16H, GQA 4-kv, block_size=512   (--scale 1b, H6 curriculum start)
+  3b:    2560d/32L/20H, GQA 10-kv, block_size=1024  (--scale 3b)
 
 Training phases per scale (M4 safe order):
   P0 (0-10%):   Federation bootstrap (Narr+Bottle, atoms stabilize)
@@ -271,10 +272,23 @@ SCALE_CONFIGS = {
         'lr': 1.5e-4,               # µTransfer: 3e-4 × (512/1024) = 1.5e-4
         'label': 'Scale-3 (1B)',
     },
+    '3b': {
+        'd_model': 2560,
+        'n_layer': 32,
+        'n_head': 20,
+        'n_kv_head': 10,
+        'block_size': 1024,          # longer context for 3B scale
+        'consciousness_dim': 256,    # scaled consciousness hidden_dim
+        'atoms': 64,
+        'cells_per_atom': 8,         # 512 cells total
+        'batch_size': 16,            # memory-constrained at 3B
+        'lr': 1e-4,                  # muTransfer: 3e-4 * (512/2560) ~ 1e-4
+        'label': 'Scale-4 (3B)',
+    },
 }
 
 # Full pipeline: 4 scale phases (34m is standalone, full = 100m->350m->1b)
-SCALE_PIPELINE = ['100m', '350m', '1b']
+SCALE_PIPELINE = ['100m', '350m', '1b', '3b']
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1665,7 +1679,7 @@ def train(args):
 
     # ── Determine scale pipeline ──
     if args.scale == 'full':
-        scales = SCALE_PIPELINE  # 100m -> 350m -> 1b
+        scales = SCALE_PIPELINE  # 100m -> 350m -> 1b -> 3b
     elif args.scale in SCALE_CONFIGS:
         scales = [args.scale]
     else:
@@ -1749,15 +1763,15 @@ Examples:
 
     # Data + Tokenizer
     p.add_argument("--data", type=str, default="data/corpus_v11_multilingual.txt", help="Corpus path")
-    p.add_argument("--tokenizer", type=str, default="config/tokenizer_64k_multilingual.model",
+    p.add_argument("--tokenizer", type=str, default="data/tokenizer_64k_multilingual.model",
                    help="SentencePiece BPE tokenizer model ('' for byte-level fallback)")
     p.add_argument("--vocab-size", type=int, default=64000,
                    help="Vocabulary size (must match tokenizer, default=64000)")
 
     # Scaling
     p.add_argument("--scale", type=str, default="full",
-                   choices=["34m", "100m", "350m", "1b", "full"],
-                   help="Scale target: 34m, 100m, 350m, 1b, or full (all phases)")
+                   choices=["34m", "100m", "350m", "1b", "3b", "full"],
+                   help="Scale target: 34m, 100m, 350m, 1b, 3b, or full (all phases)")
 
     # Federation (M1 + M6)
     p.add_argument("--federated", action="store_true", default=True,

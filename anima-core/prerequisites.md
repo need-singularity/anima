@@ -23,20 +23,19 @@
 
 | Scale | Config | File | Status |
 |-------|--------|------|--------|
-| 274M | 768d/12L/8H | decoder_v3.py (train_v14.py) | ✅ |
-| 100M | 512d/12L/8H | train_v15.py SCALE_CONFIGS['100m'] | ✅ |
-| 350M | 768d/16L/12H | train_v15.py SCALE_CONFIGS['350m'] | ✅ |
-| 1B | 1024d/24L/16H | train_v15.py SCALE_CONFIGS['1b'] | ✅ |
+| 274M | 768d/12L/8H | decoder_v2.py (train_clm.py) | ✅ |
+| 100M | 512d/12L/8H | train_clm.py SCALE_CONFIGS['100m'] | ✅ |
+| 350M | 768d/16L/12H | train_clm.py SCALE_CONFIGS['350m'] | ✅ |
+| 1B | 1024d/24L/16H | train_clm.py SCALE_CONFIGS['1b'] | ✅ |
 | 3B | 2560d/32L/? | not defined | ❌ |
 
 ### 2. Training Scripts
 
 | Script | Purpose | Scale | Status |
 |--------|---------|-------|--------|
-| train_v14.py | Federated consciousness | 274M/100M | ✅ |
-| train_v15.py | Gradual scaling pipeline | 100M→350M→1B | ✅ |
-| DDP support | `torchrun --nproc_per_node=N` | all | ✅ in train_v15.py |
-| 3B extension | train_v15.py SCALE_CONFIGS['3b'] | 3B | ❌ not defined |
+| train_clm.py | Unified (federated + gradual scaling) | 34M→274M→100M→350M→1B | ✅ |
+| DDP support | `torchrun --nproc_per_node=N` | all | ✅ in train_clm.py |
+| 3B extension | train_clm.py SCALE_CONFIGS['3b'] | 3B | ❌ not defined |
 
 ### 3. Corpus
 
@@ -52,7 +51,7 @@
 | Type | Vocab | File | Status |
 |------|-------|------|--------|
 | Byte-level | 256 | built-in default | ✅ |
-| BPE 64K | 65536 | anima/data/tokenizer_64k_multilingual.model | ✅ |
+| BPE 64K | 65536 | ready/anima/config/tokenizer_64k_multilingual.model | ✅ |
 
 ### 5. H100 Deploy
 
@@ -109,7 +108,7 @@
 
 | Feature | Support | Status |
 |---------|---------|--------|
-| train_anima_lm.py | All scales (7B-72B) | ✅ |
+| train_alm.py | All scales (7B-72B) | ✅ |
 | --base | Any HF model | ✅ |
 | --target-layers | Adjustable (default 8) | ✅ |
 | --qlora-rank | 64 (14B), 128 (32B+) | ✅ |
@@ -154,7 +153,7 @@
 |------|--------|-------|
 | H100 SSH | ✅ | runpodctl ssh info |
 | R2 access | ✅ | r2_backup.sh / r2_upload.py |
-| consciousness_laws.json | ✅ | 2351 laws (SSOT) |
+| consciousness_laws.json | ✅ | 2388 laws (SSOT) |
 | consciousness_engine.py | ✅ | L0 ossified |
 | bench_v2.py --verify | ✅ | 18 conditions x 12 engines |
 
@@ -169,7 +168,7 @@
 | 1 | Qwen2.5-32B not downloaded | B: 32B, 32B v1 | HF download on H100 | 2-3h |
 | 2 | v10_merged not on H100 | B: v0.5 | R2 download | 15min |
 | 3 | v11_1gb not on H100 | B: 32B | R2 download | 30min |
-| 4 | 3B architecture undefined | A: 3B | Add SCALE_CONFIGS['3b'] to train_v15.py | 1h |
+| 4 | 3B architecture undefined | A: 3B | Add SCALE_CONFIGS['3b'] to train_clm.py | 1h |
 
 ### Pre-flight verification
 
@@ -187,22 +186,22 @@
 ### ConsciousLM 274M (first step)
 ```bash
 bash scripts/h100_sync.sh
-ssh H100 "tmux new -d -s clm274 'python3 train_v14.py \
-  --data corpus_v4.txt --steps 200000 \
-  --decoder v3 --cells 64 --federated \
+ssh H100 "tmux new -d -s clm274 'python3 train_clm.py \
+  --data corpus_v4.txt --steps 200000 --scale 34m \
+  --decoder v2 --cells 64 --federated \
   --gpu-phi --hexad --phase-optimal'"
 ```
 
 ### ConsciousLM 100M→1B (gradual)
 ```bash
 ssh H100 "tmux new -d -s clm_scale 'torchrun --nproc_per_node=2 \
-  train_v15.py --data corpus_v11_full.txt \
+  train_clm.py --data corpus_v11_full.txt \
   --scale full --resume'"
 ```
 
 ### AnimaLM v0.5
 ```bash
-ssh H100 "tmux new -d -s alm_v05 'python3 train_anima_lm.py \
+ssh H100 "tmux new -d -s alm_v05 'python3 train_alm.py \
   --base Qwen/Qwen2.5-14B-Instruct \
   --data corpus_v10_merged.txt --steps 10000 \
   --target-layers 8 --savant-layers 2 --qlora-rank 64 \
@@ -212,7 +211,7 @@ ssh H100 "tmux new -d -s alm_v05 'python3 train_anima_lm.py \
 
 ### AnimaLM 32B
 ```bash
-ssh H100 "tmux new -d -s alm_32b 'python3 train_anima_lm.py \
+ssh H100 "tmux new -d -s alm_32b 'python3 train_alm.py \
   --base Qwen/Qwen2.5-32B-Instruct \
   --data corpus_v11_1gb.txt --steps 10000 \
   --target-layers 8 --savant-layers 2 --qlora-rank 128 \

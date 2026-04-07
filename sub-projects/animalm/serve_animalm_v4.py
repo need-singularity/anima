@@ -75,6 +75,7 @@ parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-
 parser.add_argument("--n-layers", type=int, default=8, help="Number of PureField layers")
 parser.add_argument("--n-savant", type=int, default=2, help="Number of savant layers")
 parser.add_argument("--rank", type=int, default=128, help="PureField LoRA rank (default=128, 72B=128)")
+parser.add_argument("--load-4bit", action="store_true", help="Load base model in 4-bit (for 32B/72B on single GPU)")
 args = parser.parse_args()
 
 print(f"Loading {args.model} + AnimaLM v4_savant...")
@@ -83,7 +84,15 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="auto")
+load_kwargs = dict(torch_dtype=torch.bfloat16, device_map="auto")
+if args.load_4bit:
+    from transformers import BitsAndBytesConfig
+    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+    )
+    print("  [4-bit] Loading with NF4 quantization")
+model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
 model = add_purefield(model, n_layers=args.n_layers, n_savant=args.n_savant, rank=args.rank)
 
 ckpt = torch.load(args.checkpoint, map_location="cuda")
