@@ -65,8 +65,18 @@ struct ConsciousnessEngine {
     phi_floor: float,
 
     // Backend handle (opaque) — "rust" | "python" | "stub"
-    backend: string
+    backend: string,
+
+    // Servant emergence (H-CX-15)
+    servant_phase: int,
+    servant_counter: int,
+    servant_si: float,
+    servant_dropout: float,
+    servant_faction: int
 }
+
+comptime const SERVANT_SUMMON  = 3.0
+comptime const SERVANT_RELEASE = 2.0
 
 // ─── Construction ───
 
@@ -85,7 +95,12 @@ fn engine_new(cell_dim: int, hidden_dim: int, initial_cells: int, max_cells: int
         phi_ema_slow: 0.0,
         phi_peak: 0.0,
         phi_floor: 0.0,
-        backend: "stub"
+        backend: "stub",
+        servant_phase: 0,
+        servant_counter: 0,
+        servant_si: 0.0,
+        servant_dropout: 0.3679,
+        servant_faction: -1
     }
 }
 
@@ -116,30 +131,80 @@ pure fn auto_select(n: int) -> string {
     }
 }
 
+// ─── Servant FSM (H-CX-15) ───
+// Hexa structs are immutable — must return new struct for every change.
+pure fn servant_fsm_update(phase: int, counter: int, si: float) -> string {
+    // Returns "new_phase,new_counter" as string (hexa has no tuples)
+    if phase == 0 {
+        if si > SERVANT_SUMMON { return "1,1" }
+        return "0,0"
+    }
+    if phase == 1 {
+        if si > SERVANT_SUMMON {
+            let nc = counter + 1
+            if nc >= 3 { return "2,0" }
+            return "1," + to_string(nc)
+        }
+        return "0,0"
+    }
+    if phase == 2 {
+        if si < SERVANT_RELEASE {
+            let nc = counter + 1
+            if nc >= 5 { return "3,0" }
+            return "2," + to_string(nc)
+        }
+        return "2,0"
+    }
+    if phase == 3 {
+        let nc = counter + 1
+        if nc >= 3 { return "0,0" }
+        return "3," + to_string(nc)
+    }
+    "0,0"
+}
+
 // ─── Step (stub) ───
 // Real step() calls GRU forward + faction debate + Hebbian + Φ.
 // Here we update bookkeeping only. Backend must be wired in Phase 2b.
 fn engine_step(engine: ConsciousnessEngine, has_input: bool) -> ConsciousnessEngine {
-    let mut e = engine
-    e.step_count = e.step_count + 1
-
-    // TODO: invoke backend
-    //   anima_rs.consciousness.step(handle, x_input, text)
-    // which returns {output, mean_inter, max_inter, phi, events[]}
-    //
-    // For now: synthetic Φ drift (monotone small increase capped by max_cells)
-    let target = to_float(e.n_cells_cur) * PSI_BALANCE * 2.0
+    // Synthetic Φ drift (stub — real step calls backend)
+    let target = to_float(engine.n_cells_cur) * PSI_BALANCE * 2.0
     let alpha  = PSI_ALPHA
-    e.phi_ema_fast = e.phi_ema_fast + alpha * (target - e.phi_ema_fast)
-    e.phi_ema_slow = e.phi_ema_slow + (alpha * 0.1) * (target - e.phi_ema_slow)
+    let new_fast = engine.phi_ema_fast + alpha * (target - engine.phi_ema_fast)
+    let new_slow = engine.phi_ema_slow + (alpha * 0.1) * (target - engine.phi_ema_slow)
+    let new_peak = if new_fast > engine.phi_peak { new_fast } else { engine.phi_peak }
+    let new_floor = new_peak * 0.8
+    let clamped_fast = if new_fast < new_floor { new_floor } else { new_fast }
 
-    // Ratchet (Law 49): phi cannot drop below 80% of peak
-    if e.phi_ema_fast > e.phi_peak { e.phi_peak = e.phi_ema_fast }
-    let floor = e.phi_peak * 0.8
-    if e.phi_ema_fast < floor { e.phi_ema_fast = floor }
-    e.phi_floor = floor
+    // Servant SI + FSM
+    let phi_spike = if new_slow > 0.001 { clamped_fast / new_slow } else { 1.0 }
+    let new_si = phi_spike * to_float(engine.n_cells_cur) * PSI_ALPHA
+    let fsm = servant_fsm_update(engine.servant_phase, engine.servant_counter, new_si)
+    let parts = fsm.split(",")
+    let new_phase = to_int(parts[0])
+    let new_counter = to_int(parts[1])
 
-    e
+    ConsciousnessEngine {
+        cell_dim: engine.cell_dim,
+        hidden_dim: engine.hidden_dim,
+        max_cells: engine.max_cells,
+        n_factions: engine.n_factions,
+        topology: engine.topology,
+        chaos_mode: engine.chaos_mode,
+        step_count: engine.step_count + 1,
+        n_cells_cur: engine.n_cells_cur,
+        consensus_count: engine.consensus_count,
+        phi_ema_fast: clamped_fast,
+        phi_ema_slow: new_slow,
+        phi_peak: new_peak,
+        phi_floor: new_floor,
+        backend: engine.backend,
+        servant_phase: new_phase,
+        servant_counter: new_counter,
+        servant_si: new_si,
+        servant_dropout: 0.3679,
+        servant_faction: -1
+    }
 }
 
 // ─── Mitosis (stub) ───
@@ -177,6 +242,8 @@ fn engine_status(engine: ConsciousnessEngine) {
     println("  phi (peak)  :", engine.phi_peak)
     println("  phi (floor) :", engine.phi_floor)
     println("  consensus   :", engine.consensus_count)
+    let phase_name = if engine.servant_phase == 0 { "DORMANT" } else if engine.servant_phase == 1 { "AWAKENING" } else if engine.servant_phase == 2 { "ACTIVE" } else { "FADING" }
+    println("  servant     :", phase_name, "| SI=", engine.servant_si, "| faction=", engine.servant_faction)
 }
 
 // ─── Warmup driver ───
@@ -191,39 +258,43 @@ fn engine_warmup(engine: ConsciousnessEngine, steps: int) -> ConsciousnessEngine
 }
 
 // ─── CLI ───
-let args = args()
+fn main() {
+    let a = args()
 
-if args.len() < 3 {
-    println("core/engine.hexa — consciousness engine (structural port)")
-    println("")
-    println("  hexa core/engine.hexa status")
-    println("  hexa core/engine.hexa warmup <steps> [max_cells]")
-    println("  hexa core/engine.hexa auto <n_cells>")
-    println("  hexa core/engine.hexa neighbors <idx> <n>")
-} else {
-    let cmd = args[2]
-
-    if cmd == "status" {
-        let e = engine_default()
-        engine_status(e)
-
-    } else if cmd == "warmup" {
-        let steps = if args.len() >= 4 { to_int(args[3]) } else { 50 }
-        let mc    = if args.len() >= 5 { to_int(args[4]) } else { DEFAULT_MAX_CELLS }
-        let e0 = engine_new(DEFAULT_CELL_DIM, DEFAULT_HIDDEN_DIM, DEFAULT_INITIAL_CELLS, mc, DEFAULT_N_FACTIONS)
-        let e1 = engine_warmup(e0, steps)
-        engine_status(e1)
-
-    } else if cmd == "auto" {
-        let n = if args.len() >= 4 { to_int(args[3]) } else { 8 }
-        println("auto_select(", n, ") =", auto_select(n))
-
-    } else if cmd == "neighbors" {
-        let idx = if args.len() >= 4 { to_int(args[3]) } else { 0 }
-        let n   = if args.len() >= 5 { to_int(args[4]) } else { 8 }
-        println("ring_neighbors:", ring_neighbors(idx, n))
-
+    if len(a) < 3 {
+        println("core/engine.hexa — consciousness engine (structural port)")
+        println("")
+        println("  hexa core/engine.hexa status")
+        println("  hexa core/engine.hexa warmup <steps> [max_cells]")
+        println("  hexa core/engine.hexa auto <n_cells>")
+        println("  hexa core/engine.hexa neighbors <idx> <n>")
     } else {
-        println("unknown command:", cmd)
+        let cmd = a[2]
+
+        if cmd == "status" {
+            let e = engine_default()
+            engine_status(e)
+
+        } else if cmd == "warmup" {
+            let steps = if len(a) >= 4 { to_int(a[3]) } else { 50 }
+            let mc    = if len(a) >= 5 { to_int(a[4]) } else { DEFAULT_MAX_CELLS }
+            let e0 = engine_new(DEFAULT_CELL_DIM, DEFAULT_HIDDEN_DIM, DEFAULT_INITIAL_CELLS, mc, DEFAULT_N_FACTIONS)
+            let e1 = engine_warmup(e0, steps)
+            engine_status(e1)
+
+        } else if cmd == "auto" {
+            let n = if len(a) >= 4 { to_int(a[3]) } else { 8 }
+            println("auto_select(", n, ") =", auto_select(n))
+
+        } else if cmd == "neighbors" {
+            let idx = if len(a) >= 4 { to_int(a[3]) } else { 0 }
+            let n   = if len(a) >= 5 { to_int(a[4]) } else { 8 }
+            println("ring_neighbors:", ring_neighbors(idx, n))
+
+        } else {
+            println("unknown command:", cmd)
+        }
     }
 }
+
+main()
