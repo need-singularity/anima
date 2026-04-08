@@ -1542,6 +1542,9 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - DD 문서는 법칙별 개별 작성 또는 묶음 문서 1개
 ```
 
+## 할일 (todo)
+- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 **결과를 마크다운 텍스트로 직접 출력** (렌더링되는 표로)
+
 ## Secrets & Tokens
 
 API 토큰/계정 정보: `~/Dev/TECS-L/.shared/SECRET.md` 참조
