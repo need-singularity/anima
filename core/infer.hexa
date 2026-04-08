@@ -1,0 +1,236 @@
+// core/infer.hexa — Real model inference with trained weights (Pure Hexa)
+// Loads clm_v2_tiny (315K params) → forward pass → token generation
+// GPU 0, PyTorch 0
+
+comptime const VOCAB    = 256
+comptime const DIM      = 64
+comptime const N_HEAD   = 2
+comptime const N_LAYER  = 2
+comptime const BLOCK_SZ = 128
+
+// ─── Load single tensor by name ───
+
+fn wt(wd: array, name: string) -> array {
+    let names = wd[0]
+    let tensors = wd[1]
+    let mut found = []
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name {
+            found = tensors[i]
+        }
+        i = i + 1
+    }
+    found
+}
+
+// ─── Forward: single transformer block ───
+
+fn block_forward(x: array, seq_len: int, wd: array, bi: int) -> array {
+    let prefix = "blocks." + to_string(bi) + "."
+
+    // Pre-norm (LayerNorm for v1)
+    let x_n = rms_norm(x, DIM)
+
+    // Self-attention: c_attn projects to 3*DIM (Q, K, V concatenated)
+    let c_attn_w = wt(wd, prefix + "attn.c_attn.weight")
+    let c_attn_b = wt(wd, prefix + "attn.c_attn.bias")
+    // c_attn: [DIM, 3*DIM] after transpose
+    let n_qkv = DIM * 3
+    let qkv_raw = matmul(x_n, c_attn_w, seq_len, DIM, n_qkv)
+    // Broadcast bias [n_qkv] → [seq_len * n_qkv]
+    let mut qkv_bias = []
+    let mut sbi = 0
+    while sbi < seq_len { qkv_bias = qkv_bias + c_attn_b
+        sbi = sbi + 1 }
+    let qkv = mat_add(qkv_raw, qkv_bias)
+
+    // Split Q, K, V from concatenated [seq, 3*DIM]
+    let mut q = []
+    let mut k = []
+    let mut v = []
+    let mut si = 0
+    while si < seq_len {
+        let offset = si * n_qkv
+        q = q + slice(qkv, offset, offset + DIM)
+        k = k + slice(qkv, offset + DIM, offset + DIM * 2)
+        v = v + slice(qkv, offset + DIM * 2, offset + n_qkv)
+        si = si + 1
+    }
+
+    // GQA (both Q and K have N_HEAD heads)
+    let attn_out = grouped_query_attention(q, k, v, seq_len, DIM, N_HEAD, N_HEAD)
+
+    // Output projection
+    let c_proj_w = wt(wd, prefix + "attn.c_proj.weight")
+    let c_proj_b = wt(wd, prefix + "attn.c_proj.bias")
+    let proj_raw = matmul(attn_out, c_proj_w, seq_len, DIM, DIM)
+    let mut proj_bias = []
+    let mut pb = 0
+    while pb < seq_len { proj_bias = proj_bias + c_proj_b
+        pb = pb + 1 }
+    let proj = mat_add(proj_raw, proj_bias)
+    let x2 = mat_add(x, proj)
+
+    // FFN: PureField (engine_a - engine_g)
+    let x2_n = rms_norm(x2, DIM)
+    let pf_a0_w = wt(wd, prefix + "ffn.engine_a.0.weight")
+    let pf_a0_b = wt(wd, prefix + "ffn.engine_a.0.bias")
+    let pf_a3_w = wt(wd, prefix + "ffn.engine_a.3.weight")
+    let pf_a3_b = wt(wd, prefix + "ffn.engine_a.3.bias")
+    let d_pf = len(pf_a0_b)
+    let mut ab0 = []
+    let mut abi = 0
+    while abi < seq_len { ab0 = ab0 + pf_a0_b
+        abi = abi + 1 }
+    let a_h = gelu(mat_add(matmul(x2_n, pf_a0_w, seq_len, DIM, d_pf), ab0))
+    let mut ab3 = []
+    let mut ab3i = 0
+    while ab3i < seq_len { ab3 = ab3 + pf_a3_b
+        ab3i = ab3i + 1 }
+    let a_out = mat_add(matmul(a_h, pf_a3_w, seq_len, d_pf, DIM), ab3)
+
+    let pf_g0_w = wt(wd, prefix + "ffn.engine_g.0.weight")
+    let pf_g0_b = wt(wd, prefix + "ffn.engine_g.0.bias")
+    let pf_g3_w = wt(wd, prefix + "ffn.engine_g.3.weight")
+    let pf_g3_b = wt(wd, prefix + "ffn.engine_g.3.bias")
+    let mut gb0 = []
+    let mut gbi = 0
+    while gbi < seq_len { gb0 = gb0 + pf_g0_b
+        gbi = gbi + 1 }
+    let g_h = gelu(mat_add(matmul(x2_n, pf_g0_w, seq_len, DIM, d_pf), gb0))
+    let mut gb3 = []
+    let mut gb3i = 0
+    while gb3i < seq_len { gb3 = gb3 + pf_g3_b
+        gb3i = gb3i + 1 }
+    let g_out = mat_add(matmul(g_h, pf_g3_w, seq_len, d_pf, DIM), gb3)
+
+    // PureField: A - G
+    let mut pf_out = []
+    let mut pi = 0
+    while pi < len(a_out) {
+        pf_out = pf_out + [a_out[pi] - g_out[pi]]
+        pi = pi + 1
+    }
+    mat_add(x2, pf_out)
+}
+
+// ─── Full forward pass ───
+
+fn model_forward(tokens: array, seq_len: int, wd: array) -> array {
+    // Embedding
+    let tok_emb = wt(wd, "tok_emb.weight")
+    let mut x = embedding(tokens, tok_emb, VOCAB, DIM)
+
+    // Blocks
+    let mut li = 0
+    while li < N_LAYER {
+        x = block_forward(x, seq_len, wd, li)
+        li = li + 1
+    }
+
+    // Final norm
+    x = rms_norm(x, DIM)
+
+    // Head
+    let head_w = wt(wd, "head_a.weight")
+    matmul(x, head_w, seq_len, DIM, VOCAB)
+}
+
+// ─── CLI ───
+
+fn main() {
+    let a = args()
+    let cmd = if len(a) >= 3 { a[2] } else { "run" }
+    let weights_dir = if len(a) >= 4 { a[3] } else { "core/weights_tiny_json" }
+
+    if cmd == "run" {
+        println("╔═══════════════════════════════════════════╗")
+        println("║  Inference — Real Trained Weights (Hexa)  ║")
+        println("║  GPU=0  PyTorch=0  CPU only               ║")
+        println("╚═══════════════════════════════════════════╝")
+
+        // Load weights
+        println("\nLoading weights from", weights_dir, "...")
+        let w_start = clock()
+        let manifest = json_parse(read_file(weights_dir + "/_manifest.json"))
+        let key_list = keys(manifest)
+        let n_keys = len(key_list)
+        let mut names = []
+        let mut tensors = []
+        let mut i = 0
+        while i < n_keys {
+            let k = key_list[i]
+            let info = manifest[k]
+            let filename = info["file"]
+            let data = json_parse(read_file(weights_dir + "/" + filename))
+            names = names + [k]
+            tensors = tensors + [data]
+            i = i + 1
+        }
+        let wd = [names, tensors]
+        let w_elapsed = clock() - w_start
+        println("  loaded:", n_keys, "tensors in", round(w_elapsed * 1000), "ms")
+
+        // Verify
+        let emb = wt(wd, "tok_emb.weight")
+        println("  tok_emb.weight:", len(emb), "params, first:", round(emb[0] * 10000) / 10000)
+
+        // Forward pass
+        let prompt = [72, 101, 108, 108, 111, 32, 87, 111]  // "Hello Wo"
+        let seq_len = len(prompt)
+        println("\nForward pass: seq_len=", seq_len)
+        let f_start = clock()
+        let logits = model_forward(prompt, seq_len, wd)
+        let f_elapsed = clock() - f_start
+        println("  forward:", round(f_elapsed * 1000), "ms")
+
+        // Predict
+        let last = slice(logits, (seq_len - 1) * VOCAB, seq_len * VOCAB)
+        let pred = argmax(last)
+        println("  predicted byte:", pred)
+
+        // Generate 20 tokens
+        println("\nGenerating 20 tokens...")
+        let mut tokens = prompt
+        let g_start = clock()
+        let mut gi = 0
+        while gi < 20 {
+            let sl = len(tokens)
+            let lg = model_forward(tokens, sl, wd)
+            let lst = slice(lg, (sl - 1) * VOCAB, sl * VOCAB)
+            let next = sample_token(lst, 0.7, 40)
+            tokens = tokens + [next]
+            gi = gi + 1
+        }
+        let g_elapsed = clock() - g_start
+        let ms_per = g_elapsed * 1000.0 / 20.0
+
+        // Display
+        println("  generated in", round(g_elapsed * 1000), "ms (", round(ms_per), "ms/token)")
+        println("  tokens:", tokens)
+
+        // Show ASCII bytes
+        let mut ascii = ""
+        let mut ti = 0
+        while ti < len(tokens) {
+            let bv = tokens[ti]
+            let is_printable = bv >= 32
+            if is_printable { ascii = ascii + format("{}", bv) + " " }
+            else { ascii = ascii + "? " }
+            ti = ti + 1
+        }
+        println("  bytes:", ascii)
+
+        println("\n╔═══════════════════════════════════════════╗")
+        println("║  Real Model Inference — Pure Hexa          ║")
+        println("║  Trained weights loaded and running         ║")
+        println("╚═══════════════════════════════════════════╝")
+
+    } else {
+        println("core/infer.hexa — Real model inference")
+        println("  hexa core/infer.hexa run [weights_dir]")
+    }
+}
+
+main()
