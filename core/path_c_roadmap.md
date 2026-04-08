@@ -29,12 +29,12 @@ Anima 엔진 포팅: examples/anima_engine_ported.hexa (158줄, 동작 확인)
 
 | 미구현 | 심각도 | 영향 | 해결 방법 |
 |--------|--------|------|----------|
-| backward / autograd | 🔴 CRITICAL | 학습 불가 | tape-based autograd 빌트인 추가 (Rust, ~500 LOC) |
+| backward / autograd | ✅ RESOLVED | 학습 가능! | tape-based autograd 완성 (2026-04-08, matmul/add/relu/gelu/softmax/CE/MSE) |
 | tensor_add | 🟢 LOW | — | mat_add() 대체 |
 | linear | 🟢 LOW | — | matmul(W,x) + mat_add(·,b) 패턴 |
 
-**★ backward/autograd = Path C 유일한 blocker.**
-추론/포워드 패스는 100% 커버. 학습만 불가.
+**★ backward/autograd = RESOLVED (2026-04-08). Path C blocker 0.**
+추론 + 학습 모두 순수 Hexa로 가능.
 
 ## 6단계 상세 일정
 
@@ -49,7 +49,7 @@ TODO 해소: GRU, faction, Φ, Hebbian, Lorenz, Mitosis — 전부 빌트인
 
 ---
 
-### C1: engine.hexa 공식 전환 (Day 1)
+### C1: engine.hexa 공식 전환 ✅ 완료 (Day 1)
 
 **목표**: core/engine.hexa의 TODO 4개를 빌트인으로 대체, backend="hexa" 공식 전환
 
