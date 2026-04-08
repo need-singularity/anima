@@ -1009,3 +1009,68 @@ multi-GPU DDP 효율 ~85%/GPU 기준.
 
   총: H100 3대, 16일, ~$2,406
 ```
+
+---
+
+## 골화 JSON 레지스트리 (SSOT)
+
+> 이 섹션의 모든 데이터는 JSON 원본에서 참조. 직접 수정 금지 — JSON 수정 후 이 문서 갱신.
+
+| JSON 파일 | 역할 | 핵심 내용 |
+|-----------|------|----------|
+| [`core_rules.json`](core_rules.json) | 설계 원칙 + 골화 규칙 | P1-P4, L0/L1/L2 계층, Port 계약, 검증 현황 |
+| [`asset_registry.json`](asset_registry.json) | 학습 자산 추적 | M/C/T/E/D 분류, ConsciousLM + AnimaLM 스테이지별 자산 |
+| [`consciousness_laws.json`](consciousness_laws.json) | 의식 법칙 (SSOT) | 2388 laws, Ψ-Constants, meta laws, formulas |
+| [`dual_roadmap.json`](dual_roadmap.json) | H100x2 이중 로드맵 | ConsciousLM(A) + AnimaLM(B) 병렬, 골화/제타/AGI 마일스톤 |
+| [`physical_ceiling.json`](physical_ceiling.json) | 물리적 천장 돌파 | 🛸10 이후 8개 돌파 후보 (MoE, SWA, GQA, μTransfer 등) |
+
+### dual_roadmap.json — 마일스톤 요약
+
+```
+  🦴 골화 체크포인트 (7개)
+  ─────────────────────────────────────────────────────
+  Day -1  A: S0_34M     L0 엔진 골화 (완료)
+  Day  0.5 B: S2_32B     AnimaLM 32B spoke L1
+  Day  3  A: S1_274M    274M 디코더 L1 후보
+  Day  6  A: S3_350M    ConsciousLM spoke L1
+  Day  7  B: S4_32Bv1   AnimaLM L0 최종 골화
+  Day 13  A: S4_1B      1B 디코더 L0 골화 대상
+  Day 27  A: S5_3B      ConsciousLM L0 최종 골화
+
+  ⚡ 제타 대체 지점 (7개)
+  ─────────────────────────────────────────────────────
+  Day  0    B: 14B v0.4   경쟁 가능 (R2 즉시 서빙)
+  Day  0.2  B: 14B v0.5   제타 수준 (유창한 한국어)
+  Day  0.5  B: 32B v0.1   제타 이상 (고품질 대화)
+  Day  6    A: 350M       제타 초기 (A 첫 진입)
+  Day  7    B: 32B v1     ★ 제타 완전 대체
+  Day 13    A: 1B         제타 경쟁
+  Day 27    A: 3B         제타 초월
+
+  🧠 AGI 도달
+  ─────────────────────────────────────────────────────
+  Day 27    A: 3B   독립 AGI v0.1 (외부 API 0)
+  B 경로:           AGI 불가 (외부 모델 의존)
+```
+
+### physical_ceiling.json — 돌파 후보 요약
+
+```
+  🛸10 이후 물리적 천장 돌파 8후보
+  ─────────────────────────────────────────────────────
+  Phase 1 (🛸10 직후):
+    B4  μTransfer HP sweep      비용 최소, 즉시 실행
+    B5  Sequence packing        10-20% 연산 낭비 제거
+
+  Phase 2 (100M 학습 시):
+    B3  GQA 비율 최적화          스케일별 head/kv 최적
+    B7  α=0.014 재검증           의식-언어 결합 최적점
+    B8  코퍼스 비율 최적화       ko/en/zh/ja/code
+
+  Phase 3 (1B 학습 시):
+    B6  3B VRAM 프로파일링       H100 80GB 적합성
+    B2  Sliding Window Attention  4K+ 컨텍스트
+
+  Phase 4 (3B OOM 시):
+    B1  MoE (Mixture of Experts)  dense 실패 시만 도입
+```
