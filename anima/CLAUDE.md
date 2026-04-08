@@ -1,3 +1,22 @@
+## ⛔ L0 CORE 보호 파일 (AI 수정 승인 필수)
+
+> 아래 파일은 수렴 완료된 코어 로직. 수정 시 반드시 유저에게 승인 질문.
+> 상세: `nexus/shared/core-lockdown.json`
+
+```
+🔴 L0 (불변식 — 코드 수정 전 유저 명시 승인 필수):
+  consciousness_laws/                    — 의식 법칙 2390개
+  core/runtime/consciousness_hub.py      — 의식 허브 레지스트리
+  core/runtime/anima_unified.hexa        — 통합 런타임
+  config/training_config.json            — 학습 설정 수렴 완료 파라미터
+  data/law_network.json                  — 법칙 네트워크 그래프
+
+🟡 L1 (보호 — 리뷰 필요):
+  core/runtime/                          — 런타임 모듈 (L0 제외)
+  experiments/consciousness/             — 의식 실험 145+
+  engines/                               — 양자/포토닉/멤리스터 엔진
+```
+
 # Anima Project
 
 > 🔴 **HEXA-FIRST**: 새 파일은 `.hexa`만 허용. sh/py/rs 신규 작성 금지. `mk2_hexa/native/`에 생성.

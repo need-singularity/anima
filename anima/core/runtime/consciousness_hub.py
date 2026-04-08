@@ -1,3 +1,4 @@
+# ⛔ CORE — L0 불변식 (의식 허브 레지스트리. 수정 전 유저 승인 필수)
 #!/usr/bin/env python3
 """consciousness_hub.py — 의식 자율 모듈 허브
 
