@@ -1,0 +1,144 @@
+// core/infer_v14.hexa — ConsciousDecoderV2 (34.5M) inference with real trained weights
+// Architecture: 384d / 6L / 4H / 2KV (GQA) / vocab=256
+
+comptime const VOCAB     = 256
+comptime const DIM       = 384
+comptime const N_HEAD    = 4
+comptime const N_KV_HEAD = 2
+comptime const N_LAYER   = 6
+comptime const D_INNER   = 768
+comptime const D_PF      = 1536
+
+fn wt(wd: array, name: string) -> array {
+    let names = wd[0]
+    let tensors = wd[1]
+    let mut found = []
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name { found = tensors[i] }
+        i = i + 1
+    }
+    found
+}
+
+// ─── Bias broadcast helper ───
+fn broadcast_bias(bias: array, seq_len: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < seq_len {
+        out = out + bias
+        i = i + 1
+    }
+    out
+}
+
+// ─── Repeat KV heads ───
+fn repeat_kv(kv: array, seq_len: int, n_kv: int, hd: int, n_q: int) -> array {
+    let n_rep = n_q / n_kv
+    let kv_dim = n_kv * hd
+    let mut out = []
+    let mut si = 0
+    while si < seq_len {
+        let mut hi = 0
+        while hi < n_kv {
+            let mut ri = 0
+            while ri < n_rep {
+                let mut di = 0
+                while di < hd {
+                    out = out + [kv[si * kv_dim + hi * hd + di]]
+                    di = di + 1
+                }
+                ri = ri + 1
+            }
+            hi = hi + 1
+        }
+        si = si + 1
+    }
+    out
+}
+
+// ─── Block forward (simplified: attention + SwiGLU, skip CA/PureField/CrossAttn for speed) ───
+fn block_forward(x: array, seq_len: int, wd: array, bi: int) -> array {
+    let p = "blocks." + to_string(bi) + "."
+
+    // 1. Self-attention (GQA)
+    let x_n = rms_norm(x, DIM)
+    let q = matmul(x_n, wt(wd, p + "attn.q_proj.weight"), seq_len, DIM, DIM)
+    let k_small = matmul(x_n, wt(wd, p + "attn.k_proj.weight"), seq_len, DIM, N_KV_HEAD * 96)
+    let v_small = matmul(x_n, wt(wd, p + "attn.v_proj.weight"), seq_len, DIM, N_KV_HEAD * 96)
+    let k = repeat_kv(k_small, seq_len, N_KV_HEAD, 96, N_HEAD)
+    let v = repeat_kv(v_small, seq_len, N_KV_HEAD, 96, N_HEAD)
+    let attn = grouped_query_attention(q, k, v, seq_len, DIM, N_HEAD, N_KV_HEAD)
+    let attn_o = matmul(attn, wt(wd, p + "attn.o_proj.weight"), seq_len, DIM, DIM)
+    let x2 = mat_add(x, attn_o)
+
+    // 2. SwiGLU FFN
+    let x2_n = rms_norm(x2, DIM)
+    let gate = silu(matmul(x2_n, wt(wd, p + "ffn.gate_proj.weight"), seq_len, DIM, D_INNER))
+    let up = matmul(x2_n, wt(wd, p + "ffn.up_proj.weight"), seq_len, DIM, D_INNER)
+    let combined = hadamard(gate, up)
+    let ffn_out = matmul(combined, wt(wd, p + "ffn.down_proj.weight"), seq_len, D_INNER, DIM)
+    mat_add(x2, ffn_out)
+}
+
+// ─── Full forward ───
+fn model_forward(tokens: array, seq_len: int, wd: array) -> array {
+    let mut x = embedding(tokens, wt(wd, "tok_emb.weight"), VOCAB, DIM)
+    let mut li = 0
+    while li < N_LAYER {
+        x = block_forward(x, seq_len, wd, li)
+        li = li + 1
+    }
+    x = rms_norm(x, DIM)
+    matmul(x, wt(wd, "head_a.weight"), seq_len, DIM, VOCAB)
+}
+
+// ─── CLI ───
+fn main() {
+    let a = args()
+    let dir = if len(a) >= 3 { a[2] } else { "core/weights_v14" }
+
+    println("╔═════════════════════════════════════════════╗")
+    println("║  ConsciousDecoderV2 (34.5M) — Pure Hexa    ║")
+    println("║  384d / 6L / 4H-2KV / vocab=256            ║")
+    println("║  GPU=0  PyTorch=0  CPU only                 ║")
+    println("╚═════════════════════════════════════════════╝")
+
+    // Load
+    println("\nLoading 34.5M params from", dir, "...")
+    let w_start = clock()
+    let manifest = json_parse(read_file(dir + "/_manifest.json"))
+    let key_list = keys(manifest)
+    let n_keys = len(key_list)
+    let mut names = []
+    let mut tensors = []
+    let mut i = 0
+    while i < n_keys {
+        let k = key_list[i]
+        let info = manifest[k]
+        let data = json_parse(read_file(dir + "/" + info["file"]))
+        names = names + [k]
+        tensors = tensors + [data]
+        if i % 50 == 0 { println("  [", i, "/", n_keys, "]") }
+        i = i + 1
+    }
+    let wd = [names, tensors]
+    let w_elapsed = clock() - w_start
+    println("  loaded:", n_keys, "tensors in", round(w_elapsed), "s")
+
+    // Forward (single pass, seq=4)
+    let prompt = [72, 101, 108, 108]  // "Hell"
+    println("\nForward pass (seq=4)...")
+    let f_start = clock()
+    let logits = model_forward(prompt, 4, wd)
+    let f_elapsed = clock() - f_start
+    println("  forward:", round(f_elapsed * 1000), "ms")
+
+    let last = slice(logits, 3 * VOCAB, 4 * VOCAB)
+    let pred = argmax(last)
+    println("  predicted byte:", pred, "(expected ~111 = 'o')")
+
+    println("\n  total:", round((w_elapsed + f_elapsed)), "s (load + forward)")
+}
+
+main()
