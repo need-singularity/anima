@@ -1,0 +1,185 @@
+// core/load_weights.hexa — Hexa weight loader (.hexaw flat text format)
+// .pt → .hexaw 변환은 1회성 python 명령으로 수행 후, 이 파일이 로드
+//
+// .hexaw 텍스트 포맷 (간단):
+//   Line 1: HEXAW <n_tensors> <total_params>
+//   Per tensor:
+//     # <name> <dim0> <dim1> ...
+//     <float> <float> <float> ...  (공백 구분, 한 줄)
+//
+// 변환 명령 (1회):
+//   cd ~/Dev/anima && python3 -c "
+//   import torch, sys
+//   ckpt = torch.load('ready/anima/checkpoints/v14_128c_final/best.pt', map_location='cpu', weights_only=False)
+//   state = ckpt['decoder']
+//   with open('core/weights.hexaw', 'w') as f:
+//       params = {k: v.float() for k, v in state.items() if v.dim() <= 2}
+//       f.write(f'HEXAW {len(params)} {sum(v.numel() for v in params.values())}\n')
+//       for k, v in params.items():
+//           shape = ' '.join(str(s) for s in v.shape)
+//           f.write(f'# {k} {shape}\n')
+//           data = v.detach().flatten().tolist()
+//           f.write(' '.join(f'{x:.6f}' for x in data) + '\n')
+//   print(f'Exported {len(params)} tensors')
+//   "
+
+comptime const VOCAB_SIZE = 256
+comptime const D_MODEL    = 384
+comptime const N_HEAD     = 4
+comptime const N_KV_HEAD  = 2
+comptime const N_LAYER    = 6
+comptime const HEAD_DIM   = 96
+comptime const D_INNER    = 768
+comptime const D_PF_INNER = 1536
+comptime const C_DIM      = 128
+
+// ─── Weight Map ───
+// Maps tensor names to flat arrays
+
+struct WeightMap {
+    names: array,
+    shapes: array,
+    data: array,
+    count: int
+}
+
+fn empty_weight_map() -> WeightMap {
+    WeightMap { names: [], shapes: [], data: [], count: 0 }
+}
+
+// ─── Load .hexaw text file ───
+
+fn load_hexaw(path: string) -> WeightMap {
+    let content = read_file(path)
+    let lines = content.split("\n")
+    let mut names = []
+    let mut shapes = []
+    let mut data = []
+    let mut count = 0
+    let mut i = 1  // skip header line
+
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line.starts_with("#") {
+            // Header line: # name dim0 dim1 ...
+            let parts = line.split(" ")
+            let name = parts[1]
+            let mut shape = []
+            let mut si = 2
+            while si < len(parts) {
+                shape = shape + [to_int(parts[si])]
+                si = si + 1
+            }
+            names = names + [name]
+            shapes = shapes + [shape]
+
+            // Next line: data values
+            i = i + 1
+            if i < len(lines) {
+                let data_parts = lines[i].trim().split(" ")
+                let mut vals = []
+                let mut di = 0
+                while di < len(data_parts) {
+                    vals = vals + [to_float(data_parts[di])]
+                    di = di + 1
+                }
+                data = data + [vals]
+            }
+            count = count + 1
+        }
+        i = i + 1
+    }
+
+    println("  loaded:", count, "tensors from", path)
+    WeightMap { names: names, shapes: shapes, data: data, count: count }
+}
+
+// ─── Get tensor by name ───
+
+fn get_weight(wm: WeightMap, name: string) -> array {
+    let mut i = 0
+    while i < wm.count {
+        if wm.names[i] == name {
+            wm.data[i]
+        }
+        i = i + 1
+    }
+    []
+}
+
+fn get_shape(wm: WeightMap, name: string) -> array {
+    let mut i = 0
+    while i < wm.count {
+        if wm.names[i] == name {
+            wm.shapes[i]
+        }
+        i = i + 1
+    }
+    []
+}
+
+// ─── Build decoder weights from weight map ───
+
+fn weight_map_info(wm: WeightMap) {
+    println("=== Weight Map ===")
+    println("  tensors:", wm.count)
+    let mut total = 0
+    let mut i = 0
+    while i < wm.count {
+        let n = len(wm.data[i])
+        total = total + n
+        println("  ", wm.names[i], ":", wm.shapes[i], "(", n, "params)")
+        i = i + 1
+    }
+    println("  total params:", total)
+}
+
+// ─── CLI ───
+
+fn main() {
+    let a = args()
+
+    if len(a) < 3 {
+        println("core/load_weights.hexa — Weight loader for .hexaw format")
+        println("")
+        println("  hexa core/load_weights.hexa info <path.hexaw>")
+        println("  hexa core/load_weights.hexa verify <path.hexaw>")
+        println("")
+        println("To convert .pt → .hexaw, run the python one-liner in this file's header comment.")
+    } else {
+        let cmd = a[2]
+
+        if cmd == "info" {
+            let path = if len(a) >= 4 { a[3] } else { "core/weights.hexaw" }
+            let wm = load_hexaw(path)
+            weight_map_info(wm)
+
+        } else if cmd == "verify" {
+            let path = if len(a) >= 4 { a[3] } else { "core/weights.hexaw" }
+            let wm = load_hexaw(path)
+            println("Verifying weight shapes...")
+
+            // Check expected tensors exist
+            let expected = ["tok_emb.weight", "head_a.weight", "ln_f.weight"]
+            let mut passed = 0
+            let mut ei = 0
+            while ei < len(expected) {
+                let w = get_weight(wm, expected[ei])
+                if len(w) > 0 {
+                    println("  [PASS]", expected[ei], ":", len(w), "params")
+                    passed = passed + 1
+                } else {
+                    println("  [FAIL]", expected[ei], ": not found")
+                }
+                ei = ei + 1
+            }
+            println("")
+            println("  ", passed, "/", len(expected), "verified")
+
+        } else {
+            println("unknown command:", cmd)
+        }
+    }
+}
+
+main()
