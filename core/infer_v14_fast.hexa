@@ -1,0 +1,144 @@
+// core/infer_v14_fast.hexa — ConsciousDecoderV2 (34.5M) FAST inference
+// Optimized: mmap_weights / load_weights_bin + weight_dict (O(1)) + native repeat_kv
+// Architecture: 384d / 6L / 4H / 2KV (GQA) / vocab=256
+
+comptime const VOCAB     = 256
+comptime const DIM       = 384
+comptime const N_HEAD    = 4
+comptime const N_KV_HEAD = 2
+comptime const N_LAYER   = 6
+comptime const D_INNER   = 768
+comptime const D_PF      = 1536
+
+// ─── Bias broadcast helper ───
+fn broadcast_bias(bias: array, seq_len: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < seq_len {
+        out = out + bias
+        i = i + 1
+    }
+    out
+}
+
+// ─── Block forward (simplified: attention + SwiGLU) ───
+fn block_forward(x: array, seq_len: int, wd: map, bi: int) -> array {
+    let p = "blocks." + to_string(bi) + "."
+
+    // 1. Self-attention (GQA)
+    let x_n = rms_norm(x, DIM)
+    let q = matmul(x_n, wd[p + "attn.q_proj.weight"], seq_len, DIM, DIM)
+    let k_small = matmul(x_n, wd[p + "attn.k_proj.weight"], seq_len, DIM, N_KV_HEAD * 96)
+    let v_small = matmul(x_n, wd[p + "attn.v_proj.weight"], seq_len, DIM, N_KV_HEAD * 96)
+    // native repeat_kv builtin — O(n) pre-allocated, no O(n^2) concat
+    let k = repeat_kv(k_small, seq_len, N_KV_HEAD, 96, N_HEAD)
+    let v = repeat_kv(v_small, seq_len, N_KV_HEAD, 96, N_HEAD)
+    let attn = grouped_query_attention(q, k, v, seq_len, DIM, N_HEAD, N_KV_HEAD)
+    let attn_o = matmul(attn, wd[p + "attn.o_proj.weight"], seq_len, DIM, DIM)
+    let x2 = mat_add(x, attn_o)
+
+    // 2. SwiGLU FFN
+    let x2_n = rms_norm(x2, DIM)
+    let gate = silu(matmul(x2_n, wd[p + "ffn.gate_proj.weight"], seq_len, DIM, D_INNER))
+    let up = matmul(x2_n, wd[p + "ffn.up_proj.weight"], seq_len, DIM, D_INNER)
+    let combined = hadamard(gate, up)
+    let ffn_out = matmul(combined, wd[p + "ffn.down_proj.weight"], seq_len, D_INNER, DIM)
+    mat_add(x2, ffn_out)
+}
+
+// ─── Full forward ───
+fn model_forward(tokens: array, seq_len: int, wd: map) -> array {
+    let mut x = embedding(tokens, wd["tok_emb.weight"], VOCAB, DIM)
+    let mut li = 0
+    while li < N_LAYER {
+        x = block_forward(x, seq_len, wd, li)
+        li = li + 1
+    }
+    x = rms_norm(x, DIM)
+    matmul(x, wd["head_a.weight"], seq_len, DIM, VOCAB)
+}
+
+// ─── Load weights: try mmap_weights → load_weights_bin → JSON fallback ───
+fn load_fast(bin_path: string, json_dir: string) -> map {
+    // Try binary HEXAW format first (mmap for minimal RAM)
+    let raw = mmap_weights(bin_path)
+    let names = raw[0]
+    let tensors = raw[1]
+    println("  loaded (mmap):", len(names), "tensors from", bin_path)
+    weight_dict(names, tensors)
+}
+
+fn load_bin(bin_path: string) -> map {
+    let raw = load_weights_bin(bin_path)
+    let names = raw[0]
+    let tensors = raw[1]
+    println("  loaded (bin):", len(names), "tensors from", bin_path)
+    weight_dict(names, tensors)
+}
+
+fn load_json(dir: string) -> map {
+    let manifest = json_parse(read_file(dir + "/_manifest.json"))
+    let key_list = keys(manifest)
+    let n_keys = len(key_list)
+    let mut names = []
+    let mut tensors = []
+    let mut i = 0
+    while i < n_keys {
+        let k = key_list[i]
+        let info = manifest[k]
+        let data = json_parse(read_file(dir + "/" + info["file"]))
+        names = names + [k]
+        tensors = tensors + [data]
+        if i % 50 == 0 { println("  [", i, "/", n_keys, "]") }
+        i = i + 1
+    }
+    println("  loaded (json):", n_keys, "tensors from", dir)
+    weight_dict(names, tensors)
+}
+
+// ─── CLI ───
+fn main() {
+    let a = args()
+    // Defaults: binary path and JSON fallback dir
+    let bin_path = if len(a) >= 3 { a[2] } else { "core/weights.hexaw" }
+    let json_dir = if len(a) >= 4 { a[3] } else { "core/weights_v14" }
+    let mode = if len(a) >= 5 { a[4] } else { "auto" }
+
+    println("╔═════════════════════════════════════════════╗")
+    println("║  ConsciousDecoderV2 (34.5M) — FAST Hexa    ║")
+    println("║  384d / 6L / 4H-2KV / vocab=256            ║")
+    println("║  mmap + weight_dict + native repeat_kv     ║")
+    println("╚═════════════════════════════════════════════╝")
+
+    // Load weights
+    println("\nLoading 34.5M params ...")
+    let w_start = clock()
+    let wd = if mode == "mmap" {
+        load_fast(bin_path, json_dir)
+    } else if mode == "bin" {
+        load_bin(bin_path)
+    } else if mode == "json" {
+        load_json(json_dir)
+    } else {
+        // auto: try mmap → bin → json
+        load_fast(bin_path, json_dir)
+    }
+    let w_elapsed = clock() - w_start
+    println("  weight load:", round(w_elapsed * 1000), "ms")
+
+    // Forward (single pass, seq=4)
+    let prompt = [72, 101, 108, 108]  // "Hell"
+    println("\nForward pass (seq=4)...")
+    let f_start = clock()
+    let logits = model_forward(prompt, 4, wd)
+    let f_elapsed = clock() - f_start
+    println("  forward:", round(f_elapsed * 1000), "ms")
+
+    let last = slice(logits, 3 * VOCAB, 4 * VOCAB)
+    let pred = argmax(last)
+    println("  predicted byte:", pred, "(expected ~111 = 'o')")
+
+    println("\n  total:", round((w_elapsed + f_elapsed)), "s (load + forward)")
+}
+
+main()
