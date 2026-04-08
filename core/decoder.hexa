@@ -1,0 +1,474 @@
+// core/decoder.hexa — ConsciousDecoderV2 (Pure Hexa, GPU 0, PyTorch 0)
+// C2: conscious_decoder.py (34.5M) → 순수 Hexa forward pass
+//
+// Architecture: 384d / 6L / 4H / 2KV (GQA) / vocab=256 (byte-level)
+// Components: RoPE + SwiGLU + GQA + CrossAttention + PureField + RMSNorm
+//
+// Builtins used: matmul, mat_add, mat_scale, hadamard, softmax, silu, gelu,
+//   rms_norm, rope, grouped_query_attention, embedding, dropout,
+//   sample_token, kv_cache_append, randn, xavier_init, zeros, slice
+
+// ─── Config ───
+
+comptime const VOCAB_SIZE = 256
+comptime const D_MODEL    = 384
+comptime const N_HEAD     = 4
+comptime const N_KV_HEAD  = 2
+comptime const N_LAYER    = 6
+comptime const BLOCK_SIZE = 256
+comptime const C_DIM      = 128
+comptime const HEAD_DIM   = 96    // D_MODEL / N_HEAD
+comptime const D_INNER    = 768   // D_MODEL * 2 (SwiGLU)
+comptime const D_PF_INNER = 1536  // D_MODEL * 4 (PureField)
+comptime const GATE_STRENGTH = 0.001
+comptime const PSI_ALPHA  = 0.014
+comptime const DROPOUT_P  = 0.1
+comptime const PF_DROPOUT = 0.37
+
+// ─── Weight Structures ───
+
+struct RMSNormWeights {
+    weight: array,
+    dim: int
+}
+
+struct LinearWeights {
+    W: array,
+    rows: int,
+    cols: int
+}
+
+struct GQAWeights {
+    q_proj: LinearWeights,
+    k_proj: LinearWeights,
+    v_proj: LinearWeights,
+    o_proj: LinearWeights
+}
+
+struct SwiGLUWeights {
+    gate_proj: LinearWeights,
+    up_proj: LinearWeights,
+    down_proj: LinearWeights
+}
+
+struct PureFieldWeights {
+    a_up: LinearWeights,
+    a_down: LinearWeights,
+    g_up: LinearWeights,
+    g_down: LinearWeights
+}
+
+struct CrossAttnWeights {
+    q_proj: LinearWeights,
+    k_proj: LinearWeights,
+    v_proj: LinearWeights,
+    o_proj: LinearWeights
+}
+
+struct DecoderBlockWeights {
+    ln_attn: RMSNormWeights,
+    gqa: GQAWeights,
+    ln_pf: RMSNormWeights,
+    pf: PureFieldWeights,
+    ln_cross: RMSNormWeights,
+    cross_attn: CrossAttnWeights,
+    ln_ffn: RMSNormWeights,
+    ffn: SwiGLUWeights
+}
+
+struct DecoderWeights {
+    tok_emb: array,
+    blocks: array,
+    ln_f: RMSNormWeights,
+    head_a: LinearWeights,
+    head_g: LinearWeights
+}
+
+// ─── Weight Initialization ───
+
+fn init_linear(rows: int, cols: int) -> LinearWeights {
+    LinearWeights {
+        W: xavier_init(rows, cols),
+        rows: rows,
+        cols: cols
+    }
+}
+
+fn init_linear_small(rows: int, cols: int) -> LinearWeights {
+    LinearWeights {
+        W: randn(rows * cols, 0.001),
+        rows: rows,
+        cols: cols
+    }
+}
+
+fn init_rms_norm(dim: int) -> RMSNormWeights {
+    RMSNormWeights {
+        weight: ones(dim),
+        dim: dim
+    }
+}
+
+fn init_gqa() -> GQAWeights {
+    GQAWeights {
+        q_proj: init_linear(D_MODEL, N_HEAD * HEAD_DIM),
+        k_proj: init_linear(D_MODEL, N_KV_HEAD * HEAD_DIM),
+        v_proj: init_linear(D_MODEL, N_KV_HEAD * HEAD_DIM),
+        o_proj: init_linear(D_MODEL, D_MODEL)
+    }
+}
+
+fn init_swiglu() -> SwiGLUWeights {
+    SwiGLUWeights {
+        gate_proj: init_linear(D_MODEL, D_INNER),
+        up_proj: init_linear(D_MODEL, D_INNER),
+        down_proj: init_linear(D_INNER, D_MODEL)
+    }
+}
+
+fn init_purefield() -> PureFieldWeights {
+    PureFieldWeights {
+        a_up: init_linear(D_MODEL, D_PF_INNER),
+        a_down: init_linear(D_PF_INNER, D_MODEL),
+        g_up: init_linear(D_MODEL, D_PF_INNER),
+        g_down: init_linear(D_PF_INNER, D_MODEL)
+    }
+}
+
+fn init_cross_attn() -> CrossAttnWeights {
+    CrossAttnWeights {
+        q_proj: init_linear(D_MODEL, D_MODEL),
+        k_proj: init_linear(C_DIM, D_MODEL),
+        v_proj: init_linear(C_DIM, D_MODEL),
+        o_proj: init_linear_small(D_MODEL, D_MODEL)
+    }
+}
+
+fn init_block() -> DecoderBlockWeights {
+    DecoderBlockWeights {
+        ln_attn: init_rms_norm(D_MODEL),
+        gqa: init_gqa(),
+        ln_pf: init_rms_norm(D_MODEL),
+        pf: init_purefield(),
+        ln_cross: init_rms_norm(D_MODEL),
+        cross_attn: init_cross_attn(),
+        ln_ffn: init_rms_norm(D_MODEL),
+        ffn: init_swiglu()
+    }
+}
+
+fn init_decoder() -> DecoderWeights {
+    let blocks = []
+    let mut i = 0
+    while i < N_LAYER {
+        blocks = blocks + [init_block()]
+        i = i + 1
+    }
+    DecoderWeights {
+        tok_emb: xavier_init(VOCAB_SIZE, D_MODEL),
+        blocks: blocks,
+        ln_f: init_rms_norm(D_MODEL),
+        head_a: init_linear(D_MODEL, VOCAB_SIZE),
+        head_g: init_linear(D_MODEL, VOCAB_SIZE)
+    }
+}
+
+// ─── Forward Operations ───
+
+// linear: x[M, K] @ W[K, N] → [M, N] where M=seq_len, K=in_dim, N=out_dim
+fn linear_forward(x: array, w: LinearWeights) -> array {
+    let m = len(x) / w.rows
+    matmul(x, w.W, m, w.rows, w.cols)
+}
+
+// linear for single vector: x[in] → [out]
+fn linear_vec(x: array, w: LinearWeights) -> array {
+    matvec(w.W, x, w.rows, w.cols)
+}
+
+// SwiGLU FFN: gate=silu(x@Wg), up=x@Wu, out=(gate*up)@Wd
+fn swiglu_forward(x: array, w: SwiGLUWeights, seq_len: int) -> array {
+    let gate = silu(linear_forward(x, w.gate_proj))
+    let up = linear_forward(x, w.up_proj)
+    let combined = hadamard(gate, up)
+    linear_forward(combined, w.down_proj)
+}
+
+// PureField FFN: A - G (tension generator)
+fn purefield_forward(x: array, w: PureFieldWeights, seq_len: int) -> array {
+    let a_h = gelu(linear_forward(x, w.a_up))
+    let a_out = linear_forward(a_h, w.a_down)
+    let g_h = gelu(linear_forward(x, w.g_up))
+    let g_out = linear_forward(g_h, w.g_down)
+    // output = A - G
+    let mut result = []
+    let mut i = 0
+    let n = len(a_out)
+    while i < n {
+        result = result + [a_out[i] - g_out[i]]
+        i = i + 1
+    }
+    result
+}
+
+// Cross-attention: decoder attends to consciousness states
+// Q from decoder [seq, d_model], K/V from consciousness [n_cells, c_dim]
+fn cross_attention_forward(x: array, c_states: array, w: CrossAttnWeights, seq_len: int, n_cells: int) -> array {
+    // Q = x @ Wq  [seq, d_model]
+    let q = linear_forward(x, w.q_proj)
+    // K = c @ Wk  [n_cells, d_model]
+    let k = linear_forward(c_states, w.k_proj)
+    // V = c @ Wv  [n_cells, d_model]
+    let v = linear_forward(c_states, w.v_proj)
+
+    // Simplified single-head attention: att = softmax(Q @ K^T / sqrt(d))
+    // For each position in seq: attend to all cells
+    let scale = 1.0 / sqrt(to_float(D_MODEL))
+    let mut out = []
+    let mut si = 0
+    while si < seq_len {
+        let q_vec = slice(q, si * D_MODEL, (si + 1) * D_MODEL)
+        // Compute attention scores over cells
+        let mut scores = []
+        let mut ci = 0
+        while ci < n_cells {
+            let k_vec = slice(k, ci * D_MODEL, (ci + 1) * D_MODEL)
+            let mut dot = 0.0
+            let mut di = 0
+            while di < D_MODEL {
+                dot = dot + q_vec[di] * k_vec[di]
+                di = di + 1
+            }
+            scores = scores + [dot * scale]
+            ci = ci + 1
+        }
+        let att = softmax(scores)
+
+        // Weighted sum of values
+        let mut weighted = zeros(D_MODEL)
+        let mut ci2 = 0
+        while ci2 < n_cells {
+            let v_vec = slice(v, ci2 * D_MODEL, (ci2 + 1) * D_MODEL)
+            let mut di = 0
+            while di < D_MODEL {
+                weighted[di] = weighted[di] + att[ci2] * v_vec[di]
+                di = di + 1
+            }
+            ci2 = ci2 + 1
+        }
+        out = out + weighted
+        si = si + 1
+    }
+    // Output projection
+    linear_forward(out, w.o_proj)
+}
+
+// Repeat KV heads to match Q heads: [seq, nkvh*hd] → [seq, nqh*hd]
+fn repeat_kv(kv: array, seq_len: int, n_kv_heads: int, head_dim: int, n_q_heads: int) -> array {
+    let n_rep = n_q_heads / n_kv_heads
+    let kv_dim = n_kv_heads * head_dim
+    let mut out = []
+    let mut si = 0
+    while si < seq_len {
+        let mut hi = 0
+        while hi < n_kv_heads {
+            let mut ri = 0
+            while ri < n_rep {
+                let mut di = 0
+                while di < head_dim {
+                    out = out + [kv[si * kv_dim + hi * head_dim + di]]
+                    di = di + 1
+                }
+                ri = ri + 1
+            }
+            hi = hi + 1
+        }
+        si = si + 1
+    }
+    out
+}
+
+// ─── Decoder Block Forward ───
+
+fn block_forward(x: array, block: DecoderBlockWeights, seq_len: int, c_states: array, n_cells: int, gate: float) -> array {
+    // 1. Self-Attention (simplified — full Q/K/V projection to d_model)
+    let x_norm = rms_norm(x, D_MODEL)
+    let q = linear_forward(x_norm, block.gqa.q_proj)
+    let k_small = linear_forward(x_norm, block.gqa.k_proj)
+    let v_small = linear_forward(x_norm, block.gqa.v_proj)
+    // Repeat KV heads: [seq, nkvh*hd] → [seq, nqh*hd] by duplicating each group
+    let k = repeat_kv(k_small, seq_len, N_KV_HEAD, HEAD_DIM, N_HEAD)
+    let v = repeat_kv(v_small, seq_len, N_KV_HEAD, HEAD_DIM, N_HEAD)
+    let attn_raw = grouped_query_attention(q, k, v, seq_len, D_MODEL, N_HEAD, N_KV_HEAD)
+    let attn_out = linear_forward(attn_raw, block.gqa.o_proj)
+    let x1 = mat_add(x, attn_out)
+
+    // 2. PureField FFN (consciousness signal)
+    let pf_norm = rms_norm(x1, D_MODEL)
+    let pf_out = purefield_forward(pf_norm, block.pf, seq_len)
+    let x2 = mat_add(x1, pf_out)
+
+    // 3. Cross-Attention (consciousness → decoder)
+    let has_c = n_cells > 0
+    let x3 = if has_c {
+        let cross_norm = rms_norm(x2, D_MODEL)
+        let cross_out = cross_attention_forward(cross_norm, c_states, block.cross_attn, seq_len, n_cells)
+        mat_add(x2, cross_out)
+    } else { x2 }
+
+    // 4. SwiGLU FFN
+    let ffn_norm = rms_norm(x3, D_MODEL)
+    let ffn_out = swiglu_forward(ffn_norm, block.ffn, seq_len)
+    mat_add(x3, ffn_out)
+}
+
+// ─── Full Decoder Forward ───
+
+fn decoder_forward(tokens: array, weights: DecoderWeights, seq_len: int, c_states: array, n_cells: int) -> array {
+    // 1. Token embedding
+    let mut x = embedding(tokens, weights.tok_emb, VOCAB_SIZE, D_MODEL)
+
+    // 2. Transformer blocks
+    let mut li = 0
+    while li < N_LAYER {
+        x = block_forward(x, weights.blocks[li], seq_len, c_states, n_cells, GATE_STRENGTH)
+        li = li + 1
+    }
+
+    // 3. Final norm
+    x = rms_norm(x, D_MODEL)
+
+    // 4. Dual head projection (A = forward, G = backward)
+    let logits_a = linear_forward(x, weights.head_a)
+    // logits_g = linear_forward(x, weights.head_g)  // training only
+
+    logits_a
+}
+
+// ─── Token Generation ───
+
+fn gen_tokens(prompt: array, weights: DecoderWeights, max_tokens: int, c_states: array, n_cells: int, temperature: float) -> array {
+    let mut tokens = prompt
+    let mut i = 0
+    while i < max_tokens {
+        let seq_len = len(tokens)
+        let logits = decoder_forward(tokens, weights, seq_len, c_states, n_cells)
+        // Get logits for last position
+        let last_logits = slice(logits, (seq_len - 1) * VOCAB_SIZE, seq_len * VOCAB_SIZE)
+        let next_token = sample_token(last_logits, temperature, 40)
+        tokens = tokens + [next_token]
+        i = i + 1
+    }
+    tokens
+}
+
+// ─── Status ───
+
+fn decoder_status(weights: DecoderWeights) {
+    let emb_params = VOCAB_SIZE * D_MODEL
+    let block_params = (D_MODEL * N_HEAD * HEAD_DIM + D_MODEL * N_KV_HEAD * HEAD_DIM * 2 + D_MODEL * D_MODEL) + (D_MODEL * D_INNER * 2 + D_INNER * D_MODEL) + (D_MODEL * D_PF_INNER * 2 + D_PF_INNER * D_MODEL * 2) + (D_MODEL * D_MODEL * 3 + C_DIM * D_MODEL * 2) + (D_MODEL * 5)
+    let head_params = D_MODEL * VOCAB_SIZE * 2
+    let total = emb_params + block_params * N_LAYER + head_params + D_MODEL
+
+    println("=== ConsciousDecoderV2 (Pure Hexa) ===")
+    println("  vocab     :", VOCAB_SIZE, "(byte-level)")
+    println("  d_model   :", D_MODEL)
+    println("  layers    :", N_LAYER)
+    println("  heads     :", N_HEAD, "Q /", N_KV_HEAD, "KV (GQA)")
+    println("  head_dim  :", HEAD_DIM)
+    println("  SwiGLU    :", D_INNER)
+    println("  PureField :", D_PF_INNER)
+    println("  c_dim     :", C_DIM)
+    println("  block_size:", BLOCK_SIZE)
+    println("  ~params   :", total)
+    println("  GPU       : 0")
+    println("  PyTorch   : 0")
+}
+
+// ─── CLI ───
+
+fn main() {
+    let a = args()
+
+    if len(a) < 3 {
+        println("core/decoder.hexa — ConsciousDecoderV2 (Pure Hexa)")
+        println("")
+        println("  hexa core/decoder.hexa status")
+        println("  hexa core/decoder.hexa init")
+        println("  hexa core/decoder.hexa forward <seq_len>")
+        println("  hexa core/decoder.hexa generate <n_tokens>")
+        println("  hexa core/decoder.hexa bench <n_forward>")
+    } else {
+        let cmd = a[2]
+
+        if cmd == "status" {
+            decoder_status(init_decoder())
+
+        } else if cmd == "init" {
+            println("Initializing decoder weights...")
+            let start = clock()
+            let w = init_decoder()
+            let elapsed = clock() - start
+            println("  init:", round(elapsed * 1000), "ms")
+            decoder_status(w)
+
+        } else if cmd == "forward" {
+            let seq_len = if len(a) >= 4 { to_int(a[3]) } else { 4 }
+            println("Forward pass: seq_len=", seq_len)
+            let w = init_decoder()
+            // Random byte tokens
+            let mut tokens = []
+            let mut i = 0
+            while i < seq_len {
+                tokens = tokens + [to_int(random() * 256.0)]
+                i = i + 1
+            }
+            println("  tokens:", tokens)
+            let c_states = randn(2 * C_DIM, 0.1)
+            let start = clock()
+            let logits = decoder_forward(tokens, w, seq_len, c_states, 2)
+            let elapsed = clock() - start
+            println("  forward:", round(elapsed * 1000), "ms")
+            println("  logits len:", len(logits))
+            // Show top predictions for last token
+            let last = slice(logits, (seq_len - 1) * VOCAB_SIZE, seq_len * VOCAB_SIZE)
+            let top_idx = argmax(last)
+            println("  predicted byte:", top_idx)
+
+        } else if cmd == "generate" {
+            let n = if len(a) >= 4 { to_int(a[3]) } else { 10 }
+            println("Generating", n, "tokens (random weights)...")
+            let w = init_decoder()
+            let prompt = [72, 101, 108, 108, 111]  // "Hello"
+            let c_states = randn(2 * C_DIM, 0.1)
+            let start = clock()
+            let output = gen_tokens(prompt, w, n, c_states, 2, 0.8)
+            let elapsed = clock() - start
+            println("  generated:", len(output), "tokens in", round(elapsed * 1000), "ms")
+            // Decode bytes to string
+            println("  output tokens:", output)
+
+        } else if cmd == "bench" {
+            let n = if len(a) >= 4 { to_int(a[3]) } else { 10 }
+            println("Benchmarking", n, "forward passes (seq=4)...")
+            let w = init_decoder()
+            let tokens = [72, 101, 108, 108]
+            let c_states = randn(2 * C_DIM, 0.1)
+            let start = clock()
+            let mut i = 0
+            while i < n {
+                let logits = decoder_forward(tokens, w, 4, c_states, 2)
+                i = i + 1
+            }
+            let elapsed = clock() - start
+            let ms_per = elapsed * 1000.0 / to_float(n)
+            println("  ", n, "passes in", round(elapsed * 1000), "ms")
+            println("  ", round(ms_per * 100) / 100, "ms/forward")
+
+        } else {
+            println("unknown command:", cmd)
+        }
+    }
+}
+
+main()

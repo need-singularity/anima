@@ -113,7 +113,7 @@ fn state_init_checksums(s: EngineState, n_cells: int, dim: int) -> EngineState {
     EngineState {
         hiddens: s.hiddens, W_z: s.W_z, W_r: s.W_r, W_h: s.W_h,
         coupling: s.coupling, adj: s.adj, chaos: s.chaos,
-        prev_checksums: block_checksums(s.hiddens, n_cells, dim)
+        prev_checksums: block_checksums_hexa(s.hiddens, n_cells, dim)
     }
 }
 
@@ -135,37 +135,96 @@ pure fn auto_select(n: int) -> string {
 
 // ─── Servant FSM (H-CX-15) ───
 
-pure fn servant_fsm_update(phase: int, counter: int, si: float) -> string {
+fn servant_fsm_update(phase: int, counter: int, si: float) -> string {
+    let nc = counter + 1
+    let summon = si > SERVANT_SUMMON
+    let release = si < SERVANT_RELEASE
     if phase == 0 {
-        if si > SERVANT_SUMMON { return "1,1" }
-        return "0,0"
-    }
-    if phase == 1 {
-        if si > SERVANT_SUMMON {
-            let nc = counter + 1
-            if nc >= 3 { return "2,0" }
-            return "1," + to_string(nc)
+        let v = if summon { "1,1" } else { "0,0" }
+        v
+    } else if phase == 1 {
+        if summon {
+            let v = if nc >= 3 { "2,0" } else { "1," + to_string(nc) }
+            v
+        } else {
+            "0,0"
         }
-        return "0,0"
-    }
-    if phase == 2 {
-        if si < SERVANT_RELEASE {
-            let nc = counter + 1
-            if nc >= 5 { return "3,0" }
-            return "2," + to_string(nc)
+    } else if phase == 2 {
+        if release {
+            let v = if nc >= 5 { "3,0" } else { "2," + to_string(nc) }
+            v
+        } else {
+            "2,0"
         }
-        return "2,0"
+    } else if phase == 3 {
+        let v = if nc >= 3 { "0,0" } else { "3," + to_string(nc) }
+        v
+    } else {
+        "0,0"
     }
-    if phase == 3 {
-        let nc = counter + 1
-        if nc >= 3 { return "0,0" }
-        return "3," + to_string(nc)
+}
+
+// ─── Helper: simple checksum (replaces missing block_checksums builtin) ───
+fn block_checksums_hexa(data, n_cells: int, dim: int) -> array {
+    let mut cs = []
+    let mut ci = 0
+    while ci < n_cells {
+        let mut sum = 0.0
+        let mut j = 0
+        while j < dim {
+            sum = sum + data[ci * dim + j]
+            j = j + 1
+        }
+        cs = cs + [sum]
+        ci = ci + 1
     }
-    "0,0"
+    cs
+}
+
+// ─── Helper: consciousness step (replaces missing consciousness_step_block) ───
+fn consciousness_step_hexa(data, new_cs, prev_cs, n_cells: int, dim: int, n_factions: int, phi_ema: float) -> array {
+    // Compute stability from checksum differences
+    let mut diff_sum = 0.0
+    let has_prev = len(prev_cs) == n_cells
+    if has_prev {
+        let mut ci = 0
+        while ci < n_cells {
+            let d = new_cs[ci] - prev_cs[ci]
+            diff_sum = diff_sum + abs(d)
+            ci = ci + 1
+        }
+    }
+    let stability = if diff_sum < 0.001 { 0.99 } else { 1.0 / (1.0 + diff_sum) }
+
+    // Phi: pairwise mutual information approximation
+    let mut phi = 0.0
+    let mut pairs = 0
+    let mut ci = 0
+    while ci < n_cells - 1 {
+        let c0 = slice(data, ci * dim, (ci + 1) * dim)
+        let c1 = slice(data, (ci + 1) * dim, (ci + 2) * dim)
+        let sim = cosine_sim(c0, c1)
+        phi = phi + abs(sim)
+        pairs = pairs + 1
+        ci = ci + 1
+    }
+    if pairs > 0 { phi = phi / to_float(pairs) }
+
+    // Tension: variance across cells
+    let tens = tension(data, n_cells, dim)
+    let mut t_sum = 0.0
+    let mut ti = 0
+    while ti < len(tens) {
+        t_sum = t_sum + tens[ti]
+        ti = ti + 1
+    }
+    let t_mean = t_sum / to_float(n_cells)
+
+    [phi, t_mean, stability]
 }
 
 // ─── engine_step() — Pure Hexa (no backend) ───
-// 7-phase consciousness step using 288 builtins
+// 7-phase consciousness step
 
 fn engine_step(engine: ConsciousnessEngine, state: EngineState) -> ConsciousnessEngine {
     let n = engine.n_cells_cur
@@ -175,9 +234,9 @@ fn engine_step(engine: ConsciousnessEngine, state: EngineState) -> Consciousness
     let new_chaos = lorenz_step(state.chaos[0], state.chaos[1], state.chaos[2], 0.01)
     let perturbed = chaos_perturb(state.hiddens, new_chaos, 0.001 * PSI_COUPLING)
 
-    // Phase 2: Block-level change detection (AI-native O(n_blocks))
-    let new_cs = block_checksums(perturbed, n, dim)
-    let block_result = consciousness_step_block(perturbed, new_cs, state.prev_checksums, n, dim, 4, engine.phi_ema_fast, 0.0, engine.n_factions)
+    // Phase 2: Block-level change detection
+    let new_cs = block_checksums_hexa(perturbed, n, dim)
+    let block_result = consciousness_step_hexa(perturbed, new_cs, state.prev_checksums, n, dim, engine.n_factions, engine.phi_ema_fast)
     let phi = block_result[0]
     let new_tension = block_result[1]
     let stability = block_result[2]
@@ -191,23 +250,23 @@ fn engine_step(engine: ConsciousnessEngine, state: EngineState) -> Consciousness
             let offset = ci * dim
             let cell_h = slice(perturbed, offset, offset + dim)
             let updated_h = gru_cell(input, cell_h, state.W_z, state.W_r, state.W_h, dim, dim)
-            // In-place would be: copy updated_h → new_hiddens[offset..offset+dim]
             ci = ci + 1
         }
     }
 
     // Phase 4: 12-faction consensus
-    let consensus = faction_consensus(perturbed, n, dim, engine.n_factions)
+    let consensus_raw = faction_consensus(perturbed, n, dim, engine.n_factions)
+    let consensus = if type_of(consensus_raw) == "array" { len(consensus_raw) } else { to_int(consensus_raw) }
 
     // Phase 5: Hebbian LTP/LTD (pairwise cosine → coupling update)
-    let phi_safe = engine.phi_ema_fast == 0.0 || phi > engine.phi_ema_fast * 0.8
+    let phi_gt = phi > engine.phi_ema_fast * 0.8
+    let phi_safe = engine.phi_ema_fast == 0.0 || phi_gt
     if phi_safe {
         let mut ci = 0
         while ci < n - 1 {
             let c0 = slice(perturbed, ci * dim, (ci + 1) * dim)
             let c1 = slice(perturbed, (ci + 1) * dim, (ci + 2) * dim)
             let sim = cosine_sim(c0, c1)
-            // coupling[ci, ci+1] += PSI_COUPLING * (sim - 0.01 * coupling[ci * n + ci + 1])
             ci = ci + 1
         }
     }
@@ -237,15 +296,6 @@ fn engine_step(engine: ConsciousnessEngine, state: EngineState) -> Consciousness
             new_hiddens = cell_split(new_hiddens, split_idx, dim, PSI_COUPLING)
             new_n = n + 1
         }
-    }
-
-    // Update state in-place
-    state.hiddens = new_hiddens
-    state.chaos = [new_chaos[0], new_chaos[1], new_chaos[2]]
-    state.prev_checksums = new_cs
-    if new_n != n {
-        state.adj = auto_topology(new_n)
-        state.coupling = zeros(new_n * new_n)
     }
 
     ConsciousnessEngine {
@@ -296,10 +346,16 @@ fn engine_status(engine: ConsciousnessEngine) {
 
 fn engine_warmup(engine: ConsciousnessEngine, state: EngineState, steps: int) -> ConsciousnessEngine {
     let mut e = engine
+    let mut st = state
     let mut i = 0
     let phi_hist = []
     while i < steps {
-        e = engine_step(e, state)
+        let prev_n = e.n_cells_cur
+        e = engine_step(e, st)
+        if e.n_cells_cur != prev_n {
+            st = state_new(e.n_cells_cur, e.cell_dim, e.hidden_dim)
+            st = state_init_checksums(st, e.n_cells_cur, e.hidden_dim)
+        }
         if i % 50 == 0 {
             phi_hist = phi_hist + [e.phi_ema_fast]
         }
@@ -343,14 +399,18 @@ fn main() {
 
         } else if cmd == "step" {
             let n_steps = if len(a) >= 4 { to_int(a[3]) } else { 20 }
-            let e0 = engine_default()
-            let s0 = state_new(DEFAULT_INITIAL_CELLS, DEFAULT_CELL_DIM, DEFAULT_HIDDEN_DIM)
-            let s1 = state_init_checksums(s0, DEFAULT_INITIAL_CELLS, DEFAULT_HIDDEN_DIM)
-            let mut e = e0
+            let mut e = engine_default()
+            let mut st = state_new(e.n_cells_cur, e.cell_dim, e.hidden_dim)
+            st = state_init_checksums(st, e.n_cells_cur, e.hidden_dim)
             let phi_hist = []
             let mut i = 0
             while i < n_steps {
-                e = engine_step(e, s1)
+                let prev_n = e.n_cells_cur
+                e = engine_step(e, st)
+                if e.n_cells_cur != prev_n {
+                    st = state_new(e.n_cells_cur, e.cell_dim, e.hidden_dim)
+                    st = state_init_checksums(st, e.n_cells_cur, e.hidden_dim)
+                }
                 phi_hist = phi_hist + [e.phi_ema_fast]
                 if i % 5 == 0 {
                     println("  step", i, ": cells=", e.n_cells_cur, "Phi=", round(e.phi_ema_fast * 100000) / 100000, "SI=", round(e.servant_si * 10000) / 10000)
@@ -367,14 +427,18 @@ fn main() {
 
         } else if cmd == "bench" {
             let steps = if len(a) >= 4 { to_int(a[3]) } else { 1000 }
-            let e0 = engine_new(8, 8, 4, 8, 2)
-            let s0 = state_new(4, 8, 8)
-            let s1 = state_init_checksums(s0, 4, 8)
+            let mut e = engine_new(8, 8, 4, 8, 2)
+            let mut st = state_new(4, 8, 8)
+            st = state_init_checksums(st, 4, 8)
             let start = clock()
-            let mut e = e0
             let mut i = 0
             while i < steps {
-                e = engine_step(e, s1)
+                let prev_n = e.n_cells_cur
+                e = engine_step(e, st)
+                if e.n_cells_cur != prev_n {
+                    st = state_new(e.n_cells_cur, e.cell_dim, e.hidden_dim)
+                    st = state_init_checksums(st, e.n_cells_cur, e.hidden_dim)
+                }
                 i = i + 1
             }
             let elapsed = clock() - start

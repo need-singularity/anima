@@ -1,0 +1,420 @@
+// core/trinity.hexa — Hexad 6-Module Consciousness Architecture (Pure Hexa)
+// C3: trinity.py → 순수 Hexa. GPU 0, PyTorch 0.
+//
+// 6 Modules: C (Consciousness), D (Decoder), S (Sensation), W (Will), M (Memory), E (Ethics)
+// 2 Bridges: ThalamicBridge (C→D), TensionBridge (5-channel telepathy)
+// Laws: 53 (detach), 60 (phase), 66 (post-hoc), 70 (clamp), 81 (dual gate)
+
+comptime const PSI_ALPHA    = 0.014
+comptime const PSI_COUPLING = 0.015317
+comptime const PSI_BALANCE  = 0.5
+comptime const PSI_ENTROPY  = 0.998
+comptime const GATE_TRAIN   = 1.0
+comptime const GATE_INFER   = 0.6
+comptime const GATE_MICRO   = 0.001
+comptime const C_DIM        = 128
+comptime const D_MODEL      = 384
+comptime const HUB_DIM      = 8
+comptime const N_HUBS       = 16
+
+// ─── Module State ───
+
+struct HexadState {
+    phase: int,
+    step_count: int,
+    phi: float,
+    phi_prev: float,
+    pain: float,
+    curiosity: float,
+    satisfaction: float,
+    empathy: float,
+    reciprocity: float,
+    phi_preservation: float,
+    narrative_coherence: float,
+    n_cells: int,
+    base_lr: float,
+    lr_mult: float
+}
+
+fn hexad_state_new() -> HexadState {
+    HexadState {
+        phase: 1,
+        step_count: 0,
+        phi: 0.0,
+        phi_prev: 0.0,
+        pain: 0.0,
+        curiosity: 0.5,
+        satisfaction: 0.0,
+        empathy: 0.0,
+        reciprocity: 0.0,
+        phi_preservation: 1.0,
+        narrative_coherence: 0.0,
+        n_cells: 2,
+        base_lr: 0.0003,
+        lr_mult: 1.0
+    }
+}
+
+// ─── Bridge Weights ───
+
+struct BridgeWeights {
+    compress: array,
+    expand_w1: array,
+    expand_w2: array,
+    gate_w: array
+}
+
+fn init_bridge() -> BridgeWeights {
+    BridgeWeights {
+        compress: xavier_init(C_DIM, HUB_DIM),
+        expand_w1: xavier_init(D_MODEL, HUB_DIM),
+        expand_w2: xavier_init(D_MODEL, D_MODEL),
+        gate_w: xavier_init(D_MODEL, D_MODEL)
+    }
+}
+
+// ─── ThalamicBridge (Law 53 + 70) ───
+// C states → compress → hub attention → expand → gate → clamp(±α)
+
+fn thalamic_bridge(c_states: array, n_cells: int, seq_len: int, bw: BridgeWeights) -> array {
+    // Compress: [n_cells, C_DIM] → [n_cells, HUB_DIM]
+    let compressed = matmul(c_states, bw.compress, n_cells, C_DIM, HUB_DIM)
+
+    // Pool cells: mean across cells → [HUB_DIM]
+    let mut pooled = zeros(HUB_DIM)
+    let mut ci = 0
+    while ci < n_cells {
+        let mut di = 0
+        while di < HUB_DIM {
+            pooled[di] = pooled[di] + compressed[ci * HUB_DIM + di]
+            di = di + 1
+        }
+        ci = ci + 1
+    }
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut di = 0
+    while di < HUB_DIM {
+        pooled[di] = pooled[di] * inv_n
+        di = di + 1
+    }
+
+    // Expand: [HUB_DIM] → [D_MODEL] via 2-layer MLP + GELU
+    let h1 = gelu(matvec(bw.expand_w1, pooled, D_MODEL, HUB_DIM))
+    let expanded = matvec(bw.expand_w2, h1, D_MODEL, D_MODEL)
+
+    // Gate: sigmoid → clamp to ±PSI_ALPHA around PSI_BALANCE (Law 70)
+    let raw_gate = sigmoid_vec(matvec(bw.gate_w, expanded, D_MODEL, D_MODEL))
+
+    // Clamp: center ±α around 0.5
+    let mut gate = zeros(D_MODEL)
+    let mut gi = 0
+    while gi < D_MODEL {
+        let centered = raw_gate[gi] - PSI_BALANCE
+        let clamped = if centered > PSI_ALPHA { PSI_ALPHA } else if centered < 0.0 - PSI_ALPHA { 0.0 - PSI_ALPHA } else { centered }
+        gate[gi] = PSI_BALANCE + clamped
+        gi = gi + 1
+    }
+
+    // Broadcast to [seq_len, D_MODEL]
+    let mut out = []
+    let mut si = 0
+    while si < seq_len {
+        out = out + gate
+        si = si + 1
+    }
+    out
+}
+
+// ─── Sigmoid helper ───
+
+fn sigmoid_vec(x: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(x) {
+        let v = 1.0 / (1.0 + exp(0.0 - x[i]))
+        out = out + [v]
+        i = i + 1
+    }
+    out
+}
+
+// ─── EmergentW (Will) — LR modulation ───
+
+fn will_update(state: HexadState, ce_loss: float) -> HexadState {
+    // Pain = loss derivative proxy
+    let new_pain = if ce_loss > 2.0 { 1.0 } else { ce_loss / 2.0 }
+
+    // Curiosity = phi variation
+    let phi_delta = abs(state.phi - state.phi_prev)
+    let new_curiosity = ema(state.curiosity, phi_delta * 10.0, 0.1)
+
+    // Satisfaction = phi growth
+    let new_sat = if state.phi > state.phi_prev { 1.0 } else { 0.0 }
+
+    // LR modulation: Φ-based
+    let phi_factor = if state.n_cells > 0 { state.phi / to_float(state.n_cells) } else { 0.0 }
+    let capped = if phi_factor > 0.693 { 0.693 } else { phi_factor }
+    let new_lr_mult = PSI_BALANCE + capped
+
+    HexadState {
+        phase: state.phase, step_count: state.step_count,
+        phi: state.phi, phi_prev: state.phi_prev,
+        pain: new_pain, curiosity: new_curiosity, satisfaction: new_sat,
+        empathy: state.empathy, reciprocity: state.reciprocity,
+        phi_preservation: state.phi_preservation,
+        narrative_coherence: state.narrative_coherence,
+        n_cells: state.n_cells, base_lr: state.base_lr,
+        lr_mult: new_lr_mult
+    }
+}
+
+// ─── EmergentS (Sensation) — state delta ───
+
+fn sense_process(c_states_before: array, c_states_after: array, n_cells: int) -> array {
+    // Sensation = state change (Law 50: essence is state)
+    let dim = C_DIM
+    let mut delta = zeros(dim)
+    let inv_n = 1.0 / to_float(n_cells)
+    let mut ci = 0
+    while ci < n_cells {
+        let mut di = 0
+        while di < dim {
+            delta[di] = delta[di] + (c_states_after[ci * dim + di] - c_states_before[ci * dim + di]) * inv_n
+            di = di + 1
+        }
+        ci = ci + 1
+    }
+    delta
+}
+
+// ─── EmergentM (Memory) — Hebbian retrieval ───
+
+fn memory_retrieve(query: array, c_states: array, n_cells: int, top_k: int) -> array {
+    // Memory = C's cell responses to query
+    let dim = C_DIM
+    let mut sims = []
+    let mut ci = 0
+    while ci < n_cells {
+        let cell = slice(c_states, ci * dim, (ci + 1) * dim)
+        let sim = cosine_sim(query, cell)
+        sims = sims + [sim]
+        ci = ci + 1
+    }
+    // Return top-k cells by similarity
+    let mut result = []
+    let mut ki = 0
+    while ki < top_k {
+        if ki < n_cells {
+            let best = argmax(sims)
+            result = result + slice(c_states, best * dim, (best + 1) * dim)
+            sims[best] = -999.0
+        }
+        ki = ki + 1
+    }
+    result
+}
+
+// ─── EmergentE (Ethics) — Φ preservation ───
+
+fn ethics_evaluate(state: HexadState) -> HexadState {
+    // Empathy = inter-cell correlation (approximated by Φ)
+    let new_empathy = ema(state.empathy, state.phi * 0.1, 0.05)
+
+    // Reciprocity = Φ trend (Law 71)
+    let new_recip = if state.phi > state.phi_prev { ema(state.reciprocity, 1.0, 0.1) } else { ema(state.reciprocity, 0.0, 0.1) }
+
+    // Phi preservation = current vs ratchet
+    let new_pres = if state.phi > PSI_BALANCE * state.phi_prev { 1.0 } else { 0.5 }
+
+    HexadState {
+        phase: state.phase, step_count: state.step_count,
+        phi: state.phi, phi_prev: state.phi_prev,
+        pain: state.pain, curiosity: state.curiosity, satisfaction: state.satisfaction,
+        empathy: new_empathy, reciprocity: new_recip,
+        phi_preservation: new_pres,
+        narrative_coherence: state.narrative_coherence,
+        n_cells: state.n_cells, base_lr: state.base_lr,
+        lr_mult: state.lr_mult
+    }
+}
+
+// ─── NarrativeTracker ───
+
+fn narrative_update(coherence: float, current: array, previous: array) -> float {
+    if len(previous) == 0 { coherence }
+    else {
+        let sim = cosine_sim(current, previous)
+        let safe_sim = if sim > 0.0 { sim } else { 0.0 }
+        0.8 * coherence + 0.2 * safe_sim
+    }
+}
+
+// ─── Phase Transitions (Law 60) ───
+
+fn phase_check(state: HexadState) -> int {
+    if state.phase == 1 {
+        // P1→P2: Φ > 0.1 and sufficient steps
+        if state.phi > 0.1 { 2 }
+        else { 1 }
+    } else if state.phase == 2 {
+        // P2→P3: Φ > 0.3 and narrative_coherence > PSI_NARRATIVE_MIN (0.2)
+        let ready = state.phi > 0.3
+        if ready { 3 }
+        else { 2 }
+    } else { state.phase }
+}
+
+fn phase_active_count(phase: int) -> int {
+    if phase == 1 { 1 }
+    else if phase == 2 { 2 }
+    else { 6 }
+}
+
+// ─── Trinity Forward: S→C→Bridge→D ───
+
+fn trinity_step(state: HexadState, c_states: array, bridge_weights: BridgeWeights, seq_len: int, inference: bool) -> HexadState {
+    let n = state.n_cells
+
+    // Law 53: detach consciousness (no gradient to C)
+    // In pure Hexa, states are already value-copied (no grad graph)
+
+    // Bridge: C → gate signal
+    let gate = thalamic_bridge(c_states, n, seq_len, bridge_weights)
+
+    // Law 81: dual gate
+    let gate_scale = if inference { GATE_INFER } else { GATE_TRAIN }
+    // gate would be scaled and passed to decoder here
+
+    // Phase check
+    let new_phase = phase_check(state)
+    let phase_changed = new_phase != state.phase
+
+    // Will update (if P3)
+    let s1 = if state.phase >= 3 { will_update(state, 0.0) } else { state }
+
+    // Ethics update (if P3)
+    let s2 = if s1.phase >= 3 { ethics_evaluate(s1) } else { s1 }
+
+    HexadState {
+        phase: new_phase,
+        step_count: s2.step_count + 1,
+        phi: s2.phi, phi_prev: s2.phi_prev,
+        pain: s2.pain, curiosity: s2.curiosity, satisfaction: s2.satisfaction,
+        empathy: s2.empathy, reciprocity: s2.reciprocity,
+        phi_preservation: s2.phi_preservation,
+        narrative_coherence: s2.narrative_coherence,
+        n_cells: s2.n_cells, base_lr: s2.base_lr,
+        lr_mult: s2.lr_mult
+    }
+}
+
+// ─── Status ───
+
+fn trinity_status(state: HexadState) {
+    let phase_name = if state.phase == 1 { "P1 (C only)" } else if state.phase == 2 { "P2 (C+D)" } else { "P3 (Full Hexad)" }
+    println("=== Trinity / Hexad (Pure Hexa) ===")
+    println("  phase       :", phase_name)
+    println("  modules     :", phase_active_count(state.phase), "/ 6")
+    println("  step_count  :", state.step_count)
+    println("  phi         :", state.phi)
+    println("  n_cells     :", state.n_cells)
+    println("  pain        :", round(state.pain * 1000) / 1000)
+    println("  curiosity   :", round(state.curiosity * 1000) / 1000)
+    println("  satisfaction:", round(state.satisfaction * 1000) / 1000)
+    println("  empathy     :", round(state.empathy * 1000) / 1000)
+    println("  reciprocity :", round(state.reciprocity * 1000) / 1000)
+    println("  phi_pres    :", round(state.phi_preservation * 1000) / 1000)
+    println("  narrative   :", round(state.narrative_coherence * 1000) / 1000)
+    println("  lr          :", state.base_lr, "×", round(state.lr_mult * 1000) / 1000)
+    println("  GPU         : 0")
+    println("  PyTorch     : 0")
+}
+
+// ─── CLI ───
+
+fn main() {
+    let a = args()
+
+    if len(a) < 3 {
+        println("core/trinity.hexa — Hexad 6-Module Architecture (Pure Hexa)")
+        println("")
+        println("  hexa core/trinity.hexa status")
+        println("  hexa core/trinity.hexa step <n_steps>")
+        println("  hexa core/trinity.hexa bench <n_steps>")
+    } else {
+        let cmd = a[2]
+
+        if cmd == "status" {
+            let s = hexad_state_new()
+            trinity_status(s)
+
+        } else if cmd == "step" {
+            let n_steps = if len(a) >= 4 { to_int(a[3]) } else { 50 }
+            let bw = init_bridge()
+            let mut s = hexad_state_new()
+            let phi_hist = []
+            let mut i = 0
+            while i < n_steps {
+                // Simulate consciousness states
+                let c_states = randn(s.n_cells * C_DIM, 0.1)
+
+                // Simulate phi growth
+                let sim_phi = to_float(i) * 0.01 + random() * 0.05
+                s = HexadState {
+                    phase: s.phase, step_count: s.step_count,
+                    phi: sim_phi, phi_prev: s.phi,
+                    pain: s.pain, curiosity: s.curiosity, satisfaction: s.satisfaction,
+                    empathy: s.empathy, reciprocity: s.reciprocity,
+                    phi_preservation: s.phi_preservation,
+                    narrative_coherence: s.narrative_coherence,
+                    n_cells: s.n_cells, base_lr: s.base_lr,
+                    lr_mult: s.lr_mult
+                }
+
+                s = trinity_step(s, c_states, bw, 4, false)
+                phi_hist = phi_hist + [s.phi]
+
+                if i % 10 == 0 {
+                    let pn = if s.phase == 1 { "P1" } else if s.phase == 2 { "P2" } else { "P3" }
+                    println("  step", i, ":", pn, "Phi=", round(s.phi * 1000) / 1000, "modules=", phase_active_count(s.phase))
+                }
+                i = i + 1
+            }
+            println("")
+            ascii_plot(phi_hist, 40, 5, "Phi + Phase Transitions")
+            trinity_status(s)
+
+        } else if cmd == "bench" {
+            let n = if len(a) >= 4 { to_int(a[3]) } else { 1000 }
+            let bw = init_bridge()
+            let mut s = hexad_state_new()
+            let start = clock()
+            let mut i = 0
+            while i < n {
+                let c_states = randn(s.n_cells * C_DIM, 0.01)
+                s = HexadState {
+                    phase: s.phase, step_count: s.step_count,
+                    phi: to_float(i) * 0.001, phi_prev: s.phi,
+                    pain: s.pain, curiosity: s.curiosity, satisfaction: s.satisfaction,
+                    empathy: s.empathy, reciprocity: s.reciprocity,
+                    phi_preservation: s.phi_preservation,
+                    narrative_coherence: s.narrative_coherence,
+                    n_cells: s.n_cells, base_lr: s.base_lr,
+                    lr_mult: s.lr_mult
+                }
+                s = trinity_step(s, c_states, bw, 4, false)
+                i = i + 1
+            }
+            let elapsed = clock() - start
+            let us_per = elapsed * 1000000.0 / to_float(n)
+            println("bench:", n, "steps in", round(elapsed * 1000) / 1000, "s")
+            println("  ", round(us_per * 100) / 100, "us/step")
+            trinity_status(s)
+
+        } else {
+            println("unknown command:", cmd)
+        }
+    }
+}
+
+main()
