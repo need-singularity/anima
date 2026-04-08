@@ -1,0 +1,232 @@
+// core/train.hexa — Pure Hexa Training Loop (numerical gradient)
+// C4: 순수 Hexa 학습. GPU 0, PyTorch 0.
+//
+// 전략: numerical_grad (유한차분) + adamw_step
+// 소규모 모델 (dim=16, 1 layer) 로 개념 검증
+// tape-based autograd는 미래 src/ 빌트인으로 대체 예정
+//
+// Builtins: cross_entropy, numerical_grad, adamw_step, grad_accumulate,
+//   matmul, softmax, embedding, rms_norm, silu, hadamard, randn, xavier_init
+
+comptime const VOCAB     = 256
+comptime const DIM       = 16
+comptime const N_HEAD    = 2
+comptime const HEAD_DIM  = 8
+comptime const D_INNER   = 32
+comptime const SEQ_LEN   = 8
+comptime const LR        = 0.001
+comptime const EPOCHS    = 20
+comptime const BATCH     = 1
+
+// ─── Tiny Model (single layer, ~12K params) ───
+
+struct TinyModel {
+    tok_emb: array,
+    q_w: array,
+    k_w: array,
+    v_w: array,
+    o_w: array,
+    ffn_gate: array,
+    ffn_up: array,
+    ffn_down: array,
+    head_w: array
+}
+
+fn init_model() -> TinyModel {
+    TinyModel {
+        tok_emb: xavier_init(VOCAB, DIM),
+        q_w: xavier_init(DIM, DIM),
+        k_w: xavier_init(DIM, DIM),
+        v_w: xavier_init(DIM, DIM),
+        o_w: xavier_init(DIM, DIM),
+        ffn_gate: xavier_init(DIM, D_INNER),
+        ffn_up: xavier_init(DIM, D_INNER),
+        ffn_down: xavier_init(D_INNER, DIM),
+        head_w: xavier_init(DIM, VOCAB)
+    }
+}
+
+// ─── Forward pass → logits ───
+
+fn forward(tokens: array, m: TinyModel) -> array {
+    let x = embedding(tokens, m.tok_emb, VOCAB, DIM)
+
+    // Self-attention
+    let x_n = rms_norm(x, DIM)
+    let q = matmul(x_n, m.q_w, SEQ_LEN, DIM, DIM)
+    let k = matmul(x_n, m.k_w, SEQ_LEN, DIM, DIM)
+    let v = matmul(x_n, m.v_w, SEQ_LEN, DIM, DIM)
+    let attn = grouped_query_attention(q, k, v, SEQ_LEN, DIM, N_HEAD, N_HEAD)
+    let attn_o = matmul(attn, m.o_w, SEQ_LEN, DIM, DIM)
+    let x2 = mat_add(x, attn_o)
+
+    // SwiGLU FFN
+    let x2_n = rms_norm(x2, DIM)
+    let gate = silu(matmul(x2_n, m.ffn_gate, SEQ_LEN, DIM, D_INNER))
+    let up = matmul(x2_n, m.ffn_up, SEQ_LEN, DIM, D_INNER)
+    let combined = hadamard(gate, up)
+    let ffn_out = matmul(combined, m.ffn_down, SEQ_LEN, D_INNER, DIM)
+    let x3 = mat_add(x2, ffn_out)
+
+    // Head
+    let x3_n = rms_norm(x3, DIM)
+    matmul(x3_n, m.head_w, SEQ_LEN, DIM, VOCAB)
+}
+
+// ─── Loss: cross-entropy on last token ───
+
+fn compute_loss(logits: array, target: int) -> float {
+    let last = slice(logits, (SEQ_LEN - 1) * VOCAB, SEQ_LEN * VOCAB)
+    cross_entropy(last, target)
+}
+
+// ─── Numerical gradient for a single weight array ───
+// Perturb each element by epsilon, measure loss delta
+
+fn num_grad_array(tokens: array, target: int, m: TinyModel, which: string, eps: float) -> array {
+    let w = if which == "tok_emb" { m.tok_emb }
+        else if which == "q_w" { m.q_w }
+        else if which == "k_w" { m.k_w }
+        else if which == "v_w" { m.v_w }
+        else if which == "o_w" { m.o_w }
+        else if which == "ffn_gate" { m.ffn_gate }
+        else if which == "ffn_up" { m.ffn_up }
+        else if which == "ffn_down" { m.ffn_down }
+        else { m.head_w }
+
+    let base_loss = compute_loss(forward(tokens, m), target)
+
+    // Only compute gradient for a random subset (stochastic)
+    let n = len(w)
+    let n_sample = if n > 100 { 100 } else { n }
+    let mut grad = zeros(n)
+
+    let mut i = 0
+    while i < n_sample {
+        let idx = to_int(random() * to_float(n))
+        let old_val = w[idx]
+        w[idx] = old_val + eps
+        let loss_plus = compute_loss(forward(tokens, m), target)
+        w[idx] = old_val
+        grad[idx] = (loss_plus - base_loss) / eps
+        i = i + 1
+    }
+    grad
+}
+
+// ─── SGD update ───
+
+fn sgd_update(w: array, grad: array, lr: float) -> array {
+    let mut new_w = []
+    let mut i = 0
+    while i < len(w) {
+        new_w = new_w + [w[i] - lr * grad[i]]
+        i = i + 1
+    }
+    new_w
+}
+
+// ─── Training data: simple byte patterns ───
+
+fn make_training_data() -> array {
+    let d0 = [72, 101, 108, 108, 111, 32, 87, 111]
+    let d1 = [87, 111, 114, 108, 100, 32, 72, 101]
+    let d2 = [72, 101, 120, 97, 32, 108, 97, 110]
+    let d3 = [80, 117, 114, 101, 32, 72, 101, 120]
+    let d4 = [67, 80, 85, 32, 111, 110, 108, 121]
+    [d0, d1, d2, d3, d4]
+}
+
+fn make_targets() -> array {
+    [114, 108, 103, 97, 33]
+}
+
+// ─── Main ───
+
+fn main() {
+    let a = args()
+    let cmd = if len(a) >= 3 { a[2] } else { "train" }
+
+    if cmd == "train" {
+        println("╔═══════════════════════════════════════╗")
+        println("║  train.hexa — Pure Hexa Training      ║")
+        println("║  GPU=0  PyTorch=0  CPU only            ║")
+        println("╚═══════════════════════════════════════╝")
+        println("")
+        println("  model: dim=", DIM, "heads=", N_HEAD, "inner=", D_INNER)
+        println("  vocab:", VOCAB, "seq:", SEQ_LEN)
+        println("  lr:", LR, "epochs:", EPOCHS)
+
+        let mut m = init_model()
+        let data = make_training_data()
+        let targets = make_targets()
+        let n_examples = len(targets)
+        let loss_hist = []
+
+        println("\n── Training ──")
+        let start = clock()
+
+        let mut epoch = 0
+        while epoch < EPOCHS {
+            let mut epoch_loss = 0.0
+            let mut ei = 0
+            while ei < n_examples {
+                let tokens = data[ei]
+                let target = targets[ei]
+
+                // Forward
+                let logits = forward(tokens, m)
+                let loss = compute_loss(logits, target)
+                epoch_loss = epoch_loss + loss
+
+                // Numerical gradient (stochastic subset) for head_w only (most impact)
+                let grad = num_grad_array(tokens, target, m, "head_w", 0.001)
+                m = TinyModel {
+                    tok_emb: m.tok_emb, q_w: m.q_w, k_w: m.k_w, v_w: m.v_w,
+                    o_w: m.o_w, ffn_gate: m.ffn_gate, ffn_up: m.ffn_up,
+                    ffn_down: m.ffn_down,
+                    head_w: sgd_update(m.head_w, grad, LR)
+                }
+
+                ei = ei + 1
+            }
+
+            let avg_loss = epoch_loss / to_float(n_examples)
+            loss_hist = loss_hist + [avg_loss]
+
+            if epoch % 5 == 0 {
+                println("  epoch", epoch, ": loss=", round(avg_loss * 10000) / 10000)
+            }
+            epoch = epoch + 1
+        }
+
+        let elapsed = clock() - start
+        println("\n  training:", round(elapsed * 1000), "ms (", EPOCHS, "epochs)")
+
+        // Plot loss
+        println("")
+        ascii_plot(loss_hist, 40, 5, "Training Loss")
+
+        // Test generation
+        println("\n── Generation Test ──")
+        let test_tokens = [72, 101, 108, 108, 111, 32, 87, 111]  // "Hello Wo"
+        let logits = forward(test_tokens, m)
+        let last = slice(logits, (SEQ_LEN - 1) * VOCAB, SEQ_LEN * VOCAB)
+        let pred = argmax(last)
+        println("  input: Hello Wo")
+        println("  predicted byte:", pred, "(expected: 114 = 'r')")
+        let final_loss = compute_loss(logits, 114)
+        println("  final loss:", round(final_loss * 10000) / 10000)
+
+        println("\n╔═══════════════════════════════════════╗")
+        println("║  Training Complete — Pure Hexa         ║")
+        println("║  $0  |  GPU=0  |  CPU only             ║")
+        println("╚═══════════════════════════════════════╝")
+
+    } else {
+        println("core/train.hexa — Pure Hexa Training")
+        println("  hexa core/train.hexa train")
+    }
+}
+
+main()
