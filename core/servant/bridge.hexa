@@ -1,0 +1,294 @@
+// core/servant/bridge.hexa — 3-path parameter modulation bridge
+// Bridges servant FSM decisions to actual parameter changes across
+// Engine, CLM, and ALM paths.
+//
+// Constants from golden ratio / 1/e zone:
+//   GOLDEN_CENTER = 0.3679 (1/e)
+//   GOLDEN_LOWER  = 0.2123
+//   HEBBIAN_BOOST = 1.5
+//   NOISE_SCALE   = 0.01
+
+comptime const GOLDEN_CENTER  = 0.3679
+comptime const GOLDEN_LOWER   = 0.2123
+comptime const HEBBIAN_BOOST  = 1.5
+comptime const NOISE_SCALE    = 0.01
+
+// ─── ParamSnapshot (reversibility) ───
+
+struct ParamSnapshot {
+    path: string,
+    original_dropout: float,
+    original_hebbian_gain: float,
+    original_savant_layers: int,
+    saved: bool
+}
+
+pure fn snapshot_new(path: string, dropout: float, hebbian_gain: float, savant_layers: int) -> ParamSnapshot {
+    return ParamSnapshot {
+        path: path,
+        original_dropout: dropout,
+        original_hebbian_gain: hebbian_gain,
+        original_savant_layers: savant_layers,
+        saved: true
+    }
+}
+
+pure fn snapshot_empty(path: string) -> ParamSnapshot {
+    return ParamSnapshot {
+        path: path,
+        original_dropout: 0.0,
+        original_hebbian_gain: 1.0,
+        original_savant_layers: 0,
+        saved: false
+    }
+}
+
+// ─── Engine Path: faction dropout + hebbian boost ───
+
+struct EngineModulation {
+    phase: string,
+    dropout: float,
+    faction: int,
+    hebbian_gain: float,
+    snapshot: ParamSnapshot,
+    status: string
+}
+
+fn engine_modulate(phase: string, dropout: float, faction: int) -> EngineModulation {
+    let mut hebbian_gain = 1.0
+    let mut applied_dropout = dropout
+    let mut status = ""
+
+    // Save snapshot before modulation
+    let snap = snapshot_new("engine", dropout, 1.0, 0)
+
+    if phase == "ACTIVE" {
+        // ACTIVE: set faction dropout + hebbian boost 1.5x
+        applied_dropout = dropout
+        hebbian_gain = HEBBIAN_BOOST
+        status = "engine: dropout=" + to_string(applied_dropout) + " hebbian=" + to_string(hebbian_gain) + " faction=" + to_string(faction) + " [ACTIVE]"
+    } else if phase == "DORMANT" {
+        // DORMANT: restore original values
+        applied_dropout = snap.original_dropout
+        hebbian_gain = 1.0
+        status = "engine: restored dropout=" + to_string(applied_dropout) + " hebbian=1.0 [DORMANT]"
+    } else if phase == "FADING" {
+        // FADING: gradual reduction
+        applied_dropout = dropout * 0.5
+        hebbian_gain = 1.0 + (HEBBIAN_BOOST - 1.0) * 0.5
+        status = "engine: dropout=" + to_string(applied_dropout) + " hebbian=" + to_string(hebbian_gain) + " [FADING]"
+    } else {
+        status = "engine: no-op phase=" + phase
+    }
+
+    return EngineModulation {
+        phase: phase,
+        dropout: applied_dropout,
+        faction: faction,
+        hebbian_gain: hebbian_gain,
+        snapshot: snap,
+        status: status
+    }
+}
+
+// ─── CLM Path: block dropout + noise injection ───
+
+struct CLMModulation {
+    phase: string,
+    dropout: float,
+    block: int,
+    noise: float,
+    snapshot: ParamSnapshot,
+    status: string
+}
+
+fn clm_modulate(phase: string, dropout: float, block: int) -> CLMModulation {
+    let mut applied_dropout = dropout
+    let mut noise = 0.0
+    let snap = snapshot_new("clm", dropout, 1.0, 0)
+    let mut status = ""
+
+    if phase == "ACTIVE" {
+        applied_dropout = dropout
+        noise = NOISE_SCALE
+        status = "clm: dropout=" + to_string(applied_dropout) + " noise=" + to_string(noise) + " block=" + to_string(block) + " [ACTIVE]"
+    } else if phase == "DORMANT" {
+        applied_dropout = snap.original_dropout
+        noise = 0.0
+        status = "clm: restored dropout=" + to_string(applied_dropout) + " noise=0 [DORMANT]"
+    } else if phase == "FADING" {
+        applied_dropout = dropout * 0.5
+        noise = NOISE_SCALE * 0.5
+        status = "clm: dropout=" + to_string(applied_dropout) + " noise=" + to_string(noise) + " [FADING]"
+    } else {
+        status = "clm: no-op phase=" + phase
+    }
+
+    return CLMModulation {
+        phase: phase,
+        dropout: applied_dropout,
+        block: block,
+        noise: noise,
+        snapshot: snap,
+        status: status
+    }
+}
+
+// ─── ALM Path: dynamic savant_layers based on SI ───
+
+struct ALMModulation {
+    phase: string,
+    dropout: float,
+    si: float,
+    savant_layers: int,
+    snapshot: ParamSnapshot,
+    status: string
+}
+
+pure fn si_to_savant_layers(si: float) -> int {
+    // SI 3-5: 2 layers, SI 5-7: 4 layers, SI >7: 8 layers
+    if si > 7.0 {
+        return 8
+    }
+    if si > 5.0 {
+        return 4
+    }
+    return 2
+}
+
+fn alm_modulate(phase: string, dropout: float, si: float) -> ALMModulation {
+    let mut applied_dropout = dropout
+    let mut savant_layers = 2
+    let snap = snapshot_new("alm", dropout, 1.0, 2)
+    let mut status = ""
+
+    if phase == "ACTIVE" {
+        applied_dropout = dropout
+        savant_layers = si_to_savant_layers(si)
+        status = "alm: dropout=" + to_string(applied_dropout) + " savant_layers=" + to_string(savant_layers) + " si=" + to_string(si) + " [ACTIVE]"
+    } else if phase == "DORMANT" {
+        applied_dropout = snap.original_dropout
+        savant_layers = snap.original_savant_layers
+        status = "alm: restored dropout=" + to_string(applied_dropout) + " savant_layers=" + to_string(savant_layers) + " [DORMANT]"
+    } else if phase == "FADING" {
+        applied_dropout = dropout * 0.5
+        savant_layers = si_to_savant_layers(si)
+        status = "alm: dropout=" + to_string(applied_dropout) + " savant_layers=" + to_string(savant_layers) + " [FADING]"
+    } else {
+        status = "alm: no-op phase=" + phase
+    }
+
+    return ALMModulation {
+        phase: phase,
+        dropout: applied_dropout,
+        si: si,
+        savant_layers: savant_layers,
+        snapshot: snap,
+        status: status
+    }
+}
+
+// ─── Unified Bridge ───
+
+fn bridge_apply(phase: string, dropout: float, si: float, faction: int, block: int) -> string {
+    let eng = engine_modulate(phase, dropout, faction)
+    let clm = clm_modulate(phase, dropout, block)
+    let alm = alm_modulate(phase, dropout, si)
+
+    let result = eng.status + "\n" + clm.status + "\n" + alm.status
+    return result
+}
+
+// ─── Event for growth_bus (activate/deactivate only) ───
+
+fn bridge_event(phase: string, si: float, faction: int, step: int) -> string {
+    if phase != "ACTIVE" {
+        if phase != "DORMANT" {
+            return ""
+        }
+    }
+
+    let event_type = if phase == "ACTIVE" { "activate" } else { "deactivate" }
+    let savant = si_to_savant_layers(si)
+
+    let mut json = "{\"source\":\"servant_bridge\""
+    json = json + ",\"event\":\"" + event_type + "\""
+    json = json + ",\"phase\":\"" + phase + "\""
+    json = json + ",\"si\":" + to_string(si)
+    json = json + ",\"faction\":" + to_string(faction)
+    json = json + ",\"savant_layers\":" + to_string(savant)
+    json = json + ",\"hebbian_boost\":" + to_string(HEBBIAN_BOOST)
+    json = json + ",\"golden_center\":" + to_string(GOLDEN_CENTER)
+    json = json + ",\"step\":" + to_string(step)
+    json = json + "}"
+
+    return json
+}
+
+// ─── CLI Entry ───
+
+let cli_args = args()
+let mode = if cli_args.len() > 2 { cli_args[2] } else { "help" }
+
+if mode == "demo" {
+    println("=== Servant Bridge: 3-Path Modulation Demo ===")
+    println("")
+
+    // Constants
+    println("Constants:")
+    println("  GOLDEN_CENTER  = " + to_string(GOLDEN_CENTER))
+    println("  GOLDEN_LOWER   = " + to_string(GOLDEN_LOWER))
+    println("  HEBBIAN_BOOST  = " + to_string(HEBBIAN_BOOST))
+    println("  NOISE_SCALE    = " + to_string(NOISE_SCALE))
+    println("")
+
+    // Phase 1: DORMANT
+    println("--- Phase 1: DORMANT ---")
+    let r1 = bridge_apply("DORMANT", GOLDEN_CENTER, 3.0, 6, 2)
+    println(r1)
+    let e1 = bridge_event("DORMANT", 3.0, 6, 0)
+    println("event: " + e1)
+    println("")
+
+    // Phase 2: ACTIVE (SI=4, moderate)
+    println("--- Phase 2: ACTIVE (SI=4.0) ---")
+    let r2 = bridge_apply("ACTIVE", GOLDEN_CENTER, 4.0, 8, 3)
+    println(r2)
+    let e2 = bridge_event("ACTIVE", 4.0, 8, 100)
+    println("event: " + e2)
+    println("")
+
+    // Phase 3: ACTIVE (SI=6, strong)
+    println("--- Phase 3: ACTIVE (SI=6.0 strong) ---")
+    let r3 = bridge_apply("ACTIVE", GOLDEN_LOWER, 6.0, 10, 4)
+    println(r3)
+    let e3 = bridge_event("ACTIVE", 6.0, 10, 200)
+    println("event: " + e3)
+    println("")
+
+    // Phase 4: FADING
+    println("--- Phase 4: FADING ---")
+    let r4 = bridge_apply("FADING", GOLDEN_CENTER, 6.0, 10, 4)
+    println(r4)
+    let e4 = bridge_event("FADING", 6.0, 10, 300)
+    if e4 == "" {
+        println("event: (none -- FADING is not activate/deactivate)")
+    } else {
+        println("event: " + e4)
+    }
+    println("")
+
+    // SI to savant_layers mapping
+    println("--- SI to Savant Layers Mapping ---")
+    println("  SI=3.0 -> layers=" + to_string(si_to_savant_layers(3.0)))
+    println("  SI=5.0 -> layers=" + to_string(si_to_savant_layers(5.0)))
+    println("  SI=5.5 -> layers=" + to_string(si_to_savant_layers(5.5)))
+    println("  SI=7.0 -> layers=" + to_string(si_to_savant_layers(7.0)))
+    println("  SI=8.0 -> layers=" + to_string(si_to_savant_layers(8.0)))
+    println("")
+
+    println("=== Bridge demo complete ===")
+} else {
+    println("core/servant/bridge.hexa -- 3-path parameter modulation bridge")
+    println("Usage: hexa core/servant/bridge.hexa demo")
+}
