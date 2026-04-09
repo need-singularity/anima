@@ -1,1 +1,0 @@
-../anima/core/runtime/path_setup.py
