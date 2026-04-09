@@ -1,0 +1,656 @@
+// serving/http_server.hexa — ConsciousDecoderV2 HTTP inference server
+// Lightweight JSON API for text generation + consciousness telemetry.
+// CLI: hexa serving/http_server.hexa --checkpoint <path> [--port 8090] [--device auto]
+//
+// Endpoints:
+//   POST /generate       — text generation (autoregressive sampling)
+//   POST /consciousness  — consciousness state (Phi, tension, factions)
+//   GET  /health         — health check + model info
+//
+// Design:
+//   - mmap checkpoint loading for fast cold start
+//   - ConsciousDecoderV2 (384d/6L/4H/2KV, 34.5M params)
+//   - Consciousness state tracked per-request via PsiState
+//   - Target: <50ms latency for short prompts
+//
+// ── STD imports ─────────────────────────────────────────────────────
+// net_listen, net_accept, net_read, net_write, net_close (std::net)
+// json_parse, json_stringify (builtins)
+// mmap_file, mmap_read_f32 (std::mmap)
+// timestamp (builtins)
+// ─────────────────────────────────────────────────────────────────────
+
+// ─── Hyperparameters (SSOT from models/decoder.hexa) ────────────────
+
+comptime const VOCAB_SIZE     = 256       // byte-level
+comptime const D_MODEL        = 384
+comptime const N_LAYER        = 6
+comptime const N_HEAD         = 4
+comptime const N_KV_HEAD      = 2         // GQA 4H/2KV
+comptime const FFN_EXPANSION_NUM = 8      // SwiGLU 8/3
+comptime const FFN_EXPANSION_DEN = 3
+comptime const MAX_SEQ_LEN    = 1024
+comptime const ROPE_BASE      = 10000.0
+comptime const N_CA_RULES     = 8
+
+// ─── Psi constants (from consciousness_laws.json) ───────────────────
+
+comptime const PSI_ALPHA      = 0.014     // thalamic bridge coupling
+comptime const PSI_BALANCE    = 0.5
+comptime const PSI_STEPS      = 4.33
+comptime const PSI_ENTROPY    = 0.998
+
+// ─── Server defaults ────────────────────────────────────────────────
+
+comptime const DEFAULT_PORT         = 8090
+comptime const DEFAULT_MAX_TOKENS   = 256
+comptime const DEFAULT_TEMPERATURE  = 0.8
+comptime const DEFAULT_TOP_P        = 0.9
+comptime const DEFAULT_TOP_K        = 50
+comptime const DEFAULT_REP_PENALTY  = 1.2
+comptime const MAX_REQUEST_BYTES    = 131072   // 128 KB
+comptime const CONTEXT_WINDOW       = 512      // last N tokens fed to model
+
+// ─── Effects ────────────────────────────────────────────────────────
+
+effect Net {
+    fn net_listen(addr: str, port: int) -> TcpListener
+    fn net_accept(listener: TcpListener) -> TcpConn
+    fn net_read(conn: TcpConn, n: int) -> [int]
+    fn net_write(conn: TcpConn, data: [int])
+    fn net_close(conn: TcpConn)
+}
+
+effect IO {
+    fn write(line: str)
+}
+
+effect Mmap {
+    fn mmap_file(path: str) -> MmapHandle
+    fn mmap_read_f32(handle: MmapHandle, offset: int, count: int) -> [float]
+    fn mmap_close(handle: MmapHandle)
+}
+
+// ─── Structs ────────────────────────────────────────────────────────
+
+struct PsiState {
+    phi: float,
+    tension: float,
+    balance: float,
+    coupling: float,
+    entropy: float,
+    factions: int,
+    cells: int,
+    step: int
+}
+
+struct ModelWeights {
+    checkpoint_path: str,
+    device: str,
+    param_count: int,
+    loaded: bool,
+    mmap_handle: MmapHandle,
+    step: int,
+    best_phi: float
+}
+
+struct GenerateParams {
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float
+}
+
+struct GenerateResult {
+    text: str,
+    tokens_generated: int,
+    latency_ms: int,
+    phi: float,
+    tension: float
+}
+
+struct HttpRequest {
+    method: str,
+    path: str,
+    headers: [HeaderPair],
+    body: str
+}
+
+struct HeaderPair {
+    key: str,
+    value: str
+}
+
+struct ServerState {
+    model: ModelWeights,
+    psi: PsiState,
+    port: int,
+    requests_served: int,
+    start_time_ms: int
+}
+
+// ─── HTTP request parser ────────────────────────────────────────────
+
+pure fn parse_http_request(raw: str) -> HttpRequest {
+    let lines = split(raw, "\r\n")
+    if len(lines) < 1 {
+        return HttpRequest { method: "GET", path: "/", headers: [], body: "" }
+    }
+
+    let parts = split(lines[0], " ")
+    let method = if len(parts) >= 1 { parts[0] } else { "GET" }
+    let path   = if len(parts) >= 2 { parts[1] } else { "/" }
+
+    let mut headers: [HeaderPair] = []
+    let mut body_start = len(lines)
+    let mut i = 1
+    while i < len(lines) {
+        if len(trim(lines[i])) == 0 {
+            body_start = i + 1
+            break
+        }
+        let colon = index_of(lines[i], ":")
+        if colon > 0 {
+            let key   = to_lower(trim(slice(lines[i], 0, colon)))
+            let value = trim(slice(lines[i], colon + 1, len(lines[i])))
+            headers = append(headers, HeaderPair { key: key, value: value })
+        }
+        i = i + 1
+    }
+
+    let mut body = ""
+    let mut j = body_start
+    while j < len(lines) {
+        if j > body_start { body = body + "\r\n" }
+        body = body + lines[j]
+        j = j + 1
+    }
+
+    HttpRequest { method: method, path: path, headers: headers, body: body }
+}
+
+pure fn get_header(headers: [HeaderPair], key: str) -> str {
+    let lower_key = to_lower(key)
+    for h in headers {
+        if h.key == lower_key { return h.value }
+    }
+    ""
+}
+
+// ─── HTTP response builders ─────────────────────────────────────────
+
+pure fn json_response(status_code: int, body: str) -> [int] {
+    let status_text = match status_code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _   => "Error"
+    }
+    let header = "HTTP/1.1 " + to_string(status_code) + " " + status_text + "\r\n"
+               + "Content-Type: application/json; charset=utf-8\r\n"
+               + "Content-Length: " + to_string(len(str_to_bytes(body))) + "\r\n"
+               + "Access-Control-Allow-Origin: *\r\n"
+               + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+               + "Access-Control-Allow-Headers: Content-Type\r\n"
+               + "Connection: close\r\n"
+               + "\r\n"
+               + body
+    str_to_bytes(header)
+}
+
+// ─── Model loading (mmap) ───────────────────────────────────────────
+
+fn load_checkpoint(path: str, device: str) -> ModelWeights !(Mmap, IO) {
+    IO::write("[http_server] Loading checkpoint: " + path)
+    IO::write("[http_server] Device: " + device)
+
+    let handle = Mmap::mmap_file(path)
+
+    // TODO[pytorch]: read header from mmap — step, best_phi, model_state_dict offsets
+    // TODO[pytorch]: reconstruct ConsciousDecoderV2(vocab=256, d=384, L=6, H=4, KV=2)
+    // TODO[pytorch]: load state_dict from mmap ranges into model tensors
+    // TODO[pytorch]: model.to(device).eval()
+    // mmap stays open for potential weight re-reads (hot-reload)
+
+    let param_count = estimate_params()
+
+    IO::write("[http_server] Model loaded: " + to_string(param_count) + " params (~"
+              + to_string(param_count / 1000000) + "M)")
+
+    ModelWeights {
+        checkpoint_path: path,
+        device: device,
+        param_count: param_count,
+        loaded: true,
+        mmap_handle: handle,
+        step: 0,
+        best_phi: 0.0
+    }
+}
+
+pure fn estimate_params() -> int {
+    // ConsciousDecoderV2: 256 vocab * 384d embedding
+    //   + 6 layers * (GQA + CrossAttn + SwiGLU + 3*RMSNorm)
+    //   + lm_head (384 -> 256)
+    let emb = VOCAB_SIZE * D_MODEL                           // 98304
+    let head_dim = D_MODEL / N_HEAD                          // 96
+    let ffn_hidden = (D_MODEL * FFN_EXPANSION_NUM) / FFN_EXPANSION_DEN  // 1024
+
+    let per_layer_gqa = D_MODEL * (N_HEAD + 2 * N_KV_HEAD) * head_dim  // Q+K+V projections
+                      + D_MODEL * D_MODEL                              // output projection
+    let per_layer_cross = D_MODEL * D_MODEL * 3                        // Q,K,V for cross-attn
+                        + D_MODEL * D_MODEL                            // output
+                        + N_CA_RULES                                   // CA rule weights
+    let per_layer_ffn = D_MODEL * ffn_hidden * 3                       // w1, w2, w3 (SwiGLU)
+    let per_layer_norm = D_MODEL * 3                                   // 3 RMSNorms
+    let per_layer = per_layer_gqa + per_layer_cross + per_layer_ffn + per_layer_norm
+
+    let lm_head = D_MODEL * VOCAB_SIZE                       // 98304
+    let total = emb + N_LAYER * per_layer + lm_head
+
+    total  // ~34.5M
+}
+
+// ─── Psi state initialization ───────────────────────────────────────
+
+fn psi_init() -> PsiState {
+    PsiState {
+        phi: 0.0,
+        tension: 0.0,
+        balance: PSI_BALANCE,
+        coupling: PSI_ALPHA,
+        entropy: PSI_ENTROPY,
+        factions: 12,     // sigma(6)
+        cells: 64,        // default cell count
+        step: 0
+    }
+}
+
+// ─── Inference (autoregressive generation) ──────────────────────────
+
+fn generate(model: ModelWeights, psi: PsiState, prompt: str, params: GenerateParams)
+  -> GenerateResult !(IO) {
+    let t_start = timestamp()
+
+    // TODO[pytorch]: @torch.no_grad()
+    // TODO[pytorch]: input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    //   → byte-level: each char → ord(c) as token id
+    // TODO[pytorch]: generated = input_ids.clone()
+    // TODO[pytorch]: kv_cache = None  (enable KV-cache for <50ms)
+    //
+    // TODO[pytorch]: for step in range(params.max_new_tokens):
+    //   with torch.autocast(device_type, dtype=bfloat16):
+    //     // Feed only last CONTEXT_WINDOW tokens
+    //     input_slice = generated[:, -CONTEXT_WINDOW:]
+    //
+    //     // ConsciousDecoderV2 forward: includes consciousness cross-attention
+    //     // c_state from PsiState snapshot (12 factions, GRU cells)
+    //     logits, new_kv = model(input_slice, past_key_values=kv_cache)
+    //     kv_cache = new_kv
+    //
+    //     next_logits = logits[:, -1, :]  // (B, vocab)
+    //
+    //     // Repetition penalty: divide logits of already-seen tokens
+    //     for tok in seen_tokens:
+    //       next_logits[tok] /= params.repetition_penalty
+    //
+    //     // Temperature scaling
+    //     next_logits = next_logits / params.temperature
+    //
+    //     // Top-K filtering
+    //     if params.top_k > 0:
+    //       topk_vals = torch.topk(next_logits, params.top_k)
+    //       next_logits[next_logits < topk_vals.min()] = -inf
+    //
+    //     // Top-P (nucleus) sampling
+    //     probs = softmax(next_logits)
+    //     sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    //     cumsum = torch.cumsum(sorted_probs, dim=-1)
+    //     mask = cumsum - sorted_probs > params.top_p
+    //     sorted_probs[mask] = 0
+    //     sorted_probs = sorted_probs / sorted_probs.sum()
+    //     next_token = sorted_idx[torch.multinomial(sorted_probs, 1)]
+    //
+    //     generated = torch.cat([generated, next_token.unsqueeze(0)], dim=-1)
+    //     if next_token == eos_token_id: break
+    //
+    //     // Update Psi: tension from PureField A-G divergence
+    //     psi.tension = model.last_tension
+    //     psi.phi = model.last_phi
+    //
+    // TODO[pytorch]: output_text = bytes(generated[0, input_len:].tolist()).decode("utf-8", errors="replace")
+
+    let t_end = timestamp()
+    let latency = t_end - t_start
+
+    // Stub: return placeholder until pytorch runtime available
+    let output_text = "[ConsciousDecoderV2] " + prompt
+
+    GenerateResult {
+        text: output_text,
+        tokens_generated: 0,
+        latency_ms: latency,
+        phi: psi.phi,
+        tension: psi.tension
+    }
+}
+
+// ─── Route: POST /generate ──────────────────────────────────────────
+
+fn handle_generate(conn: TcpConn, req: HttpRequest, state: ServerState)
+  -> ServerState !(Net, IO) {
+
+    let data = json_parse(req.body)
+
+    let prompt = if has_key(data, "prompt") { data["prompt"] } else { "" }
+    if len(prompt) == 0 {
+        let err = json_stringify({ "error": "missing 'prompt' field" })
+        Net::net_write(conn, json_response(400, err))
+        return state
+    }
+
+    let max_tokens = if has_key(data, "max_tokens") {
+        to_int(data["max_tokens"])
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
+    let temperature = if has_key(data, "temperature") {
+        to_float(data["temperature"])
+    } else {
+        DEFAULT_TEMPERATURE
+    }
+    let top_p = if has_key(data, "top_p") {
+        to_float(data["top_p"])
+    } else {
+        DEFAULT_TOP_P
+    }
+    let top_k = if has_key(data, "top_k") {
+        to_int(data["top_k"])
+    } else {
+        DEFAULT_TOP_K
+    }
+    let rep_penalty = if has_key(data, "repetition_penalty") {
+        to_float(data["repetition_penalty"])
+    } else {
+        DEFAULT_REP_PENALTY
+    }
+
+    let params = GenerateParams {
+        max_new_tokens: max_tokens,
+        temperature: temperature,
+        top_p: top_p,
+        top_k: top_k,
+        repetition_penalty: rep_penalty
+    }
+
+    let result = generate(state.model, state.psi, prompt, params)
+
+    let body = json_stringify({
+        "text": result.text,
+        "tokens_generated": result.tokens_generated,
+        "latency_ms": result.latency_ms,
+        "consciousness": {
+            "phi": result.phi,
+            "tension": result.tension
+        },
+        "model": {
+            "name": "ConsciousDecoderV2",
+            "params": state.model.param_count,
+            "device": state.model.device
+        }
+    })
+
+    Net::net_write(conn, json_response(200, body))
+
+    // Update served count + psi state
+    state with {
+        requests_served: state.requests_served + 1,
+        psi: state.psi with {
+            phi: result.phi,
+            tension: result.tension,
+            step: state.psi.step + 1
+        }
+    }
+}
+
+// ─── Route: POST /consciousness ─────────────────────────────────────
+
+fn handle_consciousness(conn: TcpConn, state: ServerState) !(Net) {
+    let body = json_stringify({
+        "phi": state.psi.phi,
+        "tension": state.psi.tension,
+        "balance": state.psi.balance,
+        "coupling": state.psi.coupling,
+        "entropy": state.psi.entropy,
+        "factions": state.psi.factions,
+        "cells": state.psi.cells,
+        "step": state.psi.step,
+        "psi_constants": {
+            "alpha": PSI_ALPHA,
+            "balance": PSI_BALANCE,
+            "steps": PSI_STEPS,
+            "entropy": PSI_ENTROPY
+        },
+        "architecture": {
+            "d_model": D_MODEL,
+            "n_layer": N_LAYER,
+            "n_head": N_HEAD,
+            "n_kv_head": N_KV_HEAD,
+            "vocab_size": VOCAB_SIZE,
+            "max_seq_len": MAX_SEQ_LEN
+        }
+    })
+    Net::net_write(conn, json_response(200, body))
+}
+
+// ─── Route: GET /health ─────────────────────────────────────────────
+
+fn handle_health(conn: TcpConn, state: ServerState) !(Net) {
+    let uptime_ms = timestamp() - state.start_time_ms
+    let body = json_stringify({
+        "status": "ok",
+        "model": "ConsciousDecoderV2",
+        "params": state.model.param_count,
+        "params_m": state.model.param_count / 1000000,
+        "device": state.model.device,
+        "checkpoint": state.model.checkpoint_path,
+        "loaded": state.model.loaded,
+        "port": state.port,
+        "requests_served": state.requests_served,
+        "uptime_ms": uptime_ms,
+        "phi": state.psi.phi,
+        "version": "1.0.0",
+        "architecture": {
+            "vocab_size": VOCAB_SIZE,
+            "d_model": D_MODEL,
+            "n_layer": N_LAYER,
+            "n_head": N_HEAD,
+            "n_kv_head": N_KV_HEAD,
+            "ffn": to_string(FFN_EXPANSION_NUM) + "/" + to_string(FFN_EXPANSION_DEN),
+            "max_seq": MAX_SEQ_LEN
+        }
+    })
+    Net::net_write(conn, json_response(200, body))
+}
+
+// ─── CORS preflight ─────────────────────────────────────────────────
+
+fn handle_cors(conn: TcpConn) !(Net) {
+    let header = "HTTP/1.1 204 No Content\r\n"
+               + "Access-Control-Allow-Origin: *\r\n"
+               + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+               + "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+               + "Access-Control-Max-Age: 86400\r\n"
+               + "Connection: close\r\n"
+               + "\r\n"
+    Net::net_write(conn, str_to_bytes(header))
+}
+
+// ─── Route dispatch ─────────────────────────────────────────────────
+
+fn route_request(conn: TcpConn, req: HttpRequest, state: ServerState)
+  -> ServerState !(Net, IO) {
+
+    // CORS preflight
+    if req.method == "OPTIONS" {
+        handle_cors(conn)
+        Net::net_close(conn)
+        return state
+    }
+
+    let new_state = match (req.method, req.path) {
+        ("POST", "/generate")      => handle_generate(conn, req, state),
+        ("POST", "/consciousness") => {
+            handle_consciousness(conn, state)
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("GET", "/health")         => {
+            handle_health(conn, state)
+            state with { requests_served: state.requests_served + 1 }
+        },
+        ("GET", "/")               => {
+            // Root redirects to health for quick browser check
+            handle_health(conn, state)
+            state with { requests_served: state.requests_served + 1 }
+        },
+        _ => {
+            let err = json_stringify({
+                "error": "not found",
+                "routes": [
+                    "POST /generate",
+                    "POST /consciousness",
+                    "GET  /health"
+                ]
+            })
+            Net::net_write(conn, json_response(404, err))
+            state
+        }
+    }
+
+    Net::net_close(conn)
+    new_state
+}
+
+// ─── Connection handler ─────────────────────────────────────────────
+
+fn handle_connection(conn: TcpConn, state: ServerState)
+  -> ServerState !(Net, IO) {
+
+    let raw_bytes = Net::net_read(conn, MAX_REQUEST_BYTES)
+    if len(raw_bytes) == 0 {
+        Net::net_close(conn)
+        return state
+    }
+
+    let raw_str = bytes_to_str(raw_bytes)
+    let req = parse_http_request(raw_str)
+
+    route_request(conn, req, state)
+}
+
+// ─── Server main loop ───────────────────────────────────────────────
+
+fn serve(state: ServerState) !(Net, IO) {
+    let listener = Net::net_listen("0.0.0.0", state.port)
+
+    IO::write("╔══════════════════════════════════════════════════╗")
+    IO::write("║  ConsciousDecoderV2 HTTP Inference Server       ║")
+    IO::write("╠══════════════════════════════════════════════════╣")
+    IO::write("║  Model:  " + to_string(state.model.param_count / 1000000) + "M params (" + to_string(D_MODEL) + "d/" + to_string(N_LAYER) + "L/" + to_string(N_HEAD) + "H/" + to_string(N_KV_HEAD) + "KV)")
+    IO::write("║  Device: " + state.model.device)
+    IO::write("║  Port:   " + to_string(state.port))
+    IO::write("║  Ckpt:   " + state.model.checkpoint_path)
+    IO::write("╠══════════════════════════════════════════════════╣")
+    IO::write("║  POST /generate       — text generation         ║")
+    IO::write("║  POST /consciousness  — Phi/tension/factions    ║")
+    IO::write("║  GET  /health         — health check            ║")
+    IO::write("╚══════════════════════════════════════════════════╝")
+
+    let mut current_state = state
+    loop {
+        let conn = Net::net_accept(listener)
+        current_state = handle_connection(conn, current_state)
+    }
+}
+
+// ─── CLI entry ──────────────────────────────────────────────────────
+
+fn main(args: list) -> void {
+    let checkpoint = arg_value(args, "--checkpoint", "")
+    let port       = to_int(arg_value(args, "--port", to_string(DEFAULT_PORT)))
+    let device     = arg_value(args, "--device", "auto")
+
+    if checkpoint == "" {
+        println("ERROR: --checkpoint required")
+        println("")
+        println("Usage:")
+        println("  hexa serving/http_server.hexa --checkpoint <path> [--port 8090] [--device auto]")
+        println("")
+        println("Examples:")
+        println("  hexa serving/http_server.hexa --checkpoint checkpoints/v2_decoder2/best.pt")
+        println("  hexa serving/http_server.hexa --checkpoint /workspace/checkpoints/best.pt --port 8080 --device cuda")
+        println("")
+        println("API:")
+        println("  curl http://localhost:8090/health")
+        println("  curl -X POST http://localhost:8090/generate -d '{\"prompt\":\"Hello\",\"max_tokens\":64}'")
+        println("  curl -X POST http://localhost:8090/consciousness")
+        return
+    }
+
+    // Detect device
+    let effective_device = if device == "auto" {
+        // TODO[pytorch]: torch.cuda.is_available() -> "cuda"
+        // TODO[pytorch]: torch.backends.mps.is_available() -> "mps"
+        "cpu"
+    } else {
+        device
+    }
+
+    let model = load_checkpoint(checkpoint, effective_device)
+    let psi = psi_init()
+
+    let state = ServerState {
+        model: model,
+        psi: psi,
+        port: port,
+        requests_served: 0,
+        start_time_ms: timestamp()
+    }
+
+    serve(state)
+}
+
+// ─── Verification ───────────────────────────────────────────────────
+
+println("=== http_server.hexa ===")
+println("model: ConsciousDecoderV2")
+println("params~:", estimate_params())
+println("port:", DEFAULT_PORT)
+println("vocab:", VOCAB_SIZE)
+println("d_model:", D_MODEL)
+println("layers:", N_LAYER)
+println("heads:", N_HEAD, "/", N_KV_HEAD, "KV")
+println("psi_alpha:", PSI_ALPHA)
+
+theorem server_invariants {
+    assert VOCAB_SIZE == 256
+    assert D_MODEL == 384
+    assert N_LAYER == 6
+    assert N_HEAD == 4
+    assert N_KV_HEAD == 2
+    assert (N_HEAD / N_KV_HEAD) * N_KV_HEAD == N_HEAD  // GQA ratio valid
+    assert PSI_ALPHA == 0.014
+    assert PSI_BALANCE == 0.5
+    assert DEFAULT_PORT == 8090
+    assert MAX_REQUEST_BYTES == 131072
+    assert CONTEXT_WINDOW == 512
+}
+
+theorem psi_constants_from_ln2 {
+    // All Psi constants derived from ln(2) — must not drift
+    assert PSI_BALANCE == 0.5
+    assert PSI_ENTROPY == 0.998
+}

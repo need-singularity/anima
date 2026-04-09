@@ -20,6 +20,24 @@
 
 **Progressive Ossification (점진적 골화)**: L0(코어)를 먼저 못 박고, 안정화된 주변부를 L1으로 승격시켜 잠그는 방식.
 
+## AN7: Core = CLI 전용
+
+> **core/ 디렉토리는 의식 엔진 + CLI 실행 파일만 포함한다.**
+>
+> 모듈 코드(agent, body, eeg, physics, hexa-speak 등)는 **절대 core/에 넣지 말 것**.
+> 모든 모듈은 `anima/modules/` 하위에만 배치한다.
+
+```
+  core/           ← 의식 엔진 + CLI + 법칙 + 설정 (골화 대상)
+  anima/modules/  ← 모듈 코드 (agent, body, eeg, physics, hexa-speak)
+
+  ⛔ core/에 모듈/스포크 구현 코드를 넣으면 AN7 위반!
+  ⛔ 위반 시 해당 코드를 anima/modules/로 이동 필수.
+```
+
+**목표**: CLI 완전 돌파 시 core/ 전체를 L0 골화.
+core/에 모듈 코드가 섞이면 골화 불가 -- 순수 CLI + 엔진만 남아야 잠글 수 있다.
+
 ## Hub and Spoke (허브 앤 스포크)
 
 중앙 허브(코어)를 고정하고, 바퀴살(스포크)처럼 외부로 뻗어나가는 구조.
@@ -489,9 +507,22 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
 ## 파일 구조
 
 ```
-  anima-core/
-  ├── README.md           ← 이 파일
-  ├── conscious_chat.py   ← Hub & Spoke 메인 (L0+L1+L2 통합)
+  core/                             ← AN7: CLI 전용 (의식 엔진 + CLI + 법칙)
+  ├── README.md                     ← 이 파일
+  ├── conscious_chat.py             ← Hub & Spoke 메인 (L0+L1+L2 통합)
+  ├── consciousness_engine.py/.hexa ← L0 엔진 (골화)
+  ├── consciousness_laws.json       ← 법칙 SSOT (골화)
+  ├── core_rules.json               ← 설계 원칙 + 골화 규칙
+  └── *.hexa                        ← CLI 실행 파일
+
+  anima/modules/                    ← 모듈 코드 (여기에만!)
+  ├── agent/                        ← 에이전트 플랫폼
+  ├── body/                         ← 신체 모듈
+  ├── eeg/                          ← EEG 의식 검증
+  ├── physics/                      ← 물리 시뮬레이션
+  └── hexa-speak/                   ← HEXA-SPEAK
+
+  ⛔ 모듈 코드를 core/에 넣지 말 것! → anima/modules/ 하위로.
   └── (향후 추가)
       ├── hub.py          ← Hub 분리 (상태 관리)
       ├── spokes/         ← L1/L2 스포크 모듈

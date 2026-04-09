@@ -2,14 +2,15 @@
 
 > H100 80GB pod. Record results on completion, add new experiments.
 
-## Currently Running (2026-03-31, H100 80GB)
+## [ARCHIVE] Previously Running (2026-03-31, H100 80GB)
 
 > Dashboard: [docs/training-status.md](training-status.md)
+> Archived 2026-04-09: Plan C (AnimaLM 14B/32B/72B) 확정으로 v14.2/decoder_v3 경로 종료.
 
 | # | Experiment | Architecture | Step | CE | Status |
 |---|-----------|-------------|------|-----|--------|
-| 1 | **v14.2 federated** | Hexad + federated consciousness, 64c | in progress | - | 🔄 H100 |
-| 2 | **decoder_v3 274M** | 768d/8L + RoPE+SwiGLU+GQA+CrossAttn, 64c | skeleton done | - | 🔧 training script ready |
+| 1 | **[ARCHIVE] v14.2 federated** | Hexad + federated consciousness, 64c | - | - | Plan C로 대체 |
+| 2 | **[ARCHIVE] decoder_v3 274M** | 768d/8L + RoPE+SwiGLU+GQA+CrossAttn, 64c | - | - | Plan C로 대체 |
 
 ## Completed Experiments
 
