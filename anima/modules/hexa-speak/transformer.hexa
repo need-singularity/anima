@@ -1,0 +1,1152 @@
+// transformer.hexa — HEXA-SPEAK Mk.III: Intent Encoder + Token Predictor
+//
+// Purpose:
+//   Real transformer implementation with actual numerical computation.
+//   Stage 1 (Intent Encoder):  consciousness_vec(10D) → intent_embeddings(384D)
+//   Stage 2 (Token Predictor): AR decoder with cross-attention → RVQ indices
+//
+// n=6 parameters:
+//   d_model    = 384 = 64 × 6       (bridge dim, Law 60 P2)
+//   n_heads    = 6                   (n=6 attention heads)
+//   d_ff       = 1024                (SwiGLU FFN inner dim)
+//   n_layers   = 4                   (encoder) + 4 (decoder)
+//   vocab_size = 1024                (RVQ codebook entries)
+//   max_seq    = 256                 (maximum sequence length)
+//   d_head     = 64 = 384 / 6       (per-head dimension)
+//
+// BT reference: BT-SPEAK-01 (intent→audio), BT-SPEAK-02 (AR decode)
+// Mk stage:     Mk.III (real tensor ops)
+// Upstream:      ConsciousnessEngine → consciousness_vec(10D)
+// Downstream:    rvq_codebook.hexa (indices → waveform)
+
+// ════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════
+
+let D_MODEL = 384
+let N_HEADS = 6
+let D_HEAD = 64
+let D_FF = 1024
+let ENC_LAYERS = 4
+let DEC_LAYERS = 4
+let VOCAB_SIZE = 1024
+let MAX_SEQ = 256
+let PI = 3.141592653589793
+let ROPE_BASE = 10000.0
+let EPS = 0.00001
+
+// ════════════════════════════════════════════════════════════════
+// 1. Utility: flat 2D array ops  (row-major [rows × cols])
+//    arr[r * cols + c]
+// ════════════════════════════════════════════════════════════════
+
+fn zeros(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a.push(0.0)
+        i = i + 1
+    }
+    return a
+}
+
+fn rand_vec(n, seed) {
+    // Simple LCG-based pseudo-random [-0.1, 0.1] initialization
+    let mut a = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483648
+        let val = (s % 10000) / 50000.0 - 0.1
+        a = a.push(val)
+        i = i + 1
+    }
+    return a
+}
+
+fn vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_scale(a, s) {
+    let mut out = []
+    let mut i = 0
+    while i < len(a) {
+        out = out.push(a[i] * s)
+        i = i + 1
+    }
+    return out
+}
+
+fn dot(a, b, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// mat_vec: [rows × cols] @ [cols] → [rows]
+fn mat_vec(mat, vec, rows, cols) {
+    let mut out = []
+    let mut r = 0
+    while r < rows {
+        let mut s = 0.0
+        let mut c = 0
+        while c < cols {
+            s = s + mat[r * cols + c] * vec[c]
+            c = c + 1
+        }
+        out = out.push(s)
+        r = r + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 2. Layer Norm
+// ════════════════════════════════════════════════════════════════
+
+fn layer_norm(x, gamma, beta, d) {
+    // Compute mean
+    let mut mu = 0.0
+    let mut i = 0
+    while i < d {
+        mu = mu + x[i]
+        i = i + 1
+    }
+    mu = mu / d
+
+    // Compute variance
+    let mut var = 0.0
+    i = 0
+    while i < d {
+        let diff = x[i] - mu
+        var = var + diff * diff
+        i = i + 1
+    }
+    var = var / d
+
+    let inv_std = 1.0 / sqrt(var + EPS)
+
+    // Normalize
+    let mut out = []
+    i = 0
+    while i < d {
+        let normed = (x[i] - mu) * inv_std
+        out = out.push(normed * gamma[i] + beta[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn ones(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a.push(1.0)
+        i = i + 1
+    }
+    return a
+}
+
+// ════════════════════════════════════════════════════════════════
+// 3. Position Encoding
+// ════════════════════════════════════════════════════════════════
+
+// sinusoidal_pe: returns flat array [seq_len × d_model]
+// PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+// PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+fn sinusoidal_pe(seq_len, d_model) {
+    let mut pe = []
+    let mut pos = 0
+    while pos < seq_len {
+        let mut dim = 0
+        while dim < d_model {
+            let half = floor(dim / 2)
+            let exponent = 2.0 * half / d_model
+            let freq = 1.0 / pow(ROPE_BASE, exponent)
+            let angle = pos * freq
+            if dim % 2 == 0 {
+                pe = pe.push(sin(angle))
+            } else {
+                pe = pe.push(cos(angle))
+            }
+            dim = dim + 1
+        }
+        pos = pos + 1
+    }
+    return pe
+}
+
+// rope_encode: apply RoPE rotation to a vector at a given position
+// Operates on consecutive pairs (dim 2i, 2i+1)
+//   θ_i = 10000^(-2i/d_model)
+//   x'[2i]   = x[2i] * cos(pos * θ_i) - x[2i+1] * sin(pos * θ_i)
+//   x'[2i+1] = x[2i] * sin(pos * θ_i) + x[2i+1] * cos(pos * θ_i)
+fn rope_encode(x, seq_pos, d) {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        if i + 1 < d {
+            let half = i / 2
+            let theta = 1.0 / pow(ROPE_BASE, 2.0 * half / d)
+            let angle = seq_pos * theta
+            let c = cos(angle)
+            let s = sin(angle)
+            out = out.push(x[i] * c - x[i + 1] * s)
+            out = out.push(x[i] * s + x[i + 1] * c)
+            i = i + 2
+        } else {
+            // Odd dimension: pass through
+            out = out.push(x[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 4. SwiGLU FFN
+// ════════════════════════════════════════════════════════════════
+
+// SwiGLU(x) = (xW1 * σ(xW1)) ⊙ (xW_gate)
+// But we do: gate = W_gate @ x, up = W1 @ x
+//   output = W2 @ (silu(gate) ⊙ up)
+//   silu(x) = x * sigmoid(x)
+fn sigmoid(x) {
+    return 1.0 / (1.0 + exp(0.0 - x))
+}
+
+fn silu(x) {
+    return x * sigmoid(x)
+}
+
+fn swiglu_ffn(x, w1, w_gate, w2, d_model, d_ff) {
+    // up = W1 @ x  [d_ff]
+    let up = mat_vec(w1, x, d_ff, d_model)
+    // gate = W_gate @ x  [d_ff]
+    let gate = mat_vec(w_gate, x, d_ff, d_model)
+
+    // activated = silu(gate) * up
+    let mut activated = []
+    let mut i = 0
+    while i < d_ff {
+        activated = activated.push(silu(gate[i]) * up[i])
+        i = i + 1
+    }
+
+    // down = W2 @ activated  [d_model]
+    let out = mat_vec(w2, activated, d_model, d_ff)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 5. Softmax
+// ════════════════════════════════════════════════════════════════
+
+fn softmax(logits, n) {
+    // Numerically stable softmax: subtract max first
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps.push(e)
+        total = total + e
+        i = i + 1
+    }
+
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / (total + EPS))
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 6. Multi-Head Self-Attention (with RoPE, optional causal mask)
+// ════════════════════════════════════════════════════════════════
+
+// For a SINGLE token at position `pos` attending to `kv_len` cached K/V.
+// Q: [d_model] from current token
+// K_cache: flat [kv_len × d_model] — all keys up to now
+// V_cache: flat [kv_len × d_model] — all values up to now
+// Returns: [d_model] attention output
+
+fn multi_head_attn_single(q_vec, k_cache, v_cache, wq, wk, wv, wo, n_heads, d_head, d_model, pos, kv_len, causal) {
+    // Project query
+    let q_proj = mat_vec(wq, q_vec, d_model, d_model)
+
+    // Compute attention per head
+    let mut attn_out = zeros(d_model)
+    let scale = 1.0 / sqrt(d_head + 0.0)
+
+    let mut h = 0
+    while h < n_heads {
+        let head_off = h * d_head
+
+        // Extract Q head slice + apply RoPE
+        let mut q_h = []
+        let mut di = 0
+        while di < d_head {
+            q_h = q_h.push(q_proj[head_off + di])
+            di = di + 1
+        }
+        q_h = rope_encode(q_h, pos, d_head)
+
+        // Compute attention scores over all kv positions
+        let mut scores = []
+        let mut t = 0
+        while t < kv_len {
+            // Extract k[t] for this head from k_cache
+            let mut k_h = []
+            di = 0
+            while di < d_head {
+                k_h = k_h.push(k_cache[t * d_model + head_off + di])
+                di = di + 1
+            }
+            k_h = rope_encode(k_h, t, d_head)
+
+            // dot product
+            let score = dot(q_h, k_h, d_head) * scale
+
+            // Causal mask: if causal and t > pos, score = -1e9
+            if causal == 1 && t > pos {
+                scores = scores.push(-1000000000.0)
+            } else {
+                scores = scores.push(score)
+            }
+            t = t + 1
+        }
+
+        // Softmax
+        let probs = softmax(scores, kv_len)
+
+        // Weighted sum of values
+        let mut v_sum = zeros(d_head)
+        t = 0
+        while t < kv_len {
+            di = 0
+            let mut new_v = []
+            while di < d_head {
+                new_v = new_v.push(v_sum[di] + probs[t] * v_cache[t * d_model + head_off + di])
+                di = di + 1
+            }
+            v_sum = new_v
+            t = t + 1
+        }
+
+        // Write head output into attn_out
+        let mut new_attn = []
+        di = 0
+        while di < d_model {
+            if di >= head_off && di < head_off + d_head {
+                new_attn = new_attn.push(attn_out[di] + v_sum[di - head_off])
+            } else {
+                new_attn = new_attn.push(attn_out[di])
+            }
+            di = di + 1
+        }
+        attn_out = new_attn
+
+        h = h + 1
+    }
+
+    // Output projection
+    let out = mat_vec(wo, attn_out, d_model, d_model)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 7. Cross-Attention (Q from decoder, K/V from encoder context)
+// ════════════════════════════════════════════════════════════════
+
+// Q: [d_model] single decoder token
+// ctx: flat [ctx_len × d_model] encoder output
+fn cross_attention(q_vec, ctx, wq, wk, wv, wo, n_heads, d_head, d_model, ctx_len) {
+    let q_proj = mat_vec(wq, q_vec, d_model, d_model)
+
+    let mut attn_out = zeros(d_model)
+    let scale = 1.0 / sqrt(d_head + 0.0)
+
+    let mut h = 0
+    while h < n_heads {
+        let head_off = h * d_head
+
+        // Q head (no RoPE for cross-attention — positions are different spaces)
+        let mut q_h = []
+        let mut di = 0
+        while di < d_head {
+            q_h = q_h.push(q_proj[head_off + di])
+            di = di + 1
+        }
+
+        // Scores against each context position
+        let mut scores = []
+        let mut t = 0
+        while t < ctx_len {
+            // K from context
+            let k_proj_t = mat_vec(wk, zeros(0), 0, 0)  // placeholder
+            let mut k_h = []
+            di = 0
+            while di < d_head {
+                // Direct extraction from context projected inline
+                let mut ctx_t = []
+                let mut ci = 0
+                while ci < d_model {
+                    ctx_t = ctx_t.push(ctx[t * d_model + ci])
+                    ci = ci + 1
+                }
+                let k_full = mat_vec(wk, ctx_t, d_model, d_model)
+                k_h = []
+                di = 0
+                while di < d_head {
+                    k_h = k_h.push(k_full[head_off + di])
+                    di = di + 1
+                }
+                // break out of inner — we got k_h
+                di = d_head
+            }
+
+            let score = dot(q_h, k_h, d_head) * scale
+            scores = scores.push(score)
+            t = t + 1
+        }
+
+        let probs = softmax(scores, ctx_len)
+
+        // Weighted sum of context values
+        let mut v_sum = zeros(d_head)
+        t = 0
+        while t < ctx_len {
+            // V from context
+            let mut ctx_t = []
+            let mut ci = 0
+            while ci < d_model {
+                ctx_t = ctx_t.push(ctx[t * d_model + ci])
+                ci = ci + 1
+            }
+            let v_full = mat_vec(wv, ctx_t, d_model, d_model)
+
+            let mut new_v = []
+            di = 0
+            while di < d_head {
+                new_v = new_v.push(v_sum[di] + probs[t] * v_full[head_off + di])
+                di = di + 1
+            }
+            v_sum = new_v
+            t = t + 1
+        }
+
+        // Accumulate head
+        let mut new_attn = []
+        di = 0
+        while di < d_model {
+            if di >= head_off && di < head_off + d_head {
+                new_attn = new_attn.push(attn_out[di] + v_sum[di - head_off])
+            } else {
+                new_attn = new_attn.push(attn_out[di])
+            }
+            di = di + 1
+        }
+        attn_out = new_attn
+
+        h = h + 1
+    }
+
+    return mat_vec(wo, attn_out, d_model, d_model)
+}
+
+// ════════════════════════════════════════════════════════════════
+// 8. Transformer Block (Pre-Norm, Self-Attn + SwiGLU FFN)
+// ════════════════════════════════════════════════════════════════
+
+// A block holds: wq, wk, wv, wo, w1, w_gate, w2, ln1_g, ln1_b, ln2_g, ln2_b
+// We represent it as a dict-like list of named arrays.
+// For simplicity in hexa (no struct yet with arrays), we use a flat convention:
+//   block = { wq, wk, wv, wo, w1, w_gate, w2, ln1_g, ln1_b, ln2_g, ln2_b }
+// Stored as a list of 11 arrays.
+
+fn transformer_block_init(d_model, n_heads, d_ff, seed) {
+    let dm2 = d_model * d_model
+    let df_dm = d_ff * d_model
+    let dm_df = d_model * d_ff
+
+    let wq = rand_vec(dm2, seed)
+    let wk = rand_vec(dm2, seed + 1)
+    let wv = rand_vec(dm2, seed + 2)
+    let wo = rand_vec(dm2, seed + 3)
+    let w1 = rand_vec(df_dm, seed + 4)
+    let w_gate = rand_vec(df_dm, seed + 5)
+    let w2 = rand_vec(dm_df, seed + 6)
+    let ln1_g = ones(d_model)
+    let ln1_b = zeros(d_model)
+    let ln2_g = ones(d_model)
+    let ln2_b = zeros(d_model)
+
+    // Return as list of 11 arrays
+    return [wq, wk, wv, wo, w1, w_gate, w2, ln1_g, ln1_b, ln2_g, ln2_b]
+}
+
+// Forward pass for a single token through one block
+// x: [d_model], k_cache/v_cache: flat [kv_len × d_model]
+// Returns: [output, new_k_row, new_v_row]  — output [d_model], k/v rows [d_model] each
+fn transformer_block_forward(block, x, kv_len, k_cache, v_cache, pos, d_model, n_heads, d_head, d_ff, causal) {
+    let wq = block[0]
+    let wk = block[1]
+    let wv = block[2]
+    let wo = block[3]
+    let w1 = block[4]
+    let w_gate = block[5]
+    let w2 = block[6]
+    let ln1_g = block[7]
+    let ln1_b = block[8]
+    let ln2_g = block[9]
+    let ln2_b = block[10]
+
+    // Pre-norm 1
+    let x_norm1 = layer_norm(x, ln1_g, ln1_b, d_model)
+
+    // Compute new K and V for this position (before RoPE — RoPE applied inside attn)
+    let new_k = mat_vec(wk, x_norm1, d_model, d_model)
+    let new_v = mat_vec(wv, x_norm1, d_model, d_model)
+
+    // Append new K/V to cache for attention computation
+    let mut full_k = []
+    let mut full_v = []
+    let mut ci = 0
+    while ci < len(k_cache) {
+        full_k = full_k.push(k_cache[ci])
+        full_v = full_v.push(v_cache[ci])
+        ci = ci + 1
+    }
+    ci = 0
+    while ci < d_model {
+        full_k = full_k.push(new_k[ci])
+        full_v = full_v.push(new_v[ci])
+        ci = ci + 1
+    }
+    let new_kv_len = kv_len + 1
+
+    // Self-attention (single token query, full KV cache)
+    let attn_out = multi_head_attn_single(x_norm1, full_k, full_v, wq, wk, wv, wo, n_heads, d_head, d_model, pos, new_kv_len, causal)
+
+    // Residual 1
+    let x2 = vec_add(x, attn_out)
+
+    // Pre-norm 2
+    let x_norm2 = layer_norm(x2, ln2_g, ln2_b, d_model)
+
+    // SwiGLU FFN
+    let ffn_out = swiglu_ffn(x_norm2, w1, w_gate, w2, d_model, d_ff)
+
+    // Residual 2
+    let out = vec_add(x2, ffn_out)
+
+    return [out, new_k, new_v]
+}
+
+// ════════════════════════════════════════════════════════════════
+// 9. KV Cache
+// ════════════════════════════════════════════════════════════════
+
+// KV cache: list of [n_layers] entries, each entry = [keys_flat, values_flat, seq_pos]
+// keys_flat: [seq_pos × d_model]
+
+fn kv_cache_init(n_layers) {
+    let mut cache = []
+    let mut i = 0
+    while i < n_layers {
+        // [keys_flat, values_flat, seq_pos] — all arrays of floats
+        // seq_pos stored as single-element array [0.0] to avoid type mismatch
+        cache = cache.push([[], [], [0.0]])
+        i = i + 1
+    }
+    return cache
+}
+
+fn kv_cache_append(cache, layer, new_k, new_v, d_model) {
+    let entry = cache[layer]
+    let mut keys = entry[0]
+    let mut vals = entry[1]
+    let seq_pos = entry[2][0]
+
+    let mut i = 0
+    while i < d_model {
+        keys = keys.push(new_k[i])
+        vals = vals.push(new_v[i])
+        i = i + 1
+    }
+
+    // Build new cache with updated layer
+    let mut new_cache = []
+    i = 0
+    while i < len(cache) {
+        if i == layer {
+            new_cache = new_cache.push([keys, vals, [seq_pos + 1.0]])
+        } else {
+            new_cache = new_cache.push(cache[i])
+        }
+        i = i + 1
+    }
+    return new_cache
+}
+
+fn kv_cache_get(cache, layer) {
+    let entry = cache[layer]
+    return [entry[0], entry[1], entry[2][0]]
+}
+
+// ════════════════════════════════════════════════════════════════
+// 10. Intent Encoder (Stage 1)
+// ════════════════════════════════════════════════════════════════
+//
+// consciousness_vec(10D) → input_proj(10→d_model) → N transformer blocks → output
+// Each transformer block: self-attention + SwiGLU FFN
+// For the encoder, we process seq_len=1 (single consciousness vector)
+// but the architecture supports variable-length sequences.
+
+fn intent_encoder_init(d_input, d_model, n_layers, n_heads, d_ff, seed) {
+    // Input projection: [d_model × d_input]
+    let input_proj = rand_vec(d_model * d_input, seed)
+    let input_bias = zeros(d_model)
+
+    // Output projection: [d_model × d_model]
+    let output_proj = rand_vec(d_model * d_model, seed + 100)
+    let output_bias = zeros(d_model)
+
+    // Transformer blocks
+    let mut blocks = []
+    let mut i = 0
+    while i < n_layers {
+        let blk = transformer_block_init(d_model, n_heads, d_ff, seed + 1000 + i * 10)
+        blocks = blocks.push(blk)
+        i = i + 1
+    }
+
+    return [input_proj, input_bias, output_proj, output_bias, blocks, d_input, d_model, n_layers, n_heads, d_ff]
+}
+
+fn intent_encoder_forward(enc, consciousness_vec) {
+    let input_proj = enc[0]
+    let input_bias = enc[1]
+    let output_proj = enc[2]
+    let output_bias = enc[3]
+    let blocks = enc[4]
+    let d_input = enc[5]
+    let d_model = enc[6]
+    let n_layers = enc[7]
+    let n_heads = enc[8]
+    let d_ff = enc[9]
+    let d_head = d_model / n_heads
+
+    // Project 10D → d_model
+    let projected = mat_vec(input_proj, consciousness_vec, d_model, d_input)
+    let mut x = vec_add(projected, input_bias)
+
+    // Add sinusoidal PE for position 0
+    let pe = sinusoidal_pe(1, d_model)
+    x = vec_add(x, pe)
+
+    // Pass through transformer blocks (self-attention with seq_len=1)
+    let mut layer = 0
+    while layer < n_layers {
+        let blk = blocks[layer]
+        // For seq_len=1 encoder, K/V cache is empty, kv_len=0, pos=0
+        // We do a simplified forward: just FFN since single-token self-attn is identity
+        let ln1_g = blk[7]
+        let ln1_b = blk[8]
+        let ln2_g = blk[9]
+        let ln2_b = blk[10]
+        let w1 = blk[4]
+        let w_gate = blk[5]
+        let w2 = blk[6]
+
+        // Pre-norm + FFN (self-attn on 1 token = identity after softmax)
+        let x_norm = layer_norm(x, ln1_g, ln1_b, d_model)
+        // Skip self-attn for single token (softmax([1 score]) = [1.0] → V unchanged)
+        // Just add projected V as residual
+        let wv = blk[2]
+        let wo = blk[3]
+        let v_proj = mat_vec(wv, x_norm, d_model, d_model)
+        let attn_out = mat_vec(wo, v_proj, d_model, d_model)
+        let x2 = vec_add(x, attn_out)
+
+        // FFN
+        let x2_norm = layer_norm(x2, ln2_g, ln2_b, d_model)
+        let ffn_out = swiglu_ffn(x2_norm, w1, w_gate, w2, d_model, d_ff)
+        x = vec_add(x2, ffn_out)
+
+        layer = layer + 1
+    }
+
+    // Output projection
+    let final_proj = mat_vec(output_proj, x, d_model, d_model)
+    let out = vec_add(final_proj, output_bias)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════
+// 11. Token Predictor (Stage 2 — AR Decoder)
+// ════════════════════════════════════════════════════════════════
+//
+// Autoregressive decoder: prev_tokens → embed → N blocks (causal self-attn
+// + cross-attn to intent context) → logits[vocab_size]
+//
+// Uses KV cache for efficient step-by-step generation.
+
+fn token_predictor_init(vocab_size, d_model, n_layers, n_heads, d_ff, seed) {
+    // Token embedding table: [vocab_size × d_model]
+    let embed_table = rand_vec(vocab_size * d_model, seed)
+
+    // Decoder blocks (causal self-attention)
+    let mut blocks = []
+    let mut i = 0
+    while i < n_layers {
+        let blk = transformer_block_init(d_model, n_heads, d_ff, seed + 2000 + i * 10)
+        blocks = blocks.push(blk)
+        i = i + 1
+    }
+
+    // Cross-attention weights per layer: [wq, wk, wv, wo] each [d_model × d_model]
+    let mut cross_attn = []
+    i = 0
+    while i < n_layers {
+        let ca_wq = rand_vec(d_model * d_model, seed + 3000 + i * 10)
+        let ca_wk = rand_vec(d_model * d_model, seed + 3001 + i * 10)
+        let ca_wv = rand_vec(d_model * d_model, seed + 3002 + i * 10)
+        let ca_wo = rand_vec(d_model * d_model, seed + 3003 + i * 10)
+        let ca_ln_g = ones(d_model)
+        let ca_ln_b = zeros(d_model)
+        cross_attn = cross_attn.push([ca_wq, ca_wk, ca_wv, ca_wo, ca_ln_g, ca_ln_b])
+        i = i + 1
+    }
+
+    // Output head: [vocab_size × d_model]
+    let output_head = rand_vec(vocab_size * d_model, seed + 5000)
+
+    return [embed_table, blocks, cross_attn, output_head, vocab_size, d_model, n_layers, n_heads, d_ff]
+}
+
+// Single step: given previous token id, KV cache, intent context → logits + updated cache
+fn token_predictor_step(pred, prev_token_id, cache, intent_ctx, intent_len, step) {
+    let embed_table = pred[0]
+    let blocks = pred[1]
+    let cross_attn_layers = pred[2]
+    let output_head = pred[3]
+    let vocab_size = pred[4]
+    let d_model = pred[5]
+    let n_layers = pred[6]
+    let n_heads = pred[7]
+    let d_ff = pred[8]
+    let d_head = d_model / n_heads
+
+    // Look up token embedding
+    let mut x = []
+    let mut i = 0
+    while i < d_model {
+        x = x.push(embed_table[prev_token_id * d_model + i])
+        i = i + 1
+    }
+
+    // Add positional encoding
+    let pe = sinusoidal_pe(step + 1, d_model)
+    // Extract PE for position `step`
+    let mut pe_vec = []
+    i = 0
+    while i < d_model {
+        pe_vec = pe_vec.push(pe[step * d_model + i])
+        i = i + 1
+    }
+    x = vec_add(x, pe_vec)
+
+    // Pass through decoder blocks
+    let mut cur_cache = cache
+    let mut layer = 0
+    while layer < n_layers {
+        let blk = blocks[layer]
+        let kv = kv_cache_get(cur_cache, layer)
+        let k_flat = kv[0]
+        let v_flat = kv[1]
+        let kv_len = kv[2]
+
+        // Self-attention with causal mask + KV cache
+        let result = transformer_block_forward(blk, x, kv_len, k_flat, v_flat, step, d_model, n_heads, d_head, d_ff, 1)
+        x = result[0]
+        let new_k = result[1]
+        let new_v = result[2]
+
+        // Update cache
+        cur_cache = kv_cache_append(cur_cache, layer, new_k, new_v, d_model)
+
+        // Cross-attention to intent context
+        let ca = cross_attn_layers[layer]
+        let ca_ln_g = ca[4]
+        let ca_ln_b = ca[5]
+        let x_norm = layer_norm(x, ca_ln_g, ca_ln_b, d_model)
+        let ca_out = cross_attention(x_norm, intent_ctx, ca[0], ca[1], ca[2], ca[3], n_heads, d_head, d_model, intent_len)
+        x = vec_add(x, ca_out)
+
+        layer = layer + 1
+    }
+
+    // Output head → logits[vocab_size]
+    let logits = mat_vec(output_head, x, vocab_size, d_model)
+
+    return [logits, cur_cache]
+}
+
+// Top-k sampling from logits
+fn sample_top_k(logits, vocab_size, temperature, top_k, seed) {
+    // Apply temperature
+    let mut scaled = []
+    let mut i = 0
+    while i < vocab_size {
+        scaled = scaled.push(logits[i] / (temperature + EPS))
+        i = i + 1
+    }
+
+    // Find top-k indices (simple selection sort for k elements)
+    let mut top_indices = []
+    let mut top_vals = []
+    let mut used = zeros(vocab_size)
+
+    let mut k = 0
+    while k < top_k && k < vocab_size {
+        let mut best_idx = 0
+        let mut best_val = -1000000000.0
+        i = 0
+        while i < vocab_size {
+            if used[i] < 0.5 && scaled[i] > best_val {
+                best_val = scaled[i]
+                best_idx = i
+            }
+            i = i + 1
+        }
+        top_indices = top_indices.push(best_idx)
+        top_vals = top_vals.push(best_val)
+        // Mark used
+        let mut new_used = []
+        i = 0
+        while i < vocab_size {
+            if i == best_idx {
+                new_used = new_used.push(1.0)
+            } else {
+                new_used = new_used.push(used[i])
+            }
+            i = i + 1
+        }
+        used = new_used
+        k = k + 1
+    }
+
+    // Softmax over top-k values
+    let probs = softmax(top_vals, len(top_vals))
+
+    // Sample using LCG random
+    let mut s = seed
+    s = (s * 1103515245 + 12345) % 2147483648
+    let r = (s % 10000) / 10000.0
+
+    let mut cumsum = 0.0
+    i = 0
+    while i < len(probs) {
+        cumsum = cumsum + probs[i]
+        if r < cumsum {
+            return top_indices[i]
+        }
+        i = i + 1
+    }
+    return top_indices[len(top_indices) - 1]
+}
+
+// Generate a sequence of tokens autoregressively
+fn token_predictor_generate(pred, intent_ctx, intent_len, max_len, temperature, top_k, seed) {
+    let vocab_size = pred[4]
+    let n_layers = pred[6]
+    let d_model = pred[5]
+
+    let mut cache = kv_cache_init(n_layers)
+    let mut tokens = []
+    let mut prev_token = 0  // BOS token = 0
+    let mut step = 0
+    let mut cur_seed = seed
+
+    while step < max_len {
+        let result = token_predictor_step(pred, prev_token, cache, intent_ctx, intent_len, step)
+        let logits = result[0]
+        cache = result[1]
+
+        cur_seed = cur_seed + step * 7 + 13
+        let sampled = sample_top_k(logits, vocab_size, temperature, top_k, cur_seed)
+        tokens = tokens.push(sampled)
+        prev_token = sampled
+        step = step + 1
+    }
+    return tokens
+}
+
+// ════════════════════════════════════════════════════════════════
+// 12. Consciousness → Speech Interface
+// ════════════════════════════════════════════════════════════════
+
+// Pack consciousness engine state into 10D vector
+// (Phi, alpha, Z, N, W, E, M, C, T, I) from ConsciousnessEngine
+fn consciousness_to_intent(phi, tension, arousal, valence, cells) {
+    let alpha = 0.014            // PSI coupling constant
+    let z = phi * tension        // Tension × Phi interaction
+    let n = cells / 1024.0       // Normalized cell count
+    let w = arousal * 0.5        // Will (arousal-derived)
+    let e = 0.5 + valence * 0.3  // Ethics (valence-biased)
+    let m = phi * 0.8            // Memory (Phi-scaled)
+    let c = phi                  // Consciousness = Phi
+    let t = tension              // Tension direct
+    let i_val = arousal * valence // Information (arousal × valence cross)
+
+    return [phi, alpha, z, n, w, e, m, c, t, i_val]
+}
+
+// Full pipeline: consciousness → intent → RVQ tokens
+fn intent_to_tokens(enc, pred, phi, tension, arousal, valence, cells, n_tokens, temperature, seed) {
+    // Step 1: consciousness → 10D vector
+    let c_vec = consciousness_to_intent(phi, tension, arousal, valence, cells)
+
+    // Step 2: encode intent (10D → 384D)
+    let intent_emb = intent_encoder_forward(enc, c_vec)
+
+    // Step 3: intent as context for decoder (1 token × d_model)
+    let intent_ctx = intent_emb  // flat [1 × d_model]
+    let intent_len = 1
+
+    // Step 4: generate tokens
+    let tokens = token_predictor_generate(pred, intent_ctx, intent_len, n_tokens, temperature, 8, seed)
+    return tokens
+}
+
+// ════════════════════════════════════════════════════════════════
+// 13. Demo / Main
+// ════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("================================================================")
+    println(" HEXA-SPEAK Mk.III — Transformer: Intent Encoder + Token Predictor")
+    println("================================================================")
+    println("")
+    println("  d_model=" + to_string(D_MODEL) + "  n_heads=" + to_string(N_HEADS) + "  d_head=" + to_string(D_HEAD))
+    println("  d_ff=" + to_string(D_FF) + "  enc_layers=" + to_string(ENC_LAYERS) + "  dec_layers=" + to_string(DEC_LAYERS))
+    println("  vocab_size=" + to_string(VOCAB_SIZE) + "  max_seq=" + to_string(MAX_SEQ))
+    println("")
+
+    // ── Demo 1: Position Encoding ──
+    println("── 1. Sinusoidal Position Encoding ──")
+    let pe = sinusoidal_pe(4, 8)  // 4 positions × 8 dims (small for display)
+    let mut pos = 0
+    while pos < 4 {
+        let mut line = "  pos=" + to_string(pos) + ": ["
+        let mut d = 0
+        while d < 8 {
+            let val = pe[pos * 8 + d]
+            // Round to 3 decimal places for display
+            let rounded = floor(val * 1000.0 + 0.5) / 1000.0
+            line = line + to_string(rounded)
+            if d < 7 { line = line + ", " }
+            d = d + 1
+        }
+        line = line + "]"
+        println(line)
+        pos = pos + 1
+    }
+
+    // Orthogonality check: dot product between PE of pos 0 and pos 1
+    let mut dot01 = 0.0
+    let mut dot00 = 0.0
+    let mut i = 0
+    while i < 8 {
+        dot01 = dot01 + pe[0 * 8 + i] * pe[1 * 8 + i]
+        dot00 = dot00 + pe[0 * 8 + i] * pe[0 * 8 + i]
+        i = i + 1
+    }
+    println("  dot(PE[0], PE[1]) = " + to_string(floor(dot01 * 1000.0 + 0.5) / 1000.0) + "  (near-0 = good)")
+    println("  dot(PE[0], PE[0]) = " + to_string(floor(dot00 * 1000.0 + 0.5) / 1000.0) + "  (self-similarity)")
+    println("")
+
+    // ── Demo 2: RoPE ──
+    println("── 2. RoPE Encoding ──")
+    let test_vec = [1.0, 0.0, 0.5, 0.5, 0.0, 1.0, 0.3, 0.7]
+    let rope0 = rope_encode(test_vec, 0, 8)
+    let rope1 = rope_encode(test_vec, 1, 8)
+    let mut line_r0 = "  pos=0: ["
+    let mut line_r1 = "  pos=1: ["
+    i = 0
+    while i < 8 {
+        line_r0 = line_r0 + to_string(floor(rope0[i] * 1000.0 + 0.5) / 1000.0)
+        line_r1 = line_r1 + to_string(floor(rope1[i] * 1000.0 + 0.5) / 1000.0)
+        if i < 7 {
+            line_r0 = line_r0 + ", "
+            line_r1 = line_r1 + ", "
+        }
+        i = i + 1
+    }
+    println(line_r0 + "]")
+    println(line_r1 + "]  (rotated)")
+    println("")
+
+    // ── Demo 3: Transformer Block Forward (small d=8 for demo speed) ──
+    println("── 3. Transformer Block Forward (d=8, 2 heads, demo) ──")
+    let small_d = 8
+    let small_heads = 2
+    let small_dh = 4
+    let small_ff = 16
+    let blk = transformer_block_init(small_d, small_heads, small_ff, 42)
+    let test_x = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    let empty_k = []
+    let empty_v = []
+    let result = transformer_block_forward(blk, test_x, 0, empty_k, empty_v, 0, small_d, small_heads, small_dh, small_ff, 0)
+    let out = result[0]
+    let mut line_out = "  input:  ["
+    i = 0
+    while i < small_d {
+        line_out = line_out + to_string(floor(test_x[i] * 1000.0 + 0.5) / 1000.0)
+        if i < small_d - 1 { line_out = line_out + ", " }
+        i = i + 1
+    }
+    println(line_out + "]")
+    let mut line_o2 = "  output: ["
+    i = 0
+    while i < small_d {
+        line_o2 = line_o2 + to_string(floor(out[i] * 1000.0 + 0.5) / 1000.0)
+        if i < small_d - 1 { line_o2 = line_o2 + ", " }
+        i = i + 1
+    }
+    println(line_o2 + "]")
+    // Check values changed
+    let mut diff_sum = 0.0
+    i = 0
+    while i < small_d {
+        diff_sum = diff_sum + abs(out[i] - test_x[i])
+        i = i + 1
+    }
+    println("  L1 diff (input vs output): " + to_string(floor(diff_sum * 1000.0 + 0.5) / 1000.0) + "  (>0 = transform active)")
+    println("")
+
+    // ── Demo 4: Intent Encoder (small for demo) ──
+    println("── 4. Intent Encoder: consciousness(10D) → intent(8D, demo scale) ──")
+    let small_enc = intent_encoder_init(10, small_d, 2, small_heads, small_ff, 777)
+    let c_vec = consciousness_to_intent(0.71, 0.42, 0.6, 0.5, 64)
+    println("  consciousness_vec: [" + to_string(floor(c_vec[0] * 1000.0) / 1000.0) + ", " + to_string(c_vec[1]) + ", " + to_string(floor(c_vec[2] * 1000.0) / 1000.0) + ", ...]")
+    let intent_emb = intent_encoder_forward(small_enc, c_vec)
+    let mut line_intent = "  intent_emb: ["
+    i = 0
+    while i < small_d {
+        line_intent = line_intent + to_string(floor(intent_emb[i] * 1000.0 + 0.5) / 1000.0)
+        if i < small_d - 1 { line_intent = line_intent + ", " }
+        i = i + 1
+    }
+    println(line_intent + "]")
+    // Check non-zero
+    let mut intent_norm = 0.0
+    i = 0
+    while i < small_d {
+        intent_norm = intent_norm + intent_emb[i] * intent_emb[i]
+        i = i + 1
+    }
+    intent_norm = sqrt(intent_norm)
+    println("  ||intent||=" + to_string(floor(intent_norm * 1000.0 + 0.5) / 1000.0) + "  (>0 = active)")
+    println("")
+
+    // ── Demo 5: Token Predictor AR Generation (tiny scale) ──
+    println("── 5. Token Predictor: AR generation (d=8, vocab=16, 4 tokens) ──")
+    let tiny_vocab = 16
+    let tiny_pred = token_predictor_init(tiny_vocab, small_d, 1, small_heads, small_ff, 999)
+    // Use intent embedding as context
+    let tokens = token_predictor_generate(tiny_pred, intent_emb, 1, 4, 1.0, 4, 12345)
+    let mut tok_line = "  generated tokens: ["
+    i = 0
+    while i < len(tokens) {
+        tok_line = tok_line + to_string(tokens[i])
+        if i < len(tokens) - 1 { tok_line = tok_line + ", " }
+        i = i + 1
+    }
+    println(tok_line + "]")
+    println("  (RVQ codebook indices for audio frames)")
+    println("")
+
+    // ── Demo 6: KV Cache ──
+    println("── 6. KV Cache (sequential append) ──")
+    let mut cache = kv_cache_init(2)  // 2 layers
+    println("  init: 2 layers, seq_pos=0")
+    let k1 = [1.0, 2.0, 3.0, 4.0]
+    let v1 = [0.1, 0.2, 0.3, 0.4]
+    cache = kv_cache_append(cache, 0, k1, v1, 4)
+    let kv0 = kv_cache_get(cache, 0)
+    println("  after append layer 0: seq_pos=" + to_string(kv0[2]) + ", keys_len=" + to_string(len(kv0[0])))
+    let k2 = [5.0, 6.0, 7.0, 8.0]
+    let v2 = [0.5, 0.6, 0.7, 0.8]
+    cache = kv_cache_append(cache, 0, k2, v2, 4)
+    let kv0b = kv_cache_get(cache, 0)
+    println("  after 2nd append:     seq_pos=" + to_string(kv0b[2]) + ", keys_len=" + to_string(len(kv0b[0])))
+    println("  KV cache enables O(1) per-step vs O(n^2) recompute")
+    println("")
+
+    // ── Demo 7: Full pipeline consciousness → tokens ──
+    println("── 7. Full Pipeline: consciousness → intent → tokens ──")
+    println("  Phi=0.71, tension=0.42, arousal=0.6, valence=0.5, cells=64")
+    // Use tiny models for demo speed
+    let full_enc = intent_encoder_init(10, small_d, 2, small_heads, small_ff, 42)
+    let full_pred = token_predictor_init(tiny_vocab, small_d, 1, small_heads, small_ff, 84)
+    let full_tokens = intent_to_tokens(full_enc, full_pred, 0.71, 0.42, 0.6, 0.5, 64, 4, 0.8, 54321)
+    let mut ft_line = "  consciousness → RVQ tokens: ["
+    i = 0
+    while i < len(full_tokens) {
+        ft_line = ft_line + to_string(full_tokens[i])
+        if i < len(full_tokens) - 1 { ft_line = ft_line + ", " }
+        i = i + 1
+    }
+    println(ft_line + "]")
+    println("")
+
+    // ── Summary ──
+    println("════════════════════════════════════════════════════════════════")
+    println(" Mk.III Transformer — Real Numerical Computation")
+    println("════════════════════════════════════════════════════════════════")
+    println("")
+    println("  Components implemented (all with actual matrix math):")
+    println("    [1] sinusoidal_pe          — sin/cos position encoding")
+    println("    [2] rope_encode            — rotary position embedding (pair rotation)")
+    println("    [3] layer_norm             — pre-norm (mean/var/scale/shift)")
+    println("    [4] swiglu_ffn             — SwiGLU (silu gate * up, then down)")
+    println("    [5] multi_head_attn_single — MHA with RoPE + causal mask + KV cache")
+    println("    [6] cross_attention        — Q(decoder) × K,V(encoder context)")
+    println("    [7] transformer_block      — pre-norm self-attn + FFN + residuals")
+    println("    [8] intent_encoder         — 10D consciousness → 384D intent")
+    println("    [9] token_predictor        — AR decoder with cross-attn → logits")
+    println("   [10] kv_cache               — O(1) sequential generation")
+    println("   [11] top_k_sampling         — temperature + top-k + softmax sampling")
+    println("   [12] consciousness_to_intent — Phi/tension/arousal/valence → 10D vec")
+    println("   [13] intent_to_tokens        — full pipeline: consciousness → RVQ indices")
+    println("")
+    println("  Production scale: d=384, 6 heads, 4+4 layers, vocab=1024")
+    println("  Demo ran at d=8, 2 heads for speed — same math, smaller matrices")
+    println("════════════════════════════════════════════════════════════════")
+}
+
+main()
