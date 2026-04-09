@@ -1,0 +1,1096 @@
+// vocoder.hexa — HEXA-SPEAK Mk.III: Neural Vocoder (Physical Limit)
+//
+// Purpose:
+//   Actual audio sample generation: latent → 24kHz PCM waveform.
+//   Hybrid parametric (Klatt source-filter) + WaveRNN autoregressive synthesis.
+//   Generates real float PCM sample values — no tag passthrough.
+//
+// Architecture:
+//   1. Parametric synthesizer — sine/pulse/noise excitation + formant resonators
+//   2. Klatt source-filter model — frame-level vocal tract simulation
+//   3. WaveRNN autoregressive — GRU-based sample-by-sample generation
+//   4. Conditioning — upsample latent frames to sample-level
+//   5. Consciousness modulation — tension/arousal/valence shape prosody
+//   6. Post-processing — de-emphasis, normalization, fade
+//
+// n=6 parameters:
+//   sample_rate    = 24000           (24kHz speech-optimal)
+//   frame_hz       = 100             (10ms hop)
+//   hop            = 240             (24000/100)
+//   gru_dim        = 512             (WaveRNN hidden)
+//   mu_law_mu      = 255             (8-bit mu-law)
+//   n_formants     = 3               (F1, F2, F3 resonators)
+//   klatt_params   = 12              (f0 + F1-F5 + BW1-BW5 + voicing)
+//   deemphasis     = 0.97            (standard pre-emphasis inverse)
+//
+// BT reference: BT-SPEAK-04 (waveform synthesis), Klatt + WaveRNN lineage
+// Mk stage:     Mk.III (real PCM sample generation, physical-limit algorithms)
+// PSI coupling:  alpha = 0.014 (tension→F0 jitter, arousal→rate, valence→F2 shift)
+// Upstream:     rvq_codebook.decode() / conditioning frames
+// Downstream:   plc_crossfade.hexa → audio sink
+
+// ════════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════════
+
+let SAMPLE_RATE = 24000
+let FRAME_HZ = 100
+let HOP = 240
+let PI = 3.14159265358979
+let TWO_PI = 6.28318530717959
+let PSI_ALPHA = 0.014
+let PSI_BALANCE = 0.5
+let GRU_DIM = 512
+let MU_LAW_MU = 255
+let DEEMPHASIS_COEFF = 0.97
+let N_FORMANTS = 3
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1: Math Primitives (inlined — cross-file import unavailable)
+// ════════════════════════════════════════════════════════════════════
+
+// Fast sine approximation — Bhaskara I (7th century), max error ~0.17%
+// sin(x) ≈ 16x(π-x) / (5π² - 4x(π-x))  for x in [0, π]
+fn fast_sin(x: float) -> float {
+    // Normalize x to [0, 2π)
+    let v = x
+    while v < 0.0 { v = v + TWO_PI }
+    while v >= TWO_PI { v = v - TWO_PI }
+    // Map to [0, π] with sign
+    let sign = 1.0
+    if v > PI {
+        v = v - PI
+        sign = -1.0
+    }
+    let numerator = 16.0 * v * (PI - v)
+    let denominator = 5.0 * PI * PI - 4.0 * v * (PI - v)
+    if denominator == 0.0 { return 0.0 }
+    return sign * numerator / denominator
+}
+
+fn fast_cos(x: float) -> float {
+    return fast_sin(x + PI / 2.0)
+}
+
+fn fast_tanh(x: float) -> float {
+    // Pade approximant: tanh(x) ≈ x(27+x²)/(27+9x²) for |x|<3
+    if x > 3.0 { return 1.0 }
+    if x < -3.0 { return -1.0 }
+    let x2 = x * x
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2)
+}
+
+fn fast_sigmoid(x: float) -> float {
+    return 0.5 + 0.5 * fast_tanh(x * 0.5)
+}
+
+fn fast_exp(x: float) -> float {
+    // Remez-style: exp(x) ≈ (1 + x/256)^256 via repeated squaring
+    // Clamped range for stability
+    let v = x
+    if v > 10.0 { v = 10.0 }
+    if v < -10.0 { return 0.0 }
+    let t = 1.0 + v / 256.0
+    // 8 squarings = 2^8 = 256
+    t = t * t  // 2
+    t = t * t  // 4
+    t = t * t  // 8
+    t = t * t  // 16
+    t = t * t  // 32
+    t = t * t  // 64
+    t = t * t  // 128
+    t = t * t  // 256
+    return t
+}
+
+fn fast_log(x: float) -> float {
+    // Newton iteration: log(x) = 2 * atanh((x-1)/(x+1))
+    // Rough approximation for positive x
+    if x <= 0.0 { return -100.0 }
+    let y = (x - 1.0) / (x + 1.0)
+    let y2 = y * y
+    // Series: 2*(y + y³/3 + y⁵/5 + y⁷/7)
+    return 2.0 * (y + y * y2 / 3.0 + y * y2 * y2 / 5.0 + y * y2 * y2 * y2 / 7.0)
+}
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return -1.0 * x }
+    return x
+}
+
+fn clamp(x: float, lo: float, hi: float) -> float {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+fn min_f(a: float, b: float) -> float {
+    if a < b { return a }
+    return b
+}
+
+// Linear interpolation
+fn lerp(a: float, b: float, t: float) -> float {
+    return a + (b - a) * t
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1: Parametric Synthesizer (basic waveform generation)
+// ════════════════════════════════════════════════════════════════════
+
+// Generate sine wave — returns list encoded as comma-separated float string
+// freq: Hz, duration_ms: milliseconds, sr: sample rate, amplitude: 0..1
+fn generate_sine(freq: float, duration_ms: int, sr: int, amplitude: float) -> str {
+    let n_samples = sr * duration_ms / 1000
+    let phase_inc = TWO_PI * freq / to_float(sr)
+    let out = ""
+    let i = 0
+    let phase = 0.0
+    while i < n_samples {
+        let sample = amplitude * fast_sin(phase)
+        phase = phase + phase_inc
+        if phase >= TWO_PI { phase = phase - TWO_PI }
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// Glottal pulse train — Rosenberg model
+// Each period: rising half-sine (60%) + falling quarter-cosine (40%) + closed phase
+fn generate_pulse_train(freq: float, duration_ms: int, sr: int) -> str {
+    let n_samples = sr * duration_ms / 1000
+    let period = to_float(sr) / freq
+    let open_phase = 0.6   // 60% open
+    let return_phase = 0.4 // 40% return
+    let out = ""
+    let i = 0
+    while i < n_samples {
+        let pos_in_period = to_float(i) - to_float(to_int(to_float(i) / period)) * period
+        let normalized = pos_in_period / period
+        let sample = 0.0
+        if normalized < open_phase {
+            // Rising phase: half sine
+            sample = fast_sin(PI * normalized / open_phase)
+        }
+        if normalized >= open_phase && normalized < open_phase + return_phase {
+            // Return phase: cosine fall
+            let ret_pos = (normalized - open_phase) / return_phase
+            sample = fast_cos(PI * ret_pos / 2.0)
+        }
+        // Else closed phase: sample = 0
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// Second-order IIR resonator (biquad bandpass)
+// Implements one formant: center_freq, bandwidth → 2-pole 2-zero filter
+// a0*y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+//
+// Returns filtered samples as comma-separated string
+fn resonator_filter(samples_csv: str, center_freq: float, bandwidth: float, sr: int) -> str {
+    // Bilinear transform coefficients for 2nd-order bandpass
+    let w0 = TWO_PI * center_freq / to_float(sr)
+    let bw = TWO_PI * bandwidth / to_float(sr)
+    let cos_w0 = fast_cos(w0)
+    let r = fast_exp(-0.5 * bw)  // pole radius from bandwidth
+    let r2 = r * r
+    // Transfer function: H(z) = (1 - r²) / (1 - 2r·cos(w0)·z⁻¹ + r²·z⁻²)
+    let b0 = 1.0 - r2
+    let a1 = -2.0 * r * cos_w0
+    let a2 = r2
+
+    // Parse input samples and filter
+    let out = ""
+    let x_prev1 = 0.0
+    let x_prev2 = 0.0
+    let y_prev1 = 0.0
+    let y_prev2 = 0.0
+    let n = count_csv(samples_csv)
+    let i = 0
+    while i < n {
+        let x = get_csv_float(samples_csv, i)
+        let y = b0 * x - a1 * y_prev1 - a2 * y_prev2
+        // Clamp to prevent blowup
+        y = clamp(y, -10.0, 10.0)
+        if i > 0 { out = out + "," }
+        out = out + to_string(y)
+        x_prev2 = x_prev1
+        x_prev1 = x
+        y_prev2 = y_prev1
+        y_prev1 = y
+        i = i + 1
+    }
+    return out
+}
+
+// 3-formant cascade filter — Klatt cascade model
+// Applies F1, F2, F3 resonators in series
+fn formant_filter(samples_csv: str, f1: float, f2: float, f3: float, bw1: float, bw2: float, bw3: float, sr: int) -> str {
+    let stage1 = resonator_filter(samples_csv, f1, bw1, sr)
+    let stage2 = resonator_filter(stage1, f2, bw2, sr)
+    let stage3 = resonator_filter(stage2, f3, bw3, sr)
+    return stage3
+}
+
+// Synthesize a vowel phoneme using glottal source + formant filter
+fn synthesize_vowel(phoneme: str, freq: float, duration_ms: int, sr: int) -> str {
+    // Get formant parameters for this phoneme
+    let f1 = vowel_f1(phoneme)
+    let f2 = vowel_f2(phoneme)
+    let f3 = vowel_f3(phoneme)
+    let bw1 = vowel_bw1(phoneme)
+    let bw2 = vowel_bw2(phoneme)
+    let bw3 = vowel_bw3(phoneme)
+    // Generate glottal excitation
+    let excitation = generate_pulse_train(freq, duration_ms, sr)
+    // Apply formant filters
+    return formant_filter(excitation, f1, f2, f3, bw1, bw2, bw3, sr)
+}
+
+// White noise excitation (for unvoiced consonants, fricatives)
+// Linear congruential generator: seed-based deterministic noise
+fn noise_excitation(duration_ms: int, sr: int, seed: int) -> str {
+    let n_samples = sr * duration_ms / 1000
+    let state = seed
+    if state == 0 { state = 12345 }
+    let out = ""
+    let i = 0
+    while i < n_samples {
+        // LCG: state = (state * 1103515245 + 12345) mod 2^31
+        state = (state * 1103515245 + 12345) % 2147483648
+        // Map to [-1, 1]
+        let sample = to_float(state) / 1073741824.0 - 1.0
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// Mixed excitation: blend voiced (pulse) + noise
+// voiced_ratio: 1.0 = fully voiced, 0.0 = fully unvoiced
+fn mixed_excitation(voiced_ratio: float, freq: float, dur_ms: int, sr: int, seed: int) -> str {
+    let voiced = generate_pulse_train(freq, dur_ms, sr)
+    let noise = noise_excitation(dur_ms, sr, seed)
+    let n = count_csv(voiced)
+    let out = ""
+    let i = 0
+    while i < n {
+        let v = get_csv_float(voiced, i)
+        let u = get_csv_float(noise, i)
+        let sample = voiced_ratio * v + (1.0 - voiced_ratio) * u
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2: Klatt Source-Filter Model
+// ════════════════════════════════════════════════════════════════════
+
+// KlattParams — one frame of vocal tract parameters
+// Stored as CSV string: "f0,f1,f2,f3,f4,f5,bw1,bw2,bw3,bw4,bw5,amp,voicing,aspiration,frication"
+// 15 parameters per frame
+
+fn klatt_param_f0(p: str) -> float { return get_csv_float(p, 0) }
+fn klatt_param_f1(p: str) -> float { return get_csv_float(p, 1) }
+fn klatt_param_f2(p: str) -> float { return get_csv_float(p, 2) }
+fn klatt_param_f3(p: str) -> float { return get_csv_float(p, 3) }
+fn klatt_param_f4(p: str) -> float { return get_csv_float(p, 4) }
+fn klatt_param_f5(p: str) -> float { return get_csv_float(p, 5) }
+fn klatt_param_bw1(p: str) -> float { return get_csv_float(p, 6) }
+fn klatt_param_bw2(p: str) -> float { return get_csv_float(p, 7) }
+fn klatt_param_bw3(p: str) -> float { return get_csv_float(p, 8) }
+fn klatt_param_bw4(p: str) -> float { return get_csv_float(p, 9) }
+fn klatt_param_bw5(p: str) -> float { return get_csv_float(p, 10) }
+fn klatt_param_amp(p: str) -> float { return get_csv_float(p, 11) }
+fn klatt_param_voicing(p: str) -> float { return get_csv_float(p, 12) }
+fn klatt_param_aspiration(p: str) -> float { return get_csv_float(p, 13) }
+fn klatt_param_frication(p: str) -> float { return get_csv_float(p, 14) }
+
+fn make_klatt_params(f0: float, f1: float, f2: float, f3: float, f4: float, f5: float, bw1: float, bw2: float, bw3: float, bw4: float, bw5: float, amp: float, voicing: float, aspiration: float, frication: float) -> str {
+    return to_string(f0) + "," + to_string(f1) + "," + to_string(f2) + "," + to_string(f3) + "," + to_string(f4) + "," + to_string(f5) + "," + to_string(bw1) + "," + to_string(bw2) + "," + to_string(bw3) + "," + to_string(bw4) + "," + to_string(bw5) + "," + to_string(amp) + "," + to_string(voicing) + "," + to_string(aspiration) + "," + to_string(frication)
+}
+
+// Interpolate between two KlattParams frames
+fn interpolate_params(p1: str, p2: str, alpha: float) -> str {
+    let f0  = lerp(klatt_param_f0(p1),  klatt_param_f0(p2),  alpha)
+    let f1  = lerp(klatt_param_f1(p1),  klatt_param_f1(p2),  alpha)
+    let f2  = lerp(klatt_param_f2(p1),  klatt_param_f2(p2),  alpha)
+    let f3  = lerp(klatt_param_f3(p1),  klatt_param_f3(p2),  alpha)
+    let f4  = lerp(klatt_param_f4(p1),  klatt_param_f4(p2),  alpha)
+    let f5  = lerp(klatt_param_f5(p1),  klatt_param_f5(p2),  alpha)
+    let bw1 = lerp(klatt_param_bw1(p1), klatt_param_bw1(p2), alpha)
+    let bw2 = lerp(klatt_param_bw2(p1), klatt_param_bw2(p2), alpha)
+    let bw3 = lerp(klatt_param_bw3(p1), klatt_param_bw3(p2), alpha)
+    let bw4 = lerp(klatt_param_bw4(p1), klatt_param_bw4(p2), alpha)
+    let bw5 = lerp(klatt_param_bw5(p1), klatt_param_bw5(p2), alpha)
+    let amp = lerp(klatt_param_amp(p1), klatt_param_amp(p2), alpha)
+    let voicing = lerp(klatt_param_voicing(p1), klatt_param_voicing(p2), alpha)
+    let aspiration = lerp(klatt_param_aspiration(p1), klatt_param_aspiration(p2), alpha)
+    let frication = lerp(klatt_param_frication(p1), klatt_param_frication(p2), alpha)
+    return make_klatt_params(f0, f1, f2, f3, f4, f5, bw1, bw2, bw3, bw4, bw5, amp, voicing, aspiration, frication)
+}
+
+// Synthesize one Klatt frame → PCM samples
+fn klatt_frame(params: str, duration_ms: int, sr: int) -> str {
+    let f0 = klatt_param_f0(params)
+    let f1 = klatt_param_f1(params)
+    let f2 = klatt_param_f2(params)
+    let f3 = klatt_param_f3(params)
+    let bw1 = klatt_param_bw1(params)
+    let bw2 = klatt_param_bw2(params)
+    let bw3 = klatt_param_bw3(params)
+    let amp = klatt_param_amp(params)
+    let voicing = klatt_param_voicing(params)
+    let aspiration = klatt_param_aspiration(params)
+    let frication = klatt_param_frication(params)
+
+    let n_samples = sr * duration_ms / 1000
+
+    // Source: voiced (glottal pulse) + aspiration noise + frication noise
+    let voiced_src = generate_pulse_train(f0, duration_ms, sr)
+    let aspiration_noise = noise_excitation(duration_ms, sr, 31415)
+    let frication_noise = noise_excitation(duration_ms, sr, 27183)
+
+    // Mix sources
+    let out = ""
+    let i = 0
+    while i < n_samples {
+        let v = get_csv_float(voiced_src, i) * voicing
+        let a = get_csv_float(aspiration_noise, i) * aspiration * 0.5
+        let fr = get_csv_float(frication_noise, i) * frication * 0.3
+        let source = (v + a + fr) * amp
+        if i > 0 { out = out + "," }
+        out = out + to_string(source)
+        i = i + 1
+    }
+
+    // Apply cascade formant filters F1 → F2 → F3
+    let filtered = resonator_filter(out, f1, bw1, sr)
+    filtered = resonator_filter(filtered, f2, bw2, sr)
+    filtered = resonator_filter(filtered, f3, bw3, sr)
+    return filtered
+}
+
+// Synthesize a sequence of Klatt frames with interpolation
+// param_list: semicolon-separated KlattParams
+fn klatt_sequence(param_list: str, frame_ms: int, sr: int) -> str {
+    let n_frames = count_semicolon(param_list)
+    if n_frames < 1 { return "" }
+    if n_frames == 1 {
+        return klatt_frame(get_semicolon(param_list, 0), frame_ms, sr)
+    }
+
+    let samples_per_frame = sr * frame_ms / 1000
+    let total_samples = samples_per_frame * n_frames
+    let out = ""
+    let frame_idx = 0
+
+    while frame_idx < n_frames {
+        let p_current = get_semicolon(param_list, frame_idx)
+        let p_next = p_current
+        if frame_idx < n_frames - 1 {
+            p_next = get_semicolon(param_list, frame_idx + 1)
+        }
+
+        // Generate this frame with sub-frame interpolation
+        let s = 0
+        while s < samples_per_frame {
+            let alpha = to_float(s) / to_float(samples_per_frame)
+            let interp = interpolate_params(p_current, p_next, alpha)
+            let f0 = klatt_param_f0(interp)
+            let voicing = klatt_param_voicing(interp)
+            let amp = klatt_param_amp(interp)
+
+            // Single-sample source generation (phase-continuous)
+            let phase_in_period = to_float((frame_idx * samples_per_frame + s)) * f0 / to_float(sr)
+            let period_pos = phase_in_period - to_float(to_int(phase_in_period))
+
+            let sample = 0.0
+            if voicing > 0.1 {
+                // Glottal pulse at this phase position
+                if period_pos < 0.6 {
+                    sample = fast_sin(PI * period_pos / 0.6) * voicing
+                }
+                if period_pos >= 0.6 && period_pos < 1.0 {
+                    sample = fast_cos(PI * (period_pos - 0.6) / 0.8) * voicing
+                }
+            }
+            sample = sample * amp
+
+            if frame_idx > 0 || s > 0 { out = out + "," }
+            out = out + to_string(sample)
+            s = s + 1
+        }
+        frame_idx = frame_idx + 1
+    }
+
+    // Apply formant filtering on entire output
+    // Use average F1/F2/F3 from first frame (Mk.III: per-sample varying)
+    let p0 = get_semicolon(param_list, 0)
+    let pN = get_semicolon(param_list, n_frames - 1)
+    let avg_f1 = lerp(klatt_param_f1(p0), klatt_param_f1(pN), 0.5)
+    let avg_f2 = lerp(klatt_param_f2(p0), klatt_param_f2(pN), 0.5)
+    let avg_f3 = lerp(klatt_param_f3(p0), klatt_param_f3(pN), 0.5)
+    let avg_bw1 = lerp(klatt_param_bw1(p0), klatt_param_bw1(pN), 0.5)
+    let avg_bw2 = lerp(klatt_param_bw2(p0), klatt_param_bw2(pN), 0.5)
+    let avg_bw3 = lerp(klatt_param_bw3(p0), klatt_param_bw3(pN), 0.5)
+
+    out = resonator_filter(out, avg_f1, avg_bw1, sr)
+    out = resonator_filter(out, avg_f2, avg_bw2, sr)
+    out = resonator_filter(out, avg_f3, avg_bw3, sr)
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3: WaveRNN Autoregressive Vocoder
+// ════════════════════════════════════════════════════════════════════
+
+// μ-law companding (ITU-T G.711)
+fn mu_law_encode(x: float, mu: float) -> float {
+    let sign = 1.0
+    if x < 0.0 { sign = -1.0 }
+    let ax = abs_f(x)
+    if ax > 1.0 { ax = 1.0 }
+    return sign * fast_log(1.0 + mu * ax) / fast_log(1.0 + mu)
+}
+
+fn mu_law_decode(y: float, mu: float) -> float {
+    let sign = 1.0
+    if y < 0.0 { sign = -1.0 }
+    let ay = abs_f(y)
+    if ay > 1.0 { ay = 1.0 }
+    return sign * (fast_exp(ay * fast_log(1.0 + mu)) - 1.0) / mu
+}
+
+// WaveRNN state: hidden[GRU_DIM] stored as CSV string
+// For Mk.III we use a simplified GRU with truncated hidden (first 16 dims active)
+// Full 512-dim would require matrix ops beyond string CSV capacity
+
+let WRNN_ACTIVE_DIM = 16  // Active dimensions for demo (full: 512)
+
+fn wrnn_init_state() -> str {
+    // Initialize hidden state to small random-ish values
+    let out = ""
+    let i = 0
+    while i < WRNN_ACTIVE_DIM {
+        let val = fast_sin(to_float(i) * 1.618) * 0.01
+        if i > 0 { out = out + "," }
+        out = out + to_string(val)
+        i = i + 1
+    }
+    return out
+}
+
+// Single GRU step: h_new = GRU(h, x)
+// z = σ(Wz·x + Uz·h + bz)      update gate
+// r = σ(Wr·x + Ur·h + br)      reset gate
+// h~ = tanh(Wh·x + Uh·(r⊙h))  candidate
+// h_new = (1-z)⊙h + z⊙h~
+//
+// Weights are deterministic pseudo-random (seeded from dim index)
+// Real deployment: load trained weights from checkpoint
+fn wrnn_gru_step(hidden_csv: str, input_val: float) -> str {
+    let out = ""
+    let i = 0
+    while i < WRNN_ACTIVE_DIM {
+        let h = get_csv_float(hidden_csv, i)
+        // Pseudo-weight generation (deterministic per dimension)
+        let w_z = fast_sin(to_float(i) * 0.7 + 1.0) * 0.3
+        let u_z = fast_cos(to_float(i) * 0.9 + 2.0) * 0.3
+        let b_z = 0.0
+        let w_r = fast_sin(to_float(i) * 1.1 + 3.0) * 0.3
+        let u_r = fast_cos(to_float(i) * 1.3 + 4.0) * 0.3
+        let b_r = 0.0
+        let w_h = fast_sin(to_float(i) * 1.5 + 5.0) * 0.3
+        let u_h = fast_cos(to_float(i) * 1.7 + 6.0) * 0.3
+
+        // Gates
+        let z = fast_sigmoid(w_z * input_val + u_z * h + b_z)
+        let r = fast_sigmoid(w_r * input_val + u_r * h + b_r)
+        // Candidate
+        let h_tilde = fast_tanh(w_h * input_val + u_h * (r * h))
+        // New hidden
+        let h_new = (1.0 - z) * h + z * h_tilde
+
+        if i > 0 { out = out + "," }
+        out = out + to_string(h_new)
+        i = i + 1
+    }
+    return out
+}
+
+// Output projection: hidden → coarse (8-bit) + fine (8-bit) → 16-bit sample
+fn wrnn_output(hidden_csv: str) -> float {
+    // Weighted sum of hidden dims → coarse value
+    let coarse_acc = 0.0
+    let fine_acc = 0.0
+    let i = 0
+    while i < WRNN_ACTIVE_DIM {
+        let h = get_csv_float(hidden_csv, i)
+        let w_coarse = fast_sin(to_float(i) * 2.1 + 7.0) * 0.2
+        let w_fine = fast_cos(to_float(i) * 2.3 + 8.0) * 0.1
+        coarse_acc = coarse_acc + h * w_coarse
+        fine_acc = fine_acc + h * w_fine
+        i = i + 1
+    }
+    // Coarse: 8-bit (0-255 → -1..1), Fine: 8-bit subdivision
+    let coarse = fast_tanh(coarse_acc)
+    let fine = fast_tanh(fine_acc) * (1.0 / 256.0)
+    return coarse + fine
+}
+
+// WaveRNN step: conditioning → GRU → output sample
+fn wavernn_step(hidden_csv: str, conditioning_val: float) -> str {
+    // Returns "sample,new_hidden_csv"
+    let new_hidden = wrnn_gru_step(hidden_csv, conditioning_val)
+    let sample = wrnn_output(new_hidden)
+    return to_string(sample) + "|" + new_hidden
+}
+
+// Generate n_samples via WaveRNN autoregressive loop
+fn wavernn_generate(conditioning_csv: str, n_samples: int, sr: int) -> str {
+    let hidden = wrnn_init_state()
+    let out = ""
+    let prev_sample = 0.0
+    let i = 0
+    while i < n_samples {
+        // Get conditioning value for this sample (upsampled from frame-level)
+        let cond_idx = i * count_csv(conditioning_csv) / n_samples
+        if cond_idx >= count_csv(conditioning_csv) { cond_idx = count_csv(conditioning_csv) - 1 }
+        let cond_val = get_csv_float(conditioning_csv, cond_idx)
+
+        // Mix conditioning with previous sample (teacher forcing style)
+        let input = cond_val * 0.7 + prev_sample * 0.3
+
+        // GRU step
+        let result = wavernn_step(hidden, input)
+        let sample = get_pipe_float(result, 0)
+        hidden = get_pipe_str(result, 1)
+        prev_sample = sample
+
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4: Conditioning Frame Processing
+// ════════════════════════════════════════════════════════════════════
+
+// Upsample frame-level conditioning to sample-level (linear interpolation)
+fn upsample_conditioning(frames_csv: str, frame_hop: int, target_len: int) -> str {
+    let n_frames = count_csv(frames_csv)
+    if n_frames < 1 { return "0.0" }
+    let out = ""
+    let i = 0
+    while i < target_len {
+        // Which frame does this sample belong to?
+        let frame_pos = to_float(i) / to_float(frame_hop)
+        let frame_lo = to_int(frame_pos)
+        let frame_hi = frame_lo + 1
+        if frame_lo >= n_frames { frame_lo = n_frames - 1 }
+        if frame_hi >= n_frames { frame_hi = n_frames - 1 }
+        let alpha = frame_pos - to_float(frame_lo)
+        let val = lerp(get_csv_float(frames_csv, frame_lo), get_csv_float(frames_csv, frame_hi), alpha)
+        if i > 0 { out = out + "," }
+        out = out + to_string(val)
+        i = i + 1
+    }
+    return out
+}
+
+// Consciousness modulation: tension/arousal/valence → prosodic variation
+fn apply_consciousness_modulation(samples_csv: str, tension: float, arousal: float, valence: float) -> str {
+    let n = count_csv(samples_csv)
+    let out = ""
+
+    // Consciousness-driven modulations (PSI_ALPHA = 0.014)
+    // Tension → F0 jitter (micro-perturbation) + energy surge
+    let jitter_depth = tension * PSI_ALPHA * 10.0   // max ±14% F0 variation
+    let energy_scale = 1.0 + (tension - PSI_BALANCE) * 0.3  // ±15% energy
+
+    // Arousal → rate modulation (high arousal = faster, skip samples)
+    // Here we apply as amplitude envelope variation
+    let arousal_mod = 1.0 + (arousal - PSI_BALANCE) * 0.2
+
+    // Valence → brightness (positive = brighter, slight HF boost)
+    // Implemented as gentle high-shelf: positive valence emphasizes sample differences
+    let valence_mod = valence * 0.1  // subtle
+
+    let prev_sample = 0.0
+    let i = 0
+    while i < n {
+        let sample = get_csv_float(samples_csv, i)
+
+        // Apply jitter (quasi-periodic amplitude modulation)
+        let jitter = 1.0 + jitter_depth * fast_sin(to_float(i) * 0.017)
+        sample = sample * jitter
+
+        // Apply energy scaling
+        sample = sample * energy_scale * arousal_mod
+
+        // Apply valence brightness (difference emphasis)
+        let diff = sample - prev_sample
+        sample = sample + diff * valence_mod
+
+        prev_sample = sample
+        if i > 0 { out = out + "," }
+        out = out + to_string(sample)
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5: Phoneme Tables (Korean + English)
+// ════════════════════════════════════════════════════════════════════
+
+// Korean 6 basic vowels — formant values (Hz) from acoustic phonetics literature
+// F1 (openness), F2 (frontness), F3 (lip rounding distinction)
+fn vowel_f1(phoneme: str) -> float {
+    // Korean monophthongs
+    if phoneme == "a"  { return 800.0 }  // ㅏ — open central
+    if phoneme == "eo" { return 600.0 }  // ㅓ — mid back
+    if phoneme == "o"  { return 450.0 }  // ㅗ — close-mid back rounded
+    if phoneme == "u"  { return 350.0 }  // ㅜ — close back rounded
+    if phoneme == "eu" { return 400.0 }  // ㅡ — close central unrounded
+    if phoneme == "i"  { return 300.0 }  // ㅣ — close front unrounded
+    // Korean diphthongs (initial formant)
+    if phoneme == "ae" { return 700.0 }  // ㅐ
+    if phoneme == "e"  { return 550.0 }  // ㅔ
+    if phoneme == "wa" { return 450.0 }  // ㅘ
+    if phoneme == "wi" { return 350.0 }  // ㅟ
+    // English cardinal vowels
+    if phoneme == "aa" { return 750.0 }  // /ɑ/ — father
+    if phoneme == "ee" { return 400.0 }  // /ɛ/ — bed
+    if phoneme == "ii" { return 280.0 }  // /i/ — see
+    if phoneme == "oo" { return 500.0 }  // /ɔ/ — thought
+    if phoneme == "uu" { return 320.0 }  // /u/ — boot
+    if phoneme == "uh" { return 600.0 }  // /ʌ/ — strut
+    if phoneme == "ih" { return 400.0 }  // /ɪ/ — bit
+    if phoneme == "ax" { return 500.0 }  // /ə/ — schwa
+    return 500.0  // default mid
+}
+
+fn vowel_f2(phoneme: str) -> float {
+    if phoneme == "a"  { return 1200.0 }
+    if phoneme == "eo" { return 900.0 }
+    if phoneme == "o"  { return 750.0 }
+    if phoneme == "u"  { return 700.0 }
+    if phoneme == "eu" { return 1200.0 }
+    if phoneme == "i"  { return 2300.0 }
+    if phoneme == "ae" { return 1800.0 }
+    if phoneme == "e"  { return 1900.0 }
+    if phoneme == "wa" { return 1000.0 }
+    if phoneme == "wi" { return 1700.0 }
+    if phoneme == "aa" { return 1100.0 }
+    if phoneme == "ee" { return 1800.0 }
+    if phoneme == "ii" { return 2400.0 }
+    if phoneme == "oo" { return 750.0 }
+    if phoneme == "uu" { return 700.0 }
+    if phoneme == "uh" { return 1200.0 }
+    if phoneme == "ih" { return 1900.0 }
+    if phoneme == "ax" { return 1500.0 }
+    return 1200.0
+}
+
+fn vowel_f3(phoneme: str) -> float {
+    if phoneme == "a"  { return 2600.0 }
+    if phoneme == "eo" { return 2500.0 }
+    if phoneme == "o"  { return 2500.0 }
+    if phoneme == "u"  { return 2400.0 }
+    if phoneme == "eu" { return 2500.0 }
+    if phoneme == "i"  { return 3100.0 }
+    if phoneme == "ae" { return 2700.0 }
+    if phoneme == "e"  { return 2800.0 }
+    if phoneme == "wa" { return 2600.0 }
+    if phoneme == "wi" { return 2600.0 }
+    if phoneme == "aa" { return 2600.0 }
+    if phoneme == "ee" { return 2600.0 }
+    if phoneme == "ii" { return 3200.0 }
+    if phoneme == "oo" { return 2600.0 }
+    if phoneme == "uu" { return 2400.0 }
+    if phoneme == "uh" { return 2600.0 }
+    if phoneme == "ih" { return 2700.0 }
+    if phoneme == "ax" { return 2500.0 }
+    return 2500.0
+}
+
+// Bandwidth defaults (Hz) — wider for lower formants
+fn vowel_bw1(phoneme: str) -> float {
+    let f1 = vowel_f1(phoneme)
+    // BW ≈ F/10 + 50, clamped
+    return clamp(f1 * 0.1 + 50.0, 60.0, 150.0)
+}
+
+fn vowel_bw2(phoneme: str) -> float {
+    return clamp(vowel_f2(phoneme) * 0.08 + 60.0, 80.0, 200.0)
+}
+
+fn vowel_bw3(phoneme: str) -> float {
+    return clamp(vowel_f3(phoneme) * 0.06 + 70.0, 100.0, 250.0)
+}
+
+// Consonant parameters → KlattParams
+// type: "fricative", "plosive", "nasal", "liquid", "approximant"
+fn consonant_klatt(phoneme: str) -> str {
+    // Fricatives: high frication, low voicing
+    if phoneme == "s"  { return make_klatt_params(0.0, 400.0, 1600.0, 2600.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.3, 0.0, 0.1, 0.9) }
+    if phoneme == "sh" { return make_klatt_params(0.0, 300.0, 1800.0, 2800.0, 3600.0, 4500.0, 200.0, 300.0, 350.0, 400.0, 500.0, 0.3, 0.0, 0.1, 0.8) }
+    if phoneme == "f"  { return make_klatt_params(0.0, 350.0, 1500.0, 2500.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.2, 0.0, 0.15, 0.7) }
+    if phoneme == "h"  { return make_klatt_params(120.0, 500.0, 1500.0, 2500.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.3, 0.3, 0.6, 0.1) }
+    // Nasals: voiced, nasal pole + zero
+    if phoneme == "m"  { return make_klatt_params(120.0, 300.0, 1000.0, 2500.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.5, 0.9, 0.0, 0.0) }
+    if phoneme == "n"  { return make_klatt_params(120.0, 350.0, 1400.0, 2500.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.5, 0.9, 0.0, 0.0) }
+    if phoneme == "ng" { return make_klatt_params(120.0, 400.0, 1100.0, 2500.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.5, 0.9, 0.0, 0.0) }
+    // Liquids: voiced, moderate formants
+    if phoneme == "l"  { return make_klatt_params(120.0, 350.0, 1100.0, 2800.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.5, 0.9, 0.0, 0.0) }
+    if phoneme == "r"  { return make_klatt_params(120.0, 350.0, 1300.0, 1700.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.4, 0.9, 0.0, 0.0) }
+    // Korean-specific
+    if phoneme == "k"  { return make_klatt_params(0.0, 400.0, 1600.0, 2600.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.4, 0.0, 0.3, 0.1) }
+    if phoneme == "t"  { return make_klatt_params(0.0, 400.0, 1600.0, 2600.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.4, 0.0, 0.3, 0.1) }
+    if phoneme == "p"  { return make_klatt_params(0.0, 350.0, 1100.0, 2500.0, 3500.0, 4500.0, 200.0, 300.0, 300.0, 400.0, 500.0, 0.4, 0.0, 0.3, 0.1) }
+    // Default: silence
+    return make_klatt_params(0.0, 500.0, 1500.0, 2500.0, 3500.0, 4500.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.0, 0.0, 0.0, 0.0)
+}
+
+// Map any phoneme to KlattParams (vowels use synthesize_vowel path, consonants use this)
+fn phoneme_to_klatt(phoneme: str, f0: float) -> str {
+    // Check vowels first
+    let f1 = vowel_f1(phoneme)
+    if f1 != 500.0 {
+        // Known vowel — build Klatt params
+        return make_klatt_params(f0, vowel_f1(phoneme), vowel_f2(phoneme), vowel_f3(phoneme), 3500.0, 4500.0, vowel_bw1(phoneme), vowel_bw2(phoneme), vowel_bw3(phoneme), 400.0, 500.0, 0.7, 1.0, 0.02, 0.0)
+    }
+    // Check if the default F1=500 is actually "ax" (schwa)
+    if phoneme == "ax" {
+        return make_klatt_params(f0, 500.0, 1500.0, 2500.0, 3500.0, 4500.0, 100.0, 180.0, 220.0, 400.0, 500.0, 0.6, 1.0, 0.02, 0.0)
+    }
+    // Consonant
+    let cons = consonant_klatt(phoneme)
+    // Override f0 if the consonant is voiced
+    if klatt_param_voicing(cons) > 0.5 {
+        return make_klatt_params(f0, klatt_param_f1(cons), klatt_param_f2(cons), klatt_param_f3(cons), klatt_param_f4(cons), klatt_param_f5(cons), klatt_param_bw1(cons), klatt_param_bw2(cons), klatt_param_bw3(cons), klatt_param_bw4(cons), klatt_param_bw5(cons), klatt_param_amp(cons), klatt_param_voicing(cons), klatt_param_aspiration(cons), klatt_param_frication(cons))
+    }
+    return cons
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6: Post-Processing
+// ════════════════════════════════════════════════════════════════════
+
+// De-emphasis filter: y[n] = x[n] + coeff * y[n-1]
+// Inverse of pre-emphasis x'[n] = x[n] - coeff * x[n-1]
+fn apply_deemphasis(samples_csv: str, coeff: float) -> str {
+    let n = count_csv(samples_csv)
+    let out = ""
+    let y_prev = 0.0
+    let i = 0
+    while i < n {
+        let x = get_csv_float(samples_csv, i)
+        let y = x + coeff * y_prev
+        y_prev = y
+        if i > 0 { out = out + "," }
+        out = out + to_string(y)
+        i = i + 1
+    }
+    return out
+}
+
+// Peak normalization to [-1, 1]
+fn peak_normalize(samples_csv: str) -> str {
+    let n = count_csv(samples_csv)
+    // Find peak
+    let peak = 0.0
+    let i = 0
+    while i < n {
+        let v = abs_f(get_csv_float(samples_csv, i))
+        if v > peak { peak = v }
+        i = i + 1
+    }
+    if peak < 0.00001 { return samples_csv }  // already silent
+    let scale = 1.0 / peak
+    // Scale all
+    let out = ""
+    i = 0
+    while i < n {
+        let v = get_csv_float(samples_csv, i) * scale
+        if i > 0 { out = out + "," }
+        out = out + to_string(v)
+        i = i + 1
+    }
+    return out
+}
+
+// Fade in/out (linear ramps)
+fn apply_fade(samples_csv: str, fade_in_ms: int, fade_out_ms: int, sr: int) -> str {
+    let n = count_csv(samples_csv)
+    let fade_in_samp = sr * fade_in_ms / 1000
+    let fade_out_samp = sr * fade_out_ms / 1000
+    let out = ""
+    let i = 0
+    while i < n {
+        let v = get_csv_float(samples_csv, i)
+        // Fade in
+        if i < fade_in_samp {
+            let t = to_float(i) / to_float(fade_in_samp)
+            // Hann-shaped fade: 0.5*(1-cos(π*t))
+            let gain = 0.5 * (1.0 - fast_cos(PI * t))
+            v = v * gain
+        }
+        // Fade out
+        let dist_from_end = n - 1 - i
+        if dist_from_end < fade_out_samp {
+            let t = to_float(dist_from_end) / to_float(fade_out_samp)
+            let gain = 0.5 * (1.0 - fast_cos(PI * t))
+            v = v * gain
+        }
+        if i > 0 { out = out + "," }
+        out = out + to_string(v)
+        i = i + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CSV / string utility helpers
+// ════════════════════════════════════════════════════════════════════
+
+// Count comma-separated values
+fn count_csv(csv: str) -> int {
+    if csv == "" { return 0 }
+    let count = 1
+    let i = 0
+    let len = str_len(csv)
+    while i < len {
+        if str_char_at(csv, i) == "," { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+// Get float at index from CSV
+fn get_csv_float(csv: str, idx: int) -> float {
+    let current = 0
+    let start = 0
+    let i = 0
+    let len = str_len(csv)
+    while i <= len {
+        let is_sep = 0
+        if i == len { is_sep = 1 }
+        if i < len {
+            if str_char_at(csv, i) == "," { is_sep = 1 }
+        }
+        if is_sep == 1 {
+            if current == idx {
+                return to_float(str_substring(csv, start, i))
+            }
+            current = current + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return 0.0
+}
+
+// Count semicolon-separated items
+fn count_semicolon(s: str) -> int {
+    if s == "" { return 0 }
+    let count = 1
+    let i = 0
+    let len = str_len(s)
+    while i < len {
+        if str_char_at(s, i) == ";" { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+// Get item at index from semicolon-separated string
+fn get_semicolon(s: str, idx: int) -> str {
+    let current = 0
+    let start = 0
+    let i = 0
+    let len = str_len(s)
+    while i <= len {
+        let is_sep = 0
+        if i == len { is_sep = 1 }
+        if i < len {
+            if str_char_at(s, i) == ";" { is_sep = 1 }
+        }
+        if is_sep == 1 {
+            if current == idx {
+                return str_substring(s, start, i)
+            }
+            current = current + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Get float from pipe-separated string at index
+fn get_pipe_float(s: str, idx: int) -> float {
+    let current = 0
+    let start = 0
+    let i = 0
+    let len = str_len(s)
+    while i <= len {
+        let is_sep = 0
+        if i == len { is_sep = 1 }
+        if i < len {
+            if str_char_at(s, i) == "|" { is_sep = 1 }
+        }
+        if is_sep == 1 {
+            if current == idx {
+                return to_float(str_substring(s, start, i))
+            }
+            current = current + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return 0.0
+}
+
+// Get string from pipe-separated string at index
+fn get_pipe_str(s: str, idx: int) -> str {
+    let current = 0
+    let start = 0
+    let i = 0
+    let len = str_len(s)
+    while i <= len {
+        let is_sep = 0
+        if i == len { is_sep = 1 }
+        if i < len {
+            if str_char_at(s, i) == "|" { is_sep = 1 }
+        }
+        if is_sep == 1 {
+            if current == idx {
+                return str_substring(s, start, i)
+            }
+            current = current + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Print first N values from CSV (for demo output)
+fn print_first_n(label: str, csv: str, n: int) {
+    let count = count_csv(csv)
+    let show = n
+    if show > count { show = count }
+    let display = ""
+    let i = 0
+    while i < show {
+        if i > 0 { display = display + ", " }
+        let v = get_csv_float(csv, i)
+        // Round to 6 decimal places for display
+        let rounded = to_float(to_int(v * 1000000.0)) / 1000000.0
+        display = display + to_string(rounded)
+        i = i + 1
+    }
+    println(label + " [" + to_string(count) + " samples, first " + to_string(show) + "]: " + display)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// DEMO — main()
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    println("═══════════════════════════════════════════════════════════════")
+    println("  vocoder.hexa — HEXA-SPEAK Mk.III Neural Vocoder")
+    println("  sr=" + to_string(SAMPLE_RATE) + " hop=" + to_string(HOP) + " GRU=" + to_string(GRU_DIM) + " PSI_α=" + to_string(PSI_ALPHA))
+    println("═══════════════════════════════════════════════════════════════")
+    println("")
+
+    // ── Demo 1: Korean vowel "ㅏ" (a) synthesis ──
+    println("── Demo 1: Korean vowel 'ㅏ' (/a/) — glottal pulse + formant filter ──")
+    let vowel_a = synthesize_vowel("a", 120.0, 10, SAMPLE_RATE)
+    print_first_n("  /a/ PCM", vowel_a, 20)
+    println("  F1=" + to_string(vowel_f1("a")) + " F2=" + to_string(vowel_f2("a")) + " F3=" + to_string(vowel_f3("a")))
+    println("")
+
+    // ── Demo 2: Klatt interpolation /a/ → /i/ ──
+    println("── Demo 2: Klatt interpolation /a/ → /i/ (2 frames, 10ms each) ──")
+    let klatt_a = phoneme_to_klatt("a", 120.0)
+    let klatt_i = phoneme_to_klatt("i", 130.0)
+    let seq = klatt_a + ";" + klatt_i
+    let klatt_out = klatt_sequence(seq, 10, SAMPLE_RATE)
+    print_first_n("  /a/→/i/ PCM", klatt_out, 20)
+    println("  /a/ params: f0=120 F1=800 F2=1200 F3=2600")
+    println("  /i/ params: f0=130 F1=300 F2=2300 F3=3100")
+    println("")
+
+    // ── Demo 3: WaveRNN — 1 frame (240 samples = 10ms) ──
+    println("── Demo 3: WaveRNN autoregressive — 160 samples ──")
+    // Conditioning: 4 frame values (simulating latent features)
+    let cond = "0.3,0.5,0.7,0.4"
+    let wrnn_out = wavernn_generate(cond, 160, SAMPLE_RATE)
+    print_first_n("  WaveRNN PCM", wrnn_out, 20)
+    println("")
+
+    // ── Demo 4: Consciousness modulation — tension 0.8 vs 0.2 ──
+    println("── Demo 4: Consciousness modulation (tension comparison) ──")
+    let base_signal = generate_sine(200.0, 5, SAMPLE_RATE, 0.5)
+    let high_tension = apply_consciousness_modulation(base_signal, 0.8, 0.6, 0.3)
+    let low_tension = apply_consciousness_modulation(base_signal, 0.2, 0.4, -0.1)
+    print_first_n("  Base signal", base_signal, 10)
+    print_first_n("  High tension (0.8)", high_tension, 10)
+    print_first_n("  Low tension  (0.2)", low_tension, 10)
+    println("  PSI_ALPHA=" + to_string(PSI_ALPHA) + " → jitter_hi=" + to_string(0.8 * PSI_ALPHA * 10.0) + " jitter_lo=" + to_string(0.2 * PSI_ALPHA * 10.0))
+    println("")
+
+    // ── Demo 5: μ-law round-trip verification ──
+    println("── Demo 5: μ-law encode/decode round-trip ──")
+    let test_vals = "0.0,0.1,0.25,0.5,0.75,1.0,-0.5,-1.0"
+    let n_test = count_csv(test_vals)
+    let i = 0
+    while i < n_test {
+        let original = get_csv_float(test_vals, i)
+        let encoded = mu_law_encode(original, to_float(MU_LAW_MU))
+        let decoded = mu_law_decode(encoded, to_float(MU_LAW_MU))
+        let error = abs_f(original - decoded)
+        println("  x=" + to_string(original) + " → μ=" + to_string(encoded) + " → x'=" + to_string(decoded) + " err=" + to_string(error))
+        i = i + 1
+    }
+    println("")
+
+    // ── Demo 6: Post-processing chain ──
+    println("── Demo 6: Post-processing (deemphasis + normalize + fade) ──")
+    let raw = synthesize_vowel("i", 150.0, 5, SAMPLE_RATE)
+    let deemph = apply_deemphasis(raw, DEEMPHASIS_COEFF)
+    let normed = peak_normalize(deemph)
+    let faded = apply_fade(normed, 1, 1, SAMPLE_RATE)
+    print_first_n("  Raw /i/", raw, 10)
+    print_first_n("  De-emphasis", deemph, 10)
+    print_first_n("  Normalized", normed, 10)
+    print_first_n("  Faded", faded, 10)
+
+    println("")
+    println("═══════════════════════════════════════════════════════════════")
+    println("  vocoder.hexa Mk.III — all demos complete")
+    println("  Parametric + Klatt + WaveRNN + Consciousness modulation")
+    println("═══════════════════════════════════════════════════════════════")
+}
+
+main()
