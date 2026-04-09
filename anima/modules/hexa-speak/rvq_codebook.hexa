@@ -1,30 +1,525 @@
-// rvq_codebook.hexa — HEXA-SPEAK Mk.I: Residual Vector Quantizer
+// rvq_codebook.hexa — HEXA-SPEAK Mk.III: Residual Vector Quantizer
 //
 // Purpose:
-//   8-stage residual vector quantization on continuous audio latents.
-//   encode(): latent → [8 stage indices]
-//   decode(): [8 stage indices] → reconstructed latent
+//   Real RVQ (Residual Vector Quantization) with actual vector operations.
+//   8-stage codebook encode/decode, K-Means training, quality measurement.
+//   Stage 2 (token prediction) -> Stage 3 (codebook decode) core component.
 //
 // n=6 parameters:
-//   stages     = 8 = 6 + 2                (n + extras for high-freq residual)
-//   entries    = 1024 = 2^(sopfr)         (codebook per stage, sopfr(1024)=20... use 2^10)
-//   d_latent   = 128 = 64 * 2             (per-frame latent dim, compact)
-//   bitrate_kbps ≈ stages * log2(entries) * frame_hz / 1000
-//                = 8 * 10 * 100 / 1000 = 8.0 kbps (target ≤ 6 with pruning)
+//   n_stages   = 8 = n + 2            (residual depth)
+//   n_entries  = 1024 = 2^10          (codebook size per stage)
+//   dim        = 384 = 64 * 6         (latent vector dimension)
+//   bits/vec   = 8 * 10 = 80          (8 stages * log2(1024))
 //
 // BT reference: BT-SPEAK-03 (discrete audio codes), SoundStream/EnCodec lineage
-// Mk stage:     Mk.I (skeleton, dummy nearest via modulo)
+// Mk stage:     Mk.III (real vector quantization, K-Means training, EMA update)
 // Upstream:     audio_token_predictor.hexa (predicts indices directly)
-// Downstream:   neural_vocoder.hexa (indices → waveform)
+// Downstream:   neural_vocoder.hexa (indices -> waveform)
 
 let N_STAGES = 8
 let N_ENTRIES = 1024
-let D_LATENT = 128
+let DIM = 384
 
-// TODO(Mk.II): real kmeans++ init + EMA updates + commitment loss
-// TODO(Mk.II): stage dropout for variable bitrate
+// ════════════════════════════════════════════════════════════════════
+// 1. Vector Operations (inline, no external dependency)
+// ════════════════════════════════════════════════════════════════════
+
+fn vec_add(a: [f64], b: [f64]) -> [f64] {
+    let out = []
+    let n = len(a)
+    for i in 0..n {
+        out.push(a[i] + b[i])
+    }
+    return out
+}
+
+fn vec_sub(a: [f64], b: [f64]) -> [f64] {
+    let out = []
+    let n = len(a)
+    for i in 0..n {
+        out.push(a[i] - b[i])
+    }
+    return out
+}
+
+fn vec_scale(a: [f64], s: f64) -> [f64] {
+    let out = []
+    let n = len(a)
+    for i in 0..n {
+        out.push(a[i] * s)
+    }
+    return out
+}
+
+fn vec_dot(a: [f64], b: [f64]) -> f64 {
+    let sum = 0.0
+    let n = len(a)
+    for i in 0..n {
+        sum = sum + a[i] * b[i]
+    }
+    return sum
+}
+
+fn vec_l2_dist_sq(a: [f64], b: [f64]) -> f64 {
+    // Squared Euclidean distance: sum((a_i - b_i)^2)
+    let sum = 0.0
+    let n = len(a)
+    for i in 0..n {
+        let d = a[i] - b[i]
+        sum = sum + d * d
+    }
+    return sum
+}
+
+fn vec_norm(a: [f64]) -> f64 {
+    return sqrt(vec_dot(a, a))
+}
+
+fn vec_normalize(a: [f64]) -> [f64] {
+    let n = vec_norm(a)
+    if n < 1e-12 { return a }
+    return vec_scale(a, 1.0 / n)
+}
+
+fn vec_zeros(dim: int) -> [f64] {
+    let out = []
+    for i in 0..dim {
+        out.push(0.0)
+    }
+    return out
+}
+
+fn vec_accum(dst: [f64], src: [f64]) -> [f64] {
+    // dst += src, returns new vector
+    let out = []
+    let n = len(dst)
+    for i in 0..n {
+        out.push(dst[i] + src[i])
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// PRNG — deterministic xorshift64 for reproducible init
+// ════════════════════════════════════════════════════════════════════
+
+struct PRNG {
+    state: int
+}
+
+fn prng_new(seed: int) -> PRNG {
+    let s = seed
+    if s == 0 { s = 42 }
+    return PRNG { state: s }
+}
+
+fn prng_next(rng: PRNG) -> int {
+    // xorshift64-style (truncated to 32-bit safe range)
+    let x = rng.state
+    x = x ^ (x * 13)       // approximate xor-shift via multiply
+    x = x ^ (x / 7)
+    x = x ^ (x * 17)
+    if x < 0 { x = -x }
+    rng.state = x
+    return x
+}
+
+fn prng_float(rng: PRNG) -> f64 {
+    // Uniform in [0, 1)
+    let v = prng_next(rng)
+    return to_float(v % 1000000) / 1000000.0
+}
+
+fn prng_float_range(rng: PRNG, lo: f64, hi: f64) -> f64 {
+    return lo + prng_float(rng) * (hi - lo)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 2. Codebook
+// ════════════════════════════════════════════════════════════════════
+
+struct Codebook {
+    entries: [[f64]]   // [n_entries][dim] codebook vectors
+    n_entries: int
+    dim: int
+}
+
+fn codebook_init(n_entries: int, dim: int, seed: int) -> Codebook {
+    // Xavier uniform init: U(-limit, +limit) where limit = sqrt(6 / (fan_in + fan_out))
+    // For codebook: fan_in = fan_out = dim, so limit = sqrt(6 / (2*dim))
+    let limit = sqrt(6.0 / to_float(2 * dim))
+    let rng = prng_new(seed)
+    let entries = []
+    for i in 0..n_entries {
+        let vec = []
+        for j in 0..dim {
+            let v = prng_float_range(rng, -limit, limit)
+            vec.push(v)
+        }
+        entries.push(vec)
+    }
+    return Codebook { entries: entries, n_entries: n_entries, dim: dim }
+}
+
+fn codebook_search(cb: Codebook, query: [f64]) -> (int, f64) {
+    // Brute-force nearest neighbor: O(n_entries * dim)
+    // Returns (best_index, best_squared_distance)
+    let best_idx = 0
+    let best_dist = vec_l2_dist_sq(query, cb.entries[0])
+    for i in 1..cb.n_entries {
+        let d = vec_l2_dist_sq(query, cb.entries[i])
+        if d < best_dist {
+            best_dist = d
+            best_idx = i
+        }
+    }
+    return (best_idx, best_dist)
+}
+
+fn codebook_lookup(cb: Codebook, idx: int) -> [f64] {
+    return cb.entries[idx]
+}
+
+fn codebook_batch_search(cb: Codebook, queries: [[f64]]) -> [int] {
+    let indices = []
+    let n = len(queries)
+    for i in 0..n {
+        let (idx, dist) = codebook_search(cb, queries[i])
+        indices.push(idx)
+    }
+    return indices
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 3. RVQ (Residual Vector Quantization) — 8 stages
+// ════════════════════════════════════════════════════════════════════
+
+struct RVQ {
+    stages: [Codebook]
+    n_stages: int
+    dim: int
+}
+
+fn rvq_init(n_stages: int, n_entries: int, dim: int, seed: int) -> RVQ {
+    let stages = []
+    for s in 0..n_stages {
+        let cb = codebook_init(n_entries, dim, seed + s * 7919)
+        stages.push(cb)
+    }
+    return RVQ { stages: stages, n_stages: n_stages, dim: dim }
+}
+
+fn rvq_encode(rvq: RVQ, x: [f64]) -> [int] {
+    // Encode: progressively quantize residuals through 8 stages
+    //   stage 0: find nearest to x, residual = x - cb[idx0]
+    //   stage 1: find nearest to residual, new_residual = residual - cb[idx1]
+    //   ... through stage 7
+    let indices = []
+    let residual = x
+    for s in 0..rvq.n_stages {
+        let (idx, dist) = codebook_search(rvq.stages[s], residual)
+        indices.push(idx)
+        let quantized = codebook_lookup(rvq.stages[s], idx)
+        residual = vec_sub(residual, quantized)
+    }
+    return indices
+}
+
+fn rvq_decode(rvq: RVQ, indices: [int]) -> [f64] {
+    // Decode: sum all codebook vectors
+    //   reconstructed = cb0[i0] + cb1[i1] + ... + cb7[i7]
+    let out = vec_zeros(rvq.dim)
+    for s in 0..rvq.n_stages {
+        let vec = codebook_lookup(rvq.stages[s], indices[s])
+        out = vec_add(out, vec)
+    }
+    return out
+}
+
+fn rvq_encode_batch(rvq: RVQ, vectors: [[f64]]) -> [[int]] {
+    let all_indices = []
+    let n = len(vectors)
+    for i in 0..n {
+        let indices = rvq_encode(rvq, vectors[i])
+        all_indices.push(indices)
+    }
+    return all_indices
+}
+
+fn rvq_decode_batch(rvq: RVQ, all_indices: [[int]]) -> [[f64]] {
+    let vectors = []
+    let n = len(all_indices)
+    for i in 0..n {
+        let vec = rvq_decode(rvq, all_indices[i])
+        vectors.push(vec)
+    }
+    return vectors
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 4. K-Means Codebook Training
+// ════════════════════════════════════════════════════════════════════
+
+fn kmeans_init(data: [[f64]], k: int, dim: int, seed: int) -> [[f64]] {
+    // K-Means++ style initialization:
+    //   1. Pick first centroid at random from data
+    //   2. For each subsequent centroid, pick data point with probability
+    //      proportional to squared distance to nearest existing centroid
+    let rng = prng_new(seed)
+    let n = len(data)
+    let centroids = []
+
+    // First centroid: random data point
+    let first_idx = prng_next(rng) % n
+    centroids.push(data[first_idx])
+
+    // Remaining centroids
+    for c in 1..k {
+        // Compute min distance to existing centroids for each data point
+        let dists = []
+        let total_dist = 0.0
+        for i in 0..n {
+            let min_d = vec_l2_dist_sq(data[i], centroids[0])
+            for j in 1..c {
+                let d = vec_l2_dist_sq(data[i], centroids[j])
+                if d < min_d { min_d = d }
+            }
+            dists.push(min_d)
+            total_dist = total_dist + min_d
+        }
+
+        // Weighted random selection (proportional to distance^2)
+        let target = prng_float(rng) * total_dist
+        let cumsum = 0.0
+        let chosen = 0
+        for i in 0..n {
+            cumsum = cumsum + dists[i]
+            if cumsum >= target {
+                chosen = i
+                break
+            }
+        }
+        centroids.push(data[chosen])
+    }
+    return centroids
+}
+
+fn kmeans_step(data: [[f64]], centroids: [[f64]], k: int, dim: int) -> [[f64]] {
+    // One K-Means iteration:
+    //   1. Assign each data point to nearest centroid
+    //   2. Recompute centroids as mean of assigned points
+    let n = len(data)
+
+    // Accumulate sums and counts per cluster
+    let sums = []
+    let counts = []
+    for c in 0..k {
+        sums.push(vec_zeros(dim))
+        counts.push(0)
+    }
+
+    // Assignment + accumulation
+    for i in 0..n {
+        let best_c = 0
+        let best_d = vec_l2_dist_sq(data[i], centroids[0])
+        for c in 1..k {
+            let d = vec_l2_dist_sq(data[i], centroids[c])
+            if d < best_d {
+                best_d = d
+                best_c = c
+            }
+        }
+        sums[best_c] = vec_accum(sums[best_c], data[i])
+        counts[best_c] = counts[best_c] + 1
+    }
+
+    // Compute new centroids (mean)
+    let new_centroids = []
+    for c in 0..k {
+        if counts[c] > 0 {
+            new_centroids.push(vec_scale(sums[c], 1.0 / to_float(counts[c])))
+        } else {
+            // Dead centroid: keep old position (avoid NaN)
+            new_centroids.push(centroids[c])
+        }
+    }
+    return new_centroids
+}
+
+fn kmeans_train(data: [[f64]], k: int, dim: int, max_iter: int, seed: int) -> [[f64]] {
+    // Full K-Means: init + iterate
+    let centroids = kmeans_init(data, k, dim, seed)
+    for iter in 0..max_iter {
+        centroids = kmeans_step(data, centroids, k, dim)
+    }
+    return centroids
+}
+
+fn codebook_train(data: [[f64]], n_entries: int, dim: int, max_iter: int, seed: int) -> Codebook {
+    // Train a single codebook on data via K-Means
+    let centroids = kmeans_train(data, n_entries, dim, max_iter, seed)
+    return Codebook { entries: centroids, n_entries: n_entries, dim: dim }
+}
+
+fn rvq_train(data: [[f64]], n_stages: int, n_entries: int, dim: int, max_iter: int, seed: int) -> RVQ {
+    // Train RVQ: iteratively train codebooks on residuals
+    //   stage 0: K-Means on original data -> cb0
+    //   stage 1: residuals = data - cb0[nearest] -> K-Means -> cb1
+    //   ... through n_stages
+    let n = len(data)
+    let stages = []
+    let residuals = data
+
+    for s in 0..n_stages {
+        // Train codebook on current residuals
+        let cb = codebook_train(residuals, n_entries, dim, max_iter, seed + s * 7919)
+        stages.push(cb)
+
+        // Compute next-stage residuals
+        let new_residuals = []
+        for i in 0..n {
+            let (idx, dist) = codebook_search(cb, residuals[i])
+            let quantized = codebook_lookup(cb, idx)
+            new_residuals.push(vec_sub(residuals[i], quantized))
+        }
+        residuals = new_residuals
+    }
+
+    return RVQ { stages: stages, n_stages: n_stages, dim: dim }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 5. Quality Measurement
+// ════════════════════════════════════════════════════════════════════
+
+fn reconstruction_error(rvq: RVQ, data: [[f64]]) -> f64 {
+    // Mean L2 error across dataset
+    let n = len(data)
+    let total_err = 0.0
+    for i in 0..n {
+        let indices = rvq_encode(rvq, data[i])
+        let recon = rvq_decode(rvq, indices)
+        let err = sqrt(vec_l2_dist_sq(data[i], recon))
+        total_err = total_err + err
+    }
+    return total_err / to_float(n)
+}
+
+fn codebook_utilization(rvq: RVQ, data: [[f64]]) -> [f64] {
+    // For each stage: fraction of codebook entries actually used
+    let n = len(data)
+    let utils = []
+
+    for s in 0..rvq.n_stages {
+        // Count unique indices used at this stage
+        let used = []  // set of used indices
+        let residuals = data
+
+        // Compute residuals up to stage s
+        if s > 0 {
+            let new_residuals = []
+            for i in 0..n {
+                let r = data[i]
+                for prev_s in 0..s {
+                    let (idx, dist) = codebook_search(rvq.stages[prev_s], r)
+                    let q = codebook_lookup(rvq.stages[prev_s], idx)
+                    r = vec_sub(r, q)
+                }
+                new_residuals.push(r)
+            }
+            residuals = new_residuals
+        }
+
+        // Count unique entries used
+        let entry_used = []
+        for e in 0..rvq.stages[s].n_entries {
+            entry_used.push(0)
+        }
+        for i in 0..n {
+            let (idx, dist) = codebook_search(rvq.stages[s], residuals[i])
+            entry_used[idx] = 1
+        }
+        let n_used = 0
+        for e in 0..rvq.stages[s].n_entries {
+            n_used = n_used + entry_used[e]
+        }
+        utils.push(to_float(n_used) / to_float(rvq.stages[s].n_entries))
+    }
+    return utils
+}
+
+fn bits_per_vector(n_stages: int, n_entries: int) -> f64 {
+    // Total bits = n_stages * log2(n_entries)
+    // log2(1024) = 10, so 8 * 10 = 80 bits
+    let log2_entries = 0.0
+    let v = n_entries
+    while v > 1 {
+        v = v / 2
+        log2_entries = log2_entries + 1.0
+    }
+    return to_float(n_stages) * log2_entries
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 6. Quantization Noise Injection (training helpers)
+// ════════════════════════════════════════════════════════════════════
+
+fn straight_through_quantize(x: [f64], cb: Codebook) -> ([f64], int, f64) {
+    // Straight-through estimator: quantize forward, pass gradient through
+    //   quantized = codebook[nearest(x)]
+    //   commitment_loss = ||x - quantized.detach()||^2
+    //   In backward: grad flows through x as if quantize was identity
+    let (idx, dist) = codebook_search(cb, x)
+    let quantized = codebook_lookup(cb, idx)
+    let commitment_loss = vec_l2_dist_sq(x, quantized)
+    return (quantized, idx, commitment_loss)
+}
+
+fn ema_update(cb: Codebook, data: [[f64]], assignments: [int], decay: f64) -> Codebook {
+    // EMA (Exponential Moving Average) codebook update
+    //   new_entry = decay * old_entry + (1 - decay) * mean(assigned_data)
+    //   Replaces K-Means for online/streaming training
+    let n = len(data)
+    let dim = cb.dim
+
+    // Accumulate sums and counts per entry
+    let sums = []
+    let counts = []
+    for e in 0..cb.n_entries {
+        sums.push(vec_zeros(dim))
+        counts.push(0)
+    }
+    for i in 0..n {
+        let idx = assignments[i]
+        sums[idx] = vec_accum(sums[idx], data[i])
+        counts[idx] = counts[idx] + 1
+    }
+
+    // EMA update
+    let new_entries = []
+    for e in 0..cb.n_entries {
+        if counts[e] > 0 {
+            let mean_vec = vec_scale(sums[e], 1.0 / to_float(counts[e]))
+            // new = decay * old + (1 - decay) * mean
+            let old_scaled = vec_scale(cb.entries[e], decay)
+            let new_scaled = vec_scale(mean_vec, 1.0 - decay)
+            new_entries.push(vec_add(old_scaled, new_scaled))
+        } else {
+            // No data assigned: keep old entry
+            new_entries.push(cb.entries[e])
+        }
+    }
+
+    return Codebook { entries: new_entries, n_entries: cb.n_entries, dim: dim }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Legacy API (backward compatible with Mk.I)
+// ════════════════════════════════════════════════════════════════════
+
 fn encode(latent: str) -> str {
-    // Mk.I dummy: deterministic indices
+    // Mk.I compatible: string in, string out (comma-separated indices)
+    // Uses global RVQ state conceptually; for real use, call rvq_encode directly
     let out = ""
     let s = 0
     while s < N_STAGES {
@@ -37,15 +532,203 @@ fn encode(latent: str) -> str {
 }
 
 fn decode(indices: str) -> str {
-    // Mk.I dummy: tag reconstructed latent
-    return "latent[d=" + to_string(D_LATENT) + "|from:" + indices + "]"
+    return "latent[d=" + to_string(DIM) + "|from:" + indices + "]"
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Demo / main
+// ════════════════════════════════════════════════════════════════════
+
+fn generate_test_data(n_vectors: int, dim: int, seed: int) -> [[f64]] {
+    // Generate random test vectors
+    let rng = prng_new(seed)
+    let data = []
+    for i in 0..n_vectors {
+        let vec = []
+        for j in 0..dim {
+            vec.push(prng_float_range(rng, -1.0, 1.0))
+        }
+        data.push(vec)
+    }
+    return data
+}
+
+fn format_float(v: f64, decimals: int) -> str {
+    // Simple float formatting to N decimal places
+    if decimals == 4 {
+        let vi = to_int(v * 10000.0)
+        let whole = vi / 10000
+        let frac = vi % 10000
+        if frac < 0 { frac = -frac }
+        let fs = to_string(frac)
+        while len(fs) < 4 { fs = "0" + fs }
+        return to_string(whole) + "." + fs
+    }
+    if decimals == 2 {
+        let vi = to_int(v * 100.0)
+        let whole = vi / 100
+        let frac = vi % 100
+        if frac < 0 { frac = -frac }
+        let fs = to_string(frac)
+        while len(fs) < 2 { fs = "0" + fs }
+        return to_string(whole) + "." + fs
+    }
+    return to_string(v)
 }
 
 fn main() {
-    println("rvq_codebook Mk.I — stages=" + to_string(N_STAGES) + " entries=" + to_string(N_ENTRIES) + " d=" + to_string(D_LATENT))
-    let codes = encode("latent[demo]")
-    println("encode: " + codes)
-    println("decode: " + decode(codes))
+    println("================================================================")
+    println(" RVQ Codebook Mk.III — Residual Vector Quantization")
+    println(" HEXA-SPEAK: real vector ops, K-Means training, 8-stage RVQ")
+    println("================================================================")
+    println("")
+
+    // Parameters
+    let demo_dim = 16        // small dim for demo speed (production: 384)
+    let demo_entries = 32    // small codebook for demo (production: 1024)
+    let demo_stages = 8
+    let demo_n_vecs = 64
+    let demo_kmeans_iter = 10
+    let seed = 42
+
+    println("  n=6 parameters:")
+    println("    stages      = " + to_string(N_STAGES) + " (n+2)")
+    println("    entries     = " + to_string(N_ENTRIES) + " per stage")
+    println("    dim         = " + to_string(DIM) + " (64*6)")
+    println("    bits/vector = " + to_string(to_int(bits_per_vector(N_STAGES, N_ENTRIES))))
+    println("")
+
+    println("  Demo parameters (reduced for speed):")
+    println("    dim=" + to_string(demo_dim) + " entries=" + to_string(demo_entries) + " stages=" + to_string(demo_stages) + " vectors=" + to_string(demo_n_vecs))
+    println("")
+
+    // ─── 1. Codebook init + search ─────────────────────────────────
+    println("── 1. Codebook Init + Search ──────────────────────────────")
+    let cb = codebook_init(demo_entries, demo_dim, seed)
+    println("  Codebook: " + to_string(cb.n_entries) + " entries x " + to_string(cb.dim) + "d")
+
+    // Search for nearest codeword to a random query
+    let query = generate_test_data(1, demo_dim, 999)[0]
+    let (best_idx, best_dist) = codebook_search(cb, query)
+    println("  Query -> nearest: idx=" + to_string(best_idx) + " dist^2=" + format_float(best_dist, 4))
+
+    // Batch search
+    let queries = generate_test_data(8, demo_dim, 123)
+    let batch_results = codebook_batch_search(cb, queries)
+    let idx_str = ""
+    for i in 0..len(batch_results) {
+        idx_str = idx_str + to_string(batch_results[i])
+        if i < len(batch_results) - 1 { idx_str = idx_str + "," }
+    }
+    println("  Batch search (8 queries): [" + idx_str + "]")
+    println("")
+
+    // ─── 2. RVQ encode -> decode -> error ──────────────────────────
+    println("── 2. RVQ 8-Stage Encode/Decode ───────────────────────────")
+    let rvq = rvq_init(demo_stages, demo_entries, demo_dim, seed)
+    println("  RVQ: " + to_string(rvq.n_stages) + " stages x " + to_string(demo_entries) + " entries x " + to_string(demo_dim) + "d")
+
+    let test_vec = generate_test_data(1, demo_dim, 777)[0]
+    let indices = rvq_encode(rvq, test_vec)
+    let recon = rvq_decode(rvq, indices)
+
+    let idx_out = ""
+    for i in 0..len(indices) {
+        idx_out = idx_out + to_string(indices[i])
+        if i < len(indices) - 1 { idx_out = idx_out + "," }
+    }
+    println("  Encode indices: [" + idx_out + "]")
+
+    let error = sqrt(vec_l2_dist_sq(test_vec, recon))
+    println("  Reconstruction L2 error: " + format_float(error, 4))
+
+    // Show residual reduction per stage
+    println("  Residual norm per stage:")
+    let residual = test_vec
+    for s in 0..demo_stages {
+        let q = codebook_lookup(rvq.stages[s], indices[s])
+        residual = vec_sub(residual, q)
+        let rnorm = vec_norm(residual)
+        println("    stage " + to_string(s) + ": ||residual|| = " + format_float(rnorm, 4))
+    }
+    println("")
+
+    // ─── 3. K-Means training ───────────────────────────────────────
+    println("── 3. K-Means Training (" + to_string(demo_kmeans_iter) + " iterations) ────────────────────")
+    let train_data = generate_test_data(demo_n_vecs, demo_dim, 314)
+
+    // Pre-training error
+    let pre_err = reconstruction_error(rvq, train_data)
+    println("  Pre-training mean L2 error:  " + format_float(pre_err, 4))
+
+    // Train RVQ
+    let trained_rvq = rvq_train(train_data, demo_stages, demo_entries, demo_dim, demo_kmeans_iter, seed)
+
+    // Post-training error
+    let post_err = reconstruction_error(trained_rvq, train_data)
+    println("  Post-training mean L2 error: " + format_float(post_err, 4))
+
+    let improvement = 0.0
+    if pre_err > 0.0 {
+        improvement = (1.0 - post_err / pre_err) * 100.0
+    }
+    println("  Improvement: " + format_float(improvement, 2) + "%")
+    println("")
+
+    // ─── 4. Codebook utilization ───────────────────────────────────
+    println("── 4. Codebook Utilization ────────────────────────────────")
+    let utils = codebook_utilization(trained_rvq, train_data)
+    for s in 0..demo_stages {
+        let pct = utils[s] * 100.0
+        // ASCII bar
+        let bar_len = to_int(pct / 5.0)
+        let bar = ""
+        for b in 0..bar_len {
+            bar = bar + "#"
+        }
+        println("    stage " + to_string(s) + ": " + format_float(pct, 2) + "% " + bar)
+    }
+    println("")
+
+    // ─── 5. Round-trip test ────────────────────────────────────────
+    println("── 5. Round-Trip Test (5 vectors) ─────────────────────────")
+    let test_vecs = generate_test_data(5, demo_dim, 555)
+    let all_indices = rvq_encode_batch(trained_rvq, test_vecs)
+    let all_recon = rvq_decode_batch(trained_rvq, all_indices)
+    for i in 0..5 {
+        let err = sqrt(vec_l2_dist_sq(test_vecs[i], all_recon[i]))
+        let orig_norm = vec_norm(test_vecs[i])
+        let snr = 0.0
+        if err > 1e-12 { snr = orig_norm / err }
+        println("    vec " + to_string(i) + ": L2=" + format_float(err, 4) + "  |x|=" + format_float(orig_norm, 4) + "  SNR=" + format_float(snr, 2))
+    }
+    println("")
+
+    // ─── 6. Straight-through quantize demo ─────────────────────────
+    println("── 6. Straight-Through Quantize ───────────────────────────")
+    let stq_vec = generate_test_data(1, demo_dim, 888)[0]
+    let (quantized, stq_idx, commitment) = straight_through_quantize(stq_vec, trained_rvq.stages[0])
+    println("  Input norm:       " + format_float(vec_norm(stq_vec), 4))
+    println("  Quantized idx:    " + to_string(stq_idx))
+    println("  Commitment loss:  " + format_float(commitment, 4))
+    println("")
+
+    // ─── Summary ───────────────────────────────────────────────────
+    println("================================================================")
+    println(" Summary")
+    println("================================================================")
+    println("  Stages:         " + to_string(N_STAGES) + " (n+2)")
+    println("  Entries/stage:  " + to_string(N_ENTRIES))
+    println("  Dim:            " + to_string(DIM) + " (64*6)")
+    println("  Bits/vector:    " + to_string(to_int(bits_per_vector(N_STAGES, N_ENTRIES))))
+    println("  Reconstruction: " + format_float(post_err, 4) + " L2 (trained)")
+    println("  Vector ops:     add/sub/scale/dot/l2_dist/norm/normalize")
+    println("  Training:       K-Means++ init + iterative K-Means")
+    println("  Online update:  EMA codebook (decay parameter)")
+    println("  STE:            straight-through + commitment loss")
+    println("================================================================")
+    println("")
+    println("  rvq_codebook.hexa Mk.III ready.")
 }
 
 main()
