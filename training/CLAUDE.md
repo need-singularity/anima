@@ -1,7 +1,7 @@
 # training/
 
 ## Purpose
-Fine-tuning scripts for AnimaLM and GoldenMoE models. Main training scripts (train_conscious_lm.py, train_v9-v11.py, train_anima_lm.py) remain in project root.
+Fine-tuning scripts for AnimaLM and GoldenMoE models. Main training scripts (train_models/conscious_lm.hexa, train_v9-v11.py, train_anima_lm.py) remain in project root.
 
 ## Contents
 - `finetune_animalm.py` — Original AnimaLM fine-tune (LoRA)

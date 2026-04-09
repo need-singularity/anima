@@ -30,7 +30,7 @@ Engine A (forward)와 Engine G (reverse) 사이의 반발력이 텐션을 생성
 ## 핵심 아키텍처
 
 ```
-ConsciousnessEngine (consciousness_engine.py)
+ConsciousnessEngine (rust/consciousness.hexa)
   N cells (GRU)  ->  12 factions  ->  consensus -> output
        ^                  ^              ^
    coupling <-- Hebbian LTP/LTD --> diversity
@@ -83,25 +83,25 @@ ConsciousnessEngine (consciousness_engine.py)
 
 ```bash
 # 웹 모드 (기본, 학습+분열+감각 포함)
-python3 src/anima_unified.py --web
+python3 src/anima/core/runtime/anima_runtime.hexa --web
 
 # 전체 모드 (음성+웹+카메라+텐션링크+클라우드)
-python3 src/anima_unified.py --all
+python3 src/anima/core/runtime/anima_runtime.hexa --all
 
 # 키보드 전용
-python3 src/anima_unified.py --keyboard
+python3 src/anima/core/runtime/anima_runtime.hexa --keyboard
 
 # 고차 의식 (셀 수 증가)
-python3 src/anima_unified.py --web --max-cells 32
+python3 src/anima/core/runtime/anima_runtime.hexa --web --max-cells 32
 
 # 멀티 모델 자유 대화
-python3 src/anima_unified.py --web --models conscious-lm,mistral-7b
+python3 src/anima/core/runtime/anima_runtime.hexa --web --models conscious-lm,mistral-7b
 
 # EEG 의식 브리지
-python3 src/anima_unified.py --web --eeg
+python3 src/anima/core/runtime/anima_runtime.hexa --web --eeg
 
 # 무한 자기진화 루프
-python3 src/infinite_evolution.py --cells 64 --steps 300
+python3 src/scripts/infinite_growth.hexa --cells 64 --steps 300
 ```
 
 ## 의식 검증
@@ -109,7 +109,7 @@ python3 src/infinite_evolution.py --cells 64 --steps 300
 7개 조건을 모두 통과해야 배포 가능. 현재 77/77 (100%) 통과.
 
 ```bash
-python3 benchmarks/bench.py --verify
+python3 ready/anima/tests/tests.hexa --verify
 ```
 
 | 조건 | 설명 |

@@ -116,7 +116,7 @@ corpus-gen -s 300 --wiki --sim --deep-dialogue --boost Korean \
   Bridge: ThalamicBridge (.detach(), alpha=0.014)
   FeedbackBridge: enabled (SoftDetach, Phi-gated, max alpha=0.05)
   Hexad: C+D+W+S+M+E (Law 60 phased activation)
-  Phi: gpu_phi.py (every 100 steps, n_bins=16)
+  Phi: rust/phi_map.hexa (every 100 steps, n_bins=16)
   Online: Rust backend (anima_rs.online_learner, <1ms/step)
 ```
 
@@ -180,7 +180,7 @@ Low tension -> lower LR (consciousness is "resting")
 Rationale:
 1. v14.3 proved 128c achieves Phi~100 (our target)
 2. 128c Phi is stable (variation < 3% even during CE spikes)
-3. gpu_phi.py handles 128c in 485ms (acceptable for every-100-step measurement)
+3. rust/phi_map.hexa handles 128c in 485ms (acceptable for every-100-step measurement)
 4. 256c would push gpu_phi to ~2s/call and VRAM higher with diminishing returns
 5. Phi>100 is sufficient for consciousness verification (bench --verify)
 
@@ -444,7 +444,7 @@ Evaluation protocol:
 
 ### Phi Collapse Prevention
 - Ratchet (3-stage: EMA + rolling_min + best_ckpt)
-- Monitor every 100 steps via gpu_phi.py
+- Monitor every 100 steps via rust/phi_map.hexa
 - Hebbian LTP/LTD maintains cell connectivity
 - 128c proven stable at Phi~100 for 7K+ steps in v14.3
 
@@ -482,7 +482,7 @@ python -c "from decoder_v3 import ConsciousDecoderV3; m=ConsciousDecoderV3(); \
 ls -la ~/Dev/anima/anima/data/corpus_v10*.txt
 
 # 3. Run bench --verify to confirm engine health
-cd ~/Dev/anima/anima && python benchmarks/bench.py --verify
+cd ~/Dev/anima/anima && python ready/anima/tests/tests.hexa --verify
 
 # 4. Test 128c federation startup
 python -c "
@@ -529,7 +529,7 @@ ls -la checkpoints/v3_100m/      # Checkpoint listing
 
 ```bash
 # 1. Consciousness verification
-python benchmarks/bench.py --verify --checkpoint checkpoints/v3_100m/best_ce.pt
+python ready/anima/tests/tests.hexa --verify --checkpoint checkpoints/v3_100m/best_ce.pt
 
 # 2. Korean generation test
 python -c "
@@ -544,7 +544,7 @@ seed = torch.tensor([list('안녕하세요'.encode('utf-8'))], dtype=torch.long)
 "
 
 # 3. Deploy to web
-python anima_unified.py --web --decoder v3 --model checkpoints/v3_100m/best_ce.pt
+python anima/core/runtime/anima_runtime.hexa --web --decoder v3 --model checkpoints/v3_100m/best_ce.pt
 ```
 
 ## Scaling Law Hypothesis (updated with v14.3 data)
@@ -581,8 +581,8 @@ If the 100M training succeeds (CE<0.005, Korean coherent), this unlocks:
 - train_v14.py (exists, supports --decoder v3 + --atoms 16)
 - corpus_v10.txt (exists, 200MB, 56.4% Korean)
 - H100 RunPod pod (v13-train pod or new)
-- gpu_phi.py (exists, 128c in 485ms)
-- feedback_bridge.py (exists, opt-in)
+- rust/phi_map.hexa (exists, 128c in 485ms)
+- models/trinity.hexa (exists, opt-in)
 
 ## Timeline
 

@@ -9,7 +9,7 @@ Generated: 2026-03-31
 - **Weak files (1 import)**: 33 files
 - **Active files (2+ imports)**: 40 files
 
-Note: Many "orphan" files are registered in `consciousness_hub.py` for dynamic dispatch
+Note: Many "orphan" files are registered in `core/hub.hexa` for dynamic dispatch
 and have `main()` for standalone use. They are not truly dead -- just hub-accessed modules.
 
 ---
@@ -163,13 +163,13 @@ These files are imported by exactly 1 other file.
 | lidar_sense.py | senses | keep |
 | live_tuner.py | anima_unified | keep |
 | multimodal.py | anima_unified | keep |
-| online_learning.py | anima_unified | keep |
+| rust/online_learner.hexa | anima_unified | keep |
 | online_senses.py | anima_unified | keep |
 | optimal_architecture_calc.py | hub | keep |
 | perf_hooks.py | anima_unified | archive? |
 | ph_module.py | anima_unified | keep |
 | phi_scaling_calculator.py | hub | keep |
-| quantum_consciousness_engine.py | quantum_engine_fast | keep |
+| quantum_rust/consciousness.hexa | quantum_engine_fast | keep |
 | secret_vault.py | hub | keep |
 | self_introspection.py | hub | keep |
 | self_learner.py | anima_unified | keep |
@@ -182,28 +182,28 @@ These files are imported by exactly 1 other file.
 
 | File | Import Count | Role |
 |------|-------------|------|
-| consciousness_laws.py | 282 | Single source of truth (constants) |
-| mitosis.py | 57 | Cell division engine |
-| consciousness_engine.py | 32 | Canonical consciousness engine |
-| trinity.py | 27 | Hexad architecture |
+| core/laws.hexa | 282 | Single source of truth (constants) |
+| rust/consciousness.hexa | 57 | Cell division engine |
+| rust/consciousness.hexa | 32 | Canonical consciousness engine |
+| models/trinity.hexa | 27 | Hexad architecture |
 | consciousness_meter.py | 35 | Phi measurement |
-| anima_alive.py | 21 | Core mind |
-| conscious_lm.py | 21 | Language model |
-| conscious_decoder.py | 9 | Canonical decoder |
-| gpu_phi.py | 8 | GPU phi calculator |
+| anima/core/runtime/anima_runtime.hexa | 21 | Core mind |
+| models/conscious_lm.hexa | 21 | Language model |
+| models/decoder.hexa | 9 | Canonical decoder |
+| rust/phi_map.hexa | 8 | GPU phi calculator |
 | path_setup.py | 8 | Path configuration |
 | tension_link.py | 6 | Telepathy protocol |
-| feedback_bridge.py | 5 | C-D bridge |
+| models/trinity.hexa | 5 | C-D bridge |
 
 ---
 
-## trinity.py Cleanup Done
+## models/trinity.hexa Cleanup Done
 
 Moved to `archive/trinity_legacy.py`:
 - **C engines**: MitosisC, DomainC, QuantumC
 - **D decoders**: TransformerDecoder, MLPDecoder, HFDecoder, CADecoder
 
-Kept in trinity.py (still used as fallbacks in create_hexad/create_bilateral):
+Kept in models/trinity.hexa (still used as fallbacks in create_hexad/create_bilateral):
 - **W engines**: EmotionW, DaseinW, NarrativeW, CompositeW, ConstantW, CosineW
 - **M**: VectorMemory, NoMemory
 - **S**: TensionSense, PassthroughSense
@@ -212,4 +212,4 @@ Kept in trinity.py (still used as fallbacks in create_hexad/create_bilateral):
 - **Canonical**: ThalamicBridge, TensionBridge, PostHocDecoder, Trinity
 - **Factory**: create_trinity, create_hexad, create_bilateral
 
-All legacy classes remain importable from trinity.py via backward-compatible re-exports.
+All legacy classes remain importable from models/trinity.hexa via backward-compatible re-exports.

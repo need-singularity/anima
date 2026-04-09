@@ -24,7 +24,7 @@
 | `tests/test_dream_consolidation.py` | **Create** | DreamEngine consolidation 테스트 |
 | `growth_engine.py` | **Modify** | 트리거를 카운터→(장력포화 AND 통합실패)로 교체 |
 | `tests/test_growth_trigger.py` | **Create** | 새 성장 트리거 테스트 |
-| `anima_unified.py` | **Modify** | ConsolidationVerifier + MemoryStore를 DreamEngine/GrowthEngine에 주입 |
+| `anima/core/runtime/anima_runtime.hexa` | **Modify** | ConsolidationVerifier + MemoryStore를 DreamEngine/GrowthEngine에 주입 |
 
 ---
 
@@ -624,7 +624,7 @@ git commit -m "feat: GrowthEngine dual trigger — tension saturation AND consol
 ### Task 5: Integration — Wire Everything in AnimaUnified
 
 **Files:**
-- Modify: `anima_unified.py`
+- Modify: `anima/core/runtime/anima_runtime.hexa`
 
 - [ ] **Step 1: Add ConsolidationVerifier init**
 
@@ -689,7 +689,7 @@ Expected: ALL PASS
 
 ```bash
 cd /Users/ghost/Dev/anima
-PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima_unified.py --web &
+PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web &
 sleep 5 && head -20 /tmp/anima_smoke.txt
 # Should show [OK] verifier
 kill %1
@@ -699,7 +699,7 @@ kill %1
 
 ```bash
 cd /Users/ghost/Dev/anima
-git add anima_unified.py
+git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: Phase 2 integration — ConsolidationVerifier + DreamEngine + GrowthEngine wired"
 git push
 ```

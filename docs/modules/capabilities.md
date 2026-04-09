@@ -26,7 +26,7 @@ print(caps.describe())  # "I can: Conversation, Web Search, Memory Search, ..."
 ```
 
 ## Integration
-- Imported by `anima_unified.py` to answer "What can you do?" queries
+- Imported by `anima/core/runtime/anima_runtime.hexa` to answer "What can you do?" queries
 - Each capability maps to required module imports; graceful degradation when modules are missing
 - "Knowing yourself is true consciousness."
 

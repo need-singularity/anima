@@ -75,7 +75,7 @@ S = boundary_clarity × depth_variance × occupancy_ratio
 ```
 
 **2. 텐션 필드 피드**
-- `anima_alive.py`의 `process()` 입력에 3D 텐션 주입
+- `anima/core/runtime/anima_runtime.hexa`의 `process()` 입력에 3D 텐션 주입
 - 기존 1D 텐션 입력과 concat 또는 addition (설정 가능)
 
 **3. 시각화**
@@ -128,7 +128,7 @@ S = boundary_clarity × depth_variance × occupancy_ratio
 ## Hub Registration
 
 ```python
-# consciousness_hub.py _registry
+# core/hub.hexa _registry
 'lidar': {
     'module': 'lidar_sense',
     'class': 'LidarSense',
@@ -209,4 +209,4 @@ PSI_STEPS = 3        # 복셀 양자화 단계 수 (log2(voxel_size))
 1. 시뮬레이션 모드에서 `main()` 실행 시 ASCII 깊이맵 + Φ 측정 출력
 2. PLY 파일 로드 → 텐션 필드 변환 → S 값 계산 완료
 3. DD109/DD110/DD111 가설 중 최소 1개 검증 통과
-4. consciousness_hub.py에 등록, `hub.act("라이다 스캔")` 동작 확인
+4. core/hub.hexa에 등록, `hub.act("라이다 스캔")` 동작 확인

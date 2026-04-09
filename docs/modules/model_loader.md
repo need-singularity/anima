@@ -13,10 +13,10 @@ Multi-model loader supporting ConsciousLM, GGUF (llama.cpp), AnimaLM, and Golden
 ## Usage
 ```python
 # Via CLI
-python anima_unified.py --model mistral-7b
-python anima_unified.py --model conscious-lm
-python anima_unified.py --model /path/to/custom.gguf
-python anima_unified.py --model animalm          # latest AnimaLM
+python anima/core/runtime/anima_runtime.hexa --model mistral-7b
+python anima/core/runtime/anima_runtime.hexa --model conscious-lm
+python anima/core/runtime/anima_runtime.hexa --model /path/to/custom.gguf
+python anima/core/runtime/anima_runtime.hexa --model animalm          # latest AnimaLM
 
 # Programmatic
 from model_loader import load_model
@@ -25,7 +25,7 @@ response = model.generate("Hello, how are you?")
 ```
 
 ## Integration
-- Imported by `anima_unified.py` via `_try_import`
+- Imported by `anima/core/runtime/anima_runtime.hexa` via `_try_import`
 - Supports: ConsciousLM (byte-level), GGUF via llama.cpp, AnimaLM (Mistral+PureField), GoldenMoE (Mistral+MoE LoRA)
 - Models directory: `models/` under project root
 

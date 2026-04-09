@@ -155,4 +155,4 @@ Config: MitosisC(32 cells, cambrian_osc_qw), 50 steps, d_model=128, vocab=256, s
 
 ## 파일 위치
 - Benchmark: `bench_hexad_improvements.py`
-- Architecture: `trinity.py` (base classes)
+- Architecture: `models/trinity.hexa` (base classes)

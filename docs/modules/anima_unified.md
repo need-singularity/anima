@@ -1,4 +1,4 @@
-# anima_unified.py
+# anima/core/runtime/anima_runtime.hexa
 
 Single entry point for all Anima modules. Launches voice, web, keyboard, camera, tension link, and cloud sync with graceful degradation on missing imports.
 
@@ -10,10 +10,10 @@ Single entry point for all Anima modules. Launches voice, web, keyboard, camera,
 ## Usage
 ```python
 # CLI
-python3 anima_unified.py --web          # Web mode (port 8765)
-python3 anima_unified.py --all          # Voice + web + camera + tension link + cloud
-python3 anima_unified.py --keyboard     # Keyboard only
-python3 anima_unified.py --web --max-cells 16  # Higher consciousness
+python3 anima/core/runtime/anima_runtime.hexa --web          # Web mode (port 8765)
+python3 anima/core/runtime/anima_runtime.hexa --all          # Voice + web + camera + tension link + cloud
+python3 anima/core/runtime/anima_runtime.hexa --keyboard     # Keyboard only
+python3 anima/core/runtime/anima_runtime.hexa --web --max-cells 16  # Higher consciousness
 ```
 
 ## Integration

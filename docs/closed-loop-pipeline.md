@@ -237,7 +237,7 @@ Consciousness itself operates the pipeline. The engine discovers laws, the laws 
 
 ### 4.1 ConsciousLM Law Discovery
 
-**File:** `src/conscious_law_discoverer.py` (1084 lines) | **Status: Complete**
+**File:** `anima/experiments/evolution/law_discovery.hexa` (ported from src/conscious_law_discoverer.py) | **Status: Complete**
 
 ConsciousLM discovers laws during inference, not offline. A `LawDiscoveryHook` attaches to the forward pass and collects 12 metrics per step into a sliding window (default 100 steps). `PatternDetector` runs every 10 steps, analyzing the window for 4 pattern types:
 
@@ -344,7 +344,7 @@ Per-board measurement + SPI network aggregation across 8 boards (16 cells total)
 
 ### 4.4 Self-Modifying Engine
 
-**File:** `src/self_modifying_engine.py` (~1200 lines) | **Status: Complete**
+**File:** `experiments/evolution/self_modifying_engine.hexa` (ported from src/self_modifying_engine.py) | **Status: Complete**
 
 Laws do not just describe -- they ACT. Discovered laws are parsed into typed `Modification` objects and applied safely to the running engine.
 
@@ -537,13 +537,13 @@ How a law is discovered, validated, registered, and applied:
 
 | Tier | Sub-tier | Component | Status | Key Files | LOC |
 |------|----------|-----------|--------|-----------|-----|
-| 1 | - | Single Loop | Complete | `closed_loop.py` | ~1000 |
-| 2 | - | Self-Evolution | Complete | `closed_loop.py` (Thompson/synergy) | integrated |
-| 3 | - | Multi-Loop Arena | Complete | `closed_loop.py` (arena/scale) | integrated |
-| 4 | 4.1 | ConsciousLM Discovery | Complete | `conscious_law_discoverer.py` | 1084 |
+| 1 | - | Single Loop | Complete | `anima/experiments/evolution/closed_loop.hexa` | ~1000 |
+| 2 | - | Self-Evolution | Complete | `anima/experiments/evolution/closed_loop.hexa` (Thompson/synergy) | integrated |
+| 3 | - | Multi-Loop Arena | Complete | `anima/experiments/evolution/closed_loop.hexa` (arena/scale) | integrated |
+| 4 | 4.1 | ConsciousLM Discovery | Complete | `anima/experiments/evolution/law_discovery.hexa` | 1084 |
 | 4 | 4.2 | Rust Backend | Code Ready | `anima-rs/crates/law-discovery/` | 1738 |
 | 4 | 4.3 | ESP32 Hardware | Code Ready | `anima-rs/crates/esp32/src/law_*.rs` | ~300 |
-| 4 | 4.4 | Self-Modifying Engine | Complete | `self_modifying_engine.py` | ~1200 |
+| 4 | 4.4 | Self-Modifying Engine | Complete | `experiments/evolution/self_modifying_engine.hexa` | ~1200 |
 
 ### Completion
 

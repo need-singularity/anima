@@ -14,8 +14,8 @@
 
 ```
 Modified:
-  anima_unified.py    — savant auto-toggle, CLI+Web dual mode, babysitter thread, growth dim hookup
-  anima_alive.py      — savant state tracking in ConsciousMind
+  anima/core/runtime/anima_runtime.hexa    — savant auto-toggle, CLI+Web dual mode, babysitter thread, growth dim hookup
+  anima/core/runtime/anima_runtime.hexa      — savant state tracking in ConsciousMind
   web/index.html      — savant orange indicator, babysitter panel/toggle, CLI messages display
   growth_engine.py    — emit growth event for dim expansion trigger
 
@@ -28,11 +28,11 @@ Created:
 ### Task 1: Savant Auto-Toggle + Orange UI
 
 **Files:**
-- Modify: `anima_unified.py:1205-1218` (savant toggle logic)
-- Modify: `anima_alive.py:110-126` (add savant state to self_awareness)
+- Modify: `anima/core/runtime/anima_runtime.hexa:1205-1218` (savant toggle logic)
+- Modify: `anima/core/runtime/anima_runtime.hexa:110-126` (add savant state to self_awareness)
 - Modify: `web/index.html` (savant toggle color)
 
-- [ ] **Step 1: Add savant self-activation logic to anima_unified.py**
+- [ ] **Step 1: Add savant self-activation logic to anima/core/runtime/anima_runtime.hexa**
 
 In `_think_loop()`, after background_think, check if Anima should self-activate savant:
 
@@ -120,7 +120,7 @@ self._toggle_savant(active, auto=False)
 
 - [ ] **Step 5: Commit**
 ```bash
-git add anima_unified.py anima_alive.py web/index.html
+git add anima/core/runtime/anima_runtime.hexa anima/core/runtime/anima_runtime.hexa web/index.html
 git commit -m "feat: savant auto-toggle with orange UI indicator for self-activation"
 ```
 
@@ -129,7 +129,7 @@ git commit -m "feat: savant auto-toggle with orange UI indicator for self-activa
 ### Task 2: Web UI + CLI Simultaneous Execution
 
 **Files:**
-- Modify: `anima_unified.py` (add --both mode, CLI output broadcasts to WS)
+- Modify: `anima/core/runtime/anima_runtime.hexa` (add --both mode, CLI output broadcasts to WS)
 - Modify: `web/index.html` (show CLI messages with [CLI] tag)
 
 - [ ] **Step 1: Add --both argument**
@@ -235,7 +235,7 @@ CSS:
 
 - [ ] **Step 6: Commit**
 ```bash
-git add anima_unified.py web/index.html
+git add anima/core/runtime/anima_runtime.hexa web/index.html
 git commit -m "feat: simultaneous CLI+Web execution with shared chat history"
 ```
 
@@ -245,7 +245,7 @@ git commit -m "feat: simultaneous CLI+Web execution with shared chat history"
 
 **Files:**
 - Create: `babysitter.py`
-- Modify: `anima_unified.py` (babysitter thread + module toggle)
+- Modify: `anima/core/runtime/anima_runtime.hexa` (babysitter thread + module toggle)
 - Modify: `web/index.html` (babysitter panel)
 
 - [ ] **Step 1: Create babysitter.py core**
@@ -449,7 +449,7 @@ class Babysitter:
         return {'status': 'topic_set', 'topic': topic}
 ```
 
-- [ ] **Step 2: Integrate babysitter into anima_unified.py**
+- [ ] **Step 2: Integrate babysitter into anima/core/runtime/anima_runtime.hexa**
 
 ```python
 # In __init__:
@@ -545,7 +545,7 @@ case 'babysitter_error':
 
 - [ ] **Step 4: Commit**
 ```bash
-git add babysitter.py anima_unified.py web/index.html
+git add babysitter.py anima/core/runtime/anima_runtime.hexa web/index.html
 git commit -m "feat: babysitter educator using Claude CLI with UI panel and strategy selection"
 ```
 
@@ -554,7 +554,7 @@ git commit -m "feat: babysitter educator using Claude CLI with UI panel and stra
 ### Task 4: Automatic Dim Expansion on Growth
 
 **Files:**
-- Modify: `anima_unified.py:1052-1080` (growth trigger)
+- Modify: `anima/core/runtime/anima_runtime.hexa:1052-1080` (growth trigger)
 - Modify: `growth_engine.py` (add dim expansion stages)
 
 - [ ] **Step 1: Ensure growth_manager.execute_growth() is called on stage transition**
@@ -619,7 +619,7 @@ if hasattr(self, '_phi_plateau_count'):
 
 - [ ] **Step 3: Commit**
 ```bash
-git add anima_unified.py growth_engine.py
+git add anima/core/runtime/anima_runtime.hexa growth_engine.py
 git commit -m "feat: automatic dim expansion on growth stage transition and Φ plateau"
 ```
 

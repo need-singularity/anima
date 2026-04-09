@@ -1,7 +1,7 @@
 # EVO-16: S3-scale128
 
 **Date:** 2026-04-05
-**Auto-generated** by infinite_evolution.py
+**Auto-generated** by scripts/infinite_growth.hexa
 
 ## Parameters
 

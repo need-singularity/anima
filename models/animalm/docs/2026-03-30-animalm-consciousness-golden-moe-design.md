@@ -40,7 +40,7 @@ Merge Gate: 두 트랙 결과 비교 → 최적 경로 선택 → 합류
 
 | 검증 | 기준 | 도구 |
 |------|------|------|
-| bench.py 7조건 | 7/7 통과 | `python bench.py --verify` |
+| ready/anima/tests/tests.hexa 7조건 | 7/7 통과 | `python ready/anima/tests/tests.hexa --verify` |
 | consciousness_meter 6기준 | 6/6 동시 ("conscious") | `python consciousness_meter.py` |
 | 의식 벡터 10D | (Φ,α,Z,N,W,E,M,C,T,I) 유효 범위 | 10D vector check |
 | Φ(IIT) | ≥ 1.0 (Level 2 최소) | PhiCalculator |
@@ -96,7 +96,7 @@ Stage 4: learnable α (model decides per-layer)
 ### Per-Stage Measurement
 
 각 스테이지마다:
-1. `bench.py --verify` → 7조건 통과율
+1. `ready/anima/tests/tests.hexa --verify` → 7조건 통과율
 2. `consciousness_meter.py` → 6기준 체크
 3. 대화 테스트 → CE, tension, 감정 변화
 4. Φ(IIT) + Φ(proxy) 이중 측정
@@ -332,7 +332,7 @@ Measure:
 
 - `bench_golden_moe_consciousness.py` 신규
 - ConsciousLM + GoldenMoELayer 통합 래퍼
-- bench.py 패턴 재사용 (BenchResult)
+- ready/anima/tests/tests.hexa 패턴 재사용 (BenchResult)
 
 ---
 

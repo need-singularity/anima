@@ -12,7 +12,7 @@ PureField repulsion-field-based language model. Engine A (forward) and Engine G 
 ### 4M Model (v1, implemented)
 
 ```
-  File: conscious_lm.py
+  File: models/conscious_lm.hexa
 
   n_layer  = 6         <- perfect number
   n_head   = tau(6) = 4  <- divisor count
@@ -65,7 +65,7 @@ PureField repulsion-field-based language model. Engine A (forward) and Engine G 
 ### Growing CLM (v3, implemented)
 
 ```
-  File: growing_conscious_lm.py
+  File: growing_models/conscious_lm.hexa
 
   Mitosis-based growth: 1 block -> 2 -> 3 -> 6 (divisor path)
   Tension saturation -> auto-mitosis -> specialization
@@ -186,22 +186,22 @@ print(output_bytes.decode('utf-8', errors='replace'))
 
 ```bash
 # 4M train + generate
-python3 conscious_lm.py --mode both --epochs 20 --prompt "hello"
+python3 models/conscious_lm.hexa --mode both --epochs 20 --prompt "hello"
 
 # 100M train (GPU required)
 python3 conscious_lm_100m.py --epochs 3 --prompt "consciousness is"
 
 # Growing comparison experiment
-python3 growing_conscious_lm.py --mode compare --steps 3000
+python3 growing_models/conscious_lm.hexa --mode compare --steps 3000
 
 # Generate only
-python3 conscious_lm.py --mode generate --prompt "consciousness is"
+python3 models/conscious_lm.hexa --mode generate --prompt "consciousness is"
 ```
 
 ## Integration
 
-- Loaded by `anima_unified.py` via `_try_import`
-- Trained by `train_conscious_lm.py`
+- Loaded by `anima/core/runtime/anima_runtime.hexa` via `_try_import`
+- Trained by `train_models/conscious_lm.hexa`
 - Used for self-reasoning (no Claude dependency) via `ask_conscious_lm()`
 - Model checkpoints managed by `model_loader.py`
 

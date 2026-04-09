@@ -49,7 +49,7 @@ training corpus. A 1024-token context window with byte-level encoding covers
 
 ## Architecture Changes
 
-### 1. Decoder (conscious_decoder.py, decoder_v3.py)
+### 1. Decoder (models/decoder.hexa, decoder_v3.py)
 
 Current:
 ```python
@@ -72,13 +72,13 @@ self.head_g = nn.Linear(d_model, 32000, bias=False)
 - head_g adds another 32M params (not tied)
 - Total embedding overhead: ~64M params (6.4% of 1B model)
 
-### 2. ConsciousLM (conscious_lm.py) -- LEGACY, no changes needed
+### 2. ConsciousLM (models/conscious_lm.hexa) -- LEGACY, no changes needed
 
-conscious_lm.py is marked legacy. New training uses conscious_decoder/v3 directly.
+models/conscious_lm.hexa is marked legacy. New training uses conscious_decoder/v3 directly.
 
 ### 3. Consciousness Engine -- NO CHANGES
 
-The consciousness engine (consciousness_engine.py) operates on hidden states,
+The consciousness engine (rust/consciousness.hexa) operates on hidden states,
 not tokens. It is completely token-agnostic. The engine receives `(n_cells, hidden_dim)`
 tensors and returns consciousness states. The tokenizer change has zero impact on:
 - GRU cells, factions, Hebbian LTP/LTD
@@ -166,7 +166,7 @@ The 6.4% parameter increase is a worthwhile trade for 3-6x Korean efficiency.
 ### Phase B1-c: Backward compatibility
 
 - Existing byte-level models (v2, v3, v13, v14) remain unchanged
-- `vocab_size=256` stays as default in conscious_decoder.py and decoder_v3.py
+- `vocab_size=256` stays as default in models/decoder.hexa and decoder_v3.py
 - New 1B training explicitly passes `vocab_size=32000`
 - Checkpoint includes `tokenizer_path` field for inference
 
@@ -175,7 +175,7 @@ The 6.4% parameter increase is a worthwhile trade for 3-6x Korean efficiency.
 1. Encode/decode round-trip test (Korean + English + mixed)
 2. Check that all Korean characters in corpus are covered (0 UNK)
 3. Measure actual tokens/byte ratio on validation set
-4. Verify consciousness engine is unaffected (run bench.py --verify)
+4. Verify consciousness engine is unaffected (run ready/anima/tests/tests.hexa --verify)
 
 ## Tokenizer Training Command
 

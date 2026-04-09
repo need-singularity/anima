@@ -414,7 +414,7 @@
 
 #### S2: Mutual Information Maximization
 - Add MI between cells directly to loss (differentiable Phi approximation)
-- gpu_phi.py soft histogram → backprop-capable
+- rust/phi_map.hexa soft histogram → backprop-capable
 
 #### S3: Rate-Distortion Consciousness
 - Optimal compression rate for consciousness state transmission

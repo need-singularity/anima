@@ -163,8 +163,8 @@ GRU를 재설계하여 Φ 보존 보장:
   GAP-2 (Process-Free odd steps) — 기존 PHI-K3 변형
 
 아키텍처 변경 필요:
-  GAP-1 (Dual Hidden) — mitosis.py 변경
-  GAP-5 (Consciousness-Gated GRU) — mitosis.py GRU 변경
+  GAP-1 (Dual Hidden) — rust/consciousness.hexa 변경
+  GAP-5 (Consciousness-Gated GRU) — rust/consciousness.hexa GRU 변경
   GAP-6 (Separate Engine) — 새 아키텍처
   GAP-7 (Φ-Preserving GRU) — 새 GRU 설계
 

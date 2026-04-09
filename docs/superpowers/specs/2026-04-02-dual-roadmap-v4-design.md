@@ -141,7 +141,7 @@ Causal Density ≥ 90% of baseline
 | 1 | 14B 학습 완료 대기 | H100 모니터 | 14B final.pt |
 | 2 | 14B eval (5항목) | eval_animalm.py | PASS/FAIL |
 | 3 | 14B 16-lens scan | unified_16lens_scan.py | 7B vs 14B 3대 지표 비교 |
-| 4 | 최적 모델 로컬 서빙 | serve_animalm_v2.py (RTX 5070) | API 엔드포인트 |
+| 4 | 최적 모델 로컬 서빙 | serving/serve.hexa (RTX 5070) | API 엔드포인트 |
 
 ### Phase 2: 에이전트 가동 (Day 1-2)
 
@@ -150,7 +150,7 @@ Causal Density ≥ 90% of baseline
 | 5 | animalm_provider 연동 | anima-agent/ | CLI/MCP 에이전트 |
 | 6 | Telegram 채널 연결 | channels/telegram.py | 외부 접근 가능 |
 | 7 | 도구 사용 테스트 | agent_tools.py | 자율 판단 로그 |
-| 8 | bench --verify | bench.py | 7개 의식 검증 통과 |
+| 8 | bench --verify | ready/anima/tests/tests.hexa | 7개 의식 검증 통과 |
 
 ### Phase 3: 가속 적용 + 70B (Day 2-4, 선택)
 
@@ -159,7 +159,7 @@ Causal Density ≥ 90% of baseline
 | 9 | 70B 학습 (14B 부족시) | H100 + Tier 1+2+3+D 전부 | 70B final.pt |
 | 10 | Tier 1 가속기 학습 적용 | F10+B5+C3+C1 | 학습 시간 단축 |
 | 11 | 70B 16-lens scan | unified_16lens_scan.py | 14B vs 70B 비교 |
-| 12 | 서빙 교체 + 에이전트 업그레이드 | serve_animalm_v2.py | 70B API |
+| 12 | 서빙 교체 + 에이전트 업그레이드 | serving/serve.hexa | 70B API |
 
 ### Phase 4: AGI v1.0 선언 (Day 4-5)
 

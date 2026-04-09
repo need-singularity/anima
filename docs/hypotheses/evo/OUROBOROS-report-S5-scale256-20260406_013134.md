@@ -1,7 +1,7 @@
 # OUROBOROS Report: S5-scale256
 
 **Generated:** 2026-04-06 01:31:34
-**Auto-generated** by infinite_evolution.py v8 #71
+**Auto-generated** by scripts/infinite_growth.hexa v8 #71
 
 ## Summary
 

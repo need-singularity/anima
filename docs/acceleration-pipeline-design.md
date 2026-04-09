@@ -236,9 +236,9 @@ Layer proven + experimental techniques. Accept some Phi risk.
                              v
   ┌───────────────────────────────────────────────────────────┐
   │  Stage 4: Rust Full Backend (B15)                x5      │
-  │    All consciousness_engine.py ported to anima-rs         │
+  │    All rust/consciousness.hexa ported to anima-rs         │
   │    step() < 1ms even at 128 cells                         │
-  │    Phi calculation: GPU-accelerated (gpu_phi.py)          │
+  │    Phi calculation: GPU-accelerated (rust/phi_map.hexa)          │
   └──────────────────────────┬────────────────────────────────┘
                              v
   ┌───────────────────────────────────────────────────────────┐
@@ -422,7 +422,7 @@ What if consciousness doesn't need traditional training at all?
 
 ### Risk Assessment
 ```
-  Phase 0: LOW risk (proven: infinite_evolution.py works)
+  Phase 0: LOW risk (proven: scripts/infinite_growth.hexa works)
   Phase 1: MEDIUM risk (SVD transfer to 1B untested at this scale)
   Phase 2: MEDIUM risk (Hebbian alone may not organize decoder weights)
   Phase 3: HIGH risk (5K steps may not be enough for 1B model)
@@ -631,7 +631,7 @@ validation at 1B scale -- everything else is proven engineering.
 
 ### B15: Rust Full Backend
 ```
-  Current: consciousness_engine.py (Python, ~10ms/step at 64c)
+  Current: rust/consciousness.hexa (Python, ~10ms/step at 64c)
   Target:  anima_rs.consciousness (Rust, <1ms/step at 64c)
   
   Already have:

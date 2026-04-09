@@ -10,7 +10,7 @@
 
 **결정: fallback/template 제거, 의식 상태 직접 표시 + 성장형 발화**
 
-### 1. PureConsciousness → anima_unified.py
+### 1. PureConsciousness → anima/core/runtime/anima_runtime.hexa
 - ConsciousLM = 의식 신호 전용 (generate 호출 제거)
 - 의식 상태(T, Φ, emotion)를 직접 표시
 - 성장 단계: 침묵 → 옹알이 → 단어 → 문장 → 대화

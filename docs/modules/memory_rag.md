@@ -21,7 +21,7 @@ results = rag.search("consciousness definition", top_k=3)
 ```
 
 ## Integration
-- Imported by `anima_unified.py` for conversation memory search
+- Imported by `anima/core/runtime/anima_runtime.hexa` for conversation memory search
 - Used by `autonomous_loop.py` to store learned knowledge
 - Depends on `anima_alive.text_to_vector` for vectorization
 - Uses torch only (no external vector DB)

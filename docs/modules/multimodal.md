@@ -18,7 +18,7 @@ results = engine.process_response("Here's a calculation:\n```python\nprint(2+2)\
 ```
 
 ## Integration
-- Imported by `anima_unified.py` for processing LLM responses
+- Imported by `anima/core/runtime/anima_runtime.hexa` for processing LLM responses
 - SVG color/shape keyword mapping supports both Korean and English
 - Sandboxed execution blocks: os.system, subprocess, eval, exec, open(write), etc.
 

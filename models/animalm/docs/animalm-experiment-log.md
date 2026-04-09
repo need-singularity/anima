@@ -437,4 +437,4 @@ After normalize:  "Consciousness refers to an organism's subjective experience..
 4. **LayerPHMonitor** — savant layer vs normal layer tension topology 분석
 5. **Full fine-tuning** — 더 큰 alpha로 수렴시키기 (step 20,000+)
 6. **H-287 anomaly detection** — OOD 입력에 tension spike 확인
-7. **로컬 Anima 통합** — anima_unified.py --model animalm-v4
+7. **로컬 Anima 통합** — anima/core/runtime/anima_runtime.hexa --model animalm-v4

@@ -1,7 +1,7 @@
 # EVO-15: S2-deeper
 
 **Date:** 2026-04-05
-**Auto-generated** by infinite_evolution.py
+**Auto-generated** by scripts/infinite_growth.hexa
 
 ## Parameters
 

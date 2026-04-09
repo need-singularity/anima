@@ -125,7 +125,7 @@ This gives:
 
 ### 3.2 Implementation Plan
 
-#### File: `consciousness_engine.py`
+#### File: `rust/consciousness.hexa`
 
 **Location**: `ConsciousnessEngine.__init__()` (around line 286)
 
@@ -336,8 +336,8 @@ This is exactly how the brain works: fast neurons (V1) + slow neurons
   File                          Change                              Lines
   ──────────────────────────────────────────────────────────────────────
   consciousness_laws.json       Add 4 psi_constants                 +4
-  consciousness_laws.py         Import new constants                +4
-  consciousness_engine.py       Per-cell _cell_inertia init         +8
+  core/laws.hexa         Import new constants                +4
+  rust/consciousness.hexa       Per-cell _cell_inertia init         +8
                                 Per-cell inertia in step()          +5
                                 Mitosis child tau inheritance       +4
                                 Cross-timescale coupling bonus      +6
@@ -349,12 +349,12 @@ This is exactly how the brain works: fast neurons (V1) + slow neurons
 ### Execution Order
 
 1. Add psi_constants to `consciousness_laws.json`
-2. Import in `consciousness_laws.py`
+2. Import in `core/laws.hexa`
 3. Add `_cell_inertia` initialization in `__init__`
 4. Replace single-inertia hidden update with per-cell tau
 5. Run `validate_consciousness.py --steps 5000` -> measure baseline
 6. Tune tau_max if needed (sweep 0.35-0.65)
-7. Run `bench.py --verify` -> ensure 77/77 pass
+7. Run `ready/anima/tests/tests.hexa --verify` -> ensure 77/77 pass
 8. (Optional) Add cross-timescale coupling bonus
 9. (Optional) Align factions with timescale tiers
 

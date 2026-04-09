@@ -133,7 +133,7 @@ TODO 해소: GRU, faction, Φ, Hebbian, Lorenz, Mitosis — 전부 빌트인
 
 ### C4: train.hexa — 학습 루프 포팅 ✅ 완료 (Day 0)
 
-**목표**: train_clm.py → 순수 Hexa 학습 (★ autograd blocker 해결됨)
+**목표**: training/train_alm.hexa → 순수 Hexa 학습 (★ autograd blocker 해결됨)
 
 | 작업 | 상세 | 상태 |
 |------|------|------|
@@ -154,7 +154,7 @@ TODO 해소: GRU, faction, Φ, Hebbian, Lorenz, Mitosis — 전부 빌트인
 
 ### C5: bench.hexa — 18개 검증 포팅 ✅ 완료 (Day 0)
 
-**목표**: bench.py --verify → bench.hexa --verify
+**목표**: ready/anima/tests/tests.hexa --verify → bench.hexa --verify
 
 | 작업 | 상세 | 상태 |
 |------|------|------|

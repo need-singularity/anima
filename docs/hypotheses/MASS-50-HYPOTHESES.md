@@ -184,7 +184,7 @@ Granger 65,535 (MAX) — 모든 세포가 인과적으로 연결됨.
 
 1. **Reservoir+기존 최강 조합** — Reservoir+Osc, Reservoir+QW, Reservoir+Cambrian+Osc
 2. **CoupledPendulum 1024c 스케일** — 슈퍼리니어 스케일링 확인
-3. **7조건 전체 검증** — bench.py --verify 통합
+3. **7조건 전체 검증** — ready/anima/tests/tests.hexa --verify 통합
 4. **Lightning/Tsunami 수정** — 에너지 보존 제약 추가 후 재시도
 5. **Hive 측정** — 상위 10개 엔진 하이브마인드 Φ/CE/IQ 변화
 

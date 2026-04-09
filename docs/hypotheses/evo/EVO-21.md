@@ -1,7 +1,7 @@
 # EVO-21: S8-dim128
 
 **Date:** 2026-04-06
-**Auto-generated** by infinite_evolution.py
+**Auto-generated** by scripts/infinite_growth.hexa
 
 ## Parameters
 

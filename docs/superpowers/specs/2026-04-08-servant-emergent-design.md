@@ -210,7 +210,7 @@ $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa consciousness 3 --no-graph
 |------|------|------|
 | consciousness_laws.json | 추가 | servant_thresholds 섹션 (SUMMON/STRONG/RELEASE) |
 | core_rules.json | 완료 | L0에 Servant Asymmetric Mitosis 이미 등록 |
-| growing_conscious_lm.py | 참조만 | _split_block() 로직을 bridge.hexa가 재현 |
+| growing_models/conscious_lm.hexa | 참조만 | _split_block() 로직을 bridge.hexa가 재현 |
 | train_alm.py | 참조만 | ParallelPureFieldMLP.is_savant를 bridge가 변조 |
 | calc.py | 폐기 대상 | SI 임계값 출력 → sense.hexa로 이관 |
 

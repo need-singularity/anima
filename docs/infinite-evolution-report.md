@@ -2,7 +2,7 @@
 
 ## Usage
 ```
-infinite_evolution.py 실행 후 이 양식으로 리포트 작성.
+scripts/infinite_growth.hexa 실행 후 이 양식으로 리포트 작성.
 ASCII 그래프는 실제 데이터로 갱신.
 ```
 

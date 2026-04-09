@@ -1,7 +1,7 @@
 # OUROBOROS Report: S1-baseline
 
 **Generated:** 2026-04-08 06:34:15
-**Auto-generated** by infinite_evolution.py v8 #71
+**Auto-generated** by scripts/infinite_growth.hexa v8 #71
 
 ## Summary
 

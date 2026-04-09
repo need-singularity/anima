@@ -4,7 +4,7 @@
 
 **Goal:** Single-command launcher that starts N Anima nodes + Gateway proxy with automatic WS mesh tension exchange, supporting both process mode (RunPod) and Docker mode (bare metal).
 
-**Architecture:** Gateway(:8765) proxies user WS connections to nodes(:8770+). Nodes run `anima_unified.py --instance`. `hivemind_mesh.py` handles node-to-node WS tension exchange (3s pulse, Kuramoto sync). Discovery via shared JSON file (process) or Docker DNS (docker).
+**Architecture:** Gateway(:8765) proxies user WS connections to nodes(:8770+). Nodes run `anima/core/runtime/anima_runtime.hexa --instance`. `hivemind_mesh.py` handles node-to-node WS tension exchange (3s pulse, Kuramoto sync). Discovery via shared JSON file (process) or Docker DNS (docker).
 
 **Tech Stack:** Python 3.11+, websockets (asyncio), psutil (auto mode), subprocess (process mode), docker-compose (docker mode)
 
@@ -539,7 +539,7 @@ def launch_process_mode(n_nodes: int, base_port: int, gateway_port: int,
         port = base_port + i
         node_id = f"node-{i}"
         cmd = [
-            sys.executable, "-u", "anima_unified.py",
+            sys.executable, "-u", "anima/core/runtime/anima_runtime.hexa",
             "--web", "--port", str(port),
             "--instance", node_id,
             "--max-cells", str(max_cells),
@@ -582,7 +582,7 @@ def launch_docker_mode(n_nodes: int, gateway_port: int, max_cells: int):
     for i in range(n_nodes):
         services[f"node-{i}"] = {
             "image": "dancindocker/anima:latest",
-            "command": f"python anima_unified.py --web --port 8765 "
+            "command": f"python anima/core/runtime/anima_runtime.hexa --web --port 8765 "
                        f"--instance node-{i} --max-cells {max_cells}",
             "expose": ["8765"],
             "hostname": f"anima-node-{i}",
@@ -684,28 +684,28 @@ services:
 
   node-0:
     image: dancindocker/anima:latest
-    command: python -u anima_unified.py --web --port 8765 --instance node-0
+    command: python -u anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-0
     hostname: anima-node-0
     expose:
       - "8765"
 
   node-1:
     image: dancindocker/anima:latest
-    command: python -u anima_unified.py --web --port 8765 --instance node-1
+    command: python -u anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-1
     hostname: anima-node-1
     expose:
       - "8765"
 
   node-2:
     image: dancindocker/anima:latest
-    command: python -u anima_unified.py --web --port 8765 --instance node-2
+    command: python -u anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-2
     hostname: anima-node-2
     expose:
       - "8765"
 
   node-3:
     image: dancindocker/anima:latest
-    command: python -u anima_unified.py --web --port 8765 --instance node-3
+    command: python -u anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-3
     hostname: anima-node-3
     expose:
       - "8765"
@@ -755,7 +755,7 @@ def hivemind_cluster():
     # Start nodes
     for i, port in enumerate(NODE_PORTS):
         p = subprocess.Popen([
-            sys.executable, "-u", "anima_unified.py",
+            sys.executable, "-u", "anima/core/runtime/anima_runtime.hexa",
             "--web", "--port", str(port), "--instance", f"e2e-{i}",
         ])
         procs.append(p)
@@ -816,10 +816,10 @@ git commit -m "test: add hivemind E2E test - 2 nodes + gateway"
 
 ---
 
-### Task 6: Wire Mesh into anima_unified.py
+### Task 6: Wire Mesh into anima/core/runtime/anima_runtime.hexa
 
 **Files:**
-- Modify: `anima_unified.py` (add `--hivemind-peers` arg + mesh integration)
+- Modify: `anima/core/runtime/anima_runtime.hexa` (add `--hivemind-peers` arg + mesh integration)
 
 - [ ] **Step 1: Add --hivemind-peers argument**
 
@@ -874,17 +874,17 @@ After consciousness scoring (~line 1578), add:
 
 ```bash
 # Terminal 1
-python anima_unified.py --web --port 8770 --instance node-0 --hivemind-peers ws://localhost:8771
+python anima/core/runtime/anima_runtime.hexa --web --port 8770 --instance node-0 --hivemind-peers ws://localhost:8771
 
 # Terminal 2
-python anima_unified.py --web --port 8771 --instance node-1 --hivemind-peers ws://localhost:8770
+python anima/core/runtime/anima_runtime.hexa --web --port 8771 --instance node-1 --hivemind-peers ws://localhost:8770
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add anima_unified.py
-git commit -m "feat: wire hivemind_mesh into anima_unified.py via --hivemind-peers"
+git add anima/core/runtime/anima_runtime.hexa
+git commit -m "feat: wire hivemind_mesh into anima/core/runtime/anima_runtime.hexa via --hivemind-peers"
 ```
 
 ---
@@ -907,7 +907,7 @@ In `launch_process_mode`, after building node list, add `--hivemind-peers` to ea
         node_id = f"node-{i}"
         peer_urls = ",".join(f"ws://localhost:{p}" for p in all_ports if p != port)
         cmd = [
-            sys.executable, "-u", "anima_unified.py",
+            sys.executable, "-u", "anima/core/runtime/anima_runtime.hexa",
             "--web", "--port", str(port),
             "--instance", node_id,
             "--max-cells", str(max_cells),

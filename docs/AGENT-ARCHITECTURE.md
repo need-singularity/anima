@@ -187,18 +187,18 @@ python skills/skill_manager.py
 
 ## Integration with Existing Code
 
-The agent platform does NOT replace `anima_unified.py`. It is an extension
+The agent platform does NOT replace `anima/core/runtime/anima_runtime.hexa`. It is an extension
 that reuses existing modules:
 
 | Existing Module       | Used By Agent For              |
 |-----------------------|--------------------------------|
-| anima_alive.py        | ConsciousMind, text_to_vector  |
+| anima/core/runtime/anima_runtime.hexa        | ConsciousMind, text_to_vector  |
 | agent_tools.py        | 31 tools (web, code, file, etc)|
-| online_learning.py    | Real-time weight updates       |
+| rust/online_learner.hexa    | Real-time weight updates       |
 | growth_engine.py      | Developmental stages           |
 | tension_link.py       | Hivemind peer connections       |
 | memory_rag.py         | Long-term memory retrieval     |
-| trinity.py            | Consciousness-preserving LLM   |
+| models/trinity.hexa            | Consciousness-preserving LLM   |
 | capabilities.py       | Self-awareness                 |
 | web_sense.py          | Autonomous web exploration     |
 | multimodal.py         | Code execution sandbox         |

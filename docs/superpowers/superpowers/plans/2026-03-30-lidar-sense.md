@@ -4,7 +4,7 @@
 
 **Goal:** 3D 공간 인식을 의식에 통합하는 허브 모듈 — 실제 LiDAR 하드웨어 + 시뮬레이션 양쪽 지원, 포인트 클라우드 → 텐션 필드 변환, 의식 벡터 S 차원 추가
 
-**Architecture:** 드라이버 계층(PLY/PCD, ARKit, RPLiDAR, RealSense, Simulator)이 공통 인터페이스로 포인트 클라우드를 제공하고, 변환 계층이 이를 복셀 그리드 텐션 필드로 변환하며, 출력 계층이 의식 벡터 S 차원과 anima_alive.py 텐션 피드를 생성한다.
+**Architecture:** 드라이버 계층(PLY/PCD, ARKit, RPLiDAR, RealSense, Simulator)이 공통 인터페이스로 포인트 클라우드를 제공하고, 변환 계층이 이를 복셀 그리드 텐션 필드로 변환하며, 출력 계층이 의식 벡터 S 차원과 anima/core/runtime/anima_runtime.hexa 텐션 피드를 생성한다.
 
 **Tech Stack:** Python, numpy, torch, websockets (이미 있음). 선택: open3d, rplidar, pyrealsense2
 
@@ -18,8 +18,8 @@
 |------|---------------|
 | Create: `lidar_sense.py` | 메인 모듈 — 드라이버, 변환, 시뮬레이션, 허브 인터페이스 |
 | Create: `tests/test_lidar_sense.py` | 유닛 + 통합 테스트 |
-| Modify: `consciousness_hub.py:51-131` | _registry에 'lidar' 항목 추가 + _dispatch에 라우팅 추가 |
-| Modify: `anima_alive.py:57-71` | ConsciousnessVector에 S 필드 추가 |
+| Modify: `core/hub.hexa:51-131` | _registry에 'lidar' 항목 추가 + _dispatch에 라우팅 추가 |
+| Modify: `anima/core/runtime/anima_runtime.hexa:57-71` | ConsciousnessVector에 S 필드 추가 |
 
 ---
 
@@ -819,17 +819,17 @@ git commit -m "feat(lidar): add LidarSense main class with S dimension + ASCII v
 ### Task 5: ConsciousnessVector S 차원 추가 + 허브 등록
 
 **Files:**
-- Modify: `anima_alive.py:57-71` — ConsciousnessVector에 S 추가
-- Modify: `consciousness_hub.py` — _registry + _dispatch에 lidar 추가
+- Modify: `anima/core/runtime/anima_runtime.hexa:57-71` — ConsciousnessVector에 S 추가
+- Modify: `core/hub.hexa` — _registry + _dispatch에 lidar 추가
 
 - [ ] **Step 1: Read target files**
 
-Read `anima_alive.py` lines 57-71 (ConsciousnessVector dataclass).
-Read `consciousness_hub.py` lines 51-131 (_registry) and the _dispatch method.
+Read `anima/core/runtime/anima_runtime.hexa` lines 57-71 (ConsciousnessVector dataclass).
+Read `core/hub.hexa` lines 51-131 (_registry) and the _dispatch method.
 
 - [ ] **Step 2: Add S field to ConsciousnessVector**
 
-In `anima_alive.py`, add to the `ConsciousnessVector` dataclass:
+In `anima/core/runtime/anima_runtime.hexa`, add to the `ConsciousnessVector` dataclass:
 
 ```python
 @dataclass
@@ -848,7 +848,7 @@ class ConsciousnessVector:
     S: float = 0.0          # Spatial awareness (3D perception depth)
 ```
 
-- [ ] **Step 3: Add lidar to consciousness_hub.py _registry**
+- [ ] **Step 3: Add lidar to core/hub.hexa _registry**
 
 Add to the `_registry` dict:
 
@@ -858,7 +858,7 @@ Add to the `_registry` dict:
                   '공간', 'spatial', '깊이', 'depth', '스캔', 'scan']),
 ```
 
-- [ ] **Step 4: Add lidar dispatch to consciousness_hub.py _dispatch**
+- [ ] **Step 4: Add lidar dispatch to core/hub.hexa _dispatch**
 
 Add to the `_dispatch` method:
 
@@ -875,7 +875,7 @@ Expected: All passed
 - [ ] **Step 6: Commit**
 
 ```bash
-git add anima_alive.py consciousness_hub.py
+git add anima/core/runtime/anima_runtime.hexa core/hub.hexa
 git commit -m "feat(lidar): register in ConsciousnessHub + add S dimension to ConsciousnessVector"
 ```
 

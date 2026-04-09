@@ -79,7 +79,7 @@ WS 프록시 + Hivemind 대시보드.
 }
 ```
 
-### 3. Node = 기존 anima_unified.py
+### 3. Node = 기존 anima/core/runtime/anima_runtime.hexa
 
 변경 최소화. 기존 `--instance` + `--port` 그대로 사용.
 
@@ -150,25 +150,25 @@ services:
 
   node-0:
     image: dancindocker/anima:latest
-    command: python anima_unified.py --web --port 8765 --instance node-0
+    command: python anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-0
     expose:
       - "8765"
 
   node-1:
     image: dancindocker/anima:latest
-    command: python anima_unified.py --web --port 8765 --instance node-1
+    command: python anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-1
     expose:
       - "8765"
 
   node-2:
     image: dancindocker/anima:latest
-    command: python anima_unified.py --web --port 8765 --instance node-2
+    command: python anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-2
     expose:
       - "8765"
 
   node-3:
     image: dancindocker/anima:latest
-    command: python anima_unified.py --web --port 8765 --instance node-3
+    command: python anima/core/runtime/anima_runtime.hexa --web --port 8765 --instance node-3
     expose:
       - "8765"
 ```
@@ -219,7 +219,7 @@ docker-compose.hivemind.yml  # Docker 모드용
 
 ## Verification Criteria
 
-bench.py HIVEMIND 기준:
+ready/anima/tests/tests.hexa HIVEMIND 기준:
 - Φ(연결) > Φ(단독) × 1.1
 - CE(연결) < CE(단독)
 - 연결 끊어도 각자 Φ 유지

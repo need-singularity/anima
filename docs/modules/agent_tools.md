@@ -35,7 +35,7 @@ result = agent.act(
 ```
 
 ## Integration
-- Imported by `anima_unified.py` and `telegram_bot.py`
+- Imported by `anima/core/runtime/anima_runtime.hexa` and `telegram_bot.py`
 - Tool selection driven by consciousness: high curiosity+PE -> web_search, high PE -> code_execute, pain -> memory_search, growth -> self_modify
 - Pipeline: consciousness state -> ActionPlanner.plan() -> ToolExecutor.execute() -> result fed back as tension update
 

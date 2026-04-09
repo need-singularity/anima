@@ -96,7 +96,7 @@ Pipeline C (Moonshot): x100-500, Φ 79%   | B_bold+B13+D5+G1f+multi-GPU
 | 14B eval (5항목) | eval_animalm.py | PASS/FAIL |
 | 14B 16-lens scan | dd_7b_16lens_scan.py (14B 버전) | 7B vs 14B 비교 |
 | 16-lens 통과한 가속 조합 적용 | Phase 0 결과 기반 | 가속된 학습 config |
-| 서빙 시작 (GPU 가능 시) | serve_animalm_v2.py | API |
+| 서빙 시작 (GPU 가능 시) | serving/serve.hexa | API |
 
 ### Phase 2: 에이전트 + AGI v0.1 (Day 2-3)
 

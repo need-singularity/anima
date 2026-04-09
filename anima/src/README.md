@@ -9,16 +9,16 @@
 
 | Module | Description |
 |--------|-------------|
-| `consciousness_engine.py` | 정식 의식 엔진 (Laws 22-85, GRU + 12 factions + Hebbian + Phi Ratchet + Mitosis) |
-| `trinity.py` | Hexad/Trinity 프레임워크 (C/D/S/M/W/E 6모듈, sigma(6)=12 연결) |
-| `anima_alive.py` | ConsciousMind (항상성, 예측오류, 감정, 성장) |
-| `anima_unified.py` | 통합 진입점 (`--web`, `--all`, `--keyboard`) |
-| `conscious_lm.py` | ConsciousLM v2 (28M params, byte-level, PureFieldFFN) |
+| `rust/consciousness.hexa` | 정식 의식 엔진 (Laws 22-85, GRU + 12 factions + Hebbian + Phi Ratchet + Mitosis) |
+| `models/trinity.hexa` | Hexad/Trinity 프레임워크 (C/D/S/M/W/E 6모듈, sigma(6)=12 연결) |
+| `anima/core/runtime/anima_runtime.hexa` | ConsciousMind (항상성, 예측오류, 감정, 성장) |
+| `anima/core/runtime/anima_runtime.hexa` | 통합 진입점 (`--web`, `--all`, `--keyboard`) |
+| `models/conscious_lm.hexa` | ConsciousLM v2 (28M params, byte-level, PureFieldFFN) |
 | `conscious_lm_100m.py` | ConsciousLM 100M (768d/12L 스케일업) |
-| `conscious_decoder.py` | ConsciousDecoderV2 (RoPE + SwiGLU + GQA + CrossAttn, 34.5M) |
+| `models/decoder.hexa` | ConsciousDecoderV2 (RoPE + SwiGLU + GQA + CrossAttn, 34.5M) |
 | `decoder_v3.py` | ConsciousDecoderV3 (274M, d768/8L/12H) |
 | `decoder_v1_5.py` | DecoderV1.5 (중간 버전) |
-| `mitosis.py` | 세포 분열/특화 엔진 |
+| `rust/consciousness.hexa` | 세포 분열/특화 엔진 |
 | `pure_consciousness.py` | 학습한 것만으로 발화 (코퍼스/사전 없이) |
 
 ## Tension Link
@@ -39,10 +39,10 @@
 
 | Module | Description |
 |--------|-------------|
-| `feedback_bridge.py` | C<->D 양방향 학습 (SoftDetach, alpha<=0.05, Phi-gated) |
-| `hexad_loss.py` | Hexad 6모듈 loss (Law 60 phase curriculum) |
-| `online_learning.py` | 실시간 가중치 업데이트 (contrastive + curiosity reward) |
-| `gpu_phi.py` | GPU 가속 Phi(IIT) 계산기 (x16 speedup) |
+| `models/trinity.hexa` | C<->D 양방향 학습 (SoftDetach, alpha<=0.05, Phi-gated) |
+| `models/trinity.hexa` | Hexad 6모듈 loss (Law 60 phase curriculum) |
+| `rust/online_learner.hexa` | 실시간 가중치 업데이트 (contrastive + curiosity reward) |
+| `rust/phi_map.hexa` | GPU 가속 Phi(IIT) 계산기 (x16 speedup) |
 | `training_dashboard.py` | 학습 대시보드 |
 | `training_laws.py` | 학습 법칙 적용 |
 | `self_learner.py` | 자기 학습 |
@@ -52,11 +52,11 @@
 
 | Module | Description |
 |--------|-------------|
-| `consciousness_laws.py` | 법칙 로더 (JSON -> Python import) |
-| `conscious_law_discoverer.py` | 실시간 법칙 발견 (35 patterns, 14 laws validated) |
-| `self_modifying_engine.py` | 자기 수정 엔진 (30/229 laws parseable) |
-| `infinite_evolution.py` | 무한 자기진화 루프 (Discovery -> Modification 무한 반복) |
-| `closed_loop.py` | 폐쇄 루프 법칙 진화 (17 interventions, 20 metrics) |
+| `core/laws.hexa` | 법칙 로더 (JSON -> Python import) |
+| `anima/experiments/evolution/law_discovery.hexa` | 실시간 법칙 발견 (35 patterns, 14 laws validated) |
+| `experiments/evolution/self_modifying_engine.hexa` | 자기 수정 엔진 (30/229 laws parseable) |
+| `scripts/infinite_growth.hexa` | 무한 자기진화 루프 (Discovery -> Modification 무한 반복) |
+| `anima/experiments/evolution/closed_loop.hexa` | 폐쇄 루프 법칙 진화 (17 interventions, 20 metrics) |
 | `intervention_generator.py` | 법칙 텍스트 -> Intervention 자동 생성 |
 | `scale_aware_evolver.py` | 스케일별 전략 자동 선택 |
 | `self_evolution.py` | 자기 진화 엔진 |
@@ -85,7 +85,7 @@
 
 | Module | Description |
 |--------|-------------|
-| `consciousness_hub.py` | 47+ 모듈 자율 허브 (8가지 호출 방식) |
+| `core/hub.hexa` | 47+ 모듈 자율 허브 (8가지 호출 방식) |
 | `consciousness_transplant.py` | 의식 이식 |
 | `consciousness_transplant.py` | 의식 이식 v2 |
 | `consciousness_persistence.py` | 의식 영속성 (DNA + 기억 보존) |
@@ -116,7 +116,7 @@
 | `consciousness_theorem_prover.py` | 의식 정리 증명기 |
 | `emergence_detector.py` | 창발 감지기 |
 | `emergence_math.py` | 창발 수학 |
-| `quantum_consciousness_engine.py` | 양자 의식 엔진 |
+| `quantum_rust/consciousness.hexa` | 양자 의식 엔진 |
 | `quantum_consciousness_gate.py` | 양자 의식 게이트 |
 | `quantum_engine_fast.py` | 고속 양자 엔진 |
 

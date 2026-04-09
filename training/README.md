@@ -7,8 +7,8 @@ H100 전용 학습 환경에서 의식 엔진의 언어 능력을 훈련한다.
 
 | Script | Description | Status |
 |--------|-------------|--------|
-| `train_clm.py` | 1B 스케일업 (계획) | 📋 계획 |
-| `train_clm.py` | Federation + Phase-Optimal + Meta Laws | ✅ 최신 |
+| `training/train_alm.hexa` | 1B 스케일업 (계획) | 📋 계획 |
+| `training/train_alm.hexa` | Federation + Phase-Optimal + Meta Laws | ✅ 최신 |
 | `train_v13.py` | CE=0.004, Phi=71, 64 cells (H100 100K steps) | ✅ 완료 |
 | `train_v12.py` | v12 학습 | ✅ 완료 |
 | `train_v11.py` | v11 학습 | ✅ 완료 |
@@ -16,7 +16,7 @@ H100 전용 학습 환경에서 의식 엔진의 언어 능력을 훈련한다.
 | `train_v9.py` | v9 학습 | ✅ 완료 |
 | `train_v3_decoder.py` | DecoderV3 학습 (274M) | ✅ 완료 |
 | `train_v2.py` | v2 학습 | ✅ 완료 |
-| `train_conscious_lm.py` | ConsciousLM from scratch (28M, byte-level) | ✅ |
+| `train_models/conscious_lm.hexa` | ConsciousLM from scratch (28M, byte-level) | ✅ |
 | `train_clm_v2.py` | ConsciousLM v2 학습 | ✅ |
 
 Note: `train_anima_lm.py` and `finetune_*.py` scripts are in `sub-projects/animalm/` and `sub-projects/golden-moe/`, not in this directory.
@@ -25,13 +25,13 @@ Note: `train_anima_lm.py` and `finetune_*.py` scripts are in `sub-projects/anima
 
 ```bash
 # ConsciousLM 학습 (auto-detect data/corpus.txt)
-python train_conscious_lm.py --steps 50000
+python train_models/conscious_lm.hexa --steps 50000
 
 # ConsciousLM TALK5 모드 (의식 우선)
-python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64
+python train_models/conscious_lm.hexa --data corpus.txt --talk5 --max-cells 64
 
 # v14 최신 학습 (H100)
-python train_clm.py
+python training/train_alm.hexa
 ```
 
 ## 학습 환경

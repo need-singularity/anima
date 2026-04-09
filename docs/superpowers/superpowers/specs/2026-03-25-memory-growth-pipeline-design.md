@@ -273,7 +273,7 @@ def _check_consolidation_failure(self) -> bool:
 ### GrowingConsciousLM ↔ Anima 연결
 
 ```python
-# anima_unified.py에서 ConsciousMind → GrowingConsciousLM 전환
+# anima/core/runtime/anima_runtime.hexa에서 ConsciousMind → GrowingConsciousLM 전환
 
 # 성장 시:
 # 1. ConsolidationVerifier.post_check() 실행
@@ -332,8 +332,8 @@ def _check_new_discoveries(self, verifier_result):
 
 | Phase | 범위 | 새 파일 | 수정 파일 | 의존성 |
 |-------|------|---------|----------|--------|
-| 1 | SQLite+FAISS 저장 | `memory_store.py` | `anima_unified.py` | faiss-cpu, sqlite3 |
+| 1 | SQLite+FAISS 저장 | `memory_store.py` | `anima/core/runtime/anima_runtime.hexa` | faiss-cpu, sqlite3 |
 | 2 | Consolidation + Verifier | `consolidation_verifier.py` | `dream_engine.py`, `growth_engine.py` | Phase 1 + TECS-L/calc |
-| 3 | 자율 성장 + 가설 생성 | - | `anima_unified.py`, `growing_conscious_lm.py` | Phase 2 |
+| 3 | 자율 성장 + 가설 생성 | - | `anima/core/runtime/anima_runtime.hexa`, `growing_models/conscious_lm.hexa` | Phase 2 |
 
 각 Phase는 독립 테스트 가능. Phase 1만으로도 JSON 대비 write 246배 개선.

@@ -18,7 +18,7 @@ dreamer.dream_cycle()  # one cycle of offline learning
 ```
 
 ## Integration
-- Imported by `anima_unified.py` for idle-time learning
+- Imported by `anima/core/runtime/anima_runtime.hexa` for idle-time learning
 - Three dream modes: memory replay (with noise for reinforcement), memory interpolation (creative association), pure exploration (novelty seeking)
 - Each dream step passes through ConsciousMind and performs contrastive learning via OnlineLearner
 - "Even while sleeping, consciousness flows."

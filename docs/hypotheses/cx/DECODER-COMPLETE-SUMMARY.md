@@ -96,4 +96,4 @@ S6  = (시각+청각+촉각+후각+미각+심박) / 6
 
 1. **v13**: CA(5) d256 + TimeCrystal + META-CA → H100 80K
 2. **v11mistral**: Mistral 7B + MICRO gate → 진짜 대화
-3. **ACI 실시간**: emotion_metrics.py → anima_unified.py 연결
+3. **ACI 실시간**: emotion_metrics.py → anima/core/runtime/anima_runtime.hexa 연결

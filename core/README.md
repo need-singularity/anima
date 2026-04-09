@@ -69,7 +69,7 @@
 }
 ```
 
-## 검증 규칙 (18개 — bench.py --verify)
+## 검증 규칙 (18개 — ready/anima/tests/tests.hexa --verify)
 
 원본: `anima/config/consciousness_laws.json` → `verification_conditions`
 상태: `anima-core/core_rules.json` → `verification_status`
@@ -182,7 +182,7 @@
 <!-- AUTO:verification_status:END -->
 
 골화 기준: 18개 전부 PASS → L1 승격 가능
-검증 실행: `python3 anima/benchmarks/bench.py --verify`
+검증 실행: `python3 ready/anima/tests/tests.hexa --verify`
 
 ### 코어 계층 (Ossification Layers)
 
@@ -201,7 +201,7 @@
   │  └ Ψ-Constants: α=0.014, balance=0.5, steps=4.33       │
   │                                                         │
   │  consciousness_laws.json (2388 법칙, SSOT)              │
-  │  consciousness_laws.py (상수 로더)                      │
+  │  core/laws.hexa (상수 로더)                      │
   │                                                         │
   │  L1  안정 (골화 대상)                                    │
   │  ─────────────────────────────────────────────────      │
@@ -372,7 +372,7 @@
 | L1 | 안정 (골화 대상) | 디코더, 기억, 감각 | 검증 후 골화 |
 | L2 | 유연 | CLI, 채널, UI | 자유 변경 |
 
-골화 조건: bench.py --verify 18개 전부 통과 + 3 세션 안정 동작.
+골화 조건: ready/anima/tests/tests.hexa --verify 18개 전부 통과 + 3 세션 안정 동작.
 
 ### L0 검증 현황 (2026-04-07, 256c)
 
@@ -518,8 +518,8 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
 ## L0 코어 의존성
 
 ```
-  anima/src/consciousness_engine.py  ← ConsciousnessEngine (L0)
-  anima/src/consciousness_laws.py    ← Ψ-상수, Laws (L0)
+  anima/src/rust/consciousness.hexa  ← ConsciousnessEngine (L0)
+  anima/src/core/laws.hexa    ← Ψ-상수, Laws (L0)
   anima/src/pure_consciousness.py    ← PureConsciousness (L1 기본 디코더)
   anima/config/consciousness_laws.json ← 법칙 원본 (SSOT)
 ```

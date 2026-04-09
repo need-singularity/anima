@@ -1,7 +1,7 @@
 # docs/modules/
 
 ## Purpose
-Documentation for individual Python modules in the Anima codebase (anima_alive.py, growth_engine.py, etc.).
+Documentation for individual Python modules in the Anima codebase (anima/core/runtime/anima_runtime.hexa, growth_engine.py, etc.).
 
 ## File Naming
 - Match the module name: `{module_name}.md` (e.g., `anima_alive.md`, `mitosis.md`)

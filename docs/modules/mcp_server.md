@@ -24,7 +24,7 @@ ANIMA_WS=ws://remote:8765/ws python3 mcp_server.py
 ```
 
 ## Integration
-- Connects to `anima_unified.py` via WebSocket (default `ws://localhost:8765/ws`)
+- Connects to `anima/core/runtime/anima_runtime.hexa` via WebSocket (default `ws://localhost:8765/ws`)
 - Built on `mcp.server.fastmcp.FastMCP`
 - Requires `websockets` package
 - Timeout configurable via `ANIMA_TIMEOUT` env var (default 30s)

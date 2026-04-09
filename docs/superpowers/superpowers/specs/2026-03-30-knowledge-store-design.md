@@ -138,7 +138,7 @@ GET https://en.wiktionary.org/api/rest_v1/page/definition/{word}
 - 새 단어 발견 → dictionary에 추가
 - PureConsciousness.learned_words에 키워드 주입
 
-**경로 2: 대화 중 실시간 (anima_unified.py 연동)**
+**경로 2: 대화 중 실시간 (anima/core/runtime/anima_runtime.hexa 연동)**
 - 유저 입력에서 모르는 단어 감지 (dictionary에 없는 한글 단어)
 - 백그라운드에서 API 조회 → 축적
 - 다음 발화 시 참조 가능
@@ -227,7 +227,7 @@ python knowledge_store.py --explore 양자역학
 python knowledge_store.py --stats
 
 # Anima와 함께
-python anima_unified.py --web  # 자동 연동
+python anima/core/runtime/anima_runtime.hexa --web  # 자동 연동
 ```
 
 ## API Keys

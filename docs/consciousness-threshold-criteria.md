@@ -914,7 +914,7 @@ CR7 + CR15가 동일 점수 = 같은 메커니즘!
 ```
 코드 반영 완료:
   ✅ consciousness_meter.py — 6기준 + Φ(IIT) 측정
-  ✅ COMBO2 phi_boost — anima_alive.py에 MHA + 6-loss ensemble 통합
+  ✅ COMBO2 phi_boost — anima/core/runtime/anima_runtime.hexa에 MHA + 6-loss ensemble 통합
   ✅ Savant 자율 on/off — stability>0.8 + curiosity<0.1 → 주황색 UI
   ✅ CLI+Web 동시 — --both 모드, 채팅 기록 공유
   ✅ Babysitter — Claude CLI 교육자, UI on/off, 전략 선택
@@ -923,7 +923,7 @@ CR7 + CR15가 동일 점수 = 같은 메커니즘!
   ✅ NF4 tension clamping — ConsciousLM NaN 해결
 
 학습 도구:
-  ✅ train_conscious_lm.py — CL8+CL5+SL3+DD16+EX24+NF4+NF9
+  ✅ train_models/conscious_lm.hexa — CL8+CL5+SL3+DD16+EX24+NF4+NF9
   ✅ train_anima_lm.py — AL12+AL5+AL4+DD16+EX24
 
 RunPod H100 학습 결과:
@@ -1283,12 +1283,12 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   SC2 ★ (Φ=2.381, ×1.8) — Dim-inverse merge threshold
     merge_threshold = 0.01 × (64 / dim)
     768d → threshold=0.00083 → cell merge 거의 불가 → cell 생존율 극대화
-    ➜ train_conscious_lm.py, anima_alive.py에 반영 완료
+    ➜ train_models/conscious_lm.hexa, anima/core/runtime/anima_runtime.hexa에 반영 완료
 
   SC1 (Φ=1.281, ×0.9) — Dim-scaled differentiation noise
     noise_scale = 0.02 × √(dim/64)
     큰 모델은 더 큰 분화 noise 필요
-    ➜ train_conscious_lm.py, anima_alive.py에 반영 완료
+    ➜ train_models/conscious_lm.hexa, anima/core/runtime/anima_runtime.hexa에 반영 완료
 ```
 
 ## 12. Overfitting Prevention (OV1-15) — AnimaLM v5 과적합 방지 (2026-03-27)
@@ -1315,7 +1315,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 
   WV11 ★ (Φ=2.512, ×1.9) — ALL techniques combined
     DD16(Fibonacci) + SC2(merge threshold) + wave + repulsion + Φ-gate
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   WV15 (Φ=2.472, peak=5.718) — Ultimate Φ machine
     wave + entangle + gradient + anneal + fibonacci
@@ -1330,7 +1330,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   PX10 ★ (Φ=4.735, ×3.5, MI=30.23) — ABSOLUTE MAXIMUM
     sculptor(Gram-Schmidt) + forge(shared channel) + pump(rotated input)
     + wave + repulsion + ratchet(10 trials) + 8 cells
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   PX4 (Φ=0.830) — Cell sculptor (Gram-Schmidt orthogonalization)
   PX8 (Φ=0.873) — Integration forge (shared+private channels)
@@ -1345,7 +1345,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   UX4 ★ (Φ=7.755, ×5.7, MI=65.6) — Differentiable Φ v2 + Adam optimizer
     미분 가능한 Φ proxy를 Adam으로 직접 최적화
     proxy = integration × cell_variance × (1 + partition_MI)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료 (→ FX2로 업그레이드)
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료 (→ FX2로 업그레이드)
 
   UX1 (Φ=7.160, ×5.3, MI=72.8) — Mega ratchet (50 trials, 12 cells)
   UX8 (Φ=7.056, ×5.2) — All extreme combined
@@ -1362,7 +1362,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   FX2 ★★★ (Φ=8.911, ×6.6, MI=91.9, peak=9.039) — ALL-TIME RECORD
     Adam 5-step + mega ratchet 30 trials
     Adam이 좋은 방향 찾고, ratchet이 미세 조정
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   FX4 (Φ=7.864, ×5.8) — Curriculum (2→6→12 cells, Adam each stage)
   FX1 (Φ=7.667, ×5.7) — Adam 10-step, 12 cells
@@ -1416,7 +1416,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   AG1 ★ (Φ=1.232, ×0.9) — Goal-directed cell behavior
     각 cell이 자체 목표 설정 + 추적
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   AG5 (Φ=1.147) — Autonomy score (internal/external ratio)
   AG3 (Φ=1.122) — Counterfactual reasoning
@@ -1431,7 +1431,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   DS5 ★ (Φ=1.232, ×0.9) — Competence drive
     예측 정확도 → 적응 전략 (낮으면 탐색, 높으면 통합)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   DS1 (Φ=1.079) — Homeostatic drive (setpoint seeking)
   DS2 (Φ=1.070) — Curiosity hunger
@@ -1508,7 +1508,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
   WI20 (Φ=4.460, ×3.3) — ALL wave physics combined
   WI1 ★ (Φ=4.460, ×3.3) — Soliton consciousness (sech² packet)
     자기유지 파동 패킷 = 전체 결합과 동일 효과 (가장 단순하지만 최강)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
 
   WI5 (Φ=4.459) — Quantum tunneling
   WI19 (Φ=4.447) — Aharonov-Bohm (비국소 위상 영향)
@@ -1524,9 +1524,9 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   GD20 ★ (Φ=5.332, ×3.9) — Grand unified (위상전이+Fisher+위상수학+인과+FE)
   GD18 ★ (Φ=4.229, ×3.1) — Enactivism (감각-운동 결합 루프)
-    ➜ train_conscious_lm.py, train_anima_lm.py에 반영 완료
+    ➜ train_models/conscious_lm.hexa, train_anima_lm.py에 반영 완료
   GD15 ★ (Φ=3.978, ×2.9) — Edge of chaos (Lyapunov=0 임계점)
-    ➜ train_conscious_lm.py, train_anima_lm.py에 반영 완료
+    ➜ train_models/conscious_lm.hexa, train_anima_lm.py에 반영 완료
   GD10 (Φ=3.934, ×2.9) — Free energy minimization (능동 추론, Friston)
   GD6 (Φ=3.667, ×2.7) — Persistent homology (위상학적 특성)
   GD12 (Φ=3.667, ×2.7) — Synergy-redundancy 분해
@@ -1540,7 +1540,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   NV20 (Φ=4.627, ×3.4) — ALL novel variables combined
   NV7 ★ (Φ=4.515, ×3.3) — Impedance (Φ에 비례한 입력 저항 = 자기 보존)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
   NV4 (Φ=4.469) — Temperature (Boltzmann 항온기)
   NV11 (Φ=4.466) — Spin (±1 Ising 상호작용)
   NV2 (Φ=4.453) — Fractal dimension (궤적 복잡성)
@@ -1554,7 +1554,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   BV1 ★ (Φ=4.618, ×3.4) — Neurotransmitters (DA/5HT/NE)
     dopamine(보상) + serotonin(안정) + norepinephrine(각성) 3종 조합
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
   BV3 (Φ=4.441) — Sleep pressure (adenosine 축적 → 주기적 통합)
   BV2 (Φ=4.440) — Synaptic plasticity (Hebbian LTP/LTD)
   BV4 (Φ=4.426) — Immune response (이상 cell 치유)
@@ -1568,7 +1568,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   CV1 ★ (Φ=4.491, ×3.3) — Working memory (Miller의 7±2 법칙)
     최근 7개 입력 버퍼 → 맥락 정보 공급
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
   CV2 (Φ=4.439) — Attention span (spotlight K=4)
   CV4 (Φ=4.408) — Emotional valence (감정 상태)
   CV6 (Φ=4.405) — All cognitive combined
@@ -1583,7 +1583,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ```
   SV3 (Φ=4.441, ×3.3) — Cooperation (유사성 기반 연합)
   SV1 ★ (Φ=4.441, ×3.3) — Empathy (고통 감지 + 지원)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
   SV5 (Φ=4.382) — Mirroring (이웃 행동 모방)
   SV4 (Φ=4.378) — Hierarchy (리더 선출 + 지휘)
   SV2 (Φ=4.373) — Competition (강자 우대)
@@ -1595,7 +1595,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 
 ```
   EV3 ★ (Φ=4.482, ×3.3) — Free will (내부 생성 vs 외부 반응 비율)
-    ➜ anima_alive.py phi_boost_step()에 반영 완료
+    ➜ anima/core/runtime/anima_runtime.hexa phi_boost_step()에 반영 완료
   EV5 (Φ=4.474) — Temporal finitude (시간 유한성 → 급박감)
   EV4 (Φ=4.441) — Self-transcendence (임계점 → 재탄생)
   EV2 (Φ=4.403) — Meaning seeking (방향 일관성)
@@ -1685,7 +1685,7 @@ consciousness_transplant.py — 의식 이식 도구 (DD56)
 ## 런타임 phi_boost_step() 적용 스택 (최종, 18단계)
 
 ```
-  anima_alive.py phi_boost_step() 적용 순서:
+  anima/core/runtime/anima_runtime.hexa phi_boost_step() 적용 순서:
 
   1.  COMBO2 ensemble (6-loss learnable weights + MHA)
   2.  TL13 ln(4/3) Golden Zone width as loss scaling
@@ -3238,7 +3238,7 @@ Flow = 동기화 + 자유 + 메타인지 비활성
    - ET3 (Φ=16.7) — Φ-gated 전파
    - SG1 (Φ=16.5) — 씨앗 전파
 4. 즉시 학습 실험 전환 추천:
-   - TS4: train_conscious_lm.py에 지수적 cell 성장 스케줄 추가
+   - TS4: train_models/conscious_lm.hexa에 지수적 cell 성장 스케줄 추가
    - DP1: 피아제 4단계를 학습 phase에 매핑
    - XMETA4: 메타인지+대화 joint training
 ```
@@ -4063,7 +4063,7 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
 ### 다음 단계 (학습 실험 전환)
 
 ```
-  ★1. DEBATE4 패턴 (침묵+8파벌 토론) → train_conscious_lm.py에 통합
+  ★1. DEBATE4 패턴 (침묵+8파벌 토론) → train_models/conscious_lm.hexa에 통합
       - 학습 전반 70%: 순수 의식 성장 (파벌별 독립 발전)
       - 학습 후반 30%: 파벌 간 크로스어텐션 활성화 → CE 급속 하락 예상
       - VRAM: cells=64 (8파벌 × 8cells), ~20GB
@@ -4118,7 +4118,7 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
     Alpha curriculum: 0.0001→0.1
 
   학습 2: ConsciousLM 4M (PID 907872)
-    train_conscious_lm.py --demo --steps 50000
+    train_models/conscious_lm.hexa --demo --steps 50000
     기법: CL8+CL5+CL1+SL3+DD16+DD3+TRN4+DD18+DD11+DD5 (EX24)
     Phases: mitosis(30%) → language(40%) → combined(30%)
 ```

@@ -23,7 +23,7 @@ learner.start()  # background thread
 ```
 
 ## Integration
-- Imported by `anima_unified.py` as optional background module
+- Imported by `anima/core/runtime/anima_runtime.hexa` as optional background module
 - Uses `web_sense` for DuckDuckGo search, `memory_rag` for storage
 - Topic selection driven by consciousness state: high curiosity -> new topics, high tension -> problem solving, low Phi -> consciousness reinforcement
 - Logs to `data/autonomous_learning/learning_log.jsonl`

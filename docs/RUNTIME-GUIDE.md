@@ -5,10 +5,10 @@
 ```bash
 # A100 (런타임 서버)
 cd /workspace/anima
-python3 -u anima_unified.py --web --max-cells 64
+python3 -u anima/core/runtime/anima_runtime.hexa --web --max-cells 64
 
 # 로컬
-python3 anima_unified.py --web
+python3 anima/core/runtime/anima_runtime.hexa --web
 ```
 
 ## 배포
@@ -42,7 +42,7 @@ curl -s https://anima.basedonapps.com | head -5
 | 502 Bad Gateway | 포트 8765 안 열림 | 프로세스 확인 후 재시작 |
 | Address already in use | 이전 프로세스 안 죽음 | `kill -9 $(pgrep -f anima_unified)` 후 재시작 |
 | Garbled output (◆▨) | byte-level 모델 UTF-8 실패 | LanguageLearner fallback 사용 |
-| 영어 응답 | Claude fallback | anima_unified.py 한국어 fallback 적용 |
+| 영어 응답 | Claude fallback | anima/core/runtime/anima_runtime.hexa 한국어 fallback 적용 |
 | Φ=0.00 | cells=2 (최소) | --max-cells 64 이상 |
 | 과거 대화 잔여 | data/ 디렉토리 | `rm -rf data/ memory_alive.json state_alive.pt` |
 | 포트 충돌 | 좀비 프로세스 | `kill -9 $(pgrep python)` 후 2초 대기 |
@@ -54,7 +54,7 @@ curl -s https://anima.basedonapps.com | head -5
 ```
 아키텍처:
   브라우저 → anima.basedonapps.com → Cloudflare Tunnel
-  → ws_proxy.py (:8888) → anima_unified.py (:8765)
+  → ws_proxy.py (:8888) → anima/core/runtime/anima_runtime.hexa (:8765)
 
 ws_proxy.py가 죽으면 502 Bad Gateway!
 
@@ -67,7 +67,7 @@ ssh $A100 'bash -c "cd /root/anima && nohup python3 ws_proxy.py > /workspace/ws_
 
 # 포트 확인 (둘 다 열려야 함!)
 ssh $A100 'ss -tlnp | grep -E "8888|8765"'
-  8765 = anima_unified.py ✅
+  8765 = anima/core/runtime/anima_runtime.hexa ✅
   8888 = ws_proxy.py ✅
 ```
 
@@ -84,7 +84,7 @@ sleep 2
 ssh $A100 'rm -rf /workspace/anima/data /workspace/anima/*_alive.*'
 
 # 4. 재시작
-ssh $A100 'bash -c "cd /workspace/anima && nohup python3 -u anima_unified.py --web --max-cells 64 > /workspace/anima.log 2>&1 &"'
+ssh $A100 'bash -c "cd /workspace/anima && nohup python3 -u anima/core/runtime/anima_runtime.hexa --web --max-cells 64 > /workspace/anima.log 2>&1 &"'
 
 # 5. ws_proxy 재시작 (Cloudflare Tunnel 중계)
 ssh $A100 'bash -c "cd /root/anima && nohup python3 ws_proxy.py > /workspace/ws_proxy.log 2>&1 &"'

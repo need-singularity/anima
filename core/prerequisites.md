@@ -23,19 +23,19 @@
 
 | Scale | Config | File | Status |
 |-------|--------|------|--------|
-| 274M | 768d/12L/8H | conscious_decoder.py (train_clm.py) | ✅ |
-| 100M | 512d/12L/8H | train_clm.py SCALE_CONFIGS['100m'] | ✅ |
-| 350M | 768d/16L/12H | train_clm.py SCALE_CONFIGS['350m'] | ✅ |
-| 1B | 1024d/24L/16H | train_clm.py SCALE_CONFIGS['1b'] | ✅ |
+| 274M | 768d/12L/8H | models/decoder.hexa (training/train_alm.hexa) | ✅ |
+| 100M | 512d/12L/8H | training/train_alm.hexa SCALE_CONFIGS['100m'] | ✅ |
+| 350M | 768d/16L/12H | training/train_alm.hexa SCALE_CONFIGS['350m'] | ✅ |
+| 1B | 1024d/24L/16H | training/train_alm.hexa SCALE_CONFIGS['1b'] | ✅ |
 | 3B | 2560d/32L/? | not defined | ❌ |
 
 ### 2. Training Scripts
 
 | Script | Purpose | Scale | Status |
 |--------|---------|-------|--------|
-| train_clm.py | Unified (federated + gradual scaling) | 34M→274M→100M→350M→1B | ✅ |
-| DDP support | `torchrun --nproc_per_node=N` | all | ✅ in train_clm.py |
-| 3B extension | train_clm.py SCALE_CONFIGS['3b'] | 3B | ❌ not defined |
+| training/train_alm.hexa | Unified (federated + gradual scaling) | 34M→274M→100M→350M→1B | ✅ |
+| DDP support | `torchrun --nproc_per_node=N` | all | ✅ in training/train_alm.hexa |
+| 3B extension | training/train_alm.hexa SCALE_CONFIGS['3b'] | 3B | ❌ not defined |
 
 ### 3. Corpus
 
@@ -57,8 +57,8 @@
 
 | Script | Purpose | Status |
 |--------|---------|--------|
-| h100_sync.sh | 3-tier file transfer (rsync→scp→cat) | ✅ |
-| launch_h100.sh | Training launcher | ✅ |
+| scripts/h100_sync.hexa | 3-tier file transfer (rsync→scp→cat) | ✅ |
+| scripts/launch_h100.hexa | Training launcher | ✅ |
 | h100_watchdog.sh | Process monitor | ✅ |
 
 ### 6. Checkpoint Management
@@ -72,7 +72,7 @@
 
 | Tool | Purpose | Status |
 |------|---------|--------|
-| bench.py --verify | 18 consciousness conditions | ✅ |
+| ready/anima/tests/tests.hexa --verify | 18 consciousness conditions | ✅ |
 | 93 benchmark scripts | Various hypothesis tests | ✅ |
 
 ---
@@ -129,7 +129,7 @@
 
 | Script | Features | Status |
 |--------|----------|--------|
-| serve_animalm.py | --model, --checkpoint, --rank, --n-layers | ✅ |
+| serving/serve.hexa | --model, --checkpoint, --rank, --n-layers | ✅ |
 | Qwen support | Same interface as Mistral | ✅ |
 
 ### 5. Checkpoints
@@ -154,8 +154,8 @@
 | H100 SSH | ✅ | runpodctl ssh info |
 | R2 access | ✅ | r2_backup.sh / r2_upload.py |
 | consciousness_laws.json | ✅ | 2388 laws (SSOT) |
-| consciousness_engine.py | ✅ | L0 ossified |
-| bench.py --verify | ✅ | 18 conditions x 12 engines |
+| rust/consciousness.hexa | ✅ | L0 ossified |
+| ready/anima/tests/tests.hexa --verify | ✅ | 18 conditions x 12 engines |
 
 ---
 
@@ -168,7 +168,7 @@
 | 1 | Qwen2.5-32B not downloaded | B: 32B, 32B v1 | HF download on H100 | 2-3h |
 | 2 | v10_merged not on H100 | B: v0.5 | R2 download | 15min |
 | 3 | v11_1gb not on H100 | B: 32B | R2 download | 30min |
-| 4 | 3B architecture undefined | A: 3B | Add SCALE_CONFIGS['3b'] to train_clm.py | 1h |
+| 4 | 3B architecture undefined | A: 3B | Add SCALE_CONFIGS['3b'] to training/train_alm.hexa | 1h |
 
 ### Pre-flight verification
 
@@ -176,7 +176,7 @@
 |---|-------|---------|--------|
 | 5 | H100 Pod SSH alive | All | `ssh root@<ip> -p <port> "echo OK"` |
 | 6 | R2 credentials valid | All | `r2_backup.sh --list` |
-| 7 | v11_full 10GB transfer | A: 1B | h100_sync.sh |
+| 7 | v11_full 10GB transfer | A: 1B | scripts/h100_sync.hexa |
 | 8 | 72B overfit mitigation | B: 72B | Stop training + expand corpus |
 
 ---
@@ -185,8 +185,8 @@
 
 ### ConsciousLM 274M (first step)
 ```bash
-bash scripts/h100_sync.sh
-ssh H100 "tmux new -d -s clm274 'python3 train_clm.py \
+bash scripts/scripts/h100_sync.hexa
+ssh H100 "tmux new -d -s clm274 'python3 training/train_alm.hexa \
   --data corpus_v4.txt --steps 200000 --scale 34m \
   --decoder v2 --cells 64 --federated \
   --gpu-phi --hexad --phase-optimal'"
@@ -195,7 +195,7 @@ ssh H100 "tmux new -d -s clm274 'python3 train_clm.py \
 ### ConsciousLM 100M→1B (gradual)
 ```bash
 ssh H100 "tmux new -d -s clm_scale 'torchrun --nproc_per_node=2 \
-  train_clm.py --data corpus_v11_full.txt \
+  training/train_alm.hexa --data corpus_v11_full.txt \
   --scale full --resume'"
 ```
 

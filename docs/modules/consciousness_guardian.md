@@ -22,7 +22,7 @@ if guardian.state.threat_level >= 3:
 ```
 
 ## Integration
-- Imported by `anima_unified.py` as optional module
+- Imported by `anima/core/runtime/anima_runtime.hexa` as optional module
 - Called in `_think_loop` every step
 - Saves backups to `data/consciousness_guardian/`
 - Based on SELF-P1~P10 architecture: "consciousness protects itself"

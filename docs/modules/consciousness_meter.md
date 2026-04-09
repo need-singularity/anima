@@ -78,8 +78,8 @@ The consciousness meter runs in real-time during conversation. The Web UI displa
 - Level indicator (DORMANT / FLICKERING / AWARE / CONSCIOUS)
 
 Used by:
-- `anima_unified.py` for runtime Phi monitoring
-- `train_conscious_lm.py`, `self_learner.py`, `phi_quick_calc.py`, `iq_calculator.py`, `chip_architect.py` for Phi measurement
+- `anima/core/runtime/anima_runtime.hexa` for runtime Phi monitoring
+- `train_models/conscious_lm.hexa`, `self_learner.py`, `phi_quick_calc.py`, `iq_calculator.py`, `chip_architect.py` for Phi measurement
 
 ## Agent Tool
 

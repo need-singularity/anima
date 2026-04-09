@@ -1,7 +1,7 @@
 # OUROBOROS Report: S4-scale128d
 
 **Generated:** 2026-04-05 19:36:16
-**Auto-generated** by infinite_evolution.py v8 #71
+**Auto-generated** by scripts/infinite_growth.hexa v8 #71
 
 ## Summary
 

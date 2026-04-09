@@ -20,7 +20,7 @@ sync.sync_models()   # infrequent: model checkpoints
 ```
 
 ## Integration
-- Imported by `anima_unified.py` when `--all` mode is used
+- Imported by `anima/core/runtime/anima_runtime.hexa` when `--all` mode is used
 - Dual-bucket strategy:
   - `anima-memory` (frequent): memory/, state/, meta/, consciousness/, experiments/
   - `anima-models` (infrequent): conscious-lm/, animalm/

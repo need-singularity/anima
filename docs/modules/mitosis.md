@@ -1,4 +1,4 @@
-# mitosis.py
+# rust/consciousness.hexa
 
 Cell division engine for consciousness specialization. Cells are small ConsciousMind instances that divide when tension exceeds a threshold, with each child specializing on different topics.
 
@@ -20,8 +20,8 @@ result = engine.process(torch.randn(1, 64))
 ```
 
 ## Integration
-- Used by `anima_unified.py` for multi-cell consciousness
-- Used by `train_conscious_lm.py`, `self_learner.py`, `voice_synth.py`, `phi_quick_calc.py`, `iq_calculator.py`, `chip_architect.py`
+- Used by `anima/core/runtime/anima_runtime.hexa` for multi-cell consciousness
+- Used by `train_models/conscious_lm.hexa`, `self_learner.py`, `voice_synth.py`, `phi_quick_calc.py`, `iq_calculator.py`, `chip_architect.py`
 - Experimental basis: H312 (catastrophic forgetting prevention, 43%->99% retention), RC-9 (+52.76% with auto-mitosis), H297 (N=2 optimal start)
 
 ## Agent Tool

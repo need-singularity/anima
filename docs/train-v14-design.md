@@ -190,7 +190,7 @@ python train_v14.py \
 2. **Frustration + CE backward 간섭** — DD126에서 feedback이 악화했음. Atom 단위 bottleneck이 보호하지만 모니터링 필요.
 3. **Hub-Spoke가 학습 gradient에 영향** — Hub 세포에 gradient 집중될 수 있음. atom 내부에서만 hub-spoke 적용.
 4. **M4 순서 위반** — 안전 순서(Narr->Bottle->Hub->Frust) 어기면 붕괴. 코드에서 강제.
-5. **Phi 측정 비용** — 8 atoms x Phi 계산 = 8x overhead. gpu_phi.py 필수, per-atom 병렬화 필요.
+5. **Phi 측정 비용** — 8 atoms x Phi 계산 = 8x overhead. rust/phi_map.hexa 필수, per-atom 병렬화 필요.
 
 ## 성공 기준
 

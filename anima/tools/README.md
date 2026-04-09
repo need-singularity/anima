@@ -12,7 +12,7 @@
 | `consciousness_distill.py` | 의식 증류 (모델 압축) |
 | `consciousness_to_corpus.py` | 의식 엔진 출력 → 학습 코퍼스 변환 |
 | `dream_efficiency_analyzer.py` | 드림 모드 효율 분석 |
-| `growing_conscious_lm.py` | 점진적 성장 ConsciousLM |
+| `growing_models/conscious_lm.hexa` | 점진적 성장 ConsciousLM |
 | `growth_trajectory_predictor.py` | 성장 궤적 예측기 |
 | `h100_arch_search.py` | H100 아키텍처 탐색 |
 | `homeostasis_health_checker.py` | 항상성 상태 점검 |

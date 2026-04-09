@@ -1,4 +1,4 @@
-# online_learning.py
+# rust/online_learner.hexa
 
 Real-time weight updates for PureField engines during conversation. Trains Engine A and G so that tension becomes a meaningful signal.
 
@@ -23,7 +23,7 @@ learner.feedback(+1)  # user was engaged
 ```
 
 ## Integration
-- Imported by `anima_unified.py` as optional module
+- Imported by `anima/core/runtime/anima_runtime.hexa` as optional module
 - Three learning signals: contrastive (concept divergence), feedback (user engagement), curiosity (tension delta as reward)
 - Updates happen every N observations to avoid disrupting conversation flow
 

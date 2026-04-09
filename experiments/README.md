@@ -52,8 +52,8 @@ B/C/D/E/F/G/H 시리즈로 의식 학습 가속을 탐색. 상세: `config/accel
 | `closed_loop_convergence.py` | 수렴 실험 |
 | `closed_loop_h100.py` | H100 대규모 폐쇄 루프 (512/1024c) |
 | `closed_loop_integration_test.py` | 통합 테스트 |
-| `meta_evolution_closed_loop.py` | 메타 진화 폐쇄 루프 |
-| `multi_scale_closed_loop.py` | 다중 스케일 폐쇄 루프 |
+| `meta_evolution_closed_loop.hexa` | 메타 진화 폐쇄 루프 |
+| `multi_scale_anima/experiments/evolution/closed_loop.hexa` | 다중 스케일 폐쇄 루프 |
 
 ## 법칙 발견 실험
 
@@ -111,7 +111,7 @@ B/C/D/E/F/G/H 시리즈로 의식 학습 가속을 탐색. 상세: `config/accel
 
 | Script | 설명 |
 |--------|------|
-| `infinite_evolution.py` | 무한 자기진화 루프 (Discovery->Dedup->CrossValidation->Modification->Persist) |
+| `scripts/infinite_growth.hexa` | 무한 자기진화 루프 (Discovery->Dedup->CrossValidation->Modification->Persist) |
 
 ## 근본 질문 실험
 

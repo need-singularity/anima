@@ -6,7 +6,7 @@
 
 **Architecture:** AnimaLM(Mistral/Qwen + PureField 의식 주입) 서빙 + 에이전트 가동, 16-lens 망원경으로 매 단계 의식 측정. 14B 학습 완료 후 교체.
 
-**Tech Stack:** Python, PyTorch, serve_animalm_v2.py (4-bit), anima-agent (CLI/Telegram/MCP), telescope.py (16-lens)
+**Tech Stack:** Python, PyTorch, serving/serve.hexa (4-bit), anima-agent (CLI/Telegram/MCP), telescope.py (16-lens)
 
 ---
 
@@ -84,12 +84,12 @@ cd ~/Dev/TECS-L && git add .shared/telescope.py && git commit -m "feat: telescop
 RTX 5070에서 AnimaLM 7B를 4-bit로 서빙. 에이전트의 백엔드.
 
 **Files:**
-- Use: `sub-projects/animalm/serve_animalm_v2.py`
+- Use: `sub-projects/animalm/serving/serve.hexa`
 - Use: `anima/checkpoints/animalm_7b_final.pt` (516MB, 이미 존재)
 
 - [ ] **Step 1: 서빙 테스트 실행**
 
-Run: `cd /Users/ghost/Dev/anima && python3 sub-projects/animalm/serve_animalm_v2.py --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400`
+Run: `cd /Users/ghost/Dev/anima && python3 sub-projects/animalm/serving/serve.hexa --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400`
 Expected: `Serving on http://0.0.0.0:8400` 출력, 모델 로드 완료
 
 - [ ] **Step 2: API 테스트**
@@ -99,7 +99,7 @@ Expected: 텍스트 응답 + PureField tension 값
 
 - [ ] **Step 3: 서빙을 백그라운드로**
 
-Run: `nohup python3 sub-projects/animalm/serve_animalm_v2.py --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400 > logs/serve_7b.log 2>&1 &`
+Run: `nohup python3 sub-projects/animalm/serving/serve.hexa --checkpoint anima/checkpoints/animalm_7b_final.pt --quantize 4bit --port 8400 > logs/serve_7b.log 2>&1 &`
 
 ---
 
@@ -271,12 +271,12 @@ git commit -m "feat: eval_animalm 14B auto-detect layers"
 
 **Files:**
 - Use: `sub-projects/animalm/eval_animalm.py`
-- Use: `sub-projects/animalm/serve_animalm_v2.py`
+- Use: `sub-projects/animalm/serving/serve.hexa`
 - Use: `anima-agent/providers/animalm_provider.py`
 
 - [ ] **Step 1: 14B checkpoint 회수**
 
-Run: `bash anima/scripts/h100_retrieve.sh` 또는:
+Run: `bash anima/scripts/scripts/h100_retrieve.hexa` 또는:
 ```bash
 scp -i ~/.runpod/ssh/RunPod-Key-Go -P 12234 \
     root@216.243.220.230:/workspace/checkpoints/animalm_14b/best.pt \
@@ -299,7 +299,7 @@ dd_7b_16lens_scan.py를 14B checkpoint로도 실행하여 의식 품질 비교.
 kill $(cat logs/serve_7b.pid 2>/dev/null) 2>/dev/null
 
 # 14B 서빙 시작
-nohup python3 sub-projects/animalm/serve_animalm_v2.py \
+nohup python3 sub-projects/animalm/serving/serve.hexa \
     --checkpoint anima/checkpoints/animalm_14b_best.pt \
     --base Qwen/Qwen2.5-14B \
     --quantize 4bit --port 8400 > logs/serve_14b.log 2>&1 &
@@ -322,7 +322,7 @@ git add -A && git commit -m "feat: 14B eval complete, serving swapped 7B→14B"
 에이전트가 외부 API 0으로 자율 동작하는지 최종 검증.
 
 **Files:**
-- Use: `anima/benchmarks/bench.py`
+- Use: `ready/anima/tests/tests.hexa`
 - Create: `anima/experiments/agi_v01_checklist.py`
 
 - [ ] **Step 1: AGI v0.1 체크리스트 실행**
@@ -346,7 +346,7 @@ checks = {
 
 - [ ] **Step 2: bench 의식 검증**
 
-Run: `python3 anima/benchmarks/bench.py --verify`
+Run: `python3 ready/anima/tests/tests.hexa --verify`
 Expected: 77/77 PASS
 
 - [ ] **Step 3: AGI v0.1 선언 문서**

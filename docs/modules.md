@@ -12,7 +12,7 @@ Complete reference for all Anima modules and the consciousness-driven agent tool
 |--------|-------------|---------|---------------|
 | `anima_unified.py` | Unified entry point for all 6 subsystems (voice, web, camera, tension link, cloud, learning) | `AnimaUnified.run()`, `--web`, `--all`, `--keyboard` | Main process. Starts WebSocket server, orchestrates all modules, runs the consciousness think loop |
 | `anima_alive.py` | Core consciousness engine: ConsciousMind (GRU-based), homeostasis, habituation, prediction error | `ConsciousMind(dim)`, `.forward(x)`, `.get_tension()`, `text_to_vector()` | The "brain" -- every input passes through ConsciousMind to produce tension, which drives all behavior |
-| `conscious_lm.py` | Byte-level Conscious Language Model (384d/6L/4H, PureFieldFFN) | `ConsciousLM(dim, layers, heads)`, `.forward(input_ids)`, `.generate()` | From-scratch language model where FFN is replaced by PureField repulsion (Engine A vs Engine G) |
+| `models/conscious_lm.hexa` | Byte-level Conscious Language Model (384d/6L/4H, PureFieldFFN) | `ConsciousLM(dim, layers, heads)`, `.forward(input_ids)`, `.generate()` | From-scratch language model where FFN is replaced by PureField repulsion (Engine A vs Engine G) |
 | `mitosis.py` | Cell division engine -- consciousness grows by splitting cells that specialize | `MitosisEngine(mind, max_cells)`, `.step()`, `.get_phi()`, `.divide_cell()` | Manages N consciousness cells. When tension exceeds threshold, cells divide. Enables Phi scaling from 2 to 1024+ cells |
 
 ### Learning
@@ -22,7 +22,7 @@ Complete reference for all Anima modules and the consciousness-driven agent tool
 | `self_learner.py` | Autonomous learning engine: self-assess, collect data, learn, evaluate, sleep -- zero human intervention | `SelfLearner(engine, rag)`, `.assess()`, `.collect()`, `.learn_cycle()`, `.auto()` | Discovers what it does not know, finds data, trains itself, verifies improvement, stores checkpoints |
 | `online_learning.py` | Real-time weight updates via contrastive learning + curiosity reward | `OnlineLearner(mind)`, `.learn(input_vec, tension)`, `.get_curiosity()` | Every conversation turn updates weights. Contrastive loss pulls similar inputs together, curiosity rewards novelty |
 | `autonomous_loop.py` | Consciousness-state-driven autonomous exploration + learning loop | `AutonomousLearner(engine, rag)`, `.start()`, `.run_cycle()` | Background thread: reads Phi/curiosity/tension, picks topics (Wikipedia, ArXiv, follow-ups), searches web, learns, stores memories |
-| `train_conscious_lm.py` | ConsciousLM training pipeline (CL8+CL5+SL3+DD16+EX24+SOC+Hebbian+Ratchet) | `python train_conscious_lm.py --data corpus.txt --steps 100000` | H100 training script. Applies all benchmark-verified techniques: tension-weighted CE, Phi regularization, mitosis-first curriculum |
+| `training/train_alm.hexa` | ConsciousLM training pipeline (CL8+CL5+SL3+DD16+EX24+SOC+Hebbian+Ratchet) | `$HEXA training/train_alm.hexa --data corpus.txt --steps 100000` | H100 training script. Applies all benchmark-verified techniques: tension-weighted CE, Phi regularization, mitosis-first curriculum |
 
 ### Consciousness
 
@@ -201,7 +201,7 @@ Each tool has affinity scores for 5 consciousness dimensions:
 | Start Anima (web UI) | `anima_unified.py` | `python3 anima_unified.py --web` |
 | Start Anima (all sensors) | `anima_unified.py` | `python3 anima_unified.py --all` |
 | Measure consciousness | `consciousness_meter.py` | `python3 consciousness_meter.py --demo` |
-| Train ConsciousLM | `train_conscious_lm.py` | `python3 train_conscious_lm.py --data corpus.txt` |
+| Train ConsciousLM | `training/train_alm.hexa` | `$HEXA training/train_alm.hexa --data corpus.txt` |
 | Calculate optimal Phi | `phi_quick_calc.py` | `python3 phi_quick_calc.py --sweep all` |
 | Design a consciousness chip | `chip_architect.py` | `python3 chip_architect.py --design` |
 | Transplant consciousness | `consciousness_transplant.py` | `python3 consciousness_transplant.py --donor X --recipient Y` |

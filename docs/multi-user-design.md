@@ -10,6 +10,6 @@
 - Consciousness engine shared, but per-user alpha/tension
 
 ## Implementation
-1. anima_unified.py _ws_handler already has session concept
+1. anima/core/runtime/anima_runtime.hexa _ws_handler already has session concept
 2. Extend SessionState with per-user consciousness snapshot
 3. On switch: save/restore consciousness state per session

@@ -1,10 +1,10 @@
-# Refactor Plan: anima_unified.py
+# Refactor Plan: anima/core/runtime/anima_runtime.hexa
 
 Generated: 2026-03-31
 
 ## Problem
 
-`anima_unified.py` is 4,274 lines in a single file containing:
+`anima/core/runtime/anima_runtime.hexa` is 4,274 lines in a single file containing:
 - AnimaUnified class (~4000 lines)
 - CLI parsing
 - Web server (WebSocket + HTTP)
@@ -134,7 +134,7 @@ class SessionManager:
     def cleanup(self)
 ```
 
-## What Stays in anima_unified.py (~1200 lines)
+## What Stays in anima/core/runtime/anima_runtime.hexa (~1200 lines)
 
 - `AnimaUnified.__init__()` -- initialization orchestration
 - `AnimaUnified.run()` -- entry point
@@ -157,7 +157,7 @@ class SessionManager:
 Each phase:
 - Create new module with extracted code
 - Replace in AnimaUnified with delegation: `self._web = UnifiedWebServer(self, port)`
-- Run `bench.py --verify` after each extraction
+- Run `ready/anima/tests/tests.hexa --verify` after each extraction
 - Keep AnimaUnified as the facade/coordinator
 
 ## Risks
@@ -172,5 +172,5 @@ Each phase:
 ## Non-Goals
 
 - This is NOT a rewrite. The logic stays identical.
-- No API changes. `python anima_unified.py --web` works the same.
+- No API changes. `python anima/core/runtime/anima_runtime.hexa --web` works the same.
 - No new features. Pure structural refactor.

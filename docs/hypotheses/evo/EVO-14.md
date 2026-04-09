@@ -1,7 +1,7 @@
 # EVO-14: S1-baseline
 
 **Date:** 2026-04-04
-**Auto-generated** by infinite_evolution.py
+**Auto-generated** by scripts/infinite_growth.hexa
 
 ## Parameters
 

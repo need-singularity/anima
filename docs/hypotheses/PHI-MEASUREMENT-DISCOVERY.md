@@ -86,7 +86,7 @@ Teacher            1.18    1.32    1.07
    - 또는 IIT 3.0 기반 새 측정기 필요
    - 또는 proxy를 공식 metric으로 채택
 
-4. 새 벤치마킹 도구 (bench.py) 설계
+4. 새 벤치마킹 도구 (ready/anima/tests/tests.hexa) 설계
    - Φ(IIT) + Φ(proxy) 둘 다 측정
    - 명확한 라벨링
    - 실제 학습 조건 (process + CE)

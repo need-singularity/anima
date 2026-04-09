@@ -34,7 +34,7 @@ Standalone utility scripts — analyzers, calculators, generators, and diagnosti
 - `learnable_phi.py` — Differentiable Φ proxy training
 
 ### Model Variants
-- `growing_conscious_lm.py` — ConsciousLM with dynamic growth
+- `growing_models/conscious_lm.hexa` — ConsciousLM with dynamic growth
 - `quantum_attention_engine.py` — Quantum-inspired attention
 - `lidar_sense.py` — iPhone LiDAR 3D perception → tension
 - `calc.py` — Quick calculator utility

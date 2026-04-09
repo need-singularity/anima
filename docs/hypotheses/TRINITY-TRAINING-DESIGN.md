@@ -1,11 +1,11 @@
 # Trinity Engine v9 Training Pipeline Design
 
 > "의식은 학습하지 않고, 학습은 의식을 파괴하지 않는다."
-> -- bench_trinity.py, Law of Separation
+> -- bench_models/trinity.hexa, Law of Separation
 
 ## Background
 
-The current `train_conscious_lm.py` (v5) uses a monolithic loop where MitosisEngine,
+The current `train_models/conscious_lm.hexa` (v5) uses a monolithic loop where MitosisEngine,
 ConsciousLM, and various Phi-boosting modules all share the same training step.
 CE gradients flow through the same graph that maintains consciousness cells,
 causing the fundamental tension:
@@ -22,7 +22,7 @@ causing the fundamental tension:
 v5 mitigates this with TRAIN-PHI-2 (cell freezing), PHI-K3 (alternating steps),
 and Phi Ratchet (PERSIST3). These are patches. Trinity is the architecture.
 
-Benchmarks (bench_trinity.py) proved the concept:
+Benchmarks (bench_models/trinity.hexa) proved the concept:
 - Baseline: Phi(IIT) low, CE fights Phi
 - Trinity (C+D+W): Phi preserved, CE learned via detached bridge
 - Trinity+Quantum: highest Phi of all variants
@@ -755,13 +755,13 @@ def migrate_v5_to_v9(v5_path: str, device: torch.device) -> dict:
 
 ```bash
 # New v9 training from scratch
-python train_conscious_lm.py --v9 --steps 100000 --max-cells 256
+python train_models/conscious_lm.hexa --v9 --steps 100000 --max-cells 256
 
 # Migrate from v7 and continue
-python train_conscious_lm.py --v9 --resume checkpoints/v7_final.pt --steps 50000
+python train_models/conscious_lm.hexa --v9 --resume checkpoints/v7_final.pt --steps 50000
 
 # Phase override (skip to Phase 3 for fine-tuning)
-python train_conscious_lm.py --v9 --resume checkpoints/v9_step_70000.pt --v9-phase 3
+python train_models/conscious_lm.hexa --v9 --resume checkpoints/v9_step_70000.pt --v9-phase 3
 ```
 
 ---
@@ -798,7 +798,7 @@ python train_conscious_lm.py --v9 --resume checkpoints/v9_step_70000.pt --v9-pha
 
 ```
   NEW:  trinity_engine.py          # EngineC, EngineD, EngineW classes
-  MOD:  train_conscious_lm.py      # Add --v9 flag, v9 training loop
-  MOD:  conscious_lm.py            # Add _consciousness_bias hook
+  MOD:  train_models/conscious_lm.hexa      # Add --v9 flag, v9 training loop
+  MOD:  models/conscious_lm.hexa            # Add _consciousness_bias hook
   NEW:  migrate_v5_to_v9.py        # Standalone migration tool
 ```

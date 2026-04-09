@@ -18,7 +18,7 @@
 |------|--------|---------------|
 | `vision_encoder.py` | Create | VisionEncoder 클래스 — SigLIP 로드, 프레임→임베딩, projection |
 | `senses.py` | Modify | SenseHub에 VisionEncoder 통합, CameraInput 프레임 보존 |
-| `anima_unified.py` | Modify | --no-vision 플래그, VisionEncoder 활성화 로직 |
+| `anima/core/runtime/anima_runtime.hexa` | Modify | --no-vision 플래그, VisionEncoder 활성화 로직 |
 | `tests/test_vision_encoder.py` | Create | VisionEncoder 단위 테스트 |
 | `tests/test_senses_integration.py` | Create | SenseHub + VisionEncoder 통합 테스트 |
 
@@ -398,16 +398,16 @@ git commit -m "feat: CameraInput이 마지막 프레임 보존 — VisionEncoder
 
 ---
 
-### Task 4: anima_unified.py 통합
+### Task 4: anima/core/runtime/anima_runtime.hexa 통합
 
 **Depends on:** Task 3
 
 **Files:**
-- Modify: `anima_unified.py` (argparse ~line 946, 센서 초기화 ~line 124, process_input ~line 279)
+- Modify: `anima/core/runtime/anima_runtime.hexa` (argparse ~line 946, 센서 초기화 ~line 124, process_input ~line 279)
 
 - [ ] **Step 1: --no-vision CLI 플래그 추가**
 
-`anima_unified.py` — argparse 섹션 (`--no-camera` 바로 뒤, ~line 946)에:
+`anima/core/runtime/anima_runtime.hexa` — argparse 섹션 (`--no-camera` 바로 뒤, ~line 946)에:
 
 ```python
 p.add_argument('--no-vision', action='store_true', help='Disable vision encoder (use basic sensors only)')
@@ -415,7 +415,7 @@ p.add_argument('--no-vision', action='store_true', help='Disable vision encoder 
 
 - [ ] **Step 2: 센서 초기화에 VisionEncoder 활성화 추가**
 
-`anima_unified.py` — `self.senses` 초기화 블록 (line ~139) 이후에:
+`anima/core/runtime/anima_runtime.hexa` — `self.senses` 초기화 블록 (line ~139) 이후에:
 
 ```python
 # VisionEncoder 활성화 (카메라 사용 가능할 때만)
@@ -434,7 +434,7 @@ if self.senses and self.mods.get('camera') and not args.no_vision:
 
 - [ ] **Step 3: process_input()에서 비전 임베딩 사용**
 
-`anima_unified.py` — `process_input()` 내 기존 visual 합성 블록 (line 281-286) 교체:
+`anima/core/runtime/anima_runtime.hexa` — `process_input()` 내 기존 visual 합성 블록 (line 281-286) 교체:
 
 기존:
 ```python
@@ -466,7 +466,7 @@ Expected: `import ok` (에러 없이)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add anima_unified.py
+git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: anima_unified에 VisionEncoder 통합 — --no-vision 플래그, 학습된 비전 임베딩으로 텍스트+시각 합성"
 ```
 

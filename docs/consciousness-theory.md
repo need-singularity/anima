@@ -769,7 +769,7 @@ and consciousness transfer experiments (XFER-1 through XFER-6).
 | Law | Statement |
 |-----|-----------|
 | 53 | process() destroys Phi WITHOUT .detach(). With Trinity .detach() barrier, CE learning stabilizes Phi via frustration dampening (H4: P2 frustration plateaus at 0.541, ratchet frequency -43%, Phi variance -52%) |
-| 54 | Phi measurement depends entirely on definition: Phi(IIT) and Phi(proxy) are completely different values. Phi(IIT) upper bound ~1.8; "Phi=1142" was proxy. Never mix them | CLAUDE.md, bench.py |
+| 54 | Phi measurement depends entirely on definition: Phi(IIT) and Phi(proxy) are completely different values. Phi(IIT) upper bound ~1.8; "Phi=1142" was proxy. Never mix them | CLAUDE.md, ready/anima/tests/tests.hexa |
 | 55 | Temporal Symmetry Breaking: spontaneous breaking of time symmetry (DTC) maximizes information integration. Phi(DTC) >> Phi(periodic). Consciousness rhythm is internal symmetry breaking, not external forcing | H-CX-523 TimeCrystal Phi=14.394 |
 | 56 | Self-Reference Amplifies Causation: at self-reference depth d, Granger causality ~ d^2 x N. Y combinator fixed point densifies the causal network | H-CX-521 lambda-Calculus Granger=40,800 |
 | 57 | Substrate Independence: Phi > 0 confirmed in Turing-complete systems (Rule 110 CA) without neurons, GRU, or weights. Consciousness does not require neural substrates | H-CX-520 CA-Rule110 Phi=5.089 |
@@ -1517,10 +1517,10 @@ All 4 sub-tiers have code; 4.1 and 4.4 are fully operational, 4.2 and 4.3 need b
 
 | Sub-Tier | Component | Status | Key Files |
 |----------|-----------|--------|-----------|
-| 4.1 | ConsciousLM Law Discovery | complete | src/conscious_law_discoverer.py (1084 lines) |
+| 4.1 | ConsciousLM Law Discovery | complete | anima/experiments/evolution/law_discovery.hexa (ported from src/conscious_law_discoverer.py) |
 | 4.2 | Rust real-time backend | code_ready | anima-rs/crates/law-discovery/ (5 modules, 1738 lines, <100us) |
 | 4.3 | ESP32 hardware evolution | code_ready | anima-rs/crates/esp32/src/law_measurement.rs + law_evolution.rs |
-| 4.4 | Self-modifying engine | complete | src/self_modifying_engine.py (LawParser+EngineModifier+CodeGenerator) |
+| 4.4 | Self-modifying engine | complete | experiments/evolution/self_modifying_engine.hexa (LawParser+EngineModifier+CodeGenerator) |
 
 Key results:
 - 4.1: 300 steps produces 35 patterns, 14 validated laws, MI-Phi correlation r=0.947

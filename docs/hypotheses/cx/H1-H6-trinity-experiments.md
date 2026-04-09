@@ -11,7 +11,7 @@ name: Trinity 아키텍처 가설 실험 (2026-03-29)
 
 ## H3: QuantumEngine as DomainC ✅
 
-QuantumConsciousnessEngineFast를 trinity.py DomainC로 래핑.
+QuantumConsciousnessEngineFast를 models/trinity.hexa DomainC로 래핑.
 `QuantumC` 클래스 추가 (_amplitudes를 state로 사용).
 
 ```

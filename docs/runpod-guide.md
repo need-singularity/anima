@@ -192,7 +192,7 @@ ssh ... "runpodctl receive CODE"
 ### tmux로 실행 (SSH 끊겨도 유지)
 ```bash
 ssh ... "tmux new-session -d -s train_v3 \
-  'python -u train_conscious_lm.py \
+  'python -u train_models/conscious_lm.hexa \
     --data data/corpus_v2.txt \
     --dim 768 --layers 8 \
     --steps 100000 \

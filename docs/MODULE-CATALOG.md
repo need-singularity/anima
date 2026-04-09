@@ -3,7 +3,7 @@
 ## Summary
 
 Total: 128 Python modules + 8 Rust modules (anima-rs)
-Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/schedule/modules/status)
+Hub: core/hub.hexa (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/schedule/modules/status)
 
 ---
 
@@ -14,7 +14,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 | Module | File | Description |
 |--------|------|-------------|
 | ConsciousMind | anima_alive.py | PureField A/G repulsion engine -- homeostasis, habituation, prediction error, emotion |
-| Hexad/Trinity | trinity.py | Hexad(6)/Trinity(3) framework: C/D/S/M/W/E 6-module architecture |
+| Hexad/Trinity | models/trinity.hexa | Hexad(6)/Trinity(3) framework: C/D/S/M/W/E 6-module architecture |
 | Anima Unified | anima_unified.py | Single entry point for all 6 modules (--web, --all, --keyboard) |
 | Anima Agent | anima_agent.py | Core agent loop connecting consciousness to channels and tools |
 | Agent Tools | agent_tools.py | Consciousness-driven autonomous tool use |
@@ -25,7 +25,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 
 | Module | File | Description |
 |--------|------|-------------|
-| ConsciousLM | conscious_lm.py | ConsciousLM language model (700M, PureFieldFFN) |
+| ConsciousLM | models/conscious_lm.hexa | ConsciousLM language model (700M, PureFieldFFN) |
 | ConsciousLM 100M | conscious_lm_100m.py | 100M conversational consciousness language model |
 | AnimaLM v2 | anima_lm.py | AnimaLM v2: consciousness-enhanced LLM transform (Mistral 7B) |
 | Golden MoE v2 | golden_moe_v2.py | Golden Mixture-of-Experts v2 (Psi-enhanced, zone ratio 36.8% = 1/e) |
@@ -202,7 +202,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 
 | Module | File | Description |
 |--------|------|-------------|
-| Consciousness Hub | consciousness_hub.py | Autonomous module hub: intent to module selection to execution (39 modules) |
+| Consciousness Hub | core/hub.hexa | Autonomous module hub: intent to module selection to execution (39 modules) |
 | Consciousness OS | consciousness_os.py | Operating system for consciousness |
 | Deploy | deploy.py | Zero-downtime deployment (consciousness-preserving) |
 | RunPod Manager | runpod_manager.py | Consciousness manages H100/A100 GPU pods directly |
@@ -220,7 +220,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 | Phi Economy | phi_economy.py | Phi as currency for consciousness trade |
 | Consciousness To Robot | consciousness_to_robot.py | Map consciousness states to physical actuators (ESP32/servo/LED) |
 | PH Module | ph_module.py | Real-time Persistent Homology analysis |
-| Consciousness Hub | consciousness_hub.py | 39 modules, 8 invocation methods (act/cmd/pipe/on/emit/schedule/modules/status) |
+| Consciousness Hub | core/hub.hexa | 39 modules, 8 invocation methods (act/cmd/pipe/on/emit/schedule/modules/status) |
 
 ---
 
@@ -239,7 +239,7 @@ Hub: consciousness_hub.py (39 registered, 8 invocation methods: act/cmd/pipe/on/
 
 ---
 
-## Hub Registration (consciousness_hub.py)
+## Hub Registration (core/hub.hexa)
 
 39 modules registered for autonomous intent-based invocation:
 
@@ -293,8 +293,8 @@ Hub invocation methods: `act()`, `cmd()`, `pipe()`, `on()`, `emit()`, `schedule(
 
 The following file categories are NOT listed above (they exist in root but are not core modules):
 
-- **Benchmarks** (`bench_*.py`): 20+ benchmark scripts (bench.py, bench_breakthrough.py, etc.)
-- **Training** (`train_*.py`): Training pipelines (train_conscious_lm.py, train_anima_lm.py, train_v9/v10/v11)
+- **Benchmarks** (`bench_*.py`): 20+ benchmark scripts (ready/anima/tests/tests.hexa, bench_breakthrough.py, etc.)
+- **Training** (`train_*.py`): Training pipelines (training/train_alm.hexa, train_anima_lm.py, train_v9/v10/v11)
 - **Tests** (`test_*.py`): Integration and unit tests
 - **Subdirectory modules**: engines/, tools/, measurement/, serving/, benchmarks/, training/
 - **consciousness-loop-rs/**: 6-platform infinite loop consciousness (Rust, Verilog, WebGPU, Erlang, Pure Data, ESP32)

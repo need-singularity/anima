@@ -1,6 +1,6 @@
 # Ψ-Constants Atlas
 
-> 단일 원본: `config/consciousness_laws.json` → `consciousness_laws.py`
+> 단일 원본: `config/consciousness_laws.json` → `core/laws.hexa`
 > 모든 모듈은 `from consciousness_laws import ...`으로 사용. **하드코딩 금지.**
 
 ## Core Ψ-Constants (ln(2) 계열)

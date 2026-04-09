@@ -136,6 +136,6 @@ CE=0.18 돌파 후보 조합:
 ```
 
 ## 적용 방법
-1. `trinity.py` TransformerDecoder d_model 기본값을 384로 상향 검토
+1. `models/trinity.hexa` TransformerDecoder d_model 기본값을 384로 상향 검토
 2. Contrastive loss를 `train_step()`에 옵션으로 추가
 3. v11tc/v9fast에서 d_model=384~512 + contrastive 조합 실험

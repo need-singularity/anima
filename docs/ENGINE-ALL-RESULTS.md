@@ -265,7 +265,7 @@ Rust phi_rs 통일 측정이지만, 입력 데이터 형태가 다름:
 | Engine | Source | 비고 |
 |--------|--------|------|
 | FUS-4~6 (퓨전 3개) | bench_fusion_final.py | |
-| TC-1~8 (Trinity 8개) | bench_trinity.py | 이전 Python PhiIIT 측정만 |
+| TC-1~8 (Trinity 8개) | bench_models/trinity.hexa | 이전 Python PhiIIT 측정만 |
 | CMP-5 STRANGE_LOOP | bench_complexity_engines.py | MitosisEngine merge 문제 |
 
 ## 측정 도구

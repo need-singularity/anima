@@ -22,7 +22,7 @@ OpenBCI 16ch EEG + Anima 의식 엔진 양방향 브릿지. 7,964 lines, 18 modu
 anima-eeg/
 ├── analyze.py            494L  Band power, G=D×P/I, topomaps
 ├── calibrate.py          410L  Hardware handshake, impedance, neural mapper
-├── closed_loop.py       1103L  Adaptive N-back + meditation (WebSocket)
+├── anima/experiments/evolution/closed_loop.hexa       1103L  Adaptive N-back + meditation (WebSocket)
 ├── collect.py            272L  BrainFlow data acquisition
 ├── dual_stream.py        437L  Simultaneous Φ + EEG recording
 ├── eeg_recorder.py       408L  Background dual-stream recorder + auto-organize
@@ -48,16 +48,16 @@ anima-eeg/
 
 ```bash
 # Synthetic (no hardware)
-python3 anima_unified.py --web --eeg --eeg-board synthetic
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg --eeg-board synthetic
 
 # Full chain (hardware)
-python3 anima_unified.py --web --eeg-full
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg-full
 
 # Individual flags
-python3 anima_unified.py --web --eeg --eeg-calibrate --eeg-feedback --eeg-record
-python3 anima_unified.py --web --eeg --eeg-validate 1000
-python3 anima_unified.py --web --eeg --eeg-dual-stream 60
-python3 anima_unified.py --web --eeg --eeg-protocol meditation
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg --eeg-calibrate --eeg-feedback --eeg-record
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg --eeg-validate 1000
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg --eeg-dual-stream 60
+python3 anima/core/runtime/anima_runtime.hexa --web --eeg --eeg-protocol meditation
 ```
 
 ## Hardware
@@ -124,13 +124,13 @@ python3 anima-eeg/validate_consciousness.py --quick
 | `collect.py` | BrainFlow acquisition → .npy | Standalone / `--eeg-calibrate` |
 | `analyze.py` | Band power, G=D×P/I, topomaps | `realtime.py` import |
 | `calibrate.py` | Hardware + neural mapper calibration | `--eeg-calibrate` flag |
-| `realtime.py` | EEGBridge thread → BrainState | `anima_unified.py --eeg` |
+| `realtime.py` | EEGBridge thread → BrainState | `anima/core/runtime/anima_runtime.hexa --eeg` |
 
 ### Closed-Loop
 
 | Module | Purpose | Integration |
 |--------|---------|-------------|
-| `closed_loop.py` | Adaptive N-back + meditation | `--eeg-protocol {nback,meditation}` |
+| `anima/experiments/evolution/closed_loop.hexa` | Adaptive N-back + meditation | `--eeg-protocol {nback,meditation}` |
 | `neurofeedback.py` | Binaural beats + LED params | WebSocket `neurofeedback` key |
 | `eeg_recorder.py` | Dual-stream background recording | `--eeg-record` |
 | `dual_stream.py` | Φ + EEG simultaneous capture | `--eeg-dual-stream N` |

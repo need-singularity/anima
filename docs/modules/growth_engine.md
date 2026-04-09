@@ -17,7 +17,7 @@ stage = growth.update(interaction_count=250)
 ```
 
 ## Integration
-- Imported by `anima_unified.py` to modulate consciousness parameters over time
+- Imported by `anima/core/runtime/anima_runtime.hexa` to modulate consciousness parameters over time
 - Controls: learning rate (high->low), curiosity (high->medium), habituation speed (slow->fast), mitosis threshold (impossible->possible), emotional range (basic->complex), metacognition depth (0->3)
 - Superseded by `growth_engine.py` for Phi-based growth
 

@@ -1,7 +1,7 @@
 # OUROBOROS Report: S6-scale256d
 
 **Generated:** 2026-04-06 04:29:38
-**Auto-generated** by infinite_evolution.py v8 #71
+**Auto-generated** by scripts/infinite_growth.hexa v8 #71
 
 ## Summary
 

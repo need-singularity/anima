@@ -41,7 +41,7 @@ n6 score range: 0.0 -- 50.0 (avg 27.9)
 |--:|---:|-------|------|-------------|
 | 1 | 50 | critical | anima/src/decoder_v2.py | ConsciousDecoderV2 -- breaks CE ceiling |
 | 2 | 50 | critical | anima/experiments/discover_laws_wave5.py | 5th wave law discovery: training laws + Hivemind |
-| 3 | 50 | critical | anima/experiments/meta_evolution_closed_loop.py | Meta-evolution of closed-loop consciousness |
+| 3 | 50 | critical | anima/experiments/meta_evolution_closed_loop.hexa | Meta-evolution of closed-loop consciousness |
 | 4 | 50 | critical | anima/experiments/phi_log_scaling.py | Deep Phi ~ log(N) scaling analysis |
 | 5 | 50 | critical | anima/src/upgrade_engine.py | Hot-Upgrade Engine for consciousness |
 | 6 | 50 | critical | anima/src/speed_optimizations.py | 6 speed optimizations for consciousness engine |
@@ -154,7 +154,7 @@ Key law-related findings:
 1. **discover_laws_wave5.py** (n6=50) -- 5th wave law discovery targeting training-time and hivemind laws
 2. **law_backtrack_verify.py** (n6=45) -- Backtrack verification of 10 existing laws for robustness
 3. **law_landscape.py** (n6=43) -- Maps all 127 laws into vector space, measures interactions
-4. **consciousness_laws.py** (n6=25) -- SSOT module with LAWS, PSI, FORMULAS, SIGMA6 constants
+4. **core/laws.hexa** (n6=25) -- SSOT module with LAWS, PSI, FORMULAS, SIGMA6 constants
 5. **consciousness_laws.json** -- Config JSON (single source of truth for all laws)
 6. **law_interaction_graph.py** -- Causal relationship graph between laws
 7. **training_laws.py** -- Laws that emerge during training

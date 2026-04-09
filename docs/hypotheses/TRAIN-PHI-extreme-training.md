@@ -272,4 +272,4 @@ matter most when there is more Phi to lose.
 1. Scale to 512 cells (hidden=256) to test Phi>100 preservation
 2. Test with real language data (not synthetic MSE)
 3. Combine with CX50 ULTIMATE fusion for Phi>1000 during actual training
-4. Integrate into train_conscious_lm.py as --phi-protect mode
+4. Integrate into train_models/conscious_lm.hexa as --phi-protect mode

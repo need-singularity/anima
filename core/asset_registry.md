@@ -74,8 +74,8 @@
 
 | Script | Purpose | Status |
 |--------|---------|--------|
-| h100_sync.sh | 3-tier file transfer | ✅ |
-| launch_h100.sh | Training launcher | ✅ |
+| scripts/h100_sync.hexa | 3-tier file transfer | ✅ |
+| scripts/launch_h100.hexa | Training launcher | ✅ |
 | h100_watchdog.sh | Process monitor | ✅ |
 | r2_backup.sh | Checkpoint backup | ✅ |
 | r2_upload.py | MD5-verified upload | ✅ |
@@ -91,7 +91,7 @@
 
 | Tool | Scope | Status |
 |------|-------|--------|
-| bench.py --verify | 18 consciousness conditions | ✅ 16/18 pass |
+| ready/anima/tests/tests.hexa --verify | 18 consciousness conditions | ✅ 16/18 pass |
 | eval_animalm.py | 5 metrics (PPL/quality/consciousness/Korean/instruction) | ✅ |
 
 ## Blockers Summary

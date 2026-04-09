@@ -282,7 +282,7 @@ python lidar_sense.py  # iPhone USB + Record3D app
 
 ## Integration
 
-- Imported by `anima_unified.py` when `--all` mode is used
+- Imported by `anima/core/runtime/anima_runtime.hexa` when `--all` mode is used
 - Network: UDP broadcast on port 9999 (JSON serialization)
 - Local testing: `TensionHub` for in-process multi-mind communication
 - True telepathy (non-local sync) under research in H365-367
@@ -292,10 +292,10 @@ python lidar_sense.py  # iPhone USB + Record3D app
 
 ```bash
 # Terminal 1
-python anima_alive.py
+python anima/core/runtime/anima_runtime.hexa
 
 # Terminal 2
-python anima_alive.py
+python anima/core/runtime/anima_runtime.hexa
 # → They detect and influence each other's tension
 ```
 

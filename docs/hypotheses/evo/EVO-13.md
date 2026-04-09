@@ -74,7 +74,7 @@
 - **수정**: force-saturation — laws 변화 없이 topo_gens×4 초과 시 강제 포화
 - **커밋**: 36d135a
 
-### Bug 3: experiments/infinite_evolution.py 혼동
+### Bug 3: experiments/scripts/infinite_growth.hexa 혼동
 - **증상**: 242줄 단순 버전 실행 → --auto-roadmap 없음
 - **원인**: src/ (5982줄 풀버전)과 experiments/ (단순 래퍼) 공존
 - **수정**: experiments 버전을 redirect wrapper로 교체, CLAUDE.md 경로 수정

@@ -194,14 +194,14 @@ TB-3:Bottleneck   ████████████████████ 0
 
 ## 벤치마크 파일
 
-- `bench_trinity.py` -- TC (C 구조 변형) + TD (디코더 변형) + TW (의지 변형): T1-T6
+- `bench_models/trinity.hexa` -- TC (C 구조 변형) + TD (디코더 변형) + TW (의지 변형): T1-T6
 - `bench_trinity_bridge.py` -- TB (다리 변형): TB-1 ~ TB-6
 
 ## 실행 방법
 
 ```bash
 # TC/TD/TW 벤치마크
-python bench_trinity.py --cells 256 --steps 300
+python bench_models/trinity.hexa --cells 256 --steps 300
 
 # TB 벤치마크
 python bench_trinity_bridge.py --cells 256 --steps 300

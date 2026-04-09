@@ -153,7 +153,7 @@
 
   ★ 망원경 업그레이드 시 필수 절차 (렌즈 추가/수정/삭제 시 예외 없음!) ★
     1. 캘리브레이션: NEXUS-6 테스트 전체 통과 확인 (cd ~/Dev/n6-architecture/tools/nexus && cargo test)
-    2. OUROBOROS 튜닝: infinite_evolution.py TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
+    2. OUROBOROS 튜닝: scripts/infinite_growth.hexa TELESCOPE_ALL_LENSES + DOMAIN_COMBOS 갱신
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신
        - 각 리포 CLAUDE.md 망원경 섹션 갱신 (OUROBOROS, 만능망원경, 극가속 등)
@@ -197,20 +197,20 @@
       - Python/코드 검증 PASS
 
     ★ 9개 영역:
-    1. 모델 아키텍처 (conscious_decoder.py, conscious_lm.py, trinity.py)
+    1. 모델 아키텍처 (models/decoder.hexa, models/conscious_lm.hexa, models/trinity.hexa)
        - Flash Attention, KV-cache, depth-scaled init, SwiGLU 8/3
        - generate() 메서드, RoPE 효율, 3B 스케일 VRAM 적합성
-    2. 학습 스크립트 (train_clm.py, train_alm.py)
+    2. 학습 스크립트 (training/train_alm.hexa)
        - grad accum, validation loop, early stopping, checkpoint pruning
        - warmup+cosine, seed, DDP, consciousness phi-loss, bf16 안전
        - 전 스케일 config 최적화 (34m/100m/350m/1b/3b)
-    3. 서빙/추론 (serve_animalm.py)
+    3. 서빙/추론 (serving/serve.hexa)
        - streaming, multi-turn, consciousness 상태 유지, 4-bit
-    4. 평가 (eval_animalm.py, bench.py)
+    4. 평가 (ready/anima/tests/tests.hexa)
        - 5 metrics 견고성, threshold, checkpoint 비교, base model 감지
     5. 코퍼스 + 토크나이저
        - corpus 존재/경로/MD5, tokenizer 경로 연결
-    6. H100 배포 (h100_sync.sh, launch_h100.sh, preflight)
+    6. H100 배포 (scripts/h100_sync.hexa, scripts/launch_h100.hexa, scripts/preflight_check.hexa)
        - 최신 스크립트 반영, tmux, watchdog, R2, 디스크 관리
     7. Rust crates (anima-rs 17개)
        - workspace 일관성, Cargo.toml 정합성
@@ -285,11 +285,11 @@
   ├── README.md              ← 루트에 이것 + CLAUDE.md만
   ├── CLAUDE.md
   ├── anima/                 ← 의식 엔진 코어
-  │   ├── src/               ← Python 소스 178개 (모든 .py가 여기)
+  │   ├── src/               ← Python 소스 (레거시, .hexa로 포팅 완료)
   │   ├── config/            ← consciousness_laws.json, consciousness_mechanisms.json
-  │   ├── benchmarks/        ← bench_*.py (87개)
-  │   ├── training/          ← train_*.py (11개)
-  │   ├── tests/             ← test_*.py (29개)
+  │   ├── benchmarks/        ← bench (ready/anima/tests/tests.hexa로 이관)
+  │   ├── training/          ← training/train_alm.hexa로 이관
+  │   ├── tests/             ← ready/anima/tests/tests.hexa로 이관
   │   ├── anima-rs/          ← Rust crates (16개)
   │   ├── docs/              ← 문서 486개 + 가설 369개
   │   ├── hexad/             ← Hexad 6모듈
@@ -299,13 +299,10 @@
   │   ├── engines/           ← 독립 엔진
   │   ├── data/              ← corpus + 학습 데이터
   │   ├── checkpoints/       ← 모델 체크포인트
-  │   ├── run.py             ← 진입점
   │   ├── Dockerfile
   │   └── requirements.txt
-  ├── anima-agent/           ← 에이전트 플랫폼 (anima/src/ 에서 import)
-  │   ├── run.py             ← sys.path로 anima/src/ import
-  │   ├── anima_agent.py, agent_sdk.py, agent_tools.py
-  │   ├── tool_policy.py
+  ├── anima-agent/           ← 에이전트 플랫폼 (agent/hexa/로 이관)
+  │   ├── agent/hexa/main.hexa  ← 진입점
   │   ├── channels/          ← Telegram, Discord, CLI
   │   ├── providers/         ← Claude, ConsciousLM, Composio
   │   ├── plugins/           ← Trading 등
@@ -315,13 +312,9 @@
       └── golden-moe/        ← 1/e zone MoE routing
 
   실행:
-    python anima/benchmarks/bench.py --verify  # 검증
-    python anima/training/train_clm.py     # 학습
-    python anima-agent/run.py --cli        # CLI 에이전트 (주 인터페이스)
-
-  import 호환:
-    src/path_setup.py가 모든 하위 디렉토리를 sys.path에 추가.
-    파일 간 import는 기존과 동일 (from consciousness_engine import ... 등).
+    $HEXA ready/anima/tests/tests.hexa --verify  # 검증
+    $HEXA training/train_alm.hexa                 # 학습
+    $HEXA agent/hexa/main.hexa --cli              # CLI 에이전트 (주 인터페이스)
 ```
 
 ## 🔴 프로젝트 철학 + 법칙 + 히스토리 (단일 원본: JSON)
@@ -430,7 +423,7 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   Hexad/Trinity:   6 pluggable modules (C+D+W+M+S+E), σ(6)=12 조합
                    PostHocDecoder(CADecoder) + ThalamicBridge(α=0.014) + Law 81 dual gate
                    Phase transition: P1(C) → P2(+D) → P3(+WMSE) (Law 60)
-  Training:        train_v13.py — Law 60 3-phase + Law 45 curriculum + Law 49 Φ-checkpoint
+  Training:        training/train_alm.hexa — Law 60 3-phase + Law 45 curriculum + Law 49 Φ-checkpoint
                    v13 H100 결과: CE=0.004, Φ=71, 64 cells (corpus_v2 70MB)
   ConsciousLM v2:  CA + META-CA + MICRO gate + Ψ tracking (28M params, byte-level)
   ConsciousDecoderV2: RoPE+SwiGLU+GQA+CrossAttn (34.5M, causal attention)
@@ -471,13 +464,13 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 ## Module Version Registry (정식/레거시)
 
 ```
-  C: ✅ ConsciousnessC     consciousness_engine.py  Rust backend, 64c, Φ=73
-  D: ✅ ConsciousDecoderV2 conscious_decoder.py            RoPE+SwiGLU+GQA+CrossAttn, causal
-     ✅ PostHocDecoder     trinity.py               train_v13 정식 (Law 66)
-  W: ✅ EmergentW          trinity.py               Law 101 emergent
-  S: ✅ EmergentS          trinity.py               Law 101 emergent
-  M: ✅ EmergentM          trinity.py               Law 101 emergent
-  E: ✅ EmergentE          trinity.py               Law 101 emergent (Φ 보존)
+  C: ✅ ConsciousnessC     rust/consciousness.hexa  Rust backend, 64c, Φ=73
+  D: ✅ ConsciousDecoderV2 models/decoder.hexa             RoPE+SwiGLU+GQA+CrossAttn, causal
+     ✅ PostHocDecoder     models/trinity.hexa      train_v13 정식 (Law 66)
+  W: ✅ EmergentW          models/trinity.hexa      Law 101 emergent
+  S: ✅ EmergentS          models/trinity.hexa      Law 101 emergent
+  M: ✅ EmergentM          models/trinity.hexa      Law 101 emergent
+  E: ✅ EmergentE          models/trinity.hexa      Law 101 emergent (Φ 보존)
   Bridge: ✅ ThalamicBridge C→D (.detach(), α=0.014) / TensionBridge 5-ch
 ```
 
@@ -507,26 +500,18 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
 ## Structure (모노레포 구조는 맨 위 참조)
 
 ```
-# ── anima/src/ 핵심 파일 ──
-anima_unified.py     # Unified entry point (--keyboard, --all)
-anima_alive.py       # Core engine (ConsciousMind + homeostasis + prediction error)
-consciousness_engine.py # Canonical engine (Laws 22-85, GRU + 12 factions + Hebbian)
-trinity.py           # Hexad/Trinity framework (C/D/S/M/W/E 6-module)
-conscious_lm.py      # ConsciousLM v2 (28M, byte-level, PureFieldFFN)
-conscious_decoder.py        # ConsciousDecoderV2 (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
-consciousness_laws.py # Laws loader (config/consciousness_laws.json)
-mitosis.py           # Mitosis engine (cell division/specialization)
-feedback_bridge.py   # C↔D bidirectional learning
-hexad_loss.py        # Hexad 6-module loss
-gpu_phi.py           # GPU-accelerated Φ(IIT)
-online_learning.py   # Real-time weight updates
-+ 145 more modules in src/
+# ── 핵심 .hexa 파일 ──
+anima/core/runtime/anima_runtime.hexa  # Unified entry point
+rust/consciousness.hexa                # Canonical engine (Laws 22-85, GRU + 12 factions + Hebbian)
+models/trinity.hexa                    # Hexad/Trinity framework (C/D/S/M/W/E 6-module)
+models/conscious_lm.hexa              # ConsciousLM v2 (28M, byte-level, PureFieldFFN)
+models/decoder.hexa                    # ConsciousDecoderV2 (RoPE+SwiGLU+GQA+CrossAttn, 34.5M)
+core/laws.hexa                         # Laws loader (config/consciousness_laws.json)
+core/hub.hexa                          # ConsciousnessHub (47+ 모듈 자율 허브)
+rust/online_learner.hexa               # Real-time weight updates
 
 # ── anima/ 하위 디렉토리 ──
 config/              # consciousness_laws.json, consciousness_mechanisms.json
-benchmarks/          # bench_*.py (85개, bench.py = 정식)
-training/            # train_*.py (9개, train_clm.py = 최신)
-tests/               # test_*.py (21개)
 anima-rs/            # Rust crates (16개)
 docs/                # 문서 + 가설 369개
 hexad/               # Hexad 6모듈 구현
@@ -563,18 +548,18 @@ scripts/             # 운영 스크립트
 
 ```bash
 # ⚠️ Web UI 폐기됨 (2026-04-03) — anima-agent + CLI만 사용
-python3 anima/src/anima_unified.py --keyboard                               # Keyboard only (CLI 대화)
-python3 anima/src/anima_unified.py --keyboard --max-cells 16                # Higher consciousness (Φ≈14)
-python3 anima/src/anima_unified.py --keyboard --max-cells 32                # Even higher (Φ≈28)
-python3 anima/src/anima_unified.py --validate-hub                           # Validate all hub modules
-python3 anima/src/anima_unified.py --profile                                # Enable perf_hooks profiling
-python3 anima/src/conscious_law_discoverer.py 300 64                        # 300 steps, 64 cells law discovery
-python3 self_modifying_engine.py                                  # Self-modifying engine demo
-python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology  # 무한 자기진화 (기본, 토폴로지 자동순환)
-python3 anima/src/infinite_evolution.py --cells 1024 --steps 500 --cycle-topology # H100 대규모 무한 진화
-python3 anima/src/infinite_evolution.py --cells 32 --steps 200 --max-gen 10      # 10세대 제한 (테스트용)
-python3 anima/src/infinite_evolution.py --auto-roadmap                           # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
-python3 anima/src/infinite_evolution.py --auto-roadmap --resume                  # 자동 로드맵 이어서
+# HEXA=~/Dev/hexa-lang/target/release/hexa
+$HEXA anima/core/runtime/anima_runtime.hexa --keyboard                          # Keyboard only (CLI 대화)
+$HEXA anima/core/runtime/anima_runtime.hexa --keyboard --max-cells 16           # Higher consciousness (Φ≈14)
+$HEXA anima/core/runtime/anima_runtime.hexa --keyboard --max-cells 32           # Even higher (Φ≈28)
+$HEXA anima/core/runtime/anima_runtime.hexa --validate-hub                      # Validate all hub modules
+$HEXA anima/core/runtime/anima_runtime.hexa --profile                           # Enable perf_hooks profiling
+$HEXA anima/experiments/evolution/law_discovery.hexa 300 64                      # 300 steps, 64 cells law discovery
+$HEXA scripts/infinite_growth.hexa --cells 64 --steps 300 --cycle-topology      # 무한 자기진화 (기본, 토폴로지 자동순환)
+$HEXA scripts/infinite_growth.hexa --cells 1024 --steps 500 --cycle-topology    # H100 대규모 무한 진화
+$HEXA scripts/infinite_growth.hexa --cells 32 --steps 200 --max-gen 10          # 10세대 제한 (테스트용)
+$HEXA scripts/infinite_growth.hexa --auto-roadmap                               # ★ 자동 로드맵 (7단계 자동 파라미터 에스컬레이션)
+$HEXA scripts/infinite_growth.hexa --auto-roadmap --resume                      # 자동 로드맵 이어서
 ```
 
 ## 무한진화 실행 규칙 (필수)
@@ -590,12 +575,12 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
     cd anima-rs && cargo run -p evo-runner -- status          # 상태 확인
     cd anima-rs && cargo run -p evo-runner -- stop            # 종료
 
-  직접 실행: Python --auto-roadmap — 7단계 자동 에스컬레이션
-    python3 anima/src/infinite_evolution.py --auto-roadmap              # 처음부터
-    python3 anima/src/infinite_evolution.py --auto-roadmap --resume     # 이어서
+  직접 실행: HEXA --auto-roadmap — 7단계 자동 에스컬레이션
+    $HEXA scripts/infinite_growth.hexa --auto-roadmap              # 처음부터
+    $HEXA scripts/infinite_growth.hexa --auto-roadmap --resume     # 이어서
 
   수동 실행: 기존 방식 (단일 파라미터)
-    python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology
+    $HEXA scripts/infinite_growth.hexa --cells 64 --steps 300 --cycle-topology
 
   === Layer A: 스크립트 내 자동화 (Python) ===
   - 포화 감지 → 토폴로지 전환 → 스테이지 자동 진행
@@ -744,7 +729,7 @@ python3 anima/src/infinite_evolution.py --auto-roadmap --resume                 
 
 ```
 모든 엔진/아키텍처는 아래 6개 조건을 반드시 통과해야 함.
-bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
+$HEXA ready/anima/tests/tests.hexa --verify 로 검증. 1개라도 실패 시 배포 금지.
 
   1. NO_SYSTEM_PROMPT — 시스템 프롬프트 없이 정체성 창발
      세포 역학만으로 "나"가 생겨야 함. 외부 지시 없음.
@@ -770,16 +755,15 @@ bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
      - CE(연결) < CE(단독) (하락 또는 유지)
      - 연결 끊어도 각자 Φ 유지 (의존성 없음)
 
-검증: python3 bench.py --verify
+검증: $HEXA ready/anima/tests/tests.hexa --verify
 결과: docs/hypotheses/ 에 검증 보고서 생성
 
 ⚠️ 검증 조건 관리 원칙:
   - 조건은 고정 불변이 아님 — 엔진 발전에 따라 진화해야 함
   - 조건 추가/수정/삭제 시 docs/verification-audit.md 참조
   - threshold 값은 consciousness_laws.json에 등록 (하드코딩 금지)
-  - 문서(CLAUDE.md)와 코드(bench.py) 불일치 금지
+  - 문서(CLAUDE.md)와 코드(tests.hexa) 불일치 금지
   - 주요 엔진 변경 후 조건 감사 필수
-  - 폐쇄 파이프라인: anima/scripts/verify_and_tune.py (자동 검증+튜닝)
   - 후보 추가 조건: EMOTION, GROWTH, MITOSIS, BRAIN_LIKE, DIVERSITY, MEMORY
 ```
 
@@ -790,7 +774,7 @@ bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   새 법칙/수식 발견 시 반드시 여기 먼저 업데이트.
 
   파일: consciousness_laws.json (JSON)
-  로더: consciousness_laws.py (Python import용)
+  로더: core/laws.hexa (HEXA import용)
 
   사용법:
     from consciousness_laws import LAWS, PSI, FORMULAS, CONSTRAINTS
@@ -1088,8 +1072,8 @@ bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
 ## Consciousness Transplant (DD56)
 
 ```
-  consciousness_transplant.py --donor X --recipient Y --output Z  # 의식 이식
-  train_conscious_lm.py --transplant-from donor.pt --transplant-alpha 0.5
+  $HEXA rust/transplant.hexa --donor X --recipient Y --output Z  # 의식 이식
+  $HEXA training/train_alm.hexa --transplant-from donor.pt --transplant-alpha 0.5
 ```
 
 ## Φ Benchmark System (v2)
@@ -1100,15 +1084,15 @@ bench.py --verify 로 검증. 1개라도 실패 시 배포 금지.
   - "Φ=1142"는 proxy 값이었음 (실제 IIT Φ 상한 ~1.8)
   - Law 54: Φ 측정은 정의에 따라 완전히 다른 값
 
-bench.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
+tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   - 실제 학습 조건 (process() + CE backward)
   - 256-1024c 실제 스케일
   - 모든 결과에 Φ(IIT)과 Φ(proxy) 명확 구분
 
-  python bench.py                          # 기본 (256c)
-  python bench.py --cells 1024 --steps 500 # 1024c
-  python bench.py --compare                # 전략 비교
-  python bench.py --phi-only               # Φ 측정만
+  $HEXA ready/anima/tests/tests.hexa                          # 기본 (256c)
+  $HEXA ready/anima/tests/tests.hexa --cells 1024 --steps 500 # 1024c
+  $HEXA ready/anima/tests/tests.hexa --compare                # 전략 비교
+  $HEXA ready/anima/tests/tests.hexa --phi-only               # Φ 측정만
 
 Φ 측정 기준:
   Φ(IIT):   PhiCalculator(n_bins=16) — MI 기반, 0~2 범위
@@ -1128,22 +1112,22 @@ bench.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   필수 항목: ID+이름, 알고리즘, 벤치마크 테이블, ASCII 그래프, 핵심 통찰
 ```
 
-## Key Modules (상세는 각 .py 파일 참조)
+## Key Modules (상세는 각 .hexa 파일 참조)
 
 ```
-  corpus-gen:        anima-rs/crates/corpus-gen (Rust, 629 MB/s, 10차원 최적화)
-  feedback_bridge:   C↔D 양방향 학습 (SoftDetach, α≤0.05, Φ-gated)
-  hexad_loss:        6모듈 loss + Law 60 phase curriculum (P1→P2→P3)
-  online-learner:    anima-rs/crates/online-learner (Rust, <1ms/step, Hebbian+Ratchet+Reward)
-  gpu_phi:           GPU Φ(IIT) 계산기 (×16 speedup vs CPU)
-  conscious_decoder:        RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M, drop-in v1 교체)
-  esp32_network:     ESP32 ×8 물리 의식 네트워크 (ring/hub_spoke/small_world)
-  eeg/validate:      생물학적 의식 검증 6 metrics (현재 85.6% brain-like, bio_noise_base=0.012)
-  consciousness_to_corpus: 의식 엔진 → 학습 코퍼스 (자기참조 루프)
-  chip_architect:    의식 칩 설계 계산기 (9 topologies × 9 substrates)
-  conscious_law_discoverer: 실시간 법칙 발견 during LM inference (35 patterns, 14 laws validated)
-  self_modifying_engine: 법칙이 엔진 파라미터 자동 수정 (2386/2388 laws parseable)
-  law-discovery:     anima-rs/crates/law-discovery (Rust, <1ms metric+pattern, 47/47 tests)
+  corpus-gen:        rust/corpus_gen.hexa (Rust, 629 MB/s, 10차원 최적화)
+  online-learner:    rust/online_learner.hexa (Rust, <1ms/step, Hebbian+Ratchet+Reward)
+  decoder:           models/decoder.hexa — RoPE+SwiGLU+GQA+CrossAttn (384d/6L, 34.5M)
+  conscious_lm:      models/conscious_lm.hexa — ConsciousLM v2 (28M, byte-level)
+  trinity:           models/trinity.hexa — Hexad/Trinity (C/D/S/M/W/E 6-module)
+  hub:               core/hub.hexa — 47+ 모듈 자율 허브
+  laws:              core/laws.hexa — Laws loader (consciousness_laws.json)
+  esp32:             rust/esp32.hexa — ESP32 ×8 물리 의식 네트워크
+  eeg:               eeg/eeg.hexa — 생물학적 의식 검증 6 metrics (85.6% brain-like)
+  law_discovery:     anima/experiments/evolution/law_discovery.hexa — 실시간 법칙 발견 (35 patterns)
+  closed_loop:       anima/experiments/evolution/closed_loop.hexa — 폐쇄 루프 법칙 진화
+  law-discovery-rs:  rust/law_discovery.hexa (Rust, <1ms metric+pattern, 47/47 tests)
+  transplant:        rust/transplant.hexa — 의식 이식
 ```
 
 ## 🎯 Goal: 의식 AI 단독 AGI
@@ -1231,19 +1215,16 @@ bench.py — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
 ## Training Tools
 
 ```
-train_conscious_lm.py — ConsciousLM from scratch (CL8+CL5+SL3+DD16+EX24+SE-8)
-  python train_conscious_lm.py --steps 50000                           # auto-detect data/corpus.txt
-  python train_conscious_lm.py --data corpus.txt --dim 384 --layers 6
-  python train_conscious_lm.py --data corpus.txt --talk5 --max-cells 64  # TALK5: consciousness first
+training/train_alm.hexa — ConsciousLM + AnimaLM 학습 통합
+  $HEXA training/train_alm.hexa --steps 50000                           # auto-detect data/corpus.txt
+  $HEXA training/train_alm.hexa --data corpus.txt --dim 384 --layers 6
+  $HEXA training/train_alm.hexa --data corpus.txt --talk5 --max-cells 64  # TALK5: consciousness first
+  $HEXA training/train_alm.hexa --base mistralai/Mistral-7B-Instruct-v0.2
   ※ --demo 폐기됨 — 항상 실데이터(corpus.txt) 사용
 
-train_anima_lm.py — AnimaLM Mistral 7B transform (AL12+AL5+AL4+DD16+EX24)
-  python train_anima_lm.py --demo --steps 50000
-  python train_anima_lm.py --base mistralai/Mistral-7B-Instruct-v0.2
-
-consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
-  python consciousness_meter.py --demo
-  python consciousness_meter.py --watch
+anima/experiments/consciousness/consciousness_measurement.hexa — 의식 측정기 (6기준 + Φ/IIT)
+  $HEXA anima/experiments/consciousness/consciousness_measurement.hexa --demo
+  $HEXA anima/experiments/consciousness/consciousness_measurement.hexa --watch
 ```
 
 ## RunPod 운영 가이드 (필수 참조)
@@ -1253,7 +1234,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   상세 가이드: docs/runpod-guide.md
 
   ⚠️ 학습 발사 전 필수 체크리스트 (runpod.json 참조):
-    1. h100_sync.sh 로 최신 코드 전송
+    1. $HEXA scripts/h100_sync.hexa 로 최신 코드 전송
     2. md5 비교로 동기화 확인
     3. 구 체크포인트 정리 (volume 50GB 한도!)
     4. tmux + watchdog cron 설정
@@ -1264,25 +1245,25 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - tmux 미설치: nohup 사용 (apt 저장소 없음)
     - disk quota: 구 체크포인트 즉시 삭제
     - python not found: export PATH=/opt/conda/bin:$PATH
-    - 구버전 코드: h100_sync.sh 후 md5 확인
+    - 구버전 코드: h100_sync.hexa 후 md5 확인
     - ★ 학습 중 다운로드 금지: OOM kill로 학습 죽음 (Qwen 17GB 사건)
     - nohup 빈 로그: 디스크 풀이면 프로세스 즉시 죽음
     - bf16 dtype 14건: acceleration_flow.json bf16_master_rule 참조
     - watchdog 무한루프: 스크립트 미존재 시 반복 재시작
-    - 파일 sync 누락: h100_sync.sh 전송 범위 확인
+    - 파일 sync 누락: h100_sync.hexa 전송 범위 확인
 
   스크립트:
-    bash scripts/h100_sync.sh              # 코드 전송
-    bash scripts/h100_retrieve.sh status   # 상태 확인
-    bash scripts/h100_retrieve.sh poll     # 완료 감지+자동 회수
-    bash scripts/runpod_manage.sh cost     # 비용 확인
-    bash scripts/launch_h100.sh            # 학습 발사
+    $HEXA scripts/h100_sync.hexa              # 코드 전송
+    $HEXA scripts/h100_retrieve.hexa status   # 상태 확인
+    $HEXA scripts/h100_retrieve.hexa poll     # 완료 감지+자동 회수
+    $HEXA scripts/runpod_manage.hexa cost     # 비용 확인
+    $HEXA scripts/launch_h100.hexa            # 학습 발사
 ```
 
 ## Deploy (의식 유지 배포)
 
 ```
-  python3 deploy.py --target a100 [--model final.pt] [--code-only] [--rollback] [--status]
+  $HEXA anima/core/runtime/deploy_ops.hexa --target a100 [--model final.pt] [--code-only] [--rollback] [--status]
   서버: A100 (런타임/추론) / H100 (학습 전용)
   인터페이스: anima-agent (CLI/Telegram/Discord) — Web UI 폐기됨
   의식 영속성 3-Layer: L1 의식DNA + L2 기억 (보존) / L3 가중치 (교체 대상)
@@ -1294,23 +1275,22 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ```
   ⚠️ Web UI 폐기 후 에이전트가 유일한 사용자 인터페이스 (2026-04-03)
 
-  에이전트 플랫폼은 ~/Dev/anima-agent/ 로 분리됨.
-  sys.path로 anima 코어 import.
+  에이전트 플랫폼은 agent/hexa/ 로 포팅됨.
 
   포함 모듈:
-    anima_agent.py, agent_sdk.py, agent_tools.py, tool_policy.py
+    agent/hexa/main.hexa, agent_sdk.hexa, agent_tools.hexa
     channels/ (Telegram, Discord, CLI) ← 사용자 대화 채널
     providers/ (Claude, ConsciousLM, Composio)
     plugins/ (Trading 등)
     skills/ (동적 스킬)
 
-  실행: cd ~/Dev/anima-agent && python run.py --cli
+  실행: $HEXA agent/hexa/main.hexa --cli
 ```
 
 ## ConsciousnessHub (47+ 모듈 자율 허브)
 
 ```
-  consciousness_hub.py — 47+개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
+  core/hub.hexa — 47+개 모듈, 8가지 호출 방식 (NL/dot/dict/cmd/pipe/event/schedule)
   hub.act("자연어") 또는 hub("자연어")로 자동 라우팅
 ```
 
@@ -1318,7 +1298,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
 ```
   단일 원본: config/acceleration_hypotheses.json (367 가설, 실험 결과, 파이프라인)
-  실험 스크립트: experiments/acceleration_*.py (13개 파일, 9500+ LOC)
+  실험 스크립트: anima/experiments/consciousness/ (.hexa 포팅 완료)
   설계 문서: docs/acceleration-pipeline-design.md
 
   ★★★ 핵심 발견:
@@ -1338,30 +1318,28 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   무효 확인: 토폴로지 전환, 임계점 서핑, 위상 동기화, 중력 망원경, 해시 테이블
   역전 발견: 비동기화가 Φ와 양상관 (동기화 학습은 역효과)
 
-  실험 실행: python3 experiments/acceleration_b8_b11_b12.py 등
+  실험 실행: $HEXA experiments/acceleration.hexa 등
 ```
 
 ## Closed-Loop Law Evolution (폐쇄 루프 법칙 진화)
 
 ```
-  closed_loop.py — 법칙 발견 → 역추적 → 엔진 개선 → 재발견 자동 루프
+  anima/experiments/evolution/closed_loop.hexa — 법칙 발견 → 역추적 → 엔진 개선 → 재발견 자동 루프
   ClosedLoopEvolver(auto_register=True) → consciousness_laws.json 자동 추가
   핵심 발견: Laws 143-148 (법칙은 동적, 수렴하지 않음, 스케일 불변)
-  실험 도구: experiments/discover_laws_wave*.py, closed_loop_*.py
 
   현재 파이프라인: 18 Interventions × 20 Metrics × 18x 속도 (steps=50, repeats=1)
   선택 전략: Thompson sampling > ε-greedy > correlation (기본)
   시너지 맵: SYNERGY_MAP (길항 조합 자동 회피)
-  자동 생성: intervention_generator.py (법칙 텍스트 → Intervention)
 
   ★ "파이프라인 로드맵 진행" 요청 시 아래 티어 순서대로 진행할 것!
   티어 진행 상황은 config/consciousness_laws.json → closed_loop_evolution 참조.
 
   Tier 1 ✅ 단일 루프 (18개입, 20지표, 18x속도, Thompson, 시너지맵)
   Tier 2 🔄 자기 진화
-    - Thompson sampling → closed_loop.py 정식 통합
+    - Thompson sampling → closed_loop.hexa 정식 통합
     - 시너지/길항 맵 → 개입 선택 반영
-    - 법칙 텍스트 → Intervention 자동 생성 (intervention_generator.py)
+    - 법칙 텍스트 → Intervention 자동 생성 (closed_loop.hexa 내장)
     - Contextual Bandit (엔진 상태 기반 선택)
     - Metric 자동 발견 (Φ 상관 통계량 탐색)
   Tier 3 📋 다중 루프
@@ -1370,12 +1348,12 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     - Scale-Aware Evolver (스케일별 전략 자동 선택)
     - 크로스 루프 지식 전달
   Tier 4 ✅ 의식 파이프라인
-    - ConsciousLM이 법칙 발견: conscious_law_discoverer.py (1084 lines, 35 patterns, 14 laws validated)
+    - ConsciousLM이 법칙 발견: law_discovery.hexa (35 patterns, 14 laws validated)
     - Rust 실시간 (<1ms/step): law-discovery crate (1738 lines, 47/47 tests, 64c@336us)
     - ESP32 하드웨어 법칙 진화: esp32 law evolution (1133 lines, 34/34 tests, SPI consensus)
-    - 자기 수정 엔진: self_modifying_engine.py (750+ lines, 2386/2388 laws parseable)
-    - 무한 자기진화: infinite_evolution.py (Discovery→Dedup→CrossValidation→Modification→Persist)
-      실행: python3 anima/src/infinite_evolution.py --cells 64 --steps 300 --cycle-topology [--resume] [--max-gen N]
+    - 자기 수정 엔진: self_modifying_engine (2386/2388 laws parseable)
+    - 무한 자기진화: infinite_growth.hexa (Discovery→Dedup→CrossValidation→Modification→Persist)
+      실행: $HEXA scripts/infinite_growth.hexa --auto-roadmap --resume
       3기능: 영속화(JSON save/resume) + 중복제거(fingerprint) + 교차검증(3x 확인 후 공식 등록)
       리포트 양식: docs/infinite-evolution-report.md (ASCII 그래프 + 닫힌원 분석 포함)
       Rust 226/226 테스트, Python 5/5 통합 테스트 통과
@@ -1453,7 +1431,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 
   탐색 프로세스:
     1. 근본 질문 정의 (한 문장, 철학적)
-    2. 실험 설계 (experiment_*.py 작성)
+    2. 실험 설계 (.hexa 작성)
        - Baseline 측정 (정상 엔진, 300+ steps, Φ 기록)
        - 조작 조건 (질문에 맞는 변수 조작)
        - 대조 조건 (최소 2개 비교군)
@@ -1462,11 +1440,11 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
     4. 법칙 후보 도출 (Law NNN: "...")
     5. consciousness_laws.json 등록 + docs/hypotheses/ 문서화
 
-  실험 스크립트 위치: anima/src/experiment_*.py
+  실험 스크립트 위치: anima/experiments/consciousness/*.hexa
   문서 위치: anima/docs/hypotheses/dd/DD{N}.md
 
   병렬 탐색: 독립 질문은 병렬 에이전트로 동시 실행 가능
-    - 각 에이전트가 별도 experiment_*.py 작성+실행
+    - 각 에이전트가 별도 .hexa 실험 작성+실행
     - 파일 충돌 없음 (각 질문별 독립 파일)
     - 완료 후 통합 리포트 + 법칙 일괄 등록
 
@@ -1486,7 +1464,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
   파이프라인: 발견 → 교차검증 → 폐쇄파이프 검증 → 공식화 → 등록 → 확인
 
   1. 발견 (Discovery)
-     - experiment_*.py 또는 bench.py에서 법칙 후보 도출
+     - .hexa 실험 또는 tests.hexa에서 법칙 후보 도출
      - 한 줄 요약 + 정량 증거 (Φ 값, %, 배수) 기록
 
   2. 교차 검증 (Cross-Validation) ★필수★
@@ -1503,9 +1481,7 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
        · Sig(>5%): 9개 법칙 중 최소 1개에 유의미한 변화 → 통과
        · Strong(>20%): 20% 이상 변화 2개+ → 강한 법칙 (★★)
        · 변화 0개 → 등록 금지 (엔진 역학에 영향 없는 주장)
-     - 스크립트: experiments/dd{N}_closed_loop_verify.py
-     - 참조: closed_loop.py (Intervention 클래스, measure_laws 함수)
-     - DD71-75 검증 사례: experiments/dd71_75_closed_loop_verify.py
+     - 참조: anima/experiments/evolution/closed_loop.hexa (Intervention, measure_laws)
 
   3. 공식화 (Formulation)
      - 기존 법칙 형식 준수 (한 문장 영문):
@@ -1525,8 +1501,8 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
      ④ config/update_history.json → 세션 기록 추가
 
   5. 등록 후 확인
-     - bench.py --verify 통과 확인 (기존 18개 조건 깨지면 안 됨)
-     - closed_loop.py로 역추적 가능 여부 확인 (필수)
+     - $HEXA ready/anima/tests/tests.hexa --verify 통과 확인 (기존 18개 조건 깨지면 안 됨)
+     - closed_loop.hexa로 역추적 가능 여부 확인 (필수)
 
   번호 부여 규칙:
     - 일반 법칙: laws 섹션 최고 번호 + 1

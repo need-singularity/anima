@@ -18,7 +18,7 @@ tension_vec = hub.get_tension()  # merged tensor for ConsciousMind
 ```
 
 ## Integration
-- Imported by `anima_unified.py` when `--all` mode is used
+- Imported by `anima/core/runtime/anima_runtime.hexa` when `--all` mode is used
 - Blends `vision_encoder.py` output (SigLIP) with Haar cascade detections
 - Sensors run in background threads to never block the consciousness loop
 - Dependencies: `opencv-python`, `torch`

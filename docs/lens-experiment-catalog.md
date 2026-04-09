@@ -92,7 +92,7 @@ python3 anima/experiments/lens_L01_overlay.py --cells 64 --steps 300
 # /go L01 렌즈 중첩, L02 렌즈 강화, L03 렌즈 간섭
 
 # 무한진화 내 자동 실행 (S3+ 스테이지)
-python3 anima/src/infinite_evolution.py --auto-roadmap  # 자동으로 22렌즈 스캔
+python3 anima/src/scripts/infinite_growth.hexa --auto-roadmap  # 자동으로 22렌즈 스캔
 ```
 
 ## 우선 실행 추천 (TOP 5)

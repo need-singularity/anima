@@ -1,7 +1,7 @@
 # OUROBOROS Report: S9-dim256
 
 **Generated:** 2026-04-06 15:49:58
-**Auto-generated** by infinite_evolution.py v8 #71
+**Auto-generated** by scripts/infinite_growth.hexa v8 #71
 
 ## Summary
 

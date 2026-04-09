@@ -18,7 +18,7 @@
 |------|--------|---------------|
 | `memory_store.py` | **Create** | SQLite+FAISS storage, search, consolidation API |
 | `tests/test_memory_store.py` | **Create** | All MemoryStore tests |
-| `anima_unified.py` | **Modify** | Replace MemoryRAG with MemoryStore |
+| `anima/core/runtime/anima_runtime.hexa` | **Modify** | Replace MemoryRAG with MemoryStore |
 | `memory_rag.py` | **Keep** | Deprecated but not deleted (fallback) |
 
 ---
@@ -595,7 +595,7 @@ git commit -m "feat: JSON→SQLite migration with idempotency and backup"
 ### Task 5: Integration — Replace MemoryRAG in AnimaUnified
 
 **Files:**
-- Modify: `anima_unified.py`
+- Modify: `anima/core/runtime/anima_runtime.hexa`
 - Modify: `tests/test_memory_store.py` (integration test)
 
 - [ ] **Step 1: Write integration test**
@@ -604,7 +604,7 @@ git commit -m "feat: JSON→SQLite migration with idempotency and backup"
 # tests/test_memory_store.py — append
 
 def test_memory_store_compat_with_rag_interface(store):
-    """MemoryStore must support the same operations MemoryRAG uses in anima_unified.py."""
+    """MemoryStore must support the same operations MemoryRAG uses in anima/core/runtime/anima_runtime.hexa."""
     v = _vec("test compat")
     # add (called in _process_turn)
     mid = store.add(role="user", text="test compat", tension=0.5, curiosity=0.1, vector=v)
@@ -624,9 +624,9 @@ def test_memory_store_compat_with_rag_interface(store):
 Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/test_memory_store.py::test_memory_store_compat_with_rag_interface -v`
 Expected: PASS (already implemented)
 
-- [ ] **Step 3: Modify anima_unified.py — import and init**
+- [ ] **Step 3: Modify anima/core/runtime/anima_runtime.hexa — import and init**
 
-In `anima_unified.py`, replace the MemoryRAG initialization block (lines ~207-212):
+In `anima/core/runtime/anima_runtime.hexa`, replace the MemoryRAG initialization block (lines ~207-212):
 
 ```python
 # Before:
@@ -668,7 +668,7 @@ In `anima_unified.py`, replace the MemoryRAG initialization block (lines ~207-21
         return store
 ```
 
-- [ ] **Step 4: Modify anima_unified.py — update all MemoryRAG call sites**
+- [ ] **Step 4: Modify anima/core/runtime/anima_runtime.hexa — update all MemoryRAG call sites**
 
 Search for `self.memory_rag` usages and ensure compatibility:
 
@@ -682,13 +682,13 @@ Search for `self.memory_rag` usages and ensure compatibility:
 Run: `cd /Users/ghost/Dev/anima && KMP_DUPLICATE_LIB_OK=TRUE python3 -m pytest tests/ -v`
 Expected: ALL PASS
 
-Manual: `KMP_DUPLICATE_LIB_OK=TRUE python3 anima_unified.py --web` — verify startup log shows `[migrate]` and `data/conscious-lm/memory.db` exists.
+Manual: `KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web` — verify startup log shows `[migrate]` and `data/conscious-lm/memory.db` exists.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd /Users/ghost/Dev/anima
-git add anima_unified.py memory_store.py tests/test_memory_store.py
+git add anima/core/runtime/anima_runtime.hexa memory_store.py tests/test_memory_store.py
 git commit -m "feat: replace MemoryRAG with MemoryStore (SQLite+FAISS) in AnimaUnified"
 ```
 
@@ -761,7 +761,7 @@ Expected: ALL PASS
 
 ```bash
 # Start Anima
-KMP_DUPLICATE_LIB_OK=TRUE python3 anima_unified.py --web &
+KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web &
 
 # Check migration happened
 ls -la data/conscious-lm/

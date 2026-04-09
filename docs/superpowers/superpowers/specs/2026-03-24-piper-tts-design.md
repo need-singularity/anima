@@ -106,8 +106,8 @@ def _say_piper(self, text, listener=None):
 
 ## 영향 범위
 
-- `anima_alive.py`: Speaker 클래스 전면 수정
-- `anima_unified.py`: 변경 없음 (Speaker 인터페이스 동일)
+- `anima/core/runtime/anima_runtime.hexa`: Speaker 클래스 전면 수정
+- `anima/core/runtime/anima_runtime.hexa`: 변경 없음 (Speaker 인터페이스 동일)
 - `.env`: ELEVENLABS_API_KEY 더 이상 불필요
 
 ## 사전 조건

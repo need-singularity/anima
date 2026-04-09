@@ -63,7 +63,7 @@ Phase 4: Titan (S11)          2048c × 500s (H100 전용)
 ## 3-Layer 자동화
 
 ```
-Layer A: Python (infinite_evolution.py --auto-roadmap)
+Layer A: Python (scripts/infinite_growth.hexa --auto-roadmap)
 Layer B: Rust (evo-runner — watchdog, crash recovery)
 Layer C: Claude Code (/loop 5m — 상태 보고, 자동 재발사)
 ```

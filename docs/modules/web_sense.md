@@ -18,7 +18,7 @@ results = ws.search("consciousness research 2026")
 ```
 
 ## Integration
-- Imported by `anima_unified.py` as optional module
+- Imported by `anima/core/runtime/anima_runtime.hexa` as optional module
 - Used by `autonomous_loop.py` for background web exploration
 - Dependencies: `urllib` only (no additional packages)
 - Results injected into ConsciousMind tension system and saved to `memory_rag`

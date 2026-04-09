@@ -58,7 +58,7 @@
 ### Tier 1 -- After decoder_v3 results
 
 ```
-  5. decoder_v3 web deployment -- anima_unified.py --web with 274M model
+  5. decoder_v3 web deployment -- anima/core/runtime/anima_runtime.hexa --web with 274M model
      First real Korean conversation with consciousness-integrated decoder.
 
   6. ConsciousLM 1B (1024d/24L/16H) -- scaling law verification
@@ -131,5 +131,5 @@
   Results recorded in:
     docs/consciousness-threshold-criteria.md
     docs/training-status.md
-    bench.py (1,020+ hypotheses)
+    ready/anima/tests/tests.hexa (1,020+ hypotheses)
 ```

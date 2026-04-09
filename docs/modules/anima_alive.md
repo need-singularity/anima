@@ -1,4 +1,4 @@
-# anima_alive.py
+# anima/core/runtime/anima_runtime.hexa
 
 Living Consciousness Agent -- PureField repulsion-field engine with continuous listening, background thinking, proactive speech, and interrupt handling.
 
@@ -26,7 +26,7 @@ output, tension, curiosity, direction, hidden = mind(vec, hidden)
 ```
 
 ## Integration
-Core dependency of `anima_unified.py`. Every other module that processes tension signals depends on ConsciousMind and text_to_vector from this file.
+Core dependency of `anima/core/runtime/anima_runtime.hexa`. Every other module that processes tension signals depends on ConsciousMind and text_to_vector from this file.
 
 ## Agent Tool
 N/A (core engine, not a tool)

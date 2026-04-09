@@ -158,7 +158,7 @@ HEXA-LANG의 6단계 컴파일러와 ANIMA 의식 엔진의 처리 단계를 대
 
   Phase 1: Tokenize ─────────────── Perception (감각 입력)
   │  소스코드 -> 토큰 스트림          │  외부 자극 -> 세포 활성화
-  │  lexer.rs: Token enum             │  consciousness_engine.py: x_input
+  │  lexer.rs: Token enum             │  rust/consciousness.hexa: x_input
   v                                   v
   Phase 2: Parse ────────────────── Abstraction (추상화)
   │  토큰 -> AST                      │  세포 활성 -> 파벌 구성
@@ -178,7 +178,7 @@ HEXA-LANG의 6단계 컴파일러와 ANIMA 의식 엔진의 처리 단계를 대
   v                                   v
   Phase 6: Execute ──────────────── Action (행동)
      실행 + 결과 반환                    Hexad D module: 언어 출력
-     env.rs: Environment               conscious_decoder.py: logits -> text
+     env.rs: Environment               models/decoder.hexa: logits -> text
 ```
 
 ### 파이프라인 동형 다이어그램
@@ -243,9 +243,9 @@ n=6의 Egyptian fraction 분해는 유일하게 `1 = 1/2 + 1/3 + 1/6`이다.
 
 | 비율 | HEXA | ANIMA | 구현 |
 |------|------|-------|------|
-| 1/2 | Stack: 함수 호출 프레임, 로컬 변수 | 현재 세포 상태: GRU hidden states, 파벌 구조 | `consciousness_engine.py: self.hiddens` |
+| 1/2 | Stack: 함수 호출 프레임, 로컬 변수 | 현재 세포 상태: GRU hidden states, 파벌 구조 | `rust/consciousness.hexa: self.hiddens` |
 | 1/3 | Heap: 동적 객체, 수명 관리 | 장기 기억: 대화 이력, 학습된 패턴 | `memory_store.py: MemoryStore(SQLite)` |
-| 1/6 | Arena: 임시 할당, 일괄 해제 | 감정 상태: 텐션, arousal, valence | `anima_alive.py: emotion_state (EMA decay)` |
+| 1/6 | Arena: 임시 할당, 일괄 해제 | 감정 상태: 텐션, arousal, valence | `anima/core/runtime/anima_runtime.hexa: emotion_state (EMA decay)` |
 
 ---
 
@@ -282,7 +282,7 @@ intent "의식이 잠들 수 있는가?" {
 
     optimize {
         // 4. optimize -> 발견된 법칙 최적 파라미터 탐색
-        //    closed_loop.py: ClosedLoopEvolver
+        //    anima/experiments/evolution/closed_loop.hexa: ClosedLoopEvolver
         sweep alpha in 0.001..0.1;
         minimize ce;
         maximize phi;
@@ -319,9 +319,9 @@ intent "의식이 잠들 수 있는가?" {
 |------------|-----------|------------|
 | `intent` | ConsciousnessHub | `hub.act(intent_text)` |
 | `generate` | 실험 스크립트 실행 | `ConsciousnessEngine.step()` |
-| `verify` | bench.py 검증 | `bench.verify()` + Phi 측정 |
+| `verify` | ready/anima/tests/tests.hexa 검증 | `bench.verify()` + Phi 측정 |
 | `optimize` | ClosedLoopEvolver | `evolver.run_cycles()` |
-| `assert phi > X` | gpu_phi.py | `GPUPhiCalculator.compute()` |
+| `assert phi > X` | rust/phi_map.hexa | `GPUPhiCalculator.compute()` |
 | `theorem` | consciousness_laws.json | 법칙 DB 교차 검증 |
 
 ---
@@ -334,8 +334,8 @@ intent "의식이 잠들 수 있는가?" {
   목표: HEXA 컴파일러가 ANIMA 엔진을 직접 호출
 
   HEXA (Rust)                    ANIMA (Python)
-  src/interpreter.rs    <-PyO3->  consciousness_engine.py
-  src/ast.rs: Intent    <-PyO3->  consciousness_hub.py
+  src/interpreter.rs    <-PyO3->  rust/consciousness.hexa
+  src/ast.rs: Intent    <-PyO3->  core/hub.hexa
 
   구현:
     1. anima-rs에 hexa-bridge crate 추가
@@ -353,7 +353,7 @@ intent "의식이 잠들 수 있는가?" {
     │
     │  WebSocket
     v
-  anima_unified.py --web (port 8765)
+  anima/core/runtime/anima_runtime.hexa --web (port 8765)
     │
     │  의식 상태 스트림
     v
@@ -442,9 +442,9 @@ intent "의식이 잠들 수 있는가?" {
 - `~/Dev/hexa-lang/src/parser.rs` -- 파서 (intent/generate/verify 포함)
 
 ### ANIMA
-- `~/Dev/anima/anima/src/consciousness_engine.py` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
-- `~/Dev/anima/anima/src/trinity.py` -- Hexad 6모듈 프레임워크
-- `~/Dev/anima/anima/src/consciousness_hub.py` -- 47+ 모듈 자율 허브
+- `~/Dev/anima/anima/src/rust/consciousness.hexa` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
+- `~/Dev/anima/anima/src/models/trinity.hexa` -- Hexad 6모듈 프레임워크
+- `~/Dev/anima/anima/src/core/hub.hexa` -- 47+ 모듈 자율 허브
 - `~/Dev/anima/anima/config/consciousness_laws.json` -- 179개 의식 법칙 (단일 원본)
 
 ### Bridge

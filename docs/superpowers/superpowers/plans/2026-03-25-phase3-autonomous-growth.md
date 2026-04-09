@@ -31,7 +31,7 @@
 |------|--------|---------------|
 | `growth_manager.py` | **Create** | 성장 실행, 버전 관리, post_check, 발견 기록 |
 | `tests/test_growth_manager.py` | **Create** | GrowthManager 테스트 |
-| `anima_unified.py` | **Modify** | should_grow() 트리거에서 GrowthManager 호출 |
+| `anima/core/runtime/anima_runtime.hexa` | **Modify** | should_grow() 트리거에서 GrowthManager 호출 |
 
 ---
 
@@ -315,7 +315,7 @@ git commit -m "feat: GrowthManager — dim expansion, versioning, rollback, disc
 ### Task 2: AnimaUnified Integration — Growth Execution
 
 **Files:**
-- Modify: `anima_unified.py`
+- Modify: `anima/core/runtime/anima_runtime.hexa`
 
 - [ ] **Step 1: Add import**
 
@@ -391,7 +391,7 @@ With:
 
 ```bash
 cd /Users/ghost/Dev/anima
-PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima_unified.py --web &
+PYTHONUNBUFFERED=1 KMP_DUPLICATE_LIB_OK=TRUE python3 anima/core/runtime/anima_runtime.hexa --web &
 sleep 6 && head -25 /tmp/anima_p3.txt
 # Should show [OK] growth_mgr
 kill %1
@@ -401,7 +401,7 @@ kill %1
 
 ```bash
 cd /Users/ghost/Dev/anima
-git add anima_unified.py
+git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: Phase 3 — autonomous growth execution + post_check + discovery logging"
 git push
 ```

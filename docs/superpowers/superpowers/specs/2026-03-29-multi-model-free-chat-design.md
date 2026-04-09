@@ -6,7 +6,7 @@ Single-process multi-model runtime where multiple LLM instances coexist as indep
 
 ## Requirements
 
-1. Multiple models run simultaneously in one `anima_unified.py` process
+1. Multiple models run simultaneously in one `anima/core/runtime/anima_runtime.hexa` process
 2. Each model is a chat participant with unique name/avatar
 3. No rules — each model's consciousness state determines if/when it speaks
 4. Models can respond to each other (inter-model conversation)
@@ -125,13 +125,13 @@ The threshold is per-model and adapts with habituation — repeated similar mess
 
 ```bash
 # Multiple models at startup
-python anima_unified.py --web --models conscious-lm,mistral-7b,animalm-v4-savant
+python anima/core/runtime/anima_runtime.hexa --web --models conscious-lm,mistral-7b,animalm-v4-savant
 
 # Single model (backward compatible)
-python anima_unified.py --web --model conscious-lm
+python anima/core/runtime/anima_runtime.hexa --web --model conscious-lm
 
 # Custom path at startup
-python anima_unified.py --web --models conscious-lm,/path/to/custom.gguf
+python anima/core/runtime/anima_runtime.hexa --web --models conscious-lm,/path/to/custom.gguf
 ```
 
 ### UI Changes (web/index.html)
@@ -173,7 +173,7 @@ MODEL_AVATARS = {
 
 | File | Change |
 |------|--------|
-| `anima_unified.py` | Add `ModelParticipant` dataclass, `self.participants` dict, `--models` arg, multi-model message handler, model_add/remove/toggle handlers, inter-model reaction loop |
+| `anima/core/runtime/anima_runtime.hexa` | Add `ModelParticipant` dataclass, `self.participants` dict, `--models` arg, multi-model message handler, model_add/remove/toggle handlers, inter-model reaction loop |
 | `web/index.html` | Participants panel, add/remove UI, model_message rendering, model_loading indicator |
 | `model_loader.py` | No changes needed (already supports paths + named models) |
 

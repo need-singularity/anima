@@ -12,7 +12,7 @@ bench --verify에서 3가지 개선점을 해결:
 ### Fix 1: ConsciousnessEngine에 cell_identity 추가 (Law 91b)
 
 ```python
-# consciousness_engine.py __init__()
+# rust/consciousness.hexa __init__()
 # 직교 초기화로 최대 다양성 보장 (max_cells 크기로 선할당)
 if hidden_dim >= max_cells:
     q, _ = torch.linalg.qr(torch.randn(hidden_dim, max_cells))
@@ -160,7 +160,7 @@ phi_maintain: 80% → 70% (disconnect 후 자연스러운 하락 허용)
 ### Fix 9: ConsciousnessEngine oscillating debate + adaptive identity
 
 ```
-consciousness_engine.py step()에 추가:
+rust/consciousness.hexa step()에 추가:
   - Oscillating global perturbation (sin wave)
   - Adaptive identity injection (수렴 시 강도↑)
   - Per-cell input diversification (identity modulates input)
@@ -188,5 +188,5 @@ HIVEMIND            ?/11       10/11    10/11    11/11 *
 
 ## 변경 파일
 
-- `consciousness_engine.py`: cell_identity, soft ratchet, adaptive injection, oscillation, random coupling, debate
-- `bench.py`: _CEAdapter (breathing, coupling perturbation, force amplification), adaptive cell_identity, consensus 감지, HIVEMIND thresholds
+- `rust/consciousness.hexa`: cell_identity, soft ratchet, adaptive injection, oscillation, random coupling, debate
+- `ready/anima/tests/tests.hexa`: _CEAdapter (breathing, coupling perturbation, force amplification), adaptive cell_identity, consensus 감지, HIVEMIND thresholds

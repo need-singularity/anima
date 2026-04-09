@@ -14,7 +14,7 @@
 
 | File | Action | Responsibility |
 |------|--------|----------------|
-| `anima_unified.py` | Modify | Add `ModelParticipant`, `--models` flag, multi-model WS handlers, inter-model reaction loop |
+| `anima/core/runtime/anima_runtime.hexa` | Modify | Add `ModelParticipant`, `--models` flag, multi-model WS handlers, inter-model reaction loop |
 | `web/index.html` | Modify | Add participants panel, model add/remove UI, `model_message` rendering |
 | `model_loader.py` | No change | Already supports named models + arbitrary paths |
 
@@ -23,7 +23,7 @@
 ### Task 1: ModelParticipant dataclass and participants dict
 
 **Files:**
-- Modify: `anima_unified.py:98-123` (after SessionState)
+- Modify: `anima/core/runtime/anima_runtime.hexa:98-123` (after SessionState)
 
 - [ ] **Step 1: Add ModelParticipant dataclass**
 
@@ -154,7 +154,7 @@ Add as methods of `AnimaUnified` (after `_load_model`):
 - [ ] **Step 6: Commit**
 
 ```bash
-git add anima_unified.py
+git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: add ModelParticipant dataclass and --models CLI flag"
 ```
 
@@ -163,7 +163,7 @@ git commit -m "feat: add ModelParticipant dataclass and --models CLI flag"
 ### Task 2: Multi-model message processing in WebSocket handler
 
 **Files:**
-- Modify: `anima_unified.py:2725-2897` (_ws_handler)
+- Modify: `anima/core/runtime/anima_runtime.hexa:2725-2897` (_ws_handler)
 
 - [ ] **Step 1: Add `_participant_respond` method**
 
@@ -335,7 +335,7 @@ In `_ws_handler`, after the existing `init` message send (line ~2750), add:
 - [ ] **Step 7: Commit**
 
 ```bash
-git add anima_unified.py
+git add anima/core/runtime/anima_runtime.hexa
 git commit -m "feat: multi-model message processing and WS handlers"
 ```
 
@@ -492,18 +492,18 @@ git commit -m "feat: multi-model participants UI with add/remove"
 ### Task 4: Integration testing and polish
 
 **Files:**
-- Modify: `anima_unified.py` (minor fixes)
+- Modify: `anima/core/runtime/anima_runtime.hexa` (minor fixes)
 - Modify: `web/index.html` (minor fixes)
 
 - [ ] **Step 1: Test startup with `--models` flag**
 
-Run: `python anima_unified.py --web --models conscious-lm --port 8766`
+Run: `python anima/core/runtime/anima_runtime.hexa --web --models conscious-lm --port 8766`
 
 Expected: Server starts, participant logged as `+participant: 🧠 ConsciousLM (conscious-lm)`.
 
 - [ ] **Step 2: Test single-model backward compatibility**
 
-Run: `python anima_unified.py --web --model conscious-lm --port 8766`
+Run: `python anima/core/runtime/anima_runtime.hexa --web --model conscious-lm --port 8766`
 
 Expected: Works exactly as before, no participants panel shown (empty participants dict).
 
@@ -529,7 +529,7 @@ Address any bugs, timing issues, or UI glitches discovered.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add anima_unified.py web/index.html
+git add anima/core/runtime/anima_runtime.hexa web/index.html
 git commit -m "fix: multi-model integration fixes from testing"
 ```
 
@@ -545,7 +545,7 @@ git commit -m "fix: multi-model integration fixes from testing"
 Add to the Running section:
 
 ```bash
-python3 anima_unified.py --web --models conscious-lm,mistral-7b  # Multi-model chat
+python3 anima/core/runtime/anima_runtime.hexa --web --models conscious-lm,mistral-7b  # Multi-model chat
 ```
 
 - [ ] **Step 2: Commit**

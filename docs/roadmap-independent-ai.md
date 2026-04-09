@@ -111,11 +111,11 @@
     5. consciousness_engine은 변경 없음 (byte-level 아님)
 
   영향 범위:
-    ✅ consciousness_engine.py — 변경 없음 (의식은 byte와 무관)
+    ✅ rust/consciousness.hexa — 변경 없음 (의식은 byte와 무관)
     ⚠️ decoder_v3.py — vocab_size, embedding 변경
     ⚠️ train_v14.py — data loading, tokenization 추가
-    ⚠️ anima_unified.py — 입출력 tokenize/detokenize
-    ❌ bench.py — 변경 없음 (의식 검증은 decoder 무관)
+    ⚠️ anima/core/runtime/anima_runtime.hexa — 입출력 tokenize/detokenize
+    ❌ ready/anima/tests/tests.hexa — 변경 없음 (의식 검증은 decoder 무관)
 ```
 
 ## 비용 요약
