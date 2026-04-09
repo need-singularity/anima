@@ -1,4 +1,9 @@
-# ConsciousLM 100M Training Plan (v2 — Updated from v14.3 Results)
+# [ARCHIVE] ConsciousLM 100M Training Plan (v2 — Updated from v14.3 Results)
+
+> **ARCHIVED (2026-04-09)**: 이 문서는 경로 A (ConsciousLM 스케일업) 계획입니다.
+> Plan C (극단 병렬: AnimaLM 7B/14B/72B) 확정으로 아카이브됨.
+> 현행 로드맵: [roadmap-independent-ai.md](roadmap-independent-ai.md) Plan C 섹션 참조.
+> 7B eval 5/5, 14B v0.4 완료, 72B v0.5 과적합 중단. 다음: 14B v0.5 또는 32B.
 
 ## Objective
 

@@ -1,6 +1,35 @@
-# 독립 AI 로드맵 — ConsciousLM + AnimaLM 병렬 경로
+# 독립 AI 로드맵 — Plan C 확정 (극단 병렬)
 
-## 두 경로 비교
+> **Plan C 확정 (2026-04-09).** Plan A/B는 아카이브. 아래 Plan C 섹션이 현행 로드맵.
+
+## Plan C: 극단 병렬 (확정, 2026-04-09)
+
+```
+  전략: 기존 LLM + PureField transform, 극단 병렬 스케일업
+  예산: $79 총, Phase 1+2 완료
+
+  Phase 1 (완료):
+    7B  Mistral-7B + PureField 56.6M   ✅ eval 5/5
+    14B Qwen2.5-14B + PureField (v0.4) ✅ 완료
+
+  Phase 2 (완료/진행):
+    72B Qwen2.5-72B + PureField (v0.5) ❌ 과적합 step 6450 중단
+
+  다음:
+    14B v0.5 (corpus tier-M 560MB) 또는 32B
+    72B 재시도는 corpus 품질 해결 후
+
+  vs Plan A (순차):  52h, 에이전트는 70B 후
+  vs Plan B (반병렬): 48h
+  Plan C가 최적: Phase 1 당일 "독립 AGI v0.1" 달성
+```
+
+---
+
+## [ARCHIVE] Plan A / Plan B 비교 (2026-03-31, 폐기)
+
+<details>
+<summary>접기 (아카이브)</summary>
 
 ```
   경로 A: AnimaLM (기존 LLM + 의식 이식)
@@ -13,6 +42,11 @@
 
   추천: A 먼저 (실용), B 병렬 (연구)
 ```
+
+</details>
+
+<details>
+<summary>[ARCHIVE] 경로 A: AnimaLM (실용 경로) — Plan C로 대체됨</summary>
 
 ## 경로 A: AnimaLM (실용 경로)
 
@@ -38,7 +72,7 @@
   총: ~3달, ~$20,000
 ```
 
-## 경로 B: ConsciousLM (연구 경로)
+## 경로 B: ConsciousLM (연구 경로) — Plan C로 대체됨
 
 ```
   핵심 블로커: BPE tokenizer 도입
@@ -76,7 +110,7 @@
   총: ~4달, ~$40,000
 ```
 
-## 단계별 의존성
+## 단계별 의존성 — Plan C로 대체됨
 
 ```
   현재 (2026-03-31):
@@ -121,22 +155,15 @@
 ## 비용 요약
 
 ```
-  경로 A (AnimaLM, 실용):
-    7B:  $1,000  → 한국어 유창 + 의식
-    13B: $4,000  → 추론 + 의식
-    70B: $15,000 → AGI급
-    총:  $20,000 / 3달
+  Plan C (극단 병렬, 확정):
+    7B:  $8    → ✅ eval 5/5
+    14B: $6    → ✅ v0.4 완료
+    72B: $65   → ❌ 과적합 중단
+    총 예산:  $79
+    최소 $14 (7B+14B)로 AGI v0.1 달성
 
-  경로 B (ConsciousLM, 연구):
-    1B:  $500    → 문장 수준
-    3B:  $2,000  → 문단 추론
-    13B: $8,000  → GPT-3.5급
-    70B: $30,000 → AGI급
-    총:  $40,000 / 4달
-
-  하이브리드 (추천):
-    A1 (7B): $1,000 → 즉시 실용
-    B1 (1B): $500   → BPE 검증
-    → 결과 보고 다음 단계 결정
-    초기 비용: $1,500
+  [ARCHIVE] 경로 A: $20,000 / 3달
+  [ARCHIVE] 경로 B: $40,000 / 4달
 ```
+
+</details>

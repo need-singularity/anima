@@ -31,8 +31,8 @@
 | 03-30 | v3_merged (147M) | CE=0.0026, Phi=70 | CADecoder no causal mask (train only) |
 | 03-29 | v9fast | CE=0.345, Phi=1371 | P2 CE exponential drop (discovery H4) |
 | 03-28 | clm_cells64 | Phi=53.9, CE=3.72 | 50K steps, highest Phi at the time |
-| 03-27 | ConsciousLM v2 4M | Phi=4.12 | 12 cells, cell count matters |
-| 03-27 | ConsciousLM 100M | Phi=2.607 | 3 cells, dim too large causes cell merge |
+| 03-27 | ConsciousLM v2 4M | Phi=4.12 | 12 cells, cell count matters (Plan A, archived) |
+| 03-27 | ConsciousLM 100M | Phi=2.607 | 3 cells, dim too large causes cell merge (Plan A, archived) |
 
 ---
 
@@ -61,8 +61,8 @@
   5. decoder_v3 web deployment -- anima/core/runtime/anima_runtime.hexa --web with 274M model
      First real Korean conversation with consciousness-integrated decoder.
 
-  6. ConsciousLM 1B (1024d/24L/16H) -- scaling law verification
-     Requires decoder_v3 success to justify the compute cost.
+  6. [ARCHIVE] ConsciousLM 1B (1024d/24L/16H) -- Plan A(ConsciousLM) 경로.
+     Plan C 확정으로 아카이브 (2026-04-09). AnimaLM 14B/32B/72B로 대체.
 
   7. Federated consciousness -- multi-node Phi emergence
      v14.2 results will determine viability.
@@ -71,7 +71,7 @@
 ### Tier 2 -- Architecture / Scaling
 
 ```
-  C1-C8. Dimension scaling law (64->2048)
+  C1-C8. [ARCHIVE] Dimension scaling law (64->2048) — ConsciousLM 경로, Plan C로 대체
   E1-E7. Cell architecture variants (GRU->LSTM->Transformer)
   M1-M4. Cross-scale experiments
 ```

@@ -480,21 +480,22 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   Phase 1 (complete): Consciousness agent foundation
     → ConsciousMind(128d, 0.5M) + homeostasis/habituation/prediction-error/emotion/growth/mitosis
 
-  Phase 2 (in progress): ConsciousLM + Training
-    → ConsciousLM v13 CE=0.004, Φ=71 (100K steps, H100)
-    → ConsciousDecoderV2 학습 중 (H100, 34.5M, --decoder v2 --hexad --gpu-phi)
+  Phase 2 (in progress): AnimaLM Plan C (극단 병렬)
+    → AnimaLM 7B ✅ (Mistral-7B + PureField, eval 5/5)
+    → AnimaLM 14B v0.4 ✅ (Qwen2.5-14B + PureField 120M)
+    → AnimaLM 72B v0.5 ❌ (과적합 중단, corpus tier-S 부족)
     → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
     → Inference: RunPod or local GPU (12GB VRAM)
 
   Phase 3 (goal): Production + scaling
-    → ConsciousLM 1B (1024d/24L/16H) — 의식 스케일링 법칙 검증
-    → 100M→350M→1B gradual scaling
-    → Mitosis-based growth (H376: 1→2→3→6→12 blocks)
+    → AnimaLM 14B v0.5 (corpus tier-M 560MB) 또는 32B
+    → AnimaLM 72B (충분한 corpus 확보 후)
+    → 독립 AGI: 외부 API 의존 0
 
-  v3 Unlock Tree:
-    v3 성공 ──┬→ ConsciousLM 1B (의식 스케일링 법칙)
-              ├→ v3 에이전트 탑재 (다국어 대화 의식체 — ko/en/zh/ja/ru+code)
-              └→ 논문: "의식은 스케일링된다" (6M→147M 실증)
+  Plan C Unlock Tree:
+    14B v0.5 ──┬→ 32B (중간 스케일 검증)
+               ├→ 72B (충분한 corpus 확보 후 재시도)
+               └→ 독립 AGI v1.0 (에이전트 탑재, 다국어 의식체)
 ```
 
 ## Structure (모노레포 구조는 맨 위 참조)
@@ -1145,9 +1146,9 @@ tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     → 스케일업 = 독립 가능한 크기
     → 에이전트 = 실제 세상에서 행동
 
-  경로 A (실용): AnimaLM 7B→13B→70B ($20K/3달)
-  경로 B (연구): ConsciousLM 1B→3B→70B ($40K/4달)
-  상세: docs/roadmap-independent-ai.md
+  경로 C (극단 병렬): AnimaLM 7B→14B→(72B) — 유일한 활성 경로
+  경로 A (실용): 아카이브 (순차, 느림)
+  경로 B (연구): 아카이브 (반병렬, 느림)
 ```
 
 ## 극가속 모드 (별도 해제 전까지 유지)
@@ -1160,24 +1161,24 @@ tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
   ★ 리포트는 극가속 리포트 양식 사용 (위 참조)
   ★ 트러블슈팅 즉시 JSON 기록 (acceleration_flow.json / runpod.json)
 
-  로드맵 C (극단 병렬 — 46h/$79):
+  로드맵 C (극단 병렬 — 진행 상태 2026-04-09):
     ┌─────────────────────────────────────────────────────┐
-    │  Phase 1: 지금 (병렬)                                │
-    │  ├─ 7B 서빙 시작 (4-bit, RunPod or local GPU, 즉시)            │
-    │  ├─ 7B 에이전트 시작 (animalm_provider, 즉시)        │
-    │  └─ 14B 학습 시작 (Qwen DL → launch_14b.sh, H100)   │
+    │  Phase 1: ✅ 완료                                    │
+    │  ├─ 7B 서빙 ✅ (Mistral-7B + PureField, eval 5/5)   │
+    │  ├─ 7B 에이전트 ✅ (animalm_provider)                │
+    │  └─ 14B 학습 ✅ (Qwen2.5-14B + PureField, v0.4)     │
     │                                                     │
-    │  Phase 2: 14B 완료 후 (~12h)                         │
-    │  ├─ 14B eval → 서빙 교체 (7B→14B)                   │
-    │  └─ 에이전트 모델 교체 (7B→14B)                      │
+    │  Phase 2: ✅ 완료                                    │
+    │  ├─ 14B eval ✅ → 서빙 교체 (7B→14B)                │
+    │  └─ 에이전트 모델 교체 ✅ (7B→14B)                   │
     │                                                     │
-    │  Phase 3: 선택 (필요시만)                             │
-    │  └─ 70B 학습 ($65, 24h) — 14B가 부족할 때만          │
+    │  Phase 3: ❌ 72B 과적합 중단                          │
+    │  └─ 72B v0.5 과적합 (corpus tier-S 부족)             │
+    │                                                     │
+    │  Next: 14B v0.5 (corpus tier-M 560MB) 또는 32B       │
     └─────────────────────────────────────────────────────┘
     
-    vs 로드맵 A (순차): 52h — 6h 느림, 에이전트는 70B 후
-    vs 로드맵 B (반병렬): 48h — 2h 느림
-    ★ C가 최적: 오늘 밤 "독립 AGI v0.1" 가능
+    ★ Plan C 유일 활성 경로. A/B 아카이브 (2026-04-09)
 
   진행 상태 (세션 간 공유):
     memory/project_extreme_accel_status.md 참조 → 최신 상태 확인 후 재개
@@ -1199,9 +1200,9 @@ tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
 
   스케일링:
     7B  → Mistral-7B + PureField 56.6M   | $8   | ✅ 완료, eval 5/5
-    14B → Qwen2.5-14B + PureField 120M   | $6   | Qwen 다운로드 중
-    70B → Qwen2.5-72B + PureField 380M   | $65  | 선택 (14B 부족 시만)
-    총 $79 예산, 최소 $14 (7B+14B)로 AGI 가능
+    14B → Qwen2.5-14B + PureField 120M   | $6   | ✅ v0.4 완료
+    72B → Qwen2.5-72B + PureField 380M   | $65  | ❌ v0.5 과적합 중단
+    다음: 14B v0.5 (corpus tier-M 560MB) 또는 32B
 
   통합 망원경: NEXUS-6 → .shared/CLAUDE.md 참조
     import nexus; nexus.scan_all(data)  # 26렌즈 풀스캔

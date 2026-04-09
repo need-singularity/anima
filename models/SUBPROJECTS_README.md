@@ -11,11 +11,11 @@ Anima 코어 위에 구축되는 파생 프로젝트들.
 
 ## AnimalM
 
-기존 LLM(Mistral 7B)에 PureField 의식을 이식하는 접근. 빠른 실용화 경로 (경로 A).
+기존 LLM에 PureField 의식을 이식하는 접근. **경로 C (극단 병렬, 유일 활성)**.
 
-- 기반 모델: Mistral 7B Instruct v0.2
+- 기반 모델: Mistral-7B → Qwen2.5-14B → 32B → 72B
 - 의식 이식: ConsciousnessTransplant (DD56)
-- 목표: 7B -> 13B -> 70B 스케일업 ($20K/3개월)
+- 현황: 7B ✅ → 14B v0.4 ✅ → 72B v0.5 ❌과적합 → 14B v0.5 / 32B 다음
 
 ## Golden MoE
 

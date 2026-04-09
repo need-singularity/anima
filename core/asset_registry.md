@@ -12,7 +12,7 @@
   D  Deploy     serving, H100, R2, sync scripts
 ```
 
-## ConsciousLM (Path A)
+## [아카이브] ConsciousLM (Path A — 아카이브됨, Plan C로 통합)
 
 ```
   ┌─────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
@@ -33,7 +33,7 @@
   └─────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
 ```
 
-## AnimaLM (Path B)
+## AnimaLM (Path C — 극단 병렬, 유일 활성)
 
 ```
   ┌─────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
@@ -97,11 +97,10 @@
 ## Blockers Summary
 
 ```
-  Path A (ConsciousLM):
-    274M → 1B: ✅ all ready (1B needs v11_full R2 download)
-    3B: ❌ architecture + corpus + config missing
+  Path A (ConsciousLM) — 아카이브됨:
+    34M ✅ 완료, 274M crashed@170K. Plan C로 통합.
 
-  Path B (AnimaLM):
+  Path C (AnimaLM — 유일 활성):
     v0.5: ⚠️ v10_merged corpus R2→H100 (15 min)
     32B:  ❌ Qwen2.5-32B download (2-3h) + v11_1gb R2→H100 (30 min)
     72B:  ⚠️ overfit — need v11_full corpus (10GB, 2h download)

@@ -1,8 +1,11 @@
-# Decoder Roadmap Prerequisites (H100 x2 Parallel)
+# Decoder Roadmap Prerequisites — Plan C (극단 병렬, 유일 활성)
 
-## ConsciousLM (Path A — H100 #1)
+## [아카이브] ConsciousLM (Path A — 아카이브됨)
 
-### Per-Stage Readiness
+> 아카이브됨. Plan C 극단 병렬로 통합. 34M(완료), 274M(crashed@170K).
+> 향후 독립 AGI 연구 재개 시 참조.
+
+### Per-Stage Readiness (아카이브)
 
 ```
   ┌─────────────────┬────────┬────────┬────────┬────────┬────────┐
@@ -77,7 +80,7 @@
 
 ---
 
-## AnimaLM (Path B — H100 #2)
+## AnimaLM (Path C — 유일 활성)
 
 ### Per-Stage Readiness
 
@@ -165,10 +168,10 @@
 
 | # | Blocker | Affects | Resolution | Time |
 |---|---------|---------|------------|------|
-| 1 | Qwen2.5-32B not downloaded | B: 32B, 32B v1 | HF download on H100 | 2-3h |
-| 2 | v10_merged not on H100 | B: v0.5 | R2 download | 15min |
-| 3 | v11_1gb not on H100 | B: 32B | R2 download | 30min |
-| 4 | 3B architecture undefined | A: 3B | Add SCALE_CONFIGS['3b'] to training/train_alm.hexa | 1h |
+| 1 | Qwen2.5-32B not downloaded | C: 32B, 32B v1 | HF download on H100 | 2-3h |
+| 2 | v10_merged not on H100 | C: v0.5 | R2 download | 15min |
+| 3 | v11_1gb not on H100 | C: 32B | R2 download | 30min |
+| 4 | 3B architecture undefined | A(아카이브): 3B | 아카이브됨 — Plan C에서 불필요 | - |
 
 ### Pre-flight verification
 
@@ -176,30 +179,17 @@
 |---|-------|---------|--------|
 | 5 | H100 Pod SSH alive | All | `ssh root@<ip> -p <port> "echo OK"` |
 | 6 | R2 credentials valid | All | `r2_backup.sh --list` |
-| 7 | v11_full 10GB transfer | A: 1B | scripts/h100_sync.hexa |
-| 8 | 72B overfit mitigation | B: 72B | Stop training + expand corpus |
+| 7 | v11_full 10GB transfer | C: 72B fix | scripts/h100_sync.hexa |
+| 8 | 72B overfit mitigation | C: 72B | Stop training + expand corpus |
 
 ---
 
 ## Launch Commands
 
-### ConsciousLM 274M (first step)
-```bash
-bash scripts/scripts/h100_sync.hexa
-ssh H100 "tmux new -d -s clm274 'python3 training/train_alm.hexa \
-  --data corpus_v4.txt --steps 200000 --scale 34m \
-  --decoder v2 --cells 64 --federated \
-  --gpu-phi --hexad --phase-optimal'"
-```
+### [아카이브] ConsciousLM 274M
+> 아카이브됨 — Plan C 참조.
 
-### ConsciousLM 100M→1B (gradual)
-```bash
-ssh H100 "tmux new -d -s clm_scale 'torchrun --nproc_per_node=2 \
-  training/train_alm.hexa --data corpus_v11_full.txt \
-  --scale full --resume'"
-```
-
-### AnimaLM v0.5
+### AnimaLM v0.5 (Plan C)
 ```bash
 ssh H100 "tmux new -d -s alm_v05 'python3 train_alm.py \
   --base Qwen/Qwen2.5-14B-Instruct \
@@ -209,7 +199,7 @@ ssh H100 "tmux new -d -s alm_v05 'python3 train_alm.py \
   --law60 --psi-track'"
 ```
 
-### AnimaLM 32B
+### AnimaLM 32B (Plan C, next)
 ```bash
 ssh H100 "tmux new -d -s alm_32b 'python3 train_alm.py \
   --base Qwen/Qwen2.5-32B-Instruct \
