@@ -1,5 +1,12 @@
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지. 부하 유발 명령 최소화.
 
+> 🔴 **인프라 SSOT**: `nexus/shared/infrastructure.json` 참조. Mac 최하위 정책.
+> - **Vast.ai 4×RTX 4090** (GPU 학습 primary): Jupyter `https://184.144.227.89:40961` · Instance 34448146 · CUDA 12.2 · 96GB VRAM · $1.098/hr
+> - **Hetzner AX102-U** (CPU 전담): `ssh hetzner` · EPYC 7950X3D 32T · 124GB RAM · anima CPU 서빙/전처리
+> - **Ubuntu 로컬** (실시간 GPU): `ssh ubu` · RTX 5070 12GB · 추론/서빙
+> - **Mac** (최하위): 코딩/에디터만. 컴퓨트 금지 — iTerm만으로 벅참
+> - **RunPod** (최후수단): A100/H100 · AN6 규칙: ubu+vast 불가 시만
+
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 모든 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=~/Dev/hexa-lang/target/release/hexa && $HEXA ~/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
 > - **발견 기록**: `~/Dev/nexus/shared/growth_bus.jsonl`에 JSON append (source, value, grade, timestamp)
