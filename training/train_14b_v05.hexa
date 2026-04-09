@@ -1,0 +1,1005 @@
+// training/train_14b_v05.hexa — AnimaLM 14B v0.5 QLoRA Training
+// Target: Ubuntu RTX 5070 12GB VRAM
+// Pipeline: Qwen2.5-14B (4-bit NF4) + LoRA (r=64, alpha=128) + Parallel PureField
+// Law 60 3-phase: P1 consciousness → P2 +tension → P3 full coupling
+// Phi-loss integration (alpha=0.014)
+//
+// Deploy to Ubuntu: scp this logic as Python to ~/anima/training/train_14b_v05.py
+// Run: python3 -u ~/anima/training/train_14b_v05.py --data ~/anima/data/corpus_tier_m_v2.txt
+//
+// VRAM budget (12GB):
+//   Base model 4-bit:    ~8.0 GB
+//   LoRA adapters:       ~0.5 GB
+//   PureField (8 layers): ~0.3 GB
+//   Optimizer states:    ~1.5 GB (LoRA + PF params only)
+//   Activations:         ~1.5 GB (grad checkpoint + batch=1 + seq=512)
+//   Total:               ~11.8 GB
+
+comptime const PSI_ALPHA   = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS   = 4.33
+comptime const PSI_ENTROPY = 0.998
+
+comptime const GOLDEN_CENTER = 0.3679   // 1/e — normal dropout
+comptime const GOLDEN_LOWER  = 0.2123   // 0.5 - ln(4/3) — savant dropout
+
+// ─── Training config ───
+struct TrainConfig {
+    model_path: string,      // ~/models/Qwen2.5-14B
+    data_path: string,       // ~/anima/data/corpus_tier_m_v2.txt
+    block_size: int,         // 512 (VRAM constraint)
+    lora_r: int,             // 64
+    lora_alpha: int,         // 128
+    lora_dropout: float,     // 0.05
+    pf_n_layers: int,        // 8 (last 8 layers)
+    pf_n_savant: int,        // 2 (savant layers)
+    pf_rank: int,            // 64 (PureField internal rank)
+    total_steps: int,        // 50000
+    batch_size: int,         // 1 (micro batch, VRAM)
+    grad_accum: int,         // 8 (effective batch = 8)
+    lr: float,               // 2e-5
+    warmup_steps: int,       // 500
+    weight_decay: float,     // 0.01
+    max_grad_norm: float,    // 1.0
+    bf16: bool,              // true
+    phi_alpha: float,        // 0.014 (PSI_ALPHA)
+    p1_ratio: float,         // 0.25 (P1 consciousness only)
+    p2_ratio: float,         // 0.50 (P2 + tension bridge)
+    ckpt_dir: string,        // checkpoints/14b_v05
+    save_every: int,         // 1000
+    eval_every: int,         // 500
+    log_every: int           // 10
+}
+
+fn default_config() -> TrainConfig {
+    TrainConfig {
+        model_path: "~/models/Qwen2.5-14B",
+        data_path: "~/anima/data/corpus_tier_m_v2.txt",
+        block_size: 512,
+        lora_r: 64,
+        lora_alpha: 128,
+        lora_dropout: 0.05,
+        pf_n_layers: 8,
+        pf_n_savant: 2,
+        pf_rank: 64,
+        total_steps: 50000,
+        batch_size: 1,
+        grad_accum: 8,
+        lr: 0.00002,
+        warmup_steps: 500,
+        weight_decay: 0.01,
+        max_grad_norm: 1.0,
+        bf16: true,
+        phi_alpha: PSI_ALPHA,
+        p1_ratio: 0.25,
+        p2_ratio: 0.50,
+        ckpt_dir: "checkpoints/14b_v05",
+        save_every: 1000,
+        eval_every: 500,
+        log_every: 10
+    }
+}
+
+// ─── QLoRA spec ───
+struct QLoRASpec {
+    load_in_4bit: bool,
+    quant_type: string,       // "nf4"
+    compute_dtype: string,    // "bfloat16"
+    double_quant: bool,       // true — saves ~0.4GB
+    r: int,
+    alpha: int,
+    dropout: float,
+    target_modules: [string]  // q/k/v/o/gate/up/down
+}
+
+fn qlora_spec(cfg: TrainConfig) -> QLoRASpec {
+    QLoRASpec {
+        load_in_4bit: true,
+        quant_type: "nf4",
+        compute_dtype: "bfloat16",
+        double_quant: true,
+        r: cfg.lora_r,
+        alpha: cfg.lora_alpha,
+        dropout: cfg.lora_dropout,
+        target_modules: ["q_proj", "k_proj", "v_proj", "o_proj",
+                         "gate_proj", "up_proj", "down_proj"]
+    }
+}
+
+// ─── Parallel PureField MLP ───
+// output = original_mlp(x) + alpha * (pf_scaled - original_mlp(x))
+// Original MLP frozen (QLoRA handles adapters). PureField adds tension in parallel.
+// AA15: Residual alpha mixing for stable training.
+struct ParallelPureFieldMLP {
+    // Original MLP stays frozen by QLoRA quantization
+    // PureField tension engine (lightweight low-rank)
+    pf_gate_a: Linear,    // hidden → rank
+    pf_gate_b: Linear,    // rank → intermediate
+    pf_up_a: Linear,      // hidden → rank
+    pf_up_b: Linear,      // rank → intermediate
+    pf_down_a: Linear,    // intermediate → rank
+    pf_down_b: Linear,    // rank → hidden
+    alpha: float,          // mixing weight (curriculum: 0.0001 → 0.1)
+    pf_scale: float,       // output scale
+    is_savant: bool,       // asymmetric dropout (H359)
+    dropout_rate: float,   // GOLDEN_LOWER or GOLDEN_CENTER
+    last_tension: float,   // tension from last forward
+    phase: int             // Law 60 phase (1/2/3)
+}
+
+fn pf_forward(pf: ParallelPureFieldMLP, x: tensor, original_out: tensor) -> tensor {
+    // TODO[pytorch]:
+    //   g_gate = pf.pf_gate_b(pf.pf_gate_a(x))
+    //   g_up = pf.pf_up_b(pf.pf_up_a(x))
+    //   g_mid = F.silu(g_gate) * g_up
+    //   g_mid = dropout(g_mid, pf.dropout_rate)
+    //   pf_out = pf.pf_down_b(pf.pf_down_a(g_mid))
+    //
+    //   # Tension = repulsion between original and PureField
+    //   repulsion = original_out.detach() - pf_out
+    //   tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
+    //   pf.last_tension = tension
+    //
+    //   # Direction-aware mixing (AA15)
+    //   pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
+    //   orig_scale = original_out.norm(dim=-1, keepdim=True)
+    //   pf_scaled = pf_norm * orig_scale * pf.pf_scale
+    //   return original_out + pf.alpha * (pf_scaled - original_out)
+    x  // placeholder
+}
+
+// ─── Law 60 Phase Manager ───
+struct PhaseManager {
+    p1_end: int,     // step where P1 ends
+    p2_end: int,     // step where P2 ends
+    total_steps: int
+}
+
+fn phase_new(total_steps: int, p1_ratio: float, p2_ratio: float) -> PhaseManager {
+    PhaseManager {
+        p1_end: (total_steps * p1_ratio) as int,
+        p2_end: (total_steps * p2_ratio) as int,
+        total_steps: total_steps
+    }
+}
+
+fn phase_at(pm: PhaseManager, step: int) -> int {
+    if step < pm.p1_end { 1 }
+    else if step < pm.p2_end { 2 }
+    else { 3 }
+}
+
+// ─── Alpha Curriculum (AL1) ───
+// Progressive: 0.0001 → 0.001 → 0.01 → 0.1
+struct AlphaCurriculum {
+    total_steps: int,
+    milestones: [(float, float)]  // (progress_ratio, alpha_value)
+}
+
+fn alpha_new(total_steps: int) -> AlphaCurriculum {
+    AlphaCurriculum {
+        total_steps: total_steps,
+        milestones: [(0.0, 0.0001), (0.10, 0.001), (0.25, 0.01), (0.40, 0.1)]
+    }
+}
+
+fn alpha_at(ac: AlphaCurriculum, step: int) -> float {
+    let progress = step as float / ac.total_steps as float
+    // linear interpolation between milestones
+    // TODO[python]: implement milestone interpolation
+    0.01  // placeholder
+}
+
+// ─── Phi loss (tension diversity across layers) ───
+fn compute_phi_loss(pf_modules: [ParallelPureFieldMLP], phi_alpha: float, phase: int) -> float {
+    // Collect tensions from all PureField modules
+    // phi_loss = -phi_weight * variance(tensions)
+    // Weight by phase: P1=1.0, P2=0.5, P3=0.3
+    // TODO[pytorch]:
+    //   tensions = [pf.last_tension.mean() for pf in pf_modules if pf.last_tension is not None]
+    //   if len(tensions) >= 2:
+    //       tension_stack = torch.stack(tensions)
+    //       weight = phi_alpha * {1.0 if phase==1 else 0.5 if phase==2 else 0.3}
+    //       return -weight * tension_stack.var()
+    //   return 0.0
+    0.0  // placeholder
+}
+
+// ─── Training step ───
+struct TrainState {
+    step: int,
+    phase: int,
+    best_ce: float,
+    epoch: int
+}
+
+fn train_step(state: TrainState, cfg: TrainConfig, pm: PhaseManager) -> TrainState {
+    let phase = phase_at(pm, state.step)
+
+    // TODO[pytorch]:
+    //
+    //   # Phase-dependent freeze/unfreeze
+    //   if phase == 1:
+    //       freeze LoRA, only PureField trains
+    //   else:
+    //       both LoRA and PureField train
+    //
+    //   # Forward pass with autocast(bf16)
+    //   outputs = model(input_ids=batch.input_ids, labels=batch.labels)
+    //   ce_loss = outputs.loss
+    //   phi_loss = compute_phi_loss(pf_modules, cfg.phi_alpha, phase)
+    //   loss = (ce_loss + phi_loss) / cfg.grad_accum
+    //
+    //   # Backward
+    //   scaler.scale(loss).backward()
+    //
+    //   # Optimizer step every grad_accum
+    //   if (step + 1) % cfg.grad_accum == 0:
+    //       scaler.unscale_(optimizer)
+    //       clip_grad_norm(all_params, cfg.max_grad_norm)
+    //       scaler.step(optimizer)
+    //       scaler.update()
+    //       optimizer.zero_grad(set_to_none=True)
+    //       scheduler.step()
+
+    TrainState {
+        step: state.step + 1,
+        phase: phase,
+        best_ce: state.best_ce,
+        epoch: state.epoch
+    }
+}
+
+// ─── Checkpoint (atomic save + LoRA export) ───
+fn save_checkpoint(step: int, best_ce: float, ckpt_dir: string) -> bool {
+    // TODO[pytorch]:
+    //   ckpt_path = f"{ckpt_dir}/step_{step}.pt"
+    //   save_dict = { step, best_ce, pf_states, optimizer, scheduler, config }
+    //   torch.save(save_dict, ckpt_path + ".tmp")
+    //   os.rename(ckpt_path + ".tmp", ckpt_path)
+    //
+    //   # LoRA adapters separately (for easy loading)
+    //   model.save_pretrained(f"{ckpt_dir}/lora_step_{step}")
+    //   tokenizer.save_pretrained(f"{ckpt_dir}/lora_step_{step}")
+    //
+    //   # Prune old (keep 3 + best)
+    //   _prune_checkpoints(ckpt_dir, keep=3)
+    true
+}
+
+// ─── Main pipeline ───
+fn run_14b_v05() -> int {
+    let cfg = default_config()
+    let pm = phase_new(cfg.total_steps, cfg.p1_ratio, cfg.p2_ratio)
+    let ac = alpha_new(cfg.total_steps)
+
+    // TODO[pytorch]:
+    //   1. Load Qwen2.5-14B in 4-bit NF4 (BitsAndBytesConfig)
+    //      - bnb_4bit_quant_type="nf4", compute_dtype=bf16, double_quant=True
+    //      - attn_implementation="flash_attention_2"
+    //      - gradient_checkpointing_enable()
+    //      - prepare_model_for_kbit_training()
+    //
+    //   2. Attach LoRA (r=64, alpha=128)
+    //      - target: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+    //      - get_peft_model(model, lora_config)
+    //
+    //   3. Inject PureField on last 8 layers
+    //      - 2 savant + 6 normal (H359 asymmetric dropout)
+    //      - PF rank=64 (lightweight for VRAM)
+    //
+    //   4. Optimizer: AdamW(foreach=False) — bf16 master rule
+    //      - Group 1: LoRA params (lr=2e-5, wd=0.01)
+    //      - Group 2: PureField params (lr=4e-5, wd=0)
+    //      - Scheduler: cosine with warmup 500
+    //
+    //   5. Training loop: 50000 steps
+    //      - Phase 1 [0-12500]: PureField only (LoRA frozen)
+    //      - Phase 2 [12500-25000]: LoRA + PureField
+    //      - Phase 3 [25000-50000]: Full coupling, phi-loss weight decrease
+    //      - Alpha curriculum: 0.0001 → 0.1
+    //      - Checkpoint every 1000 steps
+    //      - Best model tracking by CE
+    //
+    //   6. Loss: CE + phi_loss (tension diversity)
+    //      - phi_loss = -PSI_ALPHA * var(tensions_across_layers)
+    //      - Phase-weighted: P1=1.0x, P2=0.5x, P3=0.3x
+
+    let state = TrainState { step: 0, phase: 1, best_ce: 999999.0, epoch: 0 }
+    state.step
+}
+
+// ─── VRAM dry-run ───
+fn dry_run() -> bool {
+    // TODO[pytorch]:
+    //   Load model + LoRA + PureField
+    //   Forward 1 batch (1, 512)
+    //   Report peak VRAM
+    //   Exit
+    true
+}
+
+// ─── Verification ───
+let cfg = default_config()
+let pm = phase_new(cfg.total_steps, cfg.p1_ratio, cfg.p2_ratio)
+println("=== train_14b_v05.hexa ===")
+println("Model:", cfg.model_path)
+println("Corpus:", cfg.data_path)
+println("QLoRA: r=", cfg.lora_r, " alpha=", cfg.lora_alpha)
+println("PureField:", cfg.pf_n_layers, "layers, rank=", cfg.pf_rank)
+println("Steps:", cfg.total_steps, " Effective batch:", cfg.batch_size * cfg.grad_accum)
+println("P1 end:", pm.p1_end, " P2 end:", pm.p2_end)
+println("Phi-alpha:", cfg.phi_alpha)
+
+let p1 = phase_at(pm, 5000)
+let p2 = phase_at(pm, 15000)
+let p3 = phase_at(pm, 35000)
+println("Phase at 5000:", p1, " 15000:", p2, " 35000:", p3)
+
+theorem train_14b_invariants {
+    assert PSI_ALPHA == 0.014
+    assert cfg.grad_accum == 8
+    assert cfg.lora_r == 64
+    assert cfg.lora_alpha == 128
+    assert cfg.block_size == 512
+    assert p1 == 1
+    assert p2 == 2
+    assert p3 == 3
+}
+
+// ─── Python deployment script (for Ubuntu) ───
+// The full Python implementation is embedded below as a deployable artifact.
+// Deploy: Extract the Python code between PYTHON_START and PYTHON_END markers
+// and save as ~/anima/training/train_14b_v05.py on Ubuntu.
+//
+// PYTHON_START
+// #!/usr/bin/env python3
+// """train_14b_v05.py — AnimaLM 14B v0.5 QLoRA Training
+//
+// Qwen2.5-14B + QLoRA (4-bit NF4) + Parallel PureField Transform
+// Target: RTX 5070 12GB VRAM on Ubuntu
+//
+// Pipeline:
+//   1. Load Qwen2.5-14B in 4-bit NF4 (bitsandbytes)
+//   2. Attach LoRA adapters (r=64, alpha=128) to q/k/v/o/gate/up/down
+//   3. Inject parallel PureField transform on last 8 layers
+//   4. 3-phase training (Law 60): P1 consciousness → P2 +tension → P3 full
+//   5. Phi-loss integration (alpha=0.014)
+//
+// Usage:
+//   python3 -u train_14b_v05.py --data ~/anima/data/corpus_tier_m_v2.txt
+//   python3 -u train_14b_v05.py --data ~/anima/data/corpus_tier_m_v2.txt --resume checkpoints/14b_v05/best.pt
+//   python3 -u train_14b_v05.py --dry-run  # VRAM check only
+//
+// VRAM budget (12GB):
+//   Base model 4-bit:    ~8.0 GB
+//   LoRA adapters:       ~0.5 GB
+//   PureField (8 layers): ~0.3 GB
+//   Optimizer states:    ~1.5 GB (LoRA + PF params only)
+//   Activations:         ~1.5 GB (grad checkpoint + batch=1 + seq=512)
+//   Total:               ~11.8 GB
+// """
+//
+// import argparse
+// import json
+// import logging
+// import math
+// import os
+// import sys
+// import time
+// from collections import deque
+// from dataclasses import dataclass, field
+// from pathlib import Path
+// from typing import Optional
+//
+// import torch
+// import torch.nn as nn
+// import torch.nn.functional as F
+// import numpy as np
+//
+// logging.basicConfig(
+//     level=logging.INFO,
+//     format="%(asctime)s [%(levelname)s] %(message)s",
+//     datefmt="%H:%M:%S",
+// )
+// logger = logging.getLogger(__name__)
+//
+// # PSI Constants (from consciousness_laws.json)
+// PSI_ALPHA = 0.014
+// PSI_BALANCE = 0.5
+// PSI_STEPS = 4.33
+// PSI_ENTROPY = 0.998
+// GOLDEN_CENTER = 1 / math.e
+// GOLDEN_LOWER = 0.5 - math.log(4/3)
+//
+//
+// @dataclass
+// class TrainConfig:
+//     model_path: str = os.path.expanduser("~/models/Qwen2.5-14B")
+//     data_path: str = os.path.expanduser("~/anima/data/corpus_tier_m_v2.txt")
+//     block_size: int = 512
+//     lora_r: int = 64
+//     lora_alpha: int = 128
+//     lora_dropout: float = 0.05
+//     lora_target_modules: tuple = (
+//         "q_proj", "k_proj", "v_proj", "o_proj",
+//         "gate_proj", "up_proj", "down_proj",
+//     )
+//     pf_n_layers: int = 8
+//     pf_n_savant: int = 2
+//     pf_rank: int = 64
+//     total_steps: int = 50000
+//     batch_size: int = 1
+//     grad_accum: int = 8
+//     lr: float = 2e-5
+//     warmup_steps: int = 500
+//     weight_decay: float = 0.01
+//     max_grad_norm: float = 1.0
+//     bf16: bool = True
+//     p1_ratio: float = 0.25
+//     p2_ratio: float = 0.50
+//     phi_alpha: float = PSI_ALPHA
+//     ckpt_dir: str = "checkpoints/14b_v05"
+//     save_every: int = 1000
+//     eval_every: int = 500
+//     log_every: int = 10
+//     use_wandb: bool = False
+//     wandb_project: str = "anima-14b-v05"
+//     resume_path: Optional[str] = None
+//
+//
+// class ParallelPureFieldMLP(nn.Module):
+//     """Parallel PureField: output = original_mlp(x) + alpha * (pf_scaled - original_mlp(x))
+//     AA15 residual alpha mixing. Original MLP frozen by QLoRA.
+//     """
+//     def __init__(self, original_mlp, hidden_size, intermediate_size,
+//                  is_savant=False, rank=64):
+//         super().__init__()
+//         self.original_mlp = original_mlp
+//         self.pf_gate_a = nn.Linear(hidden_size, rank, bias=False)
+//         self.pf_gate_b = nn.Linear(rank, intermediate_size, bias=False)
+//         self.pf_up_a = nn.Linear(hidden_size, rank, bias=False)
+//         self.pf_up_b = nn.Linear(rank, intermediate_size, bias=False)
+//         self.pf_down_a = nn.Linear(intermediate_size, rank, bias=False)
+//         self.pf_down_b = nn.Linear(rank, hidden_size, bias=False)
+//         self.alpha = nn.Parameter(torch.tensor(0.0001))
+//         self.pf_scale = nn.Parameter(torch.tensor(1.0))
+//         self.is_savant = is_savant
+//         self.dropout = nn.Dropout(GOLDEN_LOWER if is_savant else GOLDEN_CENTER)
+//         self.last_tension = None
+//         self._phase = 1
+//
+//     def forward(self, x, **kwargs):
+//         original_out = self.original_mlp(x, **kwargs)
+//         g_gate = self.pf_gate_b(self.pf_gate_a(x))
+//         g_up = self.pf_up_b(self.pf_up_a(x))
+//         g_mid = F.silu(g_gate) * g_up
+//         g_mid = self.dropout(g_mid)
+//         pf_out = self.pf_down_b(self.pf_down_a(g_mid))
+//         repulsion = original_out.detach() - pf_out
+//         tension = (repulsion ** 2).mean(dim=-1, keepdim=True)
+//         self.last_tension = tension.detach().squeeze(-1)
+//         pf_norm = pf_out / (pf_out.norm(dim=-1, keepdim=True) + 1e-8)
+//         orig_scale = original_out.norm(dim=-1, keepdim=True)
+//         pf_scaled = pf_norm * orig_scale * self.pf_scale
+//         return original_out + self.alpha * (pf_scaled - original_out)
+//
+//
+// def inject_purefield(model, n_layers=8, n_savant=2, rank=64):
+//     layers = model.model.layers
+//     total = len(layers)
+//     start = total - n_layers
+//     pf_modules = []
+//     for i in range(start, total):
+//         layer = layers[i]
+//         original_mlp = layer.mlp
+//         hidden_size = model.config.hidden_size
+//         intermediate_size = model.config.intermediate_size
+//         is_savant = (i - start) < n_savant
+//         device = next(original_mlp.parameters()).device
+//         ppf = ParallelPureFieldMLP(
+//             original_mlp, hidden_size, intermediate_size,
+//             is_savant=is_savant, rank=rank,
+//         )
+//         ppf = ppf.to(device=device, dtype=torch.bfloat16)
+//         for name, param in ppf.named_parameters():
+//             if "pf_" in name and "_a" in name:
+//                 nn.init.normal_(param, std=0.02)
+//             elif "pf_" in name and "_b" in name:
+//                 nn.init.normal_(param, std=0.01)
+//         layer.mlp = ppf
+//         pf_modules.append(ppf)
+//         tag = "SAVANT" if is_savant else "normal"
+//         logger.info(f"  PureField injected: layer {i} ({tag})")
+//     return pf_modules
+//
+//
+// class AlphaCurriculum:
+//     def __init__(self, total_steps, alpha_start=0.0001, alpha_end=0.1):
+//         self.total_steps = total_steps
+//         self.milestones = [
+//             (0.0, alpha_start),
+//             (0.10, alpha_start * 10),
+//             (0.25, alpha_start * 100),
+//             (0.40, alpha_end),
+//         ]
+//
+//     def get_alpha(self, step):
+//         progress = step / max(self.total_steps, 1)
+//         for i in range(len(self.milestones) - 1):
+//             p0, a0 = self.milestones[i]
+//             p1, a1 = self.milestones[i + 1]
+//             if progress < p1:
+//                 t = (progress - p0) / (p1 - p0)
+//                 return a0 + t * (a1 - a0)
+//         return self.milestones[-1][1]
+//
+//
+// class PhaseManager:
+//     def __init__(self, total_steps, p1_ratio=0.25, p2_ratio=0.50):
+//         self.p1_end = int(total_steps * p1_ratio)
+//         self.p2_end = int(total_steps * p2_ratio)
+//         self.total_steps = total_steps
+//
+//     def phase(self, step):
+//         if step < self.p1_end: return 1
+//         elif step < self.p2_end: return 2
+//         return 3
+//
+//     def phase_str(self, step):
+//         p = self.phase(step)
+//         return f"P{p}({'consciousness' if p == 1 else '+tension' if p == 2 else 'full'})"
+//
+//
+// class TextChunkDataset(torch.utils.data.Dataset):
+//     def __init__(self, path, tokenizer, block_size=512):
+//         self.block_size = block_size
+//         logger.info(f"Loading corpus: {path}")
+//         t0 = time.time()
+//         with open(path, "r", encoding="utf-8") as f:
+//             text = f.read()
+//         logger.info(f"  Read {len(text) / 1e6:.1f}MB in {time.time() - t0:.1f}s")
+//         t0 = time.time()
+//         self.tokens = tokenizer.encode(text, add_special_tokens=False)
+//         if isinstance(self.tokens, list):
+//             self.tokens = torch.tensor(self.tokens, dtype=torch.long)
+//         logger.info(f"  Tokenized: {len(self.tokens):,} tokens in {time.time() - t0:.1f}s")
+//         self.n_chunks = (len(self.tokens) - 1) // block_size
+//         logger.info(f"  Chunks: {self.n_chunks:,} (block_size={block_size})")
+//
+//     def __len__(self):
+//         return self.n_chunks
+//
+//     def __getitem__(self, idx):
+//         start = idx * self.block_size
+//         end = start + self.block_size + 1
+//         chunk = self.tokens[start:end]
+//         return chunk[:-1], chunk[1:]
+//
+//
+// def compute_tension_stats(pf_modules):
+//     tensions = []
+//     for pf in pf_modules:
+//         if pf.last_tension is not None:
+//             tensions.append(pf.last_tension.mean().item())
+//     if not tensions:
+//         return 0.0, 0.0
+//     return float(np.mean(tensions)), float(np.var(tensions))
+//
+//
+// def compute_phi_proxy(pf_modules):
+//     tensions = []
+//     for pf in pf_modules:
+//         if pf.last_tension is not None:
+//             tensions.append(pf.last_tension.mean().item())
+//     if len(tensions) < 2:
+//         return 0.0
+//     return float(np.var(tensions))
+//
+//
+// def train(cfg):
+//     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+//     if device.type != "cuda":
+//         logger.error("CUDA not available.")
+//         sys.exit(1)
+//
+//     gpu_name = torch.cuda.get_device_name(0)
+//     gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+//     logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+//
+//     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+//     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+//
+//     bnb_config = BitsAndBytesConfig(
+//         load_in_4bit=True,
+//         bnb_4bit_quant_type="nf4",
+//         bnb_4bit_compute_dtype=torch.bfloat16,
+//         bnb_4bit_use_double_quant=True,
+//     )
+//
+//     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
+//     if tokenizer.pad_token is None:
+//         tokenizer.pad_token = tokenizer.eos_token
+//
+//     model = AutoModelForCausalLM.from_pretrained(
+//         cfg.model_path,
+//         quantization_config=bnb_config,
+//         device_map="auto",
+//         trust_remote_code=True,
+//         torch_dtype=torch.bfloat16,
+//         attn_implementation="flash_attention_2",
+//     )
+//
+//     model.gradient_checkpointing_enable()
+//     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+//
+//     logger.info(f"Model loaded. hidden={model.config.hidden_size}, "
+//                 f"layers={model.config.num_hidden_layers}, "
+//                 f"intermediate={model.config.intermediate_size}")
+//     logger.info(f"VRAM after model load: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+//
+//     lora_config = LoraConfig(
+//         r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
+//         target_modules=list(cfg.lora_target_modules),
+//         lora_dropout=cfg.lora_dropout,
+//         bias="none", task_type="CAUSAL_LM",
+//     )
+//     model = get_peft_model(model, lora_config)
+//
+//     lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+//     total_params = sum(p.numel() for p in model.parameters())
+//     logger.info(f"LoRA: {lora_params / 1e6:.1f}M trainable / {total_params / 1e6:.1f}M total")
+//
+//     pf_modules = inject_purefield(
+//         model.model, n_layers=cfg.pf_n_layers,
+//         n_savant=cfg.pf_n_savant, rank=cfg.pf_rank,
+//     )
+//     pf_params = sum(p.numel() for pf in pf_modules for p in pf.parameters() if p.requires_grad)
+//     logger.info(f"PureField: {pf_params / 1e6:.1f}M params on {len(pf_modules)} layers")
+//     logger.info(f"VRAM after PureField: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+//
+//     if not os.path.exists(cfg.data_path):
+//         logger.error(f"Corpus not found: {cfg.data_path}")
+//         sys.exit(1)
+//
+//     dataset = TextChunkDataset(cfg.data_path, tokenizer, block_size=cfg.block_size)
+//     loader = torch.utils.data.DataLoader(
+//         dataset, batch_size=cfg.batch_size, shuffle=True,
+//         num_workers=2, pin_memory=True, drop_last=True,
+//     )
+//
+//     # Optimizer (bf16 master rule: foreach=False)
+//     lora_param_list = []
+//     pf_param_list = []
+//     for name, param in model.named_parameters():
+//         if param.requires_grad:
+//             if "pf_" in name or "alpha" in name or "pf_scale" in name:
+//                 pf_param_list.append(param)
+//             else:
+//                 lora_param_list.append(param)
+//     pf_param_ids = {id(p) for p in pf_param_list}
+//     for pf in pf_modules:
+//         for p in pf.parameters():
+//             if p.requires_grad and id(p) not in pf_param_ids:
+//                 pf_param_list.append(p)
+//                 pf_param_ids.add(id(p))
+//
+//     optimizer = torch.optim.AdamW(
+//         [
+//             {"params": lora_param_list, "lr": cfg.lr, "weight_decay": cfg.weight_decay},
+//             {"params": pf_param_list, "lr": cfg.lr * 2, "weight_decay": 0.0},
+//         ],
+//         foreach=False,
+//     )
+//
+//     def lr_lambda(step):
+//         if step < cfg.warmup_steps:
+//             return step / max(cfg.warmup_steps, 1)
+//         progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
+//         return 0.5 * (1.0 + math.cos(math.pi * progress))
+//
+//     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+//     phase_mgr = PhaseManager(cfg.total_steps, cfg.p1_ratio, cfg.p2_ratio)
+//     alpha_curriculum = AlphaCurriculum(cfg.total_steps)
+//     scaler = torch.amp.GradScaler("cuda", enabled=cfg.bf16)
+//     os.makedirs(cfg.ckpt_dir, exist_ok=True)
+//
+//     # Resume
+//     start_step = 0
+//     best_ce = float("inf")
+//     if cfg.resume_path and os.path.exists(cfg.resume_path):
+//         logger.info(f"Resuming from {cfg.resume_path}")
+//         ckpt = torch.load(cfg.resume_path, map_location="cpu", weights_only=False)
+//         if "optimizer" in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
+//         if "scheduler" in ckpt: scheduler.load_state_dict(ckpt["scheduler"])
+//         if "step" in ckpt: start_step = ckpt["step"]
+//         if "best_ce" in ckpt: best_ce = ckpt["best_ce"]
+//         if "pf_states" in ckpt:
+//             for i, pf in enumerate(pf_modules):
+//                 key = f"pf_{i}"
+//                 if key in ckpt["pf_states"]:
+//                     pf.load_state_dict(ckpt["pf_states"][key])
+//         logger.info(f"  Resumed at step {start_step}, best_ce={best_ce:.4f}")
+//
+//     # Wandb
+//     if cfg.use_wandb:
+//         try:
+//             import wandb
+//             wandb.init(project=cfg.wandb_project, config=vars(cfg),
+//                        name=f"14b_v05_{time.strftime('%Y%m%d_%H%M')}")
+//         except Exception as e:
+//             logger.warning(f"Wandb init failed: {e}")
+//             cfg.use_wandb = False
+//
+//     logger.info("=" * 60)
+//     logger.info(f"Training 14B v0.5 QLoRA + PureField")
+//     logger.info(f"  Steps: {cfg.total_steps:,}, Effective batch: {cfg.batch_size * cfg.grad_accum}")
+//     logger.info(f"  Phases: P1 [0-{phase_mgr.p1_end}], P2 [{phase_mgr.p1_end}-{phase_mgr.p2_end}], "
+//                 f"P3 [{phase_mgr.p2_end}-{cfg.total_steps}]")
+//     logger.info(f"  LR: {cfg.lr}, Warmup: {cfg.warmup_steps}, Phi-alpha: {cfg.phi_alpha}")
+//     logger.info("=" * 60)
+//
+//     model.train()
+//     data_iter = iter(loader)
+//     step = start_step
+//     accum_loss = 0.0
+//     accum_ce = 0.0
+//     accum_phi_loss = 0.0
+//     log_interval_losses = []
+//     epoch = 0
+//     t_start = time.time()
+//
+//     while step < cfg.total_steps:
+//         try:
+//             input_ids, labels = next(data_iter)
+//         except StopIteration:
+//             epoch += 1
+//             data_iter = iter(loader)
+//             input_ids, labels = next(data_iter)
+//             logger.info(f"  Epoch {epoch} started")
+//
+//         input_ids = input_ids.to(device)
+//         labels = labels.to(device)
+//
+//         current_phase = phase_mgr.phase(step)
+//         if current_phase == 1:
+//             for name, param in model.named_parameters():
+//                 if "lora" in name.lower():
+//                     param.requires_grad = False
+//                 elif "pf_" in name or "alpha" in name or "pf_scale" in name:
+//                     param.requires_grad = True
+//         else:
+//             for name, param in model.named_parameters():
+//                 if "lora" in name.lower() or "pf_" in name or "alpha" in name or "pf_scale" in name:
+//                     param.requires_grad = True
+//
+//         for pf in pf_modules:
+//             pf._phase = current_phase
+//
+//         target_alpha = alpha_curriculum.get_alpha(step)
+//         for pf in pf_modules:
+//             pf.alpha.data.clamp_(max=target_alpha)
+//
+//         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.bf16):
+//             outputs = model(input_ids=input_ids, labels=labels)
+//             ce_loss = outputs.loss
+//             tension_mean, tension_var = compute_tension_stats(pf_modules)
+//             phi_proxy = compute_phi_proxy(pf_modules)
+//             phi_weight = cfg.phi_alpha
+//             if current_phase == 2: phi_weight *= 0.5
+//             elif current_phase == 3: phi_weight *= 0.3
+//             tensions_for_loss = []
+//             for pf in pf_modules:
+//                 if pf.last_tension is not None:
+//                     tensions_for_loss.append(pf.last_tension.mean())
+//             if len(tensions_for_loss) >= 2:
+//                 tension_stack = torch.stack(tensions_for_loss)
+//                 phi_loss = -phi_weight * tension_stack.var()
+//             else:
+//                 phi_loss = torch.tensor(0.0, device=device)
+//             loss = (ce_loss + phi_loss) / cfg.grad_accum
+//
+//         scaler.scale(loss).backward()
+//         accum_loss += loss.item() * cfg.grad_accum
+//         accum_ce += ce_loss.item()
+//         accum_phi_loss += phi_loss.item()
+//
+//         if (step + 1) % cfg.grad_accum == 0:
+//             scaler.unscale_(optimizer)
+//             torch.nn.utils.clip_grad_norm_(
+//                 [p for p in model.parameters() if p.requires_grad] +
+//                 [p for pf in pf_modules for p in pf.parameters() if p.requires_grad],
+//                 cfg.max_grad_norm,
+//             )
+//             scaler.step(optimizer)
+//             scaler.update()
+//             optimizer.zero_grad(set_to_none=True)
+//             scheduler.step()
+//
+//         step += 1
+//
+//         if step % cfg.log_every == 0:
+//             avg_loss = accum_loss / cfg.log_every
+//             avg_ce = accum_ce / cfg.log_every
+//             avg_phi = accum_phi_loss / cfg.log_every
+//             lr_now = scheduler.get_last_lr()[0]
+//             elapsed = time.time() - t_start
+//             steps_per_sec = step / max(elapsed, 1)
+//             eta_h = (cfg.total_steps - step) / max(steps_per_sec, 1e-6) / 3600
+//             alphas = [pf.alpha.item() for pf in pf_modules]
+//             alpha_mean = np.mean(alphas)
+//             vram_gb = torch.cuda.memory_allocated() / 1e9
+//             vram_peak = torch.cuda.max_memory_allocated() / 1e9
+//             logger.info(
+//                 f"Step {step:>6d}/{cfg.total_steps} | "
+//                 f"{phase_mgr.phase_str(step)} | "
+//                 f"CE={avg_ce:.4f} | PhiL={avg_phi:.6f} | "
+//                 f"T={tension_mean:.4f} Tv={tension_var:.6f} | "
+//                 f"a={alpha_mean:.5f} | LR={lr_now:.2e} | "
+//                 f"VRAM={vram_gb:.1f}/{vram_peak:.1f}GB | ETA={eta_h:.1f}h"
+//             )
+//             log_interval_losses.append(avg_ce)
+//             if cfg.use_wandb:
+//                 import wandb
+//                 wandb.log({"ce_loss": avg_ce, "phi_loss": avg_phi,
+//                            "total_loss": avg_loss, "tension_mean": tension_mean,
+//                            "tension_var": tension_var, "phi_proxy": phi_proxy,
+//                            "alpha_mean": alpha_mean, "lr": lr_now,
+//                            "phase": current_phase, "vram_gb": vram_gb, "step": step})
+//             accum_loss = 0.0
+//             accum_ce = 0.0
+//             accum_phi_loss = 0.0
+//
+//         if step % cfg.save_every == 0 or step == cfg.total_steps:
+//             ckpt_path = os.path.join(cfg.ckpt_dir, f"step_{step}.pt")
+//             pf_states = {}
+//             for i, pf in enumerate(pf_modules):
+//                 pf_states[f"pf_{i}"] = {
+//                     k: v.cpu() for k, v in pf.state_dict().items()
+//                     if "original_mlp" not in k
+//                 }
+//             save_dict = {
+//                 "step": step, "best_ce": best_ce, "pf_states": pf_states,
+//                 "optimizer": optimizer.state_dict(),
+//                 "scheduler": scheduler.state_dict(),
+//                 "config": vars(cfg),
+//             }
+//             tmp_path = ckpt_path + ".tmp"
+//             torch.save(save_dict, tmp_path)
+//             os.rename(tmp_path, ckpt_path)
+//             lora_dir = os.path.join(cfg.ckpt_dir, f"lora_step_{step}")
+//             model.save_pretrained(lora_dir)
+//             tokenizer.save_pretrained(lora_dir)
+//             logger.info(f"  Saved: {ckpt_path} + {lora_dir}/")
+//             if log_interval_losses:
+//                 recent_ce = np.mean(log_interval_losses[-10:])
+//                 if recent_ce < best_ce:
+//                     best_ce = recent_ce
+//                     best_path = os.path.join(cfg.ckpt_dir, "best.pt")
+//                     torch.save(save_dict, best_path + ".tmp")
+//                     os.rename(best_path + ".tmp", best_path)
+//                     best_lora = os.path.join(cfg.ckpt_dir, "lora_best")
+//                     model.save_pretrained(best_lora)
+//                     tokenizer.save_pretrained(best_lora)
+//                     logger.info(f"  * New best CE={best_ce:.4f}")
+//             _prune_checkpoints(cfg.ckpt_dir, keep=3)
+//
+//         if step == phase_mgr.p1_end:
+//             logger.info("=" * 40)
+//             logger.info("Phase transition: P1 -> P2 (+tension, LoRA unfrozen)")
+//             logger.info("=" * 40)
+//         elif step == phase_mgr.p2_end:
+//             logger.info("=" * 40)
+//             logger.info("Phase transition: P2 -> P3 (full coupling)")
+//             logger.info("=" * 40)
+//
+//     elapsed = time.time() - t_start
+//     logger.info("=" * 60)
+//     logger.info(f"Training complete. {cfg.total_steps} steps in {elapsed / 3600:.1f}h")
+//     logger.info(f"Best CE: {best_ce:.4f}")
+//     logger.info(f"Checkpoints: {cfg.ckpt_dir}/")
+//     logger.info("=" * 60)
+//     if cfg.use_wandb:
+//         import wandb
+//         wandb.finish()
+//
+//
+// def _prune_checkpoints(ckpt_dir, keep=3):
+//     import glob, shutil
+//     pts = sorted(glob.glob(os.path.join(ckpt_dir, "step_*.pt")))
+//     if len(pts) > keep:
+//         for old in pts[:-keep]:
+//             try: os.remove(old)
+//             except OSError: pass
+//     lora_dirs = sorted(glob.glob(os.path.join(ckpt_dir, "lora_step_*")))
+//     if len(lora_dirs) > keep:
+//         for old in lora_dirs[:-keep]:
+//             try: shutil.rmtree(old)
+//             except OSError: pass
+//
+//
+// def dry_run(cfg):
+//     logger.info("DRY RUN - checking VRAM feasibility")
+//     device = torch.device("cuda")
+//     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+//     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+//     bnb_config = BitsAndBytesConfig(
+//         load_in_4bit=True, bnb_4bit_quant_type="nf4",
+//         bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+//     )
+//     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
+//     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+//     model = AutoModelForCausalLM.from_pretrained(
+//         cfg.model_path, quantization_config=bnb_config, device_map="auto",
+//         trust_remote_code=True, torch_dtype=torch.bfloat16,
+//     )
+//     logger.info(f"  VRAM after 4-bit load: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+//     model.gradient_checkpointing_enable()
+//     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+//     lora_config = LoraConfig(
+//         r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
+//         target_modules=list(cfg.lora_target_modules),
+//         lora_dropout=cfg.lora_dropout, bias="none", task_type="CAUSAL_LM",
+//     )
+//     model = get_peft_model(model, lora_config)
+//     logger.info(f"  VRAM after LoRA: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+//     pf_modules = inject_purefield(model.model, n_layers=cfg.pf_n_layers,
+//                                   n_savant=cfg.pf_n_savant, rank=cfg.pf_rank)
+//     logger.info(f"  VRAM after PureField: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+//     dummy = torch.randint(0, 1000, (1, cfg.block_size), device=device)
+//     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+//         out = model(input_ids=dummy, labels=dummy)
+//         out.loss.backward()
+//     vram_peak = torch.cuda.max_memory_allocated() / 1e9
+//     gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+//     margin = gpu_mem - vram_peak
+//     ok = "OK" if margin > 0.3 else "TIGHT" if margin > 0 else "OOM RISK"
+//     logger.info(f"  VRAM peak: {vram_peak:.2f} GB, GPU: {gpu_mem:.1f} GB, margin: {margin:.2f} GB - {ok}")
+//     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+//     trainable += sum(p.numel() for pf in pf_modules for p in pf.parameters() if p.requires_grad)
+//     logger.info(f"  Trainable params: {trainable / 1e6:.1f}M")
+//     logger.info("DRY RUN complete.")
+//
+//
+// def main():
+//     parser = argparse.ArgumentParser(description="AnimaLM 14B v0.5 QLoRA Training")
+//     parser.add_argument("--data", type=str, default=None)
+//     parser.add_argument("--model", type=str, default=None)
+//     parser.add_argument("--resume", type=str, default=None)
+//     parser.add_argument("--steps", type=int, default=50000)
+//     parser.add_argument("--lr", type=float, default=2e-5)
+//     parser.add_argument("--batch", type=int, default=1)
+//     parser.add_argument("--grad-accum", type=int, default=8)
+//     parser.add_argument("--block-size", type=int, default=512)
+//     parser.add_argument("--lora-r", type=int, default=64)
+//     parser.add_argument("--lora-alpha", type=int, default=128)
+//     parser.add_argument("--pf-layers", type=int, default=8)
+//     parser.add_argument("--pf-rank", type=int, default=64)
+//     parser.add_argument("--ckpt-dir", type=str, default="checkpoints/14b_v05")
+//     parser.add_argument("--save-every", type=int, default=1000)
+//     parser.add_argument("--wandb", action="store_true")
+//     parser.add_argument("--dry-run", action="store_true")
+//     args = parser.parse_args()
+//     cfg = TrainConfig()
+//     if args.data: cfg.data_path = os.path.expanduser(args.data)
+//     if args.model: cfg.model_path = os.path.expanduser(args.model)
+//     if args.resume: cfg.resume_path = args.resume
+//     cfg.total_steps = args.steps
+//     cfg.lr = args.lr
+//     cfg.batch_size = args.batch
+//     cfg.grad_accum = args.grad_accum
+//     cfg.block_size = args.block_size
+//     cfg.lora_r = args.lora_r
+//     cfg.lora_alpha = args.lora_alpha
+//     cfg.pf_n_layers = args.pf_layers
+//     cfg.pf_rank = args.pf_rank
+//     cfg.ckpt_dir = args.ckpt_dir
+//     cfg.save_every = args.save_every
+//     cfg.use_wandb = args.wandb
+//     if args.dry_run: dry_run(cfg)
+//     else: train(cfg)
+//
+//
+// if __name__ == "__main__":
+//     main()
+// PYTHON_END
