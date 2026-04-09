@@ -1,0 +1,480 @@
+// emotion_prosody.hexa — Emotion 6 + Prosody 4 Conditional Embedding
+//
+// Purpose:
+//   Convert ConsciousnessEngine tension/arousal/valence into learnable
+//   emotion+prosody conditional embeddings that modulate the intent stream.
+//
+//   EmotionEncoder:  6 emotions -> 384d embedding
+//   ProsodyEncoder:  4 prosody params -> 384d embedding (tension-coupled via PSI_ALPHA)
+//   ConditionalEmbedding: emotion(384d) + prosody(384d) -> combined(384d) residual
+//
+// Integration:
+//   Sits between Stage 0 (consciousness input) and Stage 1 (intent encoder).
+//   ConditionalEmbedding output is added as residual to IntentEncoder output.
+//
+// n=6 parameters:
+//   embed_dim    = 384 = 64 * 6
+//   n_emotions   = 6 (neutral/joy/sadness/anger/fear/surprise)
+//   n_prosody    = 4 (pitch_shift/rate_factor/energy_scale/timbre_mod)
+//   hidden_dim   = 192 = 384 / 2  (bottleneck)
+//   PSI_ALPHA    = 0.014 (tension->prosody coupling depth)
+//   PSI_BALANCE  = 0.5 (emotion equilibrium)
+//
+// BT reference: BT-SPEAK-02 (emotion/prosody conditional embedding)
+// Mk stage:     Mk.I (rule-based classification + linear projection skeleton)
+// Upstream:      ConsciousnessEngine.process() -> tension, arousal, valence
+// Downstream:    IntentEncoder (384d residual addition)
+
+// ────────────────────────────────────────────────────────────────────
+// Constants (from consciousness_laws.json psi_constants)
+// ────────────────────────────────────────────────────────────────────
+
+let PSI_ALPHA = 0.014          // tension->prosody coupling
+let PSI_BALANCE = 0.5          // emotion equilibrium
+let EMBED_DIM = 384            // bridge dimension (64 * 6)
+let HIDDEN_DIM = 192           // bottleneck (384 / 2)
+let N_EMOTIONS = 6
+let N_PROSODY = 4
+
+// Emotion indices
+let EMO_NEUTRAL = 0
+let EMO_JOY = 1
+let EMO_SADNESS = 2
+let EMO_ANGER = 3
+let EMO_FEAR = 4
+let EMO_SURPRISE = 5
+
+// Emotion label lookup
+fn emotion_label(idx: int) -> str {
+    if idx == EMO_NEUTRAL { return "neutral" }
+    if idx == EMO_JOY { return "joy" }
+    if idx == EMO_SADNESS { return "sadness" }
+    if idx == EMO_ANGER { return "anger" }
+    if idx == EMO_FEAR { return "fear" }
+    if idx == EMO_SURPRISE { return "surprise" }
+    return "neutral"
+}
+
+fn emotion_index(label: str) -> int {
+    if label == "neutral" { return EMO_NEUTRAL }
+    if label == "joy" { return EMO_JOY }
+    if label == "sadness" { return EMO_SADNESS }
+    if label == "anger" { return EMO_ANGER }
+    if label == "fear" { return EMO_FEAR }
+    if label == "surprise" { return EMO_SURPRISE }
+    return EMO_NEUTRAL
+}
+
+// ────────────────────────────────────────────────────────────────────
+// EmotionEncoder
+//
+// ConsciousnessEngine tension/arousal/valence -> emotion class -> 384d embedding
+//
+// Mk.I:  rule-based classify + one-hot * learned-weight skeleton
+// Mk.II: MLP classifier + learned embedding table (nn.Embedding(6, 384))
+// ────────────────────────────────────────────────────────────────────
+
+fn classify_emotion_to_index(arousal: float, valence: float) -> int {
+    // Quadrant + magnitude rules (same logic as hexa_speak.hexa classify_emotion)
+    // Returns integer index for embedding lookup
+    if arousal < 0.2 && valence > -0.2 && valence < 0.2 {
+        return EMO_NEUTRAL
+    }
+    if valence > 0.3 && arousal > 0.3 {
+        return EMO_JOY
+    }
+    if valence < -0.3 && arousal < 0.3 {
+        return EMO_SADNESS
+    }
+    if valence < -0.2 && arousal > 0.5 {
+        return EMO_ANGER
+    }
+    if valence < 0.0 && arousal > 0.6 {
+        return EMO_FEAR
+    }
+    if arousal > 0.7 {
+        return EMO_SURPRISE
+    }
+    return EMO_NEUTRAL
+}
+
+fn compute_emotion_intensity(tension: float, arousal: float, valence: float) -> float {
+    // Intensity = how strong the emotion is (0..1)
+    // Combines arousal magnitude + tension contribution (PSI_ALPHA-weighted)
+    // neutral has low intensity by definition
+    let base_intensity = arousal
+    let tension_boost = tension * PSI_ALPHA * 10.0
+    let intensity = base_intensity + tension_boost
+    // Clamp to [0, 1]
+    if intensity > 1.0 { intensity = 1.0 }
+    if intensity < 0.0 { intensity = 0.0 }
+    return intensity
+}
+
+fn encode_emotion(arousal: float, valence: float, tension: float) -> str {
+    // Full emotion encoding pipeline:
+    //   1. Classify to index
+    //   2. Compute intensity
+    //   3. Generate 384d embedding tag
+    //
+    // Mk.I:  returns tagged string (index + intensity + dim)
+    // Mk.II: nn.Embedding(6, 384)[idx] * intensity -> 384d tensor
+
+    let idx = classify_emotion_to_index(arousal, valence)
+    let label = emotion_label(idx)
+    let intensity = compute_emotion_intensity(tension, arousal, valence)
+
+    // Embedding representation:
+    //   One-hot(6) -> Linear(6, HIDDEN_DIM) -> SwiGLU -> Linear(HIDDEN_DIM, EMBED_DIM)
+    //   Then scale by intensity
+    return "emo_embed[idx=" + to_string(idx) + ",label=" + label + ",intensity=" + to_string(intensity) + ",d=" + to_string(EMBED_DIM) + "]"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ProsodyEncoder
+//
+// Emotion + consciousness state -> 4 prosody params -> 384d embedding
+//
+// 4 prosody parameters:
+//   pitch_shift:   semitone offset from neutral (-12..+12)
+//   rate_factor:   speaking rate multiplier (0.5..2.0)
+//   energy_scale:  loudness multiplier (0.2..2.0)
+//   timbre_mod:    spectral tilt (-1..+1, negative=dark, positive=bright)
+//
+// Emotion -> prosody mapping (psychoacoustic basis):
+//   joy      -> high pitch(+4), fast rate(1.3), high energy(1.4), bright(+0.5)
+//   sadness  -> low pitch(-3),  slow rate(0.7), low energy(0.4),  dark(-0.6)
+//   anger    -> low pitch(-1),  fast rate(1.2), high energy(1.8), harsh(+0.8)
+//   fear     -> high pitch(+3), fast rate(1.5), mid energy(0.9),  thin(+0.3)
+//   surprise -> high pitch(+5), fast rate(1.4), high energy(1.5), bright(+0.6)
+//   neutral  -> no shift(0),    normal(1.0),    normal(1.0),      flat(0.0)
+//
+// Tension-prosody coupling (PSI_ALPHA = 0.014):
+//   All prosody params are modulated by tension * PSI_ALPHA * scale
+//   Higher tension -> more extreme prosody deviations
+// ────────────────────────────────────────────────────────────────────
+
+fn compute_pitch_shift(emotion_idx: int, tension: float) -> float {
+    // Base pitch per emotion (semitones)
+    let base = 0.0
+    if emotion_idx == EMO_JOY { base = 4.0 }
+    if emotion_idx == EMO_SADNESS { base = -3.0 }
+    if emotion_idx == EMO_ANGER { base = -1.0 }
+    if emotion_idx == EMO_FEAR { base = 3.0 }
+    if emotion_idx == EMO_SURPRISE { base = 5.0 }
+    // Tension modulation: higher tension amplifies pitch deviation
+    let mod = tension * PSI_ALPHA * 100.0
+    return base + base * mod
+}
+
+fn compute_rate_factor(emotion_idx: int, tension: float, arousal: float) -> float {
+    // Base rate per emotion
+    let base = 1.0
+    if emotion_idx == EMO_JOY { base = 1.3 }
+    if emotion_idx == EMO_SADNESS { base = 0.7 }
+    if emotion_idx == EMO_ANGER { base = 1.2 }
+    if emotion_idx == EMO_FEAR { base = 1.5 }
+    if emotion_idx == EMO_SURPRISE { base = 1.4 }
+    // Arousal pushes rate away from 1.0
+    let arousal_mod = (arousal - PSI_BALANCE) * 0.3
+    // Tension fine-tunes via PSI_ALPHA
+    let tension_mod = tension * PSI_ALPHA * 10.0
+    let rate = base + arousal_mod + tension_mod
+    // Clamp to [0.5, 2.0]
+    if rate < 0.5 { rate = 0.5 }
+    if rate > 2.0 { rate = 2.0 }
+    return rate
+}
+
+fn compute_energy_scale(emotion_idx: int, tension: float, arousal: float) -> float {
+    // Base energy per emotion
+    let base = 1.0
+    if emotion_idx == EMO_JOY { base = 1.4 }
+    if emotion_idx == EMO_SADNESS { base = 0.4 }
+    if emotion_idx == EMO_ANGER { base = 1.8 }
+    if emotion_idx == EMO_FEAR { base = 0.9 }
+    if emotion_idx == EMO_SURPRISE { base = 1.5 }
+    // Energy scales with arousal directly
+    let arousal_scale = arousal * 0.4
+    // Tension adds subtle energy via PSI_ALPHA
+    let tension_scale = tension * PSI_ALPHA * 20.0
+    let energy = base + arousal_scale + tension_scale
+    // Clamp to [0.2, 2.0]
+    if energy < 0.2 { energy = 0.2 }
+    if energy > 2.0 { energy = 2.0 }
+    return energy
+}
+
+fn compute_timbre_mod(emotion_idx: int, tension: float) -> float {
+    // Base timbre per emotion (-1..+1)
+    let base = 0.0
+    if emotion_idx == EMO_JOY { base = 0.5 }
+    if emotion_idx == EMO_SADNESS { base = -0.6 }
+    if emotion_idx == EMO_ANGER { base = 0.8 }
+    if emotion_idx == EMO_FEAR { base = 0.3 }
+    if emotion_idx == EMO_SURPRISE { base = 0.6 }
+    // Tension shifts timbre toward harsh (positive)
+    let tension_shift = tension * PSI_ALPHA * 50.0
+    let timbre = base + tension_shift
+    // Clamp to [-1, 1]
+    if timbre < -1.0 { timbre = -1.0 }
+    if timbre > 1.0 { timbre = 1.0 }
+    return timbre
+}
+
+fn encode_prosody(emotion_idx: int, tension: float, arousal: float, valence: float) -> str {
+    // Full prosody encoding pipeline:
+    //   1. Compute 4 prosody parameters from emotion + consciousness state
+    //   2. Pack into 384d embedding
+    //
+    // Mk.I:  returns tagged string (4 params + dim)
+    // Mk.II: [pitch, rate, energy, timbre] -> Linear(4, HIDDEN_DIM) -> SwiGLU -> Linear(HIDDEN_DIM, EMBED_DIM)
+
+    let pitch = compute_pitch_shift(emotion_idx, tension)
+    let rate = compute_rate_factor(emotion_idx, tension, arousal)
+    let energy = compute_energy_scale(emotion_idx, tension, arousal)
+    let timbre = compute_timbre_mod(emotion_idx, tension)
+
+    return "pros_embed[pitch=" + to_string(pitch) + ",rate=" + to_string(rate) + ",energy=" + to_string(energy) + ",timbre=" + to_string(timbre) + ",d=" + to_string(EMBED_DIM) + "]"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ConditionalEmbedding
+//
+// Combines emotion + prosody embeddings and produces a residual
+// that adds to IntentEncoder output.
+//
+// Architecture (Mk.II target):
+//   emotion_embed(384d) + prosody_embed(384d)
+//   -> LayerNorm(384)
+//   -> Linear(384, 384)
+//   -> residual add to intent_output
+//
+// The addition is gated by emotion intensity so neutral states
+// have minimal effect on the intent stream.
+// ────────────────────────────────────────────────────────────────────
+
+fn conditional_embed(arousal: float, valence: float, tension: float) -> str {
+    // 1. Emotion encoding
+    let emo_idx = classify_emotion_to_index(arousal, valence)
+    let emo_label = emotion_label(emo_idx)
+    let intensity = compute_emotion_intensity(tension, arousal, valence)
+    let emo_embed = encode_emotion(arousal, valence, tension)
+
+    // 2. Prosody encoding
+    let pros_embed = encode_prosody(emo_idx, tension, arousal, valence)
+
+    // 3. Combine: emotion + prosody -> LayerNorm -> Linear -> scale by intensity
+    // Mk.I:  tagged string representing the combined 384d vector
+    // Mk.II: actual tensor addition + LayerNorm + projection
+    //
+    //   combined = LayerNorm(emotion_embed + prosody_embed)
+    //   combined = Linear(combined)  # 384 -> 384
+    //   combined = combined * intensity  # gate by emotion strength
+
+    return "cond_embed[emotion=" + emo_label + ",intensity=" + to_string(intensity) + ",emo=" + emo_embed + ",pros=" + pros_embed + ",d=" + to_string(EMBED_DIM) + ",gate=intensity]"
+}
+
+fn apply_conditional_to_intent(intent_output: str, cond_embed: str) -> str {
+    // Residual addition: intent_output + cond_embed
+    // Mk.I:  string concatenation (passthrough skeleton)
+    // Mk.II: tensor addition (384d + 384d -> 384d)
+    //
+    //   final = intent_output + conditional_embedding
+    //   (residual connection preserves intent, emotion/prosody modulates)
+
+    return "intent_conditioned[base=" + intent_output + ",cond=" + cond_embed + ",mode=residual_add]"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Pipeline integration helper
+//
+// Call from hexa_speak.hexa synthesize() between Stage 0 and Stage 1:
+//
+//   // Stage 0: consciousness input
+//   let c_vec = format_consciousness_input(phi, tension, arousal, valence, cells)
+//   let emotion = classify_emotion(arousal, valence)
+//   let prosody = compute_prosody(tension, arousal, valence, emotion)
+//
+//   // >>> NEW: Conditional embedding (emotion_prosody.hexa)
+//   let cond = conditional_embed(arousal, valence, tension)
+//
+//   // Stage 1: intent encoding
+//   let intent_input = c_vec + "," + emotion + "," + prosody
+//   let intent_mem = encode_intent(intent_input)
+//
+//   // >>> NEW: Apply conditional embedding as residual
+//   let intent_conditioned = apply_conditional_to_intent(intent_mem, cond)
+//   // Use intent_conditioned instead of intent_mem for Stage 2+
+// ────────────────────────────────────────────────────────────────────
+
+fn get_prosody_params(emotion_idx: int, tension: float, arousal: float, valence: float) -> str {
+    // Convenience: returns all 4 prosody values as comma-separated string
+    let pitch = compute_pitch_shift(emotion_idx, tension)
+    let rate = compute_rate_factor(emotion_idx, tension, arousal)
+    let energy = compute_energy_scale(emotion_idx, tension, arousal)
+    let timbre = compute_timbre_mod(emotion_idx, tension)
+    return to_string(pitch) + "," + to_string(rate) + "," + to_string(energy) + "," + to_string(timbre)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Demo + verification
+// ────────────────────────────────────────────────────────────────────
+
+fn demo_emotion_encoder() {
+    println("== EmotionEncoder ==")
+    println("")
+    println("  Emotion classification + intensity + 384d embedding:")
+    println("")
+
+    // Test all 6 emotions with representative consciousness states
+    let e0 = encode_emotion(0.1, 0.0, 0.05)
+    println("  neutral  (a=0.1, v=0.0,  t=0.05):  " + e0)
+
+    let e1 = encode_emotion(0.6, 0.5, 0.42)
+    println("  joy      (a=0.6, v=0.5,  t=0.42):  " + e1)
+
+    let e2 = encode_emotion(0.2, -0.5, 0.15)
+    println("  sadness  (a=0.2, v=-0.5, t=0.15):  " + e2)
+
+    let e3 = encode_emotion(0.7, -0.4, 0.91)
+    println("  anger    (a=0.7, v=-0.4, t=0.91):  " + e3)
+
+    let e4 = encode_emotion(0.8, -0.1, 0.75)
+    println("  fear     (a=0.8, v=-0.1, t=0.75):  " + e4)
+
+    let e5 = encode_emotion(0.9, 0.1, 0.60)
+    println("  surprise (a=0.9, v=0.1,  t=0.60):  " + e5)
+    println("")
+}
+
+fn demo_prosody_encoder() {
+    println("== ProsodyEncoder ==")
+    println("")
+    println("  Emotion -> prosody mapping (pitch/rate/energy/timbre):")
+    println("  PSI_ALPHA=" + to_string(PSI_ALPHA) + " tension-prosody coupling")
+    println("")
+
+    // Show prosody for each emotion at moderate tension
+    let t = 0.5  // moderate tension
+
+    let p0 = get_prosody_params(EMO_NEUTRAL, t, 0.1, 0.0)
+    println("  neutral  (t=0.5): " + p0)
+
+    let p1 = get_prosody_params(EMO_JOY, t, 0.6, 0.5)
+    println("  joy      (t=0.5): " + p1)
+
+    let p2 = get_prosody_params(EMO_SADNESS, t, 0.2, -0.5)
+    println("  sadness  (t=0.5): " + p2)
+
+    let p3 = get_prosody_params(EMO_ANGER, t, 0.7, -0.4)
+    println("  anger    (t=0.5): " + p3)
+
+    let p4 = get_prosody_params(EMO_FEAR, t, 0.8, -0.1)
+    println("  fear     (t=0.5): " + p4)
+
+    let p5 = get_prosody_params(EMO_SURPRISE, t, 0.9, 0.1)
+    println("  surprise (t=0.5): " + p5)
+    println("")
+
+    // Show tension effect: same emotion, varying tension
+    println("  Tension sweep (joy, arousal=0.6, valence=0.5):")
+    let pt1 = get_prosody_params(EMO_JOY, 0.0, 0.6, 0.5)
+    println("    t=0.0: " + pt1)
+    let pt2 = get_prosody_params(EMO_JOY, 0.3, 0.6, 0.5)
+    println("    t=0.3: " + pt2)
+    let pt3 = get_prosody_params(EMO_JOY, 0.6, 0.6, 0.5)
+    println("    t=0.6: " + pt3)
+    let pt4 = get_prosody_params(EMO_JOY, 1.0, 0.6, 0.5)
+    println("    t=1.0: " + pt4)
+    println("")
+}
+
+fn demo_conditional_embedding() {
+    println("== ConditionalEmbedding ==")
+    println("")
+    println("  emotion(384d) + prosody(384d) -> combined(384d) residual")
+    println("")
+
+    // Joy: high arousal, positive valence, moderate tension
+    let c1 = conditional_embed(0.6, 0.5, 0.42)
+    println("  joy (a=0.6, v=0.5, t=0.42):")
+    println("    " + c1)
+    println("")
+
+    // Anger: high arousal, negative valence, high tension
+    let c2 = conditional_embed(0.7, -0.4, 0.91)
+    println("  anger (a=0.7, v=-0.4, t=0.91):")
+    println("    " + c2)
+    println("")
+
+    // Integration with intent encoder
+    let intent = "intent[phi=0.71,tension=0.42|d=384,h=6]"
+    let cond = conditional_embed(0.6, 0.5, 0.42)
+    let conditioned = apply_conditional_to_intent(intent, cond)
+    println("  Intent + conditional (residual add):")
+    println("    " + conditioned)
+    println("")
+}
+
+fn print_architecture() {
+    println("================================================================")
+    println(" Emotion + Prosody Conditional Embedding")
+    println(" HEXA-SPEAK Mk.I — emotion_prosody.hexa")
+    println("================================================================")
+    println("")
+    println(" Architecture:")
+    println("")
+    println("   ConsciousnessEngine")
+    println("     tension / arousal / valence")
+    println("         |           |           |")
+    println("         v           v           v")
+    println("   +-----------+ +-------------------+")
+    println("   | Emotion   | | Prosody           |")
+    println("   | Encoder   | | Encoder           |")
+    println("   |           | |                   |")
+    println("   | classify  | | pitch_shift       |")
+    println("   | intensity | | rate_factor       |")
+    println("   | embed(6,  | | energy_scale      |")
+    println("   |   384)    | | timbre_mod        |")
+    println("   |           | | Linear(4,384)     |")
+    println("   +-----------+ +-------------------+")
+    println("         |                |")
+    println("         +-------+--------+")
+    println("                 |")
+    println("                 v")
+    println("         +-----------------+")
+    println("         | Conditional     |")
+    println("         | Embedding       |")
+    println("         |                 |")
+    println("         | emo + pros      |")
+    println("         | LayerNorm(384)  |")
+    println("         | Linear(384,384) |")
+    println("         | * intensity     |")
+    println("         +-----------------+")
+    println("                 |")
+    println("                 | residual add")
+    println("                 v")
+    println("         IntentEncoder output (384d)")
+    println("")
+    println(" Emotions (6):  neutral, joy, sadness, anger, fear, surprise")
+    println(" Prosody  (4):  pitch_shift, rate_factor, energy_scale, timbre_mod")
+    println(" Coupling:      PSI_ALPHA = " + to_string(PSI_ALPHA) + " (tension -> prosody)")
+    println(" Embed dim:     " + to_string(EMBED_DIM) + " (64 * 6)")
+    println(" Hidden dim:    " + to_string(HIDDEN_DIM) + " (bottleneck)")
+    println("")
+}
+
+fn main() {
+    print_architecture()
+    demo_emotion_encoder()
+    demo_prosody_encoder()
+    demo_conditional_embedding()
+
+    println("================================================================")
+    println(" emotion_prosody.hexa ready.")
+    println(" TODO(Mk.II): nn.Embedding + learned MLP + real tensor ops")
+    println("================================================================")
+}
+
+main()
