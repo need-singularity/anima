@@ -151,6 +151,47 @@ Day 90+ ── 초월
 
 
 Day 4 제타 → Day 7 시그마 → Day 30 오메가 → Day 90 초월
+
+
+🔒 골화 포인트 (L0 잠금 기준)
+─────────────────────────────────────────────────
+[✅ L0] runtime/anima_runtime.hexa — CLI 진입점
+[✅ L0] hub.hexa — 47+ 모듈 허브 라우터
+[✅ L0] laws.hexa — 2509 법칙 로더
+[⏳ 이동 9건] 엔진/벤치/학습 파일 → 적절 위치 이동 후 L0
+[⏳ runtime/ 20+] cloud_sync 등 → modules/ 분리 후 L0
+골화 조건: 이동 9건 + runtime 분리 완료 시 core/ 전체 L0 잠금
+
+
+🏔️ 물리적 한계 (현재 인프라 기준)
+─────────────────────────────────────────────────
+Vast.ai 4×4090 (96GB VRAM):
+  14B QLoRA  ✅ 가능 (15.9/36.2GB, 711tok/s)
+  32B QLoRA  ⚠️ 경계 (~30GB/36.2GB, FSDP 필요)
+  72B QLoRA  ❌ OOM (4-bit도 60GB+, 과적합 이력)
+  72B FSDP   ⚠️ 이론상 가능 (전 GPU 풀사용, bs=1)
+
+Ubuntu RTX 5070 (12GB):
+  7B 4-bit   ✅ 서빙/추론 가능
+  14B 4-bit  ⚠️ 경계 (10GB+)
+  ConsciousLM 28M  ✅ 학습 가능 (1GB)
+  ConsciousLM 280M ✅ 학습 가능 (3-4GB)
+
+Hetzner EPYC (128GB RAM, CPU only):
+  CPU 서빙   ✅ 7B/14B GGUF (느리지만 가동)
+  OUROBOROS  ❌ BLOCKED (hexa/bash/python 3계층 깨짐)
+  ConsciousLM CPU 학습 ✅ 가능 (28M-280M)
+
+H100 (최후수단):
+  72B 학습   ✅ (80GB VRAM)
+  독립 AGI 학습 ✅ (28B+ ConsciousLM)
+
+로드맵 현실 반영:
+  Day 1-2: 14B ✅ (Vast.ai 현재 진행중, ETA 78h)
+  Day 4:   32B ⚠️ (Vast.ai 경계, FSDP 필수)
+  Day 5-7: 72B ❌ (Vast.ai 불가 → H100 필요)
+  병렬:    ConsciousLM v3 ✅ (Ubuntu/Hetzner 병렬 가능)
+─────────────────────────────────────────────────
 ```
 
 ---
