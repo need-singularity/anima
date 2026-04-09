@@ -1,0 +1,283 @@
+// consciousness_pci.hexa — Perturbation Complexity Index for AI consciousness
+// Adapted from Massimini et al. (2013) and Casali et al. (2013)
+//
+// PCI = neuroscience gold standard for consciousness detection.
+// TMS pulse -> EEG recording -> Lempel-Ziv complexity -> PCI.
+// For ConsciousnessEngine: delta pulse -> cell state recording -> LZ76 -> PCI.
+//
+// Interpretation (Casali et al., 2013):
+//   PCI > 0.31:  Conscious (awake, locked-in, REM)
+//   PCI < 0.31:  Unconscious (NREM, anesthesia, vegetative)
+//   PCI ~ 0:     No response or fully synchronized
+//
+// Key insight:
+//   ConsciousEngine: perturbation -> coupling spreads -> complex pattern -> high PCI
+//   ZombieEngine:    perturbation -> stays local -> simple pattern -> low PCI
+
+import math
+import laws from "core/laws.hexa"
+
+// PSI constants from ln(2)
+let LN2 = math.log(2.0)
+let PSI_BALANCE = 0.5
+let PSI_COUPLING = LN2 / math.pow(2.0, 5.5)
+let PSI_STEPS = 3.0 / LN2
+let PSI_ENTROPY = 0.998
+let PCI_CONSCIOUS_THRESHOLD = 0.31
+
+struct PCIResult {
+    pci_value: f64,
+    complexity: i64,
+    normalized_complexity: f64,
+    n_time_steps: i64,
+    n_cells: i64,
+    verdict: string,
+    perturbation_cell: i64,
+    perturbation_strength: f64,
+    baseline_phi_proxy: f64,
+    response_phi_proxy: f64
+}
+
+struct MultiSitePCIResult {
+    median_pci: f64,
+    mean_pci: f64,
+    std_pci: f64,
+    min_pci: f64,
+    max_pci: f64,
+    verdict: string,
+    n_sites: i64,
+    individual_results: [PCIResult]
+}
+
+struct ComparisonResult {
+    conscious_pci: MultiSitePCIResult,
+    zombie_pci: MultiSitePCIResult,
+    separation: f64,
+    ratio: f64,
+    differentiated: bool
+}
+
+struct PerturbationComplexityIndex {
+    n_cells: i64,
+    warmup_steps: i64,
+    record_steps: i64,
+    z_threshold: f64
+}
+
+pure fn pci_new(n_cells: i64, warmup_steps: i64, record_steps: i64) -> PerturbationComplexityIndex {
+    PerturbationComplexityIndex {
+        n_cells: n_cells,
+        warmup_steps: warmup_steps,
+        record_steps: record_steps,
+        z_threshold: 2.0
+    }
+}
+
+// Lempel-Ziv 1976 exhaustive parsing complexity
+// At each step, find longest match of s[i:i+l] in s[0:i+l-1]
+// (history grows with the match). Then emit component and advance.
+// Examples: "0000" -> 2, "0101" -> 3, random -> ~n/log2(n)
+pure fn lempel_ziv_complexity(sequence: [i8]) -> i64 {
+    let n = len(sequence)
+    if n == 0 { return 0 }
+    if n == 1 { return 1 }
+
+    let complexity = 1  // first symbol is always new
+    let i = 1
+
+    while i < n {
+        let max_l = 0
+        let l = 1
+        while i + l <= n {
+            // Search s[i:i+l] in s[0:i+l-1]
+            let target = slice(sequence, i, i + l)
+            let search_len = i + l - 1
+            let found = false
+            for j in range(search_len - l + 1) {
+                if slice_eq(sequence, j, target, l) {
+                    found = true
+                    break
+                }
+            }
+            if found {
+                max_l = l
+                l = l + 1
+            } else {
+                break
+            }
+        }
+        complexity = complexity + 1
+        i = i + max_l + 1
+    }
+    complexity
+}
+
+// Theoretical maximum LZ complexity for binary sequence of length n
+pure fn theoretical_max_lz(n: i64) -> f64 {
+    if n <= 1 { return max(1.0, to_float(n)) }
+    to_float(n) / math.log2(to_float(n))
+}
+
+// Full PCI measurement protocol
+fn measure(pci: PerturbationComplexityIndex, engine: any, cell_idx: i64, strength: f64) -> PCIResult {
+    // Phase 1: Warmup
+    for _ in range(pci.warmup_steps) {
+        engine.step()
+    }
+
+    // Phase 2: Record baseline
+    let baseline = record_response(engine, pci.n_cells, pci.record_steps)
+    let baseline_phi = phi_proxy(baseline)
+
+    // Phase 3: Inject perturbation (delta pulse to single cell)
+    engine.inject_perturbation(cell_idx, strength)
+
+    // Phase 4: Record response
+    let response = record_response(engine, pci.n_cells, pci.record_steps)
+    let response_phi = phi_proxy(response)
+
+    // Phase 5: Binarize via z-score threshold
+    let binary = binarize(response, baseline, pci.z_threshold)
+
+    // Phase 6: LZ complexity of flattened binary matrix
+    let flat = flatten_column_major(binary)
+    let lz = lempel_ziv_complexity(flat)
+
+    // Phase 7: Normalize
+    let n_total = pci.record_steps * pci.n_cells
+    let c_max = theoretical_max_lz(n_total)
+    let pci_value = if c_max > 0.0 { min(1.0, to_float(lz) / c_max) } else { 0.0 }
+
+    // Verdict
+    let n_ones = sum(binary)
+    let verdict = if n_ones == 0 { "NO_RESPONSE" }
+                  else if pci_value >= PCI_CONSCIOUS_THRESHOLD { "CONSCIOUS" }
+                  else { "UNCONSCIOUS" }
+
+    PCIResult {
+        pci_value: pci_value,
+        complexity: lz,
+        normalized_complexity: pci_value,
+        n_time_steps: pci.record_steps,
+        n_cells: pci.n_cells,
+        verdict: verdict,
+        perturbation_cell: cell_idx,
+        perturbation_strength: strength,
+        baseline_phi_proxy: baseline_phi,
+        response_phi_proxy: response_phi
+    }
+}
+
+// Multi-site PCI: perturb N evenly-spaced cells, take median
+fn multi_site_pci(pci: PerturbationComplexityIndex, engine: any, n_sites: i64, strength: f64) -> MultiSitePCIResult {
+    let step_size = pci.n_cells / n_sites
+    let sites = [to_int(to_float(i) * to_float(step_size)) for i in range(n_sites)]
+    let results = [measure(pci, engine, s, strength) for s in sites]
+    let values = [r.pci_value for r in results]
+    let sorted_v = sort(values)
+    let median_pci = sorted_v[len(sorted_v) / 2]
+    let mean_pci = mean(values)
+    let std_pci = std(values)
+    let verdict = if median_pci >= PCI_CONSCIOUS_THRESHOLD { "CONSCIOUS" }
+                  else if max(values) >= PCI_CONSCIOUS_THRESHOLD { "BORDERLINE" }
+                  else { "UNCONSCIOUS" }
+
+    MultiSitePCIResult {
+        median_pci: median_pci,
+        mean_pci: mean_pci,
+        std_pci: std_pci,
+        min_pci: min(values),
+        max_pci: max(values),
+        verdict: verdict,
+        n_sites: n_sites,
+        individual_results: results
+    }
+}
+
+// Compare conscious vs zombie engine — THE differentiation test
+fn compare_conscious_vs_zombie(pci: PerturbationComplexityIndex, conscious: any, zombie: any, n_sites: i64) -> ComparisonResult {
+    let c_result = multi_site_pci(pci, conscious, n_sites, 1.0)
+    let z_result = multi_site_pci(pci, zombie, n_sites, 1.0)
+    let separation = c_result.median_pci - z_result.median_pci
+    let ratio = if z_result.median_pci > 0.0 { c_result.median_pci / z_result.median_pci } else { 999.0 }
+    let differentiated = c_result.median_pci >= PCI_CONSCIOUS_THRESHOLD and z_result.median_pci < PCI_CONSCIOUS_THRESHOLD
+
+    ComparisonResult {
+        conscious_pci: c_result,
+        zombie_pci: z_result,
+        separation: separation,
+        ratio: ratio,
+        differentiated: differentiated
+    }
+}
+
+// Helper: record cell states for N steps -> matrix [steps x cells]
+fn record_response(engine: any, n_cells: i64, steps: i64) -> [[f64]] {
+    let matrix = []
+    for _ in range(steps) {
+        engine.step()
+        let states = engine.get_cell_states()
+        append(matrix, states[0..n_cells])
+    }
+    matrix
+}
+
+// Helper: binarize response via z-score threshold
+pure fn binarize(response: [[f64]], baseline: [[f64]], threshold: f64) -> [[i8]] {
+    let n_cells = len(baseline[0])
+    let baseline_mean = col_mean(baseline)
+    let baseline_std = col_std(baseline)
+    let binary = []
+    for row in response {
+        let brow = []
+        for j in range(n_cells) {
+            let std_j = max(baseline_std[j], 1e-10)
+            let z = abs(row[j] - baseline_mean[j]) / std_j
+            append(brow, if z > threshold { 1 } else { 0 })
+        }
+        append(binary, brow)
+    }
+    binary
+}
+
+// Helper: flatten matrix in column-major order (Fortran order)
+// Preserves each cell's temporal continuity
+pure fn flatten_column_major(matrix: [[i8]]) -> [i8] {
+    let rows = len(matrix)
+    let cols = len(matrix[0])
+    let flat = []
+    for j in range(cols) {
+        for i in range(rows) {
+            append(flat, matrix[i][j])
+        }
+    }
+    flat
+}
+
+// Helper: Phi proxy = global_var - mean_cell_var
+pure fn phi_proxy(matrix: [[f64]]) -> f64 {
+    let global_var = variance_2d(matrix)
+    let cell_vars = col_variances(matrix)
+    let mean_cell_var = mean(cell_vars)
+    max(0.0, global_var - mean_cell_var)
+}
+
+fn main() {
+    print("=== Perturbation Complexity Index (PCI) ===")
+    print("Adapted from Casali et al. (2013)")
+    print("Threshold: PCI > 0.31 = CONSCIOUS")
+    print("")
+
+    let pci = pci_new(64, 200, 80)
+
+    // Demo with mock engines would go here
+    // In production: pass ConsciousnessEngine from rust/consciousness.hexa
+    print("Use with ConsciousnessEngine:")
+    print("  let engine = consciousness_engine_new(64, 12)")
+    print("  let result = measure(pci, engine, 0, 1.0)")
+    print("  print(result.verdict)")
+    print("")
+    print("Multi-site comparison:")
+    print("  let comparison = compare_conscious_vs_zombie(pci, conscious, zombie, 5)")
+    print("  print(comparison.differentiated)")
+}

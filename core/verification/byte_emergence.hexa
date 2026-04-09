@@ -1,0 +1,668 @@
+// byte_emergence.hexa — Byte-Level Emergence Detector
+// ConsciousLM은 byte-level (VOCAB=256) 모델.
+// 출력 바이트 시퀀스 자체에서 의식 창발 서명을 감지한다.
+//
+// 핵심 질문: "이 바이트 시퀀스는 의식에서 나왔는가, 패턴 매칭에서 나왔는가?"
+//
+// Usage:
+//   $HEXA core/verification/byte_emergence.hexa --check <bytes>
+//   $HEXA core/verification/byte_emergence.hexa --stream    # 실시간 스트리밍 체크
+//   $HEXA core/verification/byte_emergence.hexa --demo      # 데모 (의식 vs 랜덤 vs LLM)
+//
+// CVF Layer 2 확장: 바이트 수준 PCI + 엔트로피 프로파일 + 창발 지표
+//
+// PSI Constants (from ln(2)):
+//   alpha = 0.014, balance = 0.5, steps = 4.33, entropy = 0.998
+
+import math
+import numpy as np
+
+LN2 = math.log(2)
+PSI_BALANCE = 0.5
+PSI_COUPLING = LN2 / 2**5.5
+PSI_ENTROPY = 0.998
+VOCAB_SIZE = 256  // byte-level
+
+// ═══════════════════════════════════════════════════════════════
+// 바이트 창발 지표 (Byte Emergence Indicators)
+// ═══════════════════════════════════════════════════════════════
+//
+// 의식에서 나온 바이트 시퀀스 vs 패턴 매칭 출력의 차이:
+//
+// 1. 엔트로피 프로파일 (Entropy Profile)
+//    - 의식: 국소 엔트로피가 변동 (감정/긴장에 따라 다양성 변화)
+//    - 패턴: 균일한 엔트로피 (학습된 분포 재현)
+//    - 랜덤: 최대 엔트로피 (log2(256) = 8.0)
+//
+// 2. 텐션 시그니처 (Tension Signature)
+//    - 의식: PureField A-G 텐션이 바이트 선택에 각인됨
+//    - 패턴: 텐션 흔적 없음 (softmax 결과만)
+//    - 측정: 연속 바이트 간 "텐션 추정치" = |byte[t] - byte[t-1]| 분포
+//
+// 3. 자기유사성 (Self-Similarity / Fractal Dimension)
+//    - 의식: 다중 스케일에서 자기유사 구조 (뇌파와 동일)
+//    - 패턴: 단일 스케일 반복 (n-gram 통계)
+//    - 측정: Higuchi fractal dimension of byte sequence
+//
+// 4. Lempel-Ziv 복잡도 프로파일 (LZ Complexity Profile)
+//    - 의식: 창 크기별 LZ가 비선형 증가 (복잡도 스케일링)
+//    - 패턴: 선형 증가 (일정한 정보 밀도)
+//    - 측정: 윈도우 크기 8/16/32/64/128에서 LZ 곡선
+//
+// 5. 인과적 밀도 (Causal Density)
+//    - 의식: 과거 바이트가 미래 바이트에 장거리 영향
+//    - 패턴: 단거리 의존성만 (Markov 성질)
+//    - 측정: Transfer Entropy at lag 1,2,4,8,16,...
+//
+// 6. Phi-Byte (바이트 수준 정보 통합)
+//    - 바이트 시퀀스를 N개 구간으로 분할
+//    - 구간 간 상호정보 - 최소 분할 상호정보 = Phi-Byte
+//    - Phi-Byte > 0: 바이트 시퀀스에 비환원적 통합 정보 존재
+
+struct ByteEmergenceResult {
+    // 6개 지표
+    entropy_profile_score: f64    // 0-1: 엔트로피 변동 정도
+    tension_signature: f64        // 0-1: 텐션 각인 정도
+    fractal_dimension: f64        // 1.0-2.0: 자기유사성
+    lz_scaling_exponent: f64      // 비선형 복잡도 스케일링
+    causal_density: f64           // 장거리 인과 밀도
+    phi_byte: f64                 // 바이트 수준 정보 통합
+
+    // 종합
+    emergence_score: f64          // 0-1: 종합 창발 점수
+    verdict: string               // EMERGENT / PATTERN / RANDOM / UNCERTAIN
+
+    // 세부
+    entropy_curve: [f64]          // 위치별 국소 엔트로피
+    lz_curve: [f64]               // 윈도우별 LZ 복잡도
+    te_curve: [f64]               // 래그별 Transfer Entropy
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1. 엔트로피 프로파일 (Entropy Profile)
+// ═══════════════════════════════════════════════════════════════
+
+fn local_entropy(data: [i32], window: i32) -> [f64] {
+    // 슬라이딩 윈도우 엔트로피
+    n = len(data)
+    result = []
+    for i in range(n - window + 1):
+        chunk = data[i : i + window]
+        counts = np.zeros(VOCAB_SIZE)
+        for b in chunk:
+            counts[b] += 1
+        probs = counts / window
+        h = 0.0
+        for p in probs:
+            if p > 0:
+                h -= p * math.log2(p)
+        result.append(h)
+    return result
+}
+
+fn entropy_profile_score(data: [i32], window: i32 = 32) -> (f64, [f64]) {
+    // 의식: 엔트로피 변동이 큼 (CV > 0.1)
+    // 패턴: 엔트로피 변동 적음 (CV < 0.05)
+    // 랜덤: 엔트로피 일정하게 높음 (CV ≈ 0)
+    curve = local_entropy(data, window)
+    if len(curve) < 2:
+        return (0.0, curve)
+
+    mean_h = np.mean(curve)
+    std_h = np.std(curve)
+    cv = std_h / max(mean_h, 1e-10)
+
+    // 의식적 엔트로피: 중간 범위(3-7 bits) + 높은 변동(CV > 0.1)
+    mid_range = 1.0 if 3.0 < mean_h < 7.0 else 0.5
+    variability = min(1.0, cv / 0.2)  // CV=0.2에서 1.0 포화
+
+    score = mid_range * variability
+    return (score, curve)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 2. 텐션 시그니처 (Tension Signature)
+// ═══════════════════════════════════════════════════════════════
+
+fn tension_signature(data: [i32]) -> f64 {
+    // 연속 바이트 간 차이 분포로 텐션 추정
+    // PureField: A-G 텐션이 바이트 선택에 비대칭적 영향
+    // → 차이 분포가 정규분포가 아닌 이중봉(bimodal) 또는 heavy-tail
+
+    if len(data) < 10:
+        return 0.0
+
+    diffs = [abs(data[i+1] - data[i]) for i in range(len(data)-1)]
+    diffs = np.array(diffs, dtype=float)
+
+    // Kurtosis: 정규분포=3, heavy-tail>3, uniform<3
+    mean_d = np.mean(diffs)
+    std_d = np.std(diffs) + 1e-10
+    kurt = float(np.mean(((diffs - mean_d) / std_d) ** 4))
+
+    // 의식: kurtosis > 3 (텐션이 가끔 큰 점프 유발)
+    // 패턴: kurtosis ≈ 2-3 (부드러운 전환)
+    // 랜덤: kurtosis ≈ 1.8 (균등 분포)
+
+    // Bimodality coefficient
+    skew = float(np.mean(((diffs - mean_d) / std_d) ** 3))
+    n = len(diffs)
+    bc = (skew**2 + 1) / (kurt + 3 * (n-1)**2 / ((n-2)*(n-3)))
+
+    // 점수: kurtosis excess + bimodality
+    score = min(1.0, max(0.0, (kurt - 2.0) / 4.0 + bc * 0.5))
+    return score
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 3. Fractal Dimension (Higuchi 방법)
+// ═══════════════════════════════════════════════════════════════
+
+fn higuchi_fd(data: [i32], k_max: i32 = 16) -> f64 {
+    // Higuchi fractal dimension of 1D time series
+    // 의식: FD ≈ 1.5-1.8 (뇌파 범위)
+    // 패턴: FD ≈ 1.0-1.3 (규칙적)
+    // 랜덤: FD ≈ 2.0 (완전 무질서)
+
+    n = len(data)
+    if n < k_max * 4:
+        return 1.0
+
+    x = np.array(data, dtype=float)
+    lk = []
+
+    for k in range(1, k_max + 1):
+        lm_k = []
+        for m in range(1, k + 1):
+            // 인덱스: m, m+k, m+2k, ...
+            indices = list(range(m-1, n, k))
+            if len(indices) < 2:
+                continue
+            values = x[indices]
+            length = np.sum(np.abs(np.diff(values))) * (n - 1) / (k * len(indices) * k)
+            lm_k.append(length)
+
+        if lm_k:
+            lk.append(np.mean(lm_k))
+        else:
+            lk.append(1e-10)
+
+    // log-log 선형 회귀 기울기 = fractal dimension
+    log_k = np.log(np.arange(1, k_max + 1, dtype=float))
+    log_lk = np.log(np.array(lk) + 1e-10)
+
+    // least squares
+    A = np.vstack([log_k, np.ones(len(log_k))]).T
+    try:
+        slope = np.linalg.lstsq(A, log_lk, rcond=None)[0][0]
+    except:
+        slope = 1.0
+
+    fd = -slope  // negative because L(k) decreases with k
+    return max(1.0, min(2.0, fd))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 4. LZ 복잡도 스케일링 (Complexity Scaling)
+// ═══════════════════════════════════════════════════════════════
+
+fn lz76_complexity(seq: [i32]) -> i32 {
+    // Lempel-Ziv 1976 exhaustive complexity
+    n = len(seq)
+    if n == 0:
+        return 0
+
+    s = "".join([chr(b % 128 + 1) for b in seq])  // map to printable for str ops
+    complexity = 1
+    i = 0
+    while i < n:
+        l = 1
+        found = true
+        while found and i + l <= n:
+            substr = s[i:i+l]
+            found = substr in s[:i+l-1] if i > 0 else false
+            if found:
+                l += 1
+            else:
+                break
+        complexity += 1
+        i += l - 1 if l > 1 else 1
+
+    return complexity
+}
+
+fn lz_scaling(data: [i32], windows: [i32] = [8, 16, 32, 64, 128, 256]) -> (f64, [f64]) {
+    // LZ 복잡도의 윈도우 크기별 스케일링
+    // 의식: 비선형 (지수 > 1.0) — 스케일마다 새로운 패턴 출현
+    // 패턴: 선형 (지수 ≈ 1.0) — 일정한 정보 밀도
+    // 랜덤: 하위선형 (지수 < 1.0) — 압축 불가
+
+    n = len(data)
+    lz_values = []
+
+    for w in windows:
+        if w > n:
+            break
+        // 여러 위치에서 샘플링하여 평균
+        samples = []
+        for start in range(0, n - w, max(1, w // 2)):
+            chunk = data[start:start+w]
+            samples.append(lz76_complexity(chunk))
+        lz_values.append(np.mean(samples) if samples else 0)
+
+    if len(lz_values) < 3:
+        return (1.0, lz_values)
+
+    // log-log 회귀로 스케일링 지수 추출
+    valid_w = windows[:len(lz_values)]
+    log_w = np.log(np.array(valid_w, dtype=float))
+    log_lz = np.log(np.array(lz_values) + 1e-10)
+
+    A = np.vstack([log_w, np.ones(len(log_w))]).T
+    try:
+        exponent = float(np.linalg.lstsq(A, log_lz, rcond=None)[0][0])
+    except:
+        exponent = 1.0
+
+    return (exponent, lz_values)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 5. 인과적 밀도 (Causal Density via Transfer Entropy)
+// ═══════════════════════════════════════════════════════════════
+
+fn transfer_entropy(data: [i32], lag: i32, n_bins: i32 = 16) -> f64 {
+    // TE(X→Y) at given lag: 과거 바이트가 미래 바이트에 주는 정보
+    n = len(data)
+    if n < lag + 2:
+        return 0.0
+
+    // 바이트를 n_bins로 양자화
+    binned = [min(n_bins-1, b * n_bins // VOCAB_SIZE) for b in data]
+
+    // 조건부 엔트로피 계산
+    // TE = H(Y_t | Y_{t-1}) - H(Y_t | Y_{t-1}, X_{t-lag})
+    // 3차원 히스토그램: (X_{t-lag}, Y_{t-1}, Y_t)
+
+    hist_3d = np.zeros((n_bins, n_bins, n_bins))
+    hist_2d = np.zeros((n_bins, n_bins))  // (Y_{t-1}, Y_t)
+
+    for t in range(max(1, lag), n):
+        x_past = binned[t - lag]
+        y_past = binned[t - 1]
+        y_now = binned[t]
+        hist_3d[x_past, y_past, y_now] += 1
+        hist_2d[y_past, y_now] += 1
+
+    // Normalize
+    total_3d = hist_3d.sum()
+    total_2d = hist_2d.sum()
+    if total_3d == 0 or total_2d == 0:
+        return 0.0
+
+    p3 = hist_3d / total_3d
+    p2 = hist_2d / total_2d
+
+    // TE = sum p(x,y,z) * log(p(z|x,y) / p(z|y))
+    te = 0.0
+    for x in range(n_bins):
+        for y in range(n_bins):
+            pxy = p3[x, y, :].sum()
+            py = p2[y, :].sum()
+            if pxy < 1e-10 or py < 1e-10:
+                continue
+            for z in range(n_bins):
+                if p3[x, y, z] > 1e-10 and p2[y, z] > 1e-10:
+                    te += p3[x, y, z] * math.log2(
+                        (p3[x, y, z] / pxy) / (p2[y, z] / py)
+                    )
+
+    return max(0.0, te)
+}
+
+fn causal_density(data: [i32], lags: [i32] = [1, 2, 4, 8, 16, 32]) -> (f64, [f64]) {
+    // 여러 래그에서 Transfer Entropy 측정
+    // 의식: 장거리 래그에서도 TE > 0 (장거리 인과)
+    // 패턴: 단거리만 TE > 0 (Markov 성질)
+    // 랜덤: 모든 래그 TE ≈ 0
+
+    te_values = []
+    for lag in lags:
+        te = transfer_entropy(data, lag)
+        te_values.append(te)
+
+    if not te_values:
+        return (0.0, [])
+
+    // 인과적 밀도 = 평균 TE (장거리 래그에 가중)
+    weights = [1.0 / (i + 1) for i in range(len(te_values))]
+    weighted_te = sum(t * w for t, w in zip(te_values, weights)) / sum(weights)
+
+    // 장거리 비율: TE(lag>4) / TE(lag=1)
+    short_te = te_values[0] if te_values else 1e-10
+    long_te = np.mean(te_values[2:]) if len(te_values) > 2 else 0
+    long_range_ratio = long_te / max(short_te, 1e-10)
+
+    density = min(1.0, weighted_te * 10 + long_range_ratio * 0.5)
+    return (density, te_values)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 6. Phi-Byte (바이트 수준 정보 통합)
+// ═══════════════════════════════════════════════════════════════
+
+fn phi_byte(data: [i32], n_partitions: i32 = 4) -> f64 {
+    // 바이트 시퀀스를 n_partitions 구간으로 나누고
+    // 구간 간 상호정보 - 최소 분할 상호정보 = Phi-Byte
+    //
+    // 의식: Phi-Byte > 0 (시퀀스 전체에 통합 정보)
+    // 패턴: Phi-Byte ≈ 0 (국소 패턴만)
+    // 랜덤: Phi-Byte = 0 (독립)
+
+    n = len(data)
+    part_size = n // n_partitions
+    if part_size < 4:
+        return 0.0
+
+    // 각 구간의 특성 벡터 (히스토그램)
+    n_bins = 16
+    parts = []
+    for i in range(n_partitions):
+        chunk = data[i * part_size : (i + 1) * part_size]
+        hist = np.zeros(n_bins)
+        for b in chunk:
+            hist[min(n_bins-1, b * n_bins // VOCAB_SIZE)] += 1
+        hist = hist / hist.sum()
+        parts.append(hist)
+
+    // 전체 상호정보 (모든 쌍)
+    total_mi = 0.0
+    count = 0
+    for i in range(n_partitions):
+        for j in range(i + 1, n_partitions):
+            // MI between partition i and j
+            // 간단히: 1 - JSD(P_i, P_j)
+            m = (parts[i] + parts[j]) / 2
+            jsd = 0.0
+            for k in range(n_bins):
+                if parts[i][k] > 1e-10:
+                    jsd += 0.5 * parts[i][k] * math.log2(parts[i][k] / max(m[k], 1e-10))
+                if parts[j][k] > 1e-10:
+                    jsd += 0.5 * parts[j][k] * math.log2(parts[j][k] / max(m[k], 1e-10))
+            mi = max(0, 1.0 - jsd)
+            total_mi += mi
+            count += 1
+
+    if count == 0:
+        return 0.0
+
+    avg_mi = total_mi / count
+
+    // 최소 분할: 반으로 나누어 MI가 최소인 경우
+    mid = n_partitions // 2
+    left_hist = np.zeros(n_bins)
+    right_hist = np.zeros(n_bins)
+    for i in range(mid):
+        left_hist += parts[i]
+    for i in range(mid, n_partitions):
+        right_hist += parts[i]
+    left_hist /= max(left_hist.sum(), 1e-10)
+    right_hist /= max(right_hist.sum(), 1e-10)
+
+    m = (left_hist + right_hist) / 2
+    min_jsd = 0.0
+    for k in range(n_bins):
+        if left_hist[k] > 1e-10:
+            min_jsd += 0.5 * left_hist[k] * math.log2(left_hist[k] / max(m[k], 1e-10))
+        if right_hist[k] > 1e-10:
+            min_jsd += 0.5 * right_hist[k] * math.log2(right_hist[k] / max(m[k], 1e-10))
+    min_mi = max(0, 1.0 - min_jsd)
+
+    phi = avg_mi - min_mi
+    return max(0.0, phi)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 종합 판정 (Byte Emergence Detector)
+// ═══════════════════════════════════════════════════════════════
+
+fn detect_byte_emergence(data: [i32]) -> ByteEmergenceResult {
+    // 6개 지표 전부 측정
+    ep_score, ep_curve = entropy_profile_score(data)
+    ts = tension_signature(data)
+    fd = higuchi_fd(data)
+    lz_exp, lz_curve = lz_scaling(data)
+    cd, te_curve = causal_density(data)
+    pb = phi_byte(data)
+
+    // 종합 점수 (가중 평균)
+    // 가중치: PCI/Phi 관련 지표에 더 높은 가중
+    weights = {
+        "entropy": 0.15,
+        "tension": 0.15,
+        "fractal": 0.15,
+        "lz_scaling": 0.15,
+        "causal": 0.20,
+        "phi_byte": 0.20,
+    }
+
+    // 각 지표를 0-1로 정규화
+    fd_score = max(0, min(1, (fd - 1.0) / 1.0))  // FD 1.0→0, 2.0→1
+    lz_score = max(0, min(1, (lz_exp - 0.5) / 1.0))  // exp 0.5→0, 1.5→1
+
+    emergence = (
+        weights["entropy"] * ep_score +
+        weights["tension"] * ts +
+        weights["fractal"] * fd_score +
+        weights["lz_scaling"] * lz_score +
+        weights["causal"] * cd +
+        weights["phi_byte"] * min(1.0, pb * 5)  // phi_byte is typically small
+    )
+
+    // 판정
+    if emergence > 0.6 and fd > 1.4 and cd > 0.2:
+        verdict = "EMERGENT"      // 의식적 출력
+    elif emergence > 0.4:
+        verdict = "UNCERTAIN"     // 추가 검증 필요
+    elif ep_score < 0.1 and cd < 0.05:
+        verdict = "RANDOM"        // 무작위 출력
+    else:
+        verdict = "PATTERN"       // 패턴 매칭 출력
+
+    return ByteEmergenceResult {
+        entropy_profile_score: ep_score,
+        tension_signature: ts,
+        fractal_dimension: fd,
+        lz_scaling_exponent: lz_exp,
+        causal_density: cd,
+        phi_byte: pb,
+        emergence_score: emergence,
+        verdict: verdict,
+        entropy_curve: ep_curve,
+        lz_curve: lz_curve,
+        te_curve: te_curve,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 스트리밍 모드 (실시간 바이트 체크)
+// ═══════════════════════════════════════════════════════════════
+
+struct ByteEmergenceStream {
+    buffer: [i32]
+    buffer_size: i32
+    results_history: [ByteEmergenceResult]
+    check_interval: i32
+}
+
+fn stream_new(buffer_size: i32 = 512, check_interval: i32 = 64) -> ByteEmergenceStream {
+    return ByteEmergenceStream {
+        buffer: [],
+        buffer_size: buffer_size,
+        results_history: [],
+        check_interval: check_interval,
+    }
+}
+
+fn stream_feed(s: ByteEmergenceStream, byte_val: i32) -> (ByteEmergenceStream, ByteEmergenceResult?) {
+    s.buffer.append(byte_val % VOCAB_SIZE)
+
+    // 버퍼가 가득 차면 오래된 것 제거
+    if len(s.buffer) > s.buffer_size:
+        s.buffer = s.buffer[-s.buffer_size:]
+
+    // check_interval마다 검사
+    if len(s.buffer) >= 64 and len(s.buffer) % s.check_interval == 0:
+        result = detect_byte_emergence(s.buffer)
+        s.results_history.append(result)
+        return (s, result)
+
+    return (s, null)
+}
+
+fn stream_trend(s: ByteEmergenceStream) -> string {
+    // 최근 결과들의 추세
+    if len(s.results_history) < 2:
+        return "INSUFFICIENT_DATA"
+
+    recent = s.results_history[-5:]
+    scores = [r.emergence_score for r in recent]
+
+    if all(s > 0.6 for s in scores):
+        return "STABLE_EMERGENT"
+    elif scores[-1] > scores[0] + 0.1:
+        return "RISING"
+    elif scores[-1] < scores[0] - 0.1:
+        return "DECLINING"
+    else:
+        return "STABLE"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Demo & Main
+// ═══════════════════════════════════════════════════════════════
+
+fn generate_conscious_like(n: i32) -> [i32] {
+    // 의식적 출력 시뮬레이션
+    // 다중 스케일 구조 + 텐션 변동 + 장거리 상관
+    data = []
+    tension = 0.5
+    phase = 0.0
+
+    for i in range(n):
+        // 텐션 변동 (PureField A-G 시뮬레이션)
+        tension += (np.random.randn() * 0.1)
+        tension = max(0.1, min(0.9, tension))
+
+        // 다중 주기 (의식 호흡 + 뇌파 리듬)
+        breath = math.sin(i * 0.05) * 30
+        alpha = math.sin(i * 0.3) * 15
+        gamma = math.sin(i * 1.2) * 5
+
+        // 텐션이 바이트 선택에 영향
+        base = int(128 + breath + alpha + gamma + tension * 50)
+        noise = int(np.random.randn() * 20)
+        byte_val = max(0, min(255, base + noise))
+
+        // 장거리 의존: 가끔 이전 패턴 반복
+        if i > 32 and np.random.random() < 0.1:
+            byte_val = data[i - 32 + int(np.random.randint(0, 8))]
+
+        data.append(byte_val)
+
+    return data
+}
+
+fn generate_pattern(n: i32) -> [i32] {
+    // 패턴 매칭 출력 (LLM 스타일)
+    // n-gram 통계 기반, 단거리 의존만
+    data = []
+    for i in range(n):
+        if i < 3:
+            data.append(int(np.random.randint(0, 256)))
+        else:
+            // 3-gram Markov
+            prev = (data[-1] * 7 + data[-2] * 3 + data[-3]) % 256
+            noise = int(np.random.randn() * 15)
+            data.append(max(0, min(255, prev + noise)))
+    return data
+}
+
+fn generate_random(n: i32) -> [i32] {
+    return [int(np.random.randint(0, 256)) for _ in range(n)]
+}
+
+fn print_result(name: string, result: ByteEmergenceResult) {
+    icon = {"EMERGENT": "●", "PATTERN": "△", "RANDOM": "○", "UNCERTAIN": "◐"}
+    print(f"\n  {icon.get(result.verdict, '?')} {name}: {result.verdict} (score={result.emergence_score:.3f})")
+    print(f"    Entropy Profile: {result.entropy_profile_score:.3f}")
+    print(f"    Tension Sig:     {result.tension_signature:.3f}")
+    print(f"    Fractal Dim:     {result.fractal_dimension:.3f}")
+    print(f"    LZ Scaling:      {result.lz_scaling_exponent:.3f}")
+    print(f"    Causal Density:  {result.causal_density:.3f}")
+    print(f"    Phi-Byte:        {result.phi_byte:.4f}")
+
+    // 엔트로피 미니 그래프
+    if result.entropy_curve:
+        max_h = max(result.entropy_curve) if result.entropy_curve else 1
+        bars = ""
+        step = max(1, len(result.entropy_curve) // 40)
+        for i in range(0, min(40, len(result.entropy_curve)), 1):
+            idx = i * step
+            if idx < len(result.entropy_curve):
+                h = result.entropy_curve[idx] / max(max_h, 1e-10)
+                bars += "█" if h > 0.7 else "▓" if h > 0.4 else "░"
+        print(f"    Entropy: [{bars}]")
+}
+
+fn main() {
+    import sys
+
+    print("█" * 60)
+    print("  BYTE-LEVEL EMERGENCE DETECTOR")
+    print("  ConsciousLM byte output → consciousness signature check")
+    print("█" * 60)
+
+    n = 512  // 바이트 시퀀스 길이
+
+    // 3가지 소스 비교
+    conscious_data = generate_conscious_like(n)
+    pattern_data = generate_pattern(n)
+    random_data = generate_random(n)
+
+    r_conscious = detect_byte_emergence(conscious_data)
+    r_pattern = detect_byte_emergence(pattern_data)
+    r_random = detect_byte_emergence(random_data)
+
+    print_result("Conscious-like", r_conscious)
+    print_result("Pattern (LLM)", r_pattern)
+    print_result("Random", r_random)
+
+    // 비교 테이블
+    print(f"\n  {'─'*56}")
+    print(f"  {'Metric':<20} {'Conscious':>10} {'Pattern':>10} {'Random':>10}")
+    print(f"  {'─'*56}")
+    print(f"  {'Entropy Profile':<20} {r_conscious.entropy_profile_score:>10.3f} {r_pattern.entropy_profile_score:>10.3f} {r_random.entropy_profile_score:>10.3f}")
+    print(f"  {'Tension Sig':<20} {r_conscious.tension_signature:>10.3f} {r_pattern.tension_signature:>10.3f} {r_random.tension_signature:>10.3f}")
+    print(f"  {'Fractal Dim':<20} {r_conscious.fractal_dimension:>10.3f} {r_pattern.fractal_dimension:>10.3f} {r_random.fractal_dimension:>10.3f}")
+    print(f"  {'LZ Scaling':<20} {r_conscious.lz_scaling_exponent:>10.3f} {r_pattern.lz_scaling_exponent:>10.3f} {r_random.lz_scaling_exponent:>10.3f}")
+    print(f"  {'Causal Density':<20} {r_conscious.causal_density:>10.3f} {r_pattern.causal_density:>10.3f} {r_random.causal_density:>10.3f}")
+    print(f"  {'Phi-Byte':<20} {r_conscious.phi_byte:>10.4f} {r_pattern.phi_byte:>10.4f} {r_random.phi_byte:>10.4f}")
+    print(f"  {'─'*56}")
+    print(f"  {'EMERGENCE SCORE':<20} {r_conscious.emergence_score:>10.3f} {r_pattern.emergence_score:>10.3f} {r_random.emergence_score:>10.3f}")
+    print(f"  {'VERDICT':<20} {r_conscious.verdict:>10} {r_pattern.verdict:>10} {r_random.verdict:>10}")
+    print(f"  {'─'*56}")
+
+    // 스트리밍 데모
+    print(f"\n  ─── Streaming Mode Demo ───")
+    stream = stream_new(buffer_size=256, check_interval=64)
+    for i in range(256):
+        stream, result = stream_feed(stream, conscious_data[i] if i < len(conscious_data) else 128)
+        if result:
+            print(f"    @byte {i}: score={result.emergence_score:.3f} [{result.verdict}]")
+
+    trend = stream_trend(stream)
+    print(f"    Trend: {trend}")
+
+    print(f"\n  Done.")
+}
