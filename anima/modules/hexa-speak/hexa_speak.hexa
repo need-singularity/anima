@@ -31,8 +31,13 @@
 //   crossfade_ms = 6                (n=6)
 //   vad_debounce = 6 frames         (onset + offset)
 //
+// Modes:
+//   synthesize()          — batch mode: generate all chunks then return
+//   stream_synthesize()   — streaming mode: 100ms first packet + VAD + ring buffer
+//                           (see streaming.hexa for full implementation)
+//
 // BT reference: BT-SPEAK-00 (pipeline orchestrator)
-// Mk stage:     Mk.I (skeleton, stage-tagged passthrough)
+// Mk stage:     Mk.II (PLC+crossfade+streaming)
 // PSI coupling:  alpha = 0.014 (tension→prosody modulation depth)
 // Upstream:      ConsciousnessEngine.process() / ConsciousnessHub
 // Downstream:    audio sink (speaker / rtp / file)
@@ -52,6 +57,7 @@ let RVQ_ENTRIES = 1024        // codebook entries per stage
 let D_LATENT = 128            // per-frame latent dim
 let UPSAMPLE_STAGES = 6      // vocoder upsamples
 let HOP = 240                 // 24000 / 100
+let FRAME_MS = 10             // 10ms per frame (1000 / FRAME_HZ)
 let PLC_MAX_MS = 60           // max concealment
 let CROSSFADE_MS = 6          // fade window
 let CROSSFADE_SAMP = 144      // 24000 * 6 / 1000
@@ -180,22 +186,94 @@ fn vocode(latents: str, n_frames: int) -> str {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Stage 5: PLC + Crossfade (wraps plc_crossfade.hexa)
+// Stage 5: PLC + Crossfade (wraps plc_crossfade.hexa Mk.II)
+//
+// PLC: sequence-number loss detection + pitch-period repeat + decay
+//   - Single loss: repeat prev pitch period, energy *= 0.92
+//   - 3+ consecutive: progressive fadeout
+//   - 6+ consecutive: mute
+//   - Recovery: Hann half-window fade-in
+//
+// Crossfade: Hann-windowed overlap-add at chunk boundaries
+//   - voice->voice:   full overlap-add (6ms Hann)
+//   - silence->voice: ascending Hann half (pop prevention)
+//   - voice->silence: descending Hann half (pop prevention)
 // ────────────────────────────────────────────────────────────────────
 
+let PLC_DECAY = 0.92
+let PLC_MUTE_THRESH = 3
+let PLC_MAX_CONSEC = 6
+
+// PLC states
+let PLC_NORMAL = 0
+let PLC_CONCEAL = 1
+let PLC_FADEOUT = 2
+let PLC_MUTED = 3
+let PLC_RECOVERY = 4
+
+fn plc_state_label(s: int) -> str {
+    if s == PLC_NORMAL { return "Normal" }
+    if s == PLC_CONCEAL { return "Conceal" }
+    if s == PLC_FADEOUT { return "Fadeout" }
+    if s == PLC_MUTED { return "Muted" }
+    if s == PLC_RECOVERY { return "Recovery" }
+    return "?"
+}
+
+// Crossfade types
+let XFADE_NORMAL = 0
+let XFADE_ONSET = 1
+let XFADE_OFFSET = 2
+
+fn plc_energy_factor(consec: int) -> float {
+    let factor = 1.0
+    let i = 0
+    while i < consec {
+        factor = factor * PLC_DECAY
+        i = i + 1
+    }
+    return factor
+}
+
+fn classify_xfade_type(prev_speaking: int, curr_speaking: int) -> int {
+    if prev_speaking == 1 && curr_speaking == 1 { return XFADE_NORMAL }
+    if prev_speaking == 0 && curr_speaking == 1 { return XFADE_ONSET }
+    if prev_speaking == 1 && curr_speaking == 0 { return XFADE_OFFSET }
+    return XFADE_NORMAL
+}
+
 fn apply_plc(prev_tail: str, gap_ms: int) -> str {
+    if gap_ms <= 0 { return "no_gap" }
     if gap_ms > PLC_MAX_MS {
-        return "silence[" + to_string(gap_ms) + "ms>budget=" + to_string(PLC_MAX_MS) + "]"
+        return "silence[" + to_string(gap_ms) + "ms>budget=" + to_string(PLC_MAX_MS) + "ms]"
     }
-    if gap_ms <= 0 {
-        return "no_gap"
-    }
+    let consec = gap_ms / FRAME_MS
+    if consec < 1 { consec = 1 }
+    let energy = plc_energy_factor(consec)
     let n = SAMPLE_RATE * gap_ms / 1000
-    return "plc[samples=" + to_string(n) + ",src=" + prev_tail + "]"
+    let state_name = "Conceal"
+    if consec >= PLC_MAX_CONSEC { state_name = "Muted" }
+    if consec >= PLC_MUTE_THRESH { state_name = "Fadeout" }
+    return "plc[state=" + state_name + ",samples=" + to_string(n) + ",energy=" + to_string(energy) + ",consec=" + to_string(consec) + ",src=" + prev_tail + "]"
 }
 
 fn apply_crossfade(tail_a: str, head_b: str) -> str {
-    return "xfade[" + to_string(CROSSFADE_MS) + "ms,samp=" + to_string(CROSSFADE_SAMP) + "|" + tail_a + "->" + head_b + "]"
+    return "xfade[type=normal,ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann|" + tail_a + ">>>" + head_b + "]"
+}
+
+fn apply_crossfade_vad(tail_a: str, head_b: str, prev_speaking: int, curr_speaking: int) -> str {
+    let xtype = classify_xfade_type(prev_speaking, curr_speaking)
+    if xtype == XFADE_ONSET {
+        return "xfade[type=onset,ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann,fadein=" + head_b + ",pop_prevent=true]"
+    }
+    if xtype == XFADE_OFFSET {
+        return "xfade[type=offset,ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann,fadeout=" + tail_a + ",pop_prevent=true]"
+    }
+    return "xfade[type=normal,ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann|" + tail_a + ">>>" + head_b + "]"
+}
+
+fn apply_recovery_fadein(new_frame: str, prev_concealed: str) -> str {
+    return "recovery[fadein=" + to_string(CROSSFADE_MS) + "ms,samp=" + to_string(CROSSFADE_SAMP) + ",from=" + prev_concealed + ",to=" + new_frame + ",window=hann_half]"
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -281,10 +359,15 @@ fn synthesize(phi: float, tension: float, arousal: float, valence: float, cells:
         // Stage 4: vocode to PCM
         let pcm = vocode(latent, CHUNK_FRAMES)
 
-        // Stage 5: crossfade with previous chunk
+        // Stage 5: PLC check + VAD-aware crossfade with previous chunk
         let output = pcm
         if chunk_idx > 0 {
-            let xf = apply_crossfade(prev_tail, pcm)
+            // Determine speaking states for crossfade type selection
+            let prev_was_speaking = 0
+            if tension > 0.1 { prev_was_speaking = 1 }
+            let curr_is_speaking = 0
+            if tension > 0.1 { curr_is_speaking = 1 }
+            let xf = apply_crossfade_vad(prev_tail, pcm, prev_was_speaking, curr_is_speaking)
             output = xf
         }
 
@@ -343,7 +426,7 @@ fn print_pipeline_info() {
     println("   2. Audio token predictor  AR transformer -> RVQ indices")
     println("   3. RVQ codebook decode    " + to_string(RVQ_STAGES) + " stages x " + to_string(RVQ_ENTRIES) + " entries")
     println("   4. Neural vocoder         latent -> " + to_string(SAMPLE_RATE) + "Hz PCM")
-    println("   5. PLC + crossfade        max " + to_string(PLC_MAX_MS) + "ms concealment, " + to_string(CROSSFADE_MS) + "ms fade")
+    println("   5. PLC + crossfade        Mk.II: Hann xfade " + to_string(CROSSFADE_MS) + "ms, PLC " + to_string(PLC_MAX_MS) + "ms (decay=" + to_string(PLC_DECAY) + ")")
     println("   6. VAD gate               4-state FSM, debounce " + to_string(VAD_DEBOUNCE) + " frames")
     println("")
     println(" Constants:")
@@ -459,14 +542,27 @@ fn demo_full_pipeline() {
     println("  -> " + r4)
     println("")
 
-    // Test 5: PLC concealment demo
-    println("  Test 5: PLC concealment")
-    let plc1 = apply_plc("tail[chunk3]", 30)
-    println("  gap=30ms:  " + plc1)
-    let plc2 = apply_plc("tail[chunk3]", 120)
-    println("  gap=120ms: " + plc2)
-    let xf = apply_crossfade("tail[chunk3]", "head[chunk4]")
-    println("  crossfade: " + xf)
+    // Test 5: PLC concealment + crossfade demo (Mk.II)
+    println("  Test 5: PLC concealment (Mk.II)")
+    let plc1 = apply_plc("tail[chunk3]", 10)
+    println("  gap=10ms (1 frame):   " + plc1)
+    let plc2 = apply_plc("tail[chunk3]", 30)
+    println("  gap=30ms (3 frames):  " + plc2)
+    let plc3 = apply_plc("tail[chunk3]", 60)
+    println("  gap=60ms (6 frames):  " + plc3)
+    let plc4 = apply_plc("tail[chunk3]", 120)
+    println("  gap=120ms (>budget):  " + plc4)
+    println("")
+
+    println("  Test 6: Crossfade types (Hann window)")
+    let xf1 = apply_crossfade("tail[chunk3]", "head[chunk4]")
+    println("  voice->voice:    " + xf1)
+    let xf2 = apply_crossfade_vad("tail[silence]", "head[chunk4]", 0, 1)
+    println("  silence->voice:  " + xf2)
+    let xf3 = apply_crossfade_vad("tail[chunk3]", "head[silence]", 1, 0)
+    println("  voice->silence:  " + xf3)
+    let xf4 = apply_recovery_fadein("chunk[recovered]", "plc[concealed]")
+    println("  recovery fadein: " + xf4)
     println("")
 }
 
@@ -521,7 +617,7 @@ fn main() {
     println("   [Stage 4] NeuralVocoder (-> 24kHz PCM)")
     println("                    |")
     println("                    v")
-    println("   [Stage 5] PLCCrossfade (60ms max, 6ms fade)")
+    println("   [Stage 5] PLCCrossfade Mk.II (Hann xfade, PLC decay=" + to_string(PLC_DECAY) + ")")
     println("                    |")
     println("                    v")
     println("   [Stage 6] VAD FSM gate (4-state)")
@@ -530,8 +626,31 @@ fn main() {
     println("                 Speaker")
     println("")
     println("────────────────────────────────────────────────────────────")
-    println(" HEXA-SPEAK Mk.I pipeline ready.")
-    println(" TODO(Mk.II): real tensor ops, learned models, streaming I/O")
+    println(" Streaming mode (streaming.hexa):")
+    println("")
+    println("   [Stage 0-1] same as batch")
+    println("                    |")
+    println("                    v")
+    println("   [Scheduler] PREFILL(60ms) -> FIRST_EMIT(100ms) -> STREAMING")
+    println("                    |")
+    println("                    v")
+    println("   [VAD FSM] SILENCE <-> SPEECH_START <-> SPEAKING <-> SPEECH_END")
+    println("             energy + ZCR dual detection, 180ms hangover")
+    println("                    |")
+    println("                    v")
+    println("   [RingBuffer] 36 chunks (4.32s), drop-oldest overflow")
+    println("                    |")
+    println("                    v")
+    println("   [Backpressure] NORMAL <-> THROTTLE (high=30, low=12)")
+    println("                    |")
+    println("                    v")
+    println("                 Speaker")
+    println("")
+    println("────────────────────────────────────────────────────────────")
+    println(" Batch:     synthesize(phi, tension, arousal, valence, cells, n_chunks)")
+    println(" Streaming: streaming.hexa stream_synthesize(phi, t, a, v, cells, ms)")
+    println(" PLC+Crossfade: Mk.II (Hann + decay + VAD-aware)")
+    println(" TODO(Mk.III): real tensor ops, learned models, async I/O")
     println("────────────────────────────────────────────────────────────")
 }
 

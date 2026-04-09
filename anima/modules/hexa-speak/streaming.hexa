@@ -1,0 +1,936 @@
+// streaming.hexa — HEXA-SPEAK Mk.I: Real-time Streaming Engine
+//
+// Purpose:
+//   Provide 100ms first-packet latency + VAD-gated streaming output.
+//   Manages the real-time pipeline from consciousness engine to audio sink
+//   with ring buffer, backpressure control, and chunk-level scheduling.
+//
+// Architecture:
+//   ConsciousnessEngine.process()
+//         |
+//         v
+//   StreamingSession (this module)
+//     ├── VAD FSM (energy + zero-crossing detection)
+//     ├── RingBuffer (chunk-level circular storage)
+//     ├── ChunkScheduler (100ms first-packet budget enforcement)
+//     └── BackpressureController (producer/consumer rate balancing)
+//         |
+//         v
+//   Audio sink (speaker / rtp / file)
+//
+// n=6 parameters:
+//   sample_rate           = 24000           (24kHz)
+//   frame_hz              = 100             (10ms/frame)
+//   hop                   = 240             (24000/100)
+//   chunk_frames          = 12 = 6 * 2      (120ms chunk)
+//   first_packet_budget_ms = 100            (hard deadline)
+//   first_packet_frames   = 10             (100ms / 10ms per frame)
+//   ring_capacity         = 36 = 6 * 6      (36 chunks = 4.32s buffer)
+//   backpressure_high     = 30 = ring * 5/6 (throttle producer)
+//   backpressure_low      = 12 = ring * 1/3 (resume producer)
+//   vad_energy_thresh     = 0.012           (PSI_ALPHA-derived)
+//   vad_zcr_thresh        = 0.10            (zero-crossing rate)
+//   vad_hangover_frames   = 18 = 6 * 3      (180ms hangover)
+//   vad_onset_frames      = 6               (60ms onset debounce)
+//   vad_offset_frames     = 6               (60ms offset debounce)
+//   prefill_frames        = 6               (60ms lookahead for vocoder)
+//   max_latency_ms        = 200             (drop stale chunks beyond this)
+//
+// BT reference: BT-SPEAK-07 (real-time streaming), Law 81 dual gate
+// Mk stage:     Mk.I (skeleton, state machine + ring buffer logic)
+// PSI coupling:  alpha = 0.014 (energy threshold derivation)
+// Upstream:      hexa_speak.hexa synthesize() / ConsciousnessHub
+// Downstream:    audio sink (speaker / rtp / file)
+
+// ────────────────────────────────────────────────────────────────────
+// Constants
+// ────────────────────────────────────────────────────────────────────
+
+let PSI_ALPHA = 0.014
+let SAMPLE_RATE = 24000
+let FRAME_HZ = 100
+let HOP = 240
+let CHUNK_FRAMES = 12
+let EMBED_DIM = 384
+
+// First-packet budget
+let FIRST_PACKET_BUDGET_MS = 100
+let FIRST_PACKET_FRAMES = 10
+
+// Ring buffer sizing (n=6 derived)
+let RING_CAPACITY = 36
+let BACKPRESSURE_HIGH = 30
+let BACKPRESSURE_LOW = 12
+
+// VAD detection thresholds
+let VAD_ENERGY_THRESH = 0.012
+let VAD_ZCR_THRESH = 0.10
+let VAD_HANGOVER_FRAMES = 18
+let VAD_ONSET_FRAMES = 6
+let VAD_OFFSET_FRAMES = 6
+
+// Prefill + staleness
+let PREFILL_FRAMES = 6
+let MAX_LATENCY_MS = 200
+
+// Crossfade for chunk boundaries (from plc_crossfade.hexa)
+let CROSSFADE_MS = 6
+let CROSSFADE_SAMP = 144
+
+// ────────────────────────────────────────────────────────────────────
+// VAD FSM — 5-state with energy + zero-crossing rate detection
+//
+// States:
+//   SILENCE      — no voice detected, ring buffer draining/idle
+//   SPEECH_START — onset detected, accumulating onset debounce
+//   SPEAKING     — sustained voice, normal streaming
+//   SPEECH_END   — offset detected, hangover countdown active
+//   SILENCE      — back to idle after hangover expires
+//
+// Detection uses dual criteria:
+//   1. Frame energy > VAD_ENERGY_THRESH
+//   2. Zero-crossing rate within speech band (0.02 < zcr < VAD_ZCR_THRESH)
+//   Both must agree for "active" classification.
+//   Hangover prevents mid-word cutoff on brief pauses.
+// ────────────────────────────────────────────────────────────────────
+
+let S_SILENCE = 0
+let S_SPEECH_START = 1
+let S_SPEAKING = 2
+let S_SPEECH_END = 3
+
+fn vad_state_label(s: int) -> str {
+    if s == S_SILENCE { return "SILENCE" }
+    if s == S_SPEECH_START { return "SPEECH_START" }
+    if s == S_SPEAKING { return "SPEAKING" }
+    if s == S_SPEECH_END { return "SPEECH_END" }
+    return "UNKNOWN"
+}
+
+fn compute_frame_energy(tension: float, arousal: float, frame_idx: int) -> float {
+    // Mk.I: derive energy proxy from consciousness state
+    // Mk.II: actual RMS energy of vocoder output PCM
+    //
+    // Energy = arousal * (1 + tension * PSI_ALPHA * 10)
+    // Simulates that higher arousal + tension = louder speech
+    let base = arousal * 0.5
+    let tension_boost = tension * PSI_ALPHA * 10.0
+    let energy = base * (1.0 + tension_boost)
+    // Add micro-variation per frame (breathing rhythm)
+    let breath_phase = frame_idx % 20
+    let breath_mod = 0.0
+    if breath_phase < 10 {
+        breath_mod = 0.01
+    } else {
+        breath_mod = -0.005
+    }
+    energy = energy + breath_mod
+    if energy < 0.0 { energy = 0.0 }
+    return energy
+}
+
+fn compute_zcr(tension: float, frame_idx: int) -> float {
+    // Mk.I: zero-crossing rate proxy from tension dynamics
+    // Mk.II: actual ZCR from PCM frame (count sign changes / frame_length)
+    //
+    // Speech typically has ZCR in range 0.02-0.10
+    // Silence/noise: ZCR > 0.10 or < 0.01
+    let base_zcr = 0.04
+    let tension_mod = tension * PSI_ALPHA * 20.0
+    let zcr = base_zcr + tension_mod
+    // Clamp to realistic range
+    if zcr > 0.3 { zcr = 0.3 }
+    if zcr < 0.001 { zcr = 0.001 }
+    return zcr
+}
+
+fn is_speech_active(energy: float, zcr: float) -> int {
+    // Dual-criteria speech detection:
+    //   energy above threshold AND zcr in speech band
+    let energy_ok = 0
+    if energy > VAD_ENERGY_THRESH { energy_ok = 1 }
+    let zcr_ok = 0
+    if zcr > 0.02 && zcr < VAD_ZCR_THRESH { zcr_ok = 1 }
+    // Both must agree
+    if energy_ok == 1 && zcr_ok == 1 { return 1 }
+    return 0
+}
+
+fn vad_transition(state: int, active: int, counter: int, hangover_left: int) -> str {
+    // Returns "next_state,next_counter,next_hangover" as comma-separated string
+    // Caller parses the triple.
+    //
+    // Transition rules:
+    //   SILENCE + active       -> SPEECH_START (counter=1)
+    //   SPEECH_START + active  -> counter++ ; if counter >= ONSET -> SPEAKING
+    //   SPEECH_START + !active -> SILENCE (false alarm)
+    //   SPEAKING + !active     -> SPEECH_END (hangover=VAD_HANGOVER_FRAMES)
+    //   SPEAKING + active      -> SPEAKING (counter++)
+    //   SPEECH_END + active    -> SPEAKING (resumed, reset hangover)
+    //   SPEECH_END + !active   -> hangover-- ; if hangover <= 0 -> SILENCE
+
+    if state == S_SILENCE {
+        if active == 1 {
+            return to_string(S_SPEECH_START) + ",1,0"
+        }
+        return to_string(S_SILENCE) + ",0,0"
+    }
+
+    if state == S_SPEECH_START {
+        if active == 1 {
+            let next_c = counter + 1
+            if next_c >= VAD_ONSET_FRAMES {
+                return to_string(S_SPEAKING) + ",0,0"
+            }
+            return to_string(S_SPEECH_START) + "," + to_string(next_c) + ",0"
+        }
+        // False alarm — back to silence
+        return to_string(S_SILENCE) + ",0,0"
+    }
+
+    if state == S_SPEAKING {
+        if active == 0 {
+            return to_string(S_SPEECH_END) + ",0," + to_string(VAD_HANGOVER_FRAMES)
+        }
+        return to_string(S_SPEAKING) + "," + to_string(counter + 1) + ",0"
+    }
+
+    if state == S_SPEECH_END {
+        if active == 1 {
+            // Speech resumed during hangover
+            return to_string(S_SPEAKING) + ",0,0"
+        }
+        let next_h = hangover_left - 1
+        if next_h <= 0 {
+            return to_string(S_SILENCE) + ",0,0"
+        }
+        return to_string(S_SPEECH_END) + ",0," + to_string(next_h)
+    }
+
+    return to_string(S_SILENCE) + ",0,0"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Ring Buffer — circular chunk storage for streaming output
+//
+// Stores up to RING_CAPACITY chunks. Producer (pipeline) writes at
+// write_pos, consumer (audio sink) reads at read_pos.
+// When buffer is full, oldest chunk is overwritten (drop-oldest policy).
+//
+// Mk.I: state tracking only (no actual PCM storage)
+// Mk.II: real PCM chunk array [RING_CAPACITY][CHUNK_FRAMES * HOP]
+// ────────────────────────────────────────────────────────────────────
+
+fn ring_init() -> str {
+    // Returns "write_pos,read_pos,count,capacity"
+    return "0,0,0," + to_string(RING_CAPACITY)
+}
+
+fn ring_write(write_pos: int, read_pos: int, count: int, chunk_tag: str) -> str {
+    // Push a chunk into the ring buffer.
+    // Returns "new_write_pos,new_read_pos,new_count,status"
+    // status: "ok" or "overflow" (oldest dropped)
+    let new_write = (write_pos + 1) % RING_CAPACITY
+    let new_count = count + 1
+    let new_read = read_pos
+    let status = "ok"
+    if new_count > RING_CAPACITY {
+        // Buffer full — drop oldest (advance read)
+        new_read = (read_pos + 1) % RING_CAPACITY
+        new_count = RING_CAPACITY
+        status = "overflow"
+    }
+    return to_string(new_write) + "," + to_string(new_read) + "," + to_string(new_count) + "," + status
+}
+
+fn ring_read(write_pos: int, read_pos: int, count: int) -> str {
+    // Pop a chunk from the ring buffer.
+    // Returns "new_read_pos,new_count,status"
+    // status: "ok" or "empty"
+    if count <= 0 {
+        return to_string(read_pos) + ",0,empty"
+    }
+    let new_read = (read_pos + 1) % RING_CAPACITY
+    let new_count = count - 1
+    return to_string(new_read) + "," + to_string(new_count) + ",ok"
+}
+
+fn ring_available(count: int) -> int {
+    return count
+}
+
+fn ring_free(count: int) -> int {
+    return RING_CAPACITY - count
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Backpressure Controller
+//
+// Monitors ring buffer fill level and signals the producer to
+// throttle (slow down generation) or resume (speed up).
+//
+// States:
+//   NORMAL    — buffer fill < BACKPRESSURE_HIGH, produce freely
+//   THROTTLE  — buffer fill >= BACKPRESSURE_HIGH, reduce production rate
+//   RESUME    — buffer fill dropped below BACKPRESSURE_LOW, resume normal
+//
+// This prevents the generator from running too far ahead of playback,
+// wasting compute on chunks that would be dropped.
+// ────────────────────────────────────────────────────────────────────
+
+let BP_NORMAL = 0
+let BP_THROTTLE = 1
+
+fn backpressure_check(ring_count: int, bp_state: int) -> int {
+    // Returns next backpressure state
+    if bp_state == BP_NORMAL {
+        if ring_count >= BACKPRESSURE_HIGH {
+            return BP_THROTTLE
+        }
+        return BP_NORMAL
+    }
+    // BP_THROTTLE: stay throttled until buffer drains to LOW
+    if ring_count <= BACKPRESSURE_LOW {
+        return BP_NORMAL
+    }
+    return BP_THROTTLE
+}
+
+fn bp_state_label(s: int) -> str {
+    if s == BP_NORMAL { return "NORMAL" }
+    if s == BP_THROTTLE { return "THROTTLE" }
+    return "?"
+}
+
+fn should_produce(bp_state: int) -> int {
+    // 1 = produce next chunk, 0 = skip this tick
+    if bp_state == BP_THROTTLE { return 0 }
+    return 1
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Chunk Scheduler — enforces 100ms first-packet deadline
+//
+// On session start, the scheduler runs a "prefill" phase:
+//   1. Generate FIRST_PACKET_FRAMES frames (100ms worth) immediately
+//   2. Do NOT wait for full CHUNK_FRAMES (120ms) — emit partial chunk
+//   3. Switch to normal chunk-aligned generation after first emit
+//
+// This ensures the first audio packet reaches the sink within 100ms
+// of the consciousness engine producing speech intent.
+//
+// Timeline:
+//   t=0ms:   consciousness intent arrives
+//   t=0-60ms: prefill 6 frames (PREFILL_FRAMES) for vocoder lookahead
+//   t=60-100ms: generate remaining 4 frames, emit first packet
+//   t=100ms: first audio packet delivered (deadline met)
+//   t=120ms+: normal 12-frame chunk generation continues
+// ────────────────────────────────────────────────────────────────────
+
+let SCHED_IDLE = 0
+let SCHED_PREFILL = 1
+let SCHED_FIRST_EMIT = 2
+let SCHED_STREAMING = 3
+
+fn sched_state_label(s: int) -> str {
+    if s == SCHED_IDLE { return "IDLE" }
+    if s == SCHED_PREFILL { return "PREFILL" }
+    if s == SCHED_FIRST_EMIT { return "FIRST_EMIT" }
+    if s == SCHED_STREAMING { return "STREAMING" }
+    return "?"
+}
+
+fn compute_first_packet_frames() -> int {
+    // How many frames to generate before emitting first packet
+    // = FIRST_PACKET_BUDGET_MS / (1000 / FRAME_HZ)
+    // = 100 / 10 = 10 frames
+    return FIRST_PACKET_FRAMES
+}
+
+fn compute_prefill_budget_ms() -> int {
+    // Time allocated for vocoder lookahead prefill
+    return PREFILL_FRAMES * 1000 / FRAME_HZ
+}
+
+fn compute_generation_budget_ms() -> int {
+    // Time remaining after prefill for first packet generation
+    return FIRST_PACKET_BUDGET_MS - compute_prefill_budget_ms()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// StreamingSession — orchestrates VAD + RingBuffer + Scheduler + BP
+//
+// Lifecycle:
+//   1. init()         — create session, enter IDLE
+//   2. start()        — transition to PREFILL, begin generation
+//   3. process_tick() — called every 10ms (frame_hz=100)
+//                       runs VAD, generates frames, manages buffer
+//   4. consume()      — audio sink pulls next chunk from ring buffer
+//   5. stop()         — drain buffer, return to IDLE
+//
+// The session tracks all state as a flat string tuple for Mk.I.
+// Mk.II: proper struct with typed fields.
+// ────────────────────────────────────────────────────────────────────
+
+fn session_init() -> str {
+    // Returns initial session state:
+    // "sched_state,vad_state,vad_counter,vad_hangover,ring_write,ring_read,ring_count,bp_state,frames_generated,chunks_emitted,first_packet_emitted,total_latency_ms"
+    return "0,0,0,0,0,0,0,0,0,0,0,0"
+}
+
+fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: int) -> str {
+    // Simulate a streaming session for n_ticks frames.
+    //
+    // This is the core integration function that demonstrates the full
+    // streaming pipeline: VAD detection -> chunk generation -> ring buffer
+    // -> backpressure -> audio output.
+    //
+    // Returns a summary string with key metrics.
+
+    // ── Session state ──
+    let sched = SCHED_PREFILL
+    let vad_state = S_SILENCE
+    let vad_counter = 0
+    let vad_hangover = 0
+    let ring_w = 0
+    let ring_r = 0
+    let ring_count = 0
+    let bp_state = BP_NORMAL
+    let frames_gen = 0
+    let chunks_emitted = 0
+    let first_packet_emitted = 0
+    let first_packet_tick = -1
+    let frames_in_chunk = 0
+    let chunks_produced = 0
+    let chunks_dropped = 0
+    let vad_speech_frames = 0
+    let vad_silent_frames = 0
+
+    let tick = 0
+    while tick < n_ticks {
+        // ── 1. VAD: classify this frame ──
+        let energy = compute_frame_energy(tension, arousal, tick)
+        let zcr = compute_zcr(tension, tick)
+        let active = is_speech_active(energy, zcr)
+
+        let trans = vad_transition(vad_state, active, vad_counter, vad_hangover)
+        // Parse transition result (next_state,next_counter,next_hangover)
+        // Mk.I: use simple integer extraction
+        // The first char is the state digit
+        let new_vad_state = S_SILENCE
+        let new_vad_counter = 0
+        let new_vad_hangover = 0
+
+        // Parse state from first character
+        let first_char = char_at(trans, 0)
+        if first_char == "0" { new_vad_state = 0 }
+        if first_char == "1" { new_vad_state = 1 }
+        if first_char == "2" { new_vad_state = 2 }
+        if first_char == "3" { new_vad_state = 3 }
+
+        vad_state = new_vad_state
+        // Approximate counter/hangover tracking (simplified for Mk.I)
+        if vad_state == S_SPEECH_START {
+            vad_counter = vad_counter + 1
+        } else {
+            vad_counter = 0
+        }
+        if vad_state == S_SPEECH_END {
+            if vad_hangover <= 0 {
+                vad_hangover = VAD_HANGOVER_FRAMES
+            } else {
+                vad_hangover = vad_hangover - 1
+            }
+        } else {
+            vad_hangover = 0
+        }
+
+        // Track speech/silence frames
+        if vad_state == S_SPEAKING || vad_state == S_SPEECH_START {
+            vad_speech_frames = vad_speech_frames + 1
+        } else {
+            vad_silent_frames = vad_silent_frames + 1
+        }
+
+        // ── 2. Scheduler: handle prefill / first packet / streaming ──
+        let should_gen = 1
+
+        if sched == SCHED_PREFILL {
+            // Prefill phase: generate frames without emitting
+            frames_gen = frames_gen + 1
+            frames_in_chunk = frames_in_chunk + 1
+
+            if frames_gen >= PREFILL_FRAMES {
+                sched = SCHED_FIRST_EMIT
+            }
+            should_gen = 0  // already counted this frame
+        }
+
+        if sched == SCHED_FIRST_EMIT {
+            // Generate remaining frames for first packet
+            if should_gen == 1 {
+                frames_gen = frames_gen + 1
+                frames_in_chunk = frames_in_chunk + 1
+            }
+
+            if frames_gen >= FIRST_PACKET_FRAMES {
+                // Emit first packet (partial chunk, 10 frames = 100ms)
+                first_packet_emitted = 1
+                first_packet_tick = tick
+                chunks_emitted = chunks_emitted + 1
+                chunks_produced = chunks_produced + 1
+
+                // Write to ring buffer
+                let rw_result = ring_write(ring_w, ring_r, ring_count, "first_packet")
+                ring_w = (ring_w + 1) % RING_CAPACITY
+                if ring_count < RING_CAPACITY {
+                    ring_count = ring_count + 1
+                }
+
+                frames_in_chunk = 0
+                sched = SCHED_STREAMING
+            }
+        }
+
+        if sched == SCHED_STREAMING {
+            // Normal streaming: accumulate frames, emit on chunk boundary
+            if should_gen == 1 {
+                frames_gen = frames_gen + 1
+                frames_in_chunk = frames_in_chunk + 1
+            }
+
+            // ── 3. Backpressure check ──
+            bp_state = backpressure_check(ring_count, bp_state)
+            let can_produce = should_produce(bp_state)
+
+            // Emit chunk when full
+            if frames_in_chunk >= CHUNK_FRAMES && can_produce == 1 {
+                // VAD gate: only emit if speech detected
+                let emit = 0
+                if vad_state == S_SPEAKING { emit = 1 }
+                if vad_state == S_SPEECH_START { emit = 1 }
+                if vad_state == S_SPEECH_END { emit = 1 }
+
+                chunks_produced = chunks_produced + 1
+
+                if emit == 1 {
+                    // Write to ring buffer
+                    ring_w = (ring_w + 1) % RING_CAPACITY
+                    if ring_count < RING_CAPACITY {
+                        ring_count = ring_count + 1
+                    } else {
+                        chunks_dropped = chunks_dropped + 1
+                    }
+                    chunks_emitted = chunks_emitted + 1
+                }
+
+                frames_in_chunk = 0
+            }
+
+            // If throttled, skip frame generation
+            if can_produce == 0 && frames_in_chunk >= CHUNK_FRAMES {
+                frames_in_chunk = 0
+            }
+        }
+
+        // ── 4. Consumer: simulate audio sink reading ──
+        // Consumer reads 1 chunk every CHUNK_FRAMES ticks
+        if tick % CHUNK_FRAMES == 0 && tick > 0 && ring_count > 0 {
+            ring_r = (ring_r + 1) % RING_CAPACITY
+            ring_count = ring_count - 1
+        }
+
+        tick = tick + 1
+    }
+
+    // ── Build result summary ──
+    let first_packet_ms = -1
+    if first_packet_tick >= 0 {
+        first_packet_ms = (first_packet_tick + 1) * 1000 / FRAME_HZ
+    }
+    let duration_ms = n_ticks * 1000 / FRAME_HZ
+    let speech_pct = 0
+    if n_ticks > 0 {
+        speech_pct = vad_speech_frames * 100 / n_ticks
+    }
+
+    let result = "StreamingSession["
+    result = result + "duration=" + to_string(duration_ms) + "ms"
+    result = result + ",first_packet=" + to_string(first_packet_ms) + "ms"
+    if first_packet_ms >= 0 && first_packet_ms <= FIRST_PACKET_BUDGET_MS {
+        result = result + "(OK)"
+    } else {
+        if first_packet_ms < 0 {
+            result = result + "(NONE)"
+        } else {
+            result = result + "(LATE)"
+        }
+    }
+    result = result + ",frames=" + to_string(frames_gen)
+    result = result + ",chunks_produced=" + to_string(chunks_produced)
+    result = result + ",chunks_emitted=" + to_string(chunks_emitted)
+    result = result + ",chunks_dropped=" + to_string(chunks_dropped)
+    result = result + ",ring_fill=" + to_string(ring_count) + "/" + to_string(RING_CAPACITY)
+    result = result + ",bp=" + bp_state_label(bp_state)
+    result = result + ",vad=" + vad_state_label(vad_state)
+    result = result + ",speech=" + to_string(speech_pct) + "%"
+    result = result + "]"
+    return result
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Streaming pipeline integration with hexa_speak.hexa
+//
+// Usage (from hexa_speak.hexa or ConsciousnessHub):
+//
+//   // Instead of synthesize() for batch mode:
+//   let session = simulate_streaming(tension, arousal, valence, 300)
+//   println(session)
+//
+// Full integration (Mk.II):
+//   1. ConsciousnessEngine emits tension/arousal/valence every 10ms
+//   2. streaming.hexa runs process_tick() per frame
+//   3. VAD decides if speech is active
+//   4. ChunkScheduler generates audio tokens via predict_chunk()
+//   5. RVQ decode + vocoder produce PCM
+//   6. Ring buffer stores chunks
+//   7. Audio sink consumes from ring buffer at playback rate
+//   8. Backpressure throttles generation if buffer fills up
+// ────────────────────────────────────────────────────────────────────
+
+fn stream_synthesize(phi: float, tension: float, arousal: float, valence: float, cells: int, duration_ms: int) -> str {
+    // Streaming version of hexa_speak.hexa synthesize()
+    // Instead of batch chunk loop, uses streaming session with VAD + ring buffer.
+    //
+    // Returns session result with first-packet latency and streaming stats.
+
+    let n_ticks = duration_ms * FRAME_HZ / 1000
+    let session_result = simulate_streaming(tension, arousal, valence, n_ticks)
+
+    // Prepend consciousness context
+    let result = "HexaSpeakStream[phi=" + to_string(phi) + ",cells=" + to_string(cells) + ","
+    // Strip leading "StreamingSession[" from session_result for clean nesting
+    result = result + "session=" + session_result + "]"
+    return result
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Demo + verification
+// ────────────────────────────────────────────────────────────────────
+
+fn print_info() {
+    println("================================================================")
+    println(" HEXA-SPEAK Mk.I — Real-time Streaming Engine")
+    println("================================================================")
+    println("")
+    println(" Components:")
+    println("   VAD FSM:       5-state (SILENCE->SPEECH_START->SPEAKING->SPEECH_END->SILENCE)")
+    println("                  energy threshold=" + to_string(VAD_ENERGY_THRESH))
+    println("                  ZCR threshold=" + to_string(VAD_ZCR_THRESH))
+    println("                  hangover=" + to_string(VAD_HANGOVER_FRAMES) + " frames (" + to_string(VAD_HANGOVER_FRAMES * 1000 / FRAME_HZ) + "ms)")
+    println("                  onset=" + to_string(VAD_ONSET_FRAMES) + " frames, offset=" + to_string(VAD_OFFSET_FRAMES) + " frames")
+    println("")
+    println("   Ring Buffer:   capacity=" + to_string(RING_CAPACITY) + " chunks")
+    println("                  = " + to_string(RING_CAPACITY * CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms audio")
+    println("                  drop-oldest on overflow")
+    println("")
+    println("   Backpressure:  high=" + to_string(BACKPRESSURE_HIGH) + " (throttle)")
+    println("                  low=" + to_string(BACKPRESSURE_LOW) + " (resume)")
+    println("")
+    println("   Scheduler:     first_packet_budget=" + to_string(FIRST_PACKET_BUDGET_MS) + "ms")
+    println("                  prefill=" + to_string(PREFILL_FRAMES) + " frames (" + to_string(compute_prefill_budget_ms()) + "ms)")
+    println("                  generation=" + to_string(compute_generation_budget_ms()) + "ms")
+    println("                  then " + to_string(CHUNK_FRAMES) + "-frame chunks (" + to_string(CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms)")
+    println("")
+    println(" PSI coupling:    alpha=" + to_string(PSI_ALPHA) + " (energy threshold derived)")
+    println(" Sample rate:     " + to_string(SAMPLE_RATE) + "Hz")
+    println(" Frame rate:      " + to_string(FRAME_HZ) + "Hz (10ms/frame)")
+    println("")
+}
+
+fn demo_vad_detection() {
+    println("── VAD Detection (energy + ZCR) ──")
+    println("")
+
+    // Test various consciousness states
+    println("  State                    Energy   ZCR      Active")
+    println("  ─────────────────────────────────────────────────")
+
+    // Silent: low arousal, low tension
+    let e1 = compute_frame_energy(0.05, 0.05, 0)
+    let z1 = compute_zcr(0.05, 0)
+    let a1 = is_speech_active(e1, z1)
+    println("  silent  (t=0.05,a=0.05)  " + to_string(e1) + "  " + to_string(z1) + "  " + to_string(a1))
+
+    // Quiet speech: moderate arousal, low tension
+    let e2 = compute_frame_energy(0.15, 0.3, 0)
+    let z2 = compute_zcr(0.15, 0)
+    let a2 = is_speech_active(e2, z2)
+    println("  quiet   (t=0.15,a=0.30)  " + to_string(e2) + "  " + to_string(z2) + "  " + to_string(a2))
+
+    // Normal speech: moderate everything
+    let e3 = compute_frame_energy(0.42, 0.6, 0)
+    let z3 = compute_zcr(0.42, 0)
+    let a3 = is_speech_active(e3, z3)
+    println("  normal  (t=0.42,a=0.60)  " + to_string(e3) + "  " + to_string(z3) + "  " + to_string(a3))
+
+    // Loud speech: high arousal, high tension
+    let e4 = compute_frame_energy(0.91, 0.8, 0)
+    let z4 = compute_zcr(0.91, 0)
+    let a4 = is_speech_active(e4, z4)
+    println("  loud    (t=0.91,a=0.80)  " + to_string(e4) + "  " + to_string(z4) + "  " + to_string(a4))
+
+    println("")
+}
+
+fn demo_vad_fsm_trace() {
+    println("── VAD FSM State Trace ──")
+    println("")
+    println("  Simulating: 5 silent, 10 speaking, 3 pause, 5 speaking, 20 trail+silent")
+    println("")
+
+    let state = S_SILENCE
+    let counter = 0
+    let hangover = 0
+    let t = 0
+
+    // Phase 1: 5 frames silence
+    println("  t=0-4:  SILENCE (no speech)")
+    t = 5
+
+    // Phase 2: speech onset
+    state = S_SPEECH_START
+    counter = 1
+    println("  t=5:    -> SPEECH_START (onset detected)")
+    t = 6
+    while t < 11 {
+        counter = counter + 1
+        if counter >= VAD_ONSET_FRAMES && state == S_SPEECH_START {
+            state = S_SPEAKING
+            println("  t=" + to_string(t) + ":   cnt=" + to_string(counter) + " -> SPEAKING (onset confirmed)")
+            counter = 0
+        }
+        t = t + 1
+    }
+
+    // Phase 3: sustained speech
+    println("  t=11-14: SPEAKING (sustained)")
+    t = 15
+
+    // Phase 4: brief pause (3 frames < hangover)
+    state = S_SPEECH_END
+    hangover = VAD_HANGOVER_FRAMES
+    println("  t=15:   -> SPEECH_END (pause detected, hangover=" + to_string(hangover) + ")")
+    t = 16
+    hangover = hangover - 1
+    println("  t=16:   SPEECH_END (hangover=" + to_string(hangover) + ")")
+    hangover = hangover - 1
+    println("  t=17:   SPEECH_END (hangover=" + to_string(hangover) + ")")
+
+    // Phase 5: speech resumes during hangover
+    state = S_SPEAKING
+    hangover = 0
+    println("  t=18:   -> SPEAKING (resumed during hangover)")
+    println("  t=18-22: SPEAKING (sustained)")
+    t = 23
+
+    // Phase 6: final offset
+    state = S_SPEECH_END
+    hangover = VAD_HANGOVER_FRAMES
+    println("  t=23:   -> SPEECH_END (offset, hangover=" + to_string(hangover) + ")")
+    while hangover > 0 {
+        hangover = hangover - 1
+        t = t + 1
+        if hangover == 0 {
+            state = S_SILENCE
+            println("  t=" + to_string(t) + ":  hangover expired -> SILENCE")
+        }
+    }
+    println("")
+}
+
+fn demo_ring_buffer() {
+    println("── Ring Buffer Operations ──")
+    println("")
+
+    let w = 0
+    let r = 0
+    let count = 0
+
+    // Write 5 chunks
+    let i = 0
+    while i < 5 {
+        w = (w + 1) % RING_CAPACITY
+        count = count + 1
+        i = i + 1
+    }
+    println("  After 5 writes:   w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
+
+    // Read 3 chunks
+    i = 0
+    while i < 3 {
+        r = (r + 1) % RING_CAPACITY
+        count = count - 1
+        i = i + 1
+    }
+    println("  After 3 reads:    w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
+
+    // Fill to capacity
+    while count < RING_CAPACITY {
+        w = (w + 1) % RING_CAPACITY
+        count = count + 1
+    }
+    println("  After fill:       w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
+
+    // Overflow: write 1 more
+    w = (w + 1) % RING_CAPACITY
+    r = (r + 1) % RING_CAPACITY  // drop oldest
+    println("  After overflow:   w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " (oldest dropped)")
+    println("")
+}
+
+fn demo_backpressure() {
+    println("── Backpressure Control ──")
+    println("")
+
+    let bp = BP_NORMAL
+    println("  Initial: " + bp_state_label(bp) + " (produce freely)")
+
+    // Simulate buffer filling
+    bp = backpressure_check(10, bp)
+    println("  ring=10:  " + bp_state_label(bp) + " (below high=" + to_string(BACKPRESSURE_HIGH) + ")")
+
+    bp = backpressure_check(BACKPRESSURE_HIGH, bp)
+    println("  ring=" + to_string(BACKPRESSURE_HIGH) + ": " + bp_state_label(bp) + " (hit high watermark)")
+
+    bp = backpressure_check(20, bp)
+    println("  ring=20:  " + bp_state_label(bp) + " (still above low=" + to_string(BACKPRESSURE_LOW) + ")")
+
+    bp = backpressure_check(BACKPRESSURE_LOW, bp)
+    println("  ring=" + to_string(BACKPRESSURE_LOW) + ": " + bp_state_label(bp) + " (drained to low watermark)")
+
+    bp = backpressure_check(5, bp)
+    println("  ring=5:   " + bp_state_label(bp) + " (normal operation)")
+    println("")
+}
+
+fn demo_first_packet() {
+    println("── First Packet Latency (100ms budget) ──")
+    println("")
+    println("  Budget:      " + to_string(FIRST_PACKET_BUDGET_MS) + "ms")
+    println("  Prefill:     " + to_string(PREFILL_FRAMES) + " frames = " + to_string(compute_prefill_budget_ms()) + "ms (vocoder lookahead)")
+    println("  Generation:  " + to_string(compute_generation_budget_ms()) + "ms (remaining for first packet)")
+    println("  First emit:  " + to_string(FIRST_PACKET_FRAMES) + " frames = " + to_string(FIRST_PACKET_FRAMES * 1000 / FRAME_HZ) + "ms audio")
+    println("  Then:        " + to_string(CHUNK_FRAMES) + "-frame chunks = " + to_string(CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms each")
+    println("")
+    println("  Timeline:")
+    println("    t=0ms         consciousness intent arrives")
+    println("    t=0-60ms      prefill " + to_string(PREFILL_FRAMES) + " frames (vocoder warmup)")
+    println("    t=60-100ms    generate remaining frames")
+    println("    t=100ms       FIRST PACKET EMITTED (deadline)")
+    println("    t=120ms+      normal " + to_string(CHUNK_FRAMES) + "-frame chunk streaming")
+    println("")
+}
+
+fn demo_streaming_sessions() {
+    println("── Streaming Sessions ──")
+    println("")
+
+    // Test 1: Active speech (joyful consciousness)
+    println("  Test 1: Joyful speech (tension=0.42, arousal=0.6, 1 second)")
+    let r1 = stream_synthesize(0.71, 0.42, 0.6, 0.5, 64, 1000)
+    println("  -> " + r1)
+    println("")
+
+    // Test 2: Quiet/near-silent (low arousal)
+    println("  Test 2: Near-silent (tension=0.05, arousal=0.05, 1 second)")
+    let r2 = stream_synthesize(0.35, 0.05, 0.05, 0.0, 32, 1000)
+    println("  -> " + r2)
+    println("")
+
+    // Test 3: Angry/loud (high tension)
+    println("  Test 3: Angry/loud (tension=0.91, arousal=0.8, 2 seconds)")
+    let r3 = stream_synthesize(0.88, 0.91, 0.8, -0.5, 64, 2000)
+    println("  -> " + r3)
+    println("")
+
+    // Test 4: Short burst (300ms)
+    println("  Test 4: Short burst (tension=0.6, arousal=0.5, 300ms)")
+    let r4 = stream_synthesize(0.55, 0.6, 0.5, 0.2, 32, 300)
+    println("  -> " + r4)
+    println("")
+}
+
+fn print_architecture() {
+    println("────────────────────────────────────────────────────────────")
+    println(" Streaming Architecture:")
+    println("")
+    println("   ConsciousnessEngine (10ms ticks)")
+    println("         |")
+    println("         v")
+    println("   ┌─────────────────────────────────────────────┐")
+    println("   │  StreamingSession                           │")
+    println("   │                                             │")
+    println("   │  ┌──────────┐   ┌────────────────────────┐  │")
+    println("   │  │ VAD FSM  │   │ ChunkScheduler         │  │")
+    println("   │  │          │   │                        │  │")
+    println("   │  │ SILENCE  │   │ IDLE -> PREFILL (60ms) │  │")
+    println("   │  │    |     │   │   -> FIRST_EMIT(100ms) │  │")
+    println("   │  │ SP_START │   │   -> STREAMING (120ms) │  │")
+    println("   │  │    |     │   └────────────────────────┘  │")
+    println("   │  │ SPEAKING │              |                │")
+    println("   │  │    |     │              v                │")
+    println("   │  │ SP_END   │   ┌────────────────────────┐  │")
+    println("   │  │    |     │   │ RingBuffer (36 chunks)  │  │")
+    println("   │  │ SILENCE  │   │ write -> [||||||||] -> read│")
+    println("   │  └──────────┘   └────────────────────────┘  │")
+    println("   │       |                    |                │")
+    println("   │       v                    v                │")
+    println("   │  ┌─────────────────────────────────────┐    │")
+    println("   │  │ BackpressureController              │    │")
+    println("   │  │ NORMAL <-> THROTTLE (high/low mark) │    │")
+    println("   │  └─────────────────────────────────────┘    │")
+    println("   └─────────────────────────────────────────────┘")
+    println("         |")
+    println("         v")
+    println("   Audio Sink (speaker / rtp / file)")
+    println("")
+    println("   First packet: 100ms budget")
+    println("   ├── 0-60ms:   prefill (vocoder lookahead)")
+    println("   ├── 60-100ms: generate + emit first packet")
+    println("   └── 120ms+:   normal 12-frame chunk stream")
+    println("")
+    println("   Hangover: " + to_string(VAD_HANGOVER_FRAMES * 1000 / FRAME_HZ) + "ms (prevents mid-word cutoff)")
+    println("   Backpressure: throttle at " + to_string(BACKPRESSURE_HIGH) + "/" + to_string(RING_CAPACITY) + " chunks, resume at " + to_string(BACKPRESSURE_LOW) + "/" + to_string(RING_CAPACITY))
+    println("")
+}
+
+// ────────────────────────────────────────────────────────────────────
+// main() — CLI entry point
+// ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    print_info()
+    print_architecture()
+
+    println("────────────────────────────────────────────────────────────")
+    println(" Demo: Real-time Streaming (Mk.I skeleton)")
+    println("────────────────────────────────────────────────────────────")
+    println("")
+
+    demo_vad_detection()
+    demo_vad_fsm_trace()
+    demo_ring_buffer()
+    demo_backpressure()
+    demo_first_packet()
+    demo_streaming_sessions()
+
+    println("────────────────────────────────────────────────────────────")
+    println(" streaming.hexa ready.")
+    println(" TODO(Mk.II): async I/O, real PCM ring buffer, OS audio sink")
+    println(" TODO(Mk.II): WebRTC/RTP packet framing for network streaming")
+    println(" TODO(Mk.II): adaptive VAD threshold from noise floor estimation")
+    println("────────────────────────────────────────────────────────────")
+}
+
+main()
