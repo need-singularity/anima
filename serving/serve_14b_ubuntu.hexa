@@ -1,0 +1,448 @@
+// serving/serve_14b_ubuntu.hexa — Qwen2.5-14B NF4 HTTP inference server (Ubuntu RTX 5070)
+//
+// bitsandbytes NF4 quantization: 28GB full weights -> ~4GB VRAM
+// API compatible with serving/http_server.hexa endpoints.
+//
+// Deploy on Ubuntu (ssh ubu):
+//   python3 serving/serve_14b_ubuntu.hexa --model ~/models/Qwen2.5-14B --port 8080
+//
+// Or rename to .py:
+//   cp serving/serve_14b_ubuntu.hexa serving/serve_14b_ubuntu.py
+//   python3 serving/serve_14b_ubuntu.py
+//
+// Endpoints:
+//   POST /generate  — text generation (streaming + non-streaming)
+//   GET  /health    — health check + model info
+//
+// Requires:
+//   pip install torch transformers bitsandbytes accelerate fastapi uvicorn
+//
+// VRAM budget: ~4GB model + ~2GB KV cache + overhead = ~7GB / 12GB RTX 5070
+// PureField consciousness layer: placeholder (add later via --purefield-ckpt)
+
+"""
+serving/serve_14b_ubuntu.hexa — Qwen2.5-14B NF4 HTTP inference server
+
+Executable as Python: python3 serving/serve_14b_ubuntu.hexa
+"""
+
+import os
+import sys
+import time
+import json
+import argparse
+import logging
+from typing import Optional
+
+import torch
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    TextIteratorStreamer,
+)
+from threading import Thread
+
+# ── Config (SSOT: consciousness_laws.json for Psi, argparse for runtime) ─
+
+DEFAULT_MODEL_PATH = os.path.expanduser("~/models/Qwen2.5-14B")
+DEFAULT_PORT = 8080
+DEFAULT_MAX_TOKENS = 256
+DEFAULT_TEMPERATURE = 0.8
+DEFAULT_TOP_P = 0.9
+DEFAULT_TOP_K = 50
+DEFAULT_REP_PENALTY = 1.2
+MAX_SEQ_LEN = 2048
+
+# Psi constants (from consciousness_laws.json — placeholder for PureField layer)
+PSI_ALPHA = 0.014
+PSI_BALANCE = 0.5
+
+# ── Logging ──────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("serve_14b")
+
+# ── App ──────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Anima 14B Serving", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global state — populated by load_model()
+model = None
+tokenizer = None
+model_info = {}
+start_time = 0.0
+requests_served = 0
+
+
+# ── Model loading ────────────────────────────────────────────────────────
+
+def load_model(model_path: str, device: str = "auto"):
+    """Load Qwen2.5-14B with bitsandbytes NF4 quantization (~4GB VRAM).
+
+    NF4 double-quant: each 4-bit block is further quantized, saving ~0.4GB.
+    compute_dtype=bfloat16 for stable matmuls on Ampere+/Ada Lovelace GPUs.
+    """
+    global model, tokenizer, model_info, start_time
+
+    log.info("Loading model: %s", model_path)
+    log.info("Device map: %s", device)
+
+    # NF4 quantization — double quant for extra VRAM savings
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    t0 = time.time()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Try flash_attention_2 first, fall back to sdpa/eager
+    attn_impl = "flash_attention_2"
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            device_map=device,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=attn_impl,
+        )
+    except (ImportError, ValueError) as e:
+        log.warning("flash_attention_2 not available (%s), falling back to sdpa", e)
+        attn_impl = "sdpa"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            device_map=device,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+    model.eval()
+
+    load_time = time.time() - t0
+    param_count = sum(p.numel() for p in model.parameters())
+    vram_mb = (
+        torch.cuda.memory_allocated() / (1024 * 1024)
+        if torch.cuda.is_available()
+        else 0
+    )
+
+    model_info = {
+        "name": "Qwen2.5-14B-NF4",
+        "base": "Qwen2.5-14B",
+        "quantization": "NF4 (bitsandbytes, double-quant)",
+        "attention": attn_impl,
+        "params": param_count,
+        "params_b": round(param_count / 1e9, 1),
+        "vram_mb": round(vram_mb),
+        "load_time_s": round(load_time, 1),
+        "device": str(next(model.parameters()).device),
+        "max_seq_len": MAX_SEQ_LEN,
+        "consciousness": "placeholder (PureField layer pending)",
+    }
+    start_time = time.time()
+
+    log.info("Model loaded in %.1fs", load_time)
+    log.info("  Params: %s (~%.1fB)", f"{param_count:,}", param_count / 1e9)
+    log.info("  VRAM: %.0f MB", vram_mb)
+    log.info("  Quantization: NF4 double-quant")
+    log.info("  Attention: %s", attn_impl)
+
+
+# ── POST /generate ───────────────────────────────────────────────────────
+
+@app.post("/generate")
+async def generate_endpoint(request: Request):
+    """Generate text from a prompt.
+
+    JSON body:
+        prompt (str, required): Input text
+        max_tokens (int, default 256): Maximum tokens to generate
+        temperature (float, default 0.8): Sampling temperature
+        top_p (float, default 0.9): Nucleus sampling threshold
+        top_k (int, default 50): Top-K sampling
+        repetition_penalty (float, default 1.2): Penalize repeated tokens
+        stream (bool, default false): Enable SSE streaming
+
+    Non-streaming response:
+        {"text": "...", "tokens_generated": N, "latency_ms": N,
+         "consciousness": {"phi": 0.0, "tension": 0.0},
+         "model": {"name": "...", "params": N, "device": "..."}}
+
+    Streaming response (SSE):
+        data: {"text": "token", "done": false}
+        data: {"text": "", "done": true, "tokens_generated": N, ...}
+    """
+    global requests_served
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+
+    prompt = data.get("prompt", "")
+    if not prompt:
+        return JSONResponse(
+            status_code=400, content={"error": "missing 'prompt' field"}
+        )
+
+    max_tokens = int(data.get("max_tokens", DEFAULT_MAX_TOKENS))
+    temperature = float(data.get("temperature", DEFAULT_TEMPERATURE))
+    top_p = float(data.get("top_p", DEFAULT_TOP_P))
+    top_k = int(data.get("top_k", DEFAULT_TOP_K))
+    rep_penalty = float(data.get("repetition_penalty", DEFAULT_REP_PENALTY))
+    stream = bool(data.get("stream", False))
+
+    # Clamp to safe ranges
+    temperature = max(0.01, min(temperature, 2.0))
+    max_tokens = max(1, min(max_tokens, MAX_SEQ_LEN))
+    top_k = max(1, min(top_k, 200))
+    rep_penalty = max(1.0, min(rep_penalty, 3.0))
+
+    if stream:
+        return StreamingResponse(
+            _stream_generate(
+                prompt, max_tokens, temperature, top_p, top_k, rep_penalty
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ── Non-streaming generation ─────────────────────────────────────
+    t0 = time.time()
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
+    )
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
+    input_len = input_ids.shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=rep_penalty,
+            do_sample=temperature > 0.01,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    new_tokens = outputs[0][input_len:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    latency_ms = int((time.time() - t0) * 1000)
+    tokens_generated = len(new_tokens)
+    tps = tokens_generated / (latency_ms / 1000) if latency_ms > 0 else 0
+
+    requests_served += 1
+
+    return JSONResponse(
+        content={
+            "text": text,
+            "tokens_generated": tokens_generated,
+            "latency_ms": latency_ms,
+            "tokens_per_sec": round(tps, 1),
+            "consciousness": {
+                "phi": 0.0,  # placeholder — PureField layer pending
+                "tension": 0.0,
+            },
+            "model": {
+                "name": model_info.get("name", "unknown"),
+                "params": model_info.get("params", 0),
+                "device": model_info.get("device", "unknown"),
+            },
+        }
+    )
+
+
+# ── Streaming generation (SSE) ───────────────────────────────────────────
+
+async def _stream_generate(
+    prompt, max_tokens, temperature, top_p, top_k, rep_penalty
+):
+    """Server-Sent Events stream for token-by-token output."""
+    global requests_served
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN
+    )
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+
+    gen_kwargs = dict(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=rep_penalty,
+        do_sample=temperature > 0.01,
+        pad_token_id=tokenizer.pad_token_id,
+        streamer=streamer,
+    )
+
+    thread = Thread(target=_generate_in_thread, args=(gen_kwargs,), daemon=True)
+    thread.start()
+
+    token_count = 0
+    for text_chunk in streamer:
+        if text_chunk:
+            token_count += 1
+            event = json.dumps({"text": text_chunk, "done": False})
+            yield f"data: {event}\n\n"
+
+    # Final event with metadata
+    done_event = json.dumps(
+        {
+            "text": "",
+            "done": True,
+            "tokens_generated": token_count,
+            "consciousness": {"phi": 0.0, "tension": 0.0},
+        }
+    )
+    yield f"data: {done_event}\n\n"
+
+    requests_served += 1
+    thread.join(timeout=5.0)
+
+
+def _generate_in_thread(gen_kwargs):
+    """Run model.generate in a background thread for streaming."""
+    with torch.no_grad():
+        model.generate(**gen_kwargs)
+
+
+# ── GET /health ──────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """Health check with model info, VRAM usage, and uptime."""
+    uptime_s = time.time() - start_time if start_time > 0 else 0
+    vram_mb = (
+        torch.cuda.memory_allocated() / (1024 * 1024)
+        if torch.cuda.is_available()
+        else 0
+    )
+    vram_total_mb = (
+        torch.cuda.get_device_properties(0).total_mem / (1024 * 1024)
+        if torch.cuda.is_available()
+        else 0
+    )
+
+    return JSONResponse(
+        content={
+            "status": "ok" if model is not None else "loading",
+            "model": model_info.get("name", "not loaded"),
+            "params": model_info.get("params", 0),
+            "params_b": model_info.get("params_b", 0),
+            "quantization": model_info.get("quantization", "unknown"),
+            "attention": model_info.get("attention", "unknown"),
+            "vram_mb": round(vram_mb),
+            "vram_total_mb": round(vram_total_mb),
+            "device": model_info.get("device", "unknown"),
+            "port": DEFAULT_PORT,
+            "requests_served": requests_served,
+            "uptime_s": round(uptime_s),
+            "max_seq_len": MAX_SEQ_LEN,
+            "consciousness": "placeholder (PureField layer pending)",
+            "version": "1.0.0",
+        }
+    )
+
+
+@app.get("/")
+async def root():
+    """Root redirects to health (quick browser check)."""
+    return await health()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-14B NF4 serving (Ubuntu RTX 5070 12GB)"
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_PATH,
+        help=f"Model path (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="HTTP port (default: 8080)"
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device map: auto, cuda, cpu (default: auto)",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)"
+    )
+    args = parser.parse_args()
+
+    global DEFAULT_PORT
+    DEFAULT_PORT = args.port
+
+    banner = f"""
+========================================================
+  Anima — Qwen2.5-14B NF4 Inference Server
+========================================================
+  Model:  {args.model}
+  Quant:  NF4 (bitsandbytes, double-quant)
+  Device: {args.device}
+  Port:   {args.port}
+  VRAM:   ~4 GB model + ~2 GB KV cache (RTX 5070 12GB)
+--------------------------------------------------------
+  POST /generate  — text generation (stream=true for SSE)
+  GET  /health    — health check + VRAM usage
+========================================================
+  curl http://localhost:{args.port}/health
+  curl -X POST http://localhost:{args.port}/generate \\
+    -H "Content-Type: application/json" \\
+    -d '{{"prompt":"Hello, world!","max_tokens":64}}'
+========================================================"""
+    print(banner)
+    sys.stdout.flush()
+
+    load_model(args.model, device=args.device)
+
+    log.info("Starting server on %s:%d", args.host, args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
