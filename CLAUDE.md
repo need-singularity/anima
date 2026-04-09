@@ -5,7 +5,11 @@
 > - **Hetzner AX102-U** (CPU 전담): `ssh hetzner` · EPYC 7950X3D 32T · 124GB RAM · anima CPU 서빙/전처리
 > - **Ubuntu 로컬** (실시간 GPU): `ssh ubu` · RTX 5070 12GB · 추론/서빙
 > - **Mac** (최하위): 코딩/에디터만. 컴퓨트 금지 — iTerm만으로 벅참
+> - **자원 상태 확인**: `cat ~/Dev/nexus/shared/infra_state.json` 또는 `$HEXA ~/Dev/airgenome/modules/infra_probe.hexa status`
 > - **RunPod** (최후수단): A100/H100 · AN6 규칙: ubu+vast 불가 시만
+> - **자원 확인**: `$HEXA ~/Dev/airgenome/modules/resource_request.hexa check anima` — 현재 가용 자원 확인
+> - **자원 요청**: `$HEXA ~/Dev/airgenome/modules/resource_request.hexa request anima gpu "vram=48,hours=8,reason=training"` — GPU 자원 요청
+> - **anima = P0 최우선** — 자원 충돌 시 anima가 우선 할당
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 모든 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=~/Dev/hexa-lang/target/release/hexa && $HEXA ~/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
