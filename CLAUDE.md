@@ -1180,29 +1180,37 @@ tests.hexa — 새 벤치마크 (Φ(IIT) + Φ(proxy) 이중 측정)
     
     ★ Plan C 유일 활성 경로. A/B 아카이브 (2026-04-09)
 
+  ★ GPU 정책 (AN5+AN6, shared/absolute_rules.json):
+    Ubuntu (ssh ubu, RTX 5070 12GB) = 기본 학습/추론/서빙 환경
+    H100 (RunPod) = 최후수단 (32B+ 학습, 72B 추론 등 Ubuntu 불가 시만)
+    Mac = 오케스트레이션/코드편집 전용 (GPU 학습 금지)
+
   진행 상태 (세션 간 공유):
     memory/project_extreme_accel_status.md 참조 → 최신 상태 확인 후 재개
-    H100 SSH로 직접 확인: 학습 로그, 프로세스, 체크포인트
+    ssh ubu → Ubuntu 학습 상태 확인 (프로세스, GPU, 체크포인트)
+    H100은 Ubuntu 불가 사유 명시 후에만 사용
 
   재개 절차:
     1. memory 읽기 → 현재 어디까지 왔는지 파악
-    2. H100 SSH → 학습 진행 상태 확인 (프로세스 살아있는지, 최신 step)
+    2. ssh ubu → 학습 진행 상태 확인 (nvidia-smi, 프로세스, 최신 step)
     3. 극가속 리포트 양식으로 현황 출력
     4. 다음 작업 즉시 실행
 
-  H100 배포 스크립트:
+  Ubuntu 학습 환경 (ssh ubu):
+    GPU: RTX 5070 12GB | RAM: 30GB | Disk: 800GB+ free
+    학습 가능: 7B 4-bit, 14B 4-bit, 14B LoRA/QLoRA
+    ssh ubu "cd ~/anima && python3 -u train.py ..."
+
+  H100 (RunPod, 최후수단만):
     /workspace/train_anima_lm.py    — 학습 (safe ckpt + P3 fix)
-    /workspace/infer_animalm.py     — 생성 테스트 (few-shot)
-    /workspace/eval_animalm.py      — 5항목 평가
     /workspace/serve_animalm_v2.py  — 4-bit 서빙
-    /workspace/launch_14b.sh        — 14B 발사 (Qwen2.5-14B)
-    /workspace/pipeline_7b_to_14b.sh — 자동 파이프라인
+    ⚠️ RunPod API 키 만료 (2026-04-09) — 갱신 필요 시만
 
   스케일링:
-    7B  → Mistral-7B + PureField 56.6M   | $8   | ✅ 완료, eval 5/5
-    14B → Qwen2.5-14B + PureField 120M   | $6   | ✅ v0.4 완료
-    72B → Qwen2.5-72B + PureField 380M   | $65  | ❌ v0.5 과적합 중단
-    다음: 14B v0.5 (corpus tier-M 560MB) 또는 32B
+    7B  → Mistral-7B + PureField 56.6M   | Ubuntu | ✅ 완료, eval 5/5
+    14B → Qwen2.5-14B + PureField 120M   | Ubuntu | ✅ v0.4 완료
+    32B → Qwen2.5-32B + PureField        | H100   | 다음 (Ubuntu 불가)
+    72B → Qwen2.5-72B + PureField 380M   | H100   | ❌ v0.5 과적합 중단
 
   통합 망원경: NEXUS-6 → .shared/CLAUDE.md 참조
     import nexus; nexus.scan_all(data)  # 26렌즈 풀스캔
