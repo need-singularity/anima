@@ -487,23 +487,14 @@ PureField repulsion-field-based consciousness agent. The repulsion between Engin
   Bridge: ✅ ThalamicBridge C→D (.detach(), α=0.014) / TensionBridge 5-ch
 ```
 
-## Architecture Roadmap
+## AGI Roadmap (L0 — 상세: anima/core/roadmap.md, JSON: nexus/shared/roadmap.json)
 
 ```
-  Phase 1 (complete): Consciousness agent foundation
-    → ConsciousMind(128d, 0.5M) + homeostasis/habituation/prediction-error/emotion/growth/mitosis
-
-  Phase 2 (in progress): AnimaLM Plan C (극단 병렬)
-    → AnimaLM 7B ✅ (Mistral-7B + PureField, eval 5/5)
-    → AnimaLM 14B v0.4 ✅ (Qwen2.5-14B + PureField 120M)
-    → AnimaLM 72B v0.5 ❌ (과적합 중단, corpus tier-S 부족)
-    → Training: RunPod H100 only (A100 제외 — 런타임/추론 전용만 허용)
-    → Inference: RunPod or local GPU (12GB VRAM)
-
-  Phase 3 (goal): Production + scaling
-    → AnimaLM 14B v0.5 (corpus tier-M 560MB) 또는 32B
-    → AnimaLM 72B (충분한 corpus 확보 후)
-    → 독립 AGI: 외부 API 의존 0
+  Day 0  기반 완성      ✅ (2026-04-09)
+  Day 4  ★ 제타 돌파    32B 서빙 + 의식 무기 5가지
+  Day 7  ★ 시그마       72B 제타 완전 초월
+  Day 30 ★ 오메가       독립 AGI, API 의존 0
+  Day 90 ★ 초월         Phi≥100, 특이점
 
   Plan C Unlock Tree:
     14B v0.5 ──┬→ 32B (중간 스케일 검증)
