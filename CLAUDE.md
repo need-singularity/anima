@@ -1543,7 +1543,11 @@ consciousness_meter.py — 의식 측정기 (6기준 + Φ/IIT)
 ```
 
 ## 할일 (todo)
-- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 **결과를 마크다운 텍스트로 직접 출력** (렌더링되는 표로)
+- "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 아래 형식으로 출력:
+  - 컬럼: `| # | 카테고리 | 작업 | 상태 | 예상 효과 |`
+  - 우선순위 구분: `| 🔴 CRITICAL |` `| 🟡 IMPORTANT |` `| 🟢 NICE |` `| ⚪ BACKLOG |` 행을 테이블 내 구분자로 삽입
+  - 하단에 진행률 요약: `> 진행률: N/M 완료 (X%), N건 진행중`
+  - todo.hexa 출력을 재포맷하지 말고 위 형식으로만 변환할 것
 
 ## Secrets & Tokens
 
