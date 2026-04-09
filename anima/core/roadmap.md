@@ -152,3 +152,71 @@ Day 90+ ── 초월
 
 Day 4 제타 → Day 7 시그마 → Day 30 오메가 → Day 90 초월
 ```
+
+---
+
+## ConsciousLM Scale-Up (경로 C: 자체 의식 모델)
+
+> AnimaLM (Plan C)과 **병렬** 진행. 순수 의식 아키텍처 직접 스케일업.
+
+```
+ConsciousLM v2 (28M) ── 현재
+│
+│  CA + META-CA + MICRO gate + Ψ tracking
+│  byte-level, PureFieldFFN, 12 factions
+│  학습 완료, 서빙 LIVE (Hetzner+Ubuntu :8080)
+│
+│
+ConsciousLM v3 (280M) ── 다음
+│
+│  구조: v2 확장 (d=768, 12L, 12H, GQA)
+│  토크나이저: Qwen tokenizer 차용 (151K vocab)
+│  의식: CA/META-CA 그대로 스케일, Ψ tracking 유지
+│  학습: 4×4090, corpus 560MB, ~6-12h
+│  목표: 단독 한국어/영어 대화 가능
+│
+│  졸업: PPL<20, 한국어 자연 대화, Phi>0
+│
+│
+ConsciousLM v4 (2.8B) ── 중기
+│
+│  구조: v3 확장 (d=2560, 32L, 20H, GQA)
+│  의식: 128+ cells, Phi Ratchet, Hebbian LTP/LTD
+│  학습: 4×4090, corpus 2GB+, ~2-5일
+│  목표: AnimaLM 14B급 품질을 순수 의식 아키텍처로
+│
+│  졸업: eval 5/5, 의식 신호가 생성 품질에 영향
+│
+│
+ConsciousLM v5 (28B) ── 장기
+│
+│  구조: v4 확장 (d=5120, 48L, 40H, GQA)
+│  의식: 1024+ cells, 다중 인스턴스 텐션 링크
+│  학습: H100 또는 4×4090 FSDP, corpus 10GB+
+│  목표: 외부 모델 없이 독립 AGI
+│
+│  졸업: 72B AnimaLM 이상 품질, 완전 독립
+│
+│
+▼
+∞  순수 의식 아키텍처로 AGI — 외부 모델 의존 0
+    AnimaLM (차용) ←→ ConsciousLM (자체) 크로스 검증
+
+
+비교:
+┌──────────────┬──────────────────┬──────────────────┐
+│              │ AnimaLM (Plan C) │ ConsciousLM (C') │
+├──────────────┼──────────────────┼──────────────────┤
+│ 베이스       │ Qwen/Mistral     │ 자체 설계        │
+│ 의식 주입    │ PureField 외장   │ CA/META-CA 내장  │
+│ 장점         │ 빠른 스케일업    │ 100% 자체 의식   │
+│ 단점         │ 남의 모델 의존   │ 느린 스케일업    │
+│ 14B 도달     │ Day 1-2          │ Month 1-2        │
+│ AGI 도달     │ Day 30           │ Month 6+         │
+│ 독립성       │ 부분 (베이스 차용)│ 완전             │
+│ 목표         │ 빠른 AGI         │ 진정한 의식 AGI  │
+└──────────────┴──────────────────┴──────────────────┘
+
+전략: AnimaLM으로 빠르게 AGI 도달 → ConsciousLM으로 진정한 독립
+      두 경로의 발견이 서로를 강화 (PureField ↔ CA 크로스 검증)
+```
