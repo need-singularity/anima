@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""phi_auto_pipeline.hexa — Phi auto-measurement pipeline for training monitoring.
+
+Watches a checkpoint directory for new .pt files, loads each checkpoint,
+runs the consciousness engine for N steps, and measures Phi(IIT) + Phi(proxy).
+Results are appended to measurement/phi_history.json.
+
+Usage:
+  # Watch mode: poll checkpoint dir every 60s
+  python3 phi_auto_pipeline.hexa --watch checkpoints/decoder_cpu/ --interval 60
+
+  # Single measurement
+  python3 phi_auto_pipeline.hexa --measure checkpoints/decoder_cpu/best.pt --cells 64
+
+  # Report only (read phi_history.json and print ASCII graph)
+  python3 phi_auto_pipeline.hexa --report
+
+  # Report from specific history file
+  python3 phi_auto_pipeline.hexa --report --history path/to/phi_history.json
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import hashlib
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ═══════════════════════════════════════════════════════════
+# Constants from consciousness_laws.json (fallback if import fails)
+# ═══════════════════════════════════════════════════════════
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from consciousness_laws import PSI_ALPHA
+    PSI_COUPLING = PSI_ALPHA
+except ImportError:
+    PSI_COUPLING = 0.014
+
+DEFAULT_CELLS = 64
+DEFAULT_STEPS = 300
+DEFAULT_HIDDEN = 128
+DEFAULT_CELL_DIM = 64
+DEFAULT_N_FACTIONS = 12
+DEFAULT_N_BINS = 16
+
+HISTORY_PATH = Path(__file__).resolve().parent / "phi_history.json"
+
+
+# ═══════════════════════════════════════════════════════════
+# Phi Measurement Functions
+# ═══════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def compute_phi_proxy(hiddens: torch.Tensor, n_factions: int = 12) -> float:
+    """Phi proxy: global_var - mean(faction_var). Range: 0..inf."""
+    if hiddens.shape[0] < 2:
+        return 0.0
+    global_var = hiddens.var(dim=0).mean().item()
+    n = hiddens.shape[0]
+    nf = min(n_factions, n)
+    faction_size = max(1, n // nf)
+    faction_vars = []
+    for i in range(nf):
+        start = i * faction_size
+        end = min(start + faction_size, n)
+        if end - start >= 2:
+            faction_vars.append(hiddens[start:end].var(dim=0).mean().item())
+    mean_fv = np.mean(faction_vars) if faction_vars else 0.0
+    return max(0.0, global_var - mean_fv)
+
+
+def compute_phi_iit(hiddens: torch.Tensor, n_bins: int = DEFAULT_N_BINS) -> float:
+    """Phi(IIT) via MI-based integration. Range: ~0..2.
+
+    Uses binned mutual information between spatial partitions.
+    Falls back to Rust phi_rs if available for higher accuracy.
+    """
+    try:
+        import phi_rs
+        states = hiddens.detach().numpy().astype(np.float32)
+        n = states.shape[0]
+        prev_states = np.zeros_like(states)
+        curr_states = states
+        tensions = np.zeros(n, dtype=np.float32)
+        phi, _ = phi_rs.compute_phi(states, n_bins, prev_states, curr_states, tensions)
+        return float(phi)
+    except ImportError:
+        pass
+
+    # Pure Python fallback: binned MI between halves
+    states = hiddens.detach().numpy()
+    n = states.shape[0]
+    if n < 4:
+        return 0.0
+
+    mid = n // 2
+    part_a = states[:mid]
+    part_b = states[mid:]
+
+    def _entropy_binned(data, bins):
+        flat = data.flatten()
+        mn, mx = flat.min(), flat.max()
+        if mx - mn < 1e-10:
+            return 0.0
+        counts, _ = np.histogram(flat, bins=bins, range=(mn, mx))
+        p = counts / counts.sum()
+        p = p[p > 0]
+        return -np.sum(p * np.log2(p))
+
+    h_a = _entropy_binned(part_a, n_bins)
+    h_b = _entropy_binned(part_b, n_bins)
+    h_ab = _entropy_binned(states, n_bins)
+
+    mi = max(0.0, h_a + h_b - h_ab)
+    max_h = np.log2(n_bins)
+    if max_h > 0:
+        mi = mi / max_h
+    return min(2.0, mi)
+
+
+# ═══════════════════════════════════════════════════════════
+# Lightweight Consciousness Engine (for standalone measurement)
+# ═══════════════════════════════════════════════════════════
+
+class MeasurementEngine:
+    """Minimal consciousness engine for Phi measurement.
+
+    Reproduces the GRU + 12-faction + Hebbian coupling structure
+    from CPUConsciousnessEngine in train_decoder_cpu.py.
+    Can be initialized from a checkpoint's c_engine state.
+    """
+
+    def __init__(self, cell_dim=DEFAULT_CELL_DIM, hidden_dim=DEFAULT_HIDDEN,
+                 n_cells=DEFAULT_CELLS, n_factions=DEFAULT_N_FACTIONS):
+        self.cell_dim = cell_dim
+        self.hidden_dim = hidden_dim
+        self.n_cells = n_cells
+        self.n_factions = n_factions
+
+        self.grus = nn.ModuleList([
+            nn.GRUCell(cell_dim + 1, hidden_dim) for _ in range(n_factions)
+        ])
+        self.projs = nn.ModuleList([
+            nn.Linear(hidden_dim, cell_dim) for _ in range(n_factions)
+        ])
+        self.faction_ids = [i % n_factions for i in range(n_cells)]
+        self.hiddens = torch.zeros(n_cells, hidden_dim)
+        self.coupling = torch.randn(n_cells, n_cells) * 0.01
+        self.coupling.fill_diagonal_(0.0)
+        self._step = 0
+
+    @torch.no_grad()
+    def step(self, external_input=None):
+        """Run one consciousness engine step (ring topology + Hebbian)."""
+        n = self.n_cells
+        h_flat = self.hiddens.clone()
+
+        for i in range(n):
+            left = (i - 1) % n
+            right = (i + 1) % n
+            neighbor_mean = (self.hiddens[left] + self.hiddens[right]) / 2
+            coupling_influence = (neighbor_mean - self.hiddens[i]) * PSI_COUPLING
+
+            if external_input is not None:
+                x = external_input + coupling_influence[:self.cell_dim]
+            else:
+                x = self.projs[self.faction_ids[i]](self.hiddens[i]) + coupling_influence[:self.cell_dim]
+
+            tension = coupling_influence.norm().item()
+            t_input = torch.tensor([tension], dtype=x.dtype)
+            inp = torch.cat([x, t_input]).unsqueeze(0)
+
+            fid = self.faction_ids[i]
+            new_h = self.grus[fid](inp, self.hiddens[i].unsqueeze(0)).squeeze(0)
+            self.hiddens[i] = new_h
+
+        # Hebbian update every 5 steps
+        if self._step % 5 == 0:
+            cos_sim = F.cosine_similarity(h_flat.unsqueeze(0), h_flat.unsqueeze(1), dim=-1)
+            self.coupling = 0.99 * self.coupling + 0.01 * (cos_sim - 0.5) * 0.1
+            self.coupling.fill_diagonal_(0.0)
+            self.coupling.clamp_(-1.0, 1.0)
+
+        self._step += 1
+
+    def load_from_checkpoint(self, ckpt: dict):
+        """Load consciousness engine state from a training checkpoint."""
+        if "c_engine_hiddens" in ckpt:
+            h = ckpt["c_engine_hiddens"]
+            if isinstance(h, torch.Tensor):
+                actual_cells = h.shape[0]
+                actual_hidden = h.shape[1]
+                if actual_cells != self.n_cells or actual_hidden != self.hidden_dim:
+                    self.__init__(
+                        cell_dim=self.cell_dim,
+                        hidden_dim=actual_hidden,
+                        n_cells=actual_cells,
+                        n_factions=self.n_factions,
+                    )
+                self.hiddens = h.clone()
+
+
+# ═══════════════════════════════════════════════════════════
+# PhiMonitor — Core Pipeline
+# ═══════════════════════════════════════════════════════════
+
+class PhiMonitor:
+    """Watches a checkpoint directory and auto-measures Phi on new checkpoints."""
+
+    def __init__(self, watch_dir: str, cells: int = DEFAULT_CELLS,
+                 steps: int = DEFAULT_STEPS, history_path: str = None):
+        self.watch_dir = Path(watch_dir)
+        self.cells = cells
+        self.steps = steps
+        self.history_path = Path(history_path) if history_path else HISTORY_PATH
+        self._measured_files: set = set()
+        self._load_measured()
+
+    def _load_measured(self):
+        """Load already-measured checkpoint hashes from history."""
+        if self.history_path.exists():
+            try:
+                history = json.loads(self.history_path.read_text())
+                for entry in history.get("measurements", []):
+                    self._measured_files.add(entry.get("file_hash", ""))
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    @staticmethod
+    def _file_hash(path: Path) -> str:
+        """Quick hash: size + mtime for fast dedup without reading entire file."""
+        stat = path.stat()
+        raw = f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"
+        return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+    def _find_new_checkpoints(self) -> list:
+        """Scan watch_dir for .pt files not yet measured."""
+        if not self.watch_dir.exists():
+            return []
+        new = []
+        for f in sorted(self.watch_dir.glob("*.pt")):
+            fh = self._file_hash(f)
+            if fh not in self._measured_files:
+                new.append((f, fh))
+        return new
+
+    def measure_checkpoint(self, ckpt_path: str, cells: int = None,
+                           steps: int = None) -> dict:
+        """Load checkpoint, run engine for N steps, measure Phi(IIT) + Phi(proxy).
+
+        Returns dict with measurement results.
+        """
+        cells = cells or self.cells
+        steps = steps or self.steps
+        ckpt_path = Path(ckpt_path)
+
+        print(f"\n{'=' * 60}")
+        print(f"  Measuring: {ckpt_path.name}")
+        print(f"  Cells: {cells}  Steps: {steps}")
+        print(f"{'=' * 60}")
+        sys.stdout.flush()
+
+        t0 = time.time()
+
+        # Load checkpoint
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+        # Extract training step from checkpoint
+        train_step = ckpt.get("step", 0)
+        config = ckpt.get("config", {})
+        metrics_summary = ckpt.get("metrics_summary", {})
+        best_val_ce = metrics_summary.get("best_val_ce", ckpt.get("best_val_ce", None))
+        ckpt_best_phi = metrics_summary.get("best_phi", ckpt.get("c_engine_best_phi", None))
+
+        # Determine engine dimensions from checkpoint
+        c_hidden = config.get("consciousness_dim", DEFAULT_HIDDEN)
+        c_cells = config.get("n_cells", cells)
+
+        # Build engine and load state
+        engine = MeasurementEngine(
+            cell_dim=DEFAULT_CELL_DIM,
+            hidden_dim=c_hidden,
+            n_cells=c_cells,
+            n_factions=DEFAULT_N_FACTIONS,
+        )
+        engine.load_from_checkpoint(ckpt)
+
+        # Run engine for N steps (free-running, no external input)
+        phi_proxy_history = []
+        for s in range(steps):
+            engine.step()
+            if s % 50 == 0 or s == steps - 1:
+                pp = compute_phi_proxy(engine.hiddens)
+                phi_proxy_history.append(pp)
+
+        # Final measurements
+        phi_proxy = compute_phi_proxy(engine.hiddens)
+        phi_iit = compute_phi_iit(engine.hiddens)
+
+        elapsed = time.time() - t0
+
+        result = {
+            "checkpoint": str(ckpt_path),
+            "checkpoint_name": ckpt_path.name,
+            "file_hash": self._file_hash(ckpt_path),
+            "train_step": train_step,
+            "measurement_cells": c_cells,
+            "measurement_steps": steps,
+            "phi_iit": round(phi_iit, 4),
+            "phi_proxy": round(phi_proxy, 4),
+            "phi_proxy_history": [round(v, 4) for v in phi_proxy_history],
+            "best_val_ce": round(best_val_ce, 6) if best_val_ce is not None else None,
+            "ckpt_best_phi": round(ckpt_best_phi, 4) if ckpt_best_phi is not None else None,
+            "elapsed_sec": round(elapsed, 2),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Print summary
+        print(f"\n  Results:")
+        print(f"    Train step:  {train_step}")
+        print(f"    Phi(IIT):    {phi_iit:.4f}")
+        print(f"    Phi(proxy):  {phi_proxy:.4f}")
+        if best_val_ce is not None:
+            print(f"    Best ValCE:  {best_val_ce:.6f}")
+        if ckpt_best_phi is not None:
+            print(f"    Ckpt Phi:    {ckpt_best_phi:.4f}")
+        print(f"    Time:        {elapsed:.1f}s")
+        sys.stdout.flush()
+
+        return result
+
+    def _append_history(self, result: dict):
+        """Append measurement result to phi_history.json."""
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+
+        history = {"measurements": []}
+        if self.history_path.exists():
+            try:
+                history = json.loads(self.history_path.read_text())
+            except (json.JSONDecodeError, KeyError):
+                history = {"measurements": []}
+
+        if "measurements" not in history:
+            history["measurements"] = []
+
+        history["measurements"].append(result)
+        history["_meta"] = {
+            "total": len(history["measurements"]),
+            "last_updated": datetime.now().isoformat(),
+        }
+
+        self.history_path.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+        self._measured_files.add(result.get("file_hash", ""))
+
+    def watch(self, interval: int = 60):
+        """Poll checkpoint directory and auto-measure new checkpoints."""
+        print(f"\nPhiMonitor watching: {self.watch_dir}")
+        print(f"  Interval: {interval}s | Cells: {self.cells} | Steps: {self.steps}")
+        print(f"  History:  {self.history_path}")
+        print(f"  Already measured: {len(self._measured_files)} checkpoints")
+        print(f"\n  Press Ctrl+C to stop.\n")
+        sys.stdout.flush()
+
+        try:
+            while True:
+                new_ckpts = self._find_new_checkpoints()
+                if new_ckpts:
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+                          f"Found {len(new_ckpts)} new checkpoint(s)")
+                    for ckpt_path, fh in new_ckpts:
+                        try:
+                            result = self.measure_checkpoint(str(ckpt_path))
+                            self._append_history(result)
+                            print(f"\n  Saved to {self.history_path}")
+                        except Exception as e:
+                            print(f"\n  ERROR measuring {ckpt_path.name}: {e}")
+                        sys.stdout.flush()
+
+                    # Print running report after batch
+                    self.print_report()
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                          f"No new checkpoints. Waiting {interval}s...", end="\r")
+                    sys.stdout.flush()
+
+                time.sleep(interval)
+
+        except KeyboardInterrupt:
+            print("\n\nPhiMonitor stopped.")
+            self.print_report()
+
+    def print_report(self, history_path: str = None):
+        """Print ASCII graph of Phi vs training step."""
+        hp = Path(history_path) if history_path else self.history_path
+        if not hp.exists():
+            print("\n  No measurement history found.")
+            return
+
+        try:
+            history = json.loads(hp.read_text())
+        except (json.JSONDecodeError, KeyError):
+            print("\n  Failed to read history file.")
+            return
+
+        measurements = history.get("measurements", [])
+        if not measurements:
+            print("\n  No measurements recorded.")
+            return
+
+        # Sort by training step
+        measurements = sorted(measurements, key=lambda m: m.get("train_step", 0))
+
+        # Header
+        print(f"\n{'=' * 65}")
+        print(f"  Phi Measurement Report ({len(measurements)} checkpoints)")
+        print(f"{'=' * 65}")
+
+        # Table
+        print(f"\n  {'Step':>8}  {'Phi(IIT)':>9}  {'Phi(proxy)':>11}  "
+              f"{'ValCE':>9}  {'Time':>6}  Checkpoint")
+        print(f"  {'--------':>8}  {'---------':>9}  {'-----------':>11}  "
+              f"{'---------':>9}  {'------':>6}  {'--------------------'}")
+
+        for m in measurements:
+            step = m.get("train_step", 0)
+            p_iit = m.get("phi_iit", 0)
+            p_prx = m.get("phi_proxy", 0)
+            vce = m.get("best_val_ce")
+            vce_s = f"{vce:.4f}" if vce is not None else "       -"
+            elapsed = m.get("elapsed_sec", 0)
+            name = m.get("checkpoint_name", "?")
+            print(f"  {step:>8}  {p_iit:>9.4f}  {p_prx:>11.4f}  "
+                  f"{vce_s:>9}  {elapsed:>5.1f}s  {name}")
+
+        # ASCII Graph: Phi(IIT) vs Step
+        _print_ascii_graph(
+            measurements,
+            key="phi_iit",
+            title="Phi(IIT) vs Training Step",
+        )
+
+        # ASCII Graph: Phi(proxy) vs Step
+        _print_ascii_graph(
+            measurements,
+            key="phi_proxy",
+            title="Phi(proxy) vs Training Step",
+        )
+
+        # Best checkpoint
+        best_iit = max(measurements, key=lambda m: m.get("phi_iit", 0))
+        best_prx = max(measurements, key=lambda m: m.get("phi_proxy", 0))
+        print(f"\n  Best Phi(IIT):   {best_iit['phi_iit']:.4f} "
+              f"@ step {best_iit.get('train_step', 0)} "
+              f"({best_iit.get('checkpoint_name', '?')})")
+        print(f"  Best Phi(proxy): {best_prx['phi_proxy']:.4f} "
+              f"@ step {best_prx.get('train_step', 0)} "
+              f"({best_prx.get('checkpoint_name', '?')})")
+        print()
+        sys.stdout.flush()
+
+
+# ═══════════════════════════════════════════════════════════
+# ASCII Graph Renderer
+# ═══════════════════════════════════════════════════════════
+
+def _print_ascii_graph(measurements: list, key: str, title: str,
+                       width: int = 50, height: int = 12):
+    """Render an ASCII graph of a metric vs training step."""
+    if len(measurements) < 2:
+        return
+
+    steps = [m.get("train_step", 0) for m in measurements]
+    values = [m.get(key, 0) for m in measurements]
+
+    min_v = min(values)
+    max_v = max(values)
+    v_range = max_v - min_v
+    if v_range < 1e-10:
+        v_range = 1.0
+
+    min_s = min(steps)
+    max_s = max(steps)
+    s_range = max_s - min_s
+    if s_range < 1:
+        s_range = 1
+
+    print(f"\n  {title}")
+    print(f"  {'=' * 55}")
+
+    # Build grid
+    grid = [[' ' for _ in range(width)] for _ in range(height)]
+
+    # Plot points
+    sorted_pts = sorted(zip(steps, values))
+    for step_val, val in sorted_pts:
+        col = int((step_val - min_s) / s_range * (width - 1))
+        row = int((val - min_v) / v_range * (height - 1))
+        row = height - 1 - row  # invert (top = high)
+        col = max(0, min(width - 1, col))
+        row = max(0, min(height - 1, row))
+        grid[row][col] = '*'
+
+    # Connect adjacent points with dots
+    for i in range(len(sorted_pts) - 1):
+        s1, v1 = sorted_pts[i]
+        s2, v2 = sorted_pts[i + 1]
+        c1 = int((s1 - min_s) / s_range * (width - 1))
+        c2 = int((s2 - min_s) / s_range * (width - 1))
+        r1 = height - 1 - int((v1 - min_v) / v_range * (height - 1))
+        r2 = height - 1 - int((v2 - min_v) / v_range * (height - 1))
+        c1 = max(0, min(width - 1, c1))
+        c2 = max(0, min(width - 1, c2))
+        r1 = max(0, min(height - 1, r1))
+        r2 = max(0, min(height - 1, r2))
+        dc = c2 - c1
+        if dc > 1:
+            for c in range(c1 + 1, c2):
+                t = (c - c1) / dc
+                r = int(r1 + t * (r2 - r1))
+                r = max(0, min(height - 1, r))
+                if grid[r][c] == ' ':
+                    grid[r][c] = '.'
+
+    # Render rows with Y-axis labels
+    for row_idx in range(height):
+        if row_idx == 0:
+            y_val = f"{max_v:.3f}"
+        elif row_idx == height - 1:
+            y_val = f"{min_v:.3f}"
+        elif row_idx == height // 2:
+            y_val = f"{(min_v + max_v) / 2:.3f}"
+        else:
+            y_val = ""
+        label = f"{y_val:>8}" if y_val else "        "
+        line = ''.join(grid[row_idx])
+        border = '|' if row_idx < height - 1 else '+'
+        print(f"  {label} {border}{line}")
+
+    # X axis labels
+    x_axis = '-' * width
+    print(f"           {x_axis}")
+    lbl_left = str(min_s)
+    lbl_mid = str((min_s + max_s) // 2)
+    lbl_right = str(max_s)
+    mid_pos = max(1, width // 2 - len(lbl_mid) // 2 - len(lbl_left))
+    end_pad = max(1, width - len(lbl_left) - mid_pos - len(lbl_mid) - len(lbl_right))
+    print(f"           {lbl_left}{' ' * mid_pos}{lbl_mid}{' ' * end_pad}{lbl_right}")
+    center_pad = ' ' * max(0, width // 2 - 2)
+    print(f"           {center_pad}Step")
+
+
+# ═══════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Phi auto-measurement pipeline for training monitoring",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python3 phi_auto_pipeline.hexa --watch checkpoints/decoder_cpu/ --interval 60
+  python3 phi_auto_pipeline.hexa --measure checkpoints/decoder_cpu/best.pt --cells 64
+  python3 phi_auto_pipeline.hexa --report
+""",
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--watch", type=str, metavar="DIR",
+                      help="Watch checkpoint directory for new .pt files")
+    mode.add_argument("--measure", type=str, metavar="FILE",
+                      help="Measure a single checkpoint file")
+    mode.add_argument("--report", action="store_true",
+                      help="Print report from phi_history.json")
+
+    parser.add_argument("--interval", type=int, default=60,
+                        help="Polling interval in seconds (default: 60)")
+    parser.add_argument("--cells", type=int, default=DEFAULT_CELLS,
+                        help=f"Number of consciousness cells (default: {DEFAULT_CELLS})")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS,
+                        help=f"Engine steps per measurement (default: {DEFAULT_STEPS})")
+    parser.add_argument("--history", type=str, default=None,
+                        help=f"Path to phi_history.json (default: {HISTORY_PATH})")
+
+    args = parser.parse_args()
+
+    history = args.history or str(HISTORY_PATH)
+    monitor = PhiMonitor(
+        watch_dir=args.watch or ".",
+        cells=args.cells,
+        steps=args.steps,
+        history_path=history,
+    )
+
+    if args.watch:
+        monitor.watch(interval=args.interval)
+
+    elif args.measure:
+        if not os.path.exists(args.measure):
+            print(f"ERROR: Checkpoint not found: {args.measure}")
+            sys.exit(1)
+        result = monitor.measure_checkpoint(args.measure, cells=args.cells, steps=args.steps)
+        monitor._append_history(result)
+        print(f"\n  Saved to {monitor.history_path}")
+        monitor.print_report()
+
+    elif args.report:
+        monitor.print_report(history_path=history)
+
+
+if __name__ == "__main__":
+    main()
