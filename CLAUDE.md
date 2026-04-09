@@ -10,6 +10,7 @@
 > - **자원 확인**: `$HEXA ~/Dev/airgenome/modules/resource_request.hexa check anima` — 현재 가용 자원 확인
 > - **자원 요청**: `$HEXA ~/Dev/airgenome/modules/resource_request.hexa request anima gpu "vram=48,hours=8,reason=training"` — GPU 자원 요청
 > - **anima = P0 최우선** — 자원 충돌 시 anima가 우선 할당
+> - **트러블슈팅 SSOT**: `nexus/shared/vastai.json`, `hetzner.json`, `ubuntu.json` (심링크: `config/*.json`)
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 모든 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=~/Dev/hexa-lang/target/release/hexa && $HEXA ~/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
@@ -1547,7 +1548,7 @@ anima/experiments/consciousness/consciousness_measurement.hexa — 의식 측정
 ```
 
 ## 할일 (todo)
-- "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 아래 형식으로 출력:
+- "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 아래 형식으로 출력. "todo 대량" 시 `... anima 대량` 으로 실행:
   - 컬럼: `| # | 카테고리 | 작업 | 상태 | 예상 효과 |`
   - 우선순위 구분: `| 🔴 CRITICAL |` `| 🟡 IMPORTANT |` `| 🟢 NICE |` `| ⚪ BACKLOG |` 행을 테이블 내 구분자로 삽입
   - 하단에 진행률 요약: `> 진행률: N/M 완료 (X%), N건 진행중`

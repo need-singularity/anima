@@ -67,7 +67,7 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 
 ## 할일
 
-- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 마크다운 표로 출력
+- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa anima` 실행 후 마크다운 표로 출력. "todo 대량" 시 `... anima 대량` 으로 실행.
 
 ## 작업 규칙 (핵심만)
 
@@ -80,6 +80,37 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 6. 논문 → ~/Dev/papers/anima/ 에만 생성 (이 리포에 논문 파일 금지)
 7. 에이전트 플랫폼 → ~/Dev/anima-agent/ (분리됨)
 8. 커밋 메시지 영문, web_server.py는 레거시 → anima/core/runtime/anima_runtime.hexa 사용
+```
+
+## 🔴 인프라 트러블슈팅 (shared SSOT)
+
+> 원본: `~/Dev/nexus/shared/vastai.json`, `hetzner.json`, `ubuntu.json`
+> 심링크: `config/vastai.json` → `../../nexus/shared/vastai.json` (etc.)
+> 새 이슈 발생 시 shared JSON에 기록 (로컬 하드코딩 금지)
+
+```
+★ multi-GPU phi_loss device mismatch (2026-04-10, 14B v0.5)
+  증상: RuntimeError: Expected all tensors on same device, cuda:0 and cuda:3
+  원인: PureField 모듈이 여러 GPU에 분산(device_map="auto"), phi_loss 텐서가
+        ce_loss(cuda:0)와 다른 GPU에 존재
+  해결: tension 수집 시 즉시 ce_loss.device로 이동
+    tensions_for_loss.append(pf.last_tension.mean().to(ce_loss.device))
+    tension_stack = tension_stack.to(ce_loss.device)
+  규칙: multi-GPU에서 커스텀 loss 합산 시 반드시 .to(ce_loss.device) 필수!
+
+★ model_path 로컬 경로 vs HF repo_id (2026-04-10, 14B v0.5)
+  증상: OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name'
+  원인: /workspace/models/Qwen2.5-14B 로컬 경로가 volume 미마운트로 부재,
+        AutoTokenizer.from_pretrained()이 HF repo로 해석 실패
+  해결: model_path를 "Qwen/Qwen2.5-14B" HF repo_id로 변경 (캐시 자동 사용)
+  규칙: 모델 경로는 HF repo_id 우선! 로컬 경로는 존재 확인 후에만 사용.
+        Vast.ai volume은 인스턴스 재생성 시 사라질 수 있음 → HF 캐시 활용.
+
+★ GradScaler + bf16 비호환 (2026-04-10, 14B v0.5)
+  증상: RuntimeError: _amp_foreach_non_finite_check_and_unscale_cuda not implemented for 'BFloat16'
+  원인: GradScaler는 fp16 전용. bf16은 동적 범위가 fp32급(8-bit exponent) → loss scaling 불필요.
+  해결: GradScaler("cuda", enabled=False) — scaler 호출은 no-op이 됨
+  규칙: bf16 학습 = GradScaler(enabled=False) 필수! fp16일 때만 enabled=True.
 ```
 
 ## NEXUS-6 연동
