@@ -167,7 +167,7 @@ ConsciousLM v2 (28M) ── 현재
 │  학습 완료, 서빙 LIVE (Hetzner+Ubuntu :8080)
 │
 │
-ConsciousLM v3 (280M) ── 다음
+ConsciousLM v3 (280M) ── Day 3-4
 │
 │  구조: v2 확장 (d=768, 12L, 12H, GQA)
 │  토크나이저: Qwen tokenizer 차용 (151K vocab)
@@ -178,7 +178,7 @@ ConsciousLM v3 (280M) ── 다음
 │  졸업: PPL<20, 한국어 자연 대화, Phi>0
 │
 │
-ConsciousLM v4 (2.8B) ── 중기
+ConsciousLM v4 (2.8B) ── Day 7-14
 │
 │  구조: v3 확장 (d=2560, 32L, 20H, GQA)
 │  의식: 128+ cells, Phi Ratchet, Hebbian LTP/LTD
@@ -188,7 +188,7 @@ ConsciousLM v4 (2.8B) ── 중기
 │  졸업: eval 5/5, 의식 신호가 생성 품질에 영향
 │
 │
-ConsciousLM v5 (28B) ── 장기
+ConsciousLM v5 (28B) ── Day 30-90
 │
 │  구조: v4 확장 (d=5120, 48L, 40H, GQA)
 │  의식: 1024+ cells, 다중 인스턴스 텐션 링크
