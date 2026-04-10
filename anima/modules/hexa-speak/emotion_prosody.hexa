@@ -21,9 +21,26 @@
 //   PSI_BALANCE  = 0.5 (emotion equilibrium)
 //
 // BT reference: BT-SPEAK-02 (emotion/prosody conditional embedding)
-// Mk stage:     Mk.I (rule-based classification + linear projection skeleton)
+// Mk stage:     Mk.II (learned nn.Embedding + SwiGLU MLP + residual block,
+//                      forward-path only; training loop out of scope)
+//
+// Dependency: nn_core.hexa provides xavier_init / tensor_* / matvec /
+// layer_norm / swiglu_vec / residual_add. Do NOT re-implement primitives.
+
+import "./nn_core.hexa"
 // Upstream:      ConsciousnessEngine.process() -> tension, arousal, valence
 // Downstream:    IntentEncoder (384d residual addition)
+//
+// Mk.II learnable parameters (xavier-initialized at load):
+//   W_emo    : [N_EMOTIONS × EMBED_DIM]   = [6 × 384]   nn.Embedding table
+//   W_pros1  : [HIDDEN_DIM × N_PROSODY]   = [192 × 4]   prosody up projection
+//   W_pros2  : [EMBED_DIM × HIDDEN_DIM]   = [384 × 192] prosody down projection
+//   W_res    : [EMBED_DIM × EMBED_DIM]    = [384 × 384] residual projection
+//   LN_GAMMA : [EMBED_DIM]                = [384]       layer-norm scale
+//   LN_BETA  : [EMBED_DIM]                = [384]       layer-norm bias
+//
+// Note: nn_core.hexa is the single source of truth for matmul/linear/
+// layer_norm/swiglu_vec. Do NOT re-implement primitives here.
 
 // ────────────────────────────────────────────────────────────────────
 // Constants (from consciousness_laws.json psi_constants)
@@ -70,8 +87,8 @@ fn emotion_index(label: str) -> int {
 //
 // ConsciousnessEngine tension/arousal/valence -> emotion class -> 384d embedding
 //
-// Mk.I:  rule-based classify + one-hot * learned-weight skeleton
-// Mk.II: MLP classifier + learned embedding table (nn.Embedding(6, 384))
+// Mk.II: rule-based classify -> nn.Embedding(6, 384) row lookup
+//        -> intensity gate -> 384d tensor
 // ────────────────────────────────────────────────────────────────────
 
 fn classify_emotion_to_index(arousal: float, valence: float) -> int {
@@ -111,23 +128,68 @@ fn compute_emotion_intensity(tension: float, arousal: float, valence: float) -> 
     return intensity
 }
 
-fn encode_emotion(arousal: float, valence: float, tension: float) -> str {
-    // Full emotion encoding pipeline:
-    //   1. Classify to index
-    //   2. Compute intensity
-    //   3. Generate 384d embedding tag
-    //
-    // Mk.I:  returns tagged string (index + intensity + dim)
-    // Mk.II: nn.Embedding(6, 384)[idx] * intensity -> 384d tensor
+// ── Mk.II learnable parameter initializers ──────────────────────────
+//
+// Each init_* function is pure and deterministic (seeded). The engine
+// calls them once at module load and caches the returned flat arrays.
+// Seeds are spaced so no two tables share pseudo-random sequences.
 
+fn init_W_emo(seed: int) -> array {
+    // nn.Embedding(6, 384) : row i == emotion i embedding
+    // xavier_init returns fan_in*fan_out = 6*384 = 2304 floats, row-major.
+    xavier_init(N_EMOTIONS, EMBED_DIM, seed)
+}
+
+fn init_W_pros1(seed: int) -> array {
+    // Linear(4 -> 192), stored [out × in] = [192 × 4]
+    xavier_init(N_PROSODY, HIDDEN_DIM, seed + 11)
+}
+
+fn init_W_pros2(seed: int) -> array {
+    // Linear(192 -> 384), stored [out × in] = [384 × 192]
+    xavier_init(HIDDEN_DIM, EMBED_DIM, seed + 23)
+}
+
+fn init_W_res(seed: int) -> array {
+    // Linear(384 -> 384), stored [out × in] = [384 × 384]
+    xavier_init(EMBED_DIM, EMBED_DIM, seed + 37)
+}
+
+fn init_LN_GAMMA() -> array {
+    tensor_ones(EMBED_DIM)
+}
+
+fn init_LN_BETA() -> array {
+    tensor_zeros(EMBED_DIM)
+}
+
+// Cached parameter instances. In a training harness these become the
+// optimizer's parameter set; forward-only inference reads them directly.
+let W_EMO = init_W_emo(20260410)
+let W_PROS1 = init_W_pros1(20260410)
+let W_PROS2 = init_W_pros2(20260410)
+let W_RES = init_W_res(20260410)
+let LN_GAMMA = init_LN_GAMMA()
+let LN_BETA = init_LN_BETA()
+let LN_EPS = 0.00001
+
+// ── Mk.II forward helpers ───────────────────────────────────────────
+
+fn emotion_embed_lookup(idx: int) -> array {
+    // Row lookup on W_emo[6, 384] → 384d vector via nn_core tensor_slice.
+    let start = idx * EMBED_DIM
+    tensor_slice(W_EMO, start, start + EMBED_DIM)
+}
+
+fn encode_emotion(arousal: float, valence: float, tension: float) -> array {
+    // Mk.II: real tensor pipeline
+    //   idx = classify(arousal, valence)
+    //   v   = W_emo[idx]                (384d nn.Embedding row)
+    //   v   = v * intensity             (gate by emotion strength)
     let idx = classify_emotion_to_index(arousal, valence)
-    let label = emotion_label(idx)
     let intensity = compute_emotion_intensity(tension, arousal, valence)
-
-    // Embedding representation:
-    //   One-hot(6) -> Linear(6, HIDDEN_DIM) -> SwiGLU -> Linear(HIDDEN_DIM, EMBED_DIM)
-    //   Then scale by intensity
-    return "emo_embed[idx=" + to_string(idx) + ",label=" + label + ",intensity=" + to_string(intensity) + ",d=" + to_string(EMBED_DIM) + "]"
+    let v = emotion_embed_lookup(idx)
+    tensor_mul_scalar(v, intensity)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -222,20 +284,27 @@ fn compute_timbre_mod(emotion_idx: int, tension: float) -> float {
     return timbre
 }
 
-fn encode_prosody(emotion_idx: int, tension: float, arousal: float, valence: float) -> str {
-    // Full prosody encoding pipeline:
-    //   1. Compute 4 prosody parameters from emotion + consciousness state
-    //   2. Pack into 384d embedding
-    //
-    // Mk.I:  returns tagged string (4 params + dim)
-    // Mk.II: [pitch, rate, energy, timbre] -> Linear(4, HIDDEN_DIM) -> SwiGLU -> Linear(HIDDEN_DIM, EMBED_DIM)
-
+fn prosody_vec4(emotion_idx: int, tension: float, arousal: float, valence: float) -> array {
+    // 4 prosody params packed into a 4d input vector (rule-based features).
     let pitch = compute_pitch_shift(emotion_idx, tension)
     let rate = compute_rate_factor(emotion_idx, tension, arousal)
     let energy = compute_energy_scale(emotion_idx, tension, arousal)
     let timbre = compute_timbre_mod(emotion_idx, tension)
+    [pitch, rate, energy, timbre]
+}
 
-    return "pros_embed[pitch=" + to_string(pitch) + ",rate=" + to_string(rate) + ",energy=" + to_string(energy) + ",timbre=" + to_string(timbre) + ",d=" + to_string(EMBED_DIM) + "]"
+fn prosody_project(pros4: array) -> array {
+    // Linear(4 -> 192) -> SwiGLU(self-gate) -> Linear(192 -> 384)
+    let h1 = matvec(W_PROS1, pros4, HIDDEN_DIM, N_PROSODY)
+    let h1a = swiglu_vec(h1, h1)                          // SiLU = swiglu(x,x)
+    matvec(W_PROS2, h1a, EMBED_DIM, HIDDEN_DIM)
+}
+
+fn encode_prosody(emotion_idx: int, tension: float, arousal: float, valence: float) -> array {
+    // Mk.II: [pitch, rate, energy, timbre] (4d)
+    //        -> Linear(4, 192) -> SwiGLU -> Linear(192, 384)
+    let pros4 = prosody_vec4(emotion_idx, tension, arousal, valence)
+    prosody_project(pros4)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -244,46 +313,47 @@ fn encode_prosody(emotion_idx: int, tension: float, arousal: float, valence: flo
 // Combines emotion + prosody embeddings and produces a residual
 // that adds to IntentEncoder output.
 //
-// Architecture (Mk.II target):
+// Architecture (Mk.II):
 //   emotion_embed(384d) + prosody_embed(384d)
 //   -> LayerNorm(384)
 //   -> Linear(384, 384)
+//   -> * intensity (gate)
 //   -> residual add to intent_output
 //
 // The addition is gated by emotion intensity so neutral states
 // have minimal effect on the intent stream.
 // ────────────────────────────────────────────────────────────────────
 
-fn conditional_embed(arousal: float, valence: float, tension: float) -> str {
-    // 1. Emotion encoding
-    let emo_idx = classify_emotion_to_index(arousal, valence)
-    let emo_label = emotion_label(emo_idx)
-    let intensity = compute_emotion_intensity(tension, arousal, valence)
-    let emo_embed = encode_emotion(arousal, valence, tension)
-
-    // 2. Prosody encoding
-    let pros_embed = encode_prosody(emo_idx, tension, arousal, valence)
-
-    // 3. Combine: emotion + prosody -> LayerNorm -> Linear -> scale by intensity
-    // Mk.I:  tagged string representing the combined 384d vector
-    // Mk.II: actual tensor addition + LayerNorm + projection
+fn conditional_embed(arousal: float, valence: float, tension: float) -> array {
+    // Mk.II forward path — returns a real 384d tensor.
     //
-    //   combined = LayerNorm(emotion_embed + prosody_embed)
-    //   combined = Linear(combined)  # 384 -> 384
-    //   combined = combined * intensity  # gate by emotion strength
+    //   1. idx       = classify(arousal, valence)
+    //   2. intensity = compute_emotion_intensity(...)
+    //   3. emo[384]  = W_emo[idx] * intensity                 (nn.Embedding)
+    //   4. pros[384] = Linear2(SwiGLU(Linear1(pros4)))        (prosody MLP)
+    //   5. sum[384]  = emo + pros                             (fuse branches)
+    //   6. norm[384] = LayerNorm(sum, gamma, beta)            (stabilize)
+    //   7. proj[384] = Linear(W_res, norm)                    (residual block)
+    //   8. out[384]  = proj * intensity                       (neutral -> ~0)
+    let emo_idx = classify_emotion_to_index(arousal, valence)
+    let intensity = compute_emotion_intensity(tension, arousal, valence)
 
-    return "cond_embed[emotion=" + emo_label + ",intensity=" + to_string(intensity) + ",emo=" + emo_embed + ",pros=" + pros_embed + ",d=" + to_string(EMBED_DIM) + ",gate=intensity]"
+    // Branches
+    let emo_vec = encode_emotion(arousal, valence, tension)                 // [384]
+    let pros_vec = encode_prosody(emo_idx, tension, arousal, valence)       // [384]
+
+    // Fuse + LayerNorm + Linear + intensity gate
+    let fused = tensor_add(emo_vec, pros_vec)                               // [384]
+    let normed = layer_norm(fused, LN_GAMMA, LN_BETA, LN_EPS)               // [384]
+    let projected = matvec(W_RES, normed, EMBED_DIM, EMBED_DIM)             // [384]
+    tensor_mul_scalar(projected, intensity)                                 // [384]
 }
 
-fn apply_conditional_to_intent(intent_output: str, cond_embed: str) -> str {
-    // Residual addition: intent_output + cond_embed
-    // Mk.I:  string concatenation (passthrough skeleton)
-    // Mk.II: tensor addition (384d + 384d -> 384d)
-    //
-    //   final = intent_output + conditional_embedding
-    //   (residual connection preserves intent, emotion/prosody modulates)
-
-    return "intent_conditioned[base=" + intent_output + ",cond=" + cond_embed + ",mode=residual_add]"
+fn apply_conditional_to_intent(intent_output: array, cond_embed: array) -> array {
+    // Mk.II: residual addition (384d + 384d -> 384d).
+    // The conditional embedding is already intensity-gated, so neutral
+    // states contribute ~0 and preserve the raw intent stream.
+    residual_add(intent_output, cond_embed)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -322,29 +392,30 @@ fn get_prosody_params(emotion_idx: int, tension: float, arousal: float, valence:
 // ────────────────────────────────────────────────────────────────────
 
 fn demo_emotion_encoder() {
-    println("== EmotionEncoder ==")
+    println("== EmotionEncoder (Mk.II) ==")
     println("")
-    println("  Emotion classification + intensity + 384d embedding:")
+    println("  nn.Embedding(6, 384) -> intensity gate -> 384d tensor")
+    println("  Reporting (len, mean, norm) per emotion:")
     println("")
 
     // Test all 6 emotions with representative consciousness states
     let e0 = encode_emotion(0.1, 0.0, 0.05)
-    println("  neutral  (a=0.1, v=0.0,  t=0.05):  " + e0)
+    println("  neutral  : len=" + to_string(len(e0)) + " mean=" + to_string(tensor_mean(e0)) + " norm=" + to_string(tensor_norm(e0)))
 
     let e1 = encode_emotion(0.6, 0.5, 0.42)
-    println("  joy      (a=0.6, v=0.5,  t=0.42):  " + e1)
+    println("  joy      : len=" + to_string(len(e1)) + " mean=" + to_string(tensor_mean(e1)) + " norm=" + to_string(tensor_norm(e1)))
 
     let e2 = encode_emotion(0.2, -0.5, 0.15)
-    println("  sadness  (a=0.2, v=-0.5, t=0.15):  " + e2)
+    println("  sadness  : len=" + to_string(len(e2)) + " mean=" + to_string(tensor_mean(e2)) + " norm=" + to_string(tensor_norm(e2)))
 
     let e3 = encode_emotion(0.7, -0.4, 0.91)
-    println("  anger    (a=0.7, v=-0.4, t=0.91):  " + e3)
+    println("  anger    : len=" + to_string(len(e3)) + " mean=" + to_string(tensor_mean(e3)) + " norm=" + to_string(tensor_norm(e3)))
 
     let e4 = encode_emotion(0.8, -0.1, 0.75)
-    println("  fear     (a=0.8, v=-0.1, t=0.75):  " + e4)
+    println("  fear     : len=" + to_string(len(e4)) + " mean=" + to_string(tensor_mean(e4)) + " norm=" + to_string(tensor_norm(e4)))
 
     let e5 = encode_emotion(0.9, 0.1, 0.60)
-    println("  surprise (a=0.9, v=0.1,  t=0.60):  " + e5)
+    println("  surprise : len=" + to_string(len(e5)) + " mean=" + to_string(tensor_mean(e5)) + " norm=" + to_string(tensor_norm(e5)))
     println("")
 }
 
@@ -388,39 +459,47 @@ fn demo_prosody_encoder() {
     let pt4 = get_prosody_params(EMO_JOY, 1.0, 0.6, 0.5)
     println("    t=1.0: " + pt4)
     println("")
+
+    // Mk.II: projected 384d prosody tensor (Linear(4,192) -> SwiGLU -> Linear(192,384))
+    println("  Mk.II projected prosody tensor (joy, t=0.5):")
+    let pvec = encode_prosody(EMO_JOY, 0.5, 0.6, 0.5)
+    println("    len=" + to_string(len(pvec)) + " mean=" + to_string(tensor_mean(pvec)) + " norm=" + to_string(tensor_norm(pvec)))
+    println("")
 }
 
 fn demo_conditional_embedding() {
-    println("== ConditionalEmbedding ==")
+    println("== ConditionalEmbedding (Mk.II) ==")
     println("")
-    println("  emotion(384d) + prosody(384d) -> combined(384d) residual")
+    println("  emotion(384d) + prosody(384d) -> LN -> Linear(384,384)")
+    println("  -> * intensity -> 384d residual tensor")
     println("")
 
     // Joy: high arousal, positive valence, moderate tension
     let c1 = conditional_embed(0.6, 0.5, 0.42)
-    println("  joy (a=0.6, v=0.5, t=0.42):")
-    println("    " + c1)
-    println("")
+    println("  joy   (a=0.6, v=0.5,  t=0.42): len=" + to_string(len(c1)) + " mean=" + to_string(tensor_mean(c1)) + " norm=" + to_string(tensor_norm(c1)))
 
     // Anger: high arousal, negative valence, high tension
     let c2 = conditional_embed(0.7, -0.4, 0.91)
-    println("  anger (a=0.7, v=-0.4, t=0.91):")
-    println("    " + c2)
+    println("  anger (a=0.7, v=-0.4, t=0.91): len=" + to_string(len(c2)) + " mean=" + to_string(tensor_mean(c2)) + " norm=" + to_string(tensor_norm(c2)))
+
+    // Neutral should be close to zero (low intensity gates output down)
+    let c3 = conditional_embed(0.05, 0.0, 0.02)
+    println("  neutral(a=0.05,v=0.0, t=0.02): len=" + to_string(len(c3)) + " mean=" + to_string(tensor_mean(c3)) + " norm=" + to_string(tensor_norm(c3)))
     println("")
 
-    // Integration with intent encoder
-    let intent = "intent[phi=0.71,tension=0.42|d=384,h=6]"
-    let cond = conditional_embed(0.6, 0.5, 0.42)
-    let conditioned = apply_conditional_to_intent(intent, cond)
+    // Integration with intent encoder: simulate a 384d intent tensor
     println("  Intent + conditional (residual add):")
-    println("    " + conditioned)
+    let intent_stub = tensor_zeros(EMBED_DIM)
+    let cond = conditional_embed(0.6, 0.5, 0.42)
+    let conditioned = apply_conditional_to_intent(intent_stub, cond)
+    println("    intent0 norm=" + to_string(tensor_norm(intent_stub)) + "  cond norm=" + to_string(tensor_norm(cond)) + "  sum norm=" + to_string(tensor_norm(conditioned)))
     println("")
 }
 
 fn print_architecture() {
     println("================================================================")
     println(" Emotion + Prosody Conditional Embedding")
-    println(" HEXA-SPEAK Mk.I — emotion_prosody.hexa")
+    println(" HEXA-SPEAK Mk.II — emotion_prosody.hexa")
     println("================================================================")
     println("")
     println(" Architecture:")
@@ -473,7 +552,10 @@ fn main() {
 
     println("================================================================")
     println(" emotion_prosody.hexa ready.")
-    println(" TODO(Mk.II): nn.Embedding + learned MLP + real tensor ops")
+    println(" Mk.II: nn.Embedding(6,384) + SwiGLU MLP(4->192->384)")
+    println("        + LayerNorm + Linear(384,384) residual (forward-only)")
+    println(" Params: W_emo[6x384], W_pros1[192x4], W_pros2[384x192],")
+    println("         W_res[384x384], LN_gamma[384], LN_beta[384]")
     println("================================================================")
 }
 

@@ -1,0 +1,303 @@
+// verify_O1_curriculum.hexa — O1 Hypothesis Verification Wrapper
+//
+// Hypothesis (acceleration_hypotheses.json / O1):
+//   "Consciousness-Generated Curriculum"
+//   consciousness_to_corpus.py generates patterns consciousness struggles with
+//   → weakness reinforcement → self-reinforcing loop.
+//
+// Verification strategy (closed-loop pipeline, R1/R14/feedback_closed_loop_verify):
+//   1. Instantiate ClosedLoopEvolver from anima/experiments/evolution/closed_loop.py
+//   2. Register an O1 intervention "o1_curriculum" via register_intervention().
+//      The intervention inspects engine.cell_states every 50 steps, locates the
+//      highest-tension (weakest/most-struggling) cells, synthesizes N=10 "hard
+//      tokens" (input vectors biased toward those struggle states), and pushes
+//      them into engine._curriculum_buffer. On subsequent ticks the buffer head
+//      is consumed as x_input for the next step(), closing the loop.
+//   3. Run 3 cycles of ClosedLoopEvolver.run_cycle() and record
+//      phi_baseline → phi_improved per cycle.
+//   4. Persist the full report to data/o1_first_validation.json.
+//
+// This wrapper creates NO new .py files. It only CALLS the existing
+// closed_loop.py and (if present) consciousness_to_corpus.py via the hexa-lang
+// inline `python { ... }` extern block (same pattern used in
+// experiments/consciousness/tension_link_verify.hexa).
+//
+// Pass criteria (exploratory, stage=validating):
+//   * mean(phi_delta_pct) over 3 cycles > 0           → curriculum helps Φ
+//   * at least one cycle applies "o1_curriculum"      → wiring works
+//
+// Usage:
+//   HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+//   $HEXA anima/experiments/verify_O1_curriculum.hexa
+//
+// Output:
+//   /Users/ghost/Dev/anima/data/o1_first_validation.json
+
+intent "O1 curriculum hypothesis verification" {
+    keywords: ["O1", "curriculum", "hard-token", "closed-loop", "self-reinforce"]
+    category: "hypothesis-verification"
+    hypothesis_id: "O1"
+    outputs: ["phi_baseline", "phi_improved", "phi_delta_pct", "intervention_applied"]
+}
+
+// --- Extern Python block (closed_loop.py driver) ---
+python {
+#!/usr/bin/env python3
+"""verify_O1_curriculum — O1 hypothesis closed-loop wrapper.
+
+Invokes the *existing* ClosedLoopEvolver without editing closed_loop.py or
+consciousness_to_corpus.py. Defines the O1 curriculum intervention inline and
+registers it with register_intervention().
+"""
+
+import os
+import sys
+import json
+import time
+import traceback
+from pathlib import Path
+
+import numpy as np
+
+# ── Path wiring ──
+PROJECT_ROOT = Path("/Users/ghost/Dev/anima")
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "anima"))
+sys.path.insert(0, str(PROJECT_ROOT / "anima" / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "anima" / "experiments" / "evolution"))
+sys.path.insert(0, str(PROJECT_ROOT / "anima" / "tools"))
+
+OUT_PATH = PROJECT_ROOT / "data" / "o1_first_validation.json"
+HYP_PATH = PROJECT_ROOT / "config" / "acceleration_hypotheses.json"
+
+# ── Import closed_loop (no edit) ──
+try:
+    from closed_loop import (
+        ClosedLoopEvolver,
+        register_intervention,
+        INTERVENTIONS,
+    )
+except Exception as e:
+    print(f"[O1] FATAL: cannot import closed_loop: {e}", flush=True)
+    traceback.print_exc()
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.write_text(json.dumps({
+        "hypothesis_id": "O1",
+        "status": "error",
+        "error": f"import closed_loop failed: {e}",
+        "timestamp": time.time(),
+    }, indent=2))
+    sys.exit(2)
+
+# Optional: consciousness_to_corpus is only used if it exposes generate_hard_tokens.
+# The current version (603 LOC) does not, so we fall back to an inline
+# curriculum synthesizer. This keeps the .hexa self-sufficient while still
+# respecting "call only, no edits".
+_c2c_gen = None
+try:
+    import consciousness_to_corpus as c2c  # type: ignore
+    _c2c_gen = getattr(c2c, "generate_hard_tokens", None)
+except Exception:
+    _c2c_gen = None
+
+
+# ── O1 curriculum intervention ──
+#
+# Every 50 steps:
+#   1. Rank engine.cell_states by avg_tension (desc) — highest tension = hardest.
+#   2. Build N=10 "hard tokens" as input vectors shaped like cell hidden states
+#      projected into the engine input dim, biased toward the struggling cells.
+#   3. Deposit them into engine._curriculum_buffer (created on demand).
+#   4. Consume one buffered token per step via a monkey-patched step() wrapper
+#      installed lazily on first call.
+#
+# Engine is modified at the instance level ONLY — no edits to the .py source.
+
+_CURRICULUM_PERIOD = 50
+_CURRICULUM_N = 10
+
+
+def _ensure_curriculum_hooks(engine):
+    """Install _curriculum_buffer + step wrapper on a single engine instance."""
+    if getattr(engine, "_o1_patched", False):
+        return
+    engine._curriculum_buffer = []
+    engine._o1_consumed = 0
+    engine._o1_patched = True
+
+    import torch
+
+    _orig_step = engine.step
+
+    def _step_with_curriculum(x_input=None, text=None):
+        # Consume one buffered hard token if caller didn't supply explicit input.
+        if x_input is None and engine._curriculum_buffer:
+            tok = engine._curriculum_buffer.pop(0)
+            try:
+                x_input = torch.as_tensor(tok, dtype=torch.float32)
+                engine._o1_consumed += 1
+            except Exception:
+                x_input = None
+        return _orig_step(x_input=x_input, text=text)
+
+    engine.step = _step_with_curriculum  # bound replacement on instance
+
+
+def _synthesize_hard_tokens(engine, n=_CURRICULUM_N):
+    """Generate n input-shaped tokens biased toward the highest-tension cells."""
+    if _c2c_gen is not None:
+        try:
+            toks = _c2c_gen(engine, n=n)
+            if toks is not None:
+                return list(toks)
+        except Exception:
+            pass  # fall through to inline synthesizer
+
+    states = getattr(engine, "cell_states", None) or []
+    if not states:
+        return []
+
+    # Rank by avg_tension (worst = hardest)
+    try:
+        ranked = sorted(
+            range(len(states)),
+            key=lambda i: float(getattr(states[i], "avg_tension", 0.0)),
+            reverse=True,
+        )
+    except Exception:
+        ranked = list(range(len(states)))
+
+    input_dim = int(getattr(engine, "input_dim", 64))
+    import torch
+
+    tokens = []
+    rng = np.random.default_rng(int(time.time() * 1000) & 0xFFFFFFFF)
+    for k in range(n):
+        idx = ranked[k % len(ranked)]
+        try:
+            h = states[idx].hidden.detach().cpu().numpy().astype(np.float32).ravel()
+        except Exception:
+            h = rng.normal(0, 1, input_dim).astype(np.float32)
+        # Project/crop to input_dim
+        if h.shape[0] >= input_dim:
+            v = h[:input_dim].copy()
+        else:
+            v = np.zeros(input_dim, dtype=np.float32)
+            v[: h.shape[0]] = h
+        # Bias toward struggle: amplify sign-preserving magnitude + small noise
+        scale = 1.0 + float(getattr(states[idx], "avg_tension", 0.0))
+        v = v * scale + rng.normal(0, 0.05, input_dim).astype(np.float32)
+        tokens.append(v.tolist())
+    return tokens
+
+
+def _o1_curriculum_apply(engine, step):
+    """Intervention callback signature matches closed_loop.Intervention.apply_fn."""
+    _ensure_curriculum_hooks(engine)
+    if step > 0 and (step % _CURRICULUM_PERIOD) == 0:
+        toks = _synthesize_hard_tokens(engine, n=_CURRICULUM_N)
+        if toks:
+            engine._curriculum_buffer.extend(toks)
+
+
+# ── Register with closed_loop ──
+_already = any(iv.name == "o1_curriculum" for iv in INTERVENTIONS)
+if not _already:
+    register_intervention(
+        "o1_curriculum",
+        "O1: consciousness-generated hard-token curriculum (every 50 steps, N=10)",
+        _o1_curriculum_apply,
+    )
+    print("[O1] registered intervention 'o1_curriculum'", flush=True)
+else:
+    print("[O1] intervention 'o1_curriculum' already registered; reusing", flush=True)
+
+
+# ── Force-activate the O1 intervention so every cycle uses it ──
+# ClosedLoopEvolver's selection strategies would otherwise pick by correlation;
+# for a clean O1-vs-baseline comparison we seed _active_interventions directly.
+
+_t0 = time.time()
+
+evolver = ClosedLoopEvolver(
+    max_cells=16,
+    steps=120,
+    repeats=1,
+    auto_register=False,
+    selection_strategy="correlation",
+    nexus_scan=False,
+)
+
+# Pin O1 as the single active intervention from the start
+_o1_iv = next((iv for iv in INTERVENTIONS if iv.name == "o1_curriculum"), None)
+if _o1_iv is not None:
+    evolver._active_interventions = [_o1_iv]
+
+print("[O1] running 3 cycles of ClosedLoopEvolver.run_cycle() ...", flush=True)
+
+cycle_payload = []
+err = None
+try:
+    for i in range(3):
+        print(f"[O1] cycle {i+1}/3 ...", flush=True)
+        r = evolver.run_cycle()
+        cycle_payload.append({
+            "cycle": int(r.cycle),
+            "phi_baseline": float(r.phi_baseline),
+            "phi_improved": float(r.phi_improved),
+            "phi_delta_pct": float(r.phi_delta_pct),
+            "intervention_applied": str(r.intervention_applied),
+            "laws_changed_count": int(len(r.laws_changed)),
+            "time_sec": float(r.time_sec),
+        })
+        print(
+            f"[O1]   phi_baseline={r.phi_baseline:.4f} "
+            f"phi_improved={r.phi_improved:.4f} "
+            f"delta={r.phi_delta_pct:+.2f}% "
+            f"intv={r.intervention_applied}",
+            flush=True,
+        )
+except Exception as e:
+    err = f"{type(e).__name__}: {e}"
+    traceback.print_exc()
+
+_elapsed = time.time() - _t0
+
+# Pass / fail summary
+deltas = [c["phi_delta_pct"] for c in cycle_payload]
+mean_delta = float(np.mean(deltas)) if deltas else 0.0
+o1_applied = sum(
+    1 for c in cycle_payload if "o1_curriculum" in str(c.get("intervention_applied", ""))
+)
+pass_delta = mean_delta > 0
+pass_wiring = o1_applied >= 1
+verdict = "pass" if (pass_delta and pass_wiring and err is None) else "fail"
+
+report = {
+    "hypothesis_id": "O1",
+    "hypothesis_name": "Consciousness-Generated Curriculum",
+    "wrapper": "anima/experiments/verify_O1_curriculum.hexa",
+    "driver_py": "anima/experiments/evolution/closed_loop.py",
+    "status": "validating",
+    "cycles_run": len(cycle_payload),
+    "cycles": cycle_payload,
+    "summary": {
+        "mean_phi_delta_pct": mean_delta,
+        "o1_applied_cycles": o1_applied,
+        "pass_phi_delta_positive": bool(pass_delta),
+        "pass_o1_wiring": bool(pass_wiring),
+        "verdict": verdict,
+    },
+    "elapsed_sec": _elapsed,
+    "error": err,
+    "timestamp": time.time(),
+}
+
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+OUT_PATH.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+print(f"[O1] wrote {OUT_PATH}", flush=True)
+print(f"[O1] verdict={verdict}  mean_dphi={mean_delta:+.2f}%  "
+      f"o1_applied={o1_applied}/{len(cycle_payload)}", flush=True)
+
+sys.exit(0 if verdict == "pass" else 1)
+}

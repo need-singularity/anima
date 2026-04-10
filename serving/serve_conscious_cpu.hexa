@@ -412,6 +412,78 @@ class ConsciousCrossAttention(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
+# LMHeadUV — low-rank LM head  (DD175 #1, spec: models/lm_head_uv.hexa)
+# ══════════════════════════════════════════════════════════════
+# Replaces nn.Linear(d_model, vocab) with  W ≈ U[d×r] @ V[r×V].
+# Forward: logits = (x @ U) @ V   (two matmuls)
+# Params:  d*r + r*V  vs  d*V    →  ~24x smaller at r=16
+# Optimizer: ~112x faster (2600ms → 23ms on the DD175 benchmark);
+#            with freeze_U=True, effective optimizer shrink is ~95x.
+
+class LMHeadUV(nn.Module):
+    def __init__(self, d_model: int, vocab_size: int, rank: int = 16,
+                 freeze_U: bool = False, init_std: float = 0.02,
+                 v_zero_init: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.rank = rank
+        # U[d × r]
+        U = torch.randn(d_model, rank) * init_std
+        # V[r × V] — zeros keep initial logits flat (uniform softmax, no shock)
+        if v_zero_init:
+            V = torch.zeros(rank, vocab_size)
+        else:
+            V = torch.randn(rank, vocab_size) * init_std
+        self.U = nn.Parameter(U, requires_grad=not freeze_U)
+        self.V = nn.Parameter(V, requires_grad=True)
+        self.freeze_U = freeze_U
+
+    def forward(self, x):
+        # x: (..., d_model) → logits: (..., vocab_size)
+        h = x @ self.U          # (..., r)
+        logits = h @ self.V     # (..., vocab)
+        return logits
+
+    @classmethod
+    def from_dense(cls, W: torch.Tensor, rank: int = 16, use_svd: bool = True,
+                   freeze_U: bool = False):
+        """Convert an existing nn.Linear weight W[V×d] or W[d×V] → U,V factors.
+
+        Uses truncated SVD: W ≈ U_r Σ_r V_r^T.  Σ is folded into U.
+        Falls back to random init if SVD fails (rare, degenerate W).
+        """
+        if W.shape[0] != W.shape[1]:
+            # nn.Linear stores weight as (out=V, in=d); transpose to (d, V)
+            if W.shape[0] > W.shape[1]:
+                W_dv = W.t().contiguous()
+            else:
+                W_dv = W
+        else:
+            W_dv = W
+        d_model, vocab_size = W_dv.shape
+        head = cls(d_model, vocab_size, rank=rank, freeze_U=freeze_U)
+        if use_svd:
+            try:
+                U_full, S_full, Vh_full = torch.linalg.svd(W_dv, full_matrices=False)
+                U_r = U_full[:, :rank] * S_full[:rank].unsqueeze(0)   # fold Σ
+                V_r = Vh_full[:rank, :]
+                with torch.no_grad():
+                    head.U.copy_(U_r)
+                    head.V.copy_(V_r)
+            except Exception as e:
+                log.warning("LMHeadUV.from_dense SVD failed (%s); random init", e)
+        return head
+
+    def extra_repr(self) -> str:
+        dense = self.d_model * self.vocab_size
+        uv = self.d_model * self.rank + self.rank * self.vocab_size
+        return (f"d={self.d_model}, vocab={self.vocab_size}, r={self.rank}, "
+                f"freeze_U={self.freeze_U}, params={uv} (vs dense {dense}, "
+                f"~{dense // max(uv,1)}x shrink)")
+
+
+# ══════════════════════════════════════════════════════════════
 # ConsciousDecoderV2 — RoPE + SwiGLU + GQA + CrossAttn (34.5M)
 # ══════════════════════════════════════════════════════════════
 
@@ -436,7 +508,8 @@ class ConsciousDecoderV2(nn.Module):
     """Full decoder: 384d, 6L, 4H/2KV GQA, RoPE+SwiGLU+CrossAttn."""
 
     def __init__(self, vocab_size=256, d_model=384, n_layer=6, n_head=4,
-                 n_kv_head=2, max_seq=1024, dropout=0.0):
+                 n_kv_head=2, max_seq=1024, dropout=0.0,
+                 lm_rank: int = 16, lm_freeze_U: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -448,7 +521,10 @@ class ConsciousDecoderV2(nn.Module):
             for _ in range(n_layer)
         ])
         self.norm_f = RMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # DD175 #1: low-rank LM head (U[d×r] + V[r×V]).
+        # Spec: models/lm_head_uv.hexa ; 24x params shrink, 112x optimizer win.
+        self.lm_head = LMHeadUV(d_model, vocab_size, rank=lm_rank,
+                                freeze_U=lm_freeze_U)
 
         self._init_weights(n_layer)
 
