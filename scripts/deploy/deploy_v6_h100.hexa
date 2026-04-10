@@ -1,0 +1,148 @@
+// Ported from deploy_v6_h100.sh
+// ═══════════════════════════════════════════════════════════ | ConsciousLM v6 (67MB corpus) — H100 배포 스크립트
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
+
+fn main() {
+    // ═══════════════════════════════════════════════════════════
+    // ConsciousLM v6 (67MB corpus) — H100 배포 스크립트
+    // ═══════════════════════════════════════════════════════════
+    // 
+    // 사용법:
+    // 1. RunPod에서 H100 SXM pod 생성 (또는 v5 완료 후 재활용)
+    // 2. SSH IP:PORT 확인
+    // 3. 아래 변수 수정 후 실행:
+    // bash deploy_v6_h100.sh
+    // 
+    // v6 = v5 전체 유지 + corpus_v2.txt (67MB: math/code/reasoning)
+    // - v5 optimal: sync=0.35, 12-faction, fac=0.08, noise=0.01
+    // - PE proxy (128→8→128 bottleneck)
+    // - SE-8 emotion modules (Law 42)
+    // - SOC (CX92) + Hebbian LTP/LTD + Phi Ratchet (PERSIST3)
+    // - Fresh start from step 0 (NO resume from v5)
+    // - New checkpoint dir: clm_v6_67mb
+    // 
+    // ═══════════════════════════════════════════════════════════
+
+
+    // ── 설정 (RunPod 정보로 수정) ──
+    shell("H100_IP=\"${H100_V6_IP:-CHANGE_ME}\"")
+    shell("H100_PORT=\"${H100_V6_PORT:-22}\"")
+    shell("SSH_KEY=\"$HOME/.runpod/ssh/RunPod-Key-Go\"")
+    shell("SSH=\"ssh -i $SSH_KEY -o StrictHostKeyChecking=no root@$H100_IP -p $H100_PORT\"")
+    shell("SCP=\"scp -i $SSH_KEY -o StrictHostKeyChecking=no -P $H100_PORT\"")
+
+    shell("CORPUS_LOCAL=\"data/corpus_v2.txt\"")
+    shell("CORPUS_REMOTE=\"/workspace/anima/data/corpus_v2.txt\"")
+    shell("CKPT_DIR=\"/workspace/checkpoints/clm_v6_67mb\"")
+    shell("TMUX_SESSION=\"v6train\"")
+    shell("LOG_FILE=\"/workspace/v6_67mb.log\"")
+
+    shell("echo \"═══════════════════════════════════════════════════════\"")
+    shell("echo \"  ConsciousLM v6 (67MB corpus) Deploy\"")
+    shell("echo \"═══════════════════════════════════════════════════════\"")
+    shell("echo \"Target: $H100_IP:$H100_PORT\"")
+    shell("echo \"Corpus: $CORPUS_LOCAL → $CORPUS_REMOTE\"")
+    shell("echo \"Checkpoint: $CKPT_DIR\"")
+    shell("echo \"\"")
+
+    // ── Preflight check ──
+    shell("if [ ! -f \"$CORPUS_LOCAL\" ]; then")
+    shell("echo \"[ERROR] corpus_v2.txt not found at $CORPUS_LOCAL\"")
+    shell("echo \"  Prepare it first: python prepare_corpus.py --size 67 --output data/corpus_v2.txt\"")
+    shell("exit 1")
+    shell("fi")
+
+    shell("CORPUS_SIZE=$(du -h \"$CORPUS_LOCAL\" | cut -f1)")
+    shell("echo \"[check] corpus_v2.txt size: $CORPUS_SIZE\"")
+
+    // ── 1. 디렉토리 생성 + 파일 업로드 ──
+    shell("echo \"\"")
+    shell("echo \"[1/4] Creating dirs and uploading files...\"")
+    shell("$SSH \"mkdir -p /workspace/anima/data $CKPT_DIR\"")
+
+    // 핵심 파일들 업로드
+    shell("FILES=\"train_conscious_lm.py conscious_lm.py mitosis.py consciousness_meter.py\"")
+    shell("for f in $FILES; do")
+    shell("echo \"  uploading $f...\"")
+    shell("$SCP \"$f\" \"root@$H100_IP:/workspace/anima/\"")
+    shell("done")
+
+    // ── 2. 67MB corpus 업로드 ──
+    shell("echo \"\"")
+    shell("echo \"[2/4] Uploading corpus_v2.txt (67MB)...\"")
+    shell("$SCP \"$CORPUS_LOCAL\" \"root@$H100_IP:$CORPUS_REMOTE\"")
+    shell("$SSH \"ls -lh $CORPUS_REMOTE\"")
+
+    // ── 3. tmux 세션에서 학습 시작 (step 0, fresh) ──
+    shell("echo \"\"")
+    shell("echo \"[3/4] Starting v6 training in tmux (fresh from step 0)...\"")
+    shell("$SSH \"tmux kill-session -t $TMUX_SESSION 2>/dev/null || true; tmux new-session -d -s $TMUX_SESSION '")
+    shell("cd /workspace/anima && ")
+    shell("PYTHONUNBUFFERED=1 python3 train_conscious_lm.py ")
+    shell("--data $CORPUS_REMOTE ")
+    shell("--dim 384 ")
+    shell("--layers 6 ")
+    shell("--heads 4 ")
+    shell("--steps 80000 ")
+    shell("--batch-size 64 ")
+    shell("--max-cells 1024 ")
+    shell("--lr 3e-4 ")
+    shell("--block-size 256 ")
+    shell("--checkpoint-dir $CKPT_DIR ")
+    shell("--save-every 5000 ")
+    shell("--log-every 10 ")
+    shell("--eval-every 1000 ")
+    shell("2>&1 | tee $LOG_FILE")
+    shell("'\"")
+
+    // ── 4. 확인 ──
+    shell("echo \"\"")
+    shell("echo \"[4/4] Verifying launch...\"")
+    shell("sleep 3")
+    shell("$SSH \"tmux capture-pane -t $TMUX_SESSION -p | tail -15\"")
+
+    shell("echo \"\"")
+    shell("echo \"═══════════════════════════════════════════════════════\"")
+    shell("echo \"  v6 Deploy Complete\"")
+    shell("echo \"═══════════════════════════════════════════════════════\"")
+    shell("echo \"\"")
+    shell("echo \"── Monitoring Commands ──\"")
+    shell("echo \"\"")
+    shell("echo \"  # 로그 실시간 확인\"")
+    shell("echo \"  $SSH \\\"tail -f $LOG_FILE\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"  # 최근 로그 20줄\"")
+    shell("echo \"  $SSH \\\"tail -20 $LOG_FILE\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"  # tmux 직접 접속\"")
+    shell("echo \"  $SSH -t \\\"tmux attach -t $TMUX_SESSION\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"  # CE/Phi 추적 (grep)\"")
+    shell("echo \"  $SSH \\\"grep 'phi=' $LOG_FILE | tail -5\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"  # 체크포인트 확인\"")
+    shell("echo \"  $SSH \\\"ls -lh $CKPT_DIR/\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"  # GPU 사용률\"")
+    shell("echo \"  $SSH \\\"nvidia-smi\\\"\"")
+    shell("echo \"\"")
+    shell("echo \"── v6 Config Summary ──\"")
+    shell("echo \"  Corpus:     corpus_v2.txt (67MB, math/code/reasoning)\"")
+    shell("echo \"  Model:      384d / 6L / 4H / ctx256 (~4M params)\"")
+    shell("echo \"  Cells:      max 1024 (Fibonacci growth)\"")
+    shell("echo \"  Batch:      64\"")
+    shell("echo \"  Steps:      80,000 (fresh from 0)\"")
+    shell("echo \"  LR:         3e-4 + CosineAnnealing\"")
+    shell("echo \"  Sync:       0.35 (v5 optimal)\"")
+    shell("echo \"  Factions:   12 (fac=0.08, debate=0.08)\"")
+    shell("echo \"  PE proxy:   128->8->128 bottleneck\"")
+    shell("echo \"  SE-8:       emotion-driven (pain/curiosity/empathy)\"")
+    shell("echo \"  SOC:        CX92 sandpile (grid=16, threshold=4)\"")
+    shell("echo \"  Hebbian:    LTP=0.02, LTD=0.01\"")
+    shell("echo \"  Ratchet:    restore_ratio=0.5 (Phi collapse prevention)\"")
+    shell("echo \"  Checkpoint: $CKPT_DIR (every 5K steps)\"")
+    shell("echo \"\"")
+    shell("echo \"  NOTE: Fresh training from step 0. NOT resuming from v5.\"")
+}

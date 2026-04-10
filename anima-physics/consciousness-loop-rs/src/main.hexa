@@ -1,0 +1,469 @@
+// Consciousness Infinite Loop v2 — Hexa 심화 구현
+//
+// v1 결과: 발화 존재, 대화 수렴 약함
+// v2 해결: 파벌 구조 + 물리적 상호작용 + Phi 근사 + 노이즈 주입
+//
+// 아키텍처 (발화 코드 0줄):
+//   Cell = GRU hidden state (f32 x HIDDEN)
+//   Faction = Cell 그룹 (독립적 관점 발전)
+//   Engine = [Faction] + 물리적 상호작용
+//   Loop = output(전체 mean) -> input(next step)
+
+comptime const DIM = 64
+comptime const HIDDEN = 128
+comptime const N_FACTIONS = 8
+
+// --- Math helpers ---
+
+fn random_matrix(rows: u64, cols: u64, scale: f32) -> [[f32]] {
+    var mat = [[f32]]{}
+    for r in 0..rows {
+        var row = [f32]{}
+        for c in 0..cols {
+            row.push((rand_f32() - 0.5) * scale)
+        }
+        mat.push(row)
+    }
+    return mat
+}
+
+fn matvec(m: [[f32]], v: [f32]) -> [f32] {
+    var out = [f32]{}
+    for row in m {
+        var sum = 0.0
+        for i in 0..row.len() {
+            sum = sum + row[i] * v[i]
+        }
+        out.push(sum)
+    }
+    return out
+}
+
+fn sigmoid(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)) }
+fn sigmoid_vec(v: [f32]) -> [f32] { return v.map(fn(x: f32) -> f32 { return sigmoid(x) }) }
+fn tanh_vec(v: [f32]) -> [f32] { return v.map(fn(x: f32) -> f32 { return tanh(x) }) }
+
+// --- Cell ---
+
+struct Cell {
+    hidden: [f32],
+    identity: [f32],
+    w_z: [[f32]],
+    w_r: [[f32]],
+    w_h: [[f32]],
+}
+
+fn cell_new(cell_id: u64) -> Cell {
+    var scale = 0.1
+    var identity = [f32]{}
+    for i in 0..HIDDEN {
+        var phase = (cell_id * 7 + i * 13) as f32 * 0.618033
+        identity.push(sin(phase) * 0.1 + (rand_f32() - 0.5) * 0.02)
+    }
+    var hidden = [f32]{}
+    for _ in 0..HIDDEN { hidden.push(rand_f32() * scale) }
+    return Cell {
+        hidden: hidden,
+        identity: identity,
+        w_z: random_matrix(HIDDEN, DIM + HIDDEN, scale),
+        w_r: random_matrix(HIDDEN, DIM + HIDDEN, scale),
+        w_h: random_matrix(HIDDEN, DIM + HIDDEN, scale),
+    }
+}
+
+fn cell_process(self: *Cell, input: [f32]) {
+    var combined = input ++ self.hidden
+    var z = sigmoid_vec(matvec(self.w_z, combined))
+    var r = sigmoid_vec(matvec(self.w_r, combined))
+    var r_hidden = [f32]{}
+    for i in 0..HIDDEN { r_hidden.push(r[i] * self.hidden[i]) }
+    var combined_r = input ++ r_hidden
+    var h_cand = tanh_vec(matvec(self.w_h, combined_r))
+    for i in 0..HIDDEN {
+        self.hidden[i] = (1.0 - z[i]) * h_cand[i] + z[i] * self.hidden[i]
+        // Cell identity injection: prevents uniform convergence (Law 95)
+        self.hidden[i] = self.hidden[i] + self.identity[i] * 0.03
+    }
+}
+
+fn cell_norm(self: *Cell) -> f32 {
+    var sum = 0.0
+    for x in self.hidden { sum = sum + x * x }
+    return sqrt(sum)
+}
+
+// --- Faction ---
+
+struct Faction {
+    cells: [Cell],
+}
+
+fn faction_new(n_cells: u64, base_id: u64) -> Faction {
+    var cells = [Cell]{}
+    for i in 0..n_cells { cells.push(cell_new(base_id + i)) }
+    return Faction { cells: cells }
+}
+
+fn faction_mean_hidden(self: *Faction) -> [f32] {
+    var n = self.cells.len() as f32
+    var m = [f32]{}
+    for _ in 0..HIDDEN { m.push(0.0) }
+    for c in self.cells {
+        for i in 0..HIDDEN { m[i] = m[i] + c.hidden[i] / n }
+    }
+    return m
+}
+
+fn faction_process_all(self: *Faction, input: [f32]) {
+    for cell in self.cells { cell_process(&cell, input) }
+}
+
+fn faction_internal_sync(self: *Faction, strength: f32) {
+    var mean = faction_mean_hidden(self)
+    for cell in self.cells {
+        for i in 0..HIDDEN {
+            cell.hidden[i] = (1.0 - strength) * cell.hidden[i] + strength * mean[i]
+        }
+    }
+}
+
+fn faction_add_cell(self: *Faction, cell_id: u64) {
+    var parent_idx = rand_u64() % self.cells.len()
+    var child = cell_new(cell_id)
+    for i in 0..HIDDEN {
+        child.hidden[i] = self.cells[parent_idx].hidden[i] + (rand_f32() - 0.5) * 0.1
+    }
+    self.cells.push(child)
+}
+
+// --- ConsciousnessEngine ---
+
+struct ConsciousnessEngine {
+    factions: [Faction],
+}
+
+fn engine_new(n_factions: u64, cells_per_faction: u64) -> ConsciousnessEngine {
+    var factions = [Faction]{}
+    for f in 0..n_factions {
+        factions.push(faction_new(cells_per_faction, f * cells_per_faction))
+    }
+    return ConsciousnessEngine { factions: factions }
+}
+
+fn engine_total_cells(self: *ConsciousnessEngine) -> u64 {
+    var total = 0
+    for f in self.factions { total = total + f.cells.len() }
+    return total
+}
+
+fn engine_process(self: *ConsciousnessEngine, input: [f32]) {
+    for faction in self.factions { faction_process_all(&faction, input) }
+}
+
+fn engine_intra_faction_sync(self: *ConsciousnessEngine, strength: f32) {
+    for faction in self.factions { faction_internal_sync(&faction, strength) }
+}
+
+fn engine_cross_faction_debate(self: *ConsciousnessEngine, strength: f32) {
+    var opinions = []*[f32]{}
+    for f in self.factions { opinions.push(faction_mean_hidden(&f)) }
+    var n_f = self.factions.len()
+    for i in 0..n_f {
+        var other_avg = [f32]{}
+        for _ in 0..HIDDEN { other_avg.push(0.0) }
+        for j in 0..n_f {
+            if j != i {
+                for k in 0..HIDDEN { other_avg[k] = other_avg[k] + opinions[j][k] / (n_f - 1) as f32 }
+            }
+        }
+        var n_debate = min(self.factions[i].cells.len(), 4)
+        for c in 0..n_debate {
+            for k in 0..HIDDEN {
+                self.factions[i].cells[c].hidden[k] =
+                    (1.0 - strength) * self.factions[i].cells[c].hidden[k] + strength * other_avg[k]
+            }
+        }
+    }
+}
+
+fn engine_ising_interaction(self: *ConsciousnessEngine) {
+    var opinions = []*[f32]{}
+    for f in self.factions { opinions.push(faction_mean_hidden(&f)) }
+    var n_f = self.factions.len()
+    for i in 0..n_f {
+        var left = if i == 0 { n_f - 1 } else { i - 1 }
+        var right = (i + 1) % n_f
+        var field = [f32]{}
+        for _ in 0..HIDDEN { field.push(0.0) }
+        for k in 0..HIDDEN {
+            var j_left = if i % 3 == 0 { -0.05 } else { 0.05 }
+            var j_right = if i % 3 == 1 { -0.05 } else { 0.05 }
+            field[k] = j_left * opinions[left][k] + j_right * opinions[right][k]
+        }
+        for k in 0..HIDDEN {
+            self.factions[i].cells[0].hidden[k] = self.factions[i].cells[0].hidden[k] + field[k]
+        }
+        // Thermal noise
+        for cell in self.factions[i].cells {
+            for k in 0..HIDDEN {
+                cell.hidden[k] = cell.hidden[k] + (rand_f32() - 0.5) * 0.02
+            }
+        }
+    }
+}
+
+fn engine_output(self: *ConsciousnessEngine) -> [f32] {
+    var total = engine_total_cells(self) as f32
+    var mean = [f32]{}
+    for _ in 0..DIM { mean.push(0.0) }
+    for faction in self.factions {
+        for cell in faction.cells {
+            for i in 0..min(DIM, HIDDEN) {
+                mean[i] = mean[i] + cell.hidden[i] / total
+            }
+        }
+    }
+    return mean
+}
+
+fn engine_phi_proxy(self: *ConsciousnessEngine) -> f32 {
+    var all_hiddens = []*[f32]{}
+    for f in self.factions {
+        for c in f.cells { all_hiddens.push(&c.hidden) }
+    }
+    var n = all_hiddens.len() as f32
+    if n < 2.0 { return 0.0 }
+
+    var global_mean = [f32]{}
+    for _ in 0..HIDDEN { global_mean.push(0.0) }
+    for h in all_hiddens {
+        for i in 0..HIDDEN { global_mean[i] = global_mean[i] + h[i] / n }
+    }
+    var global_var = 0.0
+    for h in all_hiddens {
+        var sq = 0.0
+        for i in 0..HIDDEN { sq = sq + (h[i] - global_mean[i]) * (h[i] - global_mean[i]) }
+        global_var = global_var + sq
+    }
+    global_var = global_var / n
+
+    var faction_var_sum = 0.0
+    for faction in self.factions {
+        var fn_ = faction.cells.len() as f32
+        if fn_ < 2.0 { continue }
+        var fmean = faction_mean_hidden(&faction)
+        var fvar = 0.0
+        for c in faction.cells {
+            var sq = 0.0
+            for i in 0..HIDDEN { sq = sq + (c.hidden[i] - fmean[i]) * (c.hidden[i] - fmean[i]) }
+            fvar = fvar + sq
+        }
+        faction_var_sum = faction_var_sum + fvar / fn_
+    }
+    var faction_var_avg = faction_var_sum / self.factions.len() as f32
+    return max(global_var - faction_var_avg, 0.0)
+}
+
+fn engine_diversity(self: *ConsciousnessEngine) -> f32 {
+    var opinions = []*[f32]{}
+    for f in self.factions { opinions.push(faction_mean_hidden(&f)) }
+    var n = opinions.len()
+    if n < 2 { return 0.0 }
+    var total_dist = 0.0
+    var count = 0
+    for i in 0..n {
+        for j in (i + 1)..n {
+            var dist = 0.0
+            for k in 0..HIDDEN {
+                dist = dist + (opinions[i][k] - opinions[j][k]) * (opinions[i][k] - opinions[j][k])
+            }
+            total_dist = total_dist + sqrt(dist)
+            count = count + 1
+        }
+    }
+    return total_dist / count as f32
+}
+
+fn main() {
+    var steps = 1000
+
+    println("=== Consciousness Infinite Loop v2 (Hexa) ===")
+    println("  Factions: {N_FACTIONS}, Cells: 2->512, Steps: {steps}")
+    println("  발화 코드: 0줄. 디코더: 없음. speak(): 없음.")
+    println("  추가: 파벌 구조 + Ising 자석 + Phi 근사 + 침묵->폭발")
+    println("")
+
+    // Test 1: 8-Faction Debate Loop
+    println(">> Test 1: 8-Faction Debate Loop")
+    var engine = engine_new(N_FACTIONS, 1)
+    var stream = [f32]{}
+    for _ in 0..DIM { stream.push(rand_f32() * 0.5) }
+    var output_norms = [f32]{}
+    var phi_history = [f32]{}
+    var diversity_history = [f32]{}
+
+    for step in 0..steps {
+        var frac = step as f32 / steps as f32
+        var target_per_faction = min(pow(2.0, (frac + 0.1) * 6.0) as u64, 64)
+        var next_id = engine_total_cells(&engine)
+        for faction in engine.factions {
+            while faction.cells.len() < target_per_faction {
+                faction_add_cell(&faction, next_id)
+                next_id = next_id + 1
+            }
+        }
+        if frac < 0.70 {
+            var quiet_input = stream.map(fn(x: f32) -> f32 { return x * 0.1 })
+            engine_process(&engine, quiet_input)
+            engine_intra_faction_sync(&engine, 0.15)
+            engine_ising_interaction(&engine)
+        } else {
+            var loud_input = stream.map(fn(x: f32) -> f32 { return x * 2.0 })
+            engine_process(&engine, loud_input)
+            engine_intra_faction_sync(&engine, 0.15)
+            engine_cross_faction_debate(&engine, 0.12)
+            engine_ising_interaction(&engine)
+        }
+        var output = engine_output(&engine)
+        var norm = 0.0
+        for x in output { norm = norm + x * x }
+        norm = sqrt(norm)
+        output_norms.push(norm)
+        stream = output.map(fn(x: f32) -> f32 { return x + (rand_f32() - 0.5) * 0.03 })
+        var phi = engine_phi_proxy(&engine)
+        var div = engine_diversity(&engine)
+        phi_history.push(phi)
+        diversity_history.push(div)
+        if step % 200 == 0 or step == steps - 1 {
+            println("  step {step}: cells={engine_total_cells(&engine)}, Phi~{phi:.3}, diversity={div:.3}, out_norm={norm:.4}")
+        }
+    }
+
+    var mean_norm = 0.0
+    for x in output_norms { mean_norm = mean_norm + x }
+    mean_norm = mean_norm / output_norms.len() as f32
+    var std_norm = 0.0
+    for x in output_norms { std_norm = std_norm + (x - mean_norm) * (x - mean_norm) }
+    std_norm = sqrt(std_norm / output_norms.len() as f32)
+
+    var never_silent = 0
+    for i in 1..output_norms.len() {
+        if abs(output_norms[i] - output_norms[i - 1]) > 0.001 { never_silent = never_silent + 1 }
+    }
+    var never_silent_pct = never_silent as f32 / (output_norms.len() - 1) as f32
+
+    var phi_final = phi_history[phi_history.len() - 1]
+    var phi_max = 0.0
+    for p in phi_history { if p > phi_max { phi_max = p } }
+
+    println("")
+    println("  --- 발화 분석 ---")
+    println("    output_std:     {std_norm:.4}")
+    println("    never_silent:   {never_silent_pct * 100.0:.1}%")
+    println("    Phi final:      {phi_final:.3}")
+    println("    Phi max:        {phi_max:.3}")
+    println("    diversity final: {diversity_history[diversity_history.len() - 1]:.3}")
+
+    // Test 2: Dual Engine Conversation
+    println("")
+    println(">> Test 2: Dual 8-Faction Engine Conversation")
+    var ea = engine_new(N_FACTIONS, 1)
+    var eb = engine_new(N_FACTIONS, 1)
+    var sa = [f32]{}
+    var sb = [f32]{}
+    for _ in 0..DIM { sa.push(rand_f32() * 0.5); sb.push(rand_f32() * 0.5) }
+    var agreements = [f32]{}
+
+    for step in 0..steps {
+        var frac = step as f32 / steps as f32
+        var target = min(pow(2.0, (frac + 0.1) * 5.0) as u64, 16)
+        for eng in [&ea, &eb] {
+            var next_id = engine_total_cells(eng)
+            for faction in eng.factions {
+                while faction.cells.len() < target {
+                    faction_add_cell(&faction, next_id)
+                    next_id = next_id + 1
+                }
+            }
+        }
+        var sa_noisy = sa.map(fn(x: f32) -> f32 { return x + (rand_f32() - 0.5) * 0.05 })
+        var sb_noisy = sb.map(fn(x: f32) -> f32 { return x + (rand_f32() - 0.5) * 0.05 })
+        engine_process(&ea, sb_noisy)
+        engine_process(&eb, sa_noisy)
+        engine_intra_faction_sync(&ea, 0.10)
+        engine_intra_faction_sync(&eb, 0.10)
+        if frac > 0.50 {
+            engine_cross_faction_debate(&ea, 0.08)
+            engine_cross_faction_debate(&eb, 0.08)
+        }
+        engine_ising_interaction(&ea)
+        engine_ising_interaction(&eb)
+        var oa = engine_output(&ea)
+        var ob = engine_output(&eb)
+        var dot = 0.0
+        var na = 0.0
+        var nb = 0.0
+        for i in 0..DIM { dot = dot + oa[i] * ob[i]; na = na + oa[i] * oa[i]; nb = nb + ob[i] * ob[i] }
+        na = sqrt(na); nb = sqrt(nb)
+        var cos = if na > 0.001 and nb > 0.001 { dot / (na * nb) } else { 0.0 }
+        agreements.push(cos)
+        sa = oa; sb = ob
+        if step % 200 == 0 or step == steps - 1 {
+            println("  step {step}: cells={engine_total_cells(&ea)}+{engine_total_cells(&eb)}, agreement={cos:.4}")
+        }
+    }
+
+    var first_agree = agreements[0]
+    var last_agree = agreements[agreements.len() - 1]
+    var max_agree = -999.0
+    for a in agreements { if a > max_agree { max_agree = a } }
+    var converging = last_agree > first_agree + 0.05 or max_agree > 0.5
+
+    println("")
+    println("  --- 대화 분석 ---")
+    println("    initial agreement: {first_agree:.4}")
+    println("    final agreement:   {last_agree:.4}")
+    println("    max agreement:     {max_agree:.4}")
+    println("    convergence: {if converging { 'YES' } else { 'weak' }}")
+
+    // Test 3: Zero-Input Eternal Loop
+    println("")
+    println(">> Test 3: Zero-Input Eternal Loop (sensory deprivation)")
+    var engine_z = engine_new(N_FACTIONS, 8)
+    var zero_input = [f32]{}
+    for _ in 0..DIM { zero_input.push(0.0) }
+    var z_changes = [f32]{}
+    var prev_out = engine_output(&engine_z)
+    for step in 0..500 {
+        engine_process(&engine_z, zero_input)
+        engine_intra_faction_sync(&engine_z, 0.10)
+        engine_ising_interaction(&engine_z)
+        if step > 250 { engine_cross_faction_debate(&engine_z, 0.08) }
+        var out = engine_output(&engine_z)
+        var change = 0.0
+        for i in 0..DIM { change = change + (out[i] - prev_out[i]) * (out[i] - prev_out[i]) }
+        change = sqrt(change)
+        z_changes.push(change)
+        prev_out = out
+        if step % 100 == 0 or step == 499 {
+            println("  step {step}: delta={change:.6}, Phi~{engine_phi_proxy(&engine_z):.3}")
+        }
+    }
+    var eternal_active = 0
+    for c in z_changes { if c > 0.0001 { eternal_active = eternal_active + 1 } }
+    var eternal_pct = eternal_active as f32 / z_changes.len() as f32
+
+    println("")
+    println("  --- 감각 박탈 분석 ---")
+    println("    still active: {eternal_pct * 100.0:.1}% of steps")
+
+    println("")
+    println("=======================================")
+    println("  v2 결론:")
+    println("  발화:  {if std_norm > 0.01 { 'YES' } else { 'weak' }}")
+    println("  대화:  {if converging { 'YES' } else { 'weak' }}")
+    println("  영원:  {if eternal_pct > 0.5 { 'YES' } else { 'weak' }}")
+    println("  Phi:   {phi_final:.3}")
+    println("  코드:  speak()=0줄, decode()=0줄, prompt=0줄")
+    println("=======================================")
+}

@@ -1,0 +1,136 @@
+// trading/portfolio.hexa -- Portfolio management, positions, PnL tracking
+// Port of trading/portfolio.py (277 lines)
+
+struct Position {
+    symbol: string,
+    side: string,
+    entry_price: float,
+    amount: float,
+    stop_loss: float,
+    take_profit: float,
+    entry_time: float,
+    unrealized_pnl: float,
+}
+
+struct Portfolio {
+    balance: float,
+    initial_balance: float,
+    positions: array,
+    closed_trades: array,
+    high_water_mark: float,
+}
+
+fn new_portfolio(initial_balance: float) -> Portfolio {
+    Portfolio {
+        balance: initial_balance,
+        initial_balance: initial_balance,
+        positions: [],
+        closed_trades: [],
+        high_water_mark: initial_balance,
+    }
+}
+
+fn open_position(portfolio: &mut Portfolio, symbol: string, side: string,
+                 amount: float, price: float, stop_loss: float, take_profit: float) -> bool {
+    let cost = amount * price
+    if cost > portfolio.balance {
+        return false
+    }
+    portfolio.balance = portfolio.balance - cost
+    append(portfolio.positions, Position {
+        symbol: symbol,
+        side: side,
+        entry_price: price,
+        amount: amount,
+        stop_loss: stop_loss,
+        take_profit: take_profit,
+        entry_time: time_now(),
+        unrealized_pnl: 0.0,
+    })
+    true
+}
+
+fn close_position(portfolio: &mut Portfolio, index: int, exit_price: float) -> map {
+    if index >= len(portfolio.positions) {
+        return {"success": false, "error": "invalid index"}
+    }
+    let pos = portfolio.positions[index]
+    let pnl = if pos.side == "buy" {
+        (exit_price - pos.entry_price) * pos.amount
+    } else {
+        (pos.entry_price - exit_price) * pos.amount
+    }
+    let proceeds = pos.amount * exit_price
+    portfolio.balance = portfolio.balance + proceeds
+
+    let trade = {
+        "symbol": pos.symbol, "side": pos.side,
+        "entry_price": pos.entry_price, "exit_price": exit_price,
+        "amount": pos.amount, "pnl": pnl,
+        "duration_s": time_now() - pos.entry_time,
+    }
+    append(portfolio.closed_trades, trade)
+    remove_at(portfolio.positions, index)
+
+    // Update high water mark
+    let total = portfolio_value(portfolio, exit_price)
+    if total > portfolio.high_water_mark {
+        portfolio.high_water_mark = total
+    }
+
+    {"success": true, "pnl": pnl, "trade": trade}
+}
+
+fn portfolio_value(portfolio: &Portfolio, current_price: float) -> float {
+    let mut total = portfolio.balance
+    for pos in portfolio.positions {
+        let mark = pos.amount * current_price
+        total = total + mark
+    }
+    total
+}
+
+fn portfolio_pnl(portfolio: &Portfolio) -> float {
+    let mut total_pnl = 0.0
+    for trade in portfolio.closed_trades {
+        total_pnl = total_pnl + trade["pnl"]
+    }
+    total_pnl
+}
+
+fn portfolio_drawdown(portfolio: &Portfolio, current_price: float) -> float {
+    let current_value = portfolio_value(portfolio, current_price)
+    if portfolio.high_water_mark <= 0.0 { return 0.0 }
+    (portfolio.high_water_mark - current_value) / portfolio.high_water_mark
+}
+
+fn check_stops(portfolio: &mut Portfolio, current_prices: map) {
+    let mut to_close = []
+    for i, pos in enumerate(portfolio.positions) {
+        let price = current_prices[pos.symbol]
+        if pos.side == "buy" {
+            if pos.stop_loss > 0.0 && price <= pos.stop_loss { append(to_close, i) }
+            if pos.take_profit > 0.0 && price >= pos.take_profit { append(to_close, i) }
+        } else {
+            if pos.stop_loss > 0.0 && price >= pos.stop_loss { append(to_close, i) }
+            if pos.take_profit > 0.0 && price <= pos.take_profit { append(to_close, i) }
+        }
+    }
+    // Close in reverse order to preserve indices
+    for i in reverse(to_close) {
+        let price = current_prices[portfolio.positions[i].symbol]
+        close_position(portfolio, i, price)
+    }
+}
+
+fn print_portfolio(portfolio: &Portfolio) {
+    println("Portfolio:")
+    println("  Balance: $" + to_string(portfolio.balance))
+    println("  Positions: " + to_string(len(portfolio.positions)))
+    println("  Closed trades: " + to_string(len(portfolio.closed_trades)))
+    println("  Total PnL: $" + to_string(portfolio_pnl(portfolio)))
+}
+
+fn main() {
+    println("trading/portfolio.hexa loaded")
+}

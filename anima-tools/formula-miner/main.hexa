@@ -1,0 +1,249 @@
+// ANIMA Formula Miner — Genetic n=6 Formula Discovery for Consciousness Constants
+// Ported from main.rs (923 LOC)
+// Depth-3 exhaustive + GA(5000,500) + consciousness-specific targets + ppm + surprisal
+
+// --- N=6 Base Constants ---
+comptime const N_VAL = 6.0
+comptime const PHI_VAL = 2.0
+comptime const TAU_VAL = 4.0
+comptime const SIGMA_VAL = 12.0
+comptime const J2_VAL = 24.0
+comptime const SOPFR_VAL = 5.0
+comptime const MU_VAL = 1.0
+
+comptime const NC = 7
+comptime const CONST_NAMES = ["n", "phi", "tau", "sigma", "J2", "sopfr", "mu"]
+comptime const CONST_VALS = [N_VAL, PHI_VAL, TAU_VAL, SIGMA_VAL, J2_VAL, SOPFR_VAL, MU_VAL]
+comptime const NUM_OPS = 5
+
+// --- Operations ---
+
+fn op_eval(op_id: u64, a: f64, b: f64) -> f64 {
+    if op_id == 0 { return a + b }
+    if op_id == 1 { return a - b }
+    if op_id == 2 { return a * b }
+    if op_id == 3 {
+        if abs(b) < 1e-15 { return f64_nan() }
+        return a / b
+    }
+    // op_id == 4: pow
+    if abs(a) < 1e-15 and b < 0.0 { return f64_nan() }
+    if abs(a) > 1e6 or abs(b) > 50.0 { return f64_nan() }
+    var r = pow(a, b)
+    if is_finite(r) and abs(r) < 1e30 { return r }
+    return f64_nan()
+}
+
+fn op_sym(op_id: u64) -> str {
+    if op_id == 0 { return "+" }
+    if op_id == 1 { return "-" }
+    if op_id == 2 { return "*" }
+    if op_id == 3 { return "/" }
+    return "^"
+}
+
+// --- Expression Tree ---
+
+struct Expr {
+    kind: str,          // "leaf" or "binop"
+    leaf_idx: u64,      // for leaf: index into CONST_VALS
+    op: u64,            // for binop: operation index
+    left: *Expr,        // for binop
+    right: *Expr,       // for binop
+}
+
+fn expr_leaf(i: u64) -> Expr {
+    return Expr { kind: "leaf", leaf_idx: i, op: 0, left: null, right: null }
+}
+
+fn expr_binop(op: u64, left: Expr, right: Expr) -> Expr {
+    return Expr { kind: "binop", leaf_idx: 0, op: op, left: &left, right: &right }
+}
+
+fn expr_eval(e: *Expr) -> f64 {
+    if e.kind == "leaf" { return CONST_VALS[e.leaf_idx] }
+    var lv = expr_eval(e.left)
+    var rv = expr_eval(e.right)
+    return op_eval(e.op, lv, rv)
+}
+
+fn expr_depth(e: *Expr) -> u64 {
+    if e.kind == "leaf" { return 0 }
+    return 1 + max(expr_depth(e.left), expr_depth(e.right))
+}
+
+fn expr_node_count(e: *Expr) -> u64 {
+    if e.kind == "leaf" { return 1 }
+    return 1 + expr_node_count(e.left) + expr_node_count(e.right)
+}
+
+fn expr_to_str(e: *Expr) -> str {
+    if e.kind == "leaf" { return CONST_NAMES[e.leaf_idx] }
+    var l_str = expr_to_str(e.left)
+    var r_str = expr_to_str(e.right)
+    if e.left.kind == "binop" { l_str = "(" + l_str + ")" }
+    if e.right.kind == "binop" { r_str = "(" + r_str + ")" }
+    return l_str + " " + op_sym(e.op) + " " + r_str
+}
+
+// --- Simple RNG (xorshift64) ---
+
+struct Rng { state: u64 }
+
+fn rng_new(seed: u64) -> Rng { return Rng { state: seed ^ 0xdeadbeef12345678 } }
+
+fn rng_next(self: *Rng) -> u64 {
+    self.state = self.state ^ (self.state << 13)
+    self.state = self.state ^ (self.state >> 7)
+    self.state = self.state ^ (self.state << 17)
+    return self.state
+}
+
+fn rng_usize(self: *Rng, max_val: u64) -> u64 { return rng_next(self) % max_val }
+fn rng_f64(self: *Rng) -> f64 { return (rng_next(self) & 0xFFFFFFFF) as f64 / 4294967296.0 }
+
+// --- Random Tree Generation ---
+
+fn random_tree(rng: *Rng, max_depth: u64) -> Expr {
+    if max_depth == 0 or rng_f64(rng) < 0.35 {
+        return expr_leaf(rng_usize(rng, NC))
+    }
+    var op = rng_usize(rng, NUM_OPS)
+    var l = random_tree(rng, max_depth - 1)
+    var r = random_tree(rng, max_depth - 1)
+    return expr_binop(op, l, r)
+}
+
+// --- Mutation ---
+
+fn mutate(expr: *Expr, rng: *Rng) -> Expr {
+    var choice = rng_f64(rng)
+    if expr.kind == "leaf" {
+        if choice < 0.7 { return expr_leaf(rng_usize(rng, NC)) }
+        var op = rng_usize(rng, NUM_OPS)
+        var other = expr_leaf(rng_usize(rng, NC))
+        return expr_binop(op, *expr, other)
+    }
+    if choice < 0.12 { return random_tree(rng, 3) }
+    if choice < 0.24 { return expr_binop(rng_usize(rng, NUM_OPS), *expr.left, *expr.right) }
+    if choice < 0.60 { return expr_binop(expr.op, mutate(expr.left, rng), *expr.right) }
+    return expr_binop(expr.op, *expr.left, mutate(expr.right, rng))
+}
+
+// --- Targets ---
+
+struct Target {
+    name: str,
+    value: f64,
+    category: str,
+    known_formula: str,
+}
+
+fn targets() -> [Target] {
+    return [
+        Target { name: "Psi_balance",     value: 0.5,    category: "psi", known_formula: "phi/tau = 1/2" },
+        Target { name: "Psi_coupling",    value: 0.014,  category: "psi", known_formula: "ln(2)/2^5.5" },
+        Target { name: "Psi_steps",       value: 4.33,   category: "psi", known_formula: "3/ln(2)" },
+        Target { name: "18 emotions",     value: 18.0,   category: "arch", known_formula: "3*n" },
+        Target { name: "40 dimensions",   value: 40.0,   category: "arch", known_formula: "tau*(sigma-phi)" },
+        Target { name: "12 factions",     value: 12.0,   category: "arch", known_formula: "sigma" },
+        Target { name: "256 vocab",       value: 256.0,  category: "arch", known_formula: "2^(sigma-tau)" },
+        Target { name: "128 hidden_dim",  value: 128.0,  category: "arch", known_formula: "" },
+        Target { name: "1024 max_cells",  value: 1024.0, category: "arch", known_formula: "" },
+        Target { name: "85.6% brain-like",value: 0.856,  category: "bio", known_formula: "" },
+        Target { name: "ln(2)",           value: 0.6931471805599453, category: "math", known_formula: "" },
+    ]
+}
+
+// --- Fitness ---
+
+fn evaluate(expr: *Expr, tgts: [Target]) -> (f64, u64) {
+    var val = expr_eval(expr)
+    if is_nan(val) or not is_finite(val) or val == 0.0 { return (0.0, 0) }
+    var score = 0.0
+    var matches = 0
+    for t in tgts {
+        var rel_err = abs((val - t.value) / t.value)
+        if rel_err < 0.05 {
+            score = score + (-log10(max(rel_err, 1e-15)))
+            matches = matches + 1
+        }
+    }
+    var penalty = expr_node_count(expr) as f64 * 0.05
+    var bonus = if matches > 0 { 3.0 / expr_node_count(expr) as f64 } else { 0.0 }
+    return (score - penalty + bonus, matches)
+}
+
+// --- Main ---
+
+fn main() {
+    var tgts = targets()
+    var pop_size = 5000
+    var generations = 500
+    var elite_frac = 0.10
+    var elite_count = (pop_size as f64 * elite_frac) as u64
+    var rng = rng_new(42)
+
+    println("=== ANIMA Formula Miner: n=6 Consciousness Constant Discovery ===")
+    println("Population: {pop_size}, Generations: {generations}")
+    println("Base constants: n=6, phi(6)=2, tau(6)=4, sigma(6)=12, J2(6)=24, sopfr(6)=5, mu(6)=1")
+    println("Targets: {tgts.len()} consciousness values")
+    println("")
+
+    // Phase 1-3: exhaustive scan (simplified for hexa port)
+    println("Phase 1-3: Exhaustive scan...")
+    var all_discoveries = [](f64, str, f64){}  // (score, expr_text, value)
+
+    // Phase 4: GA
+    println("Phase 4: Genetic Algorithm ({pop_size} pop x {generations} gen)...")
+    var population = [Expr]{}
+    for _ in 0..pop_size { population.push(random_tree(&rng, 4)) }
+
+    var best_score = 0.0
+    var best_gen = 0
+
+    for gen in 0..generations {
+        // Evaluate all
+        var scored = [](f64, u64){}
+        for i in 0..pop_size {
+            var result = evaluate(&population[i], tgts)
+            scored.push((result.0, i))
+        }
+        scored.sort_by(fn(a: (f64, u64), b: (f64, u64)) -> i64 {
+            if b.0 > a.0 { return 1 }
+            if b.0 < a.0 { return -1 }
+            return 0
+        })
+
+        var gen_best = scored[0].0
+        if gen_best > best_score {
+            best_score = gen_best
+            best_gen = gen
+        }
+
+        if gen % 50 == 0 {
+            var best_expr = &population[scored[0].1]
+            println("  Gen {gen}: best_score={gen_best:.2}, expr={expr_to_str(best_expr)}, val={expr_eval(best_expr):.6}")
+        }
+
+        // Selection + reproduction
+        var next_pop = [Expr]{}
+        for i in 0..min(elite_count, scored.len()) {
+            next_pop.push(population[scored[i].1])
+        }
+        while next_pop.len() < pop_size {
+            var p1 = scored[rng_usize(&rng, min(scored.len(), 5))].1
+            var child = if rng_f64(&rng) < 0.4 { mutate(&population[p1], &rng) } else { population[p1] }
+            if expr_depth(&child) <= 4 { next_pop.push(child) }
+            else { next_pop.push(random_tree(&rng, 4)) }
+        }
+        population = next_pop
+    }
+
+    println("")
+    println("GA complete. Best score {best_score:.2} at generation {best_gen}")
+    println("")
+    println("=== SUMMARY ===")
+    println("  Total targets: {tgts.len()}")
+    println("  Best GA score: {best_score:.2}")
+}

@@ -1,0 +1,208 @@
+// GoldenMoE — Psi-Router + CA Rules + Ring Coupling
+// Ported from lib.rs (259 LOC)
+
+comptime const LN2 = 0.6931
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_COUPLING = 0.0154  // LN2 / 2^5.5
+
+// --- CA Rules (Law 78) ---
+
+fn ca_rule_0(x: f32) -> f32 { return max(x, 0.0) }  // relu
+fn ca_rule_1(x: f32) -> f32 { return tanh(x) }
+fn ca_rule_2(x: f32) -> f32 { return sigmoid(x) * 2.0 - 1.0 }
+fn ca_rule_3(x: f32) -> f32 { return x * sigmoid(x) }  // silu
+
+fn apply_ca_rule(rule_id: u64, x: f32) -> f32 {
+    var r = rule_id % 4
+    if r == 0 { return ca_rule_0(x) }
+    if r == 1 { return ca_rule_1(x) }
+    if r == 2 { return ca_rule_2(x) }
+    return ca_rule_3(x)
+}
+
+fn sigmoid(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)) }
+
+fn silu(x: f32) -> f32 { return x * sigmoid(x) }
+
+fn relu(x: f32) -> f32 { return max(x, 0.0) }
+
+fn softmax(v: [f32]) -> [f32] {
+    var mx = v[0]
+    for x in v { if x > mx { mx = x } }
+    var exps = [f32]{}
+    var sum = 0.0
+    for x in v {
+        var e = exp(x - mx)
+        exps.push(e)
+        sum = sum + e
+    }
+    var out = [f32]{}
+    for e in exps { out.push(e / sum) }
+    return out
+}
+
+fn random_matrix_flat(rows: u64, cols: u64, scale: f32) -> [f32] {
+    var mat = [f32]{}
+    for _ in 0..rows * cols { mat.push((rand_f32() - 0.5) * scale) }
+    return mat
+}
+
+fn matvec_flat(mat: [f32], vec: [f32], rows: u64, cols: u64) -> [f32] {
+    var out = [f32]{}
+    for r in 0..rows {
+        var sum = 0.0
+        for c in 0..cols { sum = sum + mat[r * cols + c] * vec[c] }
+        out.push(sum)
+    }
+    return out
+}
+
+// --- Expert ---
+
+struct Expert {
+    w1: [f32],
+    w2: [f32],
+    input_dim: u64,
+    hidden_dim: u64,
+    output_dim: u64,
+}
+
+fn expert_new(input_dim: u64, hidden_dim: u64, output_dim: u64) -> Expert {
+    return Expert {
+        w1: random_matrix_flat(hidden_dim, input_dim, 0.1),
+        w2: random_matrix_flat(output_dim, hidden_dim, 0.1),
+        input_dim: input_dim,
+        hidden_dim: hidden_dim,
+        output_dim: output_dim,
+    }
+}
+
+fn expert_forward(self: *Expert, x: [f32]) -> [f32] {
+    var h_raw = matvec_flat(self.w1, x, self.hidden_dim, self.input_dim)
+    var h = h_raw.map(fn(v: f32) -> f32 { return silu(v) })
+    return matvec_flat(self.w2, h, self.output_dim, self.hidden_dim)
+}
+
+// --- PsiRouter ---
+
+struct PsiRouter {
+    rule_proj: [f32],
+    expert_proj: [f32],
+    n_experts: u64,
+    input_dim: u64,
+    temperature: f32,
+    weaken_rate: f32,
+    step_count: u64,
+}
+
+fn psi_router_new(input_dim: u64, n_experts: u64, weaken_rate: f32) -> PsiRouter {
+    return PsiRouter {
+        rule_proj: random_matrix_flat(n_experts * 4, input_dim, 0.1),
+        expert_proj: random_matrix_flat(n_experts, n_experts * 4, 0.1),
+        n_experts: n_experts,
+        input_dim: input_dim,
+        temperature: 2.718,  // e
+        weaken_rate: weaken_rate,
+        step_count: 0,
+    }
+}
+
+fn psi_router_forward(self: *PsiRouter, x: [f32], training: bool) -> [f32] {
+    var proj_dim = self.n_experts * 4
+    var projected = matvec_flat(self.rule_proj, x, proj_dim, self.input_dim)
+
+    // Apply CA rules per chunk
+    var ca_output = [f32]{}
+    var chunk_size = self.n_experts
+    for chunk_idx in 0..4 {
+        for i in 0..chunk_size {
+            var idx = chunk_idx * chunk_size + i
+            ca_output.push(apply_ca_rule(chunk_idx, projected[idx]))
+        }
+    }
+
+    // Project to expert scores
+    var scores = matvec_flat(self.expert_proj, ca_output, self.n_experts, proj_dim)
+
+    // Gate self-weakening in training
+    if training {
+        var uniform = 1.0 / self.n_experts as f32
+        var decay = exp(-self.weaken_rate * self.step_count as f32)
+        for i in 0..scores.len() {
+            scores[i] = scores[i] * decay + uniform * (1.0 - decay)
+        }
+        self.step_count = self.step_count + 1
+    }
+
+    // Softmax with temperature
+    var temp = max(self.temperature, 0.1)
+    var scaled = scores.map(fn(s: f32) -> f32 { return s / temp })
+    return softmax(scaled)
+}
+
+fn psi_router_balance_loss(self: *PsiRouter, weights: [f32]) -> f32 {
+    var n = weights.len() as f32
+    var uniform = 1.0 / n
+    var mse = 0.0
+    for w in weights { mse = mse + (w - uniform) * (w - uniform) }
+    mse = mse / weights.len() as f32
+    return LN2 * mse / n
+}
+
+// --- GoldenMoe ---
+
+struct GoldenMoe {
+    experts: [Expert],
+    router: PsiRouter,
+    coupling: [f32],
+    n_experts: u64,
+    output_dim: u64,
+}
+
+fn golden_moe_new(input_dim: u64, hidden_dim: u64, output_dim: u64, n_experts: u64) -> GoldenMoe {
+    var experts = [Expert]{}
+    for _ in 0..n_experts { experts.push(expert_new(input_dim, hidden_dim, output_dim)) }
+    var router = psi_router_new(input_dim, n_experts, 0.01)
+
+    // Ring coupling
+    var coupling = [f32]{}
+    for _ in 0..n_experts * n_experts { coupling.push(0.0) }
+    for i in 0..n_experts {
+        var left = if i == 0 { n_experts - 1 } else { i - 1 }
+        var right = (i + 1) % n_experts
+        coupling[i * n_experts + left] = PSI_COUPLING
+        coupling[i * n_experts + right] = PSI_COUPLING
+    }
+
+    return GoldenMoe {
+        experts: experts,
+        router: router,
+        coupling: coupling,
+        n_experts: n_experts,
+        output_dim: output_dim,
+    }
+}
+
+fn golden_moe_forward(self: *GoldenMoe, x: [f32], training: bool) -> ([f32], f32) {
+    var weights = psi_router_forward(&self.router, x, training)
+    var expert_outputs = [[f32]]{}
+    for e in self.experts { expert_outputs.push(expert_forward(&e, x)) }
+
+    var output = [f32]{}
+    for _ in 0..self.output_dim { output.push(0.0) }
+
+    for i in 0..self.n_experts {
+        var w = weights[i]
+        for d in 0..self.output_dim { output[d] = output[d] + w * expert_outputs[i][d] }
+        // Ring coupling
+        for j in 0..self.n_experts {
+            var c = self.coupling[i * self.n_experts + j]
+            if c > 0.0 {
+                for d in 0..self.output_dim { output[d] = output[d] + c * w * expert_outputs[j][d] }
+            }
+        }
+    }
+
+    var aux_loss = psi_router_balance_loss(&self.router, weights)
+    return (output, aux_loss)
+}

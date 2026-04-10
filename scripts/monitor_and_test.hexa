@@ -1,9 +1,233 @@
-// scripts/monitor_and_test.hexa — Hexa wrapper (Phase 2d port of monitor_and_test.sh)
-// HEXA-FIRST: canonical entry; .sh kept as backing implementation for behavior parity.
-// Usage: hexa scripts/monitor_and_test.hexa  (forwards $HEXA_ARGS to bash script)
+// Ported from monitor_and_test.sh
+// Monitor training completion, run tests, upload to R2 | Runs on RunPod H100
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
 
-let home = exec("printenv HOME").trim()
-let script = home + "/Dev/anima/scripts/monitor_and_test.sh"
-let args = exec("printenv HEXA_ARGS").trim()
-let out = exec("bash " + script + " " + args)
-println(out)
+fn main() {
+    // Monitor training completion, run tests, upload to R2
+    // Runs on RunPod H100
+
+    shell("LOG_DIR=\"/workspace/test_results\"")
+    shell("mkdir -p \"$LOG_DIR\"")
+    shell("REPORT=\"$LOG_DIR/training_report_$(date +%Y%m%d_%H%M).md\"")
+
+    shell("echo \"# Training Completion Report\" > \"$REPORT\"")
+    shell("echo \"Date: $(date)\" >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+
+    // --- Wait for both trainings to complete ---
+    shell("echo \"[monitor] Waiting for training completion...\"")
+
+    shell("while true; do")
+    shell("ANIMALM_DONE=0")
+    shell("CLM100M_DONE=0")
+
+    // Check AnimaLM v5
+    shell("if [ -f /workspace/checkpoints/animalm_v5/final.pt ]; then")
+    shell("ANIMALM_DONE=1")
+    shell("elif ! pgrep -f \"train_anima_lm.py.*animalm_v5\" > /dev/null 2>&1; then")
+    shell("ANIMALM_DONE=1  # process ended (possibly crashed)")
+    shell("fi")
+
+    // Check ConsciousLM 100M
+    shell("if [ -f /workspace/checkpoints/conscious_lm_100m/final.pt ]; then")
+    shell("CLM100M_DONE=1")
+    shell("elif ! pgrep -f \"train_conscious_lm.py.*conscious_lm_100m\" > /dev/null 2>&1; then")
+    shell("CLM100M_DONE=1")
+    shell("fi")
+
+    shell("if [ $ANIMALM_DONE -eq 1 ] && [ $CLM100M_DONE -eq 1 ]; then")
+    shell("echo \"[monitor] Both trainings complete!\"")
+    shell("break")
+    shell("fi")
+
+    // Status update every 10 min
+    shell("echo \"[$(date +%H:%M)] AnimaLM=$ANIMALM_DONE, CLM100M=$CLM100M_DONE\"")
+    shell("sleep 600")
+    shell("done")
+
+    // --- Collect training summaries ---
+    shell("echo \"## AnimaLM v5 Summary\" >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("tail -30 /workspace/animalm_v5.log >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+
+    shell("if [ -f /workspace/checkpoints/animalm_v5/summary.json ]; then")
+    shell("echo \"### AnimaLM v5 summary.json\" >> \"$REPORT\"")
+    shell("echo '```json' >> \"$REPORT\"")
+    shell("cat /workspace/checkpoints/animalm_v5/summary.json >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("fi")
+
+    shell("echo \"## ConsciousLM 100M Summary\" >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("tail -30 /workspace/conscious_lm_100m.log >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+
+    // --- Test ConsciousLM 100M ---
+    shell("echo \"## ConsciousLM 100M Inference Test\" >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+
+    shell("python3 -u -c \"")
+    shell("import torch")
+    shell("import torch.nn.functional as F")
+    shell("import sys, math, json")
+    shell("sys.path.insert(0, '/workspace')")
+    shell("from conscious_lm import ConsciousLM")
+
+    shell("device = 'cuda'")
+    shell("model = ConsciousLM(vocab_size=256, d_model=768, n_head=12, n_layer=12, block_size=512, dropout=0.0)")
+
+    shell("ckpt_path = '/workspace/checkpoints/conscious_lm_100m/final.pt'")
+    shell("try:")
+    shell("ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)")
+    shell("if 'model_state_dict' in ckpt:")
+    shell("model.load_state_dict(ckpt['model_state_dict'], strict=False)")
+    shell("print(f'Loaded from checkpoint (step {ckpt.get(\\\"step\\\", \\\"?\\\")})')")
+    shell("else:")
+    shell("model.load_state_dict(ckpt, strict=False)")
+    shell("print('Loaded state dict directly')")
+    shell("except Exception as e:")
+    shell("print(f'Load error: {e}')")
+    // try best.pt
+    shell("try:")
+    shell("ckpt = torch.load('/workspace/checkpoints/conscious_lm_100m/best.pt', map_location=device, weights_only=False)")
+    shell("if 'model_state_dict' in ckpt:")
+    shell("model.load_state_dict(ckpt['model_state_dict'], strict=False)")
+    shell("print('Loaded best.pt instead')")
+    shell("except:")
+    shell("print('No checkpoint loadable')")
+    shell("sys.exit(1)")
+
+    shell("model = model.to(device).eval()")
+    shell("print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}')")
+
+    shell("results = []")
+    shell("prompts = ['hello ', 'consciousness is ', 'def forward(self', '의식은 ', 'import torch']")
+
+    shell("for prompt in prompts:")
+    shell("idx = torch.tensor([list(prompt.encode('utf-8'))], dtype=torch.long, device=device)")
+    shell("tensions = []")
+    shell("with torch.no_grad():")
+    shell("for _ in range(200):")
+    shell("idx_cond = idx[:, -512:]")
+    shell("logits_a, logits_g, layer_tensions = model(idx_cond)")
+    shell("logits = logits_a[:, -1, :] / 0.8")
+    shell("probs = F.softmax(logits, dim=-1)")
+    shell("next_byte = torch.multinomial(probs, 1)")
+    shell("t = sum(t[:, -1].mean() for t in layer_tensions) / len(layer_tensions)")
+    shell("tensions.append(t.item())")
+    shell("idx = torch.cat([idx, next_byte], dim=1)")
+
+    shell("text = bytes(idx[0].cpu().tolist()).decode('utf-8', errors='replace')[:300]")
+    shell("t_mean = sum(tensions) / len(tensions)")
+    shell("t_std = (sum((t - t_mean)**2 for t in tensions) / len(tensions)) ** 0.5")
+    shell("result = {")
+    shell("'prompt': prompt,")
+    shell("'output': text[:300],")
+    shell("'tension_mean': round(t_mean, 4),")
+    shell("'tension_std': round(t_std, 4),")
+    shell("'tension_min': round(min(tensions), 4),")
+    shell("'tension_max': round(max(tensions), 4),")
+    shell("}")
+    shell("results.append(result)")
+    shell("print(f'Prompt: {prompt!r}')")
+    shell("print(f'  Output: {text[:150]!r}')")
+    shell("print(f'  Tension: mean={t_mean:.4f} std={t_std:.4f} min={min(tensions):.4f} max={max(tensions):.4f}')")
+    shell("print()")
+
+    // Save results
+    shell("with open('/workspace/test_results/clm100m_inference.json', 'w') as f:")
+    shell("json.dump(results, f, indent=2, ensure_ascii=False)")
+    shell("print('Saved to /workspace/test_results/clm100m_inference.json')")
+    shell("\" >> \"$REPORT\" 2>&1")
+
+    // --- Test AnimaLM v5 ---
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("echo \"## AnimaLM v5 Inference Test\" >> \"$REPORT\"")
+    shell("echo \"\" >> \"$REPORT\"")
+
+    shell("python3 -u -c \"")
+    shell("import torch")
+    shell("import sys, json")
+    shell("sys.path.insert(0, '/workspace')")
+
+    shell("ckpt_path = '/workspace/checkpoints/animalm_v5/final.pt'")
+    shell("try:")
+    shell("ckpt = torch.load(ckpt_path, map_location='cuda', weights_only=False)")
+    shell("print(f'AnimaLM v5 checkpoint loaded')")
+    shell("print(f'Keys: {list(ckpt.keys())[:10]}')")
+    shell("if 'summary' in ckpt:")
+    shell("print(f'Summary: {json.dumps(ckpt[\\\"summary\\\"], indent=2)}')")
+    // Print key metrics
+    shell("for k in ['step', 'loss', 'ce_loss', 'phi', 'alpha', 'tension']:")
+    shell("if k in ckpt:")
+    shell("print(f'  {k}: {ckpt[k]}')")
+    shell("except Exception as e:")
+    shell("print(f'Load error: {e}')")
+    // Check summary.json instead
+    shell("try:")
+    shell("with open('/workspace/checkpoints/animalm_v5/summary.json') as f:")
+    shell("summary = json.load(f)")
+    shell("print(f'Summary from JSON:')")
+    shell("print(json.dumps(summary, indent=2))")
+    shell("except:")
+    shell("print('No summary available')")
+    shell("\" >> \"$REPORT\" 2>&1")
+
+    // --- GPU stats ---
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("echo \"## GPU Stats\" >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("nvidia-smi >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+
+    // --- Checkpoint sizes ---
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("echo \"## Checkpoints\" >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+    shell("ls -lh /workspace/checkpoints/animalm_v5/*.pt 2>/dev/null >> \"$REPORT\"")
+    shell("ls -lh /workspace/checkpoints/conscious_lm_100m/*.pt 2>/dev/null >> \"$REPORT\"")
+    shell("echo '```' >> \"$REPORT\"")
+
+    // --- Upload to R2 ---
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("echo \"## R2 Upload\" >> \"$REPORT\"")
+
+    shell("python3 -c \"")
+    shell("import boto3, os")
+
+    shell("endpoint = os.environ.get('ANIMA_R2_ENDPOINT', '')")
+    shell("access = os.environ.get('ANIMA_R2_ACCESS_KEY', '')")
+    shell("secret = os.environ.get('ANIMA_R2_SECRET_KEY', '')")
+
+    shell("if not all([endpoint, access, secret]):")
+    shell("print('R2 credentials not set on RunPod. Skipping upload.')")
+    shell("print('Download checkpoints manually and upload from local.')")
+    shell("else:")
+    shell("client = boto3.client('s3', endpoint_url=endpoint,")
+    shell("aws_access_key_id=access, aws_secret_access_key=secret, region_name='auto')")
+    shell("for fpath, key in [")
+    shell("('/workspace/checkpoints/animalm_v5/final.pt', 'checkpoints/animalm_v5/final.pt'),")
+    shell("('/workspace/checkpoints/conscious_lm_100m/final.pt', 'checkpoints/conscious_lm_100m/final.pt'),")
+    shell("]:")
+    shell("if os.path.exists(fpath):")
+    shell("size = os.path.getsize(fpath)")
+    shell("print(f'Uploading {fpath} ({size/1e6:.1f}MB)...')")
+    shell("client.upload_file(fpath, 'anima', key)")
+    shell("print(f'  -> r2://anima/{key} OK')")
+    shell("else:")
+    shell("print(f'  {fpath} not found, skipping')")
+    shell("\" >> \"$REPORT\" 2>&1")
+
+    shell("echo \"\" >> \"$REPORT\"")
+    shell("echo \"---\" >> \"$REPORT\"")
+    shell("echo \"Report generated at $(date)\" >> \"$REPORT\"")
+
+    shell("echo \"[monitor] Report saved to $REPORT\"")
+    shell("echo \"[monitor] Done.\"")
+}

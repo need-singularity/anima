@@ -1,9 +1,316 @@
-// scripts/h100_retrieve.hexa — Hexa wrapper (Phase 2d port of h100_retrieve.sh)
-// HEXA-FIRST: canonical entry; .sh kept as backing implementation for behavior parity.
-// Usage: hexa scripts/h100_retrieve.hexa  (forwards $HEXA_ARGS to bash script)
+// Ported from h100_retrieve.sh
+// Monitor H100 training and retrieve checkpoints when done | Usage: bash scripts/h100_retrieve.sh [v14|v3|both|poll|status]
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
 
-let home = exec("printenv HOME").trim()
-let script = home + "/Dev/anima/scripts/h100_retrieve.sh"
-let args = exec("printenv HEXA_ARGS").trim()
-let out = exec("bash " + script + " " + args)
-println(out)
+fn main() {
+    var args = get_args()
+    var args_str = args.join(" ")
+    var script = "h100_retrieve.sh"
+
+    // Monitor H100 training and retrieve checkpoints when done
+    // Usage: bash scripts/h100_retrieve.sh [v14|v3|both|poll|status]
+    // 
+    // Examples:
+    // bash scripts/h100_retrieve.sh v14      # Retrieve v14 128c checkpoint now
+    // bash scripts/h100_retrieve.sh v3       # Retrieve v3 274M checkpoint now
+    // bash scripts/h100_retrieve.sh both     # Retrieve both checkpoints
+    // bash scripts/h100_retrieve.sh poll     # Poll every 5min, auto-retrieve on completion
+    // bash scripts/h100_retrieve.sh status   # One-shot status check
+
+
+    // ── Connection config (matches h100_sync.sh) ──
+    shell("SSH_KEY=~/.runpod/ssh/RunPod-Key-Go")
+    shell("SSH_OPTS=\"-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10\"")
+    shell("HOST=root@216.243.220.230")
+    shell("PORT=18038")
+
+    shell("SSH_CMD=\"ssh $SSH_OPTS $HOST -p $PORT\"")
+    shell("SCP_CMD=\"scp $SSH_OPTS -P $PORT\"")
+
+    shell("LOCAL_CKPT=\"/Users/ghost/Dev/anima/anima/checkpoints\"")
+
+    // ── Colors ──
+    shell("RED='\\033[0;31m'")
+    shell("GREEN='\\033[0;32m'")
+    shell("YELLOW='\\033[1;33m'")
+    shell("CYAN='\\033[0;36m'")
+    shell("NC='\\033[0m'")
+
+    shell("log() { echo -e \"${CYAN}[$(date +%H:%M:%S)]${NC} $*\"; }")
+    shell("ok()  { echo -e \"${GREEN}[OK]${NC} $*\"; }")
+    shell("err() { echo -e \"${RED}[ERROR]${NC} $*\"; }")
+    shell("warn(){ echo -e \"${YELLOW}[WARN]${NC} $*\"; }")
+
+    // ── Connectivity check ──
+    shell("check_connection() {")
+    shell("if ! $SSH_CMD \"echo ok\" &>/dev/null; then")
+    shell("err \"Cannot reach H100 pod. Is it running?\"")
+    shell("exit 1")
+    shell("fi")
+    shell("ok \"H100 connection OK\"")
+    shell("}")
+
+    // ── Retrieve v14 128c checkpoint ──
+    shell("retrieve_v14() {")
+    shell("log \"Retrieving v14 128c checkpoint...\"")
+    shell("local REMOTE_DIR=\"/workspace/checkpoints/v14_128c\"")
+    shell("local LOCAL_DIR=\"$LOCAL_CKPT/v14_128c_h100\"")
+    shell("mkdir -p \"$LOCAL_DIR\"")
+
+    // Get list of checkpoint files
+    shell("local FILES")
+    shell("FILES=$($SSH_CMD \"ls $REMOTE_DIR/*.pt $REMOTE_DIR/train.log 2>/dev/null\" 2>/dev/null || true)")
+    shell("if [ -z \"$FILES\" ]; then")
+    shell("err \"No v14 checkpoint files found at $REMOTE_DIR\"")
+    shell("return 1")
+    shell("fi")
+
+    // Retrieve best.pt (priority), then any other .pt files + log
+    shell("for f in best.pt final.pt train.log; do")
+    shell("if $SSH_CMD \"test -f $REMOTE_DIR/$f\" 2>/dev/null; then")
+    shell("log \"  Downloading $f...\"")
+    shell("$SCP_CMD \"$HOST:$REMOTE_DIR/$f\" \"$LOCAL_DIR/$f\"")
+    shell("local SIZE=$(du -h \"$LOCAL_DIR/$f\" | cut -f1)")
+    shell("ok \"  $f ($SIZE)\"")
+    shell("fi")
+    shell("done")
+
+    // Also grab config if present
+    shell("if $SSH_CMD \"test -f $REMOTE_DIR/config.json\" 2>/dev/null; then")
+    shell("$SCP_CMD \"$HOST:$REMOTE_DIR/config.json\" \"$LOCAL_DIR/config.json\"")
+    shell("fi")
+
+    shell("ok \"v14 checkpoint saved to $LOCAL_DIR/\"")
+    shell("ls -lh \"$LOCAL_DIR/\"")
+    shell("}")
+
+    // ── Retrieve v3 274M checkpoint ──
+    shell("retrieve_v3() {")
+    shell("log \"Retrieving v3 274M checkpoint...\"")
+    shell("local REMOTE_DIR=\"/workspace/checkpoints/v3_274M\"")
+    shell("local LOCAL_DIR=\"$LOCAL_CKPT/v3_274M_h100\"")
+    shell("mkdir -p \"$LOCAL_DIR\"")
+
+    shell("local FILES")
+    shell("FILES=$($SSH_CMD \"ls $REMOTE_DIR/*.pt $REMOTE_DIR/train.log 2>/dev/null\" 2>/dev/null || true)")
+    shell("if [ -z \"$FILES\" ]; then")
+    shell("err \"No v3 checkpoint files found at $REMOTE_DIR\"")
+    shell("return 1")
+    shell("fi")
+
+    shell("for f in best.pt final.pt train.log; do")
+    shell("if $SSH_CMD \"test -f $REMOTE_DIR/$f\" 2>/dev/null; then")
+    shell("log \"  Downloading $f...\"")
+    shell("$SCP_CMD \"$HOST:$REMOTE_DIR/$f\" \"$LOCAL_DIR/$f\"")
+    shell("local SIZE=$(du -h \"$LOCAL_DIR/$f\" | cut -f1)")
+    shell("ok \"  $f ($SIZE)\"")
+    shell("fi")
+    shell("done")
+
+    shell("if $SSH_CMD \"test -f $REMOTE_DIR/config.json\" 2>/dev/null; then")
+    shell("$SCP_CMD \"$HOST:$REMOTE_DIR/config.json\" \"$LOCAL_DIR/config.json\"")
+    shell("fi")
+
+    shell("ok \"v3 checkpoint saved to $LOCAL_DIR/\"")
+    shell("ls -lh \"$LOCAL_DIR/\"")
+    shell("}")
+
+    // ── One-shot status check ──
+    shell("status() {")
+    shell("log \"Checking H100 training status...\"")
+    shell("echo \"\"")
+
+    // Check tmux sessions
+    shell("local TMUX_INFO")
+    shell("TMUX_INFO=$($SSH_CMD \"tmux ls 2>/dev/null\" 2>/dev/null || echo \"(no tmux sessions)\")")
+    shell("echo -e \"${CYAN}tmux sessions:${NC}\"")
+    shell("echo \"  $TMUX_INFO\"")
+    shell("echo \"\"")
+
+    // v14 status
+    shell("echo -e \"${CYAN}v14 128c:${NC}\"")
+    shell("local V14_LOG")
+    shell("V14_LOG=$($SSH_CMD \"tail -5 /workspace/checkpoints/v14_128c/train.log 2>/dev/null\" 2>/dev/null || echo \"  (no log found)\")")
+    shell("echo \"$V14_LOG\"")
+    shell("echo \"\"")
+
+    // v3 status
+    shell("echo -e \"${CYAN}v3 274M:${NC}\"")
+    shell("local V3_LOG")
+    shell("V3_LOG=$($SSH_CMD \"tail -5 /workspace/checkpoints/v3_274M/train.log 2>/dev/null\" 2>/dev/null || echo \"  (no log found)\")")
+    shell("echo \"$V3_LOG\"")
+    shell("echo \"\"")
+
+    // GPU utilization
+    shell("echo -e \"${CYAN}GPU:${NC}\"")
+    shell("$SSH_CMD \"nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader 2>/dev/null\" 2>/dev/null || echo \"  (nvidia-smi unavailable)\"")
+    shell("echo \"\"")
+
+    // Disk usage
+    shell("echo -e \"${CYAN}Disk:${NC}\"")
+    shell("$SSH_CMD \"df -h /workspace 2>/dev/null | tail -1\" 2>/dev/null || echo \"  (unavailable)\"")
+    shell("}")
+
+    // ── Check if training is complete ──
+    shell("is_training_complete() {")
+    shell("local LOG_PATH=\"$1\"")
+    shell("local TARGET_STEP=\"$2\"")
+
+    shell("local LAST_LINE")
+    shell("LAST_LINE=$($SSH_CMD \"tail -1 $LOG_PATH 2>/dev/null\" 2>/dev/null || echo \"\")")
+
+    shell("if [ -z \"$LAST_LINE\" ]; then")
+    shell("echo \"no_log\"")
+    shell("return")
+    shell("fi")
+
+    // Check for explicit completion markers
+    shell("if echo \"$LAST_LINE\" | grep -qi \"complete\\|finished\\|done\\|final\"; then")
+    shell("echo \"complete\"")
+    shell("return")
+    shell("fi")
+
+    // Check if step >= target
+    shell("local CURRENT_STEP")
+    shell("CURRENT_STEP=$(echo \"$LAST_LINE\" | grep -oE 'step[= ]*[0-9]+' | grep -oE '[0-9]+' | head -1 || echo \"0\")")
+    shell("if [ -n \"$CURRENT_STEP\" ] && [ \"$CURRENT_STEP\" -ge \"$TARGET_STEP\" ] 2>/dev/null; then")
+    shell("echo \"complete\"")
+    shell("return")
+    shell("fi")
+
+    // Check if process is still running
+    shell("local RUNNING")
+    shell("RUNNING=$($SSH_CMD \"pgrep -f 'train_clm\\|train_v3' 2>/dev/null | wc -l\" 2>/dev/null || echo \"0\")")
+    shell("if [ \"$RUNNING\" = \"0\" ]; then")
+    // Process not running but didn't reach target - might have crashed
+    shell("echo \"stopped\"")
+    shell("return")
+    shell("fi")
+
+    shell("echo \"running:$CURRENT_STEP\"")
+    shell("}")
+
+    // ── Poll mode: check every 5min, auto-retrieve on completion ──
+    shell("poll() {")
+    shell("local POLL_INTERVAL=300  # 5 minutes")
+    shell("local V14_RETRIEVED=false")
+    shell("local V3_RETRIEVED=false")
+    shell("local V14_TARGET=100000")
+    shell("local V3_TARGET=200000")
+
+    shell("log \"Starting poll mode (every ${POLL_INTERVAL}s)...\"")
+    shell("log \"v14 target: step $V14_TARGET | v3 target: step $V3_TARGET\"")
+    shell("log \"Press Ctrl+C to stop\"")
+    shell("echo \"\"")
+
+    shell("while true; do")
+    // Check connectivity
+    shell("if ! $SSH_CMD \"echo ok\" &>/dev/null; then")
+    shell("warn \"H100 unreachable, retrying in ${POLL_INTERVAL}s...\"")
+    shell("sleep \"$POLL_INTERVAL\"")
+    shell("continue")
+    shell("fi")
+
+    // v14 check
+    shell("if [ \"$V14_RETRIEVED\" = false ]; then")
+    shell("local V14_STATUS")
+    shell("V14_STATUS=$(is_training_complete \"/workspace/checkpoints/v14_128c/train.log\" \"$V14_TARGET\")")
+    shell("case \"$V14_STATUS\" in")
+    shell("complete)")
+    shell("echo \"\"")
+    shell("ok \"v14 COMPLETE! Retrieving...\"")
+    shell("retrieve_v14 && V14_RETRIEVED=true")
+    shell(";;")
+    shell("stopped)")
+    shell("warn \"v14 process stopped (may have crashed). Check logs.\"")
+    shell(";;")
+    shell("running:*)")
+    shell("local STEP=${V14_STATUS#running:}")
+    shell("local PCT=$((STEP * 100 / V14_TARGET))")
+    shell("printf \"${CYAN}[%s]${NC} v14: step %s/%s (%d%%)\" \"$(date +%H:%M)\" \"$STEP\" \"$V14_TARGET\" \"$PCT\"")
+    shell(";;")
+    shell("no_log)")
+    shell("printf \"${CYAN}[%s]${NC} v14: (no log)\" \"$(date +%H:%M)\"")
+    shell(";;")
+    shell("esac")
+    shell("else")
+    shell("printf \"${CYAN}[%s]${NC} v14: ${GREEN}RETRIEVED${NC}\" \"$(date +%H:%M)\"")
+    shell("fi")
+
+    // v3 check
+    shell("if [ \"$V3_RETRIEVED\" = false ]; then")
+    shell("local V3_STATUS")
+    shell("V3_STATUS=$(is_training_complete \"/workspace/checkpoints/v3_274M/train.log\" \"$V3_TARGET\")")
+    shell("case \"$V3_STATUS\" in")
+    shell("complete)")
+    shell("echo \"\"")
+    shell("ok \"v3 COMPLETE! Retrieving...\"")
+    shell("retrieve_v3 && V3_RETRIEVED=true")
+    shell(";;")
+    shell("stopped)")
+    shell("warn \" | v3 process stopped (may have crashed)\"")
+    shell(";;")
+    shell("running:*)")
+    shell("local STEP=${V3_STATUS#running:}")
+    shell("local PCT=$((STEP * 100 / V3_TARGET))")
+    shell("printf \" | v3: step %s/%s (%d%%)\\n\" \"$STEP\" \"$V3_TARGET\" \"$PCT\"")
+    shell(";;")
+    shell("no_log)")
+    shell("printf \" | v3: (no log)\\n\"")
+    shell(";;")
+    shell("esac")
+    shell("else")
+    shell("printf \" | v3: ${GREEN}RETRIEVED${NC}\\n\"")
+    shell("fi")
+
+    // Both done? Exit.
+    shell("if [ \"$V14_RETRIEVED\" = true ] && [ \"$V3_RETRIEVED\" = true ]; then")
+    shell("echo \"\"")
+    shell("ok \"Both checkpoints retrieved. Exiting.\"")
+    shell("exit 0")
+    shell("fi")
+
+    shell("sleep \"$POLL_INTERVAL\"")
+    shell("done")
+    shell("}")
+
+    // ── Main ──
+    shell("MODE=\"${1:-status}\"")
+
+    shell("case \"$MODE\" in")
+    shell("v14)")
+    shell("check_connection")
+    shell("retrieve_v14")
+    shell(";;")
+    shell("v3)")
+    shell("check_connection")
+    shell("retrieve_v3")
+    shell(";;")
+    shell("both)")
+    shell("check_connection")
+    shell("retrieve_v14")
+    shell("echo \"\"")
+    shell("retrieve_v3")
+    shell(";;")
+    shell("poll)")
+    shell("check_connection")
+    shell("poll")
+    shell(";;")
+    shell("status)")
+    shell("check_connection")
+    shell("status")
+    shell(";;")
+    shell("*)")
+    shell("echo \"Usage: bash scripts/h100_retrieve.sh [v14|v3|both|poll|status]\"")
+    shell("echo \"\"")
+    shell("echo \"  v14     Retrieve v14 128c checkpoint now\"")
+    shell("echo \"  v3      Retrieve v3 274M checkpoint now\"")
+    shell("echo \"  both    Retrieve both checkpoints\"")
+    shell("echo \"  poll    Poll every 5min, auto-retrieve on completion\"")
+    shell("echo \"  status  One-shot training status check (default)\"")
+    shell("exit 1")
+    shell(";;")
+    shell("esac")
+}

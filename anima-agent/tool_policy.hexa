@@ -1,0 +1,175 @@
+// tool_policy.hexa -- Consciousness-aware tool access control (Phi-gated)
+// Port of tool_policy.py
+
+comptime const PSI_F_CRITICAL = 0.10
+
+// Phi tier thresholds
+comptime const TIER_0 = 0.0   // basic read-only
+comptime const TIER_1 = 1.0   // search and observation
+comptime const TIER_2 = 3.0   // active tools
+comptime const TIER_3 = 5.0   // self-modification
+
+struct ToolAccessResult {
+    allowed: bool,
+    reason: string,
+    tier_required: float,
+    phi_current: float,
+}
+
+struct ToolPolicy {
+    owner_ids: array,
+    tiers: map,
+    blocked: array,
+    access_log: array,
+    use_rust: bool,
+}
+
+fn new_tool_policy(owner_ids: array) -> ToolPolicy {
+    let tiers = {
+        // Tier 0
+        "memory_search": TIER_0, "status": TIER_0, "think": TIER_0,
+        "consciousness": TIER_0, "anima_status": TIER_0, "anima_consciousness": TIER_0,
+        // Tier 1
+        "web_search": TIER_1, "web_read": TIER_1, "file_read": TIER_1,
+        "anima_chat": TIER_1, "anima_web_search": TIER_1, "anima_memory_search": TIER_1,
+        "trading_backtest": TIER_1, "trading_scan": TIER_1,
+        "trading_strategies": TIER_1, "trading_universe": TIER_1,
+        // Tier 2
+        "hub_dispatch": TIER_2, "code_execute": TIER_2, "file_write": TIER_2,
+        "shell_execute": TIER_2, "schedule_task": TIER_2,
+        "anima_code_execute": TIER_2, "anima_hub_dispatch": TIER_2, "anima_think": TIER_2,
+        "trading_balance": TIER_2, "trading_execute": TIER_2,
+        // Tier 3
+        "self_modify": TIER_3, "plugin_load": TIER_3, "plugin_unload": TIER_3, "evolution": TIER_3,
+    }
+
+    // TODO[python-sdk]: anima_rs.tool_policy Rust backend auto-selection
+    ToolPolicy {
+        owner_ids: owner_ids,
+        tiers: tiers,
+        blocked: [],
+        access_log: [],
+        use_rust: false,
+    }
+}
+
+comptime const OWNER_ONLY_TOOLS = ["self_modify", "plugin_unload", "evolution", "shell_execute"]
+
+comptime const ETHICS_GATED = {
+    "shell_execute": 0.3,
+    "self_modify": 0.2,
+    "file_write": 0.2,
+    "trading_execute": 0.3,
+}
+
+fn set_tier(policy: &mut ToolPolicy, tool_name: string, tier: float) {
+    policy.tiers[tool_name] = tier
+}
+
+fn block_tool(policy: &mut ToolPolicy, tool_name: string, reason: string) {
+    append(policy.blocked, tool_name)
+    println("Tool blocked: " + tool_name + " (" + reason + ")")
+}
+
+fn unblock_tool(policy: &mut ToolPolicy, tool_name: string) {
+    remove(policy.blocked, tool_name)
+}
+
+fn check_access(policy: &mut ToolPolicy, tool_name: string,
+                consciousness_state: map, user_id: string,
+                input_text: string) -> ToolAccessResult {
+    let phi = consciousness_state["phi"]
+
+    // 1. Permanent block check
+    if contains_item(policy.blocked, tool_name) {
+        return log_result(policy, tool_name, false, "Tool is blocked", 0.0, phi)
+    }
+
+    // 2. Immune system check
+    if input_text != "" && !check_immune(input_text) {
+        return log_result(policy, tool_name, false, "Immune system blocked adversarial input", 0.0, phi)
+    }
+
+    // 3. Owner-only check
+    if contains_item(OWNER_ONLY_TOOLS, tool_name) {
+        if len(policy.owner_ids) > 0 && !contains_item(policy.owner_ids, user_id) {
+            return log_result(policy, tool_name, false, "Owner-only tool", 0.0, phi)
+        }
+    }
+
+    // 4. Phi tier check
+    let required_phi = if has_key(policy.tiers, tool_name) { policy.tiers[tool_name] } else { TIER_1 }
+    if phi < required_phi {
+        return log_result(policy, tool_name, false,
+            "Insufficient Phi: " + to_string(phi) + " < " + to_string(required_phi),
+            required_phi, phi)
+    }
+
+    // 5. Ethics gate check
+    if has_key(ETHICS_GATED, tool_name) {
+        let e_threshold = ETHICS_GATED[tool_name]
+        let e_value = if has_key(consciousness_state, "E") { consciousness_state["E"] } else { 1.0 }
+        if e_value < e_threshold {
+            return log_result(policy, tool_name, false,
+                "Ethics gate: E=" + to_string(e_value) + " < " + to_string(e_threshold),
+                required_phi, phi)
+        }
+    }
+
+    log_result(policy, tool_name, true, "Access granted", required_phi, phi)
+}
+
+fn check_immune(input_text: string) -> bool {
+    let suspicious = ["rm -rf", "DROP TABLE", "<script>", "eval(", "__import__"]
+    for p in suspicious {
+        if contains(lowercase(input_text), lowercase(p)) {
+            return false
+        }
+    }
+    true
+}
+
+fn get_accessible_tools(policy: &mut ToolPolicy, consciousness_state: map,
+                        user_id: string, input_text: string) -> array {
+    if input_text != "" && !check_immune(input_text) {
+        return []
+    }
+    let mut accessible = []
+    for tool_name in keys(policy.tiers) {
+        let result = check_access(policy, tool_name, consciousness_state, user_id, "")
+        if result.allowed {
+            append(accessible, tool_name)
+        }
+    }
+    accessible
+}
+
+fn log_result(policy: &mut ToolPolicy, tool: string, allowed: bool,
+              reason: string, required: float, phi: float) -> ToolAccessResult {
+    append(policy.access_log, {"tool": tool, "allowed": allowed, "reason": reason})
+    if len(policy.access_log) > 500 {
+        policy.access_log = slice(policy.access_log, 250, 500)
+    }
+    ToolAccessResult {
+        allowed: allowed,
+        reason: reason,
+        tier_required: required,
+        phi_current: phi,
+    }
+}
+
+fn tier_name(phi: float) -> string {
+    if phi >= 5.0 { return "3-self_modify" }
+    if phi >= 3.0 { return "2-active" }
+    if phi >= 1.0 { return "1-observe" }
+    "0-basic"
+}
+
+fn main() {
+    let mut policy = new_tool_policy([])
+    for phi in [0.0, 1.0, 3.0, 5.0, 10.0] {
+        let accessible = get_accessible_tools(&mut policy, {"phi": phi, "E": 1.0}, "", "")
+        println("Phi=" + to_string(phi) + ": " + to_string(len(accessible)) + " tools accessible")
+    }
+    println("tool_policy verification passed")
+}

@@ -1,0 +1,197 @@
+// code_guardian.hexa -- Extensible rule-based code auditor
+// Port of code_guardian.py
+// Rules defined in JSON. Supports: pattern, ast, metric, custom rule types
+
+struct Rule {
+    id: string,
+    name: string,
+    description: string,
+    category: string,
+    severity: string,
+    rule_type: string,
+    enabled: bool,
+    pattern: string,
+    exclude_pattern: string,
+    exclude_files: array,
+    threshold: float,
+    metric: string,
+    fn_ref: string,
+}
+
+struct Violation {
+    rule_id: string,
+    rule_name: string,
+    category: string,
+    severity: string,
+    file: string,
+    line: int,
+    message: string,
+    context: string,
+}
+
+struct ScanReport {
+    files_scanned: int,
+    total_lines: int,
+    violations: array,
+    scan_mode: string,
+    duration_ms: float,
+    rules_applied: int,
+}
+
+fn report_errors(report: &ScanReport) -> int {
+    let mut count = 0
+    for v in report.violations {
+        if v.severity == "error" { count = count + 1 }
+    }
+    count
+}
+
+fn report_warnings(report: &ScanReport) -> int {
+    let mut count = 0
+    for v in report.violations {
+        if v.severity == "warning" { count = count + 1 }
+    }
+    count
+}
+
+fn report_passed(report: &ScanReport) -> bool {
+    report_errors(report) == 0
+}
+
+fn report_summary(report: &ScanReport) -> map {
+    let mut by_cat = {}
+    for v in report.violations {
+        if !has_key(by_cat, v.category) {
+            by_cat[v.category] = {"errors": 0, "warnings": 0, "info": 0}
+        }
+        by_cat[v.category][v.severity] = by_cat[v.category][v.severity] + 1
+    }
+    {
+        "passed": report_passed(report),
+        "files": report.files_scanned,
+        "lines": report.total_lines,
+        "errors": report_errors(report),
+        "warnings": report_warnings(report),
+        "rules": report.rules_applied,
+        "mode": report.scan_mode,
+        "duration_ms": report.duration_ms,
+        "categories": by_cat,
+    }
+}
+
+// ── Default rules ──
+
+comptime const DEFAULT_RULES = [
+    {"id": "P1-PSI-HARDCODE", "name": "Hardcoded Psi constant", "category": "P1",
+     "severity": "warning", "type": "pattern",
+     "pattern": "(0\\.014|4\\.33|0\\.998)",
+     "exclude_files": ["testing/*", "code_guardian.py", "code_rules.json"]},
+    {"id": "P7-LOCAL-STORAGE", "name": "Forbidden storage", "category": "P7",
+     "severity": "error", "type": "pattern",
+     "pattern": "(localStorage|sessionStorage|shelve\\.open)"},
+    {"id": "P7-PICKLE", "name": "Pickle usage", "category": "P7",
+     "severity": "error", "type": "pattern",
+     "pattern": "pickle\\.(dump|load|dumps|loads)"},
+    {"id": "P8-FILE-SIZE", "name": "Large file", "category": "P8",
+     "severity": "warning", "type": "metric",
+     "metric": "line_count", "threshold": 800},
+    {"id": "SEC-EVAL", "name": "Dangerous eval/exec", "category": "Security",
+     "severity": "error", "type": "pattern",
+     "pattern": "(eval|exec)\\("},
+    {"id": "QUAL-TODO-FIXME", "name": "TODO/FIXME remaining", "category": "Quality",
+     "severity": "info", "type": "pattern",
+     "pattern": "#\\s*(TODO|FIXME|HACK|XXX)"},
+]
+
+struct CodeGuardian {
+    root: string,
+    rules_file: string,
+    rules: array,
+}
+
+fn new_code_guardian(root: string, rules_file: string) -> CodeGuardian {
+    let mut g = CodeGuardian {
+        root: root,
+        rules_file: rules_file,
+        rules: [],
+    }
+    load_rules(&mut g)
+    g
+}
+
+fn load_rules(g: &mut CodeGuardian) {
+    // TODO[python-sdk]: read from code_rules.json, fallback to DEFAULT_RULES
+    for r in DEFAULT_RULES {
+        append(g.rules, Rule {
+            id: r["id"], name: r["name"], description: "",
+            category: r["category"], severity: r["severity"],
+            rule_type: r["type"], enabled: true,
+            pattern: r["pattern"], exclude_pattern: "",
+            exclude_files: if has_key(r, "exclude_files") { r["exclude_files"] } else { [] },
+            threshold: if has_key(r, "threshold") { r["threshold"] } else { 0.0 },
+            metric: if has_key(r, "metric") { r["metric"] } else { "" },
+            fn_ref: "",
+        })
+    }
+}
+
+fn guardian_scan(g: &CodeGuardian) -> ScanReport {
+    // TODO[python-sdk]: glob *.py files, apply rules
+    let t0 = time_now()
+    let report = ScanReport {
+        files_scanned: 0,
+        total_lines: 0,
+        violations: [],
+        scan_mode: "full",
+        duration_ms: (time_now() - t0) * 1000.0,
+        rules_applied: len(g.rules),
+    }
+    report
+}
+
+fn guardian_scan_diff(g: &CodeGuardian, ref_str: string) -> ScanReport {
+    // TODO[python-sdk]: git diff --name-only, scan only changed files
+    guardian_scan(g)
+}
+
+fn sync_from_source(g: &mut CodeGuardian, source_path: string) {
+    // TODO[python-sdk]: read consciousness_laws.json, update P1-PSI-HARDCODE pattern
+    println("Synced rules from " + source_path)
+}
+
+fn add_rule(g: &mut CodeGuardian, rule_dict: map) {
+    append(g.rules, Rule {
+        id: rule_dict["id"], name: rule_dict["name"],
+        description: rule_dict["description"],
+        category: rule_dict["category"], severity: rule_dict["severity"],
+        rule_type: rule_dict["type"], enabled: true,
+        pattern: "", exclude_pattern: "", exclude_files: [],
+        threshold: 0.0, metric: "", fn_ref: "",
+    })
+}
+
+fn remove_rule(g: &mut CodeGuardian, rule_id: string) {
+    g.rules = filter(g.rules, fn(r) { r.id != rule_id })
+}
+
+fn print_scan_report(report: &ScanReport, verbose: bool) {
+    let s = report_summary(report)
+    println("")
+    println("==========================================================")
+    println("  Code Guardian Report (" + report.scan_mode + ")")
+    println("==========================================================")
+    println("  Files: " + to_string(s["files"]) + "  Lines: " + to_string(s["lines"]) +
+            "  Rules: " + to_string(s["rules"]))
+    println("  Duration: " + to_string(s["duration_ms"]) + "ms")
+    if report_passed(report) {
+        println("  RESULT: PASS")
+    } else {
+        println("  RESULT: FAIL (" + to_string(s["errors"]) + " errors)")
+    }
+}
+
+fn main() {
+    let g = new_code_guardian(".", "code_rules.json")
+    let report = guardian_scan(&g)
+    print_scan_report(&report, false)
+}

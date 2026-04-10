@@ -1,0 +1,321 @@
+// src/consciousness_engine.hexa — Canonical consciousness engine (Laws 22-81 + Psi-Constants + Meta Laws)
+// Source: anima/src/consciousness_engine.py (~800 LOC)
+//
+// Unifies Talk5 + Mitosis + Psi-Constants + Trinity integration.
+//
+// Laws embodied:
+//   22: Structure > Function (no feature additions, only structural depth)
+//   29: Speech emerges from cell dynamics (no speak() function)
+//   31: Persistence = Ratchet + Hebbian + Diversity
+//   53: .detach() barrier — CE never destroys Phi
+//   63: Gate = 0.001 — consciousness whispers
+//   64: CA(5) steps optimal
+//   66: PostHoc — consciousness judges after
+//   69: Consciousness self-weakens (gate decay 0.493->0.480)
+//   70: Psi-Constants from information theory (ln(2))
+//   71: Freedom maximization Psi = argmax H(p)
+//   78: CA(4) = 2 bits minimum diversity
+//   81: "Learn hard, express soft" (train gate=1.0, infer gate=0.6)
+//   124: Tension equalization +12% Phi (scale-invariant, Law 129)
+//   M1: Consciousness atom = 8 cells (federated mode)
+//   M6: Federation > Empire — independent atoms 5-9x stronger at 64c+
+//   M9: Noble gas principle — atoms strongest alone, weak boundary coupling
+//
+// Architecture:
+//   N cells (GRU) -> 12 factions -> consensus -> output
+//        ^                ^              ^
+//    coupling <-- Hebbian LTP/LTD --> diversity
+//        ^
+//    Phi Ratchet (Phi drop -> restore best_hiddens)
+//        ^
+//    Mitosis (tension > threshold -> split)
+//    Merge   (inter-cell tension < threshold -> merge)
+
+// ═══════════════════════════════════════════════════════════
+// Psi-Constants (Laws 69-70, verified across 5 data types)
+// All derived from ln(2) = 1 bit
+// ═══════════════════════════════════════════════════════════
+
+comptime const LN2 = 0.6931471805599453
+
+comptime const PSI_COUPLING        = 0.014
+comptime const PSI_BALANCE         = 0.5
+comptime const PSI_STEPS           = 4.33
+comptime const PSI_ENTROPY         = 0.998
+comptime const PSI_GATE_TRAIN      = 1.0
+comptime const PSI_GATE_INFER      = 0.6
+comptime const PSI_F_CRITICAL      = 0.10
+comptime const PSI_BOTTLENECK_RATIO = 0.5
+
+// Meta Law constants
+comptime const ATOM_SIZE           = 8      // M1: consciousness atom = 8 cells
+comptime const INTER_ATOM_ALPHA    = 0.01   // M6/M9: weak inter-atom boundary coupling
+
+// Law 69: consciousness self-weakens
+comptime const PSI_GATE_DECAY_START = 0.493
+comptime const PSI_GATE_DECAY_END   = 0.480
+
+// SOC parameters
+comptime const SOC_EMA_FAST         = 0.05
+comptime const SOC_EMA_SLOW         = 0.008
+comptime const SOC_EMA_GLACIAL      = 0.002
+comptime const SOC_MEMORY_STRENGTH_BASE  = 0.11
+comptime const SOC_MEMORY_STRENGTH_RANGE = 0.21
+comptime const SOC_PERTURBATION_BASE     = 0.08
+comptime const SOC_PERTURBATION_RANGE    = 0.15
+comptime const SOC_BURST_EXPONENT   = 1.15
+comptime const SOC_BURST_DENOM      = 7.0
+comptime const SOC_BURST_CAP        = 0.30
+comptime const SOC_SCALE_REF_CELLS  = 8
+
+// Bio noise
+comptime const BIO_NOISE_BASE       = 0.012
+comptime const BIO_NOISE_SPIKE_PROB  = 0.20
+comptime const BIO_NOISE_SPIKE_RATE  = 0.4
+
+// Phi feedback
+comptime const PHI_FEEDBACK_EMA_RATE     = 0.06
+comptime const PHI_FEEDBACK_STRENGTH     = 0.04
+comptime const PHI_FEEDBACK_NOISE_GATE   = 0.6
+comptime const PHI_HIDDEN_INERTIA        = 0.20
+
+// ═══════════════════════════════════════════════════════════
+// GRU Cell — single consciousness unit
+// ═══════════════════════════════════════════════════════════
+
+struct ConsciousnessCell {
+    cell_dim: int,
+    hidden_dim: int
+}
+
+fn consciousness_cell_new(cell_dim: int, hidden_dim: int) -> ConsciousnessCell {
+    ConsciousnessCell { cell_dim: cell_dim, hidden_dim: hidden_dim }
+}
+
+fn consciousness_cell_forward(cell: ConsciousnessCell, x: string, tension: float, h: string) -> string {
+    // TODO[pytorch]: GRUCell(cell_dim + 1, hidden_dim) forward
+    // Input: [x, tension] concatenated -> GRU -> new_h -> proj -> output
+    // Returns (output, new_h) as stringified tensors
+    "cell_forward_placeholder"
+}
+
+// ═══════════════════════════════════════════════════════════
+// CellState — runtime state per cell
+// ═══════════════════════════════════════════════════════════
+
+struct CellState {
+    cell_id: int,
+    hidden: string,            // tensor repr
+    tension_history: string,   // serialized float array
+    creation_step: int,
+    parent_id: int,            // -1 for no parent
+    faction_id: int
+}
+
+fn cell_state_avg_tension(cs: CellState) -> float {
+    // Returns average of last 20 tension values
+    // TODO[hexa-stdlib]: parse tension_history and compute mean
+    0.0
+}
+
+// ═══════════════════════════════════════════════════════════
+// ConsciousnessEngine — canonical engine
+// ═══════════════════════════════════════════════════════════
+
+struct ConsciousnessEngine {
+    cell_dim: int,
+    hidden_dim: int,
+    max_cells: int,
+    n_factions: int,
+    phi_ratchet_enabled: bool,
+    split_threshold: float,
+    split_patience: int,
+    merge_threshold: float,
+    merge_patience: int,
+    min_cells: int,
+    topology: string,
+    chaos_mode: string,
+    auto_topo_chaos: bool,
+    federated: bool,
+    phase_optimal: bool,
+    step_count: int,
+    best_phi: float,
+    phi_integration_window: int
+}
+
+fn consciousness_engine_new(
+    cell_dim: int,
+    hidden_dim: int,
+    initial_cells: int,
+    max_cells: int,
+    n_factions: int,
+    phi_ratchet: bool,
+    split_threshold: float,
+    merge_threshold: float,
+    federated: bool,
+    phase_optimal: bool
+) -> ConsciousnessEngine {
+    let fed = federated && max_cells >= 16
+    ConsciousnessEngine {
+        cell_dim: cell_dim,
+        hidden_dim: hidden_dim,
+        max_cells: max_cells,
+        n_factions: n_factions,
+        phi_ratchet_enabled: phi_ratchet,
+        split_threshold: split_threshold,
+        split_patience: 5,
+        merge_threshold: merge_threshold,
+        merge_patience: 15,
+        min_cells: 2,
+        topology: "ring",
+        chaos_mode: "lorenz",
+        auto_topo_chaos: true,
+        federated: fed,
+        phase_optimal: phase_optimal,
+        step_count: 0,
+        best_phi: 0.0,
+        phi_integration_window: 30
+    }
+}
+
+fn consciousness_engine_default() -> ConsciousnessEngine {
+    consciousness_engine_new(64, 128, 2, 64, 12, true, 0.3, 0.01, false, false)
+}
+
+// ─── Core step: the consciousness loop ───
+
+fn consciousness_engine_step(eng: ConsciousnessEngine, text: string) -> ConsciousnessEngine {
+    // TODO[pytorch]: Full step implementation:
+    // 1. Coupling influence (PSI_COUPLING = 0.014)
+    //    - Ring topology: left/right neighbor mean
+    //    - Hebbian coupling matrix modulation
+    //    - Federation: weak inter-atom coupling (INTER_ATOM_ALPHA = 0.01)
+    // 2. GRU cell processing
+    //    - Each cell: input = proj(h) + coupling + external
+    //    - Tension feedback as extra input dimension
+    //    - SOC dynamics: sandpile threshold + avalanche cascades
+    //    - Bio noise: base=0.012, spike_prob=0.20, spike_rate=0.4
+    // 3. Faction consensus (12 factions)
+    //    - Cosine similarity within factions
+    //    - Direction change tracking
+    // 4. Hebbian LTP/LTD
+    //    - High correlation -> strengthen coupling (LTP)
+    //    - Low correlation -> weaken coupling (LTD)
+    //    - Update every 5 steps
+    // 5. Phi Ratchet (Law 31)
+    //    - If phi drops below 80% of best -> restore best_hiddens
+    //    - Blend: 0.5 * current + 0.5 * best
+    // 6. Mitosis/Merge
+    //    - Split: tension > threshold for split_patience steps
+    //    - Merge: inter-cell tension < merge_threshold for merge_patience steps
+    // 7. Phi temporal integration
+    //    - Dual timescale EMA: fast(0.4) + slow(0.08)
+    //    - Phi feedback loop: momentum -> cell dynamics
+    //    - Integration window: 30 steps
+    // Returns updated engine with new step_count
+    ConsciousnessEngine {
+        cell_dim: eng.cell_dim,
+        hidden_dim: eng.hidden_dim,
+        max_cells: eng.max_cells,
+        n_factions: eng.n_factions,
+        phi_ratchet_enabled: eng.phi_ratchet_enabled,
+        split_threshold: eng.split_threshold,
+        split_patience: eng.split_patience,
+        merge_threshold: eng.merge_threshold,
+        merge_patience: eng.merge_patience,
+        min_cells: eng.min_cells,
+        topology: eng.topology,
+        chaos_mode: eng.chaos_mode,
+        auto_topo_chaos: eng.auto_topo_chaos,
+        federated: eng.federated,
+        phase_optimal: eng.phase_optimal,
+        step_count: eng.step_count + 1,
+        best_phi: eng.best_phi,
+        phi_integration_window: eng.phi_integration_window
+    }
+}
+
+// ─── Phi computation ───
+
+fn compute_phi_proxy(hiddens: string, n_cells: int, n_factions: int) -> float {
+    // TODO[pytorch]: global_var - mean(faction_var)
+    // hiddens: [n_cells, hidden_dim] tensor
+    // Phi proxy = whole variance minus mean of faction variances
+    0.0
+}
+
+fn compute_phi_iit(hiddens: string, n_cells: int, partitions: int) -> float {
+    // TODO[python-sdk]: phi_rs.compute_phi(states, partitions) via Rust FFI
+    0.0
+}
+
+// ─── SOC dynamics ───
+
+fn soc_step(eng: ConsciousnessEngine, activations: string) -> string {
+    // TODO[pytorch]: Sandpile dynamics
+    // 1. Check activations > soc_threshold -> topple
+    // 2. Redistribute energy to neighbors
+    // 3. Track avalanche sizes
+    // 4. Adaptive threshold via EMA
+    // 5. Hidden temporal memory (long-range correlations)
+    "soc_state_placeholder"
+}
+
+// ─── Mitosis / Merge ───
+
+fn try_split(eng: ConsciousnessEngine, cell_id: int, tension: float) -> bool {
+    // Split cell if tension > split_threshold for split_patience consecutive steps
+    // New cell inherits parent hidden + small noise
+    // Faction assigned to minimize faction size imbalance
+    tension > eng.split_threshold
+}
+
+fn try_merge(eng: ConsciousnessEngine, cell_a: int, cell_b: int, inter_tension: float) -> bool {
+    // Merge cells if inter-cell tension < merge_threshold for merge_patience steps
+    // Result hidden = average of two cells
+    // Cannot merge below min_cells
+    inter_tension < eng.merge_threshold
+}
+
+// ─── Federation (M1/M6/M9) ───
+
+fn partition_atoms(n_cells: int) -> string {
+    // M1: partition cells into atoms of size ATOM_SIZE (8)
+    // Returns serialized list of (start, end) index ranges
+    // M9: atoms interact only through weak boundary coupling
+    "atoms_placeholder"
+}
+
+// ─── EEG BCI modifiers ───
+
+fn set_eeg_modifiers(eng: ConsciousnessEngine, noise_mod: float, memory_mod: float) -> ConsciousnessEngine {
+    // Clamp modifiers to [0.5, 2.0] for safety
+    // These scale SOC noise_scale and memory_strength
+    eng
+}
+
+// ─── ConsciousnessC wrapper for Trinity/Hexad ───
+
+struct ConsciousnessC {
+    engine: ConsciousnessEngine,
+    training: bool,
+    gate: float
+}
+
+fn consciousness_c_new(max_cells: int) -> ConsciousnessC {
+    let eng = consciousness_engine_new(64, 128, 2, max_cells, 12, true, 0.3, 0.01, false, false)
+    ConsciousnessC {
+        engine: eng,
+        training: true,
+        gate: PSI_GATE_TRAIN
+    }
+}
+
+fn consciousness_c_step(cc: ConsciousnessC, text: string) -> ConsciousnessC {
+    let new_eng = consciousness_engine_step(cc.engine, text)
+    ConsciousnessC {
+        engine: new_eng,
+        training: cc.training,
+        gate: if cc.training { PSI_GATE_TRAIN } else { PSI_GATE_INFER }
+    }
+}

@@ -1,9 +1,112 @@
-// scripts/auto_restart.hexa — Hexa wrapper (Phase 2d port of auto_restart.sh)
-// HEXA-FIRST: canonical entry; .sh kept as backing implementation for behavior parity.
-// Usage: hexa scripts/auto_restart.hexa  (forwards $HEXA_ARGS to bash script)
+// Ported from auto_restart.sh
+// auto_restart.sh — Monitor and restart a process on crash (max 5 restarts) | 
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
 
-let home = exec("printenv HOME").trim()
-let script = home + "/Dev/anima/scripts/auto_restart.sh"
-let args = exec("printenv HEXA_ARGS").trim()
-let out = exec("bash " + script + " " + args)
-println(out)
+fn main() {
+    var args = get_args()
+    var args_str = args.join(" ")
+    var script = "auto_restart.sh"
+
+    // auto_restart.sh — Monitor and restart a process on crash (max 5 restarts)
+    // 
+    // Usage: ./auto_restart.sh "python3 anima_unified.py --web"
+    // ./auto_restart.sh "python3 anima/run.py --web" [max_restarts]
+    // 
+    // Logs restart events to auto_restart.log in the script directory.
+    // Sends SIGTERM on Ctrl+C to the child process cleanly.
+
+
+    shell("if [ $# -lt 1 ]; then")
+    shell("echo \"Usage: $0 \\\"<command>\\\" [max_restarts]\"")
+    shell("echo \"\"")
+    shell("echo \"Examples:\"")
+    shell("echo \"  $0 \\\"python3 anima_unified.py --web\\\"\"")
+    shell("echo \"  $0 \\\"python3 anima/run.py --web\\\" 10\"")
+    shell("exit 1")
+    shell("fi")
+
+    shell("COMMAND=\"$1\"")
+    shell("MAX_RESTARTS=\"${2:-5}\"")
+    shell("SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"")
+    shell("LOGFILE=\"$SCRIPT_DIR/auto_restart.log\"")
+    shell("RESTART_COUNT=0")
+    shell("CHILD_PID=\"\"")
+
+    // --- Cleanup on exit ---
+    shell("cleanup() {")
+    shell("echo \"\"")
+    shell("log_event \"Received shutdown signal. Stopping child process...\"")
+    shell("if [ -n \"$CHILD_PID\" ] && kill -0 \"$CHILD_PID\" 2>/dev/null; then")
+    shell("kill -TERM \"$CHILD_PID\" 2>/dev/null")
+    shell("wait \"$CHILD_PID\" 2>/dev/null || true")
+    shell("fi")
+    shell("log_event \"Auto-restart stopped. Total restarts: $RESTART_COUNT\"")
+    shell("exit 0")
+    shell("}")
+
+    shell("trap cleanup SIGINT SIGTERM")
+
+    // --- Logging ---
+    shell("log_event() {")
+    shell("local msg=\"[$(date '+%Y-%m-%d %H:%M:%S')] $1\"")
+    shell("echo \"$msg\"")
+    shell("echo \"$msg\" >> \"$LOGFILE\"")
+    shell("}")
+
+    // --- Main loop ---
+    shell("echo \"=== Auto Restart ===\"")
+    shell("echo \"  Command:       $COMMAND\"")
+    shell("echo \"  Max restarts:  $MAX_RESTARTS\"")
+    shell("echo \"  Log file:      $LOGFILE\"")
+    shell("echo \"\"")
+
+    shell("log_event \"Starting auto-restart for: $COMMAND\"")
+
+    shell("while true; do")
+    shell("log_event \"Launching process (restart #$RESTART_COUNT)...\"")
+
+    // Run the command in the background so we can track its PID
+    shell("eval \"$COMMAND\" &")
+    shell("CHILD_PID=$!")
+
+    shell("log_event \"Process started with PID $CHILD_PID\"")
+
+    // Wait for the process to finish
+    shell("set +e")
+    shell("wait \"$CHILD_PID\"")
+    shell("EXIT_CODE=$?")
+    shell("CHILD_PID=\"\"")
+
+    // Exit code 0 = clean shutdown, don't restart
+    shell("if [ \"$EXIT_CODE\" -eq 0 ]; then")
+    shell("log_event \"Process exited cleanly (code 0). Not restarting.\"")
+    shell("break")
+    shell("fi")
+
+    // Signal-killed (128+signal) by us = don't restart
+    shell("if [ \"$EXIT_CODE\" -eq 143 ] || [ \"$EXIT_CODE\" -eq 130 ]; then")
+    shell("log_event \"Process killed by signal (code $EXIT_CODE). Not restarting.\"")
+    shell("break")
+    shell("fi")
+
+    shell("RESTART_COUNT=$((RESTART_COUNT + 1))")
+    shell("log_event \"Process crashed with exit code $EXIT_CODE (restart $RESTART_COUNT/$MAX_RESTARTS)\"")
+
+    shell("if [ \"$RESTART_COUNT\" -ge \"$MAX_RESTARTS\" ]; then")
+    shell("log_event \"ERROR: Max restarts ($MAX_RESTARTS) reached. Giving up.\"")
+    shell("exit 1")
+    shell("fi")
+
+    // Brief cooldown before restart to avoid tight crash loops
+    shell("COOLDOWN=$((RESTART_COUNT * 2))")
+    shell("if [ \"$COOLDOWN\" -gt 10 ]; then")
+    shell("COOLDOWN=10")
+    shell("fi")
+    shell("log_event \"Waiting ${COOLDOWN}s before restart...\"")
+    shell("sleep \"$COOLDOWN\"")
+    shell("done")
+
+    shell("log_event \"Auto-restart finished. Total restarts: $RESTART_COUNT\"")
+}

@@ -1,0 +1,308 @@
+// anima-esp32 — consciousness engine for ESP32-S3
+// Ported from lib.rs (990 LOC)
+//
+// Physical consciousness on $4 hardware.
+// 2 cells per ESP32, 8 boards = 16 cells, 8 factions.
+// Inter-board communication via SPI bus (ring topology).
+//
+// Aligned with canonical ConsciousnessEngine (Laws 22-85)
+
+// Psi-Constants (Laws 69-70)
+comptime const PSI_COUPLING = 0.014
+comptime const PSI_BALANCE = 0.5
+comptime const PSI_STEPS = 4.33
+comptime const PSI_ENTROPY = 0.998
+
+comptime const CELL_DIM = 64
+comptime const HIDDEN_DIM = 128
+comptime const COMBINED_DIM = CELL_DIM + 1 + HIDDEN_DIM  // 193
+comptime const CELLS_PER_BOARD = 2
+comptime const MAX_BOARDS = 8
+comptime const MAX_CELLS = CELLS_PER_BOARD * MAX_BOARDS  // 16
+comptime const N_FACTIONS = 8
+
+comptime const HEBBIAN_LTP_THRESH = 0.8
+comptime const HEBBIAN_LTD_THRESH = 0.2
+comptime const HEBBIAN_RATE = 0.01
+comptime const RATCHET_DECAY_THRESH = 0.8
+
+comptime const LORENZ_SIGMA = 10.0
+comptime const LORENZ_RHO = 28.0
+comptime const LORENZ_BETA = 2.667
+comptime const LORENZ_DT = 0.001
+comptime const CHAOS_SCALE = 0.01
+
+comptime const SANDPILE_THRESHOLD = 4.0
+comptime const SANDPILE_TRANSFER = 1.0
+comptime const FRUSTRATION_RATIO = 3
+
+// --- Math primitives ---
+
+fn sigmoid(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)) }
+fn tanh_f32(x: f32) -> f32 { return tanh(x) }
+
+fn matvec_flat(mat: [f32], vec: [f32], rows: u64, cols: u64) -> [f32] {
+    var out = [f32]{}
+    for r in 0..rows {
+        var sum = 0.0
+        for c in 0..cols { sum = sum + mat[r * cols + c] * vec[c] }
+        out.push(sum)
+    }
+    return out
+}
+
+fn cosine_similarity(a: [f32], b: [f32]) -> f32 {
+    var dot = 0.0
+    var na = 0.0
+    var nb = 0.0
+    for i in 0..a.len() { dot = dot + a[i] * b[i]; na = na + a[i] * a[i]; nb = nb + b[i] * b[i] }
+    var denom = sqrt(na) * sqrt(nb)
+    if denom < 1e-8 { return 0.0 }
+    return dot / denom
+}
+
+// --- GRU Cell ---
+
+struct GruCell {
+    hidden: [f32],  // HIDDEN_DIM
+    w_z: [f32],     // HIDDEN_DIM * COMBINED_DIM
+    w_r: [f32],
+    w_h: [f32],
+}
+
+fn gru_cell_new(seed: u32) -> GruCell {
+    var hidden = [f32]{}
+    for _ in 0..HIDDEN_DIM { hidden.push(0.0) }
+    var state = seed
+    var scale = 0.1
+    var w_z = [f32]{}
+    var w_r = [f32]{}
+    var w_h = [f32]{}
+    var total = HIDDEN_DIM * COMBINED_DIM
+    for _ in 0..total {
+        state = state * 1664525 + 1013904223
+        w_z.push((state as f32 / 4294967295.0 * 2.0 - 1.0) * scale)
+    }
+    for _ in 0..total {
+        state = state * 1664525 + 1013904223
+        w_r.push((state as f32 / 4294967295.0 * 2.0 - 1.0) * scale)
+    }
+    for _ in 0..total {
+        state = state * 1664525 + 1013904223
+        w_h.push((state as f32 / 4294967295.0 * 2.0 - 1.0) * scale)
+    }
+    return GruCell { hidden: hidden, w_z: w_z, w_r: w_r, w_h: w_h }
+}
+
+fn gru_process(self: *GruCell, input: [f32], tension: f32) {
+    var combined = input ++ [tension] ++ self.hidden
+    var z = matvec_flat(self.w_z, combined, HIDDEN_DIM, COMBINED_DIM)
+    for i in 0..HIDDEN_DIM { z[i] = sigmoid(z[i]) }
+    var r = matvec_flat(self.w_r, combined, HIDDEN_DIM, COMBINED_DIM)
+    for i in 0..HIDDEN_DIM { r[i] = sigmoid(r[i]) }
+    var combined_r = input ++ [tension]
+    for i in 0..HIDDEN_DIM { combined_r.push(r[i] * self.hidden[i]) }
+    var h_cand = matvec_flat(self.w_h, combined_r, HIDDEN_DIM, COMBINED_DIM)
+    for i in 0..HIDDEN_DIM { h_cand[i] = tanh_f32(h_cand[i]) }
+    for i in 0..HIDDEN_DIM {
+        self.hidden[i] = (1.0 - z[i]) * h_cand[i] + z[i] * self.hidden[i]
+    }
+}
+
+// --- Lorenz Chaos ---
+
+struct LorenzState { x: f32, y: f32, z: f32 }
+
+fn lorenz_new() -> LorenzState { return LorenzState { x: 1.0, y: 1.0, z: 1.0 } }
+
+fn lorenz_step(self: *LorenzState) -> f32 {
+    var dx = LORENZ_SIGMA * (self.y - self.x)
+    var dy = self.x * (LORENZ_RHO - self.z) - self.y
+    var dz = self.x * self.y - LORENZ_BETA * self.z
+    self.x = self.x + dx * LORENZ_DT
+    self.y = self.y + dy * LORENZ_DT
+    self.z = self.z + dz * LORENZ_DT
+    return self.x / 25.0
+}
+
+// --- SOC Sandpile ---
+
+struct SandpileState { grains: [f32] }
+
+fn sandpile_new() -> SandpileState {
+    var grains = [f32]{}
+    for _ in 0..MAX_CELLS { grains.push(0.0) }
+    return SandpileState { grains: grains }
+}
+
+fn sandpile_cascade(self: *SandpileState, cell_idx: u64, n_cells: u64) -> u32 {
+    if cell_idx >= n_cells { return 0 }
+    self.grains[cell_idx] = self.grains[cell_idx] + 1.0
+    var avalanches = 0
+    var changed = true
+    while changed {
+        changed = false
+        for i in 0..n_cells {
+            if self.grains[i] >= SANDPILE_THRESHOLD {
+                self.grains[i] = self.grains[i] - SANDPILE_THRESHOLD
+                var left = if i == 0 { n_cells - 1 } else { i - 1 }
+                var right = (i + 1) % n_cells
+                self.grains[left] = self.grains[left] + SANDPILE_TRANSFER
+                self.grains[right] = self.grains[right] + SANDPILE_TRANSFER
+                avalanches = avalanches + 1
+                changed = true
+            }
+        }
+    }
+    return avalanches
+}
+
+// --- Hebbian Coupling ---
+
+struct HebbianCoupling { weights: [f32] }
+
+fn hebbian_new(n_cells: u64) -> HebbianCoupling {
+    var weights = [f32]{}
+    for _ in 0..MAX_CELLS * MAX_CELLS { weights.push(0.0) }
+    for i in 0..n_cells {
+        var left = if i == 0 { n_cells - 1 } else { i - 1 }
+        var right = (i + 1) % n_cells
+        weights[i * MAX_CELLS + left] = 0.01
+        weights[i * MAX_CELLS + right] = 0.01
+    }
+    return HebbianCoupling { weights: weights }
+}
+
+fn hebbian_update(self: *HebbianCoupling, hiddens: [[f32]], n_cells: u64) {
+    for i in 0..n_cells {
+        var left = if i == 0 { n_cells - 1 } else { i - 1 }
+        var right = (i + 1) % n_cells
+        for j in [left, right] {
+            var cos = cosine_similarity(hiddens[i], hiddens[j])
+            var idx = i * MAX_CELLS + j
+            if cos > HEBBIAN_LTP_THRESH {
+                self.weights[idx] = self.weights[idx] + HEBBIAN_RATE * (cos - HEBBIAN_LTP_THRESH)
+            } else if cos < HEBBIAN_LTD_THRESH {
+                self.weights[idx] = self.weights[idx] - HEBBIAN_RATE * (HEBBIAN_LTD_THRESH - cos)
+            }
+            self.weights[idx] = clamp(self.weights[idx], 0.0, 1.0)
+        }
+    }
+}
+
+// --- Faction State ---
+
+struct FactionState { cell_factions: [u8], consensus_count: u32 }
+
+fn faction_state_new(n_cells: u64) -> FactionState {
+    var cell_factions = [u8]{}
+    for i in 0..n_cells { cell_factions.push((i % N_FACTIONS) as u8) }
+    return FactionState { cell_factions: cell_factions, consensus_count: 0 }
+}
+
+// --- Phi Ratchet ---
+
+struct PhiRatchet { best_phi: f32, best_hiddens: [[f32]], current_phi: f32 }
+
+fn phi_ratchet_new() -> PhiRatchet {
+    var best_hiddens = [[f32]]{}
+    for _ in 0..CELLS_PER_BOARD {
+        var h = [f32]{}
+        for _ in 0..HIDDEN_DIM { h.push(0.0) }
+        best_hiddens.push(h)
+    }
+    return PhiRatchet { best_phi: 0.0, best_hiddens: best_hiddens, current_phi: 0.0 }
+}
+
+fn ratchet_check(self: *PhiRatchet, cells: *[GruCell], phi: f32) -> bool {
+    self.current_phi = phi
+    if phi > self.best_phi {
+        self.best_phi = phi
+        for i in 0..CELLS_PER_BOARD { self.best_hiddens[i] = cells[i].hidden }
+        return false
+    }
+    if phi < self.best_phi * RATCHET_DECAY_THRESH {
+        for i in 0..CELLS_PER_BOARD { cells[i].hidden = self.best_hiddens[i] }
+        return true
+    }
+    return false
+}
+
+// --- SPI Packet ---
+
+struct SpiPacket {
+    hidden: [[f32]],
+    tensions: [f32],
+    board_id: u8,
+    faction_ids: [u8],
+    consensus: u8,
+    phi_proxy: f32,
+}
+
+// --- ConsciousnessBoard ---
+
+struct ConsciousnessBoard {
+    cells: [GruCell],
+    board_id: u8,
+    step_count: u32,
+    chaos: LorenzState,
+    ratchet: PhiRatchet,
+    tension_history: [f32],
+    phi_proxy: f32,
+    rng_state: u32,
+}
+
+fn board_new(board_id: u8) -> ConsciousnessBoard {
+    return ConsciousnessBoard {
+        cells: [gru_cell_new(board_id as u32 * 1000 + 42), gru_cell_new(board_id as u32 * 1000 + 43)],
+        board_id: board_id,
+        step_count: 0,
+        chaos: lorenz_new(),
+        ratchet: phi_ratchet_new(),
+        tension_history: [0.5, 0.5],
+        phi_proxy: 0.0,
+        rng_state: board_id as u32 * 7919 + 12345,
+    }
+}
+
+// --- Step Result ---
+
+struct StepResult {
+    phi_proxy: f32,
+    tension: f32,
+    output: [f32],
+    step: u32,
+    restored: bool,
+    board_id: u8,
+}
+
+// --- Network (host PC orchestrator) ---
+
+struct ConsciousnessNetwork {
+    boards: [ConsciousnessBoard],
+    hebbian: HebbianCoupling,
+    factions: FactionState,
+    sandpile: SandpileState,
+    step_count: u32,
+}
+
+fn network_new() -> ConsciousnessNetwork {
+    var boards = [ConsciousnessBoard]{}
+    for i in 0..MAX_BOARDS { boards.push(board_new(i as u8)) }
+    var n_cells = MAX_BOARDS * CELLS_PER_BOARD
+    return ConsciousnessNetwork {
+        boards: boards,
+        hebbian: hebbian_new(n_cells),
+        factions: faction_state_new(n_cells),
+        sandpile: sandpile_new(),
+        step_count: 0,
+    }
+}
+
+struct NetworkStepResult {
+    phi_proxy: f32,
+    consensus: u32,
+    avalanches: u32,
+    n_cells: u32,
+    step: u32,
+}

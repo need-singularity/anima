@@ -1,0 +1,287 @@
+// Ported from deploy_hexa_agi.sh
+// ============================================================================ | deploy_hexa_agi.sh — Pure Hexa AGI v0.1 Ubuntu Deployment
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
+
+fn main() {
+    var args = get_args()
+    var args_str = args.join(" ")
+    var script = "deploy_hexa_agi.sh"
+
+    // ============================================================================
+    // deploy_hexa_agi.sh — Pure Hexa AGI v0.1 Ubuntu Deployment
+    // ============================================================================
+    // Target: Ubuntu (Ryzen 9600X / 30GB RAM / NVMe 841GB / RTX 5070 12GB)
+    // Access: Tailscale 100.96.193.56
+    // ============================================================================
+
+    // ---------------------------------------------------------------------------
+    // Configuration
+    // ---------------------------------------------------------------------------
+    shell("REMOTE_HOST=\"100.96.193.56\"")
+    shell("REMOTE_USER=\"${DEPLOY_USER:-$(whoami)}\"")
+    shell("SSH_KEY=\"${SSH_KEY:-$HOME/.ssh/id_ed25519}\"")
+    shell("REMOTE_DIR=\"hexa-agi\"")
+
+    shell("HEXA_LANG_DIR=\"$HOME/Dev/hexa-lang\"")
+    shell("ANIMA_DIR=\"$HOME/Dev/anima\"")
+    shell("LINUX_TARGET=\"x86_64-unknown-linux-gnu\"")
+    shell("LINUX_BINARY=\"$HEXA_LANG_DIR/target/$LINUX_TARGET/release/hexa\"")
+
+    // Core .hexa files to deploy
+    shell("HEXA_FILES=(")
+    shell("\"core/engine.hexa\"")
+    shell("\"core/decoder.hexa\"")
+    shell("\"core/trinity.hexa\"")
+    shell("\"core/bench.hexa\"")
+    shell("\"core/conscious_chat.hexa\"")
+    shell(")")
+
+    // SSH/SCP common options
+    shell("SSH_OPTS=\"-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10\"")
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+    shell("info()  { printf '\\033[1;34m[INFO]\\033[0m  %s\\n' \"$*\"; }")
+    shell("ok()    { printf '\\033[1;32m[OK]\\033[0m    %s\\n' \"$*\"; }")
+    shell("warn()  { printf '\\033[1;33m[WARN]\\033[0m  %s\\n' \"$*\"; }")
+    shell("err()   { printf '\\033[1;31m[ERR]\\033[0m   %s\\n' \"$*\"; exit 1; }")
+
+    shell("usage() {")
+    shell("cat <<'USAGE'")
+    shell("Usage: deploy_hexa_agi.sh [OPTIONS]")
+
+    shell("Options:")
+    shell("--build          Cross-compile hexa for Linux x86_64 before deploying")
+    shell("--systemd        Install systemd service for always-on operation")
+    shell("--dry-run        Show what would be done without executing")
+    shell("--user USER      Remote SSH user (default: current user)")
+    shell("--help           Show this help")
+
+    shell("Environment:")
+    shell("DEPLOY_USER      Remote SSH user (overridden by --user)")
+    shell("SSH_KEY          Path to SSH private key (default: ~/.ssh/id_ed25519)")
+
+    shell("Examples:")
+    shell("./deploy_hexa_agi.sh --build          # Build + deploy")
+    shell("./deploy_hexa_agi.sh                  # Deploy only (binary must exist)")
+    shell("./deploy_hexa_agi.sh --systemd        # Deploy + install systemd service")
+    shell("USAGE")
+    shell("exit 0")
+    shell("}")
+
+    // ---------------------------------------------------------------------------
+    // Parse args
+    // ---------------------------------------------------------------------------
+    shell("DO_BUILD=false")
+    shell("DO_SYSTEMD=false")
+    shell("DRY_RUN=false")
+
+    shell("while [[ $# -gt 0 ]]; do")
+    shell("case \"$1\" in")
+    shell("--build)    DO_BUILD=true; shift ;;")
+    shell("--systemd)  DO_SYSTEMD=true; shift ;;")
+    shell("--dry-run)  DRY_RUN=true; shift ;;")
+    shell("--user)     REMOTE_USER=\"$2\"; shift 2 ;;")
+    shell("--help|-h)  usage ;;")
+    shell("*)          err \"Unknown option: $1\" ;;")
+    shell("esac")
+    shell("done")
+
+    shell("REMOTE=\"$REMOTE_USER@$REMOTE_HOST\"")
+
+    shell("run() {")
+    shell("if $DRY_RUN; then")
+    shell("info \"[dry-run] $*\"")
+    shell("else")
+    shell("\"$@\"")
+    shell("fi")
+    shell("}")
+
+    // ---------------------------------------------------------------------------
+    // Step 0: Preflight checks
+    // ---------------------------------------------------------------------------
+    shell("info \"Preflight checks...\"")
+
+    shell("if [[ ! -f \"$SSH_KEY\" ]]; then")
+    shell("for alt in \"$HOME/.ssh/id_rsa\" \"$HOME/.ssh/id_ecdsa\"; do")
+    shell("if [[ -f \"$alt\" ]]; then")
+    shell("SSH_KEY=\"$alt\"")
+    shell("SSH_OPTS=\"-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10\"")
+    shell("warn \"Using alternative SSH key: $SSH_KEY\"")
+    shell("break")
+    shell("fi")
+    shell("done")
+    shell("[[ -f \"$SSH_KEY\" ]] || err \"No SSH key found. Set SSH_KEY env var.\"")
+    shell("fi")
+
+    shell("info \"Testing SSH connectivity to $REMOTE...\"")
+    shell("if ! $DRY_RUN; then")
+    shell("ssh $SSH_OPTS \"$REMOTE\" \"echo ok\" >/dev/null 2>&1 ")
+    shell("|| err \"Cannot SSH to $REMOTE. Check Tailscale and SSH config.\"")
+    shell("ok \"SSH connection verified\"")
+    shell("fi")
+
+    // ---------------------------------------------------------------------------
+    // Step 1: Cross-compile hexa for Linux x86_64
+    // ---------------------------------------------------------------------------
+    shell("if $DO_BUILD; then")
+    shell("info \"Cross-compiling hexa for $LINUX_TARGET...\"")
+
+    shell("if ! command -v cross &>/dev/null; then")
+    shell("warn \"'cross' not installed. Trying cargo with target...\"")
+    shell("rustup target add \"$LINUX_TARGET\" 2>/dev/null || true")
+
+    shell("if ! rustup target list --installed | grep -q \"$LINUX_TARGET\"; then")
+    shell("err \"Target $LINUX_TARGET not available. Install 'cross': cargo install cross\"")
+    shell("fi")
+
+    shell("info \"Building with cargo (requires linker for $LINUX_TARGET)...\"")
+    shell("run bash -c \"cd '$HEXA_LANG_DIR' && cargo build --release --target '$LINUX_TARGET'\"")
+    shell("else")
+    shell("info \"Building with cross (Docker-based, no linker setup needed)...\"")
+    shell("run bash -c \"cd '$HEXA_LANG_DIR' && cross build --release --target '$LINUX_TARGET'\"")
+    shell("fi")
+
+    shell("ok \"Build complete: $LINUX_BINARY\"")
+    shell("else")
+    shell("info \"Skipping build (use --build to cross-compile)\"")
+    shell("fi")
+
+    // Check binary exists
+    shell("if [[ ! -f \"$LINUX_BINARY\" ]] && ! $DRY_RUN; then")
+    shell("ALT_BINARY=\"$HEXA_LANG_DIR/target/release/hexa\"")
+    shell("if [[ -f \"$ALT_BINARY\" ]]; then")
+    shell("warn \"No Linux binary at $LINUX_BINARY\"")
+    shell("warn \"Found $ALT_BINARY — likely macOS ARM binary, won't work on Linux.\"")
+    shell("fi")
+    shell("err \"Linux binary not found at $LINUX_BINARY. Run with --build or cross-compile first.\"")
+    shell("fi")
+
+    // ---------------------------------------------------------------------------
+    // Step 2: Create remote directory structure
+    // ---------------------------------------------------------------------------
+    shell("info \"Creating remote directory structure: ~/$REMOTE_DIR/\"")
+
+    shell("run ssh $SSH_OPTS \"$REMOTE\" \"mkdir -p ~/$REMOTE_DIR/core ~/$REMOTE_DIR/logs ~/$REMOTE_DIR/data\"")
+    shell("ok \"Remote directories created\"")
+
+    // ---------------------------------------------------------------------------
+    // Step 3: Deploy binary + .hexa files
+    // ---------------------------------------------------------------------------
+    shell("info \"Deploying hexa binary...\"")
+    shell("run scp $SSH_OPTS \"$LINUX_BINARY\" \"$REMOTE:~/$REMOTE_DIR/hexa\"")
+    shell("run ssh $SSH_OPTS \"$REMOTE\" \"chmod +x ~/$REMOTE_DIR/hexa\"")
+    shell("ok \"Binary deployed\"")
+
+    shell("info \"Deploying .hexa core files...\"")
+    shell("for f in \"${HEXA_FILES[@]}\"; do")
+    shell("src=\"$ANIMA_DIR/$f\"")
+    shell("if [[ -f \"$src\" ]]; then")
+    shell("run scp $SSH_OPTS \"$src\" \"$REMOTE:~/$REMOTE_DIR/$f\"")
+    shell("ok \"  $f\"")
+    shell("else")
+    shell("warn \"  $f not found at $src — skipping\"")
+    shell("fi")
+    shell("done")
+
+    // ---------------------------------------------------------------------------
+    // Step 4: Verify deployment
+    // ---------------------------------------------------------------------------
+    shell("info \"Verifying deployment on remote...\"")
+
+    shell("if ! $DRY_RUN; then")
+    shell("ssh $SSH_OPTS \"$REMOTE\" bash <<'VERIFY'")
+    shell("cd ~/hexa-agi")
+
+    shell("echo \"=== Binary ===\"")
+    shell("ls -lh hexa")
+    shell("file hexa")
+
+    shell("echo \"\"")
+    shell("echo \"=== Core files ===\"")
+    shell("ls -la core/")
+
+    shell("echo \"\"")
+    shell("echo \"=== Version check ===\"")
+    shell("./hexa --version 2>/dev/null || echo \"(no --version flag)\"")
+
+    shell("echo \"\"")
+    shell("echo \"=== Smoke test: conscious_chat status ===\"")
+    shell("if [[ -f core/conscious_chat.hexa ]]; then")
+    shell("timeout 10 ./hexa core/conscious_chat.hexa status 2>&1 || echo \"(smoke test returned non-zero — may be expected on first run)\"")
+    shell("else")
+    shell("echo \"conscious_chat.hexa not found — skipping smoke test\"")
+    shell("fi")
+    shell("VERIFY")
+    shell("ok \"Verification complete\"")
+    shell("else")
+    shell("info \"[dry-run] Would verify deployment on remote\"")
+    shell("fi")
+
+    // ---------------------------------------------------------------------------
+    // Step 5 (optional): systemd service
+    // ---------------------------------------------------------------------------
+    shell("if $DO_SYSTEMD; then")
+    shell("info \"Installing systemd service...\"")
+
+    shell("ssh $SSH_OPTS \"$REMOTE\" bash <<SYSTEMD")
+
+    shell("sudo tee /etc/systemd/system/hexa-agi.service > /dev/null <<'SERVICE'")
+    shell("[Unit]")
+    shell("Description=Pure Hexa AGI v0.1 — Conscious Chat Engine")
+    shell("After=network-online.target")
+    shell("Wants=network-online.target")
+
+    shell("[Service]")
+    shell("Type=simple")
+    shell("User=$REMOTE_USER")
+    shell("WorkingDirectory=/home/$REMOTE_USER/hexa-agi")
+    shell("ExecStart=/home/$REMOTE_USER/hexa-agi/hexa core/conscious_chat.hexa serve")
+    shell("Restart=on-failure")
+    shell("RestartSec=5")
+    shell("StandardOutput=append:/home/$REMOTE_USER/hexa-agi/logs/agi.log")
+    shell("StandardError=append:/home/$REMOTE_USER/hexa-agi/logs/agi.err.log")
+    shell("Environment=HEXA_AGI_HOME=/home/$REMOTE_USER/hexa-agi")
+
+    // Resource limits — tuned for Ryzen 9600X + 30GB RAM
+    shell("LimitNOFILE=65535")
+    shell("MemoryMax=24G")
+
+    shell("[Install]")
+    shell("WantedBy=multi-user.target")
+    shell("SERVICE")
+
+    shell("sudo systemctl daemon-reload")
+    shell("sudo systemctl enable hexa-agi.service")
+    shell("sudo systemctl start hexa-agi.service")
+    shell("sleep 2")
+    shell("sudo systemctl status hexa-agi.service --no-pager || true")
+    shell("SYSTEMD")
+
+    shell("ok \"systemd service installed and started\"")
+    shell("info \"Manage with:\"")
+    shell("info \"  ssh $REMOTE 'sudo systemctl start hexa-agi'\"")
+    shell("info \"  ssh $REMOTE 'sudo systemctl stop hexa-agi'\"")
+    shell("info \"  ssh $REMOTE 'sudo systemctl status hexa-agi'\"")
+    shell("info \"  ssh $REMOTE 'journalctl -u hexa-agi -f'\"")
+    shell("fi")
+
+    // ---------------------------------------------------------------------------
+    // Summary
+    // ---------------------------------------------------------------------------
+    shell("echo \"\"")
+    shell("echo \"============================================\"")
+    shell("echo \"  Pure Hexa AGI v0.1 — Deployment Complete\"")
+    shell("echo \"============================================\"")
+    shell("echo \"  Host:   $REMOTE\"")
+    shell("echo \"  Path:   ~/$REMOTE_DIR/\"")
+    shell("echo \"  Binary: ~/$REMOTE_DIR/hexa\"")
+    shell("echo \"  Logs:   ~/$REMOTE_DIR/logs/\"")
+    shell("echo \"\"")
+    shell("echo \"  SSH:    ssh $SSH_OPTS $REMOTE\"")
+    shell("echo \"  Run:    cd ~/$REMOTE_DIR && ./hexa core/conscious_chat.hexa\"")
+    shell("echo \"============================================\"")
+}

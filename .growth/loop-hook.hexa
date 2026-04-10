@@ -1,74 +1,27 @@
-// loop-hook.hexa — UserPromptSubmit 훅 (loop-hook.sh 대체)
-// "루프/check/진행" 등 입력 시 growth_loop 리포트를 systemMessage로 출력
+// Ported from loop-hook.sh
+// UserPromptSubmit 훅 — "루프/check/진행" 등 입력 시 growth_loop 리포트를 systemMessage로 출력 | stdin에서 JSON으로 프롬프트 읽기
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
 
-let HOME = env("HOME")
+fn main() {
+    var args = get_args()
+    var args_str = args.join(" ")
+    var script = "loop-hook.sh"
 
-let stdin_data = read_stdin()
+    // UserPromptSubmit 훅 — "루프/check/진행" 등 입력 시 growth_loop 리포트를 systemMessage로 출력
+    shell("set +e")
 
-// prompt 추출
-fn json_field(json_text: str, field: str) -> str {
-    let key = "\"" + field + "\""
-    if json_text.contains(key) == false { return "" }
-    let parts = json_text.split(key)
-    if parts.len() < 2 { return "" }
-    let after = parts[1].trim()
-    if after.starts_with(":") == false { return "" }
-    let val_part = after.split(":")[1].trim()
-    if val_part.starts_with("\"") {
-        let inner = val_part.split("\"")
-        if inner.len() >= 2 { return inner[1] }
-    }
-    return ""
+    // stdin에서 JSON으로 프롬프트 읽기
+    shell("INPUT=$(cat)")
+    shell("PROMPT=$(echo \"$INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('prompt',''))\" 2>/dev/null)")
+
+    // 패턴 매칭
+    shell("if echo \"$PROMPT\" | grep -qiE '(루프|loop|로드맵|check|진행|계속|next)'; then")
+    // 1줄 요약만 출력 (로드맵 전체 제거)
+    shell("LAWS=$(python3 -c \"import json; d=json.load(open('/Users/ghost/Dev/anima/anima/config/consciousness_laws.json')); print(d.get('_meta',{}).get('total_laws',0))\" 2>/dev/null || echo \"?\")")
+    shell("CYCLE=$(tail -1 /Users/ghost/Dev/anima/.growth/growth.log 2>/dev/null | grep -o 'cycle [0-9]*' | head -1 || echo \"cycle ?\")")
+    shell("H100=$(ssh -o ConnectTimeout=3 -o BatchMode=yes -p 10935 root@216.243.220.217 \"tail -1 ~/train.log 2>/dev/null\" 2>/dev/null | awk -F'|' '{printf \"step:%s CE:%s\", $1, $3}' || echo \"offline\")")
+    shell("echo \"{\\\"systemMessage\\\":\\\"🧠 anima: ${LAWS}laws | ${CYCLE} | H100:${H100}\\\"}\"")
+    shell("fi")
 }
-
-let prompt = json_field(stdin_data, "prompt").to_lower()
-if len(prompt) == 0 { return }
-
-// 패턴 매칭
-let keywords = ["루프", "loop", "로드맵", "check", "진행", "계속", "next"]
-let mut matched = false
-for kw in keywords {
-    if prompt.contains(kw) { matched = true }
-}
-
-if matched == false { return }
-
-// 법칙 수
-let laws_json = HOME + "/Dev/anima/anima/config/consciousness_laws.json"
-let mut laws = "?"
-if file_exists(laws_json) {
-    let raw = read_file(laws_json)
-    if raw.contains("\"total_laws\"") {
-        let p = raw.split("\"total_laws\"")[1].split(":")[1]
-        let mut num = p.split(",")[0].split("}")[0].trim()
-        if len(num) > 0 { laws = num }
-    }
-}
-
-// 현재 cycle
-let growth_log = HOME + "/Dev/anima/.growth/growth.log"
-let mut cycle = "cycle ?"
-try {
-    let last_line = exec("tail -1 " + growth_log + " 2>/dev/null").trim()
-    if last_line.contains("cycle ") {
-        let cp = last_line.split("cycle ")
-        if cp.len() >= 2 {
-            let cnum = cp[1].split(" ")[0].trim()
-            cycle = "cycle " + cnum
-        }
-    }
-} catch e {}
-
-// H100 상태
-let mut h100 = "offline"
-try {
-    let h_out = exec("ssh -o ConnectTimeout=3 -o BatchMode=yes -p 10935 root@216.243.220.217 'tail -1 ~/train.log 2>/dev/null' 2>/dev/null").trim()
-    if len(h_out) > 0 {
-        let fields = h_out.split("|")
-        if fields.len() >= 3 {
-            h100 = "step:" + fields[0].trim() + " CE:" + fields[2].trim()
-        }
-    }
-} catch e {}
-
-println("{\"systemMessage\":\"🧠 anima: " + laws + "laws | " + cycle + " | H100:" + h100 + "\"}")

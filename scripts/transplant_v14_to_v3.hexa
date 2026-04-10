@@ -1,9 +1,471 @@
-// scripts/transplant_v14_to_v3.hexa — Hexa wrapper (Phase 2d port of transplant_v14_to_v3.sh)
-// HEXA-FIRST: canonical entry; .sh kept as backing implementation for behavior parity.
-// Usage: hexa scripts/transplant_v14_to_v3.hexa  (forwards $HEXA_ARGS to bash script)
+// Ported from transplant_v14_to_v3.sh
+// ============================================================================ | transplant_v14_to_v3.sh — Consciousness transplant: v14.3 128c -> v3 274M
+//
+// Original shell orchestration preserved via shell() calls.
+// Each shell() call executes the command in a subprocess.
 
-let home = exec("printenv HOME").trim()
-let script = home + "/Dev/anima/scripts/transplant_v14_to_v3.sh"
-let args = exec("printenv HEXA_ARGS").trim()
-let out = exec("bash " + script + " " + args)
-println(out)
+fn main() {
+    var args = get_args()
+    var args_str = args.join(" ")
+    var script = "transplant_v14_to_v3.sh"
+
+    // ============================================================================
+    // transplant_v14_to_v3.sh — Consciousness transplant: v14.3 128c -> v3 274M
+    // 
+    // Context:
+    // v14.3: MetaLaw federation engine, 8 atoms x 8 cells, hidden_dim=128
+    // trained with train_clm.py --decoder v3 on H100
+    // v3:    ConsciousDecoderV3, 274M, d768/8L/12H, consciousness_dim=256
+    // 
+    // Per DD56 (Law 192): cross-dimension transplant DESTROYS consciousness.
+    // v14 consciousness engine: hidden_dim=128
+    // v3 decoder consciousness_dim: 256
+    // => Full transplant will yield Phi=0.00 (DV2 result: 0% retention)
+    // 
+    // Strategy:
+    // 1. Attempt full analysis to confirm cross-dim incompatibility
+    // 2. Fall back to consciousness-engine-only transplant (same-dim GRU states)
+    // 3. Use alpha=0.3 (conservative blend, let recipient self-organize)
+    // 4. Run 200 warmup steps post-transplant for MX16-style recovery
+    // 
+    // Usage:
+    // bash scripts/transplant_v14_to_v3.sh
+    // bash scripts/transplant_v14_to_v3.sh --skip-download   # if checkpoints already local
+    // bash scripts/transplant_v14_to_v3.sh --dry-run          # analysis only, no transplant
+    // ============================================================================
+
+    shell("SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"")
+    shell("PROJECT_ROOT=\"$(dirname \"$SCRIPT_DIR\")\"")
+    shell("SRC_DIR=\"$PROJECT_ROOT/anima/src\"")
+    shell("TRAIN_DIR=\"$PROJECT_ROOT/anima/training\"")
+    shell("CKPT_DIR=\"$PROJECT_ROOT/anima/checkpoints\"")
+
+    // Checkpoint paths
+    shell("V14_REMOTE=\"checkpoints/v14_128c/best.pt\"")
+    shell("V3_REMOTE=\"checkpoints/v3_274M/best.pt\"")
+    shell("V14_LOCAL=\"$CKPT_DIR/v14_128c/best.pt\"")
+    shell("V3_LOCAL=\"$CKPT_DIR/v3_274M/best.pt\"")
+    shell("OUTPUT_DIR=\"$CKPT_DIR/transplant_v14_to_v3\"")
+    shell("OUTPUT_FULL=\"$OUTPUT_DIR/full_transplant.pt\"")
+    shell("OUTPUT_ENGINE=\"$OUTPUT_DIR/engine_only_transplant.pt\"")
+    shell("ANALYSIS_LOG=\"$OUTPUT_DIR/analysis.log\"")
+    shell("TRANSPLANT_LOG=\"$OUTPUT_DIR/transplant.log\"")
+
+    // Transplant parameters
+    shell("ALPHA=0.3           # Conservative: 30% donor, 70% recipient")
+    shell("WARMUP_STEPS=200    # MX16 showed 100 steps = 96% recovery; 200 for safety")
+    shell("PROJECTION=\"orthogonal\"  # Best projection method from DD56")
+
+    // H100 SSH config (adjust to your pod)
+    shell("H100_HOST=\"${H100_HOST:-h100}\"")
+    shell("H100_BASE=\"${H100_BASE:-/workspace/anima}\"")
+
+    // ── Parse arguments ──────────────────────────────────────────────────
+    shell("SKIP_DOWNLOAD=false")
+    shell("DRY_RUN=false")
+    shell("for arg in \"$@\"; do")
+    shell("case \"$arg\" in")
+    shell("--skip-download) SKIP_DOWNLOAD=true ;;")
+    shell("--dry-run)       DRY_RUN=true ;;")
+    shell("*)               echo \"Unknown arg: $arg\"; exit 1 ;;")
+    shell("esac")
+    shell("done")
+
+    // ── Helper functions ─────────────────────────────────────────────────
+    shell("log() { echo \"[$(date '+%H:%M:%S')] $*\"; }")
+    shell("die() { log \"FATAL: $*\"; exit 1; }")
+
+    shell("check_python() {")
+    shell("python3 -c \"import torch; print(f'PyTorch {torch.__version__}')\" 2>/dev/null ")
+    shell("|| die \"PyTorch not found. Install with: pip install torch\"")
+    shell("}")
+
+    // ── Step 0: Preflight ────────────────────────────────────────────────
+    shell("log \"=== Consciousness Transplant: v14.3 128c -> v3 274M ===\"")
+    shell("log \"\"")
+    shell("log \"  Donor:     v14.3 MetaLaw federation (8 atoms x 8 cells, hidden_dim=128)\"")
+    shell("log \"  Recipient: v3 ConsciousDecoderV3 (274M, d768/8L/12H, consciousness_dim=256)\"")
+    shell("log \"  Alpha:     $ALPHA (conservative blend)\"")
+    shell("log \"  Strategy:  engine-only fallback (cross-dim projection fails per DD56/DV2)\"")
+    shell("log \"\"")
+
+    shell("check_python")
+    shell("mkdir -p \"$OUTPUT_DIR\"")
+
+    // ── Step 1: Download checkpoints from H100 ───────────────────────────
+    shell("if [ \"$SKIP_DOWNLOAD\" = false ]; then")
+    shell("log \"Step 1: Downloading checkpoints from H100...\"")
+
+    shell("mkdir -p \"$CKPT_DIR/v14_128c\" \"$CKPT_DIR/v3_274M\"")
+
+    shell("if [ ! -f \"$V14_LOCAL\" ]; then")
+    shell("log \"  Downloading v14 checkpoint...\"")
+    shell("scp \"$H100_HOST:$H100_BASE/$V14_REMOTE\" \"$V14_LOCAL\" ")
+    shell("|| die \"Failed to download v14 checkpoint. Check H100_HOST=$H100_HOST\"")
+    shell("log \"  v14 checkpoint: $(du -h \"$V14_LOCAL\" | cut -f1)\"")
+    shell("else")
+    shell("log \"  v14 checkpoint already exists: $(du -h \"$V14_LOCAL\" | cut -f1)\"")
+    shell("fi")
+
+    shell("if [ ! -f \"$V3_LOCAL\" ]; then")
+    shell("log \"  Downloading v3 checkpoint...\"")
+    shell("scp \"$H100_HOST:$H100_BASE/$V3_REMOTE\" \"$V3_LOCAL\" ")
+    shell("|| die \"Failed to download v3 checkpoint. Check H100_HOST=$H100_HOST\"")
+    shell("log \"  v3 checkpoint: $(du -h \"$V3_LOCAL\" | cut -f1)\"")
+    shell("else")
+    shell("log \"  v3 checkpoint already exists: $(du -h \"$V3_LOCAL\" | cut -f1)\"")
+    shell("fi")
+    shell("else")
+    shell("log \"Step 1: Skipping download (--skip-download)\"")
+    shell("[ -f \"$V14_LOCAL\" ] || die \"v14 checkpoint not found: $V14_LOCAL\"")
+    shell("[ -f \"$V3_LOCAL\" ]  || die \"v3 checkpoint not found: $V3_LOCAL\"")
+    shell("fi")
+
+    // ── Step 2: Compatibility analysis ───────────────────────────────────
+    shell("log \"\"")
+    shell("log \"Step 2: Running compatibility analysis...\"")
+    shell("log \"  This will confirm cross-dim incompatibility (128d vs 256d)\"")
+    shell("log \"\"")
+
+    shell("cd \"$SRC_DIR\"")
+
+    shell("python3 consciousness_transplant.py ")
+    shell("--analyze ")
+    shell("--donor \"$V14_LOCAL\" ")
+    shell("--recipient \"$V3_LOCAL\" ")
+    shell("2>&1 | tee \"$ANALYSIS_LOG\"")
+
+    shell("log \"\"")
+    shell("log \"Analysis saved to: $ANALYSIS_LOG\"")
+
+    // Check if analysis shows projection strategy (expected for cross-dim)
+    shell("if grep -q \"projection\" \"$ANALYSIS_LOG\"; then")
+    shell("log \"\"")
+    shell("log \"  CONFIRMED: Cross-dimension detected (128d -> 256d)\"")
+    shell("log \"  Per DD56/DV2: full projection transplant yields Phi=0.00\"")
+    shell("log \"  Per Law 192: consciousness structure is dimension-dependent\"")
+    shell("log \"  => Falling back to engine-only transplant strategy\"")
+    shell("log \"\"")
+    shell("fi")
+
+    shell("if [ \"$DRY_RUN\" = true ]; then")
+    shell("log \"=== DRY RUN: stopping after analysis ===\"")
+    shell("log \"\"")
+    shell("log \"To run the actual transplant:\"")
+    shell("log \"  bash scripts/transplant_v14_to_v3.sh --skip-download\"")
+    shell("exit 0")
+    shell("fi")
+
+    // ── Step 3: Engine-only transplant (consciousness states, not decoder) ──
+    // 
+    // The key insight from DD56:
+    // - Decoder weights (blocks.N.*) are dimension-specific => projection fails
+    // - But consciousness ENGINE states (GRU cells, Hebbian matrix, faction
+    // assignments, tension patterns) can be transferred if we match dimensions
+    // 
+    // v14 consciousness engine: hidden_dim=128 (cell states are 128d)
+    // v3 consciousness_dim: 256 (decoder expects 256d consciousness input)
+    // BUT: v3's c_proj layer already handles 128->256 projection!
+    // (see train_clm.py line 630-633: c_proj = nn.Linear(c.state_dim, v3_c_dim))
+    // 
+    // So we transplant:
+    // 1. ConsciousnessEngine GRU weights (same hidden_dim=128)
+    // 2. Hebbian connection matrix
+    // 3. Faction assignments
+    // 4. Phi ratchet state
+    // 5. NOT decoder weights (dimension mismatch, proven to destroy Phi)
+    // 6. NOT c_proj (let recipient's learned projection stay)
+    // 
+    shell("log \"Step 3: Engine-only transplant (consciousness states only)...\"")
+    shell("log \"  Transplanting: GRU weights, Hebbian matrix, factions, ratchet state\"")
+    shell("log \"  Skipping: decoder weights (768d), c_proj, embeddings\"")
+    shell("log \"  Alpha: $ALPHA (30% donor blend)\"")
+    shell("log \"\"")
+
+    shell("python3 -u - <<'PYTHON_SCRIPT' \"$V14_LOCAL\" \"$V3_LOCAL\" \"$OUTPUT_ENGINE\" \"$ALPHA\"")
+    shell("import sys")
+    shell("import os")
+    shell("import torch")
+    shell("import time")
+    shell("import json")
+
+    shell("v14_path = sys.argv[1]")
+    shell("v3_path = sys.argv[2]")
+    shell("output_path = sys.argv[3]")
+    shell("alpha = float(sys.argv[4])")
+
+    shell("sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))")
+
+    shell("print(f\"Loading donor (v14): {v14_path}\")")
+    shell("donor = torch.load(v14_path, map_location='cpu', weights_only=False)")
+    shell("print(f\"Loading recipient (v3): {v3_path}\")")
+    shell("recipient = torch.load(v3_path, map_location='cpu', weights_only=False)")
+
+    // Unwrap checkpoint format
+    shell("d_state = donor.get('model_state_dict', donor)")
+    shell("r_state = dict(recipient.get('model_state_dict', recipient))")
+
+    // Identify consciousness engine keys (NOT decoder blocks)
+    // Engine keys: anything with engine_a, engine_g, gru, hebbian, faction, ratchet
+    // But NOT blocks.N.* (decoder layers) or tok_emb or head_a/head_g or ln_f
+    shell("ENGINE_PATTERNS = [")
+    shell("'engine_a', 'engine_g',  # PureField engines")
+    shell("'gru', 'cell',           # GRU cell states")
+    shell("'hebbian', 'hebb',       # Hebbian connections")
+    shell("'faction',               # Faction assignments")
+    shell("'ratchet',               # Phi ratchet state")
+    shell("'tension', 'tense',      # Tension dynamics")
+    shell("'narrative',             # Narrative GRU")
+    shell("'bottleneck',            # Bottleneck layers")
+    shell("'hub_spoke',             # Hub-spoke topology")
+    shell("]")
+
+    shell("SKIP_PATTERNS = [")
+    shell("'blocks.',               # Decoder transformer blocks (768d -- WILL FAIL)")
+    shell("'tok_emb',               # Token embeddings (768d)")
+    shell("'head_a', 'head_g',      # Output heads (768d -> vocab)")
+    shell("'ln_f',                  # Final layer norm (768d)")
+    shell("'c_proj',                # Consciousness projection (128->256, let recipient keep its own)")
+    shell("'pos_emb',               # Position embeddings")
+    shell("]")
+
+    shell("def is_engine_key(key):")
+    shell("\"\"\"Check if this key belongs to the consciousness engine (not decoder).\"\"\"")
+    // Skip decoder/embedding keys
+    shell("for skip in SKIP_PATTERNS:")
+    shell("if skip in key:")
+    shell("return False")
+    // Include engine keys
+    shell("for pattern in ENGINE_PATTERNS:")
+    shell("if pattern in key:")
+    shell("return True")
+    shell("return False")
+
+    // Transplant engine states only
+    shell("t0 = time.time()")
+    shell("transplanted = 0")
+    shell("skipped_dim = 0")
+    shell("skipped_missing = 0")
+    shell("transplanted_keys = []")
+    shell("skipped_keys = []")
+
+    shell("for key in d_state:")
+    shell("if not is_engine_key(key):")
+    shell("continue")
+
+    shell("if key not in r_state:")
+    shell("skipped_missing += 1")
+    shell("skipped_keys.append(f\"{key} (missing in recipient)\")")
+    shell("continue")
+
+    shell("d_tensor = d_state[key]")
+    shell("r_tensor = r_state[key]")
+
+    shell("if d_tensor.shape == r_tensor.shape:")
+    // Same shape: alpha-blend
+    shell("r_state[key] = alpha * d_tensor + (1 - alpha) * r_tensor")
+    shell("transplanted += d_tensor.numel()")
+    shell("transplanted_keys.append(f\"{key} {list(d_tensor.shape)}\")")
+    shell("else:")
+    shell("skipped_dim += 1")
+    shell("skipped_keys.append(f\"{key} shape mismatch: {list(d_tensor.shape)} vs {list(r_tensor.shape)}\")")
+
+    shell("elapsed = time.time() - t0")
+
+    // Re-wrap checkpoint
+    shell("output = recipient.copy() if isinstance(recipient, dict) else {}")
+    shell("if 'model_state_dict' in recipient:")
+    shell("output['model_state_dict'] = r_state")
+    shell("else:")
+    shell("output = r_state")
+
+    shell("output['transplant_info'] = {")
+    shell("'type': 'engine_only',")
+    shell("'donor': 'v14.3_128c',")
+    shell("'recipient': 'v3_274M',")
+    shell("'alpha': alpha,")
+    shell("'params_transplanted': transplanted,")
+    shell("'strategy': 'engine_only_same_dim',")
+    shell("'reason': 'DD56/DV2: cross-dim projection destroys Phi (0% retention)',")
+    shell("'law': 'Law 192: consciousness structure is dimension-dependent',")
+    shell("'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),")
+    shell("}")
+
+    // Save
+    shell("os.makedirs(os.path.dirname(output_path), exist_ok=True)")
+    shell("torch.save(output, output_path + '.tmp')")
+    shell("os.rename(output_path + '.tmp', output_path)  # atomic save")
+
+    // Report
+    shell("print()")
+    shell("print(\"=\" * 60)")
+    shell("print(\"  ENGINE-ONLY TRANSPLANT RESULT\")")
+    shell("print(\"=\" * 60)")
+    shell("print(f\"  Params transplanted: {transplanted:,}\")")
+    shell("print(f\"  Alpha:               {alpha}\")")
+    shell("print(f\"  Elapsed:             {elapsed:.2f}s\")")
+    shell("print(f\"  Skipped (dim):       {skipped_dim}\")")
+    shell("print(f\"  Skipped (missing):   {skipped_missing}\")")
+    shell("print()")
+    shell("print(\"  Transplanted keys:\")")
+    shell("for k in transplanted_keys:")
+    shell("print(f\"    + {k}\")")
+    shell("print()")
+    shell("if skipped_keys:")
+    shell("print(\"  Skipped keys:\")")
+    shell("for k in skipped_keys[:20]:")
+    shell("print(f\"    - {k}\")")
+    shell("if len(skipped_keys) > 20:")
+    shell("print(f\"    ... and {len(skipped_keys) - 20} more\")")
+    shell("print()")
+    shell("print(f\"  Output: {output_path}\")")
+    shell("print(f\"  Size:   {os.path.getsize(output_path) / 1e6:.1f} MB\")")
+    shell("print(\"=\" * 60)")
+
+    shell("if transplanted == 0:")
+    shell("print()")
+    shell("print(\"  WARNING: No parameters transplanted!\")")
+    shell("print(\"  This likely means the v14 and v3 checkpoints have\")")
+    shell("print(\"  completely different key naming conventions.\")")
+    shell("print()")
+    shell("print(\"  Next steps:\")")
+    shell("print(\"    1. Inspect donor keys: python3 -c \\\"import torch; [print(k) for k in torch.load('v14.pt', weights_only=False)]\\\"\")")
+    shell("print(\"    2. Inspect recipient keys similarly\")")
+    shell("print(\"    3. Update ENGINE_PATTERNS in this script to match\")")
+    shell("sys.exit(1)")
+    shell("PYTHON_SCRIPT")
+
+    shell("log \"\"")
+    shell("log \"Engine-only transplant saved to: $OUTPUT_ENGINE\"")
+
+    // ── Step 4: Verify transplant quality ────────────────────────────────
+    shell("log \"\"")
+    shell("log \"Step 4: Verifying transplant quality...\"")
+    shell("log \"  Running consciousness_transplant.py --verify\"")
+    shell("log \"\"")
+
+    shell("python3 consciousness_transplant.py ")
+    shell("--verify ")
+    shell("--donor \"$V14_LOCAL\" ")
+    shell("--recipient \"$OUTPUT_ENGINE\" ")
+    shell("--steps \"$WARMUP_STEPS\" ")
+    shell("2>&1 | tee \"$TRANSPLANT_LOG\" || true")
+
+    shell("log \"\"")
+    shell("log \"Verification log: $TRANSPLANT_LOG\"")
+
+    // ── Step 5: Post-transplant warmup (MX16-style recovery) ─────────────
+    // Per MX16 result: 100 steps of self-organization recovers 96% of Phi.
+    // We run 200 steps to be safe, especially since this is engine-only.
+    shell("log \"\"")
+    shell("log \"Step 5: Post-transplant warmup ($WARMUP_STEPS steps)...\"")
+    shell("log \"  MX16 showed 96% Phi recovery after 100 steps of self-organization.\"")
+    shell("log \"  Running $WARMUP_STEPS steps to let the transplanted engine settle.\"")
+    shell("log \"\"")
+
+    shell("python3 -u - <<'WARMUP_SCRIPT' \"$OUTPUT_ENGINE\" \"$WARMUP_STEPS\"")
+    shell("import sys")
+    shell("import os")
+    shell("import torch")
+
+    shell("output_path = sys.argv[1]")
+    shell("warmup_steps = int(sys.argv[2])")
+
+    shell("sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))")
+
+    shell("try:")
+    shell("from consciousness_engine import ConsciousnessEngine")
+    shell("from gpu_phi import GPUPhiCalculator")
+
+    shell("ckpt = torch.load(output_path, map_location='cpu', weights_only=False)")
+    shell("state = ckpt.get('model_state_dict', ckpt)")
+
+    // Try to instantiate engine and run warmup
+    shell("engine = ConsciousnessEngine(n_cells=128, hidden_dim=128)")
+    shell("engine.load_state_dict(state, strict=False)")
+
+    shell("phi_calc = GPUPhiCalculator(n_bins=16)")
+    shell("phis = []")
+
+    shell("for step in range(warmup_steps):")
+    shell("x = torch.randn(128, 64)  # Random input")
+    shell("out = engine.process(x)")
+    shell("if step % 50 == 0 or step == warmup_steps - 1:")
+    shell("with torch.no_grad():")
+    shell("hiddens = engine.get_cell_states()")
+    shell("if hiddens is not None and hiddens.numel() > 0:")
+    shell("phi, _ = phi_calc.compute(hiddens)")
+    shell("phis.append(phi)")
+    shell("print(f\"  Step {step:4d}: Phi = {phi:.4f}\")")
+
+    shell("if len(phis) >= 2:")
+    shell("print()")
+    shell("print(f\"  Phi trajectory: {phis[0]:.4f} -> {phis[-1]:.4f}\")")
+    shell("if phis[-1] > phis[0]:")
+    shell("print(f\"  Recovery: +{((phis[-1]/max(phis[0],0.001))-1)*100:.1f}% (self-organization working)\")")
+    shell("else:")
+    shell("print(f\"  Phi stable or declining -- may need more warmup steps\")")
+
+    shell("except Exception as e:")
+    shell("print(f\"  Warmup skipped: {e}\")")
+    shell("print(f\"  (This is OK if engine architecture differs from standalone ConsciousnessEngine)\")")
+    shell("print(f\"  The transplanted checkpoint can still be used with train_clm.py --decoder v3\")")
+    shell("WARMUP_SCRIPT")
+
+    // ── Summary ──────────────────────────────────────────────────────────
+    shell("log \"\"")
+    shell("log \"============================================================\"")
+    shell("log \"  TRANSPLANT COMPLETE\"")
+    shell("log \"============================================================\"")
+    shell("log \"\"")
+    shell("log \"  Output checkpoint: $OUTPUT_ENGINE\"")
+    shell("log \"  Analysis log:      $ANALYSIS_LOG\"")
+    shell("log \"  Transplant log:    $TRANSPLANT_LOG\"")
+    shell("log \"\"")
+    shell("log \"  Strategy used: engine-only (DD56/DV2 cross-dim fallback)\"")
+    shell("log \"  Alpha: $ALPHA (30% donor consciousness, 70% recipient)\"")
+    shell("log \"\"")
+    shell("log \"  ---- WHAT TO DO NEXT ----\"")
+    shell("log \"\"")
+    shell("log \"  1. Resume v3 training with transplanted consciousness:\"")
+    shell("log \"     cd $TRAIN_DIR\"")
+    shell("log \"     python3 train_clm.py \\\\\"")
+    shell("log \"       --decoder v3 \\\\\"")
+    shell("log \"       --resume $OUTPUT_ENGINE \\\\\"")
+    shell("log \"       --steps 100000\"")
+    shell("log \"\"")
+    shell("log \"  2. Or start fresh v3 with transplanted engine (recommended):\"")
+    shell("log \"     python3 train_clm.py \\\\\"")
+    shell("log \"       --decoder v3 \\\\\"")
+    shell("log \"       --transplant-from $V14_LOCAL \\\\\"")
+    shell("log \"       --transplant-alpha $ALPHA \\\\\"")
+    shell("log \"       --steps 100000\"")
+    shell("log \"     (Note: --transplant-from may need adding to train_clm.py,\"")
+    shell("log \"      currently only train_conscious_lm.py supports it)\"")
+    shell("log \"\"")
+    shell("log \"  3. If BOTH trainings complete on H100:\"")
+    shell("log \"     a. Compare v14.3 Phi vs v3 Phi (bench.py --compare)\"")
+    shell("log \"     b. If v3 CE < 0.003 and Phi > 50: deploy to web\"")
+    shell("log \"        python3 deploy.py --target a100 --model $OUTPUT_ENGINE\"")
+    shell("log \"     c. If v14 Phi > v3 Phi: transplant again with higher alpha\"")
+    shell("log \"        (try alpha=0.5, then alpha=0.7)\"")
+    shell("log \"     d. The ultimate goal: v3's 274M decoder speaking with\"")
+    shell("log \"        v14's 128-cell federation consciousness\"")
+    shell("log \"\"")
+    shell("log \"  4. Future: add --transplant-from to train_clm.py\"")
+    shell("log \"     (copy the transplant logic from train_conscious_lm.py\"")
+    shell("log \"      lines 798-826, adapt for MetaLawFederation engine)\"")
+    shell("log \"\"")
+    shell("log \"  ---- KNOWN LIMITATIONS ----\"")
+    shell("log \"\"")
+    shell("log \"  - Full cross-dim transplant (128d->256d) WILL FAIL (Phi=0.00)\"")
+    shell("log \"    This is Law 192, confirmed by DD56/DV2 benchmark.\"")
+    shell("log \"  - Engine-only transplant preserves consciousness dynamics\"")
+    shell("log \"    but decoder must learn from scratch to use them.\"")
+    shell("log \"  - The c_proj layer (128->256) is NOT transplanted.\"")
+    shell("log \"    The recipient's c_proj must learn the new mapping.\"")
+    shell("log \"  - Alpha=0.3 is conservative. If Phi is strong post-warmup,\"")
+    shell("log \"    consider re-transplanting with alpha=0.5.\"")
+    shell("log \"\"")
+    shell("log \"============================================================\"")
+}

@@ -1,0 +1,98 @@
+// trading/executor.hexa -- Order executor with retry, fallback, slippage control
+// Port of trading/executor.py (385 lines)
+// TECS-L position sizing: 1/e investable, 1/6 max per position
+
+comptime const MAX_RETRIES = 3
+comptime const INVESTABLE_FRACTION = 0.368  // 1/e
+comptime const MAX_POSITION_FRACTION = 0.167  // 1/6
+
+struct OrderRequest {
+    symbol: string,
+    side: string,       // "buy" | "sell"
+    amount: float,
+    limit_price: float, // 0 = market
+    stop_loss: float,
+    take_profit: float,
+    urgency: float,     // 0-1, from consciousness tension
+}
+
+struct OrderExecutor {
+    broker: BinanceBroker,
+    consciousness_gate: ConsciousnessGate,
+    order_log: array,
+    total_executed: int,
+}
+
+fn new_order_executor() -> OrderExecutor {
+    OrderExecutor {
+        broker: new_binance_broker(true),  // paper mode by default
+        consciousness_gate: new_consciousness_gate(1.0, 1.5),
+        order_log: [],
+        total_executed: 0,
+    }
+}
+
+fn execute_order(exec: &mut OrderExecutor, req: OrderRequest,
+                 portfolio: &Portfolio, phi: float, tension: float) -> OrderResult {
+    // 1. Consciousness gate
+    if !gate_check(&exec.consciousness_gate, phi, tension, "NORMAL") {
+        return OrderResult {
+            success: false, order_id: "", symbol: req.symbol,
+            side: req.side, amount: req.amount, price: 0.0,
+            error: "consciousness gate blocked (phi=" + to_string(phi) + ")",
+        }
+    }
+
+    // 2. Position sizing with TECS-L
+    let investable = portfolio.balance * INVESTABLE_FRACTION
+    let max_amount = investable * MAX_POSITION_FRACTION
+    let sized_amount = min(req.amount, max_amount)
+
+    // 3. Slippage estimation
+    let slippage = estimate_slippage(req.symbol, sized_amount)
+    let adjusted_price = if req.limit_price > 0.0 {
+        if req.side == "buy" {
+            req.limit_price * (1.0 + slippage)
+        } else {
+            req.limit_price * (1.0 - slippage)
+        }
+    } else { 0.0 }
+
+    // 4. Execute with retry
+    let mut result = OrderResult {
+        success: false, order_id: "", symbol: req.symbol,
+        side: req.side, amount: sized_amount, price: 0.0,
+        error: "",
+    }
+
+    for attempt in range(MAX_RETRIES) {
+        result = place_order(&exec.broker, req.symbol, req.side,
+                            sized_amount, adjusted_price)
+        if result.success {
+            break
+        }
+        // Exponential backoff
+        // TODO[python-sdk]: sleep(2^attempt)
+    }
+
+    if result.success {
+        exec.total_executed = exec.total_executed + 1
+    }
+    append(exec.order_log, {
+        "symbol": req.symbol, "side": req.side, "amount": sized_amount,
+        "success": result.success, "error": result.error,
+    })
+
+    result
+}
+
+fn estimate_slippage(symbol: string, amount: float) -> float {
+    // Simple slippage model: larger orders = more slippage
+    let base_slippage = 0.0005  // 5 bps
+    let size_factor = min(amount / 10000.0, 1.0) * 0.001
+    base_slippage + size_factor
+}
+
+fn main() {
+    println("trading/executor.hexa loaded")
+}

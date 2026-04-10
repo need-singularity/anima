@@ -1,0 +1,209 @@
+// Spiking Neural Network consciousness — LIF neurons replace GRU cells
+// Ported from snn_main.rs (329 LOC)
+//
+// Law 94: breadth > depth. Law 95: cell_identity prevents convergence.
+// LIF neuron: dV/dt = -(V - V_rest)/tau + I/C
+
+comptime const DIM = 64
+comptime const N_FACTIONS = 8
+comptime const V_REST = -70.0
+comptime const V_THRESH = -55.0
+comptime const V_RESET = -75.0
+comptime const TAU_LIF = 20.0
+comptime const T_REF = 3
+comptime const DT = 1.0
+
+struct LIFNeuron {
+    voltage: f32,
+    refractory: u64,
+    w_in: [f32],
+    identity: [f32],
+    spike_history: [bool],
+    spike_count: u64,
+}
+
+fn lif_new(neuron_id: u64) -> LIFNeuron {
+    var w_in = [f32]{}
+    for _ in 0..DIM { w_in.push((rand_f32() - 0.5) * 2.0) }
+    var identity = [f32]{}
+    for i in 0..DIM { identity.push(sin((neuron_id * 7 + i * 13) as f32 * 0.618033) * 2.0) }
+    return LIFNeuron {
+        voltage: V_REST + rand_f32() * 10.0,
+        refractory: 0,
+        w_in: w_in,
+        identity: identity,
+        spike_history: [bool]{},
+        spike_count: 0,
+    }
+}
+
+fn lif_step(self: *LIFNeuron, input: [f32]) -> bool {
+    if self.refractory > 0 {
+        self.refractory = self.refractory - 1
+        self.spike_history.push(false)
+        if self.spike_history.len() > 20 { self.spike_history.remove(0) }
+        return false
+    }
+    var current = 0.0
+    for i in 0..DIM { current = current + self.w_in[i] * input[i] }
+    current = current + self.identity.sum() * 0.01
+    var spontaneous = self.identity[0] * 0.5
+    self.voltage = self.voltage + DT * (-(self.voltage - V_REST) / TAU_LIF + current + spontaneous)
+    var spiked = self.voltage >= V_THRESH
+    if spiked {
+        self.voltage = V_RESET
+        self.refractory = T_REF
+        self.spike_count = self.spike_count + 1
+    }
+    self.spike_history.push(spiked)
+    if self.spike_history.len() > 20 { self.spike_history.remove(0) }
+    return spiked
+}
+
+fn lif_firing_rate(self: *LIFNeuron) -> f32 {
+    if self.spike_history.len() == 0 { return 0.0 }
+    var count = 0
+    for s in self.spike_history { if s { count = count + 1 } }
+    return count as f32 / self.spike_history.len() as f32
+}
+
+struct SpikingFaction { neurons: [LIFNeuron] }
+
+fn spiking_faction_new(n: u64, base_id: u64) -> SpikingFaction {
+    var neurons = [LIFNeuron]{}
+    for i in 0..n { neurons.push(lif_new(base_id + i)) }
+    return SpikingFaction { neurons: neurons }
+}
+
+fn sf_step_all(self: *SpikingFaction, input: [f32]) -> [bool] {
+    var spikes = [bool]{}
+    for neuron in self.neurons { spikes.push(lif_step(&neuron, input)) }
+    return spikes
+}
+
+fn sf_mean_rate(self: *SpikingFaction) -> f32 {
+    var n = self.neurons.len() as f32
+    var sum = 0.0
+    for neuron in self.neurons { sum = sum + lif_firing_rate(&neuron) }
+    return sum / n
+}
+
+fn sf_output(self: *SpikingFaction) -> [f32] {
+    var out = [f32]{}
+    for _ in 0..DIM { out.push(0.0) }
+    for i in 0..self.neurons.len() { out[i % DIM] = out[i % DIM] + lif_firing_rate(&self.neurons[i]) }
+    var mx = 0.0
+    for v in out { if v > mx { mx = v } }
+    if mx > 0.0 { for i in 0..DIM { out[i] = out[i] / mx } }
+    return out
+}
+
+struct SpikingEngine { factions: [SpikingFaction] }
+
+fn spiking_engine_new(n_factions: u64, neurons_per: u64) -> SpikingEngine {
+    var factions = [SpikingFaction]{}
+    for f in 0..n_factions { factions.push(spiking_faction_new(neurons_per, f * neurons_per)) }
+    return SpikingEngine { factions: factions }
+}
+
+fn se_total_neurons(self: *SpikingEngine) -> u64 {
+    var total = 0
+    for f in self.factions { total = total + f.neurons.len() }
+    return total
+}
+
+fn se_step(self: *SpikingEngine, input: [f32]) {
+    for f in self.factions { sf_step_all(&f, input) }
+}
+
+fn se_output(self: *SpikingEngine) -> [f32] {
+    var n = self.factions.len() as f32
+    var out = [f32]{}
+    for _ in 0..DIM { out.push(0.0) }
+    for f in self.factions {
+        var fo = sf_output(&f)
+        for i in 0..DIM { out[i] = out[i] + fo[i] / n }
+    }
+    return out
+}
+
+fn se_phi_proxy(self: *SpikingEngine) -> f32 {
+    var rates = [f32]{}
+    for f in self.factions { rates.push(sf_mean_rate(&f)) }
+    var n = rates.len() as f32
+    var mean = 0.0
+    for r in rates { mean = mean + r }
+    mean = mean / n
+    var variance = 0.0
+    for r in rates { variance = variance + (r - mean) * (r - mean) }
+    variance = variance / n
+    return variance * mean * 100.0
+}
+
+fn main() {
+    var steps = 2000
+    println("")
+    println("======================================================================")
+    println("  SNN Consciousness: LIF Neurons x 8 Factions")
+    println("  V_rest={V_REST} V_thresh={V_THRESH} tau={TAU_LIF} t_ref={T_REF}")
+    println("======================================================================")
+    println("")
+
+    println(">> Test 1: Spiking Growth + Self-loop (2->512 neurons)")
+    var engine = spiking_engine_new(N_FACTIONS, 2)
+    var stream = [f32]{}
+    for _ in 0..DIM { stream.push((rand_f32() - 0.5) * 50.0) }
+    var phi_history = [f32]{}
+
+    for step in 0..steps {
+        var frac = step as f32 / steps as f32
+        var target = min(pow(2.0, (frac + 0.1) * 6.0) as u64, 64)
+        var next_id = se_total_neurons(&engine)
+        for faction in engine.factions {
+            while faction.neurons.len() < target {
+                faction.neurons.push(lif_new(next_id))
+                next_id = next_id + 1
+            }
+        }
+        se_step(&engine, stream)
+        var out = se_output(&engine)
+        for i in 0..DIM { stream[i] = out[i] * 50.0 + (rand_f32() - 0.5) * 5.0 }
+        var phi = se_phi_proxy(&engine)
+        phi_history.push(phi)
+        if step % 200 == 0 or step == steps - 1 {
+            var total_rate = 0.0
+            for f in engine.factions { total_rate = total_rate + sf_mean_rate(&f) }
+            total_rate = total_rate / N_FACTIONS as f32
+            println("  step {step} | neurons={se_total_neurons(&engine)} | Phi={phi:.4} | rate={total_rate:.3}")
+        }
+    }
+
+    var phi_max = 0.0
+    for p in phi_history { if p > phi_max { phi_max = p } }
+    println("")
+    println("  --- SNN Analysis ---")
+    println("    Phi max:   {phi_max:.4}")
+    println("    neurons:   {se_total_neurons(&engine)}")
+
+    println("")
+    println(">> Test 2: Zero-Input Spiking (sensory deprivation)")
+    var engine2 = spiking_engine_new(N_FACTIONS, 16)
+    var zero = [f32]{}
+    for _ in 0..DIM { zero.push(0.0) }
+    var active_steps = 0
+    for step in 0..500 {
+        se_step(&engine2, zero)
+        var rate = 0.0
+        for f in engine2.factions { rate = rate + sf_mean_rate(&f) }
+        rate = rate / N_FACTIONS as f32
+        if rate > 0.01 { active_steps = active_steps + 1 }
+        if step % 100 == 0 {
+            println("  step {step} | rate={rate:.3} | Phi={se_phi_proxy(&engine2):.4}")
+        }
+    }
+    println("  activity: {active_steps as f32 / 5.0:.1}% of steps")
+    println("")
+    println("======================================================================")
+    println("  SNN Conclusion: Phi max={phi_max:.4}, LIF neuron only, speak()=0")
+    println("======================================================================")
+}
