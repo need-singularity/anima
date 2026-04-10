@@ -11,6 +11,7 @@
 | 프로젝트 설정 | `shared/project_config.json` | CLI/인프라/PSI 상수/법칙등록 파이프라인 |
 | 시스템 코어 | `shared/core.json` | 시스템맵 + 14종 명령어 |
 | 수렴 | `shared/convergence/anima.json` | CDO 수렴 상태 |
+| 공통 로드맵 | `shared/roadmaps/anima_hexa_common.json` | anima × hexa-lang 공통 진화 (P0~P5) |
 | 할일 | `shared/todo/anima.json` | 우선순위별 TODO |
 | API | `shared/CLAUDE.md` | NEXUS-6 상세 사용법 |
 | 문법 | `shared/hexa_grammar.jsonl` | hexa-lang 문법 + pitfalls |
