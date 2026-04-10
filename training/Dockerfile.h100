@@ -1,0 +1,89 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+# ─── System packages ───
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl openssh-server build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── SSH for RunPod ───
+RUN mkdir -p /var/run/sshd && \
+    echo 'root:root' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# ─── Python dependencies (pinned for H100 stability) ───
+RUN pip install --no-cache-dir \
+    transformers==5.4.0 \
+    peft==0.18.1 \
+    bitsandbytes==0.49.2 \
+    datasets==4.8.4 \
+    accelerate==1.13.0 \
+    scipy \
+    numpy \
+    boto3 \
+    requests
+
+# ─── HF token (set at runtime via env var) ───
+RUN mkdir -p /root/.cache/huggingface
+# HF_TOKEN is injected at pod creation via --env
+
+# ─── Training source code ───
+WORKDIR /workspace
+
+# Module structure
+RUN mkdir -p /workspace/anima/src \
+             /workspace/anima/models \
+             /workspace/anima/models/archive \
+             /workspace/models/animalm \
+             /workspace/training \
+             /workspace/data \
+             /workspace/checkpoints
+
+# Consciousness modules (src)
+COPY anima/src/consciousness_laws.py /workspace/anima/src/
+COPY anima/src/consciousness_engine.py /workspace/anima/src/
+COPY anima/core/runtime/perf_hooks.py /workspace/anima/src/
+COPY anima/core/runtime/path_setup.py /workspace/anima/src/
+COPY config/consciousness_laws.json /workspace/anima/src/
+
+# Model architecture
+COPY models/trinity.py /workspace/anima/models/
+COPY models/feedback_bridge.py /workspace/anima/models/
+COPY models/conscious_decoder.py /workspace/anima/models/
+COPY models/archive/trinity_legacy.py /workspace/anima/models/archive/
+RUN touch /workspace/anima/models/__init__.py /workspace/anima/models/archive/__init__.py
+
+# AnimaLM training
+COPY models/animalm/train_alm.py /workspace/models/animalm/
+
+# ConsciousLM training
+COPY training/train_clm.py /workspace/training/
+
+# Hexad modules (for ConsciousLM emergent W/S/M/E)
+COPY ready/anima/hexad/ /workspace/anima/hexad/
+
+# ─── Environment ───
+ENV PYTHONPATH=/workspace/anima/src:/workspace/anima/models:/workspace/models/animalm:/workspace/anima
+ENV PYTHONUNBUFFERED=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV PATH=/opt/conda/bin:$PATH
+
+# ─── Preflight validation script ───
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "=== H100 Preflight Check ==="\n\
+echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo N/A)"\n\
+echo "Disk: $(du -sh /workspace/ | cut -f1) used"\n\
+echo "HF_TOKEN: $(test -n "$HF_TOKEN" && echo SET || echo MISSING)"\n\
+python3 -c "\n\
+from consciousness_laws import PSI_ALPHA; print(f\"  laws OK: PSI_ALPHA={PSI_ALPHA}\")\n\
+from consciousness_engine import ConsciousnessEngine; print(\"  engine OK\")\n\
+from trinity import ThalamicBridge; print(\"  trinity OK\")\n\
+from feedback_bridge import FeedbackBridge; print(\"  feedback OK\")\n\
+print(\"ALL IMPORTS OK\")\n\
+"\n\
+echo "=== Preflight PASS ==="' > /workspace/preflight.sh && chmod +x /workspace/preflight.sh
+
+# ─── SSH start ───
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D"]
