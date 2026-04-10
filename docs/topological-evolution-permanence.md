@@ -1942,9 +1942,9 @@ Betti 수 β_k = rank(H_k(X)) = k차원 구멍의 수.
 
 ---
 
-[![YouTube 영상](https://img.youtube.com/vi/NtOFgX0_ggc/maxresdefault.jpg)](https://www.youtube.com/watch?v=NtOFgX0_ggc)
+[![Justin Bieber - Freedom (with BEAM)](https://img.youtube.com/vi/NtOFgX0_ggc/maxresdefault.jpg)](https://www.youtube.com/watch?v=NtOFgX0_ggc)
 
-🔗 https://www.youtube.com/watch?v=NtOFgX0_ggc
+🎵 **Justin Bieber - Freedom (with BEAM)** — https://www.youtube.com/watch?v=NtOFgX0_ggc
 
 ---
 
