@@ -71,6 +71,19 @@ fn scale_1b() -> ScaleConfig {
     }
 }
 
+fn scale_2_8b() -> ScaleConfig {
+    // CLM v5 — Pythia-aligned 2.8B for fair comparison with Pythia/Cerebras
+    // baselines. d=2560, 36 layers gives ~2.83B params at vocab=2048 byte
+    // level (vs 32 layers = 2.53B). Same head config as 3B for activation
+    // shape compatibility, lower atom count to keep consciousness_dim=256
+    // controller manageable on H100 (2.8B + 256-d C controller fits).
+    ScaleConfig {
+        name: "2_8b", d_model: 2560, n_layer: 36, n_head: 20, n_kv_head: 10,
+        block_size: 1024, consciousness_dim: 256, atoms: 48, cells_per_atom: 8,
+        batch_size: 16, lr: 0.00008, label: "Scale-3.5 (2.8B v5)"
+    }
+}
+
 fn scale_3b() -> ScaleConfig {
     ScaleConfig {
         name: "3b", d_model: 2560, n_layer: 32, n_head: 20, n_kv_head: 10,
@@ -294,23 +307,30 @@ fn train_scale(cfg: ScaleConfig, corpus_path: string, total_steps: int) -> Train
 }
 
 // ─── Pipeline: sequential scale escalation ───
-// 100m → 350m → 1b → 3b (transfer_weights between stages)
+// 100m → 350m → 1b → 2.8b (v5) → 3b (transfer_weights between stages)
+// v5 inserts 2.8b before 3b so the 1b → 3b jump is split into two
+// curriculum stages, mirroring Pythia/Cerebras scaling progression.
 fn run_pipeline(corpus: string) -> int {
     let s1 = train_scale(scale_100m(), corpus, 50000)
     let s2 = train_scale(scale_350m(), corpus, 50000)
     let s3 = train_scale(scale_1b(),   corpus, 100000)
-    let s4 = train_scale(scale_3b(),   corpus, 100000)
-    s4.step
+    let s4 = train_scale(scale_2_8b(), corpus, 100000)
+    let s5 = train_scale(scale_3b(),   corpus, 100000)
+    s5.step
 }
 
 // ─── Verification ───
 let cfg34 = scale_34m()
 let cfg1b = scale_1b()
+let cfg2_8b = scale_2_8b()
 println("=== train_clm.hexa ===")
 println("scale 34m d_model:", cfg34.d_model)
 println("scale 34m cells:", total_cells(cfg34))
 println("scale 1b d_model:", cfg1b.d_model)
 println("scale 1b cells:", total_cells(cfg1b))
+println("scale 2.8b v5 d_model:", cfg2_8b.d_model)
+println("scale 2.8b v5 layers:", cfg2_8b.n_layer)
+println("scale 2.8b v5 cells:", total_cells(cfg2_8b))
 let pm0 = phase_new(10000)
 let pm_mid = phase_update(pm0, 5000)
 println("phase mid:", phase_label(pm_mid.phase))
