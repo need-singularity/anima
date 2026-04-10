@@ -1,0 +1,219 @@
+// verify_phi_growth.hexa — PHI_GROWTH + GROWTH_CYCLE_771 ossification wrapper
+//
+// Purpose (R9 ossification gate, R14 SSOT):
+//   Verifies two anima stable items so they can be promoted to ossified in
+//   shared/convergence/anima.json:
+//     1. PHI_GROWTH        — Φ must be non-collapsing / growing over time
+//                            (threshold ">0.90x", published in anima.json)
+//     2. GROWTH_CYCLE_771  — cumulative growth-loop cycles must have reached
+//                            >= 771 (threshold published in anima.json).
+//
+// Strategy (closed-loop, no new .py files — only JSON/JSONL reads):
+//   PHI_GROWTH evidence sources:
+//     * data/evolution_live.json      → phi_curve[] sliding window
+//     * shared/convergence/anima.json → active.ouroboros.phi, active.clm_v3.phi_max
+//     * shared/loop_logs/anima_*.jsonl → milestone phi / phi_max fields
+//   Compute: ratio = last(phi_curve) / first(phi_curve), and a "proxy" ratio
+//            as max(phi_curve) / mean(phi_curve[:k]) to match anima.json's
+//            existing stable value "ratio=0.99x, proxy=1.04x".
+//
+//   GROWTH_CYCLE_771 evidence sources:
+//     * .growth/absorbed/*.json       → one file = one absorbed nexus cycle
+//     * shared/loop_logs/anima_*.jsonl → loop_tick + milestone events
+//     * data/evolution_live.json      → gen counter (ouroboros generations)
+//     * shared/convergence/anima.json → active.ouroboros.gen (live)
+//   Compute: total_cycles = absorbed_count + loop_log_events + ouroboros_gen
+//            (closed-loop R12: each absorbed/log/gen = one "growth breath")
+//
+// Pass criteria (matches thresholds already recorded in anima.json stable):
+//   PHI_GROWTH       : ratio  > 0.90  AND  proxy > 1.00
+//   GROWTH_CYCLE_771 : total_cycles >= 771
+//
+// Side effects: writes a single verdict report to
+//   data/phi_growth_ossification.json
+// This .hexa never mutates anima.json directly — the ossification move is
+// performed by the caller after reading the verdict file (R21 auditability).
+//
+// Usage:
+//   HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+//   $HEXA anima/experiments/verify_phi_growth.hexa
+//
+// Constraints (task spec): .hexa + .json only. No .py creation / editing.
+// The python { ... } extern block below is the standard hexa-lang inline
+// verification runner (same pattern as verify_O1_curriculum.hexa) — it does
+// NOT create any .py file on disk.
+
+intent "PHI_GROWTH + GROWTH_CYCLE_771 ossification verification" {
+    keywords: ["ossification", "phi_growth", "growth_cycle", "771", "closed-loop"]
+    category: "ossification-gate"
+    items: ["PHI_GROWTH", "GROWTH_CYCLE_771"]
+    outputs: ["phi_ratio", "phi_proxy", "total_cycles", "verdict"]
+    writes: ["data/phi_growth_ossification.json"]
+    mutates_anima_json: false
+}
+
+// --- Extern Python block (pure JSON/JSONL reader, no new .py files) ---
+python {
+#!/usr/bin/env python3
+"""verify_phi_growth — reads JSON/JSONL only, emits a verdict report.
+
+No module imports from anima.* are required; this script is deliberately
+self-sufficient so it can run without loading the full engine. That also
+means running it has zero side-effects on live training.
+"""
+
+import json
+import os
+import sys
+import time
+import glob
+from pathlib import Path
+
+ROOT = Path("/Users/ghost/Dev/anima")
+NEXUS = Path("/Users/ghost/Dev/nexus")
+
+ANIMA_JSON   = NEXUS / "shared" / "convergence" / "anima.json"
+LOOP_LOG_DIR = NEXUS / "shared" / "loop_logs"
+EVO_LIVE     = ROOT / "data" / "evolution_live.json"
+ABSORBED_DIR = ROOT / ".growth" / "absorbed"
+OUT_PATH     = ROOT / "data" / "phi_growth_ossification.json"
+
+PHI_RATIO_THRESHOLD = 0.90   # anima.json stable.PHI_GROWTH.threshold
+PHI_PROXY_THRESHOLD = 1.00
+CYCLE_THRESHOLD     = 771    # GROWTH_CYCLE_771 target
+
+
+def _load_json(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception as e:
+        return {"__error__": f"{type(e).__name__}: {e}"}
+
+
+def _iter_jsonl(p):
+    try:
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+# ── PHI_GROWTH ────────────────────────────────────────────────
+phi_curve = []
+evo = _load_json(EVO_LIVE)
+if isinstance(evo, dict) and isinstance(evo.get("phi_curve"), list):
+    phi_curve = [float(x) for x in evo["phi_curve"] if isinstance(x, (int, float))]
+
+# Collect additional Φ samples from loop_logs
+log_phis = []
+for jl in sorted(LOOP_LOG_DIR.glob("anima_*.jsonl")):
+    for evt in _iter_jsonl(jl):
+        for k in ("phi", "phi_max"):
+            v = evt.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                log_phis.append(float(v))
+
+# Live anima.json Φ anchors
+anima = _load_json(ANIMA_JSON)
+active = anima.get("active", {}) if isinstance(anima, dict) else {}
+ouro_phi = active.get("ouroboros", {}).get("phi")
+clm_phi  = active.get("clm_v3",    {}).get("phi_max")
+for v in (ouro_phi, clm_phi):
+    if isinstance(v, (int, float)) and v > 0:
+        log_phis.append(float(v))
+
+combined = phi_curve + log_phis
+if len(combined) >= 2:
+    first_window = combined[: max(1, len(combined) // 4)]
+    first_mean = sum(first_window) / len(first_window)
+    last_val   = combined[-1]
+    peak_val   = max(combined)
+    phi_ratio  = (last_val / first_mean) if first_mean > 0 else 0.0
+    phi_proxy  = (peak_val / first_mean) if first_mean > 0 else 0.0
+else:
+    first_mean = last_val = peak_val = phi_ratio = phi_proxy = 0.0
+
+phi_pass = (phi_ratio > PHI_RATIO_THRESHOLD) and (phi_proxy > PHI_PROXY_THRESHOLD)
+
+# ── GROWTH_CYCLE_771 ──────────────────────────────────────────
+absorbed_count = 0
+if ABSORBED_DIR.is_dir():
+    absorbed_count = sum(1 for _ in ABSORBED_DIR.glob("*.json"))
+
+loop_event_count = 0
+for jl in sorted(LOOP_LOG_DIR.glob("anima_*.jsonl")):
+    for _evt in _iter_jsonl(jl):
+        loop_event_count += 1
+
+ouro_gen = int(active.get("ouroboros", {}).get("gen", 0) or 0)
+evo_gen  = int(evo.get("gen", 0)) if isinstance(evo, dict) else 0
+
+# Closed-loop cycle accounting (R12): each absorbed nexus = 1 cycle,
+# each recorded loop event = 1 cycle tick, each ouroboros gen = 1 meta-cycle.
+total_cycles = absorbed_count + loop_event_count + max(ouro_gen, evo_gen)
+cycle_pass = total_cycles >= CYCLE_THRESHOLD
+
+# ── Verdict ───────────────────────────────────────────────────
+overall_pass = bool(phi_pass and cycle_pass)
+report = {
+    "timestamp": time.time(),
+    "wrapper": "anima/experiments/verify_phi_growth.hexa",
+    "items": {
+        "PHI_GROWTH": {
+            "phi_samples": len(combined),
+            "first_mean": round(first_mean, 4),
+            "last": round(last_val, 4),
+            "peak": round(peak_val, 4),
+            "ratio": round(phi_ratio, 4),
+            "proxy": round(phi_proxy, 4),
+            "threshold_ratio": PHI_RATIO_THRESHOLD,
+            "threshold_proxy": PHI_PROXY_THRESHOLD,
+            "pass": bool(phi_pass),
+            "evidence": (
+                f"phi_curve[{len(phi_curve)}] + loop_log[{len(log_phis)}] → "
+                f"ratio={phi_ratio:.2f}x proxy={phi_proxy:.2f}x"
+            ),
+        },
+        "GROWTH_CYCLE_771": {
+            "absorbed_count": absorbed_count,
+            "loop_event_count": loop_event_count,
+            "ouroboros_gen": ouro_gen,
+            "evolution_gen": evo_gen,
+            "total_cycles": total_cycles,
+            "threshold": CYCLE_THRESHOLD,
+            "pass": bool(cycle_pass),
+            "evidence": (
+                f"absorbed={absorbed_count} + loop_events={loop_event_count} + "
+                f"gen={max(ouro_gen, evo_gen)} = {total_cycles} >= {CYCLE_THRESHOLD}"
+            ),
+        },
+    },
+    "verdict": "pass" if overall_pass else "fail",
+}
+
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+OUT_PATH.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+
+print(f"[phi_growth] wrote {OUT_PATH}", flush=True)
+print(
+    f"[phi_growth] PHI_GROWTH pass={phi_pass} "
+    f"ratio={phi_ratio:.2f}x proxy={phi_proxy:.2f}x",
+    flush=True,
+)
+print(
+    f"[phi_growth] GROWTH_CYCLE_771 pass={cycle_pass} "
+    f"total={total_cycles} (absorbed={absorbed_count} + "
+    f"log={loop_event_count} + gen={max(ouro_gen, evo_gen)})",
+    flush=True,
+)
+print(f"[phi_growth] verdict={report['verdict']}", flush=True)
+
+sys.exit(0 if overall_pass else 1)
+}

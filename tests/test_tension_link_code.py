@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Auto-generated tests for tension_link_code (meta_loop L1)."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# FIX(2026-04-10): tension_link_code moved from src/ to anima/models/legacy/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "anima", "models", "legacy"))
 import pytest
 
 

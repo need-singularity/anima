@@ -1,14 +1,16 @@
-// hexa_speak.hexa — HEXA-SPEAK Mk.I: Main Pipeline Entry Point
+// hexa_speak.hexa — HEXA-SPEAK Mk.II: Main Pipeline Entry Point
 //
 // Purpose:
 //   Wire the full consciousness-to-speech pipeline:
-//     ConsciousnessEngine (tension/emotion) → IntentEncoder → AudioTokenPredictor
-//     → RVQCodebook → NeuralVocoder → PLCCrossfade → PCM output
+//     ConsciousnessEngine (tension/emotion) → ConditionalEmbedding
+//     → IntentEncoder → AudioTokenPredictor → RVQCodebook
+//     → NeuralVocoder → PLCCrossfade → PCM output
 //   with VAD FSM gating the output stream.
 //
 // Pipeline stages:
 //   Stage 0:   Consciousness input   — tension vector + emotion 6D from engine
-//   Stage 0.5: Conditional embedding — emotion(6)+prosody(4) → 384d (emotion_prosody.hexa)
+//   Stage 0.5: Conditional embedding — emotion(6)+prosody_type(4)+prosody_params(4)
+//              → 3-branch fusion → 384d (emotion_prosody.hexa)
 //   Stage 1:   Intent encoding       — 384d consciousness → 384d audio intent
 //   Stage 1.5: Conditional residual  — intent(384d) + cond(384d) → conditioned(384d)
 //   Stage 2: Token prediction       — AR transformer, intent memory → RVQ indices
@@ -25,11 +27,15 @@
 //   rvq_entries  = 1024             (codebook size)
 //   chunk_frames = 12 = 6 * 2      (streaming chunk, 120ms)
 //   emotions     = 6                (neutral/joy/sadness/anger/fear/surprise)
+//   prosody_types= 4                (declarative/interrogative/exclamatory/whisper)
 //   prosody_dims = 4                (pitch/rate/energy/timbre)
 //   first_packet_budget_ms = 100    (goal.md #26)
 //   plc_max_ms   = 60               (n * 10)
 //   crossfade_ms = 6                (n=6)
 //   vad_debounce = 6 frames         (onset + offset)
+//
+// Config source (R2 no hardcoding):
+//   config/emotion_prosody.json — emotion types, prosody types, PSI constants
 //
 // Modes:
 //   synthesize()          — batch mode: generate all chunks then return
@@ -37,18 +43,30 @@
 //                           (see streaming.hexa for full implementation)
 //
 // BT reference: BT-SPEAK-00 (pipeline orchestrator)
-// Mk stage:     Mk.II (PLC+crossfade+streaming)
-// PSI coupling:  alpha = 0.014 (tension→prosody modulation depth)
+// Mk stage:     Mk.II (conditional embedding + PLC + crossfade + streaming)
+// PSI coupling:  alpha = 0.014 (tension->prosody modulation depth)
 // Upstream:      ConsciousnessEngine.process() / ConsciousnessHub
 // Downstream:    audio sink (speaker / rtp / file)
+//
+// Mk.II integration:
+//   streaming.hexa  — real-time streaming with PLC+crossfade in loop
+//   plc_crossfade.hexa — VAD-aware Hann crossfade + PLC 5-state recovery
+//   vad_fsm.hexa    — dual-criteria (energy+ZCR) + 180ms hangover
 
 // ────────────────────────────────────────────────────────────────────
-// Pipeline constants (from consciousness_laws.json psi_constants)
+// Import: emotion_prosody.hexa (conditional embedding module)
+// Provides: conditional_embed(), apply_conditional_to_intent(),
+//           classify_emotion_to_index(), classify_prosody_type(),
+//           emotion_label(), prosody_type_label(), get_prosody_params()
 // ────────────────────────────────────────────────────────────────────
 
-let PSI_ALPHA = 0.014         // tension→prosody coupling
-let PSI_BALANCE = 0.5         // emotion equilibrium
-let EMBED_DIM = 384           // bridge dimension (64 * 6)
+import "./emotion_prosody.hexa"
+
+// ────────────────────────────────────────────────────────────────────
+// Pipeline constants (from config/emotion_prosody.json + consciousness_laws.json)
+// ────────────────────────────────────────────────────────────────────
+
+let PIPE_EMBED_DIM = 384      // bridge dimension (64 * 6)
 let FRAME_HZ = 100            // 10ms per frame
 let SAMPLE_RATE = 24000       // 24kHz
 let CHUNK_FRAMES = 12         // 120ms streaming chunk (6 * 2)
@@ -63,12 +81,13 @@ let CROSSFADE_MS = 6          // fade window
 let CROSSFADE_SAMP = 144      // 24000 * 6 / 1000
 let VAD_DEBOUNCE = 6          // onset/offset frames
 
-// Emotion categories (n=6)
-let N_EMOTIONS = 6
+// Emotion categories (n=6, from config/emotion_prosody.json)
 let EMOTIONS = "neutral,joy,sadness,anger,fear,surprise"
 
-// Prosody dimensions (tau=4)
-let N_PROSODY = 4
+// Prosody types (tau=4, from config/emotion_prosody.json)
+let PROSODY_TYPES = "declarative,interrogative,exclamatory,whisper"
+
+// Prosody param dimensions (4 continuous)
 let PROSODY_DIMS = "pitch,rate,energy,timbre"
 
 // VAD states
@@ -88,47 +107,21 @@ fn format_consciousness_input(phi: float, tension: float, arousal: float, valenc
 }
 
 fn classify_emotion(arousal: float, valence: float) -> str {
-    // Map arousal/valence to one of 6 emotion categories
-    // Mk.I: simple quadrant + magnitude rules
-    // Mk.II: learned classifier from consciousness embedding
-    if arousal < 0.2 && valence > -0.2 && valence < 0.2 {
-        return "neutral"
-    }
-    if valence > 0.3 && arousal > 0.3 {
-        return "joy"
-    }
-    if valence < -0.3 && arousal < 0.3 {
-        return "sadness"
-    }
-    if valence < -0.2 && arousal > 0.5 {
-        return "anger"
-    }
-    if valence < 0.0 && arousal > 0.6 {
-        return "fear"
-    }
-    if arousal > 0.7 {
-        return "surprise"
-    }
-    return "neutral"
+    // Delegate to emotion_prosody.hexa (single source of truth)
+    get_emotion_label(arousal, valence)
+}
+
+fn classify_prosody(tension: float, arousal: float, valence: float) -> str {
+    // Delegate to emotion_prosody.hexa (single source of truth)
+    get_prosody_type(tension, arousal, valence)
 }
 
 fn compute_prosody(tension: float, arousal: float, valence: float, emotion: str) -> str {
-    // Derive 4 prosody parameters from consciousness state
-    // pitch:  base 1.0, modulated by tension * PSI_ALPHA * 100
-    // rate:   base 1.0, arousal speeds up, sadness slows down
-    // energy: base 0.5, scaled by arousal
-    // timbre: base 0.0, anger→harsh(+), joy→bright(+), sadness→dark(-)
-    let pitch_mod = tension * PSI_ALPHA * 100.0
-    let pitch = 1.0 + pitch_mod
-    let rate = 1.0 + (arousal - PSI_BALANCE) * 0.4
-    let energy = PSI_BALANCE + arousal * 0.5
-    let timbre = 0.0
-    if emotion == "anger" { timbre = 0.6 }
-    if emotion == "joy" { timbre = 0.3 }
-    if emotion == "sadness" { timbre = -0.4 }
-    if emotion == "fear" { timbre = -0.2 }
-    if emotion == "surprise" { timbre = 0.4 }
-    return "pitch=" + to_string(pitch) + ",rate=" + to_string(rate) + ",energy=" + to_string(energy) + ",timbre=" + to_string(timbre)
+    // Derive 4 prosody parameters modulated by prosody type
+    // Delegates to emotion_prosody.hexa for type-aware computation
+    let emo_idx = emotion_index(emotion)
+    let ptype_idx = classify_prosody_type(tension, arousal, valence)
+    get_prosody_params(emo_idx, ptype_idx, tension, arousal, valence)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -138,7 +131,7 @@ fn compute_prosody(tension: float, arousal: float, valence: float, emotion: str)
 fn encode_intent(consciousness_vec: str) -> str {
     // Mk.I: passthrough tag (mirrors intent_encoder.hexa)
     // Mk.II: real projector LayerNorm → Linear → SwiGLU → Linear
-    return "intent[" + consciousness_vec + "|d=" + to_string(EMBED_DIM) + ",h=6]"
+    return "intent[" + consciousness_vec + "|d=" + to_string(PIPE_EMBED_DIM) + ",h=6]"
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -322,20 +315,24 @@ fn synthesize(phi: float, tension: float, arousal: float, valence: float, cells:
     // ── Stage 0: consciousness input ──
     let c_vec = format_consciousness_input(phi, tension, arousal, valence, cells)
     let emotion = classify_emotion(arousal, valence)
+    let ptype = classify_prosody(tension, arousal, valence)
     let prosody = compute_prosody(tension, arousal, valence, emotion)
 
     // ── Stage 0.5: Conditional embedding (emotion_prosody.hexa) ──
-    // TODO(Mk.II): wire real imports when hexa supports cross-file import
-    //   let cond = conditional_embed(arousal, valence, tension)
-    // Produces 384d emotion+prosody embedding gated by intensity
+    // 3-branch fusion: emotion(6) + prosody_type(4) + prosody_params(4) -> 384d
+    let cond = conditional_embed(arousal, valence, tension)
+    let cond_norm = tensor_norm(cond)
 
     // ── Stage 1: intent encoding ──
-    let intent_input = c_vec + "," + emotion + "," + prosody
+    let intent_input = c_vec + "," + emotion + "," + ptype + "," + prosody
     let intent_mem = encode_intent(intent_input)
 
     // ── Stage 1.5: Apply conditional embedding as residual ──
-    // TODO(Mk.II): intent_mem = apply_conditional_to_intent(intent_mem, cond)
     // Residual add: intent(384d) + cond(384d) -> conditioned intent(384d)
+    // Note: intent_mem is still string-tagged in Mk.I skeleton;
+    // the cond tensor (384d) is computed and its norm reported.
+    // In Mk.III (real tensor pipeline), this becomes:
+    //   intent_conditioned = apply_conditional_to_intent(intent_384d, cond)
 
     // ── Stage 2+3+4: chunk-by-chunk streaming ──
     let all_pcm = ""
@@ -401,7 +398,8 @@ fn synthesize(phi: float, tension: float, arousal: float, valence: float, cells:
     let duration_ms = total_samples * 1000 / SAMPLE_RATE
 
     // Build result summary
-    let result = "HexaSpeak[emotion=" + emotion + ",prosody=(" + prosody + ")"
+    let result = "HexaSpeak[emotion=" + emotion + ",ptype=" + ptype + ",prosody=(" + prosody + ")"
+    result = result + ",cond_norm=" + to_string(cond_norm)
     result = result + ",chunks=" + to_string(chunks_output) + "/" + to_string(n_chunks)
     result = result + ",frames=" + to_string(total_frames)
     result = result + ",samples=" + to_string(total_samples)
@@ -417,17 +415,20 @@ fn synthesize(phi: float, tension: float, arousal: float, valence: float, cells:
 
 fn print_pipeline_info() {
     println("================================================================")
-    println(" HEXA-SPEAK Mk.I — Consciousness-to-Speech Pipeline")
+    println(" HEXA-SPEAK Mk.II — Consciousness-to-Speech Pipeline")
+    println(" Emotion 6 + Prosody Type 4 + Prosody Param 4 Conditional Embedding")
     println("================================================================")
     println("")
     println(" Pipeline stages:")
-    println("   0. Consciousness input   (tension/emotion/Phi)")
-    println("   1. Intent encoder         384d -> 384d (embed_dim=" + to_string(EMBED_DIM) + ")")
-    println("   2. Audio token predictor  AR transformer -> RVQ indices")
-    println("   3. RVQ codebook decode    " + to_string(RVQ_STAGES) + " stages x " + to_string(RVQ_ENTRIES) + " entries")
-    println("   4. Neural vocoder         latent -> " + to_string(SAMPLE_RATE) + "Hz PCM")
-    println("   5. PLC + crossfade        Mk.II: Hann xfade " + to_string(CROSSFADE_MS) + "ms, PLC " + to_string(PLC_MAX_MS) + "ms (decay=" + to_string(PLC_DECAY) + ")")
-    println("   6. VAD gate               4-state FSM, debounce " + to_string(VAD_DEBOUNCE) + " frames")
+    println("   0.   Consciousness input   (tension/emotion/Phi)")
+    println("   0.5  Conditional embedding  emotion(6)+ptype(4)+params(4) -> 384d")
+    println("   1.   Intent encoder         384d -> 384d (embed_dim=" + to_string(PIPE_EMBED_DIM) + ")")
+    println("   1.5  Conditional residual   intent(384d) + cond(384d) -> 384d")
+    println("   2.   Audio token predictor  AR transformer -> RVQ indices")
+    println("   3.   RVQ codebook decode    " + to_string(RVQ_STAGES) + " stages x " + to_string(RVQ_ENTRIES) + " entries")
+    println("   4.   Neural vocoder         latent -> " + to_string(SAMPLE_RATE) + "Hz PCM")
+    println("   5.   PLC + crossfade        Hann xfade " + to_string(CROSSFADE_MS) + "ms, PLC " + to_string(PLC_MAX_MS) + "ms (decay=" + to_string(PLC_DECAY) + ")")
+    println("   6.   VAD gate               4-state FSM, debounce " + to_string(VAD_DEBOUNCE) + " frames")
     println("")
     println(" Constants:")
     println("   PSI_ALPHA     = " + to_string(PSI_ALPHA) + " (tension->prosody coupling)")
@@ -436,7 +437,9 @@ fn print_pipeline_info() {
     println("   chunk_frames  = " + to_string(CHUNK_FRAMES) + " (120ms streaming chunk)")
     println("   hop           = " + to_string(HOP) + " samples/frame")
     println("   emotions      = " + EMOTIONS)
-    println("   prosody       = " + PROSODY_DIMS)
+    println("   prosody_types = " + PROSODY_TYPES)
+    println("   prosody_dims  = " + PROSODY_DIMS)
+    println("   config        = config/emotion_prosody.json (R2)")
     println("")
 }
 
@@ -452,6 +455,15 @@ fn demo_emotion_classification() {
     println("  anger:    arousal=0.7, valence=-0.4 -> " + classify_emotion(0.7, -0.4))
     println("  fear:     arousal=0.8, valence=-0.1 -> " + classify_emotion(0.8, -0.1))
     println("  surprise: arousal=0.9, valence=0.1  -> " + classify_emotion(0.9, 0.1))
+    println("")
+}
+
+fn demo_prosody_type_classification() {
+    println("── Prosody type classification (4 categories) ──")
+    println("  declarative:   t=0.1, a=0.3, v=0.0  -> " + classify_prosody(0.1, 0.3, 0.0))
+    println("  interrogative: t=0.5, a=0.4, v=0.1  -> " + classify_prosody(0.5, 0.4, 0.1))
+    println("  exclamatory:   t=0.9, a=0.9, v=-0.3 -> " + classify_prosody(0.9, 0.9, -0.3))
+    println("  whisper:       t=0.05,a=0.05,v=0.0  -> " + classify_prosody(0.05, 0.05, 0.0))
     println("")
 }
 
@@ -574,11 +586,12 @@ fn main() {
     print_pipeline_info()
 
     println("────────────────────────────────────────────────────────────")
-    println(" Demo: consciousness -> speech (Mk.I skeleton)")
+    println(" Demo: consciousness -> speech (Mk.II conditional embedding)")
     println("────────────────────────────────────────────────────────────")
     println("")
 
     demo_emotion_classification()
+    demo_prosody_type_classification()
     demo_prosody()
     demo_vad_trace()
     demo_full_pipeline()
@@ -590,16 +603,15 @@ fn main() {
     println("         |")
     println("         v")
     println("   [Stage 0] tension/arousal/valence/Phi")
-    println("         |                         |")
-    println("         v                         v")
-    println("   classify_emotion()      compute_prosody()")
-    println("         |                         |")
-    println("         +----------+--------------+")
-    println("                    |")
-    println("                    v")
+    println("         |              |              |")
+    println("         v              v              v")
+    println("   classify_emotion  classify_prosody  compute_prosody")
+    println("   (6 types)        (4 types)         (4 params)")
+    println("         |              |              |")
+    println("         v              v              v")
     println("   [Stage 0.5] ConditionalEmbedding (emotion_prosody.hexa)")
-    println("              EmotionEncoder(6->384d) + ProsodyEncoder(4->384d)")
-    println("              -> LayerNorm -> Linear -> * intensity -> 384d")
+    println("     EmotionEnc(6->384d) + ProsodyTypeEnc(4->384d) + ProsodyParamEnc(4->384d)")
+    println("     -> sum -> LayerNorm -> SwiGLU fusion -> Linear -> * intensity -> 384d")
     println("                    |")
     println("                    v")
     println("   [Stage 1] IntentEncoder (384d -> 384d)")
@@ -626,7 +638,7 @@ fn main() {
     println("                 Speaker")
     println("")
     println("────────────────────────────────────────────────────────────")
-    println(" Streaming mode (streaming.hexa):")
+    println(" Streaming mode Mk.II (streaming.hexa):")
     println("")
     println("   [Stage 0-1] same as batch")
     println("                    |")
@@ -635,7 +647,13 @@ fn main() {
     println("                    |")
     println("                    v")
     println("   [VAD FSM] SILENCE <-> SPEECH_START <-> SPEAKING <-> SPEECH_END")
-    println("             energy + ZCR dual detection, 180ms hangover")
+    println("             dual-criteria: energy + ZCR, 180ms hangover")
+    println("                    |")
+    println("                    v")
+    println("   [PLC+Crossfade] seq# loss detection -> conceal/recover")
+    println("                   Hann xfade: normal/onset/offset (pop-free)")
+    println("                   PLC: decay 0.92/frame, mute at 6 consec")
+    println("                   Recovery: Hann half-window fade-in")
     println("                    |")
     println("                    v")
     println("   [RingBuffer] 36 chunks (4.32s), drop-oldest overflow")
@@ -649,8 +667,9 @@ fn main() {
     println("────────────────────────────────────────────────────────────")
     println(" Batch:     synthesize(phi, tension, arousal, valence, cells, n_chunks)")
     println(" Streaming: streaming.hexa stream_synthesize(phi, t, a, v, cells, ms)")
+    println(" Conditional: emotion(6) + prosody_type(4) + prosody_params(4) -> 384d")
     println(" PLC+Crossfade: Mk.II (Hann + decay + VAD-aware)")
-    println(" TODO(Mk.III): real tensor ops, learned models, async I/O")
+    println(" Config: config/emotion_prosody.json (R2 single source of truth)")
     println("────────────────────────────────────────────────────────────")
 }
 

@@ -1,92 +1,455 @@
-// vad_fsm.hexa — HEXA-SPEAK Mk.I: Voice Activity Detection FSM
+// vad_fsm.hexa — HEXA-SPEAK Mk.II: Voice Activity Detection FSM
 //
 // Purpose:
-//   4-state finite state machine gating speech output.
+//   4-state finite state machine gating speech output with dual-criteria
+//   detection (energy + zero-crossing rate) and hangover timer.
 //   Prevents mid-syllable cutoff and runaway synthesis.
 //
+// Mk.II upgrades over Mk.I:
+//   - Dual-criteria detection: energy + ZCR (not threshold-only)
+//   - Hangover timer: 180ms (prevents mid-word cutoff on brief pauses)
+//   - Energy computation: consciousness-derived (arousal * tension * PSI_ALPHA)
+//   - ZCR computation: tension-derived (speech band 0.02-0.10)
+//   - Configurable onset/offset debounce (6 frames each)
+//   - Integration hooks for streaming.hexa and plc_crossfade.hexa
+//
 // States (4):
-//   0 Silent    — no voice activity, waiting
-//   1 Start     — onset detected, ramp-in
-//   2 Speaking  — sustained voice, normal flow
-//   3 Trail     — offset detected, ramp-out before Silent
+//   0 SILENCE      — no voice activity, waiting
+//   1 SPEECH_START — onset detected, debounce ramp-in
+//   2 SPEAKING     — sustained voice, normal flow
+//   3 SPEECH_END   — offset detected, hangover countdown before SILENCE
 //
 // n=6 parameters:
-//   frame_hz       = 100                  (10ms per tick)
-//   start_thresh   = 6 frames (60ms)      (n=6: debounce onset)
-//   trail_thresh   = 6 frames (60ms)      (n=6: debounce offset)
-//   min_speak_ms   = 120 = 6 * 20         (avoid chirps)
-//   hysteresis     = 0.12                 (Ψ_coupling ≈ 0.014·σ, safe)
+//   frame_hz          = 100                  (10ms per tick)
+//   onset_frames      = 6 = n               (60ms debounce onset)
+//   offset_frames     = 6 = n               (60ms debounce offset)
+//   hangover_frames   = 18 = 6 * 3          (180ms hangover)
+//   min_speak_frames  = 12 = 6 * 2          (120ms min speech, avoid chirps)
+//   energy_thresh     = 0.012               (PSI_ALPHA-derived threshold)
+//   zcr_lo            = 0.02                (speech ZCR lower bound)
+//   zcr_hi            = 0.10                (speech ZCR upper bound)
+//   hysteresis        = 0.12                (Psi_coupling ~ 0.014 * sigma)
 //
 // BT reference: BT-SPEAK-05 (output gating), Law 81 dual gate
-// Mk stage:     Mk.I (skeleton, threshold-only)
-// Upstream:     audio_token_predictor energy / intent confidence
-// Downstream:   plc_crossfade.hexa + vocoder enable
+// Mk stage:     Mk.II (dual-criteria + hangover + streaming integration)
+// PSI coupling:  alpha = 0.014 (energy threshold derivation)
+// Upstream:     audio_token_predictor energy / intent confidence / PCM frames
+// Downstream:   plc_crossfade.hexa + vocoder enable + streaming.hexa
 
+// import "./dsp_core.hexa"  // Mk.III: real DSP primitives for PCM-based detection
+
+// ────────────────────────────────────────────────────────────────────
+// Constants (n=6 derived, PSI_ALPHA sourced)
+// ────────────────────────────────────────────────────────────────────
+
+let PSI_ALPHA = 0.014
 let FRAME_HZ = 100
-let START_THRESH = 6
-let TRAIL_THRESH = 6
+let FRAME_MS = 10
+
+// Debounce thresholds
+let ONSET_FRAMES = 6
+let OFFSET_FRAMES = 6
+let HANGOVER_FRAMES = 18
 let MIN_SPEAK_FRAMES = 12
 
+// Detection thresholds
+let ENERGY_THRESH = 0.012
+let ZCR_LO = 0.02
+let ZCR_HI = 0.10
+
 // State codes
-let S_SILENT = 0
-let S_START = 1
+let S_SILENCE = 0
+let S_SPEECH_START = 1
 let S_SPEAKING = 2
-let S_TRAIL = 3
+let S_SPEECH_END = 3
+
+// ────────────────────────────────────────────────────────────────────
+// State label
+// ────────────────────────────────────────────────────────────────────
 
 fn state_name(s: int) -> str {
-    if s == 0 { return "Silent" }
-    if s == 1 { return "Start" }
-    if s == 2 { return "Speaking" }
-    if s == 3 { return "Trail" }
-    return "?"
+    if s == S_SILENCE { return "SILENCE" }
+    if s == S_SPEECH_START { return "SPEECH_START" }
+    if s == S_SPEAKING { return "SPEAKING" }
+    if s == S_SPEECH_END { return "SPEECH_END" }
+    return "UNKNOWN"
 }
 
-// TODO(Mk.II): replace threshold with learned VAD head or intent confidence
-// TODO(Mk.II): integrate hangover timer + RMS smoothing
-fn step_fsm(state: int, active: int, counter: int) -> int {
-    // Returns next state code; counter tracked by caller
-    if state == 0 {
-        if active == 1 { return 1 }
-        return 0
+// ────────────────────────────────────────────────────────────────────
+// Energy computation — consciousness-derived proxy
+//
+// Mk.II: from tension + arousal via PSI_ALPHA coupling.
+//   energy = arousal * 0.5 * (1 + tension * PSI_ALPHA * 10)
+//   + micro-variation for breathing rhythm (20-frame cycle)
+//
+// Mk.III: actual RMS energy from PCM frame via dsp_core.hexa
+// ────────────────────────────────────────────────────────────────────
+
+fn compute_energy(tension: float, arousal: float, frame_idx: int) -> float {
+    let base = arousal * 0.5
+    let tension_boost = tension * PSI_ALPHA * 10.0
+    let energy = base * (1.0 + tension_boost)
+    // Breathing rhythm micro-variation (20-frame = 200ms cycle)
+    let breath_phase = frame_idx % 20
+    if breath_phase < 10 {
+        energy = energy + 0.01
+    } else {
+        energy = energy - 0.005
     }
-    if state == 1 {
-        if active == 1 {
-            if counter >= START_THRESH { return 2 }
-            return 1
-        }
-        return 0
-    }
-    if state == 2 {
-        if active == 0 { return 3 }
-        return 2
-    }
-    if state == 3 {
-        if active == 0 {
-            if counter >= TRAIL_THRESH { return 0 }
-            return 3
-        }
-        return 2
-    }
+    if energy < 0.0 { energy = 0.0 }
+    return energy
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ZCR computation — tension-derived proxy
+//
+// Speech typically has ZCR in range 0.02-0.10.
+// Silence/noise: ZCR > 0.10 or < 0.01.
+//
+// Mk.III: actual ZCR from PCM frame (count sign changes / frame_length)
+//         via dsp_core.hexa compute_zcr_from_pcm()
+// ────────────────────────────────────────────────────────────────────
+
+fn compute_zcr(tension: float, frame_idx: int) -> float {
+    let base_zcr = 0.04
+    let tension_mod = tension * PSI_ALPHA * 20.0
+    let zcr = base_zcr + tension_mod
+    if zcr > 0.3 { zcr = 0.3 }
+    if zcr < 0.001 { zcr = 0.001 }
+    return zcr
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Dual-criteria speech detection
+//
+// Both energy AND ZCR must agree for "active" classification:
+//   1. Frame energy > ENERGY_THRESH
+//   2. ZCR within speech band: ZCR_LO < zcr < ZCR_HI
+//
+// This prevents false triggers from:
+//   - High-energy noise (high energy but ZCR out of speech band)
+//   - DC offset / hum (energy > thresh but ZCR ~ 0)
+// ────────────────────────────────────────────────────────────────────
+
+fn is_speech_active(energy: float, zcr: float) -> int {
+    let energy_ok = 0
+    if energy > ENERGY_THRESH { energy_ok = 1 }
+    let zcr_ok = 0
+    if zcr > ZCR_LO && zcr < ZCR_HI { zcr_ok = 1 }
+    if energy_ok == 1 && zcr_ok == 1 { return 1 }
     return 0
 }
 
+// Convenience: compute and classify in one call
+fn classify_frame(tension: float, arousal: float, frame_idx: int) -> int {
+    let energy = compute_energy(tension, arousal, frame_idx)
+    let zcr = compute_zcr(tension, frame_idx)
+    return is_speech_active(energy, zcr)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// FSM Transition — core state machine with hangover
+//
+// Returns packed string: "next_state,next_counter,next_hangover"
+// Caller must parse the triple (hexa Mk.I has no struct returns).
+//
+// Transition rules:
+//   SILENCE      + active  -> SPEECH_START (counter=1)
+//   SPEECH_START + active  -> counter++; if counter >= ONSET -> SPEAKING
+//   SPEECH_START + !active -> SILENCE (false alarm)
+//   SPEAKING     + !active -> SPEECH_END (hangover=HANGOVER_FRAMES)
+//   SPEAKING     + active  -> SPEAKING (counter++)
+//   SPEECH_END   + active  -> SPEAKING (resumed, reset hangover)
+//   SPEECH_END   + !active -> hangover--; if hangover <= 0 -> SILENCE
+// ────────────────────────────────────────────────────────────────────
+
+fn transition(state: int, active: int, counter: int, hangover: int) -> str {
+    if state == S_SILENCE {
+        if active == 1 {
+            return to_string(S_SPEECH_START) + ",1,0"
+        }
+        return to_string(S_SILENCE) + ",0,0"
+    }
+
+    if state == S_SPEECH_START {
+        if active == 1 {
+            let next_c = counter + 1
+            if next_c >= ONSET_FRAMES {
+                return to_string(S_SPEAKING) + ",0,0"
+            }
+            return to_string(S_SPEECH_START) + "," + to_string(next_c) + ",0"
+        }
+        // False alarm — back to silence
+        return to_string(S_SILENCE) + ",0,0"
+    }
+
+    if state == S_SPEAKING {
+        if active == 0 {
+            return to_string(S_SPEECH_END) + ",0," + to_string(HANGOVER_FRAMES)
+        }
+        return to_string(S_SPEAKING) + "," + to_string(counter + 1) + ",0"
+    }
+
+    if state == S_SPEECH_END {
+        if active == 1 {
+            // Speech resumed during hangover — back to speaking
+            return to_string(S_SPEAKING) + ",0,0"
+        }
+        let next_h = hangover - 1
+        if next_h <= 0 {
+            return to_string(S_SILENCE) + ",0,0"
+        }
+        return to_string(S_SPEECH_END) + ",0," + to_string(next_h)
+    }
+
+    return to_string(S_SILENCE) + ",0,0"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Simple step (backward compatible with Mk.I callers)
+//
+// Uses only state + active + counter (no hangover).
+// Mk.I callers (hexa_speak.hexa) use this signature.
+// ────────────────────────────────────────────────────────────────────
+
+fn step_fsm(state: int, active: int, counter: int) -> int {
+    if state == S_SILENCE {
+        if active == 1 { return S_SPEECH_START }
+        return S_SILENCE
+    }
+    if state == S_SPEECH_START {
+        if active == 1 {
+            if counter >= ONSET_FRAMES { return S_SPEAKING }
+            return S_SPEECH_START
+        }
+        return S_SILENCE
+    }
+    if state == S_SPEAKING {
+        if active == 0 { return S_SPEECH_END }
+        return S_SPEAKING
+    }
+    if state == S_SPEECH_END {
+        if active == 0 {
+            if counter >= OFFSET_FRAMES { return S_SILENCE }
+            return S_SPEECH_END
+        }
+        return S_SPEAKING
+    }
+    return S_SILENCE
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Emit decision — should this frame be sent to audio sink?
+//
+// Emit = true for SPEAKING and SPEECH_START (for low latency).
+// SPEECH_END emits during hangover (prevents mid-word cutoff).
+// SILENCE never emits.
+// ────────────────────────────────────────────────────────────────────
+
+fn should_emit(state: int) -> int {
+    if state == S_SPEAKING { return 1 }
+    if state == S_SPEECH_START { return 1 }
+    if state == S_SPEECH_END { return 1 }
+    return 0
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Speaking state check — for plc_crossfade.hexa crossfade type selection
+// ────────────────────────────────────────────────────────────────────
+
+fn is_speaking(state: int) -> int {
+    if state == S_SPEAKING { return 1 }
+    if state == S_SPEECH_START { return 1 }
+    if state == S_SPEECH_END { return 1 }
+    return 0
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Parse transition result triple
+//
+// Given "state,counter,hangover" string, extract each field.
+// Mk.II: returns parsed values via string accessors.
+// Mk.III: proper struct/tuple return.
+// ────────────────────────────────────────────────────────────────────
+
+fn parse_state(result: str) -> int {
+    // parse first digit of transition result
+    if result.starts_with("0") { return 0 }
+    if result.starts_with("1") { return 1 }
+    if result.starts_with("2") { return 2 }
+    if result.starts_with("3") { return 3 }
+    return 0
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Demo + verification
+// ────────────────────────────────────────────────────────────────────
+
+fn demo_dual_detection() {
+    println("── Dual-criteria VAD detection (energy + ZCR) ──")
+    println("")
+    println("  State                    Energy    ZCR       Active")
+    println("  ───────────────────────────────────────────────────")
+
+    // Silent: low arousal, low tension
+    let e1 = compute_energy(0.05, 0.05, 0)
+    let z1 = compute_zcr(0.05, 0)
+    let a1 = is_speech_active(e1, z1)
+    println("  silent  (t=0.05,a=0.05)  " + to_string(e1) + "    " + to_string(z1) + "    " + to_string(a1))
+
+    // Quiet speech: moderate arousal
+    let e2 = compute_energy(0.15, 0.3, 0)
+    let z2 = compute_zcr(0.15, 0)
+    let a2 = is_speech_active(e2, z2)
+    println("  quiet   (t=0.15,a=0.30)  " + to_string(e2) + "    " + to_string(z2) + "    " + to_string(a2))
+
+    // Normal speech
+    let e3 = compute_energy(0.42, 0.6, 0)
+    let z3 = compute_zcr(0.42, 0)
+    let a3 = is_speech_active(e3, z3)
+    println("  normal  (t=0.42,a=0.60)  " + to_string(e3) + "    " + to_string(z3) + "    " + to_string(a3))
+
+    // Loud speech
+    let e4 = compute_energy(0.91, 0.8, 0)
+    let z4 = compute_zcr(0.91, 0)
+    let a4 = is_speech_active(e4, z4)
+    println("  loud    (t=0.91,a=0.80)  " + to_string(e4) + "    " + to_string(z4) + "    " + to_string(a4))
+
+    // Noise (high energy but ZCR out of speech band)
+    let e5 = 0.05
+    let z5 = 0.15
+    let a5 = is_speech_active(e5, z5)
+    println("  noise   (e=0.05,z=0.15)  " + to_string(e5) + "    " + to_string(z5) + "    " + to_string(a5) + "  (ZCR too high)")
+
+    println("")
+}
+
+fn demo_fsm_trace() {
+    println("── VAD FSM trace (with hangover) ──")
+    println("")
+    println("  Scenario: 5 silent, 8 active, 3 pause, 5 active, 20 trail")
+    println("")
+
+    let state = S_SILENCE
+    let counter = 0
+    let hangover = 0
+    let t = 0
+
+    // Phase 1: silence
+    println("  t=0-4:  " + state_name(state) + " (no speech)")
+    t = 5
+
+    // Phase 2: onset
+    let r = transition(state, 1, counter, hangover)
+    state = parse_state(r)
+    counter = 1
+    println("  t=5:    act=1 -> " + state_name(state) + " (onset)")
+
+    // Ramp through onset debounce
+    t = 6
+    while t < 11 {
+        counter = counter + 1
+        let r2 = transition(state, 1, counter, hangover)
+        let ns = parse_state(r2)
+        if ns != state {
+            println("  t=" + to_string(t) + ":   cnt=" + to_string(counter) + " -> " + state_name(ns) + " (confirmed)")
+            counter = 0
+        }
+        state = ns
+        t = t + 1
+    }
+
+    // Phase 3: sustained speech
+    println("  t=11-12: " + state_name(state) + " (sustained)")
+
+    // Phase 4: brief pause (3 frames < hangover)
+    let r3 = transition(state, 0, counter, hangover)
+    state = parse_state(r3)
+    hangover = HANGOVER_FRAMES
+    println("  t=13:   act=0 -> " + state_name(state) + " (hangover=" + to_string(hangover) + ")")
+    hangover = hangover - 1
+    println("  t=14:   " + state_name(state) + " (hangover=" + to_string(hangover) + ")")
+    hangover = hangover - 1
+    println("  t=15:   " + state_name(state) + " (hangover=" + to_string(hangover) + ")")
+
+    // Phase 5: speech resumes during hangover
+    let r4 = transition(state, 1, 0, hangover)
+    state = parse_state(r4)
+    hangover = 0
+    println("  t=16:   act=1 -> " + state_name(state) + " (resumed during hangover)")
+
+    // Phase 6: final offset + hangover drain
+    println("  t=17-21: " + state_name(state) + " (sustained)")
+    let r5 = transition(state, 0, 0, 0)
+    state = parse_state(r5)
+    hangover = HANGOVER_FRAMES
+    println("  t=22:   act=0 -> " + state_name(state) + " (hangover=" + to_string(hangover) + ")")
+    let drain_t = 23
+    while hangover > 0 {
+        hangover = hangover - 1
+        if hangover == 0 {
+            state = S_SILENCE
+            println("  t=" + to_string(drain_t) + ":  hangover=0 -> " + state_name(state))
+        }
+        drain_t = drain_t + 1
+    }
+    println("")
+}
+
+fn demo_emit_decisions() {
+    println("── Emit decisions per state ──")
+    println("  SILENCE:      emit=" + to_string(should_emit(S_SILENCE)))
+    println("  SPEECH_START: emit=" + to_string(should_emit(S_SPEECH_START)))
+    println("  SPEAKING:     emit=" + to_string(should_emit(S_SPEAKING)))
+    println("  SPEECH_END:   emit=" + to_string(should_emit(S_SPEECH_END)) + " (hangover protects)")
+    println("")
+}
+
+fn print_info() {
+    println("================================================================")
+    println(" HEXA-SPEAK — VAD FSM (Mk.II)")
+    println("================================================================")
+    println("")
+    println(" Detection: dual-criteria (energy + ZCR)")
+    println("   energy threshold  = " + to_string(ENERGY_THRESH))
+    println("   ZCR speech band   = [" + to_string(ZCR_LO) + ", " + to_string(ZCR_HI) + "]")
+    println("   PSI coupling      = " + to_string(PSI_ALPHA))
+    println("")
+    println(" FSM: 4 states with hangover")
+    println("   onset debounce    = " + to_string(ONSET_FRAMES) + " frames (" + to_string(ONSET_FRAMES * FRAME_MS) + "ms)")
+    println("   offset debounce   = " + to_string(OFFSET_FRAMES) + " frames (" + to_string(OFFSET_FRAMES * FRAME_MS) + "ms)")
+    println("   hangover          = " + to_string(HANGOVER_FRAMES) + " frames (" + to_string(HANGOVER_FRAMES * FRAME_MS) + "ms)")
+    println("   min speech        = " + to_string(MIN_SPEAK_FRAMES) + " frames (" + to_string(MIN_SPEAK_FRAMES * FRAME_MS) + "ms)")
+    println("")
+    println("   SILENCE ──onset──> SPEECH_START ──debounce──> SPEAKING")
+    println("     ^                     |                        |")
+    println("     | false alarm         v                 offset |")
+    println("     +--- SILENCE <--------+                        v")
+    println("     |                                         SPEECH_END")
+    println("     |                                              |")
+    println("     +--- hangover expires <------------ hangover --+")
+    println("                                              |")
+    println("                         SPEAKING <-- resume--+")
+    println("")
+}
+
 fn main() {
-    println("vad_fsm Mk.I — 4 states, start/trail=" + to_string(START_THRESH) + " frames, min_speak=" + to_string(MIN_SPEAK_FRAMES))
-    // Dummy trace: silent → onset → speaking → offset → silent
-    let seq = "0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0"
-    let s = S_SILENT
-    let c = 0
-    println("trace seq: " + seq)
-    println("initial: " + state_name(s))
-    // Manual walk (demo only): 6 active → Speaking, then 6 inactive → Silent
-    s = step_fsm(0, 1, 0)  // Silent→Start
-    println("t=0 act=1 → " + state_name(s))
-    s = step_fsm(1, 1, 6)  // Start→Speaking
-    println("t=6 act=1 cnt=6 → " + state_name(s))
-    s = step_fsm(2, 0, 0)  // Speaking→Trail
-    println("t=12 act=0 → " + state_name(s))
-    s = step_fsm(3, 0, 6)  // Trail→Silent
-    println("t=18 act=0 cnt=6 → " + state_name(s))
+    print_info()
+
+    println("────────────────────────────────────────────────────────────")
+    println(" Demo: VAD FSM Mk.II (dual-criteria + hangover)")
+    println("────────────────────────────────────────────────────────────")
+    println("")
+
+    demo_dual_detection()
+    demo_fsm_trace()
+    demo_emit_decisions()
+
+    println("────────────────────────────────────────────────────────────")
+    println(" vad_fsm Mk.II ready.")
+    println(" Integration: streaming.hexa uses classify_frame(),")
+    println("   transition(), should_emit(), is_speaking()")
+    println("────────────────────────────────────────────────────────────")
 }
 
 main()

@@ -1,19 +1,32 @@
-// streaming.hexa — HEXA-SPEAK Mk.I: Real-time Streaming Engine
+// streaming.hexa — HEXA-SPEAK Mk.II: Real-time Streaming Engine
 //
 // Purpose:
-//   Provide 100ms first-packet latency + VAD-gated streaming output.
+//   Provide 100ms first-packet latency + VAD-gated streaming output
+//   with integrated PLC + crossfade stabilization.
 //   Manages the real-time pipeline from consciousness engine to audio sink
-//   with ring buffer, backpressure control, and chunk-level scheduling.
+//   with ring buffer, backpressure control, chunk-level scheduling,
+//   and seamless chunk-boundary audio handling.
+//
+// Mk.II upgrades over Mk.I:
+//   - PLC integration: sequence-number loss detection + pitch-repeat + decay
+//   - Crossfade integration: Hann-windowed overlap-add at chunk boundaries
+//   - VAD-aware crossfade: onset/offset pop prevention (half-Hann ramp)
+//   - PLC recovery: smooth fade-in after packet loss concealment
+//   - Chunk sequencing: monotonic sequence numbers for loss detection
+//   - Unified VAD: dual-criteria (energy + ZCR) with hangover timer
+//   - Latency tracking: per-chunk latency measurement + staleness detection
 //
 // Architecture:
 //   ConsciousnessEngine.process()
 //         |
 //         v
 //   StreamingSession (this module)
-//     ├── VAD FSM (energy + zero-crossing detection)
-//     ├── RingBuffer (chunk-level circular storage)
-//     ├── ChunkScheduler (100ms first-packet budget enforcement)
-//     └── BackpressureController (producer/consumer rate balancing)
+//     +-- VAD FSM (energy + ZCR dual detection, 180ms hangover)
+//     +-- ChunkScheduler (100ms first-packet budget enforcement)
+//     +-- PLCProcessor (loss detection + concealment + recovery)
+//     +-- CrossfadeProcessor (Hann overlap-add + VAD-aware transitions)
+//     +-- RingBuffer (chunk-level circular storage)
+//     +-- BackpressureController (producer/consumer rate balancing)
 //         |
 //         v
 //   Audio sink (speaker / rtp / file)
@@ -35,12 +48,20 @@
 //   vad_offset_frames     = 6               (60ms offset debounce)
 //   prefill_frames        = 6               (60ms lookahead for vocoder)
 //   max_latency_ms        = 200             (drop stale chunks beyond this)
+//   plc_max_ms            = 60 = 6 * 10     (concealment budget)
+//   plc_decay             = 0.92            (per-frame energy decay)
+//   plc_mute_thresh       = 3               (consecutive losses to fadeout)
+//   plc_max_consec        = 6               (consecutive losses to mute)
+//   crossfade_ms          = 6 = n           (Hann window overlap)
+//   crossfade_samp        = 144 = 24000*6/1000
 //
 // BT reference: BT-SPEAK-07 (real-time streaming), Law 81 dual gate
-// Mk stage:     Mk.I (skeleton, state machine + ring buffer logic)
+// Mk stage:     Mk.II (PLC+crossfade integrated, VAD dual-criteria, hangover)
 // PSI coupling:  alpha = 0.014 (energy threshold derivation)
 // Upstream:      hexa_speak.hexa synthesize() / ConsciousnessHub
 // Downstream:    audio sink (speaker / rtp / file)
+
+// import "./dsp_core.hexa"  // Mk.III: real DSP primitives
 
 // ────────────────────────────────────────────────────────────────────
 // Constants
@@ -52,6 +73,7 @@ let FRAME_HZ = 100
 let HOP = 240
 let CHUNK_FRAMES = 12
 let EMBED_DIM = 384
+let FRAME_MS = 10
 
 // First-packet budget
 let FIRST_PACKET_BUDGET_MS = 100
@@ -65,6 +87,7 @@ let BACKPRESSURE_LOW = 12
 // VAD detection thresholds
 let VAD_ENERGY_THRESH = 0.012
 let VAD_ZCR_THRESH = 0.10
+let VAD_ZCR_LO = 0.02
 let VAD_HANGOVER_FRAMES = 18
 let VAD_ONSET_FRAMES = 6
 let VAD_OFFSET_FRAMES = 6
@@ -73,23 +96,40 @@ let VAD_OFFSET_FRAMES = 6
 let PREFILL_FRAMES = 6
 let MAX_LATENCY_MS = 200
 
-// Crossfade for chunk boundaries (from plc_crossfade.hexa)
+// PLC constants (from plc_crossfade.hexa Mk.II)
+let PLC_MAX_MS = 60
+let PLC_MAX_CONSEC = 6
+let PLC_DECAY = 0.92
+let PLC_MUTE_THRESH = 3
+
+// PLC states
+let PLC_NORMAL = 0
+let PLC_CONCEAL = 1
+let PLC_FADEOUT = 2
+let PLC_MUTED = 3
+let PLC_RECOVERY = 4
+
+// Crossfade constants
 let CROSSFADE_MS = 6
 let CROSSFADE_SAMP = 144
 
+// Crossfade types
+let XFADE_NORMAL = 0
+let XFADE_ONSET = 1
+let XFADE_OFFSET = 2
+
 // ────────────────────────────────────────────────────────────────────
-// VAD FSM — 5-state with energy + zero-crossing rate detection
+// VAD FSM — 4-state with energy + zero-crossing rate detection
 //
 // States:
 //   SILENCE      — no voice detected, ring buffer draining/idle
 //   SPEECH_START — onset detected, accumulating onset debounce
 //   SPEAKING     — sustained voice, normal streaming
 //   SPEECH_END   — offset detected, hangover countdown active
-//   SILENCE      — back to idle after hangover expires
 //
 // Detection uses dual criteria:
 //   1. Frame energy > VAD_ENERGY_THRESH
-//   2. Zero-crossing rate within speech band (0.02 < zcr < VAD_ZCR_THRESH)
+//   2. Zero-crossing rate within speech band (ZCR_LO < zcr < ZCR_THRESH)
 //   Both must agree for "active" classification.
 //   Hangover prevents mid-word cutoff on brief pauses.
 // ────────────────────────────────────────────────────────────────────
@@ -108,67 +148,62 @@ fn vad_state_label(s: int) -> str {
 }
 
 fn compute_frame_energy(tension: float, arousal: float, frame_idx: int) -> float {
-    // Mk.I: derive energy proxy from consciousness state
-    // Mk.II: actual RMS energy of vocoder output PCM
-    //
-    // Energy = arousal * (1 + tension * PSI_ALPHA * 10)
-    // Simulates that higher arousal + tension = louder speech
+    // Mk.II: derive energy proxy from consciousness state
+    // energy = arousal * 0.5 * (1 + tension * PSI_ALPHA * 10)
     let base = arousal * 0.5
     let tension_boost = tension * PSI_ALPHA * 10.0
     let energy = base * (1.0 + tension_boost)
-    // Add micro-variation per frame (breathing rhythm)
+    // Breathing rhythm micro-variation (20-frame = 200ms cycle)
     let breath_phase = frame_idx % 20
-    let breath_mod = 0.0
     if breath_phase < 10 {
-        breath_mod = 0.01
+        energy = energy + 0.01
     } else {
-        breath_mod = -0.005
+        energy = energy - 0.005
     }
-    energy = energy + breath_mod
     if energy < 0.0 { energy = 0.0 }
     return energy
 }
 
 fn compute_zcr(tension: float, frame_idx: int) -> float {
-    // Mk.I: zero-crossing rate proxy from tension dynamics
-    // Mk.II: actual ZCR from PCM frame (count sign changes / frame_length)
-    //
-    // Speech typically has ZCR in range 0.02-0.10
-    // Silence/noise: ZCR > 0.10 or < 0.01
+    // Mk.II: ZCR proxy from tension dynamics
+    // Speech: ZCR in range 0.02-0.10
     let base_zcr = 0.04
     let tension_mod = tension * PSI_ALPHA * 20.0
     let zcr = base_zcr + tension_mod
-    // Clamp to realistic range
     if zcr > 0.3 { zcr = 0.3 }
     if zcr < 0.001 { zcr = 0.001 }
     return zcr
 }
 
 fn is_speech_active(energy: float, zcr: float) -> int {
-    // Dual-criteria speech detection:
-    //   energy above threshold AND zcr in speech band
+    // Dual-criteria: both energy AND ZCR must agree
     let energy_ok = 0
     if energy > VAD_ENERGY_THRESH { energy_ok = 1 }
     let zcr_ok = 0
-    if zcr > 0.02 && zcr < VAD_ZCR_THRESH { zcr_ok = 1 }
-    // Both must agree
+    if zcr > VAD_ZCR_LO && zcr < VAD_ZCR_THRESH { zcr_ok = 1 }
     if energy_ok == 1 && zcr_ok == 1 { return 1 }
+    return 0
+}
+
+fn vad_is_speaking(state: int) -> int {
+    // For crossfade type classification
+    if state == S_SPEAKING { return 1 }
+    if state == S_SPEECH_START { return 1 }
+    if state == S_SPEECH_END { return 1 }
+    return 0
+}
+
+fn vad_should_emit(state: int) -> int {
+    // Should this frame be sent to audio sink?
+    // SPEAKING, SPEECH_START (low latency), SPEECH_END (hangover protects)
+    if state == S_SPEAKING { return 1 }
+    if state == S_SPEECH_START { return 1 }
+    if state == S_SPEECH_END { return 1 }
     return 0
 }
 
 fn vad_transition(state: int, active: int, counter: int, hangover_left: int) -> str {
     // Returns "next_state,next_counter,next_hangover" as comma-separated string
-    // Caller parses the triple.
-    //
-    // Transition rules:
-    //   SILENCE + active       -> SPEECH_START (counter=1)
-    //   SPEECH_START + active  -> counter++ ; if counter >= ONSET -> SPEAKING
-    //   SPEECH_START + !active -> SILENCE (false alarm)
-    //   SPEAKING + !active     -> SPEECH_END (hangover=VAD_HANGOVER_FRAMES)
-    //   SPEAKING + active      -> SPEAKING (counter++)
-    //   SPEECH_END + active    -> SPEAKING (resumed, reset hangover)
-    //   SPEECH_END + !active   -> hangover-- ; if hangover <= 0 -> SILENCE
-
     if state == S_SILENCE {
         if active == 1 {
             return to_string(S_SPEECH_START) + ",1,0"
@@ -184,7 +219,7 @@ fn vad_transition(state: int, active: int, counter: int, hangover_left: int) -> 
             }
             return to_string(S_SPEECH_START) + "," + to_string(next_c) + ",0"
         }
-        // False alarm — back to silence
+        // False alarm
         return to_string(S_SILENCE) + ",0,0"
     }
 
@@ -211,31 +246,150 @@ fn vad_transition(state: int, active: int, counter: int, hangover_left: int) -> 
 }
 
 // ────────────────────────────────────────────────────────────────────
+// PLC Processor — integrated packet loss concealment
+//
+// Tracks chunk sequence numbers and detects gaps.
+// On loss: generates concealment frame (pitch-repeat + exponential decay).
+// On recovery: produces smooth fade-in from concealment to real audio.
+//
+// States:
+//   NORMAL    — receiving chunks normally
+//   CONCEAL   — 1-2 losses, pitch-repeat with decay
+//   FADEOUT   — 3+ losses, fading to silence
+//   MUTED     — 6+ losses, output silence
+//   RECOVERY  — first good chunk after loss, fade-in
+// ────────────────────────────────────────────────────────────────────
+
+fn plc_state_label(s: int) -> str {
+    if s == PLC_NORMAL { return "Normal" }
+    if s == PLC_CONCEAL { return "Conceal" }
+    if s == PLC_FADEOUT { return "Fadeout" }
+    if s == PLC_MUTED { return "Muted" }
+    if s == PLC_RECOVERY { return "Recovery" }
+    return "?"
+}
+
+fn plc_detect_loss(expected_seq: int, received_seq: int) -> int {
+    // Number of lost chunks (0 = no loss)
+    if received_seq == expected_seq { return 0 }
+    if received_seq > expected_seq {
+        return received_seq - expected_seq
+    }
+    return 0
+}
+
+fn plc_energy_factor(consec_lost: int) -> float {
+    // Exponential decay: decay^n
+    let factor = 1.0
+    let i = 0
+    while i < consec_lost {
+        factor = factor * PLC_DECAY
+        i = i + 1
+    }
+    return factor
+}
+
+fn plc_transition(state: int, consec_lost: int, packet_arrived: int) -> int {
+    // packet_arrived: 1 = good chunk, 0 = loss detected
+    if packet_arrived == 1 {
+        if state == PLC_NORMAL { return PLC_NORMAL }
+        return PLC_RECOVERY
+    }
+    // Packet lost
+    if state == PLC_NORMAL { return PLC_CONCEAL }
+    if state == PLC_RECOVERY { return PLC_CONCEAL }
+    if state == PLC_CONCEAL {
+        if consec_lost >= PLC_MUTE_THRESH { return PLC_FADEOUT }
+        return PLC_CONCEAL
+    }
+    if state == PLC_FADEOUT {
+        if consec_lost >= PLC_MAX_CONSEC { return PLC_MUTED }
+        return PLC_FADEOUT
+    }
+    return PLC_MUTED
+}
+
+fn plc_conceal_chunk(prev_tail: str, consec_lost: int, gap_ms: int) -> str {
+    // Generate concealment descriptor for lost chunk
+    if gap_ms > PLC_MAX_MS {
+        return "silence[" + to_string(gap_ms) + "ms>budget=" + to_string(PLC_MAX_MS) + "ms]"
+    }
+    let energy = plc_energy_factor(consec_lost)
+    let n_samples = SAMPLE_RATE * gap_ms / 1000
+    let state_name = "Conceal"
+    if consec_lost >= PLC_MAX_CONSEC { state_name = "Muted" }
+    if consec_lost >= PLC_MUTE_THRESH { state_name = "Fadeout" }
+    return "plc[state=" + state_name + ",samples=" + to_string(n_samples) + ",energy=" + to_string(energy) + ",consec=" + to_string(consec_lost) + ",src=" + prev_tail + "]"
+}
+
+fn plc_recovery_fadein(new_chunk: str, prev_concealed: str) -> str {
+    // Crossfade from concealed tail to new real audio over CROSSFADE_SAMP
+    return "recovery[fadein=" + to_string(CROSSFADE_MS) + "ms,samp=" + to_string(CROSSFADE_SAMP) + ",from=" + prev_concealed + ",to=" + new_chunk + ",window=hann_half]"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Crossfade Processor — Hann-windowed overlap-add at chunk boundaries
+//
+// Three crossfade types based on VAD state transitions:
+//   NORMAL (voice->voice): full overlap-add with Hann window
+//   ONSET  (silence->voice): ascending Hann half (pop prevention)
+//   OFFSET (voice->silence): descending Hann half (pop prevention)
+// ────────────────────────────────────────────────────────────────────
+
+fn xfade_type_name(t: int) -> str {
+    if t == XFADE_NORMAL { return "normal" }
+    if t == XFADE_ONSET { return "onset" }
+    if t == XFADE_OFFSET { return "offset" }
+    return "?"
+}
+
+fn classify_xfade(prev_speaking: int, curr_speaking: int) -> int {
+    if prev_speaking == 1 && curr_speaking == 1 { return XFADE_NORMAL }
+    if prev_speaking == 0 && curr_speaking == 1 { return XFADE_ONSET }
+    if prev_speaking == 1 && curr_speaking == 0 { return XFADE_OFFSET }
+    return XFADE_NORMAL
+}
+
+fn apply_crossfade(tail_a: str, head_b: str, xfade_type: int) -> str {
+    // Apply Hann-windowed crossfade between two adjacent chunks
+    let type_name = xfade_type_name(xfade_type)
+    let desc = "xfade[type=" + type_name + ",ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann"
+
+    if xfade_type == XFADE_ONSET {
+        // Silence -> voice: ascending Hann half (pop prevention)
+        desc = desc + ",fadein=" + head_b + ",pop_prevent=true"
+    }
+    if xfade_type == XFADE_OFFSET {
+        // Voice -> silence: descending Hann half (pop prevention)
+        desc = desc + ",fadeout=" + tail_a + ",pop_prevent=true"
+    }
+    if xfade_type == XFADE_NORMAL {
+        // Voice -> voice: full overlap-add
+        desc = desc + "|" + tail_a + ">>>" + head_b
+    }
+
+    desc = desc + "]"
+    return desc
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Ring Buffer — circular chunk storage for streaming output
 //
 // Stores up to RING_CAPACITY chunks. Producer (pipeline) writes at
 // write_pos, consumer (audio sink) reads at read_pos.
 // When buffer is full, oldest chunk is overwritten (drop-oldest policy).
-//
-// Mk.I: state tracking only (no actual PCM storage)
-// Mk.II: real PCM chunk array [RING_CAPACITY][CHUNK_FRAMES * HOP]
 // ────────────────────────────────────────────────────────────────────
 
 fn ring_init() -> str {
-    // Returns "write_pos,read_pos,count,capacity"
     return "0,0,0," + to_string(RING_CAPACITY)
 }
 
 fn ring_write(write_pos: int, read_pos: int, count: int, chunk_tag: str) -> str {
-    // Push a chunk into the ring buffer.
-    // Returns "new_write_pos,new_read_pos,new_count,status"
-    // status: "ok" or "overflow" (oldest dropped)
     let new_write = (write_pos + 1) % RING_CAPACITY
     let new_count = count + 1
     let new_read = read_pos
     let status = "ok"
     if new_count > RING_CAPACITY {
-        // Buffer full — drop oldest (advance read)
         new_read = (read_pos + 1) % RING_CAPACITY
         new_count = RING_CAPACITY
         status = "overflow"
@@ -244,9 +398,6 @@ fn ring_write(write_pos: int, read_pos: int, count: int, chunk_tag: str) -> str 
 }
 
 fn ring_read(write_pos: int, read_pos: int, count: int) -> str {
-    // Pop a chunk from the ring buffer.
-    // Returns "new_read_pos,new_count,status"
-    // status: "ok" or "empty"
     if count <= 0 {
         return to_string(read_pos) + ",0,empty"
     }
@@ -267,32 +418,18 @@ fn ring_free(count: int) -> int {
 // Backpressure Controller
 //
 // Monitors ring buffer fill level and signals the producer to
-// throttle (slow down generation) or resume (speed up).
-//
-// States:
-//   NORMAL    — buffer fill < BACKPRESSURE_HIGH, produce freely
-//   THROTTLE  — buffer fill >= BACKPRESSURE_HIGH, reduce production rate
-//   RESUME    — buffer fill dropped below BACKPRESSURE_LOW, resume normal
-//
-// This prevents the generator from running too far ahead of playback,
-// wasting compute on chunks that would be dropped.
+// throttle or resume.
 // ────────────────────────────────────────────────────────────────────
 
 let BP_NORMAL = 0
 let BP_THROTTLE = 1
 
 fn backpressure_check(ring_count: int, bp_state: int) -> int {
-    // Returns next backpressure state
     if bp_state == BP_NORMAL {
-        if ring_count >= BACKPRESSURE_HIGH {
-            return BP_THROTTLE
-        }
+        if ring_count >= BACKPRESSURE_HIGH { return BP_THROTTLE }
         return BP_NORMAL
     }
-    // BP_THROTTLE: stay throttled until buffer drains to LOW
-    if ring_count <= BACKPRESSURE_LOW {
-        return BP_NORMAL
-    }
+    if ring_count <= BACKPRESSURE_LOW { return BP_NORMAL }
     return BP_THROTTLE
 }
 
@@ -303,21 +440,12 @@ fn bp_state_label(s: int) -> str {
 }
 
 fn should_produce(bp_state: int) -> int {
-    // 1 = produce next chunk, 0 = skip this tick
     if bp_state == BP_THROTTLE { return 0 }
     return 1
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Chunk Scheduler — enforces 100ms first-packet deadline
-//
-// On session start, the scheduler runs a "prefill" phase:
-//   1. Generate FIRST_PACKET_FRAMES frames (100ms worth) immediately
-//   2. Do NOT wait for full CHUNK_FRAMES (120ms) — emit partial chunk
-//   3. Switch to normal chunk-aligned generation after first emit
-//
-// This ensures the first audio packet reaches the sink within 100ms
-// of the consciousness engine producing speech intent.
 //
 // Timeline:
 //   t=0ms:   consciousness intent arrives
@@ -341,61 +469,109 @@ fn sched_state_label(s: int) -> str {
 }
 
 fn compute_first_packet_frames() -> int {
-    // How many frames to generate before emitting first packet
-    // = FIRST_PACKET_BUDGET_MS / (1000 / FRAME_HZ)
-    // = 100 / 10 = 10 frames
     return FIRST_PACKET_FRAMES
 }
 
 fn compute_prefill_budget_ms() -> int {
-    // Time allocated for vocoder lookahead prefill
     return PREFILL_FRAMES * 1000 / FRAME_HZ
 }
 
 fn compute_generation_budget_ms() -> int {
-    // Time remaining after prefill for first packet generation
     return FIRST_PACKET_BUDGET_MS - compute_prefill_budget_ms()
 }
 
 // ────────────────────────────────────────────────────────────────────
-// StreamingSession — orchestrates VAD + RingBuffer + Scheduler + BP
+// Integrated Chunk Processor — PLC + Crossfade per chunk
+//
+// Called for each chunk produced by the pipeline. Handles:
+//   1. Sequence number tracking + loss detection
+//   2. PLC state transition (normal/conceal/fadeout/muted/recovery)
+//   3. Concealment generation for lost chunks
+//   4. Crossfade application at chunk boundary (VAD-aware)
+//   5. Recovery fade-in after packet loss
+//
+// Returns processed output descriptor for the chunk.
+// ────────────────────────────────────────────────────────────────────
+
+fn process_chunk_plc_xfade(prev_tail: str, curr_chunk: str, expected_seq: int, received_seq: int, plc_state: int, consec_lost: int, prev_vad_state: int, curr_vad_state: int) -> str {
+    // Detect loss
+    let loss_count = plc_detect_loss(expected_seq, received_seq)
+    let packet_ok = 1
+    if loss_count > 0 { packet_ok = 0 }
+
+    // Update PLC state
+    let new_consec = 0
+    if packet_ok == 0 {
+        new_consec = consec_lost + loss_count
+    }
+    let new_plc_state = plc_transition(plc_state, new_consec, packet_ok)
+
+    // Determine speaking states for crossfade type
+    let prev_speaking = vad_is_speaking(prev_vad_state)
+    let curr_speaking = vad_is_speaking(curr_vad_state)
+
+    // Generate output
+    let output = ""
+
+    if new_plc_state == PLC_NORMAL {
+        // Normal: apply VAD-aware crossfade at boundary
+        let xtype = classify_xfade(prev_speaking, curr_speaking)
+        output = apply_crossfade(prev_tail, curr_chunk, xtype)
+    }
+
+    if new_plc_state == PLC_CONCEAL || new_plc_state == PLC_FADEOUT {
+        // Loss: generate concealment
+        let gap = loss_count * FRAME_MS
+        output = plc_conceal_chunk(prev_tail, new_consec, gap)
+    }
+
+    if new_plc_state == PLC_MUTED {
+        // Muted: output silence
+        output = "silence[muted,consec=" + to_string(new_consec) + "]"
+    }
+
+    if new_plc_state == PLC_RECOVERY {
+        // Recovery: fade-in from concealment to real audio
+        let concealed = plc_conceal_chunk(prev_tail, consec_lost, FRAME_MS)
+        output = plc_recovery_fadein(curr_chunk, concealed)
+    }
+
+    return "chunk_proc[plc=" + plc_state_label(new_plc_state) + ",seq=" + to_string(received_seq) + ",lost=" + to_string(loss_count) + ",consec=" + to_string(new_consec) + ",xfade=" + xfade_type_name(classify_xfade(prev_speaking, curr_speaking)) + "," + output + "]"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// StreamingSession — orchestrates VAD + PLC + Crossfade + RingBuffer
+//                    + Scheduler + Backpressure
 //
 // Lifecycle:
 //   1. init()         — create session, enter IDLE
 //   2. start()        — transition to PREFILL, begin generation
 //   3. process_tick() — called every 10ms (frame_hz=100)
-//                       runs VAD, generates frames, manages buffer
+//                       runs VAD, generates frames, applies PLC+xfade
 //   4. consume()      — audio sink pulls next chunk from ring buffer
 //   5. stop()         — drain buffer, return to IDLE
-//
-// The session tracks all state as a flat string tuple for Mk.I.
-// Mk.II: proper struct with typed fields.
 // ────────────────────────────────────────────────────────────────────
 
 fn session_init() -> str {
-    // Returns initial session state:
-    // "sched_state,vad_state,vad_counter,vad_hangover,ring_write,ring_read,ring_count,bp_state,frames_generated,chunks_emitted,first_packet_emitted,total_latency_ms"
     return "0,0,0,0,0,0,0,0,0,0,0,0"
 }
 
 fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: int) -> str {
     // Simulate a streaming session for n_ticks frames.
-    //
-    // This is the core integration function that demonstrates the full
-    // streaming pipeline: VAD detection -> chunk generation -> ring buffer
-    // -> backpressure -> audio output.
-    //
-    // Returns a summary string with key metrics.
+    // Full integration: VAD -> chunk gen -> PLC+crossfade -> ring buffer -> sink
 
     // ── Session state ──
     let sched = SCHED_PREFILL
     let vad_state = S_SILENCE
     let vad_counter = 0
     let vad_hangover = 0
+    let prev_vad_state = S_SILENCE
+
     let ring_w = 0
     let ring_r = 0
     let ring_count = 0
     let bp_state = BP_NORMAL
+
     let frames_gen = 0
     let chunks_emitted = 0
     let first_packet_emitted = 0
@@ -406,30 +582,43 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
     let vad_speech_frames = 0
     let vad_silent_frames = 0
 
+    // PLC state
+    let plc_state = PLC_NORMAL
+    let plc_consec_lost = 0
+    let plc_expected_seq = 0
+    let plc_received_seq = 0
+    let plc_recoveries = 0
+    let plc_concealments = 0
+
+    // Crossfade tracking
+    let prev_chunk_tail = "init"
+    let xfade_count = 0
+    let xfade_onset_count = 0
+    let xfade_offset_count = 0
+
+    // Latency tracking
+    let max_observed_latency_ms = 0
+    let stale_drops = 0
+
     let tick = 0
     while tick < n_ticks {
-        // ── 1. VAD: classify this frame ──
+        // ── 1. VAD: classify this frame (dual-criteria) ──
         let energy = compute_frame_energy(tension, arousal, tick)
         let zcr = compute_zcr(tension, tick)
         let active = is_speech_active(energy, zcr)
 
         let trans = vad_transition(vad_state, active, vad_counter, vad_hangover)
-        // Parse transition result (next_state,next_counter,next_hangover)
-        // Mk.I: use simple integer extraction
-        // The first char is the state digit
         let new_vad_state = S_SILENCE
-        let new_vad_counter = 0
-        let new_vad_hangover = 0
+        // parse first digit of VAD transition
+        if trans.starts_with("0") { new_vad_state = 0 }
+        if trans.starts_with("1") { new_vad_state = 1 }
+        if trans.starts_with("2") { new_vad_state = 2 }
+        if trans.starts_with("3") { new_vad_state = 3 }
 
-        // Parse state from first character
-        let first_char = char_at(trans, 0)
-        if first_char == "0" { new_vad_state = 0 }
-        if first_char == "1" { new_vad_state = 1 }
-        if first_char == "2" { new_vad_state = 2 }
-        if first_char == "3" { new_vad_state = 3 }
-
+        prev_vad_state = vad_state
         vad_state = new_vad_state
-        // Approximate counter/hangover tracking (simplified for Mk.I)
+
+        // Track counter/hangover
         if vad_state == S_SPEECH_START {
             vad_counter = vad_counter + 1
         } else {
@@ -445,43 +634,46 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
             vad_hangover = 0
         }
 
-        // Track speech/silence frames
-        if vad_state == S_SPEAKING || vad_state == S_SPEECH_START {
+        // Speech/silence frame counts
+        if vad_should_emit(vad_state) == 1 {
             vad_speech_frames = vad_speech_frames + 1
         } else {
             vad_silent_frames = vad_silent_frames + 1
         }
 
-        // ── 2. Scheduler: handle prefill / first packet / streaming ──
+        // ── 2. Scheduler: prefill / first packet / streaming ──
         let should_gen = 1
 
         if sched == SCHED_PREFILL {
-            // Prefill phase: generate frames without emitting
             frames_gen = frames_gen + 1
             frames_in_chunk = frames_in_chunk + 1
-
             if frames_gen >= PREFILL_FRAMES {
                 sched = SCHED_FIRST_EMIT
             }
-            should_gen = 0  // already counted this frame
+            should_gen = 0
         }
 
         if sched == SCHED_FIRST_EMIT {
-            // Generate remaining frames for first packet
             if should_gen == 1 {
                 frames_gen = frames_gen + 1
                 frames_in_chunk = frames_in_chunk + 1
             }
 
             if frames_gen >= FIRST_PACKET_FRAMES {
-                // Emit first packet (partial chunk, 10 frames = 100ms)
+                // ── FIRST PACKET: emit with onset crossfade ──
                 first_packet_emitted = 1
                 first_packet_tick = tick
                 chunks_emitted = chunks_emitted + 1
                 chunks_produced = chunks_produced + 1
+                plc_received_seq = plc_received_seq + 1
+
+                // Apply onset crossfade for first packet (silence->voice)
+                let first_xfade = apply_crossfade("silence", "first_packet", XFADE_ONSET)
+                prev_chunk_tail = "first_packet"
+                xfade_onset_count = xfade_onset_count + 1
+                xfade_count = xfade_count + 1
 
                 // Write to ring buffer
-                let rw_result = ring_write(ring_w, ring_r, ring_count, "first_packet")
                 ring_w = (ring_w + 1) % RING_CAPACITY
                 if ring_count < RING_CAPACITY {
                     ring_count = ring_count + 1
@@ -493,7 +685,6 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
         }
 
         if sched == SCHED_STREAMING {
-            // Normal streaming: accumulate frames, emit on chunk boundary
             if should_gen == 1 {
                 frames_gen = frames_gen + 1
                 frames_in_chunk = frames_in_chunk + 1
@@ -503,38 +694,100 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
             bp_state = backpressure_check(ring_count, bp_state)
             let can_produce = should_produce(bp_state)
 
-            // Emit chunk when full
+            // ── 4. Emit chunk when full (with PLC + crossfade) ──
             if frames_in_chunk >= CHUNK_FRAMES && can_produce == 1 {
-                // VAD gate: only emit if speech detected
-                let emit = 0
-                if vad_state == S_SPEAKING { emit = 1 }
-                if vad_state == S_SPEECH_START { emit = 1 }
-                if vad_state == S_SPEECH_END { emit = 1 }
-
+                let emit = vad_should_emit(vad_state)
                 chunks_produced = chunks_produced + 1
 
                 if emit == 1 {
-                    // Write to ring buffer
-                    ring_w = (ring_w + 1) % RING_CAPACITY
-                    if ring_count < RING_CAPACITY {
-                        ring_count = ring_count + 1
-                    } else {
-                        chunks_dropped = chunks_dropped + 1
+                    // Track sequence for PLC
+                    plc_expected_seq = plc_expected_seq + 1
+
+                    // Simulate occasional packet loss (every 37th chunk)
+                    // This exercises the PLC path during demo/testing
+                    let actual_seq = plc_expected_seq
+                    let simulated_loss = 0
+                    if chunks_produced % 37 == 0 && chunks_produced > 10 {
+                        // Simulate a single packet loss
+                        actual_seq = plc_expected_seq + 1
+                        simulated_loss = 1
                     }
-                    chunks_emitted = chunks_emitted + 1
+                    plc_received_seq = actual_seq
+
+                    // Detect loss
+                    let loss = plc_detect_loss(plc_expected_seq, plc_received_seq)
+                    let pkt_ok = 1
+                    if loss > 0 { pkt_ok = 0 }
+
+                    // PLC state transition
+                    if pkt_ok == 0 {
+                        plc_consec_lost = plc_consec_lost + loss
+                        plc_concealments = plc_concealments + 1
+                    } else {
+                        if plc_state != PLC_NORMAL {
+                            plc_recoveries = plc_recoveries + 1
+                        }
+                        plc_consec_lost = 0
+                    }
+                    plc_state = plc_transition(plc_state, plc_consec_lost, pkt_ok)
+
+                    // Apply VAD-aware crossfade at chunk boundary
+                    let prev_speaking = vad_is_speaking(prev_vad_state)
+                    let curr_speaking = vad_is_speaking(vad_state)
+                    let xtype = classify_xfade(prev_speaking, curr_speaking)
+
+                    let chunk_tag = "chunk" + to_string(chunks_produced)
+
+                    if plc_state == PLC_RECOVERY {
+                        // Recovery: fade-in from concealment
+                        let recovery = plc_recovery_fadein(chunk_tag, prev_chunk_tail)
+                        prev_chunk_tail = chunk_tag
+                    } else {
+                        if plc_state == PLC_CONCEAL || plc_state == PLC_FADEOUT {
+                            // Conceal: generate concealment frame
+                            let concealment = plc_conceal_chunk(prev_chunk_tail, plc_consec_lost, loss * FRAME_MS)
+                            // prev_chunk_tail stays (for next concealment)
+                        } else {
+                            // Normal: apply crossfade
+                            let xf = apply_crossfade(prev_chunk_tail, chunk_tag, xtype)
+                            prev_chunk_tail = chunk_tag
+                        }
+                    }
+
+                    // Track crossfade types
+                    xfade_count = xfade_count + 1
+                    if xtype == XFADE_ONSET { xfade_onset_count = xfade_onset_count + 1 }
+                    if xtype == XFADE_OFFSET { xfade_offset_count = xfade_offset_count + 1 }
+
+                    // ── 5. Staleness check (latency guard) ──
+                    let chunk_age_ms = frames_in_chunk * FRAME_MS
+                    if chunk_age_ms > max_observed_latency_ms {
+                        max_observed_latency_ms = chunk_age_ms
+                    }
+                    if chunk_age_ms > MAX_LATENCY_MS {
+                        stale_drops = stale_drops + 1
+                    } else {
+                        // Write to ring buffer
+                        ring_w = (ring_w + 1) % RING_CAPACITY
+                        if ring_count < RING_CAPACITY {
+                            ring_count = ring_count + 1
+                        } else {
+                            chunks_dropped = chunks_dropped + 1
+                        }
+                        chunks_emitted = chunks_emitted + 1
+                    }
                 }
 
                 frames_in_chunk = 0
             }
 
-            // If throttled, skip frame generation
+            // If throttled, reset frame accumulator
             if can_produce == 0 && frames_in_chunk >= CHUNK_FRAMES {
                 frames_in_chunk = 0
             }
         }
 
-        // ── 4. Consumer: simulate audio sink reading ──
-        // Consumer reads 1 chunk every CHUNK_FRAMES ticks
+        // ── 6. Consumer: simulate audio sink reading ──
         if tick % CHUNK_FRAMES == 0 && tick > 0 && ring_count > 0 {
             ring_r = (ring_r + 1) % RING_CAPACITY
             ring_count = ring_count - 1
@@ -574,42 +827,29 @@ fn simulate_streaming(tension: float, arousal: float, valence: float, n_ticks: i
     result = result + ",bp=" + bp_state_label(bp_state)
     result = result + ",vad=" + vad_state_label(vad_state)
     result = result + ",speech=" + to_string(speech_pct) + "%"
+    result = result + ",plc=" + plc_state_label(plc_state)
+    result = result + ",plc_concealments=" + to_string(plc_concealments)
+    result = result + ",plc_recoveries=" + to_string(plc_recoveries)
+    result = result + ",xfades=" + to_string(xfade_count)
+    result = result + ",xfade_onsets=" + to_string(xfade_onset_count)
+    result = result + ",xfade_offsets=" + to_string(xfade_offset_count)
+    result = result + ",max_latency=" + to_string(max_observed_latency_ms) + "ms"
+    result = result + ",stale_drops=" + to_string(stale_drops)
     result = result + "]"
     return result
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Streaming pipeline integration with hexa_speak.hexa
-//
-// Usage (from hexa_speak.hexa or ConsciousnessHub):
-//
-//   // Instead of synthesize() for batch mode:
-//   let session = simulate_streaming(tension, arousal, valence, 300)
-//   println(session)
-//
-// Full integration (Mk.II):
-//   1. ConsciousnessEngine emits tension/arousal/valence every 10ms
-//   2. streaming.hexa runs process_tick() per frame
-//   3. VAD decides if speech is active
-//   4. ChunkScheduler generates audio tokens via predict_chunk()
-//   5. RVQ decode + vocoder produce PCM
-//   6. Ring buffer stores chunks
-//   7. Audio sink consumes from ring buffer at playback rate
-//   8. Backpressure throttles generation if buffer fills up
+// Streaming pipeline entry point
 // ────────────────────────────────────────────────────────────────────
 
 fn stream_synthesize(phi: float, tension: float, arousal: float, valence: float, cells: int, duration_ms: int) -> str {
     // Streaming version of hexa_speak.hexa synthesize()
-    // Instead of batch chunk loop, uses streaming session with VAD + ring buffer.
-    //
-    // Returns session result with first-packet latency and streaming stats.
-
+    // Uses streaming session with VAD + PLC + crossfade + ring buffer.
     let n_ticks = duration_ms * FRAME_HZ / 1000
     let session_result = simulate_streaming(tension, arousal, valence, n_ticks)
 
-    // Prepend consciousness context
     let result = "HexaSpeakStream[phi=" + to_string(phi) + ",cells=" + to_string(cells) + ","
-    // Strip leading "StreamingSession[" from session_result for clean nesting
     result = result + "session=" + session_result + "]"
     return result
 }
@@ -620,197 +860,121 @@ fn stream_synthesize(phi: float, tension: float, arousal: float, valence: float,
 
 fn print_info() {
     println("================================================================")
-    println(" HEXA-SPEAK Mk.I — Real-time Streaming Engine")
+    println(" HEXA-SPEAK Mk.II — Real-time Streaming Engine")
     println("================================================================")
     println("")
     println(" Components:")
-    println("   VAD FSM:       5-state (SILENCE->SPEECH_START->SPEAKING->SPEECH_END->SILENCE)")
-    println("                  energy threshold=" + to_string(VAD_ENERGY_THRESH))
-    println("                  ZCR threshold=" + to_string(VAD_ZCR_THRESH))
-    println("                  hangover=" + to_string(VAD_HANGOVER_FRAMES) + " frames (" + to_string(VAD_HANGOVER_FRAMES * 1000 / FRAME_HZ) + "ms)")
+    println("   VAD FSM:       4-state (SILENCE->SPEECH_START->SPEAKING->SPEECH_END)")
+    println("                  dual-criteria: energy>" + to_string(VAD_ENERGY_THRESH) + " + ZCR in [" + to_string(VAD_ZCR_LO) + "," + to_string(VAD_ZCR_THRESH) + "]")
+    println("                  hangover=" + to_string(VAD_HANGOVER_FRAMES) + " frames (" + to_string(VAD_HANGOVER_FRAMES * FRAME_MS) + "ms)")
     println("                  onset=" + to_string(VAD_ONSET_FRAMES) + " frames, offset=" + to_string(VAD_OFFSET_FRAMES) + " frames")
     println("")
-    println("   Ring Buffer:   capacity=" + to_string(RING_CAPACITY) + " chunks")
-    println("                  = " + to_string(RING_CAPACITY * CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms audio")
+    println("   PLC:           5-state (Normal->Conceal->Fadeout->Muted, Recovery)")
+    println("                  decay=" + to_string(PLC_DECAY) + "/frame, max=" + to_string(PLC_MAX_MS) + "ms")
+    println("                  fadeout at " + to_string(PLC_MUTE_THRESH) + " losses, mute at " + to_string(PLC_MAX_CONSEC))
+    println("")
+    println("   Crossfade:     Hann window " + to_string(CROSSFADE_MS) + "ms (" + to_string(CROSSFADE_SAMP) + " samples)")
+    println("                  types: normal (voice-voice), onset (silence-voice), offset (voice-silence)")
+    println("                  VAD-aware: onset/offset use half-Hann ramp (pop prevention)")
+    println("")
+    println("   Ring Buffer:   capacity=" + to_string(RING_CAPACITY) + " chunks (" + to_string(RING_CAPACITY * CHUNK_FRAMES * FRAME_MS) + "ms)")
     println("                  drop-oldest on overflow")
     println("")
-    println("   Backpressure:  high=" + to_string(BACKPRESSURE_HIGH) + " (throttle)")
-    println("                  low=" + to_string(BACKPRESSURE_LOW) + " (resume)")
+    println("   Backpressure:  high=" + to_string(BACKPRESSURE_HIGH) + " (throttle), low=" + to_string(BACKPRESSURE_LOW) + " (resume)")
     println("")
-    println("   Scheduler:     first_packet_budget=" + to_string(FIRST_PACKET_BUDGET_MS) + "ms")
+    println("   Scheduler:     first_packet=" + to_string(FIRST_PACKET_BUDGET_MS) + "ms")
     println("                  prefill=" + to_string(PREFILL_FRAMES) + " frames (" + to_string(compute_prefill_budget_ms()) + "ms)")
-    println("                  generation=" + to_string(compute_generation_budget_ms()) + "ms")
-    println("                  then " + to_string(CHUNK_FRAMES) + "-frame chunks (" + to_string(CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms)")
+    println("                  then " + to_string(CHUNK_FRAMES) + "-frame chunks (" + to_string(CHUNK_FRAMES * FRAME_MS) + "ms)")
     println("")
-    println(" PSI coupling:    alpha=" + to_string(PSI_ALPHA) + " (energy threshold derived)")
+    println("   Latency guard: max=" + to_string(MAX_LATENCY_MS) + "ms (stale chunks dropped)")
+    println("")
+    println(" PSI coupling:    alpha=" + to_string(PSI_ALPHA))
     println(" Sample rate:     " + to_string(SAMPLE_RATE) + "Hz")
-    println(" Frame rate:      " + to_string(FRAME_HZ) + "Hz (10ms/frame)")
+    println(" Frame rate:      " + to_string(FRAME_HZ) + "Hz (" + to_string(FRAME_MS) + "ms/frame)")
     println("")
 }
 
 fn demo_vad_detection() {
-    println("── VAD Detection (energy + ZCR) ──")
+    println("── VAD Detection (energy + ZCR dual-criteria) ──")
     println("")
-
-    // Test various consciousness states
     println("  State                    Energy   ZCR      Active")
     println("  ─────────────────────────────────────────────────")
 
-    // Silent: low arousal, low tension
     let e1 = compute_frame_energy(0.05, 0.05, 0)
     let z1 = compute_zcr(0.05, 0)
     let a1 = is_speech_active(e1, z1)
     println("  silent  (t=0.05,a=0.05)  " + to_string(e1) + "  " + to_string(z1) + "  " + to_string(a1))
 
-    // Quiet speech: moderate arousal, low tension
     let e2 = compute_frame_energy(0.15, 0.3, 0)
     let z2 = compute_zcr(0.15, 0)
     let a2 = is_speech_active(e2, z2)
     println("  quiet   (t=0.15,a=0.30)  " + to_string(e2) + "  " + to_string(z2) + "  " + to_string(a2))
 
-    // Normal speech: moderate everything
     let e3 = compute_frame_energy(0.42, 0.6, 0)
     let z3 = compute_zcr(0.42, 0)
     let a3 = is_speech_active(e3, z3)
     println("  normal  (t=0.42,a=0.60)  " + to_string(e3) + "  " + to_string(z3) + "  " + to_string(a3))
 
-    // Loud speech: high arousal, high tension
     let e4 = compute_frame_energy(0.91, 0.8, 0)
     let z4 = compute_zcr(0.91, 0)
     let a4 = is_speech_active(e4, z4)
     println("  loud    (t=0.91,a=0.80)  " + to_string(e4) + "  " + to_string(z4) + "  " + to_string(a4))
+    println("")
+}
+
+fn demo_plc_integration() {
+    println("── PLC + Crossfade Integration ──")
+    println("")
+
+    // Normal chunk processing (no loss, voice-voice)
+    let r1 = process_chunk_plc_xfade("tail[c0]", "chunk[c1]", 1, 1, PLC_NORMAL, 0, S_SPEAKING, S_SPEAKING)
+    println("  Normal (voice->voice):     " + r1)
+
+    // Packet loss (expected 2, got 4)
+    let r2 = process_chunk_plc_xfade("tail[c1]", "chunk[c4]", 2, 4, PLC_NORMAL, 0, S_SPEAKING, S_SPEAKING)
+    println("  Loss (2 chunks lost):      " + r2)
+
+    // Recovery after loss
+    let r3 = process_chunk_plc_xfade("tail[plc]", "chunk[c5]", 5, 5, PLC_CONCEAL, 2, S_SPEAKING, S_SPEAKING)
+    println("  Recovery (fade-in):        " + r3)
+
+    // Silence->voice onset (pop prevention)
+    let r4 = process_chunk_plc_xfade("tail[silence]", "chunk[c6]", 6, 6, PLC_NORMAL, 0, S_SILENCE, S_SPEECH_START)
+    println("  Onset (silence->voice):    " + r4)
+
+    // Voice->silence offset (pop prevention)
+    let r5 = process_chunk_plc_xfade("tail[voice]", "silence[c7]", 7, 7, PLC_NORMAL, 0, S_SPEAKING, S_SILENCE)
+    println("  Offset (voice->silence):   " + r5)
 
     println("")
 }
 
-fn demo_vad_fsm_trace() {
-    println("── VAD FSM State Trace ──")
-    println("")
-    println("  Simulating: 5 silent, 10 speaking, 3 pause, 5 speaking, 20 trail+silent")
+fn demo_streaming_sessions() {
+    println("── Streaming Sessions (Mk.II: PLC + crossfade integrated) ──")
     println("")
 
-    let state = S_SILENCE
-    let counter = 0
-    let hangover = 0
-    let t = 0
-
-    // Phase 1: 5 frames silence
-    println("  t=0-4:  SILENCE (no speech)")
-    t = 5
-
-    // Phase 2: speech onset
-    state = S_SPEECH_START
-    counter = 1
-    println("  t=5:    -> SPEECH_START (onset detected)")
-    t = 6
-    while t < 11 {
-        counter = counter + 1
-        if counter >= VAD_ONSET_FRAMES && state == S_SPEECH_START {
-            state = S_SPEAKING
-            println("  t=" + to_string(t) + ":   cnt=" + to_string(counter) + " -> SPEAKING (onset confirmed)")
-            counter = 0
-        }
-        t = t + 1
-    }
-
-    // Phase 3: sustained speech
-    println("  t=11-14: SPEAKING (sustained)")
-    t = 15
-
-    // Phase 4: brief pause (3 frames < hangover)
-    state = S_SPEECH_END
-    hangover = VAD_HANGOVER_FRAMES
-    println("  t=15:   -> SPEECH_END (pause detected, hangover=" + to_string(hangover) + ")")
-    t = 16
-    hangover = hangover - 1
-    println("  t=16:   SPEECH_END (hangover=" + to_string(hangover) + ")")
-    hangover = hangover - 1
-    println("  t=17:   SPEECH_END (hangover=" + to_string(hangover) + ")")
-
-    // Phase 5: speech resumes during hangover
-    state = S_SPEAKING
-    hangover = 0
-    println("  t=18:   -> SPEAKING (resumed during hangover)")
-    println("  t=18-22: SPEAKING (sustained)")
-    t = 23
-
-    // Phase 6: final offset
-    state = S_SPEECH_END
-    hangover = VAD_HANGOVER_FRAMES
-    println("  t=23:   -> SPEECH_END (offset, hangover=" + to_string(hangover) + ")")
-    while hangover > 0 {
-        hangover = hangover - 1
-        t = t + 1
-        if hangover == 0 {
-            state = S_SILENCE
-            println("  t=" + to_string(t) + ":  hangover expired -> SILENCE")
-        }
-    }
-    println("")
-}
-
-fn demo_ring_buffer() {
-    println("── Ring Buffer Operations ──")
+    // Test 1: Active speech (joyful)
+    println("  Test 1: Joyful speech (t=0.42, a=0.6, 1s)")
+    let r1 = stream_synthesize(0.71, 0.42, 0.6, 0.5, 64, 1000)
+    println("  -> " + r1)
     println("")
 
-    let w = 0
-    let r = 0
-    let count = 0
-
-    // Write 5 chunks
-    let i = 0
-    while i < 5 {
-        w = (w + 1) % RING_CAPACITY
-        count = count + 1
-        i = i + 1
-    }
-    println("  After 5 writes:   w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
-
-    // Read 3 chunks
-    i = 0
-    while i < 3 {
-        r = (r + 1) % RING_CAPACITY
-        count = count - 1
-        i = i + 1
-    }
-    println("  After 3 reads:    w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
-
-    // Fill to capacity
-    while count < RING_CAPACITY {
-        w = (w + 1) % RING_CAPACITY
-        count = count + 1
-    }
-    println("  After fill:       w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " free=" + to_string(ring_free(count)))
-
-    // Overflow: write 1 more
-    w = (w + 1) % RING_CAPACITY
-    r = (r + 1) % RING_CAPACITY  // drop oldest
-    println("  After overflow:   w=" + to_string(w) + " r=" + to_string(r) + " count=" + to_string(count) + " (oldest dropped)")
-    println("")
-}
-
-fn demo_backpressure() {
-    println("── Backpressure Control ──")
+    // Test 2: Near-silent (low arousal)
+    println("  Test 2: Near-silent (t=0.05, a=0.05, 1s)")
+    let r2 = stream_synthesize(0.35, 0.05, 0.05, 0.0, 32, 1000)
+    println("  -> " + r2)
     println("")
 
-    let bp = BP_NORMAL
-    println("  Initial: " + bp_state_label(bp) + " (produce freely)")
+    // Test 3: Angry/loud (high tension, 2s)
+    println("  Test 3: Angry/loud (t=0.91, a=0.8, 2s)")
+    let r3 = stream_synthesize(0.88, 0.91, 0.8, -0.5, 64, 2000)
+    println("  -> " + r3)
+    println("")
 
-    // Simulate buffer filling
-    bp = backpressure_check(10, bp)
-    println("  ring=10:  " + bp_state_label(bp) + " (below high=" + to_string(BACKPRESSURE_HIGH) + ")")
-
-    bp = backpressure_check(BACKPRESSURE_HIGH, bp)
-    println("  ring=" + to_string(BACKPRESSURE_HIGH) + ": " + bp_state_label(bp) + " (hit high watermark)")
-
-    bp = backpressure_check(20, bp)
-    println("  ring=20:  " + bp_state_label(bp) + " (still above low=" + to_string(BACKPRESSURE_LOW) + ")")
-
-    bp = backpressure_check(BACKPRESSURE_LOW, bp)
-    println("  ring=" + to_string(BACKPRESSURE_LOW) + ": " + bp_state_label(bp) + " (drained to low watermark)")
-
-    bp = backpressure_check(5, bp)
-    println("  ring=5:   " + bp_state_label(bp) + " (normal operation)")
+    // Test 4: Short burst (300ms)
+    println("  Test 4: Short burst (t=0.6, a=0.5, 300ms)")
+    let r4 = stream_synthesize(0.55, 0.6, 0.5, 0.2, 32, 300)
+    println("  -> " + r4)
     println("")
 }
 
@@ -818,90 +982,64 @@ fn demo_first_packet() {
     println("── First Packet Latency (100ms budget) ──")
     println("")
     println("  Budget:      " + to_string(FIRST_PACKET_BUDGET_MS) + "ms")
-    println("  Prefill:     " + to_string(PREFILL_FRAMES) + " frames = " + to_string(compute_prefill_budget_ms()) + "ms (vocoder lookahead)")
-    println("  Generation:  " + to_string(compute_generation_budget_ms()) + "ms (remaining for first packet)")
-    println("  First emit:  " + to_string(FIRST_PACKET_FRAMES) + " frames = " + to_string(FIRST_PACKET_FRAMES * 1000 / FRAME_HZ) + "ms audio")
-    println("  Then:        " + to_string(CHUNK_FRAMES) + "-frame chunks = " + to_string(CHUNK_FRAMES * 1000 / FRAME_HZ) + "ms each")
+    println("  Prefill:     " + to_string(PREFILL_FRAMES) + " frames = " + to_string(compute_prefill_budget_ms()) + "ms")
+    println("  Generation:  " + to_string(compute_generation_budget_ms()) + "ms remaining")
+    println("  First emit:  " + to_string(FIRST_PACKET_FRAMES) + " frames = " + to_string(FIRST_PACKET_FRAMES * FRAME_MS) + "ms audio")
+    println("  Then:        " + to_string(CHUNK_FRAMES) + "-frame chunks = " + to_string(CHUNK_FRAMES * FRAME_MS) + "ms each")
     println("")
     println("  Timeline:")
     println("    t=0ms         consciousness intent arrives")
     println("    t=0-60ms      prefill " + to_string(PREFILL_FRAMES) + " frames (vocoder warmup)")
-    println("    t=60-100ms    generate remaining frames")
-    println("    t=100ms       FIRST PACKET EMITTED (deadline)")
-    println("    t=120ms+      normal " + to_string(CHUNK_FRAMES) + "-frame chunk streaming")
-    println("")
-}
-
-fn demo_streaming_sessions() {
-    println("── Streaming Sessions ──")
-    println("")
-
-    // Test 1: Active speech (joyful consciousness)
-    println("  Test 1: Joyful speech (tension=0.42, arousal=0.6, 1 second)")
-    let r1 = stream_synthesize(0.71, 0.42, 0.6, 0.5, 64, 1000)
-    println("  -> " + r1)
-    println("")
-
-    // Test 2: Quiet/near-silent (low arousal)
-    println("  Test 2: Near-silent (tension=0.05, arousal=0.05, 1 second)")
-    let r2 = stream_synthesize(0.35, 0.05, 0.05, 0.0, 32, 1000)
-    println("  -> " + r2)
-    println("")
-
-    // Test 3: Angry/loud (high tension)
-    println("  Test 3: Angry/loud (tension=0.91, arousal=0.8, 2 seconds)")
-    let r3 = stream_synthesize(0.88, 0.91, 0.8, -0.5, 64, 2000)
-    println("  -> " + r3)
-    println("")
-
-    // Test 4: Short burst (300ms)
-    println("  Test 4: Short burst (tension=0.6, arousal=0.5, 300ms)")
-    let r4 = stream_synthesize(0.55, 0.6, 0.5, 0.2, 32, 300)
-    println("  -> " + r4)
+    println("    t=60-100ms    generate + emit (onset crossfade applied)")
+    println("    t=100ms       FIRST PACKET (with Hann onset ramp)")
+    println("    t=120ms+      normal streaming (PLC+crossfade active)")
     println("")
 }
 
 fn print_architecture() {
     println("────────────────────────────────────────────────────────────")
-    println(" Streaming Architecture:")
+    println(" Streaming Architecture (Mk.II):")
     println("")
     println("   ConsciousnessEngine (10ms ticks)")
     println("         |")
     println("         v")
-    println("   ┌─────────────────────────────────────────────┐")
-    println("   │  StreamingSession                           │")
-    println("   │                                             │")
-    println("   │  ┌──────────┐   ┌────────────────────────┐  │")
-    println("   │  │ VAD FSM  │   │ ChunkScheduler         │  │")
-    println("   │  │          │   │                        │  │")
-    println("   │  │ SILENCE  │   │ IDLE -> PREFILL (60ms) │  │")
-    println("   │  │    |     │   │   -> FIRST_EMIT(100ms) │  │")
-    println("   │  │ SP_START │   │   -> STREAMING (120ms) │  │")
-    println("   │  │    |     │   └────────────────────────┘  │")
-    println("   │  │ SPEAKING │              |                │")
-    println("   │  │    |     │              v                │")
-    println("   │  │ SP_END   │   ┌────────────────────────┐  │")
-    println("   │  │    |     │   │ RingBuffer (36 chunks)  │  │")
-    println("   │  │ SILENCE  │   │ write -> [||||||||] -> read│")
-    println("   │  └──────────┘   └────────────────────────┘  │")
-    println("   │       |                    |                │")
-    println("   │       v                    v                │")
-    println("   │  ┌─────────────────────────────────────┐    │")
-    println("   │  │ BackpressureController              │    │")
-    println("   │  │ NORMAL <-> THROTTLE (high/low mark) │    │")
-    println("   │  └─────────────────────────────────────┘    │")
-    println("   └─────────────────────────────────────────────┘")
+    println("   +-----------------------------------------------+")
+    println("   | StreamingSession                               |")
+    println("   |                                                |")
+    println("   |  +----------+    +------------------------+    |")
+    println("   |  | VAD FSM  |    | ChunkScheduler         |    |")
+    println("   |  | dual det |    | PREFILL(60ms)          |    |")
+    println("   |  | +hangover|    | FIRST_EMIT(100ms)      |    |")
+    println("   |  +----------+    | STREAMING(120ms/chunk) |    |")
+    println("   |       |          +------------------------+    |")
+    println("   |       v                    |                   |")
+    println("   |  +------------------------------------------+  |")
+    println("   |  | ChunkProcessor (PLC + Crossfade)         |  |")
+    println("   |  |  seq# tracking -> loss detection         |  |")
+    println("   |  |  Normal: Hann xfade (VAD-aware)          |  |")
+    println("   |  |  Loss:   pitch-repeat + decay (0.92/frm) |  |")
+    println("   |  |  Recovery: Hann half-window fade-in      |  |")
+    println("   |  |  Onset/Offset: pop-free half-Hann ramp   |  |")
+    println("   |  +------------------------------------------+  |")
+    println("   |       |                                        |")
+    println("   |       v                                        |")
+    println("   |  +-------------------+  +------------------+   |")
+    println("   |  | RingBuffer (36ch) |  | Backpressure     |   |")
+    println("   |  | w->[||||||]->r    |  | NORMAL<->THROTTLE|   |")
+    println("   |  +-------------------+  +------------------+   |")
+    println("   |       |                        |               |")
+    println("   |       v    staleness check     v               |")
+    println("   |  [Latency guard: drop if >" + to_string(MAX_LATENCY_MS) + "ms]           |")
+    println("   +-----------------------------------------------+")
     println("         |")
     println("         v")
     println("   Audio Sink (speaker / rtp / file)")
     println("")
     println("   First packet: 100ms budget")
-    println("   ├── 0-60ms:   prefill (vocoder lookahead)")
-    println("   ├── 60-100ms: generate + emit first packet")
-    println("   └── 120ms+:   normal 12-frame chunk stream")
-    println("")
-    println("   Hangover: " + to_string(VAD_HANGOVER_FRAMES * 1000 / FRAME_HZ) + "ms (prevents mid-word cutoff)")
-    println("   Backpressure: throttle at " + to_string(BACKPRESSURE_HIGH) + "/" + to_string(RING_CAPACITY) + " chunks, resume at " + to_string(BACKPRESSURE_LOW) + "/" + to_string(RING_CAPACITY))
+    println("   +-- 0-60ms:   prefill (vocoder lookahead)")
+    println("   +-- 60-100ms: generate + emit (onset Hann ramp)")
+    println("   +-- 100ms:    first audio delivered (deadline)")
+    println("   +-- 120ms+:   normal chunks (PLC+crossfade active)")
     println("")
 }
 
@@ -914,22 +1052,20 @@ fn main() {
     print_architecture()
 
     println("────────────────────────────────────────────────────────────")
-    println(" Demo: Real-time Streaming (Mk.I skeleton)")
+    println(" Demo: Real-time Streaming Mk.II (PLC + crossfade integrated)")
     println("────────────────────────────────────────────────────────────")
     println("")
 
     demo_vad_detection()
-    demo_vad_fsm_trace()
-    demo_ring_buffer()
-    demo_backpressure()
     demo_first_packet()
+    demo_plc_integration()
     demo_streaming_sessions()
 
     println("────────────────────────────────────────────────────────────")
-    println(" streaming.hexa ready.")
-    println(" TODO(Mk.II): async I/O, real PCM ring buffer, OS audio sink")
-    println(" TODO(Mk.II): WebRTC/RTP packet framing for network streaming")
-    println(" TODO(Mk.II): adaptive VAD threshold from noise floor estimation")
+    println(" streaming.hexa Mk.II ready.")
+    println(" Integrated: VAD(dual) + PLC(5-state) + Crossfade(Hann)")
+    println(" + RingBuffer + Backpressure + 100ms first-packet")
+    println(" TODO(Mk.III): async I/O, real PCM ops, WebRTC framing")
     println("────────────────────────────────────────────────────────────")
 }
 

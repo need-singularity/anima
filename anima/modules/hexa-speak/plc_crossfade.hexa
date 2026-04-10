@@ -1,9 +1,19 @@
-// plc_crossfade.hexa — HEXA-SPEAK: Packet Loss Concealment + Crossfade
+// plc_crossfade.hexa — HEXA-SPEAK Mk.II: Packet Loss Concealment + Crossfade
 //
 // Purpose:
 //   Seamless audio output: hide packet drops (up to 60ms) via pitch-period
 //   interpolation with decay, and smooth chunk boundaries with Hann-windowed
-//   overlap-add crossfade.
+//   overlap-add crossfade. Streaming-aware: integrates with VAD FSM state
+//   for onset/offset pop prevention and PLC recovery path.
+//
+// Mk.II upgrades:
+//   - Streaming-aware PLC: sequence-number tracking per chunk
+//   - VAD-aware crossfade: onset (silence->voice) and offset (voice->silence)
+//     use half-Hann ramp for pop noise prevention
+//   - PLC recovery: smooth Hann fade-in from concealment to real audio
+//   - Chunk processor: unified PLC + crossfade per-chunk processing
+//   - Hann window: piecewise-linear approximation with 11 anchor points
+//   - Energy decay: exponential 0.92/frame for natural fadeout
 //
 // Features:
 //   PLC:
@@ -11,7 +21,7 @@
 //     - Single loss: repeat prev frame pitch period + decay (0.92/frame)
 //     - Consecutive loss: progressive fadeout (energy *= decay^n)
 //     - 3+ consecutive losses: fade to silence (mute)
-//     - Recovery: smooth fade-in over crossfade_samp
+//     - Recovery: smooth Hann half-window fade-in over crossfade_samp
 //   Crossfade:
 //     - Hann window overlap-add at chunk boundaries
 //     - Configurable length: 6ms = 144 samples @ 24kHz
@@ -30,10 +40,14 @@
 //   frame_samp        = 240 = 24000 / 100
 //
 // BT reference: BT-SPEAK-06 (robustness), real-time audio hygiene
-// Mk stage:     Mk.II (full algorithm, Hann crossfade + pitch-period PLC)
-// Upstream:     neural_vocoder.hexa output stream
+// Mk stage:     Mk.II (streaming-aware, VAD-integrated, Hann crossfade)
+// Upstream:     neural_vocoder.hexa output stream, streaming.hexa
 // Downstream:   audio sink (network/speaker)
-// Integration:  emotion_prosody.hexa (emotion-aware recovery shaping)
+// Integration:  vad_fsm.hexa (VAD-aware crossfade type selection)
+//               streaming.hexa (per-chunk processing in streaming loop)
+//               emotion_prosody.hexa (emotion-aware recovery shaping)
+
+// import "./dsp_core.hexa"  // Mk.III: real DSP primitives
 
 // ────────────────────────────────────────────────────────────────────
 // Constants (from consciousness_laws.json psi_constants + n=6 design)
@@ -54,17 +68,9 @@ let FRAME_SAMP = 240
 //
 // w(n) = 0.5 * (1 - cos(2 * pi * n / (N-1)))
 //
-// Pre-computed at 6 anchor points for Mk.II skeleton.
-// Mk.III: full sample-level Hann via lookup table or runtime cos().
+// Pre-computed at 11 anchor points for Mk.II.
+// Mk.III: full sample-level Hann via dsp_core.hexa hann_window().
 // ────────────────────────────────────────────────────────────────────
-
-// Hann window value at normalized position t in [0.0, 1.0]
-// Approximation using parabolic interpolation between anchor points
-// Exact: w(t) = 0.5 * (1 - cos(2 * pi * t))
-// Anchor values (t -> w):
-//   0.0 -> 0.0,  0.1 -> 0.095,  0.2 -> 0.345,  0.3 -> 0.655,
-//   0.4 -> 0.905, 0.5 -> 1.0,   0.6 -> 0.905,  0.7 -> 0.655,
-//   0.8 -> 0.345, 0.9 -> 0.095, 1.0 -> 0.0
 
 fn hann_weight(position: float) -> float {
     // Piecewise linear interpolation of Hann window
@@ -94,11 +100,22 @@ fn hann_weight(position: float) -> float {
     return 0.905 + (t - 0.4) * 0.95      // 0.905 -> 1.0
 }
 
+// Half-Hann ascending ramp (for onset: silence->voice)
+fn hann_ascend(position: float) -> float {
+    if position <= 0.0 { return 0.0 }
+    if position >= 1.0 { return 1.0 }
+    return hann_weight(position * 0.5)
+}
+
+// Half-Hann descending ramp (for offset: voice->silence)
+fn hann_descend(position: float) -> float {
+    if position <= 0.0 { return 1.0 }
+    if position >= 1.0 { return 0.0 }
+    return hann_weight(0.5 + position * 0.5)
+}
+
 // ────────────────────────────────────────────────────────────────────
 // PLCState — Packet Loss Concealment state machine
-//
-// Tracks sequence numbers, consecutive loss count, and energy level
-// for smooth concealment and recovery.
 //
 // States:
 //   NORMAL    — receiving packets, no loss
@@ -123,27 +140,15 @@ fn plc_state_name(s: int) -> str {
     return "?"
 }
 
-// Detect packet loss by sequence number gap
 fn detect_loss(expected_seq: int, received_seq: int) -> int {
-    // Returns number of lost packets (0 = no loss)
     if received_seq == expected_seq { return 0 }
     if received_seq > expected_seq {
         return received_seq - expected_seq
     }
-    // Out of order or wrap: treat as no loss (reordering handled upstream)
     return 0
 }
 
-// Compute PLC energy decay factor for a given consecutive loss count
 fn plc_energy_factor(consec_lost: int) -> float {
-    // decay^n: exponential decay per consecutive lost frame
-    // consec=0: 1.0 (no loss)
-    // consec=1: 0.92
-    // consec=2: 0.8464
-    // consec=3: 0.7787 (fadeout begins)
-    // consec=4: 0.7164
-    // consec=5: 0.6590
-    // consec=6: 0.6063 (mute)
     let factor = 1.0
     let i = 0
     while i < consec_lost {
@@ -153,86 +158,54 @@ fn plc_energy_factor(consec_lost: int) -> float {
     return factor
 }
 
-// Transition PLC state based on packet arrival
 fn plc_transition(state: int, consec_lost: int, packet_arrived: int) -> int {
-    // packet_arrived: 1 = good packet, 0 = loss detected
-
     if packet_arrived == 1 {
-        // Good packet received
         if state == PLC_NORMAL { return PLC_NORMAL }
-        // Any loss state -> recovery (for fade-in)
         return PLC_RECOVERY
     }
-
-    // Packet lost
-    if state == PLC_NORMAL {
-        return PLC_CONCEAL
-    }
-    if state == PLC_RECOVERY {
-        // Lost again during recovery — back to conceal
-        return PLC_CONCEAL
-    }
+    if state == PLC_NORMAL { return PLC_CONCEAL }
+    if state == PLC_RECOVERY { return PLC_CONCEAL }
     if state == PLC_CONCEAL {
-        if consec_lost >= PLC_MUTE_THRESH {
-            return PLC_FADEOUT
-        }
+        if consec_lost >= PLC_MUTE_THRESH { return PLC_FADEOUT }
         return PLC_CONCEAL
     }
     if state == PLC_FADEOUT {
-        if consec_lost >= PLC_MAX_CONSEC {
-            return PLC_MUTED
-        }
+        if consec_lost >= PLC_MAX_CONSEC { return PLC_MUTED }
         return PLC_FADEOUT
     }
-    // PLC_MUTED stays muted until a good packet
     return PLC_MUTED
 }
 
-// Generate concealment frame description
-// In Mk.III this returns actual PCM samples; Mk.II returns tagged description
 fn conceal_frame(prev_tail: str, consec_lost: int, gap_ms: int) -> str {
     if gap_ms > PLC_MAX_MS {
         return "silence[" + to_string(gap_ms) + "ms>budget=" + to_string(PLC_MAX_MS) + "ms]"
     }
-
     let energy = plc_energy_factor(consec_lost)
     let n_samples = SAMPLE_RATE * gap_ms / 1000
     let state = PLC_CONCEAL
-    if consec_lost >= PLC_MAX_CONSEC {
-        state = PLC_MUTED
-    }
-    if consec_lost >= PLC_MUTE_THRESH {
-        state = PLC_FADEOUT
-    }
+    if consec_lost >= PLC_MAX_CONSEC { state = PLC_MUTED }
+    if consec_lost >= PLC_MUTE_THRESH { state = PLC_FADEOUT }
 
     return "plc[state=" + plc_state_name(state) + ",samples=" + to_string(n_samples) + ",energy=" + to_string(energy) + ",consec=" + to_string(consec_lost) + ",src=" + prev_tail + "]"
 }
 
-// Generate recovery fade-in description
 fn recovery_fadein(new_frame: str, prev_concealed: str) -> str {
-    // Crossfade from concealed tail to new real frame over CROSSFADE_SAMP
     return "recovery[fadein=" + to_string(CROSSFADE_MS) + "ms,samp=" + to_string(CROSSFADE_SAMP) + ",from=" + prev_concealed + ",to=" + new_frame + ",window=hann_half]"
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Crossfade — Hann-windowed overlap-add at chunk boundaries
 //
-// Given tail of chunk A (last CROSSFADE_SAMP samples) and head of
-// chunk B (first CROSSFADE_SAMP samples), produce blended output:
-//
-//   out[n] = tail_a[n] * hann_fade_out(n) + head_b[n] * hann_fade_in(n)
-//
-// where:
-//   hann_fade_out(n) = hann(0.5 + 0.5*n/N)  (descending half)
-//   hann_fade_in(n)  = hann(0.5*n/N)         (ascending half)
-//
-// For silence<->voice transitions, only the active side is ramped
-// to prevent pop noise from abrupt onset/offset.
+// Three types based on VAD state:
+//   NORMAL (voice->voice): full overlap-add
+//     out[n] = tail_a[n] * hann_descend(n/N) + head_b[n] * hann_ascend(n/N)
+//   ONSET (silence->voice): ascending Hann half only (pop prevention)
+//   OFFSET (voice->silence): descending Hann half only (pop prevention)
 // ────────────────────────────────────────────────────────────────────
 
-let XFADE_NORMAL = 0         // voice-to-voice boundary
-let XFADE_ONSET = 1          // silence-to-voice (fade-in only)
-let XFADE_OFFSET = 2         // voice-to-silence (fade-out only)
+let XFADE_NORMAL = 0
+let XFADE_ONSET = 1
+let XFADE_OFFSET = 2
 
 fn xfade_type_name(t: int) -> str {
     if t == XFADE_NORMAL { return "normal" }
@@ -241,37 +214,24 @@ fn xfade_type_name(t: int) -> str {
     return "?"
 }
 
-// Determine crossfade type from VAD states
 fn classify_xfade(prev_speaking: int, curr_speaking: int) -> int {
-    // prev_speaking: 1 if previous chunk had voice, 0 if silent
-    // curr_speaking: 1 if current chunk has voice, 0 if silent
     if prev_speaking == 1 && curr_speaking == 1 { return XFADE_NORMAL }
     if prev_speaking == 0 && curr_speaking == 1 { return XFADE_ONSET }
     if prev_speaking == 1 && curr_speaking == 0 { return XFADE_OFFSET }
-    // silence-to-silence: no crossfade needed, but return normal for safety
     return XFADE_NORMAL
 }
 
-// Full crossfade between two chunks
 fn crossfade(tail_a: str, head_b: str, xfade_type: int) -> str {
     let type_name = xfade_type_name(xfade_type)
-
-    // Describe the crossfade operation
-    // Mk.III: actual sample-level multiply+add with Hann coefficients
     let desc = "xfade[type=" + type_name + ",ms=" + to_string(CROSSFADE_MS) + ",samp=" + to_string(CROSSFADE_SAMP) + ",window=hann"
 
     if xfade_type == XFADE_ONSET {
-        // Silence -> voice: only fade-in the new chunk (ascending Hann half)
-        // tail_a is silence, no need to fade out
         desc = desc + ",fadein=" + head_b + ",pop_prevent=true"
     }
     if xfade_type == XFADE_OFFSET {
-        // Voice -> silence: only fade-out the old chunk (descending Hann half)
-        // head_b is silence, no need to fade in
         desc = desc + ",fadeout=" + tail_a + ",pop_prevent=true"
     }
     if xfade_type == XFADE_NORMAL {
-        // Voice -> voice: full overlap-add
         desc = desc + "|" + tail_a + ">>>" + head_b
     }
 
@@ -279,7 +239,6 @@ fn crossfade(tail_a: str, head_b: str, xfade_type: int) -> str {
     return desc
 }
 
-// Simple crossfade (backward compatible, assumes voice-to-voice)
 fn crossfade_simple(tail_a: str, head_b: str) -> str {
     return crossfade(tail_a, head_b, XFADE_NORMAL)
 }
@@ -287,52 +246,42 @@ fn crossfade_simple(tail_a: str, head_b: str) -> str {
 // ────────────────────────────────────────────────────────────────────
 // PLCCrossfadeProcessor — Combined PLC + crossfade processor
 //
-// Maintains state across chunks for the full pipeline:
+// Unified per-chunk processing for streaming.hexa integration:
 //   1. Check sequence number for loss detection
 //   2. If loss: generate concealment frame (pitch-repeat + decay)
 //   3. If recovery: generate fade-in from concealment to real audio
 //   4. Apply crossfade at chunk boundary (Hann overlap-add)
 //   5. Detect silence/voice transitions for pop-free crossfade
-//
-// This is Stage 5 of the HEXA-SPEAK pipeline.
 // ────────────────────────────────────────────────────────────────────
 
 fn process_chunk(prev_tail: str, curr_chunk: str, expected_seq: int, received_seq: int, plc_state: int, consec_lost: int, prev_speaking: int, curr_speaking: int) -> str {
-    // Returns description of processed output
-
     let loss_count = detect_loss(expected_seq, received_seq)
     let packet_ok = 1
     if loss_count > 0 { packet_ok = 0 }
 
-    // Update PLC state
     let new_consec = 0
     if packet_ok == 0 {
         new_consec = consec_lost + loss_count
     }
     let new_state = plc_transition(plc_state, new_consec, packet_ok)
 
-    // Generate output based on state
     let output = ""
 
     if new_state == PLC_NORMAL {
-        // Normal: apply crossfade at boundary
         let xtype = classify_xfade(prev_speaking, curr_speaking)
         output = crossfade(prev_tail, curr_chunk, xtype)
     }
 
     if new_state == PLC_CONCEAL || new_state == PLC_FADEOUT {
-        // Loss: generate concealment
         let gap = loss_count * FRAME_MS
         output = conceal_frame(prev_tail, new_consec, gap)
     }
 
     if new_state == PLC_MUTED {
-        // Muted: output silence
         output = "silence[muted,consec=" + to_string(new_consec) + ",max=" + to_string(PLC_MAX_CONSEC) + "]"
     }
 
     if new_state == PLC_RECOVERY {
-        // Recovery: fade-in from concealment to real audio
         let concealed = conceal_frame(prev_tail, consec_lost, FRAME_MS)
         output = recovery_fadein(curr_chunk, concealed)
     }
@@ -341,10 +290,9 @@ fn process_chunk(prev_tail: str, curr_chunk: str, expected_seq: int, received_se
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Pipeline integration helpers (called from hexa_speak.hexa)
+// Pipeline integration helpers
 // ────────────────────────────────────────────────────────────────────
 
-// Apply PLC concealment for a gap
 fn apply_plc(prev_tail: str, gap_ms: int) -> str {
     if gap_ms <= 0 { return "no_gap" }
     let consec = gap_ms / FRAME_MS
@@ -352,12 +300,10 @@ fn apply_plc(prev_tail: str, gap_ms: int) -> str {
     return conceal_frame(prev_tail, consec, gap_ms)
 }
 
-// Apply crossfade between chunks (with VAD awareness)
 fn apply_crossfade(tail_a: str, head_b: str) -> str {
     return crossfade_simple(tail_a, head_b)
 }
 
-// Apply crossfade with explicit voice activity info
 fn apply_crossfade_vad(tail_a: str, head_b: str, prev_speaking: int, curr_speaking: int) -> str {
     let xtype = classify_xfade(prev_speaking, curr_speaking)
     return crossfade(tail_a, head_b, xtype)
@@ -376,7 +322,6 @@ fn demo_hann_window() {
         if i > 0 { t = 0.1 * i }
         if i == 10 { t = 1.0 }
         let w = hann_weight(t)
-        // ASCII bar
         let bar = ""
         let b = 0
         while b < 20 {
@@ -393,6 +338,31 @@ fn demo_hann_window() {
     println("")
 }
 
+fn demo_half_hann() {
+    println("── Half-Hann ramps (onset/offset pop prevention) ──")
+    println("")
+    println("  Ascending (onset: silence -> voice):")
+    let j = 0
+    while j <= 5 {
+        let t = 0.2 * j
+        if j == 5 { t = 1.0 }
+        let w = hann_ascend(t)
+        println("    t=" + to_string(t) + " -> " + to_string(w))
+        j = j + 1
+    }
+    println("")
+    println("  Descending (offset: voice -> silence):")
+    j = 0
+    while j <= 5 {
+        let t = 0.2 * j
+        if j == 5 { t = 1.0 }
+        let w = hann_descend(t)
+        println("    t=" + to_string(t) + " -> " + to_string(w))
+        j = j + 1
+    }
+    println("")
+}
+
 fn demo_plc_states() {
     println("── PLC state machine ──")
     println("  Simulating: 3 good, 4 lost, 1 good (recovery)")
@@ -401,7 +371,6 @@ fn demo_plc_states() {
     let state = PLC_NORMAL
     let consec = 0
 
-    // 3 good packets
     let i = 0
     while i < 3 {
         state = plc_transition(state, consec, 1)
@@ -409,7 +378,6 @@ fn demo_plc_states() {
         i = i + 1
     }
 
-    // 4 lost packets
     let j = 0
     while j < 4 {
         consec = consec + 1
@@ -419,16 +387,14 @@ fn demo_plc_states() {
         j = j + 1
     }
 
-    // Recovery
     consec = 0
     state = plc_transition(state, consec, 1)
-    println("  seq=" + to_string(i + j) + " [GOOD]  state=" + plc_state_name(state) + " -> fade-in recovery")
+    println("  seq=" + to_string(i + j) + " [GOOD]  state=" + plc_state_name(state) + " -> Hann half-window fade-in recovery")
     println("")
 }
 
 fn demo_energy_decay() {
-    println("── PLC energy decay curve ──")
-    println("  Consecutive losses -> energy factor (decay=" + to_string(PLC_DECAY) + ")")
+    println("── PLC energy decay curve (decay=" + to_string(PLC_DECAY) + ") ──")
     println("")
     let i = 0
     while i <= PLC_MAX_CONSEC {
@@ -454,47 +420,45 @@ fn demo_energy_decay() {
 }
 
 fn demo_crossfade_types() {
-    println("── Crossfade types ──")
+    println("── Crossfade types (VAD-aware) ──")
 
     let xf1 = crossfade("tail[chunk3,voice]", "head[chunk4,voice]", XFADE_NORMAL)
-    println("  voice->voice:   " + xf1)
+    println("  voice->voice (normal):   " + xf1)
 
-    let xf2 = crossfade("tail[chunk3,silence]", "head[chunk4,voice]", XFADE_ONSET)
-    println("  silence->voice: " + xf2)
+    let xf2 = crossfade("tail[silence]", "head[chunk4,voice]", XFADE_ONSET)
+    println("  silence->voice (onset):  " + xf2)
 
-    let xf3 = crossfade("tail[chunk3,voice]", "head[chunk4,silence]", XFADE_OFFSET)
-    println("  voice->silence: " + xf3)
+    let xf3 = crossfade("tail[chunk3,voice]", "head[silence]", XFADE_OFFSET)
+    println("  voice->silence (offset): " + xf3)
 
     println("")
 }
 
 fn demo_full_processor() {
-    println("── Full PLC+Crossfade processor ──")
-    println("  Simulating: normal -> loss -> recovery")
+    println("── Full PLC+Crossfade processor (streaming-integrated) ──")
     println("")
 
-    // Normal chunk
     let r1 = process_chunk("tail[c0]", "chunk[c1]", 1, 1, PLC_NORMAL, 0, 1, 1)
-    println("  chunk 1 (normal):    " + r1)
+    println("  chunk 1 (normal, voice->voice):   " + r1)
 
-    // Lost chunk (expected 2, got 4 = 2 lost)
     let r2 = process_chunk("tail[c1]", "chunk[c4]", 2, 4, PLC_NORMAL, 0, 1, 1)
-    println("  chunk 2 (2 lost):    " + r2)
+    println("  chunk 2 (2 lost, conceal):        " + r2)
 
-    // Recovery
     let r3 = process_chunk("tail[plc]", "chunk[c5]", 5, 5, PLC_CONCEAL, 2, 1, 1)
-    println("  chunk 3 (recovery):  " + r3)
+    println("  chunk 3 (recovery, fade-in):      " + r3)
 
-    // Onset (silence -> voice)
     let r4 = process_chunk("tail[silence]", "chunk[c6]", 6, 6, PLC_NORMAL, 0, 0, 1)
-    println("  chunk 4 (onset):     " + r4)
+    println("  chunk 4 (onset, pop-free):        " + r4)
+
+    let r5 = process_chunk("tail[voice]", "silence[c7]", 7, 7, PLC_NORMAL, 0, 1, 0)
+    println("  chunk 5 (offset, pop-free):       " + r5)
 
     println("")
 }
 
 fn print_info() {
     println("================================================================")
-    println(" HEXA-SPEAK — PLC + Crossfade (Mk.II)")
+    println(" HEXA-SPEAK — PLC + Crossfade (Mk.II, streaming-integrated)")
     println("================================================================")
     println("")
     println(" Packet Loss Concealment:")
@@ -503,11 +467,15 @@ fn print_info() {
     println("   fadeout threshold = " + to_string(PLC_MUTE_THRESH) + " consecutive losses")
     println("   mute threshold    = " + to_string(PLC_MAX_CONSEC) + " consecutive losses")
     println("   frame size        = " + to_string(FRAME_SAMP) + " samples (" + to_string(FRAME_MS) + "ms)")
+    println("   recovery          = Hann half-window fade-in (" + to_string(CROSSFADE_MS) + "ms)")
     println("")
-    println(" Crossfade:")
+    println(" Crossfade (VAD-aware):")
     println("   window            = Hann (raised cosine)")
     println("   length            = " + to_string(CROSSFADE_MS) + "ms (" + to_string(CROSSFADE_SAMP) + " samples)")
-    println("   types             = normal (voice-voice), onset (silence-voice), offset (voice-silence)")
+    println("   types:")
+    println("     normal:  voice->voice   full overlap-add")
+    println("     onset:   silence->voice ascending Hann half (pop prevent)")
+    println("     offset:  voice->silence descending Hann half (pop prevent)")
     println("   method            = overlap-add")
     println("")
     println(" PLC States: Normal -> Conceal -> Fadeout -> Muted -> Recovery")
@@ -517,9 +485,10 @@ fn print_info() {
     println("     |     good pkt     |     good pkt     |     good pkt    |")
     println("     +---Recovery <-----+------------------+-----------------+")
     println("             |")
-    println("             +-- fade-in (Hann half-window) --> Normal")
+    println("             +-- Hann half-window fade-in --> Normal")
     println("")
     println(" Sample rate: " + to_string(SAMPLE_RATE) + " Hz")
+    println(" Integration: streaming.hexa, vad_fsm.hexa, hexa_speak.hexa")
     println("================================================================")
     println("")
 }
@@ -527,15 +496,17 @@ fn print_info() {
 fn main() {
     print_info()
     demo_hann_window()
+    demo_half_hann()
     demo_energy_decay()
     demo_plc_states()
     demo_crossfade_types()
     demo_full_processor()
 
     println("────────────────────────────────────────────────────────────")
-    println(" plc_crossfade Mk.II ready.")
-    println(" Integration: hexa_speak.hexa Stage 5 uses apply_plc(),")
-    println("   apply_crossfade(), apply_crossfade_vad(), process_chunk()")
+    println(" plc_crossfade Mk.II ready (streaming-integrated).")
+    println(" API: apply_plc(), apply_crossfade(), apply_crossfade_vad(),")
+    println("   process_chunk(), hann_weight(), hann_ascend(), hann_descend()")
+    println(" Integration: streaming.hexa Stage 5 + hexa_speak.hexa")
     println("────────────────────────────────────────────────────────────")
 }
 
