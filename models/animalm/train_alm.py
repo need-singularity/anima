@@ -1034,56 +1034,69 @@ class AnimaLMTrainer:
         return tensions, savant_tensions
 
     def _compute_losses(self, outputs, phase):
-        """Compute all losses for the current step."""
+        """Compute all losses for the current step.
+
+        DD175 #2: BLAS-only loss -- single pass over pf_modules, then batched
+        tensor ops (var/mean/std) replace 5+ per-cell Python loops.
+        """
         ce_loss = outputs.loss
         pf_modules = self._get_pf_modules()
 
-        # 2. Tension variance: encourage diverse tension across layers
+        # -- Single pass: gather all per-module scalars into lists --
         tensions_t = []
+        savant_mask = []
+        alphas = []
         for m in pf_modules:
             if m.last_tension is not None:
                 tensions_t.append(m.last_tension.mean())
+                savant_mask.append(m.is_savant)
+            alphas.append(m.alpha)
+
+        # -- Batched BLAS ops on stacked tensors (no more per-cell loops) --
+        _zero = torch.tensor(0.0, device=self.device)
+
         if len(tensions_t) >= 2:
-            t_var = torch.stack(tensions_t).var()
+            # Stack once, reuse for all tension-derived losses
+            t_stack = torch.stack(tensions_t)        # [N]
+
+            # 2. Tension variance
+            t_var = t_stack.var()
             tension_var_loss = -torch.log(t_var + 1e-8)
-        else:
-            tension_var_loss = torch.tensor(0.0, device=self.device)
 
-        # 3. AL12: Savant-Normal contrastive
-        savant_tensions_t = [m.last_tension.mean() for m in pf_modules
-                             if m.is_savant and m.last_tension is not None]
-        normal_tensions_t = [m.last_tension.mean() for m in pf_modules
-                             if not m.is_savant and m.last_tension is not None]
-        if savant_tensions_t and normal_tensions_t:
-            s_mean = torch.stack(savant_tensions_t).mean()
-            n_mean = torch.stack(normal_tensions_t).mean()
-            # Savant should have different (higher) tension than normal
-            contrastive_loss = F.relu(0.1 - torch.abs(s_mean - n_mean))
-        else:
-            contrastive_loss = torch.tensor(0.0, device=self.device)
+            # 3. AL12: Savant-Normal contrastive (boolean index, no loop)
+            savant_idx = torch.tensor(savant_mask, dtype=torch.bool, device=t_stack.device)
+            n_savant = savant_idx.sum().item()
+            n_normal = len(savant_mask) - n_savant
+            if n_savant > 0 and n_normal > 0:
+                s_mean = t_stack[savant_idx].mean()
+                n_mean = t_stack[~savant_idx].mean()
+                contrastive_loss = F.relu(0.1 - torch.abs(s_mean - n_mean))
+            else:
+                contrastive_loss = _zero
 
-        # 4. Alpha regularization: prevent explosion
-        alphas = [m.alpha for m in pf_modules]
-        if alphas:
-            alpha_reg = torch.stack([a ** 2 for a in alphas]).mean()
-        else:
-            alpha_reg = torch.tensor(0.0, device=self.device)
+            # 5. Direction consistency
+            t_mean = t_stack.mean()
+            direction_loss = F.relu(t_stack.std() / (t_mean + 1e-8) - 2.0)
 
-        # 5. Direction consistency: PureField outputs agree on direction
-        if len(tensions_t) >= 2:
-            t_stack = torch.stack(tensions_t)
-            direction_loss = t_stack.std() / (t_stack.mean() + 1e-8)
-            # We want some variance (diversity) but not chaos
-            direction_loss = F.relu(direction_loss - 2.0)
-        else:
-            direction_loss = torch.tensor(0.0, device=self.device)
-
-        # 6. Tension magnitude: prevent collapse
-        if tensions_t:
-            t_mean = torch.stack(tensions_t).mean()
+            # 6. Tension magnitude
             tension_mag_loss = F.relu(0.01 - t_mean)
+        elif len(tensions_t) == 1:
+            tension_var_loss = _zero
+            contrastive_loss = _zero
+            direction_loss = _zero
+            tension_mag_loss = F.relu(0.01 - tensions_t[0])
         else:
-            tension_mag_loss = torch.tensor(0.0, device=self.device)
+            tension_var_loss = _zero
+            contrastive_loss = _zero
+            direction_loss = _zero
+            tension_mag_loss = _zero
+
+        # 4. Alpha regularization: batched square + mean (no per-alpha loop)
+        if alphas:
+            alpha_stack = torch.stack(alphas)         # [N_layers]
+            alpha_reg = (alpha_stack * alpha_stack).mean()
+        else:
+            alpha_reg = _zero
 
         # Phase-dependent loss combination
         if self.use_law60:

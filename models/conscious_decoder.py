@@ -595,6 +595,7 @@ class ConsciousDecoderV2(nn.Module):
         use_moe: bool = False,
         n_experts: int = 8,
         top_k_experts: int = 2,
+        lm_head_rank: int = 0,
     ):
         super().__init__()
 
@@ -603,6 +604,7 @@ class ConsciousDecoderV2(nn.Module):
         self.n_layer = n_layer
         self.d_model = d_model
         self.use_moe = use_moe
+        self.lm_head_rank = lm_head_rank
 
         # Token embedding (no position embedding — RoPE handles it)
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -635,7 +637,12 @@ class ConsciousDecoderV2(nn.Module):
 
         # Dual prediction heads
         self.head_a = nn.Linear(d_model, vocab_size, bias=False)
-        self.head_g = nn.Linear(d_model, vocab_size, bias=False)
+        # DD175: U+V factorized head_g for speedup
+        if lm_head_rank > 0:
+            self.head_g_u = nn.Linear(d_model, lm_head_rank, bias=False)
+            self.head_g_v = nn.Linear(lm_head_rank, vocab_size, bias=False)
+        else:
+            self.head_g = nn.Linear(d_model, vocab_size, bias=False)
 
         # Weight tying: tok_emb <-> head_a
         self.tok_emb.weight = self.head_a.weight
@@ -723,7 +730,7 @@ class ConsciousDecoderV2(nn.Module):
         # Final norm + dual heads
         x = self.ln_f(x)
         logits_a = self.head_a(x)
-        logits_g = self.head_g(x)
+        logits_g = self.head_g_v(self.head_g_u(x)) if self.lm_head_rank > 0 else self.head_g(x)
 
         # Psi tracking (Law 71)
         if self.training:

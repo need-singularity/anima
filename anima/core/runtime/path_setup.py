@@ -42,6 +42,15 @@ _candidates = [
     os.path.join(_anima_pkg, 'hexad'),
     os.path.join(_anima_pkg, 'config'),
     os.path.join(_anima_pkg, 'tests'),
+    # Split targets — 8 runtime files moved from core/runtime/ (2026-04-10)
+    os.path.join(_anima_pkg, 'modules', 'legacy'),
+    os.path.join(_anima_pkg, 'modules', 'logging'),
+    os.path.join(_anima_pkg, 'modules', 'monitor'),
+    os.path.join(_anima_pkg, 'modules', 'education'),
+    os.path.join(_anima_pkg, 'modules', 'training'),
+    os.path.join(_anima_pkg, 'modules', 'cloud'),
+    os.path.join(_anima_pkg, 'modules', 'learning'),
+    os.path.join(_anima_pkg, 'modules', 'sync'),
 ]
 
 for _p in _candidates:
