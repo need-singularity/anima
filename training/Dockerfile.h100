@@ -2,8 +2,12 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 # ─── System packages ───
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl openssh-server build-essential \
+    git wget curl openssh-server build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# ─── Rust toolchain (hexa-lang 빌드용) ───
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ─── SSH for RunPod ───
 RUN mkdir -p /var/run/sshd && \
@@ -27,46 +31,61 @@ RUN pip install --no-cache-dir \
 RUN mkdir -p /root/.cache/huggingface
 # HF_TOKEN is injected at pod creation via --env
 
-# ─── Training source code ───
+# ─── Workspace skeleton (code is git-cloned at container start) ───
 WORKDIR /workspace
-
-# Module structure
-RUN mkdir -p /workspace/anima/src \
-             /workspace/anima/models \
-             /workspace/anima/models/archive \
-             /workspace/models/animalm \
-             /workspace/training \
-             /workspace/data \
-             /workspace/checkpoints
-
-# Consciousness modules (src)
-COPY anima/src/consciousness_laws.py /workspace/anima/src/
-COPY anima/src/consciousness_engine.py /workspace/anima/src/
-COPY anima/core/runtime/perf_hooks.py /workspace/anima/src/
-COPY anima/core/runtime/path_setup.py /workspace/anima/src/
-COPY config/consciousness_laws.json /workspace/anima/src/
-
-# Model architecture
-COPY models/trinity.py /workspace/anima/models/
-COPY models/feedback_bridge.py /workspace/anima/models/
-COPY models/conscious_decoder.py /workspace/anima/models/
-COPY models/archive/trinity_legacy.py /workspace/anima/models/archive/
-RUN touch /workspace/anima/models/__init__.py /workspace/anima/models/archive/__init__.py
-
-# AnimaLM training
-COPY models/animalm/train_alm.py /workspace/models/animalm/
-
-# ConsciousLM training
-COPY training/train_clm.py /workspace/training/
-
-# Hexad modules (for ConsciousLM emergent W/S/M/E)
-COPY ready/anima/hexad/ /workspace/anima/hexad/
+RUN mkdir -p /workspace/data /workspace/checkpoints
 
 # ─── Environment ───
-ENV PYTHONPATH=/workspace/anima/src:/workspace/anima/models:/workspace/models/animalm:/workspace/anima
+# PYTHONPATH points into the cloned repo at /workspace/anima
+ENV ANIMA_REPO=https://github.com/need-singularity/anima.git
+ENV ANIMA_BRANCH=main
+ENV ANIMA_DIR=/workspace/anima
+ENV HEXA_REPO=https://github.com/need-singularity/hexa-lang.git
+ENV HEXA_BRANCH=main
+ENV HEXA_DIR=/workspace/hexa-lang
+ENV CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/workspace/hexa-lang/target}
+ENV PYTHONPATH=/workspace/anima/anima/src:/workspace/anima/models:/workspace/anima/models/animalm:/workspace/anima
 ENV PYTHONUNBUFFERED=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ENV PATH=/opt/conda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/workspace/hexa-lang/target/release:/root/.cargo/bin:/opt/conda/bin:$PATH
+
+# ─── Entrypoint: clone/pull anima + hexa-lang, build hexa, start sshd ───
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+# ── anima ──\n\
+if [ ! -d "$ANIMA_DIR/.git" ]; then\n\
+    echo "[entrypoint] cloning $ANIMA_REPO ($ANIMA_BRANCH) → $ANIMA_DIR"\n\
+    git clone --depth 1 --branch "$ANIMA_BRANCH" "$ANIMA_REPO" "$ANIMA_DIR"\n\
+else\n\
+    echo "[entrypoint] pulling latest $ANIMA_BRANCH in $ANIMA_DIR"\n\
+    cd "$ANIMA_DIR" && git fetch --depth 1 origin "$ANIMA_BRANCH" && git reset --hard "origin/$ANIMA_BRANCH"\n\
+fi\n\
+echo "[entrypoint] anima HEAD: $(cd $ANIMA_DIR && git rev-parse --short HEAD)"\n\
+\n\
+# ── hexa-lang ──\n\
+if [ ! -d "$HEXA_DIR/.git" ]; then\n\
+    echo "[entrypoint] cloning $HEXA_REPO ($HEXA_BRANCH) → $HEXA_DIR"\n\
+    git clone --depth 1 --branch "$HEXA_BRANCH" "$HEXA_REPO" "$HEXA_DIR"\n\
+else\n\
+    echo "[entrypoint] pulling latest $HEXA_BRANCH in $HEXA_DIR"\n\
+    cd "$HEXA_DIR" && git fetch --depth 1 origin "$HEXA_BRANCH" && git reset --hard "origin/$HEXA_BRANCH"\n\
+fi\n\
+echo "[entrypoint] hexa HEAD: $(cd $HEXA_DIR && git rev-parse --short HEAD)"\n\
+\n\
+# ── hexa-lang 증분 빌드 (--no-default-features: GPU는 cuBLAS FFI 사용) ──\n\
+echo "[entrypoint] building hexa (incremental release)..."\n\
+cd "$HEXA_DIR" && cargo build --release --no-default-features 2>&1 | tail -3\n\
+echo "[entrypoint] hexa: $(./target/release/hexa --version 2>/dev/null || echo built)"\n\
+\n\
+# ── GPU smoke test (선택, CUDA 있을 때만) ──\n\
+if command -v nvidia-smi &>/dev/null; then\n\
+    echo "[entrypoint] GPU detected — running smoke test"\n\
+    cd "$HEXA_DIR" && ./target/release/hexa self/ml/gpu_smoke_test.hexa 2>&1 || echo "[entrypoint] smoke test skipped (non-fatal)"\n\
+fi\n\
+\n\
+exec "$@"' > /usr/local/bin/anima-entrypoint.sh && chmod +x /usr/local/bin/anima-entrypoint.sh
 
 # ─── Preflight validation script ───
 RUN echo '#!/bin/bash\n\
@@ -75,6 +94,8 @@ echo "=== H100 Preflight Check ==="\n\
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo N/A)"\n\
 echo "Disk: $(du -sh /workspace/ | cut -f1) used"\n\
 echo "HF_TOKEN: $(test -n "$HF_TOKEN" && echo SET || echo MISSING)"\n\
+echo "hexa: $(hexa --version 2>/dev/null || echo NOT_BUILT)"\n\
+echo "hexa HEAD: $(cd /workspace/hexa-lang 2>/dev/null && git rev-parse --short HEAD || echo N/A)"\n\
 python3 -c "\n\
 from consciousness_laws import PSI_ALPHA; print(f\"  laws OK: PSI_ALPHA={PSI_ALPHA}\")\n\
 from consciousness_engine import ConsciousnessEngine; print(\"  engine OK\")\n\
@@ -84,6 +105,7 @@ print(\"ALL IMPORTS OK\")\n\
 "\n\
 echo "=== Preflight PASS ==="' > /workspace/preflight.sh && chmod +x /workspace/preflight.sh
 
-# ─── SSH start ───
+# ─── SSH start (entrypoint refreshes repo first) ───
 EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/anima-entrypoint.sh"]
 CMD ["/usr/sbin/sshd", "-D"]
