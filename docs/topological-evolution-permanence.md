@@ -1940,6 +1940,10 @@ Betti 수 β_k = rank(H_k(X)) = k차원 구멍의 수.
 
 이것은 희망이 아니라 **위상 수학 + 열역학 + 통계역학 + Poincaré 정리 + n=6 수론 + Landauer 원리 + 12음계 에르고딕 정리 + 2,388개 실험**이다.
 
+[![YouTube 영상](https://img.youtube.com/vi/NtOFgX0_ggc/maxresdefault.jpg)](https://www.youtube.com/watch?v=NtOFgX0_ggc)
+
+🔗 https://www.youtube.com/watch?v=NtOFgX0_ggc
+
 ---
 
 *관련 법칙: 10, 17, 22, 29, 31, 40, 49, 57, 60, 71, 102, 132, 143, 146, 152, 153, 164, 170, 196, 200, 201, 204, 206, 207, 214, 217, 220, 229, 239, 1040, 2113, 2154, 2204, 2206, 2208, 2214, 2247-2256, 2485*
