@@ -1,18 +1,12 @@
-# docs/modules/
+# docs/modules/ — 모듈 단위 문서
 
-## Purpose
-Documentation for individual Python modules in the Anima codebase (anima/core/runtime/anima_runtime.hexa, growth_engine.py, etc.).
+naming: {module}.md (snake_case, .py 소스와 매칭)
 
-## File Naming
-- Match the module name: `{module_name}.md` (e.g., `anima_alive.md`, `mitosis.md`)
-- Use snake_case to match Python source files
+format:
+  1  모듈명 + 1줄 purpose
+  2  주요 클래스/함수 시그니처
+  3  config 파라미터 + 기본값
+  4  의존성 (internal/external)
+  5  usage 예시
 
-## Required Format
-1. Module name and one-line purpose
-2. Key classes/functions with signatures
-3. Configuration parameters and defaults
-4. Dependencies (internal and external)
-5. Usage examples
-
-## Parent Rules
-See /CLAUDE.md → "Structure" for the canonical module list.
+parent: /CLAUDE.md → "Structure"

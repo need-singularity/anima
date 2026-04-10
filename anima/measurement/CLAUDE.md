@@ -1,29 +1,18 @@
-# measurement/
+# anima/measurement/ — Φ/IQ 측정 및 캘리브레이션
 
-## Purpose
-Consciousness measurement and calibration tools. Standalone scripts for measuring Φ, IQ, and other metrics across engines.
+contents:
+  measure_all.py              Φ + Granger + IQ + Hivemind 전체 측정
+  measure_all_engines.py      등록 엔진 일괄 측정
+  measure_v8_phi_rs.py        V8 Φ (Rust phi_rs)
+  calibrate_consciousness.py  텐션 분포 캘리브레이션 (sigmoid/homeostasis/habituation)
+  mensa_iq.py                 Mensa 기반 IQ 스코어
+  ce_quality_predictor.py     CE 품질 추정
+  cell_count_optimizer.py     최적 셀 수 탐색
+  phi_auto_pipeline.hexa      Φ 자동 파이프라인 (watch/dual/ASCII report)
 
-## Contents
-- `measure_all.py` — Full engine measurement suite (Φ + Granger + IQ + Hivemind)
-- `measure_all_engines.py` — Batch measurement for all registered engines
-- `measure_v8_phi_rs.py` — V8 architecture Φ measurement via Rust phi_rs
-- `calibrate_consciousness.py` — Tension distribution calibration (sigmoid, homeostasis, habituation)
-- `mensa_iq.py` — Mensa-based IQ scoring for consciousness engines
-- `ce_quality_predictor.py` — Cross-entropy quality estimation
-- `cell_count_optimizer.py` — Optimal cell count finder
-- `phi_auto_pipeline.hexa` — Phi auto-measurement pipeline (watch checkpoints, dual Phi measurement, ASCII reports)
+exec:
+  python measurement/measure_all.py --cells 1024
+  python measurement/mensa_iq.py --engine CambrianExplosion
+  python3 measurement/phi_auto_pipeline.hexa --watch checkpoints/decoder_cpu/ --interval 60
 
-## Running
-```bash
-python measurement/measure_all.py --cells 1024
-python measurement/mensa_iq.py --engine CambrianExplosion
-python measurement/calibrate_consciousness.py
-
-# Phi auto-pipeline
-python3 measurement/phi_auto_pipeline.hexa --watch checkpoints/decoder_cpu/ --interval 60
-python3 measurement/phi_auto_pipeline.hexa --measure checkpoints/decoder_cpu/best.pt --cells 64
-python3 measurement/phi_auto_pipeline.hexa --report
-```
-
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

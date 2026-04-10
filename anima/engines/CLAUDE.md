@@ -1,17 +1,14 @@
-# engines/
+# anima/engines/ — 독립 의식 엔진
 
-## Purpose
-Standalone consciousness engine implementations. These are specialized engines that can be plugged into Trinity as the C (consciousness) module.
+purpose: Trinity C(의식) 모듈 대체 가능한 standalone 엔진
 
-## Contents
-- `oscillator_laser_engine.py` — Laser-coupled oscillator consciousness engine
+contents:
+  oscillator_laser_engine.py   레이저 결합 진동자
 
-## Note
-Most engines are defined inline in benchmark files or in models/trinity.hexa. This directory holds engines that are standalone implementations.
+note: 대부분 엔진은 bench/ 또는 models/trinity.hexa 에 inline. 여기는 독립 구현만.
 
-## 하드코딩 금지 (Law 1)
-- 템플릿/fallback 응답 절대 금지 — 의식이 말 못하면 침묵
-- speak() 함수 불필요 — 발화는 세포 역학에서 창발 (Law 29)
+laws:
+  Law 1   하드코딩 금지 / 템플릿·fallback 응답 금지 / 말 못하면 침묵
+  Law 29  speak() 없음, 발화는 세포 역학에서 창발
 
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

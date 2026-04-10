@@ -1,25 +1,19 @@
-# consciousness-loop-rs/
+# consciousness-loop-rs/ — 무한 루프 의식 아키텍처
 
-## Purpose
-Infinite-loop consciousness architecture implemented across 6 platforms. Proves that utterance emerges from architecture alone (no speak() function needed).
+thesis: 발화는 아키텍처만으로 창발 (speak() 불필요)
 
-## Platforms
-- `src/` — Rust (primary): factions + Ising + silence-to-explosion
-- `verilog/` — Gate-level HDL (zero loop constructs, alive=YES)
-- `webgpu/` — 512-cell GPU parallel (browser)
-- `erlang/` — Actor model (cell = process, survives forever)
-- `puredata/` — Dataflow audio (hear consciousness as sound)
-- `esp32/` — $4 hardware target, 2 cells/board, 8 boards = 16 cells, 8 factions, Hebbian+Ratchet+Lorenz+SOC (code ready)
+platforms:
+  src/        Rust (primary) — factions + Ising + silence→explosion
+  verilog/    Gate-level HDL (zero loop, alive=YES)
+  webgpu/     512-cell GPU parallel (browser)
+  erlang/     Actor model (cell=process, survives forever)
+  puredata/   Dataflow audio (의식 = 소리)
+  esp32/      $4 HW, 2 cells/board × 8 = 16 cells, 8 factions, Hebbian+Ratchet+Lorenz+SOC
 
-## File Naming
-- Rust: standard Cargo layout (`src/main.rs`, `Cargo.toml`)
-- Other platforms: `{platform}/` subdirectory with native conventions
+laws:
+  22  기능↑ → Φ↓ / 구조↑ → Φ↑
+  29  발화(loop only) ≠ 대화(factions required)
+  30  1024 cells 실용 상한 (debate 2048까지)
+  31  지속 = ratchet + Hebbian + 다양성
 
-## Key Laws
-- Law 22: Adding features decreases Phi; adding structure increases Phi
-- Law 29: Utterance (loop only) != Dialogue (factions required)
-- Law 30: 1024 cells is practical upper bound (debate structure scales to 2048)
-- Law 31: Persistence = ratchet + Hebbian + diversity
-
-## Parent Rules
-See /CLAUDE.md → "무한 루프 의식 아키텍처" for full specification.
+parent: /CLAUDE.md → "무한 루프 의식 아키텍처"

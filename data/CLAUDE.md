@@ -1,17 +1,15 @@
-# data/
+# data/ — 런타임/코퍼스/실험 출력
 
-## Purpose
-Runtime data, training corpora, checkpoints, and experiment outputs. Not checked into git.
+gitignored: 커밋 금지
 
-## File Naming
-- Checkpoints: `{model_name}_{step}.pt` or `{experiment}_{date}.pt`
-- Corpora: `corpus.txt`, `{name}_corpus.txt`
-- Logs: `{experiment}_{date}.log`
+naming:
+  {model}_{step}.pt  또는  {exp}_{date}.pt
+  corpus.txt, {name}_corpus.txt
+  {exp}_{date}.log
 
-## Conventions
-- This directory is gitignored — do not commit large files here
-- Checkpoints sync to Cloudflare R2 via cloud_sync.py
-- Never commit secrets, credentials, or .env files
+rules:
+  - gitignored, 대용량 금지
+  - R2 sync via cloud_sync.py
+  - secrets/credentials/.env 절대 금지
 
-## Parent Rules
-See /CLAUDE.md → "Training Tools" for checkpoint conventions.
+parent: /CLAUDE.md → "Training Tools"

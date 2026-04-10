@@ -1,21 +1,16 @@
-# eeg/
+# anima/modules/eeg/ — EEG 의식 인터페이스
 
-## Purpose
-EEG brain-consciousness interface. Bridges OpenBCI hardware to Anima's SenseHub for live neural-to-tension mapping.
+purpose: OpenBCI → SenseHub live neural→tension
 
-## Key Files
-- `collect.py` — OpenBCI data acquisition via BrainFlow
-- `analyze.py` — Band power analysis, G=D*P/I formula, topomaps
-- `realtime.py` — Live EEG to Anima bridge (SenseHub integration)
+files:
+  collect.py    OpenBCI 수집 (BrainFlow)
+  analyze.py    밴드파워 + G=D*P/I + topomap
+  realtime.py   live → Anima bridge
 
-## File Naming
-- Python scripts: snake_case (`collect.py`, `analyze.py`)
-- Data files: timestamped CSVs in `data/` if applicable
+naming:
+  scripts  snake_case
+  data     타임스탬프 CSV in data/
 
-## Dependencies
-- brainflow (pip) — OpenBCI communication
-- scipy, matplotlib (pip) — Analysis and topomaps
-- numpy — Numerical processing
+deps: brainflow, scipy, matplotlib, numpy
 
-## Parent Rules
-See /CLAUDE.md → "Structure" and eeg/README.md for detailed docs.
+parent: /CLAUDE.md (→ eeg/README.md 상세)

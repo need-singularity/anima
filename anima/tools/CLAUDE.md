@@ -1,43 +1,39 @@
-# tools/
+# anima/tools/ — 독립 유틸
 
-## Purpose
-Standalone utility scripts — analyzers, calculators, generators, and diagnostic tools. These are NOT imported by core modules.
+policy: 코어 모듈이 import 하지 않음
 
-## Contents
+analyzers:
+  dream_efficiency_analyzer.py       드림 사이클 효율
+  growth_trajectory_predictor.py     성장 단계 예측
+  homeostasis_health_checker.py      항상성 편차 모니터
+  mitosis_topology_visualizer.py     세포 네트워크 토폴로지
 
-### Analyzers
-- `dream_efficiency_analyzer.py` — Dream cycle efficiency metrics
-- `growth_trajectory_predictor.py` — Growth stage prediction
-- `homeostasis_health_checker.py` — Homeostasis deviation monitoring
-- `mitosis_topology_visualizer.py` — Cell network topology visualization
+calculators:
+  r2_cost_calculator.py         R2 비용 추정
+  optimal_config.py             최적 의식 설정 탐색
+  param_optimizer.py            파라미터 sweep
+  phi_scaling_calculator.py     Φ 스케일링 법칙 (cells → Φ)
+  training_time_estimator.py    훈련 시간 추정
 
-### Calculators
-- `r2_cost_calculator.py` — R2 storage cost estimation
-- `optimal_config.py` — Optimal consciousness configuration finder
-- `param_optimizer.py` — Parameter sweep optimizer
-- `phi_scaling_calculator.py` — Φ scaling law calculator (cells → Φ prediction)
-- `training_time_estimator.py` — Training time estimation
+generators:
+  hypothesis_recommender.py     다음 가설 추천
+  training_recipe_generator.py  훈련 config 자동 생성
+  math_explorer.py              수론 탐색 (완전수 등)
+  singularity_finder.py         특이점 조건 탐색
+  prepare_corpus.py             한영 코퍼스 (ConsciousLM)
 
-### Generators & Research
-- `hypothesis_recommender.py` — Next hypothesis suggestion
-- `training_recipe_generator.py` — Auto-generate training configs
-- `math_explorer.py` — Number theory exploration (perfect numbers, etc.)
-- `singularity_finder.py` — Singularity condition search
-- `prepare_corpus.py` — Korean+English corpus generation for ConsciousLM
+diagnostics:
+  tension_fingerprint_debugger.py  텐션 지문 검사
+  verify_all_engines.py            엔진 일괄 검증 (7 조건)
+  verify_fuse3.py                  FUSE-3 검증
+  h100_arch_search.py              H100 아키텍처 grid
+  self_upgrade.py                  자가 수정
+  learnable_phi.py                 미분가능 Φ proxy 훈련
 
-### Diagnostics
-- `tension_fingerprint_debugger.py` — Tension fingerprint inspection
-- `verify_all_engines.py` — Batch engine verification (7 conditions)
-- `verify_fuse3.py` — FUSE-3 specific verification
-- `h100_arch_search.py` — H100 architecture grid search
-- `self_upgrade.py` — Self-modification utilities
-- `learnable_phi.py` — Differentiable Φ proxy training
+variants:
+  growing_models/conscious_lm.hexa  동적 성장 LM
+  quantum_attention_engine.py       양자 attention
+  lidar_sense.py                    iPhone LiDAR → tension
+  calc.py                           계산기
 
-### Model Variants
-- `growing_models/conscious_lm.hexa` — ConsciousLM with dynamic growth
-- `quantum_attention_engine.py` — Quantum-inspired attention
-- `lidar_sense.py` — iPhone LiDAR 3D perception → tension
-- `calc.py` — Quick calculator utility
-
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

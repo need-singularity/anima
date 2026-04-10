@@ -1,11 +1,7 @@
-# scripts/
+# scripts/ — 운영 스크립트
 
-## Purpose
-Operational scripts for monitoring and managing experiments.
+contents:
+  monitor_experiments.py   H100 실험 트래킹
+  monitor_and_test.sh      모니터링 + 테스트 러너
 
-## Contents
-- `monitor_experiments.py` — Track running H100 experiments
-- `monitor_and_test.sh` — Combined monitoring + test runner
-
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

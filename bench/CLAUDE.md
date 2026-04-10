@@ -1,22 +1,17 @@
-# benchmarks/
+# bench/ — 가설 벤치마크
 
-## Purpose
-Hypothesis benchmark scripts. Each file tests one or more consciousness hypotheses and measures Φ(IIT), Φ(proxy), CE, and other metrics.
+metrics: Φ(IIT), Φ(proxy), CE
 
-## File Naming
-- `bench_{domain}_engines.py` — Domain-specific engine benchmarks (algebra, evolution, physics, etc.)
-- `bench_{name}_LEGACY.py` — Deprecated benchmarks (Φ proxy/IIT confusion era)
-- `bench_v8_*.py` — V8 architecture hypothesis series
-- `bench_trinity*.py` — Trinity/Hexad architecture benchmarks
+naming:
+  bench_{domain}_engines.py   도메인 엔진 (algebra/evolution/physics ...)
+  bench_{name}_LEGACY.py      폐기 (Φ proxy/IIT 혼동기)
+  bench_v8_*.py               V8 아키텍처
+  bench_trinity*.py           Trinity/Hexad
 
-## Key File
-`ready/anima/tests/tests.hexa` remains in project root — it is the canonical benchmark with dual Φ measurement, referenced in CLAUDE.md.
+canonical: ready/anima/tests/tests.hexa (dual Φ, CLAUDE.md 참조)
 
-## Running
-```bash
-python benchmarks/bench_algebra_engines.py    # Run specific benchmark
-python ready/anima/tests/tests.hexa --verify                   # Canonical verifier (root)
-```
+exec:
+  python bench/bench_algebra_engines.py
+  python ready/anima/tests/tests.hexa --verify
 
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

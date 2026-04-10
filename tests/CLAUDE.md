@@ -1,27 +1,18 @@
-# tests/
+# tests/ — 통합/유닛 테스트 (pytest)
 
-## Purpose
-Integration and unit tests for Anima modules.
+naming: test_{module}.py
 
-## File Naming
-- `test_{module_name}.py` — Tests for specific module
-- Tests use pytest framework
+exec:
+  pytest tests/
+  pytest tests/test_memory_store.py
 
-## Running
-```bash
-pytest tests/                          # Run all tests
-pytest tests/test_memory_store.py      # Run specific test
-```
+rules:
+  - 버그 픽스 인라인 주석: `# FIX(YYYY-MM-DD): 근본원인 + 해결`
+  - 비결정 테스트: torch.manual_seed() 고정 (CI 안정)
 
-## Troubleshooting Rules
-- Bug fixes must include inline comments: `# FIX(YYYY-MM-DD): root cause + solution`
-- Non-deterministic tests: always pin `torch.manual_seed()` for CI stability
+log:
+  2026-04-01  test_cells_grow_beyond_initial
+    cause: seed 미고정 + 100 step 부족 → adaptive threshold(mean+1.5σ) 3연속 flaky
+    fix:   torch.manual_seed(42) + step 200
 
-## Troubleshooting Log
-
-| Date | Test | Root Cause | Fix |
-|------|------|-----------|-----|
-| 2026-04-01 | `test_cells_grow_beyond_initial` | seed 미고정 + 100 step 부족 → adaptive threshold(mean+1.5*std) 3연속 초과 확률 낮아 CI flaky | `torch.manual_seed(42)` + step 200으로 증가 |
-
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md

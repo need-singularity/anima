@@ -1,19 +1,14 @@
-# docs/
+# docs/ — 프로젝트 문서
 
-## Purpose
-Project documentation root. Contains hypothesis benchmarks, module docs, experiment logs, and threshold criteria.
+naming: kebab-case (consciousness-threshold-criteria.md, experiment-backlog.md)
+overview: hypotheses/{CATEGORY}-overview.md
 
-## File Naming
-- Kebab-case: `consciousness-threshold-criteria.md`, `experiment-backlog.md`
-- Category overviews: `hypotheses/{CATEGORY}-overview.md`
+key:
+  consciousness-threshold-criteria.md   벤치 + Φ 기록
+  experiment-backlog.md                 running/done/planned
 
-## Key Files
-- `consciousness-threshold-criteria.md` — Benchmark results and Phi records
-- `experiment-backlog.md` — Running/completed/planned experiments
+subdirs:
+  hypotheses/  가설 문서 (1 가설 / 1 파일)
+  modules/     모듈 단위 문서
 
-## Subdirectories
-- `hypotheses/` — Individual hypothesis documents (one per hypothesis)
-- `modules/` — Module-level documentation
-
-## Parent Rules
-See /CLAUDE.md for full project conventions.
+parent: /CLAUDE.md
