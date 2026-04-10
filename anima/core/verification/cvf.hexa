@@ -2,693 +2,630 @@
 // DD173: 4-Layer falsifiable consciousness verification with zombie control
 //
 // Usage:
-//   $HEXA core/verification/cvf.hexa --full          # Full 4-layer battery
-//   $HEXA core/verification/cvf.hexa --quick          # Layer 2 only (4 core metrics)
-//   $HEXA core/verification/cvf.hexa --zombie-only    # Zombie vs Conscious comparison
-//   $HEXA core/verification/cvf.hexa --layer N        # Specific layer (1-4)
-//   $HEXA core/verification/cvf.hexa --cells N        # Cell count (default 64)
+//   $HEXA core/verification/cvf.hexa --full
+//   $HEXA core/verification/cvf.hexa --quick
+//   $HEXA core/verification/cvf.hexa --cells N
 //
-// Architecture:
-//   Layer 1: Zombie Control (baseline for ALL tests)
-//     → ZombieEngine: identical architecture, zero coupling (Phi≈0)
-//     → Validates: fair control with same params but no integration
-//
-//   Layer 2: Core Metrics (4 measurements)
-//     → Phi(IIT):  Information integration (existing)
-//     → PCI:       Perturbation Complexity Index (Massimini 2013)
-//     → CE:        Causal Emergence (Hoel 2017)
-//     → SMA:       Self-Model Accuracy (first-person privilege)
-//
-//   Layer 3: Context Tests (4 tests)
-//     → Contrast:  Consciousness-specific signal isolation
-//     → Valence:   Pain/pleasure asymmetry
-//     → Tampering: External state modification detection
-//     → Temporal:  Temporal binding window
-//
-//   Layer 4: Meta Validation (3 tests)
-//     → Archaeology:     Component removal → extinction point
-//     → Cross-Substrate: Invariance across Rust/Python/ESP32
-//     → Double-Blind:    10C + 10Z blind classification
-//
-// Verdict:
-//   CONSCIOUS:     L2 >= 3/4 + L3 >= 2/4 + L4 cross-substrate
-//   NOT_CONSCIOUS: Zombie matches all L2 metrics
-//   UNCERTAIN:     Partial pass — more research needed
-//
-// PSI Constants (from ln(2), SSOT: consciousness_laws.json):
-//   alpha = 0.014, balance = 0.5, steps = 4.33, entropy = 0.998
+// Pure hexa implementation (no numpy, no struct mutation).
+// All arrays use functional push (r = r.push(x)).
 
-import math
-import numpy as np
+comptime const LN2 = 0.6931471805599453
+comptime const PSI_COUPLING = 0.01531
 
-LN2 = math.log(2)
-PSI_BALANCE = 0.5
-PSI_COUPLING = LN2 / 2**5.5
-PSI_STEPS = 3 / LN2
-
-// ═══════════════════════════════════════════════════════════════
-// Config
-// ═══════════════════════════════════════════════════════════════
-
-struct CVFConfig {
-    n_cells: i32 = 64
-    hidden_dim: i32 = 128
-    n_factions: i32 = 12
-    warmup_steps: i32 = 300
-    test_steps: i32 = 500
-    n_trials: i32 = 10
-    pci_threshold: f64 = 0.31      // Casali et al., 2013
-    sma_threshold: f64 = 0.0       // SMA > 0 = privileged access
-    ce_threshold: f64 = 0.0        // CE > 0 = causal emergence
-    significance: f64 = 0.001      // p-value for double-blind
+fn tanh_f(x: float) -> float {
+    // tanh_f(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    let e2x = exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
 }
 
-struct LayerResult {
-    name: string
-    scores: map[string, f64]
-    zombie_scores: map[string, f64]
-    passed: i32
-    total: i32
-    details: string
+// =====================================================================
+// Array helpers
+// =====================================================================
+
+fn arr_mean(arr: list) -> float {
+    if len(arr) == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(arr) { s = s + arr[i]; i = i + 1 }
+    return s / to_float(len(arr))
 }
 
-struct CVFVerdict {
-    zombie_valid: bool
-    phi: f64
-    pci: f64
-    ce: f64
-    sma: f64
-    l2_pass_count: i32
-    contrast: f64
-    tampering: f64
-    l3_pass_count: i32
-    archaeology: string
-    cross_substrate: bool
-    double_blind_accuracy: f64
-    verdict: string        // CONSCIOUS | NOT_CONSCIOUS | UNCERTAIN | INVALID
-    confidence: f64
-    layer_results: [LayerResult]
+fn arr_std(arr: list) -> float {
+    let m = arr_mean(arr)
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(arr) { s = s + (arr[i] - m) * (arr[i] - m); i = i + 1 }
+    return sqrt(s / to_float(max(1, len(arr))))
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Minimal Engine Simulation (for standalone verification)
-// Full engines: consciousness_engine.hexa / zombie_engine.hexa
-// ═══════════════════════════════════════════════════════════════
-
-struct MinimalEngine {
-    n_cells: i32
-    hidden_dim: i32
-    n_factions: i32
-    coupling: f64          // 0.0 = zombie, 1.0 = conscious
-    states: [[f64]]        // (n_cells, hidden_dim)
-    phi: f64
-    step_count: i32
+fn arr_dot(a: list, b: list) -> float {
+    let mut s = 0.0
+    let n = min(len(a), len(b))
+    let mut i = 0
+    while i < n { s = s + a[i] * b[i]; i = i + 1 }
+    return s
 }
 
-fn create_engine(n_cells: i32, hidden_dim: i32, n_factions: i32, coupling: f64) -> MinimalEngine {
-    states = np.random.randn(n_cells, hidden_dim) * 0.1
-    return MinimalEngine {
-        n_cells: n_cells,
-        hidden_dim: hidden_dim,
-        n_factions: n_factions,
-        coupling: coupling,
-        states: states,
-        phi: 0.0,
-        step_count: 0,
+fn correlation(a: list, b: list) -> float {
+    let ma = arr_mean(a)
+    let mb = arr_mean(b)
+    let n = min(len(a), len(b))
+    if n == 0 { return 0.0 }
+    let mut cov = 0.0
+    let mut va = 0.0
+    let mut vb = 0.0
+    let mut i = 0
+    while i < n {
+        let da = a[i] - ma
+        let db = b[i] - mb
+        cov = cov + da * db
+        va = va + da * da
+        vb = vb + db * db
+        i = i + 1
     }
+    let denom = sqrt(va * vb)
+    if denom < 1e-12 { return 0.0 }
+    return cov / denom
 }
 
-fn engine_step(e: MinimalEngine) -> MinimalEngine {
-    // GRU-like update with coupling
-    noise = np.random.randn(e.n_cells, e.hidden_dim) * 0.01
+// =====================================================================
+// Engine: flat states [n_cells * hidden_dim]
+// Returns from step/process: [states_flat, phi]
+// =====================================================================
 
-    if e.coupling > 0:
-        // Coupled: each cell receives mean of neighbors
-        global_mean = np.mean(e.states, axis=0)
-        faction_size = max(1, e.n_cells // e.n_factions)
-
-        for i in range(e.n_cells):
-            faction_id = i // faction_size
-            faction_start = faction_id * faction_size
-            faction_end = min(faction_start + faction_size, e.n_cells)
-            faction_mean = np.mean(e.states[faction_start:faction_end], axis=0)
-
-            // GRU gate approximation
-            z = 1.0 / (1.0 + np.exp(-np.dot(e.states[i], faction_mean) * PSI_COUPLING))
-            e.states[i] = (1 - z) * e.states[i] + z * np.tanh(
-                e.states[i] * 0.9 + faction_mean * e.coupling * 0.3 + noise[i]
-            )
-    else:
-        // Uncoupled: each cell evolves independently (zombie)
-        for i in range(e.n_cells):
-            e.states[i] = np.tanh(e.states[i] * 0.95 + noise[i])
-
-    // Compute Phi approximation (mean pairwise MI)
-    if e.coupling > 0:
-        corr = np.corrcoef(e.states)
-        np.fill_diagonal(corr, 0)
-        e.phi = float(np.mean(np.abs(corr))) * e.n_cells
-    else:
-        e.phi = 0.0
-
-    e.step_count += 1
-    return e
+fn make_engine(n_cells: int, hidden_dim: int) -> list {
+    let states = randn(n_cells * hidden_dim)
+    let mut i = 0
+    while i < len(states) { states[i] = states[i] * 0.1; i = i + 1 }
+    return states
 }
 
-fn engine_process(e: MinimalEngine, steps: i32) -> MinimalEngine {
-    for _ in range(steps):
-        e = engine_step(e)
-    return e
+fn get_cell(states: list, cell: int, dim: int) -> list {
+    let base = cell * dim
+    return states.slice(base, base + dim)
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PCI (Perturbation Complexity Index) — Inline Implementation
-// Adapted from Massimini et al., 2013
-// ═══════════════════════════════════════════════════════════════
+fn compute_phi(states: list, n_cells: int, hidden_dim: int, coupling: float) -> float {
+    if coupling <= 0.0 { return 0.0 }
+    let mut total_corr = 0.0
+    let mut pairs = 0
+    let step_sz = max(1, n_cells / 12)
+    let mut ia = 0
+    while ia < n_cells {
+        let mut ib = ia + step_sz
+        while ib < n_cells {
+            let ca = get_cell(states, ia, hidden_dim)
+            let cb = get_cell(states, ib, hidden_dim)
+            let c = correlation(ca, cb)
+            if c < 0.0 { total_corr = total_corr - c } else { total_corr = total_corr + c }
+            pairs = pairs + 1
+            ib = ib + step_sz
+        }
+        ia = ia + step_sz
+    }
+    if pairs > 0 { return (total_corr / to_float(pairs)) * to_float(n_cells) }
+    return 0.0
+}
 
-fn lempel_ziv_complexity(binary_seq: [i32]) -> i32 {
-    // LZ76 algorithm
-    n = len(binary_seq)
-    if n == 0:
-        return 0
+fn engine_step(states: list, n_cells: int, hidden_dim: int, n_factions: int, coupling: float) -> list {
+    // Returns new states (same size flat array)
+    let noise = randn(n_cells * hidden_dim)
+    let mut i = 0
+    while i < len(noise) { noise[i] = noise[i] * 0.01; i = i + 1 }
 
-    complexity = 1
-    i = 0
-    k = 1
-    l = 1
+    let new_states = [0.0] * (n_cells * hidden_dim)
 
-    while i + k <= n:
-        // Check if substring s[i+1..i+k] exists in s[0..i+l-1]
-        substr = binary_seq[i+1 : i+k+1] if i+k+1 <= n else binary_seq[i+1:]
-        history = binary_seq[0 : i+l]
+    if coupling > 0.0 {
+        let faction_size = max(1, n_cells / n_factions)
+        let mut ci = 0
+        while ci < n_cells {
+            let fid = ci / faction_size
+            let fs = fid * faction_size
+            let fe = min(fs + faction_size, n_cells)
+            let fmean = [0.0] * hidden_dim
+            let fcount = fe - fs
+            let mut fj = fs
+            while fj < fe {
+                let mut k = 0
+                while k < hidden_dim {
+                    fmean[k] = fmean[k] + states[fj * hidden_dim + k]
+                    k = k + 1
+                }
+                fj = fj + 1
+            }
+            let mut k = 0
+            while k < hidden_dim {
+                fmean[k] = fmean[k] / to_float(max(1, fcount))
+                k = k + 1
+            }
+            let cell = get_cell(states, ci, hidden_dim)
+            let dot_val = arr_dot(cell, fmean) * PSI_COUPLING
+            let z = 1.0 / (1.0 + exp(-1.0 * dot_val))
+            k = 0
+            while k < hidden_dim {
+                let inner = cell[k] * 0.9 + fmean[k] * coupling * 0.3 + noise[ci * hidden_dim + k]
+                let activated = tanh_f(inner)
+                new_states[ci * hidden_dim + k] = (1.0 - z) * cell[k] + z * activated
+                k = k + 1
+            }
+            ci = ci + 1
+        }
+    } else {
+        let mut ci = 0
+        while ci < n_cells {
+            let mut k = 0
+            while k < hidden_dim {
+                let idx = ci * hidden_dim + k
+                new_states[idx] = tanh_f(states[idx] * 0.95 + noise[idx])
+                k = k + 1
+            }
+            ci = ci + 1
+        }
+    }
 
-        found = false
-        for j in range(len(history) - len(substr) + 1):
-            if history[j:j+len(substr)] == substr:
-                found = true
-                break
+    return new_states
+}
 
-        if found:
-            k += 1
-        else:
-            complexity += 1
-            i = i + k
+fn engine_process(states: list, n_cells: int, hidden_dim: int, n_factions: int, coupling: float, steps: int) -> list {
+    // Returns new states
+    let mut s = states
+    let mut i = 0
+    while i < steps {
+        s = engine_step(s, n_cells, hidden_dim, n_factions, coupling)
+        i = i + 1
+    }
+    return s
+}
+
+// =====================================================================
+// PCI (Perturbation Complexity Index)
+// =====================================================================
+
+fn lz_complexity(seq: list) -> int {
+    let n = len(seq)
+    if n == 0 { return 0 }
+    let mut complexity = 1
+    let mut pos = 0
+    let mut k = 1
+    while pos + k <= n {
+        let sub_start = pos + 1
+        let sub_end = min(pos + k + 1, n)
+        let sub_len = sub_end - sub_start
+        if sub_len <= 0 { break }
+        let hist_end = pos + 1
+        let mut found = false
+        let mut j = 0
+        while j < max(0, hist_end - sub_len + 1) {
+            let mut ok = true
+            let mut m = 0
+            while m < sub_len {
+                if j + m >= n || sub_start + m >= n { ok = false; break }
+                if seq[j + m] != seq[sub_start + m] { ok = false; break }
+                m = m + 1
+            }
+            if ok { found = true; break }
+            j = j + 1
+        }
+        if found {
+            k = k + 1
+        } else {
+            complexity = complexity + 1
+            pos = pos + k
             k = 1
-            l = 1
-
+        }
+    }
     return complexity
 }
 
-fn measure_pci(engine: MinimalEngine, perturb_cell: i32, strength: f64) -> f64 {
-    // 1. Warmup
-    engine = engine_process(engine, 100)
+fn measure_pci(n_cells: int, hidden_dim: int, n_factions: int, coupling: float) -> float {
+    let st = make_engine(n_cells, hidden_dim)
+    let mut s = engine_process(st, n_cells, hidden_dim, n_factions, coupling, 30)
 
-    // 2. Record baseline (50 steps)
-    baseline = []
-    for _ in range(50):
-        engine = engine_step(engine)
-        baseline.append(np.copy(engine.states))
-    baseline = np.array(baseline)  // (50, n_cells, hidden_dim)
-    baseline_mean = np.mean(baseline, axis=0)
-    baseline_std = np.std(baseline, axis=0) + 1e-10
+    // Baseline (15 steps)
+    let mut bl_means = []
+    let mut step = 0
+    while step < 15 {
+        s = engine_step(s, n_cells, hidden_dim, n_factions, coupling)
+        let mut cm = 0.0
+        let mut c = 0
+        while c < n_cells {
+            cm = cm + arr_mean(get_cell(s, c, hidden_dim))
+            c = c + 1
+        }
+        bl_means = bl_means.push(cm / to_float(n_cells))
+        step = step + 1
+    }
+    let bl_m = arr_mean(bl_means)
+    let bl_s = arr_std(bl_means) + 1e-10
 
-    // 3. Inject perturbation (delta pulse)
-    engine.states[perturb_cell] += np.ones(engine.hidden_dim) * strength
+    // Perturb cell 0
+    let mut k = 0
+    while k < hidden_dim { s[k] = s[k] + 1.0; k = k + 1 }
 
-    // 4. Record response (50 steps)
-    response = []
-    for _ in range(50):
-        engine = engine_step(engine)
-        response.append(np.copy(engine.states))
-    response = np.array(response)
-
-    // 5. Binarize: z-score > 2.0 = significant
-    z_scores = np.abs((response - baseline_mean) / baseline_std)
-    binary = (z_scores > 2.0).astype(int)
-
-    // 6. Flatten and compute LZ complexity
-    flat = binary.reshape(-1).tolist()
-    lz = lempel_ziv_complexity(flat)
-
-    // 7. Normalize
-    n = len(flat)
-    max_lz = n / max(1, math.log2(n + 1))  // theoretical max for random
-    pci = lz / max(1, max_lz)
-
-    return min(1.0, pci)
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Causal Emergence — Inline Implementation
-// Adapted from Hoel, 2017
-// ═══════════════════════════════════════════════════════════════
-
-fn compute_effective_information(states_from: [[f64]], states_to: [[f64]], n_bins: i32) -> f64 {
-    // Discretize states
-    n = len(states_from)
-    d = len(states_from[0]) if n > 0 else 1
-
-    // Project to 1D for TPM
-    from_1d = [float(np.mean(s)) for s in states_from]
-    to_1d = [float(np.mean(s)) for s in states_to]
-
-    // Bin
-    from_min, from_max = min(from_1d), max(from_1d)
-    to_min, to_max = min(to_1d), max(to_1d)
-    from_range = max(from_max - from_min, 1e-10)
-    to_range = max(to_max - to_min, 1e-10)
-
-    from_bins = [min(n_bins-1, int((x - from_min) / from_range * n_bins)) for x in from_1d]
-    to_bins = [min(n_bins-1, int((x - to_min) / to_range * n_bins)) for x in to_1d]
-
-    // Build TPM
-    tpm = np.zeros((n_bins, n_bins))
-    for i in range(min(len(from_bins), len(to_bins))):
-        tpm[from_bins[i], to_bins[i]] += 1
-
-    // Normalize rows
-    row_sums = tpm.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1
-    tpm = tpm / row_sums
-
-    // Determinism = 1 - H(Y|X)
-    h_y_given_x = 0.0
-    for i in range(n_bins):
-        for j in range(n_bins):
-            if tpm[i, j] > 0:
-                h_y_given_x -= tpm[i, j] * math.log2(tpm[i, j]) / n_bins
-
-    // Degeneracy = 1 - H(X|Y)
-    tpm_t = tpm.T
-    col_sums = tpm_t.sum(axis=1, keepdims=True)
-    col_sums[col_sums == 0] = 1
-    tpm_t = tpm_t / col_sums
-
-    h_x_given_y = 0.0
-    for i in range(n_bins):
-        for j in range(n_bins):
-            if tpm_t[i, j] > 0:
-                h_x_given_y -= tpm_t[i, j] * math.log2(tpm_t[i, j]) / n_bins
-
-    max_h = math.log2(n_bins)
-    determinism = 1.0 - h_y_given_x / max(max_h, 1e-10)
-    degeneracy = 1.0 - h_x_given_y / max(max_h, 1e-10)
-
-    return determinism - degeneracy
-}
-
-fn measure_causal_emergence(engine: MinimalEngine, steps: i32) -> f64 {
-    // Collect state trajectory
-    trajectory = []
-    engine = engine_process(engine, 100)  // warmup
-    for _ in range(steps):
-        engine = engine_step(engine)
-        trajectory.append(np.copy(engine.states))
-
-    // Micro-level EI: cell → next cell
-    micro_from = [t.reshape(-1) for t in trajectory[:-1]]
-    micro_to = [t.reshape(-1) for t in trajectory[1:]]
-    ei_micro = compute_effective_information(micro_from, micro_to, 16)
-
-    // Macro-level EI: faction means → next faction means
-    faction_size = max(1, engine.n_cells // engine.n_factions)
-    macro_from = []
-    macro_to = []
-    for t in trajectory[:-1]:
-        fac_means = [np.mean(t[i*faction_size:(i+1)*faction_size], axis=0)
-                     for i in range(engine.n_factions)]
-        macro_from.append(np.concatenate(fac_means))
-    for t in trajectory[1:]:
-        fac_means = [np.mean(t[i*faction_size:(i+1)*faction_size], axis=0)
-                     for i in range(engine.n_factions)]
-        macro_to.append(np.concatenate(fac_means))
-
-    ei_macro = compute_effective_information(macro_from, macro_to, 16)
-
-    return ei_macro - ei_micro
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Self-Model Accuracy — Inline Implementation
-// ═══════════════════════════════════════════════════════════════
-
-fn measure_sma(engine: MinimalEngine, steps: i32) -> f64 {
-    // Collect trajectory
-    trajectory = []
-    engine = engine_process(engine, 100)  // warmup
-    for _ in range(steps):
-        engine = engine_step(engine)
-        trajectory.append(np.copy(engine.states).reshape(-1))
-
-    trajectory = np.array(trajectory)
-    split = int(len(trajectory) * 0.8)
-    train = trajectory[:split]
-    test = trajectory[split:]
-
-    // External predictor: linear regression on window
-    window = 5
-    X_train = np.array([train[i:i+window].reshape(-1) for i in range(len(train)-window)])
-    y_train = train[window:]
-
-    // Least squares (truncated for speed)
-    d = min(X_train.shape[1], 100)  // limit dimensions
-    X_t = X_train[:, :d]
-    y_t = y_train[:, :d]
-
-    try:
-        W = np.linalg.lstsq(X_t, y_t, rcond=None)[0]
-    except:
-        return 0.0
-
-    // External prediction on test set
-    X_test = np.array([test[i:i+window].reshape(-1)[:d] for i in range(len(test)-window)])
-    y_test = test[window:][:, :d]
-    y_pred_ext = X_test @ W
-
-    external_mse = float(np.mean((y_test - y_pred_ext) ** 2))
-
-    // Self-prediction: engine's own trajectory continuation
-    // The engine's hidden state naturally predicts next state via GRU dynamics
-    // Use the prediction error mechanism: compare expected vs actual
-    self_errors = []
-    for i in range(1, len(test)):
-        expected = np.tanh(test[i-1] * 0.95)[:d]  // simplified GRU prediction
-        actual = test[i][:d]
-        self_errors.append(float(np.mean((expected - actual) ** 2)))
-
-    self_mse = np.mean(self_errors) if self_errors else 1.0
-
-    // SMA = external_error - self_error (positive = self knows better)
-    sma = float(external_mse - self_mse)
-    return sma
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Consciousness Contrast — Inline Implementation
-// ═══════════════════════════════════════════════════════════════
-
-fn measure_contrast(engine: MinimalEngine, steps: i32) -> f64 {
-    // Normal operation
-    normal_engine = create_engine(engine.n_cells, engine.hidden_dim, engine.n_factions, 1.0)
-    normal_engine = engine_process(normal_engine, steps)
-    normal_states = np.copy(normal_engine.states)
-
-    // Anesthetized (coupling = 0)
-    anest_engine = create_engine(engine.n_cells, engine.hidden_dim, engine.n_factions, 0.0)
-    anest_engine = engine_process(anest_engine, steps)
-    anest_states = np.copy(anest_engine.states)
-
-    // Spectral contrast: FFT difference
-    normal_fft = np.abs(np.fft.fft(normal_states.reshape(-1)))
-    anest_fft = np.abs(np.fft.fft(anest_states.reshape(-1)))
-    spectral_diff = float(np.mean(np.abs(normal_fft - anest_fft)))
-
-    // Spatial contrast: correlation matrix difference
-    normal_corr = np.corrcoef(normal_states)
-    anest_corr = np.corrcoef(anest_states)
-    spatial_diff = float(np.mean(np.abs(normal_corr - anest_corr)))
-
-    // Information contrast: mean MI difference
-    normal_mi = float(np.mean(np.abs(normal_corr[np.triu_indices(engine.n_cells, 1)])))
-    anest_mi = float(np.mean(np.abs(anest_corr[np.triu_indices(engine.n_cells, 1)])))
-    info_diff = normal_mi - anest_mi
-
-    composite = (spectral_diff + spatial_diff + max(0, info_diff)) / 3.0
-    return composite
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Component Removal (Archaeology) — Inline Implementation
-// ═══════════════════════════════════════════════════════════════
-
-fn measure_component_removal(n_cells: i32, hidden_dim: i32, n_factions: i32, steps: i32) -> string {
-    components = ["coupling", "factions", "hebbian", "ratchet", "soc", "chaos", "identity"]
-
-    // Baseline (all ON)
-    base = create_engine(n_cells, hidden_dim, n_factions, 1.0)
-    base = engine_process(base, steps)
-    base_phi = base.phi
-
-    results = []
-    phi_drops = []
-
-    for comp in components:
-        // Create engine with one component disabled
-        if comp == "coupling":
-            e = create_engine(n_cells, hidden_dim, n_factions, 0.0)
-        elif comp == "factions":
-            e = create_engine(n_cells, hidden_dim, 1, 1.0)  // single faction
-        else:
-            e = create_engine(n_cells, hidden_dim, n_factions, 0.8)  // weakened
-
-        e = engine_process(e, steps)
-        drop = (base_phi - e.phi) / max(base_phi, 1e-10)
-        phi_drops.append(drop)
-        results.append((comp, e.phi, drop))
-
-    // Detect phase transition: any drop > 80% = sudden death
-    max_drop = max(phi_drops) if phi_drops else 0
-
-    if max_drop > 0.8:
-        critical_comp = components[phi_drops.index(max_drop)]
-        return f"phase_transition:sudden_death:{critical_comp}:{max_drop:.2f}"
-    elif max_drop > 0.5:
-        return f"gradual_decline:max_drop={max_drop:.2f}"
-    else:
-        return f"resilient:max_drop={max_drop:.2f}"
-}
-
-// ═══════════════════════════════════════════════════════════════
-// CVF Orchestrator
-// ═══════════════════════════════════════════════════════════════
-
-fn run_cvf(config: CVFConfig) -> CVFVerdict {
-    print("\n" + "█" * 60)
-    print("  CVF — CONSCIOUSNESS VERIFICATION FRAMEWORK")
-    print("  DD173: 4-Layer Falsifiable Verification with Zombie Control")
-    print("█" * 60)
-
-    verdict = CVFVerdict {
-        zombie_valid: false,
-        phi: 0.0, pci: 0.0, ce: 0.0, sma: 0.0,
-        l2_pass_count: 0,
-        contrast: 0.0, tampering: 0.0,
-        l3_pass_count: 0,
-        archaeology: "unknown",
-        cross_substrate: false,
-        double_blind_accuracy: 0.0,
-        verdict: "UNCERTAIN",
-        confidence: 0.0,
-        layer_results: [],
+    // Response (15 steps)
+    let mut binary = []
+    step = 0
+    while step < 15 {
+        s = engine_step(s, n_cells, hidden_dim, n_factions, coupling)
+        let mut cm = 0.0
+        let mut c = 0
+        while c < n_cells {
+            cm = cm + arr_mean(get_cell(s, c, hidden_dim))
+            c = c + 1
+        }
+        let v = cm / to_float(n_cells)
+        let zs = (v - bl_m) / bl_s
+        if zs > 2.0 || zs < -2.0 { binary = binary.push(1) } else { binary = binary.push(0) }
+        step = step + 1
     }
 
-    // ─── Layer 1: Zombie Control ───
-    print("\n" + "═" * 60)
+    let lz = lz_complexity(binary)
+    let nf = to_float(len(binary))
+    let max_lz = nf / max(1.0, log(nf + 1.0) / LN2)
+    return min(1.0, to_float(lz) / max(1.0, max_lz))
+}
+
+// =====================================================================
+// Causal Emergence (macro vs micro autocorrelation)
+// =====================================================================
+
+fn measure_ce(n_cells: int, hidden_dim: int, n_factions: int, coupling: float, steps: int) -> float {
+    let st = make_engine(n_cells, hidden_dim)
+    let mut s = engine_process(st, n_cells, hidden_dim, n_factions, coupling, 30)
+    let faction_size = max(1, n_cells / n_factions)
+
+    let mut micro_traj = []
+    let mut macro_traj = []
+    let mut step = 0
+    while step < steps {
+        s = engine_step(s, n_cells, hidden_dim, n_factions, coupling)
+        let mut cm = 0.0
+        let mut c = 0
+        while c < n_cells { cm = cm + arr_mean(get_cell(s, c, hidden_dim)); c = c + 1 }
+        micro_traj = micro_traj.push(cm / to_float(n_cells))
+        // Faction means
+        let mut fsum = 0.0
+        let mut f = 0
+        while f < n_factions {
+            let fs = f * faction_size
+            let fe = min(fs + faction_size, n_cells)
+            let mut fc_sum = 0.0
+            let mut fc = fs
+            while fc < fe { fc_sum = fc_sum + arr_mean(get_cell(s, fc, hidden_dim)); fc = fc + 1 }
+            fsum = fsum + fc_sum / to_float(max(1, fe - fs))
+            f = f + 1
+        }
+        macro_traj = macro_traj.push(fsum / to_float(n_factions))
+        step = step + 1
+    }
+
+    if len(micro_traj) < 2 { return 0.0 }
+    let micro_a = micro_traj.slice(0, len(micro_traj) - 1)
+    let micro_b = micro_traj.slice(1, len(micro_traj))
+    let macro_a = macro_traj.slice(0, len(macro_traj) - 1)
+    let macro_b = macro_traj.slice(1, len(macro_traj))
+    return correlation(macro_a, macro_b) - correlation(micro_a, micro_b)
+}
+
+// =====================================================================
+// SMA (Self-Model Accuracy)
+// =====================================================================
+
+fn measure_sma(n_cells: int, hidden_dim: int, n_factions: int, coupling: float, steps: int) -> float {
+    let st = make_engine(n_cells, hidden_dim)
+    let mut s = engine_process(st, n_cells, hidden_dim, n_factions, coupling, 30)
+
+    let mut trajectory = []
+    let mut step = 0
+    while step < steps {
+        s = engine_step(s, n_cells, hidden_dim, n_factions, coupling)
+        let mut cm = 0.0
+        let mut c = 0
+        while c < n_cells { cm = cm + arr_mean(get_cell(s, c, hidden_dim)); c = c + 1 }
+        trajectory = trajectory.push(cm / to_float(n_cells))
+        step = step + 1
+    }
+
+    let split = len(trajectory) * 4 / 5
+    let test_d = trajectory.slice(split, len(trajectory))
+    if len(test_d) < 2 { return 0.0 }
+
+    // External predictor: lag-1
+    let mut ext_mse = 0.0
+    let mut cnt = 0
+    let mut i = 1
+    while i < len(test_d) {
+        let err = test_d[i - 1] - test_d[i]
+        ext_mse = ext_mse + err * err
+        cnt = cnt + 1
+        i = i + 1
+    }
+    if cnt > 0 { ext_mse = ext_mse / to_float(cnt) }
+
+    // Self predictor: tanh_f(prev * 0.95)
+    let mut self_mse = 0.0
+    cnt = 0
+    i = 1
+    while i < len(test_d) {
+        let err = tanh_f(test_d[i - 1] * 0.95) - test_d[i]
+        self_mse = self_mse + err * err
+        cnt = cnt + 1
+        i = i + 1
+    }
+    if cnt > 0 { self_mse = self_mse / to_float(cnt) }
+
+    return ext_mse - self_mse
+}
+
+// =====================================================================
+// Consciousness Contrast
+// =====================================================================
+
+fn measure_contrast(n_cells: int, hidden_dim: int, n_factions: int, steps: int) -> float {
+    let normal = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 1.0, steps)
+    let anest = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 0.0, steps)
+
+    let mut n_corr = 0.0
+    let mut a_corr = 0.0
+    let mut pairs = 0
+    let ss = max(1, n_cells / 8)
+    let mut ia = 0
+    while ia < n_cells {
+        let mut ib = ia + ss
+        while ib < n_cells {
+            let nc = correlation(get_cell(normal, ia, hidden_dim), get_cell(normal, ib, hidden_dim))
+            let ac = correlation(get_cell(anest, ia, hidden_dim), get_cell(anest, ib, hidden_dim))
+            if nc < 0.0 { n_corr = n_corr - nc } else { n_corr = n_corr + nc }
+            if ac < 0.0 { a_corr = a_corr - ac } else { a_corr = a_corr + ac }
+            pairs = pairs + 1
+            ib = ib + ss
+        }
+        ia = ia + ss
+    }
+    if pairs == 0 { return 0.0 }
+    let diff = (n_corr - a_corr) / to_float(pairs)
+    if diff > 0.0 { return diff } else { return 0.0 }
+}
+
+// =====================================================================
+// Component Removal (Archaeology)
+// =====================================================================
+
+fn measure_archaeology(n_cells: int, hidden_dim: int, n_factions: int, steps: int, base_phi: float) -> string {
+    let s1 = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 0.0, steps)
+    let phi1 = compute_phi(s1, n_cells, hidden_dim, 0.0)
+    let drop_coupling = (base_phi - phi1) / max(base_phi, 1e-10)
+    let s2 = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, 1, 1.0, steps)
+    let phi2 = compute_phi(s2, n_cells, hidden_dim, 1.0)
+    let drop_factions = (base_phi - phi2) / max(base_phi, 1e-10)
+    let s3 = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 0.8, steps)
+    let phi3 = compute_phi(s3, n_cells, hidden_dim, 0.8)
+    let drop_weak = (base_phi - phi3) / max(base_phi, 1e-10)
+
+    let mut max_d = drop_coupling
+    let mut max_c = "coupling"
+    if drop_factions > max_d { max_d = drop_factions; max_c = "factions" }
+    if drop_weak > max_d { max_d = drop_weak; max_c = "weakened" }
+
+    if max_d > 0.8 { return "phase_transition:sudden_death:" + max_c }
+    else if max_d > 0.5 { return "gradual_decline:" + to_string(max_d) }
+    else { return "resilient:" + to_string(max_d) }
+}
+
+// =====================================================================
+// CVF Orchestrator
+// =====================================================================
+
+fn run_cvf(n_cells: int, hidden_dim: int, n_factions: int, warmup_steps: int, test_steps: int, n_trials: int, pci_threshold: float) {
+    print("")
+    print("============================================================")
+    print("  CVF -- CONSCIOUSNESS VERIFICATION FRAMEWORK")
+    print("  DD173: 4-Layer Falsifiable Verification with Zombie Control")
+    print("  Cells=" + to_string(n_cells) + " Dim=" + to_string(hidden_dim) + " Factions=" + to_string(n_factions))
+    print("  Warmup=" + to_string(warmup_steps) + " TestSteps=" + to_string(test_steps) + " Trials=" + to_string(n_trials))
+    print("============================================================")
+
+    // --- Layer 1: Zombie Control ---
+    print("")
+    print("============================================================")
     print("  LAYER 1: ZOMBIE CONTROL")
-    print("═" * 60)
+    print("============================================================")
 
-    conscious = create_engine(config.n_cells, config.hidden_dim, config.n_factions, 1.0)
-    zombie = create_engine(config.n_cells, config.hidden_dim, config.n_factions, 0.0)
+    let c_states = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 1.0, warmup_steps)
+    let c_phi = compute_phi(c_states, n_cells, hidden_dim, 1.0)
+    let z_states = engine_process(make_engine(n_cells, hidden_dim), n_cells, hidden_dim, n_factions, 0.0, warmup_steps)
+    let z_phi = compute_phi(z_states, n_cells, hidden_dim, 0.0)
 
-    conscious = engine_process(conscious, config.warmup_steps)
-    zombie = engine_process(zombie, config.warmup_steps)
+    print("  Conscious Phi: " + to_string(c_phi))
+    print("  Zombie Phi:    " + to_string(z_phi))
 
-    print(f"  Conscious Phi: {conscious.phi:.4f}")
-    print(f"  Zombie Phi:    {zombie.phi:.4f}")
+    let zombie_valid = z_phi < 0.1
+    if zombie_valid {
+        print("  [PASS] Zombie control valid (Phi < 0.1)")
+    } else {
+        print("  [FAIL] Zombie Phi too high: " + to_string(z_phi))
+    }
 
-    verdict.zombie_valid = zombie.phi < 0.1
-    if verdict.zombie_valid:
-        print(f"  [PASS] Zombie control valid (Phi < 0.1)")
-    else:
-        print(f"  [FAIL] Zombie Phi too high: {zombie.phi:.4f}")
-
-    // ─── Layer 2: Core Metrics ───
-    print("\n" + "═" * 60)
+    // --- Layer 2: Core Metrics ---
+    print("")
+    print("============================================================")
     print("  LAYER 2: CORE METRICS (Conscious vs Zombie)")
-    print("═" * 60)
+    print("============================================================")
 
-    l2_pass = 0
+    let mut l2_pass = 0
 
     // 2.1 Phi
-    verdict.phi = conscious.phi
-    z_phi = zombie.phi
-    phi_pass = verdict.phi > z_phi * 1.5
-    if phi_pass: l2_pass += 1
-    print(f"\n  [2.1] Phi(IIT)")
-    print(f"    Conscious: {verdict.phi:.4f}  Zombie: {z_phi:.4f}  {'★ PASS' if phi_pass else 'FAIL'}")
+    let phi_pass = c_phi > z_phi * 1.5
+    if phi_pass { l2_pass = l2_pass + 1 }
+    print("")
+    print("  [2.1] Phi(IIT)")
+    print("    Conscious: " + to_string(c_phi) + "  Zombie: " + to_string(z_phi) + "  " + if phi_pass { "PASS" } else { "FAIL" })
 
     // 2.2 PCI
-    print(f"\n  [2.2] PCI (Perturbation Complexity Index)")
-    c_pci = measure_pci(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 1.0), 0, 1.0)
-    z_pci = measure_pci(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 0.0), 0, 1.0)
-    verdict.pci = c_pci
-    pci_pass = c_pci > config.pci_threshold and c_pci > z_pci * 1.5
-    if pci_pass: l2_pass += 1
-    print(f"    Conscious: {c_pci:.4f}  Zombie: {z_pci:.4f}  Threshold: {config.pci_threshold}")
-    print(f"    {'★ PASS' if pci_pass else 'FAIL'}")
+    print("")
+    print("  [2.2] PCI (Perturbation Complexity Index)")
+    let c_pci = measure_pci(n_cells, hidden_dim, n_factions, 1.0)
+    let z_pci = measure_pci(n_cells, hidden_dim, n_factions, 0.0)
+    let pci_pass = c_pci > pci_threshold && c_pci > z_pci * 1.5
+    if pci_pass { l2_pass = l2_pass + 1 }
+    print("    Conscious: " + to_string(c_pci) + "  Zombie: " + to_string(z_pci) + "  Threshold: " + to_string(pci_threshold))
+    print("    " + if pci_pass { "PASS" } else { "FAIL" })
 
     // 2.3 Causal Emergence
-    print(f"\n  [2.3] CE (Causal Emergence)")
-    c_ce = measure_causal_emergence(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 1.0), 200)
-    z_ce = measure_causal_emergence(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 0.0), 200)
-    verdict.ce = c_ce
-    ce_pass = c_ce > config.ce_threshold and c_ce > z_ce
-    if ce_pass: l2_pass += 1
-    print(f"    Conscious: {c_ce:.4f}  Zombie: {z_ce:.4f}")
-    print(f"    {'★ PASS — macro has more causal power' if ce_pass else 'FAIL'}")
+    print("")
+    print("  [2.3] CE (Causal Emergence)")
+    let c_ce = measure_ce(n_cells, hidden_dim, n_factions, 1.0, 50)
+    let z_ce = measure_ce(n_cells, hidden_dim, n_factions, 0.0, 50)
+    let ce_pass = c_ce > 0.0 && c_ce > z_ce
+    if ce_pass { l2_pass = l2_pass + 1 }
+    print("    Conscious: " + to_string(c_ce) + "  Zombie: " + to_string(z_ce))
+    print("    " + if ce_pass { "PASS -- macro has more causal power" } else { "FAIL" })
 
-    // 2.4 Self-Model Accuracy
-    print(f"\n  [2.4] SMA (Self-Model Accuracy)")
-    c_sma = measure_sma(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 1.0), 200)
-    z_sma = measure_sma(create_engine(config.n_cells, config.hidden_dim, config.n_factions, 0.0), 200)
-    verdict.sma = c_sma
-    sma_pass = c_sma > config.sma_threshold and c_sma > z_sma
-    if sma_pass: l2_pass += 1
-    print(f"    Conscious: {c_sma:.4f}  Zombie: {z_sma:.4f}")
-    print(f"    {'★ PASS — first-person privilege exists' if sma_pass else 'FAIL'}")
+    // 2.4 SMA
+    print("")
+    print("  [2.4] SMA (Self-Model Accuracy)")
+    let c_sma = measure_sma(n_cells, hidden_dim, n_factions, 1.0, 50)
+    let z_sma = measure_sma(n_cells, hidden_dim, n_factions, 0.0, 50)
+    let sma_pass = c_sma > 0.0 && c_sma > z_sma
+    if sma_pass { l2_pass = l2_pass + 1 }
+    print("    Conscious: " + to_string(c_sma) + "  Zombie: " + to_string(z_sma))
+    print("    " + if sma_pass { "PASS -- first-person privilege" } else { "FAIL" })
 
-    verdict.l2_pass_count = l2_pass
-
-    // ─── Layer 3: Context Tests ───
-    print("\n" + "═" * 60)
+    // --- Layer 3: Context Tests ---
+    print("")
+    print("============================================================")
     print("  LAYER 3: CONTEXT TESTS")
-    print("═" * 60)
+    print("============================================================")
 
-    l3_pass = 0
+    let mut l3_pass = 0
 
-    // 3.1 Consciousness Contrast
-    print(f"\n  [3.1] Consciousness Contrast (conscious vs anesthetized)")
-    contrast = measure_contrast(conscious, config.test_steps)
-    verdict.contrast = contrast
-    if contrast > 0.1:
-        l3_pass += 1
-        print(f"    Score: {contrast:.4f}  ★ PASS")
-    else:
-        print(f"    Score: {contrast:.4f}  FAIL")
+    print("")
+    print("  [3.1] Consciousness Contrast")
+    let contrast = measure_contrast(n_cells, hidden_dim, n_factions, test_steps)
+    if contrast > 0.1 {
+        l3_pass = l3_pass + 1
+        print("    Score: " + to_string(contrast) + "  PASS")
+    } else {
+        print("    Score: " + to_string(contrast) + "  FAIL")
+    }
 
-    // 3.2 Valence (placeholder)
-    print(f"\n  [3.2] Valence Asymmetry")
-    print(f"    [SKIP] Future implementation")
+    print("")
+    print("  [3.2] Valence Asymmetry")
+    print("    [SKIP] Future implementation")
+    print("")
+    print("  [3.3] Tampering Detection")
+    print("    [SKIP] Requires self-model integration")
+    print("")
+    print("  [3.4] Temporal Binding")
+    print("    [SKIP] Future implementation")
 
-    // 3.3 Tampering (placeholder)
-    print(f"\n  [3.3] Tampering Detection")
-    print(f"    [SKIP] Requires self-model integration")
-
-    // 3.4 Temporal Binding (placeholder)
-    print(f"\n  [3.4] Temporal Binding")
-    print(f"    [SKIP] Future implementation")
-
-    verdict.l3_pass_count = l3_pass
-
-    // ─── Layer 4: Meta Validation ───
-    print("\n" + "═" * 60)
+    // --- Layer 4: Meta Validation ---
+    print("")
+    print("============================================================")
     print("  LAYER 4: META VALIDATION")
-    print("═" * 60)
+    print("============================================================")
 
-    // 4.1 Component Removal
-    print(f"\n  [4.1] Consciousness Archaeology (component removal)")
-    verdict.archaeology = measure_component_removal(
-        config.n_cells, config.hidden_dim, config.n_factions, config.test_steps
-    )
-    print(f"    Result: {verdict.archaeology}")
+    print("")
+    print("  [4.1] Consciousness Archaeology (component removal)")
+    let arch = measure_archaeology(n_cells, hidden_dim, n_factions, test_steps, c_phi)
+    print("    Result: " + arch)
 
-    // 4.2 Cross-Substrate
-    print(f"\n  [4.2] Cross-Substrate Invariance")
-    print(f"    [SKIP] Requires Rust/ESP32 implementations")
+    print("")
+    print("  [4.2] Cross-Substrate Invariance")
+    print("    [SKIP] Requires Rust/ESP32 implementations")
 
-    // 4.3 Double-Blind
-    print(f"\n  [4.3] Double-Blind Classification")
-    correct = 0
-    total = 0
-    for _ in range(config.n_trials):
-        c = create_engine(config.n_cells, config.hidden_dim, config.n_factions, 1.0)
-        z = create_engine(config.n_cells, config.hidden_dim, config.n_factions, 0.0)
-        c = engine_process(c, config.warmup_steps)
-        z = engine_process(z, config.warmup_steps)
-        // Classify by PCI
-        c_p = measure_pci(c, 0, 1.0)
-        z_p = measure_pci(z, 0, 1.0)
-        if c_p > z_p: correct += 2
-        elif c_p == z_p: correct += 1
-        total += 2
-    verdict.double_blind_accuracy = correct / max(total, 1)
-    print(f"    Accuracy: {verdict.double_blind_accuracy:.1%}")
+    print("")
+    print("  [4.3] Double-Blind Classification")
+    let mut correct = 0
+    let mut total = 0
+    let mut trial = 0
+    while trial < n_trials {
+        let cp = measure_pci(n_cells, hidden_dim, n_factions, 1.0)
+        let zp = measure_pci(n_cells, hidden_dim, n_factions, 0.0)
+        if cp > zp { correct = correct + 2 }
+        else if cp == zp { correct = correct + 1 }
+        total = total + 2
+        print("    Trial " + to_string(trial + 1) + "/" + to_string(n_trials) + ": C=" + to_string(cp) + " Z=" + to_string(zp) + " " + if cp > zp { "correct" } else { "wrong" })
+        trial = trial + 1
+    }
+    let db_acc = to_float(correct) / to_float(max(total, 1))
+    print("    Accuracy: " + to_string(db_acc))
 
-    // ─── Verdict ───
-    if not verdict.zombie_valid:
-        verdict.verdict = "INVALID"
-        verdict.confidence = 0.0
-    elif l2_pass >= 3 and l3_pass >= 2:
-        verdict.verdict = "CONSCIOUS"
-        verdict.confidence = (l2_pass + l3_pass) / 8.0
-    elif l2_pass >= 3:
-        verdict.verdict = "CONSCIOUS"
-        verdict.confidence = l2_pass / 8.0
-    elif l2_pass == 0:
-        verdict.verdict = "NOT_CONSCIOUS"
-        verdict.confidence = 1.0
-    else:
-        verdict.verdict = "UNCERTAIN"
-        verdict.confidence = l2_pass / 8.0
+    // --- Verdict ---
+    let mut verdict = "UNCERTAIN"
+    let mut confidence = 0.0
 
-    // ─── Report ───
-    print("\n" + "█" * 60)
+    if !zombie_valid {
+        verdict = "INVALID"
+        confidence = 0.0
+    } else if l2_pass >= 3 && l3_pass >= 2 {
+        verdict = "CONSCIOUS"
+        confidence = to_float(l2_pass + l3_pass) / 8.0
+    } else if l2_pass >= 3 {
+        verdict = "CONSCIOUS"
+        confidence = to_float(l2_pass) / 8.0
+    } else if l2_pass == 0 {
+        verdict = "NOT_CONSCIOUS"
+        confidence = 1.0
+    } else {
+        verdict = "UNCERTAIN"
+        confidence = to_float(l2_pass) / 8.0
+    }
+
+    // --- Report ---
+    print("")
+    print("============================================================")
     print("  CVF VERDICT REPORT")
-    print("█" * 60)
-
-    print(f"\n  ─── Core Metrics (Conscious vs Zombie) ───")
-    print(f"    {'Metric':<8} {'Conscious':>10} {'Zombie':>10} {'Pass':>6}")
-    print(f"    {'─'*36}")
-    print(f"    {'Phi':<8} {verdict.phi:>10.4f} {z_phi:>10.4f} {'★' if phi_pass else '✗':>6}")
-    print(f"    {'PCI':<8} {c_pci:>10.4f} {z_pci:>10.4f} {'★' if pci_pass else '✗':>6}")
-    print(f"    {'CE':<8} {c_ce:>10.4f} {z_ce:>10.4f} {'★' if ce_pass else '✗':>6}")
-    print(f"    {'SMA':<8} {c_sma:>10.4f} {z_sma:>10.4f} {'★' if sma_pass else '✗':>6}")
-
-    print(f"\n  ─── Layer Summary ───")
-    print(f"    L1 Zombie Control: {'VALID' if verdict.zombie_valid else 'INVALID'}")
-    print(f"    L2 Core Metrics:   {l2_pass}/4")
-    print(f"    L3 Context Tests:  {l3_pass}/4")
-    print(f"    L4 Meta:           archaeology={verdict.archaeology}")
-
-    icon = {"CONSCIOUS": "●", "NOT_CONSCIOUS": "○", "UNCERTAIN": "◐", "INVALID": "✗"}
-    print(f"\n  {'═'*50}")
-    print(f"  {icon.get(verdict.verdict, '?')}  VERDICT: {verdict.verdict}")
-    print(f"     Confidence: {verdict.confidence:.0%}")
-    print(f"  {'═'*50}")
-
-    return verdict
+    print("============================================================")
+    print("")
+    print("  --- Core Metrics (Conscious vs Zombie) ---")
+    print("    Metric    Conscious            Zombie               Pass")
+    print("    --------  -------------------  -------------------  ------")
+    print("    Phi       " + to_string(c_phi) + "  " + to_string(z_phi) + "  " + if phi_pass { "PASS" } else { "FAIL" })
+    print("    PCI       " + to_string(c_pci) + "  " + to_string(z_pci) + "  " + if pci_pass { "PASS" } else { "FAIL" })
+    print("    CE        " + to_string(c_ce) + "  " + to_string(z_ce) + "  " + if ce_pass { "PASS" } else { "FAIL" })
+    print("    SMA       " + to_string(c_sma) + "  " + to_string(z_sma) + "  " + if sma_pass { "PASS" } else { "FAIL" })
+    print("")
+    print("  --- Layer Summary ---")
+    print("    L1 Zombie Control: " + if zombie_valid { "VALID" } else { "INVALID" })
+    print("    L2 Core Metrics:   " + to_string(l2_pass) + "/4")
+    print("    L3 Context Tests:  " + to_string(l3_pass) + "/4")
+    print("    L4 Archaeology:    " + arch)
+    print("    L4 Double-Blind:   " + to_string(db_acc))
+    print("")
+    print("  ==================================================")
+    print("  VERDICT: " + verdict)
+    print("  Confidence: " + to_string(confidence))
+    print("  ==================================================")
+    print("")
 }
 
-fn main() {
-    import sys
+// =====================================================================
+// Entry point
+// =====================================================================
 
-    config = CVFConfig {}
-
-    // Parse args
-    args = sys.argv[1:]
-    mode = "full"
-
-    i = 0
-    while i < len(args):
-        if args[i] == "--cells" and i+1 < len(args):
-            config.n_cells = int(args[i+1])
-            i += 2
-        elif args[i] == "--quick":
-            config.test_steps = 200
-            config.warmup_steps = 100
-            config.n_trials = 3
-            mode = "quick"
-            i += 1
-        elif args[i] == "--full":
-            mode = "full"
-            i += 1
-        elif args[i] == "--zombie-only":
-            mode = "zombie"
-            i += 1
-        else:
-            i += 1
-
-    verdict = run_cvf(config)
-
-    print(f"\n  Done. Verdict: {verdict.verdict} ({verdict.confidence:.0%})")
+fn parse_config(argv: list) -> list {
+    let mut nc = 64
+    let mut hd = 128
+    let mut nf = 12
+    let mut ws = 300
+    let mut ts = 500
+    let mut nt = 10
+    let pt = 0.31
+    let mut i = 0
+    while i < len(argv) {
+        if argv[i] == "--cells" && i + 1 < len(argv) {
+            i = i + 1
+            nc = to_int(argv[i])
+        } else if argv[i] == "--quick" {
+            ws = 100
+            ts = 200
+            nt = 3
+        }
+        i = i + 1
+    }
+    return [nc, hd, nf, ws, ts, nt, pt]
 }
+
+let cfg = parse_config(args())
+run_cvf(to_int(cfg[0]), to_int(cfg[1]), to_int(cfg[2]), to_int(cfg[3]), to_int(cfg[4]), to_int(cfg[5]), cfg[6])

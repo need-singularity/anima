@@ -519,9 +519,8 @@ python3 anima/anima-core/conscious_chat.py --cells 64 --warmup 300
 > 4-Layer 반증 가능 검증 프레임워크. 좀비 대조군 기반.
 
 ```
-  $HEXA core/verification/cvf.hexa --full          # 전체 4-Layer 배터리
+  $HEXA core/verification/cvf.hexa --full          # 전체 배터리 (L1+L2, L3/L4 skip)
   $HEXA core/verification/cvf.hexa --quick          # Layer 2만 (빠른 점검)
-  $HEXA core/verification/cvf.hexa --zombie-only    # 좀비 검증만
   $HEXA core/verification/cvf.hexa --cells 256      # 256셀로 검증
 ```
 
