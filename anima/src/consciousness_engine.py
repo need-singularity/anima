@@ -1704,7 +1704,7 @@ class ConsciousnessEngine:
 
     # ─── Serialization ────────────────────────────────────
 
-    def state_dict(self) -> Dict:
+    def state_dict(self, **kwargs) -> Dict:
         """Serialize full engine state for checkpoint save/resume."""
         cell_modules_state = [m.state_dict() for m in self.cell_modules]
         cell_states_data = []
@@ -1737,7 +1737,7 @@ class ConsciousnessEngine:
             'federated': self.federated,
         }
 
-    def load_state_dict(self, state: Dict):
+    def load_state_dict(self, state: Dict, **kwargs):
         """Restore engine state from checkpoint."""
         if state.get('cell_dim', self.cell_dim) != self.cell_dim:
             print(f"[engine] Warning: cell_dim mismatch ({state['cell_dim']} vs {self.cell_dim}), skipping restore")
@@ -1904,7 +1904,7 @@ class RustConsciousnessEngine:
 # Trinity CEngine wrapper (auto-selects Rust or Python)
 # ═══════════════════════════════════════════════════════════
 
-class ConsciousnessC:
+class ConsciousnessC(nn.Module):
     """CEngine wrapper — plugs into Trinity/Hexad.
 
     Auto-selects Rust backend (anima_rs.consciousness) if available,
@@ -1920,6 +1920,7 @@ class ConsciousnessC:
     def __init__(self, cell_dim=64, hidden_dim=128, max_cells=64,
                  n_factions=12, phi_ratchet=True, phase_optimal=False,
                  federated=False):
+        super().__init__()
         self.phase_optimal = phase_optimal
         self.federated = federated
         if HAS_RUST_ENGINE:
@@ -1987,7 +1988,7 @@ class ConsciousnessC:
             return self.engine.federated_phi()
         return self.engine.measure_phi()
 
-    def state_dict(self) -> Dict:
+    def state_dict(self, **kwargs) -> Dict:
         """Serialize engine state. Rust backend falls back to hiddens-only snapshot."""
         if self._backend == 'python':
             return {'backend': 'python', 'engine_state': self.engine.state_dict()}
@@ -2001,7 +2002,7 @@ class ConsciousnessC:
                 'best_phi': self.engine._last_result.get('best_phi', 0) if self.engine._last_result else 0,
             }
 
-    def load_state_dict(self, state: Dict):
+    def load_state_dict(self, state: Dict, **kwargs):
         """Restore engine state from checkpoint."""
         if state.get('backend') == 'python' and self._backend == 'python':
             self.engine.load_state_dict(state['engine_state'])

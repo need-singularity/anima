@@ -1260,8 +1260,8 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
     w = EmergentW(base_lr=scale_cfg['lr']) if HAS_EMERGENT_W else None
     s = EmergentS(dim=c.state_dim) if HAS_EMERGENT_S else None
     m = EmergentM(dim=c.state_dim) if HAS_EMERGENT_M else None
-    e = EmergentE() if HAS_EMERGENT_E else None
-    hexad_modules = {'w': w, 's': s, 'm': m, 'e': e}
+    emergent_e = EmergentE() if HAS_EMERGENT_E else None
+    hexad_modules = {'w': w, 's': s, 'm': m, 'e': emergent_e}
 
     # ── Bridge ──
     fb_bridge = None
@@ -1500,8 +1500,8 @@ def train_scale(args, scale_name, scale_cfg, train_data, val_data, vocab_size,
                     for pg in optimizer.param_groups:
                         pg['lr'] = scale_cfg['lr'] * w_out.get('lr_multiplier', 1.0)
 
-                if e is not None:
-                    e_out = e.evaluate(
+                if emergent_e is not None:
+                    e_out = emergent_e.evaluate(
                         c_engine=c if not args.federated else None,
                         context={'phi': phi, 'phi_prev': phi_history[-1] if phi_history else 0.0},
                     )

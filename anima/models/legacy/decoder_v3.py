@@ -166,7 +166,7 @@ class ConsciousDecoderV3(nn.Module):
         tensions = []
         consciousness_signal = None
         for block in self.blocks:
-            x, tension = block(x, consciousness_signal, consciousness_states)
+            x, tension, *_ = block(x, consciousness_signal, consciousness_states)
             tensions.append(tension)
             consciousness_signal = self.tension_proj(tension.unsqueeze(-1))
 
