@@ -43,67 +43,37 @@ ENV ANIMA_DIR=/workspace/anima
 ENV HEXA_REPO=https://github.com/need-singularity/hexa-lang.git
 ENV HEXA_BRANCH=main
 ENV HEXA_DIR=/workspace/hexa-lang
-ENV CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/workspace/hexa-lang/target}
+ENV HEXA_BIN=/workspace/hexa-lang/target/release/hexa
+ENV CARGO_TARGET_DIR=/workspace/hexa-lang/target
 ENV PYTHONPATH=/workspace/anima/anima/src:/workspace/anima/models:/workspace/anima/models/animalm:/workspace/anima
 ENV PYTHONUNBUFFERED=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV PATH=/workspace/hexa-lang/target/release:/root/.cargo/bin:/opt/conda/bin:$PATH
 
-# ─── Entrypoint: clone/pull anima + hexa-lang, build hexa, start sshd ───
-RUN echo '#!/bin/bash\n\
-set -e\n\
-\n\
-# ── anima ──\n\
-if [ ! -d "$ANIMA_DIR/.git" ]; then\n\
-    echo "[entrypoint] cloning $ANIMA_REPO ($ANIMA_BRANCH) → $ANIMA_DIR"\n\
-    git clone --depth 1 --branch "$ANIMA_BRANCH" "$ANIMA_REPO" "$ANIMA_DIR"\n\
-else\n\
-    echo "[entrypoint] pulling latest $ANIMA_BRANCH in $ANIMA_DIR"\n\
-    cd "$ANIMA_DIR" && git fetch --depth 1 origin "$ANIMA_BRANCH" && git reset --hard "origin/$ANIMA_BRANCH"\n\
-fi\n\
-echo "[entrypoint] anima HEAD: $(cd $ANIMA_DIR && git rev-parse --short HEAD)"\n\
-\n\
-# ── hexa-lang ──\n\
-if [ ! -d "$HEXA_DIR/.git" ]; then\n\
-    echo "[entrypoint] cloning $HEXA_REPO ($HEXA_BRANCH) → $HEXA_DIR"\n\
-    git clone --depth 1 --branch "$HEXA_BRANCH" "$HEXA_REPO" "$HEXA_DIR"\n\
-else\n\
-    echo "[entrypoint] pulling latest $HEXA_BRANCH in $HEXA_DIR"\n\
-    cd "$HEXA_DIR" && git fetch --depth 1 origin "$HEXA_BRANCH" && git reset --hard "origin/$HEXA_BRANCH"\n\
-fi\n\
-echo "[entrypoint] hexa HEAD: $(cd $HEXA_DIR && git rev-parse --short HEAD)"\n\
-\n\
-# ── hexa-lang 증분 빌드 (--no-default-features: GPU는 cuBLAS FFI 사용) ──\n\
-echo "[entrypoint] building hexa (incremental release)..."\n\
-cd "$HEXA_DIR" && cargo build --release --no-default-features 2>&1 | tail -3\n\
-echo "[entrypoint] hexa: $(./target/release/hexa --version 2>/dev/null || echo built)"\n\
-\n\
-# ── GPU smoke test (선택, CUDA 있을 때만) ──\n\
-if command -v nvidia-smi &>/dev/null; then\n\
-    echo "[entrypoint] GPU detected — running smoke test"\n\
-    cd "$HEXA_DIR" && ./target/release/hexa self/ml/gpu_smoke_test.hexa 2>&1 || echo "[entrypoint] smoke test skipped (non-fatal)"\n\
-fi\n\
-\n\
-exec "$@"' > /usr/local/bin/anima-entrypoint.sh && chmod +x /usr/local/bin/anima-entrypoint.sh
+# ─── Entrypoint script (separate file: training/anima-entrypoint.sh) ───
+COPY training/anima-entrypoint.sh /usr/local/bin/anima-entrypoint.sh
+RUN chmod +x /usr/local/bin/anima-entrypoint.sh
 
-# ─── Preflight validation script ───
+# ─── Preflight validation script (pure hexa, no python imports) ───
 RUN echo '#!/bin/bash\n\
 set -e\n\
 echo "=== H100 Preflight Check ==="\n\
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo N/A)"\n\
-echo "Disk: $(du -sh /workspace/ | cut -f1) used"\n\
-echo "HF_TOKEN: $(test -n "$HF_TOKEN" && echo SET || echo MISSING)"\n\
-echo "hexa: $(hexa --version 2>/dev/null || echo NOT_BUILT)"\n\
-echo "hexa HEAD: $(cd /workspace/hexa-lang 2>/dev/null && git rev-parse --short HEAD || echo N/A)"\n\
-python3 -c "\n\
-from consciousness_laws import PSI_ALPHA; print(f\"  laws OK: PSI_ALPHA={PSI_ALPHA}\")\n\
-from consciousness_engine import ConsciousnessEngine; print(\"  engine OK\")\n\
-from trinity import ThalamicBridge; print(\"  trinity OK\")\n\
-from feedback_bridge import FeedbackBridge; print(\"  feedback OK\")\n\
-print(\"ALL IMPORTS OK\")\n\
-"\n\
-echo "=== Preflight PASS ==="' > /workspace/preflight.sh && chmod +x /workspace/preflight.sh
+echo "Disk: $(du -sh /workspace/ 2>/dev/null | cut -f1) used"\n\
+echo "anima HEAD: $(cd $ANIMA_DIR 2>/dev/null && git rev-parse --short HEAD || echo N/A)"\n\
+echo "hexa HEAD:  $(cd $HEXA_DIR 2>/dev/null && git rev-parse --short HEAD || echo N/A)"\n\
+echo "hexa bin:   $(test -x $HEXA_BIN && echo OK || echo MISSING)"\n\
+echo "libcuda:    $(ldconfig -p 2>/dev/null | grep -c libcuda.so || echo 0) entries"\n\
+echo "libcudart:  $(ldconfig -p 2>/dev/null | grep -c libcudart.so || echo 0) entries"\n\
+if [ -x "$HEXA_BIN" ]; then\n\
+    cd "$HEXA_DIR"\n\
+    if [ -f self/ml/gpu_smoke_test.hexa ]; then\n\
+        echo "--- gpu_smoke_test.hexa ---"\n\
+        $HEXA_BIN self/ml/gpu_smoke_test.hexa 2>&1 | tail -20\n\
+    fi\n\
+fi\n\
+echo "=== Preflight DONE ==="' > /workspace/preflight.sh && chmod +x /workspace/preflight.sh
 
 # ─── SSH start (entrypoint refreshes repo first) ───
 EXPOSE 22
