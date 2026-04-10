@@ -1,0 +1,180 @@
+// dd175_techniques.hexa — 5 acceleration techniques manifest for CLM v5+
+//
+// Closes roadmap next_action #3 (CRITICAL joint): "DD175 5 기법 →
+// CLM v5 직접 통합", blocker "hexa-lang LM head U+V 구현".
+//
+// LM head U+V is already implemented (models/lm_head_uv.hexa, 281 LOC).
+// This file provides the SSOT manifest that train_clm.hexa references
+// to know which techniques apply to which scale, with the measured
+// speedups from the hexa-lang DD175 study.
+//
+// Source: docs/anima/hypotheses/dd/DD175.md (2026-04-10)
+//         hexa-lang commits 149bb95, 7c9c519, fccc682, a20946b
+//
+// Each technique has:
+//   - id          : 1..5 (matches DD175 doc numbering)
+//   - name        : short label
+//   - speedup     : measured factor on the hexa-lang T2 100M benchmark
+//   - difficulty  : 1=easy / 2=medium / 3=hard
+//   - status      : "ready" | "wip" | "todo"
+//   - file        : implementation pointer (or empty)
+//   - priority    : "now" | "after_ab" | "v06" | "if_needed"
+
+struct DD175Technique {
+    id:         int,
+    name:       string,
+    speedup:    float,
+    difficulty: int,
+    status:     string,
+    file:       string,
+    priority:   string
+}
+
+fn dd175_lm_head_uv() -> DD175Technique {
+    return DD175Technique {
+        id: 1,
+        name: "LM Head U+V — Optimizer 95x",
+        speedup: 95.0,                      // 2600ms → 23ms (frozen-U variant)
+        difficulty: 1,
+        status: "ready",
+        file: "models/lm_head_uv.hexa",
+        priority: "now"
+    }
+}
+
+fn dd175_blas_only_loss() -> DD175Technique {
+    return DD175Technique {
+        id: 2,
+        name: "BLAS-only Loss/Backward — Loop 제거",
+        speedup: 1875.0,                    // bwd 6000ms → 3.2ms
+        difficulty: 2,
+        status: "todo",
+        file: "",
+        priority: "now"
+    }
+}
+
+fn dd175_lowrank_r16() -> DD175Technique {
+    return DD175Technique {
+        id: 3,
+        name: "@lowrank r=16 sweet spot",
+        speedup: 13.86,                     // 7B QKV: 99ms → 7.17ms
+        difficulty: 1,
+        status: "ready",
+        file: "models/lm_head_uv.hexa",     // shares the U+V pattern
+        priority: "after_ab"
+    }
+}
+
+fn dd175_rank_r_attention() -> DD175Technique {
+    return DD175Technique {
+        id: 4,
+        name: "Rank-r Attention — O(seq²·d) → O(seq²·r)",
+        speedup: 256.0,                     // d=4096, r=16 case
+        difficulty: 3,
+        status: "todo",
+        file: "",
+        priority: "v06"
+    }
+}
+
+fn dd175_block_diagonal_attn() -> DD175Technique {
+    return DD175Technique {
+        id: 5,
+        name: "Block-Diagonal Attention for batch>1",
+        speedup: 1.0,                       // stability fix, not raw speedup
+        difficulty: 2,
+        status: "todo",
+        file: "",
+        priority: "if_needed"
+    }
+}
+
+// Master list — order matches DD175.md numbering.
+fn dd175_all() -> [DD175Technique] {
+    let mut t = []
+    t = t.push(dd175_lm_head_uv())
+    t = t.push(dd175_blas_only_loss())
+    t = t.push(dd175_lowrank_r16())
+    t = t.push(dd175_rank_r_attention())
+    t = t.push(dd175_block_diagonal_attn())
+    return t
+}
+
+// Per-scale enablement matrix.
+// scale name → which technique IDs are turned on at training launch.
+// Conservative: small scales get the safe wins (1, 2). Large scales get
+// the rank-r options (3, 4) once A/B tests confirm quality.
+fn dd175_for_scale(scale_name: string) -> [int] {
+    if scale_name == "34m" || scale_name == "100m" {
+        // Tiny scales: only #1 (lm_head U+V) — #2/3/4 amortize poorly here.
+        return [1]
+    }
+    if scale_name == "350m" || scale_name == "1b" {
+        // Mid scales: #1 + #2. Safe, large speedup, no quality risk.
+        return [1, 2]
+    }
+    if scale_name == "2_8b" || scale_name == "3b" {
+        // CLM v5 2.8B and 3B: full conservative stack #1+#2+#3.
+        // #4 (rank-r attn) deferred to v0.6 after A/B.
+        return [1, 2, 3]
+    }
+    return []
+}
+
+// Stable-status check: how many techniques in the per-scale list are
+// in status="ready" (i.e., we won't be blocked at launch).
+fn dd175_ready_count(scale_name: string) -> int {
+    let ids = dd175_for_scale(scale_name)
+    let all = dd175_all()
+    let mut ready = 0
+    let mut i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let mut j = 0
+        while j < len(all) {
+            let t = all[j]
+            if t.id == id {
+                if t.status == "ready" {
+                    ready = ready + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return ready
+}
+
+// ─── Self-test ────────────────────────────────────────────────
+
+let _all = dd175_all()
+println("[dd175] " + str(len(_all)) + " techniques registered")
+
+let _scales = ["34m", "100m", "350m", "1b", "2_8b", "3b"]
+let mut k = 0
+while k < len(_scales) {
+    let s = _scales[k]
+    let enabled = dd175_for_scale(s)
+    let ready = dd175_ready_count(s)
+    println("[dd175] " + s + " → enabled " + str(enabled) + " ready=" + str(ready) + "/" + str(len(enabled)))
+    k = k + 1
+}
+
+// Cumulative speedup (multiplicative) for the 2.8B v5 launch path.
+// Assumes #1 × #2 × #3 compose. Real measurement should validate.
+let _v5_ids = dd175_for_scale("2_8b")
+let mut total = 1.0
+let mut i = 0
+while i < len(_v5_ids) {
+    let id = _v5_ids[i]
+    let mut j = 0
+    while j < len(_all) {
+        if _all[j].id == id {
+            total = total * _all[j].speedup
+        }
+        j = j + 1
+    }
+    i = i + 1
+}
+println("[dd175] 2.8b v5 cumulative theoretical speedup = " + str(total) + "x")
