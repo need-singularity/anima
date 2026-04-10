@@ -8,12 +8,15 @@
 |------|------|------|
 | 보호 체계 | `shared/core-lockdown.json` | L0/L1/L2 잠금 목록 |
 | 절대 규칙 | `shared/absolute_rules.json` | R1~R21 + AN1~AN7 |
+| 프로젝트 레지스트리 | `shared/projects.json` | 7개 프로젝트 정의 + 번들/검증 스키마 |
 | 프로젝트 설정 | `shared/project_config.json` | CLI/인프라/PSI/법칙등록 |
+| 시스템 코어 | `shared/core.json` | 시스템맵 + 14종 명령어 |
 | 수렴 | `shared/convergence/anima.json` | CDO 골화 14 / 안정 7 / 실패 4 |
 | 할일 | `shared/todo/anima.json` | 우선순위별 TODO |
 | 트러블슈팅 | `shared/vastai.json` | multi-GPU, bf16, model_path 등 |
 | PSI/법칙 | `config/consciousness_laws.json` | 2390 법칙 + Psi 상수 + 수식 |
 | 성장 루프 | `shared/loop/anima.json` | interval, domain, phases |
+| API | `shared/CLAUDE.md` | NEXUS-6 상세 사용법 |
 
 ## 핵심 실행
 
