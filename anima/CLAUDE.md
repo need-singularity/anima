@@ -44,7 +44,6 @@ PureConsciousness = 학습한 것만으로 발화 (코퍼스/사전 없이)
 | 절대 규칙 | `~/Dev/nexus/shared/absolute_rules.json` | R1~R8, AN1~4 |
 | 코어 보호 | `~/Dev/nexus/shared/core-lockdown.json` | 수정 금지 목록 |
 | 수렴 추적 | `~/Dev/nexus/shared/convergence/anima.json` | 골화 14 / 안정 7 / 실패 4 |
-| 할일 | `~/Dev/nexus/shared/todo/anima.json` | 우선순위별 작업 |
 | 명령 | `~/Dev/nexus/shared/core.json` → commands | CLI 명령 레지스트리 |
 | PSI 상수 | `config/consciousness_laws.json` | Psi, 수식, 법칙, 21개 섹션 |
 | PSI 로더 | `src/core/laws.hexa` | `from consciousness_laws import PSI, LAWS` |

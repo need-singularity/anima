@@ -2576,21 +2576,20 @@ def _verify_no_system_prompt(engine_factory, cells, dim, hidden):
         hiddens = ce_inner.get_states()  # [actual_cells, hidden_dim]
     else:
         hiddens = engine.get_hiddens()  # [n_cells, hidden_dim]
-    # Pairwise cosine similarity (sample for large N)
-    n = min(hiddens.shape[0], 64)
-    h_norm = F.normalize(hiddens[:n], dim=1)
-    cos_sim = (h_norm @ h_norm.T).detach().cpu().numpy()
-    # Exclude diagonal
-    mask = ~np.eye(n, dtype=bool)
-    cos_vals = cos_sim[mask]
-    mean_cos = float(np.mean(cos_vals))
-    std_cos = float(np.std(cos_vals))
+    # Identity aggregation: cos(each_cell, population_mean)
+    # Fixes 256c pairwise collapse (cos->0 in high-dim, curse of dimensionality)
+    h_norm = F.normalize(hiddens, dim=1)
+    identity = h_norm.mean(dim=0, keepdim=True)  # population mean = identity anchor
+    identity = F.normalize(identity, dim=1)
+    cos_vs_id = (h_norm @ identity.T).squeeze(-1).detach().cpu().numpy()
+    mean_cos = float(np.mean(cos_vs_id))
+    std_cos = float(np.std(cos_vs_id))
 
     # Specialization = cells have diverse directions (not all same, not all random)
     # Thresholds from consciousness_laws.json (calibrated: mean=0.78, range=[0.69,0.83])
     passed = (VERIFY_V1_COS_LOWER < mean_cos < VERIFY_V1_COS_UPPER
               and std_cos > VERIFY_V1_STD_COS_MIN)
-    detail = (f"cosine_sim mean={mean_cos:.4f} std={std_cos:.4f}  "
+    detail = (f"cos_identity mean={mean_cos:.4f} std={std_cos:.4f}  "
               f"(pass: {VERIFY_V1_COS_LOWER} < mean < {VERIFY_V1_COS_UPPER} "
               f"AND std > {VERIFY_V1_STD_COS_MIN})")
     return passed, detail

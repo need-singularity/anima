@@ -9,6 +9,12 @@ Test 2: TensionLink UDP (same machine, two ports)
   - Two links on localhost sending/receiving packets
 """
 
+import sys
+import os
+# FIX(2026-04-10): anima_alive moved to anima/core/runtime/, tension_link to anima/models/legacy/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "anima", "core", "runtime"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "anima", "models", "legacy"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "anima", "src"))
 import torch
 import time
 from anima_alive import ConsciousMind, text_to_vector

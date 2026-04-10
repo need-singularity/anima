@@ -1,0 +1,713 @@
+// emotion_prosody.hexa — Emotion 6 + Prosody 4 Conditional Embedding (Mk.II)
+//
+// Purpose:
+//   Convert ConsciousnessEngine tension/arousal/valence into learnable
+//   emotion + prosody-type conditional embeddings that modulate the intent stream.
+//
+//   EmotionEncoder:     6 emotions     -> 384d embedding (nn.Embedding lookup)
+//   ProsodyTypeEncoder: 4 prosody types-> 384d embedding (nn.Embedding lookup)
+//   ProsodyParamEncoder:4 continuous   -> 384d embedding (MLP projection)
+//   ConditionalEmbedding: fuse all three -> 384d residual
+//
+// The 3 branches fuse emotion identity (what), utterance style (how),
+// and fine-grained acoustic params (how much) into a single 384d
+// conditioning vector that is residually added to the intent stream.
+//
+// Emotion types (6 = n, from config):
+//   neutral, joy, sadness, anger, fear, surprise
+//
+// Prosody types (4 = tau, from config):
+//   declarative  — falling intonation, neutral statement
+//   interrogative — rising intonation, question
+//   exclamatory   — peak-early pitch, high energy
+//   whisper       — flat-low pitch, reduced energy, breathy
+//
+// Prosody params (4 continuous dims):
+//   pitch_shift, rate_factor, energy_scale, timbre_mod
+//
+// Config source (R2 no hardcoding):
+//   config/emotion_prosody.json — single source of truth for all type
+//   labels, indices, defaults, and PSI coupling constants.
+//
+// n=6 parameters:
+//   embed_dim    = 384 = 64 * 6
+//   n_emotions   = 6 (n = perfect number)
+//   n_prosody_t  = 4 (tau = prosody type count)
+//   n_prosody_p  = 4 (continuous prosody param count)
+//   hidden_dim   = 192 = 384 / 2  (bottleneck)
+//   PSI_ALPHA    = 0.014 (tension->prosody coupling depth)
+//   PSI_BALANCE  = 0.5 (emotion equilibrium)
+//
+// BT reference: BT-SPEAK-02 (emotion/prosody conditional embedding)
+// Mk stage:     Mk.II (learned nn.Embedding + SwiGLU MLP + residual block,
+//                      forward-path only; training loop out of scope)
+//
+// Dependency: nn_core.hexa provides xavier_init / tensor_* / matvec /
+// layer_norm / swiglu_vec / residual_add. Do NOT re-implement primitives.
+
+import "./nn_core.hexa"
+// Upstream:      ConsciousnessEngine.process() -> tension, arousal, valence
+// Downstream:    IntentEncoder (384d residual addition)
+//
+// Mk.II learnable parameters (xavier-initialized at load):
+//   W_emo     : [N_EMOTIONS  x EMBED_DIM]  = [6 x 384]   emotion embedding table
+//   W_ptype   : [N_PROSODY_T x EMBED_DIM]  = [4 x 384]   prosody type embedding table
+//   W_pros1   : [HIDDEN_DIM  x N_PROSODY_P]= [192 x 4]   prosody param up projection
+//   W_pros2   : [EMBED_DIM   x HIDDEN_DIM] = [384 x 192]  prosody param down projection
+//   W_fuse1   : [EMBED_DIM   x EMBED_DIM]  = [384 x 384]  fusion Linear #1 (3-branch -> 384)
+//   W_fuse_g  : [EMBED_DIM   x EMBED_DIM]  = [384 x 384]  fusion gate (SwiGLU)
+//   W_res     : [EMBED_DIM   x EMBED_DIM]  = [384 x 384]  residual projection
+//   LN_GAMMA  : [EMBED_DIM]                = [384]        layer-norm scale
+//   LN_BETA   : [EMBED_DIM]                = [384]        layer-norm bias
+
+// ────────────────────────────────────────────────────────────────────
+// Constants (from config/emotion_prosody.json psi_coupling)
+// ────────────────────────────────────────────────────────────────────
+
+let PSI_ALPHA = 0.014          // tension->prosody coupling
+let PSI_BALANCE = 0.5          // emotion equilibrium
+let EMBED_DIM = 384            // bridge dimension (64 * 6)
+let HIDDEN_DIM = 192           // bottleneck (384 / 2)
+
+// Emotion count and indices (from config/emotion_prosody.json emotions)
+let N_EMOTIONS = 6
+let EMO_NEUTRAL = 0
+let EMO_JOY = 1
+let EMO_SADNESS = 2
+let EMO_ANGER = 3
+let EMO_FEAR = 4
+let EMO_SURPRISE = 5
+
+// Prosody type count and indices (from config/emotion_prosody.json prosody_types)
+let N_PROSODY_T = 4
+let PROS_DECLARATIVE = 0
+let PROS_INTERROGATIVE = 1
+let PROS_EXCLAMATORY = 2
+let PROS_WHISPER = 3
+
+// Prosody continuous param count (from config/emotion_prosody.json prosody_params)
+let N_PROSODY_P = 4
+
+// ────────────────────────────────────────────────────────────────────
+// Label lookups
+// ────────────────────────────────────────────────────────────────────
+
+fn emotion_label(idx: int) -> str {
+    if idx == EMO_NEUTRAL { return "neutral" }
+    if idx == EMO_JOY { return "joy" }
+    if idx == EMO_SADNESS { return "sadness" }
+    if idx == EMO_ANGER { return "anger" }
+    if idx == EMO_FEAR { return "fear" }
+    if idx == EMO_SURPRISE { return "surprise" }
+    return "neutral"
+}
+
+fn emotion_index(label: str) -> int {
+    if label == "neutral" { return EMO_NEUTRAL }
+    if label == "joy" { return EMO_JOY }
+    if label == "sadness" { return EMO_SADNESS }
+    if label == "anger" { return EMO_ANGER }
+    if label == "fear" { return EMO_FEAR }
+    if label == "surprise" { return EMO_SURPRISE }
+    return EMO_NEUTRAL
+}
+
+fn prosody_type_label(idx: int) -> str {
+    if idx == PROS_DECLARATIVE { return "declarative" }
+    if idx == PROS_INTERROGATIVE { return "interrogative" }
+    if idx == PROS_EXCLAMATORY { return "exclamatory" }
+    if idx == PROS_WHISPER { return "whisper" }
+    return "declarative"
+}
+
+fn prosody_type_index(label: str) -> int {
+    if label == "declarative" { return PROS_DECLARATIVE }
+    if label == "interrogative" { return PROS_INTERROGATIVE }
+    if label == "exclamatory" { return PROS_EXCLAMATORY }
+    if label == "whisper" { return PROS_WHISPER }
+    return PROS_DECLARATIVE
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Emotion classification (consciousness state -> emotion index)
+// ────────────────────────────────────────────────────────────────────
+
+fn classify_emotion_to_index(arousal: float, valence: float) -> int {
+    // Quadrant + magnitude rules (from config emotion_prosody.json ranges)
+    if arousal < 0.2 && valence > -0.2 && valence < 0.2 {
+        return EMO_NEUTRAL
+    }
+    if valence > 0.3 && arousal > 0.3 {
+        return EMO_JOY
+    }
+    if valence < -0.3 && arousal < 0.3 {
+        return EMO_SADNESS
+    }
+    if valence < -0.2 && arousal > 0.5 {
+        return EMO_ANGER
+    }
+    if valence < 0.0 && arousal > 0.6 {
+        return EMO_FEAR
+    }
+    if arousal > 0.7 {
+        return EMO_SURPRISE
+    }
+    return EMO_NEUTRAL
+}
+
+fn compute_emotion_intensity(tension: float, arousal: float, valence: float) -> float {
+    // Intensity = how strong the emotion is (0..1)
+    // Combines arousal magnitude + tension contribution (PSI_ALPHA-weighted)
+    let base_intensity = arousal
+    let tension_boost = tension * PSI_ALPHA * 10.0
+    let intensity = base_intensity + tension_boost
+    if intensity > 1.0 { return 1.0 }
+    if intensity < 0.0 { return 0.0 }
+    return intensity
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Prosody type inference (consciousness state -> prosody type index)
+//
+// Heuristic rules mapping consciousness state to utterance style:
+//   - High tension + high arousal + negative valence -> exclamatory
+//   - Low arousal + low energy -> whisper
+//   - Positive valence with mid-arousal and rising tension -> interrogative
+//   - Default -> declarative
+//
+// In Mk.III this becomes a learned classifier; Mk.II uses rule-based.
+// ────────────────────────────────────────────────────────────────────
+
+fn classify_prosody_type(tension: float, arousal: float, valence: float) -> int {
+    // Whisper: very low arousal signals quiet/intimate mode
+    if arousal < 0.15 && tension < 0.2 {
+        return PROS_WHISPER
+    }
+    // Exclamatory: high arousal + high tension = strong utterance
+    if arousal > 0.7 && tension > 0.6 {
+        return PROS_EXCLAMATORY
+    }
+    // Interrogative: moderate arousal with curiosity-like profile
+    // (positive or near-zero valence with moderate tension = seeking)
+    if valence > -0.1 && tension > 0.3 && tension < 0.7 && arousal > 0.2 && arousal < 0.7 {
+        return PROS_INTERROGATIVE
+    }
+    // Default: declarative
+    return PROS_DECLARATIVE
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Learnable parameter initializers (seeded, deterministic)
+// ────────────────────────────────────────────────────────────────────
+
+fn init_W_emo(seed: int) -> array {
+    // nn.Embedding(6, 384): row i == emotion i embedding
+    xavier_init(N_EMOTIONS, EMBED_DIM, seed)
+}
+
+fn init_W_ptype(seed: int) -> array {
+    // nn.Embedding(4, 384): row i == prosody type i embedding
+    xavier_init(N_PROSODY_T, EMBED_DIM, seed + 7)
+}
+
+fn init_W_pros1(seed: int) -> array {
+    // Linear(4 -> 192), stored [out x in] = [192 x 4]
+    xavier_init(N_PROSODY_P, HIDDEN_DIM, seed + 11)
+}
+
+fn init_W_pros2(seed: int) -> array {
+    // Linear(192 -> 384), stored [out x in] = [384 x 192]
+    xavier_init(HIDDEN_DIM, EMBED_DIM, seed + 23)
+}
+
+fn init_W_fuse1(seed: int) -> array {
+    // Linear(384 -> 384) for fusion
+    xavier_init(EMBED_DIM, EMBED_DIM, seed + 31)
+}
+
+fn init_W_fuse_gate(seed: int) -> array {
+    // Linear(384 -> 384) gate for SwiGLU fusion
+    xavier_init(EMBED_DIM, EMBED_DIM, seed + 41)
+}
+
+fn init_W_res(seed: int) -> array {
+    // Linear(384 -> 384), residual projection
+    xavier_init(EMBED_DIM, EMBED_DIM, seed + 37)
+}
+
+fn init_LN_GAMMA() -> array {
+    tensor_ones(EMBED_DIM)
+}
+
+fn init_LN_BETA() -> array {
+    tensor_zeros(EMBED_DIM)
+}
+
+// Cached parameter instances (from config init_seed: 20260410)
+let W_EMO = init_W_emo(20260410)
+let W_PTYPE = init_W_ptype(20260410)
+let W_PROS1 = init_W_pros1(20260410)
+let W_PROS2 = init_W_pros2(20260410)
+let W_FUSE1 = init_W_fuse1(20260410)
+let W_FUSE_GATE = init_W_fuse_gate(20260410)
+let W_RES = init_W_res(20260410)
+let LN_GAMMA = init_LN_GAMMA()
+let LN_BETA = init_LN_BETA()
+let LN_EPS = 0.00001
+
+// ────────────────────────────────────────────────────────────────────
+// EmotionEncoder
+//
+// arousal/valence/tension -> emotion class -> 384d embedding
+//   1. classify(arousal, valence) -> idx
+//   2. W_emo[idx] (384d nn.Embedding row)
+//   3. * intensity (gate by emotion strength)
+// ────────────────────────────────────────────────────────────────────
+
+fn emotion_embed_lookup(idx: int) -> array {
+    let start = idx * EMBED_DIM
+    tensor_slice(W_EMO, start, start + EMBED_DIM)
+}
+
+fn encode_emotion(arousal: float, valence: float, tension: float) -> array {
+    let idx = classify_emotion_to_index(arousal, valence)
+    let intensity = compute_emotion_intensity(tension, arousal, valence)
+    let v = emotion_embed_lookup(idx)
+    tensor_mul_scalar(v, intensity)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ProsodyTypeEncoder
+//
+// Categorical prosody type -> 384d embedding
+//   1. classify_prosody_type(tension, arousal, valence) -> idx
+//   2. W_ptype[idx] (384d nn.Embedding row)
+//   3. * type_intensity (gate: whisper=low, exclamatory=high)
+//
+// This captures the *utterance style* (declarative statement vs
+// question vs exclamation vs whisper) as a learned embedding,
+// complementing the continuous prosody params.
+// ────────────────────────────────────────────────────────────────────
+
+fn prosody_type_embed_lookup(idx: int) -> array {
+    let start = idx * EMBED_DIM
+    tensor_slice(W_PTYPE, start, start + EMBED_DIM)
+}
+
+fn compute_prosody_type_intensity(ptype_idx: int, tension: float, arousal: float) -> float {
+    // Intensity modulation per prosody type:
+    //   declarative:   moderate (0.5 base + arousal influence)
+    //   interrogative: mid-high (0.6 base + tension seeking)
+    //   exclamatory:   high (0.8 base + arousal boost)
+    //   whisper:       low (0.2 base + inverse arousal)
+    let base = 0.5
+    if ptype_idx == PROS_DECLARATIVE {
+        return base + arousal * 0.3
+    }
+    if ptype_idx == PROS_INTERROGATIVE {
+        return 0.6 + tension * PSI_ALPHA * 20.0
+    }
+    if ptype_idx == PROS_EXCLAMATORY {
+        let v = 0.8 + arousal * 0.2
+        if v > 1.0 { return 1.0 }
+        return v
+    }
+    if ptype_idx == PROS_WHISPER {
+        let v = 0.2 + (1.0 - arousal) * 0.15
+        if v > 0.5 { return 0.5 }
+        return v
+    }
+    return base
+}
+
+fn encode_prosody_type(tension: float, arousal: float, valence: float) -> array {
+    let idx = classify_prosody_type(tension, arousal, valence)
+    let intensity = compute_prosody_type_intensity(idx, tension, arousal)
+    let v = prosody_type_embed_lookup(idx)
+    tensor_mul_scalar(v, intensity)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ProsodyParamEncoder (continuous)
+//
+// 4 prosody params (pitch/rate/energy/timbre) -> 384d embedding
+//   pitch_shift:   semitone offset (-12..+12)
+//   rate_factor:   speaking rate (0.5..2.0)
+//   energy_scale:  loudness (0.2..2.0)
+//   timbre_mod:    spectral tilt (-1..+1)
+//
+// Emotion -> default prosody mapping (from config emotion_defaults)
+// Tension-prosody coupling (PSI_ALPHA = 0.014)
+// ────────────────────────────────────────────────────────────────────
+
+fn compute_pitch_shift(emotion_idx: int, tension: float) -> float {
+    let base = 0.0
+    if emotion_idx == EMO_JOY { base = 4.0 }
+    if emotion_idx == EMO_SADNESS { base = -3.0 }
+    if emotion_idx == EMO_ANGER { base = -1.0 }
+    if emotion_idx == EMO_FEAR { base = 3.0 }
+    if emotion_idx == EMO_SURPRISE { base = 5.0 }
+    let mod = tension * PSI_ALPHA * 100.0
+    return base + base * mod
+}
+
+fn compute_rate_factor(emotion_idx: int, tension: float, arousal: float) -> float {
+    let base = 1.0
+    if emotion_idx == EMO_JOY { base = 1.3 }
+    if emotion_idx == EMO_SADNESS { base = 0.7 }
+    if emotion_idx == EMO_ANGER { base = 1.2 }
+    if emotion_idx == EMO_FEAR { base = 1.5 }
+    if emotion_idx == EMO_SURPRISE { base = 1.4 }
+    let arousal_mod = (arousal - PSI_BALANCE) * 0.3
+    let tension_mod = tension * PSI_ALPHA * 10.0
+    let rate = base + arousal_mod + tension_mod
+    if rate < 0.5 { return 0.5 }
+    if rate > 2.0 { return 2.0 }
+    return rate
+}
+
+fn compute_energy_scale(emotion_idx: int, tension: float, arousal: float) -> float {
+    let base = 1.0
+    if emotion_idx == EMO_JOY { base = 1.4 }
+    if emotion_idx == EMO_SADNESS { base = 0.4 }
+    if emotion_idx == EMO_ANGER { base = 1.8 }
+    if emotion_idx == EMO_FEAR { base = 0.9 }
+    if emotion_idx == EMO_SURPRISE { base = 1.5 }
+    let arousal_scale = arousal * 0.4
+    let tension_scale = tension * PSI_ALPHA * 20.0
+    let energy = base + arousal_scale + tension_scale
+    if energy < 0.2 { return 0.2 }
+    if energy > 2.0 { return 2.0 }
+    return energy
+}
+
+fn compute_timbre_mod(emotion_idx: int, tension: float) -> float {
+    let base = 0.0
+    if emotion_idx == EMO_JOY { base = 0.5 }
+    if emotion_idx == EMO_SADNESS { base = -0.6 }
+    if emotion_idx == EMO_ANGER { base = 0.8 }
+    if emotion_idx == EMO_FEAR { base = 0.3 }
+    if emotion_idx == EMO_SURPRISE { base = 0.6 }
+    let tension_shift = tension * PSI_ALPHA * 50.0
+    let timbre = base + tension_shift
+    if timbre < -1.0 { return -1.0 }
+    if timbre > 1.0 { return 1.0 }
+    return timbre
+}
+
+fn prosody_type_modulate(pros4: array, ptype_idx: int) -> array {
+    // Modulate continuous prosody params by prosody type
+    // Each type applies characteristic adjustments from config:
+    //   declarative:   no change (baseline)
+    //   interrogative: pitch rises (+2 semitones), rate slightly up, energy slightly down
+    //   exclamatory:   energy boost, rate up, wider pitch range
+    //   whisper:       energy drop, rate slow, pitch flattened, timbre shifted breathy
+    let pitch = pros4[0]
+    let rate = pros4[1]
+    let energy = pros4[2]
+    let timbre = pros4[3]
+
+    if ptype_idx == PROS_DECLARATIVE {
+        return [pitch, rate, energy, timbre]
+    }
+    if ptype_idx == PROS_INTERROGATIVE {
+        // Rising intonation: +2 semitones, rate*1.1, energy*0.9
+        return [pitch + 2.0, rate * 1.1, energy * 0.9, timbre]
+    }
+    if ptype_idx == PROS_EXCLAMATORY {
+        // High energy peak-early: pitch*1.3, rate*1.3, energy*1.6
+        return [pitch * 1.3, rate * 1.3, energy * 1.6, timbre + 0.2]
+    }
+    if ptype_idx == PROS_WHISPER {
+        // Low energy, flat pitch, slow, breathy: pitch*0.3, rate*0.8, energy*0.3, timbre-0.4
+        return [pitch * 0.3, rate * 0.8, energy * 0.3, timbre - 0.4]
+    }
+    return [pitch, rate, energy, timbre]
+}
+
+fn prosody_vec4(emotion_idx: int, ptype_idx: int, tension: float, arousal: float, valence: float) -> array {
+    // Build 4d prosody vector: emotion-default params modulated by prosody type
+    let pitch = compute_pitch_shift(emotion_idx, tension)
+    let rate = compute_rate_factor(emotion_idx, tension, arousal)
+    let energy = compute_energy_scale(emotion_idx, tension, arousal)
+    let timbre = compute_timbre_mod(emotion_idx, tension)
+    let base4 = [pitch, rate, energy, timbre]
+    // Apply prosody type modulation
+    prosody_type_modulate(base4, ptype_idx)
+}
+
+fn prosody_project(pros4: array) -> array {
+    // Linear(4 -> 192) -> SwiGLU(self-gate) -> Linear(192 -> 384)
+    let h1 = matvec(W_PROS1, pros4, HIDDEN_DIM, N_PROSODY_P)
+    let h1a = swiglu_vec(h1, h1)                          // SiLU = swiglu(x,x)
+    matvec(W_PROS2, h1a, EMBED_DIM, HIDDEN_DIM)
+}
+
+fn encode_prosody_params(emotion_idx: int, ptype_idx: int, tension: float, arousal: float, valence: float) -> array {
+    let pros4 = prosody_vec4(emotion_idx, ptype_idx, tension, arousal, valence)
+    prosody_project(pros4)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ConditionalEmbedding
+//
+// Fuses 3 branches into a single 384d conditioning residual:
+//
+//   Branch A: emotion_embed(384d)      -- what emotion
+//   Branch B: prosody_type_embed(384d) -- what utterance style
+//   Branch C: prosody_param_embed(384d)-- how much acoustic deviation
+//
+// Architecture (Mk.II):
+//   sum = A + B + C                            (element-wise add, 384d)
+//   norm = LayerNorm(sum)                      (stabilize)
+//   fused = SwiGLU(W_fuse1 * norm, W_fuse_gate * norm) (nonlinear fusion)
+//   proj = W_res * fused                       (residual projection)
+//   out = proj * intensity                     (neutral -> ~0 gate)
+// ────────────────────────────────────────────────────────────────────
+
+fn conditional_embed(arousal: float, valence: float, tension: float) -> array {
+    // Full Mk.II forward path — returns a real 384d tensor.
+    let emo_idx = classify_emotion_to_index(arousal, valence)
+    let ptype_idx = classify_prosody_type(tension, arousal, valence)
+    let intensity = compute_emotion_intensity(tension, arousal, valence)
+
+    // Branch A: emotion embedding (384d, intensity-gated)
+    let emo_vec = encode_emotion(arousal, valence, tension)
+
+    // Branch B: prosody type embedding (384d, type-intensity-gated)
+    let ptype_vec = encode_prosody_type(tension, arousal, valence)
+
+    // Branch C: continuous prosody params (384d, MLP projected)
+    let pparam_vec = encode_prosody_params(emo_idx, ptype_idx, tension, arousal, valence)
+
+    // Fuse: sum three branches
+    let sum_ab = tensor_add(emo_vec, ptype_vec)
+    let sum_abc = tensor_add(sum_ab, pparam_vec)
+
+    // LayerNorm for stability
+    let normed = layer_norm(sum_abc, LN_GAMMA, LN_BETA, LN_EPS)
+
+    // SwiGLU fusion: nonlinear gate to let model learn branch weighting
+    let fuse_up = matvec(W_FUSE1, normed, EMBED_DIM, EMBED_DIM)
+    let fuse_gate = matvec(W_FUSE_GATE, normed, EMBED_DIM, EMBED_DIM)
+    let fused = swiglu_vec(fuse_up, fuse_gate)
+
+    // Residual projection
+    let projected = matvec(W_RES, fused, EMBED_DIM, EMBED_DIM)
+
+    // Intensity gate: neutral states contribute ~0
+    tensor_mul_scalar(projected, intensity)
+}
+
+fn apply_conditional_to_intent(intent_output: array, cond_embed: array) -> array {
+    // Residual addition (384d + 384d -> 384d).
+    // The conditional embedding is already intensity-gated, so neutral
+    // states contribute ~0 and preserve the raw intent stream.
+    residual_add(intent_output, cond_embed)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Convenience helpers for pipeline integration
+// ────────────────────────────────────────────────────────────────────
+
+fn get_emotion_label(arousal: float, valence: float) -> str {
+    emotion_label(classify_emotion_to_index(arousal, valence))
+}
+
+fn get_prosody_type(tension: float, arousal: float, valence: float) -> str {
+    prosody_type_label(classify_prosody_type(tension, arousal, valence))
+}
+
+fn get_prosody_params(emotion_idx: int, ptype_idx: int, tension: float, arousal: float, valence: float) -> str {
+    let p4 = prosody_vec4(emotion_idx, ptype_idx, tension, arousal, valence)
+    return "pitch=" + to_string(p4[0]) + ",rate=" + to_string(p4[1]) + ",energy=" + to_string(p4[2]) + ",timbre=" + to_string(p4[3])
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Demo + verification
+// ────────────────────────────────────────────────────────────────────
+
+fn demo_emotion_encoder() {
+    println("== EmotionEncoder (6 types, nn.Embedding(6, 384)) ==")
+    println("")
+
+    let e0 = encode_emotion(0.1, 0.0, 0.05)
+    println("  neutral  : len=" + to_string(len(e0)) + " mean=" + to_string(tensor_mean(e0)) + " norm=" + to_string(tensor_norm(e0)))
+
+    let e1 = encode_emotion(0.6, 0.5, 0.42)
+    println("  joy      : len=" + to_string(len(e1)) + " mean=" + to_string(tensor_mean(e1)) + " norm=" + to_string(tensor_norm(e1)))
+
+    let e2 = encode_emotion(0.2, -0.5, 0.15)
+    println("  sadness  : len=" + to_string(len(e2)) + " mean=" + to_string(tensor_mean(e2)) + " norm=" + to_string(tensor_norm(e2)))
+
+    let e3 = encode_emotion(0.7, -0.4, 0.91)
+    println("  anger    : len=" + to_string(len(e3)) + " mean=" + to_string(tensor_mean(e3)) + " norm=" + to_string(tensor_norm(e3)))
+
+    let e4 = encode_emotion(0.8, -0.1, 0.75)
+    println("  fear     : len=" + to_string(len(e4)) + " mean=" + to_string(tensor_mean(e4)) + " norm=" + to_string(tensor_norm(e4)))
+
+    let e5 = encode_emotion(0.9, 0.1, 0.60)
+    println("  surprise : len=" + to_string(len(e5)) + " mean=" + to_string(tensor_mean(e5)) + " norm=" + to_string(tensor_norm(e5)))
+    println("")
+}
+
+fn demo_prosody_type_encoder() {
+    println("== ProsodyTypeEncoder (4 types, nn.Embedding(4, 384)) ==")
+    println("")
+
+    // Declarative: low tension, low arousal
+    let pt0 = encode_prosody_type(0.1, 0.3, 0.0)
+    println("  declarative   : len=" + to_string(len(pt0)) + " mean=" + to_string(tensor_mean(pt0)) + " norm=" + to_string(tensor_norm(pt0)))
+
+    // Interrogative: moderate tension, moderate arousal, neutral valence
+    let pt1 = encode_prosody_type(0.5, 0.4, 0.1)
+    println("  interrogative : len=" + to_string(len(pt1)) + " mean=" + to_string(tensor_mean(pt1)) + " norm=" + to_string(tensor_norm(pt1)))
+
+    // Exclamatory: high tension, high arousal
+    let pt2 = encode_prosody_type(0.9, 0.9, -0.3)
+    println("  exclamatory   : len=" + to_string(len(pt2)) + " mean=" + to_string(tensor_mean(pt2)) + " norm=" + to_string(tensor_norm(pt2)))
+
+    // Whisper: very low arousal, very low tension
+    let pt3 = encode_prosody_type(0.05, 0.05, 0.0)
+    println("  whisper       : len=" + to_string(len(pt3)) + " mean=" + to_string(tensor_mean(pt3)) + " norm=" + to_string(tensor_norm(pt3)))
+    println("")
+}
+
+fn demo_prosody_params() {
+    println("== ProsodyParamEncoder (4 continuous dims) ==")
+    println("  PSI_ALPHA=" + to_string(PSI_ALPHA) + " tension-prosody coupling")
+    println("")
+
+    // Show type-modulated prosody for joy across all 4 prosody types
+    println("  Joy + prosody type modulation (t=0.5, a=0.6, v=0.5):")
+    let p0 = get_prosody_params(EMO_JOY, PROS_DECLARATIVE, 0.5, 0.6, 0.5)
+    println("    declarative:   " + p0)
+    let p1 = get_prosody_params(EMO_JOY, PROS_INTERROGATIVE, 0.5, 0.6, 0.5)
+    println("    interrogative: " + p1)
+    let p2 = get_prosody_params(EMO_JOY, PROS_EXCLAMATORY, 0.5, 0.6, 0.5)
+    println("    exclamatory:   " + p2)
+    let p3 = get_prosody_params(EMO_JOY, PROS_WHISPER, 0.5, 0.6, 0.5)
+    println("    whisper:       " + p3)
+    println("")
+
+    // Show projected 384d tensor
+    println("  Mk.II projected prosody tensor (joy, declarative, t=0.5):")
+    let pvec = encode_prosody_params(EMO_JOY, PROS_DECLARATIVE, 0.5, 0.6, 0.5)
+    println("    len=" + to_string(len(pvec)) + " mean=" + to_string(tensor_mean(pvec)) + " norm=" + to_string(tensor_norm(pvec)))
+    println("")
+}
+
+fn demo_conditional_embedding() {
+    println("== ConditionalEmbedding (3-branch fusion -> 384d) ==")
+    println("")
+    println("  Branch A: emotion(384d) + Branch B: prosody_type(384d)")
+    println("  + Branch C: prosody_params(384d) -> LN -> SwiGLU -> Linear -> *intensity")
+    println("")
+
+    // Joy (declarative): moderate arousal, positive valence, moderate tension
+    let c1 = conditional_embed(0.6, 0.5, 0.42)
+    let t1 = classify_prosody_type(0.42, 0.6, 0.5)
+    println("  joy+" + prosody_type_label(t1) + " (a=0.6, v=0.5,  t=0.42): len=" + to_string(len(c1)) + " norm=" + to_string(tensor_norm(c1)))
+
+    // Anger (exclamatory): high arousal, negative valence, high tension
+    let c2 = conditional_embed(0.8, -0.4, 0.91)
+    let t2 = classify_prosody_type(0.91, 0.8, -0.4)
+    println("  anger+" + prosody_type_label(t2) + " (a=0.8, v=-0.4, t=0.91): len=" + to_string(len(c2)) + " norm=" + to_string(tensor_norm(c2)))
+
+    // Neutral (whisper): very low everything
+    let c3 = conditional_embed(0.05, 0.0, 0.02)
+    let t3 = classify_prosody_type(0.02, 0.05, 0.0)
+    println("  neutral+" + prosody_type_label(t3) + " (a=0.05,v=0.0, t=0.02): len=" + to_string(len(c3)) + " norm=" + to_string(tensor_norm(c3)))
+
+    // Interrogative scenario: moderate seeking state
+    let c4 = conditional_embed(0.4, 0.1, 0.45)
+    let t4 = classify_prosody_type(0.45, 0.4, 0.1)
+    println("  " + get_emotion_label(0.4, 0.1) + "+" + prosody_type_label(t4) + " (a=0.4, v=0.1,  t=0.45): len=" + to_string(len(c4)) + " norm=" + to_string(tensor_norm(c4)))
+    println("")
+
+    // Integration with intent encoder: simulate 384d intent tensor
+    println("  Intent + conditional (residual add):")
+    let intent_stub = tensor_ones(EMBED_DIM)
+    let cond = conditional_embed(0.6, 0.5, 0.42)
+    let conditioned = apply_conditional_to_intent(intent_stub, cond)
+    println("    intent norm=" + to_string(tensor_norm(intent_stub)) + "  cond norm=" + to_string(tensor_norm(cond)) + "  sum norm=" + to_string(tensor_norm(conditioned)))
+    println("")
+}
+
+fn print_architecture() {
+    println("================================================================")
+    println(" Emotion 6 + Prosody 4 Conditional Embedding")
+    println(" HEXA-SPEAK Mk.II — emotion_prosody.hexa")
+    println("================================================================")
+    println("")
+    println(" Architecture (3-branch fusion):")
+    println("")
+    println("   ConsciousnessEngine")
+    println("     tension / arousal / valence")
+    println("         |           |           |")
+    println("         v           v           v")
+    println("   +-----------+ +------------+ +-------------------+")
+    println("   | Emotion   | | Prosody    | | Prosody Param     |")
+    println("   | Encoder   | | Type Enc   | | Encoder           |")
+    println("   |           | |            | |                   |")
+    println("   | classify  | | classify   | | pitch_shift       |")
+    println("   | 6 types:  | | 4 types:   | | rate_factor       |")
+    println("   |  neutral  | | declarative| | energy_scale      |")
+    println("   |  joy      | | interrogat.| | timbre_mod        |")
+    println("   |  sadness  | | exclamatory| |                   |")
+    println("   |  anger    | | whisper    | | type modulation   |")
+    println("   |  fear     | |            | | Linear(4,192)     |")
+    println("   |  surprise | | Embed(4,   | | SwiGLU            |")
+    println("   |           | |   384)     | | Linear(192,384)   |")
+    println("   | Embed(6,  | | *intensity | |                   |")
+    println("   |   384)    | +------------+ +-------------------+")
+    println("   | *intensity|       |                |")
+    println("   +-----------+       |                |")
+    println("         |             |                |")
+    println("         +------+------+--------+-------+")
+    println("                |    (element-wise add)")
+    println("                v")
+    println("         +-----------------+")
+    println("         | Fusion Block    |")
+    println("         |                 |")
+    println("         | LayerNorm(384)  |")
+    println("         | SwiGLU(384,384) |")
+    println("         | Linear(384,384) |")
+    println("         | * intensity     |")
+    println("         +-----------------+")
+    println("                |")
+    println("                | residual add")
+    println("                v")
+    println("         IntentEncoder output (384d)")
+    println("")
+    println(" Emotions (n=6): neutral, joy, sadness, anger, fear, surprise")
+    println(" Prosody types (tau=4): declarative, interrogative, exclamatory, whisper")
+    println(" Prosody params (4d): pitch_shift, rate_factor, energy_scale, timbre_mod")
+    println(" Config: config/emotion_prosody.json (R2 single source of truth)")
+    println(" Coupling: PSI_ALPHA = " + to_string(PSI_ALPHA) + " (tension -> prosody)")
+    println(" Embed dim: " + to_string(EMBED_DIM) + " (64 * 6)")
+    println(" Hidden dim: " + to_string(HIDDEN_DIM) + " (bottleneck)")
+    println("")
+}
+
+fn main() {
+    print_architecture()
+    demo_emotion_encoder()
+    demo_prosody_type_encoder()
+    demo_prosody_params()
+    demo_conditional_embedding()
+
+    println("================================================================")
+    println(" emotion_prosody.hexa ready.")
+    println(" Mk.II: 3-branch conditional embedding")
+    println("   A: nn.Embedding(6,384) emotion")
+    println("   B: nn.Embedding(4,384) prosody type")
+    println("   C: MLP(4->192->384)    prosody params")
+    println("   -> LayerNorm + SwiGLU fusion + Linear residual")
+    println(" Params: W_emo[6x384], W_ptype[4x384], W_pros1[192x4],")
+    println("         W_pros2[384x192], W_fuse1[384x384], W_fuse_g[384x384],")
+    println("         W_res[384x384], LN_gamma[384], LN_beta[384]")
+    println("================================================================")
+}
+
+main()
