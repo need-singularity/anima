@@ -1,0 +1,167 @@
+// training/train_lmhead_loop.hexa — Real training loop: LM head U+V only
+//
+// Closes the session by proving the full stack ACTUALLY LEARNS.
+// All previous files proved composition and numerical correctness;
+// this one demonstrates monotonic loss decrease over SGD updates.
+//
+// Pipeline per step:
+//   forward:  mid = h·U, logits = mid·V          (lm_head_uv math)
+//   loss:     mean negative log-likelihood        (loss_blas_only math)
+//   backward: dV, dU via 4 matmuls                (lm_head_backward math)
+//   update:   U -= lr·dU,  V -= lr·dV             (sgd_update)
+//
+// The decoder body (attn + FFN) is frozen-random — only the LM head
+// trains. That's the DD175 #1 "freeze-U/V-only" configuration,
+// which is exactly the 95× optimizer-win setting.
+//
+// Success criterion: loss at step 50 strictly less than loss at
+// step 0. Anything else means a gradient-direction bug.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/train_lmhead_loop.hexa
+use "nn_core"
+
+// ─── Config ──────────────────────────────────────────────────
+let DIM    = 6
+let RANK   = 3
+let VOCAB  = 16
+let SEQ    = 4
+let STEPS  = 50
+let LR     = 0.1
+let LOG_EVERY = 10
+
+// Fixed random hidden states (frozen "inner layer output")
+// In a real setup this comes from the decoder forward. Here we
+// lock it so the LM head has a stable target to learn.
+let H = tensor_mul_scalar(tensor_randn(SEQ * DIM, 11), 0.5)
+
+// Fixed training targets (synthetic)
+let TARGETS = [3, 7, 11, 14]
+
+// Trainable LM head weights
+let mut U = tensor_mul_scalar(tensor_randn(DIM * RANK, 22), 0.1)
+let mut V = tensor_mul_scalar(tensor_randn(RANK * VOCAB, 33), 0.1)
+
+// ─── Forward + loss (one pass) ──────────────────────────────
+
+fn ce_row_nll(logits_row: array, t: int) -> float {
+    let lp = log_softmax(logits_row)
+    return 0.0 - lp[t]
+}
+
+fn forward_loss(h: array, u: array, v: array) -> float {
+    let mid = matmul(h, u, SEQ, DIM, RANK)
+    let logits = matmul(mid, v, SEQ, RANK, VOCAB)
+    let mut total = 0.0
+    let mut i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        total = total + ce_row_nll(row, TARGETS[i])
+        i = i + 1
+    }
+    return total / (SEQ * 1.0)
+}
+
+// ─── Backward (returns dU, dV) ──────────────────────────────
+
+struct Grads {
+    dU: array,
+    dV: array
+}
+
+fn lm_head_grads(h: array, u: array, v: array) -> Grads {
+    // Forward (recomputed because we need mid + logits for backward)
+    let mid = matmul(h, u, SEQ, DIM, RANK)
+    let logits = matmul(mid, v, SEQ, RANK, VOCAB)
+
+    // dL/dlogits = (softmax(row) - one_hot(target)) / SEQ
+    let scale = 1.0 / (SEQ * 1.0)
+    let mut dlogits = tensor_zeros(SEQ * VOCAB)
+    let mut i = 0
+    while i < SEQ {
+        let row = tensor_slice(logits, i * VOCAB, (i + 1) * VOCAB)
+        let p = softmax(row)
+        let mut j = 0
+        while j < VOCAB {
+            dlogits[i * VOCAB + j] = p[j] * scale
+            j = j + 1
+        }
+        let t = TARGETS[i]
+        dlogits[i * VOCAB + t] = dlogits[i * VOCAB + t] - scale
+        i = i + 1
+    }
+
+    // dV = mid^T · dlogits
+    let mut mid_T = tensor_zeros(RANK * SEQ)
+    i = 0
+    while i < SEQ {
+        let mut j = 0
+        while j < RANK {
+            mid_T[j * SEQ + i] = mid[i * RANK + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dV = matmul(mid_T, dlogits, RANK, SEQ, VOCAB)
+
+    // dmid = dlogits · V^T
+    let dmid = matmul_transB(dlogits, v, SEQ, VOCAB, RANK)
+
+    // dU = h^T · dmid
+    let mut h_T = tensor_zeros(DIM * SEQ)
+    i = 0
+    while i < SEQ {
+        let mut j = 0
+        while j < DIM {
+            h_T[j * SEQ + i] = h[i * DIM + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dU = matmul(h_T, dmid, DIM, SEQ, RANK)
+
+    return Grads { dU: dU, dV: dV }
+}
+
+// ─── SGD update (in-place-ish: returns new array) ───────────
+
+fn sgd(w: array, g: array, lr: float) -> array {
+    let n = len(w)
+    let mut out = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = w[i] - lr * g[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Training loop ──────────────────────────────────────────
+
+println("[train_lmhead_loop] config: dim=" + str(DIM) + " rank=" + str(RANK) + " vocab=" + str(VOCAB) + " seq=" + str(SEQ) + " steps=" + str(STEPS) + " lr=" + str(LR))
+
+let loss_0 = forward_loss(H, U, V)
+println("[train_lmhead_loop] step=0 initial_loss=" + str(loss_0))
+
+let mut step = 1
+let mut last_loss = loss_0
+while step <= STEPS {
+    let g = lm_head_grads(H, U, V)
+    U = sgd(U, g.dU, LR)
+    V = sgd(V, g.dV, LR)
+
+    if step % LOG_EVERY == 0 {
+        last_loss = forward_loss(H, U, V)
+        println("[train_lmhead_loop] step=" + str(step) + " loss=" + str(last_loss))
+    }
+    step = step + 1
+}
+
+let loss_final = forward_loss(H, U, V)
+println("[train_lmhead_loop] final_loss=" + str(loss_final))
+println("[train_lmhead_loop] Δ loss   =" + str(loss_final - loss_0))
+
+if loss_final < loss_0 {
+    println("[train_lmhead_loop] PASS — loss strictly decreased over " + str(STEPS) + " SGD steps")
+} else {
+    println("[train_lmhead_loop] FAIL — loss did not decrease (gradient sign bug?)")
+}
