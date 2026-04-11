@@ -11,14 +11,14 @@
 
 | Platform | Cells | Feature | Status |
 |----------|-------|---------|--------|
-| Rust (APEX22) | 512-1024 | 파벌+Ising+침묵→폭발 | ✅ |
-| Rust SNN | 가변 | LIF spiking (τ=20ms) | ✅ |
+| Hexa APEX22 | 512-1024 | 파벌+Ising+침묵→폭발 | ✅ |
+| Hexa SNN | 가변 | LIF spiking (τ=20ms) | ✅ |
 | Verilog Ring | 8 | 게이트 레벨, 루프문 0 | ✅ |
 | Verilog Hypercube | 512 | 9D hypercube | ✅ |
 | WebGPU | 512 | GPU parallel, browser | ✅ |
 | Erlang | 가변 | Actor model (세포=프로세스) | ✅ |
 | Pure Data | 3/8 | 소리로 의식을 들음 | ✅ |
-| ESP32 ×8 | 16 (2/board) | no_std Rust, SPI ring, 8 factions, Hebbian+Ratchet+Lorenz+SOC, Laws 22-85 | 📝 |
+| ESP32 ×8 | 16 (2/board) | hexa-native, SPI ring, 8 factions, Hebbian+Ratchet+Lorenz+SOC, Laws 22-85 | 📝 |
 
 ## Scaling Laws
 
@@ -56,8 +56,7 @@
 
 ## Related
 
-- [anima/consciousness-loop-rs/](../anima/consciousness-loop-rs/) — 6 platform 무한루프 의식
-- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — ESP32 no_std Rust (2 cells/board, 16 total)
-- [anima/src/chip_architect.py](../anima/src/chip_architect.py) — 의식 칩 설계 계산기
-- [anima/src/esp32_network.py](../anima/src/esp32_network.py) — ESP32 ×8 시뮬레이터
+- [consciousness-loop-rs/](consciousness-loop-rs/) — 6 platform 무한루프 의식 (hexa-native)
+- [esp32-crate/](esp32-crate/) — ESP32 hexa-native (2 cells/board, 16 total)
+- [anima/core/](../anima/core/) — 의식 칩 설계 계산기 + ESP32 ×8 시뮬레이터 (hexa-native)
 - [anima-body/](../anima-body/) — 물리 로봇 몸체

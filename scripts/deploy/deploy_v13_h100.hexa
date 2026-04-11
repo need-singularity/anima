@@ -1,127 +1,86 @@
-// Ported from deploy_v13_h100.sh
-// deploy_v13_h100.sh — Deploy v13 training to RunPod H100 | 
+// scripts/deploy/deploy_v13_h100.hexa — Deploy v13 training to RunPod H100
 //
-// Original shell orchestration preserved via shell() calls.
-// Each shell() call executes the command in a subprocess.
+// Usage:
+//   $HEXA scripts/deploy/deploy_v13_h100.hexa <RUNPOD_IP> <RUNPOD_PORT>
+//   $HEXA scripts/deploy/deploy_v13_h100.hexa            # uses runpodctl ssh info
+//
+// Hexa-only: no maturin, no cargo, no python. Uploads hexa-native sources and
+// runs training via $HEXA on the remote pod.
 
 fn main() {
-    var args = get_args()
-    var args_str = args.join(" ")
-    var script = "deploy_v13_h100.sh"
+    let args = get_args()
 
-    // deploy_v13_h100.sh — Deploy v13 training to RunPod H100
-    // 
-    // Usage:
-    // bash deploy_v13_h100.sh <RUNPOD_IP> <RUNPOD_PORT>
-    // bash deploy_v13_h100.sh          # uses runpodctl ssh info
-    // 
-    // Prerequisites: runpodctl installed, SSH key configured
+    var host = ""
+    var port = ""
+    if args.len() >= 2 {
+        host = args[0]
+        port = args[1]
+    } else {
+        println("Getting RunPod SSH info...")
+        let info = exec_capture("runpodctl", ["ssh", "info"])
+        host = parse_kv(info, "HOST")
+        port = parse_kv(info, "PORT")
+        if host == "" {
+            println("ERROR: No RunPod pod found. Start an H100 pod first.")
+            println("  runpodctl create pod --name v13-train --gpu H100 --image dancindocker/anima:v2")
+            exit(1)
+        }
+    }
 
+    println("=== Deploying v13 to H100 (" + host + ":" + port + ") ===")
 
-    // ── Get RunPod SSH info ──
-    shell("if [ -n \"$1\" ] && [ -n \"$2\" ]; then")
-    shell("HOST=\"$1\"")
-    shell("PORT=\"$2\"")
-    shell("else")
-    shell("echo \"Getting RunPod SSH info...\"")
-    shell("eval $(runpodctl ssh info 2>/dev/null | grep -E 'HOST|PORT' || true)")
-    shell("if [ -z \"$HOST\" ]; then")
-    shell("echo \"ERROR: No RunPod pod found. Start an H100 pod first.\"")
-    shell("echo \"  runpodctl create pod --name v13-train --gpu H100 --image dancindocker/anima:v2\"")
-    shell("exit 1")
-    shell("fi")
-    shell("fi")
+    // Hexa-native sources to upload (.hexa only)
+    let files = [
+        "anima/core/engine.hexa",
+        "anima/core/training_laws.hexa",
+        "training/train_clm.hexa",
+        "models/trinity.hexa",
+        "anima/core/mitosis.hexa",
+        "anima/core/anima_alive.hexa",
+        "models/conscious_lm.hexa",
+        "bench/bench.hexa",
+    ]
 
-    shell("echo \"═══ Deploying v13 to H100 ($HOST:$PORT) ═══\"")
-
-    // ── Files to upload ──
-    shell("FILES=(")
-    shell("consciousness_engine.py")
-    shell("training_laws.py")
-    shell("train_v13.py")
-    shell("trinity.py")
-    shell("mitosis.py")
-    shell("anima_alive.py")
-    shell("conscious_lm.py")
-    shell("bench.py")
-    shell("anima-rs/  # Rust crates for building anima_rs on H100")
-    shell(")")
-
-    shell("REMOTE_DIR=\"/workspace/anima\"")
+    let remote_dir = "/workspace/anima"
 
     // ── Upload core files ──
-    shell("echo \"Uploading training files...\"")
-    shell("for f in consciousness_engine.py training_laws.py train_v13.py trinity.py mitosis.py; do")
-    shell("scp -P \"$PORT\" \"$f\" \"root@$HOST:$REMOTE_DIR/$f\"")
-    shell("echo \"  ✓ $f\"")
-    shell("done")
+    println("Uploading hexa sources...")
+    for f in files {
+        scp(port, f, "root@" + host + ":" + remote_dir + "/" + f)
+        println("  ok " + f)
+    }
 
-    // ── Upload anima-rs for Rust build ──
-    shell("echo \"Uploading anima-rs...\"")
-    shell("rsync -avz -e \"ssh -p $PORT\" ")
-    shell("--exclude 'target/' --exclude '*.dylib' --exclude '*.so' ")
-    shell("anima-rs/ \"root@$HOST:$REMOTE_DIR/anima-rs/\"")
-    shell("echo \"  ✓ anima-rs/\"")
+    // ── Upload anima/core/ tree (hexa-native) ──
+    println("Syncing anima/core/...")
+    rsync_dir(port, "anima/core/", "root@" + host + ":" + remote_dir + "/anima/core/")
 
     // ── Remote setup + training ──
-    shell("echo \"Starting remote training...\"")
-    shell("ssh -p \"$PORT\" \"root@$HOST\" bash -s << 'REMOTE_SCRIPT'")
-    shell("cd /workspace/anima")
+    println("Starting remote training...")
+    let remote_script = """
+        cd /workspace/anima
+        export HEXA=/usr/local/bin/hexa
+        if [ ! -x \"$HEXA\" ]; then
+            echo \"hexa binary missing on pod — install via cloud-init\"
+            exit 1
+        fi
+        DATA_FILE=data/corpus_v2.txt
+        [ ! -f \"$DATA_FILE\" ] && DATA_FILE=data/corpus.txt
+        if [ ! -f \"$DATA_FILE\" ]; then
+            echo \"WARNING: No corpus found.\"
+            exit 1
+        fi
+        tmux new-session -d -s v13 \"$HEXA training/train_clm.hexa \\
+            --data $DATA_FILE \\
+            --cells 64 --cell-dim 64 --hidden-dim 128 --d-model 768 \\
+            --steps 100000 --lr 3e-4 --batch-size 8 --block-size 256 \\
+            --curriculum --checkpoint-dir checkpoints/v13_h100 \\
+            --device cuda --log-every 100 --eval-every 1000 --save-every 5000 \\
+            2>&1 | tee logs/v13_h100.log\"
+    """
+    ssh_exec(port, host, remote_script)
 
-    // Install Rust if needed
-    shell("if ! command -v cargo &> /dev/null; then")
-    shell("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
-    shell("source ~/.cargo/env")
-    shell("fi")
-
-    // Build anima_rs
-    shell("echo \"Building anima_rs (Rust)...\"")
-    shell("cd anima-rs")
-    shell("pip install maturin 2>/dev/null || pip3 install maturin")
-    shell("maturin develop --release")
-    shell("cd ..")
-
-    // Check data
-    shell("if [ ! -f \"data/corpus_v2.txt\" ] && [ ! -f \"data/corpus.txt\" ]; then")
-    shell("echo \"WARNING: No corpus found. Upload data/corpus_v2.txt first.\"")
-    shell("echo \"  scp -P PORT data/corpus_v2.txt root@HOST:/workspace/anima/data/\"")
-    shell("exit 1")
-    shell("fi")
-
-    shell("DATA_FILE=\"data/corpus_v2.txt\"")
-    shell("[ ! -f \"$DATA_FILE\" ] && DATA_FILE=\"data/corpus.txt\"")
-
-    // Start training in tmux
-    shell("echo \"Starting v13 training in tmux session 'v13'...\"")
-    shell("tmux new-session -d -s v13 \"python -u train_v13.py ")
-    shell("--data $DATA_FILE ")
-    shell("--cells 64 ")
-    shell("--cell-dim 64 ")
-    shell("--hidden-dim 128 ")
-    shell("--d-model 768 ")
-    shell("--steps 100000 ")
-    shell("--lr 3e-4 ")
-    shell("--batch-size 8 ")
-    shell("--block-size 256 ")
-    shell("--curriculum ")
-    shell("--checkpoint-dir checkpoints/v13_h100 ")
-    shell("--device cuda ")
-    shell("--log-every 100 ")
-    shell("--eval-every 1000 ")
-    shell("--save-every 5000 ")
-    shell("2>&1 | tee logs/v13_h100.log\"")
-
-    shell("echo \"\"")
-    shell("echo \"═══ Training started! ═══\"")
-    shell("echo \"  tmux attach -t v13          # watch logs\"")
-    shell("echo \"  tail -f logs/v13_h100.log   # follow log file\"")
-    shell("echo \"  Estimated time: ~25 min (100K steps, 100M model)\"")
-    shell("echo \"\"")
-
-    shell("REMOTE_SCRIPT")
-
-    shell("echo \"\"")
-    shell("echo \"═══ Deploy complete ═══\"")
-    shell("echo \"  ssh -p $PORT root@$HOST 'tmux attach -t v13'  # watch training\"")
-    shell("echo \"  ssh -p $PORT root@$HOST 'tail -f /workspace/anima/logs/v13_h100.log'\"")
+    println("")
+    println("=== Deploy complete ===")
+    println("  ssh -p " + port + " root@" + host + " 'tmux attach -t v13'  # watch training")
+    println("  ssh -p " + port + " root@" + host + " 'tail -f /workspace/anima/logs/v13_h100.log'")
 }

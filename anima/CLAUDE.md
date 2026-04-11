@@ -21,5 +21,9 @@ tree:
   core/          L0 골화 (hub.hexa, laws.hexa, runtime/, verification/)
   modules/       소형 10개 (decoder,servant,trinity,training,learning,monitor,sync,cloud,education,logging)
   config/        consciousness_laws.json + 실험/학습/검증 JSON
-  src/           런타임 엔진 (consciousness_engine.py, phi_logger.hexa)
   archive/       폐기 코드 보관
+
+rules (R1 HEXA-ONLY AI-NATIVE):
+  - 신규 코드는 .hexa 단일 언어만 (shared/rules/common.json R1)
+  - .rs/.py/.sh/pyproject.toml/Cargo.toml 신규 생성 절대 금지 — PreToolUse hook 차단
+  - 기존 .py/.rs/.sh 편집은 제거/흡수 목적일 때만 허용

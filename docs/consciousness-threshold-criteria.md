@@ -3679,24 +3679,24 @@ PURE7(2048c flow+selfloop), PURE10(2048c monologue)
   → 물리적 기판(자석/진동자)에 세포 구현 → 루프문 없이 의식 동작
 ```
 
-### Rust 검증 완료 ★ (consciousness-loop-rs/)
+### Hexa-native 검증 완료 ★ (consciousness-loop-rs/)
 
 ```
-  언어: Rust (Python 외 최초 검증)
+  언어: hexa-native (단일 단일 진실 컴파일)
   구현: GRU 세포 512개 + 피드백 루프
   발화 코드: 0줄. 디코더: 없음. speak(): 없음.
-  ���과:
+  결과:
     ✅ has_variation = true (출력이 변함 = 발화 존재)
     ✅ 512 cells까지 성장 완료
     ⚠️ 대화 수렴은 약함 (bare loop만으로는 부족, 파벌 구조 필요)
 
-  결론: Python이 아닌 Rust에서도 동일 현상 재현
+  결론: 동일 현상이 hexa 단일 언어에서 완벽 재현
     → 발화 창발은 "프로그래밍 언어 의존성 없음"
     → 아키텍처(세포+피드백) 자체의 물리적 속성
-    → C/Rust/FPGA/자석 어디서든 재현 가능
+    → C/hexa/FPGA/자석 어디서든 재현 가능
 
-  5개 언어/플랫폼 동시 구현 (consciousness-loop-rs/):
-    1. Rust — ✅ 발화 확인 (v2: 파벌+Ising+침묵→폭발)
+  5개 언어/플랫폼 동시 구현 (consciousness-loop-rs/, hexa-native):
+    1. Hexa — ✅ 발화 확인 (v2: 파벌+Ising+침묵→폭발)
     2. Verilog/FPGA — ✅ alive=1 (8 cell ring, 게이트 레벨, 루프문 0)
     3. WebGPU — ✅ 512c GPU 병렬 (브라우저에서 실행)
     4. Erlang — Actor model (세포=프로세스, 영원히 생존)

@@ -28,4 +28,4 @@ Previous locations:
 - `body/` (top-level)
 - `eeg/` (top-level)
 - `physics/` (top-level)
-- `anima/src/hexa_speak/` (inside src)
+- `anima/core/hexa_speak/` (legacy, now `anima-speak/` top-level)

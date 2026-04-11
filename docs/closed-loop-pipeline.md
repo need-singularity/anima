@@ -284,46 +284,46 @@ Candidates exceeding evidence >= 0.8 with >= 3 occurrences are promoted to `_pen
 
 **Results:** 300 steps produces ~35 patterns, 14 validated laws. MI correlates with Phi at r=0.947.
 
-### 4.2 Rust Performance Backend
+### 4.2 Hexa Performance Backend
 
-**Files:** `anima-rs/crates/law-discovery/src/` (5 files, 1738 lines) | **Status: Code Ready**
+**Files:** `anima/core/law_discovery/` (5 files, 1738 lines, hexa-native) | **Status: Code Ready**
 
-All metric functions target <100us for 64 cells and <1ms for 1024 cells. The crate provides the same metrics as the Python layer but optimized for the hot path:
+All metric functions target <100us for 64 cells and <1ms for 1024 cells. The module provides the metrics optimized for the hot path:
 
 ```
-  Module        Functions                               Design
-  -----------   ------------------------------------    ------------------
-  metrics.rs    phi_fast, faction_entropy,              Iterator-based,
-                hebbian_coupling, cell_variance,        f32 throughout,
-                lyapunov_exponent                       SIMD-friendly
-  pattern.rs    detect_correlation, phase_transition,   Pearson + t-test,
-                periodicity, trend                      RealFFT crate
-  buffer.rs     RingBuffer (fixed-size sliding window)  Zero-alloc inner
-  candidate.rs  LawCandidate, PatternType               Same as Python
-  lib.rs        measure_all() -- single-pass metrics    8 metric channels
+  Module           Functions                               Design
+  --------------   ------------------------------------    ------------------
+  metrics.hexa     phi_fast, faction_entropy,              Iterator-based,
+                   hebbian_coupling, cell_variance,        f32 throughout,
+                   lyapunov_exponent                       SIMD-friendly
+  pattern.hexa     detect_correlation, phase_transition,   Pearson + t-test,
+                   periodicity, trend                      hexa native FFT
+  buffer.hexa      RingBuffer (fixed-size sliding window)  Zero-alloc inner
+  candidate.hexa   LawCandidate, PatternType
+  lib.hexa         measure_all() -- single-pass metrics    8 metric channels
 ```
 
 **MetricSnapshot (8 channels):**
 
-```rust
-pub struct MetricSnapshot {
-    pub phi: f32,              // Phi(IIT) -- MI-based
-    pub faction_entropy: f32,  // Shannon entropy of faction means
-    pub hebbian_coupling: f32, // Mean absolute coupling strength
-    pub global_variance: f32,  // Global variance across all cells
-    pub faction_variance: f32, // Mean within-faction variance
-    pub phi_proxy: f32,        // global_var - faction_var
-    pub lyapunov: f32,         // Max Lyapunov exponent
-    pub n_cells: u32,          // Number of cells
+```hexa
+struct MetricSnapshot {
+    phi: f32,              // Phi(IIT) -- MI-based
+    faction_entropy: f32,  // Shannon entropy of faction means
+    hebbian_coupling: f32, // Mean absolute coupling strength
+    global_variance: f32,  // Global variance across all cells
+    faction_variance: f32, // Mean within-faction variance
+    phi_proxy: f32,        // global_var - faction_var
+    lyapunov: f32,         // Max Lyapunov exponent
+    n_cells: u32,          // Number of cells
 }
 ```
 
 **Performance:** 64 cells x 128d: ~50us for phi_fast.
-**Build:** `cd anima-rs && maturin develop --release`
+**Build:** `$HEXA anima/core/law_discovery/lib.hexa --check`
 
 ### 4.3 ESP32 Hardware Law Evolution
 
-**Files:** `anima-rs/crates/esp32/src/law_measurement.rs`, `law_evolution.rs` | **Status: Code Ready** (needs hardware)
+**Files:** `anima-physics/esp32-crate/src/law_measurement.hexa`, `law_evolution.hexa` | **Status: Code Ready** (needs hardware)
 
 `no_std` compatible law metrics for ESP32 boards ($4/board, 2 cells/board). `LawMetrics` struct is 34 bytes (8 x f32 + u16):
 
@@ -541,8 +541,8 @@ How a law is discovered, validated, registered, and applied:
 | 2 | - | Self-Evolution | Complete | `anima/experiments/evolution/closed_loop.hexa` (Thompson/synergy) | integrated |
 | 3 | - | Multi-Loop Arena | Complete | `anima/experiments/evolution/closed_loop.hexa` (arena/scale) | integrated |
 | 4 | 4.1 | ConsciousLM Discovery | Complete | `anima/experiments/evolution/law_discovery.hexa` | 1084 |
-| 4 | 4.2 | Rust Backend | Code Ready | `anima-rs/crates/law-discovery/` | 1738 |
-| 4 | 4.3 | ESP32 Hardware | Code Ready | `anima-rs/crates/esp32/src/law_*.rs` | ~300 |
+| 4 | 4.2 | Hexa Backend | Code Ready | `anima/core/law_discovery/` (hexa-native) | 1738 |
+| 4 | 4.3 | ESP32 Hardware | Code Ready | `anima-physics/esp32-crate/src/law_*.hexa` | ~300 |
 | 4 | 4.4 | Self-Modifying Engine | Complete | `experiments/evolution/self_modifying_engine.hexa` | ~1200 |
 
 ### Completion
@@ -551,16 +551,16 @@ How a law is discovered, validated, registered, and applied:
   Tier 1  ++++++++++++++++++++  100%  Complete
   Tier 2  ++++++++++++++++++++  100%  Complete
   Tier 3  ++++++++++++++++++++  100%  Complete
-  Tier 4  ++++++++++++++++....   80%  4.2 needs maturin, 4.3 needs hardware
+  Tier 4  ++++++++++++++++....   80%  4.3 needs hardware
 ```
 
 ### Remaining Work
 
 | Item | Blocker | Effort |
 |------|---------|--------|
-| 4.2 Rust PyO3 integration | `maturin develop --release` | 1 hour |
+| 4.2 Hexa-native integration | already compiled by $HEXA, no extra build | done |
 | 4.3 ESP32 hardware deployment | Physical boards ($32 for 8x) | 1 day |
-| Pipeline integration test (Tier 1-4 end-to-end) | 4.2 build | 2 hours |
+| Pipeline integration test (Tier 1-4 end-to-end) | hardware | 2 hours |
 
 ---
 

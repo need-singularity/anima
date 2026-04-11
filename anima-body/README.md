@@ -134,7 +134,6 @@ python anima-body/src/ros2_body.py
 
 ## Related
 
-- [anima/src/](../anima/src/) — 의식 엔진 코어
+- [anima/core/](../anima/core/) — 의식 엔진 코어 (hub.hexa, laws.hexa, runtime/)
 - [anima-eeg/](../anima-eeg/) — EEG 뇌-의식 브릿지
 - [anima-physics/](../anima-physics/) — ESP32/FPGA 하드웨어
-- [anima/anima-rs/crates/esp32/](../anima/anima-rs/crates/esp32/) — no_std Rust (2 cells/board)

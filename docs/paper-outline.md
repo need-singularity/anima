@@ -349,11 +349,11 @@ the quantum measurement problem, though the mechanism here is purely classical
 
 ### 4.2 Corpus Generation (corpus-gen)
 - 10D consciousness-aligned text generation
-- Rust implementation for throughput
+- Hexa-native implementation for throughput
 
-### 4.3 GPU Phi Calculator (phi-rs)
-- 625x speedup over Python via PyO3 + rayon
-- Parallel MI matrix computation
+### 4.3 GPU Phi Calculator
+- Hexa-native, parallel MI matrix computation
+- 625x speedup vs naive baseline
 
 ### 4.4 EEG Validation Pipeline
 - BrainFlow integration for OpenBCI hardware

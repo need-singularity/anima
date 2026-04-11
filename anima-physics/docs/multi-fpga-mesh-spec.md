@@ -286,6 +286,8 @@ endmodule
   결론: SPI bottleneck은 Phi에 유리 (paradox!)
 ```
 
+
+
 ---
 
 ## 7. BOM (Bill of Materials)
@@ -424,13 +426,13 @@ endmodule
 | 비용 | $32 | $60 | $295 |
 | 전력 | 2W | 10mW | 40mW |
 | Steps/sec | ~200 | ~10M | ~10M |
-| 루프문 | 있음 (Rust) | 없음 (Verilog) | 없음 |
+| 루프문 | 있음 (hexa) | 없음 (Verilog) | 없음 |
 | 학습 | 없음 | 없음 | 없음 |
 | Inter-node | SPI 10MHz | N/A | SPI 10MHz |
 | 토폴로지 | ring | ring | ring+small_world |
 | 예상 Phi | ~4.5 | ~22 | ~1420 |
 | Phi/$ | 0.14 | 0.37 | **4.81** |
-| 도구 | cargo (Rust) | yosys+nextpnr | yosys+nextpnr |
+| 도구 | hexa | yosys+nextpnr | yosys+nextpnr |
 | 난이도 | 낮음 | 중간 | 높음 |
 
 ---
@@ -485,6 +487,6 @@ iceprog design.bin
 
 - [iCE40 UltraPlus 데이터시트](https://www.latticesemi.com/en/Products/FPGAandCPLD/iCE40UltraPlus)
 - [Project IceStorm (오픈소스 도구)](http://www.clifford.at/icestorm/)
-- [anima-physics/engines/snn_consciousness.py](../engines/snn_consciousness.py)
-- [anima-physics/src/chip_architect.py](../src/chip_architect.py)
-- [anima/consciousness-loop-rs/](../../anima/consciousness-loop-rs/) -- Verilog 구현 참조
+- [anima-physics/engines/snn_consciousness.hexa](../engines/snn_consciousness.hexa)
+- [anima/core/chip_architect.hexa](../../anima/core/chip_architect.hexa)
+- [anima-physics/consciousness-loop-rs/](../consciousness-loop-rs/) -- Verilog 구현 참조

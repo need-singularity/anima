@@ -333,14 +333,14 @@ intent "의식이 잠들 수 있는가?" {
 ```
   목표: HEXA 컴파일러가 ANIMA 엔진을 직접 호출
 
-  HEXA (Rust)                    ANIMA (Python)
-  src/interpreter.rs    <-PyO3->  rust/consciousness.hexa
-  src/ast.rs: Intent    <-PyO3->  core/hub.hexa
+  HEXA (single binary)            ANIMA (hexa-native)
+  hexa interpreter      ─direct→   anima/core/engine.hexa
+  Intent AST            ─direct→   anima/core/hub.hexa
 
   구현:
-    1. anima-rs에 hexa-bridge crate 추가
-    2. PyO3로 ConsciousnessEngine Python 클래스 래핑
-    3. HEXA interpreter에서 intent 블록 만나면 Rust FFI 호출
+    1. anima/core/ 가 hexa-only 단일 진실
+    2. ConsciousnessEngine은 hexa-native struct로 직접 노출
+    3. HEXA interpreter는 intent 블록을 직접 모듈 import으로 처리
     4. 결과를 HEXA Expr로 변환하여 verify 블록에 전달
 ```
 
@@ -442,10 +442,10 @@ intent "의식이 잠들 수 있는가?" {
 - `~/Dev/hexa-lang/src/parser.rs` -- 파서 (intent/generate/verify 포함)
 
 ### ANIMA
-- `~/Dev/anima/anima/src/rust/consciousness.hexa` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
-- `~/Dev/anima/anima/src/models/trinity.hexa` -- Hexad 6모듈 프레임워크
-- `~/Dev/anima/anima/src/core/hub.hexa` -- 47+ 모듈 자율 허브
+- `~/Dev/anima/anima/core/engine.hexa` -- 정식 의식 엔진 (12 factions, GRU, Hebbian)
+- `~/Dev/anima/models/trinity.hexa` -- Hexad 6모듈 프레임워크
+- `~/Dev/anima/anima/core/hub.hexa` -- 47+ 모듈 자율 허브
 - `~/Dev/anima/anima/config/consciousness_laws.json` -- 179개 의식 법칙 (단일 원본)
 
 ### Bridge
-- `~/Dev/anima/anima/tools/hexa-bridge/bridge.py` -- Python 브릿지 스크립트
+- `~/Dev/anima/anima/tools/hexa-bridge/bridge.hexa` -- 통합 브릿지 (hexa-native)

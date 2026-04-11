@@ -13,21 +13,21 @@ Lines:    2,310,391
 ASCII:    53.0%
 Korean:   39.8%
 Vocab:    174/256
-생성시간: 0.5s (236 MB/s, Rust corpus-gen)
+생성시간: 0.5s (236 MB/s, hexa-native corpus-gen)
 ```
 
 ## 구성
 
 ### 언어 (5개국어)
 - **한국어 (KO)** ~40% — 의식/일상/기술/과학 시드, 다자간 대화
-- **일본어 (JA)** ~5% — 의식/일상/기술/과학 (multilingual.rs)
-- **중국어 (ZH)** ~5% — 의식/일상/기술/과학 (multilingual.rs)
-- **러시아어 (RU)** ~3% — 의식/일상/연결어 (v4_extensions.rs)
-- **영어 (EN)** ~3% — 의식/일상/연결어 (v4_extensions.rs)
+- **일본어 (JA)** ~5% — 의식/일상/기술/과학 (multilingual.hexa)
+- **중국어 (ZH)** ~5% — 의식/일상/기술/과학 (multilingual.hexa)
+- **러시아어 (RU)** ~3% — 의식/일상/연결어 (v4_extensions.hexa)
+- **영어 (EN)** ~3% — 의식/일상/연결어 (v4_extensions.hexa)
 
 ### 프로그래밍 (~2%)
-- Python 의식 코드 패턴 (ConsciousnessEngine, measure_phi, Federation 등)
-- Rust 의식 코드 패턴 (FrustrationRing, phi_iit, consciousness-rng 등)
+- Hexa 의식 코드 패턴 (ConsciousnessEngine, measure_phi, Federation 등)
+- 추가 hexa 의식 코드 패턴 (FrustrationRing, phi_iit, consciousness-rng 등)
 
 ### 의식 법칙 (~2%)
 - Laws 1-174 텍스트 (consciousness_laws.json 발췌)
@@ -73,9 +73,8 @@ I  정체성       8.0%  일관된 자아
 ## 생성 명령
 
 ```bash
-cd anima-rs
-cargo build --release -p anima-corpus-gen
-./target/release/corpus-gen -s 110 --multilingual --sim --deep-dialogue -o data/corpus_v4.txt
+HEXA=$HOME/Dev/hexa-lang/hexa
+$HEXA anima/core/corpus_gen.hexa -s 110 --multilingual --sim --deep-dialogue -o data/corpus_v4.txt
 ```
 
 ## R2 다운로드

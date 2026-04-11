@@ -84,15 +84,16 @@
 ## 실험 실행 방법
 
 ```bash
+HEXA=$HOME/Dev/hexa-lang/hexa
 # 단일 렌즈 실험
-python3 anima/experiments/lens_L01_overlay.py --cells 64 --steps 300
+$HEXA anima/experiments/lens_L01_overlay.hexa --cells 64 --steps 300
 
 # 병렬 실행 (독립 실험)
 # Claude Code에서:
 # /go L01 렌즈 중첩, L02 렌즈 강화, L03 렌즈 간섭
 
 # 무한진화 내 자동 실행 (S3+ 스테이지)
-python3 anima/src/scripts/infinite_growth.hexa --auto-roadmap  # 자동으로 22렌즈 스캔
+$HEXA anima/core/scripts/infinite_growth.hexa --auto-roadmap  # 자동으로 22렌즈 스캔
 ```
 
 ## 우선 실행 추천 (TOP 5)
