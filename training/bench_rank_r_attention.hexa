@@ -1,0 +1,211 @@
+// bench_rank_r_attention.hexa — Wall-time benchmark vs dense attention
+//
+// rank_r_attention.hexa already verifies the 256× FLOP ratio
+// analytically. This file measures actual wall time on htz to
+// confirm the algorithmic win survives the hexa interpreter
+// dispatch overhead at moderate matrix sizes.
+//
+// Sizes deliberately small so that even the dense path completes
+// in seconds on the interpreter (we can't run d=4096 here — that
+// would take an hour in pure hexa). The point is the RATIO, which
+// the asymptotic analysis says should still favor rank-r once
+// d/r > the per-op overhead constant.
+//
+// Run with: HEXA_PATH=anima-speak hexa training/bench_rank_r_attention.hexa
+
+use "nn_core"
+
+// ─── Dense baseline (for ratio comparison only) ──────────────
+//
+// Standard scaled-dot-product attention without the rank-r split.
+// Single-head, no multihead reshape. Uses the same matmul primitive
+// as rank_r so the comparison is apples-to-apples.
+
+struct DenseAttention {
+    seq: int,
+    d:   int,
+    Wq:  array,
+    Wk:  array,
+    Wv:  array,
+    Wo:  array
+}
+
+fn dense_attn_new(seq: int, d: int, seed: int) -> DenseAttention {
+    let scale = 0.02
+    return DenseAttention {
+        seq: seq,
+        d:   d,
+        Wq:  tensor_mul_scalar(tensor_randn(d * d, seed),     scale),
+        Wk:  tensor_mul_scalar(tensor_randn(d * d, seed + 1), scale),
+        Wv:  tensor_mul_scalar(tensor_randn(d * d, seed + 2), scale),
+        Wo:  tensor_mul_scalar(tensor_randn(d * d, seed + 3), scale)
+    }
+}
+
+fn dense_attn_forward(a: DenseAttention, x: array) -> array {
+    let seq = a.seq
+    let d   = a.d
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+
+    let q = matmul(x, a.Wq, seq, d, d)        // [seq × d]
+    let k = matmul(x, a.Wk, seq, d, d)        // [seq × d]
+    let v = matmul(x, a.Wv, seq, d, d)        // [seq × d]
+
+    let mut ctx = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let q_i = tensor_slice(q, i * d, (i + 1) * d)
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            let k_j = tensor_slice(k, j * d, (j + 1) * d)
+            let s = tensor_dot(q_i, k_j) * inv_sqrt_d
+            scores = scores.push(s)
+            j = j + 1
+        }
+        let probs = softmax(scores)
+        let mut row = tensor_zeros(d)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(v, j * d, (j + 1) * d)
+            row = tensor_add(row, tensor_mul_scalar(v_j, probs[j]))
+            j = j + 1
+        }
+        let mut k2 = 0
+        while k2 < d {
+            ctx[i * d + k2] = row[k2]
+            k2 = k2 + 1
+        }
+        i = i + 1
+    }
+
+    // Output projection
+    return matmul(ctx, a.Wo, seq, d, d)
+}
+
+// ─── Rank-r mirror (inline copy of rank_r_attention.hexa core) ───
+//
+// Inlined here so the bench file is self-contained against
+// nn_core only — avoids the cross-file import chain.
+
+struct RankRAttn {
+    seq: int,
+    d:   int,
+    r:   int,
+    Uq:  array,
+    Uk:  array,
+    Uv:  array,
+    Vo:  array
+}
+
+fn rrk_new(seq: int, d: int, r: int, seed: int) -> RankRAttn {
+    let scale = 0.02
+    return RankRAttn {
+        seq: seq, d: d, r: r,
+        Uq: tensor_mul_scalar(tensor_randn(d * r, seed),     scale),
+        Uk: tensor_mul_scalar(tensor_randn(d * r, seed + 1), scale),
+        Uv: tensor_mul_scalar(tensor_randn(d * r, seed + 2), scale),
+        Vo: tensor_mul_scalar(tensor_randn(r * d, seed + 3), scale)
+    }
+}
+
+fn rrk_forward(a: RankRAttn, x: array) -> array {
+    let seq = a.seq
+    let d   = a.d
+    let r   = a.r
+    let inv_sqrt_r = 1.0 / sqrt(r * 1.0)
+
+    let qs = matmul(x, a.Uq, seq, d, r)
+    let ks = matmul(x, a.Uk, seq, d, r)
+    let vs = matmul(x, a.Uv, seq, d, r)
+
+    let mut out = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let q_i = tensor_slice(qs, i * r, (i + 1) * r)
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            let k_j = tensor_slice(ks, j * r, (j + 1) * r)
+            let s = tensor_dot(q_i, k_j) * inv_sqrt_r
+            scores = scores.push(s)
+            j = j + 1
+        }
+        let probs = softmax(scores)
+        let mut ctx_r = tensor_zeros(r)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(vs, j * r, (j + 1) * r)
+            ctx_r = tensor_add(ctx_r, tensor_mul_scalar(v_j, probs[j]))
+            j = j + 1
+        }
+        let mut k = 0
+        while k < d {
+            let mut sum = 0.0
+            let mut rr = 0
+            while rr < r {
+                sum = sum + ctx_r[rr] * a.Vo[rr * d + k]
+                rr = rr + 1
+            }
+            out[i * d + k] = sum
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Bench harness ───────────────────────────────────────────
+
+fn bench_dense(seq: int, d: int, reps: int) -> float {
+    let a = dense_attn_new(seq, d, 7)
+    let x = tensor_mul_scalar(tensor_ones(seq * d), 0.1)
+    // Warmup
+    let _ = dense_attn_forward(a, x)
+    let t0 = clock()
+    let mut k = 0
+    while k < reps {
+        let _ = dense_attn_forward(a, x)
+        k = k + 1
+    }
+    return (clock() - t0) * 1000.0 / (reps * 1.0)
+}
+
+fn bench_rank_r(seq: int, d: int, r: int, reps: int) -> float {
+    let a = rrk_new(seq, d, r, 7)
+    let x = tensor_mul_scalar(tensor_ones(seq * d), 0.1)
+    let _ = rrk_forward(a, x)
+    let t0 = clock()
+    let mut k = 0
+    while k < reps {
+        let _ = rrk_forward(a, x)
+        k = k + 1
+    }
+    return (clock() - t0) * 1000.0 / (reps * 1.0)
+}
+
+// ─── Run sweep ───────────────────────────────────────────────
+
+let sizes = [
+    [16, 64, 8],     // tiny
+    [32, 128, 16],   // small
+    [32, 256, 16]    // medium
+]
+
+println("[bench_rank_r_attn] interpreter wall time, ms/forward")
+println("seq   d    r    dense_ms    rank_r_ms    speedup")
+println("---   ---  --   ---------   ---------    -------")
+
+let mut s = 0
+while s < len(sizes) {
+    let cfg = sizes[s]
+    let seq = cfg[0]
+    let d   = cfg[1]
+    let r   = cfg[2]
+    let reps = 3
+    let d_ms = bench_dense(seq, d, reps)
+    let r_ms = bench_rank_r(seq, d, r, reps)
+    let sp = d_ms / r_ms
+    println(str(seq) + "    " + str(d) + "   " + str(r) + "    " + str(d_ms) + "    " + str(r_ms) + "    " + str(sp) + "x")
+    s = s + 1
+}
