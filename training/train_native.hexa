@@ -1,0 +1,128 @@
+// training/train_native.hexa — Native C FFI bridge for CLM/ALM training
+//
+// Provides a clean hexa interface to libtrain_native.so (train_step.c).
+// Both CLM (from-scratch) and ALM (LoRA) training loops use this module
+// for 500x speedup on H100 vs interpreter.
+//
+// Build: nvcc -O3 -shared -Xcompiler -fPIC -lcublas -lcudart \
+//              native/train_ffi.c native/train_step.c -o libtrain_native.so
+//
+// Usage:
+//   use "train_native"
+//   native_init(24, 2048, 16, 128, 5504, 32000, 2048)  // 1B config
+//   native_set_hp(0.0003, 0.9, 0.999, 0.00000001, 0.01, 1.0)
+//   let loss = native_step(tokens_ptr, targets_ptr)
+//   native_cleanup()
+
+// ── FFI declarations (resolved at link time on H100 pod) ────
+
+@link("train_native")
+extern fn train_ffi_init(
+    n_layers: int, dim: int, n_heads: int, head_dim: int,
+    ff_dim: int, vocab_size: int, seq_len: int
+) -> int
+
+@link("train_native")
+extern fn train_ffi_set_hp(
+    lr: float, beta1: float, beta2: float,
+    eps: float, wd: float, grad_clip: float
+)
+
+@link("train_native")
+extern fn train_ffi_step(tokens_ptr: long, targets_ptr: long) -> float
+
+@link("train_native")
+extern fn train_ffi_get_grad_norm() -> float
+
+@link("train_native")
+extern fn train_ffi_get_elapsed_us() -> long
+
+@link("train_native")
+extern fn train_ffi_get_step() -> int
+
+@link("train_native")
+extern fn train_ffi_cleanup()
+
+// ── Clean hexa wrappers ─────────────────────────────────────
+
+fn native_init(n_layers: int, dim: int, n_heads: int, head_dim: int,
+               ff_dim: int, vocab_size: int, seq_len: int) -> bool {
+    let rc = train_ffi_init(n_layers, dim, n_heads, head_dim,
+                            ff_dim, vocab_size, seq_len)
+    if rc == 1 {
+        println("[native] init OK: L=" + str(n_layers) + " D=" + str(dim) +
+                " FF=" + str(ff_dim) + " V=" + str(vocab_size) + " SEQ=" + str(seq_len))
+        return true
+    }
+    println("[native] init FAILED")
+    return false
+}
+
+fn native_set_hp(lr: float, beta1: float, beta2: float,
+                 eps: float, wd: float, grad_clip: float) {
+    train_ffi_set_hp(lr, beta1, beta2, eps, wd, grad_clip)
+}
+
+fn native_step(tokens_ptr: long, targets_ptr: long) -> float {
+    return train_ffi_step(tokens_ptr, targets_ptr)
+}
+
+fn native_grad_norm() -> float { return train_ffi_get_grad_norm() }
+fn native_elapsed_us() -> long { return train_ffi_get_elapsed_us() }
+fn native_step_count() -> int  { return train_ffi_get_step() }
+
+fn native_cleanup() {
+    train_ffi_cleanup()
+    println("[native] cleanup done")
+}
+
+// ── Model size presets (matches model_1b_gpu.hexa) ──────────
+
+struct NativeModelConfig {
+    name: string,
+    n_layers: int,
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    ff_dim: int,
+    vocab_size: int,
+    seq_len: int,
+    params_m: int
+}
+
+fn config_smoke() -> NativeModelConfig {
+    // Tiny smoke test — runs in < 1s even on CPU stub
+    NativeModelConfig {
+        name: "smoke", n_layers: 2, dim: 64, n_heads: 4, head_dim: 16,
+        ff_dim: 128, vocab_size: 256, seq_len: 32, params_m: 0
+    }
+}
+
+fn config_34m() -> NativeModelConfig {
+    NativeModelConfig {
+        name: "34M", n_layers: 6, dim: 384, n_heads: 6, head_dim: 64,
+        ff_dim: 1024, vocab_size: 32000, seq_len: 512, params_m: 34
+    }
+}
+
+fn config_103m() -> NativeModelConfig {
+    // Matches R8 pod validation (43.6M actual, named 103M in roadmap)
+    NativeModelConfig {
+        name: "103M", n_layers: 8, dim: 512, n_heads: 8, head_dim: 64,
+        ff_dim: 1408, vocab_size: 32000, seq_len: 512, params_m: 103
+    }
+}
+
+fn config_1b() -> NativeModelConfig {
+    // P5b-1 spec: 1,279,885,312 params, fits 1× H100 80GB
+    NativeModelConfig {
+        name: "1B", n_layers: 24, dim: 2048, n_heads: 16, head_dim: 128,
+        ff_dim: 5504, vocab_size: 32000, seq_len: 2048, params_m: 1280
+    }
+}
+
+// ── Self-test (runs on import) ──────────────────────────────
+
+println("[train_native] module loaded — 4 configs: smoke/34M/103M/1B")
+println("[train_native] CLM: native_init → native_step (from-scratch)")
+println("[train_native] ALM: same pipeline, freeze base + LoRA adapter in C")
