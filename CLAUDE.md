@@ -2,6 +2,13 @@
 
 > shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)
 
+## ⛔ 규칙 준수 (필수)
+
+모든 작업 전 아래 규칙 파일을 읽고 준수할 것. 위반 시 즉시 수정.
+
+- **공통**: `shared/rules/common.json` — R0~R27, AI-NATIVE 원칙
+- **프로젝트**: `shared/rules/anima.json` — AN1~AN7
+
 ## ref
 
 ```
