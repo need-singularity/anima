@@ -1,0 +1,187 @@
+// training/ffn_backward.hexa — FFN backward as composition of primitives
+//
+// First composed backward in the session. Shows the pattern for
+// chaining primitives from ops_backward.hexa + matmul_backward.hexa
+// into a layer-level backward. attention_backward uses the same
+// pattern but has a per-row scoring loop; ffn is simpler (three
+// matmuls, no per-row softmax).
+//
+// Forward (from decoder_minimal.ffn_forward):
+//   up  = x · Wff1           [seq × ff]
+//   act = swiglu(up, up)     [seq × ff]   (minimal: gate = up)
+//   y   = act · Wff2         [seq × d]
+//
+// Backward (given dy [seq × d]):
+//   dact, dWff2 = matmul_backward(act, Wff2, dy, seq, ff, d)
+//   dup_x, dup_g = swiglu_backward(up, up, dact)
+//   dup = dup_x + dup_g             ← same tensor is both x and gate
+//   dx, dWff1 = matmul_backward(x, Wff1, dup, seq, d, ff)
+//
+// Run with: HEXA_PATH=anima-speak hexa training/ffn_backward.hexa
+use "nn_core"
+
+// ─── Inline primitives (mirrors matmul_backward + ops_backward) ───
+//
+// Kept self-contained so this file runs without cross-file imports.
+
+fn mm_backward(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut a_T = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K {
+            a_T[j * M + i] = a[i * K + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dB = matmul(a_T, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn sg_backward(x: array, gate: array, dy: array) -> [array] {
+    let n = len(x)
+    let mut dx = tensor_zeros(n)
+    let mut dg = tensor_zeros(n)
+    let mut i = 0
+    while i < n {
+        let s = sigmoid(gate[i])
+        dx[i] = dy[i] * s
+        dg[i] = dy[i] * x[i] * s * (1.0 - s)
+        i = i + 1
+    }
+    return [dx, dg]
+}
+
+// ─── FFN forward (saves intermediates for backward) ─────────
+
+struct FFNActivations {
+    up:  array,    // [seq × ff]
+    act: array,    // [seq × ff]
+    out: array     // [seq × d]
+}
+
+fn ffn_forward(x: array, wff1: array, wff2: array, seq: int, d: int, ff: int) -> FFNActivations {
+    let up  = matmul(x, wff1, seq, d, ff)
+    let act = swiglu_vec(up, up)
+    let out = matmul(act, wff2, seq, ff, d)
+    return FFNActivations { up: up, act: act, out: out }
+}
+
+// ─── FFN backward: matmul + swiglu + matmul ─────────────────
+
+struct FFNGrads {
+    dx:    array,   // [seq × d]
+    dWff1: array,   // [d × ff]
+    dWff2: array    // [ff × d]
+}
+
+fn ffn_backward(
+    x: array, wff1: array, wff2: array, acts: FFNActivations, dy: array,
+    seq: int, d: int, ff: int
+) -> FFNGrads {
+    // dact, dWff2 from out = act · Wff2
+    let g1 = mm_backward(acts.act, wff2, dy, seq, ff, d)
+    let dact  = g1[0]
+    let dWff2 = g1[1]
+
+    // dup_x, dup_gate from act = swiglu(up, up)
+    // Since gate = up (minimal FFN), sum the two gradient paths
+    let g2 = sg_backward(acts.up, acts.up, dact)
+    let dup_x = g2[0]
+    let dup_g = g2[1]
+    let dup = tensor_add(dup_x, dup_g)
+
+    // dx, dWff1 from up = x · Wff1
+    let g3 = mm_backward(x, wff1, dup, seq, d, ff)
+    let dx    = g3[0]
+    let dWff1 = g3[1]
+
+    return FFNGrads { dx: dx, dWff1: dWff1, dWff2: dWff2 }
+}
+
+// ─── Self-test: FD validation ───────────────────────────────
+
+let _seq = 2
+let _d   = 3
+let _ff  = 4
+
+// Fixed random-ish inputs
+let _x    = [0.1, 0.2, 0.3,   0.4, 0.5, 0.6]
+let _wff1 = [
+    0.1, 0.2, 0.3, 0.4,
+    0.5, 0.6, 0.7, 0.8,
+    0.9, 1.0, 1.1, 1.2
+]
+let _wff2 = [
+    0.1, 0.2, 0.3,
+    0.4, 0.5, 0.6,
+    0.7, 0.8, 0.9,
+    1.0, 1.1, 1.2
+]
+
+// Forward
+let _acts = ffn_forward(_x, _wff1, _wff2, _seq, _d, _ff)
+
+// Loss = 0.5 · ||out||²   so   dy = out
+fn half_sq_norm(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + 0.5 * v[i] * v[i]
+        i = i + 1
+    }
+    return s
+}
+let _loss = half_sq_norm(_acts.out)
+println("[ffn_backward] loss = " + str(_loss))
+
+let _dy = _acts.out
+let _grads = ffn_backward(_x, _wff1, _wff2, _acts, _dy, _seq, _d, _ff)
+println("[ffn_backward] dx    len = " + str(len(_grads.dx))    + " (expect " + str(_seq * _d)    + ")")
+println("[ffn_backward] dWff1 len = " + str(len(_grads.dWff1)) + " (expect " + str(_d * _ff)     + ")")
+println("[ffn_backward] dWff2 len = " + str(len(_grads.dWff2)) + " (expect " + str(_ff * _d)     + ")")
+
+// FD on x[0]
+let eps = 0.0001
+let _x_pert = [_x[0] + eps, _x[1], _x[2], _x[3], _x[4], _x[5]]
+let _acts_p = ffn_forward(_x_pert, _wff1, _wff2, _seq, _d, _ff)
+let _loss_p = half_sq_norm(_acts_p.out)
+let _fd_dx0 = (_loss_p - _loss) / eps
+let _ana_dx0 = _grads.dx[0]
+
+println("[ffn_backward] dx[0] analytical  = " + str(_ana_dx0))
+println("[ffn_backward] dx[0] finite-diff = " + str(_fd_dx0))
+
+let _d0 = _ana_dx0 - _fd_dx0
+let _abs0 = if _d0 < 0.0 { 0.0 - _d0 } else { _d0 }
+
+// FD on Wff1[5] (middle-ish)
+let mut _w_pert = []
+let mut _j = 0
+while _j < len(_wff1) {
+    _w_pert = _w_pert.push(_wff1[_j])
+    _j = _j + 1
+}
+_w_pert[5] = _w_pert[5] + eps
+let _acts_pw = ffn_forward(_x, _w_pert, _wff2, _seq, _d, _ff)
+let _loss_pw = half_sq_norm(_acts_pw.out)
+let _fd_w5 = (_loss_pw - _loss) / eps
+let _ana_w5 = _grads.dWff1[5]
+
+println("[ffn_backward] dWff1[5] analytical  = " + str(_ana_w5))
+println("[ffn_backward] dWff1[5] finite-diff = " + str(_fd_w5))
+
+let _d1 = _ana_w5 - _fd_w5
+let _abs1 = if _d1 < 0.0 { 0.0 - _d1 } else { _d1 }
+
+println("")
+if _abs0 < 0.001 && _abs1 < 0.001 {
+    println("[ffn_backward] PASS — composed ffn backward matches FD within 0.001")
+    println("[ffn_backward] pattern: matmul_bwd + swiglu_bwd + matmul_bwd")
+    println("[ffn_backward] same pattern composes attention backward via")
+    println("              qkv projections + softmax_bwd + matmul_bwd.")
+} else {
+    println("[ffn_backward] FAIL — dx Δ=" + str(_d0) + " dWff1 Δ=" + str(_d1))
+}
