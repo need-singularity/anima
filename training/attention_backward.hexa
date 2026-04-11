@@ -1,0 +1,291 @@
+// training/attention_backward.hexa — Attention backward (no causal mask)
+//
+// The most complex composed backward in the session. The per-row
+// softmax means gradients fan out across seq² paths and have to be
+// accumulated carefully into dQ/dK/dV. Validates against finite
+// difference on a small shape.
+//
+// Forward (simplified — no causal mask for the FD test):
+//   q = x · Wq          [seq × d]
+//   k = x · Wk          [seq × d]
+//   v = x · Wv          [seq × d]
+//   for each i:
+//     scores_i = q_i · k^T / √d       [seq]
+//     probs_i  = softmax(scores_i)    [seq]
+//     ctx_i    = Σ_j probs_i[j] · v_j [d]
+//   out = ctx · Wo      [seq × d]
+//
+// Backward (given dout):
+//   dctx, dWo = matmul_backward(ctx, Wo, dout, seq, d, d)
+//   for each i:
+//     dprobs_i[j]  = dctx_i · v_j                     (for all j)
+//     dv_j        += probs_i[j] · dctx_i              (accumulated over i)
+//     dscores_i    = softmax_backward(probs_i, dprobs_i)
+//     dq_i        += Σ_j dscores_i[j] · k_j / √d
+//     dk_j        += dscores_i[j] · q_i / √d          (accumulated over i)
+//   dxq, dWq = matmul_backward(x, Wq, dq, seq, d, d)
+//   dxk, dWk = matmul_backward(x, Wk, dk, seq, d, d)
+//   dxv, dWv = matmul_backward(x, Wv, dv, seq, d, d)
+//   dx = dxq + dxk + dxv
+//
+// Run with: HEXA_PATH=anima-speak hexa training/attention_backward.hexa
+use "nn_core"
+
+// ─── Inline primitives ──────────────────────────────────────
+
+fn mm_backward(a: array, b: array, dc: array, M: int, K: int, N: int) -> [array] {
+    let dA = matmul_transB(dc, b, M, N, K)
+    let mut a_T = tensor_zeros(K * M)
+    let mut i = 0
+    while i < M {
+        let mut j = 0
+        while j < K {
+            a_T[j * M + i] = a[i * K + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let dB = matmul(a_T, dc, K, M, N)
+    return [dA, dB]
+}
+
+fn sm_backward(p: array, dp: array) -> array {
+    let n = len(p)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + p[i] * dp[i]
+        i = i + 1
+    }
+    let mut dx = tensor_zeros(n)
+    i = 0
+    while i < n {
+        dx[i] = p[i] * (dp[i] - s)
+        i = i + 1
+    }
+    return dx
+}
+
+// ─── Attention forward (saves intermediates) ────────────────
+
+struct AttnActs {
+    q:     array,       // [seq × d]
+    k:     array,
+    v:     array,
+    probs: array,       // [seq × seq] flat
+    ctx:   array,       // [seq × d]
+    out:   array        // [seq × d]
+}
+
+fn attn_forward(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    seq: int, d: int
+) -> AttnActs {
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+    let q = matmul(x, wq, seq, d, d)
+    let k = matmul(x, wk, seq, d, d)
+    let v = matmul(x, wv, seq, d, d)
+
+    let mut probs_flat = tensor_zeros(seq * seq)
+    let mut ctx = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        let q_i = tensor_slice(q, i * d, (i + 1) * d)
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            let k_j = tensor_slice(k, j * d, (j + 1) * d)
+            scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        // Save probs row
+        j = 0
+        while j < seq {
+            probs_flat[i * seq + j] = p_i[j]
+            j = j + 1
+        }
+        // ctx_i = Σ p_i[j] · v_j
+        let mut row = tensor_zeros(d)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(v, j * d, (j + 1) * d)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < d {
+            ctx[i * d + p] = row[p]
+            p = p + 1
+        }
+        i = i + 1
+    }
+
+    let out = matmul(ctx, wo, seq, d, d)
+    return AttnActs { q: q, k: k, v: v, probs: probs_flat, ctx: ctx, out: out }
+}
+
+// ─── Attention backward ─────────────────────────────────────
+
+struct AttnGrads {
+    dx:  array,
+    dWq: array,
+    dWk: array,
+    dWv: array,
+    dWo: array
+}
+
+fn attn_backward(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    acts: AttnActs, dout: array,
+    seq: int, d: int
+) -> AttnGrads {
+    let inv_sqrt_d = 1.0 / sqrt(d * 1.0)
+
+    // dctx, dWo from out = ctx · Wo
+    let g_wo = mm_backward(acts.ctx, wo, dout, seq, d, d)
+    let dctx = g_wo[0]
+    let dWo  = g_wo[1]
+
+    // Per-row gradient accumulation into dq, dk, dv
+    let mut dq = tensor_zeros(seq * d)
+    let mut dk = tensor_zeros(seq * d)
+    let mut dv = tensor_zeros(seq * d)
+
+    let mut i = 0
+    while i < seq {
+        // dctx_i [d]
+        let dctx_i = tensor_slice(dctx, i * d, (i + 1) * d)
+
+        // Row i of probs, q
+        let mut p_i = []
+        let mut j = 0
+        while j < seq {
+            p_i = p_i.push(acts.probs[i * seq + j])
+            j = j + 1
+        }
+        let q_i = tensor_slice(acts.q, i * d, (i + 1) * d)
+
+        // dprobs_i[j] = dctx_i · v_j  AND  dv_j += p_i[j] · dctx_i
+        let mut dprobs_i = []
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(acts.v, j * d, (j + 1) * d)
+            dprobs_i = dprobs_i.push(tensor_dot(dctx_i, v_j))
+            // Accumulate dv_j += p_i[j] · dctx_i
+            let p_ij = p_i[j]
+            let mut m = 0
+            while m < d {
+                dv[j * d + m] = dv[j * d + m] + p_ij * dctx_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+
+        // dscores_i = softmax_backward(p_i, dprobs_i)
+        let dscores_i = sm_backward(p_i, dprobs_i)
+
+        // dq_i += Σ_j dscores_i[j] · k_j / √d
+        // dk_j += dscores_i[j] · q_i / √d
+        j = 0
+        while j < seq {
+            let k_j = tensor_slice(acts.k, j * d, (j + 1) * d)
+            let s_ij = dscores_i[j] * inv_sqrt_d
+            let mut m = 0
+            while m < d {
+                dq[i * d + m] = dq[i * d + m] + s_ij * k_j[m]
+                dk[j * d + m] = dk[j * d + m] + s_ij * q_i[m]
+                m = m + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Now backprop through the three projections
+    let g_q = mm_backward(x, wq, dq, seq, d, d)
+    let g_k = mm_backward(x, wk, dk, seq, d, d)
+    let g_v = mm_backward(x, wv, dv, seq, d, d)
+    let dx = tensor_add(tensor_add(g_q[0], g_k[0]), g_v[0])
+    return AttnGrads {
+        dx: dx,
+        dWq: g_q[1],
+        dWk: g_k[1],
+        dWv: g_v[1],
+        dWo: dWo
+    }
+}
+
+// ─── Self-test: FD validation ───────────────────────────────
+//
+// Tiny shape seq=2 d=2 (4-dim square matrices) so FD is fast.
+// Loss = ½||out||².
+
+fn half_sq_norm(v: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + 0.5 * v[i] * v[i]
+        i = i + 1
+    }
+    return s
+}
+
+let _seq = 2
+let _d   = 2
+
+let _x  = [0.1, 0.2, 0.3, 0.4]
+let _Wq = [0.5, 0.1, 0.2, 0.6]
+let _Wk = [0.3, 0.4, 0.1, 0.2]
+let _Wv = [0.7, 0.2, 0.5, 0.3]
+let _Wo = [0.1, 0.4, 0.3, 0.2]
+
+let _acts = attn_forward(_x, _Wq, _Wk, _Wv, _Wo, _seq, _d)
+let _loss = half_sq_norm(_acts.out)
+println("[attn_backward] loss = " + str(_loss))
+
+let _dout = _acts.out
+let _grads = attn_backward(_x, _Wq, _Wk, _Wv, _Wo, _acts, _dout, _seq, _d)
+println("[attn_backward] dx  len = " + str(len(_grads.dx))  + " (expect " + str(_seq * _d) + ")")
+println("[attn_backward] dWq len = " + str(len(_grads.dWq)) + " (expect " + str(_d * _d)   + ")")
+
+// FD on x[0]
+let eps = 0.0001
+let _x_p = [_x[0] + eps, _x[1], _x[2], _x[3]]
+let _acts_p = attn_forward(_x_p, _Wq, _Wk, _Wv, _Wo, _seq, _d)
+let _fd_dx0 = (half_sq_norm(_acts_p.out) - _loss) / eps
+let _ana_dx0 = _grads.dx[0]
+println("[attn_backward] dx[0]  analytical  = " + str(_ana_dx0))
+println("[attn_backward] dx[0]  finite-diff = " + str(_fd_dx0))
+let _d0 = _ana_dx0 - _fd_dx0
+let _abs0 = if _d0 < 0.0 { 0.0 - _d0 } else { _d0 }
+
+// FD on Wq[1]
+let mut _Wq_p = []
+let mut _j = 0
+while _j < len(_Wq) {
+    _Wq_p = _Wq_p.push(_Wq[_j])
+    _j = _j + 1
+}
+_Wq_p[1] = _Wq_p[1] + eps
+let _acts_pw = attn_forward(_x, _Wq_p, _Wk, _Wv, _Wo, _seq, _d)
+let _fd_wq1 = (half_sq_norm(_acts_pw.out) - _loss) / eps
+let _ana_wq1 = _grads.dWq[1]
+println("[attn_backward] dWq[1] analytical  = " + str(_ana_wq1))
+println("[attn_backward] dWq[1] finite-diff = " + str(_fd_wq1))
+let _d1 = _ana_wq1 - _fd_wq1
+let _abs1 = if _d1 < 0.0 { 0.0 - _d1 } else { _d1 }
+
+println("")
+if _abs0 < 0.001 && _abs1 < 0.001 {
+    println("[attn_backward] PASS — full attention backward matches FD within 0.001")
+    println("[attn_backward] Δ dx[0]  = " + str(_d0))
+    println("[attn_backward] Δ dWq[1] = " + str(_d1))
+    println("[attn_backward] the hardest decoder primitive is now validated.")
+    println("              Combining with ffn_backward (debcd71d) + rmsnorm_backward")
+    println("              (ops_backward) gives a full layer_backward. N of those")
+    println("              plus lm_head_backward and an embed gather is the full")
+    println("              decoder gradient.")
+} else {
+    println("[attn_backward] FAIL — Δ dx=" + str(_d0) + " Δ dWq=" + str(_d1))
+}
