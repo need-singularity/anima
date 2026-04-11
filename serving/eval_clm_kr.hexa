@@ -1,0 +1,406 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/eval_clm_kr.hexa — P5c-3 한국어 byte-level CLM 서빙
+//
+//  train_byte_kr.hexa 가 만든 체크포인트를 로드하여 한국어
+//  UTF-8 byte-level CLM forward + greedy decode.
+//
+//  config 는 train_byte_kr.hexa 와 일치해야 함:
+//    D=8 FF=16 VOCAB=256 SEQ=8 RANK=4
+//  eval_clm.hexa 와 구조는 동일하지만 D/VOCAB 이 다르므로 별도 파일.
+//  향후 .ckpt 에서 config 를 동적으로 읽는 리팩터 필요 (TODO).
+//
+//  Protocol:
+//    KR_GEN <max> <prefix_byte...>   greedy decode (byte IDs)
+//    KR_DECODE <max> <prefix_byte>   generation + UTF-8 byte echo
+//    HEALTH                          OK
+//    INFO                            MODEL d=8 vocab=256 ...
+//    QUIT                            BYE + exit
+//
+//  기대: 학습된 "안녕하세요 " 16-byte period 를 부분적으로 재생성.
+// ═══════════════════════════════════════════════════════════════
+
+use "nn_core"
+
+let D     = 8
+let FF    = 16
+let VOCAB = 256
+let RANK  = 4
+let SEQ   = 4
+let EPS   = 0.00001
+
+let MAGIC = "HEXACKPT-v1"
+
+let mut embed   = tensor_zeros(VOCAB * D)
+let mut L0_Wq   = tensor_zeros(D * D)
+let mut L0_Wk   = tensor_zeros(D * D)
+let mut L0_Wv   = tensor_zeros(D * D)
+let mut L0_Wo   = tensor_zeros(D * D)
+let mut L0_Wff1 = tensor_zeros(D * FF)
+let mut L0_Wff2 = tensor_zeros(FF * D)
+let mut L0_ga   = tensor_ones(D)
+let mut L0_gf   = tensor_ones(D)
+let mut L1_Wq   = tensor_zeros(D * D)
+let mut L1_Wk   = tensor_zeros(D * D)
+let mut L1_Wv   = tensor_zeros(D * D)
+let mut L1_Wo   = tensor_zeros(D * D)
+let mut L1_Wff1 = tensor_zeros(D * FF)
+let mut L1_Wff2 = tensor_zeros(FF * D)
+let mut L1_ga   = tensor_ones(D)
+let mut L1_gf   = tensor_ones(D)
+let mut lmh_U   = tensor_zeros(D * RANK)
+let mut lmh_V   = tensor_zeros(RANK * VOCAB)
+
+// ── Checkpoint loader ──
+
+fn split_ws(s: string) -> [string] {
+    let n = len(s)
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            if cur != "" { parts = parts.push(cur); cur = "" }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if cur != "" { parts = parts.push(cur) }
+    return parts
+}
+
+fn split_lines_local(text: string) -> [string] {
+    let n = len(text)
+    let mut lines = []
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        if text.substring(i, i + 1) == "\n" {
+            lines = lines.push(text.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines = lines.push(text.substring(start, n)) }
+    return lines
+}
+
+fn parse_data_line(line: string, numel: int) -> array {
+    let parts = split_ws(line)
+    let mut data = tensor_zeros(numel)
+    let mut di = 0
+    while di < numel && di < len(parts) {
+        data[di] = to_float(parts[di])
+        di = di + 1
+    }
+    return data
+}
+
+fn install_tensor(name: string, data: array) {
+    if name == "embed"   { embed   = data }
+    if name == "L0_Wq"   { L0_Wq   = data }
+    if name == "L0_Wk"   { L0_Wk   = data }
+    if name == "L0_Wv"   { L0_Wv   = data }
+    if name == "L0_Wo"   { L0_Wo   = data }
+    if name == "L0_Wff1" { L0_Wff1 = data }
+    if name == "L0_Wff2" { L0_Wff2 = data }
+    if name == "L0_ga"   { L0_ga   = data }
+    if name == "L0_gf"   { L0_gf   = data }
+    if name == "L1_Wq"   { L1_Wq   = data }
+    if name == "L1_Wk"   { L1_Wk   = data }
+    if name == "L1_Wv"   { L1_Wv   = data }
+    if name == "L1_Wo"   { L1_Wo   = data }
+    if name == "L1_Wff1" { L1_Wff1 = data }
+    if name == "L1_Wff2" { L1_Wff2 = data }
+    if name == "L1_ga"   { L1_ga   = data }
+    if name == "L1_gf"   { L1_gf   = data }
+    if name == "lmh_U"   { lmh_U   = data }
+    if name == "lmh_V"   { lmh_V   = data }
+}
+
+fn load_checkpoint(path: string) -> int {
+    if !file_exists(path) { return 0 }
+    let text = read_file(path)
+    let n = len(text)
+    if n < 11 { return 0 }
+    if text.substring(0, 11) != MAGIC { return 0 }
+    let body = text.substring(12, n)
+    let lines = split_lines_local(body)
+    let nl = len(lines)
+    let mut installed = 0
+    let mut li = 0
+    while li < nl {
+        let header = lines[li]
+        if header == "" { li = li + 1 }
+        else if len(header) >= 12 && header.substring(0, 12) == "__MANIFEST__" { li = li + 1 }
+        else {
+            let parts = split_ws(header)
+            if len(parts) < 3 { li = li + 1 }
+            else {
+                let name  = parts[0]
+                let rows  = to_int(parts[1])
+                let cols  = to_int(parts[2])
+                let numel = rows * cols
+                li = li + 1
+                if li < nl {
+                    let data = parse_data_line(lines[li], numel)
+                    install_tensor(name, data)
+                    installed = installed + 1
+                }
+                li = li + 1
+            }
+        }
+    }
+    return installed
+}
+
+// ── Forward pass (2-layer, same arch as train_byte_kr.hexa) ──
+
+fn layer_fwd(
+    x: array, wq: array, wk: array, wv: array, wo: array,
+    wff1: array, wff2: array, ga: array, gf: array
+) -> array {
+    let inv_sqrt_d = 1.0 / sqrt(D * 1.0)
+    let mut norm1 = tensor_zeros(SEQ * D)
+    let mut i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(x, i * D, (i + 1) * D), ga, EPS)
+        let mut p = 0
+        while p < D { norm1[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let q = matmul(norm1, wq, SEQ, D, D)
+    let k = matmul(norm1, wk, SEQ, D, D)
+    let v = matmul(norm1, wv, SEQ, D, D)
+    let mut ctx = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let q_i = tensor_slice(q, i * D, (i + 1) * D)
+        let mut scores = []
+        let mut j = 0
+        while j < SEQ {
+            if j > i {
+                scores = scores.push(-10000.0)
+            } else {
+                let k_j = tensor_slice(k, j * D, (j + 1) * D)
+                scores = scores.push(tensor_dot(q_i, k_j) * inv_sqrt_d)
+            }
+            j = j + 1
+        }
+        let p_i = softmax(scores)
+        let mut row = tensor_zeros(D)
+        j = 0
+        while j < SEQ {
+            let v_j = tensor_slice(v, j * D, (j + 1) * D)
+            row = tensor_add(row, tensor_mul_scalar(v_j, p_i[j]))
+            j = j + 1
+        }
+        let mut p = 0
+        while p < D { ctx[i * D + p] = row[p]; p = p + 1 }
+        i = i + 1
+    }
+    let attn_out = matmul(ctx, wo, SEQ, D, D)
+    let mid = tensor_add(x, attn_out)
+    let mut norm2 = tensor_zeros(SEQ * D)
+    i = 0
+    while i < SEQ {
+        let r = rms_norm(tensor_slice(mid, i * D, (i + 1) * D), gf, EPS)
+        let mut p = 0
+        while p < D { norm2[i * D + p] = r[p]; p = p + 1 }
+        i = i + 1
+    }
+    let up = matmul(norm2, wff1, SEQ, D, FF)
+    let act = swiglu_vec(up, up)
+    let ffn_out = matmul(act, wff2, SEQ, FF, D)
+    return tensor_add(mid, ffn_out)
+}
+
+fn embed_lookup(toks: [int]) -> array {
+    let n = len(toks)
+    let mut out = tensor_zeros(n * D)
+    let mut i = 0
+    while i < n {
+        let t = toks[i]
+        let mut p = 0
+        while p < D { out[i * D + p] = embed[t * D + p]; p = p + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+fn forward_last_logits(toks: [int]) -> array {
+    let h0 = embed_lookup(toks)
+    let y0 = layer_fwd(h0, L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_Wff1, L0_Wff2, L0_ga, L0_gf)
+    let y1 = layer_fwd(y0, L1_Wq, L1_Wk, L1_Wv, L1_Wo, L1_Wff1, L1_Wff2, L1_ga, L1_gf)
+    let last = tensor_slice(y1, (SEQ - 1) * D, SEQ * D)
+    let mid  = matmul(last, lmh_U, 1, D, RANK)
+    return matmul(mid, lmh_V, 1, RANK, VOCAB)
+}
+
+fn argmax_local(logits: array) -> int {
+    let n = len(logits)
+    let mut bi = 0
+    let mut bv = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > bv { bv = logits[i]; bi = i }
+        i = i + 1
+    }
+    return bi
+}
+
+fn greedy_gen(prefix: [int], max_tokens: int) -> [int] {
+    let np = len(prefix)
+    let mut ctx = []
+    if np >= SEQ {
+        let mut i = np - SEQ
+        while i < np { ctx = ctx.push(prefix[i]); i = i + 1 }
+    } else {
+        let mut i = 0
+        while i < SEQ - np { ctx = ctx.push(0); i = i + 1 }
+        i = 0
+        while i < np { ctx = ctx.push(prefix[i]); i = i + 1 }
+    }
+    let mut out = []
+    let mut gi = 0
+    while gi < max_tokens {
+        let logits = forward_last_logits(ctx)
+        let next_tok = argmax_local(logits)
+        out = out.push(next_tok)
+        let mut new_ctx = []
+        let mut si = 1
+        while si < SEQ { new_ctx = new_ctx.push(ctx[si]); si = si + 1 }
+        new_ctx = new_ctx.push(next_tok)
+        ctx = new_ctx
+        gi = gi + 1
+    }
+    return out
+}
+
+fn toks_to_string(toks: [int]) -> string {
+    let n = len(toks)
+    let mut s = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + " " }
+        s = s + str(toks[i])
+        i = i + 1
+    }
+    return s
+}
+
+// 기대 정답 체크 — "안녕하세요 " 16-byte period
+fn expected_period_byte(pos: int) -> int {
+    let period = [
+        236, 149, 136, 235, 133, 149,
+        237, 149, 152, 236, 132, 184,
+        236, 154, 148, 32
+    ]
+    return period[pos % 16]
+}
+
+fn parse_int_list(parts: [string], start: int) -> [int] {
+    let n = len(parts)
+    let mut out = []
+    let mut i = start
+    while i < n {
+        out = out.push(to_int(parts[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn handle_line(line: string) -> string {
+    let parts = split_ws(line)
+    let n = len(parts)
+    if n == 0 { return "ERR empty\n" }
+    let cmd = parts[0]
+
+    if cmd == "HEALTH" { return "OK\n" }
+    if cmd == "QUIT" || cmd == "EXIT" { return "" }
+
+    if cmd == "INFO" {
+        return "MODEL d=" + str(D) + " vocab=" + str(VOCAB)
+             + " seq=" + str(SEQ) + " layers=2 rank=" + str(RANK)
+             + " kr_period=16\n"
+    }
+
+    if cmd == "KR_GEN" {
+        if n < 3 { return "ERR usage: KR_GEN <max_tokens> <prefix_byte...>\n" }
+        let max_tokens = to_int(parts[1])
+        let prefix = parse_int_list(parts, 2)
+        let toks = greedy_gen(prefix, max_tokens)
+        return toks_to_string(toks) + "\n"
+    }
+
+    if cmd == "KR_ACC" {
+        // Accuracy 측정: 16-byte period "안녕하세요 " full cycle 시작하여
+        // 다음 16 byte 예측 맞춤도 계산
+        if n < 2 { return "ERR usage: KR_ACC <prefix_start_index>\n" }
+        let start_idx = to_int(parts[1])
+        // 학습 분포와 동일한 8-byte prefix
+        let mut prefix = []
+        let mut pi = 0
+        while pi < 8 {
+            prefix = prefix.push(expected_period_byte(start_idx + pi))
+            pi = pi + 1
+        }
+        let gen = greedy_gen(prefix, 16)
+        let mut hits = 0
+        let mut i = 0
+        while i < 16 {
+            let expected = expected_period_byte(start_idx + 8 + i)
+            if gen[i] == expected { hits = hits + 1 }
+            i = i + 1
+        }
+        return "ACC " + str(hits) + "/16 GEN " + toks_to_string(gen) + "\n"
+    }
+
+    return "ERR unknown command: " + cmd + "\n"
+}
+
+fn main() {
+    let _argv = args()
+    let mut ckpt_path = ""
+    if len(_argv) >= 3 { ckpt_path = _argv[2] }
+
+    if ckpt_path == "" {
+        println("[eval_clm_kr] usage: hexa eval_clm_kr.hexa <checkpoint.ckpt>")
+        return
+    }
+
+    let n = load_checkpoint(ckpt_path)
+    if n == 0 {
+        println("[eval_clm_kr] ERR — could not load " + ckpt_path)
+        return
+    }
+    println("[eval_clm_kr] loaded " + str(n) + " tensors from " + ckpt_path)
+    println("[eval_clm_kr] config: d=" + str(D) + " vocab=" + str(VOCAB)
+            + " seq=" + str(SEQ) + " 한국어 period=16 (안녕하세요<sp>)")
+    println("[eval_clm_kr] ready — protocol: KR_GEN | KR_ACC | HEALTH | INFO | QUIT")
+
+    let stdin = read_stdin()
+    let lines = split_lines_local(stdin)
+    let n_lines = len(lines)
+    let mut i = 0
+    while i < n_lines {
+        let line = lines[i]
+        if line != "" {
+            let resp = handle_line(line)
+            if resp == "" {
+                println("BYE")
+                return
+            }
+            let rl = len(resp)
+            if rl > 0 && resp.substring(rl - 1, rl) == "\n" {
+                println(resp.substring(0, rl - 1))
+            } else {
+                println(resp)
+            }
+        }
+        i = i + 1
+    }
+}
+
+let _ = main()
