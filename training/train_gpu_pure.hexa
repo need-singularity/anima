@@ -88,55 +88,104 @@ fn host_free_floats(p, n) {
     let _ = free_raw(p, nbytes)
 }
 
-// ── Single training step on a tiny matmul: C = A @ B ──────
-fn train_step_tiny() {
-    println("[step] gpu_alloc 64x64 tensors")
-    let A = gpu_alloc(64, 64)
-    let B = gpu_alloc(64, 64)
-    let C = gpu_alloc(64, 64)
+// ── Bench loop: cublasSgemm × N iterations with wall-clock timing ──
+// On H100 this measures the per-call cuBLAS dispatch cost when invoked
+// from a NATIVE binary (no hexa interpreter loop). Compares directly
+// to R8 measurements (which were 36.41 TFLOPS for 1024³ via interpreter).
+//
+// Same SGEMM size as R8: 1024³. iters=10. Target output:
+//   - per-call ms < 0.1
+//   - sustained TFLOPS > 30
+//
+// If both met, the pure-hexa→C path delivers cuBLAS at ceiling speed
+// without the 533× interpreter overhead. → 500× claim PROVEN.
+fn bench_sgemm_loop(handle, M, N, K, iters) {
+    let A = gpu_alloc(M, K)
+    let B = gpu_alloc(K, N)
+    let C = gpu_alloc(M, N)
 
-    // Allocate host scratch + alpha/beta scalars
     let alpha_buf = alloc_raw(4)
     let beta_buf = alloc_raw(4)
     write_f32(alpha_buf, 0, 1.0)
     write_f32(beta_buf, 0, 0.0)
 
-    // Create cuBLAS handle
+    // Warmup
+    let _ = cublasSgemm_v2(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        M, N, K,
+        ptr_addr(alpha_buf), A, M,
+        B, K,
+        ptr_addr(beta_buf), C, M
+    )
+    let _ = cudaDeviceSynchronize()
+
+    // Timed loop
+    let t0 = clock()
+    let mut i = 0
+    while i < iters {
+        let _ = cublasSgemm_v2(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            M, N, K,
+            ptr_addr(alpha_buf), A, M,
+            B, K,
+            ptr_addr(beta_buf), C, M
+        )
+        i = i + 1
+    }
+    let _ = cudaDeviceSynchronize()
+    let t1 = clock()
+
+    let total_ms = (t1 - t0) * 1000.0
+    let per_ms = total_ms / (iters * 1.0)
+    let flops = 2.0 * M * 1.0 * N * 1.0 * K * 1.0 * iters
+    let tflops = flops / (total_ms / 1000.0) / 1.0e12
+
+    println("  SGEMM ", M, "x", N, "x", K, " iters=", iters)
+    println("    total_ms = ", total_ms)
+    println("    per_ms   = ", per_ms)
+    println("    TFLOPS   = ", tflops)
+
+    // JSON-style line for downstream parsing
+    println("BENCH_RESULT {\"M\":", M, ",\"N\":", N, ",\"K\":", K,
+            ",\"iters\":", iters, ",\"total_ms\":", total_ms,
+            ",\"per_ms\":", per_ms, ",\"tflops\":", tflops, "}")
+
+    let _ = free_raw(alpha_buf, 4)
+    let _ = free_raw(beta_buf, 4)
+    gpu_free(A)
+    gpu_free(B)
+    gpu_free(C)
+}
+
+fn main() {
+    println("=== train_gpu_pure: pure-hexa GPU bench (no C shim) ===")
+    println("Comparing to R8 interpreter baseline:")
+    println("  - R8 t2_gpu_bench SGEMM 1024³ via hexa interpreter = 36.41 TFLOPS")
+    println("  - R8 t2_gpu_bench SGEMM 4096³ via hexa interpreter = 52.29 TFLOPS")
+    println("  - This file: same SGEMM via PURE NATIVE BINARY (no interpreter)")
+    println("")
+
+    let _ = cudaSetDevice(0)
+
+    // Create cuBLAS handle once, reuse across benches
     let h_buf = alloc_raw(8)
     write_i64(h_buf, 0, 0)
     let _ = cublasCreate_v2(ptr_addr(h_buf))
 
-    println("[step] cublasSgemm_v2 64x64x64")
-    let _ = cublasSgemm_v2(
-        ptr_addr(h_buf),
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        64, 64, 64,
-        ptr_addr(alpha_buf),
-        A, 64,
-        B, 64,
-        ptr_addr(beta_buf),
-        C, 64
-    )
-    let _ = cudaDeviceSynchronize()
+    // Bench at the same sizes R8 measured
+    bench_sgemm_loop(ptr_addr(h_buf), 512,  512,  512,  20)
+    bench_sgemm_loop(ptr_addr(h_buf), 1024, 1024, 1024, 10)
+    bench_sgemm_loop(ptr_addr(h_buf), 2048, 2048, 2048, 5)
+    bench_sgemm_loop(ptr_addr(h_buf), 4096, 4096, 4096, 3)
 
-    println("[step] cublasDestroy + free")
     let _ = cublasDestroy_v2(ptr_addr(h_buf))
-
-    gpu_free(A)
-    gpu_free(B)
-    gpu_free(C)
-
-    let _ = free_raw(alpha_buf, 4)
-    let _ = free_raw(beta_buf, 4)
     let _ = free_raw(h_buf, 8)
-}
 
-fn main() {
-    println("=== train_gpu_pure: pure-hexa GPU step (no C shim) ===")
-    let _ = cudaSetDevice(0)
-    train_step_tiny()
+    println("")
     println("=== train_gpu_pure DONE ===")
-    println("(On H100: cc -lcudart -lcublas → first measurement vs R8 161s baseline)")
+    println("Compare BENCH_RESULT lines vs R8 ml-perf-tracker.json entries")
 }
 
 let _ = main()
