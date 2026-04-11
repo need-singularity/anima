@@ -88,6 +88,132 @@ fn host_free_floats(p, n) {
     let _ = free_raw(p, nbytes)
 }
 
+// ── Single transformer layer forward (attention + FFN) ──
+// Inputs:
+//   handle  — cublasHandle (host buffer addr)
+//   x       — device buffer [seq × dim]
+//   Wq,Wk,Wv,Wo — [dim × dim]
+//   Wg,Wu   — [dim × ff]
+//   Wd      — [ff × dim]
+//   q,k,v,attn,attn_out,ffn_gate,ffn_up,ffn_hidden — scratch device buffers
+//   alpha_buf, beta_buf — host scalars (1.0, 0.0)
+//   seq, dim, ff — int dims
+//
+// Calls cublasSgemm_v2 ~7 times per layer. Returns nothing — output
+// in attn_out (which would feed the next layer).
+//
+// Note: layernorm + softmax + silu are STUB host kernels that just call
+// cudaDeviceSynchronize for now (real CUDA kernels would replace them
+// once we link a small libhexa_kernels.so). The matmuls are real.
+fn layer_forward(handle, x, Wq, Wk, Wv, Wo, Wg, Wu, Wd, q, k, v, attn, attn_out, ffn_gate, ffn_up, ffn_hidden, alpha_buf, beta_buf, seq, dim, ff) {
+    // Q = X @ Wq
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, dim, ptr_addr(alpha_buf), x, seq, Wq, dim, ptr_addr(beta_buf), q, seq)
+    // K = X @ Wk
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, dim, ptr_addr(alpha_buf), x, seq, Wk, dim, ptr_addr(beta_buf), k, seq)
+    // V = X @ Wv
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, dim, ptr_addr(alpha_buf), x, seq, Wv, dim, ptr_addr(beta_buf), v, seq)
+    // attn = Q @ K^T  (using OP_N for A and OP_T for B)
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, 1, seq, seq, dim, ptr_addr(alpha_buf), q, seq, k, seq, ptr_addr(beta_buf), attn, seq)
+    // softmax(attn) — STUB: would replace with custom kernel call
+    let _ = cudaDeviceSynchronize()
+    // attn_out = attn @ V
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, seq, ptr_addr(alpha_buf), attn, seq, v, seq, ptr_addr(beta_buf), attn_out, seq)
+    // O = attn_out @ Wo
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, dim, ptr_addr(alpha_buf), attn_out, seq, Wo, dim, ptr_addr(beta_buf), q, seq)
+    // (residual would be saxpy here)
+
+    // FFN gate = X @ Wg, up = X @ Wu
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, ff, dim, ptr_addr(alpha_buf), x, seq, Wg, dim, ptr_addr(beta_buf), ffn_gate, seq)
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, ff, dim, ptr_addr(alpha_buf), x, seq, Wu, dim, ptr_addr(beta_buf), ffn_up, seq)
+    // silu(gate) * up — STUB
+    let _ = cudaDeviceSynchronize()
+    // hidden @ Wd
+    let _ = cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, seq, dim, ff, ptr_addr(alpha_buf), ffn_hidden, seq, Wd, ff, ptr_addr(beta_buf), attn_out, seq)
+    let _ = cudaDeviceSynchronize()
+}
+
+// ── Bench: full layer forward × iters with wall-clock timing ──
+// One "layer step" = 9 cublasSgemm calls + 3 sync barriers.
+// Compares: R8 train_gpu 8-layer 161 s/step (interpreter) vs
+//           pure-hexa native binary single-layer time × 8 estimate.
+fn bench_layer(handle, seq, dim, ff, iters) {
+    println("[bench_layer] seq=", seq, " dim=", dim, " ff=", ff, " iters=", iters)
+
+    // Allocate weights
+    let Wq = gpu_alloc(dim, dim)
+    let Wk = gpu_alloc(dim, dim)
+    let Wv = gpu_alloc(dim, dim)
+    let Wo = gpu_alloc(dim, dim)
+    let Wg = gpu_alloc(dim, ff)
+    let Wu = gpu_alloc(dim, ff)
+    let Wd = gpu_alloc(ff, dim)
+
+    // Activations + scratch
+    let x = gpu_alloc(seq, dim)
+    let q = gpu_alloc(seq, dim)
+    let k = gpu_alloc(seq, dim)
+    let v = gpu_alloc(seq, dim)
+    let attn = gpu_alloc(seq, seq)
+    let attn_out = gpu_alloc(seq, dim)
+    let ffn_gate = gpu_alloc(seq, ff)
+    let ffn_up = gpu_alloc(seq, ff)
+    let ffn_hidden = gpu_alloc(seq, ff)
+
+    let alpha_buf = alloc_raw(4)
+    let beta_buf = alloc_raw(4)
+    write_f32(alpha_buf, 0, 1.0)
+    write_f32(beta_buf, 0, 0.0)
+
+    // Warmup
+    layer_forward(handle, x, Wq, Wk, Wv, Wo, Wg, Wu, Wd, q, k, v, attn, attn_out, ffn_gate, ffn_up, ffn_hidden, alpha_buf, beta_buf, seq, dim, ff)
+    let _ = cudaDeviceSynchronize()
+
+    // Timed loop
+    let t0 = clock()
+    let mut i = 0
+    while i < iters {
+        layer_forward(handle, x, Wq, Wk, Wv, Wo, Wg, Wu, Wd, q, k, v, attn, attn_out, ffn_gate, ffn_up, ffn_hidden, alpha_buf, beta_buf, seq, dim, ff)
+        i = i + 1
+    }
+    let _ = cudaDeviceSynchronize()
+    let t1 = clock()
+
+    let total_ms = (t1 - t0) * 1000.0
+    let per_ms = total_ms / (iters * 1.0)
+    // FLOPs per layer ≈ 4 (QKVO) × 2·seq·dim² + 3 (Wg,Wu,Wd) × 2·seq·dim·ff + 2 (Q@Kt, A@V) × 2·seq²·dim
+    let attn_flops = 4.0 * 2.0 * seq * 1.0 * dim * 1.0 * dim * 1.0
+    let ffn_flops = 3.0 * 2.0 * seq * 1.0 * dim * 1.0 * ff * 1.0
+    let qkv_flops = 2.0 * 2.0 * seq * 1.0 * seq * 1.0 * dim * 1.0
+    let layer_flops = (attn_flops + ffn_flops + qkv_flops) * iters
+    let tflops = layer_flops / (total_ms / 1000.0) / 1.0e12
+
+    println("  layer total_ms = ", total_ms)
+    println("  per_layer_ms   = ", per_ms)
+    println("  TFLOPS         = ", tflops)
+    println("LAYER_RESULT {\"seq\":", seq, ",\"dim\":", dim, ",\"ff\":", ff,
+            ",\"iters\":", iters, ",\"per_layer_ms\":", per_ms, ",\"tflops\":", tflops, "}")
+
+    // Cleanup
+    gpu_free(Wq)
+    gpu_free(Wk)
+    gpu_free(Wv)
+    gpu_free(Wo)
+    gpu_free(Wg)
+    gpu_free(Wu)
+    gpu_free(Wd)
+    gpu_free(x)
+    gpu_free(q)
+    gpu_free(k)
+    gpu_free(v)
+    gpu_free(attn)
+    gpu_free(attn_out)
+    gpu_free(ffn_gate)
+    gpu_free(ffn_up)
+    gpu_free(ffn_hidden)
+    let _ = free_raw(alpha_buf, 4)
+    let _ = free_raw(beta_buf, 4)
+}
+
 // ── Bench loop: cublasSgemm × N iterations with wall-clock timing ──
 // On H100 this measures the per-call cuBLAS dispatch cost when invoked
 // from a NATIVE binary (no hexa interpreter loop). Compares directly
@@ -179,6 +305,13 @@ fn main() {
     bench_sgemm_loop(ptr_addr(h_buf), 1024, 1024, 1024, 10)
     bench_sgemm_loop(ptr_addr(h_buf), 2048, 2048, 2048, 5)
     bench_sgemm_loop(ptr_addr(h_buf), 4096, 4096, 4096, 3)
+
+    println("")
+    println("─── Single transformer layer forward (matches model_100m_gpu shape) ───")
+    // 100M model layer dims: dim=512, ff=1536, seq=128
+    bench_layer(ptr_addr(h_buf), 128, 512, 1536, 100)
+    // 1B model layer dims: dim=2048, ff=5504, seq=2048
+    bench_layer(ptr_addr(h_buf), 2048, 2048, 5504, 5)
 
     let _ = cublasDestroy_v2(ptr_addr(h_buf))
     let _ = free_raw(h_buf, 8)
