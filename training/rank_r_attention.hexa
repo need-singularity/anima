@@ -1,0 +1,200 @@
+// rank_r_attention.hexa — Rank-r attention (DD175 #4)
+//
+// Closes the implementation half of DD175 technique #4
+// (status was "todo" in training/dd175_techniques.hexa).
+//
+// Standard attention:
+//   Q = X · Wq    [seq × d]
+//   K = X · Wk    [seq × d]
+//   V = X · Wv    [seq × d]
+//   scores = (Q · K^T) / √d_k                [seq × seq]
+//   probs  = softmax(scores)                 [seq × seq]
+//   ctx    = probs · V                       [seq × d]
+//
+//   Cost per layer: 4·seq·d² (projections) + 2·seq²·d (QK^T + scores·V)
+//   At d=4096, seq=128: ~270M FLOPs
+//
+// Rank-r attention (DD175 #4):
+//   Uq, Uk, Uv: [d × r]   (r ≪ d)
+//   Qs = X · Uq   [seq × r]
+//   Ks = X · Uk   [seq × r]
+//   Vs = X · Uv   [seq × r]
+//   scores = (Qs · Ks^T) / √r                [seq × seq]
+//   probs  = softmax(scores)                 [seq × seq]
+//   ctx_r  = probs · Vs                      [seq × r]
+//   ctx    = ctx_r · Vo  where Vo: [r × d]   [seq × d]   ← output expand
+//
+//   Cost per layer: 4·seq·d·r (projections) + 2·seq²·r (QK^T + scores·V)
+//                 + seq·r·d (output expand)
+//   At d=4096, r=16, seq=128: ~33M FLOPs
+//   Speedup: 270M / 33M ≈ 8×  (matrix shape; full d=4096 r=16 attn-only ≈ 256×)
+//
+//   The 256× number from DD175.md is the attention-block-only ratio:
+//   2·seq²·d / 2·seq²·r = d/r = 256 when d=4096, r=16. The end-to-end
+//   speedup is bounded by the projection cost which doesn't shrink as
+//   much (linear in d, only saves the K^d^2 quadratic term).
+
+use "nn_core"
+
+// ─── Constants ──────────────────────────────────────────────
+let RANK_R_DEFAULT = 16
+let SQRT_INV_R     = 0.25      // 1/√16 — change if RANK_R_DEFAULT changes
+
+// ─── Struct ─────────────────────────────────────────────────
+// Flat row-major storage. All matrices are length d*r or r*d.
+struct RankRAttention {
+    seq:    int,
+    d:      int,
+    r:      int,
+    Uq:     array,    // [d × r]
+    Uk:     array,    // [d × r]
+    Uv:     array,    // [d × r]
+    Vo:     array     // [r × d]   output expand
+}
+
+// Constructor: random init via nn_core's tensor_randn.
+fn rank_r_attn_new(seq: int, d: int, r: int, seed: int) -> RankRAttention {
+    let scale = 0.02
+    let uq = tensor_mul_scalar(tensor_randn(d * r, seed),     scale)
+    let uk = tensor_mul_scalar(tensor_randn(d * r, seed + 1), scale)
+    let uv = tensor_mul_scalar(tensor_randn(d * r, seed + 2), scale)
+    let vo = tensor_mul_scalar(tensor_randn(r * d, seed + 3), scale)
+    return RankRAttention { seq: seq, d: d, r: r, Uq: uq, Uk: uk, Uv: uv, Vo: vo }
+}
+
+// ─── Forward ────────────────────────────────────────────────
+//
+// x:       flat [seq × d]
+// returns: flat [seq × d]
+//
+// Steps (each is one BLAS-friendly matmul or vector op):
+//   Qs = x @ Uq      [seq × r]
+//   Ks = x @ Uk      [seq × r]
+//   Vs = x @ Uv      [seq × r]
+//   for each query row i:
+//       scores_i = Qs[i] · Ks^T          (seq scalars)
+//       probs_i  = softmax(scores_i / √r)
+//       ctx_r_i  = probs_i · Vs          (r-vector)
+//       out_i    = ctx_r_i · Vo          (d-vector)
+
+fn rank_r_attn_forward(a: RankRAttention, x: array) -> array {
+    let seq = a.seq
+    let d   = a.d
+    let r   = a.r
+
+    // Project x → Qs, Ks, Vs
+    let qs = matmul(x, a.Uq, seq, d, r)     // [seq × r]
+    let ks = matmul(x, a.Uk, seq, d, r)     // [seq × r]
+    let vs = matmul(x, a.Uv, seq, d, r)     // [seq × r]
+
+    // For each query row, compute attention output
+    let mut out = tensor_zeros(seq * d)
+    let mut i = 0
+    while i < seq {
+        // Slice Qs[i] : [r]
+        let q_i = tensor_slice(qs, i * r, (i + 1) * r)
+
+        // scores[j] = q_i · ks[j] / √r        for j in 0..seq
+        let mut scores = []
+        let mut j = 0
+        while j < seq {
+            let k_j = tensor_slice(ks, j * r, (j + 1) * r)
+            let s = tensor_dot(q_i, k_j) * SQRT_INV_R
+            scores = scores.push(s)
+            j = j + 1
+        }
+
+        // softmax
+        let probs = softmax(scores)
+
+        // ctx_r = probs · Vs   →  [r] vector
+        let mut ctx_r = tensor_zeros(r)
+        j = 0
+        while j < seq {
+            let v_j = tensor_slice(vs, j * r, (j + 1) * r)
+            let p = probs[j]
+            // ctx_r += p * v_j  (single AXPY)
+            let scaled = tensor_mul_scalar(v_j, p)
+            ctx_r = tensor_add(ctx_r, scaled)
+            j = j + 1
+        }
+
+        // Expand back to d: out[i] = ctx_r · Vo   →  [d]
+        // Vo is row-major [r × d], so this is a matvec.
+        let mut k = 0
+        while k < d {
+            let mut sum = 0.0
+            let mut rr = 0
+            while rr < r {
+                sum = sum + ctx_r[rr] * a.Vo[rr * d + k]
+                rr = rr + 1
+            }
+            out[i * d + k] = sum
+            k = k + 1
+        }
+
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Param accounting ────────────────────────────────────────
+
+fn rank_r_attn_params(a: RankRAttention) -> int {
+    return 3 * a.d * a.r + a.r * a.d   // Uq + Uk + Uv + Vo
+}
+
+fn rank_r_attn_dense_params(d: int) -> int {
+    return 4 * d * d                   // Wq + Wk + Wv + Wo (dense baseline)
+}
+
+// FLOP estimate per forward call.
+fn rank_r_attn_flops(seq: int, d: int, r: int) -> int {
+    let proj  = 3 * (2 * seq * d * r)         // Qs, Ks, Vs each = matmul
+    let attn  = 2 * (2 * seq * seq * r)       // QsKs^T + probs·Vs (in r-dim)
+    let outp  = 2 * seq * r * d               // output expand
+    return proj + attn + outp
+}
+
+fn rank_r_attn_flops_dense(seq: int, d: int) -> int {
+    let proj  = 4 * (2 * seq * d * d)         // Wq, Wk, Wv, Wo
+    let attn  = 2 * (2 * seq * seq * d)       // QK^T + probs·V
+    return proj + attn
+}
+
+// ─── Self-test ──────────────────────────────────────────────
+
+// Tiny shape: seq=4, d=8, r=2 — hand-verifiable, fast.
+let _seq = 4
+let _d   = 8
+let _r   = 2
+let _attn = rank_r_attn_new(_seq, _d, _r, 7)
+
+// Fake input: tokens × d, all 0.1
+let _x = tensor_mul_scalar(tensor_ones(_seq * _d), 0.1)
+let _out = rank_r_attn_forward(_attn, _x)
+
+println("[rank_r_attn] forward output len = " + str(len(_out)) + " (expected " + str(_seq * _d) + ")")
+println("[rank_r_attn] first output = " + str(_out[0]))
+
+// Param + FLOP report
+println("[rank_r_attn] tiny (seq=4 d=8 r=2):")
+println("  rank-r params: " + str(rank_r_attn_params(_attn)))
+println("  dense params:  " + str(rank_r_attn_dense_params(_d)))
+println("  rank-r FLOPs:  " + str(rank_r_attn_flops(_seq, _d, _r)))
+println("  dense FLOPs:   " + str(rank_r_attn_flops_dense(_seq, _d)))
+
+// Full-scale projection (no forward — just numbers)
+let full_seq = 128
+let full_d   = 4096
+let full_r   = 16
+println("[rank_r_attn] full (seq=128 d=4096 r=16):")
+println("  rank-r params: " + str(3 * full_d * full_r + full_r * full_d))
+println("  dense params:  " + str(4 * full_d * full_d))
+println("  rank-r FLOPs:  " + str(rank_r_attn_flops(full_seq, full_d, full_r)))
+println("  dense FLOPs:   " + str(rank_r_attn_flops_dense(full_seq, full_d)))
+
+// Speedup estimate (FLOPs only — real speedup also depends on memory)
+let _r_flops = rank_r_attn_flops(full_seq, full_d, full_r)
+let _d_flops = rank_r_attn_flops_dense(full_seq, full_d)
+println("  FLOP ratio (dense/rank-r) = " + str(_d_flops / _r_flops) + "x")
