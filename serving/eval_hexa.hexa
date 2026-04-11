@@ -1,0 +1,314 @@
+// ═══════════════════════════════════════════════════════════════
+//  serving/eval_hexa.hexa — pure-hexa 5-metric evaluation harness
+//
+//  Replaces serving/eval.hexa (which is full of PyTorch TODO stubs)
+//  with a CPU-only, dependency-free implementation that runs against
+//  a hexa-native trained model.
+//
+//  5 metrics:
+//    M1 PPL          — perplexity on a held-out validation set
+//    M2 TopK accuracy — top-1/5 match rate on next-token prediction
+//    M3 Diversity    — distinct n-gram ratio in generated samples
+//    M4 Korean ratio — fraction of generated codepoints in Hangul block
+//    M5 Length stats — mean and std of generated sequence lengths
+//
+//  Target thresholds (P5c-4 latency separate):
+//    PPL < 20.0          (random baseline log(vocab))
+//    top1 > 0.30
+//    distinct-2 > 0.20
+//    korean_ratio > 0.20  (when prompt is Korean)
+//    length_mean > 16
+//
+//  This file calls a stub `model_logits(token, ctx)` that returns a
+//  fake-but-deterministic logit vector. Real integration replaces it
+//  with the actual hexa-native model forward pass once a checkpoint
+//  exists (train_byte_clm.hexa style or train_gpu_pure.hexa output).
+// ═══════════════════════════════════════════════════════════════
+
+let VOCAB = 256
+let DEFAULT_VAL_TOKENS = 256
+let DEFAULT_GEN_TOKENS = 64
+let DEFAULT_GEN_PROMPTS = 4
+
+// Korean Hangul Syllables block: U+AC00..U+D7A3
+let HANGUL_LO = 44032
+let HANGUL_HI = 55203
+
+// ── Stub deterministic model: logits[i] = (token * 7 + i * 3 + ctx) % vocab ──
+// Real model replaces this with a trained forward pass.
+fn model_logits(token, ctx) {
+    let mut logits = []
+    let mut i = 0
+    while i < VOCAB {
+        let raw = (token * 7 + i * 3 + ctx) % VOCAB
+        logits = logits.push(raw * 1.0)
+        i = i + 1
+    }
+    return logits
+}
+
+// ── Numerically stable log-softmax row → log probabilities ──
+fn log_softmax(logits) {
+    let n = len(logits)
+    // max
+    let mut m = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > m { m = logits[i] }
+        i = i + 1
+    }
+    // sum exp(x - m)
+    let mut s = 0.0
+    let mut j = 0
+    while j < n {
+        s = s + exp(logits[j] - m)
+        j = j + 1
+    }
+    let logZ = m + log(s)
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out = out.push(logits[k] - logZ)
+        k = k + 1
+    }
+    return out
+}
+
+// ── argmax of a logit row ──
+fn argmax(logits) {
+    let n = len(logits)
+    let mut best_i = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+// ── M1 PPL: perplexity on validation tokens ──
+fn metric_ppl(val_tokens) {
+    let n = len(val_tokens)
+    if n < 2 { return 0.0 }
+    let mut total_nll = 0.0
+    let mut count = 0
+    let mut i = 0
+    while i < n - 1 {
+        let token = val_tokens[i]
+        let target = val_tokens[i + 1]
+        let logits = model_logits(token, i)
+        let lp = log_softmax(logits)
+        total_nll = total_nll - lp[target]
+        count = count + 1
+        i = i + 1
+    }
+    let mean_nll = total_nll / (count * 1.0)
+    return exp(mean_nll)
+}
+
+// ── M2 TopK accuracy: how often is the target in the top-k logits? ──
+fn metric_top1(val_tokens) {
+    let n = len(val_tokens)
+    if n < 2 { return 0.0 }
+    let mut hits = 0
+    let mut i = 0
+    while i < n - 1 {
+        let token = val_tokens[i]
+        let target = val_tokens[i + 1]
+        let logits = model_logits(token, i)
+        let pred = argmax(logits)
+        if pred == target { hits = hits + 1 }
+        i = i + 1
+    }
+    return (hits * 1.0) / ((n - 1) * 1.0)
+}
+
+// ── Greedy generation from a prompt token (renamed: 'generate' is a hexa keyword) ──
+fn gen_sample(start, max_len) {
+    let mut out = []
+    out = out.push(start)
+    let mut i = 0
+    let mut prev = start
+    while i < max_len - 1 {
+        let logits = model_logits(prev, i)
+        let next_tok = argmax(logits)
+        out = out.push(next_tok)
+        prev = next_tok
+        i = i + 1
+    }
+    return out
+}
+
+// ── M3 Diversity: distinct-2 ratio across generated samples ──
+fn metric_diversity_d2(samples) {
+    let n_samples = len(samples)
+    if n_samples == 0 { return 0.0 }
+    // Concatenate all bigrams across samples
+    let mut bigram_keys = []
+    let mut total_bigrams = 0
+    let mut s = 0
+    while s < n_samples {
+        let toks = samples[s]
+        let nt = len(toks)
+        let mut t = 0
+        while t < nt - 1 {
+            // encode bigram as token1 * VOCAB + token2 for uniqueness
+            let key = toks[t] * VOCAB + toks[t + 1]
+            // dedupe
+            let mut found = false
+            let mut k = 0
+            while k < len(bigram_keys) {
+                if bigram_keys[k] == key { found = true }
+                k = k + 1
+            }
+            if !found { bigram_keys = bigram_keys.push(key) }
+            total_bigrams = total_bigrams + 1
+            t = t + 1
+        }
+        s = s + 1
+    }
+    if total_bigrams == 0 { return 0.0 }
+    return (len(bigram_keys) * 1.0) / (total_bigrams * 1.0)
+}
+
+// ── M4 Korean ratio: fraction of tokens in Hangul codepoint range ──
+// (For byte-level vocab, this won't fire; for codepoint vocab from
+// corpus_pipeline.hexa, it will.)
+fn metric_korean_ratio(samples) {
+    let n_samples = len(samples)
+    if n_samples == 0 { return 0.0 }
+    let mut hangul = 0
+    let mut total = 0
+    let mut s = 0
+    while s < n_samples {
+        let toks = samples[s]
+        let nt = len(toks)
+        let mut t = 0
+        while t < nt {
+            let cp = toks[t]
+            if cp >= HANGUL_LO && cp <= HANGUL_HI {
+                hangul = hangul + 1
+            }
+            total = total + 1
+            t = t + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0.0 }
+    return (hangul * 1.0) / (total * 1.0)
+}
+
+// ── M5 Length stats: mean + std of sample lengths ──
+fn metric_length_stats(samples) {
+    let n = len(samples)
+    if n == 0 {
+        let result = [0.0, 0.0]
+        return result
+    }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + len(samples[i]) * 1.0
+        i = i + 1
+    }
+    let mean = sum / (n * 1.0)
+    let mut var_sum = 0.0
+    let mut j = 0
+    while j < n {
+        let d = len(samples[j]) * 1.0 - mean
+        var_sum = var_sum + d * d
+        j = j + 1
+    }
+    let std = sqrt(var_sum / (n * 1.0))
+    let result = [mean, std]
+    return result
+}
+
+// ── Build a small validation token sequence for self-test ──
+fn build_val_tokens(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push((i * 13 + 7) % VOCAB)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Build a few generated samples ──
+fn build_samples(n_samples, gen_len) {
+    let mut samples = []
+    let mut s = 0
+    while s < n_samples {
+        let start_tok = (s * 31) % VOCAB
+        let g = gen_sample(start_tok, gen_len)
+        samples = samples.push(g)
+        s = s + 1
+    }
+    return samples
+}
+
+// ── Pass/fail thresholds ──
+fn passes(ppl, top1, d2, korean, len_mean) {
+    let mut count = 0
+    if ppl < 20.0 { count = count + 1 }
+    if top1 > 0.30 { count = count + 1 }
+    if d2 > 0.20 { count = count + 1 }
+    if korean > 0.20 { count = count + 1 }
+    if len_mean > 16.0 { count = count + 1 }
+    return count
+}
+
+fn main() {
+    println("═══ eval_hexa: 5-metric harness ═══")
+    println("  vocab=", VOCAB)
+    println("  val_tokens=", DEFAULT_VAL_TOKENS)
+    println("  gen_prompts=", DEFAULT_GEN_PROMPTS)
+    println("  gen_tokens=", DEFAULT_GEN_TOKENS)
+    println("")
+
+    // Validation set
+    let val = build_val_tokens(DEFAULT_VAL_TOKENS)
+
+    // M1 PPL
+    let ppl = metric_ppl(val)
+    println("  M1 PPL          = ", ppl, "  (threshold < 20)")
+
+    // M2 top1
+    let top1 = metric_top1(val)
+    println("  M2 top-1 acc    = ", top1, "  (threshold > 0.30)")
+
+    // Generated samples
+    let samples = build_samples(DEFAULT_GEN_PROMPTS, DEFAULT_GEN_TOKENS)
+
+    // M3 diversity
+    let d2 = metric_diversity_d2(samples)
+    println("  M3 distinct-2   = ", d2, "  (threshold > 0.20)")
+
+    // M4 korean ratio
+    let kr = metric_korean_ratio(samples)
+    println("  M4 korean ratio = ", kr, "  (threshold > 0.20, off for byte vocab)")
+
+    // M5 length stats
+    let ls = metric_length_stats(samples)
+    let len_mean = ls[0]
+    let len_std = ls[1]
+    println("  M5 length mean  = ", len_mean, "  std= ", len_std, "  (threshold mean > 16)")
+
+    // Summary
+    let n_pass = passes(ppl, top1, d2, kr, len_mean)
+    println("")
+    println("  → ", n_pass, " / 5 metrics passed")
+    if n_pass >= 3 {
+        println("  → eval verdict: PASS (>= 3/5)")
+    } else {
+        println("  → eval verdict: FAIL (need >= 3/5)")
+    }
+    println("═══ eval_hexa DONE ═══")
+}
+
+let _ = main()
