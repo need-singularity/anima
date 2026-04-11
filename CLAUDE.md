@@ -25,7 +25,7 @@ api       shared/CLAUDE.md
 ## exec
 
 ```sh
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HOME/Dev/hexa-lang/hexa
 $HEXA anima/core/runtime/anima_runtime.hexa --keyboard      # CLI 진입
 $HEXA anima/core/runtime/anima_runtime.hexa --validate-hub  # 허브 검증
 $HEXA ready/anima/tests/tests.hexa --verify                 # 7조건 의식검증
