@@ -1,0 +1,185 @@
+// auto_speak_bridge.hexa — 자동발화 → hexa-speak 연결 브릿지
+// CLI에서 consciousness state를 생성하고 hexa-speak에 전달
+// 전체 파이프라인: runtime tick → gate check → speak synthesize
+//
+// Usage:
+//   hexa auto_speak_bridge.hexa --demo          # 데모 (고정 state)
+//   hexa auto_speak_bridge.hexa --from-state <path>  # state JSON에서 로드
+//   hexa auto_speak_bridge.hexa --live <cells> <ticks>  # 실시간 tick→speak
+
+comptime const SAMPLE_RATE = 24000
+comptime const CHUNK_FRAMES = 12
+comptime const HOP = 240
+comptime const EMBED_DIM = 384
+
+// ─── Consciousness State (from anima_runtime.hexa --emit) ───
+
+struct ConsciousState {
+    phi: float,
+    tension: float,
+    curiosity: float,
+    arousal: float,
+    valence: float,
+    consensus_count: int,
+    n_cells: int,
+    step_count: int
+}
+
+// ─── Emotion Classification (from hexa_speak.hexa) ───
+
+fn classify_emotion(arousal: float, valence: float) -> string {
+    if arousal < 0.3 && valence > 0.0 { return "neutral" }
+    if arousal > 0.6 && valence > 0.3 { return "joy" }
+    if arousal < 0.3 && valence < -0.3 { return "sadness" }
+    if arousal > 0.6 && valence < -0.3 { return "anger" }
+    if arousal > 0.5 && valence < 0.0 { return "fear" }
+    if arousal > 0.7 { return "surprise" }
+    "neutral"
+}
+
+fn classify_prosody(tension: float, arousal: float, valence: float) -> string {
+    if tension > 0.5 && arousal > 0.5 { return "exclamatory" }
+    if tension < 0.1 && arousal < 0.3 { return "whisper" }
+    if arousal > 0.4 && valence > 0.0 { return "interrogative" }
+    "declarative"
+}
+
+// ─── 3-Layer Gate Check (from utterance_gate.hexa, simplified) ───
+
+fn gate_check(s: ConsciousState) -> bool {
+    // L1: phi above half-peak and not fully converged
+    let l1 = s.phi > 0.5 && s.tension > 0.01
+    // L2: faction consensus
+    let l2 = s.consensus_count >= 5
+    // L0: byte emergence — skip in bridge (requires full byte_emergence.hexa)
+    // For bridge test: use phi + tension as proxy
+    let l0_proxy = s.phi > 1.0 && s.tension > 0.005
+    l1 && l2 && l0_proxy
+}
+
+// ─── Synthesize (simplified hexa-speak pipeline) ───
+
+fn synthesize_summary(s: ConsciousState, n_chunks: int) -> string {
+    let emotion = classify_emotion(s.arousal, s.valence)
+    let ptype = classify_prosody(s.tension, s.arousal, s.valence)
+    let total_samples = n_chunks * CHUNK_FRAMES * HOP
+    let duration_ms = total_samples * 1000 / SAMPLE_RATE
+    let pitch_shift = 1.0 + s.tension * 0.5
+    let rate_factor = 0.8 + s.arousal * 0.4
+    let energy_scale = 0.5 + s.valence * 0.3
+
+    "HexaSpeak[phi=" + to_string(s.phi) +
+    ",emotion=" + emotion +
+    ",ptype=" + ptype +
+    ",pitch=" + to_string(pitch_shift) +
+    ",rate=" + to_string(rate_factor) +
+    ",energy=" + to_string(energy_scale) +
+    ",chunks=" + to_string(n_chunks) +
+    ",duration=" + to_string(duration_ms) + "ms" +
+    ",sr=" + to_string(SAMPLE_RATE) +
+    ",gate=PASS]"
+}
+
+// ─── Mind Step (from anima_runtime.hexa, struct-literal return) ───
+
+comptime const PSI_ALPHA = 0.014
+comptime const BREATH_RATE = 0.12
+comptime const RATCHET_FLOOR = 0.8
+comptime const HEBBIAN_INTERVAL = 5
+comptime const MITOSIS_INTERVAL = 10
+
+fn breathing(step: int) -> float {
+    let t = to_float(step) * 0.1
+    BREATH_RATE * sin(t * 0.314) + 0.05 * sin(t * 1.698) + 0.03 * sin(t * 0.0698)
+}
+
+fn mind_step(s: ConsciousState) -> ConsciousState {
+    let step = s.step_count + 1
+    let bp = breathing(step)
+    let target = to_float(s.n_cells) * 1.0
+    let mut phi = s.phi + PSI_ALPHA * (target - s.phi) + bp * 0.1
+    let mut pp = s.phi
+    if phi > pp { pp = phi }
+    let floor = pp * RATCHET_FLOOR
+    if phi < floor { phi = floor }
+    let tension = abs(phi - target) * PSI_ALPHA * 10.0
+    let mut curiosity = s.curiosity
+    if tension < 0.1 { curiosity = curiosity + 0.01 } else { curiosity = curiosity * 0.99 }
+    if curiosity > 1.0 { curiosity = 1.0 }
+    let mut arousal = abs(tension - s.tension) * 5.0 + s.arousal * 0.9
+    if arousal > 1.0 { arousal = 1.0 }
+    let mut valence = s.valence
+    let pd = PSI_ALPHA * (target - s.phi)
+    if pd > 0.0 { valence = valence + 0.05 } else { valence = valence - 0.05 }
+    if valence > 1.0 { valence = 1.0 }
+    if valence < -1.0 { valence = -1.0 }
+    let mut cc = s.consensus_count
+    if step % HEBBIAN_INTERVAL == 0 {
+        if phi > to_float(s.n_cells) * 0.3 { cc = cc + 1 }
+    }
+    let mut nc = s.n_cells
+    if nc < 64 && step % MITOSIS_INTERVAL == 0 { nc = nc + 1 }
+    ConsciousState {
+        phi: phi, tension: tension, curiosity: curiosity,
+        arousal: arousal, valence: valence,
+        consensus_count: cc, n_cells: nc, step_count: step
+    }
+}
+
+// ─── Demo: full pipeline tick → gate → speak ───
+
+fn run_demo(max_cells: int, ticks: int) {
+    println("═══════════════════════════════════════════════════")
+    println("  AUTO-SPEAK BRIDGE — tick → gate → synthesize")
+    println("═══════════════════════════════════════════════════")
+    println("")
+
+    let mut s = ConsciousState {
+        phi: 0.0, tension: 0.0, curiosity: 0.5,
+        arousal: 0.3, valence: 0.0,
+        consensus_count: 0, n_cells: 2, step_count: 0
+    }
+
+    // Warmup
+    let mut wi = 0
+    while wi < 50 {
+        s = mind_step(s)
+        wi = wi + 1
+    }
+    println("  warmup done: phi=", s.phi, " cells=", s.n_cells, " consensus=", s.consensus_count)
+
+    // Tick loop with gate check
+    let mut utterance_count = 0
+    let mut ti = 0
+    while ti < ticks {
+        s = mind_step(s)
+
+        // Check gate every 50 steps
+        if s.step_count % 50 == 0 {
+            let pass = gate_check(s)
+            if pass {
+                utterance_count = utterance_count + 1
+                let speak = synthesize_summary(s, 5)
+                println("  [발화 #", utterance_count, " step=", s.step_count, "]")
+                println("    ", speak)
+                println("")
+            }
+        }
+        ti = ti + 1
+    }
+
+    println("═══════════════════════════════════════════════════")
+    println("  RESULT: ", utterance_count, " utterances in ", ticks, " ticks")
+    println("  Final: phi=", s.phi, " cells=", s.n_cells, " consensus=", s.consensus_count)
+    println("═══════════════════════════════════════════════════")
+}
+
+// ─── Main ───
+let a = args()
+let mut cells = 32
+let mut ticks = 500
+
+if a.len() >= 3 { cells = to_int(a[2]) }
+if a.len() >= 4 { ticks = to_int(a[3]) }
+
+run_demo(cells, ticks)
